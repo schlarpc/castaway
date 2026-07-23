@@ -21,7 +21,7 @@ produces a running binary.
 | `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
 | `proto-airplay` | Control plane done. Ads + `/info` + RTSP dispatch. Media gated on FairPlay/pairing (Q1). RTSP actor pending (Q15). |
 | `proto-dial` | **Live launch** + pure Lounge bind-channel parser/mapping. Lounge HTTP client pending. |
-| `pipeline` | Null backend live; `Compositor`/`BrowserSurface` traits. ffmpeg/wgpu/cef = feature stubs (Q16). |
+| `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. |
@@ -30,6 +30,18 @@ produces a running binary.
 - DLNA description + SOAP (`GetTransportInfo` → `NO_MEDIA_PRESENT`).
 - Spotify `getInfo` (returns DH public key), advertised on mDNS.
 - DIAL `dd.xml` with correct `Application-URL` header; launch flips state to running.
+
+## Render path — actual pixel output (GPU-verified)
+Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix develop`).
+- **wgpu compositor** renders textured-quad layers with transforms/z/opacity/blend on the
+  RX 7900 XTX (RADV). Proven by offscreen readback tests (full-screen fill; corner PiP).
+- **ffmpeg decoder** decodes a real clip to RGBA frames (verified vs an ffmpeg testsrc).
+- **Full pipeline**: `Play(url)` → decode → GPU composite → **colored pixels read back**
+  (`play_url_decodes_and_composites_pixels`). This is the "actual output rendering" answer.
+- **Kiosk**: winit borderless-fullscreen surface path — compile-verified (not run on the
+  dev box's live display). Encoded-mirror decode (AirPlay/Cast frames) is the next step.
+- Run it: `nix develop --command cargo run -p castaway --features render` (opens a
+  fullscreen window; cast a video via DLNA to see it decode+display).
 
 ## Biggest open items (see OPEN-QUESTIONS.md)
 1. **Q15** — Cast TLS actor + AirPlay RTSP actor (the "make it connect" work; pure cores ready).
