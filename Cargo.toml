@@ -7,6 +7,9 @@ members = [
     "crates/core",
     "crates/substrate-ssdp",
     "crates/proto-dlna",
+    "crates/substrate-mdns",
+    "crates/proto-cast",
+    "crates/proto-spotify",
     "crates/app",
 ]
 
@@ -76,6 +79,8 @@ x25519-dalek = "2"
 aes = "0.8"
 ctr = "0.9"
 sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
 hkdf = "0.12"
 rand = "0.8"
 

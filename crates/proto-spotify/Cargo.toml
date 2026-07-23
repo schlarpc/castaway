@@ -1,0 +1,36 @@
+[package]
+name = "proto-spotify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Spotify Connect zeroconf onboarding: _spotify-connect._tcp advertisement, getInfo/addUser, and the DH pairing + blob decryption (librespot-compatible)."
+
+[dependencies]
+castaway-core.workspace = true
+substrate-mdns.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+num-bigint = "0.4"
+num-traits = "0.2"
+sha1.workspace = true
+hmac.workspace = true
+aes.workspace = true
+ctr.workspace = true
+base64 = "0.22"
+rand.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

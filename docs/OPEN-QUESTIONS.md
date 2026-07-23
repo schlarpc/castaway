@@ -35,6 +35,28 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   the tree buildable. Confirm when you want the real CEF slice wired + the Windows-CI
   escape hatch turned on.
 
+## Spotify
+
+- **Q9 — Spotify playback backend.** Onboarding is done (advertise → `getInfo` →
+  `addUser` blob decrypt, librespot-compatible). Post-pairing playback needs the
+  "dealer" WebSocket (control) + audio pull from the CDN with the AP-login step that
+  turns the decrypted blob into stored credentials — a large stack that needs a Premium
+  account. Deferred. Current behavior: pairing succeeds, credentials are decrypted and
+  logged, no `SessionEvent` emitted. Confirm you want to invest here vs. leave at
+  "appears in the picker + pairs."
+- **Q10 — Spotify blob wire-validation.** The DH + blob crypto is tested by round-trip
+  (our encrypt vs. decrypt), not against a real Spotify sender. Capture one `addUser`
+  from a phone in `~/re-shell` to confirm the exact byte framing (iv/ciphertext/hmac
+  split) matches before trusting it live.
+
+## Cast
+
+- **Q11 — Device-auth is required even for media-URL LOAD.** The pure Cast session
+  answers `AuthChallenge` via a `DeviceAuthResponder` trait; without a signer it returns
+  `AuthError`, which real senders may reject before LOAD. So even the "simple" media path
+  needs `crypto-cast-auth` (task 5 / Q2) wired with real cert material to work against
+  Chrome. Local testing can use a dev cert; Chrome may still refuse an untrusted chain.
+
 ## Deferred (per docs, not blockers)
 
 - **Q7 — Miracast backend.** `proto-miracast` deferred (rule: get everything else

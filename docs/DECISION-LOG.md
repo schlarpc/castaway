@@ -6,6 +6,21 @@ Review at next sync.
 
 ## 2026-07-23
 
+### D9 — Cast protobuf messages hand-written, no `protoc` build dependency
+`proto-cast` derives `CastMessage`/`DeviceAuthMessage` with `#[derive(prost::Message)]`
+and explicit tags rather than compiling `cast_channel.proto` via `prost-build`. The
+tags/types match Google's proto exactly (wire-compatible), and the build needs no
+`protoc` binary — important for the reproducible Nix cross-build (cross-build.md). If
+the proto surface grows a lot we can revisit codegen.
+
+### D10 — Spotify scope: onboarding + pairing crypto only, playback deferred
+Spotify Connect's full value (dealer WS + CDN audio) is credential-gated (Premium) and a
+large stack. The autonomous slice is the reimplementable, testable part: zeroconf
+advertise + `getInfo` + `addUser` DH pairing and blob decryption (librespot algorithm),
+matching the shape of the other HTTP protocols (`router()` + `mdns_service()`). Playback
+is logged in OPEN-QUESTIONS Q9. This keeps "appears in the Spotify picker and pairs"
+working now without sinking the session into one protocol.
+
 ### D7 — HTTP-mounted protocols expose `router()` + `ssdp_device()`, not `SourceAdapter`
 `SourceAdapter::run()` models an *active* actor that owns a socket (Cast, AirPlay,
 Spotify, the Lounge bind channel). DLNA (and later DIAL) are *passive*: their work

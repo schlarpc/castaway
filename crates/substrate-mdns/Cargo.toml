@@ -1,0 +1,17 @@
+[package]
+name = "substrate-mdns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Shared mDNS-SD responder: one daemon advertising every service instance (AirPlay/Cast/Spotify/RAOP) with its TXT records."
+
+[dependencies]
+castaway-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+mdns-sd.workspace = true
+
+[lints]
+workspace = true
