@@ -66,8 +66,8 @@ where
     let mut keep_going = true;
 
     let drain = |decoder: &mut ffmpeg::decoder::Video,
-                     scaler: &mut ffmpeg::software::scaling::Context,
-                     on_frame: &mut F|
+                 scaler: &mut ffmpeg::software::scaling::Context,
+                 on_frame: &mut F|
      -> Result<bool, PipelineError> {
         let mut decoded = ffmpeg::frame::Video::empty();
         while decoder.receive_frame(&mut decoded).is_ok() {
@@ -140,7 +140,13 @@ mod tests {
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join("testsrc.mp4");
         let status = std::process::Command::new("ffmpeg")
-            .args(["-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1"])
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=10:duration=1",
+            ])
             .arg("-pix_fmt")
             .arg("yuv420p")
             .arg(&path)

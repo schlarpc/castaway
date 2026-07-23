@@ -34,5 +34,11 @@ serde.workspace = true
 toml = "0.8"
 uuid.workspace = true
 
+[features]
+default = []
+# Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)
+# and run the winit fullscreen kiosk on the main thread. Native deps required (see flake).
+render = ["pipeline/kiosk", "pipeline/ffmpeg"]
+
 [lints]
 workspace = true

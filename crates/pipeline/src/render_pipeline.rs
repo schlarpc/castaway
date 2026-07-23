@@ -1,0 +1,377 @@
+//! The real [`Pipeline`]: wires a `Play(url)` to decode → GPU compositor → present, and
+//! forwards decoded mirror frames straight to the compositor. Threading follows
+//! architecture §6: the compositor/GPU lives on ONE render thread (the [`RenderLoop`],
+//! driven by the kiosk's winit loop or, in tests, pumped directly); decode runs on its
+//! own blocking thread; this [`RenderPipeline`] is the tokio-side handle that connects
+//! them over a bounded channel that **drops frames when full** (latency > freshness).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use castaway_core::{
+    ControlTxn, CoreError, DecodedFrame, FrameSource, MediaUri, OsdMessage, Pipeline, PixelFormat,
+};
+use tracing::{info, warn};
+
+use crate::compositor::{Compositor, Layer, LayerId, Transform};
+use crate::error::PipelineError;
+use crate::wgpu_compositor::WgpuCompositor;
+
+/// A command sent from the tokio/decode side to the render thread.
+pub enum RenderCommand {
+    /// Upload a decoded frame as the video layer.
+    Video(DecodedFrame),
+    /// Set (or clear) the OSD text.
+    Osd(Option<String>),
+    /// Drop the video layer (playback stopped).
+    ClearVideo,
+}
+
+/// The tokio-side pipeline handle. Implements [`Pipeline`]; owns decode threads and the
+/// sender half of the render channel.
+pub struct RenderPipeline {
+    tx: SyncSender<RenderCommand>,
+    /// Stop flag for the currently-running decode thread, so a new `Play`/`stop`
+    /// preempts the old one.
+    active: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+impl RenderPipeline {
+    /// Create the pipeline and the receiver the [`RenderLoop`] consumes. `depth` bounds
+    /// the in-flight frame queue; when full, new frames are dropped (drop-late).
+    #[must_use]
+    pub fn new(depth: usize) -> (Self, Receiver<RenderCommand>) {
+        let (tx, rx) = sync_channel(depth.max(1));
+        (
+            Self {
+                tx,
+                active: Mutex::new(None),
+            },
+            rx,
+        )
+    }
+
+    fn preempt(&self) {
+        if let Ok(mut guard) = self.active.lock() {
+            if let Some(flag) = guard.take() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn set_active(&self, flag: Arc<AtomicBool>) {
+        if let Ok(mut guard) = self.active.lock() {
+            *guard = Some(flag);
+        }
+    }
+}
+
+#[async_trait]
+impl Pipeline for RenderPipeline {
+    async fn play(&self, source: MediaUri, start: Option<Duration>) -> Result<(), CoreError> {
+        self.preempt();
+        let stop = Arc::new(AtomicBool::new(false));
+        self.set_active(stop.clone());
+        info!(%source, ?start, "render pipeline: PLAY (decode → compositor)");
+
+        let tx = self.tx.clone();
+        let uri = source.to_string();
+        // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
+        std::thread::spawn(move || {
+            let result = decode_into(&uri, &tx, &stop);
+            if let Err(e) = result {
+                warn!(error = %e, "decode ended with error");
+            }
+        });
+        Ok(())
+    }
+
+    async fn mirror(
+        &self,
+        video: FrameSource,
+        _audio: Option<FrameSource>,
+    ) -> Result<(), CoreError> {
+        self.preempt();
+        match video {
+            FrameSource::Url(uri) => self.play(uri, None).await,
+            FrameSource::Decoded(mut rx) => {
+                info!("render pipeline: MIRROR (decoded frames → compositor)");
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = rx.recv().await {
+                        // Drop on full — live mirroring favors latency over freshness.
+                        if let Err(TrySendError::Disconnected(_)) =
+                            tx.try_send(RenderCommand::Video(frame))
+                        {
+                            break;
+                        }
+                    }
+                });
+                Ok(())
+            }
+            FrameSource::Encoded(_) => {
+                // Encoded mirror (AirPlay/Cast) needs the decoder fed packet-by-packet;
+                // that path reuses the ffmpeg decoder and is the next render milestone.
+                warn!("render pipeline: encoded mirror not wired yet (needs streaming decode)");
+                Ok(())
+            }
+        }
+    }
+
+    async fn control(&self, txn: ControlTxn) -> Result<(), CoreError> {
+        // Seek/volume against a live decode is a follow-up; log for now so the protocol
+        // side sees success.
+        info!(?txn, "render pipeline: CONTROL (noted)");
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), CoreError> {
+        self.preempt();
+        let _ = self.tx.try_send(RenderCommand::ClearVideo);
+        info!("render pipeline: STOP");
+        Ok(())
+    }
+
+    async fn osd(&self, message: Option<OsdMessage>) -> Result<(), CoreError> {
+        let _ = self
+            .tx
+            .try_send(RenderCommand::Osd(message.map(|m| m.text)));
+        Ok(())
+    }
+}
+
+/// Decode `uri` into render commands until EOF or `stop` is set.
+fn decode_into(
+    uri: &str,
+    tx: &SyncSender<RenderCommand>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), PipelineError> {
+    #[cfg(feature = "ffmpeg")]
+    {
+        crate::ffmpeg_decode::decode(uri, |frame| {
+            if stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            // Drop on full (bounded queue) but stop if the render loop is gone.
+            !matches!(
+                tx.try_send(RenderCommand::Video(frame)),
+                Err(TrySendError::Disconnected(_))
+            )
+        })
+    }
+    #[cfg(not(feature = "ffmpeg"))]
+    {
+        let _ = (uri, tx, stop);
+        Err(PipelineError::Decode(
+            "decode requires the `ffmpeg` feature".into(),
+        ))
+    }
+}
+
+/// The render-thread side: owns the GPU compositor and applies render commands, then
+/// presents. The kiosk's winit loop calls [`Self::pump`] each frame; tests call
+/// [`Self::pump_blocking`].
+pub struct RenderLoop {
+    compositor: WgpuCompositor,
+    rx: Receiver<RenderCommand>,
+    has_video: bool,
+}
+
+impl RenderLoop {
+    /// Build a render loop over an existing compositor and the pipeline's receiver.
+    #[must_use]
+    pub fn new(compositor: WgpuCompositor, rx: Receiver<RenderCommand>) -> Self {
+        Self {
+            compositor,
+            rx,
+            has_video: false,
+        }
+    }
+
+    /// Build an offscreen render loop (headless — for tests / capture).
+    ///
+    /// # Errors
+    /// [`PipelineError`] if the GPU can't be acquired.
+    pub fn offscreen(
+        width: u32,
+        height: u32,
+        rx: Receiver<RenderCommand>,
+    ) -> Result<Self, PipelineError> {
+        Ok(Self::new(WgpuCompositor::new_offscreen(width, height)?, rx))
+    }
+
+    /// Read back the composited image (offscreen only).
+    ///
+    /// # Errors
+    /// [`PipelineError`] if not offscreen or the readback fails.
+    pub fn read_rgba(&self) -> Result<Vec<u8>, PipelineError> {
+        self.compositor.read_rgba()
+    }
+
+    /// Drain all pending commands (non-blocking) and present once. Returns the number of
+    /// video frames applied this pump.
+    pub fn pump(&mut self) -> usize {
+        let mut applied = 0;
+        while let Ok(cmd) = self.rx.try_recv() {
+            if self.apply(cmd) {
+                applied += 1;
+            }
+        }
+        self.compositor.present();
+        applied
+    }
+
+    /// Block up to `timeout` for at least one command, apply it (and any others queued),
+    /// then present. Returns how many video frames were applied. Used by tests where the
+    /// decode thread races the render loop.
+    pub fn pump_blocking(&mut self, timeout: Duration) -> usize {
+        let mut applied = 0;
+        if let Ok(cmd) = self.rx.recv_timeout(timeout) {
+            if self.apply(cmd) {
+                applied += 1;
+            }
+            while let Ok(cmd) = self.rx.try_recv() {
+                if self.apply(cmd) {
+                    applied += 1;
+                }
+            }
+        }
+        self.compositor.present();
+        applied
+    }
+
+    /// Apply one command. Returns true if it was a video frame.
+    fn apply(&mut self, cmd: RenderCommand) -> bool {
+        match cmd {
+            RenderCommand::Video(frame) => {
+                let rgba = to_rgba(&frame);
+                if self
+                    .compositor
+                    .upload_texture(LayerId::Video, frame.width, frame.height, &rgba)
+                    .is_ok()
+                {
+                    if !self.has_video {
+                        self.compositor.upsert_layer(Layer {
+                            id: LayerId::Video,
+                            z: 0,
+                            opacity: 1.0,
+                            transform: Transform::default(),
+                        });
+                        self.has_video = true;
+                    }
+                    return true;
+                }
+                false
+            }
+            RenderCommand::Osd(text) => {
+                // Text rasterization (glyphon/fontdue) is a follow-up; log for now.
+                if let Some(t) = text {
+                    info!(osd = %t, "render loop: OSD");
+                }
+                false
+            }
+            RenderCommand::ClearVideo => {
+                self.compositor.remove_layer(LayerId::Video);
+                self.has_video = false;
+                false
+            }
+        }
+    }
+
+    /// Resize the underlying surface (kiosk window resize).
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.compositor.resize(width, height);
+    }
+}
+
+/// Convert a decoded frame's pixels to RGBA8 (the compositor's upload format).
+fn to_rgba(frame: &DecodedFrame) -> std::borrow::Cow<'_, [u8]> {
+    match frame.format {
+        PixelFormat::Rgba8 => std::borrow::Cow::Borrowed(&frame.data),
+        PixelFormat::Bgra8 => {
+            let mut out = frame.data.to_vec();
+            for px in out.chunks_exact_mut(4) {
+                px.swap(0, 2); // BGRA → RGBA
+            }
+            std::borrow::Cow::Owned(out)
+        }
+        // Planar YUV would be converted by swscale in the decoder; if one slips through,
+        // fall back to the raw bytes (better a wrong frame than a panic). Same for any
+        // future non-exhaustive variant.
+        _ => std::borrow::Cow::Borrowed(&frame.data),
+    }
+}
+
+#[cfg(all(test, feature = "ffmpeg"))]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn make_test_clip() -> Option<std::path::PathBuf> {
+        let dir = std::env::temp_dir().join("castaway-render-test");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("testsrc.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=10:duration=1",
+            ])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?
+            .success();
+        ok.then_some(path)
+    }
+
+    #[test]
+    fn play_url_decodes_and_composites_pixels() {
+        let Some(path) = make_test_clip() else {
+            eprintln!("skipping: no ffmpeg CLI");
+            return;
+        };
+        let (pipe, rx) = RenderPipeline::new(4);
+        let mut rloop = match RenderLoop::offscreen(64, 48, rx) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+
+        // Drive play() on a small runtime; it spawns the decode thread.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let uri = format!("file://{}", path.display());
+        rt.block_on(async {
+            pipe.play(MediaUri::parse(&uri).unwrap(), None)
+                .await
+                .unwrap();
+        });
+
+        // Pump until a video frame lands (decode thread races us).
+        let mut got = 0;
+        for _ in 0..50 {
+            got += rloop.pump_blocking(Duration::from_millis(200));
+            if got > 0 {
+                break;
+            }
+        }
+        assert!(got > 0, "expected at least one composited video frame");
+
+        // The composited output must not be all-black (testsrc is colorful).
+        let px = rloop.read_rgba().unwrap();
+        let non_black = px.chunks_exact(4).any(|p| p[0] > 8 || p[1] > 8 || p[2] > 8);
+        assert!(non_black, "composited frame should contain color");
+    }
+}

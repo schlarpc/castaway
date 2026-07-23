@@ -134,3 +134,15 @@ The devShell adds the native toolchain (pkg-config, `ffmpeg_7` — pinned to mat
 `ffmpeg-sys-next` 7.1, libclang + `BINDGEN_EXTRA_CLANG_ARGS` for bindgen, and
 Vulkan/Wayland/X11 for wgpu+winit at runtime). Feature named `render` not `wgpu` because a
 Cargo feature can't share a dependency's name.
+
+### D19 — RenderPipeline + winit kiosk; app render mode restructures threading
+`RenderPipeline` implements the core `Pipeline`: `play(url)` spawns a blocking decode
+thread that pushes RGBA frames over a bounded sync-channel (drops when full — latency >
+freshness); `mirror(Decoded)` forwards frames directly; the `RenderLoop` (render thread)
+uploads frames to the wgpu compositor and presents. The winit `kiosk` runs the RenderLoop
+against a fullscreen surface and MUST own the main thread, so under the app `render`
+feature `main()` is a plain `fn` that builds a tokio runtime, spawns the session manager +
+`serve()` on it, and runs the kiosk on main; the default (no render) build keeps a plain
+`block_on(serve())`. The whole Play→decode→composite→pixels path is proven by an offscreen
+readback test; the on-screen kiosk is compile-verified (not run here — a fullscreen window
+would hijack the dev box's live display).

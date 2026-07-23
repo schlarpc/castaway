@@ -1,7 +1,13 @@
 //! The castaway binary. Composes the enabled protocol adapters into one session
 //! manager driving one pipeline, behind one shared HTTP host, one SSDP responder, and
-//! one mDNS responder — the "advertise once, not five racing daemons" goal. This is the
-//! only crate that uses `anyhow` (ground rule 7).
+//! one mDNS responder. This is the only crate that uses `anyhow` (ground rule 7).
+//!
+//! Two run modes:
+//! - default: [`pipeline::NullPipeline`] (logs + drains) — proves the whole stack with
+//!   no GPU/codec, and stays on a plain tokio runtime.
+//! - `render` feature: [`pipeline::RenderPipeline`] (ffmpeg decode → wgpu compositor) with
+//!   the winit fullscreen kiosk on the **main thread**; tokio runs the servers on a
+//!   spawned runtime (the three-thread model, architecture §6).
 
 mod config;
 
@@ -15,7 +21,6 @@ use castaway_core::{
     SourceMessage,
 };
 use control_display::NullDisplay;
-use pipeline::NullPipeline;
 use proto_dial::DialService;
 use proto_dlna::DlnaService;
 use proto_spotify::SpotifyService;
@@ -26,25 +31,78 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     init_tracing();
     let config = Config::load("castaway.toml").context("loading config")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+
+    let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
+    let shutdown = Arc::new(Notify::new());
+
+    // ctrl-c triggers the same shutdown as a kiosk window close.
+    {
+        let shutdown = shutdown.clone();
+        runtime.spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("ctrl-c: shutting down");
+            shutdown.notify_waiters();
+        });
+    }
+
+    #[cfg(feature = "render")]
+    {
+        use pipeline::RenderPipeline;
+        let (render_pipeline, rx) = RenderPipeline::new(3);
+        let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
+        let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default());
+        runtime.spawn(manager.run(event_rx));
+
+        let serve_cfg = config.clone();
+        let serve_tx = event_tx.clone();
+        let serve_shutdown = shutdown.clone();
+        runtime.spawn(async move {
+            if let Err(e) = serve(serve_cfg, serve_tx, serve_shutdown).await {
+                warn!(error = %e, "service layer exited with error");
+            }
+        });
+
+        info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
+        // The winit event loop MUST own the main thread.
+        pipeline::kiosk::run(rx).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        shutdown.notify_waiters();
+    }
+
+    #[cfg(not(feature = "render"))]
+    {
+        use pipeline::NullPipeline;
+        let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
+        let manager =
+            SessionManager::new(NullPipeline::new(), Some(display), SessionConfig::default());
+        runtime.spawn(manager.run(event_rx));
+        runtime.block_on(serve(config, event_tx, shutdown))?;
+    }
+
+    Ok(())
+}
+
+/// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
+/// protocols, and run until `shutdown` is signalled.
+async fn serve(
+    config: Config,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<()> {
     let iface = config.resolved_interface();
     info!(
         name = %config.friendly_name,
         interface = %iface,
         http_port = config.http_port,
-        "castaway starting"
+        "castaway services starting"
     );
 
-    // --- session manager over the null pipeline (real pipeline lands behind features) ---
-    let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
-    let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
-    let manager = SessionManager::new(NullPipeline::new(), Some(display), SessionConfig::default());
-    let manager_handle = tokio::spawn(manager.run(event_rx));
-
-    // --- shared HTTP host: merge each enabled protocol's router ---
     let mut http = Router::new();
     let mut ssdp_devices: Vec<(SsdpDevice, String)> = Vec::new();
     let mut mdns = MdnsResponder::new().context("creating mDNS responder")?;
@@ -78,7 +136,6 @@ async fn main() -> anyhow::Result<()> {
             dial.description_path().to_string(),
         ));
         info!("enabled: DIAL → YouTube Lounge (launch)");
-        // Until the Lounge bind-channel client lands, log launches.
         tokio::spawn(async move {
             while let Some(params) = launch_rx.recv().await {
                 warn!(pairing = ?params.pairing_code, "YouTube launched; Lounge client is a follow-up");
@@ -86,13 +143,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // mDNS-only advertisements for socket protocols whose TCP actors aren't wired yet.
     advertise_socket_protocols(&config, &mut mdns);
 
-    // --- shutdown signalling ---
-    let shutdown = Arc::new(Notify::new());
-
-    // --- SSDP responder over all registered devices ---
+    // SSDP responder.
     let ssdp_handle = {
         let mut responder = Responder::new(ResponderConfig {
             interface: iface,
@@ -114,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // --- HTTP host ---
+    // HTTP host.
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.http_port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -130,26 +183,21 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("castaway running — press Ctrl-C to stop");
-    tokio::signal::ctrl_c().await.ok();
-    info!("shutting down (sending SSDP byebye, unregistering mDNS)");
-    shutdown.notify_waiters();
+    info!("castaway services running");
+    shutdown.notified().await;
+    info!("services: shutting down (SSDP byebye, unregister mDNS)");
 
-    // mDNS unregisters on drop; give async servers a moment to finish.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let _ = ssdp_handle.await;
         let _ = http_handle.await;
     })
     .await;
     drop(mdns);
-    drop(event_tx);
-    let _ = manager_handle.await;
     Ok(())
 }
 
 /// mDNS-advertise Cast/AirPlay if enabled. Their TCP actors (Cast TLS, AirPlay RTSP)
-/// aren't wired yet, so this is off by default — advertising without a listener would
-/// only frustrate senders. When enabled we still warn.
+/// aren't wired yet, so this is off by default.
 fn advertise_socket_protocols(config: &Config, mdns: &mut MdnsResponder) {
     use substrate_mdns::MdnsService;
     if config.enable.cast {

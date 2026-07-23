@@ -17,7 +17,9 @@ use crate::compositor::{Compositor, Layer, LayerId, Transform};
 use crate::error::PipelineError;
 
 const SHADER: &str = r#"
-struct Uniform { transform: vec4<f32>, opacity: f32, _pad: vec3<f32> };
+// {vec4, f32} lays out as 32 bytes (struct align 16), matching the Rust `Uniform`
+// which pads to 32. Do NOT add a vec3 pad here — that would round the size up to 48.
+struct Uniform { transform: vec4<f32>, opacity: f32 };
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var<uniform> u: Uniform;

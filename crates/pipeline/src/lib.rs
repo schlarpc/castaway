@@ -20,6 +20,10 @@ pub mod null;
 
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
+#[cfg(feature = "kiosk")]
+pub mod kiosk;
+#[cfg(feature = "render")]
+pub mod render_pipeline;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
 
@@ -28,5 +32,7 @@ pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
 pub use error::PipelineError;
 pub use null::NullPipeline;
 
+#[cfg(feature = "render")]
+pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
 #[cfg(feature = "render")]
 pub use wgpu_compositor::WgpuCompositor;
