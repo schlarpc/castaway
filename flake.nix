@@ -52,7 +52,15 @@
           craneLib = cranelibFor system;
         in
         {
-          src = craneLib.cleanCargoSource ./.;
+          # Keep Cargo sources plus non-Rust assets that crates `include_str!`
+          # (SCPD/description XML in proto-dlna, and future .proto fixtures).
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type:
+              (craneLib.filterCargoSources path type)
+              || (pkgs.lib.hasSuffix ".xml" path);
+            name = "source";
+          };
           strictDeps = true;
 
           buildInputs = [

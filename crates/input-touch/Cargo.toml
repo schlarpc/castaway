@@ -1,0 +1,22 @@
+[package]
+name = "input-touch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Touch input for the C6522QT 4K touch wall: a TouchSource trait routing HID touch into the compositor/CEF. evdev (Linux) / Raw Input (Windows) behind features."
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[features]
+default = []
+# `evdev` = Linux USB HID via evdev; `winuser` = Windows Raw Input / WM_POINTER.
+evdev = []
+winuser = []
+
+[lints]
+workspace = true

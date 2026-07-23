@@ -14,10 +14,25 @@ path = "src/main.rs"
 
 [dependencies]
 castaway-core.workspace = true
+substrate-ssdp.workspace = true
+substrate-mdns.workspace = true
+proto-dlna.workspace = true
+proto-cast.workspace = true
+proto-spotify.workspace = true
+proto-airplay.workspace = true
+proto-dial.workspace = true
+pipeline.workspace = true
+control-display.workspace = true
+input-touch.workspace = true
+
 anyhow.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+axum.workspace = true
+serde.workspace = true
+toml = "0.8"
+uuid.workspace = true
 
 [lints]
 workspace = true

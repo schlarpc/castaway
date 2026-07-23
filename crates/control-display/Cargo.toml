@@ -1,0 +1,27 @@
+[package]
+name = "control-display"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Display control for the Dell C6522QT: DisplayControl backends (null default; RS-232 primary and DDC/CI behind features) + the Dell command table."
+
+[dependencies]
+castaway-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+default = []
+# Hardware backends. `serial` = RS-232 via `serialport`; `ddc` = DDC/CI via `ddc-hi`.
+# Off by default so a headless dev box builds with the null backend.
+serial = []
+ddc = []
+
+[lints]
+workspace = true

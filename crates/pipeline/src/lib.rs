@@ -1,0 +1,22 @@
+//! # pipeline
+//!
+//! The media/render pipeline. Today it ships the [`NullPipeline`] (log + drain) that the
+//! whole protocol stack runs against on the Linux dev box with no GPU/codec present, and
+//! the backend-agnostic [`compositor`] and [`browser`] trait surfaces the real backends
+//! slot behind feature flags:
+//!
+//! - `ffmpeg` — libav decode (d3d11va/vaapi) → frames.
+//! - `wgpu` — the [`compositor::Compositor`] impl (DX12/Vulkan), layers + PiP.
+//! - `cef` — the [`browser::BrowserSurface`] impl (offscreen YouTube TV surface / PiP).
+//!
+//! This crate is where `unsafe` FFI *would* live, so unlike the pure crates it does not
+//! `forbid(unsafe_code)`; the null backend uses none, and any real backend's `unsafe`
+//! must carry a `// SAFETY:` note (ground rule 8).
+
+pub mod browser;
+pub mod compositor;
+pub mod null;
+
+pub use browser::{BrowserSurface, NullBrowser};
+pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
+pub use null::NullPipeline;

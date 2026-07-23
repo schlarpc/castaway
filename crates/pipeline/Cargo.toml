@@ -1,0 +1,30 @@
+[package]
+name = "pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Media pipeline: the null (log) backend used for daily dev, plus the Compositor/Decoder/Browser trait surfaces the ffmpeg + wgpu + CEF backends slot behind feature flags."
+
+[dependencies]
+castaway-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
+
+[features]
+default = []
+# Real backends land behind these. Kept off so the daily loop builds with no system
+# libav / Vulkan / CEF present (DECISION-LOG D4; CEF pull-in gated on Q6).
+ffmpeg = []
+wgpu = []
+cef = []
+
+[lints]
+workspace = true

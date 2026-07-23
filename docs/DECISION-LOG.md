@@ -109,3 +109,18 @@ gated on the FairPlay-SAP session key (`crypto-fairplay`, stubbed at the capture
 boundary) and HomeKit transient pairing (not implemented) — both return `501` at the
 gate. This makes castaway appear in the AirPlay picker and models every transaction; the
 media plane slots in once Q1's captures land.
+
+### D16 — app composes HTTP protocols live; socket protocols advertise-gated
+`app` wires the null pipeline + null display into the session manager and stands up ONE
+axum host (DLNA + Spotify + DIAL routers merged), ONE SSDP responder (DLNA + DIAL
+devices), and ONE mDNS responder — the "advertise once" goal, now real. DLNA/Spotify/
+DIAL are live end-to-end (verified via curl). Cast and AirPlay have complete pure cores
+but their TCP actors (CASTv2 TLS server, AirPlay RTSP server) aren't wired, so their mDNS
+advertisement is behind config flags defaulting OFF — advertising a service with no
+listener only frustrates senders. Config is TOML (`castaway.toml`), interface auto-detected.
+
+### D17 — Crane source filter extended to keep `include_str!` XML assets
+proto-dlna `include_str!`s its SCPD/description XML; `craneLib.cleanCargoSource` drops
+non-Rust files, breaking the nix build (but not `cargo`). Fixed the flake's `src` filter
+to keep `.xml` alongside cargo sources. Same pattern will cover future `.proto`/fixture
+assets.

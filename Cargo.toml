@@ -16,6 +16,9 @@ members = [
     "crates/crypto-fairplay",
     "crates/proto-airplay",
     "crates/proto-dial",
+    "crates/pipeline",
+    "crates/control-display",
+    "crates/input-touch",
     "crates/app",
 ]
 

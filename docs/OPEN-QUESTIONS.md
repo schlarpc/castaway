@@ -74,3 +74,20 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 - **Q13 — Per-frame IV derivation.** `mirror::frame_iv` XORs the frame_id into the low 4
   bytes of the IV mask. This is self-consistent but not verified against openscreen's
   exact scheme — confirm from a capture before trusting decrypted output.
+
+## App / hardware wiring
+
+- **Q14 — Dell C6522QT RS-232 opcodes.** `control-display::dell` models the command frame
+  (header/id/category/opcode/len/data/XOR-checksum) but the opcode bytes (power, input
+  select) are placeholders. Confirm against Dell's C6522QT *RS232 External Control
+  Application* manual before trusting on hardware.
+- **Q15 — Cast TLS actor + AirPlay RTSP actor.** The pure cores (`proto-cast::CastSession`,
+  `proto-airplay::AirPlaySession`) are done and tested, but the socket actors that own the
+  connection (CASTv2 needs a TLS server with a self-signed cert the device-auth signs over;
+  AirPlay needs the RTSP TCP server + the post-pairing ChaCha20 `ByteTransform`) aren't
+  written. Until they are, `app` keeps Cast/AirPlay mDNS ads OFF by default (D16). These
+  actors are the main remaining "make it connect" work for those two protocols.
+- **Q16 — Real pipeline behind features.** `NullPipeline` proves the stack; the ffmpeg
+  decode + wgpu compositor + winit kiosk surface (and CEF) are declared feature flags with
+  trait surfaces (`Compositor`, `BrowserSurface`) but no backend impls yet. Wiring these is
+  the render-path milestone (needs the C6522QT box for real validation).
