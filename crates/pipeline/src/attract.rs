@@ -66,35 +66,32 @@ impl AttractScene {
     /// A representative scene for previews/tests.
     #[must_use]
     pub fn demo() -> Self {
+        let name = "dma.space/screen";
         Self {
-            title: "Hackerspace TV".into(),
+            title: name.into(),
             tagline: "Throw anything at the wall — no app to install.".into(),
             rows: vec![
                 AttractRow::new(
                     [0x42, 0x85, 0xf4, 0xff],
                     "Chrome / Edge",
-                    "Cast \u{2192} Hackerspace TV",
+                    format!("Cast \u{2192} {name}"),
                 ),
                 AttractRow::new(
                     [0xff, 0xff, 0xff, 0xff],
                     "iPhone / Mac",
-                    "AirPlay \u{2192} Hackerspace TV",
+                    format!("AirPlay \u{2192} {name}"),
                 ),
                 AttractRow::new(
                     [0x3d, 0xdc, 0x84, 0xff],
                     "Android / VLC",
-                    "Cast or DLNA \u{2192} Hackerspace TV",
+                    format!("Cast or DLNA \u{2192} {name}"),
                 ),
                 AttractRow::new(
                     [0x1d, 0xb9, 0x54, 0xff],
                     "Spotify",
-                    "Devices \u{2192} Hackerspace TV",
+                    format!("Devices \u{2192} {name}"),
                 ),
-                AttractRow::new(
-                    [0xff, 0x00, 0x00, 0xff],
-                    "YouTube",
-                    "Cast button \u{2192} Hackerspace TV",
-                ),
+                AttractRow::new([0xff, 0x00, 0x00, 0xff], "YouTube", "Cast button".to_string()),
             ],
             footer: "castaway  •  DLNA / mDNS on 10.0.0.5:8080".into(),
         }

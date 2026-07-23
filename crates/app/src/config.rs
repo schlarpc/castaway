@@ -53,7 +53,7 @@ impl Default for Enable {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            friendly_name: "Hackerspace TV".to_string(),
+            friendly_name: "dma.space/screen".to_string(),
             uuid: "0f8c2e10-castaway-0001-000000000001".to_string(),
             http_port: 8080,
             interface: None,
