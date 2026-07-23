@@ -1,0 +1,23 @@
+[package]
+name = "castaway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Universal cast receiver: one binary terminating AirPlay, Cast, Miracast, DLNA, YouTube Lounge, and Spotify Connect."
+default-run = "castaway"
+
+[[bin]]
+name = "castaway"
+path = "src/main.rs"
+
+[dependencies]
+castaway-core.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

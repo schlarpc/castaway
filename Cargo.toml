@@ -1,48 +1,107 @@
-[package]
+[workspace]
+resolver = "2"
+# Explicit list (not a `crates/*` glob): crane's dependency-only build generates a
+# dummy source tree from this list, and it does not expand globs. Add each crate here
+# as it lands.
+members = [
+    "crates/core",
+    "crates/app",
+]
+
+# Crane reads this to name the workspace build (the root manifest is virtual).
+[workspace.metadata.crane]
 name = "castaway"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A Rust application built with Nix flakes"
-readme = "README.md"
-keywords = ["nix", "flake"]
-categories = ["command-line-utilities"]
+rust-version = "1.96"
+repository = "https://github.com/schlarpc/castaway"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Shared dependency versions. Individual crates opt in with `foo.workspace = true`.
+[workspace.dependencies]
+# --- internal crates ---
+castaway-core = { path = "crates/core" }
+substrate-mdns = { path = "crates/substrate-mdns" }
+substrate-ssdp = { path = "crates/substrate-ssdp" }
+substrate-rtsp = { path = "crates/substrate-rtsp" }
+substrate-rtp = { path = "crates/substrate-rtp" }
+crypto-cast-auth = { path = "crates/crypto-cast-auth" }
+crypto-fairplay = { path = "crates/crypto-fairplay" }
+proto-dlna = { path = "crates/proto-dlna" }
+proto-cast = { path = "crates/proto-cast" }
+proto-airplay = { path = "crates/proto-airplay" }
+proto-dial = { path = "crates/proto-dial" }
+proto-spotify = { path = "crates/proto-spotify" }
+pipeline = { path = "crates/pipeline" }
+control-display = { path = "crates/control-display" }
+input-touch = { path = "crates/input-touch" }
 
-[dependencies]
-# Production dependencies go here
+# --- async / runtime ---
+tokio = { version = "1.43", default-features = false }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
 
-[dev-dependencies]
-# Dev-only dependencies (tests, benchmarks) - these don't leak to production builds
+# --- error / logging ---
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[lints.rust]
-# Rust compiler lints
+# --- serialization / wire ---
+bytes = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+prost-build = "0.13"
+
+# --- networking / discovery ---
+mdns-sd = "0.13"
+axum = "0.8"
+hyper = "1"
+rtsp-types = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# --- crypto ---
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+x25519-dalek = "2"
+aes = "0.8"
+ctr = "0.9"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+
+# --- dev / test ---
+hex-literal = "0.4"
+tokio-test = "0.4"
+
+[workspace.lints.rust]
 unsafe_code = "warn"
-missing_docs = "allow"  # Enable when API stabilizes
+missing_docs = "allow"
 
-[lints.clippy]
-# Clippy lint groups (lower priority so individual lints can override)
+[workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-pedantic = { level = "allow", priority = -1 }  # Enable selectively as needed
-nursery = { level = "allow", priority = -1 }   # Enable selectively as needed
-
-# Individual clippy lints worth enabling
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
 enum_glob_use = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
 cast_possible_wrap = "warn"
 ptr_as_ptr = "warn"
 redundant_closure_for_method_calls = "warn"
-unwrap_used = "warn"  # Warn in production code; allow per-module in tests/examples
+unwrap_used = "warn"
 
 [profile.dev]
-# Fast compile times for development
 opt-level = 0
 debug = true
 
 [profile.release]
-# Optimize for binary size and performance
 opt-level = 3
 lto = "thin"
 codegen-units = 1
@@ -50,6 +109,5 @@ strip = true
 panic = "abort"
 
 [profile.test]
-# Keep some debug info for test failures
 opt-level = 0
 debug = true

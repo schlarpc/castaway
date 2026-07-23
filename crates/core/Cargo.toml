@@ -1,0 +1,22 @@
+[package]
+name = "castaway-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Core traits, session manager, and internal event API for the castaway universal cast receiver."
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+url.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+
+[lints]
+workspace = true
