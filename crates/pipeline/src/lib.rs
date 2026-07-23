@@ -25,7 +25,11 @@ pub mod ffmpeg_decode;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
 #[cfg(feature = "render")]
+pub mod osd;
+#[cfg(feature = "render")]
 pub mod render_pipeline;
+#[cfg(feature = "render")]
+pub mod text;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
 
@@ -36,6 +40,8 @@ pub use null::NullPipeline;
 
 #[cfg(feature = "render")]
 pub use attract::{AttractRow, AttractScene};
+#[cfg(feature = "render")]
+pub use osd::{OsdController, OsdUpdate};
 #[cfg(feature = "render")]
 pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
 #[cfg(feature = "render")]

@@ -158,3 +158,17 @@ crane .ttf filter). The scene is config-driven: the app builds rows only for ena
 protocols (honest — no "Cast from Chrome" row until the Cast actor lands). attract::to_png
 exports a preview (examples/attract_preview.rs). This also lays the groundwork for real OSD
 text (same rasterizer), which is still logged rather than drawn.
+
+### D21 — OSD is a core multi-producer channel, not a Pipeline method
+Refactored OSD out of the `Pipeline` trait into its own subsystem so *any* source can
+inject overlay messages, not just the session manager. `core::osd` defines `OsdMessage`,
+`OsdCommand`, a cloneable `OsdSink` (multi-producer, std mpsc), and one `OsdReceiver` —
+the same shape as `SessionSink`, and in `core` (not `pipeline`) so protocol crates that
+don't depend on the GPU can still post. `Pipeline::osd` is removed; the session manager
+now holds an optional `OsdSink` (`with_osd`) and is just one producer. Consumers vary by
+mode: the render backend's `OsdController` (pipeline, feature `render`) rasterizes banners
+via the shared `text` rasterizer and shows them as the `LayerId::Osd` layer (z=10, above
+video) with TTL auto-clear; headless, the app drains the channel to the log. The text
+rasterizer was extracted from `attract` into `pipeline::text` (source-over alpha, so the
+OSD banner composites as a transparent overlay). The app posts a startup banner as a
+worked example of a non-session producer.

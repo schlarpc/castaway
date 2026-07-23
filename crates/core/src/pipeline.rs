@@ -1,32 +1,15 @@
-//! The [`Pipeline`] trait: what the session manager drives. The real impl (ffmpeg +
-//! wgpu + CEF) lives in the `pipeline` crate; a null logging impl lives there too and
-//! is what the daily Linux dev loop and tests use.
+//! The [`Pipeline`] trait: what the session manager drives for *media*. The real impl
+//! (ffmpeg + wgpu + CEF) lives in the `pipeline` crate; a null logging impl lives there
+//! too and is what the daily Linux dev loop and tests use.
+//!
+//! OSD is deliberately NOT here — it's a separate overlay concern that many sources feed
+//! (see [`crate::osd`]), not something only the media backend owns.
 
 use std::time::Duration;
 
 use crate::error::CoreError;
 use crate::event::ControlTxn;
 use crate::types::{FrameSource, MediaUri};
-
-/// An on-screen-display message the session manager can post ("now casting from …").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OsdMessage {
-    /// The text to show.
-    pub text: String,
-    /// How long to show it; `None` means until replaced/cleared.
-    pub ttl: Option<Duration>,
-}
-
-impl OsdMessage {
-    /// A transient banner shown for `ttl`.
-    #[must_use]
-    pub fn banner(text: impl Into<String>, ttl: Duration) -> Self {
-        Self {
-            text: text.into(),
-            ttl: Some(ttl),
-        }
-    }
-}
 
 /// The media/render backend the session drives. One active session maps to one set of
 /// these calls. Kept minimal and codec/GPU-agnostic so the session layer stays pure.
@@ -56,10 +39,4 @@ pub trait Pipeline: Send + Sync {
     /// # Errors
     /// [`CoreError::Pipeline`] on teardown failure.
     async fn stop(&self) -> Result<(), CoreError>;
-
-    /// Post (or clear, with `None`) an OSD message.
-    ///
-    /// # Errors
-    /// [`CoreError::Pipeline`] if the OSD layer can't be updated.
-    async fn osd(&self, message: Option<OsdMessage>) -> Result<(), CoreError>;
 }

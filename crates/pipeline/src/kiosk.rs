@@ -17,6 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::error::PipelineError;
+use crate::osd::OsdController;
 use crate::render_pipeline::{RenderCommand, RenderLoop};
 use crate::wgpu_compositor::WgpuCompositor;
 
@@ -26,6 +27,7 @@ pub type AttractImage = (u32, u32, Vec<u8>);
 struct KioskApp {
     rx: Option<Receiver<RenderCommand>>,
     attract: Option<AttractImage>,
+    osd: Option<OsdController>,
     window: Option<Arc<Window>>,
     render: Option<RenderLoop>,
 }
@@ -74,6 +76,9 @@ impl ApplicationHandler for KioskApp {
                     error!(error = %e, "failed to install attract scene");
                 }
             }
+            if let Some(osd) = self.osd.take() {
+                render = render.with_osd(osd);
+            }
             self.render = Some(render);
         }
         info!(width = size.width, height = size.height, "kiosk window up");
@@ -117,6 +122,7 @@ impl ApplicationHandler for KioskApp {
 pub fn run(
     rx: Receiver<RenderCommand>,
     attract: Option<AttractImage>,
+    osd: Option<OsdController>,
 ) -> Result<(), PipelineError> {
     let event_loop =
         EventLoop::new().map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
@@ -124,6 +130,7 @@ pub fn run(
     let mut app = KioskApp {
         rx: Some(rx),
         attract,
+        osd,
         window: None,
         render: None,
     };

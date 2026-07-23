@@ -1,5 +1,7 @@
-//! The session manager: arbitrates a single active source, drives the [`Pipeline`],
-//! fires [`DisplayControl`] on session start, and owns the OSD.
+//! The session manager: arbitrates a single active source, drives the [`Pipeline`], and
+//! fires [`DisplayControl`] on session start. It's one *producer* on the OSD channel
+//! (posting "Now casting from …"), not the OSD owner — the overlay is a shared subsystem
+//! ([`crate::osd`]) many sources feed.
 //!
 //! Policy today is **last-writer-wins**: a new `Play`/`Mirror` from any source
 //! preempts whatever is active (matching how casting UIs behave — the newest sender
@@ -13,7 +15,8 @@ use crate::adapter::{SourceId, SourceMessage};
 use crate::display::{DisplayControl, DisplayInput};
 use crate::error::CoreError;
 use crate::event::SessionEvent;
-use crate::pipeline::{OsdMessage, Pipeline};
+use crate::osd::{OsdMessage, OsdSink};
+use crate::pipeline::Pipeline;
 
 /// Configuration the session manager needs that isn't per-event.
 #[derive(Debug, Clone)]
@@ -38,6 +41,7 @@ impl Default for SessionConfig {
 pub struct SessionManager<P: Pipeline> {
     pipeline: P,
     display: Option<Box<dyn DisplayControl>>,
+    osd: Option<OsdSink>,
     config: SessionConfig,
     active: Option<SourceId>,
 }
@@ -52,9 +56,18 @@ impl<P: Pipeline> SessionManager<P> {
         Self {
             pipeline,
             display,
+            osd: None,
             config,
             active: None,
         }
+    }
+
+    /// Attach an OSD sink so the manager posts "Now casting from …" banners. Without one,
+    /// session start/end simply doesn't touch the overlay.
+    #[must_use]
+    pub fn with_osd(mut self, osd: OsdSink) -> Self {
+        self.osd = Some(osd);
+        self
     }
 
     /// The currently active source, if any.
@@ -103,7 +116,9 @@ impl<P: Pipeline> SessionManager<P> {
                 if self.active.as_ref() == Some(&source) {
                     info!(%source, "session: end");
                     self.active = None;
-                    self.pipeline.osd(None).await.ok();
+                    if let Some(osd) = &self.osd {
+                        osd.clear();
+                    }
                     self.pipeline.stop().await
                 } else {
                     // End for a source that isn't active — already preempted; no-op.
@@ -128,8 +143,12 @@ impl<P: Pipeline> SessionManager<P> {
             display.select_input(self.config.output_input).await?;
         }
         self.active = Some(source.clone());
-        let banner = OsdMessage::banner(format!("Now casting from {source}"), self.config.osd_ttl);
-        self.pipeline.osd(Some(banner)).await.ok();
+        if let Some(osd) = &self.osd {
+            osd.show(OsdMessage::banner(
+                format!("Now casting from {source}"),
+                self.config.osd_ttl,
+            ));
+        }
         Ok(())
     }
 }
@@ -149,8 +168,6 @@ mod tests {
         play: AtomicUsize,
         stop: AtomicUsize,
         control: AtomicUsize,
-        osd_set: AtomicUsize,
-        osd_clear: AtomicUsize,
     }
 
     #[derive(Clone)]
@@ -175,14 +192,6 @@ mod tests {
         }
         async fn stop(&self) -> Result<(), CoreError> {
             self.0.stop.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn osd(&self, m: Option<OsdMessage>) -> Result<(), CoreError> {
-            if m.is_some() {
-                self.0.osd_set.fetch_add(1, Ordering::SeqCst);
-            } else {
-                self.0.osd_clear.fetch_add(1, Ordering::SeqCst);
-            }
             Ok(())
         }
     }
@@ -216,17 +225,23 @@ mod tests {
     async fn first_play_powers_display_and_sets_osd() {
         let counts = Arc::new(Counts::default());
         let powered = Arc::new(AtomicUsize::new(0));
+        let (osd, osd_rx) = crate::osd::osd_channel();
         let mut mgr = SessionManager::new(
             FakePipeline(counts.clone()),
             Some(Box::new(FakeDisplay(powered.clone()))),
             SessionConfig::default(),
-        );
+        )
+        .with_osd(osd);
         let src = SourceId::new(ProtocolKind::Dlna, "a");
         mgr.handle(play_msg(&src)).await.unwrap();
         assert_eq!(counts.play.load(Ordering::SeqCst), 1);
-        assert_eq!(counts.osd_set.load(Ordering::SeqCst), 1);
         assert_eq!(powered.load(Ordering::SeqCst), 1);
         assert_eq!(mgr.active(), Some(&src));
+        // The session posted a "Now casting from …" banner on the OSD channel.
+        match osd_rx.try_recv() {
+            Some(crate::osd::OsdCommand::Show(m)) => assert!(m.text.contains("dlna/a")),
+            other => panic!("expected an OSD banner, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -264,8 +279,10 @@ mod tests {
     #[tokio::test]
     async fn end_from_active_source_stops_and_clears() {
         let counts = Arc::new(Counts::default());
+        let (osd, osd_rx) = crate::osd::osd_channel();
         let mut mgr =
-            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default())
+                .with_osd(osd);
         let a = SourceId::new(ProtocolKind::Dlna, "a");
         mgr.handle(play_msg(&a)).await.unwrap();
         mgr.handle(SourceMessage {
@@ -275,7 +292,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts.stop.load(Ordering::SeqCst), 1);
-        assert_eq!(counts.osd_clear.load(Ordering::SeqCst), 1);
         assert!(mgr.active().is_none());
+        // Start posted a Show; End posted a Clear.
+        assert!(matches!(
+            osd_rx.try_recv(),
+            Some(crate::osd::OsdCommand::Show(_))
+        ));
+        assert_eq!(osd_rx.try_recv(), Some(crate::osd::OsdCommand::Clear));
     }
 }

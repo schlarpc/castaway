@@ -12,6 +12,7 @@ pub mod adapter;
 pub mod display;
 pub mod error;
 pub mod event;
+pub mod osd;
 pub mod pipeline;
 pub mod session;
 pub mod types;
@@ -20,7 +21,8 @@ pub use adapter::{MiracastBackend, SessionSink, SourceAdapter, SourceId, SourceM
 pub use display::{DisplayControl, DisplayInput};
 pub use error::CoreError;
 pub use event::{Advertisement, ControlTxn, SessionEvent};
-pub use pipeline::{OsdMessage, Pipeline};
+pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
+pub use pipeline::Pipeline;
 pub use session::{SessionConfig, SessionManager};
 pub use types::{
     AudioCodec, DecodedFrame, EncodedFrame, FrameSource, FriendlyName, MediaUri, PixelFormat,

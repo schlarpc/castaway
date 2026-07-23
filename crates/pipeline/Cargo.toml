@@ -44,3 +44,7 @@ workspace = true
 [[example]]
 name = "attract_preview"
 required-features = ["render"]
+
+[[example]]
+name = "screen_preview"
+required-features = ["render"]

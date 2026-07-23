@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use castaway_core::{
-    ControlTxn, CoreError, DecodedFrame, FrameSource, MediaUri, OsdMessage, Pipeline, PixelFormat,
+    ControlTxn, CoreError, DecodedFrame, FrameSource, MediaUri, Pipeline, PixelFormat,
 };
 use tracing::{info, warn};
 
@@ -20,12 +20,11 @@ use crate::compositor::{Compositor, Layer, LayerId, Transform};
 use crate::error::PipelineError;
 use crate::wgpu_compositor::WgpuCompositor;
 
-/// A command sent from the tokio/decode side to the render thread.
+/// A command sent from the tokio/decode side to the render thread. (OSD is a separate
+/// channel — see [`castaway_core::osd`] / [`crate::osd`] — so any source can post it.)
 pub enum RenderCommand {
     /// Upload a decoded frame as the video layer.
     Video(DecodedFrame),
-    /// Set (or clear) the OSD text.
-    Osd(Option<String>),
     /// Drop the video layer (playback stopped).
     ClearVideo,
 }
@@ -134,13 +133,6 @@ impl Pipeline for RenderPipeline {
         info!("render pipeline: STOP");
         Ok(())
     }
-
-    async fn osd(&self, message: Option<OsdMessage>) -> Result<(), CoreError> {
-        let _ = self
-            .tx
-            .try_send(RenderCommand::Osd(message.map(|m| m.text)));
-        Ok(())
-    }
 }
 
 /// Decode `uri` into render commands until EOF or `stop` is set.
@@ -177,6 +169,7 @@ fn decode_into(
 pub struct RenderLoop {
     compositor: WgpuCompositor,
     rx: Receiver<RenderCommand>,
+    osd: Option<crate::osd::OsdController>,
     has_video: bool,
 }
 
@@ -187,7 +180,41 @@ impl RenderLoop {
         Self {
             compositor,
             rx,
+            osd: None,
             has_video: false,
+        }
+    }
+
+    /// Attach an OSD controller (consumes the core OSD channel and draws banners).
+    #[must_use]
+    pub fn with_osd(mut self, controller: crate::osd::OsdController) -> Self {
+        self.osd = Some(controller);
+        self
+    }
+
+    /// Drive the OSD overlay: poll the controller and update the OSD layer.
+    fn update_osd(&mut self) {
+        let update = match &mut self.osd {
+            Some(controller) => controller.poll(std::time::Instant::now()),
+            None => return,
+        };
+        match update {
+            crate::osd::OsdUpdate::Show { width, height, rgba } => {
+                if self
+                    .compositor
+                    .upload_texture(LayerId::Osd, width, height, &rgba)
+                    .is_ok()
+                {
+                    self.compositor.upsert_layer(Layer {
+                        id: LayerId::Osd,
+                        z: 10,
+                        opacity: 1.0,
+                        transform: Transform::default(),
+                    });
+                }
+            }
+            crate::osd::OsdUpdate::Clear => self.compositor.remove_layer(LayerId::Osd),
+            crate::osd::OsdUpdate::Unchanged => {}
         }
     }
 
@@ -242,6 +269,7 @@ impl RenderLoop {
                 applied += 1;
             }
         }
+        self.update_osd();
         self.compositor.present();
         applied
     }
@@ -261,6 +289,7 @@ impl RenderLoop {
                 }
             }
         }
+        self.update_osd();
         self.compositor.present();
         applied
     }
@@ -285,13 +314,6 @@ impl RenderLoop {
                         self.has_video = true;
                     }
                     return true;
-                }
-                false
-            }
-            RenderCommand::Osd(text) => {
-                // Text rasterization (glyphon/fontdue) is a follow-up; log for now.
-                if let Some(t) = text {
-                    info!(osd = %t, "render loop: OSD");
                 }
                 false
             }

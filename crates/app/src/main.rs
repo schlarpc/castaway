@@ -14,10 +14,12 @@ mod config;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use anyhow::Context as _;
 use axum::Router;
 use castaway_core::{
-    DisplayControl, ProtocolKind, SessionConfig, SessionManager, SessionSink, SourceId,
+    osd_channel, DisplayControl, ProtocolKind, SessionConfig, SessionManager, SessionSink, SourceId,
     SourceMessage,
 };
 use control_display::NullDisplay;
@@ -42,6 +44,10 @@ fn main() -> anyhow::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
     let shutdown = Arc::new(Notify::new());
 
+    // The OSD channel: the session manager posts "Now casting from …", and any other
+    // source (here, the app itself) can post to the same overlay by cloning `osd`.
+    let (osd, osd_rx) = osd_channel();
+
     // ctrl-c triggers the same shutdown as a kiosk window close.
     {
         let shutdown = shutdown.clone();
@@ -52,12 +58,17 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // A welcome banner, injected by the app (a non-session OSD producer) — demonstrates
+    // that OSD messages can come from anywhere holding an `OsdSink`.
+    osd.banner(format!("{} ready", config.friendly_name), Duration::from_secs(6));
+
     #[cfg(feature = "render")]
     {
-        use pipeline::RenderPipeline;
+        use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
         let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
-        let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default());
+        let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default())
+            .with_osd(osd.clone());
         runtime.spawn(manager.run(event_rx));
 
         let serve_cfg = config.clone();
@@ -71,8 +82,10 @@ fn main() -> anyhow::Result<()> {
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
         let attract = build_attract(&config);
+        let osd_controller = OsdController::new(osd_rx, 1280, 720);
         // The winit event loop MUST own the main thread.
-        pipeline::kiosk::run(rx, attract).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        pipeline::kiosk::run(rx, attract, Some(osd_controller))
+            .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
     }
 
@@ -81,12 +94,27 @@ fn main() -> anyhow::Result<()> {
         use pipeline::NullPipeline;
         let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
         let manager =
-            SessionManager::new(NullPipeline::new(), Some(display), SessionConfig::default());
+            SessionManager::new(NullPipeline::new(), Some(display), SessionConfig::default())
+                .with_osd(osd.clone());
         runtime.spawn(manager.run(event_rx));
+        // Headless: no renderer, so drain the OSD channel to the log.
+        std::thread::spawn(move || drain_osd_to_log(&osd_rx));
         runtime.block_on(serve(config, event_tx, shutdown))?;
     }
 
     Ok(())
+}
+
+/// Headless OSD consumer: log each banner instead of drawing it.
+#[cfg(not(feature = "render"))]
+fn drain_osd_to_log(rx: &castaway_core::OsdReceiver) {
+    use castaway_core::OsdCommand;
+    while let Some(cmd) = rx.recv() {
+        match cmd {
+            OsdCommand::Show(m) => info!(osd = %m.text, "OSD"),
+            OsdCommand::Clear => info!("OSD clear"),
+        }
+    }
 }
 
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled

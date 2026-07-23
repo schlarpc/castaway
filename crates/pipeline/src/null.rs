@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use castaway_core::{ControlTxn, CoreError, FrameSource, MediaUri, OsdMessage, Pipeline};
+use castaway_core::{ControlTxn, CoreError, FrameSource, MediaUri, Pipeline};
 use tracing::info;
 
 /// A pipeline that logs every operation and drains mirror frame sources (dropping
@@ -74,14 +74,6 @@ impl Pipeline for NullPipeline {
 
     async fn stop(&self) -> Result<(), CoreError> {
         info!("null pipeline: STOP");
-        Ok(())
-    }
-
-    async fn osd(&self, message: Option<OsdMessage>) -> Result<(), CoreError> {
-        match message {
-            Some(m) => info!(text = %m.text, "null pipeline: OSD"),
-            None => info!("null pipeline: OSD clear"),
-        }
         Ok(())
     }
 }
