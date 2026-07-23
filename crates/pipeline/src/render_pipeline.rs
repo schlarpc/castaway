@@ -199,7 +199,11 @@ impl RenderLoop {
             None => return,
         };
         match update {
-            crate::osd::OsdUpdate::Show { width, height, rgba } => {
+            crate::osd::OsdUpdate::Show {
+                width,
+                height,
+                rgba,
+            } => {
                 if self
                     .compositor
                     .upload_texture(LayerId::Osd, width, height, &rgba)

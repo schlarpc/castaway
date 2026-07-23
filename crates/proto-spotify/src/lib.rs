@@ -15,14 +15,15 @@ pub mod discovery;
 pub mod error;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use castaway_core::{ProtocolKind, SessionSink};
+use castaway_core::{OsdSink, ProtocolKind, SessionSink};
 use substrate_mdns::MdnsService;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -42,6 +43,8 @@ struct SpotifyStateInner {
     active_user: Mutex<String>,
     #[allow(dead_code)] // used once playback is wired
     sink: SessionSink,
+    /// Optional overlay sink so pairing is visible on screen.
+    osd: OnceLock<OsdSink>,
 }
 
 /// A Spotify Connect onboarding endpoint. Like the other HTTP protocols it exposes a
@@ -68,8 +71,16 @@ impl SpotifyService {
                 },
                 active_user: Mutex::new(String::new()),
                 sink,
+                osd: OnceLock::new(),
             }),
         }
+    }
+
+    /// Give this adapter an [`OsdSink`] so pairing shows a banner on the overlay.
+    #[must_use]
+    pub fn with_osd(self, osd: OsdSink) -> Self {
+        let _ = self.state.osd.set(osd);
+        self
     }
 
     /// The axum router for the zeroconf endpoint.
@@ -119,6 +130,12 @@ async fn handle_post(State(st): State<Arc<SpotifyStateInner>>, body: String) -> 
                     *st.active_user.lock().await = creds.user_name.clone();
                     info!(user = %creds.user_name, blob_len = creds.blob.len(),
                         "Spotify addUser paired (playback backend deferred)");
+                    if let Some(osd) = st.osd.get() {
+                        osd.banner(
+                            format!("Spotify: {} connected", creds.user_name),
+                            Duration::from_secs(4),
+                        );
+                    }
                     json_ok(discovery::add_user_ok())
                 }
                 Err(e) => {

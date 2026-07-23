@@ -60,7 +60,16 @@ pub fn fill_gradient(buf: &mut [u8], width: u32, height: u32, top: Rgba, bottom:
 }
 
 /// Fill a rectangle with source-over compositing (honours the color's alpha).
-pub fn fill_rect(buf: &mut [u8], width: u32, height: u32, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
+pub fn fill_rect(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Rgba,
+) {
     let x0 = x.max(0.0) as u32;
     let y0 = y.max(0.0) as u32;
     let x1 = ((x + w) as u32).min(width);
@@ -131,7 +140,15 @@ pub fn ascent(font: &FontRef, px: f32) -> f32 {
 }
 
 /// Source-over composite one pixel: works on opaque and transparent canvases alike.
-pub fn blend_over(buf: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: Rgba, coverage: f32) {
+pub fn blend_over(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    color: Rgba,
+    coverage: f32,
+) {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
@@ -181,7 +198,17 @@ mod tests {
         let (w, h) = (64u32, 32u32);
         let mut buf = vec![0u8; (w * h * 4) as usize]; // transparent
         let f = fonts().unwrap();
-        draw_text(&mut buf, w, h, 2.0, 24.0, "Hi", 24.0, [255, 255, 255, 255], &f.regular);
+        draw_text(
+            &mut buf,
+            w,
+            h,
+            2.0,
+            24.0,
+            "Hi",
+            24.0,
+            [255, 255, 255, 255],
+            &f.regular,
+        );
         // Some pixels became opaque (the glyphs); most stayed transparent.
         let opaque = buf.chunks_exact(4).filter(|p| p[3] > 200).count();
         let transparent = buf.chunks_exact(4).filter(|p| p[3] == 0).count();

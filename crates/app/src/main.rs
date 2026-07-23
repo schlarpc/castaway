@@ -19,8 +19,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 use axum::Router;
 use castaway_core::{
-    osd_channel, DisplayControl, ProtocolKind, SessionConfig, SessionManager, SessionSink, SourceId,
-    SourceMessage,
+    osd_channel, DisplayControl, ProtocolKind, SessionConfig, SessionManager, SessionSink,
+    SourceId, SourceMessage,
 };
 use control_display::NullDisplay;
 use proto_dial::DialService;
@@ -60,7 +60,10 @@ fn main() -> anyhow::Result<()> {
 
     // A welcome banner, injected by the app (a non-session OSD producer) — demonstrates
     // that OSD messages can come from anywhere holding an `OsdSink`.
-    osd.banner(format!("{} ready", config.friendly_name), Duration::from_secs(6));
+    osd.banner(
+        format!("{} ready", config.friendly_name),
+        Duration::from_secs(6),
+    );
 
     #[cfg(feature = "render")]
     {
@@ -74,8 +77,9 @@ fn main() -> anyhow::Result<()> {
         let serve_cfg = config.clone();
         let serve_tx = event_tx.clone();
         let serve_shutdown = shutdown.clone();
+        let serve_osd = osd.clone();
         runtime.spawn(async move {
-            if let Err(e) = serve(serve_cfg, serve_tx, serve_shutdown).await {
+            if let Err(e) = serve(serve_cfg, serve_tx, serve_shutdown, serve_osd).await {
                 warn!(error = %e, "service layer exited with error");
             }
         });
@@ -99,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         runtime.spawn(manager.run(event_rx));
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
-        runtime.block_on(serve(config, event_tx, shutdown))?;
+        runtime.block_on(serve(config, event_tx, shutdown, osd))?;
     }
 
     Ok(())
@@ -118,11 +122,13 @@ fn drain_osd_to_log(rx: &castaway_core::OsdReceiver) {
 }
 
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
-/// protocols, and run until `shutdown` is signalled.
+/// protocols, and run until `shutdown` is signalled. `osd` is cloned to each adapter so
+/// they can surface their own status on the overlay.
 async fn serve(
     config: Config,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
+    osd: castaway_core::OsdSink,
 ) -> anyhow::Result<()> {
     let iface = config.resolved_interface();
     info!(
@@ -138,7 +144,8 @@ async fn serve(
 
     if config.enable.dlna {
         let sink = SessionSink::new(SourceId::new(ProtocolKind::Dlna, "http"), event_tx.clone());
-        let dlna = DlnaService::new(&config.friendly_name, &config.uuid, sink);
+        let dlna =
+            DlnaService::new(&config.friendly_name, &config.uuid, sink).with_osd(osd.clone());
         http = http.merge(dlna.router());
         ssdp_devices.push((dlna.ssdp_device(), dlna.description_path().to_string()));
         info!("enabled: DLNA MediaRenderer");
@@ -149,7 +156,8 @@ async fn serve(
             SourceId::new(ProtocolKind::Spotify, "http"),
             event_tx.clone(),
         );
-        let spotify = SpotifyService::new(&config.friendly_name, spotify_device_id(&config), sink);
+        let spotify = SpotifyService::new(&config.friendly_name, spotify_device_id(&config), sink)
+            .with_osd(osd.clone());
         http = http.merge(spotify.router());
         mdns.advertise(&spotify.mdns_service(config.http_port, "castaway"))
             .context("advertising Spotify")?;
@@ -158,7 +166,8 @@ async fn serve(
 
     let (launch_tx, mut launch_rx) = mpsc::channel(8);
     if config.enable.dial {
-        let dial = DialService::new(config.http_base_url(), launch_tx.clone());
+        let dial =
+            DialService::new(config.http_base_url(), launch_tx.clone()).with_osd(osd.clone());
         http = http.merge(dial.router());
         ssdp_devices.push((
             dial.ssdp_device(&config.uuid),

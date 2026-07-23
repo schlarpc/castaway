@@ -5,7 +5,9 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let out = args.next().unwrap_or_else(|| "screen_preview.png".to_string());
+    let out = args
+        .next()
+        .unwrap_or_else(|| "screen_preview.png".to_string());
     let (w, h) = args
         .next()
         .and_then(|s| {

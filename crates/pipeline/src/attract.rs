@@ -55,11 +55,31 @@ impl AttractScene {
             title: name.into(),
             tagline: "Throw anything at the wall — no app to install.".into(),
             rows: vec![
-                AttractRow::new([0x42, 0x85, 0xf4, 0xff], "Chrome / Edge", format!("Cast \u{2192} {name}")),
-                AttractRow::new([0xff, 0xff, 0xff, 0xff], "iPhone / Mac", format!("AirPlay \u{2192} {name}")),
-                AttractRow::new([0x3d, 0xdc, 0x84, 0xff], "Android / VLC", format!("Cast or DLNA \u{2192} {name}")),
-                AttractRow::new([0x1d, 0xb9, 0x54, 0xff], "Spotify", format!("Devices \u{2192} {name}")),
-                AttractRow::new([0xff, 0x00, 0x00, 0xff], "YouTube", "Cast button".to_string()),
+                AttractRow::new(
+                    [0x42, 0x85, 0xf4, 0xff],
+                    "Chrome / Edge",
+                    format!("Cast \u{2192} {name}"),
+                ),
+                AttractRow::new(
+                    [0xff, 0xff, 0xff, 0xff],
+                    "iPhone / Mac",
+                    format!("AirPlay \u{2192} {name}"),
+                ),
+                AttractRow::new(
+                    [0x3d, 0xdc, 0x84, 0xff],
+                    "Android / VLC",
+                    format!("Cast or DLNA \u{2192} {name}"),
+                ),
+                AttractRow::new(
+                    [0x1d, 0xb9, 0x54, 0xff],
+                    "Spotify",
+                    format!("Devices \u{2192} {name}"),
+                ),
+                AttractRow::new(
+                    [0xff, 0x00, 0x00, 0xff],
+                    "YouTube",
+                    "Cast button".to_string(),
+                ),
             ],
             footer: "castaway  •  DLNA / mDNS on 10.0.0.5:8080".into(),
         }
@@ -110,13 +130,33 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     let title_px = 76.0 * s;
     let title_w = text::measure(&f.bold, &scene.title, title_px);
     let mut y = 120.0 * s + text::ascent(&f.bold, title_px);
-    text::draw_text(&mut buf, width, height, (w - title_w) / 2.0, y, &scene.title, title_px, pal.title, &f.bold);
+    text::draw_text(
+        &mut buf,
+        width,
+        height,
+        (w - title_w) / 2.0,
+        y,
+        &scene.title,
+        title_px,
+        pal.title,
+        &f.bold,
+    );
 
     // Tagline (centered).
     let tag_px = 30.0 * s;
     let tag_w = text::measure(&f.regular, &scene.tagline, tag_px);
     y += 46.0 * s + text::ascent(&f.regular, tag_px);
-    text::draw_text(&mut buf, width, height, (w - tag_w) / 2.0, y, &scene.tagline, tag_px, pal.tagline, &f.regular);
+    text::draw_text(
+        &mut buf,
+        width,
+        height,
+        (w - tag_w) / 2.0,
+        y,
+        &scene.tagline,
+        tag_px,
+        pal.tagline,
+        &f.regular,
+    );
 
     // Rows.
     let row_px = 34.0 * s;
@@ -127,16 +167,47 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     for row in &scene.rows {
         let baseline = y + text::ascent(&f.regular, row_px) * 0.8;
         let sq = 22.0 * s;
-        text::fill_rect(&mut buf, width, height, margin, baseline - sq, sq, sq, row.accent);
-        text::draw_text(&mut buf, width, height, label_x, baseline, &row.label, row_px, pal.label, &f.bold);
-        text::draw_text(&mut buf, width, height, detail_x, baseline, &row.detail, row_px, pal.detail, &f.regular);
+        text::fill_rect(
+            &mut buf,
+            width,
+            height,
+            margin,
+            baseline - sq,
+            sq,
+            sq,
+            row.accent,
+        );
+        text::draw_text(
+            &mut buf, width, height, label_x, baseline, &row.label, row_px, pal.label, &f.bold,
+        );
+        text::draw_text(
+            &mut buf,
+            width,
+            height,
+            detail_x,
+            baseline,
+            &row.detail,
+            row_px,
+            pal.detail,
+            &f.regular,
+        );
         y += row_gap;
     }
 
     // Footer.
     let foot_px = 24.0 * s;
     let foot_baseline = height as f32 - 50.0 * s;
-    text::draw_text(&mut buf, width, height, margin, foot_baseline, &scene.footer, foot_px, pal.footer, &f.regular);
+    text::draw_text(
+        &mut buf,
+        width,
+        height,
+        margin,
+        foot_baseline,
+        &scene.footer,
+        foot_px,
+        pal.footer,
+        &f.regular,
+    );
 
     Ok(buf)
 }
@@ -179,7 +250,10 @@ mod tests {
         let bright = img
             .chunks_exact(4)
             .any(|p| u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2]) > 600);
-        assert!(bright, "expected bright text pixels over the dark background");
+        assert!(
+            bright,
+            "expected bright text pixels over the dark background"
+        );
         let png = to_png(w, h, &img).unwrap();
         assert!(png.starts_with(b"\x89PNG"), "valid PNG signature");
     }

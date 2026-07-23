@@ -6,13 +6,15 @@
 //! layer (via a channel) to start the Lounge bind-channel client, which then drives
 //! playback. DIAL itself carries no media — it's pure launch/stop/state.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use castaway_core::OsdSink;
 use substrate_ssdp::SsdpDevice;
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
@@ -44,6 +46,8 @@ struct DialInner {
     /// Absolute base URL of the DIAL REST service, e.g. `http://10.0.0.5:8080/dial`.
     base_url: String,
     launch_tx: mpsc::Sender<LaunchParams>,
+    /// Optional overlay sink so this adapter can post its own status ("Launching …").
+    osd: OnceLock<OsdSink>,
 }
 
 /// The DIAL service. Exposes a [`Router`] to merge and an [`SsdpDevice`] to advertise.
@@ -61,8 +65,16 @@ impl DialService {
                 state: Mutex::new(AppState::Stopped),
                 base_url: base_url.into(),
                 launch_tx,
+                osd: OnceLock::new(),
             }),
         }
+    }
+
+    /// Give this adapter an [`OsdSink`] so it can surface its own status on the overlay.
+    #[must_use]
+    pub fn with_osd(self, osd: OsdSink) -> Self {
+        let _ = self.inner.osd.set(osd);
+        self
     }
 
     /// The DIAL router. Mount its paths under the host root.
@@ -141,6 +153,9 @@ async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
     *st.state.lock().await = AppState::Running;
     let pairing_code = form_field(&body, "pairingCode");
     info!(pairing = ?pairing_code, "DIAL launched YouTube");
+    if let Some(osd) = st.osd.get() {
+        osd.banner("Launching YouTube\u{2026}", Duration::from_secs(4));
+    }
     let _ = st
         .launch_tx
         .send(LaunchParams {
@@ -233,6 +248,28 @@ mod tests {
             .unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("<state>running</state>"));
+    }
+
+    #[tokio::test]
+    async fn launch_posts_osd_banner() {
+        use castaway_core::{osd_channel, OsdCommand};
+        let (tx, _rx) = mpsc::channel(4);
+        let (osd, osd_rx) = osd_channel();
+        let svc = DialService::new("http://10.0.0.5:8080", tx).with_osd(osd);
+        svc.router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dial/apps/YouTube")
+                    .body(Body::from("pairingCode=xyz"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match osd_rx.try_recv() {
+            Some(OsdCommand::Show(m)) => assert!(m.text.contains("YouTube")),
+            other => panic!("expected an OSD banner, got {other:?}"),
+        }
     }
 
     #[test]

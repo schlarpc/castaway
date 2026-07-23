@@ -2,14 +2,15 @@
 //! return a SOAP response. This is the thin I/O shell; all decisions live in
 //! [`crate::state`]. The router is meant to be merged onto the shared HTTP host.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
-use castaway_core::SessionSink;
+use castaway_core::{OsdSink, SessionSink};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -43,6 +44,8 @@ pub(crate) struct DlnaState {
     pub(crate) friendly_name: String,
     /// Bare UUID (no `uuid:` prefix).
     pub(crate) uuid: String,
+    /// Optional overlay sink for transport feedback ("Volume 60%", "Muted").
+    pub(crate) osd: OnceLock<OsdSink>,
 }
 
 /// Build the DLNA router over shared state.
@@ -123,10 +126,31 @@ async fn handle_control(
                     warn!(error = %e, "failed to emit DLNA session event");
                 }
             }
+            post_control_osd(st, &action);
             let xml = soap::action_response(kind.service_type(), &action.name, &out.out_args);
             xml_ok(xml)
         }
         Err(e) => fault_response(&e),
+    }
+}
+
+/// Surface transport feedback on the overlay for actions the "Now casting" banner
+/// doesn't cover (volume/mute changes).
+fn post_control_osd(st: &DlnaState, action: &SoapAction) {
+    let Some(osd) = st.osd.get() else { return };
+    let text = match action.name.as_str() {
+        "SetVolume" => action.arg("DesiredVolume").map(|v| format!("Volume {v}%")),
+        "SetMute" => Some(
+            if matches!(action.arg("DesiredMute"), Some("1" | "true" | "True")) {
+                "Muted".to_string()
+            } else {
+                "Unmuted".to_string()
+            },
+        ),
+        _ => None,
+    };
+    if let Some(text) = text {
+        osd.banner(text, Duration::from_secs(2));
     }
 }
 

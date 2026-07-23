@@ -14,10 +14,10 @@ pub mod service;
 pub mod soap;
 pub mod state;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::Router;
-use castaway_core::{Advertisement, ProtocolKind, SessionSink};
+use castaway_core::{Advertisement, OsdSink, ProtocolKind, SessionSink};
 use substrate_ssdp::SsdpDevice;
 use tokio::sync::Mutex;
 
@@ -48,8 +48,16 @@ impl DlnaService {
                 sink,
                 friendly_name: friendly_name.into(),
                 uuid: uuid.into(),
+                osd: OnceLock::new(),
             }),
         }
+    }
+
+    /// Give this renderer an [`OsdSink`] so volume/mute changes show on the overlay.
+    #[must_use]
+    pub fn with_osd(self, osd: OsdSink) -> Self {
+        let _ = self.state.osd.set(osd);
+        self
     }
 
     /// The axum router serving this renderer's description, SCPDs, and control

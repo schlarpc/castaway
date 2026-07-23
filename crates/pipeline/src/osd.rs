@@ -106,8 +106,26 @@ pub fn render_banner(message: &str, width: u32, height: u32) -> Result<Vec<u8>, 
     let y = height as f32 - pill_h - 60.0 * s;
 
     // Semi-transparent dark pill + a cyan accent stripe on its left edge.
-    text::fill_rect(&mut buf, width, height, x, y, pill_w, pill_h, [0x0a, 0x0e, 0x18, 0xdc]);
-    text::fill_rect(&mut buf, width, height, x, y, 6.0 * s, pill_h, [0x4f, 0xd1, 0xc5, 0xff]);
+    text::fill_rect(
+        &mut buf,
+        width,
+        height,
+        x,
+        y,
+        pill_w,
+        pill_h,
+        [0x0a, 0x0e, 0x18, 0xdc],
+    );
+    text::fill_rect(
+        &mut buf,
+        width,
+        height,
+        x,
+        y,
+        6.0 * s,
+        pill_h,
+        [0x4f, 0xd1, 0xc5, 0xff],
+    );
 
     let baseline = y + pad_y + text::ascent(&f.regular, px) * 0.9;
     text::draw_text(
@@ -145,7 +163,10 @@ mod tests {
         sink.banner("Now casting from cast/abc", Duration::from_secs(2));
         match ctrl.poll(t0) {
             OsdUpdate::Show { rgba, .. } => {
-                assert!(rgba.chunks_exact(4).any(|p| p[3] > 200), "banner has opaque pixels");
+                assert!(
+                    rgba.chunks_exact(4).any(|p| p[3] > 200),
+                    "banner has opaque pixels"
+                );
             }
             _ => panic!("expected Show"),
         }
