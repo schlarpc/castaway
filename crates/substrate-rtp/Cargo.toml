@@ -1,0 +1,15 @@
+[package]
+name = "substrate-rtp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Shared RTP/RTCP parsing and a reorder/jitter buffer. Divergent depacketization stays in the proto-* crates."
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

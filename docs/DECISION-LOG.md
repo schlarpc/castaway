@@ -87,3 +87,25 @@ pure + tested. The session surfaces a `MirrorConfig` via `Reaction::start_mirror
 actor (future) pre-binds the UDP port, receives Cast RTP, decrypts, and emits
 `SessionEvent::Mirror`. The RTP depacketize/reassembly + exact per-frame IV derivation
 need a real capture to validate (Q12/Q13).
+
+### D13 — RTP depacketization stays per-protocol; only parse + reorder are shared
+`substrate-rtp` hand-rolls the RFC 3550 header parse (no webrtc-rs pull-in — keeps the
+dep light) and a bounded reorder buffer that *skips* gaps on overflow rather than
+stalling (live latency > freshness, architecture §6). Payload depacketization (MPEG-TS,
+ALAC/AAC, AirPlay's bespoke mirror framing) is deliberately NOT here — it differs per
+protocol and lives in each `proto-*` crate (architecture §1b).
+
+### D14 — RTSP framing via rtsp-types + a ByteTransform slot; semantics per-protocol
+`substrate-rtsp` wraps `rtsp-types` for the message codec + CSeq correlation and exposes
+a `ByteTransform` trait (Identity for Miracast; ChaCha20 for AirPlay 2 post-pairing) as
+the one crypto concession the shared layer makes. Method dispatch, body parsers, and
+state machines stay per-protocol. AirPlay takes method/path/body as plain args so its
+core tests without constructing rtsp-types messages.
+
+### D15 — AirPlay: control plane real, media plane gated on FairPlay/pairing
+`proto-airplay` ships working mDNS advertisements (`_airplay._tcp` + `_raop._tcp`), the
+`/info` capabilities plist, and the full RTSP dispatch state machine. Mirroring media is
+gated on the FairPlay-SAP session key (`crypto-fairplay`, stubbed at the captured-tables
+boundary) and HomeKit transient pairing (not implemented) — both return `501` at the
+gate. This makes castaway appear in the AirPlay picker and models every transaction; the
+media plane slots in once Q1's captures land.

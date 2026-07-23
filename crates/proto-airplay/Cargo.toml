@@ -1,0 +1,20 @@
+[package]
+name = "proto-airplay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "AirPlay receiver: mDNS advertisements, /info, and the RTSP dispatch state machine. Mirroring media is gated on FairPlay-SAP (crypto-fairplay, Q1)."
+
+[dependencies]
+castaway-core.workspace = true
+substrate-mdns.workspace = true
+substrate-rtsp.workspace = true
+crypto-fairplay.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+plist.workspace = true
+
+[lints]
+workspace = true

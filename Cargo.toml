@@ -11,6 +11,10 @@ members = [
     "crates/proto-cast",
     "crates/proto-spotify",
     "crates/crypto-cast-auth",
+    "crates/substrate-rtp",
+    "crates/substrate-rtsp",
+    "crates/crypto-fairplay",
+    "crates/proto-airplay",
     "crates/app",
 ]
 
@@ -70,6 +74,7 @@ mdns-sd = "0.13"
 axum = "0.8"
 hyper = "1"
 rtsp-types = "0.1"
+plist = "1"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 

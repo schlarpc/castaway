@@ -1,0 +1,15 @@
+[package]
+name = "substrate-rtsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Shared RTSP message framing (rtsp-types) + a byte-stream transform slot (identity for Miracast, ChaCha20 for AirPlay 2 post-pairing)."
+
+[dependencies]
+thiserror.workspace = true
+rtsp-types.workspace = true
+
+[lints]
+workspace = true
