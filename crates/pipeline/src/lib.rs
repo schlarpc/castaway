@@ -15,8 +15,16 @@
 
 pub mod browser;
 pub mod compositor;
+pub mod error;
 pub mod null;
+
+#[cfg(feature = "render")]
+pub mod wgpu_compositor;
 
 pub use browser::{BrowserSurface, NullBrowser};
 pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
+pub use error::PipelineError;
 pub use null::NullPipeline;
+
+#[cfg(feature = "render")]
+pub use wgpu_compositor::WgpuCompositor;

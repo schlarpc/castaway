@@ -15,15 +15,25 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 bytes.workspace = true
 
+# --- real render backends (optional; default off, DECISION-LOG D4) ---
+wgpu = { version = "22", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+winit = { version = "0.30", optional = true }
+ffmpeg-next = { version = "7.1", optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
 
 [features]
 default = []
-# Real backends land behind these. Kept off so the daily loop builds with no system
-# libav / Vulkan / CEF present (DECISION-LOG D4; CEF pull-in gated on Q6).
-ffmpeg = []
-wgpu = []
+# `render` = the wgpu Compositor backend (feature can't be named `wgpu` — that's a dep).
+# `kiosk`  = winit fullscreen output driving the compositor.
+# `ffmpeg` = libav decode. `cef` = offscreen browser (still a marker; Q6).
+render = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
+ffmpeg = ["dep:ffmpeg-next"]
 cef = []
 
 [lints]
