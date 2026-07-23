@@ -1,0 +1,15 @@
+{
+  "template": "https://github.com/schlarpc/rust-flake",
+  "commit": "c47c030b8841c3eb3ff17a25c0ce9a3093056d48",
+  "checkout": "template",
+  "context": {
+    "cookiecutter": {
+      "project_name": "castaway",
+      "_template": "https://github.com/schlarpc/rust-flake",
+      "_output_dir": "/tmp/cc-out",
+      "_repo_dir": "/home/schlarpc/.cookiecutters/rust-flake",
+      "_checkout": "template"
+    }
+  },
+  "directory": null
+}
