@@ -1,0 +1,21 @@
+[package]
+name = "substrate-ssdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Shared SSDP responder (UDP 1900) and UPnP device-description HTTP host. DLNA/DIAL mount handlers on top."
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time"] }
+axum.workspace = true
+socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "rt-multi-thread"] }
+
+[lints]
+workspace = true

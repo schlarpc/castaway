@@ -6,6 +6,24 @@ Review at next sync.
 
 ## 2026-07-23
 
+### D7 — HTTP-mounted protocols expose `router()` + `ssdp_device()`, not `SourceAdapter`
+`SourceAdapter::run()` models an *active* actor that owns a socket (Cast, AirPlay,
+Spotify, the Lounge bind channel). DLNA (and later DIAL) are *passive*: their work
+happens inside axum handlers on the **shared** HTTP host, driven by the **shared**
+SSDP responder. Forcing them through `run()` would mean a handler that just parks.
+So `proto-dlna` exposes `router() -> axum::Router` + `ssdp_device()` +
+`description_path()`, and the `app` composes: it merges every protocol router onto one
+`axum` server and registers every `SsdpDevice` with one `Responder`. This is exactly
+the "advertise once, not five racing responders" goal (architecture §1d). Socket
+protocols still implement `SourceAdapter`. Revisit if we want a uniform lifecycle.
+
+### D8 — DLNA GENA eventing is stubbed (ack-only); control points poll instead
+Full GENA (LastChange NOTIFY callbacks over the subscriber's URL) is conformance-heavy
+and not needed for the core "cast a video" flow: control points that don't get events
+fall back to polling `GetTransportInfo`/`GetPositionInfo`, which we answer fully. The
+event endpoints return `200 OK` with a plausible SID/TIMEOUT so subscription setup
+succeeds. Logged for revisit if a specific control point misbehaves.
+
 ### D1 — Workspace-wide lints via `[workspace.lints]`, crates opt in
 The template had per-package lint config. Moved the full lint table (ground rules
 1/7/8) into `[workspace.lints]`; every crate does `[lints] workspace = true`. Keeps
