@@ -1,0 +1,28 @@
+# Rust formatting configuration
+# https://rust-lang.github.io/rustfmt/
+
+# Use the 2021 edition style
+edition = "2021"
+
+# Maximum line width
+max_width = 100
+
+# Use spaces, not tabs
+hard_tabs = false
+tab_spaces = 4
+
+# Newline style (native = platform-specific)
+newline_style = "Auto"
+
+# These options are stable
+reorder_imports = true
+reorder_modules = true
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Note: The following options require nightly rustfmt and are commented out for stable compatibility:
+# imports_granularity = "Module"
+# group_imports = "StdExternalCrate"
+# wrap_comments = false
+# normalize_comments = false
+# format_code_in_doc_comments = true

@@ -1,0 +1,39 @@
+# Cargo configuration
+# https://doc.rust-lang.org/cargo/reference/config.html
+
+[alias]
+# Useful aliases for common tasks
+t = "test"
+c = "check"
+b = "build"
+r = "run"
+br = "build --release"
+rr = "run --release"
+
+# Testing shortcuts
+tn = "nextest run"
+tc = "llvm-cov nextest"
+
+# Linting
+lint = "clippy --all-targets"
+lint-fix = "clippy --all-targets --fix --allow-dirty"
+
+# Format check (use rustfmt for actual formatting)
+fmt-check = "fmt -- --check"
+
+[build]
+# Use all available cores for parallel compilation
+jobs = -1
+
+[term]
+# Show warnings during compilation (not just errors)
+verbose = false
+color = "auto"
+
+# Progress bar configuration
+[term.progress]
+# "never" instead of "auto": some runners (CI, agent harnesses) allocate a PTY,
+# so "auto" detects a terminal and floods logs with per-frame progress bars.
+# Override locally with CARGO_TERM_PROGRESS_WHEN=auto for an interactive bar.
+when = "never"
+width = 80

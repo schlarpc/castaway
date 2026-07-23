@@ -1,0 +1,12 @@
+# Single source of truth for the Rust toolchain.
+#
+# - Nix reads this via `rust-bin.fromRustupToolchainFile` in flake.nix, so the
+#   exact build is still pinned/reproducible through rust-overlay in flake.lock.
+# - Non-Nix users with rustup get the identical version automatically.
+#
+# To upgrade Rust: bump `channel` here (optionally `nix flake update` rust-overlay
+# so the new version is available), then commit. Nix follows this file.
+[toolchain]
+channel = "1.96.1"
+profile = "default"
+components = ["rust-src", "rust-analyzer", "llvm-tools-preview"]

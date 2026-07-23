@@ -1,0 +1,55 @@
+[package]
+name = "castaway"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A Rust application built with Nix flakes"
+readme = "README.md"
+keywords = ["nix", "flake"]
+categories = ["command-line-utilities"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Production dependencies go here
+
+[dev-dependencies]
+# Dev-only dependencies (tests, benchmarks) - these don't leak to production builds
+
+[lints.rust]
+# Rust compiler lints
+unsafe_code = "warn"
+missing_docs = "allow"  # Enable when API stabilizes
+
+[lints.clippy]
+# Clippy lint groups (lower priority so individual lints can override)
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }  # Enable selectively as needed
+nursery = { level = "allow", priority = -1 }   # Enable selectively as needed
+
+# Individual clippy lints worth enabling
+enum_glob_use = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+ptr_as_ptr = "warn"
+redundant_closure_for_method_calls = "warn"
+unwrap_used = "warn"  # Warn in production code; allow per-module in tests/examples
+
+[profile.dev]
+# Fast compile times for development
+opt-level = 0
+debug = true
+
+[profile.release]
+# Optimize for binary size and performance
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.test]
+# Keep some debug info for test failures
+opt-level = 0
+debug = true
