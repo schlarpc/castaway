@@ -124,3 +124,13 @@ proto-dlna `include_str!`s its SCPD/description XML; `craneLib.cleanCargoSource`
 non-Rust files, breaking the nix build (but not `cargo`). Fixed the flake's `src` filter
 to keep `.xml` alongside cargo sources. Same pattern will cover future `.proto`/fixture
 assets.
+
+### D18 — Real render/decode backends land behind `render`/`ffmpeg`/`kiosk` features
+The render path is now real, not stubbed: `pipeline` gains a wgpu `WgpuCompositor`
+(GPU-verified by offscreen readback) and an ffmpeg `decode()` producing RGBA
+`DecodedFrame`s (verified against a testsrc clip). Both stay behind default-off features
+so the pure-protocol daily loop and the default `nix build` remain native-dep-free (D4).
+The devShell adds the native toolchain (pkg-config, `ffmpeg_7` — pinned to match
+`ffmpeg-sys-next` 7.1, libclang + `BINDGEN_EXTRA_CLANG_ARGS` for bindgen, and
+Vulkan/Wayland/X11 for wgpu+winit at runtime). Feature named `render` not `wgpu` because a
+Cargo feature can't share a dependency's name.

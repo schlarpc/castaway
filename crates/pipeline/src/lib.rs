@@ -18,6 +18,8 @@ pub mod compositor;
 pub mod error;
 pub mod null;
 
+#[cfg(feature = "ffmpeg")]
+pub mod ffmpeg_decode;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
 

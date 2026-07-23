@@ -168,13 +168,46 @@
               # Macro expansion (debugging)
               pkgs.cargo-expand
 
+              # Native-dep build tooling for the render/decode features:
+              # pkg-config + ffmpeg for `ffmpeg-sys-next`; the render stack links
+              # against Vulkan/Wayland/X11 at runtime.
+              pkgs.pkg-config
+
               # nix-direnv for this flake's shell
               nix-direnv.packages.${system}.default
+            ];
+
+            buildInputs = [
+              # ffmpeg dev libs for the `ffmpeg` pipeline feature. Pin to 7.x to match
+              # `ffmpeg-next`/`ffmpeg-sys-next` 7.1 (nixpkgs default is 8.x).
+              pkgs.ffmpeg_7
+              # Runtime libs for the `render`/`kiosk` pipeline features (wgpu + winit).
+              pkgs.vulkan-loader
+              pkgs.wayland
+              pkgs.libxkbcommon
+              pkgs.xorg.libX11
+              pkgs.xorg.libXcursor
+              pkgs.xorg.libXi
+              pkgs.xorg.libXrandr
             ];
 
             # Environment variables for development
             RUST_BACKTRACE = "1";
             RUST_LOG = "debug";
+            # `ffmpeg-sys-next` generates bindings with bindgen, which dlopens libclang
+            # and needs the libc headers pointed out explicitly in a Nix env.
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+            # Let winit/wgpu dlopen Vulkan/Wayland/X11 at runtime.
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.vulkan-loader
+              pkgs.wayland
+              pkgs.libxkbcommon
+              pkgs.xorg.libX11
+              pkgs.xorg.libXcursor
+              pkgs.xorg.libXi
+              pkgs.xorg.libXrandr
+            ];
           };
         });
 
