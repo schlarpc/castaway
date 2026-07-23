@@ -2,6 +2,90 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## What this project is
+
+**castaway** is a single unified "universal cast receiver" — one Rust binary that advertises and
+terminates many casting protocols (AirPlay, Google Cast, Miracast, DLNA, YouTube Lounge, Spotify
+Connect) so any device on the LAN can throw media at the display with no app install. It drives a
+Dell C6522QT commercial touch panel; the deploy target is a Windows box, development happens
+natively on Linux (NixOS).
+
+The design docs are the spec — read them before touching a subsystem:
+
+- **docs/hackerspace-receiver-build.md** — the "why", protocol surface, crypto/auth modules, effort tiers, build priority.
+- **docs/architecture-substrate.md** — what is *actually* shared vs. what only looks shared; the Cargo workspace layout; the core traits (`SourceAdapter`, `SessionEvent`, `FrameSource`); pipeline and threading model.
+- **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`, MSVC), the CEF/ffmpeg escape hatches, and the testing matrix.
+
+Reference implementations named in the docs (UxPlay, openscreen, librespot, yt-cast-receiver, …)
+are **RE sources / wire-behavior specs, not runtime dependencies** — we reimplement.
+
+## Ground rules
+
+These are binding engineering constraints for this project. They override general defaults.
+
+1. **Correct by construction — lean hard on the type system.** Make illegal states unrepresentable.
+   Prefer enums over booleans/strings, newtypes over bare primitives, typestate/session-type
+   patterns for protocol state machines (a message that can't be sent in the current state should
+   not typecheck). Parse, don't validate: convert wire bytes into rich types at the boundary and
+   pass those inward. If a `match` could be non-exhaustive tomorrow, model it so the compiler forces
+   the update.
+
+2. **Workspace build, one concern per crate.** Follow the layout in architecture-substrate.md §2:
+   `core` (traits/session), `substrate-*` (shared wire framing/plumbing), `crypto-*`, `proto-*`
+   (one per protocol), `pipeline`, `control-display`, `input-touch`, `app` (wiring/binary). Share
+   the wire framing and connection plumbing; **do not** share protocol *semantics* — each protocol
+   owns its own state machine. Dependencies flow toward `core`; `proto-*` crates never depend on
+   each other.
+
+3. **Pure protocol, composed with I/O — never interleaved.** Protocol logic is
+   `fn(state, input_bytes) -> (new_state, outputs)` — sans-I/O, deterministic, synchronous, unit-
+   testable without a socket. The async/socket layer is a thin actor that owns the connection and
+   feeds bytes to the pure core. No parsing inside `tokio::select!`; no network calls inside a
+   state transition. This is what makes the wire-fixture tests (rule 6) possible.
+
+4. **Async everything.** Media playback must run fluidly, so I/O is `tokio`-based and non-blocking
+   end to end. Adapters are async actors emitting `SessionEvent`s; blocking/CPU work (decode,
+   crypto) goes on dedicated threads or `spawn_blocking`, never on the runtime. Respect the
+   three-thread-domain model (winit/wgpu main, CEF pump, tokio pool) in architecture-substrate.md §6;
+   for live mirroring, **drop late frames** (latency beats freshness).
+
+5. **Cross-platform is a ground rule; Linux-first is the tactic.** Build the portable core
+   correct-and-complete on Linux natively, but every platform-specific seam goes behind a trait or
+   `cfg`/feature flag from day one so the Windows slice (and later the Windows→Linux Miracast move)
+   is a new backend impl, not a core-trait change. Never bake a platform assumption into a portable
+   crate. The `FrameSource::{Encoded,Decoded}` split and `MiracastBackend` trait exist precisely for
+   this — keep that discipline everywhere.
+
+6. **Test without a human in the loop; use Nix to make it reproducible.** Two tiers:
+   - *Pure-protocol tests* run the sans-I/O cores against captured/golden byte fixtures
+     (pcap transcripts, `bplist`/SDP/`wfd-kv` bodies, RTSP exchanges) — fast, deterministic, no network.
+     Capture real fixtures from reference impls / live senders during RE and check them in.
+   - *Integration tests* drive whole adapters against scripted senders inside **Nix-built VMs**
+     (`nixosTest`/`pkgs.testers`) so end-to-end discovery+session flows run in CI with no hardware.
+   Prefer building a harness over manual verification. Hardware-only paths (Miracast Wi-Fi Direct,
+   DX12/CEF render, the physical panel) are the *only* things allowed to require the real box; isolate them.
+
+7. **Errors: typed in libraries, `anyhow` in the app.** Every `substrate-*`/`proto-*`/`crypto-*`/
+   `core` crate exposes a `thiserror` enum whose variants enumerate its real failure modes (so
+   callers can match and protocol errors are exhaustive). Only the `app` crate uses `anyhow` for
+   top-level wiring. No `unwrap`/`expect`/`panic!` on runtime-reachable paths in library crates
+   (`unwrap_used` is already a warn — treat it as deny outside tests).
+
+8. **`unsafe` is quarantined to FFI.** Pure crates (`core`, `substrate-*`, `proto-*`, `crypto-*`)
+   set `unsafe_code = "forbid"`. The FFI/interop crates (`pipeline` for ffmpeg/wgpu, `control-display`,
+   `input-touch`, the `windows`/CEF glue) may use `unsafe`, but every `unsafe` block carries a
+   `// SAFETY:` comment stating the invariant it upholds. Keep FFI surface thin and wrapped in safe
+   types at the crate boundary.
+
+9. **Reverse engineering happens in `~/re-shell`.** Use that environment (Frida, capture tools,
+   the reference impls) to derive wire behavior and crypto flows. Land the *findings* here as
+   checked-in fixtures + notes; never add a reference impl as a runtime dependency.
+
+10. **Commit semi-regularly, straight to `main`.** Commit at independent logical boundaries — often
+    several commits within a single feature build-out, each one a coherent, self-contained change.
+    Run `cargo fmt` and `cargo clippy --all-targets` (clean) before **every** commit. No feature
+    branches or PRs; work lands directly on `main`.
+
 ## Development Commands
 
 This is a Rust project using Nix flakes with a pinned toolchain. First load the environment:
@@ -30,9 +114,12 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 
 ## Architecture
 
-Built from the [rust-flake](https://github.com/schlarpc/rust-flake) template.
+Built from the [rust-flake](https://github.com/schlarpc/rust-flake) template. The repo is still
+single-crate template scaffolding; the **target** structure is the Cargo workspace in
+architecture-substrate.md §2 (see ground rule 2). Migrate to the workspace before adding real
+subsystems.
 
-- **src/main.rs** — application entry point
+- **src/main.rs** — application entry point (template scaffolding; becomes the `app` crate)
 - **Cargo.toml** — package manifest; lints configured under `[lints.rust]` and `[lints.clippy]`
 - **flake.nix** — Nix build (Crane), dev shell, and CI checks
 - **rust-toolchain.toml** — single source of truth for the Rust version; Nix reads it via
