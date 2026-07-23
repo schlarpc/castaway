@@ -58,7 +58,8 @@
             src = ./.;
             filter = path: type:
               (craneLib.filterCargoSources path type)
-              || (pkgs.lib.hasSuffix ".xml" path);
+              || (pkgs.lib.hasSuffix ".xml" path)
+              || (pkgs.lib.hasSuffix ".ttf" path);
             name = "source";
           };
           strictDeps = true;

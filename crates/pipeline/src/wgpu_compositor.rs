@@ -550,6 +550,7 @@ fn build_pipeline(
 
 fn default_z(id: LayerId) -> i32 {
     match id {
+        LayerId::Attract => -10,
         LayerId::Video => 0,
         LayerId::Browser => 5,
         LayerId::Osd => 10,

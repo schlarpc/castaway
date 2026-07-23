@@ -18,6 +18,8 @@ pub mod compositor;
 pub mod error;
 pub mod null;
 
+#[cfg(feature = "render")]
+pub mod attract;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
 #[cfg(feature = "kiosk")]
@@ -32,6 +34,8 @@ pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
 pub use error::PipelineError;
 pub use null::NullPipeline;
 
+#[cfg(feature = "render")]
+pub use attract::{AttractRow, AttractScene};
 #[cfg(feature = "render")]
 pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
 #[cfg(feature = "render")]

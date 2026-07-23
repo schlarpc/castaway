@@ -211,6 +211,28 @@ impl RenderLoop {
         self.compositor.read_rgba()
     }
 
+    /// Install the idle/attract background (shown when no video layer is present; a
+    /// playing video covers it since it sits below `z=0`).
+    ///
+    /// # Errors
+    /// [`PipelineError`] if the image can't be uploaded.
+    pub fn set_attract(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), PipelineError> {
+        self.compositor
+            .upload_texture(LayerId::Attract, width, height, rgba)?;
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::Attract,
+            z: -10,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        Ok(())
+    }
+
     /// Drain all pending commands (non-blocking) and present once. Returns the number of
     /// video frames applied this pump.
     pub fn pump(&mut self) -> usize {

@@ -20,8 +20,12 @@ use crate::error::PipelineError;
 use crate::render_pipeline::{RenderCommand, RenderLoop};
 use crate::wgpu_compositor::WgpuCompositor;
 
+/// An idle-scene image to show before/between casts: `(width, height, rgba8)`.
+pub type AttractImage = (u32, u32, Vec<u8>);
+
 struct KioskApp {
     rx: Option<Receiver<RenderCommand>>,
+    attract: Option<AttractImage>,
     window: Option<Arc<Window>>,
     render: Option<RenderLoop>,
 }
@@ -64,7 +68,13 @@ impl ApplicationHandler for KioskApp {
             };
 
         if let Some(rx) = self.rx.take() {
-            self.render = Some(RenderLoop::new(compositor, rx));
+            let mut render = RenderLoop::new(compositor, rx);
+            if let Some((w, h, rgba)) = self.attract.take() {
+                if let Err(e) = render.set_attract(w, h, &rgba) {
+                    error!(error = %e, "failed to install attract scene");
+                }
+            }
+            self.render = Some(render);
         }
         info!(width = size.width, height = size.height, "kiosk window up");
         window.request_redraw();
@@ -99,16 +109,21 @@ impl ApplicationHandler for KioskApp {
 }
 
 /// Run the kiosk to completion (blocks the calling — main — thread). Consumes render
-/// commands from `rx` and displays them fullscreen until the window is closed.
+/// commands from `rx` and displays them fullscreen until the window is closed. `attract`
+/// is the idle scene shown before/between casts.
 ///
 /// # Errors
 /// [`PipelineError`] if the event loop can't be created or run.
-pub fn run(rx: Receiver<RenderCommand>) -> Result<(), PipelineError> {
+pub fn run(
+    rx: Receiver<RenderCommand>,
+    attract: Option<AttractImage>,
+) -> Result<(), PipelineError> {
     let event_loop =
         EventLoop::new().map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = KioskApp {
         rx: Some(rx),
+        attract,
         window: None,
         render: None,
     };

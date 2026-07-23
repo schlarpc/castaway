@@ -146,3 +146,15 @@ feature `main()` is a plain `fn` that builds a tokio runtime, spawns the session
 `block_on(serve())`. The whole Play→decode→composite→pixels path is proven by an offscreen
 readback test; the on-screen kiosk is compile-verified (not run here — a fullscreen window
 would hijack the dev box's live display).
+
+### D20 — Idle/attract scene: CPU-rasterized background layer, DejaVu embedded
+The kiosk now shows an idle "lobby" when nothing is casting: the receiver name, a tagline,
+per-protocol "how to cast" rows, and a network footer. Text is rasterized on the CPU with
+ab_glyph over a gradient (module attract.rs) into an RGBA image the compositor shows as a
+background layer at z=-10 — a playing video (z=0) simply covers it, and it reappears on
+stop, so no explicit idle/active state machine is needed. DejaVu Sans (regular + bold) is
+embedded via include_str-style include_bytes (permissive Bitstream Vera license, asset +
+crane .ttf filter). The scene is config-driven: the app builds rows only for enabled
+protocols (honest — no "Cast from Chrome" row until the Cast actor lands). attract::to_png
+exports a preview (examples/attract_preview.rs). This also lays the groundwork for real OSD
+text (same rasterizer), which is still logged rather than drawn.

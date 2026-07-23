@@ -55,6 +55,8 @@ impl Transform {
 /// Identifies a compositor layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayerId {
+    /// The idle/attract background (shown when nothing is casting; video covers it).
+    Attract,
     /// The main cast video/mirroring surface.
     Video,
     /// The CEF browser surface (PiP / YouTube TV surface).

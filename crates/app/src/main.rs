@@ -70,8 +70,9 @@ fn main() -> anyhow::Result<()> {
         });
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
+        let attract = build_attract(&config);
         // The winit event loop MUST own the main thread.
-        pipeline::kiosk::run(rx).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        pipeline::kiosk::run(rx, attract).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
     }
 
@@ -234,6 +235,70 @@ fn advertise_socket_protocols(config: &Config, mdns: &mut MdnsResponder) {
 
 fn spotify_device_id(config: &Config) -> String {
     config.uuid.replace('-', "")
+}
+
+/// Build the idle/attract image from the enabled protocols. Rendered at 1920×1080 and
+/// scaled to fill the panel.
+#[cfg(feature = "render")]
+fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
+    use pipeline::attract::{render, AttractRow, AttractScene};
+
+    let name = &config.friendly_name;
+    let detail = |verb: &str| format!("{verb} \u{2192} {name}");
+    let mut rows = Vec::new();
+    if config.enable.cast {
+        rows.push(AttractRow::new(
+            [0x42, 0x85, 0xf4, 0xff],
+            "Chrome / Edge",
+            detail("Cast"),
+        ));
+    }
+    if config.enable.airplay {
+        rows.push(AttractRow::new(
+            [0xff, 0xff, 0xff, 0xff],
+            "iPhone / Mac",
+            detail("AirPlay"),
+        ));
+    }
+    if config.enable.dlna {
+        rows.push(AttractRow::new(
+            [0x3d, 0xdc, 0x84, 0xff],
+            "Android / VLC",
+            detail("Cast or DLNA"),
+        ));
+    }
+    if config.enable.spotify {
+        rows.push(AttractRow::new(
+            [0x1d, 0xb9, 0x54, 0xff],
+            "Spotify",
+            detail("Devices"),
+        ));
+    }
+    if config.enable.dial {
+        rows.push(AttractRow::new(
+            [0xff, 0x00, 0x00, 0xff],
+            "YouTube",
+            "Cast button".to_string(),
+        ));
+    }
+
+    let scene = AttractScene {
+        title: name.clone(),
+        tagline: "Throw anything at the wall — no app to install.".to_string(),
+        rows,
+        footer: format!(
+            "castaway  •  {}",
+            config.http_base_url().replace("http://", "")
+        ),
+    };
+    let (w, h) = (1920, 1080);
+    match render(&scene, w, h) {
+        Ok(rgba) => Some((w, h, rgba)),
+        Err(e) => {
+            warn!(error = %e, "failed to render attract scene");
+            None
+        }
+    }
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).
