@@ -1,0 +1,25 @@
+[package]
+name = "proto-dial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "DIAL app-launch (YouTube) on the shared SSDP/HTTP host + the YouTube Lounge bind-channel parser and command mapping."
+
+[dependencies]
+castaway-core.workspace = true
+substrate-ssdp.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

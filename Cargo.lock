@@ -1032,6 +1032,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-dial"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "castaway-core",
+ "serde",
+ "serde_json",
+ "substrate-ssdp",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "proto-dlna"
 version = "0.1.0"
 dependencies = [

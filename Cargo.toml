@@ -15,6 +15,7 @@ members = [
     "crates/substrate-rtsp",
     "crates/crypto-fairplay",
     "crates/proto-airplay",
+    "crates/proto-dial",
     "crates/app",
 ]
 
