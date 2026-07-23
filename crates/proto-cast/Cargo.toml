@@ -9,12 +9,15 @@ description = "Google Cast (CASTv2) receiver: framing, device-auth handshake, an
 
 [dependencies]
 castaway-core.workspace = true
+crypto-cast-auth.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+aes.workspace = true
+ctr.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true

@@ -64,3 +64,13 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   backend impl yet. `backend-windows` is the intended first impl (cross-build).
 - **Q8 — Zero-copy decode path.** MVP is decode→CPU AVFrame→wgpu upload. DXGI shared
   handle / dmabuf import is explicitly post-MVP. Not touching until the CPU path runs.
+
+## Cast mirroring media plane
+
+- **Q12 — Cast RTP receive + frame reassembly.** Negotiation + AES-CTR decrypt are done;
+  the UDP RTP receiver (Cast's own RTP framing: frame_id, packet_id, reference frames,
+  RTCP feedback/NACK) that assembles encoded access units is not. Needs an openscreen
+  `standalone_receiver` capture to build against. This is the bulk of the media plane.
+- **Q13 — Per-frame IV derivation.** `mirror::frame_iv` XORs the frame_id into the low 4
+  bytes of the IV mask. This is self-consistent but not verified against openscreen's
+  exact scheme — confirm from a capture before trusting decrypted output.

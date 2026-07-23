@@ -31,6 +31,30 @@ pub struct Reaction {
     pub outgoing: Vec<CastMessage>,
     /// A session event to forward to the session manager, if any.
     pub event: Option<SessionEvent>,
+    /// A negotiated mirroring config the actor should start receiving on. The session
+    /// can't emit [`SessionEvent::Mirror`] itself (that needs an I/O-fed frame channel),
+    /// so it surfaces the config and the actor wires the RTP receiver + `FrameSource`.
+    pub start_mirror: Option<crate::mirror::MirrorConfig>,
+}
+
+impl Reaction {
+    /// A reaction that only writes messages back.
+    fn reply(outgoing: Vec<CastMessage>) -> Self {
+        Self {
+            outgoing,
+            event: None,
+            start_mirror: None,
+        }
+    }
+
+    /// A reaction that writes messages back and forwards a session event.
+    fn reply_with(outgoing: Vec<CastMessage>, event: SessionEvent) -> Self {
+        Self {
+            outgoing,
+            event: Some(event),
+            start_mirror: None,
+        }
+    }
 }
 
 /// The receiver-side Cast session for one sender connection.
@@ -42,6 +66,8 @@ pub struct CastSession {
     media_session_id: i64,
     id_counter: u64,
     auth: Option<Box<dyn DeviceAuthResponder>>,
+    /// UDP port the actor pre-bound for mirroring RTP, if mirroring is enabled.
+    mirror_port: Option<u16>,
 }
 
 impl CastSession {
@@ -57,7 +83,16 @@ impl CastSession {
             media_session_id: 1,
             id_counter: 0,
             auth,
+            mirror_port: None,
         }
+    }
+
+    /// Enable mirroring: the actor pre-binds a UDP socket and passes its `port` so the
+    /// negotiator can put it in the `ANSWER`.
+    #[must_use]
+    pub fn with_mirror_port(mut self, port: u16) -> Self {
+        self.mirror_port = Some(port);
+        self
     }
 
     /// Fold one inbound message into a [`Reaction`].
@@ -71,6 +106,7 @@ impl CastSession {
             ns::HEARTBEAT => Ok(self.handle_heartbeat(msg)),
             ns::RECEIVER => self.handle_receiver(msg),
             ns::MEDIA => self.handle_media(msg),
+            crate::mirror::WEBRTC_NS => self.handle_webrtc(msg),
             other => {
                 debug!(namespace = %other, "ignoring message on unknown namespace");
                 Ok(Reaction::default())
@@ -104,15 +140,12 @@ impl CastSession {
         reply
             .encode(&mut buf)
             .map_err(|e| CastError::Encode(e.to_string()))?;
-        Ok(Reaction {
-            outgoing: vec![CastMessage::binary(
-                &msg.destination_id,
-                &msg.source_id,
-                ns::DEVICE_AUTH,
-                buf,
-            )],
-            event: None,
-        })
+        Ok(Reaction::reply(vec![CastMessage::binary(
+            &msg.destination_id,
+            &msg.source_id,
+            ns::DEVICE_AUTH,
+            buf,
+        )]))
     }
 
     fn handle_connection(&mut self, msg: &CastMessage) -> Reaction {
@@ -125,10 +158,7 @@ impl CastSession {
         // A CLOSE to the receiver ends the whole session; virtual-connection setup
         // (CONNECT) is silent.
         if ty == "CLOSE" && msg.destination_id == self.receiver_id {
-            return Reaction {
-                outgoing: vec![],
-                event: Some(SessionEvent::End),
-            };
+            return Reaction::reply_with(vec![], SessionEvent::End);
         }
         Reaction::default()
     }
@@ -140,15 +170,12 @@ impl CastSession {
             .and_then(|p| Envelope::parse(p).ok())
             .is_some_and(|e| e.r#type == "PING");
         if is_ping {
-            Reaction {
-                outgoing: vec![CastMessage::json(
-                    &msg.destination_id,
-                    &msg.source_id,
-                    ns::HEARTBEAT,
-                    messages::pong(),
-                )],
-                event: None,
-            }
+            Reaction::reply(vec![CastMessage::json(
+                &msg.destination_id,
+                &msg.source_id,
+                ns::HEARTBEAT,
+                messages::pong(),
+            )])
         } else {
             Reaction::default()
         }
@@ -200,10 +227,10 @@ impl CastSession {
                     .current_time
                     .filter(|t| *t > 0.0)
                     .map(std::time::Duration::from_secs_f64);
-                Ok(Reaction {
-                    outgoing: vec![self.media_status_msg(&sender, request_id, "PLAYING")],
-                    event: Some(SessionEvent::Play { source: uri, start }),
-                })
+                Ok(Reaction::reply_with(
+                    vec![self.media_status_msg(&sender, request_id, "PLAYING")],
+                    SessionEvent::Play { source: uri, start },
+                ))
             }
             "PLAY" => Ok(self.media_control(&sender, request_id, "PLAYING", ControlTxn::Play)),
             "PAUSE" => Ok(self.media_control(&sender, request_id, "PAUSED", ControlTxn::Pause)),
@@ -220,15 +247,58 @@ impl CastSession {
                 let txn = ControlTxn::Seek(std::time::Duration::from_secs_f64(secs.max(0.0)));
                 Ok(self.media_control(&sender, request_id, "PLAYING", txn))
             }
-            "GET_STATUS" => Ok(Reaction {
-                outgoing: vec![self.media_status_msg(&sender, request_id, "PLAYING")],
-                event: None,
-            }),
+            "GET_STATUS" => Ok(Reaction::reply(vec![
+                self.media_status_msg(&sender, request_id, "PLAYING")
+            ])),
             other => {
                 debug!(kind = %other, "unhandled media message");
                 Ok(Reaction::default())
             }
         }
+    }
+
+    fn handle_webrtc(&mut self, msg: &CastMessage) -> Result<Reaction, CastError> {
+        let payload = msg
+            .payload_utf8
+            .as_deref()
+            .ok_or_else(|| CastError::Json("webrtc message without payload".into()))?;
+        let env = Envelope::parse(payload)?;
+        if env.r#type != "OFFER" {
+            debug!(kind = %env.r#type, "unhandled webrtc message");
+            return Ok(Reaction::default());
+        }
+        let sender = msg.source_id.clone();
+        let seq_num = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|v| v.get("seqNum").and_then(serde_json::Value::as_i64))
+            .unwrap_or(0);
+        let Some(port) = self.mirror_port else {
+            // Mirroring not enabled: decline so the sender doesn't hang.
+            let nack = serde_json::json!({
+                "type": "ANSWER",
+                "seqNum": seq_num,
+                "result": "error",
+                "error": { "code": 1, "description": "mirroring disabled" },
+            })
+            .to_string();
+            return Ok(Reaction::reply(vec![CastMessage::json(
+                &msg.destination_id,
+                &sender,
+                crate::mirror::WEBRTC_NS,
+                nack,
+            )]));
+        };
+        let (answer, config) = crate::mirror::negotiate(payload, port)?;
+        Ok(Reaction {
+            outgoing: vec![CastMessage::json(
+                &msg.destination_id,
+                &sender,
+                crate::mirror::WEBRTC_NS,
+                answer,
+            )],
+            event: None,
+            start_mirror: Some(config),
+        })
     }
 
     fn launch(&mut self, req: &LaunchRequest) {
@@ -246,15 +316,12 @@ impl CastSession {
     fn reply_receiver_status(&self, sender: &str, request_id: i64) -> Reaction {
         let json =
             messages::receiver_status(request_id, self.app.as_ref(), self.volume, self.muted);
-        Reaction {
-            outgoing: vec![CastMessage::json(
-                &self.receiver_id,
-                sender,
-                ns::RECEIVER,
-                json,
-            )],
-            event: None,
-        }
+        Reaction::reply(vec![CastMessage::json(
+            &self.receiver_id,
+            sender,
+            ns::RECEIVER,
+            json,
+        )])
     }
 
     fn media_control(
@@ -264,10 +331,10 @@ impl CastSession {
         player_state: &str,
         txn: ControlTxn,
     ) -> Reaction {
-        Reaction {
-            outgoing: vec![self.media_status_msg(sender, request_id, player_state)],
-            event: Some(SessionEvent::Control(txn)),
-        }
+        Reaction::reply_with(
+            vec![self.media_status_msg(sender, request_id, player_state)],
+            SessionEvent::Control(txn),
+        )
     }
 
     fn media_status_msg(&self, sender: &str, request_id: i64, player_state: &str) -> CastMessage {
@@ -417,6 +484,38 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(r.event, Some(SessionEvent::End)));
+    }
+
+    #[test]
+    fn webrtc_offer_negotiates_and_starts_mirror() {
+        let mut s = session().with_mirror_port(51000);
+        let offer = r#"{"type":"OFFER","seqNum":9,"offer":{"supportedStreams":[
+          {"index":0,"type":"video_source","codecName":"h264","rtpPayloadType":96,"ssrc":5,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"}]}}"#;
+        let msg = recv_msg(crate::mirror::WEBRTC_NS, "sender-0", "receiver-0", offer);
+        let r = s.handle(&msg).unwrap();
+        assert!(r.start_mirror.is_some());
+        assert!(r.outgoing[0]
+            .payload_utf8
+            .as_ref()
+            .unwrap()
+            .contains("\"result\":\"ok\""));
+    }
+
+    #[test]
+    fn webrtc_offer_declined_when_mirroring_disabled() {
+        let mut s = session(); // no mirror port
+        let offer = r#"{"type":"OFFER","seqNum":9,"offer":{"supportedStreams":[
+          {"index":0,"type":"video_source","codecName":"h264","ssrc":5,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"}]}}"#;
+        let msg = recv_msg(crate::mirror::WEBRTC_NS, "sender-0", "receiver-0", offer);
+        let r = s.handle(&msg).unwrap();
+        assert!(r.start_mirror.is_none());
+        assert!(r.outgoing[0]
+            .payload_utf8
+            .as_ref()
+            .unwrap()
+            .contains("\"result\":\"error\""));
     }
 
     #[test]

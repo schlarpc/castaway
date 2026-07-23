@@ -1,0 +1,20 @@
+[package]
+name = "crypto-cast-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Cast device-auth signer: signs the CASTv2 AuthChallenge with a device certificate + RSA key. Pure; no protobuf/socket dependency."
+
+[dependencies]
+thiserror.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -72,3 +72,18 @@ RE happens in `~/re-shell` (rule 9) which this session can't drive. Where a gold
 capture is needed (FairPlay-SAP bytes, a real Cast auth challenge, a Lounge bind
 transcript), the core is built to the documented wire shape and tested with
 hand-constructed fixtures; the need for a *real* capture is logged in OPEN-QUESTIONS.
+
+### D11 — Cast device-auth signer is protobuf-agnostic; proto-cast bridges it
+`crypto-cast-auth` returns a `SignedAuth` (raw signature + cert bytes), not a proto
+`AuthResponse`, so the dependency flows `proto-cast → crypto-cast-auth` (never a cycle).
+`proto-cast::auth::CastAuthResponder` binds the shared signer to one connection's TLS
+cert and assembles the proto. `generate_dev()` makes an ephemeral key for local runs;
+real gen-1 cert material is provisioned out of band (Q2).
+
+### D12 — Cast mirroring: pure negotiation now, RTP receive loop deferred
+Implemented the webrtc-namespace OFFER→ANSWER negotiator (picks one video + one audio
+stream, echoes the sender-provided AES key/IV) and the per-frame AES-128-CTR crypt, both
+pure + tested. The session surfaces a `MirrorConfig` via `Reaction::start_mirror`; the
+actor (future) pre-binds the UDP port, receives Cast RTP, decrypts, and emits
+`SessionEvent::Mirror`. The RTP depacketize/reassembly + exact per-frame IV derivation
+need a real capture to validate (Q12/Q13).
