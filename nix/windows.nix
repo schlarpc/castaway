@@ -230,27 +230,61 @@ let
     "CMAKE_TOOLCHAIN_FILE_${envTarget}" = "${cmakeToolchain}";
   };
 
-  # Needed only to satisfy a *host* compile, not the cross build. ffmpeg-sys-next's build
-  # script compiles and runs a small Linux program that prints libav version macros
-  # (`.target(HOST) // don't cross-compile this`), and cc-rs adds `-static` to any GNU-family
-  # invocation whenever CARGO_CFG_TARGET_FEATURE contains `crt-static` — which it does,
-  # because that's what we asked of the Windows target. cc-rs applies it regardless of the
-  # per-Build target override, so the throwaway probe needs a static glibc to link against.
-  hostProbeInputs = [ pkgs.glibc.static ];
+  # A host compiler that refuses to be static, for build scripts that compile *host* helper
+  # programs while we cross-compile.
+  #
+  # cc-rs turns `crt-static` into a bare `-static` for any GNU-family compiler, reading it
+  # from CARGO_CFG_TARGET_FEATURE — which describes the *Windows* target, and which it
+  # consults even when a `Build` overrides `.target()` to the host. ffmpeg-sys-next hits this:
+  # it compiles and runs a small Linux program to print libav's version macros, commented
+  # `.target(HOST) // don't cross-compile this`. With `-static` that needs a static glibc.
+  #
+  # Supplying one (`glibc.static`) is the obvious fix and the wrong one: it puts a lib dir
+  # holding `libc.a` and no `libc.so` on the link path for *everything*, so ordinary build
+  # scripts resolve `-lc` to the archive and segfault as half-static binaries. Strip the flag
+  # instead — a throwaway host helper has no reason to be statically linked either way.
+  hostCc = pkgs.writeShellScriptBin "host-cc-no-static" ''
+    args=()
+    for arg in "$@"; do
+      [ "$arg" = "-static" ] || args+=("$arg")
+    done
+    exec ${pkgs.stdenv.cc}/bin/cc "''${args[@]}"
+  '';
+
+  # cc-rs looks these up by the literal triple, dashes and all.
+  hostTriple = pkgs.stdenv.buildPlatform.config;
+  hostCcEnv = { "CC_${hostTriple}" = "${hostCc}/bin/host-cc-no-static"; };
 
   # Dependency artifacts must be built for the same target as the final binary, so this
   # cross build gets its own `buildDepsOnly` rather than reusing the native one.
-  crossArgs = commonArgs // crossEnv // {
+  crossArgs = commonArgs // crossEnv // hostCcEnv // {
     strictDeps = true;
     nativeBuildInputs = (commonArgs.nativeBuildInputs or [ ]) ++ toolchainBins;
-    buildInputs = (commonArgs.buildInputs or [ ]) ++ hostProbeInputs;
     # Windows binaries can't be executed on the Linux builder.
     doCheck = false;
   };
 
+  # CEF's runtime layout is flat: everything beside the .exe. Upstream splits the
+  # distribution into Release/ (libraries) and Resources/ (.pak, ICU data, locales) for its
+  # own CMake build, but at runtime CEF resolves all of it relative to the module directory
+  # — which is exactly where an empty `Settings::resources_dir_path` points it. cef_browser.rs
+  # leaves those empty when CEF_PATH is unset, which is the case on the deploy box: there is
+  # no /nix/store there to point at.
+  #
+  # bootstrap.exe/bootstrapc.exe are deliberately not staged. They're the entry point for
+  # CEF's sandboxed "app is a DLL" mode; we initialize with `no_sandbox` and ship a real .exe.
+  stageCef = ''
+    install -Dm644 -t "$out/bin/" \
+      ${cef}/Release/*.dll ${cef}/Release/*.bin ${cef}/Release/*.json
+    install -Dm644 -t "$out/bin/" \
+      ${cef}/Resources/*.pak ${cef}/Resources/icudtl.dat
+    install -Dm644 -t "$out/bin/locales/" ${cef}/Resources/locales/*.pak
+    install -Dm644 ${./castaway.exe.manifest} "$out/bin/castaway.exe.manifest"
+  '';
+
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
-  mkCastaway = { pname, features ? [ ], withFfmpeg ? false }:
+  mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withCef ? false }:
     let
       cargoExtraArgs = "--package castaway"
         + lib.optionalString (features != [ ])
@@ -266,29 +300,122 @@ let
       # binary dies at startup on the deploy box with a missing-DLL dialog.
       postInstall = lib.optionalString withFfmpeg ''
         cp ${ffmpeg}/bin/*.dll "$out/bin/"
-      '';
+      '' + lib.optionalString withCef stageCef;
     });
 
+  # DLLs Windows itself guarantees. Everything else has to travel with the binary.
+  #
+  # The `api-ms-win-*` API sets and `ext-ms-*` are matched by prefix rather than listed:
+  # they're virtual names the loader redirects via the API set schema, and rustc/LLVM emit
+  # different ones as the toolchain moves. `opengl32` is Windows' own software GL, pulled in
+  # by wgpu's GL backend even though we select DX12.
+  systemDlls = [
+    "advapi32.dll"
+    "bcrypt.dll"
+    "bcryptprimitives.dll"
+    "comctl32.dll"
+    "crypt32.dll"
+    "cryptbase.dll"
+    "d3d11.dll"
+    "d3d12.dll"
+    "d3dcompiler_47.dll"
+    "dwmapi.dll"
+    "dxgi.dll"
+    "gdi32.dll"
+    "imm32.dll"
+    "iphlpapi.dll" # IP Helper — interface enumeration for mDNS/SSDP advertisement
+    "kernel32.dll"
+    "ntdll.dll"
+    "ole32.dll"
+    "oleaut32.dll"
+    "opengl32.dll"
+    "powrprof.dll"
+    "propsys.dll"
+    "secur32.dll"
+    "setupapi.dll"
+    "shell32.dll"
+    "shlwapi.dll"
+    "user32.dll"
+    "userenv.dll"
+    "uxtheme.dll"
+    "version.dll"
+    "winmm.dll"
+    "ws2_32.dll"
+  ];
+
+  # Ground rule 6: prefer a harness over manual verification. A DLL that is neither staged
+  # nor OS-provided doesn't fail the build — it fails at process startup, on the panel, as a
+  # modal dialog nobody is standing there to dismiss. Catch it here instead.
+  #
+  # Covers delay-loaded imports too: llvm-readobj lists those under their own heading, and a
+  # missing one merely defers the crash to whenever that symbol is first touched.
+  mkBundleCheck = pkg: pkgs.runCommand "${pkg.pname}-dll-closure"
+    {
+      nativeBuildInputs = [ pkgs.llvm ];
+      meta.description = "Every DLL ${pkg.pname} imports is staged or OS-provided";
+    } ''
+    llvm-readobj --coff-imports ${pkg}/bin/castaway.exe \
+      | grep -oP 'Name: \K\S+\.dll' | tr 'A-Z' 'a-z' | sort -u > imports.txt
+
+    missing=""
+    while read -r dll; do
+      case "$dll" in
+        api-ms-win-*|ext-ms-*) continue ;;
+      esac
+      for known in ${lib.escapeShellArgs systemDlls}; do
+        [ "$dll" = "$known" ] && continue 2
+      done
+      [ -e "${pkg}/bin/$dll" ] && continue
+      missing="$missing $dll"
+    done < imports.txt
+
+    if [ -n "$missing" ]; then
+      echo "${pkg.pname} imports DLLs that are neither staged beside the .exe nor" >&2
+      echo "known to ship with Windows:$missing" >&2
+      echo >&2
+      echo "Either stage them in postInstall, or add them to systemDlls in" >&2
+      echo "nix/windows.nix if Windows really does provide them." >&2
+      exit 1
+    fi
+
+    echo "checked $(wc -l < imports.txt) imported DLLs" > "$out"
+  '';
+
 in
-{
+rec {
   inherit sysroot crossEnv target toolchainBins;
 
   # No optional features: the portable protocol core only. This is the canary — if it
   # stops linking, the toolchain broke, not the render/browser stack.
   castaway = mkCastaway { pname = "castaway-windows"; };
 
-  # The real deploy artifact: DX12 compositor + winit kiosk.
+  # DX12 compositor + winit kiosk, no browser. Useful on its own for bisecting a render
+  # problem without CEF's ~200 MB of runtime in the way.
   castaway-render = mkCastaway {
     pname = "castaway-windows-render";
     features = [ "render" ];
     withFfmpeg = true;
   };
 
+  # The full deploy artifact: render + the offscreen CEF browser (YouTube leanback via DIAL).
+  castaway-cef = mkCastaway {
+    pname = "castaway-windows-cef";
+    features = [ "cef" ];
+    withFfmpeg = true;
+    withCef = true;
+  };
+
+  # One check per artifact — the staging differs between them, so each needs its own.
+  checks = {
+    castaway-windows-dll-closure = mkBundleCheck castaway;
+    castaway-windows-render-dll-closure = mkBundleCheck castaway-render;
+    castaway-windows-cef-dll-closure = mkBundleCheck castaway-cef;
+  };
+
   # Cross dev shell: `nix develop .#windows` then plain `cargo build`, which picks the
   # target up from CARGO_BUILD_TARGET. Incremental, unlike rebuilding through Nix.
-  devShell = pkgs.mkShell (crossEnv // {
+  devShell = pkgs.mkShell (crossEnv // hostCcEnv // {
     nativeBuildInputs = [ rustToolchain pkgs.cargo-xwin ] ++ toolchainBins;
-    buildInputs = hostProbeInputs;
     # Escape hatch: `cargo xwin build` reuses the pinned sysroot instead of downloading
     # its own, because the derivation leaves cargo-xwin's `DONE` marker in place.
     XWIN_CACHE_DIR = "${sysroot}";

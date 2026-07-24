@@ -58,15 +58,19 @@
           craneLib = cranelibFor system;
         in
         {
-          # Keep Cargo sources plus non-Rust assets that crates `include_str!`
-          # (SCPD/description XML in proto-dlna, fonts + blue-noise dither in pipeline).
+          # Keep Cargo sources plus non-Rust assets that crates `include_str!`/`include_bytes!`
+          # (SCPD/description XML in proto-dlna; fonts, blue-noise dither and the default
+          # adblock filter list in pipeline). A missing suffix here only shows up as an
+          # `include_str!` failure inside the sandbox, since a plain `cargo build` reads the
+          # real tree — so add the extension when you add the asset.
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
               (craneLib.filterCargoSources path type)
               || (pkgs.lib.hasSuffix ".xml" path)
               || (pkgs.lib.hasSuffix ".ttf" path)
-              || (pkgs.lib.hasSuffix ".bin" path);
+              || (pkgs.lib.hasSuffix ".bin" path)
+              || (pkgs.lib.hasSuffix ".txt" path);
             name = "source";
           };
           strictDeps = true;
@@ -117,10 +121,12 @@
           castaway = self.packages.${system}.default;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
-            # The Windows deploy artifacts, cross-compiled from Linux. `-render` is the
-            # one that ships; the bare build is the toolchain canary.
+            # The Windows deploy artifacts, cross-compiled from Linux. `-cef` is the one
+            # that ships; `-render` drops the browser, and the bare build is the toolchain
+            # canary — if it stops linking, the toolchain broke, not the media stack.
             castaway-windows = windows.castaway;
             castaway-windows-render = windows.castaway-render;
+            castaway-windows-cef = windows.castaway-cef;
 
             # The MSVC CRT + Windows SDK sysroot they build against. Exposed on its own so
             # it can be built and cached independently of the Rust build.
@@ -162,7 +168,11 @@
           coverage = craneLib.cargoLlvmCov (commonArgs // {
             inherit cargoArtifacts;
           });
-        });
+        }
+        # Cross-build the Windows artifacts and verify each one's DLL closure. The Windows
+        # binaries can't be executed on the builder, so a static check of what the loader
+        # will look for is the closest thing to a smoke test we get without the hardware.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (windowsFor system).checks);
 
       # Development shell
       devShells = eachSystem (system:
