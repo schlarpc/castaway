@@ -62,11 +62,16 @@ The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly a
   blocking YouTube's ad requests (doubleclick instream `ad_status.js`, googleads id/tracking).
 - `RenderLoop::upload_browser` feeds CEF frames into the compositor `Browser` layer.
 
-**Remaining wiring (task 16, needs the physical box to verify):** restructure `app::main` so
-CEF `bootstrap()` runs first, the kiosk loop pumps CEF + winit on the main thread and uploads
-browser frames, and DIAL launch → navigate CEF to `youtube.com/tv` with the pairing params so
-a phone binds to the screen (§5 "double duty"). All the pieces exist; it's the main-thread
-merge + the launch→navigate channel.
+**Task 16 (the app-main merge) is DONE and smoke-verified** (D24). Build `castaway` with
+`--features cef`: `main` bootstraps CEF first (subprocess re-exec), the winit kiosk loop pumps
+CEF each redraw via `pipeline::BrowserHost` and uploads new paints to the `Browser` layer, and
+DIAL launch/stop (`DialEvent`) navigates/hides the browser over a `BrowserCommand` channel —
+launch body → `youtube.com/tv?<pairing params>` so the phone binds to this screen. Verified
+end-to-end on headless Xvfb with real network: DIAL POST → leanback UI composited on the kiosk
+surface (screenshot), ad request blocked, DIAL DELETE → attract scene back, relaunch works,
+ctrl-c → clean CEF/service shutdown. Also fixed en route: 4K-surface wgpu limits (the panel is
+3840×2160 — would have crashed on first boot) and ctrl-c being swallowed by Chromium's SIGINT
+handler. Still needs the physical box: real display/GPU present path, audio, and touch.
 
 ## Design decisions worth your review
 D7 (router composition vs SourceAdapter), D9 (hand-written prost, no protoc), D10 (Spotify

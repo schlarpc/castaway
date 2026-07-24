@@ -194,3 +194,25 @@ CEF `ResourceRequestHandler` and returns RV_CANCEL for blocked requests, logging
 `from_list_text`/`set_adblock`. Dropped adblock's default `single-thread` feature so the Engine is
 Arc-based (Send+Sync) — CEF calls the handler across threads. Proven live: blocks
 imasdk.googleapis.com (Google video-ad loader) + brightline.tv on cnn.com.
+
+### D24 — Task 16 (app-main CEF merge): DIAL is an event stream; CEF lives in the winit loop
+The kiosk merge is done and smoke-verified end-to-end (headless Xvfb + real network: DIAL POST →
+YouTube leanback rendered on the compositor, doubleclick ad request blocked, DELETE → attract
+scene back, ctrl-c → clean exit). Shape of the merge:
+- `proto-dial` now emits `DialEvent::{Launched(LaunchParams), Stopped}` (not just launches) —
+  a phone's disconnect must dismiss the surface, and DIAL advertises `allowStop="true"`.
+  `LaunchParams::leanback_url()` is the pure YouTube contract: launch body fields pass through
+  as `youtube.com/tv?<query>` so the sender's pairingCode binds its Lounge session to us.
+- `pipeline::cef_browser::BrowserHost` owns the initialized `Cef` + lazily-created offscreen
+  browser on the **main thread**; `kiosk` pumps it each redraw before the render pump (one CEF
+  message-loop iteration, then upload the newest paint via `CefFrameSink::take` — upload once
+  per paint, not per redraw). Navigation crosses threads as `BrowserCommand::{Navigate, Hide}`
+  over std mpsc; `app::serve` hands `DialEvent`s to an injected `on_dial` closure that maps them
+  to commands. `kiosk::run_with_browser` shuts CEF down on the main thread after the loop exits.
+- `app::main` bootstraps CEF before *everything* (subprocess re-exec), and registers the ctrl-c
+  handler **after** `cef_initialize` — Chromium installs its own SIGINT handler during init and
+  silently replaces any earlier one (found live: ctrl-c was swallowed). The winit loop polls an
+  `AtomicBool` exit flag since a borderless-fullscreen kiosk has no chrome to close.
+- Found+fixed on the way: the compositor requested `Limits::downlevel_defaults()` (2048 max
+  texture), which can't even configure a 4K surface — the Dell panel is 3840×2160 and would have
+  crashed on first boot. Now `.using_resolution(adapter.limits())`.
