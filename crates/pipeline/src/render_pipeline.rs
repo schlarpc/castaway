@@ -16,7 +16,7 @@ use castaway_core::{
 };
 use tracing::{info, warn};
 
-use crate::compositor::{Compositor, Layer, LayerId, Transform};
+use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
 use crate::wgpu_compositor::{TexelFormat, WgpuCompositor};
 
@@ -270,9 +270,9 @@ impl RenderLoop {
     }
 
     /// Upload a CEF browser frame (BGRA8, as `on_paint` delivers) as the `Browser`
-    /// compositor layer (z=5, above video, below OSD). The kiosk calls this each frame
-    /// with the latest painted frame; a playing video sits below it unless made PiP.
-    /// Uploaded as native BGRA — no CPU swizzle on this per-frame path.
+    /// compositor layer (z=5, above video, below OSD). `bgra` is always the complete
+    /// frame; only the `dirty` regions are written to the GPU (native BGRA, no CPU
+    /// swizzle), falling back to a full upload on first paint or resize.
     ///
     /// # Errors
     /// [`PipelineError::InvalidFrame`] if the buffer is undersized.
@@ -281,13 +281,15 @@ impl RenderLoop {
         width: u32,
         height: u32,
         bgra: &[u8],
+        dirty: &[DirtyRect],
     ) -> Result<(), PipelineError> {
-        self.compositor.upload_texture(
+        self.compositor.upload_texture_regions(
             LayerId::Browser,
             width,
             height,
             TexelFormat::Bgra8,
             bgra,
+            dirty,
         )?;
         self.compositor.upsert_layer(Layer {
             id: LayerId::Browser,

@@ -52,6 +52,54 @@ impl Transform {
     }
 }
 
+/// An axis-aligned pixel region of a layer's texture — the granularity of partial
+/// uploads (CEF `on_paint` dirty rects).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRect {
+    /// Left edge in pixels.
+    pub x: u32,
+    /// Top edge in pixels.
+    pub y: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+impl DirtyRect {
+    /// The full-frame rect for a `width`×`height` surface.
+    #[must_use]
+    pub fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    /// Clamp to a `width`×`height` surface; `None` if nothing remains.
+    #[must_use]
+    pub fn clamped(self, width: u32, height: u32) -> Option<Self> {
+        let x = self.x.min(width);
+        let y = self.y.min(height);
+        let w = self.width.min(width - x);
+        let h = self.height.min(height - y);
+        (w > 0 && h > 0).then_some(Self {
+            x,
+            y,
+            width: w,
+            height: h,
+        })
+    }
+
+    /// Area in pixels.
+    #[must_use]
+    pub fn area(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+}
+
 /// Identifies a compositor layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayerId {

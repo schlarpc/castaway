@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt as _;
 
-use crate::compositor::{Compositor, Layer, LayerId, Transform};
+use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
 
 const SHADER: &str = r#"
@@ -261,7 +261,13 @@ impl WgpuCompositor {
                 && gpu.texture.width() == width
                 && gpu.texture.height() == height
             {
-                write_pixels(&self.queue, &gpu.texture, width, height, &pixels[..need]);
+                write_pixels_region(
+                    &self.queue,
+                    &gpu.texture,
+                    width,
+                    &pixels[..need],
+                    DirtyRect::full(width, height),
+                );
                 return Ok(());
             }
         }
@@ -280,7 +286,13 @@ impl WgpuCompositor {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        write_pixels(&self.queue, &texture, width, height, &pixels[..need]);
+        write_pixels_region(
+            &self.queue,
+            &texture,
+            width,
+            &pixels[..need],
+            DirtyRect::full(width, height),
+        );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let meta = self.layers.get(&id).map_or(
@@ -331,6 +343,43 @@ impl WgpuCompositor {
             },
         );
         Ok(())
+    }
+
+    /// Write only `rects` regions of the full `width`×`height` frame in `pixels` into
+    /// the layer's existing texture — the partial-update path for CEF dirty rects.
+    /// Falls back to a full [`Self::upload_texture`] when the layer has no texture yet
+    /// or its size/format changed (the caller always passes the complete frame, so the
+    /// fallback needs nothing extra).
+    ///
+    /// # Errors
+    /// [`PipelineError::InvalidFrame`] if the buffer is smaller than `width*height*4`.
+    pub fn upload_texture_regions(
+        &mut self,
+        id: LayerId,
+        width: u32,
+        height: u32,
+        format: TexelFormat,
+        pixels: &[u8],
+        rects: &[DirtyRect],
+    ) -> Result<(), PipelineError> {
+        let need = (width as usize) * (height as usize) * 4;
+        if width == 0 || height == 0 || pixels.len() < need {
+            return Err(PipelineError::InvalidFrame("pixel buffer too small"));
+        }
+        if let Some(gpu) = self.layers.get(&id).and_then(|s| s.gpu.as_ref()) {
+            if gpu.format == format
+                && gpu.texture.width() == width
+                && gpu.texture.height() == height
+            {
+                for rect in rects {
+                    if let Some(r) = rect.clamped(width, height) {
+                        write_pixels_region(&self.queue, &gpu.texture, width, &pixels[..need], r);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.upload_texture(id, width, height, format, pixels)
     }
 
     /// Read back the offscreen target as RGBA8 (`width*height*4` bytes). Offscreen only.
@@ -489,24 +538,36 @@ impl Compositor for WgpuCompositor {
     }
 }
 
-/// Copy one tightly-packed frame into `texture` via the queue's staging path.
-fn write_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, px: &[u8]) {
+/// Copy one already-clamped sub-rect of a tightly-packed `full_width`-stride frame into
+/// `texture` via the queue's staging path. `DirtyRect::full` writes the whole frame.
+fn write_pixels_region(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    full_width: u32,
+    px: &[u8],
+    rect: DirtyRect,
+) {
+    let offset = ((rect.y as usize) * (full_width as usize) + rect.x as usize) * 4;
     queue.write_texture(
         wgpu::ImageCopyTexture {
             texture,
             mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
+            origin: wgpu::Origin3d {
+                x: rect.x,
+                y: rect.y,
+                z: 0,
+            },
             aspect: wgpu::TextureAspect::All,
         },
-        px,
+        &px[offset..],
         wgpu::ImageDataLayout {
             offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: Some(height),
+            bytes_per_row: Some(4 * full_width),
+            rows_per_image: None,
         },
         wgpu::Extent3d {
-            width,
-            height,
+            width: rect.width,
+            height: rect.height,
             depth_or_array_layers: 1,
         },
     );
@@ -663,6 +724,49 @@ mod tests {
         // Center pixel should be red.
         let idx = ((16 * 32) + 16) * 4;
         assert_eq!(&px[idx..idx + 4], &[255, 0, 0, 255], "center should be red");
+    }
+
+    #[test]
+    fn region_update_writes_only_the_rect() {
+        // 4×4 target with a 4×4 texture → 1:1 texel-to-pixel mapping, exact readback.
+        let mut c = compositor_or_skip!(4, 4);
+        c.upload_texture(
+            LayerId::Video,
+            4,
+            4,
+            TexelFormat::Rgba8,
+            &solid(4, 4, [255, 0, 0, 255]),
+        )
+        .unwrap();
+        c.upsert_layer(Layer {
+            id: LayerId::Video,
+            z: 0,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        // Green frame, but only the top-left 2×2 declared dirty.
+        c.upload_texture_regions(
+            LayerId::Video,
+            4,
+            4,
+            TexelFormat::Rgba8,
+            &solid(4, 4, [0, 255, 0, 255]),
+            &[DirtyRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }],
+        )
+        .unwrap();
+        c.present();
+        let px = c.read_rgba().unwrap();
+        let at = |x: usize, y: usize| {
+            let i = (y * 4 + x) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        assert_eq!(at(0, 0), [0, 255, 0], "dirty rect took the new pixels");
+        assert_eq!(at(3, 3), [255, 0, 0], "outside the rect is untouched");
     }
 
     #[test]

@@ -25,6 +25,7 @@ use cef::{args::Args, *};
 use tracing::{debug, info};
 
 use crate::cef_adblock::AdBlocker;
+use crate::compositor::DirtyRect;
 use crate::error::PipelineError;
 
 /// A frame painted by CEF: BGRA8, top-down.
@@ -38,30 +39,99 @@ pub struct CefFrame {
     pub bgra: Vec<u8>,
 }
 
-/// A shared slot holding the most recent painted frame. Cloneable; the render handler
-/// writes, the compositor/consumer reads.
+/// The accumulated browser frame plus the regions painted since the last consume.
+/// `on_paint` copies only the dirty rows in; the consumer uploads only those regions —
+/// during video playback that's mostly the video rect, not the whole 4K surface.
+#[derive(Default)]
+struct FrameAccum {
+    width: u32,
+    height: u32,
+    /// BGRA8, always the complete current frame (`width*height*4`).
+    bgra: Vec<u8>,
+    /// Painted-but-not-consumed regions.
+    dirty: Vec<DirtyRect>,
+}
+
+impl FrameAccum {
+    /// Merge one `on_paint` into the accumulated frame, copying only the dirty rows.
+    fn paint(&mut self, src: &[u8], width: u32, height: u32, rects: &[DirtyRect]) {
+        let need = (width as usize) * (height as usize) * 4;
+        if self.width != width || self.height != height || self.bgra.len() != need {
+            // First paint or resize: take the whole frame.
+            self.width = width;
+            self.height = height;
+            self.bgra.clear();
+            self.bgra.extend_from_slice(&src[..need]);
+            self.dirty = vec![DirtyRect::full(width, height)];
+            return;
+        }
+        let full = [DirtyRect::full(width, height)];
+        let rects = if rects.is_empty() { &full[..] } else { rects };
+        let stride = (width as usize) * 4;
+        for rect in rects {
+            let Some(r) = rect.clamped(width, height) else {
+                continue;
+            };
+            let row_bytes = (r.width as usize) * 4;
+            let mut off = (r.y as usize) * stride + (r.x as usize) * 4;
+            for _ in 0..r.height {
+                self.bgra[off..off + row_bytes].copy_from_slice(&src[off..off + row_bytes]);
+                off += stride;
+            }
+            self.dirty.push(r);
+        }
+        // Degenerate accumulations (long lists, or most of the frame anyway) collapse
+        // to one full-frame write — cheaper than per-rect bookkeeping past that point.
+        let area: u64 = self.dirty.iter().map(|r| r.area()).sum();
+        if self.dirty.len() > 32 || area.saturating_mul(2) > DirtyRect::full(width, height).area() {
+            self.dirty = vec![DirtyRect::full(width, height)];
+        }
+    }
+}
+
+/// A shared accumulator for painted frames. Cloneable; the render handler writes,
+/// the compositor/consumer reads.
 #[derive(Clone, Default)]
 pub struct CefFrameSink {
-    inner: Arc<Mutex<Option<CefFrame>>>,
+    inner: Arc<Mutex<FrameAccum>>,
 }
 
 impl CefFrameSink {
-    /// Clone out the latest frame, if any.
+    /// Clone out the latest complete frame, if any (screenshot/example path).
     #[must_use]
     pub fn latest(&self) -> Option<CefFrame> {
-        self.inner.lock().ok().and_then(|g| g.clone())
+        self.inner.lock().ok().and_then(|g| {
+            (!g.bgra.is_empty()).then(|| CefFrame {
+                width: g.width,
+                height: g.height,
+                bgra: g.bgra.clone(),
+            })
+        })
     }
 
-    /// Take the latest frame, leaving the slot empty — so a per-frame consumer uploads
-    /// each paint exactly once instead of re-uploading a stale frame every tick.
-    #[must_use]
-    pub fn take(&self) -> Option<CefFrame> {
-        self.inner.lock().ok().and_then(|mut g| g.take())
+    /// If any regions were painted since the last consume, hand the accumulated frame
+    /// and those regions to `f` and mark them consumed; `None` if nothing changed.
+    /// The lock is held across `f` — paints and consumes both happen on the kiosk main
+    /// thread (the CEF UI thread under the external pump), so it never contends.
+    pub fn consume<R>(&self, f: impl FnOnce(u32, u32, &[u8], &[DirtyRect]) -> R) -> Option<R> {
+        let mut g = self.inner.lock().ok()?;
+        if g.bgra.is_empty() || g.dirty.is_empty() {
+            return None;
+        }
+        let dirty = std::mem::take(&mut g.dirty);
+        Some(f(g.width, g.height, &g.bgra, &dirty))
     }
 
-    fn put(&self, frame: CefFrame) {
+    /// Drop the accumulated frame (browser hidden) so the next paint starts fresh.
+    pub fn clear(&self) {
         if let Ok(mut g) = self.inner.lock() {
-            *g = Some(frame);
+            *g = FrameAccum::default();
+        }
+    }
+
+    fn paint(&self, src: &[u8], width: u32, height: u32, rects: &[DirtyRect]) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.paint(src, width, height, rects);
         }
     }
 }
@@ -136,7 +206,7 @@ wrap_render_handler! {
             &self,
             _browser: Option<&mut Browser>,
             _type_: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
+            dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
             width: ::std::os::raw::c_int,
             height: ::std::os::raw::c_int,
@@ -146,13 +216,23 @@ wrap_render_handler! {
             }
             let len = (width * height * 4) as usize;
             // SAFETY: CEF guarantees `buffer` points to `width*height*4` BGRA bytes for
-            // the duration of this callback; we copy out immediately.
-            let bgra = unsafe { std::slice::from_raw_parts(buffer, len) }.to_vec();
-            self.handler.sink.put(CefFrame {
-                width: width as u32,
-                height: height as u32,
-                bgra,
-            });
+            // the duration of this callback; the sink copies the dirty rows out before
+            // we return.
+            let src = unsafe { std::slice::from_raw_parts(buffer, len) };
+            let rects: Vec<DirtyRect> = dirty_rects
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.x >= 0 && r.y >= 0 && r.width > 0 && r.height > 0)
+                .map(|r| DirtyRect {
+                    x: r.x as u32,
+                    y: r.y as u32,
+                    width: r.width as u32,
+                    height: r.height as u32,
+                })
+                .collect();
+            self.handler
+                .sink
+                .paint(src, width as u32, height as u32, &rects);
         }
     }
 }
@@ -580,7 +660,7 @@ impl BrowserHost {
     }
 
     /// One per-frame tick (main thread): apply queued commands, pump CEF, upload the
-    /// latest painted frame to `render`'s `Browser` layer.
+    /// regions painted since the last tick to `render`'s `Browser` layer.
     pub fn pump(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
@@ -589,17 +669,18 @@ impl BrowserHost {
                     if let Some(browser) = self.browser.take() {
                         browser.close();
                     }
-                    let _ = self.sink.take();
+                    self.sink.clear();
                     render.clear_browser();
                 }
             }
         }
         self.cef.pump();
         if self.browser.is_some() {
-            if let Some(frame) = self.sink.take() {
-                if let Err(e) = render.upload_browser(frame.width, frame.height, &frame.bgra) {
-                    tracing::warn!(error = %e, "browser frame upload failed");
-                }
+            let uploaded = self.sink.consume(|width, height, bgra, dirty| {
+                render.upload_browser(width, height, bgra, dirty)
+            });
+            if let Some(Err(e)) = uploaded {
+                tracing::warn!(error = %e, "browser frame upload failed");
             }
         }
     }
@@ -734,5 +815,86 @@ impl input_touch::InputSink for BrowserHost {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn frame(width: u32, height: u32, val: u8) -> Vec<u8> {
+        vec![val; (width * height * 4) as usize]
+    }
+
+    #[test]
+    fn first_paint_takes_full_frame() {
+        let mut acc = FrameAccum::default();
+        acc.paint(&frame(4, 4, 1), 4, 4, &[]);
+        assert_eq!(acc.bgra, frame(4, 4, 1));
+        assert_eq!(acc.dirty, vec![DirtyRect::full(4, 4)]);
+    }
+
+    #[test]
+    fn partial_paint_copies_only_dirty_rows() {
+        let mut acc = FrameAccum::default();
+        acc.paint(&frame(4, 4, 1), 4, 4, &[]);
+        acc.dirty.clear();
+        // New source is all-2s, but only a 2×2 rect is declared dirty.
+        let rect = DirtyRect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        acc.paint(&frame(4, 4, 2), 4, 4, &[rect]);
+        assert_eq!(acc.bgra[0], 1, "outside the rect keeps the old pixels");
+        let inside = ((4 + 1) * 4) as usize; // (x=1, y=1)
+        assert_eq!(acc.bgra[inside], 2, "inside the rect took the new pixels");
+        assert_eq!(acc.dirty, vec![rect]);
+    }
+
+    #[test]
+    fn majority_dirty_area_collapses_to_full() {
+        let mut acc = FrameAccum::default();
+        acc.paint(&frame(4, 4, 1), 4, 4, &[]);
+        acc.dirty.clear();
+        acc.paint(
+            &frame(4, 4, 2),
+            4,
+            4,
+            &[DirtyRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 3,
+            }],
+        );
+        assert_eq!(acc.dirty, vec![DirtyRect::full(4, 4)]);
+    }
+
+    #[test]
+    fn resize_resets_to_full_frame() {
+        let mut acc = FrameAccum::default();
+        acc.paint(&frame(4, 4, 1), 4, 4, &[]);
+        acc.paint(&frame(2, 2, 3), 2, 2, &[]);
+        assert_eq!(acc.width, 2);
+        assert_eq!(acc.bgra, frame(2, 2, 3));
+        assert_eq!(acc.dirty, vec![DirtyRect::full(2, 2)]);
+    }
+
+    #[test]
+    fn consume_drains_dirty_and_skips_when_clean() {
+        let sink = CefFrameSink::default();
+        assert!(sink.consume(|_, _, _, _| ()).is_none(), "empty sink");
+        sink.paint(&frame(2, 2, 1), 2, 2, &[]);
+        let seen = sink.consume(|w, h, bgra, dirty| (w, h, bgra.len(), dirty.to_vec()));
+        assert_eq!(seen, Some((2, 2, 16, vec![DirtyRect::full(2, 2)])));
+        assert!(
+            sink.consume(|_, _, _, _| ()).is_none(),
+            "nothing new since last consume"
+        );
+        // latest() still serves the accumulated frame after a consume.
+        assert_eq!(sink.latest().map(|f| f.bgra), Some(frame(2, 2, 1)));
     }
 }
