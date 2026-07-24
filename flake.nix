@@ -28,6 +28,12 @@
       pkgsFor = system: import nixpkgs {
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
+        config = {
+          # The Windows cross-build sysroot repacks Microsoft's MSVC CRT + Windows SDK,
+          # which are redistributable-for-building but not free software. Whitelist that
+          # one derivation by name rather than flipping `allowUnfree` wholesale.
+          allowUnfreePredicate = pkg: nixpkgs.lib.getName pkg == "msvc-sysroot";
+        };
       };
 
       # Rust toolchain - pinned via rust-toolchain.toml (single source of truth).
@@ -82,6 +88,14 @@
         let craneLib = cranelibFor system;
         in craneLib.buildDepsOnly (commonArgsFor system);
 
+      # Linux → Windows cross-build (x86_64-pc-windows-msvc). Only meaningful from
+      # Linux; the sysroot derivation is Linux-only.
+      windowsFor = system: import ./nix/windows.nix {
+        pkgs = pkgsFor system;
+        craneLib = cranelibFor system;
+        commonArgs = commonArgsFor system;
+      };
+
     in
     {
       # The main package output
@@ -100,7 +114,16 @@
           });
 
           castaway = self.packages.${system}.default;
-        });
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
+          let windows = windowsFor system; in {
+            # The Windows deploy artifact, cross-compiled from Linux.
+            castaway-windows = windows.castaway;
+
+            # The MSVC CRT + Windows SDK sysroot it builds against. Exposed on its own so
+            # it can be built and cached independently of the Rust build.
+            msvc-sysroot = windows.sysroot;
+          }
+        ));
 
       # Checks run by `nix flake check`
       checks = eachSystem (system:
