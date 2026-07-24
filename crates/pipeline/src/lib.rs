@@ -20,6 +20,8 @@ pub mod null;
 
 #[cfg(feature = "render")]
 pub mod attract;
+#[cfg(feature = "cef")]
+pub mod cef_browser;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
 #[cfg(feature = "kiosk")]

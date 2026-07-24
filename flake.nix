@@ -142,6 +142,17 @@
         let
           pkgs = pkgsFor system;
           rustToolchain = rustToolchainFor system;
+          # The `cef`/`cef-dll-sys` crates expect a *flattened* CEF distribution
+          # (libcef.so + .pak resources at the root, not the Release/Resources split
+          # nixpkgs ships) plus an `archive.json` to pass their version check. We match
+          # the `cef` crate 147.1.0 to nixpkgs `cef-binary` (147.0.10) so the crates use
+          # the already-NixOS-linked libcef.so instead of downloading their own.
+          cefDist = pkgs.runCommand "cef-dist-${pkgs.cef-binary.version}" { } ''
+            mkdir -p $out
+            ln -s ${pkgs.cef-binary}/Release/* $out/
+            ln -s ${pkgs.cef-binary}/Resources/* $out/
+            printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
+          '';
         in
         {
           default = pkgs.mkShell {
@@ -174,6 +185,11 @@
               # against Vulkan/Wayland/X11 at runtime.
               pkgs.pkg-config
 
+              # For the `cef` feature (cef-dll-sys constructs a cmake::Config; the C++
+              # wrapper is only *built* on Windows/macOS, but keep the tools available).
+              pkgs.cmake
+              pkgs.ninja
+
               # nix-direnv for this flake's shell
               nix-direnv.packages.${system}.default
             ];
@@ -199,7 +215,9 @@
             # and needs the libc headers pointed out explicitly in a Nix env.
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
-            # Let winit/wgpu dlopen Vulkan/Wayland/X11 at runtime.
+            # Point the `cef` crates at the flattened, NixOS-linked CEF distribution.
+            CEF_PATH = "${cefDist}";
+            # Let winit/wgpu dlopen Vulkan/Wayland/X11, and the loader find libcef.so.
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.vulkan-loader
               pkgs.wayland
@@ -208,7 +226,7 @@
               pkgs.xorg.libXcursor
               pkgs.xorg.libXi
               pkgs.xorg.libXrandr
-            ];
+            ] + ":${cefDist}";
           };
         });
 

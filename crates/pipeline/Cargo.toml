@@ -24,6 +24,11 @@ winit = { version = "0.30", optional = true }
 ffmpeg-next = { version = "7.1", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 png = { version = "0.17", optional = true }
+# CEF (offscreen browser). Pinned to the CEF 147.0.10 build so it matches the nixpkgs
+# `cef-binary` the flake points CEF_PATH at (flake.nix cefDist). If nixpkgs bumps
+# cef-binary, bump these together.
+cef = { version = "=147.1.0", optional = true }
+cef-dll-sys = { version = "=147.1.0", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
@@ -36,7 +41,8 @@ default = []
 render = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ab_glyph", "dep:png"]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
-cef = []
+# `cef` needs `render` for the compositor it paints into.
+cef = ["render", "dep:cef", "dep:cef-dll-sys"]
 
 [lints]
 workspace = true
@@ -48,3 +54,7 @@ required-features = ["render"]
 [[example]]
 name = "screen_preview"
 required-features = ["render"]
+
+[[example]]
+name = "cef_shot"
+required-features = ["cef"]
