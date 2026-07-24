@@ -45,9 +45,9 @@ pub use error::PipelineError;
 pub use null::NullPipeline;
 
 #[cfg(feature = "render")]
-pub use attract::{AttractRow, AttractScene};
+pub use attract::{AttractRow, AttractScene, InsetRect, WidgetSlot};
 #[cfg(feature = "cef")]
-pub use cef_browser::{BrowserCommand, BrowserHost, Cef, TV_USER_AGENT};
+pub use cef_browser::{BrowserCommand, BrowserHost, BrowserRole, Cef, TV_USER_AGENT};
 #[cfg(feature = "render")]
 pub use osd::{Banner, OsdController, OsdUpdate};
 #[cfg(feature = "render")]

@@ -20,6 +20,9 @@ pub struct Config {
     pub interface: Option<Ipv4Addr>,
     /// Which protocols to enable.
     pub enable: Enable,
+    /// A page to render live in the idle screen's widget card (a clock, a dashboard).
+    /// `None` leaves the attract scene text-only, full width. Needs the `cef` build.
+    pub attract_widget_url: Option<String>,
 }
 
 /// Per-protocol enable flags.
@@ -58,6 +61,7 @@ impl Default for Config {
             http_port: 8080,
             interface: None,
             enable: Enable::default(),
+            attract_widget_url: Some("https://digitalclock.live/".to_string()),
         }
     }
 }

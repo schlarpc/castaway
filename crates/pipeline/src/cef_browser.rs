@@ -24,8 +24,9 @@ use cef::rc::Rc as _;
 use cef::{args::Args, *};
 use tracing::{debug, info};
 
+use crate::attract::{InsetRect, WidgetSlot};
 use crate::cef_adblock::AdBlocker;
-use crate::compositor::DirtyRect;
+use crate::compositor::{DirtyRect, Transform};
 use crate::error::PipelineError;
 
 /// A frame painted by CEF: BGRA8, top-down.
@@ -613,8 +614,75 @@ pub enum BrowserCommand {
     /// Show the browser fullscreen, navigating to `url` (the offscreen browser is
     /// created on first use).
     Navigate(String),
-    /// Close the browser and drop its compositor layer (e.g. DIAL stop).
+    /// Give the panel back: return to the idle widget if one is configured, else close
+    /// the browser and drop its compositor layer (e.g. DIAL stop).
     Hide,
+}
+
+/// What the one offscreen browser is currently for. There is exactly one CEF browser, so
+/// its two uses are mutually exclusive by construction: a cast takes the panel over, and
+/// dismissing it hands the screen back to the idle widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserRole {
+    /// The idle web widget (the clock) painting into the attract scene's reserved card,
+    /// *below* the video layer so a starting cast simply covers it.
+    AttractWidget,
+    /// A cast surface (YouTube leanback): fills the panel, above the video layer.
+    Fullscreen,
+}
+
+/// Where a role's browser lives on a `surface`-sized panel: the offscreen viewport CEF
+/// rasterizes into (device pixels — the page lays itself out at the size it will actually
+/// be shown, instead of a small render upscaled) and the layer that viewport maps onto.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrowserView {
+    /// Viewport rect in device pixels.
+    pub rect: InsetRect,
+    /// Layer placement: `rect` normalized onto the surface, one texel per device pixel.
+    pub transform: Transform,
+    /// Layer depth in the compositor stack.
+    pub z: i32,
+}
+
+impl BrowserRole {
+    /// Viewport + layer placement for this role on a `surface`-sized panel.
+    #[must_use]
+    pub fn view(self, surface: (u32, u32)) -> BrowserView {
+        let (w, h) = (surface.0.max(1), surface.1.max(1));
+        let full = InsetRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        // The widget's rect comes from the attract renderer, which draws the card frame
+        // from the same call — the two cannot drift. Falling back to fullscreen keeps a
+        // slot that reserves nothing from producing a zero-sized viewport.
+        let rect = match self {
+            Self::AttractWidget => WidgetSlot::RightCard.rect(w, h).unwrap_or(full),
+            Self::Fullscreen => full,
+        };
+        BrowserView {
+            rect,
+            transform: rect.transform(w, h),
+            // Attract is -10 and video is 0, so the idle widget sits between them: no
+            // explicit "hide the clock" step, a cast just covers it.
+            z: match self {
+                Self::AttractWidget => -5,
+                Self::Fullscreen => 5,
+            },
+        }
+    }
+}
+
+/// Map window-normalized coordinates into a browser view-space pixel position. Free
+/// function (not a method) so the inset mapping is testable without a live CEF instance.
+fn to_view_px(rect: InsetRect, surface: (u32, u32), x: f32, y: f32) -> (f32, f32) {
+    // Clamped into the viewport rather than dropped when outside: CEF still needs the
+    // move that leaves the card to end a hover or a drag.
+    let vx = (x * surface.0.max(1) as f32 - rect.x as f32).clamp(0.0, rect.width as f32);
+    let vy = (y * surface.1.max(1) as f32 - rect.y as f32).clamp(0.0, rect.height as f32);
+    (vx, vy)
 }
 
 /// Owns the initialized [`Cef`] instance and the lazily-created offscreen browser on the
@@ -629,6 +697,14 @@ pub struct BrowserHost {
     commands: std::sync::mpsc::Receiver<BrowserCommand>,
     /// Current kiosk surface size; the browser viewport tracks it.
     size: (u32, u32),
+    /// What the browser is currently showing — decides its viewport and its layer.
+    role: BrowserRole,
+    /// The idle widget's URL (the attract clock), if configured.
+    widget: Option<String>,
+    /// Whether the idle widget has been brought up yet. It can't be created in
+    /// [`Self::new`] (CEF needs the real surface size, which arrives with the window), and
+    /// a create failure is logged once rather than retried every frame at 60 Hz.
+    widget_started: bool,
     /// Primary mouse button held (so moves carry the drag modifier).
     left_down: bool,
 }
@@ -644,8 +720,20 @@ impl BrowserHost {
             sink: CefFrameSink::default(),
             commands,
             size: (1920, 1080),
+            role: BrowserRole::Fullscreen,
+            widget: None,
+            widget_started: false,
             left_down: false,
         }
+    }
+
+    /// Paint `url` into the attract scene's reserved card while nothing is casting — a
+    /// live web widget (the clock) on the idle screen. The same browser is taken over
+    /// fullscreen by a cast and handed back here when the cast is dismissed.
+    #[must_use]
+    pub fn with_attract_widget(mut self, url: &str) -> Self {
+        self.widget = Some(url.to_string());
+        self
     }
 
     /// Track the kiosk surface size so the browser viewport matches.
@@ -655,29 +743,46 @@ impl BrowserHost {
         }
         self.size = (width, height);
         if let Some(browser) = &self.browser {
-            browser.resize(width, height);
+            let rect = self.role.view(self.size).rect;
+            browser.resize(rect.width, rect.height);
         }
     }
 
     /// One per-frame tick (main thread): apply queued commands, pump CEF, upload the
     /// regions painted since the last tick to `render`'s `Browser` layer.
     pub fn pump(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        // Deferred to the first pump, not done in `new`: CEF needs the real surface size
+        // to size the widget's viewport, and that only exists once the window is up.
+        if !self.widget_started {
+            self.widget_started = true;
+            if let Some(url) = self.widget.clone() {
+                self.show(render, &url, BrowserRole::AttractWidget);
+            }
+        }
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
-                BrowserCommand::Navigate(url) => self.navigate(&url),
-                BrowserCommand::Hide => {
-                    if let Some(browser) = self.browser.take() {
-                        browser.close();
-                    }
-                    self.sink.clear();
-                    render.clear_browser();
+                BrowserCommand::Navigate(url) => {
+                    self.show(render, &url, BrowserRole::Fullscreen);
                 }
+                BrowserCommand::Hide => match self.widget.clone() {
+                    // Back to the idle widget rather than a hole in the attract card. The
+                    // browser is already warm, so it's a navigation, not a re-create.
+                    Some(url) => self.show(render, &url, BrowserRole::AttractWidget),
+                    None => {
+                        if let Some(browser) = self.browser.take() {
+                            browser.close();
+                        }
+                        self.sink.clear();
+                        render.clear_browser();
+                    }
+                },
             }
         }
         self.cef.pump();
         if self.browser.is_some() {
+            let view = self.role.view(self.size);
             let uploaded = self.sink.consume(|width, height, bgra, dirty| {
-                render.upload_browser(width, height, bgra, dirty)
+                render.upload_browser(width, height, bgra, dirty, view.transform, view.z)
             });
             if let Some(Err(e)) = uploaded {
                 tracing::warn!(error = %e, "browser frame upload failed");
@@ -685,23 +790,40 @@ impl BrowserHost {
         }
     }
 
-    fn navigate(&mut self, url: &str) {
+    /// Point the browser at `url` in `role`, creating it on first use.
+    fn show(
+        &mut self,
+        render: &mut crate::render_pipeline::RenderLoop,
+        url: &str,
+        role: BrowserRole,
+    ) {
+        let rect = role.view(self.size).rect;
+        if self.role != role || self.browser.is_none() {
+            // The layer's transform changes with the role, but the texture it holds is
+            // still the old viewport's size. Drop it until CEF paints at the new size,
+            // rather than stretching one frame of the wrong thing across the new rect.
+            self.sink.clear();
+            render.clear_browser();
+        }
+        self.role = role;
         match &self.browser {
-            Some(browser) => browser.load_url(url),
-            None => {
-                let (w, h) = self.size;
-                match self.cef.create_offscreen(url, w, h, self.sink.clone()) {
-                    Ok(browser) => self.browser = Some(browser),
-                    Err(e) => tracing::warn!(error = %e, %url, "browser create failed"),
-                }
+            Some(browser) => {
+                browser.resize(rect.width, rect.height);
+                browser.load_url(url);
             }
+            None => match self
+                .cef
+                .create_offscreen(url, rect.width, rect.height, self.sink.clone())
+            {
+                Ok(browser) => self.browser = Some(browser),
+                Err(e) => tracing::warn!(error = %e, %url, "browser create failed"),
+            },
         }
     }
 
     /// Map a normalized coordinate to browser view space.
     fn to_view(&self, x: f32, y: f32) -> (f32, f32) {
-        let (w, h) = self.size;
-        (x * w as f32, y * h as f32)
+        to_view_px(self.role.view(self.size).rect, self.size, x, y)
     }
 
     fn cef_host(&self) -> Option<cef::BrowserHost> {
@@ -881,6 +1003,52 @@ mod tests {
         assert_eq!(acc.width, 2);
         assert_eq!(acc.bgra, frame(2, 2, 3));
         assert_eq!(acc.dirty, vec![DirtyRect::full(2, 2)]);
+    }
+
+    const UHD: (u32, u32) = (3840, 2160);
+
+    /// The idle widget must land inside the attract scene's reserved card and *below* the
+    /// video layer — that's what makes a starting cast cover it with no extra bookkeeping.
+    #[test]
+    fn attract_widget_view_matches_the_reserved_card_and_sits_under_video() {
+        let view = BrowserRole::AttractWidget.view(UHD);
+        assert_eq!(view.rect, WidgetSlot::RightCard.rect(UHD.0, UHD.1).unwrap());
+        assert!(view.rect.width < UHD.0 && view.rect.height < UHD.1);
+        assert!(view.z < 0, "the widget belongs under the video layer");
+        // One texel per device pixel, so the page isn't resampled.
+        assert!((view.transform.scale_x * UHD.0 as f32 - view.rect.width as f32).abs() < 0.01);
+    }
+
+    #[test]
+    fn fullscreen_view_covers_the_panel_above_video() {
+        let view = BrowserRole::Fullscreen.view(UHD);
+        assert_eq!(view.rect.width, UHD.0);
+        assert_eq!(view.rect.height, UHD.1);
+        assert_eq!(view.transform, Transform::default());
+        assert!(view.z > 0, "a cast surface covers the video layer");
+    }
+
+    /// Input arrives normalized to the *window*; the inset widget's view space is only a
+    /// corner of it, so a tap on the card must land at the same spot inside the page.
+    #[test]
+    fn input_maps_into_the_inset_view_space() {
+        let rect = BrowserRole::AttractWidget.view(UHD).rect;
+        let center = (
+            (rect.x + rect.width / 2) as f32 / UHD.0 as f32,
+            (rect.y + rect.height / 2) as f32 / UHD.1 as f32,
+        );
+        let (vx, vy) = to_view_px(rect, UHD, center.0, center.1);
+        assert!((vx - rect.width as f32 / 2.0).abs() <= 1.0, "vx {vx}");
+        assert!((vy - rect.height as f32 / 2.0).abs() <= 1.0, "vy {vy}");
+
+        // Outside the card, coordinates clamp to its edges instead of going negative or
+        // past the viewport — CEF would otherwise see an out-of-bounds pointer.
+        let (lx, ly) = to_view_px(rect, UHD, 0.0, 1.0);
+        assert_eq!((lx, ly), (0.0, rect.height as f32));
+
+        // Fullscreen is the identity mapping it always was.
+        let full = BrowserRole::Fullscreen.view(UHD).rect;
+        assert_eq!(to_view_px(full, UHD, 0.5, 0.25), (1920.0, 540.0));
     }
 
     #[test]

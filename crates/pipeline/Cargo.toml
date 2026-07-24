@@ -72,3 +72,7 @@ required-features = ["render"]
 [[example]]
 name = "cef_shot"
 required-features = ["cef"]
+
+[[example]]
+name = "idle_preview"
+required-features = ["cef"]

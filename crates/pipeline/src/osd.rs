@@ -312,15 +312,18 @@ mod tests {
             let b = render_banner("Now casting", surface.0, surface.1).unwrap();
             let drawn_w = b.transform.scale_x * surface.0 as f32;
             let drawn_h = b.transform.scale_y * surface.1 as f32;
+            // Sub-pixel tolerance, not f32::EPSILON: normalizing and re-multiplying by a
+            // 4K dimension loses far more than one ulp, and what matters is that the quad
+            // lands on the pixel grid.
             assert!(
-                (drawn_w - b.width as f32).abs() < f32::EPSILON,
+                (drawn_w - b.width as f32).abs() < 0.01,
                 "{surface:?}: {drawn_w} px on screen vs {} texels",
                 b.width
             );
-            assert!((drawn_h - b.height as f32).abs() < f32::EPSILON);
+            assert!((drawn_h - b.height as f32).abs() < 0.01);
             // And the origin lands on a pixel boundary too.
             let origin_x = b.transform.offset_x * surface.0 as f32;
-            assert!((origin_x - origin_x.round()).abs() < f32::EPSILON);
+            assert!((origin_x - origin_x.round()).abs() < 0.01);
         }
     }
 

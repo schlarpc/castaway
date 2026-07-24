@@ -277,9 +277,11 @@ impl RenderLoop {
     }
 
     /// Upload a CEF browser frame (BGRA8, as `on_paint` delivers) as the `Browser`
-    /// compositor layer (z=5, above video, below OSD). `bgra` is always the complete
-    /// frame; only the `dirty` regions are written to the GPU (native BGRA, no CPU
-    /// swizzle), falling back to a full upload on first paint or resize.
+    /// compositor layer. `bgra` is always the complete frame; only the `dirty` regions are
+    /// written to the GPU (native BGRA, no CPU swizzle), falling back to a full upload on
+    /// first paint or resize. `transform` and `z` come from the browser's role — fullscreen
+    /// above the video, or the attract scene's inset widget below it — so this layer's
+    /// placement is the caller's decision, not a constant here.
     ///
     /// # Errors
     /// [`PipelineError::InvalidFrame`] if the buffer is undersized.
@@ -289,6 +291,8 @@ impl RenderLoop {
         height: u32,
         bgra: &[u8],
         dirty: &[DirtyRect],
+        transform: Transform,
+        z: i32,
     ) -> Result<(), PipelineError> {
         self.compositor.upload_texture_regions(
             LayerId::Browser,
@@ -300,9 +304,9 @@ impl RenderLoop {
         )?;
         self.compositor.upsert_layer(Layer {
             id: LayerId::Browser,
-            z: 5,
+            z,
             opacity: 1.0,
-            transform: Transform::default(),
+            transform,
         });
         Ok(())
     }

@@ -119,7 +119,13 @@ fn main() -> anyhow::Result<()> {
             ));
             cef.initialize()
                 .map_err(|e| anyhow::anyhow!("cef initialize: {e}"))?;
-            pipeline::BrowserHost::new(cef, nav_rx)
+            let host = pipeline::BrowserHost::new(cef, nav_rx);
+            // The same browser does double duty: a live widget in the idle screen's card
+            // until a cast takes it fullscreen, then back to the widget on DIAL stop.
+            match &config.attract_widget_url {
+                Some(url) => host.with_attract_widget(url),
+                None => host,
+            }
         };
 
         // Registered after `cef.initialize()` on purpose: Chromium installs its own
@@ -368,7 +374,7 @@ fn spotify_device_id(config: &Config) -> String {
 /// scaled to fill the panel.
 #[cfg(feature = "render")]
 fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
-    use pipeline::attract::{render, AttractRow, AttractScene};
+    use pipeline::attract::{render, AttractRow, AttractScene, WidgetSlot};
 
     let name = &config.friendly_name;
     let detail = |verb: &str| format!("{verb} \u{2192} {name}");
@@ -409,6 +415,13 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
         ));
     }
 
+    // Reserve the widget card only if something will actually paint into it: with no CEF
+    // build (or no URL configured) the text should use the full width rather than frame a
+    // permanently empty panel.
+    let widget = match (cfg!(feature = "cef"), &config.attract_widget_url) {
+        (true, Some(_)) => WidgetSlot::RightCard,
+        _ => WidgetSlot::None,
+    };
     let scene = AttractScene {
         title: name.clone(),
         tagline: "Throw anything at the wall — no app to install.".to_string(),
@@ -417,6 +430,7 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
             "castaway  •  {}",
             config.http_base_url().replace("http://", "")
         ),
+        widget,
     };
     // Native panel resolution (Dell C6522QT is 4K): a 1:1 background keeps the dither
     // pattern intact — GPU upscaling would smear it and re-introduce banding.
