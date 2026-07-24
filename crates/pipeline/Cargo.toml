@@ -29,9 +29,13 @@ png = { version = "0.17", optional = true }
 # cef-binary, bump these together.
 cef = { version = "=147.1.0", optional = true }
 cef-dll-sys = { version = "=147.1.0", optional = true }
+# Brave's adblock engine — request-level ad/tracker blocking in the CEF host (Q6 answer).
+# Keep default features (the embedded domain resolver is required for URL parsing).
+adblock = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []
@@ -41,8 +45,8 @@ default = []
 render = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ab_glyph", "dep:png"]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
-# `cef` needs `render` for the compositor it paints into.
-cef = ["render", "dep:cef", "dep:cef-dll-sys"]
+# `cef` needs `render` for the compositor it paints into; adblock is baked in.
+cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock"]
 
 [lints]
 workspace = true

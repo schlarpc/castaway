@@ -24,6 +24,7 @@ use cef::rc::Rc as _;
 use cef::{args::Args, *};
 use tracing::{debug, info};
 
+use crate::cef_adblock::AdBlocker;
 use crate::error::PipelineError;
 
 /// A frame painted by CEF: BGRA8, top-down.
@@ -141,11 +142,102 @@ wrap_render_handler! {
     }
 }
 
-// --- Client: hands CEF our render handler ---
+// --- ResourceRequestHandler: ad/tracker blocking on every resource load ---
+
+#[derive(Clone)]
+struct ResourceInner {
+    adblock: Arc<AdBlocker>,
+}
+
+wrap_resource_request_handler! {
+    struct ResourceRequestHandlerBuilder {
+        inner: ResourceInner,
+    }
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            let Some(request) = request else {
+                return ReturnValue::CONTINUE;
+            };
+            let url = CefString::from(&request.url()).to_string();
+            let source = frame
+                .map(|f| CefString::from(&f.url()).to_string())
+                .unwrap_or_default();
+            let kind = adblock_type(request.resource_type());
+            if self.inner.adblock.should_block(&url, &source, kind) {
+                ReturnValue::CANCEL
+            } else {
+                ReturnValue::CONTINUE
+            }
+        }
+    }
+}
+
+/// Map CEF's `ResourceType` to an Adblock request-type string.
+fn adblock_type(rt: ResourceType) -> &'static str {
+    if rt == ResourceType::SCRIPT {
+        "script"
+    } else if rt == ResourceType::IMAGE || rt == ResourceType::FAVICON {
+        "image"
+    } else if rt == ResourceType::STYLESHEET {
+        "stylesheet"
+    } else if rt == ResourceType::FONT_RESOURCE {
+        "font"
+    } else if rt == ResourceType::MEDIA {
+        "media"
+    } else if rt == ResourceType::XHR {
+        "xmlhttprequest"
+    } else if rt == ResourceType::SUB_FRAME {
+        "subdocument"
+    } else if rt == ResourceType::MAIN_FRAME {
+        "document"
+    } else if rt == ResourceType::OBJECT {
+        "object"
+    } else if rt == ResourceType::PING || rt == ResourceType::CSP_REPORT {
+        "ping"
+    } else {
+        "other"
+    }
+}
+
+// --- RequestHandler: provides the ResourceRequestHandler ---
+
+#[derive(Clone)]
+struct RequestInner {
+    resource_handler: ResourceRequestHandler,
+}
+
+wrap_request_handler! {
+    struct RequestHandlerBuilder {
+        inner: RequestInner,
+    }
+    impl RequestHandler {
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _is_navigation: ::std::os::raw::c_int,
+            _is_download: ::std::os::raw::c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            Some(self.inner.resource_handler.clone())
+        }
+    }
+}
+
+// --- Client: hands CEF our render + request handlers ---
 
 #[derive(Clone)]
 struct ClientInner {
     render_handler: RenderHandler,
+    request_handler: RequestHandler,
 }
 
 wrap_client! {
@@ -156,6 +248,9 @@ wrap_client! {
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(self.inner.render_handler.clone())
         }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.inner.request_handler.clone())
+        }
     }
 }
 
@@ -163,6 +258,7 @@ wrap_client! {
 pub struct Cef {
     args: Args,
     app: App,
+    adblock: Arc<AdBlocker>,
 }
 
 impl Cef {
@@ -187,7 +283,14 @@ impl Cef {
             debug!(code = ret, "cef subprocess finished");
             return Ok(None);
         }
-        Ok(Some(Self { args, app }))
+        // Browser process: build the ad blocker (parses rules once).
+        let adblock = Arc::new(AdBlocker::with_defaults());
+        Ok(Some(Self { args, app, adblock }))
+    }
+
+    /// Replace the ad blocker (e.g. loaded from a full EasyList) before creating browsers.
+    pub fn set_adblock(&mut self, adblock: AdBlocker) {
+        self.adblock = Arc::new(adblock);
     }
 
     /// Initialize the CEF browser process (windowless, external message pump).
@@ -250,7 +353,14 @@ impl Cef {
             size: size.clone(),
             sink,
         });
-        let mut client = ClientBuilder::new(ClientInner { render_handler });
+        let resource_handler = ResourceRequestHandlerBuilder::new(ResourceInner {
+            adblock: self.adblock.clone(),
+        });
+        let request_handler = RequestHandlerBuilder::new(RequestInner { resource_handler });
+        let mut client = ClientBuilder::new(ClientInner {
+            render_handler,
+            request_handler,
+        });
 
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
@@ -277,6 +387,18 @@ impl Cef {
     /// Pump one iteration of CEF's message loop. Call regularly on the main thread.
     pub fn pump(&self) {
         do_message_loop_work();
+    }
+
+    /// Adblock stats so far: `(requests_seen, requests_blocked)`.
+    #[must_use]
+    pub fn adblock_stats(&self) -> (u64, u64) {
+        (self.adblock.seen_count(), self.adblock.blocked_count())
+    }
+
+    /// Diagnostic host tally: `(host, seen, blocked)` most-seen first.
+    #[must_use]
+    pub fn adblock_hosts(&self) -> Vec<(String, u32, u32)> {
+        self.adblock.host_tally()
     }
 
     /// Shut CEF down.

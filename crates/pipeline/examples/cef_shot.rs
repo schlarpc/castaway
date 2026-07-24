@@ -17,6 +17,14 @@ fn main() -> std::process::ExitCode {
         }
     };
 
+    // Show adblock (and other) logs. `castaway::adblock` logs at INFO on each block.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let mut args = std::env::args().skip(1);
     let out = args.next().unwrap_or_else(|| "cef_shot.png".to_string());
     let url = args
@@ -30,6 +38,17 @@ fn main() -> std::process::ExitCode {
         })
         .unwrap_or((1280u32, 720u32));
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(5);
+    // Optional 5th arg: a filter-list file (e.g. EasyList) to use instead of the
+    // compact built-in list.
+    if let Some(list_path) = args.next() {
+        match std::fs::read_to_string(&list_path) {
+            Ok(text) => {
+                cef.set_adblock(pipeline::cef_adblock::AdBlocker::from_list_text(&text));
+                eprintln!("loaded filter list from {list_path}");
+            }
+            Err(e) => eprintln!("could not read {list_path}: {e}"),
+        }
+    }
 
     if let Err(e) = cef.initialize() {
         eprintln!("cef initialize failed: {e}");
@@ -54,6 +73,13 @@ fn main() -> std::process::ExitCode {
             paints += 1;
         }
         std::thread::sleep(Duration::from_millis(16));
+    }
+
+    let (seen, blocked) = cef.adblock_stats();
+    println!("adblock: {blocked} blocked / {seen} requests inspected");
+    println!("--- top hosts requested (host: seen/blocked) ---");
+    for (host, s, b) in cef.adblock_hosts().into_iter().take(30) {
+        println!("  {host}: {s}/{b}");
     }
 
     let Some(frame) = sink.latest() else {
