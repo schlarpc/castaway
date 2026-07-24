@@ -239,12 +239,40 @@ wrap_request_handler! {
     }
 }
 
-// --- Client: hands CEF our render + request handlers ---
+// --- DisplayHandler: surface the page's JS console on the `castaway::console` target
+// (YouTube leanback logs its player errors there — the only visibility we have into
+// "why won't this video play" on a kiosk with no devtools) ---
+
+wrap_display_handler! {
+    struct DisplayHandlerBuilder;
+    impl DisplayHandler {
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            level: LogSeverity,
+            message: Option<&CefString>,
+            source: Option<&CefString>,
+            line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let msg = message.map(ToString::to_string).unwrap_or_default();
+            let src = source.map(ToString::to_string).unwrap_or_default();
+            if level == LogSeverity::ERROR || level == LogSeverity::FATAL {
+                tracing::warn!(target: "castaway::console", %src, line, "{msg}");
+            } else {
+                tracing::debug!(target: "castaway::console", %src, line, "{msg}");
+            }
+            0
+        }
+    }
+}
+
+// --- Client: hands CEF our render + request + display handlers ---
 
 #[derive(Clone)]
 struct ClientInner {
     render_handler: RenderHandler,
     request_handler: RequestHandler,
+    display_handler: DisplayHandler,
 }
 
 wrap_client! {
@@ -257,6 +285,9 @@ wrap_client! {
         }
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.inner.request_handler.clone())
+        }
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.inner.display_handler.clone())
         }
     }
 }
@@ -323,7 +354,10 @@ impl Cef {
     /// # Errors
     /// [`PipelineError::GpuInit`] if `cef_initialize` fails.
     pub fn initialize(&mut self) -> Result<(), PipelineError> {
-        let cache = std::env::temp_dir().join("castaway-cef-cache");
+        // A STABLE cache dir, not temp_dir(): the profile stores durable choices (e.g.
+        // YouTube leanback's "Watch as guest"), and nix-shell TMPDIRs differ per shell,
+        // which would re-ask on every kiosk restart.
+        let cache = stable_cache_dir();
         let _ = std::fs::create_dir_all(&cache);
         // Point CEF at the flattened distribution's resources (.pak/ICU/locales). The
         // build copies them next to the *crate* binary, but a subprocess/example binary
@@ -386,9 +420,11 @@ impl Cef {
             adblock: self.adblock.clone(),
         });
         let request_handler = RequestHandlerBuilder::new(RequestInner { resource_handler });
+        let display_handler = DisplayHandlerBuilder::new();
         let mut client = ClientBuilder::new(ClientInner {
             render_handler,
             request_handler,
+            display_handler,
         });
 
         let window_info = WindowInfo {
@@ -434,6 +470,19 @@ impl Cef {
     pub fn shutdown(self) {
         shutdown();
     }
+}
+
+/// The persistent CEF profile dir: `$XDG_CACHE_HOME/castaway/cef`, else
+/// `$HOME/.cache/castaway/cef` (or `%LOCALAPPDATA%` on Windows), else the temp dir.
+fn stable_cache_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("castaway").join("cef")
 }
 
 /// A live offscreen browser. Dropping it closes the browser.
