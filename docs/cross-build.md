@@ -58,12 +58,24 @@ There is no `.cargo/config.toml` for this. Everything comes from the environment
 
 ## Vendored Windows dependencies
 
-Both are fixed-output derivations pinned by hash — no build-time network, no rolling tags.
+Both archives are **flake inputs** (`ffmpeg-windows-src`, `cef-windows-src`, both `flake = false`),
+so their URLs and hashes live in `flake.lock` alongside nixpkgs and crane — one place to audit
+every external blob, one update story. They use the `file+https://` scheme, which yields the raw
+archive rather than an unpacked tree, because each needs layout fixups afterwards that a tarball
+input can't express. A `file+` input lands in the store named bare `source`, with no extension for
+stdenv to dispatch on, so both derivations unpack explicitly and assert on the expected top-level
+directory name — that assert is what catches a URL bump in `flake.nix` that forgot the matching
+`.nix` file.
+
+The MSVC sysroot is deliberately *not* an input: it isn't fetched, it's *generated* by running
+`xwin`, so it stays a fixed-output derivation (`nix/msvc-sysroot.nix`) pinned by `outputHash`. Note
+that this couples it to the nixpkgs `xwin` package — a `nix flake update` that changes `xwin`'s
+splat behaviour can break the hash even though `crtVersion`/`sdkVersion` haven't moved.
 
 - **ffmpeg** (`nix/ffmpeg-windows.nix`) — a prebuilt LGPL BtbN build, pinned to an immutable
-  `autobuild-*` release tag rather than `latest`, whose assets are replaced daily and would break
-  `outputHash` at random. The archive already ships the exact `FFMPEG_DIR` layout
-  (`include/`, `lib/*.lib`, `bin/*.dll`), so the install is a straight copy.
+  `autobuild-*` release tag rather than `latest`, whose assets are replaced daily. The archive
+  already ships the exact `FFMPEG_DIR` layout (`include/`, `lib/*.lib`, `bin/*.dll`), so the
+  install is a straight copy.
 
   Prebuilt rather than source-built because nixpkgs marks `pkgsCross.mingwW64.ffmpeg` broken on
   64-bit MinGW, and it is: trimming it to a decode-only build just walks into the next transitive
@@ -78,8 +90,21 @@ Both are fixed-output derivations pinned by hash — no build-time network, no r
   and a root `libcef.lib` symlink (the build script emits `link-search=native={CEF_PATH}` at the
   root but upstream puts the import lib under `Release/`).
 
-  The CEF version must stay in lockstep with the `cef`/`cef-dll-sys` crates in
-  `crates/pipeline/Cargo.toml` — bump all three together.
+### One CEF version, three pins
+
+The CEF version is fixed in three unrelated places and all three must agree:
+
+| Pin | Where | Moves when |
+|---|---|---|
+| nixpkgs `cef-binary` | `cefDist` in `flake.nix` — what the **Linux** dev shell runs | `nix flake update` |
+| `cef-windows-src` | `flake.nix` input — what ships on **Windows** | never, by hand |
+| `cef`/`cef-dll-sys` crates | `crates/pipeline/Cargo.toml` | never, by hand |
+
+Only the first moves on its own, which is the whole hazard: nixpkgs drifting ahead silently turns
+every browser bug into "does it reproduce on the box?". `cef-dll-sys` already enforces the third
+against the second by parsing `archive.json`, so `nix/cef-windows.nix` closes the loop with an
+eval-time assert against `cef-binary.version`. A mismatch fails `nix flake check` with a message
+naming both versions rather than producing two subtly different builds.
 
 ## Cross-building CEF: the four things that bite
 

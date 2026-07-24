@@ -10,7 +10,10 @@
 #
 # The toolchain is all LLVM: clang-cl as the C/C++ driver, lld-link as the linker,
 # llvm-lib as the archiver, llvm-rc for resources.
-{ pkgs, craneLib, commonArgs, rustToolchain }:
+#
+# `ffmpegSrc`/`cefSrc` are the raw archives, pinned as flake inputs so they land in
+# flake.lock; the derivations beside this file unpack and rearrange them.
+{ pkgs, craneLib, commonArgs, rustToolchain, ffmpegSrc, cefSrc }:
 
 let
   inherit (pkgs) lib;
@@ -24,8 +27,8 @@ let
   arch = "x86_64";
 
   sysroot = pkgs.callPackage ./msvc-sysroot.nix { };
-  ffmpeg = pkgs.callPackage ./ffmpeg-windows.nix { };
-  cef = pkgs.callPackage ./cef-windows.nix { };
+  ffmpeg = pkgs.callPackage ./ffmpeg-windows.nix { src = ffmpegSrc; };
+  cef = pkgs.callPackage ./cef-windows.nix { src = cefSrc; };
 
   includeDirs = [
     "${sysroot}/crt/include"

@@ -7,22 +7,19 @@
 # already calls this out and picks the same escape hatch, with the note that wrapping the
 # archive as a fixed-output derivation is what keeps it reproducible. That's this file.
 #
-# The build is pinned to an immutable `autobuild-*` release tag, *not* BtbN's rolling
-# `latest` tag, whose assets are replaced daily and would break `outputHash` at random.
+# The archive itself is the `ffmpeg-windows-src` flake input, so the URL and its hash live
+# in flake.nix/flake.lock. Only the unpacking is here.
 #
 # LGPL rather than GPL: we only decode, and the LGPL build keeps the receiver's licensing
-# options open. The DLLs must ship next to castaway.exe — see `dlls` below.
-{ lib, stdenvNoCC, fetchurl, unzip }:
+# options open. The DLLs must ship next to castaway.exe — see `stageCef`'s sibling copy in
+# nix/windows.nix.
+{ lib, stdenvNoCC, src, unzip }:
 
 let
-  # BtbN release tag + the exact asset inside it. Both must be bumped together.
-  releaseTag = "autobuild-2026-07-24-13-32";
+  # The asset name inside BtbN's release, which is also the archive's single top-level
+  # directory. Duplicated from the flake input's URL out of necessity — flake input URLs
+  # have to be literals — so unpackPhase checks the two still describe the same archive.
   asset = "ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1";
-
-  src = fetchurl {
-    url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/${releaseTag}/${asset}.zip";
-    hash = "sha256-uAnlYSVMwGNNn+TORpwCrC4ZTVYOB5uyQrlpBpSP++s=";
-  };
 in
 stdenvNoCC.mkDerivation {
   pname = "ffmpeg-windows-x64";
@@ -31,7 +28,21 @@ stdenvNoCC.mkDerivation {
 
   inherit src;
   nativeBuildInputs = [ unzip ];
-  sourceRoot = asset;
+
+  # A `file+` flake input is the raw archive, and it lands in the store named bare
+  # `source` — no extension for stdenv's unpackPhase to dispatch on — so unpack by hand.
+  # Naming the expected directory also catches a flake.nix URL bump that forgot this file.
+  unpackPhase = ''
+    runHook preUnpack
+    unzip -qq "$src"
+    if [ ! -d ${asset} ]; then
+      echo "ffmpeg-windows-src does not contain ${asset}/; it has: $(echo */)" >&2
+      echo "Bump \`asset\` here to match the URL in flake.nix." >&2
+      exit 1
+    fi
+    cd ${asset}
+    runHook postUnpack
+  '';
 
   # The archive already ships `include/`, `lib/*.lib` (MSVC-format import libraries, which
   # is why BtbN's shared builds are usable from lld-link at all) and `bin/*.dll`. That is

@@ -18,9 +18,39 @@
       url = "github:nix-community/nix-direnv";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Prebuilt third-party blobs for the Windows cross-build. Inputs rather than in-tree
+    # `fetchurl` hashes so `flake.lock` records every external artifact this repo pulls in
+    # — one place to audit, one update story. `file+` keeps them as the raw archives:
+    # nix/{ffmpeg,cef}-windows.nix do the unpacking, because both need layout fixups
+    # afterwards that a bare tarball input can't express.
+    #
+    # Both URLs are immutable by construction. BtbN replaces the assets under its `latest`
+    # tag daily, so this pins the dated `autobuild-*` release instead; the CEF CDN keys on
+    # the full version+commit+chromium triple.
+    ffmpeg-windows-src = {
+      url = "file+https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-24-13-32/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip";
+      flake = false;
+    };
+
+    cef-windows-src = {
+      # `+` has to stay percent-encoded or the CDN reads it as a space.
+      url = "file+https://cef-builds.spotifycdn.com/cef_binary_147.0.10%2Bgd58e84d%2Bchromium-147.0.7727.118_windows64_minimal.tar.bz2";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, systems, rust-overlay, crane, nix-direnv, ... }:
+  outputs =
+    { self
+    , nixpkgs
+    , systems
+    , rust-overlay
+    , crane
+    , nix-direnv
+    , ffmpeg-windows-src
+    , cef-windows-src
+    , ...
+    }:
     let
       eachSystem = nixpkgs.lib.genAttrs (import systems);
 
@@ -99,6 +129,8 @@
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
         rustToolchain = rustToolchainFor system;
+        ffmpegSrc = ffmpeg-windows-src;
+        cefSrc = cef-windows-src;
       };
 
     in
