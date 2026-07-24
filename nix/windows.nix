@@ -24,6 +24,7 @@ let
   arch = "x86_64";
 
   sysroot = pkgs.callPackage ./msvc-sysroot.nix { };
+  ffmpeg = pkgs.callPackage ./ffmpeg-windows.nix { };
 
   # clang-unwrapped, not the nixpkgs `clang` wrapper: the wrapper injects glibc include
   # paths and host flags that make no sense when the target is Windows. clang's own
@@ -78,11 +79,18 @@ let
     "CFLAGS_${envTarget}" = clFlags;
     "CXXFLAGS_${envTarget}" = "${clFlags} /EHsc";
     "BINDGEN_EXTRA_CLANG_ARGS_${envTarget}" = bindgenFlags;
+    # bindgen (in ffmpeg-sys-next's build script) dlopens libclang rather than shelling
+    # out to the driver, so it needs the library pointed out explicitly in a Nix env.
+    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     RCFLAGS = lib.concatStringsSep " " (map (dir: "-I${dir}") includeDirs);
 
     # clang-cl and lld-link resolve bare `foo.lib` names through LIB, the way the MSVC
     # toolchain does on Windows. Semicolons, not colons — this is a Windows-style path list.
     LIB = lib.concatStringsSep ";" libDirs;
+
+    # `ffmpeg-sys-next` takes this branch instead of pkg-config, reading `include/` for
+    # bindgen and `lib/` for the import libraries.
+    FFMPEG_DIR = "${ffmpeg}";
   };
 
   # Dependency artifacts must be built for the same target as the final binary, so this
@@ -96,7 +104,7 @@ let
 
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
-  mkCastaway = { pname, features ? [ ] }:
+  mkCastaway = { pname, features ? [ ], withFfmpeg ? false }:
     let
       cargoExtraArgs = "--package castaway"
         + lib.optionalString (features != [ ])
@@ -106,6 +114,13 @@ let
     craneLib.buildPackage (args // {
       inherit pname;
       cargoArtifacts = craneLib.buildDepsOnly args;
+
+      # Windows has no rpath and no /nix/store to resolve against: the loader looks for
+      # DLLs next to the .exe. Anything dynamically linked has to be copied in, or the
+      # binary dies at startup on the deploy box with a missing-DLL dialog.
+      postInstall = lib.optionalString withFfmpeg ''
+        cp ${ffmpeg}/bin/*.dll "$out/bin/"
+      '';
     });
 
 in
@@ -120,6 +135,7 @@ in
   castaway-render = mkCastaway {
     pname = "castaway-windows-render";
     features = [ "render" ];
+    withFfmpeg = true;
   };
 
   # Cross dev shell: `nix develop .#windows` then plain `cargo build`, which picks the
