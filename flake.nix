@@ -238,5 +238,45 @@
       lib = {
         inherit nix-direnv;
       };
+
+      # NixOS module: `services.castaway.enable = true` opens the LAN-discovery and
+      # HTTP ports the receiver needs. (Running castaway as a systemd/kiosk service is
+      # a follow-up; the firewall is the part that silently breaks discovery today.)
+      nixosModules = rec {
+        castaway = { config, lib, ... }:
+          let
+            cfg = config.services.castaway;
+          in
+          {
+            options.services.castaway = {
+              enable = lib.mkEnableOption
+                "the castaway universal cast receiver (currently: open its firewall ports)";
+
+              httpPort = lib.mkOption {
+                type = lib.types.port;
+                default = 8080;
+                description = ''
+                  TCP port of castaway's shared HTTP host (DLNA description/SOAP,
+                  Spotify onboarding, DIAL REST). Must match `http_port` in
+                  castaway.toml.
+                '';
+              };
+            };
+
+            config = lib.mkIf cfg.enable {
+              networking.firewall = {
+                # The shared HTTP host (dd.xml fetches, DIAL launch, SOAP, Spotify).
+                allowedTCPPorts = [ cfg.httpPort ];
+                allowedUDPPorts = [
+                  # SSDP: DIAL/DLNA senders discover us via M-SEARCH on 1900.
+                  1900
+                  # mDNS: Spotify Connect (and later Cast/AirPlay) advertisements.
+                  5353
+                ];
+              };
+            };
+          };
+        default = castaway;
+      };
     };
 }
