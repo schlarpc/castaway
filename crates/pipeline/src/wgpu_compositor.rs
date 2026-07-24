@@ -69,9 +69,28 @@ impl Uniform {
     }
 }
 
+/// Pixel layout accepted by [`WgpuCompositor::upload_texture`]. BGRA sources (CEF
+/// `on_paint`, some decoders) upload as native `Bgra8Unorm` — no CPU swizzle pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TexelFormat {
+    /// Packed RGBA8.
+    Rgba8,
+    /// Packed BGRA8.
+    Bgra8,
+}
+
+impl TexelFormat {
+    fn to_wgpu(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+            Self::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
+        }
+    }
+}
+
 struct LayerGpu {
-    _texture: wgpu::Texture,
-    _view: wgpu::TextureView,
+    texture: wgpu::Texture,
+    format: TexelFormat,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
@@ -217,8 +236,10 @@ impl WgpuCompositor {
         }
     }
 
-    /// Upload RGBA8 pixels for a layer's texture (a decoded frame or OSD/browser paint).
-    /// Creates the layer's GPU resources on first upload.
+    /// Upload packed pixels for a layer's texture (a decoded frame or OSD/browser
+    /// paint). Creates the layer's GPU resources on first upload; a same-size,
+    /// same-format re-upload writes into the existing texture, so the per-frame
+    /// video/browser paths never rebuild texture + bind group.
     ///
     /// # Errors
     /// [`PipelineError::InvalidFrame`] if the buffer is smaller than `width*height*4`.
@@ -227,11 +248,22 @@ impl WgpuCompositor {
         id: LayerId,
         width: u32,
         height: u32,
-        rgba: &[u8],
+        format: TexelFormat,
+        pixels: &[u8],
     ) -> Result<(), PipelineError> {
         let need = (width as usize) * (height as usize) * 4;
-        if width == 0 || height == 0 || rgba.len() < need {
-            return Err(PipelineError::InvalidFrame("rgba buffer too small"));
+        if width == 0 || height == 0 || pixels.len() < need {
+            return Err(PipelineError::InvalidFrame("pixel buffer too small"));
+        }
+
+        if let Some(gpu) = self.layers.get(&id).and_then(|s| s.gpu.as_ref()) {
+            if gpu.format == format
+                && gpu.texture.width() == width
+                && gpu.texture.height() == height
+            {
+                write_pixels(&self.queue, &gpu.texture, width, height, &pixels[..need]);
+                return Ok(());
+            }
         }
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -244,29 +276,11 @@ impl WgpuCompositor {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: format.to_wgpu(),
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &rgba[..need],
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+        write_pixels(&self.queue, &texture, width, height, &pixels[..need]);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let meta = self.layers.get(&id).map_or(
@@ -309,8 +323,8 @@ impl WgpuCompositor {
             LayerState {
                 meta,
                 gpu: Some(LayerGpu {
-                    _texture: texture,
-                    _view: view,
+                    texture,
+                    format,
                     uniform,
                     bind_group,
                 }),
@@ -475,6 +489,29 @@ impl Compositor for WgpuCompositor {
     }
 }
 
+/// Copy one tightly-packed frame into `texture` via the queue's staging path.
+fn write_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, px: &[u8]) {
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        px,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), PipelineError> {
     pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -607,8 +644,14 @@ mod tests {
     #[test]
     fn full_screen_red_layer_fills_target() {
         let mut c = compositor_or_skip!(32, 32);
-        c.upload_texture(LayerId::Video, 4, 4, &solid(4, 4, [255, 0, 0, 255]))
-            .unwrap();
+        c.upload_texture(
+            LayerId::Video,
+            4,
+            4,
+            TexelFormat::Rgba8,
+            &solid(4, 4, [255, 0, 0, 255]),
+        )
+        .unwrap();
         c.upsert_layer(Layer {
             id: LayerId::Video,
             z: 0,
@@ -626,17 +669,30 @@ mod tests {
     fn pip_layer_covers_only_its_corner() {
         let mut c = compositor_or_skip!(64, 64);
         // Full-screen blue background.
-        c.upload_texture(LayerId::Video, 2, 2, &solid(2, 2, [0, 0, 255, 255]))
-            .unwrap();
+        c.upload_texture(
+            LayerId::Video,
+            2,
+            2,
+            TexelFormat::Rgba8,
+            &solid(2, 2, [0, 0, 255, 255]),
+        )
+        .unwrap();
         c.upsert_layer(Layer {
             id: LayerId::Video,
             z: 0,
             opacity: 1.0,
             transform: Transform::default(),
         });
-        // Green PiP in the bottom-right corner (corner 3).
-        c.upload_texture(LayerId::Browser, 2, 2, &solid(2, 2, [0, 255, 0, 255]))
-            .unwrap();
+        // Green PiP in the bottom-right corner (corner 3) — BGRA path: green survives
+        // the swizzle-free upload because G is channel-order invariant.
+        c.upload_texture(
+            LayerId::Browser,
+            2,
+            2,
+            TexelFormat::Bgra8,
+            &solid(2, 2, [0, 255, 0, 255]),
+        )
+        .unwrap();
         c.upsert_layer(Layer {
             id: LayerId::Browser,
             z: 5,

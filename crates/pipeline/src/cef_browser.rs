@@ -91,6 +91,14 @@ wrap_app! {
                 // Headless-friendly + no GPU sandbox surprises on the kiosk box.
                 cl.append_switch(Some(&"disable-gpu-shader-disk-cache".into()));
                 cl.append_switch(Some(&"enable-logging=stderr".into()));
+                // We consume the CPU `on_paint` path (accelerated OSR is buggy upstream
+                // — cross-build.md Q6). With GPU compositing on, every OSR frame takes a
+                // GPU→CPU readback that caps the paint rate well below the requested
+                // windowless_frame_rate; software compositing paints straight into the
+                // shared-memory buffer and is the CEF-recommended pairing for
+                // windowless rendering.
+                cl.append_switch(Some(&"disable-gpu".into()));
+                cl.append_switch(Some(&"disable-gpu-compositing".into()));
             }
         }
     }
@@ -432,7 +440,9 @@ impl Cef {
             ..Default::default()
         };
         let browser_settings = BrowserSettings {
-            windowless_frame_rate: 30,
+            // Match the kiosk's 60 Hz present cadence; the compositor's take()-latest
+            // slot drops anything the redraw loop doesn't consume.
+            windowless_frame_rate: 60,
             ..Default::default()
         };
 

@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::compositor::{Compositor, Layer, LayerId, Transform};
 use crate::error::PipelineError;
-use crate::wgpu_compositor::WgpuCompositor;
+use crate::wgpu_compositor::{TexelFormat, WgpuCompositor};
 
 /// A command sent from the tokio/decode side to the render thread. (OSD is a separate
 /// channel — see [`castaway_core::osd`] / [`crate::osd`] — so any source can post it.)
@@ -206,7 +206,7 @@ impl RenderLoop {
             } => {
                 if self
                     .compositor
-                    .upload_texture(LayerId::Osd, width, height, &rgba)
+                    .upload_texture(LayerId::Osd, width, height, TexelFormat::Rgba8, &rgba)
                     .is_ok()
                 {
                     self.compositor.upsert_layer(Layer {
@@ -253,8 +253,13 @@ impl RenderLoop {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), PipelineError> {
-        self.compositor
-            .upload_texture(LayerId::Attract, width, height, rgba)?;
+        self.compositor.upload_texture(
+            LayerId::Attract,
+            width,
+            height,
+            TexelFormat::Rgba8,
+            rgba,
+        )?;
         self.compositor.upsert_layer(Layer {
             id: LayerId::Attract,
             z: -10,
@@ -267,6 +272,7 @@ impl RenderLoop {
     /// Upload a CEF browser frame (BGRA8, as `on_paint` delivers) as the `Browser`
     /// compositor layer (z=5, above video, below OSD). The kiosk calls this each frame
     /// with the latest painted frame; a playing video sits below it unless made PiP.
+    /// Uploaded as native BGRA — no CPU swizzle on this per-frame path.
     ///
     /// # Errors
     /// [`PipelineError::InvalidFrame`] if the buffer is undersized.
@@ -276,12 +282,13 @@ impl RenderLoop {
         height: u32,
         bgra: &[u8],
     ) -> Result<(), PipelineError> {
-        let mut rgba = bgra.to_vec();
-        for px in rgba.chunks_exact_mut(4) {
-            px.swap(0, 2); // BGRA → RGBA
-        }
-        self.compositor
-            .upload_texture(LayerId::Browser, width, height, &rgba)?;
+        self.compositor.upload_texture(
+            LayerId::Browser,
+            width,
+            height,
+            TexelFormat::Bgra8,
+            bgra,
+        )?;
         self.compositor.upsert_layer(Layer {
             id: LayerId::Browser,
             z: 5,
@@ -334,10 +341,22 @@ impl RenderLoop {
     fn apply(&mut self, cmd: RenderCommand) -> bool {
         match cmd {
             RenderCommand::Video(frame) => {
-                let rgba = to_rgba(&frame);
+                let format = match frame.format {
+                    PixelFormat::Bgra8 => TexelFormat::Bgra8,
+                    // Planar YUV is converted by swscale in the decoder; if a frame
+                    // slips through (or a future variant appears), treat the bytes as
+                    // RGBA (better a wrong frame than a panic).
+                    _ => TexelFormat::Rgba8,
+                };
                 if self
                     .compositor
-                    .upload_texture(LayerId::Video, frame.width, frame.height, &rgba)
+                    .upload_texture(
+                        LayerId::Video,
+                        frame.width,
+                        frame.height,
+                        format,
+                        &frame.data,
+                    )
                     .is_ok()
                 {
                     if !self.has_video {
@@ -364,24 +383,6 @@ impl RenderLoop {
     /// Resize the underlying surface (kiosk window resize).
     pub fn resize(&mut self, width: u32, height: u32) {
         self.compositor.resize(width, height);
-    }
-}
-
-/// Convert a decoded frame's pixels to RGBA8 (the compositor's upload format).
-fn to_rgba(frame: &DecodedFrame) -> std::borrow::Cow<'_, [u8]> {
-    match frame.format {
-        PixelFormat::Rgba8 => std::borrow::Cow::Borrowed(&frame.data),
-        PixelFormat::Bgra8 => {
-            let mut out = frame.data.to_vec();
-            for px in out.chunks_exact_mut(4) {
-                px.swap(0, 2); // BGRA → RGBA
-            }
-            std::borrow::Cow::Owned(out)
-        }
-        // Planar YUV would be converted by swscale in the decoder; if one slips through,
-        // fall back to the raw bytes (better a wrong frame than a panic). Same for any
-        // future non-exhaustive variant.
-        _ => std::borrow::Cow::Borrowed(&frame.data),
     }
 }
 
