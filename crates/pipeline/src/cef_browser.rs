@@ -259,7 +259,14 @@ pub struct Cef {
     args: Args,
     app: App,
     adblock: Arc<AdBlocker>,
+    user_agent: Option<String>,
 }
+
+/// A smart-TV user agent that makes `youtube.com/tv` serve the 10-foot leanback UI
+/// (Chromium's default desktop UA gets the normal site).
+pub const TV_USER_AGENT: &str =
+    "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Version/6.0 TV Safari/537.36";
 
 impl Cef {
     /// Must be called first thing in `main`. Returns `Ok(None)` if this invocation was a
@@ -285,12 +292,23 @@ impl Cef {
         }
         // Browser process: build the ad blocker (parses rules once).
         let adblock = Arc::new(AdBlocker::with_defaults());
-        Ok(Some(Self { args, app, adblock }))
+        Ok(Some(Self {
+            args,
+            app,
+            adblock,
+            user_agent: None,
+        }))
     }
 
     /// Replace the ad blocker (e.g. loaded from a full EasyList) before creating browsers.
     pub fn set_adblock(&mut self, adblock: AdBlocker) {
         self.adblock = Arc::new(adblock);
+    }
+
+    /// Set the browser user agent (call before [`Self::initialize`]). Use [`TV_USER_AGENT`]
+    /// for YouTube leanback.
+    pub fn set_user_agent(&mut self, ua: &str) {
+        self.user_agent = Some(ua.to_string());
     }
 
     /// Initialize the CEF browser process (windowless, external message pump).
@@ -317,6 +335,10 @@ impl Cef {
             root_cache_path: CefString::from(&*cache.to_string_lossy()),
             resources_dir_path: resources_dir,
             locales_dir_path: locales_dir,
+            user_agent: self
+                .user_agent
+                .as_deref()
+                .map_or_else(CefString::default, CefString::from),
             log_severity: LogSeverity::default(),
             ..Default::default()
         };

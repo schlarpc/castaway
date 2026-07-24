@@ -264,6 +264,38 @@ impl RenderLoop {
         Ok(())
     }
 
+    /// Upload a CEF browser frame (BGRA8, as `on_paint` delivers) as the `Browser`
+    /// compositor layer (z=5, above video, below OSD). The kiosk calls this each frame
+    /// with the latest painted frame; a playing video sits below it unless made PiP.
+    ///
+    /// # Errors
+    /// [`PipelineError::InvalidFrame`] if the buffer is undersized.
+    pub fn upload_browser(
+        &mut self,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<(), PipelineError> {
+        let mut rgba = bgra.to_vec();
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2); // BGRA → RGBA
+        }
+        self.compositor
+            .upload_texture(LayerId::Browser, width, height, &rgba)?;
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::Browser,
+            z: 5,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        Ok(())
+    }
+
+    /// Remove the browser layer (browser hidden).
+    pub fn clear_browser(&mut self) {
+        self.compositor.remove_layer(LayerId::Browser);
+    }
+
     /// Drain all pending commands (non-blocking) and present once. Returns the number of
     /// video frames applied this pump.
     pub fn pump(&mut self) -> usize {

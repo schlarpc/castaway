@@ -50,6 +50,11 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // YouTube's leanback (10-foot) UI is served only to TV clients.
+    if url.contains("youtube.com") {
+        cef.set_user_agent(pipeline::cef_browser::TV_USER_AGENT);
+    }
+
     if let Err(e) = cef.initialize() {
         eprintln!("cef initialize failed: {e}");
         return std::process::ExitCode::FAILURE;

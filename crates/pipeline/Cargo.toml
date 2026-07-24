@@ -37,6 +37,8 @@ adblock = { version = "0.13", optional = true, default-features = false, feature
     "embedded-domain-resolver",
     "full-regex-handling",
 ] }
+# Blocking HTTP client to fetch+cache EasyList at startup.
+ureq = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
@@ -51,7 +53,7 @@ render = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ab_glyph", "dep:png"]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
 # `cef` needs `render` for the compositor it paints into; adblock is baked in.
-cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock"]
+cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock", "dep:ureq"]
 
 [lints]
 workspace = true
