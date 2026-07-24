@@ -2,6 +2,7 @@
 //! viewer sees the moment a cast starts).
 //!
 //! `cargo run -p pipeline --example screen_preview --features render -- out.png [WxH] [msg]`
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

@@ -11,7 +11,12 @@
 //!
 //! This is the FFI boundary to libcef, so `unsafe` is permitted here (ground rule 8);
 //! the one `unsafe` block carries a `// SAFETY:` note.
-#![allow(unsafe_code, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    unsafe_code,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 use std::sync::{Arc, Mutex};
 
@@ -98,7 +103,12 @@ wrap_render_handler! {
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             if let Some(rect) = rect {
-                let (w, h) = *self.handler.size.dims.lock().unwrap();
+                let (w, h) = self
+                    .handler
+                    .size
+                    .dims
+                    .lock()
+                    .map_or((1, 1), |g| *g);
                 rect.x = 0;
                 rect.y = 0;
                 rect.width = w.max(1) as _;
@@ -284,7 +294,9 @@ pub struct CefBrowser {
 impl CefBrowser {
     /// Resize the offscreen viewport.
     pub fn resize(&self, width: u32, height: u32) {
-        *self.size.dims.lock().unwrap() = (width, height);
+        if let Ok(mut dims) = self.size.dims.lock() {
+            *dims = (width, height);
+        }
         if let Some(host) = self.browser.host() {
             host.was_resized();
         }
