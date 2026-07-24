@@ -46,17 +46,43 @@ pub fn fonts() -> Result<Fonts, PipelineError> {
 pub fn fill_gradient(buf: &mut [u8], width: u32, height: u32, top: Rgba, bottom: Rgba) {
     for y in 0..height {
         let t = f32::from(u16::try_from(y).unwrap_or(0)) / height.max(1) as f32;
-        let color = [
-            lerp(top[0], bottom[0], t),
-            lerp(top[1], bottom[1], t),
-            lerp(top[2], bottom[2], t),
-            255,
+        let row = [
+            lerp_f(top[0], bottom[0], t),
+            lerp_f(top[1], bottom[1], t),
+            lerp_f(top[2], bottom[2], t),
         ];
         for x in 0..width {
+            // Ordered dither before 8-bit quantization: a slow dark gradient spans few
+            // 8-bit steps, so flat per-row rounding shows as wide bands on a big panel.
+            let d = dither_offset(x, y);
             let i = ((y * width + x) * 4) as usize;
-            buf[i..i + 4].copy_from_slice(&color);
+            buf[i] = quant(row[0] + d);
+            buf[i + 1] = quant(row[1] + d);
+            buf[i + 2] = quant(row[2] + d);
+            buf[i + 3] = 255;
         }
     }
+}
+
+/// A 64×64 blue-noise ranking matrix (void-and-cluster), 4096 little-endian u16 ranks.
+/// Blue noise beats a Bayer matrix here: no visible crosshatch, energy pushed to high
+/// frequencies the eye ignores.
+const BLUE_NOISE: &[u8] = include_bytes!("../assets/bluenoise64.bin");
+
+/// The dither offset for a pixel, in `[-0.5, 0.5)` — one same-sign nudge for all three
+/// channels (luminance dither; per-channel offsets would add color speckle).
+fn dither_offset(x: u32, y: u32) -> f32 {
+    let i = (((y & 63) * 64 + (x & 63)) * 2) as usize;
+    let rank = u16::from_le_bytes([BLUE_NOISE[i], BLUE_NOISE[i + 1]]);
+    (f32::from(rank) + 0.5) / 4096.0 - 0.5
+}
+
+fn lerp_f(a: u8, b: u8, t: f32) -> f32 {
+    f32::from(a) * (1.0 - t) + f32::from(b) * t
+}
+
+fn quant(v: f32) -> u8 {
+    v.round().clamp(0.0, 255.0) as u8
 }
 
 /// Fill a rectangle with source-over compositing (honours the color's alpha).
@@ -172,12 +198,6 @@ pub fn blend_over(
     buf[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-fn lerp(a: u8, b: u8, t: f32) -> u8 {
-    (f32::from(a) * (1.0 - t) + f32::from(b) * t)
-        .round()
-        .clamp(0.0, 255.0) as u8
-}
-
 /// Attach an error source to a `PipelineError` (used by the embedded-font loaders).
 trait Context {
     fn context<E: std::fmt::Display>(self, e: E) -> PipelineError;
@@ -214,5 +234,40 @@ mod tests {
         let transparent = buf.chunks_exact(4).filter(|p| p[3] == 0).count();
         assert!(opaque > 0, "glyphs should be drawn");
         assert!(transparent > opaque, "background should stay transparent");
+    }
+
+    #[test]
+    fn blue_noise_matrix_is_a_complete_ranking() {
+        // 64×64 u16 ranks, each of 0..4096 exactly once — a valid ordered-dither matrix.
+        assert_eq!(BLUE_NOISE.len(), 64 * 64 * 2);
+        let mut seen = [false; 64 * 64];
+        for pair in BLUE_NOISE.chunks_exact(2) {
+            let rank = u16::from_le_bytes([pair[0], pair[1]]) as usize;
+            assert!(rank < 64 * 64, "rank out of range");
+            assert!(!seen[rank], "duplicate rank {rank}");
+            seen[rank] = true;
+        }
+    }
+
+    #[test]
+    fn gradient_dither_preserves_mean_and_breaks_bands() {
+        // A gradient spanning ONE 8-bit step: undithered it would be two flat bands;
+        // dithered, every row mixes the two levels in the right proportion.
+        let (w, h) = (256u32, 256u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        fill_gradient(&mut buf, w, h, [10, 10, 10, 255], [11, 11, 11, 255]);
+        // Rows near the middle should contain BOTH values (no hard band edge)...
+        let row = |y: u32| {
+            let start = (y * w * 4) as usize;
+            &buf[start..start + (w * 4) as usize]
+        };
+        let mid = row(h / 2);
+        let lo = mid.chunks_exact(4).filter(|p| p[0] == 10).count();
+        let hi = mid.chunks_exact(4).filter(|p| p[0] == 11).count();
+        assert!(lo > 0 && hi > 0, "mid row should dither between levels");
+        // ...and the overall mean must track the analytic gradient mean closely.
+        let sum: u64 = buf.chunks_exact(4).map(|p| u64::from(p[0])).sum();
+        let mean = sum as f64 / f64::from(w * h);
+        assert!((mean - 10.5).abs() < 0.05, "mean drifted: {mean}");
     }
 }

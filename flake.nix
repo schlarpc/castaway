@@ -53,13 +53,14 @@
         in
         {
           # Keep Cargo sources plus non-Rust assets that crates `include_str!`
-          # (SCPD/description XML in proto-dlna, and future .proto fixtures).
+          # (SCPD/description XML in proto-dlna, fonts + blue-noise dither in pipeline).
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
               (craneLib.filterCargoSources path type)
               || (pkgs.lib.hasSuffix ".xml" path)
-              || (pkgs.lib.hasSuffix ".ttf" path);
+              || (pkgs.lib.hasSuffix ".ttf" path)
+              || (pkgs.lib.hasSuffix ".bin" path);
             name = "source";
           };
           strictDeps = true;
@@ -202,10 +203,10 @@
               pkgs.vulkan-loader
               pkgs.wayland
               pkgs.libxkbcommon
-              pkgs.xorg.libX11
-              pkgs.xorg.libXcursor
-              pkgs.xorg.libXi
-              pkgs.xorg.libXrandr
+              pkgs.libx11
+              pkgs.libxcursor
+              pkgs.libxi
+              pkgs.libxrandr
             ];
 
             # Environment variables for development
@@ -218,14 +219,17 @@
             # Point the `cef` crates at the flattened, NixOS-linked CEF distribution.
             CEF_PATH = "${cefDist}";
             # Let winit/wgpu dlopen Vulkan/Wayland/X11, and the loader find libcef.so.
+            # libGL is needed because cefDist's bundled libGLESv2.so links libGL.so.1;
+            # without it CEF's GPU process dies and wgpu's GL-backend probe SIGSEGVs.
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.vulkan-loader
+              pkgs.libGL
               pkgs.wayland
               pkgs.libxkbcommon
-              pkgs.xorg.libX11
-              pkgs.xorg.libXcursor
-              pkgs.xorg.libXi
-              pkgs.xorg.libXrandr
+              pkgs.libx11
+              pkgs.libxcursor
+              pkgs.libxi
+              pkgs.libxrandr
             ] + ":${cefDist}";
           };
         });

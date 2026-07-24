@@ -411,7 +411,9 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
             config.http_base_url().replace("http://", "")
         ),
     };
-    let (w, h) = (1920, 1080);
+    // Native panel resolution (Dell C6522QT is 4K): a 1:1 background keeps the dither
+    // pattern intact — GPU upscaling would smear it and re-introduce banding.
+    let (w, h) = (3840, 2160);
     match render(&scene, w, h) {
         Ok(rgba) => Some((w, h, rgba)),
         Err(e) => {
