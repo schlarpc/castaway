@@ -462,7 +462,10 @@ fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)
         &wgpu::DeviceDescriptor {
             label: Some("castaway-compositor"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            // Downlevel baseline, but raised to the adapter's real max texture size:
+            // the baseline caps 2D textures at 2048, which can't even configure a 4K
+            // surface (the Dell panel is 3840×2160).
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             memory_hints: wgpu::MemoryHints::Performance,
         },
         None,
