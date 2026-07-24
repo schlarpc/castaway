@@ -10,7 +10,7 @@
 #
 # The toolchain is all LLVM: clang-cl as the C/C++ driver, lld-link as the linker,
 # llvm-lib as the archiver, llvm-rc for resources.
-{ pkgs, craneLib, commonArgs }:
+{ pkgs, craneLib, commonArgs, rustToolchain }:
 
 let
   inherit (pkgs) lib;
@@ -94,14 +94,40 @@ let
     doCheck = false;
   };
 
-  cargoArtifacts = craneLib.buildDepsOnly crossArgs;
+  # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
+  # selecting build has to name the package too.
+  mkCastaway = { pname, features ? [ ] }:
+    let
+      cargoExtraArgs = "--package castaway"
+        + lib.optionalString (features != [ ])
+        " --features ${lib.concatStringsSep "," features}";
+      args = crossArgs // { inherit cargoExtraArgs; };
+    in
+    craneLib.buildPackage (args // {
+      inherit pname;
+      cargoArtifacts = craneLib.buildDepsOnly args;
+    });
 
 in
 {
   inherit sysroot crossEnv target toolchainBins;
 
-  castaway = craneLib.buildPackage (crossArgs // {
-    inherit cargoArtifacts;
-    pname = "castaway-windows";
+  # No optional features: the portable protocol core only. This is the canary — if it
+  # stops linking, the toolchain broke, not the render/browser stack.
+  castaway = mkCastaway { pname = "castaway-windows"; };
+
+  # The real deploy artifact: DX12 compositor + winit kiosk.
+  castaway-render = mkCastaway {
+    pname = "castaway-windows-render";
+    features = [ "render" ];
+  };
+
+  # Cross dev shell: `nix develop .#windows` then plain `cargo build`, which picks the
+  # target up from CARGO_BUILD_TARGET. Incremental, unlike rebuilding through Nix.
+  devShell = pkgs.mkShell (crossEnv // {
+    nativeBuildInputs = [ rustToolchain pkgs.cargo-xwin ] ++ toolchainBins;
+    # Escape hatch: `cargo xwin build` reuses the pinned sysroot instead of downloading
+    # its own, because the derivation leaves cargo-xwin's `DONE` marker in place.
+    XWIN_CACHE_DIR = "${sysroot}";
   });
 }

@@ -16,6 +16,29 @@ use wgpu::util::DeviceExt as _;
 use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
 
+/// Build the wgpu instance restricted to the backend this platform is meant to run on.
+///
+/// Windows gets **DX12 only**, not `Backends::all()`. The deploy target's whole render
+/// path is D3D12 — and the interop that lands on top of it (CEF's shared textures, the
+/// Miracast encode path) is DXGI-specific — so a silent fallback to Vulkan or GL would
+/// paper over a broken driver install and then fail much later, somewhere less obvious.
+/// Failing at adapter selection is the diagnosable outcome.
+///
+/// Linux keeps `Backends::all()`: Vulkan is what we actually use, but the GL fallback is
+/// load-bearing for headless/software CI runs. `WGPU_BACKEND` overrides either way, which
+/// is the escape hatch for bisecting a backend-specific bug on the panel.
+pub(crate) fn create_instance() -> wgpu::Instance {
+    #[cfg(windows)]
+    let backends = wgpu::Backends::DX12;
+    #[cfg(not(windows))]
+    let backends = wgpu::Backends::all();
+
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::util::backend_bits_from_env().unwrap_or(backends),
+        ..Default::default()
+    })
+}
+
 const SHADER: &str = r#"
 // {vec4, f32} lays out as 32 bytes (struct align 16), matching the Rust `Uniform`
 // which pads to 32. Do NOT add a vec3 pad here — that would round the size up to 48.
@@ -129,7 +152,7 @@ impl WgpuCompositor {
     /// # Errors
     /// [`PipelineError::GpuInit`] if no adapter/device is available.
     pub fn new_offscreen(width: u32, height: u32) -> Result<Self, PipelineError> {
-        let instance = wgpu::Instance::default();
+        let instance = create_instance();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,

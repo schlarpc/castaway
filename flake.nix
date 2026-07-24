@@ -94,6 +94,7 @@
         pkgs = pkgsFor system;
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
+        rustToolchain = rustToolchainFor system;
       };
 
     in
@@ -116,10 +117,12 @@
           castaway = self.packages.${system}.default;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
-            # The Windows deploy artifact, cross-compiled from Linux.
+            # The Windows deploy artifacts, cross-compiled from Linux. `-render` is the
+            # one that ships; the bare build is the toolchain canary.
             castaway-windows = windows.castaway;
+            castaway-windows-render = windows.castaway-render;
 
-            # The MSVC CRT + Windows SDK sysroot it builds against. Exposed on its own so
+            # The MSVC CRT + Windows SDK sysroot they build against. Exposed on its own so
             # it can be built and cached independently of the Rust build.
             msvc-sysroot = windows.sysroot;
           }
@@ -255,6 +258,11 @@
               pkgs.libxrandr
             ] + ":${cefDist}";
           };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # `nix develop .#windows` — cross shell where plain `cargo build` targets
+          # Windows. Deliberately separate from the default shell: it exports
+          # CARGO_BUILD_TARGET, which would silently hijack the native dev loop.
+          windows = (windowsFor system).devShell;
         });
 
       # Expose nix-direnv for .envrc to use
