@@ -176,12 +176,20 @@ impl WgpuCompositor {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
+        // Prefer Mailbox (latest-frame, no tearing, and immune to the Wayland frame-
+        // callback stalls that make Fifo's acquire time out on some compositors);
+        // Fifo is the spec-guaranteed fallback.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: width.max(1),
             height: height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -443,16 +451,26 @@ impl Compositor for WgpuCompositor {
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 self.render_into(&view);
             }
-            Target::Surface { surface, .. } => match surface.get_current_texture() {
-                Ok(frame) => {
+            Target::Surface { surface, config } => {
+                let frame = match surface.get_current_texture() {
+                    Ok(frame) => Some(frame),
+                    Err(e) => {
+                        // Outdated/Lost after compositor-side changes (scale, mode) and
+                        // Timeout under Wayland frame-callback stalls all recover the
+                        // same way: reconfigure the swapchain and try once more.
+                        tracing::warn!(error = ?e, "surface frame acquire failed; reconfiguring");
+                        surface.configure(&self.device, config);
+                        surface.get_current_texture().ok()
+                    }
+                };
+                if let Some(frame) = frame {
                     let view = frame
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
                     self.render_into(&view);
                     frame.present();
                 }
-                Err(e) => tracing::warn!(error = ?e, "surface frame acquire failed"),
-            },
+            }
         }
     }
 }
