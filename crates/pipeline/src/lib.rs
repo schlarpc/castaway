@@ -49,7 +49,7 @@ pub use attract::{AttractRow, AttractScene};
 #[cfg(feature = "cef")]
 pub use cef_browser::{BrowserCommand, BrowserHost, Cef, TV_USER_AGENT};
 #[cfg(feature = "render")]
-pub use osd::{OsdController, OsdUpdate};
+pub use osd::{Banner, OsdController, OsdUpdate};
 #[cfg(feature = "render")]
 pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
 #[cfg(feature = "render")]

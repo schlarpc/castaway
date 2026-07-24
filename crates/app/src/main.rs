@@ -128,7 +128,9 @@ fn main() -> anyhow::Result<()> {
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
         let attract = build_attract(&config);
-        let osd_controller = OsdController::new(osd_rx, 1280, 720);
+        // No size here on purpose: the controller rasterizes each banner for whatever the
+        // surface measures at the time, so it follows the panel and any resize.
+        let osd_controller = OsdController::new(osd_rx);
         // The winit event loop MUST own the main thread; with CEF it doubles as the
         // browser's message pump and shuts CEF down when the loop exits.
         #[cfg(feature = "cef")]

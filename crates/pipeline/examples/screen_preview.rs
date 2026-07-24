@@ -25,11 +25,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frame = pipeline::attract::render(&scene, w, h)?;
 
     // Overlay: the OSD banner, alpha-composited over the background (as the GPU would).
+    // The banner is a tight image placed by a transform, so blit it row by row at the
+    // transform's pixel origin — the same texel-per-pixel mapping the compositor does.
     let banner = pipeline::osd::render_banner(&msg, w, h)?;
-    for (bg, fg) in frame.chunks_exact_mut(4).zip(banner.chunks_exact(4)) {
-        let a = f32::from(fg[3]) / 255.0;
-        for c in 0..3 {
-            bg[c] = (f32::from(fg[c]) * a + f32::from(bg[c]) * (1.0 - a)).round() as u8;
+    let ox = (banner.transform.offset_x * w as f32).round() as u32;
+    let oy = (banner.transform.offset_y * h as f32).round() as u32;
+    for row in 0..banner.height.min(h.saturating_sub(oy)) {
+        let cols = banner.width.min(w.saturating_sub(ox)) as usize;
+        let src = (row * banner.width) as usize * 4;
+        let dst = ((oy + row) * w + ox) as usize * 4;
+        let fg_row = &banner.rgba[src..src + cols * 4];
+        let bg_row = &mut frame[dst..dst + cols * 4];
+        for (bg, fg) in bg_row.chunks_exact_mut(4).zip(fg_row.chunks_exact(4)) {
+            let a = f32::from(fg[3]) / 255.0;
+            for c in 0..3 {
+                bg[c] = (f32::from(fg[c]) * a + f32::from(bg[c]) * (1.0 - a)).round() as u8;
+            }
         }
     }
 

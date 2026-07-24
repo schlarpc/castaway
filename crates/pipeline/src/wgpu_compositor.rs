@@ -251,6 +251,17 @@ impl WgpuCompositor {
     }
 
     /// Resize the surface target (no-op for offscreen).
+    /// The current target size in device pixels. Layers place themselves in normalized
+    /// surface coords, so anything that wants to rasterize at native scale (the OSD) has
+    /// to ask what that scale currently is.
+    #[must_use]
+    pub fn target_size(&self) -> (u32, u32) {
+        match &self.target {
+            Target::Offscreen { size, .. } => *size,
+            Target::Surface { config, .. } => (config.width, config.height),
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if let Target::Surface { surface, config } = &mut self.target {
             config.width = width.max(1);

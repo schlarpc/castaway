@@ -194,26 +194,33 @@ impl RenderLoop {
 
     /// Drive the OSD overlay: poll the controller and update the OSD layer.
     fn update_osd(&mut self) {
+        // Passed in rather than remembered by the controller, so it tracks a window resize
+        // for free and the banner is always rasterized at the panel's real pixel scale.
+        let surface = self.compositor.target_size();
         let update = match &mut self.osd {
-            Some(controller) => controller.poll(std::time::Instant::now()),
+            Some(controller) => controller.poll(std::time::Instant::now(), surface),
             None => return,
         };
         match update {
-            crate::osd::OsdUpdate::Show {
-                width,
-                height,
-                rgba,
-            } => {
+            crate::osd::OsdUpdate::Show(banner) => {
                 if self
                     .compositor
-                    .upload_texture(LayerId::Osd, width, height, TexelFormat::Rgba8, &rgba)
+                    .upload_texture(
+                        LayerId::Osd,
+                        banner.width,
+                        banner.height,
+                        TexelFormat::Rgba8,
+                        &banner.rgba,
+                    )
                     .is_ok()
                 {
+                    // The banner is a tight image; its transform is what puts it in the
+                    // bottom-center of the surface.
                     self.compositor.upsert_layer(Layer {
                         id: LayerId::Osd,
                         z: 10,
                         opacity: 1.0,
-                        transform: Transform::default(),
+                        transform: banner.transform,
                     });
                 }
             }
