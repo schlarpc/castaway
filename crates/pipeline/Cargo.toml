@@ -30,8 +30,13 @@ png = { version = "0.17", optional = true }
 cef = { version = "=147.1.0", optional = true }
 cef-dll-sys = { version = "=147.1.0", optional = true }
 # Brave's adblock engine — request-level ad/tracker blocking in the CEF host (Q6 answer).
-# Keep default features (the embedded domain resolver is required for URL parsing).
-adblock = { version = "0.13", optional = true }
+# Drop the default `single-thread` feature so the Engine is Arc-based (Send+Sync) — CEF
+# calls the resource handler across threads. Keep `embedded-domain-resolver` (needed for
+# URL parsing) and `full-regex-handling`.
+adblock = { version = "0.13", optional = true, default-features = false, features = [
+    "embedded-domain-resolver",
+    "full-regex-handling",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }

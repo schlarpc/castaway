@@ -91,3 +91,20 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   decode + wgpu compositor + winit kiosk surface (and CEF) are declared feature flags with
   trait surfaces (`Compositor`, `BrowserSurface`) but no backend impls yet. Wiring these is
   the render-path milestone (needs the C6522QT box for real validation).
+
+## CEF / adblock / YouTube Lounge
+
+- **Q17 — Filter-list source + refresh.** Default adblock is a compact built-in list; the real
+  coverage comes from EasyList (proven: it blocks the video-ad loader). Decide how the kiosk gets
+  a full list: bundle a snapshot (goes stale), fetch+cache from easylist.to on a timer (needs
+  network), or a config path. Recommend fetch+cache with the compact list as offline fallback.
+- **Q18 — YouTube Lounge via CEF (the actual plan).** With CEF working, the Lounge path is: on
+  DIAL launch, navigate the offscreen browser to YouTube's TV surface (`https://www.youtube.com/tv`
+  + the launch params/pairing code) and let the page do Lounge registration + playback itself
+  (architecture §5 "double duty"). This replaces the native bind-channel client (the parser stays
+  useful for a non-CEF fallback). Still to wire (task 16): feed CEF on_paint into the compositor
+  Browser layer, and the DIAL-launch → navigate handoff. YouTube ad-blocking is an arms race —
+  request blocking + JS help, but no guarantees.
+- **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
+  147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
+  `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.

@@ -172,3 +172,25 @@ video) with TTL auto-clear; headless, the app drains the channel to the log. The
 rasterizer was extracted from `attract` into `pipeline::text` (source-over alpha, so the
 OSD banner composites as a transparent overlay). The app posts a startup banner as a
 worked example of a non-session producer.
+
+### D22 — CEF pulled in, reproducibly, against nixpkgs cef-binary (the boss fight, won)
+CEF is real now, behind the `cef` feature. The doc's "boss fight" (cross-build.md/Q6) turned
+out tractable: the `cef` crate 147.1.0 exactly matches nixpkgs `cef-binary` 147.0.10, which is
+already NixOS-linked. The flake builds a *flattened* `cefDist` (libcef.so + .pak/ICU/locales at
+the root, not the Release/Resources split CEF ships) + a crafted `archive.json` to pass the
+crate's version check, and sets `CEF_PATH`. Result: no download, no patchelf, no cross-version
+API mismatch. `pipeline::cef_browser` wraps libcef (wrap_app!/wrap_client!/wrap_render_handler!/
+wrap_request_handler!/wrap_resource_request_handler!): bootstrap (subprocess entry point — MUST
+be first in main), initialize (windowless + external pump), create_offscreen (CPU on_paint →
+CefFrameSink). Proven: renders real pages offscreen headlessly (SwiftShader) to PNG. FFI unsafe
+is allowed in this crate per ground rule 8.
+
+### D23 — Adblock is host-side request blocking, not a Chrome extension
+CEF can't host uBlock Origin (its extension APIs don't implement webRequest/declarativeNetRequest,
+and the OSR path we need is the Alloy runtime with limited extensions anyway). So blocking lives in
+the host: `pipeline::cef_adblock::AdBlocker` (Brave adblock-rust) checks every resource load in the
+CEF `ResourceRequestHandler` and returns RV_CANCEL for blocked requests, logging each on the
+`castaway::adblock` target. Default is a compact built-in list; a full EasyList loads via
+`from_list_text`/`set_adblock`. Dropped adblock's default `single-thread` feature so the Engine is
+Arc-based (Send+Sync) — CEF calls the handler across threads. Proven live: blocks
+imasdk.googleapis.com (Google video-ad loader) + brightline.tv on cnn.com.
