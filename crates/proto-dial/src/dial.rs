@@ -68,6 +68,8 @@ enum AppState {
 
 struct DialInner {
     state: Mutex<AppState>,
+    /// The receiver's friendly name — what the sender's cast picker shows.
+    friendly_name: String,
     /// Absolute base URL of the DIAL REST service, e.g. `http://10.0.0.5:8080/dial`.
     base_url: String,
     events: mpsc::Sender<DialEvent>,
@@ -81,13 +83,19 @@ pub struct DialService {
 }
 
 impl DialService {
-    /// Create the service. `base_url` is the absolute URL this router is mounted at
-    /// (advertised as `Application-URL`); launch/stop events are sent on `events`.
+    /// Create the service. `friendly_name` is what the sender's cast picker lists;
+    /// `base_url` is the absolute URL this router is mounted at (advertised as
+    /// `Application-URL`); launch/stop events are sent on `events`.
     #[must_use]
-    pub fn new(base_url: impl Into<String>, events: mpsc::Sender<DialEvent>) -> Self {
+    pub fn new(
+        friendly_name: impl Into<String>,
+        base_url: impl Into<String>,
+        events: mpsc::Sender<DialEvent>,
+    ) -> Self {
         Self {
             inner: Arc::new(DialInner {
                 state: Mutex::new(AppState::Stopped),
+                friendly_name: friendly_name.into(),
                 base_url: base_url.into(),
                 events,
                 osd: OnceLock::new(),
@@ -132,16 +140,19 @@ impl DialService {
 }
 
 async fn device_description(State(st): State<Arc<DialInner>>) -> Response {
-    let xml = r#"<?xml version="1.0"?>
+    let name = xml_escape(&st.friendly_name);
+    let xml = format!(
+        r#"<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
     <deviceType>urn:schemas-upnp-org:device:tvdevice:1</deviceType>
-    <friendlyName>castaway</friendlyName>
+    <friendlyName>{name}</friendlyName>
     <manufacturer>castaway</manufacturer>
     <modelName>castaway</modelName>
   </device>
-</root>"#;
+</root>"#
+    );
     // DIAL: the description response MUST carry Application-URL pointing at the app base.
     let app_url = format!("{}/dial/apps/", st.base_url.trim_end_matches('/'));
     (
@@ -202,6 +213,21 @@ async fn stop(State(st): State<Arc<DialInner>>) -> Response {
     StatusCode::OK.into_response()
 }
 
+/// Escape the five XML-special characters for element text (the friendly name is
+/// operator-configured free text).
+fn xml_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&apos;".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 /// Extract a field from an `application/x-www-form-urlencoded` body (no external dep for
 /// this one lookup).
 fn form_field(body: &str, key: &str) -> Option<String> {
@@ -221,11 +247,14 @@ mod tests {
 
     fn service() -> (DialService, mpsc::Receiver<DialEvent>) {
         let (tx, rx) = mpsc::channel(4);
-        (DialService::new("http://10.0.0.5:8080", tx), rx)
+        (
+            DialService::new("Test & Screen", "http://10.0.0.5:8080", tx),
+            rx,
+        )
     }
 
     #[tokio::test]
-    async fn description_carries_application_url() {
+    async fn description_carries_application_url_and_friendly_name() {
         let (svc, _rx) = service();
         let resp = svc
             .router()
@@ -240,6 +269,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let app_url = resp.headers().get("Application-URL").unwrap();
         assert_eq!(app_url, "http://10.0.0.5:8080/dial/apps/");
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        // The configured name is what the sender's cast picker shows — XML-escaped.
+        assert!(
+            body.contains("<friendlyName>Test &amp; Screen</friendlyName>"),
+            "dd.xml should carry the escaped friendly name: {body}"
+        );
     }
 
     #[tokio::test]
@@ -314,7 +350,7 @@ mod tests {
         use castaway_core::{osd_channel, OsdCommand};
         let (tx, _rx) = mpsc::channel(4);
         let (osd, osd_rx) = osd_channel();
-        let svc = DialService::new("http://10.0.0.5:8080", tx).with_osd(osd);
+        let svc = DialService::new("screen", "http://10.0.0.5:8080", tx).with_osd(osd);
         svc.router()
             .oneshot(
                 Request::builder()

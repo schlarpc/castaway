@@ -310,10 +310,16 @@ fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
     let event_loop =
         EventLoop::new().map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop
+    let result = event_loop
         .run_app(app)
-        .map_err(|e| PipelineError::Surface(format!("event loop: {e}")))?;
-    Ok(())
+        .map_err(|e| PipelineError::Surface(format!("event loop: {e}")));
+    // Release the GPU stack (wgpu surface/instance → EGL displays) and the window while
+    // `event_loop` — and with it the Wayland connection — is still alive. `app` outlives
+    // this function, and tearing EGL down after the connection closes segfaults in
+    // Mesa's Wayland teardown (wl_proxy on a dead wl_display).
+    app.render = None;
+    app.window = None;
+    result
 }
 
 #[cfg(test)]

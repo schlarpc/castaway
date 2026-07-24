@@ -250,7 +250,12 @@ async fn serve(
 
     let (dial_tx, mut dial_rx) = mpsc::channel(8);
     if config.enable.dial {
-        let dial = DialService::new(config.http_base_url(), dial_tx.clone()).with_osd(osd.clone());
+        let dial = DialService::new(
+            &config.friendly_name,
+            config.http_base_url(),
+            dial_tx.clone(),
+        )
+        .with_osd(osd.clone());
         http = http.merge(dial.router());
         ssdp_devices.push((
             dial.ssdp_device(&config.uuid),
