@@ -103,7 +103,10 @@ fn main() -> std::process::ExitCode {
             if let Err(e) = std::fs::write(&out, png) {
                 eprintln!("write png: {e}");
             } else {
-                println!("wrote {out} ({}x{}) after {paints} paints", frame.width, frame.height);
+                println!(
+                    "wrote {out} ({}x{}) after {paints} paints",
+                    frame.width, frame.height
+                );
             }
         }
         Err(e) => eprintln!("png encode: {e}"),

@@ -29,7 +29,10 @@ impl AdBlocker {
     #[must_use]
     pub fn from_list_text(text: &str) -> Self {
         let engine = Engine::new_with_list_text(text);
-        let rules = text.lines().filter(|l| !l.trim_start().starts_with('!') && !l.trim().is_empty()).count();
+        let rules = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('!') && !l.trim().is_empty())
+            .count();
         info!(target: "castaway::adblock", rules, "ad blocker loaded");
         Self {
             engine,

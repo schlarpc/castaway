@@ -71,7 +71,11 @@ mod tests {
         let cache = dir.join("list.txt");
         std::fs::write(&cache, "||tracker.example^\n").unwrap();
         let ab = load_or_fetch("http://127.0.0.1:1/nope", &cache);
-        assert!(ab.should_block("https://tracker.example/x.js", "https://site.test/", "script"));
+        assert!(ab.should_block(
+            "https://tracker.example/x.js",
+            "https://site.test/",
+            "script"
+        ));
     }
 
     #[test]
