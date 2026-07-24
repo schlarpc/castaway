@@ -2527,6 +2527,7 @@ dependencies = [
  "cef",
  "cef-dll-sys",
  "ffmpeg-next",
+ "input-touch",
  "png",
  "pollster",
  "raw-window-handle",

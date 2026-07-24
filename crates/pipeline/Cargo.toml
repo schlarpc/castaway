@@ -9,6 +9,9 @@ description = "Media pipeline: the null (log) backend used for daily dev, plus t
 
 [dependencies]
 castaway-core.workspace = true
+# The InputSink/TouchEvent/PointerEvent interface: the kiosk routes window input to the
+# focused surface (the CEF browser today) through it.
+input-touch.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

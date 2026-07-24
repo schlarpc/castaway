@@ -490,6 +490,8 @@ pub struct BrowserHost {
     commands: std::sync::mpsc::Receiver<BrowserCommand>,
     /// Current kiosk surface size; the browser viewport tracks it.
     size: (u32, u32),
+    /// Primary mouse button held (so moves carry the drag modifier).
+    left_down: bool,
 }
 
 impl BrowserHost {
@@ -503,6 +505,7 @@ impl BrowserHost {
             sink: CefFrameSink::default(),
             commands,
             size: (1920, 1080),
+            left_down: false,
         }
     }
 
@@ -555,6 +558,20 @@ impl BrowserHost {
         }
     }
 
+    /// Map a normalized coordinate to browser view space.
+    fn to_view(&self, x: f32, y: f32) -> (f32, f32) {
+        let (w, h) = self.size;
+        (x * w as f32, y * h as f32)
+    }
+
+    fn cef_host(&self) -> Option<cef::BrowserHost> {
+        self.browser.as_ref().and_then(|b| b.browser.host())
+    }
+
+    /// The `EVENTFLAG_LEFT_MOUSE_BUTTON` bit of `cef_event_flags_t` — set on move events
+    /// while the primary button is held so Chromium recognizes drags.
+    const LEFT_BUTTON_FLAG: u32 = 1 << 4;
+
     /// Close any open browser and shut CEF down. Call on the main thread after the
     /// kiosk event loop exits.
     pub fn shutdown(mut self) {
@@ -569,5 +586,94 @@ impl BrowserHost {
         let (seen, blocked) = self.cef.adblock_stats();
         info!(seen, blocked, "adblock totals at shutdown");
         self.cef.shutdown();
+    }
+}
+
+/// Routed panel/window input → CEF injection. The kiosk (input router) delivers
+/// normalized events; this maps them to browser view space and hands them to the
+/// offscreen browser, which does its own gesture recognition (touch scroll/fling/tap).
+impl input_touch::InputSink for BrowserHost {
+    fn touch(&mut self, event: input_touch::TouchEvent) {
+        use input_touch::TouchPhase;
+        let Some(host) = self.cef_host() else { return };
+        let (x, y) = self.to_view(event.x, event.y);
+        let type_ = match event.phase {
+            TouchPhase::Down => TouchEventType::PRESSED,
+            TouchPhase::Move => TouchEventType::MOVED,
+            TouchPhase::Up => TouchEventType::RELEASED,
+            TouchPhase::Cancel => TouchEventType::CANCELLED,
+        };
+        host.send_touch_event(Some(&TouchEvent {
+            id: event.id as i32,
+            x,
+            y,
+            radius_x: 0.0,
+            radius_y: 0.0,
+            rotation_angle: 0.0,
+            pressure: if event.phase == TouchPhase::Up {
+                0.0
+            } else {
+                1.0
+            },
+            type_,
+            modifiers: 0,
+            pointer_type: PointerType::TOUCH,
+        }));
+    }
+
+    fn pointer(&mut self, event: input_touch::PointerEvent) {
+        use input_touch::{PointerButton, PointerEvent};
+        let Some(host) = self.cef_host() else { return };
+        match event {
+            PointerEvent::Move { x, y } => {
+                let (vx, vy) = self.to_view(x, y);
+                let modifiers = if self.left_down {
+                    Self::LEFT_BUTTON_FLAG
+                } else {
+                    0
+                };
+                host.send_mouse_move_event(
+                    Some(&MouseEvent {
+                        x: vx as i32,
+                        y: vy as i32,
+                        modifiers,
+                    }),
+                    0,
+                );
+            }
+            PointerEvent::Button { x, y, button, down } => {
+                let (vx, vy) = self.to_view(x, y);
+                let type_ = match button {
+                    PointerButton::Left => {
+                        self.left_down = down;
+                        MouseButtonType::LEFT
+                    }
+                    PointerButton::Middle => MouseButtonType::MIDDLE,
+                    PointerButton::Right => MouseButtonType::RIGHT,
+                };
+                host.send_mouse_click_event(
+                    Some(&MouseEvent {
+                        x: vx as i32,
+                        y: vy as i32,
+                        modifiers: 0,
+                    }),
+                    type_,
+                    i32::from(!down),
+                    1,
+                );
+            }
+            PointerEvent::Wheel { x, y, dx, dy } => {
+                let (vx, vy) = self.to_view(x, y);
+                host.send_mouse_wheel_event(
+                    Some(&MouseEvent {
+                        x: vx as i32,
+                        y: vy as i32,
+                        modifiers: 0,
+                    }),
+                    dx as i32,
+                    dy as i32,
+                );
+            }
+        }
     }
 }

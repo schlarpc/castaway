@@ -51,6 +51,65 @@ impl TouchEvent {
     }
 }
 
+/// A mouse button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerButton {
+    /// The primary button.
+    Left,
+    /// The middle button / wheel click.
+    Middle,
+    /// The secondary button.
+    Right,
+}
+
+/// A mouse/pointer update. Coordinates are normalized to the surface like
+/// [`TouchEvent`]; wheel deltas are in pixels (positive `dy` scrolls content up).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerEvent {
+    /// The pointer moved.
+    Move {
+        /// X position, 0.0 (left) .. 1.0 (right).
+        x: f32,
+        /// Y position, 0.0 (top) .. 1.0 (bottom).
+        y: f32,
+    },
+    /// A button was pressed or released at a position.
+    Button {
+        /// X position, 0.0 .. 1.0.
+        x: f32,
+        /// Y position, 0.0 .. 1.0.
+        y: f32,
+        /// Which button.
+        button: PointerButton,
+        /// `true` on press, `false` on release.
+        down: bool,
+    },
+    /// A scroll at a position, deltas in pixels.
+    Wheel {
+        /// X position, 0.0 .. 1.0.
+        x: f32,
+        /// Y position, 0.0 .. 1.0.
+        y: f32,
+        /// Horizontal scroll delta in pixels.
+        dx: f32,
+        /// Vertical scroll delta in pixels (positive scrolls content up).
+        dy: f32,
+    },
+}
+
+/// A consumer of routed panel/window input: the surface that currently "owns" the
+/// screen. The kiosk (or any input router) decodes raw events — winit window events
+/// today, HID/evdev on the physical panel — into normalized [`TouchEvent`]s /
+/// [`PointerEvent`]s and delivers them to exactly one focused sink. The CEF browser
+/// layer is the first implementor; protocol adapters or native UI layers that want
+/// direct interaction implement this same trait and take focus.
+pub trait InputSink {
+    /// A touch contact update.
+    fn touch(&mut self, event: TouchEvent);
+    /// A mouse/pointer update.
+    fn pointer(&mut self, event: PointerEvent);
+}
+
 /// A source of touch events. The backend spawns a reader and forwards events on the
 /// channel; the compositor/CEF layer consumes them.
 pub trait TouchSource: Send {
