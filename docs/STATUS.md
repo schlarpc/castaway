@@ -50,6 +50,24 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 4. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
 5. **Q12/Q13** — Cast mirroring RTP receive loop + IV validation.
 
+## CEF browser + adblock + YouTube (behind the `cef` feature)
+The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly against nixpkgs
+`cef-binary` (flake `cefDist` + `CEF_PATH`; no download/patchelf). Proven with screenshots:
+- `pipeline::cef_browser` — offscreen Chromium via cef-rs; renders real pages headlessly
+  (SwiftShader) → `on_paint` BGRA → `CefFrameSink`. Subprocess entry point, TV user-agent.
+- `pipeline::cef_adblock` — Brave adblock-rust in CEF's `ResourceRequestHandler`, cancels +
+  **logs** blocked requests (`castaway::adblock`). `easylist::load_or_fetch` fetches+caches
+  EasyList, falls back to cache then compact built-in.
+- **YouTube**: `youtube.com/tv` renders the leanback cast-receiver UI (TV UA), with EasyList
+  blocking YouTube's ad requests (doubleclick instream `ad_status.js`, googleads id/tracking).
+- `RenderLoop::upload_browser` feeds CEF frames into the compositor `Browser` layer.
+
+**Remaining wiring (task 16, needs the physical box to verify):** restructure `app::main` so
+CEF `bootstrap()` runs first, the kiosk loop pumps CEF + winit on the main thread and uploads
+browser frames, and DIAL launch → navigate CEF to `youtube.com/tv` with the pairing params so
+a phone binds to the screen (§5 "double duty"). All the pieces exist; it's the main-thread
+merge + the launch→navigate channel.
+
 ## Design decisions worth your review
 D7 (router composition vs SourceAdapter), D9 (hand-written prost, no protoc), D10 (Spotify
 scope), D16 (socket protocols advertise-gated). All in DECISION-LOG.md.
