@@ -34,6 +34,15 @@ use tracing::{info, warn};
 use crate::config::Config;
 
 fn main() -> anyhow::Result<()> {
+    // CEF is multi-process: subprocesses re-exec this same binary, so bootstrap must be
+    // the very first thing in main — before tracing, config, or the tokio runtime.
+    // `None` means this invocation *was* a subprocess and has already run to completion.
+    #[cfg(feature = "cef")]
+    let cef = match pipeline::Cef::bootstrap().map_err(|e| anyhow::anyhow!("cef bootstrap: {e}"))? {
+        Some(cef) => cef,
+        None => return Ok(()),
+    };
+
     init_tracing();
     let config = Config::load("castaway.toml").context("loading config")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -43,20 +52,13 @@ fn main() -> anyhow::Result<()> {
 
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
     let shutdown = Arc::new(Notify::new());
+    // A fullscreen kiosk has no window chrome, so ctrl-c must also stop the winit loop;
+    // it polls this flag every iteration.
+    let kiosk_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // The OSD channel: the session manager posts "Now casting from …", and any other
     // source (here, the app itself) can post to the same overlay by cloning `osd`.
     let (osd, osd_rx) = osd_channel();
-
-    // ctrl-c triggers the same shutdown as a kiosk window close.
-    {
-        let shutdown = shutdown.clone();
-        runtime.spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("ctrl-c: shutting down");
-            shutdown.notify_waiters();
-        });
-    }
 
     // A welcome banner, injected by the app (a non-session OSD producer) — demonstrates
     // that OSD messages can come from anywhere holding an `OsdSink`.
@@ -74,21 +76,72 @@ fn main() -> anyhow::Result<()> {
             .with_osd(osd.clone());
         runtime.spawn(manager.run(event_rx));
 
+        // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
+        // the sender's pairing params, so the phone binds to this screen; DIAL stop →
+        // hide it. Without CEF the events are only logged.
+        #[cfg(feature = "cef")]
+        let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
+        #[cfg(feature = "cef")]
+        let on_dial = move |event: proto_dial::DialEvent| match event {
+            proto_dial::DialEvent::Launched(params) => {
+                let url = params.leanback_url();
+                info!(%url, "DIAL launch: navigating kiosk browser");
+                let _ = nav_tx.send(pipeline::BrowserCommand::Navigate(url));
+            }
+            proto_dial::DialEvent::Stopped => {
+                info!("DIAL stop: hiding kiosk browser");
+                let _ = nav_tx.send(pipeline::BrowserCommand::Hide);
+            }
+        };
+        #[cfg(not(feature = "cef"))]
+        let on_dial = log_dial_event;
+
         let serve_cfg = config.clone();
         let serve_tx = event_tx.clone();
         let serve_shutdown = shutdown.clone();
         let serve_osd = osd.clone();
         runtime.spawn(async move {
-            if let Err(e) = serve(serve_cfg, serve_tx, serve_shutdown, serve_osd).await {
+            if let Err(e) = serve(serve_cfg, serve_tx, serve_shutdown, serve_osd, on_dial).await {
                 warn!(error = %e, "service layer exited with error");
             }
         });
 
+        // CEF setup happens on the main thread (which will also pump it): TV user agent
+        // so youtube.com/tv serves the leanback UI, EasyList (fetch → cache → built-in
+        // fallback) for the ad blocker, then cef_initialize.
+        #[cfg(feature = "cef")]
+        let browser_host = {
+            let mut cef = cef;
+            cef.set_user_agent(pipeline::TV_USER_AGENT);
+            cef.set_adblock(pipeline::easylist::load_or_fetch(
+                pipeline::easylist::EASYLIST_URL,
+                &pipeline::easylist::default_cache_path(),
+            ));
+            cef.initialize()
+                .map_err(|e| anyhow::anyhow!("cef initialize: {e}"))?;
+            pipeline::BrowserHost::new(cef, nav_rx)
+        };
+
+        // Registered after `cef.initialize()` on purpose: Chromium installs its own
+        // SIGINT handler during init, which would silently replace an earlier one.
+        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit);
+
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
         let attract = build_attract(&config);
         let osd_controller = OsdController::new(osd_rx, 1280, 720);
-        // The winit event loop MUST own the main thread.
-        pipeline::kiosk::run(rx, attract, Some(osd_controller))
+        // The winit event loop MUST own the main thread; with CEF it doubles as the
+        // browser's message pump and shuts CEF down when the loop exits.
+        #[cfg(feature = "cef")]
+        pipeline::kiosk::run_with_browser(
+            rx,
+            attract,
+            Some(osd_controller),
+            Some(kiosk_exit),
+            browser_host,
+        )
+        .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        #[cfg(not(feature = "cef"))]
+        pipeline::kiosk::run(rx, attract, Some(osd_controller), Some(kiosk_exit))
             .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
     }
@@ -103,10 +156,28 @@ fn main() -> anyhow::Result<()> {
         runtime.spawn(manager.run(event_rx));
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
-        runtime.block_on(serve(config, event_tx, shutdown, osd))?;
+        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit);
+        runtime.block_on(serve(config, event_tx, shutdown, osd, log_dial_event))?;
     }
 
     Ok(())
+}
+
+/// ctrl-c triggers the same shutdown as a kiosk window close: stop the services and
+/// tell the winit loop to exit.
+fn spawn_ctrl_c(
+    runtime: &tokio::runtime::Runtime,
+    shutdown: &Arc<Notify>,
+    kiosk_exit: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let shutdown = shutdown.clone();
+    let kiosk_exit = kiosk_exit.clone();
+    runtime.spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("ctrl-c: shutting down");
+        kiosk_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+        shutdown.notify_waiters();
+    });
 }
 
 /// Headless OSD consumer: log each banner instead of drawing it.
@@ -121,14 +192,27 @@ fn drain_osd_to_log(rx: &castaway_core::OsdReceiver) {
     }
 }
 
+/// What to do with a DIAL launch/stop when there's no kiosk browser: log it.
+#[cfg(not(feature = "cef"))]
+fn log_dial_event(event: proto_dial::DialEvent) {
+    match event {
+        proto_dial::DialEvent::Launched(params) => {
+            warn!(pairing = ?params.pairing_code, "YouTube launched; no kiosk browser (build with `cef`)");
+        }
+        proto_dial::DialEvent::Stopped => info!("YouTube stopped"),
+    }
+}
+
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
 /// protocols, and run until `shutdown` is signalled. `osd` is cloned to each adapter so
-/// they can surface their own status on the overlay.
+/// they can surface their own status on the overlay; DIAL launch/stop events are handed
+/// to `on_dial` (the kiosk browser navigation hook, or a logger).
 async fn serve(
     config: Config,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
     osd: castaway_core::OsdSink,
+    on_dial: impl Fn(proto_dial::DialEvent) + Send + 'static,
 ) -> anyhow::Result<()> {
     let iface = config.resolved_interface();
     info!(
@@ -164,19 +248,18 @@ async fn serve(
         info!("enabled: Spotify Connect (onboarding/pairing)");
     }
 
-    let (launch_tx, mut launch_rx) = mpsc::channel(8);
+    let (dial_tx, mut dial_rx) = mpsc::channel(8);
     if config.enable.dial {
-        let dial =
-            DialService::new(config.http_base_url(), launch_tx.clone()).with_osd(osd.clone());
+        let dial = DialService::new(config.http_base_url(), dial_tx.clone()).with_osd(osd.clone());
         http = http.merge(dial.router());
         ssdp_devices.push((
             dial.ssdp_device(&config.uuid),
             dial.description_path().to_string(),
         ));
-        info!("enabled: DIAL → YouTube Lounge (launch)");
+        info!("enabled: DIAL → YouTube leanback (launch/stop)");
         tokio::spawn(async move {
-            while let Some(params) = launch_rx.recv().await {
-                warn!(pairing = ?params.pairing_code, "YouTube launched; Lounge client is a follow-up");
+            while let Some(event) = dial_rx.recv().await {
+                on_dial(event);
             }
         });
     }

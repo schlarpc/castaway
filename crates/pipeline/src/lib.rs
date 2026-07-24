@@ -46,6 +46,8 @@ pub use null::NullPipeline;
 
 #[cfg(feature = "render")]
 pub use attract::{AttractRow, AttractScene};
+#[cfg(feature = "cef")]
+pub use cef_browser::{BrowserCommand, BrowserHost, Cef, TV_USER_AGENT};
 #[cfg(feature = "render")]
 pub use osd::{OsdController, OsdUpdate};
 #[cfg(feature = "render")]

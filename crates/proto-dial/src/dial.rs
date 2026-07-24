@@ -35,6 +35,31 @@ pub struct LaunchParams {
     pub raw_body: String,
 }
 
+impl LaunchParams {
+    /// The YouTube leanback (TV) URL for this launch. The DIAL launch body is
+    /// `application/x-www-form-urlencoded` and YouTube's receiver contract is to pass
+    /// those fields through as query params on `youtube.com/tv`, so the sender's
+    /// `pairingCode` binds its Lounge session to this screen.
+    #[must_use]
+    pub fn leanback_url(&self) -> String {
+        let body = self.raw_body.trim();
+        if body.is_empty() {
+            "https://www.youtube.com/tv".to_string()
+        } else {
+            format!("https://www.youtube.com/tv?{body}")
+        }
+    }
+}
+
+/// A DIAL app-lifecycle event, sent to the app layer over the service's channel.
+#[derive(Debug, Clone)]
+pub enum DialEvent {
+    /// A sender launched the app (`POST /apps/YouTube`).
+    Launched(LaunchParams),
+    /// A sender stopped the app (`DELETE`); the display surface should be dismissed.
+    Stopped,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppState {
     Stopped,
@@ -45,7 +70,7 @@ struct DialInner {
     state: Mutex<AppState>,
     /// Absolute base URL of the DIAL REST service, e.g. `http://10.0.0.5:8080/dial`.
     base_url: String,
-    launch_tx: mpsc::Sender<LaunchParams>,
+    events: mpsc::Sender<DialEvent>,
     /// Optional overlay sink so this adapter can post its own status ("Launching …").
     osd: OnceLock<OsdSink>,
 }
@@ -57,14 +82,14 @@ pub struct DialService {
 
 impl DialService {
     /// Create the service. `base_url` is the absolute URL this router is mounted at
-    /// (advertised as `Application-URL`); launches are sent on `launch_tx`.
+    /// (advertised as `Application-URL`); launch/stop events are sent on `events`.
     #[must_use]
-    pub fn new(base_url: impl Into<String>, launch_tx: mpsc::Sender<LaunchParams>) -> Self {
+    pub fn new(base_url: impl Into<String>, events: mpsc::Sender<DialEvent>) -> Self {
         Self {
             inner: Arc::new(DialInner {
                 state: Mutex::new(AppState::Stopped),
                 base_url: base_url.into(),
-                launch_tx,
+                events,
                 osd: OnceLock::new(),
             }),
         }
@@ -157,11 +182,11 @@ async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
         osd.banner("Launching YouTube\u{2026}", Duration::from_secs(4));
     }
     let _ = st
-        .launch_tx
-        .send(LaunchParams {
+        .events
+        .send(DialEvent::Launched(LaunchParams {
             pairing_code,
             raw_body: body,
-        })
+        }))
         .await;
     let location = format!(
         "{}/dial/apps/YouTube/run",
@@ -173,6 +198,7 @@ async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
 async fn stop(State(st): State<Arc<DialInner>>) -> Response {
     *st.state.lock().await = AppState::Stopped;
     info!("DIAL stopped YouTube");
+    let _ = st.events.send(DialEvent::Stopped).await;
     StatusCode::OK.into_response()
 }
 
@@ -193,7 +219,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn service() -> (DialService, mpsc::Receiver<LaunchParams>) {
+    fn service() -> (DialService, mpsc::Receiver<DialEvent>) {
         let (tx, rx) = mpsc::channel(4);
         (DialService::new("http://10.0.0.5:8080", tx), rx)
     }
@@ -233,8 +259,41 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert!(resp.headers().get("Location").is_some());
-        let params = rx.recv().await.unwrap();
+        let DialEvent::Launched(params) = rx.recv().await.unwrap() else {
+            panic!("expected a Launched event");
+        };
         assert_eq!(params.pairing_code.as_deref(), Some("abcd1234"));
+        assert_eq!(
+            params.leanback_url(),
+            "https://www.youtube.com/tv?pairingCode=abcd1234&theme=cl"
+        );
+
+        // Stop emits its own event so the app layer can dismiss the surface.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/dial/apps/YouTube/run")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(matches!(rx.recv().await.unwrap(), DialEvent::Stopped));
+
+        // Re-launch so the state check below still sees "running".
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dial/apps/YouTube")
+                    .body(Body::from("pairingCode=abcd1234&theme=cl"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         // State now reports running.
         let resp = app
@@ -270,6 +329,15 @@ mod tests {
             Some(OsdCommand::Show(m)) => assert!(m.text.contains("YouTube")),
             other => panic!("expected an OSD banner, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn leanback_url_with_empty_body_has_no_query() {
+        let params = LaunchParams {
+            pairing_code: None,
+            raw_body: String::new(),
+        };
+        assert_eq!(params.leanback_url(), "https://www.youtube.com/tv");
     }
 
     #[test]

@@ -52,6 +52,13 @@ impl CefFrameSink {
         self.inner.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Take the latest frame, leaving the slot empty — so a per-frame consumer uploads
+    /// each paint exactly once instead of re-uploading a stale frame every tick.
+    #[must_use]
+    pub fn take(&self) -> Option<CefFrame> {
+        self.inner.lock().ok().and_then(|mut g| g.take())
+    }
+
     fn put(&self, frame: CefFrame) {
         if let Ok(mut g) = self.inner.lock() {
             *g = Some(frame);
@@ -451,5 +458,116 @@ impl CefBrowser {
         if let Some(frame) = self.browser.main_frame() {
             frame.load_url(Some(&url.into()));
         }
+    }
+
+    /// Ask CEF to close this browser (force-close: no beforeunload prompt — this is a
+    /// kiosk, not a document editor).
+    pub fn close(&self) {
+        if let Some(host) = self.browser.host() {
+            host.close_browser(1);
+        }
+    }
+}
+
+/// A command sent from the tokio side (e.g. a DIAL launch) to the main-thread browser.
+pub enum BrowserCommand {
+    /// Show the browser fullscreen, navigating to `url` (the offscreen browser is
+    /// created on first use).
+    Navigate(String),
+    /// Close the browser and drop its compositor layer (e.g. DIAL stop).
+    Hide,
+}
+
+/// Owns the initialized [`Cef`] instance and the lazily-created offscreen browser on the
+/// kiosk **main thread** (the thread that called [`Cef::initialize`]). The kiosk calls
+/// [`Self::pump`] once per redraw: it applies queued [`BrowserCommand`]s, runs one CEF
+/// message-loop iteration, and feeds any newly painted frame to the compositor's
+/// `Browser` layer.
+pub struct BrowserHost {
+    cef: Cef,
+    browser: Option<CefBrowser>,
+    sink: CefFrameSink,
+    commands: std::sync::mpsc::Receiver<BrowserCommand>,
+    /// Current kiosk surface size; the browser viewport tracks it.
+    size: (u32, u32),
+}
+
+impl BrowserHost {
+    /// Wrap an initialized [`Cef`]. `commands` is the channel other threads use to
+    /// navigate/hide the browser.
+    #[must_use]
+    pub fn new(cef: Cef, commands: std::sync::mpsc::Receiver<BrowserCommand>) -> Self {
+        Self {
+            cef,
+            browser: None,
+            sink: CefFrameSink::default(),
+            commands,
+            size: (1920, 1080),
+        }
+    }
+
+    /// Track the kiosk surface size so the browser viewport matches.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.size = (width, height);
+        if let Some(browser) = &self.browser {
+            browser.resize(width, height);
+        }
+    }
+
+    /// One per-frame tick (main thread): apply queued commands, pump CEF, upload the
+    /// latest painted frame to `render`'s `Browser` layer.
+    pub fn pump(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        while let Ok(cmd) = self.commands.try_recv() {
+            match cmd {
+                BrowserCommand::Navigate(url) => self.navigate(&url),
+                BrowserCommand::Hide => {
+                    if let Some(browser) = self.browser.take() {
+                        browser.close();
+                    }
+                    let _ = self.sink.take();
+                    render.clear_browser();
+                }
+            }
+        }
+        self.cef.pump();
+        if self.browser.is_some() {
+            if let Some(frame) = self.sink.take() {
+                if let Err(e) = render.upload_browser(frame.width, frame.height, &frame.bgra) {
+                    tracing::warn!(error = %e, "browser frame upload failed");
+                }
+            }
+        }
+    }
+
+    fn navigate(&mut self, url: &str) {
+        match &self.browser {
+            Some(browser) => browser.load_url(url),
+            None => {
+                let (w, h) = self.size;
+                match self.cef.create_offscreen(url, w, h, self.sink.clone()) {
+                    Ok(browser) => self.browser = Some(browser),
+                    Err(e) => tracing::warn!(error = %e, %url, "browser create failed"),
+                }
+            }
+        }
+    }
+
+    /// Close any open browser and shut CEF down. Call on the main thread after the
+    /// kiosk event loop exits.
+    pub fn shutdown(mut self) {
+        if let Some(browser) = self.browser.take() {
+            browser.close();
+            // Give CEF a few pump iterations to tear the browser down first.
+            for _ in 0..30 {
+                self.cef.pump();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let (seen, blocked) = self.cef.adblock_stats();
+        info!(seen, blocked, "adblock totals at shutdown");
+        self.cef.shutdown();
     }
 }

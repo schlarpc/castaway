@@ -7,6 +7,7 @@
 //! composites. Late frames were already dropped at the bounded channel, so the window
 //! always shows the freshest available frame.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
@@ -30,6 +31,12 @@ struct KioskApp {
     osd: Option<OsdController>,
     window: Option<Arc<Window>>,
     render: Option<RenderLoop>,
+    /// External shutdown request (ctrl-c / service failure): checked every loop
+    /// iteration, since a borderless-fullscreen kiosk has no chrome to close.
+    exit: Option<Arc<AtomicBool>>,
+    /// The main-thread CEF host (this loop is CEF's message pump — architecture §6).
+    #[cfg(feature = "cef")]
+    browser: Option<crate::cef_browser::BrowserHost>,
 }
 
 impl ApplicationHandler for KioskApp {
@@ -81,6 +88,10 @@ impl ApplicationHandler for KioskApp {
             }
             self.render = Some(render);
         }
+        #[cfg(feature = "cef")]
+        if let Some(host) = &mut self.browser {
+            host.resize(size.width, size.height);
+        }
         info!(width = size.width, height = size.height, "kiosk window up");
         window.request_redraw();
         self.window = Some(window);
@@ -93,8 +104,18 @@ impl ApplicationHandler for KioskApp {
                 if let Some(r) = &mut self.render {
                     r.resize(size.width, size.height);
                 }
+                #[cfg(feature = "cef")]
+                if let Some(host) = &mut self.browser {
+                    host.resize(size.width, size.height);
+                }
             }
             WindowEvent::RedrawRequested => {
+                // CEF first: its message-loop iteration may paint a fresh frame, which
+                // then lands in this same redraw's present.
+                #[cfg(feature = "cef")]
+                if let (Some(host), Some(r)) = (&mut self.browser, &mut self.render) {
+                    host.pump(r);
+                }
                 if let Some(r) = &mut self.render {
                     r.pump();
                 }
@@ -106,7 +127,16 @@ impl ApplicationHandler for KioskApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .exit
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            info!("kiosk: exit requested, closing");
+            event_loop.exit();
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -114,8 +144,8 @@ impl ApplicationHandler for KioskApp {
 }
 
 /// Run the kiosk to completion (blocks the calling — main — thread). Consumes render
-/// commands from `rx` and displays them fullscreen until the window is closed. `attract`
-/// is the idle scene shown before/between casts.
+/// commands from `rx` and displays them fullscreen until the window is closed or `exit`
+/// is set (ctrl-c). `attract` is the idle scene shown before/between casts.
 ///
 /// # Errors
 /// [`PipelineError`] if the event loop can't be created or run.
@@ -123,19 +153,58 @@ pub fn run(
     rx: Receiver<RenderCommand>,
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
+    exit: Option<Arc<AtomicBool>>,
 ) -> Result<(), PipelineError> {
-    let event_loop =
-        EventLoop::new().map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
-    event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = KioskApp {
         rx: Some(rx),
         attract,
         osd,
         window: None,
         render: None,
+        exit,
+        #[cfg(feature = "cef")]
+        browser: None,
     };
+    run_app(&mut app)
+}
+
+/// [`run`], plus a main-thread CEF [`BrowserHost`](crate::cef_browser::BrowserHost)
+/// pumped every frame (the kiosk loop is CEF's external message pump). Shuts CEF down
+/// after the event loop exits.
+///
+/// # Errors
+/// [`PipelineError`] if the event loop can't be created or run.
+#[cfg(feature = "cef")]
+pub fn run_with_browser(
+    rx: Receiver<RenderCommand>,
+    attract: Option<AttractImage>,
+    osd: Option<OsdController>,
+    exit: Option<Arc<AtomicBool>>,
+    browser: crate::cef_browser::BrowserHost,
+) -> Result<(), PipelineError> {
+    let mut app = KioskApp {
+        rx: Some(rx),
+        attract,
+        osd,
+        window: None,
+        render: None,
+        exit,
+        browser: Some(browser),
+    };
+    let result = run_app(&mut app);
+    // CEF must be shut down on this (main) thread, after the loop stops pumping it.
+    if let Some(host) = app.browser.take() {
+        host.shutdown();
+    }
+    result
+}
+
+fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
+    let event_loop =
+        EventLoop::new().map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
+    event_loop.set_control_flow(ControlFlow::Poll);
     event_loop
-        .run_app(&mut app)
+        .run_app(app)
         .map_err(|e| PipelineError::Surface(format!("event loop: {e}")))?;
     Ok(())
 }
