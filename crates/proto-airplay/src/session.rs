@@ -24,8 +24,10 @@ pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
 pub struct AirPlayResponse {
     /// RTSP status code.
     pub status: u16,
-    /// Extra headers to include.
-    pub headers: Vec<(String, String)>,
+    /// Extra headers to include. The *names* are `&'static str` on purpose: every header
+    /// this state machine emits is one the protocol names at compile time, so the actor
+    /// never has to handle "the session asked for a header name that isn't valid ASCII".
+    pub headers: Vec<(&'static str, String)>,
     /// Body content type, if a body is present.
     pub content_type: Option<String>,
     /// Response body.
@@ -55,8 +57,8 @@ impl AirPlayResponse {
         }
     }
 
-    fn header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_string(), value.to_string()));
+    fn header(mut self, name: &'static str, value: &str) -> Self {
+        self.headers.push((name, value.to_string()));
         self
     }
 }
@@ -166,7 +168,7 @@ mod tests {
         assert!(r
             .headers
             .iter()
-            .any(|(k, v)| k == "Public" && v.contains("SETUP")));
+            .any(|(k, v)| *k == "Public" && v.contains("SETUP")));
     }
 
     #[test]

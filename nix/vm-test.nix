@@ -295,6 +295,89 @@ let
     tls.close()
     print("cast session completed")
   '';
+  # A scripted AirPlay sender: RTSP over a plain TCP socket, bare-path request-URIs and
+  # all. It sends two requests in a single write on purpose — a receiver that framed by
+  # "one read == one message" passes every other test and fails this one.
+  airplaySender = pkgs.writers.writePython3Bin "airplay-send" { flakeIgnore = [ "E501" "W503" ]; } ''
+    import plistlib
+    import socket
+    import sys
+
+    host = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 7000
+
+    sock = socket.create_connection((host, port), timeout=15)
+    sock.settimeout(10)
+    buffered = bytearray()
+
+
+    def request(method, path, cseq, flush=True):
+        """Queue a request; send it unless the caller is batching."""
+        raw = "{} {} RTSP/1.0\r\nCSeq: {}\r\n\r\n".format(method, path, cseq).encode()
+        if flush:
+            sock.sendall(raw)
+        return raw
+
+
+    def response():
+        """Read one response, honoring Content-Length for the body."""
+        while b"\r\n\r\n" not in buffered:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise SystemExit("receiver closed the connection mid-response")
+            buffered.extend(chunk)
+        head, _, rest = bytes(buffered).partition(b"\r\n\r\n")
+        del buffered[:len(head) + 4]
+        lines = head.decode("utf-8", "replace").split("\r\n")
+        status = int(lines[0].split()[1])
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        length = int(headers.get("content-length", "0"))
+        body = bytearray(rest)
+        del buffered[:len(rest)]
+        while len(body) < length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise SystemExit("receiver closed the connection mid-body")
+            body.extend(chunk)
+        # Anything past this message belongs to the next one.
+        buffered[:0] = body[length:]
+        print("<- {} CSeq {}".format(status, headers.get("cseq")))
+        return status, headers, bytes(body[:length])
+
+
+    # Two requests, one write: this is the pipelining a real sender does, and it only
+    # works if the actor drains its buffer by the parser's consumed count.
+    sock.sendall(request("OPTIONS", "*", 1, flush=False) + request("GET", "/info", 2, flush=False))
+
+    status, headers, _ = response()
+    assert status == 200, status
+    assert headers["cseq"] == "1", headers
+    assert "SETUP" in headers.get("public", ""), headers
+
+    status, headers, body = response()
+    assert status == 200, status
+    # Echoing the *right* CSeq per request is what pipelining depends on.
+    assert headers["cseq"] == "2", headers
+    info = plistlib.loads(body)
+    print("info: " + repr(sorted(info)))
+    assert info["name"] == sys.argv[3], info
+
+    # Refused, not faked: pairing isn't implemented, and the receiver must say so rather
+    # than 200 its way into a sender that then waits forever for a media plane.
+    request("POST", "/pair-setup", 3)
+    status, _, _ = response()
+    assert status == 501, status
+
+    request("TEARDOWN", "/stream", 4)
+    status, _, _ = response()
+    assert status == 200, status
+
+    sock.close()
+    print("airplay session completed")
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "castaway-integration";
@@ -317,9 +400,11 @@ pkgs.testers.runNixOSTest {
           # The VM's default route is the NAT interface, so the auto-detect would pick
           # the wrong address; pin discovery to the test LAN.
           interface = config.networking.primaryIPAddress;
-          # Off in the shipped defaults (device auth is still a dev key, Q2/Q11), on
-          # here — the TLS actor is exactly what this test exists to exercise.
+          # Both off in the shipped defaults — Cast's device auth is still a dev key
+          # (Q2/Q11) and AirPlay can't pair (Q1) — and both on here, because their
+          # socket actors are exactly what this test exists to exercise.
           enable.cast = true;
+          enable.airplay = true;
         };
       };
     };
@@ -334,7 +419,7 @@ pkgs.testers.runNixOSTest {
         enable = true;
         openFirewall = false;
       };
-      environment.systemPackages = [ pkgs.curl ssdpSearch dlnaCtl castSender ];
+      environment.systemPackages = [ pkgs.curl ssdpSearch dlnaCtl castSender airplaySender ];
     };
   };
 
@@ -420,6 +505,39 @@ pkgs.testers.runNixOSTest {
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'CASTv2 sender connected'")
         # The CLOSE must land as a session End, not a leaked session holding the screen.
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'CASTv2 sender disconnected'")
+
+    with subtest("an AirPlay sender gets OPTIONS, /info, and an honest 501 for pairing"):
+        receiver.wait_for_open_port(7000)
+        receiver.wait_for_open_port(7011)
+        session = sender.succeed(f"airplay-send {kiosk} 7000 ${friendlyName}")
+        assert "airplay session completed" in session, session
+        # `wait_for_open_port` also produces a connect/disconnect pair, so this next line
+        # alone is weak. The pairing refusal is the one only a real request can log — it
+        # proves the sender's 501 came from the state machine, not from a closed socket.
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay pairing not implemented (Q1) path=/pair-setup'")
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender connected channel=\"mirror\"'")
+        # The connection must be *closed*, not leaked: the actor emits End and logs this
+        # on the way out. It can't be asserted as 'session: end' the way Cast is — the
+        # manager only logs that for the active source, and AirPlay never becomes active
+        # while the media plane is gated on pairing (Q1).
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender disconnected channel=\"mirror\"'")
+
+    with subtest("the RAOP audio port speaks the same RTSP"):
+        # Same state machine, different socket — a sender that finds _raop._tcp and gets
+        # silence is the failure this catches.
+        assert "airplay session completed" in sender.succeed(f"airplay-send {kiosk} 7011 ${friendlyName}")
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender disconnected channel=\"audio\"'")
+
+    with subtest("AirPlay and RAOP are both advertised over mDNS"):
+        airplay = sender.succeed("avahi-browse -rpt _airplay._tcp")
+        assert "${friendlyName}" in airplay, airplay
+        assert ";7000;" in airplay, airplay
+        raop = sender.succeed("avahi-browse -rpt _raop._tcp")
+        # RAOP's instance convention is <deviceid>@<name>, and senders rely on it.
+        # avahi's parsable output escapes the '@' as its octal code, so match that —
+        # written \\064 because a bare \064 is a Python octal escape and means "4".
+        assert "\\064${friendlyName}" in raop, raop
+        assert ";7011;" in raop, raop
 
     with subtest("Cast is advertised over mDNS with the port that answered"):
         txt = sender.succeed("avahi-browse -rpt _googlecast._tcp")

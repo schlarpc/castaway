@@ -2,34 +2,51 @@
 
 Snapshot for our next sync. Companion to DECISION-LOG.md (why) and OPEN-QUESTIONS.md
 (what needs you). Everything below builds with `cargo build`, passes `cargo test`
-(~130 tests), passes `cargo clippy --all-targets -- -D warnings`, and `nix build`
-produces a running binary.
+(~150 tests), passes `cargo clippy --all-targets -- -D warnings`, `nix build` produces a
+running binary, and `nix build .#checks.x86_64-linux.integration-vm` passes the two-VM
+integration test.
 
-## What exists (15 crates, workspace per architecture-substrate.md §2)
+## What exists (16 crates, workspace per architecture-substrate.md §2)
 
 | Crate | State |
 |---|---|
 | `core` | Done. Traits (`SourceAdapter`, `Pipeline`, `DisplayControl`, `MiracastBackend`), `SessionEvent`/`FrameSource`, newtypes, last-writer-wins `SessionManager`. |
 | `substrate-ssdp` | Done. Pure M-SEARCH/NOTIFY layer + UDP 1900 `Responder`. |
 | `substrate-mdns` | Done. `mdns-sd` wrapper, validated `MdnsService`. |
-| `substrate-rtsp` | Done. `rtsp-types` framing + CSeq + `ByteTransform` slot. |
+| `substrate-rtsp` | Done. `rtsp-types` framing + CSeq + `ByteTransform` slot + AirPlay's bare-path request-URIs. |
 | `substrate-rtp` | Done. RFC 3550 parse + gap-skipping reorder buffer. |
 | `crypto-cast-auth` | Done. RSA device-auth signer (SHA1/256, PKCS1v15). |
 | `crypto-fairplay` | Boundary stub. fp-setup typestate; key derivation = `NotImplemented` (Q1). |
 | `proto-dlna` | **Live.** AVTransport/RenderingControl/ConnectionManager SOAP; cast-a-video works. |
-| `proto-cast` | Core done. Framing, JSON, device-auth, media LOAD, mirroring negotiation + AES-CTR. TLS actor pending (Q15). |
+| `proto-cast` | **Live.** Framing, JSON, device-auth, media LOAD, mirroring negotiation + AES-CTR, and a TLS actor on 8009 driven end-to-end in the VM test. Dev device key (Q2/Q11); mirroring RTP receive loop pending (Q12). |
 | `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
-| `proto-airplay` | Control plane done. Ads + `/info` + RTSP dispatch. Media gated on FairPlay/pairing (Q1). RTSP actor pending (Q15). |
+| `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
 | `proto-dial` | **Live launch** + pure Lounge bind-channel parser/mapping. Lounge HTTP client pending. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. |
 
-## Verified working end-to-end (curl against `cargo run`)
-- DLNA description + SOAP (`GetTransportInfo` → `NO_MEDIA_PRESENT`).
-- Spotify `getInfo` (returns DH public key), advertised on mDNS.
-- DIAL `dd.xml` with correct `Application-URL` header; launch flips state to running.
+## Verified working end-to-end (tier-2 VM test, no human in the loop)
+`nix build .#checks.x86_64-linux.integration-vm` boots the receiver from the real NixOS
+module in one VM and drives it from a *second* VM over a real LAN with scripted senders —
+so the deploy path and the tested path are the same path, and discovery is real rather
+than hidden by loopback. Each of these asserts the sender's view **and** greps the
+receiver's journal, so the event is proven to cross adapter → session manager → pipeline:
+
+- **SSDP**: M-SEARCH answered; every advertised `LOCATION` is fetched from the other host.
+- **DIAL**: `dd.xml` `Application-URL`; launch → `201` + `Location`, state flips
+  stopped → running → stopped on `DELETE`.
+- **DLNA**: `SetAVTransportURI`/`Play`/`Pause`/`Stop` walk
+  `NO_MEDIA_PRESENT → PLAYING → PAUSED_PLAYBACK → STOPPED`.
+- **Cast**: a hand-rolled CASTv2 sender does TLS → CONNECT → PING → GET_STATUS → LAUNCH
+  `CC1AD845` → LOAD → PAUSE → CLOSE; the LOAD reaches the pipeline and the CLOSE ends the
+  session.
+- **AirPlay**: pipelined `OPTIONS` + `GET /info` in one write (bare-path URIs), the `/info`
+  binary plist parses, pairing answers `501` rather than faking success, `TEARDOWN` ends
+  the session — on both 7000 and 7011.
+- **mDNS**: `_spotify-connect._tcp`, `_googlecast._tcp`, `_airplay._tcp`, and `_raop._tcp`
+  are all browsable from the sender with the ports that actually answered.
 
 ## Render path — actual pixel output (GPU-verified)
 Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix develop`).
@@ -44,7 +61,8 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
   fullscreen window; cast a video via DLNA to see it decode+display).
 
 ## Biggest open items (see OPEN-QUESTIONS.md)
-1. **Q15** — Cast TLS actor + AirPlay RTSP actor (the "make it connect" work; pure cores ready).
+1. ~~**Q15** — Cast TLS actor + AirPlay RTSP actor.~~ **Done**: both listen, both are
+   driven end-to-end by the VM test. What's left behind them is the media plane, below.
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
 3. **Q16** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.
 4. **Q2/Q11** — real Cast device cert for Chrome to accept auth.

@@ -216,3 +216,53 @@ scene back, ctrl-c → clean exit). Shape of the merge:
 - Found+fixed on the way: the compositor requested `Limits::downlevel_defaults()` (2048 max
   texture), which can't even configure a 4K surface — the Dell panel is 3840×2160 and would have
   crashed on first boot. Now `.using_resolution(adapter.limits())`.
+
+### D25 — Tier-2 VM harness: two nodes, and the module under test is the deploy module
+Ground rule 6's integration tier existed only as a docs promise; the "verified" claims in
+STATUS.md were hand-run `curl`s. `nix/vm-test.nix` (`checks.integration-vm`) now boots the
+receiver from `nixosModules.castaway` — the same module a deploy uses, so the tested path
+and the deploy path can't drift — and drives it from a **second** VM. Two nodes is the
+whole point: discovery is what breaks in the field, and loopback hides all of it. Bind to
+the wrong interface or advertise `127.0.0.1` and this fails, where a localhost curl passes.
+
+Scripted senders (SSDP control point, DLNA control point, CASTv2 sender, AirPlay sender)
+are hand-written Python rather than generated from our own definitions. For Cast that's
+deliberate: encoding `CastMessage` by hand is a *second, independent* reading of the wire
+format, where generating from the same `.proto` the receiver uses would make the test agree
+with the implementation by construction — exactly the agreement not worth assuming.
+
+Every protocol assertion is doubled: the sender's own view, plus a `journalctl` grep on the
+receiver proving the event crossed adapter → session manager → pipeline. A SOAP 200 only
+says the state machine answered; `null pipeline: PLAY` says the stack carried it.
+
+Two field lessons are baked in. Multicast egress needs pinning (`IP_MULTICAST_IF` + bind):
+`239.255.255.250` matches no route, so an unbound socket in a two-NIC VM sends M-SEARCH out
+QEMU's NAT and the receiver never sees it. And the sender node disables its firewall —
+SSDP replies are unicast from `:1900` to an ephemeral port, which conntrack can't associate
+with a datagram sent to the multicast group, so the default firewall drops every reply and
+the test fails for entirely the wrong reason.
+
+### D26 — Socket actors: the adapter advertises itself; the app supplies only the hostname
+Q15's Cast TLS actor and AirPlay RTSP actor are the first adapters that own real listeners,
+which forced the question of who decides what gets advertised. Answer: the adapter.
+`Advertisement::MdnsService` gained a required `instance` field, and the actor fills it from
+the port it will actually bind — so a TXT record can't advertise a port nothing answers, and
+per-protocol naming conventions (RAOP's `<deviceid>@<name>`) live with the protocol that
+requires them instead of as a special case in `app`'s wiring. The app contributes exactly one
+thing: `MDNS_HOST`, the box's single name.
+
+Both actors are the same shape, per ground rule 3: accept → one pure session per connection →
+read, hand bytes to the session, write what it says. `SessionSink::with_instance` retags per
+connection so two senders are two sources rather than one interleaved mess. Neither actor
+makes a protocol decision.
+
+Where they differ is the crypto seam. Cast keeps its TLS certificate DER because device-auth
+signs over it — self-signed is *correct* there, not a shortcut, since CASTv2 authenticates
+the device and senders never build a chain. AirPlay carries a `Box<dyn ByteTransform>` that
+is `Identity` today; the encrypted control channel only starts after pair-verify, so landing
+Q1 is a swap of that transform rather than a rewrite of the loop.
+
+Both stay OFF by default, but D16's reason has narrowed: the listeners answer now. What's
+still missing is a real Cast device key (Q2/Q11) and AirPlay pairing (Q1) — so AirPlay
+answers `501` at the pairing gate rather than faking a 200 and leaving a sender waiting
+forever for a media plane that can't start.

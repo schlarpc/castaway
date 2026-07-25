@@ -24,6 +24,7 @@ use castaway_core::{
 };
 use control_display::NullDisplay;
 use crypto_cast_auth::CastDeviceSigner;
+use proto_airplay::AirPlayReceiver;
 use proto_cast::{CastReceiver, TlsIdentity};
 use proto_dial::DialService;
 use proto_dlna::DlnaService;
@@ -286,13 +287,19 @@ async fn serve(
     // Cast is the first protocol whose adapter owns a real listener, so it advertises
     // itself: what goes in the TXT record comes from the same object that answers the
     // port, and the two can't drift.
-    let cast_handle = if config.enable.cast {
-        Some(spawn_cast(&config, &mut mdns, event_tx.clone(), shutdown.clone()).await?)
-    } else {
-        None
-    };
-
-    advertise_socket_protocols(&config, &mut mdns);
+    let mut adapter_handles = Vec::new();
+    if config.enable.cast {
+        adapter_handles
+            .push(spawn_cast(&config, &mut mdns, event_tx.clone(), shutdown.clone()).await?);
+    }
+    if config.enable.airplay {
+        adapter_handles.push(spawn_airplay(
+            &config,
+            &mut mdns,
+            event_tx.clone(),
+            shutdown.clone(),
+        ));
+    }
 
     // SSDP responder.
     let ssdp_handle = {
@@ -339,7 +346,7 @@ async fn serve(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let _ = ssdp_handle.await;
         let _ = http_handle.await;
-        if let Some(handle) = cast_handle {
+        for handle in adapter_handles {
             let _ = handle.await;
         }
     })
@@ -426,22 +433,41 @@ fn advertise_adapter(adapter: &dyn SourceAdapter, mdns: &mut MdnsResponder) {
     }
 }
 
-/// mDNS-advertise AirPlay if enabled. Its RTSP actor isn't wired yet, so it stays off
-/// by default.
-fn advertise_socket_protocols(config: &Config, mdns: &mut MdnsResponder) {
-    if config.enable.airplay {
-        let ident = proto_airplay::AirPlayIdentity {
-            name: config.friendly_name.clone(),
-            device_id: derive_mac(&config.uuid),
-            host: MDNS_HOST.to_string(),
-        };
-        for svc in [ident.airplay_service(), ident.raop_service()] {
-            if let Err(e) = mdns.advertise(&svc) {
-                warn!(error = %e, "failed to advertise AirPlay/RAOP");
+/// Stand up the AirPlay/RAOP RTSP listeners, advertise what they ask for, and run them
+/// until `shutdown`. Returns the actor's join handle so shutdown can wait on it.
+fn spawn_airplay(
+    config: &Config,
+    mdns: &mut MdnsResponder,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+) -> tokio::task::JoinHandle<()> {
+    let receiver = AirPlayReceiver::new(proto_airplay::AirPlayIdentity {
+        name: config.friendly_name.clone(),
+        device_id: derive_mac(&config.uuid),
+        host: MDNS_HOST.to_string(),
+    });
+
+    advertise_adapter(&receiver, mdns);
+    info!("enabled: AirPlay (RTSP control on 7000/7011)");
+    // Say this once, plainly: the control plane answers, the media plane can't start.
+    // A sender will find us, connect, and stall at pairing rather than mirror.
+    warn!(
+        "AirPlay control is live, but pairing and FairPlay-SAP are not implemented — \
+           mirroring will not start (Q1)"
+    );
+
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "listener"), event_tx);
+    let adapter = Arc::new(receiver);
+    tokio::spawn(async move {
+        tokio::select! {
+            res = adapter.run(sink) => {
+                if let Err(e) = res {
+                    warn!(error = %e, "AirPlay adapter exited");
+                }
             }
+            () = shutdown.notified() => info!("AirPlay listeners stopping"),
         }
-        warn!("AirPlay advertised, but the RTSP actor + FairPlay are not wired yet (Q1)");
-    }
+    })
 }
 
 fn spotify_device_id(config: &Config) -> String {

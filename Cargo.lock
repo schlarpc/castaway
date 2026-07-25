@@ -2790,12 +2790,14 @@ dependencies = [
 name = "proto-airplay"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "castaway-core",
  "crypto-fairplay",
  "plist",
  "substrate-mdns",
  "substrate-rtsp",
  "thiserror 2.0.19",
+ "tokio",
  "tracing",
 ]
 

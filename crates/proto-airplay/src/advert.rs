@@ -15,6 +15,7 @@ pub const AIRPLAY_SERVICE: &str = "_airplay._tcp";
 pub const RAOP_SERVICE: &str = "_raop._tcp";
 
 /// Identity used to build the AirPlay/RAOP advertisements.
+#[derive(Debug, Clone)]
 pub struct AirPlayIdentity {
     /// Friendly name shown in the AirPlay picker.
     pub name: String,

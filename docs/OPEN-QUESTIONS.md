@@ -81,12 +81,13 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   (header/id/category/opcode/len/data/XOR-checksum) but the opcode bytes (power, input
   select) are placeholders. Confirm against Dell's C6522QT *RS232 External Control
   Application* manual before trusting on hardware.
-- **Q15 — Cast TLS actor + AirPlay RTSP actor.** The pure cores (`proto-cast::CastSession`,
-  `proto-airplay::AirPlaySession`) are done and tested, but the socket actors that own the
-  connection (CASTv2 needs a TLS server with a self-signed cert the device-auth signs over;
-  AirPlay needs the RTSP TCP server + the post-pairing ChaCha20 `ByteTransform`) aren't
-  written. Until they are, `app` keeps Cast/AirPlay mDNS ads OFF by default (D16). These
-  actors are the main remaining "make it connect" work for those two protocols.
+- **Q15 — Cast TLS actor + AirPlay RTSP actor. RESOLVED.** Both socket actors are written
+  and driven end-to-end by the tier-2 VM test: CASTv2 over TLS on 8009 with a self-signed
+  cert the device-auth signs over, and AirPlay RTSP on 7000/7011. The post-pairing ChaCha20
+  transform is still `Identity` — the `ByteTransform` seam is there, but there is nothing
+  to key it with until Q1 lands. Both protocols stay OFF by default, now for a narrower
+  reason than D16 gave: the *listeners* answer, but Cast's device key is a dev key
+  (Q2/Q11) and AirPlay can't pair (Q1), so a sender that finds either still can't play.
 - **Q16 — Real pipeline behind features.** `NullPipeline` proves the stack; the ffmpeg
   decode + wgpu compositor + winit kiosk surface (and CEF) are declared feature flags with
   trait surfaces (`Compositor`, `BrowserSurface`) but no backend impls yet. Wiring these is

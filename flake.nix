@@ -438,11 +438,15 @@
                 # The shared HTTP host (dd.xml fetches, DIAL launch, SOAP, Spotify),
                 # plus a socket protocol's own listener when it's switched on.
                 allowedTCPPorts = [ cfg.httpPort ]
-                  ++ lib.optional (cfg.settings.enable.cast or false) 8009;
+                  ++ lib.optional (cfg.settings.enable.cast or false) 8009
+                  # AirPlay control (7000) and RAOP audio (7011). The mirroring media
+                  # plane needs UDP ports too, but it can't start until pairing and
+                  # FairPlay land (Q1) — no point opening what nothing listens on.
+                  ++ lib.optionals (cfg.settings.enable.airplay or false) [ 7000 7011 ];
                 allowedUDPPorts = [
                   # SSDP: DIAL/DLNA senders discover us via M-SEARCH on 1900.
                   1900
-                  # mDNS: Spotify Connect (and later Cast/AirPlay) advertisements.
+                  # mDNS: Spotify Connect, Cast, and AirPlay/RAOP advertisements.
                   5353
                 ];
               };
