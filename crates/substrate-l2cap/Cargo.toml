@@ -1,0 +1,19 @@
+[package]
+name = "substrate-l2cap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "BR/EDR L2CAP basic mode: PDU framing, signaling, and a sans-I/O channel multiplexer. The layer Windows exposes no user-mode access to."
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+
+[lints]
+workspace = true
