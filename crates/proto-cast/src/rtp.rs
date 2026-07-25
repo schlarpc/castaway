@@ -520,6 +520,19 @@ pub struct EncryptedFrame {
     pub payload: Bytes,
 }
 
+/// Whether a packet added anything to a frame.
+///
+/// Retransmission means the same packet can arrive twice, so a duplicate is ordinary
+/// traffic and not a [`CollectError`] — but the caller still needs to tell the two
+/// apart, because only a new packet can be what completes a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accepted {
+    /// The packet filled a hole.
+    New,
+    /// We already had this packet.
+    Duplicate,
+}
+
 /// Accumulates the packets of a single frame.
 ///
 /// A frame arrives split across packets that may be reordered, duplicated, or lost.
@@ -558,16 +571,21 @@ impl FrameCollector {
         self.chunks.is_some() && self.missing == 0
     }
 
-    /// Add a packet.
+    /// The frame's metadata, once packet 0 has arrived.
     ///
-    /// Returns `true` if the packet was accepted or was a harmless duplicate, `false`
-    /// if it contradicted what earlier packets said about this frame. Duplicates are
-    /// expected — they are what retransmission produces — so they are not an error.
+    /// Lets a caller decide whether a frame is worth delivering — is it independent,
+    /// does it change the playout delay — without consuming the collector.
+    #[must_use]
+    pub const fn header(&self) -> Option<&FrameHeader> {
+        self.header.as_ref()
+    }
+
+    /// Add a packet.
     ///
     /// # Errors
     /// [`CollectError`] if the packet belongs to a different frame, or if its packet
     /// count disagrees with the count already established for this frame.
-    pub fn collect(&mut self, packet: &CastRtpPacket) -> Result<(), CollectError> {
+    pub fn collect(&mut self, packet: &CastRtpPacket) -> Result<Accepted, CollectError> {
         if packet.frame_id != self.frame_id {
             return Err(CollectError::WrongFrame {
                 want: self.frame_id,
@@ -604,7 +622,7 @@ impl FrameCollector {
             });
         };
         if chunk.is_some() {
-            return Ok(()); // A retransmission we already have.
+            return Ok(Accepted::Duplicate);
         }
         *chunk = Some(packet.payload.clone());
         self.missing -= 1;
@@ -625,7 +643,7 @@ impl FrameCollector {
             });
         }
 
-        Ok(())
+        Ok(Accepted::New)
     }
 
     /// The NACKs describing what is still missing.

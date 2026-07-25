@@ -18,6 +18,7 @@ pub mod framing;
 pub mod messages;
 pub mod mirror;
 pub mod proto;
+pub mod receiver;
 pub mod rtcp;
 pub mod rtp;
 pub mod session;
@@ -28,6 +29,7 @@ pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
 pub use mirror::{Codec, MirrorConfig, StreamConfig};
 pub use proto::CastMessage;
+pub use receiver::{CastRtpReceiver, Consume, Delivered, Received};
 pub use rtcp::{BuildReport, Feedback};
 pub use rtp::{
     CastRtpPacket, CastRtpStream, EncryptedFrame, FrameCollector, FrameId, NackTarget, PacketId,
