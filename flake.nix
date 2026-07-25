@@ -38,6 +38,19 @@
       url = "file+https://cef-builds.spotifycdn.com/cef_binary_147.0.10%2Bgd58e84d%2Bchromium-147.0.7727.118_windows64_minimal.tar.bz2";
       flake = false;
     };
+
+    # Chromium's Open Screen Protocol library — the reference implementation of Cast
+    # Streaming, and the only authoritative description of its RTP framing and crypto.
+    #
+    # A *test* dependency, never a runtime one (ground rule 9). The
+    # `openscreen-rtp-fixtures` check compiles nine of its translation units to
+    # regenerate the golden RTP stream in `crates/proto-cast/tests/fixtures/rtp-stream/`,
+    # which is what proves our receiver agrees with real senders instead of only with
+    # itself. Nothing here is linked into the binary.
+    openscreen-src = {
+      url = "git+https://chromium.googlesource.com/openscreen?rev=b13215d275c0c1661cf3d7c19f55ad7f59020938";
+      flake = false;
+    };
   };
 
   outputs =
@@ -49,6 +62,7 @@
     , nix-direnv
     , ffmpeg-windows-src
     , cef-windows-src
+    , openscreen-src
     , ...
     }:
     let
@@ -200,6 +214,14 @@
           coverage = craneLib.cargoLlvmCov (commonArgs // {
             inherit cargoArtifacts;
           });
+
+          # Prove the checked-in Cast RTP fixtures still match what openscreen's own
+          # packetizer emits. `tests/openscreen_stream.rs` tests our receiver against
+          # those bytes; this is what keeps the bytes honest.
+          openscreen-rtp-fixtures = import ./nix/openscreen-fixtures.nix {
+            inherit pkgs;
+            openscreenSrc = openscreen-src;
+          };
         }
         # Tier-2: whole adapters driven by scripted senders from a second VM over a real
         # LAN (ground rule 6). Linux-only — nixosTest needs KVM and a NixOS guest.

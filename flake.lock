@@ -98,6 +98,23 @@
         "type": "github"
       }
     },
+    "openscreen-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784241895,
+        "narHash": "sha256-I+e6hCrJCfuEdmPbhuQlak011vS8GHoKyq1plN4R8Bo=",
+        "ref": "refs/heads/main",
+        "rev": "b13215d275c0c1661cf3d7c19f55ad7f59020938",
+        "revCount": 1574,
+        "type": "git",
+        "url": "https://chromium.googlesource.com/openscreen"
+      },
+      "original": {
+        "rev": "b13215d275c0c1661cf3d7c19f55ad7f59020938",
+        "type": "git",
+        "url": "https://chromium.googlesource.com/openscreen"
+      }
+    },
     "root": {
       "inputs": {
         "cef-windows-src": "cef-windows-src",
@@ -105,6 +122,7 @@
         "ffmpeg-windows-src": "ffmpeg-windows-src",
         "nix-direnv": "nix-direnv",
         "nixpkgs": "nixpkgs",
+        "openscreen-src": "openscreen-src",
         "rust-overlay": "rust-overlay",
         "systems": "systems"
       }
