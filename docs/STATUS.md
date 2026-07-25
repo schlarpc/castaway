@@ -71,7 +71,8 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
 3. ~~**Q16** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.~~ **Mostly
    done**: all three `FrameSource` variants reach composited pixels in readback tests.
-   What's left is hardware — the kiosk surface on the real panel, and hwaccel decode.
+   What's left is hardware — the kiosk surface on the real panel, and hwaccel decode (Q20,
+   now scoped: a zero-copy surface-import project, not a "turn on VAAPI" one).
 4. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
 5. ~~**Q12/Q13** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
    receive path is differential-tested against openscreen's `RtpPacketizer` +
