@@ -2809,11 +2809,13 @@ dependencies = [
 name = "proto-bluetooth-audio"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "castaway-core",
  "hex-literal",
  "substrate-rtp",
  "thiserror 2.0.19",
+ "tokio",
  "tracing",
 ]
 

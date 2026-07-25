@@ -398,6 +398,15 @@ Alongside it, two additions the existing enums can't express:
 
 ### 11.6 Audio output
 
+**Image decode for cover art:** JPEG is effectively the only format on this path. BIP fixes
+the *linked thumbnail* (`x-bt/img-thumb`) at 200×200 JPEG with no descriptor to negotiate,
+which is why we fetch that rather than `x-bt/img-img` — the full-image form requires
+describing the exact encoding and dimensions wanted, and responders disagree. General decode
+still costs nothing, because ffmpeg is already linked for audio and brings `mjpeg`/`png`/
+`gif`/`bmp` with it; no `image` crate is needed. `ImageFormat` stays a closed set parsed at
+the boundary, and anything outside it is refused rather than handed to a decoder that can't
+read it — a text-only card beats a decoder failure three layers down.
+
 The pipeline is video-only today. A2DP needs decoded PCM to reach a speaker, so `pipeline`
 grows an audio sink (`cpal`, cross-platform) alongside the compositor, plus libav decoders
 for SBC/AAC/aptX/aptX HD. **LDAC is the one codec libav lacks** — AOSP's `libldac` is
