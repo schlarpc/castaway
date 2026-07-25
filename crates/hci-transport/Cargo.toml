@@ -1,0 +1,38 @@
+[package]
+name = "hci-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "HciTransport backends (USB/WinUSB, Linux HCI_CHANNEL_USER) and the ControllerInit registry that loads vendor firmware."
+build = "build.rs"
+
+[dependencies]
+substrate-hci.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+# Pure-Rust USB, so the transport needs no libusb and no unsafe. Same code drives a
+# dongle on Linux and a WinUSB-bound one on Windows.
+nusb = { version = "0.1", optional = true }
+futures = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+
+[features]
+default = ["usb"]
+# The USB backend. Works on both platforms; the only one Windows can use.
+usb = ["dep:nusb", "dep:futures"]
+# The Linux raw-HCI socket. A convenience for working on the layers above: it hands over
+# a controller the kernel has *already* initialised, so it cannot exercise ControllerInit.
+socket = ["dep:libc"]
+
+[lints]
+workspace = true
