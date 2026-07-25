@@ -193,6 +193,17 @@
           # for `ffmpeg-sys-next` (7.x, matching the crate — nixpkgs defaults to 8.x) and
           # libclang, which its bindgen dlopens. `ash` and `wgpu-hal` need nothing at build
           # time; Vulkan is loaded at runtime, which is why this check stops at compiling.
+          # The audio path: libav decoders for the A2DP codecs plus a real PCM device.
+          # Kept as its own check because it is the one feature whose absence is
+          # *silent* — a receiver with no decoder pairs, streams, and plays nothing.
+          audioArgs = {
+            cargoExtraArgs = "--package castaway --features audio-out";
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.ffmpeg_7 pkgs.alsa-lib ];
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+          };
+
           hwaccelArgs = {
             cargoExtraArgs = "--package castaway --features hwaccel";
             nativeBuildInputs = [ pkgs.pkg-config ];
@@ -248,6 +259,21 @@
           # backend rotting behind its feature flag — raw libav and `wgpu-hal` are exactly
           # the kind of unsafe FFI that stops compiling when a dependency moves, and the
           # default build never touches it. Running the real thing needs the dev box's GPU.
+          # The audio path must keep compiling *and* keep passing its round-trip tests:
+          # this is the one feature whose failure is silent, since a receiver with no
+          # decoder still pairs and still streams — it just plays nothing. The decode
+          # tests assert on the decoded audio's level, so a path that produces silence
+          # fails here rather than in the room.
+          audio = craneLib.cargoNextest (commonArgs // {
+            cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+              pname = "castaway-audio-deps";
+              inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+              cargoExtraArgs = audioArgs.cargoExtraArgs;
+            });
+            inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+            cargoExtraArgs = "--package pipeline --features audio";
+          });
+
           hwaccel-clippy = craneLib.cargoClippy (commonArgs // {
             cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
               pname = "castaway-hwaccel-deps";
@@ -324,6 +350,9 @@
               # ffmpeg dev libs for the `ffmpeg` pipeline feature. Pin to 7.x to match
               # `ffmpeg-next`/`ffmpeg-sys-next` 7.1 (nixpkgs default is 8.x).
               pkgs.ffmpeg_7
+              # ALSA dev libs for `cpal`, the PCM output behind the `audio-out` feature.
+              # Linux-only: the Windows build reaches WASAPI through the OS.
+              pkgs.alsa-lib
               # Runtime libs for the `render`/`kiosk` pipeline features (wgpu + winit).
               pkgs.vulkan-loader
               pkgs.wayland

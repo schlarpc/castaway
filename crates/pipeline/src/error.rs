@@ -18,6 +18,10 @@ pub enum PipelineError {
     #[error("decode error: {0}")]
     Decode(String),
 
+    /// Audio decode or output failed.
+    #[error("audio: {0}")]
+    Audio(String),
+
     /// A frame's dimensions or format weren't usable.
     #[error("invalid frame: {0}")]
     InvalidFrame(&'static str),

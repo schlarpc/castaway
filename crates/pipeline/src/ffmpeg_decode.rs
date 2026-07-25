@@ -180,7 +180,7 @@ impl HwAttempt {
     /// on the CPU, and the render thread has no way to tell the decoder it is dropping
     /// everything it sends.
     fn new(preference: HwPreference) -> Self {
-        let mut policy = FallbackPolicy::new(preference);
+        let policy = FallbackPolicy::new(preference);
         #[cfg(feature = "render")]
         if policy.wants_hardware() {
             use crate::hwaccel::{import_capability, SurfaceImport};

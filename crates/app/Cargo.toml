@@ -44,6 +44,14 @@ render = ["pipeline/kiosk", "pipeline/ffmpeg"]
 # are *used* is a runtime decision, so this is safe to leave on: a box with no GPU decode
 # still plays, on the CPU, with a log line saying so.
 hwaccel = ["render", "pipeline/hwaccel"]
+# A2DP audio decode (libav) with no output device — what CI builds, since a headless
+# box has no sound card and the null sink still proves the whole path ran.
+audio = ["pipeline/audio"]
+# …and the real PCM device (ALSA / WASAPI). What the kiosk ships with.
+audio-out = ["audio", "pipeline/audio-out"]
+# LDAC decode. Off by default: advertising a codec we cannot decode makes the session
+# silence rather than a clean fallback to one we can (OPEN-QUESTIONS Q22).
+ldac = ["audio", "pipeline/ldac"]
 # CEF offscreen browser in the kiosk (YouTube leanback via DIAL launch). Implies `render`;
 # needs CEF_PATH from the flake devshell. CEF re-execs this binary for subprocesses, so
 # main() bootstraps it before anything else.

@@ -46,6 +46,8 @@ adblock = { version = "0.13", optional = true, default-features = false, feature
 ] }
 # Blocking HTTP client to fetch+cache EasyList at startup.
 ureq = { version = "2", optional = true }
+# Cross-platform audio output: ALSA on Linux, WASAPI on Windows.
+cpal = { version = "0.15", optional = true }
 
 # --- hwaccel interop (optional; per-platform) ---
 # Version-locked to what `wgpu-hal` 22 itself links, because these types cross the
@@ -82,6 +84,15 @@ default = []
 render = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ab_glyph", "dep:png"]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
+# `audio` = A2DP/audio decode (libav) plus a PCM output device (cpal). Separate from
+# `ffmpeg` because the decoders are useful in tests without pulling in an audio device,
+# and a headless CI box has no sound card.
+audio = ["ffmpeg", "dep:ffmpeg-sys-next"]
+audio-out = ["audio", "dep:cpal"]
+# LDAC has no libav decoder and AOSP's libldac is encoder-only, so this needs the
+# reverse-engineered libldacdec (Q22). Without it the LDAC endpoint must not be
+# advertised at all.
+ldac = ["audio"]
 # `hwaccel` gates whether the hardware decode backends are *compiled*, never whether they
 # are *used* — that is a runtime decision (`HwPreference`), so a build with this on still
 # plays on a box with no GPU decode. Needs both halves: `ffmpeg` produces the surfaces and

@@ -152,15 +152,27 @@ impl Pipeline for RenderPipeline {
         }
     }
 
-    async fn play_audio(&self, _source: FrameSource) -> Result<(), CoreError> {
-        // Deliberately a typed refusal rather than a silent success: this pipeline has
-        // no audio output device yet (there is no PCM sink in the crate at all), so
-        // accepting the session would present as a phone that pairs, streams, and plays
-        // to silence — the worst possible failure to diagnose. The null pipeline still
-        // exercises the whole Bluetooth stack end to end in the meantime.
-        Err(CoreError::Pipeline(
-            "audio output not wired into the render pipeline yet".into(),
-        ))
+    async fn play_audio(&self, source: FrameSource) -> Result<(), CoreError> {
+        #[cfg(feature = "audio")]
+        {
+            let FrameSource::Encoded(rx) = source else {
+                return Err(CoreError::Pipeline(
+                    "an audio session must arrive as encoded frames".into(),
+                ));
+            };
+            crate::audio_session::spawn(rx, crate::audio_session::default_output());
+            Ok(())
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            let _ = source;
+            // A typed refusal rather than a silent success: a build without the `audio`
+            // feature has no decoder at all, and a phone that pairs, streams and plays
+            // to silence is the worst possible thing to diagnose.
+            Err(CoreError::Pipeline(
+                "this build has no audio support; rebuild with the `audio` feature".into(),
+            ))
+        }
     }
 
     async fn now_playing(&self, snapshot: castaway_core::NowPlaying) -> Result<(), CoreError> {

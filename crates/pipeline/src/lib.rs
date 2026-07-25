@@ -13,6 +13,12 @@
 //! `forbid(unsafe_code)`; the null backend uses none, and any real backend's `unsafe`
 //! must carry a `// SAFETY:` note (ground rule 8).
 
+#[cfg(feature = "audio")]
+pub mod audio_decode;
+#[cfg(feature = "audio")]
+pub mod audio_out;
+#[cfg(feature = "audio")]
+pub mod audio_session;
 pub mod browser;
 pub mod color;
 pub mod compositor;
