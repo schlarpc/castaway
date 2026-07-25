@@ -181,3 +181,42 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.
+
+## Bluetooth audio sink
+
+Design settled in architecture-substrate.md §11 (own everything above HCI). These are the
+choices that need you; each has a default I'm building against so nothing is blocked.
+
+- **Q21 — Which dongle, and who loads its firmware.** The Windows `HciTransport` needs a USB
+  Bluetooth dongle bound to WinUSB instead of the Microsoft Bluetooth driver, because
+  Winsock exposes no L2CAP and the inbox sink is SBC-only with no stream access (§11.1).
+  The selection criterion is *not* antenna or spec version — it's **firmware**: most modern
+  controllers ship with no usable ROM image and depend on the OS driver uploading one at
+  probe. On Linux that still happens under `HCI_CHANNEL_USER` (the kernel runs the vendor
+  `hdev->setup()` before handing over), but under WinUSB **nothing** loads it, so the chip's
+  firmware protocol becomes ours to implement.
+  Default: standardise on **RTL8761BU** (TP-Link UB500 and the flood of identical cheap
+  dongles) and write the Realtek uploader ourselves — read ROM version via vendor opcode
+  `0xFC6D`, then chunked download via `0xFC20`. It is ~150 lines, well documented by
+  `btrtl.c`, and doing it ourselves means we use the *same* init path on both platforms
+  instead of depending on kernel behaviour on one and not the other. Buy 2–3 identical units
+  so dev box and kiosk debug as one target. Confirm the dedicated-dongle approach and
+  whether the WinUSB INF gets checked in.
+  Rejected alternatives: CSR8510 (needs no firmware, but BT 4.0 only and the market is
+  saturated with counterfeits), Intel AX200/AX210 (worst firmware flow of the lot).
+- **Q22 — LDAC decoder provenance.** libav has SBC/AAC/aptX/aptX HD decoders; **LDAC has
+  none** and AOSP's `libldac` is encoder-only, so decode means the reverse-engineered
+  `libldacdec` over FFI. Default: feature-gated (`ldac`), on by default in the Nix build,
+  and a build without it drops the LDAC SEP from the table rather than failing — so the
+  phone negotiates aptX HD or AAC instead. Also note aptX is Qualcomm IP and LDAC is Sony's;
+  a clean-room decoder on a hackerspace box is a different posture from shipping a product.
+- **Q23 — Pairing and takeover policy.** Who may connect, and what happens when a second
+  phone tries while the first is streaming? Default: `NoInputNoOutput` Just Works,
+  discoverable whenever no session is active, link keys persisted to the config dir so a
+  repeat guest reconnects silently, and **last-writer-wins takeover** to match the existing
+  `SessionManager`. The alternative — a confirmation prompt on the panel — is nicer socially
+  but needs the touch UI to exist first.
+- **Q24 — Absolute volume ownership.** AVRCP absolute volume lets the phone's volume rocker
+  drive the receiver, or vice versa. Default: we accept `SetAbsoluteVolume` from the phone
+  and mirror it into the pipeline's gain, and we do *not* push volume back on our own except
+  when the panel UI changes it. Tell me if you'd rather the panel be authoritative.

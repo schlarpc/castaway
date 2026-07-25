@@ -255,3 +255,159 @@ Priorities are set by the **actual crowd** (NixOS/Rust/Windows programmers + som
 ## 10. Cross-build (dev Linux → target Windows)
 
 See **`cross-build.md`**. TL;DR: portable ~90% runs native on the Linux dev box; the Windows slice targets **`x86_64-pc-windows-msvc` via `cargo-xwin`** (MSVC needed for CEF's import libs + windows-rs). CEF is the cross-link boss fight — fall back to a **`windows-latest` CI build** for the CEF-heavy binary if cross-linking fights back. Wine can't test Miracast/WinRT/DX12/CEF — the physical C6522QT-connected Windows box is the integration rig.
+
+---
+
+## 11. Bluetooth audio sink — the owned stack
+
+The one castable surface that needs **no LAN, no app, and no ecosystem membership**: any
+phone, including a guest's locked-down one, can pair and play. Audio-only, ~100–200 ms
+latency, so it is a *music + now-playing screen* surface, not a mirroring one. It is also
+the first source that gives us **playback control back toward the sender** and **rich track
+metadata**, which is why it forces a new core interface rather than reusing `SessionEvent`
+as-is (§11.5).
+
+### 11.1 Why we own the stack instead of using the OS
+
+Both OS-provided routes fail the ground rules, in different places:
+
+| | Linux (BlueZ) | Windows (inbox) |
+|---|---|---|
+| Codecs in sink role | all of them — BlueZ delegates codec choice to *our* `MediaEndpoint1` | **SBC only**, 44.1 kHz forced. aptX/LDAC are vendor codecs shipped by IHVs for the *source* role only. |
+| Stream access | yes — `MediaTransport1.Acquire()` hands us an fd of codec payloads | **no** — `AudioPlaybackConnection` is an open/close toggle; decoded PCM goes to the default render endpoint. We'd have to WASAPI-loopback the system mix. |
+| Metadata | `MediaPlayer1` gives Title/Artist/Album/Duration/Status/Position | via GSMTC, coarser |
+| Album art | **no** — `bluetoothd` never surfaces AVRCP attribute 8 and `obexd` has no BIP client | unknown; possibly free if the inbox stack fetches it |
+| Reproducible test | D-Bus daemon in the loop | untestable from Linux CI |
+
+There is also no user-mode L2CAP on Windows at all — Winsock's `AF_BTH` is RFCOMM-only,
+and AVDTP (PSM `0x19`) / AVCTP (PSM `0x17`) are therefore unreachable without a
+kernel-mode profile driver. So "implement the profile ourselves on top of the OS stack" is
+available on Linux and *impossible* on Windows.
+
+**Decision: own everything above HCI.** One portable stack, one set of fixtures, identical
+behaviour on both platforms, every codec, and album art — none of which is reachable any
+other way. The platform seam drops all the way down to *"give me a byte stream of HCI
+packets"*, which is the smallest and most stable seam available (ground rule 5).
+
+Two things make this smaller than it sounds:
+- **BR/EDR pairing crypto lives in the controller.** Secure Simple Pairing does P-192/P-256
+  ECDH and link-key derivation on the chip. Just Works needs no `crypto-*` crate — the host
+  does IO-capability exchange and confirmation only. (Contrast FairPlay, Q1.)
+- **These are small, well-documented binary protocols** in exactly the sans-I/O shape the
+  project already builds (`fn(state, bytes) -> (state, outputs)`), so they are fixture-tested
+  without a radio.
+
+### 11.2 Crate layout
+
+```
+substrate-hci/        HCI packet codec (cmd/event/ACL) + HciTransport trait + backends
+substrate-l2cap/      BR/EDR L2CAP: signaling, basic-mode channels, PSM routing
+substrate-sdp/        SDP data elements, record server, minimal client
+proto-bluetooth-audio/  AVDTP/A2DP + AVCTP/AVRCP + OBEX-BIP cover art
+```
+
+Dependencies flow toward `core` as always; `proto-bluetooth-audio` is the only one that
+knows what a track is. Codec *decode* stays in `pipeline` with the rest of libav — the proto
+crate depacketizes and hands up `EncodedFrame`s, exactly as `proto-cast` does for video.
+
+### 11.3 The platform seam: `HciTransport`
+
+```rust
+/// A byte-pipe to a Bluetooth controller, framed as HCI packets. The whole
+/// platform-specific surface of the Bluetooth stack is this trait.
+#[async_trait::async_trait]
+pub trait HciTransport: Send + Sync {
+    async fn send(&self, packet: HciPacket) -> Result<(), HciError>;
+    async fn recv(&self) -> Result<HciPacket, HciError>;
+}
+```
+
+| Backend | Mechanism |
+|---|---|
+| Linux | `AF_BLUETOOTH` raw socket on `HCI_CHANNEL_USER` — exclusive userspace control of a downed adapter. BlueZ is not in the path. |
+| Windows | `nusb` (pure-Rust USB, WinUSB backend) against a dedicated dongle. HCI-over-USB is a standard class interface (`0xE0/0x01/0x01`): cmd on control transfers, events on interrupt IN, ACL on bulk. |
+
+Windows needs the dongle bound to WinUSB rather than the Microsoft Bluetooth driver — a
+one-time provisioning step on a kiosk we control, and it also means the machine's *internal*
+radio stays available to the OS. Both backends see the same controller-side behaviour, so
+everything above this line is tested once.
+
+### 11.4 Protocol stack
+
+```
+ A2DP sink                     AVRCP CT/TG              cover art
+ (AVDTP, PSM 0x19)             (AVCTP, PSM 0x17)        (OBEX/BIP, PSM from SDP)
+        └──────────────┬────────────────┴────────────────────┘
+                  L2CAP (BR/EDR basic mode)
+                       │
+                  HCI ACL / events
+                       │
+              HciTransport (platform)
+```
+
+- **SDP** advertises us as A2DP Sink + AVRCP Controller/Target, and is *also* used as a
+  client to read the peer's cover-art PSM out of its AVRCP Target record.
+- **AVDTP** negotiates one stream endpoint: DISCOVER → GET_CAPABILITIES → SET_CONFIGURATION
+  → OPEN → START. Our SEP table offers, in preference order: **LDAC, aptX HD, aptX, AAC, SBC**.
+  The sender picks; we decode whatever it picks.
+- **AVRCP** gives metadata (`GetElementAttributes`), playback status and position
+  (`RegisterNotification`), and takes passthrough commands (play/pause/next/previous) plus
+  absolute volume. Both directions matter — see §11.5.
+- **Cover art** is AVRCP 1.6: metadata attribute **8** carries a BIP image handle, fetched by
+  OBEX `GET` (`GetLinkedThumbnail`/`GetImage`) over a *separate* L2CAP channel to the PSM
+  found via SDP. Art arrives asynchronously after the track change, so it is a second event,
+  never part of an atomic track update.
+
+### 11.5 What this forces into `core` (the new interface)
+
+Every existing adapter is one-directional: it emits `SessionEvent`s and never hears back.
+Bluetooth is the first source where the receiver can *drive the sender* — the panel is a
+touch screen, so a user tapping pause on the 65" surface must reach the phone. That is a new
+core surface, not a new `SessionEvent`:
+
+```rust
+/// A handle back into a live session, so the receiver can drive the *sender*.
+/// Adapters that can't do this simply never publish one.
+#[async_trait::async_trait]
+pub trait RemoteControl: Send + Sync {
+    /// Which verbs this peer actually advertised support for.
+    fn capabilities(&self) -> ControlCapabilities;
+    async fn issue(&self, txn: ControlTxn) -> Result<(), CoreError>;
+}
+```
+
+`ControlCapabilities` is populated from the peer's AVRCP supported-features bitmask, so the
+UI cannot offer a button the phone will reject — the illegal state is unrepresentable at the
+point of construction rather than checked at the point of use (ground rule 1).
+
+Alongside it, two additions the existing enums can't express:
+- **`SessionEvent::Audio`** — a live audio-only session. `Play{url}` is wrong (there is no
+  URL) and `Mirror{video, audio}` is wrong (there is no video).
+- **`SessionEvent::NowPlaying`** — track metadata with optional artwork, emitted repeatedly
+  over a session's life. Every protocol here has some version of this (Cast `MediaStatus`,
+  DLNA `AVTransportURIMetaData`, Spotify), so it belongs in `core` rather than in the
+  Bluetooth crate; Bluetooth is just the first adapter rich enough to justify it.
+
+### 11.6 Audio output
+
+The pipeline is video-only today. A2DP needs decoded PCM to reach a speaker, so `pipeline`
+grows an audio sink (`cpal`, cross-platform) alongside the compositor, plus libav decoders
+for SBC/AAC/aptX/aptX HD. **LDAC is the one codec libav lacks** — AOSP's `libldac` is
+encoder-only, so decode uses the reverse-engineered `libldacdec` behind FFI, feature-gated
+so a build without it degrades to refusing the LDAC SEP rather than failing to build.
+
+### 11.7 Testing without a radio
+
+Everything above `HciTransport` is pure, so the tier-1 tests drive the whole stack against a
+scripted controller: a fake transport replays HCI events, and the L2CAP/AVDTP/AVRCP cores are
+asserted on the bytes they emit. Tier-2 puts two of these back-to-back — our sink against a
+scripted *source* over an in-memory L2CAP — so a full pair → discover → configure → stream →
+metadata → cover-art flow runs in CI with no hardware at all.
+
+For byte-level ground truth, **Fuchsia's Bluetooth profile layer is Rust and BSD-3**
+(`src/connectivity/bluetooth/profiles/bt-a2dp`, `bt-avrcp`, `lib/bt-avdtp`) and implements the
+sink role. It is not a dependency — it is pinned as a **differential-test oracle** the way
+`nix/openscreen-fixtures.nix` pins openscreen's packetizer to settle Cast's IV derivation
+(Q13). AVDTP capability records and AVRCP attribute encodings are exactly the bit-packed
+surfaces where a golden encoder beats careful reading (ground rule 9: findings land here,
+the reference impl never ships).
