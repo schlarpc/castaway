@@ -1,0 +1,19 @@
+[package]
+name = "substrate-sdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Service Discovery Protocol: the records we publish, and the client query that finds the peer's cover-art PSM — the field no OS Bluetooth stack surfaces."
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+
+[lints]
+workspace = true

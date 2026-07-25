@@ -3610,6 +3610,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "substrate-sdp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex-literal",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "substrate-ssdp"
 version = "0.1.0"
 dependencies = [
