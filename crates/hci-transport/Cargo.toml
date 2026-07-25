@@ -24,7 +24,12 @@ futures = { workspace = true, optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "probe"
+required-features = ["usb"]
 
 [features]
 default = ["usb"]

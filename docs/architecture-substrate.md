@@ -383,6 +383,35 @@ the device through `nusb`, which is also exactly the path Windows takes. That ma
 unbind route the *primary* one on both platforms and `HCI_CHANNEL_USER` a convenience for
 working on the layers above.
 
+### 11.3a-i First hardware bring-up
+
+`cargo run -p hci-transport --example probe` is the tool: it lists attached controllers,
+names which loader claims each, and says up front whether the firmware images that
+controller needs are actually in the build. Pass a `vendor:product` and it claims the
+device, runs the loader, resets, and reads back the controller's address — which is the
+smallest thing that proves the part is alive and talking rather than merely enumerated.
+
+On Linux the kernel's `btusb` holds the device until told otherwise:
+
+```sh
+ls /sys/bus/usb/drivers/btusb/                          # find the interface, e.g. 3-10:1.0
+echo 3-10:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
+cargo run -p hci-transport --example probe -- 8087:0029
+```
+
+Unbinding is **required** to test firmware loading at all, not merely convenient:
+`HCI_CHANNEL_USER` hands over a controller the kernel has already initialised, so it can
+never exercise the loader. This is also exactly what Windows does, which is why the unbind
+path is primary on both platforms.
+
+**Diffing against the kernel.** `btintel.c` is the specification, and the kernel driving
+the same radio is the oracle — the `nix/openscreen-fixtures.nix` pattern that settled
+Q13's IV derivation. Capture the kernel's own bring-up with `btmon -w intel.btsnoop`
+while re-binding `btusb`, then compare the command sequence against what the probe emits.
+Divergence in *order* matters as much as divergence in content: Intel's secure boot
+rejects out-of-order fragments, and a controller that accepts a partial upload boots an
+image that half-works.
+
 ### 11.3b Firmware blobs
 
 Firmware is embedded at build time rather than read from `/lib/firmware`, because the deploy
@@ -399,14 +428,19 @@ pub enum Firmware {
 }
 ```
 
-Two things to get right before this lands:
-- **Licensing.** `linux-firmware` blobs are redistributable, but each vendor's licence must
-  ship alongside — Intel's `LICENCE.ibt_firmware` permits binary redistribution *provided the
-  licence text is reproduced*. Those files get vendored next to the blobs and surfaced in the
-  binary's `--licenses` output.
+Both of the risks flagged here turned out to be real, and are handled in `flake.nix`:
+- **Licensing.** `linux-firmware` blobs are redistributable *provided the vendor licence
+  travels with them* — Intel's `LICENCE.ibt_firmware` says so explicitly. nixpkgs' install
+  phase **drops** those files, so they are taken from `linux-firmware.src` instead, and the
+  copy is deliberately fatal rather than `|| true`: shipping a blob without its licence is
+  not something we are permitted to do, so it must not be possible to do by accident.
 - **nixpkgs gating.** `pkgs.linux-firmware` carries `unfreeRedistributableFirmware`, which a
-  default `allowUnfree = false` evaluation refuses. The flake needs an explicit
-  `allowUnfreePredicate` for it, or `nix flake check` fails somewhere unrelated-looking.
+  default evaluation refuses. `allowUnfreePredicate` whitelists it by name alongside
+  `msvc-sysroot`, so anything else unfree still fails loudly.
+
+The derivation carves out ~1.2 MB — Intel `ibt-20-1-3` and `ibt-0041-0041`, Realtek
+`rtl8761b*` — rather than pulling in the 1.7 GB whole, which keeps the closure sane and
+makes what we ship auditable.
 
 ### 11.4 Protocol stack
 
