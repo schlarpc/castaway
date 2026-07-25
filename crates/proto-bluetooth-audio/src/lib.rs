@@ -11,13 +11,17 @@
 //! out, and the state machines are driven by the caller.
 #![forbid(unsafe_code)]
 
+pub mod avctp;
 pub mod avdtp;
+pub mod avrcp;
 pub mod codec;
 pub mod error;
 pub mod media;
 pub mod sink;
 
+pub use avctp::{AvcFrame, AvctpMessage, Ctype};
 pub use avdtp::{Message, MessageType, Seid, Signal, StreamEndpoint};
+pub use avrcp::{TrackAttributes, VendorPdu};
 pub use codec::{advertised, ChannelModes, CodecCapability, SampleRates};
 pub use error::AudioError;
 pub use media::Depacketizer;

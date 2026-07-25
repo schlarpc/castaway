@@ -1,0 +1,559 @@
+//! AVRCP: track metadata, playback notifications, transport control, and the cover-art
+//! image handle.
+//!
+//! Role note, because it reads backwards: the *phone* owns the media player, so the phone
+//! is the AVRCP **Target** and we are the **Controller**. We ask it for metadata and send
+//! it play/pause. We are additionally a Target for one thing only — absolute volume — so
+//! the phone's volume rocker reaches us (Q24).
+//!
+//! **Attribute 8 is the point.** It carries a BIP image handle, and fetching that handle
+//! over OBEX is the only route to album art. `bluetoothd` parses this exact response and
+//! never surfaces the field, which is why owning the stack is what makes artwork
+//! reachable (architecture-substrate.md §11.1).
+
+use std::time::Duration;
+
+use bytes::{BufMut, Bytes, BytesMut};
+use castaway_core::{ControlCapabilities, ControlTxn, NowPlaying, PlaybackState};
+
+use crate::avctp::{opcode, AvcFrame, Ctype};
+use crate::error::AudioError;
+
+/// The Bluetooth SIG company id that tags an AVRCP vendor-dependent frame.
+pub const BT_SIG_COMPANY_ID: u32 = 0x0000_1958;
+
+/// AVRCP PDU identifiers.
+pub mod pdu {
+    /// Ask which events the peer supports.
+    pub const GET_CAPABILITIES: u8 = 0x10;
+    /// Read metadata for the current track.
+    pub const GET_ELEMENT_ATTRIBUTES: u8 = 0x20;
+    /// Read length, position and play state.
+    pub const GET_PLAY_STATUS: u8 = 0x30;
+    /// Subscribe to a change notification.
+    pub const REGISTER_NOTIFICATION: u8 = 0x31;
+    /// The phone setting *our* volume.
+    pub const SET_ABSOLUTE_VOLUME: u8 = 0x50;
+}
+
+/// Notification event identifiers.
+pub mod event {
+    /// Play/pause/stop changed.
+    pub const PLAYBACK_STATUS_CHANGED: u8 = 0x01;
+    /// The current track changed.
+    pub const TRACK_CHANGED: u8 = 0x02;
+    /// Playback position moved.
+    pub const PLAYBACK_POS_CHANGED: u8 = 0x05;
+    /// The peer's volume changed.
+    pub const VOLUME_CHANGED: u8 = 0x0D;
+}
+
+/// Media attribute identifiers.
+pub mod attribute {
+    /// Track title.
+    pub const TITLE: u32 = 1;
+    /// Artist.
+    pub const ARTIST: u32 = 2;
+    /// Album.
+    pub const ALBUM: u32 = 3;
+    /// Track number within the album.
+    pub const TRACK_NUMBER: u32 = 4;
+    /// Total tracks on the album.
+    pub const TOTAL_TRACKS: u32 = 5;
+    /// Genre.
+    pub const GENRE: u32 = 6;
+    /// Total playing time in milliseconds.
+    pub const PLAYING_TIME: u32 = 7;
+    /// **The BIP image handle for cover art.** The one field no OS stack surfaces.
+    pub const COVER_ART_HANDLE: u32 = 8;
+
+    /// Every attribute worth asking for, cover art included.
+    pub const ALL: [u32; 8] = [
+        TITLE,
+        ARTIST,
+        ALBUM,
+        TRACK_NUMBER,
+        TOTAL_TRACKS,
+        GENRE,
+        PLAYING_TIME,
+        COVER_ART_HANDLE,
+    ];
+}
+
+/// Passthrough operation ids — the transport keys.
+pub mod operation {
+    /// Play.
+    pub const PLAY: u8 = 0x44;
+    /// Stop.
+    pub const STOP: u8 = 0x45;
+    /// Pause.
+    pub const PAUSE: u8 = 0x46;
+    /// Skip forward.
+    pub const FORWARD: u8 = 0x4B;
+    /// Skip backward.
+    pub const BACKWARD: u8 = 0x4C;
+    /// Volume up.
+    pub const VOLUME_UP: u8 = 0x41;
+    /// Volume down.
+    pub const VOLUME_DOWN: u8 = 0x42;
+    /// Mute.
+    pub const MUTE: u8 = 0x43;
+}
+
+/// Map a control transaction onto its passthrough operation id.
+///
+/// Returns `None` for verbs passthrough cannot express — seek and queue replacement
+/// need the browsing channel, and volume is absolute rather than stepwise. Returning
+/// `None` rather than a nearest-equivalent matters: a "seek" silently delivered as
+/// fast-forward moves the track by an unpredictable amount.
+#[must_use]
+pub const fn operation_for(txn: &ControlTxn) -> Option<u8> {
+    Some(match txn {
+        ControlTxn::Play => operation::PLAY,
+        ControlTxn::Pause => operation::PAUSE,
+        ControlTxn::Stop => operation::STOP,
+        ControlTxn::Next => operation::FORWARD,
+        ControlTxn::Previous => operation::BACKWARD,
+        ControlTxn::Mute(_) => operation::MUTE,
+        ControlTxn::Seek(_) | ControlTxn::Volume(_) | ControlTxn::SetQueue { .. } => return None,
+        // ControlTxn is #[non_exhaustive]. A verb added upstream is *not* silently
+        // mapped to a nearest equivalent — the capability set simply won't offer it,
+        // which is the same answer as for seek and for the same reason.
+        _ => return None,
+    })
+}
+
+/// The capabilities an AVRCP peer supporting basic transport gives us.
+///
+/// Derived from what passthrough can actually express, not from optimism: seek and queue
+/// are excluded because [`operation_for`] cannot encode them, so a UI built from this set
+/// never offers a control that would silently do nothing.
+#[must_use]
+pub fn capabilities_for_passthrough() -> ControlCapabilities {
+    ControlCapabilities::TRANSPORT | ControlCapabilities::STOP | ControlCapabilities::MUTE
+}
+
+/// Whether a passthrough operand marks the key as released rather than pressed.
+const RELEASE_BIT: u8 = 0x80;
+
+/// Build the two AV/C frames a passthrough keypress requires.
+///
+/// **Both are mandatory.** A press with no matching release leaves the peer believing the
+/// key is held down; many phones then auto-repeat, so a single tap on "next" skips
+/// through the whole album. This returns them together so the pair cannot be separated.
+#[must_use]
+pub fn passthrough(operation: u8) -> [AvcFrame; 2] {
+    let frame = |op: u8| {
+        AvcFrame::panel(
+            Ctype::Control,
+            opcode::PASS_THROUGH,
+            Bytes::copy_from_slice(&[op, 0x00]),
+        )
+    };
+    [frame(operation), frame(operation | RELEASE_BIT)]
+}
+
+/// Build a vendor-dependent AVRCP command frame.
+#[must_use]
+pub fn vendor_command(ctype: Ctype, pdu_id: u8, parameters: &[u8]) -> AvcFrame {
+    let mut operands = BytesMut::with_capacity(7 + parameters.len());
+    // Company id is three bytes, big-endian.
+    operands.put_u8(((BT_SIG_COMPANY_ID >> 16) & 0xFF) as u8);
+    operands.put_u8(((BT_SIG_COMPANY_ID >> 8) & 0xFF) as u8);
+    operands.put_u8((BT_SIG_COMPANY_ID & 0xFF) as u8);
+    operands.put_u8(pdu_id);
+    operands.put_u8(0x00); // packet type: single
+    operands.put_u16(u16::try_from(parameters.len()).unwrap_or(u16::MAX));
+    operands.extend_from_slice(parameters);
+    AvcFrame::panel(ctype, opcode::VENDOR_DEPENDENT, operands.freeze())
+}
+
+/// A parsed vendor-dependent AVRCP PDU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorPdu {
+    /// Which PDU.
+    pub pdu_id: u8,
+    /// Its parameters.
+    pub parameters: Bytes,
+}
+
+impl VendorPdu {
+    /// Parse the operands of a vendor-dependent AV/C frame.
+    ///
+    /// # Errors
+    /// [`AudioError::Truncated`] if shorter than the header or than its declared
+    /// parameter length.
+    pub fn parse(operands: &[u8]) -> Result<Self, AudioError> {
+        if operands.len() < 7 {
+            return Err(AudioError::Truncated {
+                what: "avrcp vendor pdu header",
+                need: 7,
+                have: operands.len(),
+            });
+        }
+        let len = usize::from(u16::from_be_bytes([operands[5], operands[6]]));
+        if operands.len() < 7 + len {
+            return Err(AudioError::Truncated {
+                what: "avrcp vendor pdu parameters",
+                need: 7 + len,
+                have: operands.len(),
+            });
+        }
+        Ok(Self {
+            pdu_id: operands[3],
+            parameters: Bytes::copy_from_slice(&operands[7..7 + len]),
+        })
+    }
+}
+
+/// Build a `GetElementAttributes` command for the currently playing track.
+#[must_use]
+pub fn get_element_attributes(attributes: &[u32]) -> AvcFrame {
+    let mut params = BytesMut::with_capacity(9 + attributes.len() * 4);
+    // Identifier 0 = "the track that is playing now". The field is eight bytes.
+    params.put_u64(0);
+    params.put_u8(u8::try_from(attributes.len()).unwrap_or(u8::MAX));
+    for id in attributes {
+        params.put_u32(*id);
+    }
+    vendor_command(Ctype::Status, pdu::GET_ELEMENT_ATTRIBUTES, &params)
+}
+
+/// Build a `RegisterNotification` command.
+#[must_use]
+pub fn register_notification(event_id: u8, interval_secs: u32) -> AvcFrame {
+    let mut params = BytesMut::with_capacity(5);
+    params.put_u8(event_id);
+    params.put_u32(interval_secs);
+    vendor_command(Ctype::Notify, pdu::REGISTER_NOTIFICATION, &params)
+}
+
+/// Build a `GetPlayStatus` command.
+#[must_use]
+pub fn get_play_status() -> AvcFrame {
+    vendor_command(Ctype::Status, pdu::GET_PLAY_STATUS, &[])
+}
+
+/// What a `GetElementAttributes` response told us.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackAttributes {
+    /// The metadata, as a snapshot ready to hand to the session manager.
+    pub now_playing: NowPlaying,
+    /// The BIP image handle from attribute 8, if the peer offered one.
+    ///
+    /// Kept separate from [`NowPlaying`] because it is not renderable — it is a token to
+    /// go fetch with, and the artwork it names arrives seconds later over a different
+    /// L2CAP channel.
+    pub cover_art_handle: Option<String>,
+}
+
+/// Parse a `GetElementAttributes` response.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if an attribute's declared length runs past the buffer.
+pub fn parse_element_attributes(params: &[u8]) -> Result<TrackAttributes, AudioError> {
+    let Some((&count, mut rest)) = params.split_first() else {
+        return Err(AudioError::Truncated {
+            what: "element attributes count",
+            need: 1,
+            have: 0,
+        });
+    };
+    let mut out = TrackAttributes::default();
+    let mut total_tracks = None;
+    let mut track_number = None;
+
+    for _ in 0..count {
+        if rest.len() < 8 {
+            return Err(AudioError::Truncated {
+                what: "element attribute header",
+                need: 8,
+                have: rest.len(),
+            });
+        }
+        let id = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let charset = u16::from_be_bytes([rest[4], rest[5]]);
+        let len = usize::from(u16::from_be_bytes([rest[6], rest[7]]));
+        if rest.len() < 8 + len {
+            return Err(AudioError::Truncated {
+                what: "element attribute value",
+                need: 8 + len,
+                have: rest.len(),
+            });
+        }
+        let raw = &rest[8..8 + len];
+        // Charset 106 is UTF-8 and is what every peer uses in practice, but the field
+        // exists, and a lossy decode beats refusing a track because its title is in
+        // some legacy encoding.
+        let _ = charset;
+        let value = String::from_utf8_lossy(raw).into_owned();
+
+        match id {
+            attribute::TITLE => out.now_playing.title = non_empty(value),
+            attribute::ARTIST => out.now_playing.artist = non_empty(value),
+            attribute::ALBUM => out.now_playing.album = non_empty(value),
+            attribute::GENRE => out.now_playing.genre = non_empty(value),
+            attribute::TRACK_NUMBER => track_number = value.trim().parse::<u32>().ok(),
+            attribute::TOTAL_TRACKS => total_tracks = value.trim().parse::<u32>().ok(),
+            attribute::PLAYING_TIME => {
+                // Milliseconds, as a decimal *string* — every numeric attribute in
+                // AVRCP is text, which is easy to miss and reads as a garbage duration.
+                out.now_playing.duration =
+                    value.trim().parse::<u64>().ok().map(Duration::from_millis);
+            }
+            attribute::COVER_ART_HANDLE => out.cover_art_handle = non_empty(value),
+            _ => {}
+        }
+        rest = &rest[8 + len..];
+    }
+
+    if let Some(n) = track_number {
+        out.now_playing.track = Some((n, total_tracks));
+    }
+    Ok(out)
+}
+
+/// Parse a `GetPlayStatus` response into duration, position and state.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if shorter than nine bytes.
+pub fn parse_play_status(
+    params: &[u8],
+) -> Result<(Option<Duration>, Option<Duration>, PlaybackState), AudioError> {
+    if params.len() < 9 {
+        return Err(AudioError::Truncated {
+            what: "play status",
+            need: 9,
+            have: params.len(),
+        });
+    }
+    let length = u32::from_be_bytes([params[0], params[1], params[2], params[3]]);
+    let position = u32::from_be_bytes([params[4], params[5], params[6], params[7]]);
+    Ok((
+        // 0xFFFFFFFF means "not supported", and rendering it literally is a track
+        // 49 days long.
+        millis_or_none(length),
+        millis_or_none(position),
+        playback_state(params[8]),
+    ))
+}
+
+/// Map an AVRCP play-status byte onto the core state.
+#[must_use]
+pub const fn playback_state(raw: u8) -> PlaybackState {
+    match raw {
+        0x00 => PlaybackState::Stopped,
+        0x01 => PlaybackState::Playing,
+        0x02 => PlaybackState::Paused,
+        0x03 => PlaybackState::SeekingForward,
+        0x04 => PlaybackState::SeekingBackward,
+        _ => PlaybackState::Error,
+    }
+}
+
+/// Volume as AVRCP carries it: seven bits, `0..=127`.
+///
+/// Scaling matters and is easy to get wrong: dividing by 128 never reaches 1.0, so a
+/// phone at maximum volume would leave us fractionally quiet forever.
+#[must_use]
+pub fn volume_to_fraction(raw: u8) -> f32 {
+    f32::from(raw & 0x7F) / 127.0
+}
+
+/// The inverse of [`volume_to_fraction`], clamped into the legal range.
+#[must_use]
+pub fn fraction_to_volume(fraction: f32) -> u8 {
+    let clamped = fraction.clamp(0.0, 1.0);
+    // `round` rather than truncate, so a round trip through both functions is stable.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = (clamped * 127.0).round() as u8;
+    scaled & 0x7F
+}
+
+fn non_empty(s: String) -> Option<String> {
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn millis_or_none(raw: u32) -> Option<Duration> {
+    (raw != u32::MAX).then(|| Duration::from_millis(u64::from(raw)))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use bytes::BufMut;
+
+    use super::*;
+
+    /// Build a `GetElementAttributes` response body the way a phone would.
+    fn attributes_response(items: &[(u32, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(u8::try_from(items.len()).unwrap());
+        for (id, value) in items {
+            buf.put_u32(*id);
+            buf.put_u16(106); // UTF-8
+            buf.put_u16(u16::try_from(value.len()).unwrap());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn metadata_becomes_a_now_playing_snapshot() {
+        let body = attributes_response(&[
+            (attribute::TITLE, "Bloom"),
+            (attribute::ARTIST, "Beach House"),
+            (attribute::ALBUM, "Bloom"),
+            (attribute::PLAYING_TIME, "321000"),
+            (attribute::TRACK_NUMBER, "1"),
+            (attribute::TOTAL_TRACKS, "10"),
+        ]);
+        let parsed = parse_element_attributes(&body).unwrap();
+        assert_eq!(parsed.now_playing.title.as_deref(), Some("Bloom"));
+        assert_eq!(parsed.now_playing.artist.as_deref(), Some("Beach House"));
+        assert_eq!(
+            parsed.now_playing.duration,
+            Some(Duration::from_millis(321_000))
+        );
+        assert_eq!(parsed.now_playing.track, Some((1, Some(10))));
+    }
+
+    #[test]
+    fn the_cover_art_handle_is_extracted_and_kept_out_of_the_renderable_snapshot() {
+        // Attribute 8 is the whole reason this parser exists. It is a token to fetch
+        // with, not something to draw, so it must not leak into NowPlaying as text.
+        let body = attributes_response(&[
+            (attribute::TITLE, "Myth"),
+            (attribute::COVER_ART_HANDLE, "0000001"),
+        ]);
+        let parsed = parse_element_attributes(&body).unwrap();
+        assert_eq!(parsed.cover_art_handle.as_deref(), Some("0000001"));
+        assert!(parsed.now_playing.artwork.is_none(), "art arrives later");
+        assert_eq!(parsed.now_playing.title.as_deref(), Some("Myth"));
+    }
+
+    #[test]
+    fn numeric_attributes_are_decimal_strings_not_integers() {
+        // Every AVRCP attribute value is text, including durations and track numbers.
+        // Reading the bytes as a big-endian integer yields a nonsense duration.
+        let body = attributes_response(&[(attribute::PLAYING_TIME, "60000")]);
+        let parsed = parse_element_attributes(&body).unwrap();
+        assert_eq!(parsed.now_playing.duration, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn empty_attribute_values_are_absent_rather_than_blank() {
+        // A phone that sends an empty artist should render as no artist, not as an empty
+        // line under the title.
+        let body = attributes_response(&[(attribute::TITLE, "x"), (attribute::ARTIST, "  ")]);
+        let parsed = parse_element_attributes(&body).unwrap();
+        assert_eq!(parsed.now_playing.artist, None);
+    }
+
+    #[test]
+    fn a_truncated_attribute_list_is_refused() {
+        let mut body = attributes_response(&[(attribute::TITLE, "Bloom")]);
+        body.truncate(body.len() - 2);
+        assert!(matches!(
+            parse_element_attributes(&body),
+            Err(AudioError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn play_status_maps_onto_the_core_state_and_rejects_the_unknown_sentinel() {
+        let mut body = Vec::new();
+        body.put_u32(240_000);
+        body.put_u32(15_000);
+        body.push(0x01);
+        let (len, pos, state) = parse_play_status(&body).unwrap();
+        assert_eq!(len, Some(Duration::from_secs(240)));
+        assert_eq!(pos, Some(Duration::from_secs(15)));
+        assert_eq!(state, PlaybackState::Playing);
+
+        // 0xFFFFFFFF is AVRCP's "not supported". Rendering it literally shows a track
+        // 49 days long with a scrubber pinned at zero.
+        let mut unknown = Vec::new();
+        unknown.put_u32(u32::MAX);
+        unknown.put_u32(u32::MAX);
+        unknown.push(0x02);
+        let (len, pos, state) = parse_play_status(&unknown).unwrap();
+        assert_eq!(len, None);
+        assert_eq!(pos, None);
+        assert_eq!(state, PlaybackState::Paused);
+    }
+
+    #[test]
+    fn a_passthrough_keypress_is_always_a_press_and_a_release() {
+        // Press without release leaves the peer thinking the key is held; phones
+        // auto-repeat, so one tap on "next" walks the whole album.
+        let [press, release] = passthrough(operation::FORWARD);
+        assert_eq!(press.operands[0], operation::FORWARD);
+        assert_eq!(release.operands[0], operation::FORWARD | RELEASE_BIT);
+        assert_eq!(press.opcode, opcode::PASS_THROUGH);
+        assert_eq!(release.opcode, opcode::PASS_THROUGH);
+    }
+
+    #[test]
+    fn verbs_passthrough_cannot_express_map_to_nothing() {
+        // Delivering "seek" as fast-forward moves the track by an unpredictable amount.
+        // Refusing is the honest answer, and ControlCapabilities is built to match.
+        assert_eq!(operation_for(&ControlTxn::Play), Some(operation::PLAY));
+        assert_eq!(operation_for(&ControlTxn::Next), Some(operation::FORWARD));
+        assert_eq!(
+            operation_for(&ControlTxn::Seek(Duration::from_secs(30))),
+            None
+        );
+        assert_eq!(operation_for(&ControlTxn::Volume(0.5)), None);
+
+        let caps = capabilities_for_passthrough();
+        assert!(caps.supports(&ControlTxn::Play));
+        assert!(caps.supports(&ControlTxn::Next));
+        assert!(
+            !caps.supports(&ControlTxn::Seek(Duration::from_secs(1))),
+            "the capability set must not offer what operation_for cannot encode"
+        );
+    }
+
+    #[test]
+    fn volume_scaling_reaches_both_ends_of_the_range() {
+        // Dividing by 128 never reaches 1.0, so a phone at full volume would leave us
+        // permanently a little quiet.
+        assert_eq!(volume_to_fraction(0), 0.0);
+        assert!((volume_to_fraction(127) - 1.0).abs() < f32::EPSILON);
+        assert_eq!(fraction_to_volume(1.0), 127);
+        assert_eq!(fraction_to_volume(0.0), 0);
+        // Out-of-range input is clamped, not wrapped.
+        assert_eq!(fraction_to_volume(2.0), 127);
+        assert_eq!(fraction_to_volume(-1.0), 0);
+        // Round trip is stable.
+        for raw in [0u8, 1, 63, 64, 126, 127] {
+            assert_eq!(fraction_to_volume(volume_to_fraction(raw)), raw);
+        }
+    }
+
+    #[test]
+    fn a_vendor_pdu_round_trips_through_its_frame() {
+        let frame = get_element_attributes(&attribute::ALL);
+        let parsed = VendorPdu::parse(&frame.operands).unwrap();
+        assert_eq!(parsed.pdu_id, pdu::GET_ELEMENT_ATTRIBUTES);
+        // 8 bytes of identifier, 1 count byte, then four bytes per attribute.
+        assert_eq!(parsed.parameters.len(), 8 + 1 + attribute::ALL.len() * 4);
+        assert_eq!(parsed.parameters[8] as usize, attribute::ALL.len());
+    }
+
+    #[test]
+    fn the_attribute_request_asks_for_cover_art() {
+        // Omitting attribute 8 from the request is a silent way to never get artwork.
+        assert!(attribute::ALL.contains(&attribute::COVER_ART_HANDLE));
+    }
+
+    #[test]
+    fn a_short_vendor_pdu_is_refused() {
+        assert!(matches!(
+            VendorPdu::parse(&[0x00, 0x19, 0x58]),
+            Err(AudioError::Truncated { .. })
+        ));
+    }
+}
