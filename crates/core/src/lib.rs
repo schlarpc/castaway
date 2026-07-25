@@ -9,18 +9,22 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod control;
 pub mod display;
 pub mod error;
 pub mod event;
+pub mod nowplaying;
 pub mod osd;
 pub mod pipeline;
 pub mod session;
 pub mod types;
 
 pub use adapter::{MiracastBackend, SessionSink, SourceAdapter, SourceId, SourceMessage};
+pub use control::{ControlCapabilities, RemoteControl};
 pub use display::{DisplayControl, DisplayInput};
 pub use error::CoreError;
 pub use event::{Advertisement, ControlTxn, SessionEvent};
+pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState};
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::Pipeline;
 pub use session::{SessionConfig, SessionManager};

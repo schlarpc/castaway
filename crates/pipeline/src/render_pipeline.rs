@@ -40,6 +40,8 @@ pub struct RenderPipeline {
     /// Whether decode threads may use hardware decode. A *runtime* setting, never a
     /// compile-time one — see [`crate::hwaccel`].
     hw: HwPreference,
+    /// Latest now-playing snapshot, held for the surface that will draw it.
+    now_playing: Mutex<Option<castaway_core::NowPlaying>>,
 }
 
 impl RenderPipeline {
@@ -56,6 +58,7 @@ impl RenderPipeline {
                 tx,
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
+                now_playing: Mutex::new(None),
             },
             rx,
         )
@@ -147,6 +150,27 @@ impl Pipeline for RenderPipeline {
                 Ok(())
             }
         }
+    }
+
+    async fn play_audio(&self, _source: FrameSource) -> Result<(), CoreError> {
+        // Deliberately a typed refusal rather than a silent success: this pipeline has
+        // no audio output device yet (there is no PCM sink in the crate at all), so
+        // accepting the session would present as a phone that pairs, streams, and plays
+        // to silence — the worst possible failure to diagnose. The null pipeline still
+        // exercises the whole Bluetooth stack end to end in the meantime.
+        Err(CoreError::Pipeline(
+            "audio output not wired into the render pipeline yet".into(),
+        ))
+    }
+
+    async fn now_playing(&self, snapshot: castaway_core::NowPlaying) -> Result<(), CoreError> {
+        // The metadata itself is real and cheap to hold; what's missing is the surface
+        // that draws it. Keep the latest snapshot so the render loop can pick it up as
+        // soon as that layer exists, and don't lose data in the meantime.
+        if let Ok(mut guard) = self.now_playing.lock() {
+            *guard = Some(snapshot);
+        }
+        Ok(())
     }
 
     async fn control(&self, txn: ControlTxn) -> Result<(), CoreError> {

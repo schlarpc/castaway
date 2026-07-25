@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use castaway_core::{ControlTxn, CoreError, FrameSource, MediaUri, Pipeline};
+use castaway_core::{ControlTxn, CoreError, FrameSource, MediaUri, NowPlaying, Pipeline};
 use tracing::info;
 
 /// A pipeline that logs every operation and drains mirror frame sources (dropping
@@ -64,6 +64,26 @@ impl Pipeline for NullPipeline {
         if let Some(audio) = audio {
             Self::drain(audio, "audio");
         }
+        Ok(())
+    }
+
+    async fn play_audio(&self, source: FrameSource) -> Result<(), CoreError> {
+        info!("null pipeline: AUDIO begin");
+        Self::drain(source, "audio");
+        Ok(())
+    }
+
+    async fn now_playing(&self, snapshot: NowPlaying) -> Result<(), CoreError> {
+        // Log the art's *size* rather than the snapshot wholesale: a `Debug` of the
+        // struct would dump a JPEG's worth of bytes into the journal on every track.
+        info!(
+            title = ?snapshot.title,
+            artist = ?snapshot.artist,
+            album = ?snapshot.album,
+            state = ?snapshot.state,
+            artwork_bytes = snapshot.artwork.as_ref().map(castaway_core::Artwork::len),
+            "null pipeline: NOW PLAYING"
+        );
         Ok(())
     }
 

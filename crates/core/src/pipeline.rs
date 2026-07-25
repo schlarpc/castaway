@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::error::CoreError;
 use crate::event::ControlTxn;
+use crate::nowplaying::NowPlaying;
 use crate::types::{FrameSource, MediaUri};
 
 /// The media/render backend the session drives. One active session maps to one set of
@@ -27,6 +28,20 @@ pub trait Pipeline: Send + Sync {
     /// [`CoreError::Pipeline`] if the mirror session can't be established.
     async fn mirror(&self, video: FrameSource, audio: Option<FrameSource>)
         -> Result<(), CoreError>;
+
+    /// Begin a live audio-only session: decode `source` and play it out, with the screen
+    /// showing the now-playing surface rather than video.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the audio session can't be established.
+    async fn play_audio(&self, source: FrameSource) -> Result<(), CoreError>;
+
+    /// Update the now-playing surface. Called with a full snapshot whenever any part of
+    /// the metadata changes, including artwork arriving after the text.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the surface can't be updated.
+    async fn now_playing(&self, snapshot: NowPlaying) -> Result<(), CoreError>;
 
     /// Apply a transport-control transaction to the active session.
     ///

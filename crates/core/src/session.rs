@@ -7,11 +7,13 @@
 //! preempts whatever is active (matching how casting UIs behave — the newest sender
 //! takes the screen). Main+PiP arbitration is a future extension point.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::{info, warn};
 
 use crate::adapter::{SourceId, SourceMessage};
+use crate::control::RemoteControl;
 use crate::display::{DisplayControl, DisplayInput};
 use crate::error::CoreError;
 use crate::event::SessionEvent;
@@ -44,6 +46,7 @@ pub struct SessionManager<P: Pipeline> {
     osd: Option<OsdSink>,
     config: SessionConfig,
     active: Option<SourceId>,
+    remote: Option<Arc<dyn RemoteControl>>,
 }
 
 impl<P: Pipeline> SessionManager<P> {
@@ -59,6 +62,7 @@ impl<P: Pipeline> SessionManager<P> {
             osd: None,
             config,
             active: None,
+            remote: None,
         }
     }
 
@@ -74,6 +78,17 @@ impl<P: Pipeline> SessionManager<P> {
     #[must_use]
     pub fn active(&self) -> Option<&SourceId> {
         self.active.as_ref()
+    }
+
+    /// A handle for driving the *active sender*, if it published one.
+    ///
+    /// This is what the touch UI reaches for when a finger lands on pause: the panel
+    /// doesn't pause the pipeline, it tells the phone to stop sending. Cleared whenever
+    /// the session ends or is preempted, so a stale handle can't outlive its session and
+    /// send commands to a phone that walked out of the room.
+    #[must_use]
+    pub fn remote(&self) -> Option<&Arc<dyn RemoteControl>> {
+        self.remote.as_ref()
     }
 
     /// Consume the event stream until it closes, arbitrating sources.
@@ -104,6 +119,29 @@ impl<P: Pipeline> SessionManager<P> {
                 info!(%source, "session: mirror");
                 self.pipeline.mirror(video, audio).await
             }
+            SessionEvent::Audio { source: frames } => {
+                self.begin_session(&source).await?;
+                info!(%source, "session: audio");
+                self.pipeline.play_audio(frames).await
+            }
+            SessionEvent::NowPlaying(snapshot) => {
+                if self.active.as_ref() == Some(&source) {
+                    self.pipeline.now_playing(snapshot).await
+                } else {
+                    // Metadata from a backgrounded source would overwrite the active
+                    // card; drop it rather than let a preempted phone win the screen.
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
+            SessionEvent::ControlSurface(remote) => {
+                if self.active.as_ref() == Some(&source) {
+                    info!(%source, caps = ?remote.capabilities(), "session: control surface up");
+                    self.remote = Some(remote);
+                    Ok(())
+                } else {
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
             SessionEvent::Control(txn) => {
                 if self.active.as_ref() == Some(&source) {
                     self.pipeline.control(txn).await
@@ -116,6 +154,7 @@ impl<P: Pipeline> SessionManager<P> {
                 if self.active.as_ref() == Some(&source) {
                     info!(%source, "session: end");
                     self.active = None;
+                    self.remote = None;
                     if let Some(osd) = &self.osd {
                         osd.clear();
                     }
@@ -137,6 +176,9 @@ impl<P: Pipeline> SessionManager<P> {
         if let Some(prev) = &self.active {
             info!(%prev, %source, "session: preempting active source");
             self.pipeline.stop().await.ok();
+            // The outgoing source's control handle dies with its session — the new
+            // source publishes its own if it has one.
+            self.remote = None;
         } else if let Some(display) = &self.display {
             // Idle → active: wake the panel and select our input.
             display.power_on().await?;
@@ -162,12 +204,15 @@ mod tests {
     use super::*;
     use crate::event::ControlTxn;
     use crate::types::{MediaUri, ProtocolKind};
+    use crate::ControlCapabilities;
 
     #[derive(Default)]
     struct Counts {
         play: AtomicUsize,
         stop: AtomicUsize,
         control: AtomicUsize,
+        audio: AtomicUsize,
+        snapshots: std::sync::Mutex<Vec<crate::NowPlaying>>,
     }
 
     #[derive(Clone)]
@@ -186,12 +231,38 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
+        async fn play_audio(&self, _s: crate::types::FrameSource) -> Result<(), CoreError> {
+            self.0.audio.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn now_playing(&self, snapshot: crate::NowPlaying) -> Result<(), CoreError> {
+            self.0.snapshots.lock().expect("poisoned").push(snapshot);
+            Ok(())
+        }
         async fn control(&self, _txn: ControlTxn) -> Result<(), CoreError> {
             self.0.control.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn stop(&self) -> Result<(), CoreError> {
             self.0.stop.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Stands in for a phone's AVRCP target: records what the receiver told it to do.
+    #[derive(Debug, Default)]
+    struct FakeRemote {
+        caps: ControlCapabilities,
+        sent: std::sync::Mutex<Vec<ControlTxn>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RemoteControl for FakeRemote {
+        fn capabilities(&self) -> ControlCapabilities {
+            self.caps
+        }
+        async fn issue_unchecked(&self, txn: ControlTxn) -> Result<(), CoreError> {
+            self.sent.lock().expect("poisoned").push(txn);
             Ok(())
         }
     }
@@ -274,6 +345,135 @@ mod tests {
             .await;
         assert!(matches!(res, Err(CoreError::NoActiveSession(_))));
         assert_eq!(counts.control.load(Ordering::SeqCst), 0);
+    }
+
+    fn audio_msg(src: &SourceId) -> SourceMessage {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        SourceMessage {
+            source: src.clone(),
+            event: SessionEvent::Audio {
+                source: crate::types::FrameSource::Encoded(rx),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn an_audio_session_starts_the_pipeline_and_takes_metadata() {
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let src = SourceId::new(ProtocolKind::Bluetooth, "aa:bb:cc:dd:ee:ff");
+        mgr.handle(audio_msg(&src)).await.unwrap();
+        assert_eq!(counts.audio.load(Ordering::SeqCst), 1);
+
+        // Text first, artwork second — the two-snapshot shape cover art actually has.
+        let text = crate::NowPlaying::default()
+            .with_title("Bloom")
+            .with_artist("Beach House");
+        mgr.handle(SourceMessage {
+            source: src.clone(),
+            event: SessionEvent::NowPlaying(text.clone()),
+        })
+        .await
+        .unwrap();
+        mgr.handle(SourceMessage {
+            source: src,
+            event: SessionEvent::NowPlaying(text.with_artwork(crate::Artwork::new(
+                crate::ImageFormat::Jpeg,
+                bytes::Bytes::from_static(&[0xff, 0xd8]),
+            ))),
+        })
+        .await
+        .unwrap();
+
+        let snaps = counts.snapshots.lock().unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps[0].artwork.is_none());
+        assert!(snaps[1].artwork.is_some());
+        assert!(
+            snaps[0].is_same_item(&snaps[1]),
+            "art is not a track change"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_from_a_backgrounded_source_cannot_hijack_the_card() {
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Bluetooth, "a");
+        let b = SourceId::new(ProtocolKind::Cast, "b");
+        mgr.handle(audio_msg(&a)).await.unwrap();
+        mgr.handle(play_msg(&b)).await.unwrap(); // b preempts a
+        let res = mgr
+            .handle(SourceMessage {
+                source: a,
+                event: SessionEvent::NowPlaying(crate::NowPlaying::default().with_title("stale")),
+            })
+            .await;
+        assert!(matches!(res, Err(CoreError::NoActiveSession(_))));
+        assert!(counts.snapshots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_control_surface_is_published_then_dies_with_its_session() {
+        // The reverse channel's lifetime rule: a handle must never outlive the session
+        // that produced it, or the panel ends up pausing a phone that left the room.
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Bluetooth, "a");
+        mgr.handle(audio_msg(&a)).await.unwrap();
+        assert!(mgr.remote().is_none(), "no handle before AVCTP connects");
+
+        mgr.handle(SourceMessage {
+            source: a.clone(),
+            event: SessionEvent::ControlSurface(Arc::new(FakeRemote {
+                caps: ControlCapabilities::TRANSPORT,
+                sent: std::sync::Mutex::new(Vec::new()),
+            })),
+        })
+        .await
+        .unwrap();
+
+        let remote = mgr.remote().expect("published").clone();
+        assert!(remote.capabilities().supports(&ControlTxn::Pause));
+        remote.issue(ControlTxn::Pause).await.unwrap();
+        // Seek is outside TRANSPORT, so the capability set refuses it before the wire.
+        assert!(matches!(
+            remote.issue(ControlTxn::Seek(Duration::from_secs(5))).await,
+            Err(CoreError::UnsupportedControl(_))
+        ));
+
+        mgr.handle(SourceMessage {
+            source: a,
+            event: SessionEvent::End,
+        })
+        .await
+        .unwrap();
+        assert!(
+            mgr.remote().is_none(),
+            "handle cleared when the session ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn preemption_drops_the_previous_sources_control_surface() {
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Bluetooth, "a");
+        let b = SourceId::new(ProtocolKind::Cast, "b");
+        mgr.handle(audio_msg(&a)).await.unwrap();
+        mgr.handle(SourceMessage {
+            source: a,
+            event: SessionEvent::ControlSurface(Arc::new(FakeRemote::default())),
+        })
+        .await
+        .unwrap();
+        assert!(mgr.remote().is_some());
+        mgr.handle(play_msg(&b)).await.unwrap();
+        assert!(mgr.remote().is_none());
     }
 
     #[tokio::test]

@@ -27,6 +27,11 @@ pub enum CoreError {
     #[error("display control error: {0}")]
     Display(String),
 
+    /// A control transaction was issued that the peer never advertised support for.
+    /// Refused before it reaches the wire — see [`crate::ControlCapabilities`].
+    #[error("peer does not support control transaction: {0}")]
+    UnsupportedControl(String),
+
     /// The event bus was closed before the operation completed.
     #[error("session channel closed")]
     ChannelClosed,

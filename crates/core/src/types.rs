@@ -26,6 +26,8 @@ pub enum ProtocolKind {
     YouTubeLounge,
     /// Spotify Connect.
     Spotify,
+    /// Bluetooth A2DP sink (+ AVRCP). Audio-only, and the only source that needs no LAN.
+    Bluetooth,
 }
 
 impl ProtocolKind {
@@ -39,6 +41,7 @@ impl ProtocolKind {
             ProtocolKind::Dlna => "dlna",
             ProtocolKind::YouTubeLounge => "youtube-lounge",
             ProtocolKind::Spotify => "spotify",
+            ProtocolKind::Bluetooth => "bluetooth",
         }
     }
 }
@@ -148,12 +151,20 @@ pub enum VideoCodec {
 pub enum AudioCodec {
     /// Apple Lossless (AirPlay 1 RAOP).
     Alac,
-    /// AAC / AAC-ELD (AirPlay 2).
+    /// AAC / AAC-ELD (AirPlay 2, and the A2DP codec every iPhone offers).
     Aac,
     /// Opus.
     Opus,
     /// Raw PCM.
     Pcm,
+    /// Low-complexity subband coding — A2DP's mandatory baseline, so every sender has it.
+    Sbc,
+    /// Qualcomm aptX (A2DP vendor codec `0x004F/0x0001`).
+    AptX,
+    /// Qualcomm aptX HD (A2DP vendor codec `0x004F/0x0024`).
+    AptXHd,
+    /// Sony LDAC (A2DP vendor codec `0x012D/0x00AA`). The only one libav cannot decode.
+    Ldac,
 }
 
 /// Decoded-frame pixel layout. `Decoded` frames carry one of these.
