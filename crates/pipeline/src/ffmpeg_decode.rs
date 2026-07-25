@@ -11,7 +11,23 @@
 //! `on_frame` is called per frame and returning `false` stops early (teardown /
 //! drop-late). Nothing here touches tokio — [`decode_stream`] *pulls* its input through a
 //! caller-supplied closure precisely so the choice of channel stays with the caller.
-//! Hardware decode (vaapi/d3d11va) is a later refinement on the same seam.
+//!
+//! ## Hardware decode lives on the same seam
+//!
+//! With the `hwaccel` feature and a [`HwPreference`] that allows it, the decoder is
+//! pointed at VA-API (Linux) or D3D11VA (Windows) and frames come out as
+//! [`castaway_core::FrameImage::Gpu`] surfaces the compositor imports without a copy.
+//! Everything about that is a *runtime* decision: the same binary decodes in software on
+//! a box with no GPU decode, and can drop back to software **mid-session** — which is the
+//! normal case, not an edge case, because a driver refuses a profile or a bit depth long
+//! after the session started. Every downgrade is logged once, because the symptom of a
+//! silent one is only a warm room.
+//!
+//! Pointing libavcodec at a hardware decoder means writing `AVCodecContext` fields the
+//! wrapper crate does not expose, so this module reaches into raw pointers (ground rule 8
+//! permits that in `pipeline`); each block carries the invariant it relies on, and the
+//! FFI itself lives next door in [`crate::hwaccel::ffmpeg_hw`].
+#![allow(unsafe_code)]
 
 use std::sync::Once;
 use std::time::Duration;
@@ -21,6 +37,7 @@ use ffmpeg_next as ffmpeg;
 use tracing::warn;
 
 use crate::error::PipelineError;
+use crate::hwaccel::{FallbackPolicy, HwPreference};
 
 /// swscale quality/speed tradeoff, shared by both entry points.
 const SCALE_FLAGS: ffmpeg::software::scaling::flag::Flags =
@@ -50,12 +67,36 @@ fn map_err(e: ffmpeg::Error) -> PipelineError {
 ///
 /// # Errors
 /// [`PipelineError::Decode`] on open/decode failure.
-pub fn decode<F>(uri: &str, mut on_frame: F) -> Result<(), PipelineError>
+pub fn decode<F>(uri: &str, preference: HwPreference, mut on_frame: F) -> Result<(), PipelineError>
 where
     F: FnMut(DecodedFrame) -> bool,
 {
     ensure_init();
+    let mut hw = HwAttempt::new(preference);
 
+    // Same restart structure as the mirror path: a hardware give-up rebuilds the decoder
+    // rather than ending playback. Demuxing starts over, which for a file is a seek back
+    // to the beginning of the stream — acceptable for the rare mid-file fallback, and the
+    // alternative is a black screen.
+    loop {
+        match url_session(uri, &mut hw, &mut on_frame)? {
+            SessionEnd::Finished => return Ok(()),
+            SessionEnd::RebuildInSoftware => {
+                warn!(uri, "decode: restarting playback in software mid-stream");
+            }
+        }
+    }
+}
+
+/// One decoder incarnation over a demuxed URL.
+fn url_session<F>(
+    uri: &str,
+    hw: &mut HwAttempt,
+    on_frame: &mut F,
+) -> Result<SessionEnd, PipelineError>
+where
+    F: FnMut(DecodedFrame) -> bool,
+{
     let mut ictx = ffmpeg::format::input(&uri).map_err(map_err)?;
     let input = ictx
         .streams()
@@ -64,54 +105,232 @@ where
     let stream_index = input.index();
     let time_base = input.time_base();
 
-    let decoder_ctx =
+    let mut decoder_ctx =
         ffmpeg::codec::context::Context::from_parameters(input.parameters()).map_err(map_err)?;
+    let codec_id = decoder_ctx.id();
+    if hw.wants_hardware() {
+        // SAFETY: the context has been filled from stream parameters but not opened —
+        // `.decoder().video()` below is what opens it — and it will be opened with the
+        // decoder for `codec_id`.
+        unsafe { hw.attach(decoder_ctx.as_mut_ptr().cast(), codec_id) }?;
+    }
     let mut decoder = decoder_ctx.decoder().video().map_err(map_err)?;
-
-    let mut scaler = ffmpeg::software::scaling::context::Context::get(
-        decoder.format(),
-        decoder.width(),
-        decoder.height(),
-        ffmpeg::format::Pixel::RGBA,
-        decoder.width(),
-        decoder.height(),
-        SCALE_FLAGS,
-    )
-    .map_err(map_err)?;
-
-    let mut keep_going = true;
-
-    let drain = |decoder: &mut ffmpeg::decoder::Video,
-                 scaler: &mut ffmpeg::software::scaling::Context,
-                 on_frame: &mut F|
-     -> Result<bool, PipelineError> {
-        let mut decoded = ffmpeg::frame::Video::empty();
-        while decoder.receive_frame(&mut decoded).is_ok() {
-            let mut rgba = ffmpeg::frame::Video::empty();
-            scaler.run(&decoded, &mut rgba).map_err(map_err)?;
-            let frame = to_decoded_frame(&rgba, decoded.pts(), time_base);
-            if !on_frame(frame) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
+    let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
 
     for (stream, packet) in ictx.packets() {
         if stream.index() != stream_index {
             continue;
         }
         decoder.send_packet(&packet).map_err(map_err)?;
-        if !drain(&mut decoder, &mut scaler, &mut on_frame)? {
-            keep_going = false;
-            break;
+        hw.check_negotiation()?;
+        match drain(&mut decoder, hw, &mut scaler, time_base, on_frame)? {
+            Drained::Continue => {}
+            Drained::Stopped => return Ok(SessionEnd::Finished),
+            Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
         }
     }
-    if keep_going {
-        decoder.send_eof().map_err(map_err)?;
-        drain(&mut decoder, &mut scaler, &mut on_frame)?;
+    decoder.send_eof().map_err(map_err)?;
+    drain(&mut decoder, hw, &mut scaler, time_base, on_frame)?;
+    Ok(SessionEnd::Finished)
+}
+
+/// What happened when a decoded frame was offered to the hardware export path.
+///
+/// Without the `hwaccel` feature only `Software` is ever produced; the others stay in the
+/// type so the decode loop below reads the same either way, rather than growing a `cfg`
+/// around every match arm.
+#[cfg_attr(not(feature = "hwaccel"), allow(dead_code))]
+enum Export {
+    /// A GPU surface, ready for the compositor to import.
+    Gpu(DecodedFrame),
+    /// Not a hardware frame — the software conversion applies.
+    Software,
+    /// Export failed within budget; drop this frame and keep going.
+    Dropped,
+    /// Hardware has been abandoned; rebuild the decoder in software.
+    Restart,
+}
+
+/// The hardware-decode attempt for one decode session: the policy, plus whatever is
+/// currently attached to the decoder.
+///
+/// Always compiled. Without the `hwaccel` feature it degrades to "the policy said
+/// software", which keeps the decode loops below free of `cfg`.
+struct HwAttempt {
+    policy: FallbackPolicy,
+    #[cfg(feature = "hwaccel")]
+    live: Option<HwLive>,
+}
+
+#[cfg(feature = "hwaccel")]
+struct HwLive {
+    /// The pixel format a frame carries when it really is a GPU surface. Frames that come
+    /// out in anything else are software frames from a decoder that declined.
+    format: ffmpeg::format::Pixel,
+    exporter: crate::hwaccel::SurfaceExporter,
+    /// Owns the device context for as long as the decoder is open.
+    _setup: crate::hwaccel::ffmpeg_hw::HwSetup,
+}
+
+impl HwAttempt {
+    /// Decide whether to try hardware at all.
+    ///
+    /// The compositor's import capability is part of the decision, not an afterthought:
+    /// decoding to GPU surfaces that nothing can sample is strictly worse than decoding
+    /// on the CPU, and the render thread has no way to tell the decoder it is dropping
+    /// everything it sends.
+    fn new(preference: HwPreference) -> Self {
+        let mut policy = FallbackPolicy::new(preference);
+        #[cfg(feature = "render")]
+        if policy.wants_hardware() {
+            use crate::hwaccel::{import_capability, SurfaceImport};
+            if import_capability() == SurfaceImport::Unsupported {
+                policy.give_up(crate::hwaccel::HwGiveUp::DeviceUnavailable(
+                    "the compositor's device cannot import GPU surfaces".into(),
+                ));
+            }
+        }
+        Self {
+            policy,
+            #[cfg(feature = "hwaccel")]
+            live: None,
+        }
     }
-    Ok(())
+
+    const fn wants_hardware(&self) -> bool {
+        self.policy.wants_hardware()
+    }
+
+    /// Attach a hardware decoder to an unopened context, if the policy still wants one.
+    ///
+    /// Never fails the session: an unavailable device or an unsupported codec becomes a
+    /// logged fallback and a software decoder, unless the operator asked for
+    /// [`HwPreference::HardwareOnly`].
+    ///
+    /// # Safety
+    /// `ctx` must be an allocated, not-yet-opened `AVCodecContext` that will be opened
+    /// with the decoder for `codec_id`.
+    #[allow(unused_variables)]
+    unsafe fn attach(
+        &mut self,
+        ctx: *mut std::ffi::c_void,
+        codec_id: ffmpeg::codec::Id,
+    ) -> Result<(), PipelineError> {
+        #[cfg(feature = "hwaccel")]
+        {
+            use crate::hwaccel::ffmpeg_hw::{attach_for_id, HwDevice};
+            use ffmpeg_sys_next as sys;
+
+            self.live = None;
+            if !self.policy.wants_hardware() {
+                return Ok(());
+            }
+            let Some(kind) = crate::hwaccel::HwBackendKind::for_this_platform() else {
+                return self.give_up(crate::hwaccel::HwGiveUp::NotCompiled);
+            };
+            let device = match HwDevice::open(kind) {
+                Ok(device) => device,
+                Err(reason) => return self.give_up(reason),
+            };
+            let exporter = match crate::hwaccel::SurfaceExporter::new(&device) {
+                Ok(exporter) => exporter,
+                Err(reason) => return self.give_up(reason),
+            };
+            // SAFETY: caller guarantees an unopened context; the id is converted by the
+            // wrapper crate's own mapping, not reinterpreted.
+            let setup = unsafe {
+                attach_for_id(
+                    ctx.cast::<sys::AVCodecContext>(),
+                    sys::AVCodecID::from(codec_id),
+                    device,
+                )
+            };
+            match setup {
+                Ok(setup) => {
+                    self.live = Some(HwLive {
+                        format: ffmpeg::format::Pixel::from(setup.hw_format),
+                        exporter,
+                        _setup: setup,
+                    });
+                    self.policy.confirm_hardware(kind);
+                    Ok(())
+                }
+                Err(reason) => self.give_up(reason),
+            }
+        }
+        #[cfg(not(feature = "hwaccel"))]
+        {
+            Ok(())
+        }
+    }
+
+    /// Feed a give-up through the policy, turning a refusal into an error only when the
+    /// operator asked for one.
+    #[cfg(feature = "hwaccel")]
+    fn give_up(&mut self, reason: crate::hwaccel::HwGiveUp) -> Result<(), PipelineError> {
+        use crate::hwaccel::Reaction;
+        match self.policy.give_up(reason) {
+            Reaction::Fail(reason) => Err(PipelineError::HwDecode(reason.to_string())),
+            Reaction::DropFrame | Reaction::FallBackToSoftware => {
+                self.live = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Notice a `get_format` refusal. libavcodec answers "not this stream" by simply not
+    /// offering the hardware format, which is not an error anywhere — so it has to be
+    /// asked about explicitly, or the session quietly runs in software forever.
+    #[allow(clippy::unnecessary_wraps)]
+    fn check_negotiation(&mut self) -> Result<(), PipelineError> {
+        #[cfg(feature = "hwaccel")]
+        {
+            if self.live.is_some() && crate::hwaccel::ffmpeg_hw::take_format_rejected() {
+                let kind = self
+                    .live
+                    .as_ref()
+                    .and_then(|_| crate::hwaccel::HwBackendKind::for_this_platform());
+                if let Some(kind) = kind {
+                    return self.give_up(crate::hwaccel::HwGiveUp::FormatRejected(kind));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Offer a decoded frame to the export path.
+    #[allow(unused_variables)]
+    fn export(&mut self, decoded: &mut ffmpeg::frame::Video, pts: Duration) -> Export {
+        #[cfg(feature = "hwaccel")]
+        {
+            let Some(live) = self.live.as_mut() else {
+                return Export::Software;
+            };
+            if decoded.format() != live.format {
+                // The decoder handed back a software frame despite being pointed at
+                // hardware — `check_negotiation` will have said why.
+                return Export::Software;
+            }
+            let (width, height) = (decoded.width(), decoded.height());
+            // SAFETY: `decoded` is a live decoded frame in the hardware format, which is
+            // exactly what the exporter requires.
+            let exported = unsafe { live.exporter.export(decoded.as_mut_ptr()) };
+            match exported {
+                Ok(surface) => Export::Gpu(DecodedFrame::gpu(width, height, pts, surface)),
+                Err(reason) => match self.policy.give_up(reason) {
+                    crate::hwaccel::Reaction::DropFrame => Export::Dropped,
+                    _ => {
+                        self.live = None;
+                        Export::Restart
+                    }
+                },
+            }
+        }
+        #[cfg(not(feature = "hwaccel"))]
+        {
+            Export::Software
+        }
+    }
 }
 
 /// Which ffmpeg decoder a negotiated codec asks for.
@@ -148,6 +367,7 @@ fn codec_id(codec: VideoCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
 /// than fatal — one corrupt packet must not tear down a live mirror.
 pub fn decode_stream<N, F>(
     codec: VideoCodec,
+    preference: HwPreference,
     mut next: N,
     mut on_frame: F,
 ) -> Result<(), PipelineError>
@@ -158,10 +378,51 @@ where
     ensure_init();
 
     let id = codec_id(codec)?;
+    let mut hw = HwAttempt::new(preference);
+
+    // One iteration per decoder incarnation. A mid-session fallback drops out of the
+    // inner loop, rebuilds in software, and resumes from the next key frame — a brief gap
+    // in the mirror rather than the end of it, which is the whole point.
+    loop {
+        let outcome = stream_session(id, codec, &mut hw, &mut next, &mut on_frame)?;
+        match outcome {
+            SessionEnd::Finished => return Ok(()),
+            SessionEnd::RebuildInSoftware => {
+                warn!("mirror decode: restarting the decoder in software mid-session");
+            }
+        }
+    }
+}
+
+/// How one decoder incarnation ended.
+enum SessionEnd {
+    /// The source finished, or the consumer asked to stop.
+    Finished,
+    /// Hardware was abandoned; the caller should build a software decoder and continue.
+    RebuildInSoftware,
+}
+
+/// Run one decoder incarnation over the stream until it ends or hardware is given up on.
+fn stream_session<N, F>(
+    id: ffmpeg::codec::Id,
+    codec: VideoCodec,
+    hw: &mut HwAttempt,
+    next: &mut N,
+    on_frame: &mut F,
+) -> Result<SessionEnd, PipelineError>
+where
+    N: FnMut() -> Option<EncodedFrame>,
+    F: FnMut(DecodedFrame) -> bool,
+{
     let found = ffmpeg::decoder::find(id)
         .ok_or_else(|| PipelineError::Decode(format!("this ffmpeg build has no {id:?} decoder")))?;
     let mut context = ffmpeg::decoder::new();
     context.set_packet_time_base(STREAM_TIMEBASE);
+    if hw.wants_hardware() {
+        // SAFETY: `context` is allocated and not yet opened — `open_as` below is what
+        // opens it — and it will be opened with the decoder for `id`.
+        unsafe { hw.attach(context.as_mut_ptr().cast(), id) }?;
+    }
     let mut decoder = context
         .open_as(found)
         .map_err(map_err)?
@@ -172,7 +433,6 @@ where
     // the picture size is not known until one comes out.
     let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
     let mut synced = false;
-    let mut running = true;
 
     while let Some(frame) = next() {
         if frame.video_codec != Some(codec) {
@@ -200,48 +460,73 @@ where
             warn!(error = %e, "mirror decode: decoder rejected a frame, skipping it");
             continue;
         }
-        if !drain_stream(&mut decoder, &mut scaler, &mut on_frame)? {
-            running = false;
-            break;
+        // Asked once per packet rather than once per session: the refusal only becomes
+        // visible after libavcodec has parsed enough of the stream to negotiate.
+        hw.check_negotiation()?;
+        match drain(&mut decoder, hw, &mut scaler, STREAM_TIMEBASE, on_frame)? {
+            Drained::Continue => {}
+            Drained::Stopped => return Ok(SessionEnd::Finished),
+            Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
         }
     }
 
-    if running {
-        decoder.send_eof().map_err(map_err)?;
-        drain_stream(&mut decoder, &mut scaler, &mut on_frame)?;
-    }
-    Ok(())
+    decoder.send_eof().map_err(map_err)?;
+    drain(&mut decoder, hw, &mut scaler, STREAM_TIMEBASE, on_frame)?;
+    Ok(SessionEnd::Finished)
 }
 
-/// Pull every frame the decoder is holding, scale it to RGBA, and hand it over. Returns
-/// `false` once `on_frame` asks to stop.
-fn drain_stream<F>(
+/// What a drain pass concluded.
+enum Drained {
+    /// Keep feeding this decoder.
+    Continue,
+    /// `on_frame` asked to stop.
+    Stopped,
+    /// Hardware was abandoned mid-drain; the decoder must be rebuilt.
+    Restart,
+}
+
+/// Pull every frame the decoder is holding and hand each one over — as a GPU surface when
+/// the decoder produced one, otherwise scaled to RGBA by swscale.
+fn drain<F>(
     decoder: &mut ffmpeg::decoder::Video,
+    hw: &mut HwAttempt,
     scaler: &mut Option<ffmpeg::software::scaling::Context>,
+    time_base: ffmpeg::Rational,
     on_frame: &mut F,
-) -> Result<bool, PipelineError>
+) -> Result<Drained, PipelineError>
 where
     F: FnMut(DecodedFrame) -> bool,
 {
     let mut decoded = ffmpeg::frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        let (format, width, height) = (decoded.format(), decoded.width(), decoded.height());
-        // `cached` is a no-op when the parameters match and a rebuild when they do not,
-        // which is what a sender changing resolution mid-mirror needs.
-        let fresh = match scaler.take() {
-            Some(mut sws) => {
-                sws.cached(
-                    format,
-                    width,
-                    height,
-                    ffmpeg::format::Pixel::RGBA,
-                    width,
-                    height,
-                    SCALE_FLAGS,
-                );
-                sws
-            }
-            None => ffmpeg::software::scaling::context::Context::get(
+        let pts = frame_pts(decoded.pts(), time_base);
+        let frame = match hw.export(&mut decoded, pts) {
+            Export::Gpu(frame) => frame,
+            // A tolerated export failure: the mirror is better served by a dropped frame
+            // than by a stall.
+            Export::Dropped => continue,
+            Export::Restart => return Ok(Drained::Restart),
+            Export::Software => scale_to_rgba(&decoded, scaler, pts)?,
+        };
+        if !on_frame(frame) {
+            return Ok(Drained::Stopped);
+        }
+    }
+    Ok(Drained::Continue)
+}
+
+/// Convert a software frame to packed RGBA, rebuilding the scaler if the picture changed.
+fn scale_to_rgba(
+    decoded: &ffmpeg::frame::Video,
+    scaler: &mut Option<ffmpeg::software::scaling::Context>,
+    pts: Duration,
+) -> Result<DecodedFrame, PipelineError> {
+    let (format, width, height) = (decoded.format(), decoded.width(), decoded.height());
+    // `cached` is a no-op when the parameters match and a rebuild when they do not,
+    // which is what a sender changing resolution mid-mirror needs.
+    let fresh = match scaler.take() {
+        Some(mut sws) => {
+            sws.cached(
                 format,
                 width,
                 height,
@@ -249,27 +534,38 @@ where
                 width,
                 height,
                 SCALE_FLAGS,
-            )
-            .map_err(map_err)?,
-        };
-        let sws = scaler.insert(fresh);
-
-        let mut rgba = ffmpeg::frame::Video::empty();
-        sws.run(&decoded, &mut rgba).map_err(map_err)?;
-        if !on_frame(to_decoded_frame(&rgba, decoded.pts(), STREAM_TIMEBASE)) {
-            return Ok(false);
+            );
+            sws
         }
-    }
-    Ok(true)
+        None => ffmpeg::software::scaling::context::Context::get(
+            format,
+            width,
+            height,
+            ffmpeg::format::Pixel::RGBA,
+            width,
+            height,
+            SCALE_FLAGS,
+        )
+        .map_err(map_err)?,
+    };
+    let sws = scaler.insert(fresh);
+
+    let mut rgba = ffmpeg::frame::Video::empty();
+    sws.run(decoded, &mut rgba).map_err(map_err)?;
+    Ok(to_decoded_frame(&rgba, pts))
+}
+
+/// A decoder timestamp in its own timebase, as a wall-clock offset.
+fn frame_pts(pts: Option<i64>, time_base: ffmpeg::Rational) -> Duration {
+    let secs = pts.map_or(0.0, |p| {
+        p as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator())
+    });
+    Duration::from_secs_f64(secs.max(0.0))
 }
 
 /// Copy a scaled RGBA `ffmpeg` frame into an owned [`DecodedFrame`], stripping row
 /// padding (swscale may pad the stride past `width*4`).
-fn to_decoded_frame(
-    rgba: &ffmpeg::frame::Video,
-    pts: Option<i64>,
-    time_base: ffmpeg::Rational,
-) -> DecodedFrame {
+fn to_decoded_frame(rgba: &ffmpeg::frame::Video, pts: Duration) -> DecodedFrame {
     let width = rgba.width();
     let height = rgba.height();
     let stride = rgba.stride(0);
@@ -282,16 +578,13 @@ fn to_decoded_frame(
         data.extend_from_slice(&src[start..start + row_bytes]);
     }
 
-    let secs = pts.map_or(0.0, |p| {
-        p as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator())
-    });
-    DecodedFrame {
+    DecodedFrame::cpu(
         width,
         height,
-        format: PixelFormat::Rgba8,
-        pts: Duration::from_secs_f64(secs.max(0.0)),
-        data: bytes::Bytes::from(data),
-    }
+        PixelFormat::Rgba8,
+        pts,
+        bytes::Bytes::from(data),
+    )
 }
 
 #[cfg(test)]
@@ -299,11 +592,24 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    /// Assert a frame came back as system-memory RGBA of exactly the right size — the
+    /// software path's contract with the compositor.
+    fn assert_rgba(f: &DecodedFrame) {
+        let castaway_core::FrameImage::Cpu { format, data } = &f.image else {
+            panic!("software decode must produce a CPU frame");
+        };
+        assert_eq!(*format, PixelFormat::Rgba8);
+        assert_eq!(data.len(), (f.width * f.height * 4) as usize);
+    }
+
     /// Generate a tiny test clip with the ffmpeg CLI, or skip if it isn't available.
-    fn make_test_clip() -> Option<std::path::PathBuf> {
+    ///
+    /// `name` keeps each test on its own file: the suite runs tests in parallel threads,
+    /// and two of them writing one path races a half-written container into a decoder.
+    fn make_test_clip(name: &str) -> Option<std::path::PathBuf> {
         let dir = std::env::temp_dir().join("castaway-ffmpeg-test");
         std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("testsrc.mp4");
+        let path = dir.join(format!("{name}.mp4"));
         let status = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
@@ -324,17 +630,16 @@ mod tests {
 
     #[test]
     fn decodes_testsrc_to_rgba_frames() {
-        let Some(path) = make_test_clip() else {
+        let Some(path) = make_test_clip("decodes-to-rgba") else {
             eprintln!("skipping: ffmpeg CLI not available to make a test clip");
             return;
         };
         let mut frames = 0usize;
         let mut first_dims = None;
-        decode(path.to_str().unwrap(), |f| {
+        decode(path.to_str().unwrap(), HwPreference::SoftwareOnly, |f| {
             if first_dims.is_none() {
                 first_dims = Some((f.width, f.height));
-                assert_eq!(f.format, PixelFormat::Rgba8);
-                assert_eq!(f.data.len(), (f.width * f.height * 4) as usize);
+                assert_rgba(&f);
             }
             frames += 1;
             true
@@ -350,10 +655,10 @@ mod tests {
     /// Generate a bare Annex-B H.264 elementary stream — no container, so the SPS/PPS is
     /// in-band exactly as a mirroring sender delivers it. `-bf 0` matches how a real
     /// sender encodes: B-frames trade latency for size, which mirroring never wants.
-    fn make_test_stream() -> Option<std::path::PathBuf> {
+    fn make_test_stream(name: &str) -> Option<std::path::PathBuf> {
         let dir = std::env::temp_dir().join("castaway-ffmpeg-test");
         std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("testsrc.h264");
+        let path = dir.join(format!("{name}.h264"));
         let status = std::process::Command::new("ffmpeg")
             .args([
                 "-y",
@@ -405,7 +710,7 @@ mod tests {
 
     #[test]
     fn stream_decode_turns_pushed_frames_into_rgba() {
-        let Some(path) = make_test_stream() else {
+        let Some(path) = make_test_stream("stream-decode") else {
             eprintln!("skipping: ffmpeg CLI not available to make a test stream");
             return;
         };
@@ -416,12 +721,12 @@ mod tests {
         let mut times = Vec::new();
         decode_stream(
             VideoCodec::H264,
+            HwPreference::SoftwareOnly,
             || input.next(),
             |f| {
                 if dims.is_none() {
                     dims = Some((f.width, f.height));
-                    assert_eq!(f.format, PixelFormat::Rgba8);
-                    assert_eq!(f.data.len(), (f.width * f.height * 4) as usize);
+                    assert_rgba(&f);
                 }
                 times.push(f.pts);
                 true
@@ -447,7 +752,7 @@ mod tests {
 
     #[test]
     fn stream_decode_waits_for_a_key_frame_before_starting() {
-        let Some(path) = make_test_stream() else {
+        let Some(path) = make_test_stream("stream-sync") else {
             return;
         };
         // Join mid-stream, as a receiver attaching to a live mirror does. Everything
@@ -457,6 +762,7 @@ mod tests {
         let mut frames = 0usize;
         decode_stream(
             VideoCodec::H264,
+            HwPreference::SoftwareOnly,
             || input.next(),
             |_f| {
                 frames += 1;
@@ -469,7 +775,7 @@ mod tests {
 
     #[test]
     fn stream_decode_skips_frames_in_another_codec() {
-        let Some(path) = make_test_stream() else {
+        let Some(path) = make_test_stream("stream-wrong-codec") else {
             return;
         };
         // An audio frame on the video source, or a sender that switched codecs without
@@ -482,6 +788,7 @@ mod tests {
         let mut frames = 0usize;
         decode_stream(
             VideoCodec::H264,
+            HwPreference::SoftwareOnly,
             || input.next(),
             |_f| {
                 frames += 1;
@@ -508,11 +815,11 @@ mod tests {
 
     #[test]
     fn callback_can_stop_early() {
-        let Some(path) = make_test_clip() else {
+        let Some(path) = make_test_clip("stop-early") else {
             return;
         };
         let mut frames = 0usize;
-        decode(path.to_str().unwrap(), |_f| {
+        decode(path.to_str().unwrap(), HwPreference::SoftwareOnly, |_f| {
             frames += 1;
             frames < 2 // stop after the second frame
         })

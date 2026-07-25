@@ -168,6 +168,89 @@ pub enum PixelFormat {
     Rgba8,
 }
 
+/// The YUV→RGB matrix a luma/chroma surface's samples were encoded against.
+///
+/// Only meaningful for a surface that is still YUV — which is exactly why it hangs off
+/// [`GpuSurface`] and not off [`DecodedFrame`]: a frame swscale already converted to RGBA
+/// cannot carry a colorspace that means anything, so it is not given a field to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColorSpace {
+    /// ITU-R BT.601 — SD, and what an unlabelled small-format stream is assumed to be.
+    Bt601,
+    /// ITU-R BT.709 — HD, and what every mirroring sender we care about emits.
+    Bt709,
+    /// ITU-R BT.2020 non-constant luminance — UHD/HDR sources.
+    Bt2020Ncl,
+}
+
+/// Whether samples span the full 0..=255 code range or the studio-limited sub-range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorRange {
+    /// Studio/"TV" range: luma 16..=235, chroma 16..=240.
+    Limited,
+    /// Full/"PC" range: 0..=255.
+    Full,
+}
+
+/// Everything the compositor needs to turn YUV samples into linear RGB correctly.
+///
+/// Getting this wrong is washed-out or oversaturated video rather than an obvious
+/// failure, so it travels *with* the surface instead of being assumed downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorInfo {
+    /// Which matrix the samples were encoded with.
+    pub space: ColorSpace,
+    /// Which code range the samples occupy.
+    pub range: ColorRange,
+}
+
+impl Default for ColorInfo {
+    /// BT.709 limited — what an HD mirroring sender emits when it labels nothing.
+    fn default() -> Self {
+        Self {
+            space: ColorSpace::Bt709,
+            range: ColorRange::Limited,
+        }
+    }
+}
+
+/// A decoded picture that never left the GPU.
+///
+/// `core` deliberately cannot name what is inside. The concrete surface is a platform
+/// handle — a Vulkan image bound to imported DMA-BUF memory on Linux, a shared D3D
+/// texture on Windows — owned by the render backend, which recovers its own type via
+/// [`GpuSurface::as_any`]. Keeping the *variant* portable and the *handle* opaque is what
+/// lets a Windows `MiracastReceiver` hand the pipeline a GPU surface without `core`
+/// growing a `cfg` (ground rule 5).
+pub trait GpuSurface: fmt::Debug + Send + Sync {
+    /// Colorimetry of the samples in this surface.
+    fn color(&self) -> ColorInfo;
+
+    /// Downcast hook so the render backend can recover the concrete surface type.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Where a decoded frame's pixels actually live.
+///
+/// The split is the whole point of hardware decode: a `Gpu` frame is one the decoder
+/// produced straight into video memory and that the compositor samples without a
+/// round-trip through system memory. A `Cpu` frame is the software path, and the
+/// fallback every hardware path must be able to degrade to mid-session.
+#[derive(Debug, Clone)]
+pub enum FrameImage {
+    /// Tightly-packed pixels in system memory, in a layout the compositor uploads
+    /// directly.
+    Cpu {
+        /// Layout of `data`.
+        format: PixelFormat,
+        /// One frame's worth of pixels, `width * height * bytes_per_pixel`.
+        data: bytes::Bytes,
+    },
+    /// A surface already resident on the GPU; the compositor imports rather than uploads.
+    Gpu(std::sync::Arc<dyn GpuSurface>),
+}
+
 /// A single encoded (compressed) video/audio frame handed from an adapter to the
 /// pipeline. The adapter has already depacketized and decrypted; the pipeline decodes.
 #[derive(Debug, Clone)]
@@ -191,12 +274,45 @@ pub struct DecodedFrame {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// Pixel layout of `data`.
-    pub format: PixelFormat,
     /// Presentation timestamp (nanoseconds since stream start).
     pub pts: std::time::Duration,
-    /// Tightly-packed pixel data for one frame.
-    pub data: bytes::Bytes,
+    /// The pixels — in system memory, or already on the GPU.
+    pub image: FrameImage,
+}
+
+impl DecodedFrame {
+    /// Build a frame from packed pixels in system memory.
+    #[must_use]
+    pub fn cpu(
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        pts: std::time::Duration,
+        data: bytes::Bytes,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pts,
+            image: FrameImage::Cpu { format, data },
+        }
+    }
+
+    /// Build a frame from a surface that is already resident on the GPU.
+    #[must_use]
+    pub fn gpu(
+        width: u32,
+        height: u32,
+        pts: std::time::Duration,
+        surface: std::sync::Arc<dyn GpuSurface>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pts,
+            image: FrameImage::Gpu(surface),
+        }
+    }
 }
 
 /// How an adapter delivers media to the pipeline.
@@ -244,6 +360,58 @@ mod tests {
     fn media_uri_rejects_unsupported_scheme() {
         assert!(MediaUri::parse("ftp://example.com/a").is_err());
         assert!(MediaUri::parse("not a url").is_err());
+    }
+
+    /// A stand-in for what `pipeline` really puts behind the trait (a DMA-BUF descriptor
+    /// or a shared D3D handle) — enough to prove the seam works without a GPU.
+    #[derive(Debug)]
+    struct FakeSurface(u32);
+
+    impl GpuSurface for FakeSurface {
+        fn color(&self) -> ColorInfo {
+            ColorInfo {
+                space: ColorSpace::Bt2020Ncl,
+                range: ColorRange::Full,
+            }
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_gpu_frame_round_trips_through_the_opaque_handle() {
+        // The point of the `dyn GpuSurface` seam: `core` carries the frame without
+        // knowing what a DMA-BUF or a DXGI handle is, and the render backend gets its
+        // own type back on the other side.
+        let frame = DecodedFrame::gpu(
+            1920,
+            1080,
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(FakeSurface(7)),
+        );
+        let FrameImage::Gpu(surface) = &frame.image else {
+            panic!("expected a GPU frame");
+        };
+        assert_eq!(surface.color().space, ColorSpace::Bt2020Ncl);
+        assert_eq!(
+            surface.as_any().downcast_ref::<FakeSurface>().map(|s| s.0),
+            Some(7),
+        );
+    }
+
+    #[test]
+    fn unlabelled_video_is_treated_as_bt709_limited() {
+        // Nearly every mirroring sender emits HD and labels nothing; guessing 601 or
+        // full-range here is the washed-out/oversaturated failure, so the default is
+        // stated once and asserted.
+        assert_eq!(
+            ColorInfo::default(),
+            ColorInfo {
+                space: ColorSpace::Bt709,
+                range: ColorRange::Limited
+            }
+        );
     }
 
     #[test]

@@ -25,6 +25,10 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 winit = { version = "0.30", optional = true }
 ffmpeg-next = { version = "7.1", optional = true }
+# Raw libav for the hwaccel path: `ffmpeg-next` 7.1 wraps none of `hw_device_ctx`,
+# `get_format`, or `AVHWFramesContext`, so those go through the -sys crate it already
+# depends on (same version, so there is only ever one libav binding in the tree).
+ffmpeg-sys-next = { version = "7.1", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 png = { version = "0.17", optional = true }
 # CEF (offscreen browser). Pinned to the CEF 147.0.10 build so it matches the nixpkgs
@@ -43,6 +47,29 @@ adblock = { version = "0.13", optional = true, default-features = false, feature
 # Blocking HTTP client to fetch+cache EasyList at startup.
 ureq = { version = "2", optional = true }
 
+# --- hwaccel interop (optional; per-platform) ---
+# Version-locked to what `wgpu-hal` 22 itself links, because these types cross the
+# `wgpu::hal` boundary: a different `ash` or `d3d12` would be a different `vk::Image` /
+# `ID3D12Resource` as far as the type system is concerned. `wgpu-hal` itself is reached
+# through wgpu's own `wgpu::hal` re-export rather than a direct dependency, so it cannot
+# drift from the wgpu we link.
+[target.'cfg(unix)'.dependencies]
+ash = { version = "0.38", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", optional = true, features = [
+    "d3d11",
+    "d3d12",
+    "dxgi",
+    "dxgi1_2",
+    "dxgiformat",
+    "dxgitype",
+    "handleapi",
+    "winerror",
+    "winnt",
+] }
+d3d12 = { version = "22", optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
@@ -55,6 +82,18 @@ default = []
 render = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ab_glyph", "dep:png"]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
+# `hwaccel` gates whether the hardware decode backends are *compiled*, never whether they
+# are *used* — that is a runtime decision (`HwPreference`), so a build with this on still
+# plays on a box with no GPU decode. Needs both halves: `ffmpeg` produces the surfaces and
+# `render` is what imports and samples them.
+hwaccel = [
+    "ffmpeg",
+    "render",
+    "dep:ffmpeg-sys-next",
+    "dep:ash",
+    "dep:winapi",
+    "dep:d3d12",
+]
 # `cef` needs `render` for the compositor it paints into; adblock is baked in.
 cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock", "dep:ureq"]
 
@@ -76,3 +115,7 @@ required-features = ["cef"]
 [[example]]
 name = "idle_preview"
 required-features = ["cef"]
+
+[[test]]
+name = "hwaccel_zero_copy"
+required-features = ["hwaccel"]

@@ -14,8 +14,10 @@
 //! must carry a `// SAFETY:` note (ground rule 8).
 
 pub mod browser;
+pub mod color;
 pub mod compositor;
 pub mod error;
+pub mod hwaccel;
 pub mod null;
 
 #[cfg(feature = "render")]
@@ -40,8 +42,10 @@ pub mod text;
 pub mod wgpu_compositor;
 
 pub use browser::{BrowserSurface, NullBrowser};
+pub use color::YuvMatrix;
 pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
 pub use error::PipelineError;
+pub use hwaccel::{DecodePath, FallbackPolicy, HwBackendKind, HwGiveUp, HwPreference};
 pub use null::NullPipeline;
 
 #[cfg(feature = "render")]

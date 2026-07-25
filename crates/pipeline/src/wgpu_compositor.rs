@@ -11,10 +11,13 @@
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
+use castaway_core::GpuSurface;
 use wgpu::util::DeviceExt as _;
 
+use crate::color::YuvMatrix;
 use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
+use crate::hwaccel::{GpuImporter, SurfaceImport};
 
 /// Build the wgpu instance restricted to the backend this platform is meant to run on.
 ///
@@ -74,6 +77,57 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// The hardware-decode path's shader. Same quad and same transform as [`SHADER`], but the
+/// texture is a two-plane NV12 surface the decoder wrote and we never copied, so the
+/// YUV→RGB conversion swscale used to do on the CPU happens here instead — three dot
+/// products against a matrix [`YuvMatrix`] derived from the surface's own colorimetry.
+const SHADER_NV12: &str = r#"
+// {vec4 ×5} = 80 bytes, align 16. `offset.xyz` is the YUV zero point; `offset.w` carries
+// opacity so the struct stays five clean vec4s.
+struct Uniform {
+    transform: vec4<f32>,
+    m0: vec4<f32>,
+    m1: vec4<f32>,
+    m2: vec4<f32>,
+    offset: vec4<f32>,
+};
+@group(0) @binding(0) var luma: texture_2d<f32>;
+@group(0) @binding(1) var chroma: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
+@group(0) @binding(3) var<uniform> u: Uniform;
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    );
+    let uv = quad[vi];
+    let sx = u.transform.x; let sy = u.transform.y;
+    let ox = u.transform.z; let oy = u.transform.w;
+    let x = (ox + uv.x * sx) * 2.0 - 1.0;
+    let y = 1.0 - (oy + uv.y * sy) * 2.0;
+    var out: VsOut;
+    out.pos = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Plane 0 is full-resolution luma (R8); plane 1 is half-resolution interleaved
+    // chroma (RG8). Both are sampled with the same normalized uv — the hardware handles
+    // the 2× chroma upsample as part of filtering.
+    let y = textureSample(luma, smp, in.uv).r;
+    let cbcr = textureSample(chroma, smp, in.uv).rg;
+    let s = vec3<f32>(y, cbcr.r, cbcr.g) - u.offset.xyz;
+    let rgb = vec3<f32>(dot(u.m0.xyz, s), dot(u.m1.xyz, s), dot(u.m2.xyz, s));
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), u.offset.w);
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniform {
@@ -88,6 +142,30 @@ impl Uniform {
             transform: [t.scale_x, t.scale_y, t.offset_x, t.offset_y],
             opacity,
             _pad: [0.0; 3],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Nv12Uniform {
+    transform: [f32; 4],
+    m0: [f32; 4],
+    m1: [f32; 4],
+    m2: [f32; 4],
+    /// `xyz` = YUV zero point, `w` = opacity.
+    offset: [f32; 4],
+}
+
+impl Nv12Uniform {
+    fn from_layer(t: Transform, opacity: f32, yuv: YuvMatrix) -> Self {
+        let row = |r: [f32; 3]| [r[0], r[1], r[2], 0.0];
+        Self {
+            transform: [t.scale_x, t.scale_y, t.offset_x, t.offset_y],
+            m0: row(yuv.matrix[0]),
+            m1: row(yuv.matrix[1]),
+            m2: row(yuv.matrix[2]),
+            offset: [yuv.offset[0], yuv.offset[1], yuv.offset[2], opacity],
         }
     }
 }
@@ -111,11 +189,63 @@ impl TexelFormat {
     }
 }
 
+/// How a layer's pixels got onto the GPU, and therefore which pipeline draws it.
+///
+/// Modeled as an enum rather than a `format` field with a magic value because the two
+/// cases differ in bind-group *shape*, not just in format: an imported surface binds two
+/// plane views and a color matrix, an uploaded one binds a single packed texture. A
+/// mismatch between the two must not be representable.
+enum LayerTexture {
+    /// A packed RGBA/BGRA texture we own and write into.
+    Packed {
+        texture: wgpu::Texture,
+        format: TexelFormat,
+    },
+    /// A two-plane NV12 surface produced by a hardware decoder and imported in place.
+    Nv12 {
+        /// Held so the imported surface outlives the bind group referencing its views.
+        _texture: wgpu::Texture,
+        /// Held so the *decoder's* surface is not recycled while we sample it. A DMA-BUF
+        /// keeps the memory alive but does nothing to stop libavcodec handing the same
+        /// VA surface to the next picture, so this reference is what prevents tearing.
+        _surface: std::sync::Arc<dyn GpuSurface>,
+        yuv: YuvMatrix,
+    },
+}
+
 struct LayerGpu {
-    texture: wgpu::Texture,
-    format: TexelFormat,
+    texture: LayerTexture,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+impl LayerGpu {
+    /// The packed texture this layer draws from, if it is on the upload path. `None` for
+    /// an imported surface — which is exactly why a re-upload cannot silently write into
+    /// one.
+    const fn packed(&self) -> Option<(&wgpu::Texture, TexelFormat)> {
+        match &self.texture {
+            LayerTexture::Packed { texture, format } => Some((texture, *format)),
+            LayerTexture::Nv12 { .. } => None,
+        }
+    }
+
+    /// Rewrite this layer's uniform for a new transform/opacity, in whichever layout its
+    /// pipeline expects.
+    fn write_uniform(&self, queue: &wgpu::Queue, transform: Transform, opacity: f32) {
+        match &self.texture {
+            LayerTexture::Packed { .. } => queue.write_buffer(
+                &self.uniform,
+                0,
+                bytemuck::bytes_of(&Uniform::from_layer(transform, opacity)),
+            ),
+            LayerTexture::Nv12 { yuv, .. } => queue.write_buffer(
+                &self.uniform,
+                0,
+                bytemuck::bytes_of(&Nv12Uniform::from_layer(transform, opacity, *yuv)),
+            ),
+        }
+    }
 }
 
 struct LayerState {
@@ -134,15 +264,25 @@ enum Target {
     },
 }
 
+/// The two draw programs a layer can use, built once for the target's format.
+struct Programs {
+    packed: wgpu::RenderPipeline,
+    packed_bgl: wgpu::BindGroupLayout,
+    nv12: wgpu::RenderPipeline,
+    nv12_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
 /// The wgpu compositor.
 pub struct WgpuCompositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    programs: Programs,
     target: Target,
     layers: HashMap<LayerId, LayerState>,
+    /// Set when the device was opened with the external-memory extensions a hardware
+    /// decoder's surfaces need. `None` once we have concluded it cannot import.
+    importer: Option<GpuImporter>,
 }
 
 impl WgpuCompositor {
@@ -159,10 +299,10 @@ impl WgpuCompositor {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| PipelineError::GpuInit("no GPU adapter".into()))?;
-        let (device, queue) = request_device(&adapter)?;
+        let (device, queue, importer) = open_device(&adapter)?;
 
         let format = wgpu::TextureFormat::Rgba8Unorm;
-        let (pipeline, bind_group_layout, sampler) = build_pipeline(&device, format);
+        let programs = build_programs(&device, format);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen-target"),
             size: wgpu::Extent3d {
@@ -181,14 +321,13 @@ impl WgpuCompositor {
         Ok(Self {
             device,
             queue,
-            pipeline,
-            bind_group_layout,
-            sampler,
+            programs,
             target: Target::Offscreen {
                 texture,
                 size: (width, height),
             },
             layers: HashMap::new(),
+            importer,
         })
     }
 
@@ -209,7 +348,7 @@ impl WgpuCompositor {
             force_fallback_adapter: false,
         }))
         .ok_or_else(|| PipelineError::GpuInit("no GPU adapter for surface".into()))?;
-        let (device, queue) = request_device(&adapter)?;
+        let (device, queue, importer) = open_device(&adapter)?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -238,16 +377,25 @@ impl WgpuCompositor {
         };
         surface.configure(&device, &config);
 
-        let (pipeline, bind_group_layout, sampler) = build_pipeline(&device, format);
+        let programs = build_programs(&device, format);
         Ok(Self {
             device,
             queue,
-            pipeline,
-            bind_group_layout,
-            sampler,
+            programs,
             target: Target::Surface { surface, config },
             layers: HashMap::new(),
+            importer,
         })
+    }
+
+    /// Whether this compositor's device can import a hardware decoder's surfaces
+    /// zero-copy. The decode side asks *before* choosing a path: decoding to GPU surfaces
+    /// that nothing can sample is strictly worse than decoding on the CPU.
+    #[must_use]
+    pub fn surface_import(&self) -> SurfaceImport {
+        self.importer
+            .as_ref()
+            .map_or(SurfaceImport::Unsupported, GpuImporter::capability)
     }
 
     /// Resize the surface target (no-op for offscreen).
@@ -290,14 +438,16 @@ impl WgpuCompositor {
             return Err(PipelineError::InvalidFrame("pixel buffer too small"));
         }
 
-        if let Some(gpu) = self.layers.get(&id).and_then(|s| s.gpu.as_ref()) {
-            if gpu.format == format
-                && gpu.texture.width() == width
-                && gpu.texture.height() == height
-            {
+        if let Some((texture, existing)) = self
+            .layers
+            .get(&id)
+            .and_then(|s| s.gpu.as_ref())
+            .and_then(LayerGpu::packed)
+        {
+            if existing == format && texture.width() == width && texture.height() == height {
                 write_pixels_region(
                     &self.queue,
-                    &gpu.texture,
+                    texture,
                     width,
                     &pixels[..need],
                     DirtyRect::full(width, height),
@@ -347,7 +497,7 @@ impl WgpuCompositor {
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("layer-bg"),
-            layout: &self.bind_group_layout,
+            layout: &self.programs.packed_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -355,7 +505,7 @@ impl WgpuCompositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.programs.sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -369,8 +519,126 @@ impl WgpuCompositor {
             LayerState {
                 meta,
                 gpu: Some(LayerGpu {
-                    texture,
-                    format,
+                    texture: LayerTexture::Packed { texture, format },
+                    uniform,
+                    bind_group,
+                }),
+            },
+        );
+        Ok(())
+    }
+
+    /// Bind a hardware decoder's surface as a layer, **without copying it**.
+    ///
+    /// This is the payoff for the whole hwaccel exercise: the decoder wrote NV12 into
+    /// video memory, and the same allocation is handed to the sampler. The alternative —
+    /// `av_hwframe_transfer_data` back to system memory so [`Self::upload_texture`] can
+    /// take it — costs a GPU→CPU→GPU round trip that, at 4K, is usually more expensive
+    /// than the CPU decode it was meant to replace.
+    ///
+    /// A fresh `wgpu::Texture` (and therefore a fresh bind group) is built per frame:
+    /// the decoder cycles a pool of surfaces and gives no stable identity to cache on.
+    /// The import is a handful of driver objects, not a copy, so it costs microseconds.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if this device cannot import external surfaces or the
+    /// surface is not one this platform's importer understands. The caller's answer to
+    /// that is to fall back to software decode, not to fail the session.
+    pub fn import_surface(
+        &mut self,
+        id: LayerId,
+        width: u32,
+        height: u32,
+        surface: &std::sync::Arc<dyn GpuSurface>,
+    ) -> Result<(), PipelineError> {
+        let importer = self
+            .importer
+            .as_mut()
+            .ok_or_else(|| PipelineError::GpuImport("device cannot import GPU surfaces".into()))?;
+        let texture = importer.import(&self.device, surface)?;
+        if texture.width() != width || texture.height() != height {
+            // The frame's declared size and the surface's real size disagreeing means a
+            // resize was mishandled somewhere upstream; drawing it would sample garbage
+            // outside the picture.
+            return Err(PipelineError::GpuImport(format!(
+                "surface is {}×{} but the frame claims {width}×{height}",
+                texture.width(),
+                texture.height(),
+            )));
+        }
+
+        // NV12 is sampled through per-plane views: plane 0 is full-res R8 luma, plane 1
+        // is half-res RG8 chroma. wgpu exposes exactly this via `TextureAspect`, so the
+        // only part that needed raw hal was getting the surface in.
+        let luma = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("nv12-luma"),
+            format: Some(wgpu::TextureFormat::R8Unorm),
+            aspect: wgpu::TextureAspect::Plane0,
+            ..Default::default()
+        });
+        let chroma = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("nv12-chroma"),
+            format: Some(wgpu::TextureFormat::Rg8Unorm),
+            aspect: wgpu::TextureAspect::Plane1,
+            ..Default::default()
+        });
+
+        let meta = self.layers.get(&id).map_or(
+            Layer {
+                id,
+                z: default_z(id),
+                opacity: 1.0,
+                transform: Transform::default(),
+            },
+            |s| s.meta.clone(),
+        );
+        let yuv = YuvMatrix::new(surface.color());
+        // `width`/`height` were consumed by the size check above; the texture carries the
+        // real extent from here on.
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("layer-uniform-nv12"),
+                contents: bytemuck::bytes_of(&Nv12Uniform::from_layer(
+                    meta.transform,
+                    meta.opacity,
+                    yuv,
+                )),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer-bg-nv12"),
+            layout: &self.programs.nv12_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&luma),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&chroma),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.programs.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.layers.insert(
+            id,
+            LayerState {
+                meta,
+                gpu: Some(LayerGpu {
+                    texture: LayerTexture::Nv12 {
+                        _texture: texture,
+                        _surface: std::sync::Arc::clone(surface),
+                        yuv,
+                    },
                     uniform,
                     bind_group,
                 }),
@@ -400,14 +668,16 @@ impl WgpuCompositor {
         if width == 0 || height == 0 || pixels.len() < need {
             return Err(PipelineError::InvalidFrame("pixel buffer too small"));
         }
-        if let Some(gpu) = self.layers.get(&id).and_then(|s| s.gpu.as_ref()) {
-            if gpu.format == format
-                && gpu.texture.width() == width
-                && gpu.texture.height() == height
-            {
+        if let Some((texture, existing)) = self
+            .layers
+            .get(&id)
+            .and_then(|s| s.gpu.as_ref())
+            .and_then(LayerGpu::packed)
+        {
+            if existing == format && texture.width() == width && texture.height() == height {
                 for rect in rects {
                     if let Some(r) = rect.clamped(width, height) {
-                        write_pixels_region(&self.queue, &gpu.texture, width, &pixels[..need], r);
+                        write_pixels_region(&self.queue, texture, width, &pixels[..need], r);
                     }
                 }
                 return Ok(());
@@ -509,9 +779,14 @@ impl WgpuCompositor {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
             for state in ordered {
                 if let Some(gpu) = &state.gpu {
+                    // Each layer picks its program: uploaded layers sample one packed
+                    // texture, imported ones sample two planes and convert.
+                    pass.set_pipeline(match gpu.texture {
+                        LayerTexture::Packed { .. } => &self.programs.packed,
+                        LayerTexture::Nv12 { .. } => &self.programs.nv12,
+                    });
                     pass.set_bind_group(0, &gpu.bind_group, &[]);
                     pass.draw(0..6, 0..1);
                 }
@@ -530,11 +805,7 @@ impl Compositor for WgpuCompositor {
         entry.meta = layer.clone();
         // If the layer already has a texture, push the new transform/opacity to its uniform.
         if let Some(gpu) = &entry.gpu {
-            self.queue.write_buffer(
-                &gpu.uniform,
-                0,
-                bytemuck::bytes_of(&Uniform::from_layer(layer.transform, layer.opacity)),
-            );
+            gpu.write_uniform(&self.queue, layer.transform, layer.opacity);
         }
     }
 
@@ -607,68 +878,111 @@ fn write_pixels_region(
     );
 }
 
-fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), PipelineError> {
-    pollster::block_on(adapter.request_device(
+/// The limits every device we open gets: the downlevel baseline, raised to the adapter's
+/// real max texture size. The baseline caps 2D textures at 2048, which can't even
+/// configure a 4K surface (the Dell panel is 3840×2160).
+fn compositor_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits())
+}
+
+/// Open the render device, preferring one that can import a hardware decoder's surfaces.
+///
+/// Two attempts, in order, and the *downgrade is logged* — a compositor that quietly
+/// opened a plain device is a compositor that will quietly decode on the CPU forever,
+/// which looks like nothing at all until someone notices the fan.
+fn open_device(
+    adapter: &wgpu::Adapter,
+) -> Result<(wgpu::Device, wgpu::Queue, Option<GpuImporter>), PipelineError> {
+    match GpuImporter::open_device(adapter, compositor_limits(adapter)) {
+        Ok(Some((device, queue, importer))) => {
+            tracing::info!(
+                backend = %importer.capability(),
+                "compositor device opened with GPU surface import",
+            );
+            return Ok((device, queue, Some(importer)));
+        }
+        Ok(None) => {
+            // No hwaccel backend compiled for this platform — expected, not a downgrade.
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "no interop-capable GPU device; falling back to a plain device \
+             (hardware decode will not be used)",
+        ),
+    }
+
+    let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("castaway-compositor"),
             required_features: wgpu::Features::empty(),
-            // Downlevel baseline, but raised to the adapter's real max texture size:
-            // the baseline caps 2D textures at 2048, which can't even configure a 4K
-            // surface (the Dell panel is 3840×2160).
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            required_limits: compositor_limits(adapter),
             memory_hints: wgpu::MemoryHints::Performance,
         },
         None,
     ))
-    .map_err(|e| PipelineError::GpuInit(e.to_string()))
+    .map_err(|e| PipelineError::GpuInit(e.to_string()))?;
+    Ok((device, queue, None))
 }
 
-fn build_pipeline(
+/// One entry in a bind group layout, spelled out so the two layouts below stay readable.
+const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+const fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+const fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// Build one textured-quad program from a shader source and a bind group layout.
+fn build_program(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
-) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
+    label: &str,
+    source: &str,
+    entries: &[wgpu::BindGroupLayoutEntry],
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("composite-shader"),
-        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("layer-bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
+        label: Some(label),
+        entries,
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("composite-layout"),
+        label: Some(label),
         bind_group_layouts: &[&bind_group_layout],
         push_constant_ranges: &[],
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("composite-pipeline"),
+        label: Some(label),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -692,13 +1006,44 @@ fn build_pipeline(
         multiview: None,
         cache: None,
     });
+    (pipeline, bind_group_layout)
+}
+
+fn build_programs(device: &wgpu::Device, format: wgpu::TextureFormat) -> Programs {
+    let (packed, packed_bgl) = build_program(
+        device,
+        format,
+        "composite-packed",
+        SHADER,
+        &[texture_entry(0), sampler_entry(1), uniform_entry(2)],
+    );
+    // The NV12 program only compiles usefully on a device that has the feature; building
+    // it unconditionally is still fine — it is a shader and a layout, not a texture.
+    let (nv12, nv12_bgl) = build_program(
+        device,
+        format,
+        "composite-nv12",
+        SHADER_NV12,
+        &[
+            texture_entry(0),
+            texture_entry(1),
+            sampler_entry(2),
+            uniform_entry(3),
+        ],
+    );
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("layer-sampler"),
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    (pipeline, bind_group_layout, sampler)
+    Programs {
+        packed,
+        packed_bgl,
+        nv12,
+        nv12_bgl,
+        sampler,
+    }
 }
 
 fn default_z(id: LayerId) -> i32 {

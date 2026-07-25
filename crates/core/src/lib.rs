@@ -25,6 +25,6 @@ pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::Pipeline;
 pub use session::{SessionConfig, SessionManager};
 pub use types::{
-    AudioCodec, DecodedFrame, EncodedFrame, FrameSource, FriendlyName, MediaUri, PixelFormat,
-    ProtocolKind, VideoCodec,
+    AudioCodec, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame, FrameImage,
+    FrameSource, FriendlyName, GpuSurface, MediaUri, PixelFormat, ProtocolKind, VideoCodec,
 };

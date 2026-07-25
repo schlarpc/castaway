@@ -12,12 +12,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use castaway_core::{
-    ControlTxn, CoreError, DecodedFrame, FrameSource, MediaUri, Pipeline, PixelFormat,
+    ControlTxn, CoreError, DecodedFrame, FrameImage, FrameSource, MediaUri, Pipeline, PixelFormat,
 };
 use tracing::{info, warn};
 
 use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
+use crate::hwaccel::HwPreference;
 use crate::wgpu_compositor::{TexelFormat, WgpuCompositor};
 
 /// A command sent from the tokio/decode side to the render thread. (OSD is a separate
@@ -36,11 +37,17 @@ pub struct RenderPipeline {
     /// Stop flag for the currently-running decode thread, so a new `Play`/`stop`
     /// preempts the old one.
     active: Mutex<Option<Arc<AtomicBool>>>,
+    /// Whether decode threads may use hardware decode. A *runtime* setting, never a
+    /// compile-time one — see [`crate::hwaccel`].
+    hw: HwPreference,
 }
 
 impl RenderPipeline {
     /// Create the pipeline and the receiver the [`RenderLoop`] consumes. `depth` bounds
     /// the in-flight frame queue; when full, new frames are dropped (drop-late).
+    ///
+    /// Hardware decode is attempted when the build and the box support it; see
+    /// [`Self::with_hw_preference`] to pin it either way.
     #[must_use]
     pub fn new(depth: usize) -> (Self, Receiver<RenderCommand>) {
         let (tx, rx) = sync_channel(depth.max(1));
@@ -48,9 +55,21 @@ impl RenderPipeline {
             Self {
                 tx,
                 active: Mutex::new(None),
+                hw: HwPreference::Auto,
             },
             rx,
         )
+    }
+
+    /// Pin the hardware-decode choice.
+    ///
+    /// [`HwPreference::HardwareOnly`] is the useful one for diagnosis: it turns a silent
+    /// downgrade into a hard error, which is the only way to notice that hwaccel stopped
+    /// working — everything still plays without it, just on the CPU.
+    #[must_use]
+    pub const fn with_hw_preference(mut self, preference: HwPreference) -> Self {
+        self.hw = preference;
+        self
     }
 
     fn preempt(&self) {
@@ -78,9 +97,10 @@ impl Pipeline for RenderPipeline {
 
         let tx = self.tx.clone();
         let uri = source.to_string();
+        let hw = self.hw;
         // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
         std::thread::spawn(move || {
-            let result = decode_into(&uri, &tx, &stop);
+            let result = decode_into(&uri, hw, &tx, &stop);
             if let Err(e) = result {
                 warn!(error = %e, "decode ended with error");
             }
@@ -116,10 +136,11 @@ impl Pipeline for RenderPipeline {
                 let stop = Arc::new(AtomicBool::new(false));
                 self.set_active(stop.clone());
                 let tx = self.tx.clone();
+                let hw = self.hw;
                 // Same reasoning as `play`: decode blocks, so it gets an OS thread of its
                 // own rather than a runtime worker.
                 std::thread::spawn(move || {
-                    if let Err(e) = decode_mirror(rx, &tx, &stop) {
+                    if let Err(e) = decode_mirror(rx, hw, &tx, &stop) {
                         warn!(error = %e, "mirror decode ended with error");
                     }
                 });
@@ -146,12 +167,13 @@ impl Pipeline for RenderPipeline {
 /// Decode `uri` into render commands until EOF or `stop` is set.
 fn decode_into(
     uri: &str,
+    hw: HwPreference,
     tx: &SyncSender<RenderCommand>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), PipelineError> {
     #[cfg(feature = "ffmpeg")]
     {
-        crate::ffmpeg_decode::decode(uri, |frame| {
+        crate::ffmpeg_decode::decode(uri, hw, |frame| {
             if stop.load(Ordering::SeqCst) {
                 return false;
             }
@@ -164,7 +186,7 @@ fn decode_into(
     }
     #[cfg(not(feature = "ffmpeg"))]
     {
-        let _ = (uri, tx, stop);
+        let _ = (uri, hw, tx, stop);
         Err(PipelineError::Decode(
             "decode requires the `ffmpeg` feature".into(),
         ))
@@ -183,6 +205,7 @@ fn decode_into(
 /// not spinning.
 fn decode_mirror(
     #[allow(unused_mut)] mut rx: tokio::sync::mpsc::Receiver<castaway_core::EncodedFrame>,
+    hw: HwPreference,
     tx: &SyncSender<RenderCommand>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), PipelineError> {
@@ -202,6 +225,7 @@ fn decode_mirror(
         let mut queued = Some(first);
         crate::ffmpeg_decode::decode_stream(
             codec,
+            hw,
             || {
                 if stop.load(Ordering::SeqCst) {
                     return None;
@@ -222,7 +246,7 @@ fn decode_mirror(
     }
     #[cfg(not(feature = "ffmpeg"))]
     {
-        let _ = (rx, tx, stop);
+        let _ = (rx, hw, tx, stop);
         Err(PipelineError::Decode(
             "mirror decode requires the `ffmpeg` feature".into(),
         ))
@@ -237,6 +261,11 @@ pub struct RenderLoop {
     rx: Receiver<RenderCommand>,
     osd: Option<crate::osd::OsdController>,
     has_video: bool,
+    /// Consecutive GPU-surface imports that failed on a device which claimed to support
+    /// them. The decode thread cannot see these — it hands over surfaces and never hears
+    /// back — so past a threshold the render thread records the verdict where the *next*
+    /// session's decoder will find it.
+    failed_imports: u32,
 }
 
 impl RenderLoop {
@@ -248,6 +277,7 @@ impl RenderLoop {
             rx,
             osd: None,
             has_video: false,
+            failed_imports: 0,
         }
     }
 
@@ -420,24 +450,42 @@ impl RenderLoop {
     fn apply(&mut self, cmd: RenderCommand) -> bool {
         match cmd {
             RenderCommand::Video(frame) => {
-                let format = match frame.format {
-                    PixelFormat::Bgra8 => TexelFormat::Bgra8,
-                    // Planar YUV is converted by swscale in the decoder; if a frame
-                    // slips through (or a future variant appears), treat the bytes as
-                    // RGBA (better a wrong frame than a panic).
-                    _ => TexelFormat::Rgba8,
-                };
-                if self
-                    .compositor
-                    .upload_texture(
+                // Two ways pixels reach the video layer: uploaded from system memory
+                // (software decode, CEF) or imported in place from a surface the decoder
+                // produced on the GPU (hwaccel). Only the second one avoids the copy.
+                let landed = match &frame.image {
+                    FrameImage::Cpu { format, data } => {
+                        let format = match format {
+                            PixelFormat::Bgra8 => TexelFormat::Bgra8,
+                            // Planar YUV is converted by swscale in the decoder; if a
+                            // frame slips through (or a future variant appears), treat
+                            // the bytes as RGBA (better a wrong frame than a panic).
+                            _ => TexelFormat::Rgba8,
+                        };
+                        self.compositor.upload_texture(
+                            LayerId::Video,
+                            frame.width,
+                            frame.height,
+                            format,
+                            data,
+                        )
+                    }
+                    FrameImage::Gpu(surface) => self.compositor.import_surface(
                         LayerId::Video,
                         frame.width,
                         frame.height,
-                        format,
-                        &frame.data,
-                    )
-                    .is_ok()
-                {
+                        surface,
+                    ),
+                };
+                if let Err(e) = &landed {
+                    warn!(error = %e, "render loop: dropping a frame the compositor could not take");
+                    if matches!(frame.image, FrameImage::Gpu(_)) {
+                        self.note_failed_import();
+                    }
+                } else {
+                    self.failed_imports = 0;
+                }
+                if landed.is_ok() {
                     if !self.has_video {
                         self.compositor.upsert_layer(Layer {
                             id: LayerId::Video,
@@ -456,6 +504,21 @@ impl RenderLoop {
                 self.has_video = false;
                 false
             }
+        }
+    }
+
+    /// Count an import failure, and past a short run conclude that this device cannot
+    /// really do it after all.
+    ///
+    /// The threshold matters: a single failure is a dropped frame on a live mirror and
+    /// invisible, but a steady stream of them means the decoder is doing hardware work
+    /// whose output lands nowhere — strictly worse than decoding on the CPU. Recording it
+    /// is what lets the next session start in software instead of rediscovering this.
+    fn note_failed_import(&mut self) {
+        const GIVE_UP_AFTER: u32 = 8;
+        self.failed_imports += 1;
+        if self.failed_imports == GIVE_UP_AFTER {
+            crate::hwaccel::mark_import_broken();
         }
     }
 
