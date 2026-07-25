@@ -198,5 +198,9 @@ unsafe fn open_shared(
             Some(Ok(wrapped))
         })
     };
-    opened.ok_or_else(|| PipelineError::GpuImport("device has no DX12 backend".into()))?
+    // `Device::as_hal` wraps the callback's own result in an `Option` for the non-core
+    // backends, so there are two layers to unwrap: "no DX12 backend" and "the open failed".
+    opened
+        .flatten()
+        .ok_or_else(|| PipelineError::GpuImport("device has no DX12 backend".into()))?
 }

@@ -40,10 +40,14 @@ default = []
 # Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)
 # and run the winit fullscreen kiosk on the main thread. Native deps required (see flake).
 render = ["pipeline/kiosk", "pipeline/ffmpeg"]
+# Compile the hardware decode backends (VA-API on Linux, D3D11VA on Windows). Whether they
+# are *used* is a runtime decision, so this is safe to leave on: a box with no GPU decode
+# still plays, on the CPU, with a log line saying so.
+hwaccel = ["render", "pipeline/hwaccel"]
 # CEF offscreen browser in the kiosk (YouTube leanback via DIAL launch). Implies `render`;
 # needs CEF_PATH from the flake devshell. CEF re-execs this binary for subprocesses, so
 # main() bootstraps it before anything else.
-cef = ["render", "pipeline/cef"]
+cef = ["render", "hwaccel", "pipeline/cef"]
 
 [lints]
 workspace = true

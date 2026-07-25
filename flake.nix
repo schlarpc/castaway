@@ -172,6 +172,7 @@
             # canary — if it stops linking, the toolchain broke, not the media stack.
             castaway-windows = windows.castaway;
             castaway-windows-render = windows.castaway-render;
+            castaway-windows-hwaccel = windows.castaway-hwaccel;
             castaway-windows-cef = windows.castaway-cef;
 
             # The MSVC CRT + Windows SDK sysroot they build against. Exposed on its own so

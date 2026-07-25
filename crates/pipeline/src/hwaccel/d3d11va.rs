@@ -53,6 +53,27 @@ use winapi::Interface as _;
 
 use super::{ffmpeg_hw, HwGiveUp};
 
+/// libavutil's `AVD3D11VADeviceContext`, declared here because the bindings do not have
+/// it: `ffmpeg-sys-next` generates `hwcontext.h` and `hwcontext_drm.h` and stops, so the
+/// D3D11VA context struct has no Rust definition to import.
+///
+/// This is a public, documented libavutil ABI (`libavutil/hwcontext_d3d11va.h`), pinned
+/// to the same 7.1 that `ffmpeg-sys-next` binds. ffmpeg only ever *appends* to these
+/// structs across minor versions, and only the leading fields are read here, so a future
+/// addition cannot shift what this reads. The interfaces are `c_void` rather than the
+/// `winapi` types because libavutil's declaration is opaque to us — they are cast at the
+/// use site, where the cast is checked against a null.
+#[repr(C)]
+struct AvD3d11vaDeviceContext {
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+    video_device: *mut std::ffi::c_void,
+    video_context: *mut std::ffi::c_void,
+    lock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    unlock: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+    lock_ctx: *mut std::ffi::c_void,
+}
+
 /// How many shared textures to cycle through.
 ///
 /// One is not enough: the compositor may still be sampling the previous frame's texture
@@ -185,7 +206,7 @@ impl D3d11Exporter {
             if ctx.is_null() {
                 return Err(HwGiveUp::DeviceUnavailable("null hw device context".into()));
             }
-            (*ctx).hwctx.cast::<sys::AVD3D11VADeviceContext>()
+            (*ctx).hwctx.cast::<AvD3d11vaDeviceContext>()
         };
         if hwctx.is_null() {
             return Err(HwGiveUp::DeviceUnavailable("null D3D11VA hwctx".into()));
