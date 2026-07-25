@@ -300,11 +300,19 @@ Two things make this smaller than it sounds:
 ### 11.2 Crate layout
 
 ```
-substrate-hci/        HCI packet codec (cmd/event/ACL) + HciTransport trait + backends
+substrate-hci/        HCI packet codec (cmd/event/ACL) + the HciTransport trait
+hci-transport/        The backends: Linux HCI_CHANNEL_USER socket, USB/WinUSB via nusb
 substrate-l2cap/      BR/EDR L2CAP: signaling, basic-mode channels, PSM routing
 substrate-sdp/        SDP data elements, record server, minimal client
 proto-bluetooth-audio/  AVDTP/A2DP + AVCTP/AVRCP + OBEX-BIP cover art
 ```
+
+**Why the transports are a separate crate from `substrate-hci`:** ground rule 8 has every
+`substrate-*` crate at `unsafe_code = "forbid"`, and the Linux `HCI_CHANNEL_USER` socket
+needs raw syscalls. So the backends live in `hci-transport`, declared as an FFI/interop
+crate alongside `pipeline` and `input-touch`. Note the USB backend needs no `unsafe` at all
+— `nusb` is a safe API — which also makes the Realtek firmware uploader (Q21) pure safe Rust
+on both platforms.
 
 Dependencies flow toward `core` as always; `proto-bluetooth-audio` is the only one that
 knows what a track is. Codec *decode* stays in `pipeline` with the rest of libav — the proto

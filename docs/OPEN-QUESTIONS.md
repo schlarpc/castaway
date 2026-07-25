@@ -184,39 +184,42 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Bluetooth audio sink
 
-Design settled in architecture-substrate.md §11 (own everything above HCI). These are the
-choices that need you; each has a default I'm building against so nothing is blocked.
+Design settled in architecture-substrate.md §11 (own everything above HCI). **Q21–Q24 were
+answered at the 2026-07-25 sync — all four confirmed as the proposed defaults.** Kept here
+with their reasoning because each one is a behavioural commitment, not a structural one, and
+the reasons are what a future reversal has to argue against.
 
-- **Q21 — Which dongle, and who loads its firmware.** The Windows `HciTransport` needs a USB
-  Bluetooth dongle bound to WinUSB instead of the Microsoft Bluetooth driver, because
-  Winsock exposes no L2CAP and the inbox sink is SBC-only with no stream access (§11.1).
-  The selection criterion is *not* antenna or spec version — it's **firmware**: most modern
-  controllers ship with no usable ROM image and depend on the OS driver uploading one at
-  probe. On Linux that still happens under `HCI_CHANNEL_USER` (the kernel runs the vendor
-  `hdev->setup()` before handing over), but under WinUSB **nothing** loads it, so the chip's
-  firmware protocol becomes ours to implement.
-  Default: standardise on **RTL8761BU** (TP-Link UB500 and the flood of identical cheap
-  dongles) and write the Realtek uploader ourselves — read ROM version via vendor opcode
-  `0xFC6D`, then chunked download via `0xFC20`. It is ~150 lines, well documented by
-  `btrtl.c`, and doing it ourselves means we use the *same* init path on both platforms
-  instead of depending on kernel behaviour on one and not the other. Buy 2–3 identical units
-  so dev box and kiosk debug as one target. Confirm the dedicated-dongle approach and
-  whether the WinUSB INF gets checked in.
-  Rejected alternatives: CSR8510 (needs no firmware, but BT 4.0 only and the market is
-  saturated with counterfeits), Intel AX200/AX210 (worst firmware flow of the lot).
-- **Q22 — LDAC decoder provenance.** libav has SBC/AAC/aptX/aptX HD decoders; **LDAC has
-  none** and AOSP's `libldac` is encoder-only, so decode means the reverse-engineered
-  `libldacdec` over FFI. Default: feature-gated (`ldac`), on by default in the Nix build,
-  and a build without it drops the LDAC SEP from the table rather than failing — so the
-  phone negotiates aptX HD or AAC instead. Also note aptX is Qualcomm IP and LDAC is Sony's;
-  a clean-room decoder on a hackerspace box is a different posture from shipping a product.
-- **Q23 — Pairing and takeover policy.** Who may connect, and what happens when a second
-  phone tries while the first is streaming? Default: `NoInputNoOutput` Just Works,
-  discoverable whenever no session is active, link keys persisted to the config dir so a
-  repeat guest reconnects silently, and **last-writer-wins takeover** to match the existing
-  `SessionManager`. The alternative — a confirmation prompt on the panel — is nicer socially
-  but needs the touch UI to exist first.
-- **Q24 — Absolute volume ownership.** AVRCP absolute volume lets the phone's volume rocker
-  drive the receiver, or vice versa. Default: we accept `SetAbsoluteVolume` from the phone
-  and mirror it into the pipeline's gain, and we do *not* push volume back on our own except
-  when the panel UI changes it. Tell me if you'd rather the panel be authoritative.
+- **Q21 — Dongle and firmware. ANSWERED: RTL8761BU, with our own uploader.** The selection
+  criterion was never antenna or spec version — it is **firmware**. Most modern controllers
+  ship with no usable ROM image and depend on the OS driver uploading one at probe. Under
+  Linux's `HCI_CHANNEL_USER` the kernel still runs the vendor `hdev->setup()` before handing
+  over, but under WinUSB **nothing** loads it, so the chip's firmware protocol is ours.
+  Standardising on RTL8761BU (TP-Link UB500 and the flood of identical cheap dongles) and
+  writing the Realtek uploader — ROM version via vendor opcode `0xFC6D`, chunked download via
+  `0xFC20`, ~150 lines, documented by `btrtl.c` — means both platforms use the *same* init
+  path rather than depending on kernel behaviour on one and not the other. Buy 2–3 identical
+  units so dev box and kiosk debug as one target.
+  Rejected: CSR8510 (no firmware needed, but BT 4.0 only and the market is saturated with
+  counterfeits), Intel AX200/AX210 (worst firmware flow of the lot).
+  Practical notes for the build: BT spec version is irrelevant — A2DP is BR/EDR, and the 5.x
+  additions are LE features. Some cheap "5.3" dongles are BLE-only and cannot do A2DP at all.
+  Plug into **USB 2.0** and use a short extension cable: USB 3.0 radiated noise desensitises
+  2.4 GHz radios and is the single biggest real-world range factor. And when Miracast lands,
+  force its P2P group to 5 GHz or a mirroring session will stomp on A2DP (§7.5).
+- **Q22 — LDAC decoder. ANSWERED: feature-gated `libldacdec`, on by default.** libav decodes
+  SBC/AAC/aptX/aptX HD; LDAC has no libav support and AOSP's `libldac` is encoder-only, so
+  decode means the reverse-engineered `libldacdec` over FFI. A build without the `ldac`
+  feature drops the LDAC SEP from the table rather than failing, so the phone negotiates
+  aptX HD or AAC instead — the codec table degrades, the build never breaks.
+- **Q23 — Pairing and takeover. ANSWERED: Just Works, keys persisted, last-writer-wins.**
+  `NoInputNoOutput` so neither side prompts, discoverable whenever no session is active, link
+  keys persisted to the config dir so a repeat guest reconnects silently, and a second phone
+  preempts the first to match the existing `SessionManager`. The accepted cost is that anyone
+  in range can seize the speakers; the panel-confirmation alternative was rejected *for now*
+  because it would block this work behind the touch UI, not because it is worse. Revisit once
+  the panel UI exists.
+- **Q24 — Absolute volume. ANSWERED: the phone is authoritative.** We accept
+  `SetAbsoluteVolume` from the phone and mirror it into the pipeline's gain; we push volume
+  back only when the panel UI changes it. Matches what people expect of a Bluetooth speaker —
+  the rocker in your hand works. Bidirectional sync was rejected: the phone's 0–127 scale and
+  our 0.0–1.0 gain round differently, and two ends mirroring each other chase the rounding.
