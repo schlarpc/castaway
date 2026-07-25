@@ -1,0 +1,26 @@
+[package]
+name = "proto-bluetooth-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "A2DP sink (AVDTP) and AVRCP: all five codecs, track metadata, transport control, and cover art."
+
+[dependencies]
+castaway-core.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+
+[features]
+default = []
+# Advertise the LDAC endpoint. Gated because advertising a codec we cannot decode is
+# worse than omitting it: the sender picks it and the session is silence (Q22).
+ldac = []
+
+[lints]
+workspace = true
