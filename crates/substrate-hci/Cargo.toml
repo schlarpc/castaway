@@ -1,0 +1,22 @@
+[package]
+name = "substrate-hci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Host Controller Interface: pure HCI packet codec (BR/EDR subset) plus the HciTransport seam that is the entire platform-specific surface of the Bluetooth stack."
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[lints]
+workspace = true

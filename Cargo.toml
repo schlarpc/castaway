@@ -5,6 +5,7 @@ resolver = "2"
 # as it lands.
 members = [
     "crates/core",
+    "crates/substrate-hci",
     "crates/substrate-ssdp",
     "crates/proto-dlna",
     "crates/substrate-mdns",
@@ -40,6 +41,7 @@ castaway-core = { path = "crates/core" }
 substrate-mdns = { path = "crates/substrate-mdns" }
 substrate-ssdp = { path = "crates/substrate-ssdp" }
 substrate-rtsp = { path = "crates/substrate-rtsp" }
+substrate-hci = { path = "crates/substrate-hci" }
 substrate-rtp = { path = "crates/substrate-rtp" }
 crypto-cast-auth = { path = "crates/crypto-cast-auth" }
 crypto-fairplay = { path = "crates/crypto-fairplay" }
