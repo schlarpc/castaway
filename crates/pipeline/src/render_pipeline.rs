@@ -111,10 +111,18 @@ impl Pipeline for RenderPipeline {
                 });
                 Ok(())
             }
-            FrameSource::Encoded(_) => {
-                // Encoded mirror (AirPlay/Cast) needs the decoder fed packet-by-packet;
-                // that path reuses the ffmpeg decoder and is the next render milestone.
-                warn!("render pipeline: encoded mirror not wired yet (needs streaming decode)");
+            FrameSource::Encoded(rx) => {
+                info!("render pipeline: MIRROR (encoded frames → decode → compositor)");
+                let stop = Arc::new(AtomicBool::new(false));
+                self.set_active(stop.clone());
+                let tx = self.tx.clone();
+                // Same reasoning as `play`: decode blocks, so it gets an OS thread of its
+                // own rather than a runtime worker.
+                std::thread::spawn(move || {
+                    if let Err(e) = decode_mirror(rx, &tx, &stop) {
+                        warn!(error = %e, "mirror decode ended with error");
+                    }
+                });
                 Ok(())
             }
         }
@@ -159,6 +167,64 @@ fn decode_into(
         let _ = (uri, tx, stop);
         Err(PipelineError::Decode(
             "decode requires the `ffmpeg` feature".into(),
+        ))
+    }
+}
+
+/// Decode an encoded mirror stream into render commands until the adapter hangs up, the
+/// render loop goes away, or `stop` is set.
+///
+/// The codec is only known once a frame has arrived — [`castaway_core::EncodedFrame`]
+/// carries it per frame — so the first frame both chooses the decoder and starts it.
+///
+/// `stop` is observed between frames, so preempting a *silent* mirror does not end this
+/// thread until the sender speaks again or drops the channel. That is fine for a live
+/// mirror, which by definition keeps sending; the thread is parked on `blocking_recv`,
+/// not spinning.
+fn decode_mirror(
+    #[allow(unused_mut)] mut rx: tokio::sync::mpsc::Receiver<castaway_core::EncodedFrame>,
+    tx: &SyncSender<RenderCommand>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), PipelineError> {
+    #[cfg(feature = "ffmpeg")]
+    {
+        // This runs on a plain OS thread, never a runtime worker, so blocking here is
+        // allowed — see the `std::thread::spawn` that calls us.
+        let Some(first) = rx.blocking_recv() else {
+            return Ok(());
+        };
+        let Some(codec) = first.video_codec else {
+            return Err(PipelineError::Decode(
+                "mirror stream delivered a frame with no video codec".into(),
+            ));
+        };
+
+        let mut queued = Some(first);
+        crate::ffmpeg_decode::decode_stream(
+            codec,
+            || {
+                if stop.load(Ordering::SeqCst) {
+                    return None;
+                }
+                queued.take().or_else(|| rx.blocking_recv())
+            },
+            |frame| {
+                if stop.load(Ordering::SeqCst) {
+                    return false;
+                }
+                // Drop on full (bounded queue) but stop if the render loop is gone.
+                !matches!(
+                    tx.try_send(RenderCommand::Video(frame)),
+                    Err(TrySendError::Disconnected(_))
+                )
+            },
+        )
+    }
+    #[cfg(not(feature = "ffmpeg"))]
+    {
+        let _ = (rx, tx, stop);
+        Err(PipelineError::Decode(
+            "mirror decode requires the `ffmpeg` feature".into(),
         ))
     }
 }
@@ -467,5 +533,100 @@ mod tests {
         let px = rloop.read_rgba().unwrap();
         let non_black = px.chunks_exact(4).any(|p| p[0] > 8 || p[1] > 8 || p[2] > 8);
         assert!(non_black, "composited frame should contain color");
+    }
+
+    /// A raw Annex-B H.264 stream, split into the per-frame units an adapter pushes.
+    fn encoded_h264() -> Option<Vec<castaway_core::EncodedFrame>> {
+        let dir = std::env::temp_dir().join("castaway-render-test");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("testsrc.h264");
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=10:duration=1",
+            ])
+            // No B-frames, as a mirroring sender encodes: reordering costs latency.
+            .args(["-pix_fmt", "yuv420p", "-bf", "0", "-f", "h264"])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?
+            .success();
+        if !ok {
+            return None;
+        }
+
+        let mut ictx = ffmpeg_next::format::input(&path).ok()?;
+        let index = ictx
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)?
+            .index();
+        let mut out = Vec::new();
+        for (stream, packet) in ictx.packets() {
+            if stream.index() != index {
+                continue;
+            }
+            if let Some(data) = packet.data() {
+                out.push(castaway_core::EncodedFrame {
+                    video_codec: Some(castaway_core::VideoCodec::H264),
+                    audio_codec: None,
+                    pts: Duration::from_millis(100 * out.len() as u64),
+                    keyframe: packet.is_key(),
+                    data: bytes::Bytes::copy_from_slice(data),
+                });
+            }
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn encoded_mirror_decodes_and_composites_pixels() {
+        let Some(frames) = encoded_h264() else {
+            eprintln!("skipping: no ffmpeg CLI");
+            return;
+        };
+        let (pipe, rx) = RenderPipeline::new(4);
+        let mut rloop = match RenderLoop::offscreen(64, 48, rx) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+
+        let (tx, frame_rx) = tokio::sync::mpsc::channel(frames.len().max(1));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // This is what a Cast/AirPlay adapter hands over: encoded frames and nothing
+            // else — no URL, no container, no codec on the source itself.
+            pipe.mirror(FrameSource::Encoded(frame_rx), None)
+                .await
+                .unwrap();
+            for frame in frames {
+                tx.send(frame).await.unwrap();
+            }
+        });
+        // Closing the source is what lets the decode thread flush and finish.
+        drop(tx);
+
+        let mut got = 0;
+        for _ in 0..50 {
+            got += rloop.pump_blocking(Duration::from_millis(200));
+            if got > 0 {
+                break;
+            }
+        }
+        assert!(got > 0, "expected at least one composited mirror frame");
+
+        let px = rloop.read_rgba().unwrap();
+        let non_black = px.chunks_exact(4).any(|p| p[0] > 8 || p[1] > 8 || p[2] > 8);
+        assert!(non_black, "composited mirror frame should contain color");
     }
 }

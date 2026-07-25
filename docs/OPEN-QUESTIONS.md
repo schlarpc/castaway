@@ -100,10 +100,14 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   to key it with until Q1 lands. Both protocols stay OFF by default, now for a narrower
   reason than D16 gave: the *listeners* answer, but Cast's device key is a dev key
   (Q2/Q11) and AirPlay can't pair (Q1), so a sender that finds either still can't play.
-- **Q16 — Real pipeline behind features.** `NullPipeline` proves the stack; the ffmpeg
-  decode + wgpu compositor + winit kiosk surface (and CEF) are declared feature flags with
-  trait surfaces (`Compositor`, `BrowserSurface`) but no backend impls yet. Wiring these is
-  the render-path milestone (needs the C6522QT box for real validation).
+- **Q16 — Real pipeline behind features.** Largely **RESOLVED**. `RenderPipeline` now
+  covers all three `FrameSource` variants: `Url` demuxes and decodes, `Encoded` feeds a
+  containerless decoder (`ffmpeg_decode::decode_stream`) from the adapter's frame channel,
+  and `Decoded` forwards straight to the compositor. Each lands composited pixels in an
+  offscreen readback test, so the render path is verified without a human or a panel.
+  What is still open is not wiring but *hardware*: the winit kiosk surface has only ever
+  been compile-checked, and hwaccel decode (vaapi on Linux, d3d11va on Windows) is still
+  the software path. Both want the C6522QT box.
 
 ## CEF / adblock / YouTube Lounge
 

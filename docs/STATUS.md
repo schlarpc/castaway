@@ -52,11 +52,16 @@ receiver's journal, so the event is proven to cross adapter → session manager 
 Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix develop`).
 - **wgpu compositor** renders textured-quad layers with transforms/z/opacity/blend on the
   RX 7900 XTX (RADV). Proven by offscreen readback tests (full-screen fill; corner PiP).
-- **ffmpeg decoder** decodes a real clip to RGBA frames (verified vs an ffmpeg testsrc).
+- **ffmpeg decoder** decodes a real clip to RGBA frames (verified vs an ffmpeg testsrc),
+  from a URL (`decode`) *or* from pushed frames with no container at all (`decode_stream`).
 - **Full pipeline**: `Play(url)` → decode → GPU composite → **colored pixels read back**
   (`play_url_decodes_and_composites_pixels`). This is the "actual output rendering" answer.
+- **Encoded mirror**: `FrameSource::Encoded` → streaming decode → GPU composite → colored
+  pixels (`encoded_mirror_decodes_and_composites_pixels`). Decode waits for a key frame
+  (mirror sessions are joined mid-stream), carries the adapter's timestamps through the
+  decoder's reorder buffer, and rebuilds swscale when the sender changes resolution.
 - **Kiosk**: winit borderless-fullscreen surface path — compile-verified (not run on the
-  dev box's live display). Encoded-mirror decode (AirPlay/Cast frames) is the next step.
+  dev box's live display).
 - Run it: `nix develop --command cargo run -p castaway --features render` (opens a
   fullscreen window; cast a video via DLNA to see it decode+display).
 
@@ -64,7 +69,9 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 1. ~~**Q15** — Cast TLS actor + AirPlay RTSP actor.~~ **Done**: both listen, both are
    driven end-to-end by the VM test. What's left behind them is the media plane, below.
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
-3. **Q16** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.
+3. ~~**Q16** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.~~ **Mostly
+   done**: all three `FrameSource` variants reach composited pixels in readback tests.
+   What's left is hardware — the kiosk surface on the real panel, and hwaccel decode.
 4. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
 5. ~~**Q12/Q13** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
    receive path is differential-tested against openscreen's `RtpPacketizer` +
