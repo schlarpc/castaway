@@ -201,6 +201,11 @@
             inherit cargoArtifacts;
           });
         }
+        # Tier-2: whole adapters driven by scripted senders from a second VM over a real
+        # LAN (ground rule 6). Linux-only — nixosTest needs KVM and a NixOS guest.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          integration-vm = import ./nix/vm-test.nix { inherit pkgs self; };
+        }
         # Cross-build the Windows artifacts and verify each one's DLL closure. The Windows
         # binaries can't be executed on the builder, so a static check of what the loader
         # will look for is the closest thing to a smoke test we get without the hardware.
@@ -312,32 +317,124 @@
         inherit nix-direnv;
       };
 
-      # NixOS module: `services.castaway.enable = true` opens the LAN-discovery and
-      # HTTP ports the receiver needs. (Running castaway as a systemd/kiosk service is
-      # a follow-up; the firewall is the part that silently breaks discovery today.)
+      # NixOS module: `services.castaway.enable = true` runs the receiver and opens the
+      # LAN-discovery and HTTP ports it needs. This is also what the integration VMs
+      # boot, so the deploy path and the tested path are the same path.
       nixosModules = rec {
-        castaway = { config, lib, ... }:
+        castaway = { config, lib, pkgs, ... }:
           let
             cfg = config.services.castaway;
+            settingsFormat = pkgs.formats.toml { };
+            configFile = settingsFormat.generate "castaway.toml" cfg.settings;
           in
           {
             options.services.castaway = {
-              enable = lib.mkEnableOption
-                "the castaway universal cast receiver (currently: open its firewall ports)";
+              enable = lib.mkEnableOption "the castaway universal cast receiver";
+
+              package = lib.mkOption {
+                type = lib.types.package;
+                default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+                defaultText = lib.literalExpression "castaway.packages.\${system}.default";
+                description = "The castaway package to run.";
+              };
 
               httpPort = lib.mkOption {
                 type = lib.types.port;
                 default = 8080;
                 description = ''
                   TCP port of castaway's shared HTTP host (DLNA description/SOAP,
-                  Spotify onboarding, DIAL REST). Must match `http_port` in
-                  castaway.toml.
+                  Spotify onboarding, DIAL REST). Written into the generated config as
+                  `http_port`, so the firewall hole and the listener can't drift apart.
+                '';
+              };
+
+              settings = lib.mkOption {
+                type = settingsFormat.type;
+                default = { };
+                example = lib.literalExpression ''
+                  {
+                    friendly_name = "hackerspace screen";
+                    interface = "10.0.0.20";
+                    enable.spotify = false;
+                  }
+                '';
+                description = ''
+                  Contents of `castaway.toml`, as a Nix attrset. See `crates/app/src/config.rs`
+                  for the full schema; unset keys take the binary's own defaults.
+                '';
+              };
+
+              logLevel = lib.mkOption {
+                type = lib.types.str;
+                default = "info";
+                example = "info,castaway=debug";
+                description = "`RUST_LOG` filter for the service.";
+              };
+
+              openFirewall = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = ''
+                  Open the HTTP port plus SSDP (1900/udp) and mDNS (5353/udp). Discovery
+                  fails silently without these, which is the failure mode this exists to
+                  prevent — turn it off only if something else manages the rules.
                 '';
               };
             };
 
             config = lib.mkIf cfg.enable {
-              networking.firewall = {
+              # One source of truth for the port: the option feeds the config file.
+              services.castaway.settings.http_port = lib.mkDefault cfg.httpPort;
+
+              # castaway runs its own mDNS responder on 5353 (OPEN-QUESTIONS Q5). Both
+              # can bind with SO_REUSEPORT, so this is a warning rather than an
+              # assertion — but which one answers a given query becomes a race.
+              warnings = lib.optional config.services.avahi.enable ''
+                services.castaway: avahi is also enabled and will contend for UDP 5353
+                with castaway's own mDNS responder. Disable services.avahi on the
+                receiver so Cast/AirPlay/Spotify advertisements are answered by castaway.
+              '';
+
+              systemd.services.castaway = {
+                description = "castaway universal cast receiver";
+                wantedBy = [ "multi-user.target" ];
+                # Discovery joins multicast groups on a specific interface, so the
+                # address has to be up before we bind.
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+
+                environment = {
+                  CASTAWAY_CONFIG = "${configFile}";
+                  RUST_LOG = cfg.logLevel;
+                };
+
+                serviceConfig = {
+                  ExecStart = lib.getExe' cfg.package "castaway";
+                  Restart = "on-failure";
+                  RestartSec = 2;
+
+                  # Everything it binds is above 1024 (HTTP, 1900, 5353), so it never
+                  # needs root or CAP_NET_BIND_SERVICE.
+                  DynamicUser = true;
+                  StateDirectory = "castaway";
+                  WorkingDirectory = "/var/lib/castaway";
+
+                  NoNewPrivileges = true;
+                  PrivateTmp = true;
+                  ProtectSystem = "strict";
+                  ProtectHome = true;
+                  ProtectKernelTunables = true;
+                  ProtectKernelModules = true;
+                  ProtectControlGroups = true;
+                  RestrictNamespaces = true;
+                  RestrictRealtime = true;
+                  RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ];
+                  SystemCallArchitectures = "native";
+                  SystemCallFilter = [ "@system-service" ];
+                };
+              };
+
+              networking.firewall = lib.mkIf cfg.openFirewall {
                 # The shared HTTP host (dd.xml fetches, DIAL launch, SOAP, Spotify).
                 allowedTCPPorts = [ cfg.httpPort ];
                 allowedUDPPorts = [

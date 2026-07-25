@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     init_tracing();
-    let config = Config::load("castaway.toml").context("loading config")?;
+    let config = Config::from_env().context("loading config")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

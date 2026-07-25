@@ -2,8 +2,9 @@
 //! (OPEN-QUESTIONS Q4: confirm TOML is the config source you want.)
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::Deserialize;
 
 /// Top-level configuration.
@@ -66,7 +67,37 @@ impl Default for Config {
     }
 }
 
+/// Environment variable naming the config file, for run-as-a-service deployments where
+/// the working directory isn't ours to choose (the NixOS module points this at the
+/// generated `castaway.toml` in the Nix store).
+pub const CONFIG_ENV: &str = "CASTAWAY_CONFIG";
+
+/// The config file looked for in the working directory when [`CONFIG_ENV`] is unset.
+pub const DEFAULT_CONFIG_FILE: &str = "castaway.toml";
+
 impl Config {
+    /// Load the config the environment selects.
+    ///
+    /// The two sources differ in how strict they are, on purpose: an operator who set
+    /// `$CASTAWAY_CONFIG` meant *that* file, so a missing one is a hard error rather than
+    /// a silent boot with defaults, while the conventional working-directory file stays
+    /// optional (running `cargo run` in a bare checkout should just work).
+    ///
+    /// # Errors
+    /// If `$CASTAWAY_CONFIG` names a file that can't be read, or any config file present
+    /// fails to parse.
+    pub fn from_env() -> anyhow::Result<Self> {
+        match std::env::var_os(CONFIG_ENV) {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {CONFIG_ENV}={}", path.display()))?;
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
+            None => Self::load(DEFAULT_CONFIG_FILE),
+        }
+    }
+
     /// Load from `path` if it exists, else return defaults.
     ///
     /// # Errors
@@ -134,6 +165,13 @@ mod tests {
         assert!(c.enable.cast);
         // Unspecified flags fall back to their defaults.
         assert!(c.enable.dlna);
+    }
+
+    #[test]
+    fn missing_conventional_file_falls_back_to_defaults() {
+        let absent = std::env::temp_dir().join("castaway-does-not-exist.toml");
+        let c = Config::load(absent).unwrap();
+        assert_eq!(c.http_port, Config::default().http_port);
     }
 
     #[test]
