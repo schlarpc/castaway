@@ -10,6 +10,9 @@ description = "A2DP sink (AVDTP) and AVRCP: all five codecs, track metadata, tra
 [dependencies]
 castaway-core.workspace = true
 substrate-rtp.workspace = true
+substrate-hci.workspace = true
+substrate-l2cap.workspace = true
+substrate-sdp.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync"] }

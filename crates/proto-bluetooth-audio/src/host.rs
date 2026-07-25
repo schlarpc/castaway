@@ -1,0 +1,643 @@
+//! Controller bring-up and pairing policy, as a pure state machine.
+//!
+//! Everything Q23 decided lives here and is therefore testable: Just Works pairing with
+//! no prompt on either side, link keys persisted so a repeat guest reconnects silently,
+//! discoverable only while no session is active, and legacy PIN pairing refused outright.
+//!
+//! `fn(state, event) -> (state, actions)` per ground rule 3. The actor above writes the
+//! [`HostAction::Send`]s to the transport and hands events back; nothing here opens a
+//! socket, so the whole bring-up sequence and every pairing path is exercised in unit
+//! tests with no radio.
+
+use std::collections::HashMap;
+
+use substrate_hci::{
+    AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, ConnectionHandle, Event,
+    IoCapability, LinkKey, LinkType, ScanEnable, Status,
+};
+
+/// How far controller bring-up has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostState {
+    /// Nothing sent yet.
+    Down,
+    /// Working through the initialisation sequence.
+    Initializing,
+    /// Ready to accept connections.
+    Ready,
+}
+
+/// What the host wants done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostAction {
+    /// Send this command to the controller.
+    Send(Command),
+    /// Bring-up finished; the controller is discoverable.
+    Ready {
+        /// Our own address, useful for logs and for the EIR.
+        address: BdAddr,
+        /// How many ACL fragments may be outstanding.
+        acl_credits: u16,
+        /// Largest ACL fragment the controller accepts.
+        acl_mtu: u16,
+    },
+    /// A link came up.
+    LinkUp {
+        /// The controller's handle for it.
+        handle: ConnectionHandle,
+        /// Who is on the other end.
+        peer: BdAddr,
+    },
+    /// A link went away.
+    LinkDown {
+        /// The handle that is now dead.
+        handle: ConnectionHandle,
+        /// Who it was.
+        peer: BdAddr,
+        /// Why, as the controller reported it.
+        reason: Status,
+    },
+    /// Pairing produced a link key the caller should persist (Q23).
+    Paired {
+        /// The peer it belongs to.
+        peer: BdAddr,
+        /// The key.
+        key: LinkKey,
+    },
+    /// The controller freed ACL buffers; this many fragments may be sent again.
+    Credits {
+        /// Which link.
+        handle: ConnectionHandle,
+        /// How many fragments completed.
+        count: u16,
+    },
+}
+
+/// Static configuration for the controller.
+#[derive(Debug, Clone)]
+pub struct HostConfig {
+    /// The name senders see in their Bluetooth menu.
+    pub name: String,
+    /// What kind of device we claim to be.
+    pub class_of_device: ClassOfDevice,
+    /// Whether to be discoverable when idle.
+    pub discoverable_when_idle: bool,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            name: "castaway".to_owned(),
+            class_of_device: ClassOfDevice::LOUDSPEAKER,
+            discoverable_when_idle: true,
+        }
+    }
+}
+
+/// Drives a controller from reset to discoverable, and answers pairing.
+#[derive(Debug)]
+pub struct HostController {
+    config: HostConfig,
+    state: HostState,
+    /// Commands still to send, each fired when the previous one completes.
+    pending: Vec<Command>,
+    address: BdAddr,
+    acl_credits: u16,
+    acl_mtu: u16,
+    /// Link keys for peers we have paired with before.
+    link_keys: HashMap<BdAddr, LinkKey>,
+    /// Live connections, so a disconnection can name its peer.
+    connections: HashMap<u16, BdAddr>,
+}
+
+impl HostController {
+    /// Build a host controller.
+    #[must_use]
+    pub fn new(config: HostConfig) -> Self {
+        Self {
+            config,
+            state: HostState::Down,
+            pending: Vec::new(),
+            address: BdAddr::ZERO,
+            acl_credits: 1,
+            acl_mtu: 339,
+            link_keys: HashMap::new(),
+            connections: HashMap::new(),
+        }
+    }
+
+    /// Seed the controller with link keys loaded from disk, so a repeat guest
+    /// reconnects without pairing again (Q23).
+    pub fn load_link_keys(&mut self, keys: impl IntoIterator<Item = (BdAddr, LinkKey)>) {
+        self.link_keys.extend(keys);
+    }
+
+    /// Bring-up state.
+    #[must_use]
+    pub const fn state(&self) -> HostState {
+        self.state
+    }
+
+    /// The controller's own address, once known.
+    #[must_use]
+    pub const fn address(&self) -> BdAddr {
+        self.address
+    }
+
+    /// Largest ACL fragment the controller accepts. Fragmentation must respect this.
+    #[must_use]
+    pub const fn acl_mtu(&self) -> u16 {
+        self.acl_mtu
+    }
+
+    /// Whether we have a stored key for `peer`.
+    #[must_use]
+    pub fn knows(&self, peer: BdAddr) -> bool {
+        self.link_keys.contains_key(&peer)
+    }
+
+    /// Begin bring-up. Returns the first command; the rest follow as each completes.
+    ///
+    /// The order is not arbitrary. `Reset` must come first because a controller that a
+    /// previous run left configured will otherwise answer with stale state, and
+    /// `WriteSimplePairingMode` must precede `WriteScanEnable` — a peer that pages us
+    /// before SSP is enabled gets legacy PIN pairing, which we refuse, so it would fail
+    /// to connect for reasons no log explains.
+    pub fn start(&mut self) -> Vec<HostAction> {
+        self.state = HostState::Initializing;
+        self.pending = vec![
+            Command::ReadLocalVersion,
+            Command::ReadBufferSize,
+            Command::ReadBdAddr,
+            // Every event we actually handle, plus the SSP ones — which are masked off
+            // by default on many controllers, so omitting this makes pairing hang with
+            // no event ever arriving.
+            Command::SetEventMask(0xFFFF_FFFF_FFFF_FFFF),
+            Command::WriteClassOfDevice(self.config.class_of_device),
+            Command::WriteLocalName(self.config.name.clone()),
+            Command::WriteSimplePairingMode(true),
+            Command::WriteScanEnable(self.idle_scan()),
+        ];
+        vec![HostAction::Send(Command::Reset)]
+    }
+
+    /// Set discoverability directly — used to go quiet while a session is active (Q23).
+    #[must_use]
+    pub fn set_discoverable(&mut self, discoverable: bool) -> Vec<HostAction> {
+        let scan = if discoverable {
+            self.idle_scan()
+        } else {
+            // Still connectable: a phone that is already paired must be able to
+            // reconnect even while someone else is streaming, or takeover never works.
+            ScanEnable::ConnectableOnly
+        };
+        vec![HostAction::Send(Command::WriteScanEnable(scan))]
+    }
+
+    const fn idle_scan(&self) -> ScanEnable {
+        if self.config.discoverable_when_idle {
+            ScanEnable::DiscoverableAndConnectable
+        } else {
+            ScanEnable::ConnectableOnly
+        }
+    }
+
+    /// Feed one controller event.
+    #[must_use]
+    pub fn on_event(&mut self, event: &Event) -> Vec<HostAction> {
+        match event {
+            Event::CommandComplete { opcode, params, .. } => {
+                self.on_command_complete(*opcode, params)
+            }
+            Event::CommandStatus { .. } => Vec::new(),
+
+            // --- connection lifecycle ---
+            Event::ConnectionRequest {
+                addr, link_type, ..
+            } => {
+                if *link_type == LinkType::Acl {
+                    // Stay peripheral: the phone paged us, and forcing a role switch
+                    // mid-pairing is handled badly by more controllers than not.
+                    vec![HostAction::Send(Command::AcceptConnectionRequest {
+                        addr: *addr,
+                        role: AcceptRole::RemainPeripheral,
+                    })]
+                } else {
+                    // SCO is HFP's business. Refusing is correct and keeps the
+                    // controller from allocating a synchronous link we never service.
+                    vec![HostAction::Send(Command::RejectConnectionRequest {
+                        addr: *addr,
+                        reason: Status::REJECTED_LIMITED_RESOURCES,
+                    })]
+                }
+            }
+            Event::ConnectionComplete {
+                status,
+                handle,
+                addr,
+                ..
+            } => {
+                if status.is_success() {
+                    self.connections.insert(handle.raw(), *addr);
+                    vec![HostAction::LinkUp {
+                        handle: *handle,
+                        peer: *addr,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            Event::DisconnectionComplete { handle, reason, .. } => {
+                let peer = self.connections.remove(&handle.raw()).unwrap_or_default();
+                vec![HostAction::LinkDown {
+                    handle: *handle,
+                    peer,
+                    reason: *reason,
+                }]
+            }
+
+            // --- pairing (Q23: Just Works, bonded, no prompt) ---
+            Event::IoCapabilityRequest(addr) => {
+                vec![HostAction::Send(Command::IoCapabilityRequestReply {
+                    addr: *addr,
+                    // Claiming no input and no output is what *selects* Just Works. Any
+                    // other claim makes the controller run numeric comparison and wait
+                    // for a confirmation the kiosk has no way to collect.
+                    io: IoCapability::NoInputNoOutput,
+                    auth: AuthRequirements::GeneralBondingNoMitm,
+                })]
+            }
+            Event::UserConfirmationRequest { addr, .. } => {
+                // Auto-accept. With NoInputNoOutput on our side the numeric value is not
+                // meant to be shown to anyone, and waiting for a human here is how a
+                // kiosk becomes unpairable.
+                vec![HostAction::Send(Command::UserConfirmationRequestReply(
+                    *addr,
+                ))]
+            }
+            Event::LinkKeyRequest(addr) => self.link_keys.get(addr).map_or_else(
+                || {
+                    vec![HostAction::Send(Command::LinkKeyRequestNegativeReply(
+                        *addr,
+                    ))]
+                },
+                |key| {
+                    vec![HostAction::Send(Command::LinkKeyRequestReply {
+                        addr: *addr,
+                        key: *key,
+                    })]
+                },
+            ),
+            Event::LinkKeyNotification { addr, key, .. } => {
+                self.link_keys.insert(*addr, *key);
+                vec![HostAction::Paired {
+                    peer: *addr,
+                    key: *key,
+                }]
+            }
+            Event::PinCodeRequest(addr) => {
+                // Legacy PIN pairing is refused: it would mean prompting for a number on
+                // a device with no keypad, and SSP has been mandatory since 2.1.
+                vec![HostAction::Send(Command::PinCodeRequestNegativeReply(
+                    *addr,
+                ))]
+            }
+
+            Event::NumberOfCompletedPackets(pairs) => pairs
+                .iter()
+                .map(|(handle, count)| HostAction::Credits {
+                    handle: *handle,
+                    count: *count,
+                })
+                .collect(),
+
+            _ => Vec::new(),
+        }
+    }
+
+    fn on_command_complete(
+        &mut self,
+        opcode: substrate_hci::OpCode,
+        params: &[u8],
+    ) -> Vec<HostAction> {
+        use substrate_hci::OpCode;
+
+        // Record what the informational commands told us before moving on.
+        if opcode == OpCode::READ_BUFFER_SIZE {
+            if let Ok(bs) = substrate_hci::BufferSize::parse(params) {
+                self.acl_mtu = bs.acl_max_len.max(1);
+                self.acl_credits = bs.total_packets.max(1);
+            }
+        } else if opcode == OpCode::READ_BD_ADDR {
+            if let Ok(addr) = substrate_hci::event::parse_bd_addr(params) {
+                self.address = addr;
+            }
+        }
+
+        if self.state != HostState::Initializing {
+            return Vec::new();
+        }
+        if self.pending.is_empty() {
+            self.state = HostState::Ready;
+            return vec![HostAction::Ready {
+                address: self.address,
+                acl_credits: self.acl_credits,
+                acl_mtu: self.acl_mtu,
+            }];
+        }
+        // One command in flight at a time. Controllers advertise how many they will
+        // accept, but the bring-up sequence is order-dependent anyway, so pipelining it
+        // buys nothing and risks a WriteScanEnable landing before SSP is on.
+        let next = self.pending.remove(0);
+        vec![HostAction::Send(next)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use bytes::Bytes;
+    use substrate_hci::{event::code, OpCode};
+
+    use super::*;
+
+    /// A command-complete for `opcode` with the given return parameters.
+    fn complete(opcode: OpCode, params: &[u8]) -> Event {
+        Event::parse(code::COMMAND_COMPLETE, &{
+            let mut v = vec![0x01];
+            v.extend_from_slice(&opcode.raw().to_le_bytes());
+            v.extend_from_slice(params);
+            v
+        })
+        .unwrap()
+    }
+
+    fn sent(actions: &[HostAction]) -> Vec<Command> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                HostAction::Send(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run bring-up to completion, returning every command in order.
+    fn bring_up(host: &mut HostController) -> Vec<Command> {
+        let mut all = sent(&host.start());
+        let mut last = all.last().cloned().unwrap();
+        for _ in 0..32 {
+            let params: &[u8] = match last.opcode() {
+                OpCode::READ_BUFFER_SIZE => &[0x00, 0x54, 0x01, 0xff, 0x08, 0x00, 0x08, 0x00],
+                OpCode::READ_BD_ADDR => &[0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa],
+                _ => &[0x00],
+            };
+            let actions = host.on_event(&complete(last.opcode(), params));
+            let next = sent(&actions);
+            if next.is_empty() {
+                break;
+            }
+            all.extend(next.clone());
+            last = next.last().cloned().unwrap();
+        }
+        all
+    }
+
+    #[test]
+    fn bring_up_resets_first_and_enables_ssp_before_becoming_discoverable() {
+        // Order is load-bearing twice over. Reset first, or a controller left configured
+        // by a previous run answers with stale state. SSP before scan enable, or a phone
+        // that pages us in the gap gets legacy PIN pairing — which we refuse, so it
+        // fails to connect for reasons no log explains.
+        let mut host = HostController::new(HostConfig::default());
+        let commands = bring_up(&mut host);
+        let opcodes: Vec<OpCode> = commands.iter().map(Command::opcode).collect();
+
+        assert_eq!(opcodes.first(), Some(&OpCode::RESET));
+        let ssp = opcodes
+            .iter()
+            .position(|o| *o == OpCode::WRITE_SIMPLE_PAIRING_MODE)
+            .expect("ssp must be enabled");
+        let scan = opcodes
+            .iter()
+            .position(|o| *o == OpCode::WRITE_SCAN_ENABLE)
+            .expect("must become discoverable");
+        assert!(ssp < scan, "SSP must be on before we answer inquiries");
+        assert_eq!(host.state(), HostState::Ready);
+    }
+
+    #[test]
+    fn bring_up_learns_the_controllers_address_and_buffer_geometry() {
+        // The ACL numbers *are* transmit flow control: send more than the controller
+        // will hold and it drops fragments silently, which presents as audio that
+        // stutters under load with nothing in any log.
+        let mut host = HostController::new(HostConfig::default());
+        bring_up(&mut host);
+        assert_eq!(host.address().to_string(), "AA:BB:CC:DD:EE:FF");
+        assert_eq!(host.acl_mtu(), 340);
+    }
+
+    #[test]
+    fn an_incoming_acl_connection_is_accepted_as_peripheral() {
+        // Forcing a role switch mid-pairing is handled badly by more controllers than
+        // not, and the phone paged us, so peripheral is the natural role.
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let actions = host.on_event(&Event::ConnectionRequest {
+            addr,
+            class_of_device: 0x5A_020C,
+            link_type: LinkType::Acl,
+        });
+        assert_eq!(
+            sent(&actions),
+            vec![Command::AcceptConnectionRequest {
+                addr,
+                role: AcceptRole::RemainPeripheral,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sco_connection_request_is_refused() {
+        // SCO is HFP's business. Accepting allocates a synchronous link we never
+        // service, which some controllers then refuse to tear down.
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let actions = host.on_event(&Event::ConnectionRequest {
+            addr,
+            class_of_device: 0,
+            link_type: LinkType::Sco,
+        });
+        assert!(matches!(
+            sent(&actions).first(),
+            Some(Command::RejectConnectionRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn pairing_is_just_works_with_no_prompt_on_either_side() {
+        // Q23's decision, made testable. Claiming NoInputNoOutput is what *selects*
+        // Just Works; any other claim makes the controller run numeric comparison and
+        // wait for a confirmation a kiosk has no way to collect.
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+
+        let io = sent(&host.on_event(&Event::IoCapabilityRequest(addr)));
+        assert_eq!(
+            io,
+            vec![Command::IoCapabilityRequestReply {
+                addr,
+                io: IoCapability::NoInputNoOutput,
+                auth: AuthRequirements::GeneralBondingNoMitm,
+            }]
+        );
+
+        let confirm = sent(&host.on_event(&Event::UserConfirmationRequest {
+            addr,
+            numeric_value: 123_456,
+        }));
+        assert_eq!(
+            confirm,
+            vec![Command::UserConfirmationRequestReply(addr)],
+            "auto-accept, or the kiosk is unpairable"
+        );
+    }
+
+    #[test]
+    fn legacy_pin_pairing_is_refused() {
+        // It would mean prompting for a number on a device with no keypad.
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        assert_eq!(
+            sent(&host.on_event(&Event::PinCodeRequest(addr))),
+            vec![Command::PinCodeRequestNegativeReply(addr)]
+        );
+    }
+
+    #[test]
+    fn a_returning_guest_reconnects_with_the_stored_key_and_a_new_one_pairs() {
+        // The bonding half of Q23: keys persist, so a repeat visitor never sees a
+        // pairing prompt again.
+        let mut host = HostController::new(HostConfig::default());
+        let known: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let stranger: BdAddr = "11:22:33:44:55:66".parse().unwrap();
+        let key = LinkKey::new([0xAB; 16]);
+        host.load_link_keys([(known, key)]);
+
+        assert!(host.knows(known));
+        assert_eq!(
+            sent(&host.on_event(&Event::LinkKeyRequest(known))),
+            vec![Command::LinkKeyRequestReply { addr: known, key }]
+        );
+        assert_eq!(
+            sent(&host.on_event(&Event::LinkKeyRequest(stranger))),
+            vec![Command::LinkKeyRequestNegativeReply(stranger)],
+            "an unknown peer must be told to pair fresh"
+        );
+    }
+
+    #[test]
+    fn a_new_link_key_is_surfaced_for_persistence_and_used_immediately() {
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let key = LinkKey::new([0x11; 16]);
+        let actions = host.on_event(&Event::LinkKeyNotification {
+            addr,
+            key,
+            key_type: 0x04,
+        });
+        assert_eq!(actions, vec![HostAction::Paired { peer: addr, key }]);
+        // …and it is live in this session, not only after a restart.
+        assert!(host.knows(addr));
+    }
+
+    #[test]
+    fn a_link_that_drops_names_its_peer_and_its_reason() {
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let handle = ConnectionHandle::new(0x0b).unwrap();
+        let _ = host.on_event(&Event::ConnectionComplete {
+            status: Status::SUCCESS,
+            handle,
+            addr,
+            link_type: LinkType::Acl,
+            encryption_enabled: false,
+        });
+        let actions = host.on_event(&Event::DisconnectionComplete {
+            status: Status::SUCCESS,
+            handle,
+            reason: Status::REMOTE_USER_TERMINATED,
+        });
+        assert_eq!(
+            actions,
+            vec![HostAction::LinkDown {
+                handle,
+                peer: addr,
+                reason: Status::REMOTE_USER_TERMINATED,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_connection_does_not_report_a_link() {
+        let mut host = HostController::new(HostConfig::default());
+        let actions = host.on_event(&Event::ConnectionComplete {
+            status: Status::PAGE_TIMEOUT,
+            handle: ConnectionHandle::new(0).unwrap(),
+            addr: "AA:BB:CC:DD:EE:FF".parse().unwrap(),
+            link_type: LinkType::Acl,
+            encryption_enabled: false,
+        });
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn going_quiet_for_a_session_stays_connectable() {
+        // Undiscoverable, but a phone that already paired must still be able to
+        // reconnect while someone else streams — otherwise takeover never works (Q23).
+        let mut host = HostController::new(HostConfig::default());
+        assert_eq!(
+            sent(&host.set_discoverable(false)),
+            vec![Command::WriteScanEnable(ScanEnable::ConnectableOnly)]
+        );
+        assert_eq!(
+            sent(&host.set_discoverable(true)),
+            vec![Command::WriteScanEnable(
+                ScanEnable::DiscoverableAndConnectable
+            )]
+        );
+    }
+
+    #[test]
+    fn completed_packets_are_reported_per_link_as_credits() {
+        let mut host = HostController::new(HostConfig::default());
+        let a = ConnectionHandle::new(0x0a).unwrap();
+        let b = ConnectionHandle::new(0x0b).unwrap();
+        let actions = host.on_event(&Event::NumberOfCompletedPackets(vec![(a, 5), (b, 3)]));
+        assert_eq!(
+            actions,
+            vec![
+                HostAction::Credits {
+                    handle: a,
+                    count: 5
+                },
+                HostAction::Credits {
+                    handle: b,
+                    count: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unmodelled_event_produces_no_action() {
+        let mut host = HostController::new(HostConfig::default());
+        let noise = Event::Unhandled {
+            code: 0x1b,
+            params: Bytes::from_static(&[0x0b, 0x00, 0x05]),
+        };
+        assert!(host.on_event(&noise).is_empty());
+    }
+}
