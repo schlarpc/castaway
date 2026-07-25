@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use castaway_core::{ControlTxn, CoreError, FrameSource, MediaUri, NowPlaying, Pipeline};
+use castaway_core::{
+    ControlTxn, CoreError, FrameSource, MediaUri, NowPlaying, Pipeline, SourceDescription,
+};
 use tracing::info;
 
 /// A pipeline that logs every operation and drains mirror frame sources (dropping
@@ -84,6 +86,11 @@ impl Pipeline for NullPipeline {
             artwork_bytes = snapshot.artwork.as_ref().map(castaway_core::Artwork::len),
             "null pipeline: NOW PLAYING"
         );
+        Ok(())
+    }
+
+    async fn source_info(&self, source: SourceDescription) -> Result<(), CoreError> {
+        info!(%source, "null pipeline: SOURCE");
         Ok(())
     }
 

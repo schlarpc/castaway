@@ -19,6 +19,7 @@ use crate::error::CoreError;
 use crate::event::SessionEvent;
 use crate::osd::{OsdMessage, OsdSink};
 use crate::pipeline::Pipeline;
+use crate::source::SourceDescription;
 
 /// Configuration the session manager needs that isn't per-event.
 #[derive(Debug, Clone)]
@@ -47,6 +48,7 @@ pub struct SessionManager<P: Pipeline> {
     config: SessionConfig,
     active: Option<SourceId>,
     remote: Option<Arc<dyn RemoteControl>>,
+    description: SourceDescription,
 }
 
 impl<P: Pipeline> SessionManager<P> {
@@ -63,6 +65,7 @@ impl<P: Pipeline> SessionManager<P> {
             config,
             active: None,
             remote: None,
+            description: SourceDescription::new(),
         }
     }
 
@@ -78,6 +81,12 @@ impl<P: Pipeline> SessionManager<P> {
     #[must_use]
     pub fn active(&self) -> Option<&SourceId> {
         self.active.as_ref()
+    }
+
+    /// What is known about the connected sender: name, address, negotiated codec.
+    #[must_use]
+    pub const fn description(&self) -> &SourceDescription {
+        &self.description
     }
 
     /// A handle for driving the *active sender*, if it published one.
@@ -133,6 +142,23 @@ impl<P: Pipeline> SessionManager<P> {
                     Err(CoreError::NoActiveSession(source.to_string()))
                 }
             }
+            SessionEvent::SourceInfo(info) => {
+                if self.active.as_ref() == Some(&source) {
+                    // Merged, not replaced: each update knows only the fact it just
+                    // learned, and a codec update must not erase the device's name.
+                    self.description = std::mem::take(&mut self.description).merged(info);
+                    let description = self.description.clone();
+                    if let Some(osd) = &self.osd {
+                        osd.show(OsdMessage::banner(
+                            format!("Now playing from {description}"),
+                            self.config.osd_ttl,
+                        ));
+                    }
+                    self.pipeline.source_info(description).await
+                } else {
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
             SessionEvent::ControlSurface(remote) => {
                 if self.active.as_ref() == Some(&source) {
                     info!(%source, caps = ?remote.capabilities(), "session: control surface up");
@@ -155,6 +181,7 @@ impl<P: Pipeline> SessionManager<P> {
                     info!(%source, "session: end");
                     self.active = None;
                     self.remote = None;
+                    self.description = SourceDescription::new();
                     if let Some(osd) = &self.osd {
                         osd.clear();
                     }
@@ -176,9 +203,10 @@ impl<P: Pipeline> SessionManager<P> {
         if let Some(prev) = &self.active {
             info!(%prev, %source, "session: preempting active source");
             self.pipeline.stop().await.ok();
-            // The outgoing source's control handle dies with its session — the new
-            // source publishes its own if it has one.
+            // The outgoing source's control handle and description die with its session
+            // — the new source publishes its own if it has any.
             self.remote = None;
+            self.description = SourceDescription::new();
         } else if let Some(display) = &self.display {
             // Idle → active: wake the panel and select our input.
             display.power_on().await?;
@@ -213,6 +241,7 @@ mod tests {
         control: AtomicUsize,
         audio: AtomicUsize,
         snapshots: std::sync::Mutex<Vec<crate::NowPlaying>>,
+        description: std::sync::Mutex<SourceDescription>,
     }
 
     #[derive(Clone)]
@@ -237,6 +266,10 @@ mod tests {
         }
         async fn now_playing(&self, snapshot: crate::NowPlaying) -> Result<(), CoreError> {
             self.0.snapshots.lock().expect("poisoned").push(snapshot);
+            Ok(())
+        }
+        async fn source_info(&self, info: SourceDescription) -> Result<(), CoreError> {
+            *self.0.description.lock().expect("poisoned") = info;
             Ok(())
         }
         async fn control(&self, _txn: ControlTxn) -> Result<(), CoreError> {

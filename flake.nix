@@ -73,12 +73,48 @@
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
         config = {
-          # The Windows cross-build sysroot repacks Microsoft's MSVC CRT + Windows SDK,
-          # which are redistributable-for-building but not free software. Whitelist that
-          # one derivation by name rather than flipping `allowUnfree` wholesale.
-          allowUnfreePredicate = pkg: nixpkgs.lib.getName pkg == "msvc-sysroot";
+          # Two derivations are whitelisted by name rather than flipping `allowUnfree`
+          # wholesale, so anything else unfree still fails the evaluation loudly.
+          #
+          # - msvc-sysroot: repacks Microsoft's MSVC CRT + Windows SDK, redistributable
+          #   for building but not free software.
+          # - linux-firmware: carries `unfreeRedistributableFirmware`. Redistribution is
+          #   permitted; the vendor licence text just has to travel with the blobs, which
+          #   `bluetoothFirmwareFor` copies alongside them. Without this line the failure
+          #   surfaces somewhere that looks unrelated (architecture §11.3b).
+          allowUnfreePredicate = pkg:
+            builtins.elem (nixpkgs.lib.getName pkg) [ "msvc-sysroot" "linux-firmware" ];
         };
       };
+
+      # Just the Bluetooth firmware out of linux-firmware, plus the licence text each
+      # vendor requires be redistributed with it. Carving out a subset keeps ~1 GB of
+      # unrelated blobs out of the build closure, and makes what we ship auditable.
+      bluetoothFirmwareFor = system:
+        let pkgs = pkgsFor system;
+        in pkgs.runCommand "castaway-bluetooth-firmware" { } ''
+          mkdir -p $out/intel $out/rtl_bt $out/LICENSES
+
+          # Intel AX200/AX201/AX210 — the dev box's own radio.
+          cp ${pkgs.linux-firmware}/lib/firmware/intel/ibt-20-1-3.* $out/intel/
+          cp ${pkgs.linux-firmware}/lib/firmware/intel/ibt-0041-0041.* $out/intel/
+          # Realtek RTL8761B/BU — the deploy dongle.
+          cp ${pkgs.linux-firmware}/lib/firmware/rtl_bt/rtl8761b*.bin $out/rtl_bt/
+
+          # The licences are a *condition* of redistributing the blobs, so a missing one
+          # fails the build rather than shipping a binary we are not allowed to hand out.
+          # They live in the source tree, not the installed output — nixpkgs' install
+          # phase drops them, which is precisely the sort of thing that goes unnoticed
+          # until someone asks where the licence is.
+          for licence in LICENCE.ibt_firmware LICENCE.rtlwifi_firmware.txt; do
+            cp ${pkgs.linux-firmware.src}/LICENSES/"$licence" $out/LICENSES/
+          done
+
+          # build.rs skips anything with LICEN in its name, so these travel with the
+          # binary's Nix closure without being embedded as firmware images.
+          test -n "$(ls -A $out/intel)" || { echo "no intel firmware; layout changed?" >&2; exit 1; }
+          test -n "$(ls -A $out/rtl_bt)" || { echo "no realtek firmware; layout changed?" >&2; exit 1; }
+        '';
 
       # Rust toolchain - pinned via rust-toolchain.toml (single source of truth).
       # rust-overlay (locked in flake.lock) supplies the exact build, so this stays
@@ -362,6 +398,10 @@
               pkgs.libxi
               pkgs.libxrandr
             ];
+
+            # Where `hci-transport`'s build.rs finds controller firmware to embed.
+            # Windows has no /lib/firmware, so blobs travel inside the binary.
+            CASTAWAY_FIRMWARE_DIR = "${bluetoothFirmwareFor system}";
 
             # Environment variables for development
             RUST_BACKTRACE = "1";

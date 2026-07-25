@@ -273,6 +273,76 @@ impl CodecCapability {
         }
     }
 
+    /// A human-readable summary of a *configuration*, for the on-screen device card.
+    ///
+    /// Only meaningful once the sender has narrowed the offer — a capability describes a
+    /// set, and "44.1 or 48 kHz" is not something to put on a screen. Returns just the
+    /// codec name when the rate cannot be resolved, which is honest rather than wrong.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let Some(rate) = self.sample_rate() else {
+            return self.name().to_ascii_uppercase();
+        };
+        let khz = if rate % 1000 == 0 {
+            format!("{} kHz", rate / 1000)
+        } else {
+            // 44100 reads as 44.1, not 44 — the difference people actually look for.
+            format!("{:.1} kHz", f64::from(rate) / 1000.0)
+        };
+        match self.channel_summary() {
+            Some(channels) => format!("{} · {khz} · {channels}", self.display_name()),
+            None => format!("{} · {khz}", self.display_name()),
+        }
+    }
+
+    /// The codec's name as it is normally written.
+    #[must_use]
+    pub const fn display_name(&self) -> &'static str {
+        match self {
+            Self::Sbc { .. } => "SBC",
+            Self::Aac { .. } => "AAC",
+            Self::AptX { .. } => "aptX",
+            Self::AptXHd { .. } => "aptX HD",
+            Self::Ldac { .. } => "LDAC",
+        }
+    }
+
+    /// The channel mode of a configuration, in words.
+    #[must_use]
+    pub fn channel_summary(&self) -> Option<&'static str> {
+        let modes = match self {
+            Self::Sbc { channels, .. }
+            | Self::AptX { channels, .. }
+            | Self::AptXHd { channels, .. } => *channels,
+            Self::Aac { channel_bits, .. } => {
+                return Some(if *channel_bits == 0b10 {
+                    "mono"
+                } else {
+                    "stereo"
+                })
+            }
+            Self::Ldac { channel_bits, .. } => {
+                return Some(match channel_bits {
+                    0b100 => "mono",
+                    0b010 => "dual channel",
+                    _ => "stereo",
+                })
+            }
+        };
+        if !modes.is_single() {
+            return None;
+        }
+        Some(if modes == ChannelModes::MONO {
+            "mono"
+        } else if modes == ChannelModes::DUAL {
+            "dual channel"
+        } else if modes == ChannelModes::JOINT_STEREO {
+            "joint stereo"
+        } else {
+            "stereo"
+        })
+    }
+
     /// Preference order, highest first. Used to order the SEP table we advertise.
     ///
     /// Senders generally pick the first endpoint they also support, so the order here is
@@ -745,6 +815,51 @@ mod tests {
             CodecCapability::decode(&hex!("00 00 21")),
             Err(AudioError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn a_configuration_describes_itself_for_the_device_card() {
+        // What ends up on screen. 44100 must read as 44.1 kHz, not 44 — the digit people
+        // actually look at to tell CD rate from 48.
+        let aptx_hd = CodecCapability::AptXHd {
+            rates: SampleRates::HZ_48000,
+            channels: ChannelModes::JOINT_STEREO,
+        };
+        assert_eq!(aptx_hd.describe(), "aptX HD · 48 kHz · joint stereo");
+
+        let sbc = CodecCapability::Sbc {
+            rates: SampleRates::HZ_44100,
+            channels: ChannelModes::STEREO,
+            block_lengths: 0b0001,
+            subbands: 0b01,
+            allocations: 0b01,
+            min_bitpool: 2,
+            max_bitpool: 53,
+        };
+        assert_eq!(sbc.describe(), "SBC · 44.1 kHz · stereo");
+    }
+
+    #[test]
+    fn an_unnarrowed_offer_describes_only_the_codec() {
+        // A capability is a set. "44.1 or 48 kHz" is not something to put on a screen,
+        // so the codec name alone is the honest answer.
+        let offer = CodecCapability::AptX {
+            rates: SampleRates::COMMON,
+            channels: ChannelModes::ALL,
+        };
+        assert_eq!(offer.describe(), "APTX");
+    }
+
+    #[test]
+    fn every_advertised_codec_has_a_display_name() {
+        for cap in advertised(true) {
+            let name = cap.display_name();
+            assert!(!name.is_empty(), "{} needs a display name", cap.name());
+            assert!(
+                !name.contains('-'),
+                "{name} should read the way it is written"
+            );
+        }
     }
 
     #[test]

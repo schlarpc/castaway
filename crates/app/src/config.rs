@@ -24,6 +24,23 @@ pub struct Config {
     /// A page to render live in the idle screen's widget card (a clock, a dashboard).
     /// `None` leaves the attract scene text-only, full width. Needs the `cef` build.
     pub attract_widget_url: Option<String>,
+    /// Bluetooth A2DP sink settings.
+    pub bluetooth: Bluetooth,
+}
+
+/// Bluetooth A2DP sink settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Bluetooth {
+    /// Which USB controller to claim, as `vendor:product` the way `lsusb` prints it
+    /// (`8087:0029` for an AX200). `None` takes the first Bluetooth device found.
+    pub controller: Option<String>,
+    /// A directory of firmware laid out like `linux-firmware`. `None` uses whatever was
+    /// embedded at build time (architecture §11.3b).
+    pub firmware_dir: Option<String>,
+    /// Where link keys and other persistent state live. `None` uses
+    /// `$XDG_STATE_HOME/castaway`, falling back to the working directory.
+    pub state_dir: Option<String>,
 }
 
 /// Per-protocol enable flags.
@@ -40,6 +57,9 @@ pub struct Enable {
     pub cast: bool,
     /// Advertise AirPlay/RAOP over mDNS. Off by default until the RTSP actor lands.
     pub airplay: bool,
+    /// Bluetooth A2DP sink. Off by default: it claims a USB controller exclusively, so
+    /// turning it on without a dedicated one takes the box's Bluetooth away.
+    pub bluetooth: bool,
 }
 
 impl Default for Enable {
@@ -50,6 +70,7 @@ impl Default for Enable {
             dial: true,
             cast: false,
             airplay: false,
+            bluetooth: false,
         }
     }
 }
@@ -63,6 +84,7 @@ impl Default for Config {
             interface: None,
             enable: Enable::default(),
             attract_widget_url: Some("https://digitalclock.live/".to_string()),
+            bluetooth: Bluetooth::default(),
         }
     }
 }
@@ -86,6 +108,24 @@ impl Config {
     /// # Errors
     /// If `$CASTAWAY_CONFIG` names a file that can't be read, or any config file present
     /// fails to parse.
+    /// Where persistent state lives.
+    ///
+    /// Config says where if it wants to; otherwise `$XDG_STATE_HOME/castaway`, falling
+    /// back to the working directory. Deliberately *not* the config directory: link keys
+    /// are state a running receiver writes, not something an operator edits.
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.bluetooth.state_dir {
+            return PathBuf::from(dir);
+        }
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+            })
+            .map_or_else(|| PathBuf::from("."), |base| base.join("castaway"))
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         match std::env::var_os(CONFIG_ENV) {
             Some(path) => {

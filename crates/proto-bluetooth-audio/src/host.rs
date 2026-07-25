@@ -59,6 +59,13 @@ pub enum HostAction {
         /// Why, as the controller reported it.
         reason: Status,
     },
+    /// The peer told us what it calls itself.
+    PeerName {
+        /// Which peer.
+        peer: BdAddr,
+        /// Its friendly name.
+        name: String,
+    },
     /// Pairing produced a link key the caller should persist (Q23).
     Paired {
         /// The peer it belongs to.
@@ -241,10 +248,16 @@ impl HostController {
             } => {
                 if status.is_success() {
                     self.connections.insert(handle.raw(), *addr);
-                    vec![HostAction::LinkUp {
-                        handle: *handle,
-                        peer: *addr,
-                    }]
+                    vec![
+                        HostAction::LinkUp {
+                            handle: *handle,
+                            peer: *addr,
+                        },
+                        // Ask what the phone calls itself, so the screen can say
+                        // "Pixel 8" rather than a MAC. Fire-and-forget: plenty of
+                        // senders never answer, and the session must not wait on it.
+                        HostAction::Send(Command::RemoteNameRequest(*addr)),
+                    ]
                 } else {
                     Vec::new()
                 }
@@ -303,6 +316,21 @@ impl HostController {
                 vec![HostAction::Send(Command::PinCodeRequestNegativeReply(
                     *addr,
                 ))]
+            }
+
+            Event::RemoteNameRequestComplete {
+                status, addr, name, ..
+            } => {
+                // A failed name request is ordinary, not an error: the address is still
+                // shown, which is what actually identifies the phone in a room.
+                if status.is_success() && !name.trim().is_empty() {
+                    vec![HostAction::PeerName {
+                        peer: *addr,
+                        name: name.trim().to_owned(),
+                    }]
+                } else {
+                    Vec::new()
+                }
             }
 
             Event::NumberOfCompletedPackets(pairs) => pairs
@@ -551,6 +579,60 @@ mod tests {
         assert_eq!(actions, vec![HostAction::Paired { peer: addr, key }]);
         // …and it is live in this session, not only after a restart.
         assert!(host.knows(addr));
+    }
+
+    #[test]
+    fn a_new_link_triggers_a_name_request_so_the_screen_can_say_who() {
+        // A MAC identifies a phone but nobody reads one. The request is fire-and-forget
+        // because plenty of senders never answer and the session must not wait.
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let actions = host.on_event(&Event::ConnectionComplete {
+            status: Status::SUCCESS,
+            handle: ConnectionHandle::new(0x0b).unwrap(),
+            addr,
+            link_type: LinkType::Acl,
+            encryption_enabled: false,
+        });
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, HostAction::LinkUp { .. })));
+        assert_eq!(sent(&actions), vec![Command::RemoteNameRequest(addr)]);
+    }
+
+    #[test]
+    fn a_name_that_arrives_is_surfaced_and_one_that_fails_is_not_an_error() {
+        let mut host = HostController::new(HostConfig::default());
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+
+        let named = host.on_event(&Event::RemoteNameRequestComplete {
+            status: Status::SUCCESS,
+            addr,
+            name: "Pixel 8".to_owned(),
+        });
+        assert_eq!(
+            named,
+            vec![HostAction::PeerName {
+                peer: addr,
+                name: "Pixel 8".to_owned()
+            }]
+        );
+
+        // Failure is ordinary: the address still identifies the phone.
+        let failed = host.on_event(&Event::RemoteNameRequestComplete {
+            status: Status::PAGE_TIMEOUT,
+            addr,
+            name: String::new(),
+        });
+        assert!(failed.is_empty());
+
+        // …as is a sender that answers with nothing.
+        let blank = host.on_event(&Event::RemoteNameRequestComplete {
+            status: Status::SUCCESS,
+            addr,
+            name: "   ".to_owned(),
+        });
+        assert!(blank.is_empty());
     }
 
     #[test]

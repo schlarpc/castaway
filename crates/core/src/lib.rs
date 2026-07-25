@@ -17,6 +17,7 @@ pub mod nowplaying;
 pub mod osd;
 pub mod pipeline;
 pub mod session;
+pub mod source;
 pub mod types;
 
 pub use adapter::{MiracastBackend, SessionSink, SourceAdapter, SourceId, SourceMessage};
@@ -28,6 +29,7 @@ pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState};
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::Pipeline;
 pub use session::{SessionConfig, SessionManager};
+pub use source::SourceDescription;
 pub use types::{
     AudioCodec, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame, FrameImage,
     FrameSource, FriendlyName, GpuSurface, MediaUri, PixelFormat, ProtocolKind, VideoCodec,

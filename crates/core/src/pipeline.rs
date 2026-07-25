@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::error::CoreError;
 use crate::event::ControlTxn;
 use crate::nowplaying::NowPlaying;
+use crate::source::SourceDescription;
 use crate::types::{FrameSource, MediaUri};
 
 /// The media/render backend the session drives. One active session maps to one set of
@@ -42,6 +43,12 @@ pub trait Pipeline: Send + Sync {
     /// # Errors
     /// [`CoreError::Pipeline`] if the surface can't be updated.
     async fn now_playing(&self, snapshot: NowPlaying) -> Result<(), CoreError>;
+
+    /// Update the description of who is connected and how.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the surface can't be updated.
+    async fn source_info(&self, source: SourceDescription) -> Result<(), CoreError>;
 
     /// Apply a transport-control transaction to the active session.
     ///

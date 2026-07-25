@@ -448,12 +448,55 @@ async fn a_dropped_link_ends_the_session() {
         params: Bytes::from(params),
     });
 
-    let end = eventually("session end", || rx.try_recv().ok()).await;
-    assert!(
-        matches!(end.event, SessionEvent::End),
-        "expected End, got {:?}",
-        end.event
+    // Drain past whatever else the session emitted — source info arrives around the
+    // same time — and assert End actually lands.
+    eventually("session end", || match rx.try_recv() {
+        Ok(msg) if matches!(msg.event, SessionEvent::End) => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_device_and_its_codec_are_reported_for_the_screen() {
+    // What the panel shows above the now-playing card: which phone, and what was
+    // negotiated. The address is known at link-up and the codec at configuration, so
+    // this also checks the two are merged rather than one overwriting the other.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = Seid::from_shifted(discover.payload[4]).unwrap(); // the aptX endpoint
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_44100,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 2, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 3, Signal::Open, &[seid.shifted()]).await;
+    avdtp(&transport, signaling, 4, Signal::Start, &[seid.shifted()]).await;
+
+    let info = eventually("source info", || match rx.try_recv() {
+        Ok(msg) => match msg.event {
+            SessionEvent::SourceInfo(info) => Some(info),
+            _ => None,
+        },
+        Err(_) => None,
+    })
+    .await;
+
+    assert_eq!(info.address.as_deref(), Some(PEER), "which phone");
+    assert_eq!(
+        info.link.as_deref(),
+        Some("aptX · 44.1 kHz · joint stereo"),
+        "what was negotiated"
     );
+    // Rendered for a human, both facts on one line.
+    assert!(info.to_string().contains(PEER));
+    assert!(info.to_string().contains("aptX"));
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::control::RemoteControl;
 use crate::nowplaying::NowPlaying;
+use crate::source::SourceDescription;
 use crate::types::{FrameSource, MediaUri};
 
 /// What an adapter needs advertised on the network to be discoverable.
@@ -107,6 +108,10 @@ pub enum SessionEvent {
     /// Track metadata for the now-playing surface — a full snapshot, re-emitted whenever
     /// any part of it changes (including artwork arriving late).
     NowPlaying(NowPlaying),
+    /// Who connected and what was negotiated. Distinct from [`SessionEvent::NowPlaying`]
+    /// because it changes on a different schedule — once per session rather than once
+    /// per track — and arrives in pieces as each fact becomes known.
+    SourceInfo(SourceDescription),
     /// The source's control channel came up: the receiver may now drive the *sender*.
     ///
     /// Separate from the session-start events on purpose. For Bluetooth this is a second

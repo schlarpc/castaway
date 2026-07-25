@@ -12,7 +12,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use castaway_core::{
     Advertisement, CoreError, EncodedFrame, FrameSource, NowPlaying, ProtocolKind, SessionEvent,
-    SessionSink, SourceAdapter,
+    SessionSink, SourceAdapter, SourceDescription,
 };
 use substrate_hci::{
     AclPacket, BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, PacketBoundary,
@@ -39,8 +39,15 @@ use crate::{avdtp, Message};
 /// than silently absorbed, because it means decode is not keeping up.
 const AUDIO_QUEUE_DEPTH: usize = 256;
 
+/// Called when a phone pairs, so the caller can persist its link key.
+///
+/// A callback rather than a path, because this crate must not open files (ground rule
+/// 2): where the config directory lives is the app's business, and keeping it out of
+/// here is what lets the whole adapter be tested with no filesystem at all.
+pub type OnPaired = Arc<dyn Fn(BdAddr, LinkKey) + Send + Sync>;
+
 /// Configuration for the Bluetooth adapter.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BluetoothConfig {
     /// Controller bring-up settings.
     pub host: HostConfig,
@@ -49,6 +56,20 @@ pub struct BluetoothConfig {
     pub enable_ldac: bool,
     /// Link keys loaded from disk, so repeat guests reconnect silently (Q23).
     pub link_keys: Vec<(BdAddr, LinkKey)>,
+    /// Called with each newly paired peer's key. Without one, pairing works for the
+    /// current session and every guest re-pairs after a restart.
+    pub on_paired: Option<OnPaired>,
+}
+
+impl std::fmt::Debug for BluetoothConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BluetoothConfig")
+            .field("host", &self.host)
+            .field("enable_ldac", &self.enable_ldac)
+            .field("link_keys", &self.link_keys.len())
+            .field("persists_keys", &self.on_paired.is_some())
+            .finish()
+    }
 }
 
 // Not derivable, despite appearances: `enable_ldac` follows the build feature, and
@@ -61,6 +82,7 @@ impl Default for BluetoothConfig {
             host: HostConfig::default(),
             enable_ldac: cfg!(feature = "ldac"),
             link_keys: Vec::new(),
+            on_paired: None,
         }
     }
 }
@@ -86,6 +108,9 @@ struct Link {
     now_playing: NowPlaying,
     /// Next AVCTP transaction label.
     avctp_transaction: u8,
+    /// What we know about this phone: address from link-up, name from the remote-name
+    /// request, codec from AVDTP configuration. Each arrives separately.
+    description: SourceDescription,
 }
 
 impl Link {
@@ -107,6 +132,7 @@ impl Link {
             session_open: false,
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
+            description: SourceDescription::new().with_address(peer.to_string()),
         }
     }
 
@@ -244,6 +270,20 @@ impl SourceAdapter for BluetoothAdapter {
                                     Link::new(*peer, self.config.enable_ldac),
                                 );
                             }
+                            HostAction::PeerName { peer, name } => {
+                                if let Some(link) = links.values_mut().find(|l| l.peer == *peer) {
+                                    link.description = std::mem::take(&mut link.description)
+                                        .merged(SourceDescription::new().with_display_name(name));
+                                    if link.session_open {
+                                        let link_sink = sink.with_instance(peer.to_string());
+                                        link_sink
+                                            .emit(SessionEvent::SourceInfo(
+                                                link.description.clone(),
+                                            ))
+                                            .await?;
+                                    }
+                                }
+                            }
                             HostAction::LinkDown { handle, peer, .. } => {
                                 info!(%peer, "bluetooth: link down");
                                 if let Some(mut link) = links.remove(&handle.raw()) {
@@ -318,10 +358,13 @@ impl BluetoothAdapter {
                 .map_err(|e| CoreError::Adapter(format!("hci encode: {e}")))?;
             self.send(packet).await?;
         }
-        if let HostAction::Paired { peer, .. } = action {
-            // Persistence is the app's job (it owns the config dir); surfacing it here
-            // keeps this crate free of filesystem access.
+        if let HostAction::Paired { peer, key } = action {
             info!(%peer, "bluetooth: paired");
+            // Persistence is the app's job — it owns the config directory — so the key
+            // goes out through a callback rather than to a path this crate knows.
+            if let Some(on_paired) = &self.config.on_paired {
+                on_paired(*peer, *key);
+            }
         }
         Ok(())
     }
@@ -440,10 +483,14 @@ impl BluetoothAdapter {
             match event {
                 SinkEvent::Reply(reply) => outbound.push(L2capPdu::new(cid, reply.encode())),
                 SinkEvent::Configured {
-                    codec, sample_rate, ..
+                    codec,
+                    sample_rate,
+                    configuration,
                 } => {
                     info!(?codec, sample_rate, "bluetooth: stream configured");
                     link.depacketizer = Some(Depacketizer::new(codec, sample_rate));
+                    link.description = std::mem::take(&mut link.description)
+                        .merged(SourceDescription::new().with_link(configuration.describe()));
                 }
                 SinkEvent::Started => {
                     if !link.session_open {
@@ -455,6 +502,12 @@ impl BluetoothAdapter {
                             .emit(SessionEvent::Audio {
                                 source: FrameSource::Encoded(rx),
                             })
+                            .await?;
+                        // Only now can the description be delivered: the session
+                        // manager rejects source info for a source that is not active,
+                        // and this is the moment it becomes active.
+                        link_sink
+                            .emit(SessionEvent::SourceInfo(link.description.clone()))
                             .await?;
                     }
                 }

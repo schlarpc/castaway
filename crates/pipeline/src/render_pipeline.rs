@@ -42,6 +42,8 @@ pub struct RenderPipeline {
     hw: HwPreference,
     /// Latest now-playing snapshot, held for the surface that will draw it.
     now_playing: Mutex<Option<castaway_core::NowPlaying>>,
+    /// Who is connected and over what codec, for the same surface.
+    source: Mutex<castaway_core::SourceDescription>,
 }
 
 impl RenderPipeline {
@@ -59,9 +61,27 @@ impl RenderPipeline {
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
                 now_playing: Mutex::new(None),
+                source: Mutex::new(castaway_core::SourceDescription::new()),
             },
             rx,
         )
+    }
+
+    /// What is known about the connected sender: name, address, negotiated codec.
+    ///
+    /// Read by the render loop when it draws the device card.
+    #[must_use]
+    pub fn source(&self) -> castaway_core::SourceDescription {
+        self.source
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// The latest now-playing snapshot, if any.
+    #[must_use]
+    pub fn now_playing_snapshot(&self) -> Option<castaway_core::NowPlaying> {
+        self.now_playing.lock().ok().and_then(|g| g.clone())
     }
 
     /// Pin the hardware-decode choice.
@@ -181,6 +201,16 @@ impl Pipeline for RenderPipeline {
         // soon as that layer exists, and don't lose data in the meantime.
         if let Ok(mut guard) = self.now_playing.lock() {
             *guard = Some(snapshot);
+        }
+        Ok(())
+    }
+
+    async fn source_info(&self, source: castaway_core::SourceDescription) -> Result<(), CoreError> {
+        // Held beside the now-playing snapshot, for the same surface: the device card
+        // says who is connected and over what, above whatever they are playing.
+        info!(%source, "render pipeline: SOURCE");
+        if let Ok(mut guard) = self.source.lock() {
+            *guard = source;
         }
         Ok(())
     }

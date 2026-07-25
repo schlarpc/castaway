@@ -9,6 +9,7 @@
 //!   the winit fullscreen kiosk on the **main thread**; tokio runs the servers on a
 //!   spawned runtime (the three-thread model, architecture §6).
 
+mod bluetooth;
 mod config;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -299,6 +300,20 @@ async fn serve(
             event_tx.clone(),
             shutdown.clone(),
         ));
+    }
+    if config.enable.bluetooth {
+        // Bluetooth is its own discovery layer — inquiry scan and SDP records, no mDNS —
+        // so nothing is registered with the responder here.
+        //
+        // A missing or unclaimable controller is logged and skipped rather than fatal: a
+        // receiver that can still do AirPlay and Cast should not refuse to start because
+        // someone unplugged a dongle.
+        match bluetooth::spawn(&config, event_tx.clone(), shutdown.clone()).await {
+            Ok(handle) => adapter_handles.push(handle),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Bluetooth sink unavailable; continuing without it")
+            }
+        }
     }
 
     // SSDP responder.

@@ -180,7 +180,11 @@ impl HwAttempt {
     /// on the CPU, and the render thread has no way to tell the decoder it is dropping
     /// everything it sends.
     fn new(preference: HwPreference) -> Self {
-        let policy = FallbackPolicy::new(preference);
+        // `mut` is needed only when the hwaccel backends are compiled in — the give-up
+        // path below is behind that feature — so a build without them would otherwise
+        // warn about a mutability it cannot see the use of.
+        #[cfg_attr(not(feature = "hwaccel"), allow(unused_mut))]
+        let mut policy = FallbackPolicy::new(preference);
         #[cfg(feature = "render")]
         if policy.wants_hardware() {
             use crate::hwaccel::{import_capability, SurfaceImport};

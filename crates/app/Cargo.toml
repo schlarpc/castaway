@@ -20,6 +20,9 @@ proto-dlna.workspace = true
 proto-cast.workspace = true
 crypto-cast-auth.workspace = true
 proto-spotify.workspace = true
+proto-bluetooth-audio.workspace = true
+hci-transport.workspace = true
+substrate-hci.workspace = true
 proto-airplay.workspace = true
 proto-dial.workspace = true
 pipeline.workspace = true
@@ -51,7 +54,7 @@ audio = ["pipeline/audio"]
 audio-out = ["audio", "pipeline/audio-out"]
 # LDAC decode. Off by default: advertising a codec we cannot decode makes the session
 # silence rather than a clean fallback to one we can (OPEN-QUESTIONS Q22).
-ldac = ["audio", "pipeline/ldac"]
+ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
 # CEF offscreen browser in the kiosk (YouTube leanback via DIAL launch). Implies `render`;
 # needs CEF_PATH from the flake devshell. CEF re-execs this binary for subprocesses, so
 # main() bootstraps it before anything else.
