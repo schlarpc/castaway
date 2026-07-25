@@ -189,7 +189,14 @@ answered at the 2026-07-25 sync — all four confirmed as the proposed defaults.
 with their reasoning because each one is a behavioural commitment, not a structural one, and
 the reasons are what a future reversal has to argue against.
 
-- **Q21 — Dongle and firmware. ANSWERED: RTL8761BU, with our own uploader.** The selection
+- **Q21 — Dongle and firmware. ANSWERED: RTL8761BU, with our own uploader.**
+  **AMENDED 2026-07-25: support a vendor registry, not a single chip.** Standardising on one
+  part made the firmware uploader a hardcoding wearing a trait's clothes. Controller
+  initialisation now sits behind its own `ControllerInit` seam with *two* implementations
+  from the start — Realtek for the deploy dongle and Intel for the AX200 already in the dev
+  box — because a seam with one implementation has never been tested as a seam. See
+  architecture-substrate.md §11.3a. The AX200 also gives us a way to check the loader against
+  the kernel's own: `btintel.c` is the spec, and `btmon` captures the reference transcript. The selection
   criterion was never antenna or spec version — it is **firmware**. Most modern controllers
   ship with no usable ROM image and depend on the OS driver uploading one at probe. Under
   Linux's `HCI_CHANNEL_USER` the kernel still runs the vendor `hdev->setup()` before handing

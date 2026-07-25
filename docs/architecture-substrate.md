@@ -340,6 +340,74 @@ one-time provisioning step on a kiosk we control, and it also means the machine'
 radio stays available to the OS. Both backends see the same controller-side behaviour, so
 everything above this line is tested once.
 
+### 11.3a Controller initialisation is its own seam
+
+Moving packets and *bringing a controller to life* are different problems, and only the
+first is vendor-neutral. Most modern controllers ship with no usable ROM image and depend
+on the OS driver uploading firmware at probe; under WinUSB nothing does, so the chip's
+firmware protocol is ours — and it differs per vendor. That belongs behind its own trait
+rather than baked into one backend:
+
+```rust
+/// Brings a cold controller to the point where HCI_Reset will work.
+#[async_trait::async_trait]
+pub trait ControllerInit: Send + Sync {
+    /// Whether this initialiser handles the device at this USB id.
+    fn matches(&self, id: UsbId) -> bool;
+    /// Upload firmware and any vendor configuration.
+    async fn init(&self, hci: &dyn HciTransport, fw: &FirmwareSet) -> Result<(), TransportError>;
+}
+```
+
+The registry is `[IntelInit, RealtekInit, NoInit]`, tried in order; `NoInit` covers ROM-based
+parts (CSR8510) and is the correct answer, not a fallback. Two implementations from the
+start, because one implementation behind a trait is just a trait-shaped hardcoding:
+
+| | Realtek RTL8761BU | Intel AX200 (`8087:0029`) |
+|---|---|---|
+| Version probe | vendor opcode `0xFC6D`, fixed struct | `HCI_Intel_Read_Version` `0xFC05`, **TLV-encoded** on AX2xx |
+| Upload | chunked `0xFC20`, ~150 lines | secure boot: CSS header, public key, signature, then command/data blocks parsed out of the `.sfi`, all via `HCI_Intel_Secure_Send` `0xFC09` |
+| After | reset, done | wait for the boot vendor event, `Intel_Reset` `0xFC01`, then push the `.ddc` config via `0xFC8B` |
+| Reference | `btrtl.c` | `btintel.c` |
+
+Intel is the more involved of the two — which is why Q21 originally rejected it — but having
+one in the tree makes the seam real, and the AX200 in the dev box is hardware we already have.
+
+**Testing it against the kernel.** `btintel.c` is the specification, and the kernel driving
+the same radio is an oracle in the `nix/openscreen-fixtures.nix` mould: capture the kernel's
+own bring-up with `btmon`, replay ours against a `ScriptedTransport`, and diff the command
+sequence. One caveat that decides the test's shape — `HCI_CHANNEL_USER` hands over a
+controller the kernel has *already* initialised, so it cannot exercise our loader at all.
+Testing the loader means unbinding `btusb` (`/sys/bus/usb/drivers/btusb/unbind`) and claiming
+the device through `nusb`, which is also exactly the path Windows takes. That makes the
+unbind route the *primary* one on both platforms and `HCI_CHANNEL_USER` a convenience for
+working on the layers above.
+
+### 11.3b Firmware blobs
+
+Firmware is embedded at build time rather than read from `/lib/firmware`, because the deploy
+target is Windows and there is no such path there. `build.rs` copies blobs from a directory
+Nix points it at into `OUT_DIR`, and the loader `include_bytes!`s them — so nothing binary is
+checked into git, the binary stays self-contained, and the cross-build works unchanged.
+
+```rust
+pub enum Firmware {
+    /// Baked in at build time. What ships.
+    Embedded(&'static [u8]),
+    /// Read at runtime — for trying a newer blob without a rebuild.
+    File(PathBuf),
+}
+```
+
+Two things to get right before this lands:
+- **Licensing.** `linux-firmware` blobs are redistributable, but each vendor's licence must
+  ship alongside — Intel's `LICENCE.ibt_firmware` permits binary redistribution *provided the
+  licence text is reproduced*. Those files get vendored next to the blobs and surfaced in the
+  binary's `--licenses` output.
+- **nixpkgs gating.** `pkgs.linux-firmware` carries `unfreeRedistributableFirmware`, which a
+  default `allowUnfree = false` evaluation refuses. The flake needs an explicit
+  `allowUnfreePredicate` for it, or `nix flake check` fails somewhere unrelated-looking.
+
 ### 11.4 Protocol stack
 
 ```
