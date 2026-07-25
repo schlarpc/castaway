@@ -45,10 +45,14 @@ const HEIGHT: u32 = 240;
 
 /// Generate a solid-colour Annex-B H.264 elementary stream, the shape a mirroring adapter
 /// delivers: no container, in-band SPS/PPS, no B-frames.
-fn solid_colour_stream() -> Option<Vec<u8>> {
+///
+/// `name` keeps each test on its own file. `nextest` runs these in concurrent processes,
+/// and two of them writing one path races a half-written stream into a decoder — which
+/// surfaces as an unrelated-looking assertion about frame counts.
+fn solid_colour_stream(name: &str) -> Option<Vec<u8>> {
     let dir = std::env::temp_dir().join("castaway-hwaccel-test");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("solid.h264");
+    let path = dir.join(format!("{name}.h264"));
     let [r, g, b] = SOURCE_RGB;
     let source =
         format!("color=c=0x{r:02X}{g:02X}{b:02X}:size={WIDTH}x{HEIGHT}:rate=10:duration=1");
@@ -156,7 +160,7 @@ fn centre_colour(pixels: &[u8]) -> [f32; 3] {
 
 #[test]
 fn vaapi_decode_imports_zero_copy_and_composites_the_right_colour() {
-    let Some(stream) = solid_colour_stream() else {
+    let Some(stream) = solid_colour_stream("zero-copy") else {
         eprintln!("skipping: no ffmpeg CLI to generate the fixture");
         return;
     };
@@ -258,12 +262,138 @@ fn vaapi_decode_imports_zero_copy_and_composites_the_right_colour() {
     }
 }
 
+/// Generate a stream no fixed-function decoder will accept.
+///
+/// `-qp 0` is lossless H.264 — High 4:4:4 Predictive — which VA-API, D3D11VA and every
+/// other hardware decoder refuses. That makes it a genuine fixture for the give-up path
+/// rather than a mocked one: libavcodec really does offer `get_format` a list without the
+/// hardware format in it, which is exactly how a driver says "not this profile" in the
+/// field.
+fn undecodable_by_hardware_stream() -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir().join("castaway-hwaccel-test");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("lossless.h264");
+    let [r, g, b] = SOURCE_RGB;
+    let source =
+        format!("color=c=0x{r:02X}{g:02X}{b:02X}:size={WIDTH}x{HEIGHT}:rate=10:duration=1");
+    let ok = Command::new("ffmpeg")
+        .args(["-y", "-f", "lavfi", "-i", &source])
+        .args(["-pix_fmt", "yuv444p", "-bf", "0", "-qp", "0", "-f", "h264"])
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?
+        .success();
+    ok.then(|| std::fs::read(&path).ok()).flatten()
+}
+
+#[test]
+fn a_stream_the_gpu_refuses_falls_back_to_software_and_keeps_playing() {
+    // The behaviour the whole fallback apparatus exists for, driven by a real driver
+    // refusal rather than an injected one. `Auto` must not fail, must not go black, and
+    // must not stall — it must quietly produce frames on the CPU.
+    let Some(stream) = undecodable_by_hardware_stream() else {
+        eprintln!("skipping: no ffmpeg CLI to generate the fixture");
+        return;
+    };
+    // Opening a compositor first is what tells the decode side that GPU surfaces have
+    // somewhere to go — otherwise the policy declines hardware before ever asking the
+    // driver, and this would pass without exercising the refusal at all.
+    let Ok(compositor) = WgpuCompositor::new_offscreen(WIDTH, HEIGHT) else {
+        eprintln!("skipping: no GPU");
+        return;
+    };
+    if compositor.surface_import() == SurfaceImport::Unsupported {
+        eprintln!("skipping: this device cannot import GPU surfaces");
+        return;
+    }
+
+    let mut source = split_access_units(&stream).into_iter();
+    assert!(source.len() >= 5, "fixture should have several frames");
+    let mut gpu_frames = 0usize;
+    let mut cpu_frames = 0usize;
+
+    let log = CapturedLog::default();
+    let result = tracing::subscriber::with_default(log.subscriber(), || {
+        pipeline::ffmpeg_decode::decode_stream(
+            VideoCodec::H264,
+            HwPreference::Auto,
+            || source.next(),
+            |frame| {
+                match &frame.image {
+                    FrameImage::Gpu(_) => gpu_frames += 1,
+                    FrameImage::Cpu { .. } => cpu_frames += 1,
+                }
+                true
+            },
+        )
+    });
+    result.expect("a hardware refusal must not fail the session");
+
+    assert_eq!(gpu_frames, 0, "the GPU cannot decode this profile");
+    assert!(
+        cpu_frames >= 5,
+        "the mirror must survive the fallback; got {cpu_frames} software frames",
+    );
+
+    // A silent downgrade is the failure mode this whole path is designed around: the
+    // mirror keeps working, so the only symptom is a hot CPU that nobody attributes to
+    // anything. The log line is part of the contract, not decoration.
+    let captured = log.text();
+    assert!(
+        captured.contains("falling back to SOFTWARE decode"),
+        "the fallback must announce itself; captured log was:\n{captured}",
+    );
+    assert_eq!(
+        captured.matches("falling back to SOFTWARE decode").count(),
+        1,
+        "…and exactly once, or a live mirror turns the log into a firehose:\n{captured}",
+    );
+}
+
+/// Collects `tracing` output so a test can assert on what was logged.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn subscriber(&self) -> impl tracing::Subscriber {
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish()
+    }
+
+    fn text(&self) -> String {
+        let buffer = self.0.lock().expect("log mutex");
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log mutex").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
+    type Writer = Self;
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 #[test]
 fn software_only_never_touches_the_hardware_path() {
     // The other half of the runtime-choice contract: the same binary, the same stream,
     // and an explicit preference produces system-memory frames. If this ever yields a GPU
     // frame, `HwPreference` is not actually in control of anything.
-    let Some(stream) = solid_colour_stream() else {
+    let Some(stream) = solid_colour_stream("software-only") else {
         return;
     };
     let mut source = split_access_units(&stream).into_iter();
