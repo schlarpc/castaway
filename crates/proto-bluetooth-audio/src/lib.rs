@@ -17,6 +17,7 @@ pub mod avrcp;
 pub mod codec;
 pub mod error;
 pub mod media;
+pub mod obex;
 pub mod sink;
 
 pub use avctp::{AvcFrame, AvctpMessage, Ctype};
@@ -25,4 +26,5 @@ pub use avrcp::{TrackAttributes, VendorPdu};
 pub use codec::{advertised, ChannelModes, CodecCapability, SampleRates};
 pub use error::AudioError;
 pub use media::Depacketizer;
+pub use obex::{CoverArtClient, FetchState};
 pub use sink::{SinkEvent, SinkSession, StreamState};
