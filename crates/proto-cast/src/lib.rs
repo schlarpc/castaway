@@ -7,7 +7,8 @@
 //! them with I/O — it makes no protocol decisions of its own.
 //!
 //! Today this implements the **media-URL** path (Default Media Receiver `LOAD`).
-//! Mirroring (offer/answer + custom RTP) is the next Cast milestone.
+//! Mirroring is in progress: [`rtp`] parses and reassembles Cast's RTP framing and
+//! [`rtcp`] builds the feedback a sender needs to keep sending.
 #![forbid(unsafe_code)]
 
 pub mod actor;
@@ -17,6 +18,7 @@ pub mod framing;
 pub mod messages;
 pub mod mirror;
 pub mod proto;
+pub mod rtcp;
 pub mod rtp;
 pub mod session;
 
@@ -26,6 +28,7 @@ pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
 pub use mirror::{Codec, MirrorConfig, StreamConfig};
 pub use proto::CastMessage;
+pub use rtcp::{BuildReport, Feedback};
 pub use rtp::{
     CastRtpPacket, CastRtpStream, EncryptedFrame, FrameCollector, FrameId, NackTarget, PacketId,
     PacketNack, RtpError,
