@@ -18,7 +18,7 @@ integration test.
 | `crypto-cast-auth` | Done. RSA device-auth signer (SHA1/256, PKCS1v15). |
 | `crypto-fairplay` | Boundary stub. fp-setup typestate; key derivation = `NotImplemented` (Q1). |
 | `proto-dlna` | **Live.** AVTransport/RenderingControl/ConnectionManager SOAP; cast-a-video works. |
-| `proto-cast` | **Live.** Framing, JSON, device-auth, media LOAD, mirroring negotiation + AES-CTR, and a TLS actor on 8009 driven end-to-end in the VM test. Dev device key (Q2/Q11); mirroring RTP receive loop pending (Q12). |
+| `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). Dev device key (Q2/Q11). |
 | `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
 | `proto-dial` | **Live launch** + pure Lounge bind-channel parser/mapping. Lounge HTTP client pending. |
@@ -66,7 +66,9 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
 3. **Q16** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.
 4. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
-5. **Q12/Q13** — Cast mirroring RTP receive loop + IV validation.
+5. ~~**Q12/Q13** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
+   receive path is differential-tested against openscreen's `RtpPacketizer` +
+   `FrameCrypto`, compiled from a pinned checkout by the `openscreen-rtp-fixtures` check.
 
 ## CEF browser + adblock + YouTube (behind the `cef` feature)
 The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly against nixpkgs

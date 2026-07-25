@@ -8,104 +8,18 @@
 //!
 //! A round-trip against our own serializer would prove none of that — it would only
 //! show our encoder and decoder sharing a misunderstanding.
+//!
+//! This exercises the pure core directly. `mirror_udp.rs` pushes the same bytes through
+//! the socket actor.
 
 #![allow(clippy::unwrap_used)]
 
-use bytes::Bytes;
-use proto_cast::mirror::{crypt_frame, Codec, StreamConfig};
+mod common;
+
+use common::{config, datagrams, expected_frames, ExpectedFrame, RECEIVER_SSRC, SENDER_SSRC};
+use proto_cast::mirror::crypt_frame;
 use proto_cast::receiver::{CastRtpReceiver, Consume, Received};
-use proto_cast::rtp::{Dependency, FrameId, NackTarget};
-
-const SENDER_SSRC: u32 = 0x0102_0304;
-const RECEIVER_SSRC: u32 = 0x0a0b_0c0d;
-
-/// Must match the constants in `fixtures/rtp-stream/generator/gen_rtp_fixtures.cc`.
-const AES_KEY: [u8; 16] = [
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-];
-const AES_IV_MASK: [u8; 16] = [
-    0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
-];
-
-const PACKETS_BIN: &[u8] = include_bytes!("fixtures/rtp-stream/packets.bin");
-const FRAMES_BIN: &[u8] = include_bytes!("fixtures/rtp-stream/frames.bin");
-
-/// One frame as openscreen encoded it, before encryption.
-#[derive(Debug, PartialEq, Eq)]
-struct ExpectedFrame {
-    dependency: Dependency,
-    frame_id: i64,
-    referenced_frame_id: i64,
-    rtp_timestamp: i64,
-    new_playout_delay_ms: u16,
-    payload: Vec<u8>,
-}
-
-fn config() -> StreamConfig {
-    StreamConfig {
-        index: 0,
-        sender_ssrc: SENDER_SSRC,
-        receiver_ssrc: RECEIVER_SSRC,
-        payload_type: 100,
-        codec: Codec::Vp8,
-        aes_key: AES_KEY,
-        aes_iv_mask: AES_IV_MASK,
-    }
-}
-
-/// Split `packets.bin` into its u16-length-prefixed datagrams.
-fn datagrams() -> Vec<Bytes> {
-    let mut out = Vec::new();
-    let mut at = 0;
-    while at + 2 <= PACKETS_BIN.len() {
-        let len = usize::from(u16::from_be_bytes([PACKETS_BIN[at], PACKETS_BIN[at + 1]]));
-        at += 2;
-        out.push(Bytes::copy_from_slice(&PACKETS_BIN[at..at + len]));
-        at += len;
-    }
-    assert_eq!(at, PACKETS_BIN.len(), "trailing bytes in packets.bin");
-    out
-}
-
-fn expected_frames() -> Vec<ExpectedFrame> {
-    fn u32_at(buf: &[u8], at: usize) -> u32 {
-        u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
-    }
-
-    let mut out = Vec::new();
-    let mut at = 0;
-    while at < FRAMES_BIN.len() {
-        // openscreen's EncodedFrame::Dependency, as its underlying int8_t.
-        let dependency = match FRAMES_BIN[at] {
-            1 => Dependency::Dependent,
-            2 => Dependency::Independent,
-            3 => Dependency::KeyFrame,
-            other => panic!("unknown dependency {other} in frames.bin"),
-        };
-        at += 1;
-        let frame_id = i64::from(u32_at(FRAMES_BIN, at));
-        at += 4;
-        let referenced_frame_id = i64::from(u32_at(FRAMES_BIN, at));
-        at += 4;
-        let rtp_timestamp = i64::from(u32_at(FRAMES_BIN, at));
-        at += 4;
-        let new_playout_delay_ms = u16::from_be_bytes([FRAMES_BIN[at], FRAMES_BIN[at + 1]]);
-        at += 2;
-        let length = u32_at(FRAMES_BIN, at) as usize;
-        at += 4;
-        let payload = FRAMES_BIN[at..at + length].to_vec();
-        at += length;
-        out.push(ExpectedFrame {
-            dependency,
-            frame_id,
-            referenced_frame_id,
-            rtp_timestamp,
-            new_playout_delay_ms,
-            payload,
-        });
-    }
-    out
-}
+use proto_cast::rtp::{FrameId, NackTarget};
 
 /// Drain everything the receiver is willing to hand over, decrypting as we go.
 fn drain(rx: &mut CastRtpReceiver) -> Vec<ExpectedFrame> {

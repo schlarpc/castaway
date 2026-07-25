@@ -137,6 +137,9 @@ pub enum VideoCodec {
     H264,
     /// H.265 / HEVC (newer AirPlay).
     Hevc,
+    /// VP8 (Cast mirroring — Chrome offers it alongside H.264 and a sender may only
+    /// have it).
+    Vp8,
 }
 
 /// Audio codecs the decode path understands.

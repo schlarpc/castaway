@@ -18,11 +18,13 @@ use crypto_cast_auth::CastDeviceSigner;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::auth::CastAuthResponder;
 use crate::error::CastError;
+use crate::rtp_actor::MirrorSocket;
 use crate::session::CastSession;
 use crate::{framing, CAST_PORT, CAST_SERVICE_TYPE};
 
@@ -146,8 +148,38 @@ impl CastReceiver {
         });
         let mut session = CastSession::new(auth);
 
-        if let Err(e) = self.pump(&mut tls, &mut session, &sink, peer).await {
+        // Bind the RTP socket up front. The ANSWER has to name a port, and the only way
+        // to name one we are certain of is to already hold it. A failure here costs
+        // mirroring, not the connection — the media-URL path does not need a socket.
+        let mut rtp = match MirrorSocket::bind(self.listen.ip()).await {
+            Ok(socket) => {
+                session = session.with_mirror_port(socket.port());
+                Some(socket)
+            }
+            Err(e) => {
+                warn!(%peer, error = %e, "no RTP socket; mirroring will be declined");
+                None
+            }
+        };
+
+        let mut mirror_task: Option<JoinHandle<()>> = None;
+        if let Err(e) = self
+            .pump(
+                &mut tls,
+                &mut session,
+                &sink,
+                peer,
+                &mut rtp,
+                &mut mirror_task,
+            )
+            .await
+        {
             warn!(%peer, error = %e, "CASTv2 connection ended with an error");
+        }
+        // The control connection is what authorizes the media stream. When it goes, the
+        // RTP loop goes with it, whatever the pipeline still holds.
+        if let Some(task) = mirror_task {
+            task.abort();
         }
         // A dropped connection is a finished session, however it ended: tell the manager
         // so the pipeline doesn't hold the screen for a sender that walked away.
@@ -163,6 +195,8 @@ impl CastReceiver {
         session: &mut CastSession,
         sink: &SessionSink,
         peer: SocketAddr,
+        rtp: &mut Option<MirrorSocket>,
+        mirror_task: &mut Option<JoinHandle<()>>,
     ) -> Result<(), CastError> {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -206,16 +240,25 @@ impl CastReceiver {
                     }
                 }
                 if let Some(config) = reaction.start_mirror {
-                    // Negotiation succeeded, but the RTP receive loop that would turn
-                    // this into frames is Q12 — say so once, loudly, instead of leaving
-                    // the sender streaming into a socket nobody reads.
-                    warn!(
+                    // The socket is consumed here, so a second OFFER on one connection
+                    // finds nothing to bind and is ignored. Senders renegotiate by
+                    // reconnecting, which gets a fresh socket with it.
+                    let Some(socket) = rtp.take() else {
+                        warn!(%peer, "mirroring already started on this connection");
+                        continue;
+                    };
+                    info!(
                         %peer,
                         udp_port = config.udp_port,
-                        video = config.video.is_some(),
-                        audio = config.audio.is_some(),
-                        "Cast mirroring negotiated, but the RTP receive loop is not implemented (Q12)"
+                        video = ?config.video.codec,
+                        audio = ?config.audio.as_ref().map(|a| a.codec),
+                        "Cast mirroring negotiated"
                     );
+                    let (video, audio, receive_loop) = socket.start(&config);
+                    *mirror_task = Some(tokio::spawn(receive_loop.run()));
+                    sink.emit(SessionEvent::Mirror { video, audio })
+                        .await
+                        .map_err(|e| CastError::Io(e.to_string()))?;
                 }
             }
         }

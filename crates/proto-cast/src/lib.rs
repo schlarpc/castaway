@@ -6,9 +6,10 @@
 //! against constructed `CastMessage`s. [`actor`] is the thin TLS shell that composes
 //! them with I/O — it makes no protocol decisions of its own.
 //!
-//! Today this implements the **media-URL** path (Default Media Receiver `LOAD`).
-//! Mirroring is in progress: [`rtp`] parses and reassembles Cast's RTP framing and
-//! [`rtcp`] builds the feedback a sender needs to keep sending.
+//! Both casting paths are implemented. The **media-URL** path (Default Media Receiver
+//! `LOAD`) hands the pipeline a URI; the **mirroring** path negotiates in [`mirror`],
+//! reassembles RTP in [`rtp`]/[`receiver`], reports back with [`rtcp`], and is driven
+//! over UDP by [`rtp_actor`].
 #![forbid(unsafe_code)]
 
 pub mod actor;
@@ -21,13 +22,14 @@ pub mod proto;
 pub mod receiver;
 pub mod rtcp;
 pub mod rtp;
+pub mod rtp_actor;
 pub mod session;
 
 pub use actor::{CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;
 pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
-pub use mirror::{Codec, MirrorConfig, StreamConfig};
+pub use mirror::{Codec, MediaKind, MirrorConfig, StreamConfig};
 pub use proto::CastMessage;
 pub use receiver::{CastRtpReceiver, Consume, Delivered, Received};
 pub use rtcp::{BuildReport, Feedback};
@@ -35,6 +37,7 @@ pub use rtp::{
     CastRtpPacket, CastRtpStream, EncryptedFrame, FrameCollector, FrameId, NackTarget, PacketId,
     PacketNack, RtpError,
 };
+pub use rtp_actor::{MirrorRtp, MirrorSocket};
 pub use session::{CastSession, DeviceAuthResponder, Reaction};
 
 /// The default Cast TLS port senders connect to.

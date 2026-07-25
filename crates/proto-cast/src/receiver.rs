@@ -134,6 +134,16 @@ impl CastRtpReceiver {
         self.playout_delay_ms
     }
 
+    /// Whether the sender has moved past the frame we owe the decoder.
+    ///
+    /// This is what tells "the next frame is late" apart from "the stream is idle" —
+    /// both make [`Self::next_frame`] return `None`, but only the first is a reason to
+    /// start a clock running toward [`Consume::SkipToDecodable`].
+    #[must_use]
+    pub const fn is_awaiting_frames(&self) -> bool {
+        self.latest_expected.value() > self.last_delivered.value()
+    }
+
     /// Feed in one UDP datagram.
     ///
     /// # Errors

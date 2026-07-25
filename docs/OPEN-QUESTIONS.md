@@ -67,13 +67,25 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Cast mirroring media plane
 
-- **Q12 — Cast RTP receive + frame reassembly.** Negotiation + AES-CTR decrypt are done;
-  the UDP RTP receiver (Cast's own RTP framing: frame_id, packet_id, reference frames,
-  RTCP feedback/NACK) that assembles encoded access units is not. Needs an openscreen
-  `standalone_receiver` capture to build against. This is the bulk of the media plane.
-- **Q13 — Per-frame IV derivation.** `mirror::frame_iv` XORs the frame_id into the low 4
-  bytes of the IV mask. This is self-consistent but not verified against openscreen's
-  exact scheme — confirm from a capture before trusting decrypted output.
+- **Q12 — Cast RTP receive + frame reassembly. RESOLVED.** `proto-cast::rtp` parses
+  Cast's RTP framing (truncated frame/packet ids, reference frames, the adaptive-latency
+  extension) and reassembles frames; `receiver` holds the sliding window, the checkpoint
+  and the skip-ahead policy; `rtcp` builds the compound feedback (ACK bit vector, NACK
+  loss fields, PLI, receiver reference time); `rtp_actor` is the UDP shell that composes
+  them with a socket and a clock. No capture was needed in the end — see Q13.
+- **Q13 — Per-frame IV derivation. RESOLVED.** The frame id's low 32 bits go at offset
+  **8**, not 12: the last four bytes are the AES-CTR block counter, and putting the id
+  there would have made it march through the keystream mid-frame. Verified rather than
+  reasoned: `nix/openscreen-fixtures.nix` compiles openscreen's own `RtpPacketizer` and
+  `FrameCrypto` from a pinned checkout, and `tests/openscreen_stream.rs` reassembles and
+  decrypts the bytes they produce. A wrong nonce offset cannot pass that test.
+
+  This is the pattern to reach for when a protocol detail is unverifiable by inspection:
+  pin the reference implementation as a Nix derivation, compile the handful of
+  translation units that produce the bytes, and check the output in as a fixture. It is
+  much cheaper than a live capture and it cannot drift, because the Nix check
+  regenerates it. Ground rule 9 forbids reference impls in the *shipping binary*; it
+  does not forbid them as test oracles.
 
 ## App / hardware wiring
 

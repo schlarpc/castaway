@@ -8,7 +8,10 @@
 //! receive/reassembly loop is the actor's job and is deferred (OPEN-QUESTIONS): the
 //! negotiator hands the actor a [`MirrorConfig`] to drive it.
 
+use std::num::NonZeroU32;
+
 use aes::cipher::{KeyIvInit, StreamCipher};
+use castaway_core::{AudioCodec, VideoCodec};
 use serde::Deserialize;
 
 use crate::error::CastError;
@@ -49,7 +52,69 @@ impl Codec {
     const fn is_video(self) -> bool {
         matches!(self, Codec::H264 | Codec::Hevc | Codec::Vp8)
     }
+
+    /// How this codec is named to the pipeline, which is codec-aware but Cast-agnostic.
+    ///
+    /// Total on purpose: a codec we can negotiate but cannot name would be a stream we
+    /// accept and then fail to play, and the compiler should refuse to let that happen.
+    const fn media_kind(self) -> MediaKind {
+        match self {
+            Codec::H264 => MediaKind::Video(VideoCodec::H264),
+            Codec::Hevc => MediaKind::Video(VideoCodec::Hevc),
+            Codec::Vp8 => MediaKind::Video(VideoCodec::Vp8),
+            Codec::Opus => MediaKind::Audio(AudioCodec::Opus),
+            Codec::Aac => MediaKind::Audio(AudioCodec::Aac),
+        }
+    }
+
+    /// Which of two offered codecs to prefer, higher wins.
+    ///
+    /// The deploy target hardware-decodes H.264 and HEVC but not VP8, and Chrome lists
+    /// VP8 first in its offer — so "take the first one we recognize" would
+    /// systematically land on the software path.
+    const fn preference(self) -> u8 {
+        match self {
+            Codec::H264 => 3,
+            Codec::Hevc => 2,
+            Codec::Vp8 => 1,
+            Codec::Opus => 2,
+            Codec::Aac => 1,
+        }
+    }
+
+    /// The RTP clock rate to assume when an offered stream omits `timeBase`.
+    const fn default_timebase(self) -> NonZeroU32 {
+        match self {
+            Codec::H264 | Codec::Hevc | Codec::Vp8 => VIDEO_TIMEBASE,
+            Codec::Opus | Codec::Aac => AUDIO_TIMEBASE,
+        }
+    }
 }
+
+/// A codec sorted into the two halves of [`castaway_core::EncodedFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// A video codec the pipeline decodes.
+    Video(VideoCodec),
+    /// An audio codec the pipeline decodes.
+    Audio(AudioCodec),
+}
+
+/// A literal clock rate. `NonZeroU32::new(..).unwrap()` is not const, and a library
+/// crate does not get to panic (ground rule 7), so the zero case is spelled out.
+macro_rules! timebase {
+    ($hz:literal) => {
+        match NonZeroU32::new($hz) {
+            Some(rate) => rate,
+            None => NonZeroU32::MIN,
+        }
+    };
+}
+
+/// 90 kHz — the RTP convention for video, and what Cast senders offer.
+const VIDEO_TIMEBASE: NonZeroU32 = timebase!(90_000);
+/// 48 kHz — Cast audio is timestamped in samples, and every sender we have seen is 48k.
+const AUDIO_TIMEBASE: NonZeroU32 = timebase!(48_000);
 
 /// The negotiated configuration for one RTP stream.
 #[derive(Debug, Clone)]
@@ -64,19 +129,35 @@ pub struct StreamConfig {
     pub payload_type: u8,
     /// The codec.
     pub codec: Codec,
+    /// The stream's RTP clock rate, from the offer's `timeBase`. Frame timestamps are
+    /// counted in these ticks, so a wrong value is a wrong presentation time.
+    pub rtp_timebase: NonZeroU32,
     /// AES-128 key for this stream (from the offer).
     pub aes_key: [u8; 16],
     /// AES IV mask for this stream (from the offer); per-frame IVs derive from it.
     pub aes_iv_mask: [u8; 16],
 }
 
+impl StreamConfig {
+    /// How the pipeline should be told to decode this stream.
+    #[must_use]
+    pub const fn media_kind(&self) -> MediaKind {
+        self.codec.media_kind()
+    }
+}
+
 /// The full negotiated mirroring session.
+///
+/// Video is not optional. Cast Streaming can carry an audio-only session, but
+/// [`castaway_core::SessionEvent::Mirror`] has nowhere to put one — so an offer without
+/// video is declined at negotiation rather than accepted and then abandoned when the
+/// actor discovers it has nothing to show.
 #[derive(Debug, Clone)]
 pub struct MirrorConfig {
     /// UDP port we will receive RTP on.
     pub udp_port: u16,
-    /// The selected video stream, if any.
-    pub video: Option<StreamConfig>,
+    /// The selected video stream.
+    pub video: StreamConfig,
     /// The selected audio stream, if any.
     pub audio: Option<StreamConfig>,
 }
@@ -102,10 +183,26 @@ struct OfferedStream {
     #[serde(rename = "rtpPayloadType")]
     rtp_payload_type: Option<u8>,
     ssrc: u32,
+    #[serde(rename = "timeBase")]
+    time_base: Option<String>,
     #[serde(rename = "aesKey")]
     aes_key: String,
     #[serde(rename = "aesIvMask")]
     aes_iv_mask: String,
+}
+
+/// Parse an offered `timeBase` — always written as the reciprocal, `"1/90000"`.
+fn parse_timebase(spec: Option<&str>, codec: Codec) -> Result<NonZeroU32, CastError> {
+    let Some(spec) = spec else {
+        return Ok(codec.default_timebase());
+    };
+    let denominator = spec
+        .trim()
+        .strip_prefix("1/")
+        .ok_or(CastError::Mirror("timeBase is not of the form 1/N"))?;
+    denominator
+        .parse::<NonZeroU32>()
+        .map_err(|_| CastError::Mirror("timeBase denominator is not a positive integer"))
 }
 
 /// Negotiate a mirroring OFFER: choose one video + one audio stream and build the
@@ -129,23 +226,32 @@ pub fn negotiate(offer_payload: &str, udp_port: u16) -> Result<(String, MirrorCo
             receiver_ssrc: s.ssrc.wrapping_add(1),
             payload_type: s.rtp_payload_type.unwrap_or(96),
             codec,
+            rtp_timebase: parse_timebase(s.time_base.as_deref(), codec)?,
             aes_key: parse_hex16(&s.aes_key)?,
             aes_iv_mask: parse_hex16(&s.aes_iv_mask)?,
         };
-        if codec.is_video() && video.is_none() {
-            video = Some(cfg);
-        } else if !codec.is_video() && audio.is_none() {
-            audio = Some(cfg);
+        let slot = if codec.is_video() {
+            &mut video
+        } else {
+            &mut audio
+        };
+        // Offers list several codecs per medium and we take exactly one, so this is a
+        // choice rather than a first match — see `Codec::preference`.
+        if slot
+            .as_ref()
+            .is_none_or(|held| codec.preference() > held.codec.preference())
+        {
+            *slot = Some(cfg);
         }
     }
 
-    if video.is_none() && audio.is_none() {
-        return Err(CastError::Mirror("offer had no usable streams"));
-    }
+    let Some(video) = video else {
+        return Err(CastError::Mirror("offer had no video stream we can decode"));
+    };
 
     let mut send_indexes = Vec::new();
     let mut ssrcs = Vec::new();
-    for cfg in [video.as_ref(), audio.as_ref()].into_iter().flatten() {
+    for cfg in [Some(&video), audio.as_ref()].into_iter().flatten() {
         send_indexes.push(cfg.index);
         ssrcs.push(cfg.receiver_ssrc);
     }
@@ -249,7 +355,7 @@ mod tests {
         assert!(answer.contains("\"udpPort\":51234"));
         assert!(answer.contains("\"sendIndexes\":[0,1]"));
 
-        let v = cfg.video.unwrap();
+        let v = cfg.video;
         assert_eq!(v.codec, Codec::H264);
         assert_eq!(v.sender_ssrc, 100);
         assert_eq!(v.receiver_ssrc, 101);
@@ -270,7 +376,7 @@ mod tests {
     #[test]
     fn frame_crypto_roundtrips() {
         let (_a, cfg) = negotiate(OFFER, 5000).unwrap();
-        let v = cfg.video.unwrap();
+        let v = cfg.video;
         let plaintext = b"an-encoded-h264-access-unit";
         let ciphertext = crypt_frame(&v, FrameId::new(7), plaintext).unwrap();
         assert_ne!(ciphertext, plaintext);
@@ -281,7 +387,7 @@ mod tests {
     #[test]
     fn different_frame_ids_give_different_ciphertext() {
         let (_a, cfg) = negotiate(OFFER, 5000).unwrap();
-        let v = cfg.video.unwrap();
+        let v = cfg.video;
         let c1 = crypt_frame(&v, FrameId::new(1), b"same").unwrap();
         let c2 = crypt_frame(&v, FrameId::new(2), b"same").unwrap();
         assert_ne!(c1, c2);
