@@ -128,6 +128,173 @@ let
         sys.exit(1)
     print(match.group(1))
   '';
+  # A scripted CASTv2 sender: TLS to :8009, then length-prefixed protobuf CastMessages.
+  #
+  # The protobuf is hand-rolled rather than generated. CastMessage is seven scalar
+  # fields, so an encoder is ~20 lines — and a hand-written one is a *second*, independent
+  # reading of the wire format. Generating from the same .proto the receiver uses would
+  # make the test agree with the implementation by construction, which is exactly the
+  # agreement worth not assuming.
+  # W503: flake8's own docs call it the non-PEP8 half of a mutually exclusive pair —
+  # the operators lead their continuation lines here, which is the readable half.
+  castSender = pkgs.writers.writePython3Bin "cast-send" { flakeIgnore = [ "E501" "W503" ]; } ''
+    import json
+    import socket
+    import ssl
+    import struct
+    import sys
+
+    CONNECTION = "urn:x-cast:com.google.cast.tp.connection"
+    HEARTBEAT = "urn:x-cast:com.google.cast.tp.heartbeat"
+    RECEIVER = "urn:x-cast:com.google.cast.receiver"
+    MEDIA = "urn:x-cast:com.google.cast.media"
+
+    host = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8009
+    media_url = sys.argv[3] if len(sys.argv) > 3 else "http://example.invalid/cast.mp4"
+
+
+    def varint(value):
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            out.append(byte | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+
+    def tag(field, wire):
+        return varint((field << 3) | wire)
+
+
+    def field_varint(field, value):
+        return tag(field, 0) + varint(value)
+
+
+    def field_bytes(field, value):
+        raw = value.encode() if isinstance(value, str) else value
+        return tag(field, 2) + varint(len(raw)) + raw
+
+
+    def encode(source, destination, namespace, payload):
+        return (
+            field_varint(1, 0)          # protocol_version = CASTV2_1_0
+            + field_bytes(2, source)
+            + field_bytes(3, destination)
+            + field_bytes(4, namespace)
+            + field_varint(5, 0)        # payload_type = STRING
+            + field_bytes(6, payload)
+        )
+
+
+    def decode(body):
+        """Pull namespace and the utf8 payload back out of a CastMessage."""
+        fields, i = {}, 0
+        while i < len(body):
+            key, i = read_varint(body, i)
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                fields[field], i = read_varint(body, i)
+            elif wire == 2:
+                length, i = read_varint(body, i)
+                fields[field] = body[i:i + length]
+                i += length
+            else:
+                raise ValueError("unexpected wire type {}".format(wire))
+        return {
+            "namespace": fields.get(4, b"").decode("utf-8", "replace"),
+            "payload": fields.get(6, b"").decode("utf-8", "replace"),
+        }
+
+
+    def read_varint(buf, i):
+        value, shift = 0, 0
+        while True:
+            byte = buf[i]
+            i += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value, i
+            shift += 7
+
+
+    # Senders never validate the receiver's certificate — CASTv2 authenticates the
+    # *device* (device-auth over the cert), not the transport. Matching that here is
+    # accuracy, not laziness.
+    context = ssl._create_unverified_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+
+    raw = socket.create_connection((host, port), timeout=15)
+    tls = context.wrap_socket(raw)
+    tls.settimeout(10)
+
+    buffered = bytearray()
+
+
+    def send(destination, namespace, payload):
+        body = encode("sender-0", destination, namespace, json.dumps(payload))
+        tls.sendall(struct.pack(">I", len(body)) + body)
+
+
+    def recv():
+        while True:
+            if len(buffered) >= 4:
+                (length,) = struct.unpack(">I", buffered[:4])
+                if len(buffered) >= 4 + length:
+                    frame = bytes(buffered[4:4 + length])
+                    del buffered[:4 + length]
+                    return decode(frame)
+            chunk = tls.recv(65536)
+            if not chunk:
+                raise SystemExit("receiver closed the connection")
+            buffered.extend(chunk)
+
+
+    def expect(namespace, kind):
+        """Read until the expected message arrives; unrelated traffic is not an error."""
+        for _ in range(10):
+            message = recv()
+            payload = json.loads(message["payload"]) if message["payload"] else {}
+            print("<- {} {}".format(message["namespace"], payload.get("type")))
+            if message["namespace"] == namespace and payload.get("type") == kind:
+                return payload
+        raise SystemExit("never saw {} on {}".format(kind, namespace))
+
+
+    send("receiver-0", CONNECTION, {"type": "CONNECT"})
+
+    send("receiver-0", HEARTBEAT, {"type": "PING"})
+    expect(HEARTBEAT, "PONG")
+
+    send("receiver-0", RECEIVER, {"type": "GET_STATUS", "requestId": 1})
+    status = expect(RECEIVER, "RECEIVER_STATUS")
+    assert not status["status"].get("applications"), status
+
+    send("receiver-0", RECEIVER, {"type": "LAUNCH", "requestId": 2, "appId": "CC1AD845"})
+    status = expect(RECEIVER, "RECEIVER_STATUS")
+    apps = status["status"]["applications"]
+    assert apps[0]["appId"] == "CC1AD845", status
+
+    send("receiver-0", MEDIA, {
+        "type": "LOAD",
+        "requestId": 3,
+        "media": {"contentId": media_url, "contentType": "video/mp4", "streamType": "BUFFERED"},
+        "autoplay": True,
+    })
+    media = expect(MEDIA, "MEDIA_STATUS")
+    assert media["status"][0]["playerState"] == "PLAYING", media
+
+    send("receiver-0", MEDIA, {"type": "PAUSE", "requestId": 4})
+    media = expect(MEDIA, "MEDIA_STATUS")
+    assert media["status"][0]["playerState"] == "PAUSED", media
+
+    # CLOSE to the receiver ends the session; the actor must emit End for it.
+    send("receiver-0", CONNECTION, {"type": "CLOSE"})
+    tls.close()
+    print("cast session completed")
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "castaway-integration";
@@ -150,6 +317,9 @@ pkgs.testers.runNixOSTest {
           # The VM's default route is the NAT interface, so the auto-detect would pick
           # the wrong address; pin discovery to the test LAN.
           interface = config.networking.primaryIPAddress;
+          # Off in the shipped defaults (device auth is still a dev key, Q2/Q11), on
+          # here — the TLS actor is exactly what this test exists to exercise.
+          enable.cast = true;
         };
       };
     };
@@ -164,14 +334,15 @@ pkgs.testers.runNixOSTest {
         enable = true;
         openFirewall = false;
       };
-      environment.systemPackages = [ pkgs.curl ssdpSearch dlnaCtl ];
+      environment.systemPackages = [ pkgs.curl ssdpSearch dlnaCtl castSender ];
     };
   };
 
   testScript = { nodes, ... }: ''
     import json
 
-    base = "http://${nodes.receiver.networking.primaryIPAddress}:${toString httpPort}"
+    kiosk = "${nodes.receiver.networking.primaryIPAddress}"
+    base = f"http://{kiosk}:${toString httpPort}"
     lan = "${nodes.sender.networking.primaryIPAddress}"
 
     start_all()
@@ -233,6 +404,27 @@ pkgs.testers.runNixOSTest {
         info = json.loads(sender.succeed(f"curl -sSf '{base}/spotify?action=getInfo'"))
         assert info["remoteName"] == "${friendlyName}", info
         assert info["publicKey"], info
+
+    with subtest("a CASTv2 sender launches the media receiver and LOADs a video"):
+        receiver.wait_for_open_port(8009)
+        session = sender.succeed(
+            f"cast-send {kiosk} 8009 http://example.invalid/cast.mp4"
+        )
+        assert "cast session completed" in session, session
+
+        # As with DLNA: the sender's own assertions prove the state machine answered.
+        # These prove the LOAD crossed the actor into the session manager and pipeline.
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q 'source=cast/.*example.invalid/cast.mp4'"
+        )
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'CASTv2 sender connected'")
+        # The CLOSE must land as a session End, not a leaked session holding the screen.
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'CASTv2 sender disconnected'")
+
+    with subtest("Cast is advertised over mDNS with the port that answered"):
+        txt = sender.succeed("avahi-browse -rpt _googlecast._tcp")
+        assert "${friendlyName}" in txt, txt
+        assert ";8009;" in txt, txt
 
     with subtest("the receiver is discoverable over mDNS from another host"):
         sender.wait_until_succeeds(

@@ -3,13 +3,14 @@
 //! A Google Cast (CASTv2) receiver. The [`framing`], [`proto`], [`messages`], and
 //! [`session`] modules are pure and socket-free (ground rule 3): they fold sender
 //! messages into outgoing messages + [`castaway_core::SessionEvent`]s, unit-tested
-//! against constructed `CastMessage`s. The TLS actor and real device-auth signer land
-//! with `crypto-cast-auth` + the app wiring.
+//! against constructed `CastMessage`s. [`actor`] is the thin TLS shell that composes
+//! them with I/O — it makes no protocol decisions of its own.
 //!
 //! Today this implements the **media-URL** path (Default Media Receiver `LOAD`).
 //! Mirroring (offer/answer + custom RTP) is the next Cast milestone.
 #![forbid(unsafe_code)]
 
+pub mod actor;
 pub mod auth;
 pub mod error;
 pub mod framing;
@@ -18,6 +19,7 @@ pub mod mirror;
 pub mod proto;
 pub mod session;
 
+pub use actor::{CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;
 pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};

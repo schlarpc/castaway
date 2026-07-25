@@ -66,6 +66,17 @@ impl SessionSink {
         &self.source
     }
 
+    /// A sink onto the same channel with a different instance tag — one per accepted
+    /// connection, so a listening adapter's two senders arrive as distinct sources.
+    /// The [`ProtocolKind`] is carried over, so this still can't spoof another protocol.
+    #[must_use]
+    pub fn with_instance(&self, instance: impl Into<Arc<str>>) -> Self {
+        Self {
+            source: SourceId::new(self.source.kind, instance),
+            tx: self.tx.clone(),
+        }
+    }
+
     /// Emit an event to the session manager.
     ///
     /// # Errors
@@ -121,6 +132,17 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.source.kind, ProtocolKind::Dlna);
         assert_eq!(&*msg.source.instance, "conn-1");
+    }
+
+    #[tokio::test]
+    async fn retagging_keeps_the_protocol_but_changes_the_instance() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Cast, "listener"), tx);
+        let conn = sink.with_instance("10.0.0.7:41234");
+        conn.emit(SessionEvent::End).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.source.kind, ProtocolKind::Cast);
+        assert_eq!(&*msg.source.instance, "10.0.0.7:41234");
     }
 
     #[tokio::test]

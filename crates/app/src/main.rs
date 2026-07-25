@@ -19,10 +19,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use axum::Router;
 use castaway_core::{
-    osd_channel, DisplayControl, ProtocolKind, SessionConfig, SessionManager, SessionSink,
-    SourceId, SourceMessage,
+    osd_channel, Advertisement, DisplayControl, ProtocolKind, SessionConfig, SessionManager,
+    SessionSink, SourceAdapter, SourceId, SourceMessage,
 };
 use control_display::NullDisplay;
+use crypto_cast_auth::CastDeviceSigner;
+use proto_cast::{CastReceiver, TlsIdentity};
 use proto_dial::DialService;
 use proto_dlna::DlnaService;
 use proto_spotify::SpotifyService;
@@ -32,6 +34,10 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{info, warn};
 
 use crate::config::Config;
+
+/// The mDNS host label every advertisement resolves to (`castaway.local.`). One name for
+/// the box, however many services it publishes.
+const MDNS_HOST: &str = "castaway";
 
 fn main() -> anyhow::Result<()> {
     // CEF is multi-process: subprocesses re-exec this same binary, so bootstrap must be
@@ -251,7 +257,7 @@ async fn serve(
         let spotify = SpotifyService::new(&config.friendly_name, spotify_device_id(&config), sink)
             .with_osd(osd.clone());
         http = http.merge(spotify.router());
-        mdns.advertise(&spotify.mdns_service(config.http_port, "castaway"))
+        mdns.advertise(&spotify.mdns_service(config.http_port, MDNS_HOST))
             .context("advertising Spotify")?;
         info!("enabled: Spotify Connect (onboarding/pairing)");
     }
@@ -276,6 +282,15 @@ async fn serve(
             }
         });
     }
+
+    // Cast is the first protocol whose adapter owns a real listener, so it advertises
+    // itself: what goes in the TXT record comes from the same object that answers the
+    // port, and the two can't drift.
+    let cast_handle = if config.enable.cast {
+        Some(spawn_cast(&config, &mut mdns, event_tx.clone(), shutdown.clone()).await?)
+    } else {
+        None
+    };
 
     advertise_socket_protocols(&config, &mut mdns);
 
@@ -324,38 +339,101 @@ async fn serve(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let _ = ssdp_handle.await;
         let _ = http_handle.await;
+        if let Some(handle) = cast_handle {
+            let _ = handle.await;
+        }
     })
     .await;
     drop(mdns);
     Ok(())
 }
 
-/// mDNS-advertise Cast/AirPlay if enabled. Their TCP actors (Cast TLS, AirPlay RTSP)
-/// aren't wired yet, so this is off by default.
-fn advertise_socket_protocols(config: &Config, mdns: &mut MdnsResponder) {
-    use substrate_mdns::MdnsService;
-    if config.enable.cast {
-        let svc = MdnsService::new(
-            proto_cast::CAST_SERVICE_TYPE,
-            &config.friendly_name,
-            "castaway",
-            proto_cast::CAST_PORT,
-        )
-        .with_txt("id", config.uuid.replace('-', ""))
-        .with_txt("md", "castaway")
-        .with_txt("fn", &config.friendly_name)
-        .with_txt("ca", "5")
-        .with_txt("ve", "05");
-        if let Err(e) = mdns.advertise(&svc) {
-            warn!(error = %e, "failed to advertise Cast");
+/// Stand up the CASTv2 TLS listener, advertise what it asks for, and run it until
+/// `shutdown`. Returns the actor's join handle so shutdown can wait on it.
+async fn spawn_cast(
+    config: &Config,
+    mdns: &mut MdnsResponder,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    // RSA-2048 keygen takes seconds; it belongs on a blocking thread, not stalling the
+    // runtime while the other adapters are trying to come up (ground rule 4).
+    let signer = tokio::task::spawn_blocking(CastDeviceSigner::generate_dev)
+        .await
+        .context("joining Cast device-key generation")?
+        .context("generating the Cast device key")?;
+    warn!(
+        "Cast device auth uses a self-generated dev key; senders that verify the Google \
+         chain will reject it (Q2/Q11)"
+    );
+
+    let identity = TlsIdentity::self_signed(&["castaway.local".to_string()])
+        .context("generating the Cast TLS identity")?;
+    let receiver = CastReceiver::new(
+        proto_cast::actor::default_listen_addr(),
+        config.friendly_name.as_str(),
+        config.uuid.replace('-', ""),
+        &identity,
+    )
+    .context("building the CASTv2 receiver")?
+    .with_signer(Arc::new(signer));
+
+    advertise_adapter(&receiver, mdns);
+    info!("enabled: Google Cast (CASTv2 media-URL LOAD)");
+
+    // The listener adapter's own tag; each accepted sender is retagged with its peer.
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::Cast, "listener"), event_tx);
+    let adapter = Arc::new(receiver);
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            res = adapter.run(sink) => {
+                if let Err(e) = res {
+                    warn!(error = %e, "Cast adapter exited");
+                }
+            }
+            () = shutdown.notified() => info!("Cast listener stopping"),
         }
-        warn!("Cast advertised, but the CASTv2 TLS actor is not wired yet (pure core only)");
+    }))
+}
+
+/// Register whatever an adapter says it needs discoverable. The app supplies only
+/// [`MDNS_HOST`] — the box's one name. Everything else, instance name included, comes
+/// from the adapter, because the instance-naming convention is per-protocol.
+fn advertise_adapter(adapter: &dyn SourceAdapter, mdns: &mut MdnsResponder) {
+    use substrate_mdns::MdnsService;
+    for ad in adapter.advertisements() {
+        match ad {
+            Advertisement::MdnsService {
+                ty,
+                instance,
+                port,
+                txt,
+            } => {
+                let svc = txt.into_iter().fold(
+                    MdnsService::new(ty, instance, MDNS_HOST, port),
+                    |svc, (key, value)| svc.with_txt(key, value),
+                );
+                if let Err(e) = mdns.advertise(&svc) {
+                    warn!(error = %e, protocol = %adapter.kind(), "failed to advertise");
+                }
+            }
+            other => warn!(
+                ?other,
+                protocol = %adapter.kind(),
+                "adapter asked for an advertisement the app doesn't serve yet"
+            ),
+        }
     }
+}
+
+/// mDNS-advertise AirPlay if enabled. Its RTSP actor isn't wired yet, so it stays off
+/// by default.
+fn advertise_socket_protocols(config: &Config, mdns: &mut MdnsResponder) {
     if config.enable.airplay {
         let ident = proto_airplay::AirPlayIdentity {
             name: config.friendly_name.clone(),
             device_id: derive_mac(&config.uuid),
-            host: "castaway".to_string(),
+            host: MDNS_HOST.to_string(),
         };
         for svc in [ident.airplay_service(), ident.raop_service()] {
             if let Err(e) = mdns.advertise(&svc) {

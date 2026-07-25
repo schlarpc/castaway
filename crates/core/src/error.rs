@@ -30,4 +30,10 @@ pub enum CoreError {
     /// The event bus was closed before the operation completed.
     #[error("session channel closed")]
     ChannelClosed,
+
+    /// A [`crate::SourceAdapter`] failed to run: its listener could not be bound, or its
+    /// transport died in a way it can't recover from. The adapter's own typed error is
+    /// rendered into the message — `core` can't depend on the `proto-*` crates.
+    #[error("adapter failure: {0}")]
+    Adapter(String),
 }

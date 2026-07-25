@@ -435,8 +435,10 @@
               };
 
               networking.firewall = lib.mkIf cfg.openFirewall {
-                # The shared HTTP host (dd.xml fetches, DIAL launch, SOAP, Spotify).
-                allowedTCPPorts = [ cfg.httpPort ];
+                # The shared HTTP host (dd.xml fetches, DIAL launch, SOAP, Spotify),
+                # plus a socket protocol's own listener when it's switched on.
+                allowedTCPPorts = [ cfg.httpPort ]
+                  ++ lib.optional (cfg.settings.enable.cast or false) 8009;
                 allowedUDPPorts = [
                   # SSDP: DIAL/DLNA senders discover us via M-SEARCH on 1900.
                   1900

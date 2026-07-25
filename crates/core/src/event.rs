@@ -15,6 +15,10 @@ pub enum Advertisement {
     MdnsService {
         /// Service type, e.g. `_googlecast._tcp`.
         ty: String,
+        /// The instance name to publish. Usually the receiver's friendly name — but the
+        /// adapter decides, because the convention is per-protocol: RAOP requires
+        /// `<deviceid>@<name>`. Adapters are handed the friendly name at construction.
+        instance: String,
         /// TCP port the service listens on.
         port: u16,
         /// TXT record key/value pairs.

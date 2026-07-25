@@ -29,4 +29,13 @@ pub enum CastError {
     /// A mirroring OFFER could not be negotiated.
     #[error("mirror negotiation error: {0}")]
     Mirror(&'static str),
+
+    /// The TLS identity could not be generated, or a handshake/config failed. Rendered
+    /// from `rcgen`/`rustls`, which the pure modules never see.
+    #[error("cast tls error: {0}")]
+    Tls(String),
+
+    /// The socket died, or a peer sent something the actor won't buffer.
+    #[error("cast io error: {0}")]
+    Io(String),
 }

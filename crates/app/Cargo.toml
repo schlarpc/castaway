@@ -18,6 +18,7 @@ substrate-ssdp.workspace = true
 substrate-mdns.workspace = true
 proto-dlna.workspace = true
 proto-cast.workspace = true
+crypto-cast-auth.workspace = true
 proto-spotify.workspace = true
 proto-airplay.workspace = true
 proto-dial.workspace = true
