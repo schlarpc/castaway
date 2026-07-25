@@ -9,6 +9,7 @@ description = "A2DP sink (AVDTP) and AVRCP: all five codecs, track metadata, tra
 
 [dependencies]
 castaway-core.workspace = true
+substrate-rtp.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true

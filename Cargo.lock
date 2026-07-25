@@ -2812,6 +2812,7 @@ dependencies = [
  "bytes",
  "castaway-core",
  "hex-literal",
+ "substrate-rtp",
  "thiserror 2.0.19",
  "tracing",
 ]

@@ -14,7 +14,11 @@
 pub mod avdtp;
 pub mod codec;
 pub mod error;
+pub mod media;
+pub mod sink;
 
 pub use avdtp::{Message, MessageType, Seid, Signal, StreamEndpoint};
 pub use codec::{advertised, ChannelModes, CodecCapability, SampleRates};
 pub use error::AudioError;
+pub use media::Depacketizer;
+pub use sink::{SinkEvent, SinkSession, StreamState};
