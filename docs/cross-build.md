@@ -30,7 +30,8 @@ continuously exercises your *future* Linux target.
 |---|---|---|
 | `.#castaway-windows` | none | toolchain canary — if it stops linking, the toolchain broke, not the media stack |
 | `.#castaway-windows-render` | `render` | DX12 compositor + kiosk, no browser; bisect render problems without CEF's ~200 MB in the way |
-| `.#castaway-windows-cef` | `cef` | the deploy artifact: render + offscreen browser, with the full CEF runtime staged |
+| `.#castaway-windows-hwaccel` | `hwaccel` | the D3D11VA → shared-NV12 → D3D12 decode bridge. Exists as its own artifact because it is the one part of Q20 Linux cannot exercise: the VA-API half has an offscreen readback test, this half has only the compiler until it reaches the Dell |
+| `.#castaway-windows-cef` | `cef` | the deploy artifact: render + offscreen browser + hwaccel, with the full CEF runtime staged |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
 
 For an incremental loop, `nix develop .#windows` exports the whole cross environment (including

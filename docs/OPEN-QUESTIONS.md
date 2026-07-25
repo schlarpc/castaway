@@ -106,65 +106,64 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   and `Decoded` forwards straight to the compositor. Each lands composited pixels in an
   offscreen readback test, so the render path is verified without a human or a panel.
   What is still open is not wiring but *hardware*: the winit kiosk surface has only ever
-  been compile-checked, and decode is software-only (hwaccel is Q20). Both want the
-  C6522QT box.
-- **Q20 — Hardware-accelerated decode.** Software decode is fine for the 1080p test
-  streams and will not hold a 4K60 mirror on the deploy box, so this is scoped rather
-  than speculative. The framing question is *not* "turn on VAAPI" — it is "who owns the
-  decoded surface", and that answer changes types in `core`.
+  been compile-checked and wants the C6522QT box. (Decode is no longer software-only —
+  Q20 landed the zero-copy hardware path.)
+- **Q20 — Hardware-accelerated decode. RESOLVED on Linux; Windows is compile-checked.**
+  Behind the `hwaccel` feature (on by default for the Windows `cef` deploy artifact).
 
-  Findings that shape it:
-  - **`ffmpeg-next` 7.1 wraps none of this.** No `hw_device_ctx`, no `get_format`, no
-    `AVHWFramesContext` anywhere in the crate — every piece is raw `ffmpeg_sys_next`
-    through `codec::Context::as_mut_ptr()`. Ground rule 8 permits that in `pipeline`, but
-    it means `// SAFETY:` comments and a thin safe wrapper at the crate boundary.
-  - **The naive version is a regression.** Decoding to a GPU surface and then
-    `av_hwframe_transfer_data`-ing back to system memory for the existing swscale → RGBA →
-    `queue.write_texture` path trades CPU decode cycles for a GPU→CPU→GPU round trip; at
-    4K the readback usually costs more than it saved. Hwaccel only pays if the surface
-    never leaves the GPU, so this is a zero-copy *import* project, not a decode project.
-  - **wgpu 22 already does the sampling half.** `Features::TEXTURE_FORMAT_NV12` plus
-    `TextureAspect::Plane0`/`Plane1` views works on Vulkan and DX12. Only the import needs
-    raw `wgpu-hal`.
-  - **Linux is not hardware-blocked.** `av_hwframe_map` to `AV_PIX_FMT_DRM_PRIME` yields an
-    `AVDRMFrameDescriptor` (per-plane fds + DRM format modifier) without calling libva
-    directly; import via `VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`
-    and `wgpu_hal::vulkan::Device::texture_from_raw`. The dev box's RX 7900 XTX (RADV) can
-    verify all of that natively by offscreen readback.
-  - **Windows costs one GPU-local copy.** D3D11VA hands back an `ID3D11Texture2D` + array
-    index, but wgpu runs DX12/Vulkan there, and ffmpeg allocates its decoder array with
-    `BIND_DECODER`, which is generally not shareable. Realistically: `CopySubresourceRegion`
-    into a shared NV12 texture we own, `IDXGIResource1::CreateSharedHandle` →
-    `ID3D12Device::OpenSharedHandle`. Still far cheaper than a readback, but not literally
-    zero-copy. Only this step needs the Dell.
-  - **Colorspace stops being swscale's problem.** Surfaces are NV12 (P010 for 10-bit), so
-    YUV→RGB moves into the fragment shader and `AVFrame.colorspace`/`color_range` (BT.709
-    vs 601 vs 2020, limited vs full) must reach the compositor. `DecodedFrame` carries
-    neither today. Getting it wrong is subtly wrong — washed out or oversaturated — not
-    obviously broken, which is the worse failure.
-  - **Fallback is most of the correctness.** Hwaccel fails routinely in the field:
-    unsupported profile, too many reference frames, 10-bit on an older GPU, a VM with no
-    device. Decode must fall back to software *mid-session* without dropping the mirror.
+  The framing was right: this was never "turn on VAAPI", it was "who owns the decoded
+  surface", and the answer changed types in `core`. `DecodedFrame` is now
+  `FrameImage::{Cpu, Gpu}`; the GPU variant is an opaque `dyn GpuSurface` so `core` still
+  cannot name a DMA-BUF or a DXGI handle, and a Windows `MiracastReceiver` can hand one
+  over without `core` growing a `cfg`.
 
-  Default, unless you say otherwise: the hw/sw choice is a **runtime** decision behind a
-  `HwDecodeBackend` trait, not a cargo feature — a `--features vaapi` that turns a working
-  mirror into a black screen on the wrong GPU is exactly the failure mode to avoid. The
-  feature flag gates whether the backend is *compiled*, never whether it is *used*.
+  What landed, against the slicing this question proposed:
+  1. **Types + policy.** `FrameImage`, `GpuSurface`, `ColorInfo`, and `FallbackPolicy`.
+  2. **Linux zero-copy, proven.** `av_hwframe_map` to `AV_PIX_FMT_DRM_PRIME` (no libva),
+     imported via `VK_EXT_image_drm_format_modifier` + `VK_EXT_external_memory_dma_buf`.
+     wgpu never requests those extensions, so the logical device is built in
+     `hwaccel::vulkan_import` — wgpu-hal's own extension list plus the interop ones —
+     and handed back through `Adapter::create_device_from_hal`.
+  3. **NV12 sampling replaces swscale on that path**, via `TextureFormat::NV12` with
+     `Plane0`/`Plane1` views and a matrix derived from the surface's own colorimetry.
+  4. **Windows**: D3D11VA → `CopySubresourceRegion` into a shared NV12 texture →
+     `CreateSharedHandle` → `ID3D12Device::OpenSharedHandle`. Written, cross-compiled,
+     **not run** — see below.
 
-  Slicing, so the portable-crate churn happens once and early:
-  1. `DecodedFrame` gains a GPU variant and colorspace metadata; `HwDecodeBackend` lands
-     with a null impl. Nothing gets faster, the shape gets right. (Touches every consumer —
-     do it deliberately, per ground rule 5.)
-  2. VAAPI → DMA-BUF → `wgpu-hal` Vulkan import, proven by offscreen readback on the dev
-     box. This is the slice that proves zero-copy end to end.
-  3. NV12 shader sampling replaces swscale on that path.
-  4. D3D11VA + shared-handle bridge, on the Dell.
+  Things worth knowing before touching this again:
+  - **`tests/hwaccel_zero_copy.rs` asserts on colour, not on the absence of errors.** It
+    decodes a known solid colour and reads the composited pixels back off the dev box's
+    RX 7900 XTX. That matters because nearly every way this path breaks produces a
+    *picture*: a wrong DRM format modifier renders the right image with the wrong tiling,
+    swapped plane pitches shift the chroma, the wrong matrix shifts the colour, and
+    `VK_IMAGE_LAYOUT_UNDEFINED` on the import barrier is *permitted by the spec* to
+    discard the contents entirely. Mesa preserves them for a DRM-modifier image; this test
+    is what says so on this driver.
+  - **The `AVFrame` reference in `DmaBufSurface` is load-bearing.** A DMA-BUF fd keeps the
+    buffer object alive but does nothing to stop libavcodec handing the same VA surface to
+    the next picture. That reference lives inside the Vulkan image's drop guard, so it is
+    released exactly when wgpu retires the last submission that sampled it.
+  - **`ffmpeg-sys-next` binds `hwcontext.h` and `hwcontext_drm.h` and stops.** There is no
+    `AVD3D11VADeviceContext`; `hwaccel::d3d11va` declares it as a `#[repr(C)]` shim against
+    libavutil's published ABI, reading only leading fields.
+  - **Lossless H.264 (`-qp 0`) is undecodable by any fixed-function decoder.** It cost an
+    hour of "why does VA-API refuse this"; test fixtures must use a normal CRF or the
+    fixture itself forces the software fallback the test exists to rule out.
 
-  Steps 1–3 are natively verifiable here; only 4 is hardware-gated. `get_format` selection,
-  the fallback state machine, and colorspace matrix derivation are pure functions over
-  metadata and get unit tests regardless of GPU (ground rule 6). Mirroring also wants
-  `AV_CODEC_FLAG_LOW_DELAY` and no frame-level threading — hwaccel decoders will otherwise
-  buffer 2–3 frames, which is the wrong trade for a live mirror.
+  Still open:
+  - **The Windows bridge needs the Dell.** `nix build .#castaway-windows-hwaccel` keeps it
+    compiling and its DLL closure checked, which is all Linux can do. Unverified in
+    particular: whether the `D3D11_QUERY_EVENT` producer-side wait is sufficient
+    synchronisation in practice (it should be — it blocks until the copy has retired
+    before the handle is published — but a shared `ID3D11Fence` would be cheaper, and
+    needs D3D11.4 interfaces `winapi` 0.3 does not declare), and whether the pool's
+    `Arc`-count reuse gate is conservative enough under real frame latency.
+  - **10-bit.** P010 is refused by `DmaBufSurface` rather than reinterpreted, so an HDR or
+    10-bit sender falls back to software cleanly. Adding it is a second Vulkan format and
+    a second shader variant, not a redesign.
+  - **`Play(url)` restarts demuxing on a mid-stream fallback**, which for a file means
+    seeking back to the start. Acceptable for a rare event; the mirror path has no such
+    problem because it just resyncs on the next key frame.
 
 ## CEF / adblock / YouTube Lounge
 

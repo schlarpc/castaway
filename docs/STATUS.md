@@ -60,6 +60,14 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
   pixels (`encoded_mirror_decodes_and_composites_pixels`). Decode waits for a key frame
   (mirror sessions are joined mid-stream), carries the adapter's timestamps through the
   decoder's reorder buffer, and rebuilds swscale when the sender changes resolution.
+- **Hardware decode** (`hwaccel` feature, Q20): VA-API → DMA-BUF → Vulkan import → NV12
+  sampled in the shader, with **no copy anywhere**. `tests/hwaccel_zero_copy.rs` decodes a
+  known colour on the dev box's RX 7900 XTX and asserts on the composited pixels, which is
+  what catches a wrong tiling, wrong plane pitches, or the wrong colour matrix — all of
+  which render a picture rather than an error. The hw/sw choice is runtime, not a build
+  flag, and falls back to software mid-session with a log line. The Windows half
+  (D3D11VA → shared NV12 texture → D3D12) is cross-compiled and DLL-closure-checked but
+  needs the Dell to run.
 - **Kiosk**: winit borderless-fullscreen surface path — compile-verified (not run on the
   dev box's live display).
 - Run it: `nix develop --command cargo run -p castaway --features render` (opens a
@@ -71,10 +79,12 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
 3. ~~**Q16** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.~~ **Mostly
    done**: all three `FrameSource` variants reach composited pixels in readback tests.
-   What's left is hardware — the kiosk surface on the real panel, and hwaccel decode (Q20,
-   now scoped: a zero-copy surface-import project, not a "turn on VAAPI" one).
-4. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
-5. ~~**Q12/Q13** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
+   What's left is the kiosk surface on the real panel.
+4. ~~**Q20** — hardware-accelerated decode.~~ **Done on Linux**, proven zero-copy by an
+   offscreen readback test; the Windows D3D11VA bridge is written and cross-compiled but
+   unverified until the Dell.
+5. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
+6. ~~**Q12/Q13** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
    receive path is differential-tested against openscreen's `RtpPacketizer` +
    `FrameCrypto`, compiled from a pinned checkout by the `openscreen-rtp-fixtures` check.
 

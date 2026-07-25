@@ -188,6 +188,18 @@
           craneLib = cranelibFor system;
           commonArgs = commonArgsFor system;
           cargoArtifacts = cargoArtifactsFor system;
+
+          # What the `hwaccel` feature needs on top of a default build: ffmpeg's headers
+          # for `ffmpeg-sys-next` (7.x, matching the crate — nixpkgs defaults to 8.x) and
+          # libclang, which its bindgen dlopens. `ash` and `wgpu-hal` need nothing at build
+          # time; Vulkan is loaded at runtime, which is why this check stops at compiling.
+          hwaccelArgs = {
+            cargoExtraArgs = "--package castaway --features hwaccel";
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.ffmpeg_7 ];
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+          };
         in
         {
           # Build the crate as part of checks
@@ -228,6 +240,23 @@
         # LAN (ground rule 6). Linux-only — nixosTest needs KVM and a NixOS guest.
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           integration-vm = import ./nix/vm-test.nix { inherit pkgs self; };
+
+          # Compile-check the Linux hardware-decode backend (VA-API → DMA-BUF → Vulkan).
+          #
+          # Only clippy, not the tests: the sandbox has no render node, so the zero-copy
+          # readback test would skip and prove nothing. What this *does* catch is the
+          # backend rotting behind its feature flag — raw libav and `wgpu-hal` are exactly
+          # the kind of unsafe FFI that stops compiling when a dependency moves, and the
+          # default build never touches it. Running the real thing needs the dev box's GPU.
+          hwaccel-clippy = craneLib.cargoClippy (commonArgs // {
+            cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+              pname = "castaway-hwaccel-deps";
+              inherit (hwaccelArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+              cargoExtraArgs = hwaccelArgs.cargoExtraArgs;
+            });
+            inherit (hwaccelArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+            cargoClippyExtraArgs = "${hwaccelArgs.cargoExtraArgs} --all-targets -- --deny warnings";
+          });
         }
         # Cross-build the Windows artifacts and verify each one's DLL closure. The Windows
         # binaries can't be executed on the builder, so a static check of what the loader
