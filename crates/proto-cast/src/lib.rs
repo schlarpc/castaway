@@ -17,6 +17,7 @@ pub mod framing;
 pub mod messages;
 pub mod mirror;
 pub mod proto;
+pub mod rtp;
 pub mod session;
 
 pub use actor::{CastReceiver, TlsIdentity};
@@ -25,6 +26,10 @@ pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
 pub use mirror::{Codec, MirrorConfig, StreamConfig};
 pub use proto::CastMessage;
+pub use rtp::{
+    CastRtpPacket, CastRtpStream, EncryptedFrame, FrameCollector, FrameId, NackTarget, PacketId,
+    PacketNack, RtpError,
+};
 pub use session::{CastSession, DeviceAuthResponder, Reaction};
 
 /// The default Cast TLS port senders connect to.

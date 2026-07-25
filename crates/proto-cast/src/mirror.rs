@@ -12,6 +12,7 @@ use aes::cipher::{KeyIvInit, StreamCipher};
 use serde::Deserialize;
 
 use crate::error::CastError;
+use crate::rtp::FrameId;
 
 /// The mirroring namespace.
 pub const WEBRTC_NS: &str = "urn:x-cast:com.google.cast.webrtc";
@@ -172,19 +173,22 @@ pub fn negotiate(offer_payload: &str, udp_port: u16) -> Result<(String, MirrorCo
     ))
 }
 
-/// Compute the per-frame CTR IV from the stream's IV mask and a frame id.
+/// Compute the per-frame AES-CTR nonce from the stream's IV mask and a frame id.
 ///
-/// NOTE: the exact mixing of `frame_id` into the mask needs validation against a real
-/// capture (OPEN-QUESTIONS). This is self-consistent (encrypt/decrypt round-trip) and
-/// follows the documented "XOR the frame counter into the mask" shape.
+/// Start from sixteen zero bytes, write the frame id's low 32 bits big-endian at
+/// **offset 8**, then XOR the whole thing with the mask. Byte 8 and not byte 12: the
+/// nonce's last four bytes are the CTR block counter, so putting the frame id there
+/// would have made it march through the keystream as a frame was encrypted.
+///
+/// Derived from openscreen `cast/streaming/impl/frame_crypto.cc` (`FrameCrypto::Crypt`).
 #[must_use]
-pub fn frame_iv(iv_mask: &[u8; 16], frame_id: u32) -> [u8; 16] {
-    let mut iv = *iv_mask;
-    let fid = frame_id.to_be_bytes();
-    for (dst, src) in iv[12..16].iter_mut().zip(fid.iter()) {
+pub fn frame_iv(iv_mask: &[u8; 16], frame_id: FrameId) -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    nonce[8..12].copy_from_slice(&frame_id.lower_32_bits().to_be_bytes());
+    for (dst, src) in nonce.iter_mut().zip(iv_mask.iter()) {
         *dst ^= *src;
     }
-    iv
+    nonce
 }
 
 /// Decrypt (or, symmetrically, encrypt) one frame's payload in place-style, returning
@@ -192,7 +196,11 @@ pub fn frame_iv(iv_mask: &[u8; 16], frame_id: u32) -> [u8; 16] {
 ///
 /// # Errors
 /// [`CastError::Mirror`] if the key/IV lengths are wrong (never for a [`StreamConfig`]).
-pub fn crypt_frame(cfg: &StreamConfig, frame_id: u32, data: &[u8]) -> Result<Vec<u8>, CastError> {
+pub fn crypt_frame(
+    cfg: &StreamConfig,
+    frame_id: FrameId,
+    data: &[u8],
+) -> Result<Vec<u8>, CastError> {
     let iv = frame_iv(&cfg.aes_iv_mask, frame_id);
     let mut cipher = Aes128Ctr::new_from_slices(&cfg.aes_key, &iv)
         .map_err(|_| CastError::Mirror("bad AES key/iv length"))?;
@@ -264,9 +272,9 @@ mod tests {
         let (_a, cfg) = negotiate(OFFER, 5000).unwrap();
         let v = cfg.video.unwrap();
         let plaintext = b"an-encoded-h264-access-unit";
-        let ciphertext = crypt_frame(&v, 7, plaintext).unwrap();
+        let ciphertext = crypt_frame(&v, FrameId::new(7), plaintext).unwrap();
         assert_ne!(ciphertext, plaintext);
-        let back = crypt_frame(&v, 7, &ciphertext).unwrap();
+        let back = crypt_frame(&v, FrameId::new(7), &ciphertext).unwrap();
         assert_eq!(back, plaintext);
     }
 
@@ -274,8 +282,42 @@ mod tests {
     fn different_frame_ids_give_different_ciphertext() {
         let (_a, cfg) = negotiate(OFFER, 5000).unwrap();
         let v = cfg.video.unwrap();
-        let c1 = crypt_frame(&v, 1, b"same").unwrap();
-        let c2 = crypt_frame(&v, 2, b"same").unwrap();
+        let c1 = crypt_frame(&v, FrameId::new(1), b"same").unwrap();
+        let c2 = crypt_frame(&v, FrameId::new(2), b"same").unwrap();
         assert_ne!(c1, c2);
+    }
+
+    /// The nonce layout is the whole of Q13, and a round-trip test cannot catch a
+    /// wrong offset — our encrypt and decrypt would agree with each other while
+    /// disagreeing with every real sender. So assert the bytes.
+    #[test]
+    fn nonce_puts_the_frame_id_at_offset_8() {
+        let mask = [0u8; 16];
+        let iv = frame_iv(&mask, FrameId::new(0x0102_0304));
+        let mut expected = [0u8; 16];
+        expected[8..12].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(iv, expected);
+
+        // The last four bytes are the CTR block counter and must stay untouched.
+        assert_eq!(&iv[12..16], &[0, 0, 0, 0]);
+
+        // A non-zero mask XORs over the whole nonce, not just the frame-id window.
+        let mask = [0xff; 16];
+        let iv = frame_iv(&mask, FrameId::new(1));
+        assert_eq!(&iv[0..8], &[0xff; 8]);
+        assert_eq!(&iv[8..12], &[0xff, 0xff, 0xff, 0xfe]);
+        assert_eq!(&iv[12..16], &[0xff; 4]);
+    }
+
+    /// Frame ids are 64-bit but only the low 32 reach the nonce, so ids a multiple of
+    /// 2^32 apart share a keystream. Pinning this documents the wrap as intended
+    /// rather than an oversight.
+    #[test]
+    fn only_the_low_32_bits_of_the_frame_id_reach_the_nonce() {
+        let mask = [0u8; 16];
+        assert_eq!(
+            frame_iv(&mask, FrameId::new(5)),
+            frame_iv(&mask, FrameId::new(5 + (1 << 32)))
+        );
     }
 }
