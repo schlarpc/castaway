@@ -821,9 +821,14 @@ impl BluetoothAdapter {
                     // GetElementAttributes carries no play state, so its default would
                     // overwrite whatever the subscription told us. Keep ours.
                     let state = link.now_playing.state;
-                    link.now_playing = parsed.now_playing.clone();
+                    let previous = std::mem::replace(&mut link.now_playing, parsed.now_playing);
                     link.now_playing.state = state;
-                    if link.session_open {
+                    // A sender may re-notify several times for one track as its metadata
+                    // fills in — an iPhone sent nine TRACK_CHANGED for three songs — and
+                    // most of those re-reads come back identical. Re-emitting them churns
+                    // the card for no reason.
+                    let unchanged = link.now_playing == previous;
+                    if link.session_open && !unchanged {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
