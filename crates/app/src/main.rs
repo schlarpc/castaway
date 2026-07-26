@@ -308,13 +308,15 @@ async fn serve(
         let spotify = SpotifyService::new(
             config.advertised_name(ProtocolKind::Spotify),
             spotify_device_id(&config),
-            sink,
         )
-        .with_osd(osd.clone());
+        // Order matters: the runner clones the overlay sink when it starts, so the OSD
+        // has to be attached first or session-level messages never reach the screen.
+        .with_osd(osd.clone())
+        .with_playback(sink, config.spotify.initial_volume);
         http = http.merge(spotify.router());
         mdns.advertise(&spotify.mdns_service(config.http_port, MDNS_HOST))
             .context("advertising Spotify")?;
-        info!("enabled: Spotify Connect (onboarding/pairing)");
+        info!("enabled: Spotify Connect (pairing + playback)");
     }
 
     let (dial_tx, mut dial_rx) = mpsc::channel(8);

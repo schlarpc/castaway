@@ -5,14 +5,20 @@
 //! pairing crypto, in [`crypto`]). This makes "castaway" appear in the Spotify device
 //! picker and complete pairing.
 //!
-//! Post-pairing playback (the dealer WebSocket + audio pull) is deferred — it needs a
-//! Premium account and a large audio stack (OPEN-QUESTIONS). [`crypto`] and
-//! [`discovery`] are pure and unit-tested; [`lib`](self) is the axum shell.
+//! Post-pairing playback — the access point, the dealer WebSocket, connect-state, and
+//! the audio pull — is librespot's, driven from [`session`] (DECISION-LOG D31). The
+//! zeroconf half stays ours because it has to share this receiver's single HTTP host and
+//! single mDNS responder, which librespot's own discovery would duplicate.
+//!
+//! [`crypto`] and [`discovery`] are pure and unit-tested; [`lib`](self) is the axum shell.
 #![forbid(unsafe_code)]
 
+pub mod control;
 pub mod crypto;
 pub mod discovery;
 pub mod error;
+pub mod session;
+pub mod sink;
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -31,6 +37,7 @@ use tracing::{info, warn};
 pub use crypto::DhKeys;
 pub use discovery::DeviceInfo;
 pub use error::SpotifyError;
+pub use session::{ConnectHandle, ConnectSettings, PairedUser};
 
 /// The mDNS service type Spotify apps browse for.
 pub const SPOTIFY_SERVICE_TYPE: &str = "_spotify-connect._tcp";
@@ -41,8 +48,9 @@ struct SpotifyStateInner {
     keys: DhKeys,
     info: DeviceInfo,
     active_user: Mutex<String>,
-    #[allow(dead_code)] // used once playback is wired
-    sink: SessionSink,
+    /// Where a successful pairing goes. `None` in tests and in builds that only want the
+    /// device to appear in the picker without logging anyone in.
+    connect: OnceLock<ConnectHandle>,
     /// Optional overlay sink so pairing is visible on screen.
     osd: OnceLock<OsdSink>,
 }
@@ -54,14 +62,13 @@ pub struct SpotifyService {
 }
 
 impl SpotifyService {
-    /// Create the service with a friendly `remote_name`, a stable `device_id`, and the
-    /// event sink (used once playback lands).
+    /// Create the service with a friendly `remote_name` and a stable `device_id`.
+    ///
+    /// On its own this only makes the receiver *appear* in the Spotify picker and pair.
+    /// Playback needs [`SpotifyService::with_playback`]; without it a pairing is accepted,
+    /// logged, and goes nowhere.
     #[must_use]
-    pub fn new(
-        remote_name: impl Into<String>,
-        device_id: impl Into<String>,
-        sink: SessionSink,
-    ) -> Self {
+    pub fn new(remote_name: impl Into<String>, device_id: impl Into<String>) -> Self {
         Self {
             state: Arc::new(SpotifyStateInner {
                 keys: DhKeys::generate(),
@@ -70,13 +77,35 @@ impl SpotifyService {
                     device_id: device_id.into(),
                 },
                 active_user: Mutex::new(String::new()),
-                sink,
+                connect: OnceLock::new(),
                 osd: OnceLock::new(),
             }),
         }
     }
 
+    /// Start the Connect session runner and route pairings into it.
+    ///
+    /// The `device_id` handed to the runner is this service's own, and it has to be: it
+    /// is what `getInfo` advertised, and the blob is encrypted against it.
+    #[must_use]
+    pub fn with_playback(self, sink: SessionSink, initial_volume: f32) -> Self {
+        let handle = session::spawn(
+            ConnectSettings {
+                device_name: self.state.info.remote_name.clone(),
+                device_id: self.state.info.device_id.clone(),
+                initial_volume,
+            },
+            sink,
+            self.state.osd.get().cloned(),
+        );
+        let _ = self.state.connect.set(handle);
+        self
+    }
+
     /// Give this adapter an [`OsdSink`] so pairing shows a banner on the overlay.
+    ///
+    /// Call before [`SpotifyService::with_playback`] — the runner takes its own clone, so
+    /// an overlay attached afterwards will not reach session-level messages.
     #[must_use]
     pub fn with_osd(self, osd: OsdSink) -> Self {
         let _ = self.state.osd.set(osd);
@@ -129,12 +158,32 @@ async fn handle_post(State(st): State<Arc<SpotifyStateInner>>, body: String) -> 
                 Ok(creds) => {
                     *st.active_user.lock().await = creds.user_name.clone();
                     info!(user = %creds.user_name, blob_len = creds.blob.len(),
-                        "Spotify addUser paired (playback backend deferred)");
-                    if let Some(osd) = st.osd.get() {
-                        osd.banner(
-                            format!("Spotify: {} connected", creds.user_name),
-                            Duration::from_secs(4),
-                        );
+                        "Spotify addUser paired");
+                    match st.connect.get() {
+                        Some(handle) => {
+                            // Hand off and answer immediately. The phone is waiting on
+                            // this response and the login behind it takes an AP handshake
+                            // — blocking here makes the picker look like it hung, and the
+                            // Spotify app gives up long before login5 finishes.
+                            let user = PairedUser {
+                                user_name: creds.user_name.clone(),
+                                blob: creds.blob,
+                            };
+                            if let Err(e) = handle.paired(user).await {
+                                warn!(error = %e, "Spotify pairing accepted but the runner is gone");
+                            }
+                        }
+                        None => {
+                            // Pairing works, playback was never wired. Say so rather than
+                            // leaving a device that joins and stays silent.
+                            warn!("Spotify paired with no playback backend configured");
+                            if let Some(osd) = st.osd.get() {
+                                osd.banner(
+                                    format!("Spotify: {} paired (no playback)", creds.user_name),
+                                    Duration::from_secs(4),
+                                );
+                            }
+                        }
                     }
                     json_ok(discovery::add_user_ok())
                 }
@@ -171,14 +220,10 @@ fn bad_request(msg: &str) -> Response {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use castaway_core::SourceId;
-    use tokio::sync::mpsc;
 
     #[test]
     fn mdns_service_has_cpath_txt() {
-        let (tx, _rx) = mpsc::channel(1);
-        let sink = SessionSink::new(SourceId::new(ProtocolKind::Spotify, "t"), tx);
-        let svc = SpotifyService::new("castaway", "deadbeef", sink);
+        let svc = SpotifyService::new("castaway", "deadbeef");
         let m = svc.mdns_service(8080, "castaway");
         assert!(m.txt.iter().any(|(k, v)| k == "CPath" && v == CPATH));
         assert_eq!(m.service_type, SPOTIFY_SERVICE_TYPE);
@@ -190,9 +235,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let (tx, _rx) = mpsc::channel(1);
-        let sink = SessionSink::new(SourceId::new(ProtocolKind::Spotify, "t"), tx);
-        let svc = SpotifyService::new("castaway", "deadbeef", sink);
+        let svc = SpotifyService::new("castaway", "deadbeef");
         let app = svc.router();
         let resp = app
             .oneshot(

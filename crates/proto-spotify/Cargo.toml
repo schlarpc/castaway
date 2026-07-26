@@ -26,6 +26,11 @@ aes.workspace = true
 ctr.workspace = true
 base64 = "0.22"
 rand.workspace = true
+librespot-core.workspace = true
+librespot-connect.workspace = true
+librespot-playback.workspace = true
+librespot-metadata.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true

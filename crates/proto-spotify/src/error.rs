@@ -17,4 +17,15 @@ pub enum SpotifyError {
     /// A base64 field could not be decoded.
     #[error("invalid base64 in {0}")]
     Base64(&'static str),
+
+    /// Pairing succeeded but the account could not be logged in — the blob was stale, or
+    /// the account is not Premium. Carries text already phrased for the panel, because
+    /// this is the failure a person standing in front of the screen has to act on.
+    #[error("{0}")]
+    Login(String),
+
+    /// The Connect session runner is no longer accepting work. Either the receiver is
+    /// shutting down or the session manager dropped its end.
+    #[error("the Spotify session runner has stopped")]
+    SessionGone,
 }

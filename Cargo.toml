@@ -119,6 +119,19 @@ hmac = "0.12"
 hkdf = "0.12"
 rand = "0.8"
 
+# --- spotify ---
+# The one protocol we do NOT reimplement (DECISION-LOG D31). Spotify Connect is a cloud
+# service that changes unilaterally — login5 replaced password auth, the dealer replaced
+# Mercury, keymaster started 403ing — so owning the wire here buys a maintenance treadmill
+# rather than a durable asset. `rustls-tls-webpki-roots` keeps the cross-build off OpenSSL;
+# `default-features = false` keeps librespot's own audio backends out, because the Sink is
+# ours (crates/proto-spotify/src/sink.rs).
+librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-connect = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-metadata = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-protocol = "0.8"
+
 # --- dev / test ---
 hex-literal = "0.4"
 tokio-test = "0.4"

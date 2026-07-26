@@ -27,6 +27,8 @@ pub struct Config {
     pub attract_widget_url: Option<String>,
     /// Bluetooth A2DP sink settings.
     pub bluetooth: Bluetooth,
+    /// Spotify Connect settings.
+    pub spotify: Spotify,
     /// Skipping sponsor segments in YouTube playback.
     pub sponsorblock: SponsorBlock,
 }
@@ -140,13 +142,38 @@ pub struct Bluetooth {
     pub state_dir: Option<String>,
 }
 
+/// Spotify Connect settings.
+///
+/// There is deliberately no account here. The receiver holds no credentials: whoever
+/// walks up hands it theirs over zeroconf by picking castaway in their Spotify app, and
+/// they are dropped when the next person pairs (DECISION-LOG D31). A `username`/`password`
+/// pair in this file would be both a downgrade in behaviour and a secret on disk.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Spotify {
+    /// Volume the device comes up at, `0.0..=1.0`.
+    ///
+    /// Applies once per session, when someone pairs. Half scale because a panel that
+    /// comes up at full volume in a shared space is the kind of thing that only happens
+    /// once before somebody unplugs it.
+    pub initial_volume: f32,
+}
+
+impl Default for Spotify {
+    fn default() -> Self {
+        Self {
+            initial_volume: 0.5,
+        }
+    }
+}
+
 /// Per-protocol enable flags.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Enable {
     /// DLNA MediaRenderer (SSDP + HTTP). Live.
     pub dlna: bool,
-    /// Spotify Connect onboarding (mDNS + HTTP). Live (pairing only).
+    /// Spotify Connect (mDNS + HTTP onboarding, then playback). Live.
     pub spotify: bool,
     /// DIAL → YouTube Lounge (SSDP + HTTP). Live launch; Lounge client is follow-up.
     pub dial: bool,
@@ -182,6 +209,7 @@ impl Default for Config {
             enable: Enable::default(),
             attract_widget_url: Some("https://digitalclock.live/".to_string()),
             bluetooth: Bluetooth::default(),
+            spotify: Spotify::default(),
             sponsorblock: SponsorBlock::default(),
         }
     }

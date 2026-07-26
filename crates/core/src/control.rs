@@ -61,6 +61,16 @@ impl ControlCapabilities {
     pub const TRANSPORT: Self =
         Self(Self::PLAY.0 | Self::PAUSE.0 | Self::NEXT.0 | Self::PREVIOUS.0);
 
+    /// Union of two sets, usable in `const` context.
+    ///
+    /// [`BitOr`] is the idiomatic spelling and stays the one to reach for, but it cannot
+    /// be called from a `const fn`, which is exactly where an adapter wants to state its
+    /// fixed capability set once.
+    #[must_use]
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// Whether every capability in `other` is present in `self`.
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
