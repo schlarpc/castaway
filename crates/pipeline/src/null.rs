@@ -122,6 +122,7 @@ impl Pipeline for NullPipeline {
                     format,
                     crate::audio_session::default_output(),
                     stop,
+                    std::sync::Arc::new(crate::audio_session::Gain::default()),
                 );
                 return Ok(());
             }

@@ -10,13 +10,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::adapter::{SourceId, SourceMessage};
 use crate::control::RemoteControl;
 use crate::display::{DisplayControl, DisplayInput};
 use crate::error::CoreError;
-use crate::event::SessionEvent;
+use crate::event::{ControlTxn, SessionEvent};
 use crate::osd::{OsdMessage, OsdSink};
 use crate::pipeline::Pipeline;
 use crate::source::SourceDescription;
@@ -47,8 +47,49 @@ pub struct SessionManager<P: Pipeline> {
     osd: Option<OsdSink>,
     config: SessionConfig,
     active: Option<SourceId>,
-    remote: Option<Arc<dyn RemoteControl>>,
+    remote: RemoteHandle,
     description: SourceDescription,
+}
+
+/// A shared view of the active source's control surface.
+///
+/// This exists because the manager's own `remote()` was unreachable by construction:
+/// `run(self, ..)` consumes the manager, so once the receiver is running there is no
+/// `&self` left to ask. Every protocol that published a `ControlSurface` — Spotify's
+/// whole `control` module, and AVRCP's — was therefore dead at runtime, and the panel
+/// could not drive playback no matter what it advertised.
+///
+/// Handed out before `run` takes ownership, so a touch handler or an overlay can hold one
+/// for the life of the process and always see whoever is currently playing.
+#[derive(Clone, Default)]
+pub struct RemoteHandle(Arc<std::sync::Mutex<Option<Arc<dyn RemoteControl>>>>);
+
+impl std::fmt::Debug for RemoteHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHandle")
+            .field("present", &self.get().is_some())
+            .finish()
+    }
+}
+
+impl RemoteHandle {
+    /// The active source's control surface, if it published one.
+    ///
+    /// Returns an owned handle rather than a borrow: the caller is on another thread and
+    /// the session it belongs to may end while they are using it. A `RemoteControl` that
+    /// outlives its session answers with a typed error, which is the honest outcome.
+    #[must_use]
+    pub fn get(&self) -> Option<Arc<dyn RemoteControl>> {
+        self.0.lock().ok()?.clone()
+    }
+
+    /// Publish (or clear) the control surface. A poisoned lock is not worth failing an
+    /// event over — the next publish recovers it.
+    fn set(&self, remote: Option<Arc<dyn RemoteControl>>) {
+        if let Ok(mut held) = self.0.lock() {
+            *held = remote;
+        }
+    }
 }
 
 impl<P: Pipeline> SessionManager<P> {
@@ -64,7 +105,7 @@ impl<P: Pipeline> SessionManager<P> {
             osd: None,
             config,
             active: None,
-            remote: None,
+            remote: RemoteHandle::default(),
             description: SourceDescription::new(),
         }
     }
@@ -96,8 +137,17 @@ impl<P: Pipeline> SessionManager<P> {
     /// the session ends or is preempted, so a stale handle can't outlive its session and
     /// send commands to a phone that walked out of the room.
     #[must_use]
-    pub fn remote(&self) -> Option<&Arc<dyn RemoteControl>> {
-        self.remote.as_ref()
+    pub fn remote(&self) -> Option<Arc<dyn RemoteControl>> {
+        self.remote.get()
+    }
+
+    /// A handle onto the active source's control surface that outlives [`Self::run`].
+    ///
+    /// Take this *before* starting the manager: `run` consumes `self`, so this is the
+    /// only way anything else can reach the remote once the receiver is up.
+    #[must_use]
+    pub fn remote_handle(&self) -> RemoteHandle {
+        self.remote.clone()
     }
 
     /// Consume the event stream until it closes, arbitrating sources.
@@ -175,7 +225,7 @@ impl<P: Pipeline> SessionManager<P> {
             SessionEvent::ControlSurface(remote) => {
                 if self.active.as_ref() == Some(&source) {
                     info!(%source, caps = ?remote.capabilities(), "session: control surface up");
-                    self.remote = Some(remote);
+                    self.remote.set(Some(remote));
                     Ok(())
                 } else {
                     Err(CoreError::NoActiveSession(source.to_string()))
@@ -193,7 +243,7 @@ impl<P: Pipeline> SessionManager<P> {
                 if self.active.as_ref() == Some(&source) {
                     info!(%source, "session: end");
                     self.active = None;
-                    self.remote = None;
+                    self.remote.set(None);
                     self.description = SourceDescription::new();
                     if let Some(osd) = &self.osd {
                         osd.clear();
@@ -215,10 +265,21 @@ impl<P: Pipeline> SessionManager<P> {
         }
         if let Some(prev) = &self.active {
             info!(%prev, %source, "session: preempting active source");
+            // Ask the outgoing source to stop *itself* before we stop rendering it.
+            // Dropping its frames is not the same as it having stopped: a phone that is
+            // still streaming keeps its encoder running and keeps burning radio time
+            // against the source that just won, and when the winner ends, the loser's
+            // audio reappears from wherever it got to. Best-effort — a peer that never
+            // advertised Pause refuses, which is exactly what `issue` is for.
+            if let Some(remote) = self.remote.get() {
+                if let Err(e) = remote.issue(ControlTxn::Pause).await {
+                    debug!(%prev, error = %e, "session: preempted source would not pause");
+                }
+            }
             self.pipeline.stop().await.ok();
             // The outgoing source's control handle and description die with its session
             // — the new source publishes its own if it has any.
-            self.remote = None;
+            self.remote.set(None);
             self.description = SourceDescription::new();
         } else if let Some(display) = &self.display {
             // Idle → active: wake the panel and select our input.
@@ -541,7 +602,7 @@ mod tests {
         .await
         .unwrap();
 
-        let remote = mgr.remote().expect("published").clone();
+        let remote = mgr.remote().expect("published");
         assert!(remote.capabilities().supports(&ControlTxn::Pause));
         remote.issue(ControlTxn::Pause).await.unwrap();
         // Seek is outside TRANSPORT, so the capability set refuses it before the wire.
@@ -579,6 +640,61 @@ mod tests {
         assert!(mgr.remote().is_some());
         mgr.handle(play_msg(&b)).await.unwrap();
         assert!(mgr.remote().is_none());
+    }
+
+    #[tokio::test]
+    async fn preemption_asks_the_outgoing_source_to_stop_sending() {
+        // Dropping a source's frames is not the same as that source having stopped. A
+        // preempted phone keeps its encoder running, keeps burning radio time against the
+        // source that just won, and reappears mid-track when the winner ends. So the
+        // outgoing sender is told, over its own protocol, before we stop rendering it.
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Bluetooth, "a");
+        let b = SourceId::new(ProtocolKind::Cast, "b");
+        let remote = Arc::new(FakeRemote {
+            caps: ControlCapabilities::TRANSPORT,
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        mgr.handle(audio_msg(&a)).await.unwrap();
+        mgr.handle(SourceMessage {
+            source: a,
+            event: SessionEvent::ControlSurface(remote.clone()),
+        })
+        .await
+        .unwrap();
+
+        mgr.handle(play_msg(&b)).await.unwrap();
+        assert_eq!(
+            *remote.sent.lock().unwrap(),
+            vec![ControlTxn::Pause],
+            "the preempted source should have been told to pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_cannot_pause_does_not_block_the_preemption() {
+        // Best-effort: a peer that never advertised Pause refuses, and the new source
+        // still takes the screen. A preemption that failed because the *loser* said no
+        // would be the worst possible arbitration policy.
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Bluetooth, "a");
+        let b = SourceId::new(ProtocolKind::Cast, "b");
+        mgr.handle(audio_msg(&a)).await.unwrap();
+        mgr.handle(SourceMessage {
+            source: a,
+            event: SessionEvent::ControlSurface(Arc::new(FakeRemote {
+                caps: ControlCapabilities::NONE,
+                sent: std::sync::Mutex::new(Vec::new()),
+            })),
+        })
+        .await
+        .unwrap();
+        mgr.handle(play_msg(&b)).await.unwrap();
+        assert_eq!(mgr.active(), Some(&b));
     }
 
     #[tokio::test]

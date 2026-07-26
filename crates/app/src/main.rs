@@ -37,7 +37,7 @@ use proto_spotify::SpotifyService;
 use substrate_mdns::MdnsResponder;
 use substrate_ssdp::{Responder, ResponderConfig, SsdpDevice};
 use tokio::sync::{mpsc, Notify};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
@@ -108,6 +108,7 @@ fn main() -> anyhow::Result<()> {
         let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
         let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default())
             .with_osd(osd.clone());
+        let remote = manager.remote_handle();
         runtime.spawn(manager.run(event_rx));
 
         // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
@@ -185,7 +186,7 @@ fn main() -> anyhow::Result<()> {
 
         // Registered after `cef.initialize()` on purpose: Chromium installs its own
         // SIGINT handler during init, which would silently replace an earlier one.
-        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit);
+        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
         let attract = build_attract(&config);
@@ -216,10 +217,11 @@ fn main() -> anyhow::Result<()> {
         let manager =
             SessionManager::new(NullPipeline::new(), Some(display), SessionConfig::default())
                 .with_osd(osd.clone());
+        let remote = manager.remote_handle();
         runtime.spawn(manager.run(event_rx));
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
-        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit);
+        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
         // Headless: no renderer at all, so certainly no browser to launch YouTube in.
         let on_dial: Option<NoLauncher> = None;
         runtime.block_on(serve(config, event_tx, shutdown, osd, on_dial, None))?;
@@ -234,12 +236,30 @@ fn spawn_ctrl_c(
     runtime: &tokio::runtime::Runtime,
     shutdown: &Arc<Notify>,
     kiosk_exit: &Arc<std::sync::atomic::AtomicBool>,
+    remote: castaway_core::RemoteHandle,
 ) {
     let shutdown = shutdown.clone();
     let kiosk_exit = kiosk_exit.clone();
     runtime.spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("ctrl-c: shutting down");
+        // Tell whoever is sending to stop, before the thing they are sending to goes
+        // away. A phone streaming A2DP into a receiver that has exited does not find out
+        // quickly — it keeps encoding into a link that is gone, and the person holding it
+        // sees playback running with no sound. Best-effort and bounded: shutdown must not
+        // wait on a peer that has stopped answering.
+        if let Some(remote) = remote.get() {
+            let asked = tokio::time::timeout(
+                Duration::from_secs(2),
+                remote.issue(castaway_core::ControlTxn::Pause),
+            )
+            .await;
+            match asked {
+                Ok(Ok(())) => info!("told the active sender to pause"),
+                Ok(Err(e)) => debug!(error = %e, "the active sender would not pause"),
+                Err(_) => debug!("the active sender did not answer in time"),
+            }
+        }
         kiosk_exit.store(true, std::sync::atomic::Ordering::Relaxed);
         shutdown.notify_waiters();
     });

@@ -27,6 +27,89 @@ use crate::audio_out::AudioOut;
 #[cfg(any(test, not(feature = "audio-out")))]
 use crate::audio_out::NullAudioOut;
 
+/// Output gain, shared between the thread that is playing and whoever holds the remote.
+///
+/// This exists because a volume command had nowhere to land. AVRCP `SET_ABSOLUTE_VOLUME`
+/// was parsed, answered `Accepted`, and emitted as a `ControlTxn` that the pipeline
+/// logged and dropped — so a phone's volume rocker did nothing, and a phone that entered
+/// absolute-volume mode on the strength of our Target record stopped attenuating locally
+/// and pinned playback at full scale.
+///
+/// Applied here, at the last point before the device, rather than in each protocol: the
+/// panel has one pair of speakers, so it has one volume, and a source-side gain would
+/// leave every other source at whatever the last one set.
+///
+/// Stored as bits in an atomic so the audio thread never takes a lock — a mutex here
+/// would put the remote's contention on the path that must not stall.
+#[derive(Debug)]
+pub struct Gain {
+    level: std::sync::atomic::AtomicU32,
+    muted: AtomicBool,
+}
+
+impl Default for Gain {
+    fn default() -> Self {
+        Self {
+            level: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
+            muted: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Gain {
+    /// Set the level, clamped to `0.0..=1.0`.
+    pub fn set(&self, level: f32) {
+        let level = if level.is_finite() {
+            level.clamp(0.0, 1.0)
+        } else {
+            // A NaN would compare false against every bound and multiply every sample
+            // into silence-that-is-not-silence. Ignore it rather than pass it on.
+            return;
+        };
+        self.level
+            .store(level.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The current level.
+    #[must_use]
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Mute or unmute without disturbing the level.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// Whether output is muted.
+    #[must_use]
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// What every sample should be multiplied by right now.
+    fn factor(&self) -> f32 {
+        if self.muted() {
+            0.0
+        } else {
+            self.level()
+        }
+    }
+
+    /// Scale a block in place.
+    fn apply(&self, block: &mut PcmFrame) {
+        let factor = self.factor();
+        // Unity is the overwhelmingly common case — every source that never touches the
+        // volume — and skipping it keeps the whole mechanism free when unused.
+        if (factor - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        for sample in &mut block.samples {
+            *sample *= factor;
+        }
+    }
+}
+
 /// The output a session uses when the caller expresses no preference.
 ///
 /// Real device when the `audio-out` feature is on, accounting-only otherwise — so a
@@ -54,8 +137,9 @@ pub fn spawn(
     format: AudioFormat,
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
+    gain: Arc<Gain>,
 ) {
-    std::thread::spawn(move || run(frames, format, output, &stop));
+    std::thread::spawn(move || run(frames, format, output, &stop, &gain));
 }
 
 /// Drive one audio session to completion. Blocking; call it on its own thread.
@@ -64,6 +148,7 @@ pub fn run(
     format: AudioFormat,
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
+    gain: &Gain,
 ) {
     // Wait for the first frame so the codec comes from the stream itself.
     let Some(first) = frames.blocking_recv() else {
@@ -86,10 +171,11 @@ pub fn run(
             }
             pending.take().or_else(|| frames.blocking_recv())
         },
-        |block| {
+        |mut block| {
             if stop.load(Ordering::Relaxed) {
                 return false;
             }
+            gain.apply(&mut block);
             if !started {
                 if let Err(e) = output.start(block.sample_rate, block.channels) {
                     warn!(error = %e, "audio session: output refused the stream");
@@ -132,8 +218,9 @@ pub fn spawn_pcm(
     frames: std::sync::mpsc::Receiver<PcmFrame>,
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
+    gain: Arc<Gain>,
 ) {
-    std::thread::spawn(move || run_pcm(frames, output, &stop));
+    std::thread::spawn(move || run_pcm(frames, output, &stop, &gain));
 }
 
 /// Drive one already-decoded audio session to completion. Blocking; call it on its own
@@ -147,6 +234,7 @@ pub fn run_pcm(
     frames: std::sync::mpsc::Receiver<PcmFrame>,
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
+    gain: &Gain,
 ) {
     // What the output device is currently open as, not what the first block said: a
     // source may change rate between tracks, and writing 48 kHz samples into a device
@@ -154,7 +242,23 @@ pub fn run_pcm(
     let mut open_as: Option<(u32, u16)> = None;
     let mut pace = Pace::default();
 
-    while let Ok(block) = frames.recv() {
+    loop {
+        // `recv_timeout`, not `recv`, so `stop` is observable while nothing is arriving.
+        // A session preempted while its source was *paused* has no next block to wake on,
+        // so a plain `recv` parked here forever: the thread leaked and — worse — the
+        // output device stayed open, which on an exclusive-mode device means the source
+        // that preempted us cannot start at all.
+        let mut block = match frames.recv_timeout(STOP_POLL) {
+            Ok(block) => block,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) {
+                    info!("pcm session: preempted while idle");
+                    break;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if stop.load(Ordering::Relaxed) {
             info!("pcm session: preempted");
             break;
@@ -175,6 +279,7 @@ pub fn run_pcm(
             pace = Pace::default();
         }
         let played = block.duration();
+        gain.apply(&mut block);
         if let Err(e) = output.write(&block) {
             warn!(error = %e, "pcm session: output failed");
             break;
@@ -184,6 +289,12 @@ pub fn run_pcm(
 
     output.stop();
 }
+
+/// How often a parked PCM session looks up to see whether it has been preempted.
+///
+/// Short enough that a preempted session releases the audio device promptly, long enough
+/// that an idle one is not a busy loop.
+const STOP_POLL: Duration = Duration::from_millis(200);
 
 /// How far ahead of real time the session is allowed to run.
 ///
@@ -274,7 +385,13 @@ mod tests {
         // The phone connected and never sent anything. The thread must not leak.
         let (tx, rx) = mpsc::channel::<EncodedFrame>(1);
         drop(tx);
-        run(rx, format(), Box::new(NullAudioOut::new()), &running());
+        run(
+            rx,
+            format(),
+            Box::new(NullAudioOut::new()),
+            &running(),
+            &Gain::default(),
+        );
     }
 
     #[test]
@@ -290,7 +407,13 @@ mod tests {
         .unwrap();
         drop(tx);
         // Guessing SBC here would decode noise; exiting is the honest answer.
-        run(rx, format(), Box::new(NullAudioOut::new()), &running());
+        run(
+            rx,
+            format(),
+            Box::new(NullAudioOut::new()),
+            &running(),
+            &Gain::default(),
+        );
     }
 
     /// An output that remembers what it was asked to do, so a test can assert on the
@@ -342,7 +465,85 @@ mod tests {
     fn a_pcm_session_with_no_frames_exits_instead_of_parking() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<PcmFrame>(1);
         drop(tx);
-        run_pcm(rx, Box::new(NullAudioOut::new()), &running());
+        run_pcm(
+            rx,
+            Box::new(NullAudioOut::new()),
+            &running(),
+            &Gain::default(),
+        );
+    }
+
+    /// Records the samples themselves, not just how many there were.
+    struct AmplitudeOut {
+        peak: Arc<Mutex<f32>>,
+    }
+    impl AudioOut for AmplitudeOut {
+        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
+            Ok(())
+        }
+        fn write(&mut self, block: &crate::audio_decode::PcmBlock) -> Result<(), PipelineError> {
+            let loudest = block.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            if let Ok(mut peak) = self.peak.lock() {
+                *peak = peak.max(loudest);
+            }
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    fn loud(frames: usize) -> PcmFrame {
+        PcmFrame {
+            sample_rate: 44_100,
+            channels: 2,
+            samples: vec![1.0; frames * 2],
+            pts: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn the_gain_reaches_the_samples() {
+        // The bug: AVRCP absolute volume was parsed, answered `Accepted`, and dropped by
+        // a pipeline whose `control` only logged — so the phone's rocker did nothing, and
+        // a phone that had taken absolute-volume control pinned us at full scale.
+        for (level, muted, expected) in [(1.0, false, 1.0), (0.5, false, 0.5), (1.0, true, 0.0)] {
+            let peak = Arc::new(Mutex::new(0.0f32));
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            tx.send(loud(64)).unwrap();
+            drop(tx);
+            let gain = Gain::default();
+            gain.set(level);
+            gain.set_muted(muted);
+            run_pcm(
+                rx,
+                Box::new(AmplitudeOut {
+                    peak: Arc::clone(&peak),
+                }),
+                &running(),
+                &gain,
+            );
+            let got = *peak.lock().unwrap();
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "level {level} muted {muted}: peak {got}, want {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_outside_the_scale_is_clamped_rather_than_passed_on() {
+        // A protocol that scales wrong (or a NaN out of a division) must not be able to
+        // hand the output a factor that clips every sample or silences it by accident.
+        let gain = Gain::default();
+        gain.set(4.0);
+        assert!((gain.level() - 1.0).abs() < f32::EPSILON);
+        gain.set(-1.0);
+        assert!(gain.level().abs() < f32::EPSILON);
+        gain.set(0.5);
+        gain.set(f32::NAN);
+        assert!(
+            (gain.level() - 0.5).abs() < f32::EPSILON,
+            "NaN must not stick"
+        );
     }
 
     #[test]
@@ -361,6 +562,7 @@ mod tests {
                 log: Arc::clone(&log),
             }),
             &running(),
+            &Gain::default(),
         );
 
         assert_eq!(
@@ -390,6 +592,7 @@ mod tests {
                 log: Arc::clone(&log),
             }),
             &running(),
+            &Gain::default(),
         );
 
         assert_eq!(
@@ -421,7 +624,12 @@ mod tests {
         drop(tx);
 
         let start = std::time::Instant::now();
-        run_pcm(rx, Box::new(NullAudioOut::new()), &running());
+        run_pcm(
+            rx,
+            Box::new(NullAudioOut::new()),
+            &running(),
+            &Gain::default(),
+        );
         let taken = start.elapsed();
 
         let expected = Duration::from_secs(2).saturating_sub(LEAD);
@@ -469,6 +677,7 @@ mod tests {
                 log: Arc::clone(&log),
             }),
             &stop,
+            &Gain::default(),
         );
 
         assert_eq!(

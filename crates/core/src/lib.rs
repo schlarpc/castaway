@@ -28,7 +28,7 @@ pub use event::{Advertisement, ControlTxn, SessionEvent};
 pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState, QueueItem};
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::Pipeline;
-pub use session::{SessionConfig, SessionManager};
+pub use session::{RemoteHandle, SessionConfig, SessionManager};
 pub use source::SourceDescription;
 pub use types::{
     AudioCodec, AudioFormat, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame,

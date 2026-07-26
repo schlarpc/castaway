@@ -698,7 +698,13 @@ mod tests {
                 blocks: std::sync::Arc::clone(&counted),
             };
             let stop = std::sync::atomic::AtomicBool::new(false);
-            crate::audio_session::run(rx, format(44_100, 2), Box::new(sink), &stop);
+            crate::audio_session::run(
+                rx,
+                format(44_100, 2),
+                Box::new(sink),
+                &stop,
+                &crate::audio_session::Gain::default(),
+            );
             let blocks = counted.lock().unwrap().clone();
             blocks
         });

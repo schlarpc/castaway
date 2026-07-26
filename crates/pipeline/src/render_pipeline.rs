@@ -87,6 +87,13 @@ pub struct RenderPipeline {
     /// The card as last sent. Held because its two halves arrive on separate calls and
     /// each render needs both — not as a cache for someone else to read.
     card: Mutex<crate::nowplaying_card::NowPlayingCard>,
+    /// Output gain, shared with whichever audio session is live.
+    ///
+    /// Owned by the pipeline rather than by a session because it has to outlive them:
+    /// the panel has one volume, and a level set over AVRCP should still be the level
+    /// when the next source starts.
+    #[cfg(feature = "audio")]
+    gain: Arc<crate::audio_session::Gain>,
 }
 
 impl RenderPipeline {
@@ -104,6 +111,8 @@ impl RenderPipeline {
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
                 card: Mutex::new(crate::nowplaying_card::NowPlayingCard::default()),
+                #[cfg(feature = "audio")]
+                gain: Arc::new(crate::audio_session::Gain::default()),
             },
             rx,
         )
@@ -255,6 +264,7 @@ impl Pipeline for RenderPipeline {
                         format,
                         crate::audio_session::default_output(),
                         stop,
+                        Arc::clone(&self.gain),
                     );
                     Ok(())
                 }
@@ -265,6 +275,7 @@ impl Pipeline for RenderPipeline {
                         rx,
                         crate::audio_session::default_output(),
                         stop,
+                        Arc::clone(&self.gain),
                     );
                     Ok(())
                 }
@@ -304,10 +315,39 @@ impl Pipeline for RenderPipeline {
     }
 
     async fn control(&self, txn: ControlTxn) -> Result<(), CoreError> {
-        // Seek/volume against a live decode is a follow-up; log for now so the protocol
-        // side sees success.
-        info!(?txn, "render pipeline: CONTROL (noted)");
-        Ok(())
+        match txn {
+            // Volume and mute land on the output gain. Everything a phone does with its
+            // rocker arrives here, and it used to be logged and dropped — which is how a
+            // receiver ends up pinned at full scale on a phone that has handed us
+            // absolute-volume control and stopped attenuating locally.
+            ControlTxn::Volume(level) => {
+                #[cfg(feature = "audio")]
+                {
+                    self.gain.set(level);
+                    info!(level = self.gain.level(), "render pipeline: volume");
+                }
+                #[cfg(not(feature = "audio"))]
+                let _ = level;
+                Ok(())
+            }
+            ControlTxn::Mute(muted) => {
+                #[cfg(feature = "audio")]
+                {
+                    self.gain.set_muted(muted);
+                    info!(muted, "render pipeline: mute");
+                }
+                #[cfg(not(feature = "audio"))]
+                let _ = muted;
+                Ok(())
+            }
+            // Transport against a live decode is a follow-up. Refused rather than logged
+            // as success, so a caller can tell the difference — `UnsupportedControl` is
+            // the typed way to say "not on this pipeline" (ground rule 7).
+            other => {
+                info!(?other, "render pipeline: CONTROL (unsupported)");
+                Err(CoreError::UnsupportedControl(format!("{other:?}")))
+            }
+        }
     }
 
     async fn stop(&self) -> Result<(), CoreError> {
