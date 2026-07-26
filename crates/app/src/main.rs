@@ -105,17 +105,31 @@ fn main() -> anyhow::Result<()> {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
         let shot_handle = render_pipeline.screenshot_handle();
-        let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
-        let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default())
-            .with_osd(osd.clone());
-        let remote = manager.remote_handle();
-        runtime.spawn(manager.run(event_rx));
 
         // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
         // hide it. Without CEF there is no launch target, and DIAL goes unadvertised.
         #[cfg(feature = "cef")]
         let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
+
+        // Whoever casts next gets the panel. Nothing but DIAL `DELETE` used to dismiss
+        // the leanback page, and nothing sends `DELETE` (D28) — so the first YouTube cast
+        // owned the screen for the rest of the process, with later DLNA/Cast video
+        // decoding underneath it and Spotify playing under YouTube's own audio.
+        #[cfg(feature = "cef")]
+        {
+            let release_tx = nav_tx.clone();
+            render_pipeline.set_screen_release(Arc::new(move || {
+                let _ = release_tx.send(pipeline::BrowserCommand::Hide);
+            }));
+        }
+
+        let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
+        let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default())
+            .with_osd(osd.clone());
+        let remote = manager.remote_handle();
+        runtime.spawn(manager.run(event_rx));
+
         #[cfg(feature = "cef")]
         let on_dial = move |event: proto_dial::DialEvent| match event {
             proto_dial::DialEvent::Launched(params) => {

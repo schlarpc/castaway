@@ -87,6 +87,13 @@ pub struct RenderPipeline {
     /// The card as last sent. Held because its two halves arrive on separate calls and
     /// each render needs both — not as a cache for someone else to read.
     card: Mutex<crate::nowplaying_card::NowPlayingCard>,
+    /// Called when another source takes the screen, so a browser that is covering the
+    /// panel gives it back.
+    ///
+    /// A callback rather than a `BrowserCommand` sender because the browser lives behind
+    /// the `cef` feature and the pipeline should not: the pipeline's concern is "somebody
+    /// else is casting now", and what that means for a browser is the app's business.
+    release_screen: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Output gain, shared with whichever audio session is live.
     ///
     /// Owned by the pipeline rather than by a session because it has to outlive them:
@@ -111,6 +118,7 @@ impl RenderPipeline {
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
                 card: Mutex::new(crate::nowplaying_card::NowPlayingCard::default()),
+                release_screen: Mutex::new(None),
                 #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
             },
@@ -162,6 +170,32 @@ impl RenderPipeline {
         self
     }
 
+    /// Register what to do when another source takes the screen.
+    ///
+    /// The bug this closes: `BrowserCommand` was produced from exactly one place, the
+    /// DIAL launch handler, and nothing else ever sent `Hide` — while DIAL `DELETE`, the
+    /// only thing that did, is something no real sender sends (D28). So the first YouTube
+    /// cast owned the panel permanently: a later DLNA or Cast video decoded and
+    /// composited *underneath* an opaque leanback page at z=5, and the attract scene
+    /// never came back.
+    pub fn set_screen_release(&self, release: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut held) = self.release_screen.lock() {
+            *held = Some(release);
+        }
+    }
+
+    /// Hand the panel back from whatever is covering it, if anything is.
+    fn release_screen(&self) {
+        let release = self
+            .release_screen
+            .lock()
+            .ok()
+            .and_then(|held| held.clone());
+        if let Some(release) = release {
+            release();
+        }
+    }
+
     fn preempt(&self) {
         if let Ok(mut guard) = self.active.lock() {
             if let Some(flag) = guard.take() {
@@ -180,6 +214,7 @@ impl RenderPipeline {
 #[async_trait]
 impl Pipeline for RenderPipeline {
     async fn play(&self, source: MediaUri, start: Option<Duration>) -> Result<(), CoreError> {
+        self.release_screen();
         self.preempt();
         let stop = Arc::new(AtomicBool::new(false));
         self.set_active(stop.clone());
@@ -203,6 +238,7 @@ impl Pipeline for RenderPipeline {
         video: FrameSource,
         _audio: Option<FrameSource>,
     ) -> Result<(), CoreError> {
+        self.release_screen();
         self.preempt();
         match video {
             // A mirror session is pixels by definition. PCM reaching here means an
@@ -252,6 +288,10 @@ impl Pipeline for RenderPipeline {
     ) -> Result<(), CoreError> {
         #[cfg(feature = "audio")]
         {
+            // A source that is only audio still takes the session, and a YouTube page
+            // left on screen would keep playing its own sound over it — CEF's audio goes
+            // straight to the system device, not through our mixer.
+            self.release_screen();
             // Preempt first: the flag slot holds whichever session is live, video or
             // audio, because only one source may own the output at a time.
             self.preempt();
@@ -1000,7 +1040,7 @@ mod tests {
 #[cfg(test)]
 mod card_tests {
     #![allow(clippy::unwrap_used)]
-    use castaway_core::{NowPlaying, Pipeline as _, SourceDescription};
+    use castaway_core::{FrameSource, MediaUri, NowPlaying, Pipeline as _, SourceDescription};
 
     use super::{RenderCommand, RenderPipeline};
 
@@ -1027,6 +1067,47 @@ mod card_tests {
         let card = last.expect("the card should have been published");
         assert_eq!(card.track.title.as_deref(), Some("Derezzed"));
         assert_eq!(card.source.display_name.as_deref(), Some("iPhone"));
+    }
+
+    #[tokio::test]
+    async fn any_source_taking_the_session_asks_the_browser_for_the_panel_back() {
+        // The D28 shape, from the other side: nothing but DIAL `DELETE` ever hid the
+        // leanback page, and nothing sends `DELETE`. So a YouTube cast covered every
+        // later source — video decoded underneath an opaque page, and audio-only sources
+        // played under YouTube's own sound, which does not even pass through our mixer.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let released = Arc::new(AtomicUsize::new(0));
+
+        let (pipeline, _rx) = RenderPipeline::new(8);
+        let counter = Arc::clone(&released);
+        pipeline.set_screen_release(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        pipeline
+            .play(
+                MediaUri::parse("http://example.invalid/a.mp4").unwrap(),
+                None,
+            )
+            .await
+            .ok();
+        assert_eq!(released.load(Ordering::SeqCst), 1, "a video cast");
+
+        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+        pipeline
+            .play_audio(
+                FrameSource::Pcm(rx),
+                castaway_core::AudioFormat::from_hz(44_100, 2).unwrap(),
+            )
+            .await
+            .ok();
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            2,
+            "an audio-only source takes the panel too"
+        );
     }
 
     #[tokio::test]
