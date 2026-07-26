@@ -3,7 +3,7 @@
 Things I could not resolve autonomously and want to settle at the next sync.
 Grouped by subsystem. Each: the question, why it's blocked, and my current default.
 
-## Fixtures / reverse engineering (needs `~/re-shell`)
+## Fixtures / reverse engineering (needs captures we do not have yet)
 
 - **Q1 — FairPlay-SAP byte captures.** The AirPlay `/fp-setup` v3 handshake (~568-byte
   flow) needs real captures from `airplay2-receiver`/UxPlay against a live iOS sender.
@@ -46,8 +46,8 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   "appears in the picker + pairs."
 - **Q10 — Spotify blob wire-validation.** The DH + blob crypto is tested by round-trip
   (our encrypt vs. decrypt), not against a real Spotify sender. Capture one `addUser`
-  from a phone in `~/re-shell` to confirm the exact byte framing (iv/ciphertext/hmac
-  split) matches before trusting it live.
+  from a real phone to confirm the exact byte framing (iv/ciphertext/hmac split)
+  matches before trusting it live.
 
 ## Cast
 
@@ -245,8 +245,8 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   bodies are GPLv3: fetch them at runtime rather than vendoring.)
 
   **What is actually unresolved:** where the in-stream ad manifest reaches the TV player from.
-  Not `next`, not a `/player` call. Answering that is RE work for `~/re-shell` (capture a
-  session while an ad plays and follow `tv-player-ias.js`'s ad control flow), and it decides
+  Not `next`, not a `/player` call. Answering that is RE work (capture a session
+  while an ad plays and follow `tv-player-ias.js`'s ad control flow), and it decides
   whether *any* filtering approach can work here or whether `skipAd` plus patience is the
   ceiling on this surface.
 - **Q35 — SponsorBlock rate limits are unverified.** The API's own wiki is behind bot
@@ -567,7 +567,7 @@ the reasons are what a future reversal has to argue against.
   identifier reading as an attribute count of zero — and a head unit asking us what was
   playing silently emptied the card the phone had just filled in.
   **Still open: the capture.** No public iPhone `0x110C` SDP dump appears to exist
-  anywhere. Taking one in `~/re-shell` (BlueZ >= 5.81, `bluetoothd --experimental`,
+  anywhere. Taking one (BlueZ >= 5.81, `bluetoothd --experimental`,
   `mpris-proxy`, `btmon`) would give both a golden SDP record and a live attribute-8
   response — fixtures that do not currently exist publicly, which is exactly what rule 9
   asks for, and the only thing that will confirm any of the above. What to look for, in

@@ -68,7 +68,7 @@ logic (rule 3). The tokio actor lives in a separate module (`actor.rs`) behind a
 tokio. This is what makes wire-fixture tests (rule 6) possible.
 
 ### D6 — No real RE fixtures yet; cores tested against constructed/synthetic vectors
-RE happens in `~/re-shell` (rule 9) which this session can't drive. Where a golden
+The captures rule 9 asks for need hardware and senders this session can't drive. Where a golden
 capture is needed (FairPlay-SAP bytes, a real Cast auth challenge, a Lounge bind
 transcript), the core is built to the documented wire shape and tested with
 hand-constructed fixtures; the need for a *real* capture is logged in OPEN-QUESTIONS.
