@@ -98,6 +98,23 @@ impl Default for BluetoothConfig {
     }
 }
 
+/// What a handler wants sent, and what it wants the caller to know.
+///
+/// Three separate out-parameters was one too many for a signature, and they travel
+/// together anyway: the two send paths differ only in whether the multiplexer has already
+/// addressed the PDU.
+#[derive(Default)]
+struct Outbox {
+    /// Protocol replies keyed by *our* channel id; the multiplexer maps each to the
+    /// peer's on the way out.
+    replies: Vec<(Cid, Bytes)>,
+    /// Signalling the multiplexer built, already addressed, and riding the fixed
+    /// signalling channel that is not in the channel map.
+    signalling: Vec<L2capPdu>,
+    /// Set when a link starts streaming, so every other one can be preempted.
+    started: Option<BdAddr>,
+}
+
 /// Per-ACL-link state.
 struct Link {
     peer: BdAddr,
@@ -457,18 +474,11 @@ impl BluetoothAdapter {
         let Some(link) = link else {
             return Ok(None);
         };
-        // Set when this link starts streaming, so the *other* links can be told after
-        // this borrow ends.
-        let mut preempt: Option<BdAddr> = None;
-        // Signalling PDUs the multiplexer built are already addressed to the peer.
-        let mut signalling: Vec<L2capPdu> = Vec::new();
-        // Protocol replies are keyed by *our* channel id — the one the incoming event
-        // named — and the multiplexer maps each to the peer's before it goes out.
-        let mut outbound: Vec<(Cid, Bytes)> = Vec::new();
+        let mut out = Outbox::default();
 
         for event in events {
             match event {
-                L2capEvent::Send(pdu) => signalling.push(pdu),
+                L2capEvent::Send(pdu) => out.signalling.push(pdu),
 
                 L2capEvent::ChannelOpen { cid, psm, .. } => {
                     if psm == Psm::AVDTP {
@@ -509,7 +519,7 @@ impl BluetoothAdapter {
                         // Ask for metadata straight away rather than waiting for a
                         // notification; a track already playing produces no change event.
                         let transaction = link.next_transaction();
-                        outbound.push((
+                        out.replies.push((
                             cid,
                             avctp_body(
                                 transaction,
@@ -526,7 +536,7 @@ impl BluetoothAdapter {
                             avrcp::event::TRACK_CHANGED,
                         ] {
                             let transaction = link.next_transaction();
-                            outbound.push((
+                            out.replies.push((
                                 cid,
                                 avctp_body(transaction, &avrcp::register_notification(event, 0)),
                             ));
@@ -537,13 +547,13 @@ impl BluetoothAdapter {
                     if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
                         if let Some((_, query)) = &link.art_sdp {
                             if let Some(request) = query.next_request() {
-                                outbound.push((cid, request));
+                                out.replies.push((cid, request));
                             }
                         }
                     } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
                         if let Some((_, client)) = &link.art_fetch {
                             if let Some(request) = client.next_request() {
-                                outbound.push((cid, request));
+                                out.replies.push((cid, request));
                             }
                         }
                     }
@@ -573,9 +583,9 @@ impl BluetoothAdapter {
                     // Before the SDP server: this is a channel *we* opened, so what
                     // arrives on it is a response to our query, not a request to answer.
                     if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        self.on_cover_art_sdp(link, &payload, &mut outbound, &mut signalling);
+                        self.on_cover_art_sdp(link, &payload, &mut out);
                     } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        self.on_cover_art_data(link, &payload, sink, &mut outbound)
+                        self.on_cover_art_data(link, &payload, sink, &mut out)
                             .await?;
                     } else if psm == Psm::SDP {
                         let response = self.sdp.handle(&payload);
@@ -586,25 +596,15 @@ impl BluetoothAdapter {
                             response = %hex(&response),
                             "sdp exchange",
                         );
-                        outbound.push((cid, response));
+                        out.replies.push((cid, response));
                     } else if psm == Psm::AVDTP {
                         if Some(cid) == link.avdtp_media {
                             self.on_media(link, payload).await;
                         } else {
-                            self.on_avdtp(
-                                link,
-                                cid,
-                                &payload,
-                                sink,
-                                &mut outbound,
-                                &mut signalling,
-                                &mut preempt,
-                            )
-                            .await?;
+                            self.on_avdtp(link, cid, &payload, sink, &mut out).await?;
                         }
                     } else if psm == Psm::AVCTP {
-                        self.on_avctp(link, cid, &payload, sink, &mut outbound, &mut signalling)
-                            .await?;
+                        self.on_avctp(link, cid, &payload, sink, &mut out).await?;
                     }
                 }
 
@@ -617,13 +617,13 @@ impl BluetoothAdapter {
             }
         }
 
-        for pdu in signalling {
+        for pdu in out.signalling {
             acl.send(handle, pdu);
         }
         // `Multiplexer::send` is the only thing that knows which identifier the peer uses
         // for a channel. Addressing a reply with our own is invisible whenever both ends
         // happen to allocate the same number — which BlueZ did, and an iPhone does not.
-        for (cid, payload) in outbound {
+        for (cid, payload) in out.replies {
             match link.mux.send(cid, payload) {
                 Ok(events) => {
                     for event in events {
@@ -635,7 +635,7 @@ impl BluetoothAdapter {
                 Err(e) => warn!(error = %e, %cid, "dropping a reply we cannot address"),
             }
         }
-        Ok(preempt)
+        Ok(out.started)
     }
 
     /// Tell a phone we are no longer listening to it.
@@ -668,9 +668,7 @@ impl BluetoothAdapter {
         cid: Cid,
         payload: &[u8],
         sink: &SessionSink,
-        outbound: &mut Vec<(Cid, Bytes)>,
-        signalling: &mut Vec<L2capPdu>,
-        preempt: &mut Option<BdAddr>,
+        out: &mut Outbox,
     ) -> Result<(), CoreError> {
         let msg = match Message::decode(payload) {
             Ok(m) => m,
@@ -681,7 +679,7 @@ impl BluetoothAdapter {
         };
         for event in link.sink.handle(&msg) {
             match event {
-                SinkEvent::Reply(reply) => outbound.push((cid, reply.encode())),
+                SinkEvent::Reply(reply) => out.replies.push((cid, reply.encode())),
                 SinkEvent::Configured {
                     codec,
                     format,
@@ -698,7 +696,7 @@ impl BluetoothAdapter {
                     // sources feeding one output do not mix — they fight — and the phone
                     // that loses deserves to be told rather than left streaming into a
                     // decoder nobody is listening to (Q23: last writer wins).
-                    *preempt = Some(link.peer);
+                    out.started = Some(link.peer);
                     // START cannot precede SET_CONFIGURATION in the sink state machine,
                     // so a missing format means a bug here rather than a sender problem —
                     // and starting a session without one would decode at a guessed rate,
@@ -741,7 +739,7 @@ impl BluetoothAdapter {
                         match link.mux.connect(Psm::AVCTP) {
                             Ok((_, events)) => {
                                 debug!("bluetooth: peer opened no avctp; connecting out");
-                                Self::queue_signalling(events, signalling);
+                                Self::queue_signalling(events, &mut out.signalling);
                             }
                             Err(e) => warn!(error = %e, "no channel for avctp"),
                         }
@@ -804,8 +802,7 @@ impl BluetoothAdapter {
         cid: Cid,
         payload: &[u8],
         sink: &SessionSink,
-        outbound: &mut Vec<(Cid, Bytes)>,
-        signalling: &mut Vec<L2capPdu>,
+        out: &mut Outbox,
     ) -> Result<(), CoreError> {
         let Ok(msg) = AvctpMessage::decode(payload) else {
             return Ok(());
@@ -837,7 +834,7 @@ impl BluetoothAdapter {
                             // The text card is already on screen; the art lands as a
                             // second snapshot whenever it arrives, or never, without
                             // holding anything up.
-                            self.begin_cover_art(link, handle, signalling);
+                            self.begin_cover_art(link, handle, out);
                         }
                     }
                 }
@@ -854,7 +851,7 @@ impl BluetoothAdapter {
                 let changed = frame.ctype == Ctype::Changed;
                 if changed {
                     let transaction = link.next_transaction();
-                    outbound.push((
+                    out.replies.push((
                         cid,
                         avctp_body(transaction, &avrcp::register_notification(event, 0)),
                     ));
@@ -881,7 +878,7 @@ impl BluetoothAdapter {
                         // in step with what is actually playing.
                         debug!("bluetooth: track changed; re-reading metadata");
                         let transaction = link.next_transaction();
-                        outbound.push((
+                        out.replies.push((
                             cid,
                             avctp_body(
                                 transaction,
@@ -910,7 +907,7 @@ impl BluetoothAdapter {
                         avrcp::pdu::SET_ABSOLUTE_VOLUME,
                         &[raw & 0x7F],
                     );
-                    outbound.push((
+                    out.replies.push((
                         cid,
                         AvctpMessage::response(&msg, response.encode()).encode(),
                     ));
@@ -926,7 +923,7 @@ impl BluetoothAdapter {
     /// Two round trips the first time: the peer's image server lives on a PSM only its
     /// SDP record knows, so we have to ask before we can connect. The PSM is cached for
     /// the life of the link, so later tracks skip straight to the pull.
-    fn begin_cover_art(&self, link: &mut Link, handle: String, signalling: &mut Vec<L2capPdu>) {
+    fn begin_cover_art(&self, link: &mut Link, handle: String, out: &mut Outbox) {
         if link.art_fetch.is_some() || link.art_sdp.is_some() {
             // One at a time. A skipped-through album would otherwise open a channel per
             // track and leave them all half-finished.
@@ -934,7 +931,7 @@ impl BluetoothAdapter {
             return;
         }
         if let Some(psm) = link.art_psm {
-            self.connect_cover_art(link, psm, handle, signalling);
+            self.connect_cover_art(link, psm, handle, out);
             return;
         }
         let Ok(psm) = Psm::new(Psm::SDP.raw()) else {
@@ -945,20 +942,14 @@ impl BluetoothAdapter {
                 debug!(handle, "bluetooth: asking where cover art lives");
                 link.art_wanted = Some(handle);
                 link.art_sdp = Some((cid, Box::new(substrate_sdp::Query::avrcp_target(1))));
-                Self::queue_signalling(events, signalling);
+                Self::queue_signalling(events, &mut out.signalling);
             }
             Err(e) => warn!(error = %e, "cover art: no channel for the sdp query"),
         }
     }
 
     /// Open the image channel itself, once the PSM is known.
-    fn connect_cover_art(
-        &self,
-        link: &mut Link,
-        psm: u16,
-        handle: String,
-        signalling: &mut Vec<L2capPdu>,
-    ) {
+    fn connect_cover_art(&self, link: &mut Link, psm: u16, handle: String, out: &mut Outbox) {
         let Ok(psm) = Psm::new(psm) else {
             warn!(psm, "cover art: the peer named a psm that is not one");
             return;
@@ -967,7 +958,7 @@ impl BluetoothAdapter {
             Ok((cid, events)) => {
                 debug!(%psm, handle, "bluetooth: fetching cover art");
                 link.art_fetch = Some((cid, Box::new(CoverArtClient::new(handle))));
-                Self::queue_signalling(events, signalling);
+                Self::queue_signalling(events, &mut out.signalling);
             }
             Err(e) => warn!(error = %e, "cover art: no channel for the image pull"),
         }
@@ -985,13 +976,7 @@ impl BluetoothAdapter {
     }
 
     /// A response to our "where do you serve images from" query.
-    fn on_cover_art_sdp(
-        &self,
-        link: &mut Link,
-        payload: &[u8],
-        outbound: &mut Vec<(Cid, Bytes)>,
-        signalling: &mut Vec<L2capPdu>,
-    ) {
+    fn on_cover_art_sdp(&self, link: &mut Link, payload: &[u8], out: &mut Outbox) {
         let Some((cid, query)) = &mut link.art_sdp else {
             return;
         };
@@ -1001,7 +986,7 @@ impl BluetoothAdapter {
             // asks again with the continuation state the peer handed back.
             Ok(false) => {
                 if let Some(request) = query.next_request() {
-                    outbound.push((cid, request));
+                    out.replies.push((cid, request));
                 }
                 return;
             }
@@ -1015,7 +1000,10 @@ impl BluetoothAdapter {
         }
         let psm = query.cover_art_psm().ok().flatten();
         link.art_sdp = None;
-        Self::queue_signalling(link.mux.disconnect(cid).unwrap_or_default(), signalling);
+        Self::queue_signalling(
+            link.mux.disconnect(cid).unwrap_or_default(),
+            &mut out.signalling,
+        );
 
         let Some(psm) = psm else {
             // Plenty of phones advertise a cover-art handle and no image server. Not an
@@ -1026,7 +1014,7 @@ impl BluetoothAdapter {
         };
         link.art_psm = Some(psm);
         if let Some(handle) = link.art_wanted.take() {
-            self.connect_cover_art(link, psm, handle, signalling);
+            self.connect_cover_art(link, psm, handle, out);
         }
     }
 
@@ -1036,7 +1024,7 @@ impl BluetoothAdapter {
         link: &mut Link,
         payload: &[u8],
         sink: &SessionSink,
-        outbound: &mut Vec<(Cid, Bytes)>,
+        out: &mut Outbox,
     ) -> Result<(), CoreError> {
         let Some((cid, client)) = &mut link.art_fetch else {
             return Ok(());
@@ -1058,7 +1046,7 @@ impl BluetoothAdapter {
             // asked for.
             Ok(None) => {
                 if let Some(request) = client.next_request() {
-                    outbound.push((cid, request));
+                    out.replies.push((cid, request));
                 }
             }
             Err(e) => {
