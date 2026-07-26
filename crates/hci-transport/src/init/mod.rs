@@ -60,11 +60,16 @@ pub trait ControllerInit: Send + Sync {
 
     /// Which firmware images this controller will need, so a build missing one can say
     /// so before touching the radio rather than half-way through an upload.
-    fn required_images(&self) -> &'static [&'static str] {
-        &[]
+    fn required_images(&self, _id: UsbId) -> Vec<&'static str> {
+        Vec::new()
     }
 
     /// Upload firmware and apply any vendor configuration.
+    ///
+    /// `id` is the USB id the loader matched, because which *image* a part needs is not
+    /// something the loader knows from its own type: Intel's AX200 and AX210 share a
+    /// loader and take different signed images, and sending the wrong one to a
+    /// secure-boot part is the worst outcome available here.
     ///
     /// Must be idempotent in the sense that running against an already-initialised
     /// controller is a no-op, not a failure: a warm reboot leaves the part in operational
@@ -74,6 +79,7 @@ pub trait ControllerInit: Send + Sync {
     /// [`TransportError`] if the controller refuses a step or an image is missing.
     async fn init(
         &self,
+        id: UsbId,
         hci: &dyn HciTransport,
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError>;
@@ -98,6 +104,7 @@ impl ControllerInit for NoInit {
 
     async fn init(
         &self,
+        _id: UsbId,
         _hci: &dyn HciTransport,
         _firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
@@ -112,11 +119,7 @@ impl ControllerInit for NoInit {
 /// merely optimistic for the rest. [`registry_strict`] is the version that says no.
 #[must_use]
 pub fn registry() -> Vec<Box<dyn ControllerInit>> {
-    vec![
-        Box::new(IntelInit::default()),
-        Box::new(RealtekInit::default()),
-        Box::new(NoInit),
-    ]
+    vec![Box::new(IntelInit), Box::new(RealtekInit), Box::new(NoInit)]
 }
 
 /// The initialisers, without the catch-all.
@@ -125,10 +128,7 @@ pub fn registry() -> Vec<Box<dyn ControllerInit>> {
 /// enumerates, accepts `HCI_Reset`, and then behaves oddly for reasons nobody can see.
 #[must_use]
 pub fn registry_strict() -> Vec<Box<dyn ControllerInit>> {
-    vec![
-        Box::new(IntelInit::default()),
-        Box::new(RealtekInit::default()),
-    ]
+    vec![Box::new(IntelInit), Box::new(RealtekInit)]
 }
 
 /// Pick the initialiser for a controller.
@@ -195,7 +195,7 @@ mod tests {
         // So a build missing a blob fails at startup naming the file, rather than
         // half-way through an upload with the part in bootloader mode.
         let images = |id| match select(registry(), id) {
-            Ok(init) => init.required_images(),
+            Ok(init) => init.required_images(id),
             Err(e) => panic!("nothing claimed {id}: {e}"),
         };
         assert!(
@@ -217,7 +217,10 @@ mod tests {
     #[tokio::test]
     async fn a_rom_based_part_initialises_by_doing_nothing() {
         let transport = substrate_hci::ScriptedTransport::new();
-        NoInit.init(&transport, &FirmwareSet::new()).await.unwrap();
+        NoInit
+            .init(CSR8510, &transport, &FirmwareSet::new())
+            .await
+            .unwrap();
         assert!(
             transport.sent().is_empty(),
             "a ROM part must not be sent vendor commands it will reject"

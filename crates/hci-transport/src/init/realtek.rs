@@ -32,14 +32,44 @@ const MANUFACTURER_REALTEK: u16 = 0x005D;
 /// concatenate to `0xdfc6d922`: precisely the `fw_version` in the epatch header. That is
 /// how an already-patched part is recognised, and it is the difference between skipping
 /// a redundant download and wedging a working dongle.
-const KNOWN_LMP_SUBVER: &[(u16, &str)] = &[
-    (0x8761, "RTL8761A/B"),
-    (0x8723, "RTL8723B"),
-    (0x8821, "RTL8821A"),
-    (0x8822, "RTL8822B"),
-    (0x8852, "RTL8852A"),
-    (0x8703, "RTL8703B"),
+/// What blob a `(lmp_subver, hci_rev)` pair calls for.
+///
+/// **Both halves, because `lmp_subver` alone does not identify the image.** `btrtl.c`
+/// keys on the pair, and it has to: `0x8761` with `hci_rev 0x000b` is a bare RTL8761B and
+/// takes `rtl8761b_fw.bin`, while `0x8761` with `hci_rev 0x000c` is the BU variant and
+/// takes `rtl8761bu_fw.bin`. The loader used to hold one fixed pair of filenames and send
+/// them to every part it claimed, while reading `hci_rev` into `LocalVersion` and only
+/// logging it. A bare 8761B or an 8723B therefore got another chip's patch — which
+/// downloads command-by-command without complaint and then misbehaves or bricks the
+/// radio, the worst case this file's own comments warn about.
+///
+/// `None` for a chip we can name but have no blob for: better a clear refusal than a
+/// plausible-looking wrong image.
+const KNOWN_CHIPS: &[(u16, Option<u16>, &str, Option<&str>)] = &[
+    (0x8761, Some(0x000b), "RTL8761B", Some("rtl8761b")),
+    (0x8761, Some(0x000c), "RTL8761BU", Some("rtl8761bu")),
+    // Seen on the TP-Link UB500 in the dev box, which is a BU.
+    (0x8761, None, "RTL8761A/B", Some("rtl8761bu")),
+    (0x8723, None, "RTL8723B", None),
+    (0x8821, None, "RTL8821A", None),
+    (0x8822, None, "RTL8822B", None),
+    (0x8852, None, "RTL8852A", None),
+    (0x8703, None, "RTL8703B", None),
 ];
+
+/// Identify the chip and the blob stem for a version response.
+///
+/// Exact `hci_rev` matches win over the wildcard entry, so adding a precise pair narrows
+/// the rule rather than being shadowed by the catch-all above it.
+fn chip_for(lmp_subver: u16, hci_rev: u16) -> Option<(&'static str, Option<&'static str>)> {
+    let exact = KNOWN_CHIPS
+        .iter()
+        .find(|(subver, rev, _, _)| *subver == lmp_subver && *rev == Some(hci_rev));
+    let any = KNOWN_CHIPS
+        .iter()
+        .find(|(subver, rev, _, _)| *subver == lmp_subver && rev.is_none());
+    exact.or(any).map(|(_, _, chip, stem)| (*chip, *stem))
+}
 /// Download one firmware fragment.
 const DOWNLOAD: OpCode = OpCode::new(0xFC20);
 
@@ -57,20 +87,8 @@ const EPATCH_SIGNATURE: &[u8; 8] = b"Realtech";
 const RTL_EPATCH_SIGNATURE_V2: &[u8; 8] = b"RTBTCore";
 
 /// Realtek firmware loader.
-#[derive(Debug, Clone)]
-pub struct RealtekInit {
-    firmware_name: &'static str,
-    config_name: &'static str,
-}
-
-impl Default for RealtekInit {
-    fn default() -> Self {
-        Self {
-            firmware_name: "rtl_bt/rtl8761bu_fw.bin",
-            config_name: "rtl_bt/rtl8761bu_config.bin",
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct RealtekInit;
 
 impl RealtekInit {
     /// Realtek's own USB vendor id.
@@ -113,12 +131,16 @@ impl ControllerInit for RealtekInit {
             .any(|(vendor, product)| *vendor == id.vendor && *product == id.product)
     }
 
-    fn required_images(&self) -> &'static [&'static str] {
-        &["rtl_bt/rtl8761bu_fw.bin", "rtl_bt/rtl8761bu_config.bin"]
+    fn required_images(&self, _id: UsbId) -> Vec<&'static str> {
+        // The USB id does not say which blob: the chip does, and that answer needs an HCI
+        // round trip we cannot do here. The BU is what every dongle in this list has
+        // turned out to be so far, so it is what the probe checks for.
+        vec!["rtl_bt/rtl8761bu_fw.bin", "rtl_bt/rtl8761bu_config.bin"]
     }
 
     async fn init(
         &self,
+        _id: UsbId,
         hci: &dyn HciTransport,
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
@@ -139,10 +161,7 @@ impl ControllerInit for RealtekInit {
             });
         }
 
-        let Some((_, chip)) = KNOWN_LMP_SUBVER
-            .iter()
-            .find(|(id, _)| *id == version.lmp_subver)
-        else {
+        let Some((chip, stem)) = chip_for(version.lmp_subver, version.hci_rev) else {
             // An unrecognised subver on a confirmed Realtek part means firmware is
             // already loaded: patching rewrites this field to the firmware's own
             // version. Re-downloading is at best redundant and at worst wedges a
@@ -155,17 +174,36 @@ impl ControllerInit for RealtekInit {
             );
             return Ok(());
         };
-        info!(chip, lmp_subver = version.lmp_subver, "realtek controller");
+        info!(
+            chip,
+            lmp_subver = version.lmp_subver,
+            hci_rev = version.hci_rev,
+            "realtek controller"
+        );
+
+        let Some(stem) = stem else {
+            return Err(TransportError::Controller {
+                what: "realtek firmware selection",
+                detail: format!(
+                    "{chip} (lmp_subver {:#06x}, hci_rev {:#06x}) is recognised but this \
+                     build ships no blob for it; refusing rather than downloading another \
+                     chip's patch",
+                    version.lmp_subver, version.hci_rev
+                ),
+            });
+        };
 
         let rom_version = read_rom_version(hci).await?;
         debug!(rom_version, "realtek rom version");
 
-        let fw = firmware.get(self.firmware_name)?;
+        let firmware_name = format!("rtl_bt/{stem}_fw.bin");
+        let config_name = format!("rtl_bt/{stem}_config.bin");
+        let fw = firmware.get(&firmware_name)?;
 
         // The config is appended to the *extracted patch*, not to the container, and not
         // sent separately. It is optional — a controller without one uses its defaults —
         // so a missing file is a debug line rather than a refusal to start.
-        let config = match firmware.get(self.config_name) {
+        let config = match firmware.get(&config_name) {
             Ok(config) => config.to_vec(),
             Err(e) => {
                 debug!(error = %e, "realtek: no config blob; using controller defaults");
@@ -173,7 +211,7 @@ impl ControllerInit for RealtekInit {
             }
         };
 
-        let payload = build_payload(&fw, &config, rom_version, self.firmware_name)?;
+        let payload = build_payload(&fw, &config, rom_version, &firmware_name)?;
         download(hci, &payload).await?;
         info!(bytes = payload.len(), "realtek firmware loaded");
         Ok(())
@@ -465,6 +503,9 @@ mod tests {
         })
     }
 
+    /// The TP-Link UB500 in the dev box.
+    const UB500: UsbId = UsbId::new(0x2357, 0x0604);
+
     /// A container whose extracted patch is exactly `len` bytes — which is what the
     /// fragmentation tests care about, since the patch is what gets downloaded.
     fn image(len: usize) -> Vec<u8> {
@@ -511,8 +552,12 @@ mod tests {
         // A controller that never sees the end flag waits forever for more data; two
         // flags would end the transfer early with a truncated image.
         let transport = controller();
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(MAX_FRAGMENT * 3 + 7)))
+        RealtekInit
+            .init(
+                UB500,
+                &transport,
+                &firmware_with(image(MAX_FRAGMENT * 3 + 7)),
+            )
             .await
             .unwrap();
 
@@ -531,8 +576,8 @@ mod tests {
         // The off-by-one that leaves a small image hanging: with one chunk, index 0 is
         // also the last one.
         let transport = controller();
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(64)))
+        RealtekInit
+            .init(UB500, &transport, &firmware_with(image(64)))
             .await
             .unwrap();
         assert_eq!(indices(&transport), vec![0x80]);
@@ -542,8 +587,8 @@ mod tests {
     async fn indices_wrap_correctly_across_a_long_image() {
         let transport = controller();
         // 130 fragments, so the counter goes past 127 and starts again.
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(MAX_FRAGMENT * 130)))
+        RealtekInit
+            .init(UB500, &transport, &firmware_with(image(MAX_FRAGMENT * 130)))
             .await
             .unwrap();
         let indices = indices(&transport);
@@ -556,8 +601,8 @@ mod tests {
     #[tokio::test]
     async fn fragments_fit_the_single_byte_parameter_length() {
         let transport = controller();
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(MAX_FRAGMENT * 2)))
+        RealtekInit
+            .init(UB500, &transport, &firmware_with(image(MAX_FRAGMENT * 2)))
             .await
             .unwrap();
         for packet in transport.sent() {
@@ -721,8 +766,8 @@ mod tests {
     #[tokio::test]
     async fn a_missing_image_fails_before_anything_is_downloaded() {
         let transport = controller();
-        let err = RealtekInit::default()
-            .init(&transport, &FirmwareSet::new())
+        let err = RealtekInit
+            .init(UB500, &transport, &FirmwareSet::new())
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("rtl8761bu_fw.bin"), "got: {err}");
@@ -749,8 +794,8 @@ mod tests {
                 params: bytes::Bytes::from(params),
             }]
         });
-        let err = RealtekInit::default()
-            .init(&transport, &firmware_with(image(64)))
+        let err = RealtekInit
+            .init(UB500, &transport, &firmware_with(image(64)))
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("not Realtek"), "got: {err}");
@@ -778,8 +823,8 @@ mod tests {
                 params: bytes::Bytes::from(params),
             }]
         });
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(64)))
+        RealtekInit
+            .init(UB500, &transport, &firmware_with(image(64)))
             .await
             .unwrap();
         assert!(
@@ -793,8 +838,8 @@ mod tests {
         // btrtl.c's order, and a better diagnostic: a failure on an ordinary HCI
         // command says the transport is broken, not the vendor sequence.
         let transport = controller();
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(64)))
+        RealtekInit
+            .init(UB500, &transport, &firmware_with(image(64)))
             .await
             .unwrap();
         let opcodes = transport.sent_commands();
@@ -810,8 +855,8 @@ mod tests {
     async fn the_rom_version_is_read_before_the_download() {
         // It selects which patch applies; reading it after would be pointless.
         let transport = controller();
-        RealtekInit::default()
-            .init(&transport, &firmware_with(image(64)))
+        RealtekInit
+            .init(UB500, &transport, &firmware_with(image(64)))
             .await
             .unwrap();
         let opcodes = transport.sent_commands();
@@ -825,7 +870,7 @@ mod tests {
         // Found on hardware: the TP-Link UB500 is an RTL8761BU that reports TP-Link's
         // vendor id. Matching on 0x0BDA alone left it falling through to NoInit, which
         // does nothing — invisible on Linux, fatal on Windows.
-        let rtl = RealtekInit::default();
+        let rtl = RealtekInit;
         assert!(rtl.matches(UsbId::new(0x2357, 0x0604)), "TP-Link UB500");
         assert!(rtl.matches(UsbId::new(0x0bda, 0x8771)), "Realtek reference");
         assert!(rtl.matches(UsbId::new(0x0b05, 0x190e)), "ASUS BT500");

@@ -260,7 +260,7 @@ impl UsbTransport {
         };
         let loader = init::select(init::registry(), transport.id)?;
         debug!(loader = loader.name(), id = %transport.id, "initialising controller");
-        loader.init(&transport, firmware).await?;
+        loader.init(transport.id, &transport, firmware).await?;
         Ok(transport)
     }
 }

@@ -90,34 +90,44 @@ const SFI_HEADER_LEN: usize = CSS_HEADER_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
 const MAX_FRAGMENT: usize = 252;
 
 /// Intel firmware loader.
-#[derive(Debug, Clone)]
-pub struct IntelInit {
-    /// Which firmware image to use. AX200 and AX201 both take `ibt-20-1-3`.
-    image_stem: &'static str,
-}
-
-impl Default for IntelInit {
-    fn default() -> Self {
-        Self {
-            image_stem: "intel/ibt-20-1-3",
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct IntelInit;
 
 impl IntelInit {
     /// Intel's USB vendor id.
     pub const VENDOR: u16 = 0x8087;
 
-    /// Products this loader handles.
+    /// Products this loader handles, and the image stem each one takes.
     ///
-    /// AX200 is `0x0029`. The others are the same generation and take the same image;
-    /// anything Intel outside this list gets a clear "no loader" rather than a wrong one.
-    pub const PRODUCTS: &'static [u16] = &[
-        0x0029, // AX200
-        0x0026, // AX201
-        0x0032, // AX210
-        0x0033, // AX211
+    /// The stem is per-product, not per-loader, and that is the whole point. It used to be
+    /// a fixed field on the loader — `ibt-20-1-3`, which is the AX200/AX201 image — while
+    /// the product list also claimed the AX210 and AX211. Those are a different generation
+    /// and need `ibt-0041-0041`, so a bootloader-mode AX210 was being sent another part's
+    /// *signed* image: secure boot rejects it, or worse accepts a partial upload. The
+    /// right blob was already in the binary, unused, because `flake.nix` embeds it.
+    ///
+    /// `btintel` derives this from the TLV version response (the CNVi/CNVR ids) rather
+    /// than from USB. Keying on the product id is a narrower rule that happens to agree
+    /// for every part we claim; if that stops being true, the answer is to read the TLV,
+    /// not to add another entry here.
+    pub const PRODUCTS: &'static [(u16, &'static str)] = &[
+        (0x0029, "intel/ibt-20-1-3"),    // AX200
+        (0x0026, "intel/ibt-20-1-3"),    // AX201
+        (0x0032, "intel/ibt-0041-0041"), // AX210
+        (0x0033, "intel/ibt-0041-0041"), // AX211
     ];
+
+    /// The image stem for a product, if this loader claims it.
+    #[must_use]
+    fn image_stem(id: UsbId) -> Option<&'static str> {
+        if id.vendor != Self::VENDOR {
+            return None;
+        }
+        Self::PRODUCTS
+            .iter()
+            .find(|(product, _)| *product == id.product)
+            .map(|(_, stem)| *stem)
+    }
 }
 
 #[async_trait::async_trait]
@@ -127,18 +137,27 @@ impl ControllerInit for IntelInit {
     }
 
     fn matches(&self, id: UsbId) -> bool {
-        id.vendor == Self::VENDOR && Self::PRODUCTS.contains(&id.product)
+        Self::image_stem(id).is_some()
     }
 
-    fn required_images(&self) -> &'static [&'static str] {
-        &["intel/ibt-20-1-3.sfi", "intel/ibt-20-1-3.ddc"]
+    fn required_images(&self, id: UsbId) -> Vec<&'static str> {
+        // Leaking through as `&'static str` so the probe can name the missing file. The
+        // stems are compile-time constants, so the only allocation is the pair.
+        Self::image_stem(id).map_or_else(Vec::new, |stem| match stem {
+            "intel/ibt-0041-0041" => {
+                vec!["intel/ibt-0041-0041.sfi", "intel/ibt-0041-0041.ddc"]
+            }
+            _ => vec!["intel/ibt-20-1-3.sfi", "intel/ibt-20-1-3.ddc"],
+        })
     }
 
     async fn init(
         &self,
+        id: UsbId,
         hci: &dyn HciTransport,
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
+        let image_stem = Self::image_stem(id).ok_or(TransportError::UnsupportedController(id))?;
         let version = read_version(hci).await?;
         debug!(tlv = ?hex(&version), "intel version response");
 
@@ -160,7 +179,7 @@ impl ControllerInit for IntelInit {
             }
         }
 
-        let sfi_name = format!("{}.sfi", self.image_stem);
+        let sfi_name = format!("{image_stem}.sfi");
         let sfi = firmware.get(&sfi_name)?;
         download_firmware(hci, &sfi, &sfi_name).await?;
 
@@ -180,7 +199,7 @@ impl ControllerInit for IntelInit {
         // DDC is the per-board tuning table. Missing it is not fatal — the radio works,
         // just not to spec for this antenna layout — so a build without the file logs
         // and continues rather than refusing to start.
-        let ddc_name = format!("{}.ddc", self.image_stem);
+        let ddc_name = format!("{image_stem}.ddc");
         match firmware.get(&ddc_name) {
             Ok(ddc) => load_ddc(hci, &ddc).await?,
             Err(e) => debug!(error = %e, "intel: no DDC config; using controller defaults"),
@@ -630,8 +649,8 @@ mod tests {
         // case; the bad case is a part that accepts a partial upload and boots an image
         // that half-works.
         let transport = controller(version_tlv(tlv_image::BOOTLOADER));
-        IntelInit::default()
-            .init(&transport, &firmware_with(sfi(&command_block(8))))
+        IntelInit
+            .init(AX200, &transport, &firmware_with(sfi(&command_block(8))))
             .await
             .unwrap();
 
@@ -659,8 +678,8 @@ mod tests {
         // A 256-byte key cannot go in one command: the parameter length field is one
         // byte and the fragment type eats one of them.
         let transport = controller(version_tlv(tlv_image::BOOTLOADER));
-        IntelInit::default()
-            .init(&transport, &firmware_with(sfi(&command_block(0))))
+        IntelInit
+            .init(AX200, &transport, &firmware_with(sfi(&command_block(0))))
             .await
             .unwrap();
 
@@ -682,8 +701,8 @@ mod tests {
         // A warm reboot leaves the part running its firmware. Re-uploading is neither
         // possible nor needed, and erroring here would make every second start fail.
         let transport = controller(version_tlv(tlv_image::OPERATIONAL));
-        IntelInit::default()
-            .init(&transport, &FirmwareSet::new())
+        IntelInit
+            .init(AX200, &transport, &FirmwareSet::new())
             .await
             .unwrap();
 
@@ -696,8 +715,8 @@ mod tests {
     #[tokio::test]
     async fn a_missing_image_fails_before_the_upload_starts() {
         let transport = controller(version_tlv(tlv_image::BOOTLOADER));
-        let err = IntelInit::default()
-            .init(&transport, &FirmwareSet::new())
+        let err = IntelInit
+            .init(AX200, &transport, &FirmwareSet::new())
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("ibt-20-1-3.sfi"), "got: {err}");
@@ -707,8 +726,8 @@ mod tests {
     #[tokio::test]
     async fn the_reset_comes_after_the_firmware_and_not_before() {
         let transport = controller(version_tlv(tlv_image::BOOTLOADER));
-        IntelInit::default()
-            .init(&transport, &firmware_with(sfi(&command_block(2))))
+        IntelInit
+            .init(AX200, &transport, &firmware_with(sfi(&command_block(2))))
             .await
             .unwrap();
 
@@ -718,9 +737,43 @@ mod tests {
         assert!(reset > last_send, "reset must follow the whole upload");
     }
 
+    /// The AX200 in the dev box.
+    const AX200: UsbId = UsbId::new(0x8087, 0x0029);
+
+    #[test]
+    fn each_generation_gets_its_own_signed_image() {
+        // A secure-boot part sent another part's signed image rejects it, or worse
+        // accepts a partial upload. The AX210 blob was already embedded by `flake.nix`
+        // and simply never selected, because the stem was a fixed field on the loader.
+        let intel = IntelInit;
+        assert_eq!(
+            IntelInit::image_stem(AX200),
+            Some("intel/ibt-20-1-3"),
+            "AX200"
+        );
+        assert_eq!(
+            IntelInit::image_stem(UsbId::new(0x8087, 0x0032)),
+            Some("intel/ibt-0041-0041"),
+            "AX210 is a different generation"
+        );
+        assert_ne!(
+            IntelInit::image_stem(AX200),
+            IntelInit::image_stem(UsbId::new(0x8087, 0x0033)),
+            "AX211 must not be sent the AX200 image"
+        );
+        // And the probe must name the file it will actually ask for, or its MISSING
+        // check lies about a part that is going to fail.
+        assert!(intel
+            .required_images(UsbId::new(0x8087, 0x0032))
+            .contains(&"intel/ibt-0041-0041.sfi"));
+        assert!(intel
+            .required_images(AX200)
+            .contains(&"intel/ibt-20-1-3.sfi"));
+    }
+
     #[test]
     fn the_loader_claims_only_the_intel_parts_it_knows() {
-        let intel = IntelInit::default();
+        let intel = IntelInit;
         assert!(intel.matches(UsbId::new(0x8087, 0x0029)), "AX200");
         assert!(intel.matches(UsbId::new(0x8087, 0x0032)), "AX210");
         // An Intel part with no loader must fall through, not get the wrong image.

@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // than discovering it half-way through an upload.
         let missing: Vec<&str> = init::select(init::registry(), *id)
             .map(|l| {
-                l.required_images()
+                l.required_images(*id)
                     .iter()
                     .filter(|n| !firmware.has(n))
                     .copied()
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("initialising…");
     let loader = init::select(init::registry(), id)?;
     println!("  loader: {}", loader.name());
-    loader.init(&transport, &firmware).await?;
+    loader.init(id, &transport, &firmware).await?;
     println!("  firmware ok");
 
     // The proof that the controller is alive and talking: reset it, then ask its
