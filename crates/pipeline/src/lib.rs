@@ -45,6 +45,8 @@ pub mod osd;
 #[cfg(feature = "render")]
 pub mod render_pipeline;
 #[cfg(feature = "render")]
+pub mod tap;
+#[cfg(feature = "render")]
 pub mod text;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;

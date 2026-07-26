@@ -366,7 +366,10 @@ impl WgpuCompositor {
             wgpu::PresentMode::Fifo
         };
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC so the composited surface can be read back: screenshots and the
+            // stream tee both need it, and it cannot be added after configuration
+            // (Q30). Costs nothing when nothing reads.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             width: width.max(1),
             height: height.max(1),
@@ -690,13 +693,66 @@ impl WgpuCompositor {
     ///
     /// # Errors
     /// [`PipelineError`] if called on a surface target or the map fails.
+    /// Present, optionally reading the frame back as RGBA8.
+    ///
+    /// The capture happens *inside* the frame because a surface texture only exists
+    /// between acquire and present — there is nothing to copy from afterwards. Returns
+    /// `None` when not asked, or when the readback failed, which must not stop the panel
+    /// from presenting.
+    pub fn present_and_capture(&mut self, capture: bool) -> Option<Vec<u8>> {
+        if !capture {
+            self.present();
+            return None;
+        }
+        match &self.target {
+            Target::Offscreen { texture, size } => {
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                self.render_into(&view);
+                let (w, h) = *size;
+                self.copy_back(texture, w, h, wgpu::TextureFormat::Rgba8Unorm)
+                    .ok()
+            }
+            Target::Surface { surface, config } => {
+                let frame = surface.get_current_texture().ok()?;
+                let view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                self.render_into(&view);
+                let (w, h) = (config.width, config.height);
+                let out = self.copy_back(&frame.texture, w, h, config.format).ok();
+                frame.present();
+                out
+            }
+        }
+    }
+
     pub fn read_rgba(&self) -> Result<Vec<u8>, PipelineError> {
-        let Target::Offscreen { texture, size } = &self.target else {
-            return Err(PipelineError::Surface(
-                "read_rgba only valid offscreen".into(),
-            ));
+        let (texture, (width, height)) = match &self.target {
+            Target::Offscreen { texture, size } => (texture, *size),
+            // A surface texture only exists between `get_current_texture` and `present`,
+            // so there is nothing to copy from here. `capture_into` does the readback
+            // inside the frame instead, while the texture is alive.
+            Target::Surface { .. } => {
+                return Err(PipelineError::Surface(
+                    "read_rgba needs an offscreen target; use capture_into during a frame".into(),
+                ))
+            }
         };
-        let (width, height) = *size;
+        self.copy_back(texture, width, height, wgpu::TextureFormat::Rgba8Unorm)
+    }
+
+    /// Copy a texture back to tightly-packed RGBA8.
+    ///
+    /// Swizzles when the surface is BGRA, which it usually is: a swapchain picks whatever
+    /// the platform prefers, and a PNG of a BGRA buffer read as RGBA looks plausible and
+    /// has the red and blue channels swapped — the kind of wrong that survives review.
+    fn copy_back(
+        &self,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<Vec<u8>, PipelineError> {
         let unpadded = (width * 4) as usize;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
         let padded = unpadded.div_ceil(align) * align;
@@ -752,6 +808,18 @@ impl WgpuCompositor {
         }
         drop(data);
         buffer.unmap();
+
+        // A swapchain picks whatever the platform prefers, which on most desktops is
+        // BGRA. Read as RGBA that produces a picture that looks entirely plausible with
+        // red and blue swapped — wrong in a way that survives a glance.
+        if matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for px in out.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
         Ok(out)
     }
 

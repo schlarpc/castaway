@@ -339,6 +339,9 @@ pub struct RenderLoop {
     rx: Receiver<RenderCommand>,
     osd: Option<crate::osd::OsdController>,
     has_video: bool,
+    /// Consumers of the composited output — screenshots, and later a stream tee. Empty
+    /// on the default path, which is the point: a readback is a full-surface copy.
+    taps: Vec<Box<dyn crate::tap::OutputTap>>,
     /// Consecutive GPU-surface imports that failed on a device which claimed to support
     /// them. The decode thread cannot see these — it hands over surfaces and never hears
     /// back — so past a threshold the render thread records the verdict where the *next*
@@ -355,6 +358,7 @@ impl RenderLoop {
             rx,
             osd: None,
             has_video: false,
+            taps: Vec::new(),
             failed_imports: 0,
         }
     }
@@ -533,7 +537,7 @@ impl RenderLoop {
             }
         }
         self.update_osd();
-        self.compositor.present();
+        self.present_and_serve_taps();
         applied
     }
 
@@ -553,8 +557,50 @@ impl RenderLoop {
             }
         }
         self.update_osd();
-        self.compositor.present();
+        self.present_and_serve_taps();
         applied
+    }
+
+    /// Attach a consumer of composited frames.
+    ///
+    /// Costs nothing until it asks for a frame, and is dropped when it says it is
+    /// finished — a screenshot retires itself after one capture.
+    pub fn add_tap(&mut self, tap: Box<dyn crate::tap::OutputTap>) {
+        self.taps.push(tap);
+    }
+
+    /// Present, reading the frame back only if some tap asked for it.
+    ///
+    /// The question is put to every tap *before* the copy, because the copy is a full
+    /// surface — 33 MB at 4K — and doing it speculatively would cost more than the rest
+    /// of the frame. One readback serves everyone who said yes.
+    fn present_and_serve_taps(&mut self) {
+        if self.taps.is_empty() {
+            self.compositor.present();
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut wanted = Vec::with_capacity(self.taps.len());
+        for (i, tap) in self.taps.iter_mut().enumerate() {
+            if tap.wants_frame(now) {
+                wanted.push(i);
+            }
+        }
+        let captured = self.compositor.present_and_capture(!wanted.is_empty());
+        if let Some(rgba) = captured {
+            let (width, height) = self.compositor.target_size();
+            let frame = crate::tap::TappedFrame::Rgba {
+                width,
+                height,
+                data: &rgba,
+            };
+            for i in wanted {
+                if let Some(tap) = self.taps.get_mut(i) {
+                    tap.on_frame(&frame);
+                }
+            }
+        }
+        self.taps.retain(|t| !t.finished());
     }
 
     /// Apply one command. Returns true if it was a video frame.

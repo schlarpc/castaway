@@ -115,6 +115,12 @@ workspace = true
 name = "attract_preview"
 required-features = ["render"]
 
+# The now-playing surface, rendered to a PNG so a change to it can be reviewed without a
+# panel attached — the sibling of `attract_preview` for the other idle-ish screen.
+[[example]]
+name = "card_preview"
+required-features = ["render"]
+
 [[example]]
 name = "screen_preview"
 required-features = ["render"]
