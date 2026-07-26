@@ -244,8 +244,12 @@ async fn serve(
 
     if config.enable.dlna {
         let sink = SessionSink::new(SourceId::new(ProtocolKind::Dlna, "http"), event_tx.clone());
-        let dlna =
-            DlnaService::new(&config.friendly_name, &config.uuid, sink).with_osd(osd.clone());
+        let dlna = DlnaService::new(
+            config.advertised_name(ProtocolKind::Dlna),
+            &config.uuid,
+            sink,
+        )
+        .with_osd(osd.clone());
         http = http.merge(dlna.router());
         ssdp_devices.push((dlna.ssdp_device(), dlna.description_path().to_string()));
         info!("enabled: DLNA MediaRenderer");
@@ -256,8 +260,12 @@ async fn serve(
             SourceId::new(ProtocolKind::Spotify, "http"),
             event_tx.clone(),
         );
-        let spotify = SpotifyService::new(&config.friendly_name, spotify_device_id(&config), sink)
-            .with_osd(osd.clone());
+        let spotify = SpotifyService::new(
+            config.advertised_name(ProtocolKind::Spotify),
+            spotify_device_id(&config),
+            sink,
+        )
+        .with_osd(osd.clone());
         http = http.merge(spotify.router());
         mdns.advertise(&spotify.mdns_service(config.http_port, MDNS_HOST))
             .context("advertising Spotify")?;
@@ -267,7 +275,7 @@ async fn serve(
     let (dial_tx, mut dial_rx) = mpsc::channel(8);
     if config.enable.dial {
         let dial = DialService::new(
-            &config.friendly_name,
+            config.advertised_name(ProtocolKind::YouTubeLounge),
             config.http_base_url(),
             dial_tx.clone(),
         )
@@ -393,7 +401,7 @@ async fn spawn_cast(
         .context("generating the Cast TLS identity")?;
     let receiver = CastReceiver::new(
         proto_cast::actor::default_listen_addr(),
-        config.friendly_name.as_str(),
+        config.advertised_name(ProtocolKind::Cast).as_str(),
         config.uuid.replace('-', ""),
         &identity,
     )
@@ -457,7 +465,7 @@ fn spawn_airplay(
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let receiver = AirPlayReceiver::new(proto_airplay::AirPlayIdentity {
-        name: config.friendly_name.clone(),
+        name: config.advertised_name(ProtocolKind::AirPlay),
         device_id: derive_mac(&config.uuid),
         host: MDNS_HOST.to_string(),
     });
@@ -496,34 +504,47 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
     use pipeline::attract::{render, AttractRow, AttractScene, WidgetSlot};
 
     let name = &config.friendly_name;
-    let detail = |verb: &str| format!("{verb} \u{2192} {name}");
+    // Each row names the entry that surface actually publishes, not the bare friendly
+    // name: the whole job of this screen is to tell someone what to look for in their
+    // picker, and since every surface now advertises `name#protocol` the bare name is
+    // a string they will not find.
+    let detail = |verb: &str, kind: ProtocolKind| {
+        format!("{verb} \u{2192} {}", config.advertised_name(kind))
+    };
     let mut rows = Vec::new();
     if config.enable.cast {
         rows.push(AttractRow::new(
             [0x42, 0x85, 0xf4, 0xff],
             "Chrome / Edge",
-            detail("Cast"),
+            detail("Cast", ProtocolKind::Cast),
         ));
     }
     if config.enable.airplay {
         rows.push(AttractRow::new(
             [0xff, 0xff, 0xff, 0xff],
             "iPhone / Mac",
-            detail("AirPlay"),
+            detail("AirPlay", ProtocolKind::AirPlay),
         ));
     }
     if config.enable.dlna {
         rows.push(AttractRow::new(
             [0x3d, 0xdc, 0x84, 0xff],
             "Android / VLC",
-            detail("Cast or DLNA"),
+            detail("Cast or DLNA", ProtocolKind::Dlna),
         ));
     }
     if config.enable.spotify {
         rows.push(AttractRow::new(
             [0x1d, 0xb9, 0x54, 0xff],
             "Spotify",
-            detail("Devices"),
+            detail("Devices", ProtocolKind::Spotify),
+        ));
+    }
+    if config.enable.bluetooth {
+        rows.push(AttractRow::new(
+            [0x00, 0x82, 0xfc, 0xff],
+            "Any phone",
+            detail("Bluetooth", ProtocolKind::Bluetooth),
         ));
     }
     if config.enable.dial {

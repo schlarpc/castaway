@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use castaway_core::ProtocolKind;
 use serde::Deserialize;
 
 /// Top-level configuration.
@@ -26,6 +27,37 @@ pub struct Config {
     pub attract_widget_url: Option<String>,
     /// Bluetooth A2DP sink settings.
     pub bluetooth: Bluetooth,
+}
+
+impl Config {
+    /// The name one protocol advertises itself under: `<friendly_name>#<protocol>`.
+    ///
+    /// One box shows up in several pickers at once — AirPlay, Cast, DLNA, Bluetooth — and
+    /// with a single name they are indistinguishable: you pick one, something happens, and
+    /// you do not know which path you took. The suffix makes the picker say which surface
+    /// it is offering, which matters most when one of them is broken.
+    ///
+    /// Takes a [`ProtocolKind`] rather than a string so a surface cannot be labelled with
+    /// a typo, and so adding a protocol cannot silently skip this.
+    ///
+    /// A name too long for an mDNS label is truncated in the *base*, never the suffix:
+    /// dropping the suffix would defeat the point, while a clipped name is still
+    /// recognisable. Truncation respects char boundaries, so a multi-byte name cannot be
+    /// cut into invalid UTF-8.
+    #[must_use]
+    pub fn advertised_name(&self, kind: ProtocolKind) -> String {
+        let suffix = format!("#{}", kind.slug());
+        let room = MAX_ADVERTISED_LEN.saturating_sub(suffix.len());
+        let base = &self.friendly_name;
+        if base.len() <= room {
+            return format!("{base}{suffix}");
+        }
+        let mut end = room.min(base.len());
+        while end > 0 && !base.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{suffix}", &base[..end])
+    }
 }
 
 /// Bluetooth A2DP sink settings.
@@ -122,6 +154,9 @@ impl Default for Bluetooth {
 /// the working directory isn't ours to choose (the NixOS module points this at the
 /// generated `castaway.toml` in the Nix store).
 pub const CONFIG_ENV: &str = "CASTAWAY_CONFIG";
+
+/// mDNS instance labels cap at 63 octets, and UPnP friendly names are not much kinder.
+const MAX_ADVERTISED_LEN: usize = 63;
 
 /// The config file looked for in the working directory when [`CONFIG_ENV`] is unset.
 pub const DEFAULT_CONFIG_FILE: &str = "castaway.toml";
@@ -250,5 +285,54 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.http_base_url(), "http://10.0.0.5:8080");
+    }
+}
+
+#[cfg(test)]
+mod advertised_name_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn every_surface_says_which_one_it_is() {
+        let c = Config::default();
+        assert_eq!(
+            c.advertised_name(ProtocolKind::Bluetooth),
+            "dma.space/screen#bluetooth"
+        );
+        assert_eq!(
+            c.advertised_name(ProtocolKind::AirPlay),
+            "dma.space/screen#airplay"
+        );
+        assert_eq!(
+            c.advertised_name(ProtocolKind::YouTubeLounge),
+            "dma.space/screen#youtube-lounge"
+        );
+    }
+
+    #[test]
+    fn a_long_name_loses_its_tail_rather_than_its_suffix() {
+        // An mDNS instance label caps at 63 octets. Truncating the suffix away would
+        // leave two surfaces indistinguishable, which is the thing this exists to fix.
+        let c = Config {
+            friendly_name: "x".repeat(200),
+            ..Config::default()
+        };
+        let name = c.advertised_name(ProtocolKind::YouTubeLounge);
+        assert!(name.len() <= 63, "{} octets", name.len());
+        assert!(name.ends_with("#youtube-lounge"));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        // A name of multi-byte characters must not be cut mid-codepoint; the result has
+        // to still be a string, and `String` would panic on a bad boundary.
+        let c = Config {
+            friendly_name: "\u{1f4fa}".repeat(40),
+            ..Config::default()
+        };
+        let name = c.advertised_name(ProtocolKind::Cast);
+        assert!(name.len() <= 63, "{} octets", name.len());
+        assert!(name.ends_with("#cast"));
     }
 }

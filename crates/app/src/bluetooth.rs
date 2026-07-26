@@ -73,7 +73,7 @@ pub async fn spawn(
         transport,
         BluetoothConfig {
             host: HostConfig {
-                name: config.friendly_name.clone(),
+                name: config.advertised_name(castaway_core::ProtocolKind::Bluetooth),
                 discoverable: true,
                 ..HostConfig::default()
             },
