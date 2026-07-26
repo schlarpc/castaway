@@ -16,6 +16,7 @@ use castaway_core::{
     SourceMessage,
 };
 use proto_bluetooth_audio::adapter::{BluetoothAdapter, BluetoothConfig};
+use proto_bluetooth_audio::avctp::CommandResponse;
 use proto_bluetooth_audio::avdtp::{Message, Seid, Signal};
 use proto_bluetooth_audio::codec::{ChannelModes, CodecCapability, SampleRates};
 use proto_bluetooth_audio::obex::{Header as ObexHeader, ObexPacket};
@@ -1091,6 +1092,73 @@ fn requested_attributes(body: &[u8]) -> Option<Vec<u32>> {
             })
             .collect(),
     )
+}
+
+#[tokio::test]
+async fn an_inbound_metadata_request_is_answered_and_does_not_empty_the_card() {
+    // A head unit asking *us* what is playing. Real GM and Hyundai-Kia units enumerate
+    // attributes 1..=8 unconditionally, and the request used to fall into the branch that
+    // parses responses — where its eight-byte track identifier reads as an attribute
+    // count of zero and wipes the now-playing card the phone had just filled in.
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    eventually("the avrcp opening traffic", || {
+        (sent_avrcp_pdus(&transport).len() >= 3).then_some(())
+    })
+    .await;
+
+    // The phone tells us what is playing.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            attributes_response(&[
+                (proto_bluetooth_audio::avrcp::attribute::TITLE, b"Derezzed"),
+                (
+                    proto_bluetooth_audio::avrcp::attribute::ARTIST,
+                    b"Daft Punk",
+                ),
+            ]),
+        ),
+    );
+
+    // Then something else asks us the same question, attribute 8 included.
+    let before = sent_pdus(&transport).len();
+    let request = proto_bluetooth_audio::avrcp::get_element_attributes(
+        &proto_bluetooth_audio::avrcp::attribute::ALL,
+    );
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            proto_bluetooth_audio::AvctpMessage::command(3, request.encode()).encode(),
+        ),
+    );
+
+    let answer = eventually("an answer to the inbound request", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+            .filter(|msg| msg.cr == CommandResponse::Response)
+            .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+            .find(|frame| frame.ctype == proto_bluetooth_audio::Ctype::Stable)
+    })
+    .await;
+
+    let vendor = proto_bluetooth_audio::VendorPdu::parse(&answer.operands).unwrap();
+    assert_eq!(
+        vendor.pdu_id,
+        proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES
+    );
+    let parsed =
+        proto_bluetooth_audio::avrcp::parse_element_attributes(&vendor.parameters).unwrap();
+    assert_eq!(
+        parsed.now_playing.title.as_deref(),
+        Some("Derezzed"),
+        "attribute 8 in the request must not cost us the seven we can answer"
+    );
+    assert_eq!(parsed.now_playing.artist.as_deref(), Some("Daft Punk"));
 }
 
 #[tokio::test]

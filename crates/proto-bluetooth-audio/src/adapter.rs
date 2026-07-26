@@ -850,7 +850,23 @@ impl BluetoothAdapter {
         };
 
         match vendor.pdu_id {
-            avrcp::pdu::GET_ELEMENT_ATTRIBUTES if !frame.ctype.is_failure() => {
+            // Inbound *command*, not a response to ours. Real GM and Hyundai-Kia head
+            // units enumerate attributes 1..=8 unconditionally, and this used to fall
+            // into the response branch below — where the request's eight-byte track
+            // identifier parses as an attribute count of zero and empties the card (Q29).
+            avrcp::pdu::GET_ELEMENT_ATTRIBUTES if !frame.ctype.is_response() => {
+                let requested = avrcp::parse_attribute_request(&vendor.parameters)
+                    .unwrap_or_else(|_| avrcp::attribute::ALL.to_vec());
+                debug!(?requested, "bluetooth: a peer is asking us what is playing");
+                let response = avrcp::element_attributes_response(&link.now_playing, &requested);
+                out.replies.push((
+                    cid,
+                    AvctpMessage::response(&msg, response.encode()).encode(),
+                ));
+            }
+            avrcp::pdu::GET_ELEMENT_ATTRIBUTES
+                if frame.ctype.is_response() && !frame.ctype.is_failure() =>
+            {
                 if let Ok(parsed) = avrcp::parse_element_attributes(&vendor.parameters) {
                     let changed = !parsed.now_playing.is_same_item(&link.now_playing);
                     // GetElementAttributes carries no play state, so its default would

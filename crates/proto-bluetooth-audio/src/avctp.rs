@@ -172,6 +172,19 @@ impl Ctype {
     pub const fn is_failure(self) -> bool {
         matches!(self, Self::Rejected | Self::NotImplemented)
     }
+
+    /// Whether this frame is a response rather than a command.
+    ///
+    /// AV/C splits the four-bit field down the middle — `0x0..=0x7` are command types,
+    /// `0x8..=0xF` are response codes — which makes this the reliable discriminator even
+    /// when a peer is careless with AVCTP's own command/response bit. It matters because
+    /// the two directions share a PDU id: a head unit's `GetElementAttributes` *command*
+    /// read as a response parses its eight-byte track identifier as an attribute count of
+    /// zero, and quietly empties the now-playing card.
+    #[must_use]
+    pub const fn is_response(self) -> bool {
+        self.bits() >= 0x8
+    }
 }
 
 /// AV/C opcodes.
@@ -302,6 +315,26 @@ mod tests {
     fn ctypes_round_trip_including_ones_we_do_not_name() {
         for raw in 0u8..16 {
             assert_eq!(Ctype::from_bits(raw).bits(), raw);
+        }
+    }
+
+    #[test]
+    fn the_top_bit_of_the_ctype_separates_commands_from_responses() {
+        // The two directions share a PDU id, so this is what tells them apart. Reading a
+        // GetElementAttributes *command* as a response parses its eight-byte track
+        // identifier as an attribute count of zero and empties the card.
+        for command in [Ctype::Control, Ctype::Status, Ctype::Notify] {
+            assert!(!command.is_response(), "{command:?}");
+        }
+        for response in [
+            Ctype::NotImplemented,
+            Ctype::Accepted,
+            Ctype::Rejected,
+            Ctype::Stable,
+            Ctype::Changed,
+            Ctype::Interim,
+        ] {
+            assert!(response.is_response(), "{response:?}");
         }
     }
 }

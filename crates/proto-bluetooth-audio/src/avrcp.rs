@@ -235,6 +235,98 @@ pub fn get_element_attributes(attributes: &[u32]) -> AvcFrame {
     vendor_command(Ctype::Status, pdu::GET_ELEMENT_ATTRIBUTES, &params)
 }
 
+/// The attribute ids an inbound `GetElementAttributes` command asked for.
+///
+/// An empty list in the request means *every* attribute — a zero count is "all", not
+/// "none", and reading it the other way answers a head unit with a blank card.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if the parameters are shorter than the identifier and count
+/// they declare.
+pub fn parse_attribute_request(params: &[u8]) -> Result<Vec<u32>, AudioError> {
+    if params.len() < 9 {
+        return Err(AudioError::Truncated {
+            what: "get element attributes request",
+            need: 9,
+            have: params.len(),
+        });
+    }
+    let count = usize::from(params[8]);
+    if count == 0 {
+        return Ok(attribute::ALL.to_vec());
+    }
+    if params.len() < 9 + count * 4 {
+        return Err(AudioError::Truncated {
+            what: "get element attributes request ids",
+            need: 9 + count * 4,
+            have: params.len(),
+        });
+    }
+    Ok((0..count)
+        .map(|i| {
+            let at = 9 + i * 4;
+            u32::from_be_bytes([params[at], params[at + 1], params[at + 2], params[at + 3]])
+        })
+        .collect())
+}
+
+/// The most a metadata response may occupy, so it fits one AVCTP packet.
+///
+/// AVRCP can fragment a response across packets, and we do not — so the list is truncated
+/// rather than overflowed. A card missing its genre beats a response the peer drops.
+const MAX_RESPONSE_PARAMETERS: usize = 450;
+
+/// Answer an inbound `GetElementAttributes`, supplying what we know and skipping what we
+/// do not.
+///
+/// **Skipping, not rejecting.** Real GM and Hyundai-Kia head units enumerate attributes
+/// 1..=8 unconditionally, so refusing the whole PDU because attribute 8 is in the list —
+/// or because some id is unknown — loses the metadata for every attribute that *was*
+/// askable. Attribute 8 is one we never supply: we hold an image handle for the peer's
+/// image server, which is meaningless as a handle on ours.
+#[must_use]
+pub fn element_attributes_response(now: &NowPlaying, requested: &[u32]) -> AvcFrame {
+    let track = now.track.map(|(number, _)| number);
+    let total = now.track.and_then(|(_, total)| total);
+    let mut values: Vec<(u32, String)> = Vec::with_capacity(requested.len());
+    for id in requested {
+        let value = match *id {
+            attribute::TITLE => now.title.clone(),
+            attribute::ARTIST => now.artist.clone(),
+            attribute::ALBUM => now.album.clone(),
+            attribute::GENRE => now.genre.clone(),
+            attribute::TRACK_NUMBER => track.map(|n| n.to_string()),
+            attribute::TOTAL_TRACKS => total.map(|n| n.to_string()),
+            // Every numeric attribute in AVRCP is a decimal *string*, milliseconds
+            // included.
+            attribute::PLAYING_TIME => now
+                .duration
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).to_string()),
+            // Attribute 8 and anything we do not model: skipped, not refused.
+            _ => None,
+        };
+        if let Some(value) = value {
+            values.push((*id, value));
+        }
+    }
+
+    let mut params = BytesMut::with_capacity(64);
+    params.put_u8(0); // count, filled in once the list is known to fit
+    let mut written = 0u8;
+    for (id, value) in values {
+        if params.len() + 8 + value.len() > MAX_RESPONSE_PARAMETERS || written == u8::MAX {
+            break;
+        }
+        params.put_u32(id);
+        params.put_u16(106); // UTF-8
+        params.put_u16(u16::try_from(value.len()).unwrap_or(u16::MAX));
+        params.extend_from_slice(value.as_bytes());
+        written += 1;
+    }
+    params[0] = written;
+    vendor_command(Ctype::Stable, pdu::GET_ELEMENT_ATTRIBUTES, &params)
+}
+
 /// Build a `RegisterNotification` command.
 #[must_use]
 pub fn register_notification(event_id: u8, interval_secs: u32) -> AvcFrame {
@@ -563,6 +655,77 @@ mod tests {
     fn the_attribute_request_asks_for_cover_art() {
         // Omitting attribute 8 from the request is a silent way to never get artwork.
         assert!(attribute::ALL.contains(&attribute::COVER_ART_HANDLE));
+    }
+
+    #[test]
+    fn an_inbound_request_for_every_attribute_is_answered_with_what_we_have() {
+        // Real GM and Hyundai-Kia head units enumerate 1..=8 unconditionally. Refusing
+        // the PDU because attribute 8 is in the list loses the metadata for the seven
+        // attributes that *were* askable, so unknown ids are skipped instead.
+        let mut now = NowPlaying::default();
+        now.title = Some("Derezzed".into());
+        now.artist = Some("Daft Punk".into());
+        now.duration = Some(Duration::from_millis(104_000));
+        now.track = Some((7, Some(22)));
+        let request = get_element_attributes(&attribute::ALL);
+        let requested =
+            parse_attribute_request(&VendorPdu::parse(&request.operands).unwrap().parameters)
+                .unwrap();
+        assert_eq!(requested.len(), 8);
+
+        let response = element_attributes_response(&now, &requested);
+        assert_eq!(response.ctype, Ctype::Stable);
+        let parsed =
+            parse_element_attributes(&VendorPdu::parse(&response.operands).unwrap().parameters)
+                .unwrap();
+        assert_eq!(parsed.now_playing.title.as_deref(), Some("Derezzed"));
+        assert_eq!(parsed.now_playing.artist.as_deref(), Some("Daft Punk"));
+        assert_eq!(parsed.now_playing.track, Some((7, Some(22))));
+        assert_eq!(
+            parsed.now_playing.duration,
+            Some(Duration::from_millis(104_000))
+        );
+        assert!(
+            parsed.cover_art_handle.is_none(),
+            "attribute 8 is a handle on someone else's image server; we have none to give"
+        );
+        assert_eq!(parsed.now_playing.album, None, "and nothing is invented");
+    }
+
+    #[test]
+    fn a_zero_count_in_a_request_means_every_attribute_not_none() {
+        // Reading it the other way answers a head unit with a blank card and no error.
+        let mut params = Vec::new();
+        params.put_u64(0); // track identifier
+        params.push(0); // count
+        assert_eq!(
+            parse_attribute_request(&params).unwrap(),
+            attribute::ALL.to_vec()
+        );
+    }
+
+    #[test]
+    fn an_attribute_we_cannot_supply_is_omitted_rather_than_sent_empty() {
+        let mut now = NowPlaying::default();
+        now.title = Some("x".into());
+        let response = element_attributes_response(&now, &[attribute::ARTIST, attribute::TITLE]);
+        let params = VendorPdu::parse(&response.operands).unwrap().parameters;
+        assert_eq!(params[0], 1, "one attribute, not two with a blank");
+    }
+
+    #[test]
+    fn a_truncated_inbound_request_is_refused_rather_than_read_as_zero_attributes() {
+        assert!(matches!(
+            parse_attribute_request(&[0, 0, 0]),
+            Err(AudioError::Truncated { .. })
+        ));
+        let mut short = Vec::new();
+        short.put_u64(0);
+        short.push(4); // claims four ids and carries none
+        assert!(matches!(
+            parse_attribute_request(&short),
+            Err(AudioError::Truncated { .. })
+        ));
     }
 
     #[test]
