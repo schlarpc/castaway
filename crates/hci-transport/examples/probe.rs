@@ -115,7 +115,10 @@ async fn expect_complete(
     opcode: substrate_hci::OpCode,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     for _ in 0..64 {
-        let HciPacket::Event { code, params } = transport.recv().await? else {
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(5), transport.recv())
+            .await
+            .map_err(|_| format!("timed out waiting for {opcode}"))??;
+        let HciPacket::Event { code, params } = packet else {
             continue;
         };
         if let substrate_hci::Event::CommandComplete {

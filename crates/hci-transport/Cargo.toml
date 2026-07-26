@@ -14,7 +14,7 @@ thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 # Pure-Rust USB, so the transport needs no libusb and no unsafe. Same code drives a
 # dongle on Linux and a WinUSB-bound one on Windows.
 nusb = { version = "0.1", optional = true }

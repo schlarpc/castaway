@@ -165,12 +165,19 @@ async fn download(hci: &dyn HciTransport, payload: &[u8]) -> Result<(), Transpor
     Ok(())
 }
 
+/// How long to wait for a controller to answer. See the note in `intel.rs`: bounding
+/// iterations without bounding time leaves a wedged part hanging on the first pass.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Send a command and wait for its completion.
 async fn send(hci: &dyn HciTransport, command: Command) -> Result<Vec<u8>, TransportError> {
     let opcode = command.opcode();
     hci.send(command.encode()?).await?;
     for _ in 0..64 {
-        let HciPacket::Event { code, params } = hci.recv().await? else {
+        let packet = tokio::time::timeout(COMMAND_TIMEOUT, hci.recv())
+            .await
+            .map_err(|_| TransportError::Timeout("realtek command completion"))??;
+        let HciPacket::Event { code, params } = packet else {
             continue;
         };
         let event = substrate_hci::Event::parse(code, &params)?;

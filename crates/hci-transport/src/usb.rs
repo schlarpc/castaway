@@ -16,7 +16,7 @@
 //! [`substrate_hci::HciPacket::decode_body`] exists — the type comes from context here,
 //! and from a leading byte everywhere else.
 
-use nusb::transfer::{ControlOut, ControlType, Recipient, RequestBuffer};
+use nusb::transfer::{ControlOut, ControlType, Queue, Recipient, RequestBuffer};
 use nusb::{Device, DeviceInfo, Interface};
 use substrate_hci::{HciError, HciPacket, HciTransport, PacketType};
 use tokio::sync::Mutex;
@@ -50,16 +50,34 @@ pub struct UsbTransport {
     _device: Device,
 }
 
-/// Which endpoint to poll next.
+/// Both IN endpoints, kept armed at once.
 ///
-/// Events and ACL arrive on separate endpoints with no ordering between them, so the
-/// reader alternates rather than draining one — an ACL flood must not starve the events
-/// that carry disconnections and flow-control credits.
-#[derive(Debug, Default)]
+/// Events and ACL arrive on separate endpoints with no ordering between them and no way
+/// to know which will speak next. **Reading one at a time blocks forever on whichever is
+/// idle** — which is most of the time, because a controller sitting there with no
+/// connection sends events and no ACL at all. Keeping a transfer in flight on each and
+/// taking whichever completes is the only arrangement that works; an earlier version
+/// alternated, and hung on the first real controller it met.
 struct Reader {
-    prefer_acl: bool,
+    events: Queue<RequestBuffer>,
+    acl: Queue<RequestBuffer>,
     /// Packets already read but not yet returned, so one transfer can yield several.
     queued: std::collections::VecDeque<HciPacket>,
+}
+
+impl Reader {
+    /// Arm both endpoints.
+    fn new(interface: &Interface) -> Self {
+        let mut events = interface.interrupt_in_queue(EP_EVENT_IN);
+        let mut acl = interface.bulk_in_queue(EP_ACL_IN);
+        events.submit(RequestBuffer::new(EVENT_BUF));
+        acl.submit(RequestBuffer::new(ACL_BUF));
+        Self {
+            events,
+            acl,
+            queued: std::collections::VecDeque::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for UsbTransport {
@@ -139,10 +157,11 @@ impl UsbTransport {
                 detail: claim_hint(&e.to_string()),
             })?;
         info!(%id, "opened bluetooth controller over USB");
+        let reader = Reader::new(&interface);
         Ok(Self {
             interface,
             id,
-            reader: Mutex::new(Reader::default()),
+            reader: Mutex::new(reader),
             _device: device,
         })
     }
@@ -237,28 +256,23 @@ impl HciTransport for UsbTransport {
                 return Ok(packet);
             }
 
-            // Alternate endpoints. Draining ACL first under load would starve the events
-            // carrying disconnections and flow-control credits, which presents as a
-            // session that never ends and a link that slowly stops sending.
-            reader.prefer_acl = !reader.prefer_acl;
-            let (endpoint, size, kind) = if reader.prefer_acl {
-                (EP_ACL_IN, ACL_BUF, PacketType::AclData)
-            } else {
-                (EP_EVENT_IN, EVENT_BUF, PacketType::Event)
-            };
-
-            let data = if kind == PacketType::Event {
-                self.interface
-                    .interrupt_in(endpoint, RequestBuffer::new(size))
-                    .await
-                    .into_result()
-                    .map_err(|e| HciError::Transport(format!("interrupt in: {e}")))?
-            } else {
-                self.interface
-                    .bulk_in(endpoint, RequestBuffer::new(size))
-                    .await
-                    .into_result()
-                    .map_err(|e| HciError::Transport(format!("bulk in: {e}")))?
+            // Await *both* endpoints. Taking them in turn blocks on whichever is idle,
+            // and an idle controller sends events and no ACL whatsoever — which is
+            // exactly how this hung the first time it met real hardware.
+            let reader = &mut *reader;
+            let (kind, data) = tokio::select! {
+                completion = reader.events.next_complete() => {
+                    let data = completion.into_result()
+                        .map_err(|e| HciError::Transport(format!("interrupt in: {e}")))?;
+                    reader.events.submit(RequestBuffer::new(EVENT_BUF));
+                    (PacketType::Event, data)
+                }
+                completion = reader.acl.next_complete() => {
+                    let data = completion.into_result()
+                        .map_err(|e| HciError::Transport(format!("bulk in: {e}")))?;
+                    reader.acl.submit(RequestBuffer::new(ACL_BUF));
+                    (PacketType::AclData, data)
+                }
             };
 
             if data.is_empty() {

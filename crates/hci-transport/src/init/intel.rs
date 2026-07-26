@@ -32,12 +32,39 @@ const READ_VERSION_TLV: u8 = 0xFF;
 /// TLV type carrying which image the controller is currently running.
 const TLV_IMAGE_TYPE: u8 = 0x1C;
 
-/// Image type values.
-mod image {
+/// Image type values in a *TLV* response.
+mod tlv_image {
     /// Running the bootloader: firmware is needed.
     pub const BOOTLOADER: u8 = 0x01;
     /// Running operational firmware already: nothing to do.
     pub const OPERATIONAL: u8 = 0x03;
+}
+
+/// `fw_variant` values in a *legacy* response, which mean the same thing with different
+/// numbers. Two encodings for one fact is exactly the sort of thing that gets assumed
+/// away.
+mod legacy_variant {
+    /// Bootloader.
+    pub const BOOTLOADER: u8 = 0x06;
+    /// Operational firmware.
+    pub const OPERATIONAL: u8 = 0x23;
+}
+
+/// Length of the legacy fixed-struct version response, once the status byte is stripped.
+const LEGACY_VERSION_LEN: usize = 9;
+/// Offset of `fw_variant` within it.
+const LEGACY_FW_VARIANT: usize = 3;
+
+/// Which image a controller is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunningImage {
+    /// In the bootloader, waiting for firmware.
+    Bootloader,
+    /// Already running operational firmware; there is nothing to upload.
+    Operational,
+    /// The response was a shape we do not recognise.
+    Unknown,
 }
 
 /// Secure-send fragment types, in the order `btintel` sends them.
@@ -113,20 +140,22 @@ impl ControllerInit for IntelInit {
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
         let version = read_version(hci).await?;
+        debug!(tlv = ?hex(&version), "intel version response");
 
-        match image_type(&version) {
-            Some(image::OPERATIONAL) => {
-                // A warm reboot leaves the part running its firmware already. Uploading
-                // again is neither possible nor needed, and treating this as an error
-                // would make every second start fail.
+        match running_image(&version) {
+            RunningImage::Operational => {
+                // A warm reboot — or a kernel that already initialised the part before we
+                // took it — leaves operational firmware in place. Uploading again is not
+                // merely unnecessary: the controller refuses every Secure_Send with
+                // "command disallowed", which is how this was discovered.
                 info!("intel controller already running operational firmware");
                 return Ok(());
             }
-            Some(image::BOOTLOADER) | None => {}
-            Some(other) => {
+            RunningImage::Bootloader => {}
+            RunningImage::Unknown => {
                 return Err(TransportError::Controller {
                     what: "intel read_version",
-                    detail: format!("unknown image type {other:#04x}"),
+                    detail: format!("unrecognised version response: {}", hex(&version)),
                 })
             }
         }
@@ -169,6 +198,14 @@ async fn send(hci: &dyn HciTransport, command: Command) -> Result<Vec<u8>, Trans
     wait_for_complete(hci, opcode).await
 }
 
+/// How long to wait for a controller to answer one command.
+///
+/// A bound on *iterations* is worthless without one on time: `recv` blocks until
+/// something arrives, so a wedged controller that answers nothing would hang the loop on
+/// its first pass rather than spinning through it. Firmware upload has no other failure
+/// mode, and hanging is the worst one — it looks like the loader is working.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Wait for the command-complete matching `opcode`.
 ///
 /// Vendor events and unrelated completions are skipped rather than treated as the
@@ -178,7 +215,9 @@ async fn wait_for_complete(
     opcode: OpCode,
 ) -> Result<Vec<u8>, TransportError> {
     for _ in 0..64 {
-        let packet = hci.recv().await?;
+        let packet = tokio::time::timeout(COMMAND_TIMEOUT, hci.recv())
+            .await
+            .map_err(|_| TransportError::Timeout("intel command completion"))??;
         let HciPacket::Event { code, params } = packet else {
             continue;
         };
@@ -230,24 +269,56 @@ async fn read_version(hci: &dyn HciTransport) -> Result<Vec<u8>, TransportError>
     .await
 }
 
-/// Find the image-type TLV in a version response.
+/// Hex for logging a raw response.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Work out which image a controller is running, from either response shape.
 ///
-/// TLVs are `type, length, value…`. Walking them properly matters because the block's
-/// contents vary by part, and indexing at a fixed offset reads a different field on the
-/// next generation.
+/// **Both shapes exist and this was found the hard way.** `Read_Version` with the `0xFF`
+/// parameter is supposed to return a TLV list, but an AX200 already running operational
+/// firmware answers the *legacy* fixed struct and ignores the parameter — nine bytes
+/// beginning `37 14`. Parsing that as TLVs finds no image-type entry, concludes
+/// "bootloader", and cheerfully tries to upload firmware to a part that then refuses
+/// every `Secure_Send` with "command disallowed".
+///
+/// The two encodings disagree on the numbers as well as the layout: a TLV says `0x03`
+/// for operational, the legacy struct says `0x23`.
 #[must_use]
-pub fn image_type(tlv: &[u8]) -> Option<u8> {
-    let mut rest = tlv;
+pub fn running_image(response: &[u8]) -> RunningImage {
+    // The legacy struct is a fixed nine bytes and starts with the Intel hardware
+    // platform id, which is always 0x37. A TLV list starts with a type byte, and no
+    // type we care about is 0x37 — so the two are told apart without guessing.
+    if response.len() == LEGACY_VERSION_LEN && response.first() == Some(&0x37) {
+        return match response.get(LEGACY_FW_VARIANT) {
+            Some(&legacy_variant::BOOTLOADER) => RunningImage::Bootloader,
+            Some(&legacy_variant::OPERATIONAL) => RunningImage::Operational,
+            _ => RunningImage::Unknown,
+        };
+    }
+
+    let mut rest = response;
     while rest.len() >= 2 {
         let kind = rest[0];
         let len = usize::from(rest[1]);
-        let value = rest.get(2..2 + len)?;
+        let Some(value) = rest.get(2..2 + len) else {
+            break;
+        };
         if kind == TLV_IMAGE_TYPE {
-            return value.first().copied();
+            return match value.first() {
+                Some(&tlv_image::BOOTLOADER) => RunningImage::Bootloader,
+                Some(&tlv_image::OPERATIONAL) => RunningImage::Operational,
+                _ => RunningImage::Unknown,
+            };
         }
         rest = &rest[2 + len..];
     }
-    None
+    RunningImage::Unknown
 }
 
 /// The four transfers a `.sfi` is split into, in the order secure boot requires them.
@@ -401,6 +472,12 @@ mod tests {
         })
     }
 
+    /// The **real** `Read_Version` response from the AX200 in this dev box, captured
+    /// 2026-07-25 while it was running operational firmware. Nine bytes, legacy layout,
+    /// despite the request carrying the 0xFF parameter that asks for TLVs (ground rule 6:
+    /// land the finding as a fixture rather than a memory).
+    const AX200_OPERATIONAL: [u8; 9] = [0x37, 0x14, 0x00, 0x23, 0x00, 0xfa, 0x11, 0x14, 0x00];
+
     /// A TLV block reporting `image`.
     fn version_tlv(image: u8) -> Vec<u8> {
         vec![
@@ -444,19 +521,65 @@ mod tests {
     }
 
     #[test]
+    fn a_real_ax200_answers_the_legacy_layout_not_tlvs() {
+        // Found on hardware, not by reading: an AX200 already running operational
+        // firmware ignores the 0xFF parameter and returns the nine-byte legacy struct.
+        // Parsing that as TLVs finds no image-type entry, concludes "bootloader", and
+        // uploads firmware to a part that refuses every Secure_Send with "command
+        // disallowed" — which is precisely what happened.
+        assert_eq!(running_image(&AX200_OPERATIONAL), RunningImage::Operational);
+    }
+
+    #[test]
+    fn the_legacy_and_tlv_encodings_disagree_on_the_numbers_too() {
+        // Operational is 0x23 in the legacy struct and 0x03 in a TLV. Sharing one
+        // constant between them would make one of the two silently wrong.
+        let mut legacy_bootloader = AX200_OPERATIONAL;
+        legacy_bootloader[LEGACY_FW_VARIANT] = legacy_variant::BOOTLOADER;
+        assert_eq!(running_image(&legacy_bootloader), RunningImage::Bootloader);
+
+        assert_eq!(
+            running_image(&version_tlv(tlv_image::OPERATIONAL)),
+            RunningImage::Operational
+        );
+        assert_eq!(
+            running_image(&version_tlv(tlv_image::BOOTLOADER)),
+            RunningImage::Bootloader
+        );
+    }
+
+    #[test]
     fn the_image_type_tlv_is_found_by_walking_not_by_offset() {
         // TLV contents vary by part, so a fixed offset reads a different field on the
         // next generation — which would silently mean "already operational" and skip
         // the upload entirely.
-        assert_eq!(image_type(&version_tlv(image::BOOTLOADER)), Some(0x01));
-        assert_eq!(image_type(&version_tlv(image::OPERATIONAL)), Some(0x03));
-        assert_eq!(image_type(&[]), None);
-        assert_eq!(image_type(&[0x01, 0x02, 0xAA, 0xBB]), None);
+        assert_eq!(
+            running_image(&version_tlv(tlv_image::BOOTLOADER)),
+            RunningImage::Bootloader
+        );
+        assert_eq!(running_image(&[]), RunningImage::Unknown);
+        assert_eq!(
+            running_image(&[0x01, 0x02, 0xAA, 0xBB]),
+            RunningImage::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_response_is_refused_rather_than_assumed_to_be_a_bootloader() {
+        // The original bug in one line: treating "I could not tell" as "needs firmware"
+        // is what turned a readable state into a wedged upload.
+        assert_eq!(
+            running_image(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            RunningImage::Unknown
+        );
     }
 
     #[test]
     fn a_truncated_tlv_does_not_panic() {
-        assert_eq!(image_type(&[TLV_IMAGE_TYPE, 0x04, 0x01]), None);
+        assert_eq!(
+            running_image(&[TLV_IMAGE_TYPE, 0x04, 0x01]),
+            RunningImage::Unknown
+        );
     }
 
     #[test]
@@ -506,7 +629,7 @@ mod tests {
         // Order is fixed by the protocol. Out of order the controller rejects — the good
         // case; the bad case is a part that accepts a partial upload and boots an image
         // that half-works.
-        let transport = controller(version_tlv(image::BOOTLOADER));
+        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
         IntelInit::default()
             .init(&transport, &firmware_with(sfi(&command_block(8))))
             .await
@@ -535,7 +658,7 @@ mod tests {
     async fn fragments_respect_the_single_byte_parameter_length() {
         // A 256-byte key cannot go in one command: the parameter length field is one
         // byte and the fragment type eats one of them.
-        let transport = controller(version_tlv(image::BOOTLOADER));
+        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
         IntelInit::default()
             .init(&transport, &firmware_with(sfi(&command_block(0))))
             .await
@@ -558,7 +681,7 @@ mod tests {
     async fn an_already_operational_controller_is_left_alone() {
         // A warm reboot leaves the part running its firmware. Re-uploading is neither
         // possible nor needed, and erroring here would make every second start fail.
-        let transport = controller(version_tlv(image::OPERATIONAL));
+        let transport = controller(version_tlv(tlv_image::OPERATIONAL));
         IntelInit::default()
             .init(&transport, &FirmwareSet::new())
             .await
@@ -572,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_image_fails_before_the_upload_starts() {
-        let transport = controller(version_tlv(image::BOOTLOADER));
+        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
         let err = IntelInit::default()
             .init(&transport, &FirmwareSet::new())
             .await
@@ -583,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_reset_comes_after_the_firmware_and_not_before() {
-        let transport = controller(version_tlv(image::BOOTLOADER));
+        let transport = controller(version_tlv(tlv_image::BOOTLOADER));
         IntelInit::default()
             .init(&transport, &firmware_with(sfi(&command_block(2))))
             .await
