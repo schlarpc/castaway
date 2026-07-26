@@ -48,6 +48,15 @@ receiver's journal, so the event is proven to cross adapter → session manager 
 - **mDNS**: `_spotify-connect._tcp`, `_googlecast._tcp`, `_airplay._tcp`, and `_raop._tcp`
   are all browsable from the sender with the ports that actually answered.
 
+## Which package to run
+- `packages.default` — portable, no renderer, no browser. Serves and discovers; **cannot**
+  play YouTube, and honestly declines to advertise DIAL (D27). What CI builds.
+- `packages.castaway-cef` — the Linux kiosk: render pipeline + CEF browser, wrapped with
+  `CEF_PATH`/`LD_LIBRARY_PATH` so it runs outside the devShell. **This is the one to deploy
+  on Linux** (`services.castaway.package`). Verified 2026-07-26: built from the flake, run
+  headless on Xvfb, and passed both `yt-selfplay` modes with real video composited at 4K.
+- `packages.castaway-windows-cef` — the Windows deploy artifact, cross-compiled.
+
 ## A YouTube cast, with no phone (`nix run .#yt-selfplay -- http://<receiver>:8080`)
 The one path a VM test cannot cover: YouTube's Lounge servers are a third party to the
 session, so this needs the real internet and a running `--features cef` receiver. It is a

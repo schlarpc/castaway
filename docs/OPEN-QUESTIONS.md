@@ -187,23 +187,26 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   blocks ad *requests*, not the ad segments the player itself serves, so a pre-roll ran before
   a queued video. That is the arms race this bullet predicted; skipping it is a separate
   mechanism from request blocking.
-- **Q32 — a Linux package with the browser in it.** Confirmed on the bench 2026-07-26 (see
-  below): a build without `--features cef` cannot play YouTube at all, and now says so instead
-  of pretending. But `packages.default` — which is what `services.castaway` deploys and what
-  `nix run` gives you — *is* that build, and there is no Linux `castaway-cef` package to reach
-  for; only `cargo build --features cef` inside the devShell. The Windows side already ships
-  `castaway-windows-cef`. Default: add a Linux `castaway-cef` package (cefDist + `CEF_PATH` +
-  the runtime library path, mirroring the devShell) and a module option to select it, so the
-  deployed thing and the thing that can play YouTube are the same thing. Not done here because
-  it changes what the deploy ships.
-- **Q33 — the leanback page's storage is per-launch.** The page generates a fresh screen id on
-  every DIAL launch (`generate_screen_id` seen in the netlog each time), because CEF has no
-  persistent cache path configured. Real TVs keep theirs in localStorage. **Now partly load-
-  bearing:** we publish that id for senders to attach to (D28), and clear it on every launch
-  and stop precisely because it does not survive one. A persistent CEF cache would make the
-  screen stable across launches and reboots, which is what a sender caching an id expects.
-  Nothing observed breaks today — senders re-read the id from the app-info XML — but decide it
-  before someone debugs a phone holding a screen id from last week.
+- ~~**Q32 — a Linux package with the browser in it.**~~ **DONE 2026-07-26.**
+  `packages.castaway-cef` (`nix/linux-cef.nix`) is the Linux kiosk build: `--features cef`,
+  built against the same flattened `cefDist` the devShell uses — hoisted to `cefDistFor` so
+  the two cannot drift — and wrapped so `CEF_PATH` and `LD_LIBRARY_PATH` are set at *run*
+  time. Both matter: `Cef::initialize` reads `CEF_PATH` at runtime to find the .pak/ICU/
+  locales, and CEF re-execs the same binary for its subprocesses, so the wrapper has to be
+  what runs. `services.castaway.package` documents it as the choice for a real display.
+  `packages.default` stays the portable, browser-less build — the right thing for CI, and now
+  honest about not offering YouTube (D27).
+- ~~**Q33 — the leanback page's storage is per-launch.**~~ **WITHDRAWN 2026-07-26 — the premise
+  was wrong.** The `generate_screen_id` calls that prompted this were from a *bare Chromium*
+  probe run with a throwaway `--user-data-dir`, not from castaway. The kiosk's CEF profile is
+  already persistent: `Cef::initialize` points `root_cache_path` at a stable
+  `~/.cache/castaway/cef` (deliberately, for exactly this class of reason), and the profile on
+  disk has a real `Default/Local Storage`. Measured directly: the screen id survives a full
+  process restart — two separate runs published the same
+  `f970ef4ce158…`. So the id we publish for senders to attach to (D28) is stable across
+  reboots, and nothing needs changing. Left here as a correction rather than deleted, because
+  "the receiver mints a new screen every launch" is a plausible-sounding claim that would have
+  sent the next person down a hole.
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.
