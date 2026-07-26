@@ -550,6 +550,79 @@ async fn a_dropped_link_gives_its_controller_buffers_back() {
 }
 
 #[tokio::test]
+async fn replies_are_addressed_with_the_peers_channel_id_not_our_own() {
+    // Each end of an L2CAP channel allocates its own identifier, and an outgoing packet
+    // carries the *receiver's*. Reusing the id the inbound event named is invisible for
+    // as long as both ends happen to pick the same number — which BlueZ does, because it
+    // allocates from 0x0040 exactly like we do. An iPhone does not, and every reply we
+    // sent addressed a channel it had never heard of: it waited for an answer that never
+    // came, timed out after seven seconds, and hung up before ever trying to pair.
+    //
+    // The phone's id here is deliberately far from ours so the two cannot coincide.
+    const PHONE_CID: u16 = 0x00F1;
+    let (transport, _rx) = connected().await;
+    let (ours, theirs) = open_channel(&transport, Psm::SDP, PHONE_CID).await;
+    assert_ne!(
+        ours.raw(),
+        theirs.raw(),
+        "the test is worthless unless the two ends disagree about the id"
+    );
+
+    let before = sent_pdus(&transport).len();
+    let request = substrate_sdp::SdpRequest::ServiceSearchAttribute {
+        tid: 7,
+        patterns: vec![substrate_sdp::Uuid::AUDIO_SINK],
+        max_bytes: 672,
+        attributes: vec![substrate_sdp::AttributeRange::Range(0x0000, 0xFFFF)],
+        cont: substrate_sdp::Continuation::none(),
+    };
+    push_pdu(&transport, &L2capPdu::new(ours, request.encode()));
+
+    let reply = eventually("the sdp reply", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .find(|pdu| substrate_sdp::SdpResponse::decode(&pdu.payload).is_ok())
+    })
+    .await;
+    assert_eq!(
+        reply.cid.raw(),
+        PHONE_CID,
+        "a reply must carry the peer's channel id; ours means the peer never sees it"
+    );
+}
+
+#[tokio::test]
+async fn avdtp_replies_also_use_the_peers_channel_id() {
+    // Same bug, the path that actually carries audio: an AVDTP reply sent to our own id
+    // means the sender never learns what we support and the stream never starts.
+    const PHONE_CID: u16 = 0x00E7;
+    let (transport, _rx) = connected().await;
+    let (ours, _) = open_channel(&transport, Psm::AVDTP, PHONE_CID).await;
+
+    let before = sent_pdus(&transport).len();
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            ours,
+            Message::command(1, Signal::Discover, Bytes::new()).encode(),
+        ),
+    );
+    let reply = eventually("the avdtp reply", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .find(|pdu| Message::decode(&pdu.payload).is_ok_and(|m| m.signal == Signal::Discover))
+    })
+    .await;
+    assert_eq!(
+        reply.cid.raw(),
+        PHONE_CID,
+        "an AVDTP reply must reach the peer's channel, not ours"
+    );
+}
+
+#[tokio::test]
 async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
     // The whole point. A phone connects, negotiates aptX, opens a media channel, and
     // pushes packets — and the session manager sees an audio session with real frames.

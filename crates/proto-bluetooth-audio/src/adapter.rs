@@ -233,6 +233,7 @@ impl SourceAdapter for BluetoothAdapter {
                             continue;
                         }
                     };
+                    debug!(?event, "hci event");
                     for action in host.on_event(&event) {
                         match &action {
                             HostAction::Ready {
@@ -272,8 +273,15 @@ impl SourceAdapter for BluetoothAdapter {
                                     }
                                 }
                             }
-                            HostAction::LinkDown { handle, peer, .. } => {
-                                info!(%peer, "bluetooth: link down");
+                            HostAction::LinkDown {
+                                handle,
+                                peer,
+                                reason,
+                            } => {
+                                // The reason separates "authentication failed" from
+                                // "connection timeout" from "the phone walked away".
+                                // Without it every failure reads the same.
+                                info!(%peer, %reason, "bluetooth: link down");
                                 // The controller flushed whatever was queued for this
                                 // handle without ever reporting it complete, so the
                                 // credits have to be taken back by hand.
@@ -374,11 +382,15 @@ impl BluetoothAdapter {
         let Some(link) = link else {
             return Ok(());
         };
-        let mut outbound: Vec<L2capPdu> = Vec::new();
+        // Signalling PDUs the multiplexer built are already addressed to the peer.
+        let mut signalling: Vec<L2capPdu> = Vec::new();
+        // Protocol replies are keyed by *our* channel id — the one the incoming event
+        // named — and the multiplexer maps each to the peer's before it goes out.
+        let mut outbound: Vec<(Cid, Bytes)> = Vec::new();
 
         for event in events {
             match event {
-                L2capEvent::Send(pdu) => outbound.push(pdu),
+                L2capEvent::Send(pdu) => signalling.push(pdu),
 
                 L2capEvent::ChannelOpen { cid, psm, .. } => {
                     if psm == Psm::AVDTP {
@@ -400,14 +412,23 @@ impl BluetoothAdapter {
                         link_sink
                             .emit(SessionEvent::ControlSurface(control))
                             .await?;
-                        Self::spawn_control_writer(handle, cid, rx, acl.clone());
+                        // Resolve the peer's identifier once, here: the writer task
+                        // outlives this borrow and cannot consult the multiplexer later.
+                        let peer_cid = link.mux.channel(cid).map(|c| c.remote_cid);
+                        if let Some(peer_cid) = peer_cid {
+                            Self::spawn_control_writer(handle, peer_cid, rx, acl.clone());
+                        } else {
+                            warn!(%cid, "avctp channel vanished before its writer started");
+                        }
                         // Ask for metadata straight away rather than waiting for a
                         // notification; a track already playing produces no change event.
                         let transaction = link.next_transaction();
-                        outbound.push(avctp_pdu(
+                        outbound.push((
                             cid,
-                            transaction,
-                            &avrcp::get_element_attributes(&avrcp::attribute::ALL),
+                            avctp_body(
+                                transaction,
+                                &avrcp::get_element_attributes(&avrcp::attribute::ALL),
+                            ),
                         ));
                     }
                     debug!(%cid, %psm, "l2cap channel open");
@@ -427,7 +448,15 @@ impl BluetoothAdapter {
 
                 L2capEvent::Data { cid, psm, payload } => {
                     if psm == Psm::SDP {
-                        outbound.push(L2capPdu::new(cid, self.sdp.handle(&payload)));
+                        let response = self.sdp.handle(&payload);
+                        // Both sides in full: an SDP exchange that a peer walks away from
+                        // cannot be diagnosed from our side's opinion of it.
+                        debug!(
+                            request = %hex(&payload),
+                            response = %hex(&response),
+                            "sdp exchange",
+                        );
+                        outbound.push((cid, response));
                     } else if psm == Psm::AVDTP {
                         if Some(cid) == link.avdtp_media {
                             self.on_media(link, payload).await;
@@ -450,8 +479,23 @@ impl BluetoothAdapter {
             }
         }
 
-        for pdu in outbound {
+        for pdu in signalling {
             acl.send(handle, pdu);
+        }
+        // `Multiplexer::send` is the only thing that knows which identifier the peer uses
+        // for a channel. Addressing a reply with our own is invisible whenever both ends
+        // happen to allocate the same number — which BlueZ did, and an iPhone does not.
+        for (cid, payload) in outbound {
+            match link.mux.send(cid, payload) {
+                Ok(events) => {
+                    for event in events {
+                        if let L2capEvent::Send(pdu) = event {
+                            acl.send(handle, pdu);
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, %cid, "dropping a reply we cannot address"),
+            }
         }
         Ok(())
     }
@@ -463,7 +507,7 @@ impl BluetoothAdapter {
         cid: Cid,
         payload: &[u8],
         sink: &SessionSink,
-        outbound: &mut Vec<L2capPdu>,
+        outbound: &mut Vec<(Cid, Bytes)>,
     ) -> Result<(), CoreError> {
         let msg = match Message::decode(payload) {
             Ok(m) => m,
@@ -474,7 +518,7 @@ impl BluetoothAdapter {
         };
         for event in link.sink.handle(&msg) {
             match event {
-                SinkEvent::Reply(reply) => outbound.push(L2capPdu::new(cid, reply.encode())),
+                SinkEvent::Reply(reply) => outbound.push((cid, reply.encode())),
                 SinkEvent::Configured {
                     codec,
                     format,
@@ -556,7 +600,7 @@ impl BluetoothAdapter {
         cid: Cid,
         payload: &[u8],
         sink: &SessionSink,
-        outbound: &mut Vec<L2capPdu>,
+        outbound: &mut Vec<(Cid, Bytes)>,
     ) -> Result<(), CoreError> {
         let Ok(msg) = AvctpMessage::decode(payload) else {
             return Ok(());
@@ -607,7 +651,7 @@ impl BluetoothAdapter {
                         avrcp::pdu::SET_ABSOLUTE_VOLUME,
                         &[raw & 0x7F],
                     );
-                    outbound.push(L2capPdu::new(
+                    outbound.push((
                         cid,
                         AvctpMessage::response(&msg, response.encode()).encode(),
                     ));
@@ -639,12 +683,27 @@ impl BluetoothAdapter {
     }
 }
 
-/// Wrap an AV/C frame in AVCTP and an L2CAP PDU.
-fn avctp_pdu(cid: Cid, transaction: u8, frame: &AvcFrame) -> L2capPdu {
-    L2capPdu::new(
-        cid,
-        AvctpMessage::command(transaction, frame.encode()).encode(),
-    )
+/// Hex for a log line, truncated so a big record does not swamp the journal.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes.iter().take(256) {
+        let _ = write!(out, "{b:02x}");
+    }
+    if bytes.len() > 256 {
+        let _ = write!(out, "…({} bytes)", bytes.len());
+    }
+    out
+}
+
+/// Wrap an AV/C frame in AVCTP, ready for an L2CAP channel.
+fn avctp_body(transaction: u8, frame: &AvcFrame) -> Bytes {
+    AvctpMessage::command(transaction, frame.encode()).encode()
+}
+
+/// Wrap an AV/C frame in AVCTP and an L2CAP PDU addressed to `peer_cid`.
+fn avctp_pdu(peer_cid: Cid, transaction: u8, frame: &AvcFrame) -> L2capPdu {
+    L2capPdu::new(peer_cid, avctp_body(transaction, frame))
 }
 
 /// Re-exported for the adapter's tests and the app's wiring.
