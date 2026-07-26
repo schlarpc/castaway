@@ -404,6 +404,23 @@ Unbinding is **required** to test firmware loading at all, not merely convenient
 never exercise the loader. This is also exactly what Windows does, which is why the unbind
 path is primary on both platforms.
 
+**What the first run proved, and what it did not** (dev box AX200 `8087:0029`,
+2026-07-25). Validated on hardware: enumeration, claiming through `nusb`, commands out on
+the control pipe, events in on interrupt IN, HCI framing, `HCI_Reset`, and reading back
+`E0:D4:E8:A3:C0:8B` — the same address the kernel reports for `hci0`. It also found two
+bugs no scripted test could: the reader blocked forever on whichever IN endpoint was idle
+(a controller with no connection sends events and no ACL at all), and both loaders bounded
+*iterations* over a `recv` that blocks, which is not a bound on anything.
+
+**Still unproven: the secure-boot upload itself.** The part only presents as a bootloader
+before something loads firmware into it, and by the time we can claim it the kernel has
+already done so. A logical re-enumeration (`echo 0 > .../authorized`) does *not* clear it —
+the firmware survives, so the loader correctly reports "already operational" and uploads
+nothing. Testing the upload needs the kernel kept away from it across a real power cycle:
+add `modprobe.blacklist=btusb` to the kernel command line, reboot, and run the probe. Until
+that happens the `Secure_Send` sequencing is verified against `ScriptedTransport` and
+`btintel.c` only.
+
 **Diffing against the kernel.** `btintel.c` is the specification, and the kernel driving
 the same radio is the oracle — the `nix/openscreen-fixtures.nix` pattern that settled
 Q13's IV derivation. Capture the kernel's own bring-up with `btmon -w intel.btsnoop`
