@@ -388,12 +388,57 @@ impl DecodedFrame {
     }
 }
 
+/// A block of already-decoded interleaved audio.
+///
+/// The audio counterpart of [`DecodedFrame`], and it exists for the same reason: some
+/// sources hand over samples rather than a bitstream, and re-encoding them just to run
+/// them back through a decoder would be pure loss. Spotify is the first — librespot owns
+/// the Vorbis decode and normalisation, so what reaches us is PCM (DECISION-LOG D31).
+///
+/// Samples are `f32` in `-1.0..=1.0`, interleaved by channel, because that is what the
+/// output stage already speaks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PcmFrame {
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Channel count.
+    pub channels: u16,
+    /// Interleaved samples in `-1.0..=1.0`.
+    pub samples: Vec<f32>,
+    /// Presentation timestamp from the start of the stream.
+    pub pts: std::time::Duration,
+}
+
+impl PcmFrame {
+    /// How many sample frames (one per channel-group) this block holds.
+    #[must_use]
+    pub fn frame_count(&self) -> usize {
+        self.samples.len() / usize::from(self.channels.max(1))
+    }
+
+    /// How long this block plays for.
+    #[must_use]
+    pub fn duration(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(
+            (self.frame_count() as u64)
+                .saturating_mul(1_000_000_000)
+                .checked_div(u64::from(self.sample_rate.max(1)))
+                .unwrap_or(0),
+        )
+    }
+}
+
 /// How an adapter delivers media to the pipeline.
 ///
-/// The three-way split is load-bearing for cross-platform Miracast: Linux gives us
+/// The split is load-bearing for cross-platform Miracast: Linux gives us
 /// [`FrameSource::Encoded`], Windows `MiracastReceiver` decodes for us and yields
 /// [`FrameSource::Decoded`]. Baking this in from day one means the backend swap is a
 /// new impl, not a core-trait change (ground rule 5).
+///
+/// [`FrameSource::Pcm`] is the audio-only member of that family: an adapter that has
+/// already decoded to samples. Keeping it distinct from [`FrameSource::Decoded`] rather
+/// than widening that variant means the pipeline cannot be handed audio where it expects
+/// pixels, and the `match` that routes them stays exhaustive (ground rule 1).
 #[derive(Debug)]
 pub enum FrameSource {
     /// A URL the pipeline opens with libav itself.
@@ -402,6 +447,9 @@ pub enum FrameSource {
     Encoded(mpsc::Receiver<EncodedFrame>),
     /// The adapter (or the OS) pushes already-decoded frames / GPU surfaces.
     Decoded(mpsc::Receiver<DecodedFrame>),
+    /// The adapter pushes already-decoded audio samples. There is nothing to decode and
+    /// no codec to name — see [`PcmFrame`].
+    Pcm(mpsc::Receiver<PcmFrame>),
 }
 
 #[cfg(test)]

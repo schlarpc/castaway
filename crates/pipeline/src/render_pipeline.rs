@@ -237,18 +237,35 @@ impl Pipeline for RenderPipeline {
     ) -> Result<(), CoreError> {
         #[cfg(feature = "audio")]
         {
-            let FrameSource::Encoded(rx) = source else {
-                return Err(CoreError::Pipeline(
-                    "an audio session must arrive as encoded frames".into(),
-                ));
-            };
             // Preempt first: the flag slot holds whichever session is live, video or
             // audio, because only one source may own the output at a time.
             self.preempt();
             let stop = Arc::new(AtomicBool::new(false));
             self.set_active(Arc::clone(&stop));
-            crate::audio_session::spawn(rx, format, crate::audio_session::default_output(), stop);
-            Ok(())
+            match source {
+                FrameSource::Encoded(rx) => {
+                    crate::audio_session::spawn(
+                        rx,
+                        format,
+                        crate::audio_session::default_output(),
+                        stop,
+                    );
+                    Ok(())
+                }
+                // Already decoded (Spotify): `format` is what the adapter negotiated, but
+                // each block restates it, so the session takes it from the samples.
+                FrameSource::Pcm(rx) => {
+                    crate::audio_session::spawn_pcm(
+                        rx,
+                        crate::audio_session::default_output(),
+                        stop,
+                    );
+                    Ok(())
+                }
+                FrameSource::Url(_) | FrameSource::Decoded(_) => Err(CoreError::Pipeline(
+                    "an audio session must arrive as encoded or PCM frames".into(),
+                )),
+            }
         }
         #[cfg(not(feature = "audio"))]
         {

@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use castaway_core::{AudioCodec, AudioFormat, EncodedFrame};
+use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -125,6 +125,61 @@ pub fn run(
     output.stop();
 }
 
+/// Spawn a PCM playback session on a dedicated thread. The audio-only sibling of
+/// [`spawn`], for adapters that arrive already decoded.
+pub fn spawn_pcm(
+    frames: mpsc::Receiver<PcmFrame>,
+    output: Box<dyn AudioOut>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || run_pcm(frames, output, &stop));
+}
+
+/// Drive one already-decoded audio session to completion. Blocking; call it on its own
+/// thread.
+///
+/// There is no `format` parameter, and that is the whole point of the variant: unlike the
+/// A2DP path — where aptX carries no in-band rate and the negotiated one has to be handed
+/// down separately (Q25) — every [`PcmFrame`] states its own rate and channel count. The
+/// shape cannot disagree with the samples because it travels with them.
+pub fn run_pcm(
+    mut frames: mpsc::Receiver<PcmFrame>,
+    mut output: Box<dyn AudioOut>,
+    stop: &AtomicBool,
+) {
+    // What the output device is currently open as, not what the first block said: a
+    // source may change rate between tracks, and writing 48 kHz samples into a device
+    // opened at 44.1 plays them at the wrong pitch rather than failing.
+    let mut open_as: Option<(u32, u16)> = None;
+
+    while let Some(block) = frames.blocking_recv() {
+        if stop.load(Ordering::Relaxed) {
+            info!("pcm session: preempted");
+            break;
+        }
+        let shape = (block.sample_rate, block.channels);
+        if open_as != Some(shape) {
+            if open_as.is_some() {
+                info!(?open_as, new = ?shape, "pcm session: stream shape changed, reopening");
+                output.stop();
+            }
+            if let Err(e) = output.start(shape.0, shape.1) {
+                warn!(error = %e, rate = shape.0, channels = shape.1,
+                    "pcm session: output refused the stream");
+                break;
+            }
+            info!(rate = shape.0, channels = shape.1, "pcm session: playing");
+            open_as = Some(shape);
+        }
+        if let Err(e) = output.write(&block) {
+            warn!(error = %e, "pcm session: output failed");
+            break;
+        }
+    }
+
+    output.stop();
+}
+
 /// Which codecs this build can actually decode.
 ///
 /// The adapter's endpoint table must be built from this. Advertising a codec we cannot
@@ -147,9 +202,11 @@ pub fn decodable_codecs() -> Vec<AudioCodec> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
+    use crate::error::PipelineError;
 
     fn format() -> AudioFormat {
         AudioFormat::from_hz(44_100, 2).unwrap()
@@ -181,6 +238,144 @@ mod tests {
         drop(tx);
         // Guessing SBC here would decode noise; exiting is the honest answer.
         run(rx, format(), Box::new(NullAudioOut::new()), &running());
+    }
+
+    /// An output that remembers what it was asked to do, so a test can assert on the
+    /// device calls rather than only on "it did not crash".
+    #[derive(Debug, Default)]
+    struct RecordingOut {
+        log: Arc<Mutex<Vec<Call>>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Call {
+        Start(u32, u16),
+        Wrote(usize),
+        Stop,
+    }
+
+    impl crate::audio_out::AudioOut for RecordingOut {
+        fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
+            self.log
+                .lock()
+                .map_err(|_| PipelineError::Audio("poisoned".into()))?
+                .push(Call::Start(sample_rate, channels));
+            Ok(())
+        }
+        fn write(&mut self, block: &crate::audio_decode::PcmBlock) -> Result<(), PipelineError> {
+            self.log
+                .lock()
+                .map_err(|_| PipelineError::Audio("poisoned".into()))?
+                .push(Call::Wrote(block.frame_count()));
+            Ok(())
+        }
+        fn stop(&mut self) {
+            if let Ok(mut log) = self.log.lock() {
+                log.push(Call::Stop);
+            }
+        }
+    }
+
+    fn pcm(sample_rate: u32, channels: u16, frames: usize) -> PcmFrame {
+        PcmFrame {
+            sample_rate,
+            channels,
+            samples: vec![0.0; frames * usize::from(channels)],
+            pts: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_pcm_session_with_no_frames_exits_instead_of_parking() {
+        let (tx, rx) = mpsc::channel::<PcmFrame>(1);
+        drop(tx);
+        run_pcm(rx, Box::new(NullAudioOut::new()), &running());
+    }
+
+    #[test]
+    fn a_pcm_session_opens_the_output_with_the_shape_the_samples_state() {
+        // Nothing hands this session a negotiated format, so if it ever invents one the
+        // stream plays at the wrong pitch — the Q25 failure, arriving by a new route.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel(4);
+        tx.blocking_send(pcm(44_100, 2, 512)).unwrap();
+        tx.blocking_send(pcm(44_100, 2, 256)).unwrap();
+        drop(tx);
+
+        run_pcm(
+            rx,
+            Box::new(RecordingOut {
+                log: Arc::clone(&log),
+            }),
+            &running(),
+        );
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                Call::Start(44_100, 2),
+                Call::Wrote(512),
+                Call::Wrote(256),
+                Call::Stop
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pcm_session_reopens_the_output_when_the_stream_shape_changes() {
+        // Writing 48 kHz samples into a device opened at 44.1 does not fail, it plays
+        // everything sharp — so the reopen has to be driven by the samples themselves.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel(4);
+        tx.blocking_send(pcm(44_100, 2, 128)).unwrap();
+        tx.blocking_send(pcm(48_000, 2, 128)).unwrap();
+        drop(tx);
+
+        run_pcm(
+            rx,
+            Box::new(RecordingOut {
+                log: Arc::clone(&log),
+            }),
+            &running(),
+        );
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                Call::Start(44_100, 2),
+                Call::Wrote(128),
+                Call::Stop,
+                Call::Start(48_000, 2),
+                Call::Wrote(128),
+                Call::Stop
+            ]
+        );
+    }
+
+    #[test]
+    fn a_preempted_pcm_session_stops_without_draining_the_rest() {
+        // The second source has already taken the output device; this one must let go.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel(4);
+        for _ in 0..3 {
+            tx.blocking_send(pcm(44_100, 2, 64)).unwrap();
+        }
+        drop(tx);
+        let stop = Arc::new(AtomicBool::new(true));
+
+        run_pcm(
+            rx,
+            Box::new(RecordingOut {
+                log: Arc::clone(&log),
+            }),
+            &stop,
+        );
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![Call::Stop],
+            "wrote after preemption"
+        );
     }
 
     #[test]

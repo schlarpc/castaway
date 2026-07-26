@@ -58,6 +58,20 @@ impl NullPipeline {
                     info!(frames = n, "null pipeline: decoded {label} source ended");
                 });
             }
+            FrameSource::Pcm(mut rx) => {
+                tokio::spawn(async move {
+                    // Count sample frames rather than blocks: block size is a property of
+                    // whoever produced them, so "3140 blocks" says nothing about whether
+                    // the right amount of audio arrived, and this is the number a silent
+                    // session gets diagnosed with.
+                    let (mut blocks, mut frames) = (0u64, 0u64);
+                    while let Some(pcm) = rx.recv().await {
+                        blocks += 1;
+                        frames += pcm.frame_count() as u64;
+                    }
+                    info!(blocks, frames, "null pipeline: pcm {label} source ended");
+                });
+            }
         }
     }
 }

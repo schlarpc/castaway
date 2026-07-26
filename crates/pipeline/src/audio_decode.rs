@@ -38,36 +38,15 @@ fn map_err(e: ffmpeg::Error) -> PipelineError {
 }
 
 /// A block of decoded audio.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PcmBlock {
-    /// Sample rate in Hz.
-    pub sample_rate: u32,
-    /// Channel count.
-    pub channels: u16,
-    /// Interleaved samples in `-1.0..=1.0`.
-    pub samples: Vec<f32>,
-    /// Presentation timestamp carried through from the encoded frame.
-    pub pts: Duration,
-}
-
-impl PcmBlock {
-    /// How many sample frames (one per channel-group) this block holds.
-    #[must_use]
-    pub fn frame_count(&self) -> usize {
-        self.samples.len() / usize::from(self.channels.max(1))
-    }
-
-    /// How long this block plays for.
-    #[must_use]
-    pub fn duration(&self) -> Duration {
-        Duration::from_nanos(
-            (self.frame_count() as u64)
-                .saturating_mul(1_000_000_000)
-                .checked_div(u64::from(self.sample_rate.max(1)))
-                .unwrap_or(0),
-        )
-    }
-}
+///
+/// The type lives in `core` as [`PcmFrame`] because it is no longer only a decoder
+/// output: an adapter can hand the pipeline PCM directly ([`FrameSource::Pcm`]), and
+/// two structurally identical types either side of that seam would only invite a
+/// pointless conversion. The local name stays because "block" is what the decode and
+/// output stages have always called it.
+///
+/// [`FrameSource::Pcm`]: castaway_core::FrameSource::Pcm
+pub use castaway_core::PcmFrame as PcmBlock;
 
 /// Which ffmpeg decoder an A2DP codec asks for.
 fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
