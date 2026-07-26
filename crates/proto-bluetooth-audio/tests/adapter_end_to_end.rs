@@ -893,6 +893,72 @@ async fn a_changed_notification_is_re_registered_and_acted_on() {
 }
 
 #[tokio::test]
+async fn cover_art_is_discovered_then_fetched() {
+    // We advertise CONTROLLER_SUPPORTS_COVER_ART, which is what makes a peer bother to
+    // send an image handle at all. Until now we logged the handle and did nothing with
+    // it, so the card never got a picture. The chain is two round trips the first time:
+    // the image server lives on a PSM only the peer's SDP record knows.
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    eventually("the avrcp opening traffic", || {
+        (sent_avrcp_pdus(&transport).len() >= 3).then_some(())
+    })
+    .await;
+
+    // The phone answers our metadata request, naming an image handle.
+    let mut attrs = BytesMut::new();
+    attrs.put_u8(2); // a real track, plus the handle
+    for (id, value) in [
+        (
+            proto_bluetooth_audio::avrcp::attribute::TITLE,
+            &b"Derezzed"[..],
+        ),
+        (
+            proto_bluetooth_audio::avrcp::attribute::COVER_ART_HANDLE,
+            &b"0000001"[..],
+        ),
+    ] {
+        attrs.put_u32(id);
+        attrs.put_u16(0x006A); // UTF-8
+        attrs.put_u16(u16::try_from(value.len()).unwrap());
+        attrs.extend_from_slice(value);
+    }
+    let frame = proto_bluetooth_audio::avrcp::vendor_command(
+        proto_bluetooth_audio::Ctype::Stable,
+        proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES,
+        &attrs,
+    );
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            proto_bluetooth_audio::AvctpMessage::command(0, frame.encode()).encode(),
+        ),
+    );
+
+    // That must make us go looking for the peer's image server over SDP — an *outgoing*
+    // connection, which is the part that did not exist.
+    let request = eventually("an outgoing sdp connection request", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .filter(|pdu| pdu.cid == Cid::SIGNALING)
+            .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
+            .flatten()
+            .find_map(|sig| match sig {
+                L2capSignal::ConnectionRequest {
+                    psm, source_cid, ..
+                } if psm == Psm::SDP => Some(source_cid),
+                _ => None,
+            })
+    })
+    .await;
+    assert!(
+        request.is_dynamic(),
+        "we should have allocated our own channel id for the query"
+    );
+}
+
+#[tokio::test]
 async fn a_dropped_link_ends_the_session() {
     // The phone walks out mid-song. No teardown handshake, just a dead link — and the
     // session manager must be told, or the panel keeps showing a card forever.

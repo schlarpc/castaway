@@ -86,7 +86,7 @@ impl Link {
 
     /// The peer connects to `psm` on us; returns (our CID, their CID).
     fn connect(&mut self, psm: Psm) -> (Cid, Cid) {
-        let start = self.peer.connect(psm).unwrap();
+        let (_, start) = self.peer.connect(psm).unwrap();
         let (sink_seen, peer_seen) = self.settle(true, start);
 
         let sink_cid = sink_seen
@@ -198,7 +198,7 @@ fn sending_before_the_channel_is_open_is_refused() {
     // than emitting a PDU the peer will drop without telling anyone.
     let mut sink = Multiplexer::new(672);
     sink.listen(Psm::AVDTP);
-    let events = sink.connect(Psm::AVCTP).unwrap();
+    let (_, events) = sink.connect(Psm::AVCTP).unwrap();
     let L2capEvent::Send(pdu) = &events[0] else {
         panic!("expected a connection request");
     };
@@ -214,7 +214,7 @@ fn an_unregistered_psm_is_refused_rather_than_ignored() {
     // RFCOMM is a PSM we deliberately don't serve. The peer must get a definite
     // "not supported" instead of a timeout.
     let mut link = Link::new();
-    let start = link.peer.connect(Psm::RFCOMM).unwrap();
+    let (_, start) = link.peer.connect(Psm::RFCOMM).unwrap();
     let (_, peer_seen) = link.settle(true, start);
 
     assert_eq!(

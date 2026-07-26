@@ -29,6 +29,7 @@ use crate::codec::advertised;
 use crate::control::AvrcpControl;
 use crate::host::{HostAction, HostConfig, HostController};
 use crate::media::Depacketizer;
+use crate::obex::CoverArtClient;
 use crate::sink::{SinkEvent, SinkSession};
 use crate::{avdtp, Message};
 
@@ -126,6 +127,16 @@ struct Link {
     /// The handle that lets the panel drive this phone, held until there is a session to
     /// attach it to.
     control: Option<Arc<dyn castaway_core::RemoteControl>>,
+    /// Where the peer serves cover art, once its SDP record has told us. Cached for the
+    /// life of the link: it does not move between tracks, and asking again per track
+    /// would put an SDP round trip in front of every image.
+    art_psm: Option<u16>,
+    /// An SDP query in flight to find that PSM, and the channel carrying it.
+    art_sdp: Option<(Cid, Box<substrate_sdp::Query>)>,
+    /// An image pull in flight, and the channel carrying it.
+    art_fetch: Option<(Cid, Box<CoverArtClient>)>,
+    /// The image handle we want, held while we work out where to ask for it.
+    art_wanted: Option<String>,
     /// What we know about this phone: address from link-up, name from the remote-name
     /// request, codec from AVDTP configuration. Each arrives separately.
     description: SourceDescription,
@@ -164,6 +175,10 @@ impl Link {
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
             control: None,
+            art_psm: None,
+            art_sdp: None,
+            art_fetch: None,
+            art_wanted: None,
             description: SourceDescription::new().with_address(peer.to_string()),
         }
     }
@@ -517,6 +532,21 @@ impl BluetoothAdapter {
                             ));
                         }
                     }
+                    // Our own outgoing channels: the cover-art chain. Both state
+                    // machines are pull-driven, so opening one means "ask your question".
+                    if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        if let Some((_, query)) = &link.art_sdp {
+                            if let Some(request) = query.next_request() {
+                                outbound.push((cid, request));
+                            }
+                        }
+                    } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        if let Some((_, client)) = &link.art_fetch {
+                            if let Some(request) = client.next_request() {
+                                outbound.push((cid, request));
+                            }
+                        }
+                    }
                     debug!(%cid, %psm, "l2cap channel open");
                 }
 
@@ -528,12 +558,26 @@ impl BluetoothAdapter {
                         link.avdtp_signaling = None;
                     } else if Some(cid) == link.avctp {
                         link.avctp = None;
+                    } else if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        link.art_sdp = None;
+                    } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        // A fetch that dies with the channel is not worth retrying: the
+                        // card already has its text and the next track will ask again.
+                        debug!("cover art: channel closed mid-fetch");
+                        link.art_fetch = None;
                     }
                     debug!(%cid, %psm, "l2cap channel closed");
                 }
 
                 L2capEvent::Data { cid, psm, payload } => {
-                    if psm == Psm::SDP {
+                    // Before the SDP server: this is a channel *we* opened, so what
+                    // arrives on it is a response to our query, not a request to answer.
+                    if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        self.on_cover_art_sdp(link, &payload, &mut outbound, &mut signalling);
+                    } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        self.on_cover_art_data(link, &payload, sink, &mut outbound)
+                            .await?;
+                    } else if psm == Psm::SDP {
                         let response = self.sdp.handle(&payload);
                         // Both sides in full: an SDP exchange that a peer walks away from
                         // cannot be diagnosed from our side's opinion of it.
@@ -551,7 +595,7 @@ impl BluetoothAdapter {
                                 .await?;
                         }
                     } else if psm == Psm::AVCTP {
-                        self.on_avctp(link, cid, &payload, sink, &mut outbound)
+                        self.on_avctp(link, cid, &payload, sink, &mut outbound, &mut signalling)
                             .await?;
                     }
                 }
@@ -738,6 +782,7 @@ impl BluetoothAdapter {
         payload: &[u8],
         sink: &SessionSink,
         outbound: &mut Vec<(Cid, Bytes)>,
+        signalling: &mut Vec<L2capPdu>,
     ) -> Result<(), CoreError> {
         let Ok(msg) = AvctpMessage::decode(payload) else {
             return Ok(());
@@ -766,10 +811,10 @@ impl BluetoothAdapter {
                     }
                     if changed {
                         if let Some(handle) = parsed.cover_art_handle {
-                            // The fetch runs on its own L2CAP channel to the PSM in the
-                            // peer's SDP record; the text card is already on screen and
-                            // the art lands as a second snapshot.
-                            debug!(handle, "bluetooth: cover art available");
+                            // The text card is already on screen; the art lands as a
+                            // second snapshot whenever it arrives, or never, without
+                            // holding anything up.
+                            self.begin_cover_art(link, handle, signalling);
                         }
                     }
                 }
@@ -849,6 +894,154 @@ impl BluetoothAdapter {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Start fetching an image handle the peer just told us about.
+    ///
+    /// Two round trips the first time: the peer's image server lives on a PSM only its
+    /// SDP record knows, so we have to ask before we can connect. The PSM is cached for
+    /// the life of the link, so later tracks skip straight to the pull.
+    fn begin_cover_art(&self, link: &mut Link, handle: String, signalling: &mut Vec<L2capPdu>) {
+        if link.art_fetch.is_some() || link.art_sdp.is_some() {
+            // One at a time. A skipped-through album would otherwise open a channel per
+            // track and leave them all half-finished.
+            debug!(handle, "bluetooth: cover art already in flight; skipping");
+            return;
+        }
+        if let Some(psm) = link.art_psm {
+            self.connect_cover_art(link, psm, handle, signalling);
+            return;
+        }
+        let Ok(psm) = Psm::new(Psm::SDP.raw()) else {
+            return;
+        };
+        match link.mux.connect(psm) {
+            Ok((cid, events)) => {
+                debug!(handle, "bluetooth: asking where cover art lives");
+                link.art_wanted = Some(handle);
+                link.art_sdp = Some((cid, Box::new(substrate_sdp::Query::avrcp_target(1))));
+                Self::queue_signalling(events, signalling);
+            }
+            Err(e) => warn!(error = %e, "cover art: no channel for the sdp query"),
+        }
+    }
+
+    /// Open the image channel itself, once the PSM is known.
+    fn connect_cover_art(
+        &self,
+        link: &mut Link,
+        psm: u16,
+        handle: String,
+        signalling: &mut Vec<L2capPdu>,
+    ) {
+        let Ok(psm) = Psm::new(psm) else {
+            warn!(psm, "cover art: the peer named a psm that is not one");
+            return;
+        };
+        match link.mux.connect(psm) {
+            Ok((cid, events)) => {
+                debug!(%psm, handle, "bluetooth: fetching cover art");
+                link.art_fetch = Some((cid, Box::new(CoverArtClient::new(handle))));
+                Self::queue_signalling(events, signalling);
+            }
+            Err(e) => warn!(error = %e, "cover art: no channel for the image pull"),
+        }
+    }
+
+    /// Signalling the multiplexer produced is already addressed to the peer, and rides
+    /// the fixed signalling channel — which is not in the channel map, so it must not go
+    /// through the reply path that maps our channel ids onto the peer's.
+    fn queue_signalling(events: Vec<L2capEvent>, signalling: &mut Vec<L2capPdu>) {
+        for event in events {
+            if let L2capEvent::Send(pdu) = event {
+                signalling.push(pdu);
+            }
+        }
+    }
+
+    /// A response to our "where do you serve images from" query.
+    fn on_cover_art_sdp(
+        &self,
+        link: &mut Link,
+        payload: &[u8],
+        outbound: &mut Vec<(Cid, Bytes)>,
+        signalling: &mut Vec<L2capPdu>,
+    ) {
+        let Some((cid, query)) = &mut link.art_sdp else {
+            return;
+        };
+        let cid = *cid;
+        match query.feed(payload) {
+            // More to come: SDP responses are continued, not fragmented, so the client
+            // asks again with the continuation state the peer handed back.
+            Ok(false) => {
+                if let Some(request) = query.next_request() {
+                    outbound.push((cid, request));
+                }
+                return;
+            }
+            Ok(true) => {}
+            Err(e) => {
+                debug!(error = %e, "cover art: unreadable sdp response");
+                link.art_sdp = None;
+                link.art_wanted = None;
+                return;
+            }
+        }
+        let psm = query.cover_art_psm().ok().flatten();
+        link.art_sdp = None;
+        Self::queue_signalling(link.mux.disconnect(cid).unwrap_or_default(), signalling);
+
+        let Some(psm) = psm else {
+            // Plenty of phones advertise a cover-art handle and no image server. Not an
+            // error, just no picture.
+            debug!("bluetooth: peer serves no cover art");
+            link.art_wanted = None;
+            return;
+        };
+        link.art_psm = Some(psm);
+        if let Some(handle) = link.art_wanted.take() {
+            self.connect_cover_art(link, psm, handle, signalling);
+        }
+    }
+
+    /// Bytes from the peer's image server.
+    async fn on_cover_art_data(
+        &self,
+        link: &mut Link,
+        payload: &[u8],
+        sink: &SessionSink,
+        outbound: &mut Vec<(Cid, Bytes)>,
+    ) -> Result<(), CoreError> {
+        let Some((cid, client)) = &mut link.art_fetch else {
+            return Ok(());
+        };
+        let cid = *cid;
+        match client.feed(payload) {
+            Ok(Some(artwork)) => {
+                info!(bytes = artwork.len(), "bluetooth: cover art fetched");
+                link.art_fetch = None;
+                link.now_playing.artwork = Some(artwork);
+                if link.session_open {
+                    let link_sink = sink.with_instance(link.peer.to_string());
+                    link_sink
+                        .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
+                        .await?;
+                }
+            }
+            // OBEX is request/response all the way down: every chunk we take has to be
+            // asked for.
+            Ok(None) => {
+                if let Some(request) = client.next_request() {
+                    outbound.push((cid, request));
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "cover art: fetch failed");
+                link.art_fetch = None;
+            }
         }
         Ok(())
     }

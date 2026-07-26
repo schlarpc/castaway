@@ -202,9 +202,14 @@ impl Multiplexer {
     /// Open a channel to `psm` on the peer — used for the AVRCP cover-art fetch, where
     /// *we* are the one connecting out.
     ///
+    /// Returns the identifier we allocated along with the request to send. The caller
+    /// needs it: an outgoing channel is only recognisable later by the id it was given,
+    /// and a client that cannot tell its own channel from an inbound one routes the
+    /// peer's *response* into its own server.
+    ///
     /// # Errors
     /// [`L2capError::OutOfCids`] if no identifier is free.
-    pub fn connect(&mut self, psm: Psm) -> Result<Vec<L2capEvent>, L2capError> {
+    pub fn connect(&mut self, psm: Psm) -> Result<(Cid, Vec<L2capEvent>), L2capError> {
         let local_cid = self.alloc_cid()?;
         let id = self.alloc_id();
         self.channels.insert(
@@ -219,11 +224,14 @@ impl Multiplexer {
             },
         );
         self.pending.insert(id, local_cid.raw());
-        Ok(vec![Self::signal(&Signal::ConnectionRequest {
-            id,
-            psm,
-            source_cid: local_cid,
-        })?])
+        Ok((
+            local_cid,
+            vec![Self::signal(&Signal::ConnectionRequest {
+                id,
+                psm,
+                source_cid: local_cid,
+            })?],
+        ))
     }
 
     /// Queue an SDU for an open channel.
