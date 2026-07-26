@@ -123,6 +123,9 @@ struct Link {
     now_playing: NowPlaying,
     /// Next AVCTP transaction label.
     avctp_transaction: u8,
+    /// The handle that lets the panel drive this phone, held until there is a session to
+    /// attach it to.
+    control: Option<Arc<dyn castaway_core::RemoteControl>>,
     /// What we know about this phone: address from link-up, name from the remote-name
     /// request, codec from AVDTP configuration. Each arrives separately.
     description: SourceDescription,
@@ -149,6 +152,7 @@ impl Link {
             reported_bitpool: None,
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
+            control: None,
             description: SourceDescription::new().with_address(peer.to_string()),
         }
     }
@@ -450,16 +454,24 @@ impl BluetoothAdapter {
                         }
                     } else if psm == Psm::AVCTP {
                         link.avctp = Some(cid);
-                        // The control channel is up, so the receiver can now drive the
-                        // sender. This is deliberately its own event rather than part of
-                        // session start — AVCTP routinely connects after audio is
-                        // already flowing.
+                        // The control channel is up, so the receiver can drive the sender.
+                        // It stays its own event because the two really are independent —
+                        // but which order they arrive in is the sender's choice, and both
+                        // happen: an iPhone opens AVCTP *before* it starts streaming, and
+                        // the session manager rejects a control surface for a source that
+                        // is not active yet. So hold it, and emit it whenever the session
+                        // does exist. Dropping it costs the panel every transport control
+                        // it has over that phone.
                         let (tx, rx) = mpsc::channel(32);
-                        let control = Arc::new(AvrcpControl::passthrough(tx));
-                        let link_sink = sink.with_instance(link.peer.to_string());
-                        link_sink
-                            .emit(SessionEvent::ControlSurface(control))
-                            .await?;
+                        let control: Arc<dyn castaway_core::RemoteControl> =
+                            Arc::new(AvrcpControl::passthrough(tx));
+                        if link.session_open {
+                            let link_sink = sink.with_instance(link.peer.to_string());
+                            link_sink
+                                .emit(SessionEvent::ControlSurface(Arc::clone(&control)))
+                                .await?;
+                        }
+                        link.control = Some(control);
                         // Resolve the peer's identifier once, here: the writer task
                         // outlives this borrow and cannot consult the multiplexer later.
                         let peer_cid = link.mux.channel(cid).map(|c| c.remote_cid);
@@ -633,6 +645,13 @@ impl BluetoothAdapter {
                         link_sink
                             .emit(SessionEvent::SourceInfo(link.description.clone()))
                             .await?;
+                        // …and the control surface, if AVCTP got in first. It usually
+                        // does.
+                        if let Some(control) = &link.control {
+                            link_sink
+                                .emit(SessionEvent::ControlSurface(Arc::clone(control)))
+                                .await?;
+                        }
                     }
                 }
                 SinkEvent::Closed => {

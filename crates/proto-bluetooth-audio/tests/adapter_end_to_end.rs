@@ -746,6 +746,55 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
 }
 
 #[tokio::test]
+async fn the_control_surface_survives_avctp_connecting_before_the_stream() {
+    // Both orders happen and the sender chooses. A phone that opens AVCTP first — which
+    // an iPhone does, nine seconds ahead of START in one capture — used to have its
+    // control surface emitted while no session was active, rejected, and dropped. That
+    // silently costs the panel every transport control it has over that phone.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+
+    // AVCTP first, deliberately.
+    let _ = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = Seid::from_shifted(discover.payload[4]).unwrap(); // the aptX endpoint
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_44100,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 2, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 3, Signal::Open, &[seid.shifted()]).await;
+    avdtp(&transport, signaling, 4, Signal::Start, &[seid.shifted()]).await;
+
+    // The control surface must arrive once the session exists, not before it.
+    let mut saw_audio = false;
+    let mut saw_control = false;
+    for _ in 0..40 {
+        match rx.try_recv() {
+            Ok(msg) => match msg.event {
+                SessionEvent::Audio { .. } => saw_audio = true,
+                SessionEvent::ControlSurface(_) => {
+                    assert!(saw_audio, "control surface must not precede the session");
+                    saw_control = true;
+                }
+                _ => {}
+            },
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+        if saw_control {
+            break;
+        }
+    }
+    assert!(saw_audio, "the session should have started");
+    assert!(saw_control, "the control surface was dropped");
+}
+
+#[tokio::test]
 async fn a_dropped_link_ends_the_session() {
     // The phone walks out mid-song. No teardown handshake, just a dead link — and the
     // session manager must be told, or the panel keeps showing a card forever.
