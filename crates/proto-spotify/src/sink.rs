@@ -13,7 +13,7 @@ use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
-use tokio::sync::mpsc;
+use std::sync::mpsc;
 use tracing::{debug, warn};
 
 /// How many blocks may sit between librespot's decoder and our output device.
@@ -26,7 +26,7 @@ const QUEUE_BLOCKS: usize = 8;
 /// The [`Sink`] librespot writes into. Forwards blocks to a [`PcmFrame`] channel that the
 /// pipeline's PCM session drains.
 pub struct PcmSink {
-    tx: mpsc::Sender<PcmFrame>,
+    tx: mpsc::SyncSender<PcmFrame>,
     /// Sample frames handed over so far, that is, the presentation time of the *next*
     /// block. Counted rather than taken from a clock so a paused stream does not
     /// accumulate position while nothing is playing.
@@ -36,15 +36,15 @@ pub struct PcmSink {
 impl PcmSink {
     /// Build a sink feeding `tx`.
     #[must_use]
-    pub const fn new(tx: mpsc::Sender<PcmFrame>) -> Self {
+    pub const fn new(tx: mpsc::SyncSender<PcmFrame>) -> Self {
         Self { tx, frames_sent: 0 }
     }
 
     /// A channel pair sized for this sink: the sender for [`PcmSink::new`], the receiver
     /// for [`castaway_core::FrameSource::Pcm`].
     #[must_use]
-    pub fn channel() -> (mpsc::Sender<PcmFrame>, mpsc::Receiver<PcmFrame>) {
-        mpsc::channel(QUEUE_BLOCKS)
+    pub fn channel() -> (mpsc::SyncSender<PcmFrame>, mpsc::Receiver<PcmFrame>) {
+        mpsc::sync_channel(QUEUE_BLOCKS)
     }
 
     /// The shape librespot always decodes to.
@@ -99,11 +99,17 @@ impl Sink for PcmSink {
         };
         self.frames_sent += block.frame_count() as u64;
 
-        // Blocking is correct here, and deliberate. This runs on librespot's own player
-        // thread (never a runtime worker), and a full queue means the speaker has not
-        // caught up — so stalling the decoder is exactly what a real audio device does.
-        // Dropping instead would turn a slow output into a stream of clicks.
-        self.tx.blocking_send(block).map_err(|_| {
+        // Blocking is correct here, and deliberate: a full queue means the speaker has
+        // not caught up, so stalling the decoder is what a real audio device does, and
+        // dropping instead would turn a slow output into a stream of clicks.
+        //
+        // It has to be a *std* channel to do it. This runs on librespot's player thread,
+        // which builds its own tokio runtime and blocks on it (player.rs), so tokio's
+        // `blocking_send` panics here with "Cannot block the current thread from within a
+        // runtime" — on the very first block of audio, killing the sink thread and taking
+        // playback with it. Blocking librespot's own runtime is fine; asking tokio to let
+        // us do it is not.
+        self.tx.send(block).map_err(|_| {
             // The session was torn down under us; say so once and let librespot stop.
             warn!("spotify sink: pipeline went away");
             SinkError::NotConnected("pcm session ended".into())
@@ -122,7 +128,7 @@ mod tests {
 
     #[test]
     fn samples_are_forwarded_with_the_shape_librespot_decodes_to() {
-        let (tx, mut rx) = PcmSink::channel();
+        let (tx, rx) = PcmSink::channel();
         let mut sink = PcmSink::new(tx);
         // Four stereo sample frames.
         sink.write(AudioPacket::Samples(vec![0.5; 8]), &mut converter())
@@ -142,7 +148,7 @@ mod tests {
     fn presentation_time_accumulates_across_blocks() {
         // A card that shows position needs this to be the *audio* clock. Taking it from a
         // wall clock would drift the moment playback paused.
-        let (tx, mut rx) = PcmSink::channel();
+        let (tx, rx) = PcmSink::channel();
         let mut sink = PcmSink::new(tx);
         let one_second = vec![0.0; (SAMPLE_RATE as usize) * 2];
         sink.write(AudioPacket::Samples(one_second.clone()), &mut converter())
@@ -161,6 +167,26 @@ mod tests {
         assert!(sink
             .write(AudioPacket::Raw(vec![0; 16]), &mut converter())
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_write_from_inside_a_runtime_does_not_panic() {
+        // The bug this exists to prevent, and it was not theoretical — it killed playback
+        // on the first block of audio of the first real session.
+        //
+        // librespot's player thread builds its own tokio runtime and blocks on it
+        // (playback/src/player.rs), so `write` runs *inside* a runtime context even though
+        // it is not a runtime worker. tokio's `blocking_send` panics there unconditionally
+        // — "Cannot block the current thread from within a runtime" — taking the sink
+        // thread down and leaving librespot with a closed command channel.
+        //
+        // `#[tokio::test]` puts this test body in exactly that position. A std channel has
+        // no such rule, which is why the PCM path uses one.
+        let (tx, rx) = PcmSink::channel();
+        let mut sink = PcmSink::new(tx);
+        sink.write(AudioPacket::Samples(vec![0.0; 8]), &mut converter())
+            .expect("writing from a runtime context must not panic or fail");
+        assert_eq!(rx.try_recv().unwrap().frame_count(), 4);
     }
 
     #[test]

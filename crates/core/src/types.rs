@@ -449,7 +449,15 @@ pub enum FrameSource {
     Decoded(mpsc::Receiver<DecodedFrame>),
     /// The adapter pushes already-decoded audio samples. There is nothing to decode and
     /// no codec to name — see [`PcmFrame`].
-    Pcm(mpsc::Receiver<PcmFrame>),
+    ///
+    /// A **std** channel, unlike its siblings, because both ends of this one are ordinary
+    /// threads: the producer is a decoder running off-runtime and the consumer is the
+    /// output thread. A tokio channel here looks harmless and is not — `blocking_send`
+    /// panics with "Cannot block the current thread from within a runtime" if the
+    /// producer happens to sit inside *any* runtime context, which librespot's player
+    /// thread does (it builds its own runtime and blocks on it). Sending on a std channel
+    /// blocks the producer, which is exactly the backpressure an audio sink wants.
+    Pcm(std::sync::mpsc::Receiver<PcmFrame>),
 }
 
 #[cfg(test)]

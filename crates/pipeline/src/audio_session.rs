@@ -16,6 +16,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame};
 use tokio::sync::mpsc;
@@ -128,7 +129,7 @@ pub fn run(
 /// Spawn a PCM playback session on a dedicated thread. The audio-only sibling of
 /// [`spawn`], for adapters that arrive already decoded.
 pub fn spawn_pcm(
-    frames: mpsc::Receiver<PcmFrame>,
+    frames: std::sync::mpsc::Receiver<PcmFrame>,
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
 ) {
@@ -143,7 +144,7 @@ pub fn spawn_pcm(
 /// down separately (Q25) — every [`PcmFrame`] states its own rate and channel count. The
 /// shape cannot disagree with the samples because it travels with them.
 pub fn run_pcm(
-    mut frames: mpsc::Receiver<PcmFrame>,
+    frames: std::sync::mpsc::Receiver<PcmFrame>,
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
 ) {
@@ -151,8 +152,9 @@ pub fn run_pcm(
     // source may change rate between tracks, and writing 48 kHz samples into a device
     // opened at 44.1 plays them at the wrong pitch rather than failing.
     let mut open_as: Option<(u32, u16)> = None;
+    let mut pace = Pace::default();
 
-    while let Some(block) = frames.blocking_recv() {
+    while let Ok(block) = frames.recv() {
         if stop.load(Ordering::Relaxed) {
             info!("pcm session: preempted");
             break;
@@ -170,14 +172,65 @@ pub fn run_pcm(
             }
             info!(rate = shape.0, channels = shape.1, "pcm session: playing");
             open_as = Some(shape);
+            pace = Pace::default();
         }
+        let played = block.duration();
         if let Err(e) = output.write(&block) {
             warn!(error = %e, "pcm session: output failed");
             break;
         }
+        pace.wait_for(played);
     }
 
     output.stop();
+}
+
+/// How far ahead of real time the session is allowed to run.
+///
+/// This is the buffer that absorbs a scheduling hiccup on either side. Too small and any
+/// stall is a dropout; too large and a pause takes that long to actually go quiet.
+const LEAD: Duration = Duration::from_millis(250);
+
+/// A gap this big means the stream stopped rather than merely stuttered — a pause, a
+/// buffering stall, a track that took a while to load — so the clock restarts instead of
+/// trying to make up the time in one burst.
+const RESYNC_AFTER: Duration = Duration::from_secs(1);
+
+/// Wall-clock pacing for a pull-based source.
+///
+/// A *pushed* stream needs none of this: A2DP arrives in real time because the phone is
+/// the clock, and the output drops a late block rather than stalling the link (ground
+/// rule 4). A *pulled* stream is the opposite — librespot decodes as fast as its sink
+/// accepts — so with an output that never blocks (both of ours: cpal drops when its ring
+/// is full, and the null sink accepts instantly) a track is consumed in seconds and the
+/// queue turbo-advances. Nothing else in the chain is a clock, so this is.
+#[derive(Default)]
+struct Pace {
+    /// When the current run of audio started, and how much has been handed over since.
+    /// `None` until the first block, and reset whenever the stream stops for a while.
+    since: Option<(std::time::Instant, Duration)>,
+}
+
+impl Pace {
+    /// Account for `played` worth of audio, then sleep off anything beyond [`LEAD`].
+    fn wait_for(&mut self, played: Duration) {
+        let now = std::time::Instant::now();
+        let (start, submitted) = self.since.get_or_insert((now, Duration::ZERO));
+
+        // Fell far behind: the source paused or stalled. Catching up would replay the
+        // silence at speed, which is the very thing this exists to prevent.
+        if now.duration_since(*start) > *submitted + RESYNC_AFTER {
+            *start = now;
+            *submitted = Duration::ZERO;
+        }
+
+        *submitted += played;
+        if let Some(ahead) = submitted.checked_sub(now.duration_since(*start)) {
+            if let Some(excess) = ahead.checked_sub(LEAD) {
+                std::thread::sleep(excess);
+            }
+        }
+    }
 }
 
 /// Which codecs this build can actually decode.
@@ -287,7 +340,7 @@ mod tests {
 
     #[test]
     fn a_pcm_session_with_no_frames_exits_instead_of_parking() {
-        let (tx, rx) = mpsc::channel::<PcmFrame>(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PcmFrame>(1);
         drop(tx);
         run_pcm(rx, Box::new(NullAudioOut::new()), &running());
     }
@@ -297,9 +350,9 @@ mod tests {
         // Nothing hands this session a negotiated format, so if it ever invents one the
         // stream plays at the wrong pitch — the Q25 failure, arriving by a new route.
         let log = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx) = mpsc::channel(4);
-        tx.blocking_send(pcm(44_100, 2, 512)).unwrap();
-        tx.blocking_send(pcm(44_100, 2, 256)).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send(pcm(44_100, 2, 512)).unwrap();
+        tx.send(pcm(44_100, 2, 256)).unwrap();
         drop(tx);
 
         run_pcm(
@@ -326,9 +379,9 @@ mod tests {
         // Writing 48 kHz samples into a device opened at 44.1 does not fail, it plays
         // everything sharp — so the reopen has to be driven by the samples themselves.
         let log = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx) = mpsc::channel(4);
-        tx.blocking_send(pcm(44_100, 2, 128)).unwrap();
-        tx.blocking_send(pcm(48_000, 2, 128)).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send(pcm(44_100, 2, 128)).unwrap();
+        tx.send(pcm(48_000, 2, 128)).unwrap();
         drop(tx);
 
         run_pcm(
@@ -353,12 +406,59 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_based_session_plays_in_real_time_rather_than_as_fast_as_it_can() {
+        // The bug this exists to prevent, seen twice on real hardware: neither output
+        // blocks — cpal drops when its ring is full, the null sink accepts instantly — so
+        // librespot decoded a whole track in seconds and the queue turbo-advanced.
+        //
+        // Two seconds of audio in 40 ms blocks. It must take roughly two seconds minus the
+        // lead, not the microseconds a memcpy loop would.
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let per_block = 44_100 / 25; // 40 ms
+        for _ in 0..50 {
+            tx.send(pcm(44_100, 2, per_block)).unwrap();
+        }
+        drop(tx);
+
+        let start = std::time::Instant::now();
+        run_pcm(rx, Box::new(NullAudioOut::new()), &running());
+        let taken = start.elapsed();
+
+        let expected = Duration::from_secs(2).saturating_sub(LEAD);
+        assert!(
+            taken >= expected.mul_f32(0.8),
+            "played 2s of audio in {taken:?}; it is not pacing"
+        );
+        // And not the opposite failure: pacing must not *add* time.
+        assert!(taken < Duration::from_secs(4), "far too slow: {taken:?}");
+    }
+
+    #[test]
+    fn a_stall_resyncs_the_clock_instead_of_sprinting_to_catch_up() {
+        // After a pause the source resumes where it left off. Treating the silent gap as
+        // a debt to repay would replay it at speed — the same audible failure by a
+        // different route.
+        let mut pace = Pace::default();
+        pace.wait_for(Duration::from_millis(100));
+        // Pretend a long stall happened by rewinding the recorded start.
+        if let Some((start, _)) = pace.since.as_mut() {
+            *start -= Duration::from_secs(30);
+        }
+        let resumed = std::time::Instant::now();
+        pace.wait_for(Duration::from_millis(100));
+        assert!(
+            resumed.elapsed() < Duration::from_millis(50),
+            "a resync must not sleep, and must not try to reclaim the stall"
+        );
+    }
+
+    #[test]
     fn a_preempted_pcm_session_stops_without_draining_the_rest() {
         // The second source has already taken the output device; this one must let go.
         let log = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
         for _ in 0..3 {
-            tx.blocking_send(pcm(44_100, 2, 64)).unwrap();
+            tx.send(pcm(44_100, 2, 64)).unwrap();
         }
         drop(tx);
         let stop = Arc::new(AtomicBool::new(true));
