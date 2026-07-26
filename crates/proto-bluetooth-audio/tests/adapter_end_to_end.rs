@@ -276,6 +276,38 @@ async fn avdtp(
 }
 
 #[tokio::test]
+async fn a_restricted_codec_table_advertises_only_what_it_was_given() {
+    // A sender takes the first endpoint it also supports, so narrowing the table is the
+    // only way to make one negotiate a codec it would not have chosen — which is how the
+    // SBC fallback gets exercised against a phone that would always prefer AAC.
+    let adapter = BluetoothAdapter::new(
+        transport() as Arc<dyn HciTransport>,
+        BluetoothConfig {
+            enable_ldac: true,
+            codecs: Some(vec![AudioCodec::Sbc]),
+            ..BluetoothConfig::default()
+        },
+    );
+    assert_eq!(adapter.advertised_codecs(), vec![AudioCodec::Sbc]);
+
+    // …and the default still offers the full table, LDAC first.
+    let all = BluetoothAdapter::new(
+        transport() as Arc<dyn HciTransport>,
+        BluetoothConfig {
+            enable_ldac: true,
+            ..BluetoothConfig::default()
+        },
+    );
+    let codecs = all.advertised_codecs();
+    assert_eq!(codecs.first(), Some(&AudioCodec::Ldac));
+    assert!(
+        codecs.contains(&AudioCodec::Sbc),
+        "SBC is the guaranteed floor"
+    );
+    assert!(codecs.len() > 1);
+}
+
+#[tokio::test]
 async fn the_adapter_brings_a_controller_up_and_becomes_discoverable() {
     let transport = transport();
     let adapter = Arc::new(BluetoothAdapter::new(

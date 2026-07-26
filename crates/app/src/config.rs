@@ -48,6 +48,13 @@ pub struct Bluetooth {
     /// A directory of firmware laid out like `linux-firmware`. `None` uses whatever was
     /// embedded at build time (architecture §11.3b).
     pub firmware_dir: Option<String>,
+    /// Advertise only these codecs, by name: `sbc`, `aac`, `aptx`, `aptx-hd`, `ldac`.
+    /// `None` advertises everything the build supports.
+    ///
+    /// A sender takes the first endpoint it also supports, so this is the only way to
+    /// exercise a specific codec on real hardware — narrow it to `["sbc"]` and every
+    /// phone falls back to the mandatory codec.
+    pub codecs: Option<Vec<String>>,
     /// Where link keys and other persistent state live. `None` uses
     /// `$XDG_STATE_HOME/castaway`, falling back to the working directory.
     pub state_dir: Option<String>,
@@ -105,6 +112,7 @@ impl Default for Bluetooth {
             transport: "usb".to_owned(),
             controller: None,
             firmware_dir: None,
+            codecs: None,
             state_dir: None,
         }
     }

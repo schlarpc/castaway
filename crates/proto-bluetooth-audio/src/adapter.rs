@@ -54,6 +54,14 @@ pub struct BluetoothConfig {
     /// Whether to advertise the LDAC endpoint. Should mirror the `ldac` build feature —
     /// advertising a codec we cannot decode makes the session silence (Q22).
     pub enable_ldac: bool,
+    /// Restrict the advertised endpoints to these codecs. `None` advertises everything
+    /// the build supports, which is what a deployment wants.
+    ///
+    /// Exists for bring-up: a sender picks the first endpoint it also supports, so the
+    /// only way to exercise a *particular* codec against real hardware is to stop
+    /// offering the ones it would otherwise prefer. Narrowing this to SBC is how the
+    /// mandatory fallback path gets tested at all.
+    pub codecs: Option<Vec<castaway_core::AudioCodec>>,
     /// Link keys loaded from disk, so repeat guests reconnect silently (Q23).
     pub link_keys: Vec<(BdAddr, LinkKey)>,
     /// Called with each newly paired peer's key. Without one, pairing works for the
@@ -66,6 +74,7 @@ impl std::fmt::Debug for BluetoothConfig {
         f.debug_struct("BluetoothConfig")
             .field("host", &self.host)
             .field("enable_ldac", &self.enable_ldac)
+            .field("codecs", &self.codecs)
             .field("link_keys", &self.link_keys.len())
             .field("persists_keys", &self.on_paired.is_some())
             .finish()
@@ -81,6 +90,7 @@ impl Default for BluetoothConfig {
         Self {
             host: HostConfig::default(),
             enable_ldac: cfg!(feature = "ldac"),
+            codecs: None,
             link_keys: Vec::new(),
             on_paired: None,
         }
@@ -117,7 +127,7 @@ struct Link {
 }
 
 impl Link {
-    fn new(peer: BdAddr, enable_ldac: bool) -> Self {
+    fn new(peer: BdAddr, capabilities: Vec<crate::codec::CodecCapability>) -> Self {
         let mut mux = Multiplexer::new(672);
         mux.listen(Psm::SDP);
         mux.listen(Psm::AVDTP);
@@ -126,7 +136,7 @@ impl Link {
             peer,
             reassembler: Reassembler::new(),
             mux,
-            sink: SinkSession::new(advertised(enable_ldac)),
+            sink: SinkSession::new(capabilities),
             avdtp_signaling: None,
             avdtp_media: None,
             avctp: None,
@@ -152,6 +162,8 @@ pub struct BluetoothAdapter {
     transport: Arc<dyn HciTransport>,
     config: BluetoothConfig,
     sdp: SdpServer,
+    /// The endpoint table every link advertises, resolved once.
+    capabilities: Vec<crate::codec::CodecCapability>,
 }
 
 impl std::fmt::Debug for BluetoothAdapter {
@@ -173,11 +185,25 @@ impl BluetoothAdapter {
         // its volume rocker reaches us (Q24). Publishing one loses half the feature.
         sdp.add(avrcp_controller(0x0001_0001, &name));
         sdp.add(avrcp_target(0x0001_0002, &name));
+        let mut capabilities = advertised(config.enable_ldac);
+        if let Some(allowed) = &config.codecs {
+            capabilities.retain(|c| allowed.contains(&c.audio_codec()));
+        }
         Self {
             transport,
             config,
             sdp,
+            capabilities,
         }
+    }
+
+    /// The codecs this adapter advertises, in preference order.
+    #[must_use]
+    pub fn advertised_codecs(&self) -> Vec<castaway_core::AudioCodec> {
+        self.capabilities
+            .iter()
+            .map(crate::codec::CodecCapability::audio_codec)
+            .collect()
     }
 
     /// Send one HCI packet.
@@ -256,7 +282,7 @@ impl SourceAdapter for BluetoothAdapter {
                                 info!(%peer, "bluetooth: link up");
                                 links.insert(
                                     handle.raw(),
-                                    Link::new(*peer, self.config.enable_ldac),
+                                    Link::new(*peer, self.capabilities.clone()),
                                 );
                             }
                             HostAction::PeerName { peer, name } => {

@@ -46,6 +46,18 @@ pub async fn spawn(
     // we cannot decode means the phone picks it and the session is silence rather than a
     // clean fallback to one we can (Q22).
     let enable_ldac = decodable().contains(&castaway_core::AudioCodec::Ldac);
+    let codecs = match &config.bluetooth.codecs {
+        Some(names) => Some(
+            names
+                .iter()
+                .map(|n| parse_codec(n))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+        None => None,
+    };
+    if let Some(codecs) = &codecs {
+        info!(?codecs, "bluetooth: advertising a restricted codec table");
+    }
 
     // Persist each new key as it is issued, so a repeat guest never re-pairs (Q23). A
     // write failure costs one re-pairing next time, which is not worth ending a live
@@ -66,6 +78,7 @@ pub async fn spawn(
                 ..HostConfig::default()
             },
             enable_ldac,
+            codecs,
             link_keys,
             on_paired: Some(on_paired),
         },
@@ -84,6 +97,25 @@ pub async fn spawn(
             () = shutdown.notified() => info!("Bluetooth sink stopping"),
         }
     }))
+}
+
+/// Resolve a configured codec name.
+///
+/// # Errors
+/// If the name is not one of the codecs this crate knows, because a typo that silently
+/// advertised the full table would be a confusing way to lose a test.
+fn parse_codec(name: &str) -> anyhow::Result<castaway_core::AudioCodec> {
+    use castaway_core::AudioCodec;
+    match name.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+        "sbc" => Ok(AudioCodec::Sbc),
+        "aac" => Ok(AudioCodec::Aac),
+        "aptx" => Ok(AudioCodec::AptX),
+        "aptx-hd" => Ok(AudioCodec::AptXHd),
+        "ldac" => Ok(AudioCodec::Ldac),
+        other => anyhow::bail!(
+            "unknown bluetooth codec {other:?}; expected sbc, aac, aptx, aptx-hd or ldac"
+        ),
+    }
 }
 
 /// Open whichever transport the config names.
