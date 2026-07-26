@@ -167,10 +167,32 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## CEF / adblock / YouTube Lounge
 
-- **Q17 — Filter-list source + refresh.** Default adblock is a compact built-in list; the real
-  coverage comes from EasyList (proven: it blocks the video-ad loader). Decide how the kiosk gets
-  a full list: bundle a snapshot (goes stale), fetch+cache from easylist.to on a timer (needs
-  network), or a config path. Recommend fetch+cache with the compact list as offline fallback.
+- **Q17 — Filter-list source + refresh. ANSWERED, with one caveat that matters.** The kiosk
+  subscribes to **EasyList** (network rules) *and* **uBlock Origin's own list** (mostly
+  cosmetic, including every `##+js(...)` scriptlet rule), fetched at startup, cached, merged
+  into one engine. Offline it uses the cache; with no cache, the compact built-in list.
+  `CASTAWAY_FILTERLISTS_OFFLINE=1` pins it to the cache deliberately.
+
+  **What updates and what does not.** Filter *rules* update themselves — every boot pulls the
+  current lists, so new rules arrive without a redeploy. Scriptlet *bodies* do not: they are
+  pinned to uBO **1.46.0**, because `adblock`'s assembler reads uBO's legacy bundle format
+  (`/// name.js` headers) and current uBO ships ES modules calling `registerScriptlet`, which
+  the assembler parses into zero resources — silently. 1.46.0 is the last readable revision
+  and yields 37 real scriptlets. A rule naming anything newer injects nothing: a no-op, not a
+  broken page, and the count is logged at startup and asserted by an `--ignored` test.
+
+  **Two refresh gaps worth knowing.** Lists refresh at *startup only* — a kiosk up for a month
+  runs month-old rules until it restarts. And the fetch is unconditional (no `If-Modified-Since`),
+  so every boot re-downloads ~2.7 MB. Both are small fixes when they start to matter.
+- **Q36 — lifting the scriptlet pin.** To track uBO's scriptlets again, something has to read
+  their current format: one file per scriptlet under `src/js/resources/`, each ending in
+  `registerScriptlet(fn, { name, dependencies })`. That means fetching the directory and
+  extracting each function's source plus its dependency functions — a JS-shaped parsing job in
+  Rust, brittle in the way that upstream can break at any time. Options, in the order I would
+  try them: watch for `adblock` to support the new format upstream (Brave has the same problem);
+  write the converter; or hand-write the handful of scriptlets that actually matter for the
+  sites this display shows. Not urgent — the pinned 37 cover the common rules — but it is why
+  "subscribe and get updates forever" is only three-quarters true.
 - **Q18 — YouTube Lounge via CEF (the actual plan).** With CEF working, the Lounge path is: on
   DIAL launch, navigate the offscreen browser to YouTube's TV surface (`https://www.youtube.com/tv`
   + the launch params/pairing code) and let the page do Lounge registration + playback itself

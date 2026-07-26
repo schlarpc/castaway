@@ -166,8 +166,15 @@ The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly a
 - `pipeline::cef_browser` — offscreen Chromium via cef-rs; renders real pages headlessly
   (SwiftShader) → `on_paint` BGRA → `CefFrameSink`. Subprocess entry point, TV user-agent.
 - `pipeline::cef_adblock` — Brave adblock-rust in CEF's `ResourceRequestHandler`, cancels +
-  **logs** blocked requests (`castaway::adblock`). `easylist::load_or_fetch` fetches+caches
-  EasyList, falls back to cache then compact built-in.
+  **logs** blocked requests (`castaway::adblock`), **and** computes per-page scriptlet
+  injections. `filterlists` subscribes to EasyList *and* uBlock Origin's list (fetch → cache
+  → built-in fallback; `CASTAWAY_FILTERLISTS_OFFLINE=1` pins to cache).
+- **Scriptlet injection is live** — a render-process `on_context_created` handler runs uBO's
+  `##+js(...)` code inside the page *before its own scripts*, which is the only timing at
+  which hooking `fetch`/XHR works. Verified by planting a probe rule and watching it come
+  back through the page console (`castaway-injection-ok src=castaway://scriptlets`). Rules
+  auto-update; scriptlet *bodies* are pinned to uBO 1.46.0 (37 of them) because the current
+  bundle format is unreadable by `adblock`'s assembler — see Q17/Q36.
 - **YouTube**: `youtube.com/tv` renders the leanback cast-receiver UI (TV UA), with EasyList
   blocking YouTube's ad requests (doubleclick instream `ad_status.js`, googleads id/tracking).
 - `RenderLoop::upload_browser` feeds CEF frames into the compositor `Browser` layer.
