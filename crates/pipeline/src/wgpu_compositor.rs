@@ -174,10 +174,21 @@ impl Nv12Uniform {
 /// `on_paint`, some decoders) upload as native `Bgra8Unorm` — no CPU swizzle pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexelFormat {
-    /// Packed RGBA8.
+    /// Packed RGBA8, sample values taken as-is.
+    ///
+    /// For pixels that are already linear. Uploading *authored* colours — anything a
+    /// human picked, or a font rasterised — through this is the sRGB double-encode: the
+    /// sampler reads sRGB bytes as if they were linear and the sRGB swapchain encodes
+    /// them a second time on the way out. `#0d1428` reaches the panel as `#404f6e`.
     Rgba8,
-    /// Packed BGRA8.
+    /// Packed BGRA8, sample values taken as-is.
     Bgra8,
+    /// Packed RGBA8 holding sRGB-encoded values.
+    ///
+    /// What every CPU-authored surface wants: the sampler decodes to linear, the
+    /// compositor blends in linear, and the swapchain re-encodes — a round trip that
+    /// preserves the colour that was chosen.
+    Rgba8Srgb,
 }
 
 impl TexelFormat {
@@ -185,6 +196,7 @@ impl TexelFormat {
         match self {
             Self::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
             Self::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
+            Self::Rgba8Srgb => wgpu::TextureFormat::Rgba8UnormSrgb,
         }
     }
 }

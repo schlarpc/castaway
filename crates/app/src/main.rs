@@ -644,7 +644,7 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
         rows.push(AttractRow::new(
             [0xff, 0x00, 0x00, 0xff],
             "YouTube",
-            "Cast button".to_string(),
+            detail("Cast button", ProtocolKind::YouTubeLounge),
         ));
     }
 

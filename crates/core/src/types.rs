@@ -40,7 +40,9 @@ impl ProtocolKind {
             ProtocolKind::Cast => "cast",
             ProtocolKind::Miracast => "miracast",
             ProtocolKind::Dlna => "dlna",
-            ProtocolKind::YouTubeLounge => "youtube-lounge",
+            // "youtube", not "youtube-lounge": the Lounge protocol is how we get there,
+            // but the name is what a person reads in a picker and on the idle screen.
+            ProtocolKind::YouTubeLounge => "youtube",
             ProtocolKind::Spotify => "spotify",
             ProtocolKind::Bluetooth => "bluetooth",
         }
@@ -488,6 +490,8 @@ mod tests {
     #[test]
     fn protocol_slug_is_stable() {
         assert_eq!(ProtocolKind::Cast.slug(), "cast");
-        assert_eq!(ProtocolKind::YouTubeLounge.to_string(), "youtube-lounge");
+        // "youtube", not the transport that gets us there — this string ends up in a
+        // picker and on the idle screen.
+        assert_eq!(ProtocolKind::YouTubeLounge.to_string(), "youtube");
     }
 }

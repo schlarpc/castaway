@@ -438,7 +438,8 @@ impl RenderLoop {
                         LayerId::Osd,
                         banner.width,
                         banner.height,
-                        TexelFormat::Rgba8,
+                        // Authored colour: sRGB in, sRGB out. See `TexelFormat::Rgba8`.
+                        TexelFormat::Rgba8Srgb,
                         &banner.rgba,
                     )
                     .is_ok()
@@ -504,7 +505,8 @@ impl RenderLoop {
             LayerId::NowPlaying,
             width,
             height,
-            TexelFormat::Rgba8,
+            // Authored colour: sRGB in, sRGB out. See `TexelFormat::Rgba8`.
+            TexelFormat::Rgba8Srgb,
             rgba,
         )?;
         self.compositor.upsert_layer(Layer {
@@ -526,7 +528,8 @@ impl RenderLoop {
             LayerId::Attract,
             width,
             height,
-            TexelFormat::Rgba8,
+            // Authored colour: sRGB in, sRGB out. See `TexelFormat::Rgba8`.
+            TexelFormat::Rgba8Srgb,
             rgba,
         )?;
         self.compositor.upsert_layer(Layer {

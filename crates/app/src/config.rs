@@ -306,7 +306,7 @@ mod advertised_name_tests {
         );
         assert_eq!(
             c.advertised_name(ProtocolKind::YouTubeLounge),
-            "dma.space/screen#youtube-lounge"
+            "dma.space/screen#youtube"
         );
     }
 
@@ -320,7 +320,7 @@ mod advertised_name_tests {
         };
         let name = c.advertised_name(ProtocolKind::YouTubeLounge);
         assert!(name.len() <= 63, "{} octets", name.len());
-        assert!(name.ends_with("#youtube-lounge"));
+        assert!(name.ends_with("#youtube"));
     }
 
     #[test]
