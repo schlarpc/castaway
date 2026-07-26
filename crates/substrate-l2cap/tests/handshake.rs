@@ -8,7 +8,12 @@
 #![allow(clippy::unwrap_used)]
 
 use bytes::Bytes;
-use substrate_l2cap::{Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
+use substrate_l2cap::{ChannelMode, Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
+
+/// A dynamic PSM of the shape a phone publishes its image server on.
+fn cover_art_psm() -> Psm {
+    Psm::new(0x1005).unwrap()
+}
 
 /// A link that carries PDUs between two multiplexers, returning what each side observed.
 struct Link {
@@ -82,6 +87,25 @@ impl Link {
         }
         assert!(queue.is_empty(), "signaling did not settle");
         (sink_seen, peer_seen)
+    }
+
+    /// We connect out to `psm` on the peer in `mode`; returns (our CID, their CID).
+    ///
+    /// The direction the cover-art fetch actually runs in: the phone publishes an image
+    /// server and we are the client.
+    fn connect_out(&mut self, psm: Psm, mode: ChannelMode) -> (Cid, Cid) {
+        let (_, start) = self.sink.connect_with(psm, mode).unwrap();
+        let (sink_seen, peer_seen) = self.settle(false, start);
+        let find = |seen: &[L2capEvent]| {
+            seen.iter().find_map(|e| match e {
+                L2capEvent::ChannelOpen { cid, psm: p, .. } if *p == psm => Some(*cid),
+                _ => None,
+            })
+        };
+        (
+            find(&sink_seen).expect("we should have opened a channel"),
+            find(&peer_seen).expect("the peer should have opened a channel"),
+        )
     }
 
     /// The peer connects to `psm` on us; returns (our CID, their CID).
@@ -316,4 +340,190 @@ fn data_for_an_unknown_channel_is_an_error() {
     let mut link = Link::new();
     let stray = L2capPdu::new(Cid::new(0x00ff), Bytes::from_static(&[1, 2]));
     assert!(link.sink.handle_pdu(&stray).is_err());
+}
+
+#[test]
+fn a_cover_art_channel_negotiates_enhanced_retransmission_end_to_end() {
+    // The channel Q29 was blocked on. GOEP 2.0 requires ERTM for the OBEX transfer, so a
+    // channel that quietly settles into basic mode is a channel the peer will not serve
+    // an image over — both ends have to *agree* on ERTM, not merely tolerate it.
+    let mut link = Link::new();
+    link.peer
+        .listen_with(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+    let (sink_cid, peer_cid) =
+        link.connect_out(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+
+    let sink_ch = link.sink.channel(sink_cid).unwrap();
+    let peer_ch = link.peer.channel(peer_cid).unwrap();
+    assert_eq!(sink_ch.mode, ChannelMode::EnhancedRetransmission);
+    assert_eq!(peer_ch.mode, ChannelMode::EnhancedRetransmission);
+    // The frame size we segment against is the peer's *receive* capability, not our own.
+    assert!(sink_ch.parameters.send_mps <= peer_ch.local_mtu);
+    assert!(sink_ch.parameters.send_window >= 1);
+}
+
+#[test]
+fn an_object_larger_than_one_frame_crosses_an_ertm_channel_intact() {
+    // A 200x200 thumbnail is several kilobytes and no L2CAP frame is: without
+    // segmentation the cover-art path tops out at one packet, which is the size of
+    // nothing worth showing.
+    let mut link = Link::new();
+    link.peer
+        .listen_with(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+    let (_, peer_cid) = link.connect_out(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+
+    let image: Vec<u8> = (0..3000).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    let sends = link
+        .peer
+        .send(peer_cid, Bytes::from(image.clone()))
+        .unwrap();
+    let (sink_seen, _) = link.settle(true, sends);
+
+    let delivered: Vec<Bytes> = sink_seen
+        .into_iter()
+        .filter_map(|e| match e {
+            L2capEvent::Data { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the SDU must arrive once, not as its segments"
+    );
+    assert_eq!(&delivered[0][..], &image[..]);
+}
+
+#[test]
+fn a_peer_that_only_speaks_basic_mode_gets_a_counter_proposal_and_a_channel_anyway() {
+    // Advertising ERTM support must not make us refuse peers that do not have it. A
+    // counter-proposal naming basic mode is how the spec says "not that one, this one",
+    // and it is the difference between falling back and hanging up.
+    let mut link = Link::new();
+    link.peer.listen(cover_art_psm()); // basic only
+    let (sink_cid, peer_cid) =
+        link.connect_out(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+
+    assert_eq!(
+        link.sink.channel(sink_cid).unwrap().mode,
+        ChannelMode::Basic,
+        "we should have come down to the mode the peer offered"
+    );
+    assert_eq!(
+        link.peer.channel(peer_cid).unwrap().mode,
+        ChannelMode::Basic
+    );
+
+    // …and it carries data, which is the whole point of falling back rather than failing.
+    let payload = Bytes::from_static(b"GET / OBEX");
+    let sends = link.peer.send(peer_cid, payload.clone()).unwrap();
+    let (sink_seen, _) = link.settle(true, sends);
+    assert!(sink_seen.iter().any(|e| matches!(
+        e,
+        L2capEvent::Data { payload: got, .. } if got == &payload
+    )));
+}
+
+#[test]
+fn a_phone_that_asks_for_retransmission_on_audio_is_brought_back_to_basic_mode() {
+    // The interop risk that comes free with advertising ERTM: a sender that sees the bit
+    // may well propose the mode for AVDTP too. Our audio channels are registered basic —
+    // hardware-proven, and A2DP has no use for retransmission — so the answer has to be a
+    // counter-proposal the sender can act on, not a refusal that costs us the session.
+    let mut link = Link::new();
+    let (_, start) = link
+        .peer
+        .connect_with(Psm::AVDTP, ChannelMode::EnhancedRetransmission)
+        .unwrap();
+    let (sink_seen, peer_seen) = link.settle(true, start);
+
+    let opened = |seen: &[L2capEvent]| {
+        seen.iter().find_map(|e| match e {
+            L2capEvent::ChannelOpen { cid, psm, .. } if *psm == Psm::AVDTP => Some(*cid),
+            _ => None,
+        })
+    };
+    let sink_cid = opened(&sink_seen).expect("the audio channel must still open");
+    let peer_cid = opened(&peer_seen).expect("and on the sender's side too");
+    assert_eq!(
+        link.sink.channel(sink_cid).unwrap().mode,
+        ChannelMode::Basic
+    );
+    assert_eq!(
+        link.peer.channel(peer_cid).unwrap().mode,
+        ChannelMode::Basic,
+        "the sender should have come down to the mode we serve audio in"
+    );
+}
+
+#[test]
+fn the_extended_features_mask_advertises_retransmission() {
+    // The bit that decides whether a peer bothers proposing ERTM at all. Answering zero
+    // here is what left cover art unreachable no matter what the layers above did.
+    let mut sink = Multiplexer::new(672);
+    let request = L2capPdu::new(
+        Cid::SIGNALING,
+        substrate_l2cap::Signal::InformationRequest {
+            id: 1,
+            info_type: 0x0002,
+        }
+        .encode()
+        .unwrap(),
+    );
+    let events = sink.handle_pdu(&request).unwrap();
+    let L2capEvent::Send(pdu) = &events[0] else {
+        panic!("expected a reply");
+    };
+    let sigs = substrate_l2cap::Signal::decode_all(&pdu.payload).unwrap();
+    let substrate_l2cap::Signal::InformationResponse { data, result, .. } = &sigs[0] else {
+        panic!("expected an information response");
+    };
+    assert_eq!(*result, 0x0000, "the request must be answered, not refused");
+    let mask = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    assert_ne!(mask & (1 << 3), 0, "bit 3 is enhanced retransmission mode");
+    assert_ne!(mask & (1 << 5), 0, "bit 5 is the fcs option");
+}
+
+#[test]
+fn an_ertm_channel_recovers_a_lost_frame_rather_than_losing_the_object() {
+    // What ERTM is *for*. Drop one segment on the floor and the object still arrives —
+    // in basic mode the same loss is a truncated JPEG nobody can decode and nobody can
+    // explain.
+    let mut link = Link::new();
+    link.peer
+        .listen_with(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+    let (_, peer_cid) = link.connect_out(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+
+    let object: Vec<u8> = (0..2000).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    let sends = link
+        .peer
+        .send(peer_cid, Bytes::from(object.clone()))
+        .unwrap();
+
+    // Deliver everything except the second frame, which the radio ate.
+    let mut frames: Vec<L2capPdu> = sends
+        .into_iter()
+        .filter_map(|e| match e {
+            L2capEvent::Send(pdu) => Some(pdu),
+            _ => None,
+        })
+        .collect();
+    assert!(frames.len() > 2, "the object must actually be segmented");
+    let lost = frames.remove(1);
+
+    drop(lost);
+
+    let mut delivered: Vec<Bytes> = Vec::new();
+    for pdu in frames {
+        let (sink_seen, _) = link.settle(true, vec![L2capEvent::Send(pdu)]);
+        delivered.extend(sink_seen.into_iter().filter_map(|e| match e {
+            L2capEvent::Data { payload, .. } => Some(payload),
+            _ => None,
+        }));
+    }
+
+    // The gap makes the receiver reject, the rejection makes the sender replay, and the
+    // object arrives whole — once, not as a truncated prefix and not twice.
+    assert_eq!(delivered.len(), 1, "the object must survive the loss");
+    assert_eq!(&delivered[0][..], &object[..]);
 }

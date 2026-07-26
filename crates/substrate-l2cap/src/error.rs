@@ -64,4 +64,30 @@ pub enum L2capError {
     /// No dynamic CIDs left to allocate.
     #[error("no free channel identifiers")]
     OutOfCids,
+
+    /// An ERTM frame's checksum did not match the bytes it arrived with.
+    ///
+    /// Carries both numbers because the usual cause is not a corrupt link but a checksum
+    /// computed over the wrong bytes — the FCS covers the basic L2CAP header, and an
+    /// implementation that forgets it fails *every* frame rather than an occasional one.
+    #[error(
+        "bad frame check sequence on cid {cid}: computed {expected:#06x}, frame says {actual:#06x}"
+    )]
+    BadFcs {
+        /// The channel the frame arrived on.
+        cid: Cid,
+        /// What we computed.
+        expected: u16,
+        /// What the frame claimed.
+        actual: u16,
+    },
+
+    /// A peer proposed an L2CAP mode we do not implement on that channel.
+    #[error("channel {cid} cannot run in mode {proposed:#04x}")]
+    UnsupportedMode {
+        /// The channel.
+        cid: Cid,
+        /// The mode asked for.
+        proposed: u8,
+    },
 }

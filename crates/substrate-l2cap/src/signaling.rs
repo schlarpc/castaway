@@ -3,6 +3,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::error::L2capError;
+use crate::ertm::{FcsType, RetransmissionConfig};
 use crate::pdu::{Cid, Psm};
 
 /// Why a connection request was refused.
@@ -112,6 +113,16 @@ pub enum ConfigOption {
     Mtu(u16),
     /// Flush timeout.
     FlushTimeout(u16),
+    /// Retransmission and flow control: which mode the channel runs in, and the window,
+    /// timers and frame size that go with it. The option cover art turns on (Q29).
+    Retransmission(RetransmissionConfig),
+    /// Whether frames carry a frame check sequence.
+    Fcs(FcsType),
+    /// Extended window size, which comes with the four-byte control field we don't
+    /// implement. Decoded rather than left unknown so it can be refused by name with a
+    /// counter-proposal of zero — "use the standard field" — instead of failing the whole
+    /// configuration.
+    ExtendedWindowSize(u16),
     /// An option we don't implement.
     Unknown {
         /// Option type, with the hint bit already stripped.
@@ -126,13 +137,20 @@ pub enum ConfigOption {
 impl ConfigOption {
     const MTU: u8 = 0x01;
     const FLUSH_TIMEOUT: u8 = 0x02;
+    const RETRANSMISSION: u8 = 0x04;
+    const FCS: u8 = 0x05;
+    const EXTENDED_WINDOW_SIZE: u8 = 0x07;
     const HINT_BIT: u8 = 0x80;
 
     /// Whether this option may be ignored rather than refused.
     #[must_use]
     pub const fn is_ignorable(&self) -> bool {
         match self {
-            Self::Mtu(_) | Self::FlushTimeout(_) => true,
+            Self::Mtu(_)
+            | Self::FlushTimeout(_)
+            | Self::Retransmission(_)
+            | Self::Fcs(_)
+            | Self::ExtendedWindowSize(_) => true,
             Self::Unknown { hint, .. } => *hint,
         }
     }
@@ -148,6 +166,22 @@ impl ConfigOption {
                 buf.put_u8(Self::FLUSH_TIMEOUT);
                 buf.put_u8(2);
                 buf.put_u16_le(*t);
+            }
+            Self::Retransmission(config) => {
+                buf.put_u8(Self::RETRANSMISSION);
+                let body = config.encode();
+                buf.put_u8(u8::try_from(body.len()).unwrap_or(u8::MAX));
+                buf.extend_from_slice(&body);
+            }
+            Self::Fcs(fcs) => {
+                buf.put_u8(Self::FCS);
+                buf.put_u8(1);
+                buf.put_u8(fcs.bits());
+            }
+            Self::ExtendedWindowSize(size) => {
+                buf.put_u8(Self::EXTENDED_WINDOW_SIZE);
+                buf.put_u8(2);
+                buf.put_u16_le(*size);
             }
             Self::Unknown { kind, hint, data } => {
                 buf.put_u8(kind | if *hint { Self::HINT_BIT } else { 0 });
@@ -187,6 +221,13 @@ impl ConfigOption {
                 (Self::MTU, 2) => Self::Mtu(u16::from_le_bytes([body[0], body[1]])),
                 (Self::FLUSH_TIMEOUT, 2) => {
                     Self::FlushTimeout(u16::from_le_bytes([body[0], body[1]]))
+                }
+                (Self::RETRANSMISSION, RetransmissionConfig::LEN) => {
+                    Self::Retransmission(RetransmissionConfig::decode(body)?)
+                }
+                (Self::FCS, 1) => Self::Fcs(FcsType::from_bits(body[0])),
+                (Self::EXTENDED_WINDOW_SIZE, 2) => {
+                    Self::ExtendedWindowSize(u16::from_le_bytes([body[0], body[1]]))
                 }
                 _ => Self::Unknown {
                     kind,
