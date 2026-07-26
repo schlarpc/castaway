@@ -196,6 +196,12 @@ impl Pipeline for RenderPipeline {
     ) -> Result<(), CoreError> {
         self.preempt();
         match video {
+            // A mirror session is pixels by definition. PCM reaching here means an
+            // adapter routed an audio-only source down the video path, which would
+            // otherwise show as a black screen rather than as the wiring mistake it is.
+            FrameSource::Pcm(_) => Err(CoreError::Pipeline(
+                "a mirror session cannot be PCM audio; use play_audio".into(),
+            )),
             FrameSource::Url(uri) => self.play(uri, None).await,
             FrameSource::Decoded(mut rx) => {
                 info!("render pipeline: MIRROR (decoded frames → compositor)");

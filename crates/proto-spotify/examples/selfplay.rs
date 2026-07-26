@@ -173,7 +173,18 @@ async fn access_token(env: &HashMap<String, String>) -> Result<String, Error> {
     let refresh = env.get("SPOTIFY_REFRESH_TOKEN").filter(|s| !s.is_empty());
     if let Some(refresh) = refresh {
         match client.refresh_token_async(refresh).await {
-            Ok(token) => return Ok(token.access_token),
+            Ok(token) => {
+                // Spotify's PKCE flow *rotates* the refresh token: the one just used is
+                // revoked and a replacement comes back in the response. Dropping it turns
+                // "hands-free forever" into "hands-free exactly once", and the next run
+                // fails with `invalid_grant: Refresh token revoked` — which reads like an
+                // expiry rather than the self-inflicted wound it is.
+                if let Err(e) = persist_refresh_token(&token.refresh_token) {
+                    eprintln!("  ! could not store the rotated refresh token: {e}");
+                    eprintln!("    the next run will need the browser again");
+                }
+                return Ok(token.access_token);
+            }
             Err(e) => eprintln!("  ! stored refresh token rejected ({e}), logging in again"),
         }
     }
