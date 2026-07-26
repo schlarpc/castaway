@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use adblock::request::Request;
+use adblock::resources::Resource;
 use adblock::Engine;
 use tracing::info;
 
@@ -22,6 +23,8 @@ pub struct AdBlocker {
     seen: AtomicU64,
     /// host → (seen, blocked) — diagnostic tally so we can see what a page actually loads.
     hosts: Mutex<BTreeMap<String, (u32, u32)>>,
+    /// How many scriptlet bodies the engine can substitute into `##+js(...)` rules.
+    scriptlets: usize,
 }
 
 impl AdBlocker {
@@ -39,7 +42,38 @@ impl AdBlocker {
             blocked: AtomicU64::new(0),
             seen: AtomicU64::new(0),
             hosts: Mutex::new(BTreeMap::new()),
+            scriptlets: 0,
         }
+    }
+
+    /// Give the engine the scriptlet bodies that `##+js(...)` rules name.
+    ///
+    /// Without these, cosmetic filters still parse but [`Self::injected_script`] returns
+    /// nothing for them: a rule says *which* scriptlet to run with *which* arguments, and
+    /// the implementation lives in a separate resource bundle.
+    pub fn use_resources(&mut self, resources: Vec<Resource>) {
+        let count = resources.len();
+        self.engine.use_resources(resources);
+        self.scriptlets = count;
+        info!(target: "castaway::adblock", scriptlets = count, "scriptlet resources loaded");
+    }
+
+    /// How many scriptlet resources are loaded.
+    #[must_use]
+    pub fn scriptlet_count(&self) -> usize {
+        self.scriptlets
+    }
+
+    /// The JavaScript to run at document start for `url`, if any rule calls for it.
+    ///
+    /// This is the half of uBlock Origin that request blocking cannot do: rules like
+    /// `##+js(set-constant, foo, true)` do not name a request to cancel, they name code to
+    /// run inside the page before its own scripts. Returns `None` when no rule matches, so
+    /// the caller can skip the injection entirely rather than evaluating an empty string.
+    #[must_use]
+    pub fn injected_script(&self, url: &str) -> Option<String> {
+        let script = self.engine.url_cosmetic_resources(url).injected_script;
+        (!script.trim().is_empty()).then_some(script)
     }
 
     /// A sorted diagnostic of the hosts seen: `(host, seen, blocked)`, most-seen first.
@@ -102,7 +136,67 @@ impl AdBlocker {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+    use adblock::resources::{MimeType, ResourceType};
+    use base64::Engine as _;
+
+    /// A scriptlet resource in the shape the engine wants: base64 body, and a name ending
+    /// in `.js` — a `##+js(probe, …)` rule resolves to the resource `probe.js`, so a
+    /// bundle whose names lack the extension silently matches nothing.
+    fn scriptlet(name: &str, body: &str) -> Resource {
+        Resource {
+            name: name.to_string(),
+            aliases: vec![],
+            kind: ResourceType::Mime(MimeType::ApplicationJavascript),
+            content: base64::prelude::BASE64_STANDARD.encode(body),
+            dependencies: vec![],
+            permission: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_scriptlet_rule_becomes_javascript_for_the_matching_site_only() {
+        // The whole point of the injection path: this rule names code to run *inside* the
+        // page, which no amount of request blocking can express.
+        let mut ab = AdBlocker::from_list_text("example.com##+js(probe, hello)\n");
+        assert_eq!(
+            ab.injected_script("https://example.com/"),
+            None,
+            "a rule without its scriptlet body has nothing to inject"
+        );
+
+        // Function-style, as modern bundles are: the engine finds the function name and
+        // invokes it with the rule's arguments.
+        ab.use_resources(vec![scriptlet(
+            "probe.js",
+            "function probe(a) { console.log('probe:' + a); }",
+        )]);
+        let script = ab
+            .injected_script("https://example.com/")
+            .expect("the rule matches this site");
+        assert!(
+            script.contains("probe"),
+            "the scriptlet body has to reach the page: {script}"
+        );
+        assert!(
+            script.contains("hello"),
+            "the rule's argument has to be substituted in: {script}"
+        );
+        assert_eq!(ab.scriptlet_count(), 1);
+
+        // Scriptlets are per-site; injecting one everywhere would be a different product.
+        assert_eq!(ab.injected_script("https://other.test/"), None);
+    }
+
+    #[test]
+    fn a_rule_naming_an_unknown_scriptlet_injects_nothing() {
+        // Lists reference scriptlets our bundle may not carry. That must be silence, not
+        // a broken script tag inside someone else's page.
+        let mut ab = AdBlocker::from_list_text("example.com##+js(not-in-our-bundle, x)\n");
+        ab.use_resources(vec![scriptlet("probe.js", "function probe() {}")]);
+        assert_eq!(ab.injected_script("https://example.com/"), None);
+    }
 
     #[test]
     fn blocks_a_known_ad_domain_and_passes_content() {
