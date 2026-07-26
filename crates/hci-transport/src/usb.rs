@@ -16,7 +16,7 @@
 //! [`substrate_hci::HciPacket::decode_body`] exists — the type comes from context here,
 //! and from a leading byte everywhere else.
 
-use nusb::transfer::{ControlOut, ControlType, Queue, Recipient, RequestBuffer};
+use nusb::transfer::{ControlOut, ControlType, Queue, Recipient, RequestBuffer, TransferError};
 use nusb::{Device, DeviceInfo, Interface};
 use substrate_hci::{HciError, HciPacket, HciTransport, PacketType};
 use tokio::sync::Mutex;
@@ -65,11 +65,60 @@ struct Reader {
     queued: std::collections::VecDeque<HciPacket>,
 }
 
+/// What a completed IN transfer told us to do next.
+enum Read {
+    /// Bytes arrived.
+    Data(Vec<u8>),
+    /// The endpoint stalled and was recovered; nothing to decode this time round.
+    Recovered,
+}
+
+/// Handle one IN completion, clearing a stall rather than dying of it.
+///
+/// A STALL is the device signalling an error condition on that pipe, not the end of the
+/// world: for bulk and interrupt endpoints it is cleared with `CLEAR_FEATURE(HALT)` and
+/// the pipe carries on. Treating it as fatal cost a live session — the reader exited
+/// silently, and a phone spent five minutes pairing with a controller nothing was
+/// listening to.
+fn handle_completion(
+    queue: &mut Queue<RequestBuffer>,
+    completion: nusb::transfer::Completion<Vec<u8>>,
+    what: &'static str,
+    buf_len: usize,
+) -> Result<Read, HciError> {
+    match completion.into_result() {
+        Ok(data) => {
+            queue.submit(RequestBuffer::new(buf_len));
+            Ok(Read::Data(data))
+        }
+        Err(TransferError::Stall) => {
+            warn!(endpoint = what, "endpoint stalled; clearing and re-arming");
+            queue
+                .clear_halt()
+                .map_err(|e| HciError::Transport(format!("{what}: clearing stall: {e}")))?;
+            queue.submit(RequestBuffer::new(buf_len));
+            Ok(Read::Recovered)
+        }
+        // Everything else really is fatal: the device is gone, or the transfer was
+        // cancelled because we are shutting down.
+        Err(e) => Err(HciError::Transport(format!("{what}: {e}"))),
+    }
+}
+
 impl Reader {
     /// Arm both endpoints.
     fn new(interface: &Interface) -> Self {
         let mut events = interface.interrupt_in_queue(EP_EVENT_IN);
         let mut acl = interface.bulk_in_queue(EP_ACL_IN);
+        // Clear any halt inherited from a previous owner before arming. A process that
+        // died on a stall leaves the pipe halted, and the next claim then times out
+        // during vendor initialisation — which reads as a dead dongle needing a replug
+        // rather than as a pipe needing one control transfer.
+        for (queue, what) in [(&mut events, "interrupt in"), (&mut acl, "bulk in")] {
+            if let Err(e) = queue.clear_halt() {
+                debug!(endpoint = what, error = %e, "no stall to clear at open");
+            }
+        }
         events.submit(RequestBuffer::new(EVENT_BUF));
         acl.submit(RequestBuffer::new(ACL_BUF));
         Self {
@@ -260,21 +309,24 @@ impl HciTransport for UsbTransport {
             // and an idle controller sends events and no ACL whatsoever — which is
             // exactly how this hung the first time it met real hardware.
             let reader = &mut *reader;
-            let (kind, data) = tokio::select! {
+            let (kind, read) = tokio::select! {
                 completion = reader.events.next_complete() => {
-                    let data = completion.into_result()
-                        .map_err(|e| HciError::Transport(format!("interrupt in: {e}")))?;
-                    reader.events.submit(RequestBuffer::new(EVENT_BUF));
-                    (PacketType::Event, data)
+                    let read = handle_completion(
+                        &mut reader.events, completion, "interrupt in", EVENT_BUF,
+                    )?;
+                    (PacketType::Event, read)
                 }
                 completion = reader.acl.next_complete() => {
-                    let data = completion.into_result()
-                        .map_err(|e| HciError::Transport(format!("bulk in: {e}")))?;
-                    reader.acl.submit(RequestBuffer::new(ACL_BUF));
-                    (PacketType::AclData, data)
+                    let read = handle_completion(
+                        &mut reader.acl, completion, "bulk in", ACL_BUF,
+                    )?;
+                    (PacketType::AclData, read)
                 }
             };
 
+            let Read::Data(data) = read else {
+                continue;
+            };
             if data.is_empty() {
                 continue;
             }
