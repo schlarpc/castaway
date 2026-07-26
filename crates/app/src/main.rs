@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
 
         // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
-        // hide it. Without CEF the events are only logged.
+        // hide it. Without CEF there is no launch target, and DIAL goes unadvertised.
         #[cfg(feature = "cef")]
         let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
         #[cfg(feature = "cef")]
@@ -102,8 +102,12 @@ fn main() -> anyhow::Result<()> {
                 let _ = nav_tx.send(pipeline::BrowserCommand::Hide);
             }
         };
+        #[cfg(feature = "cef")]
+        let on_dial = Some(on_dial);
+        // Rendering but browser-less: there is a screen, and still nothing to put YouTube
+        // on it with.
         #[cfg(not(feature = "cef"))]
-        let on_dial = log_dial_event;
+        let on_dial: Option<NoLauncher> = None;
 
         let serve_cfg = config.clone();
         let serve_tx = event_tx.clone();
@@ -186,7 +190,9 @@ fn main() -> anyhow::Result<()> {
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit);
-        runtime.block_on(serve(config, event_tx, shutdown, osd, log_dial_event, None))?;
+        // Headless: no renderer at all, so certainly no browser to launch YouTube in.
+        let on_dial: Option<NoLauncher> = None;
+        runtime.block_on(serve(config, event_tx, shutdown, osd, on_dial, None))?;
     }
 
     Ok(())
@@ -221,27 +227,22 @@ fn drain_osd_to_log(rx: &castaway_core::OsdReceiver) {
     }
 }
 
-/// What to do with a DIAL launch/stop when there's no kiosk browser: log it.
+/// The `on_dial` a build with no kiosk browser has: none. Spelled out as a type so the
+/// `None` at the call site has something to be `None` of.
 #[cfg(not(feature = "cef"))]
-fn log_dial_event(event: proto_dial::DialEvent) {
-    match event {
-        proto_dial::DialEvent::Launched(params) => {
-            warn!(pairing = ?params.pairing_code, "YouTube launched; no kiosk browser (build with `cef`)");
-        }
-        proto_dial::DialEvent::Stopped => info!("YouTube stopped"),
-    }
-}
+type NoLauncher = fn(proto_dial::DialEvent);
 
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
 /// protocols, and run until `shutdown` is signalled. `osd` is cloned to each adapter so
 /// they can surface their own status on the overlay; DIAL launch/stop events are handed
-/// to `on_dial` (the kiosk browser navigation hook, or a logger).
+/// to `on_dial` (the kiosk browser navigation hook). `on_dial: None` means this build has
+/// nowhere to launch YouTube, and DIAL is then neither mounted nor advertised.
 async fn serve(
     config: Config,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
     osd: castaway_core::OsdSink,
-    on_dial: impl Fn(proto_dial::DialEvent) + Send + 'static,
+    on_dial: Option<impl Fn(proto_dial::DialEvent) + Send + 'static>,
     screenshot: Option<Screenshot>,
 ) -> anyhow::Result<()> {
     let iface = config.resolved_interface();
@@ -287,24 +288,38 @@ async fn serve(
     }
 
     let (dial_tx, mut dial_rx) = mpsc::channel(8);
-    if config.enable.dial {
-        let dial = DialService::new(
-            config.advertised_name(ProtocolKind::YouTubeLounge),
-            config.http_base_url(),
-            dial_tx.clone(),
-        )
-        .with_osd(osd.clone());
-        http = http.merge(dial.router());
-        ssdp_devices.push((
-            dial.ssdp_device(&config.uuid),
-            dial.description_path().to_string(),
-        ));
-        info!("enabled: DIAL → YouTube leanback (launch/stop)");
-        tokio::spawn(async move {
-            while let Some(event) = dial_rx.recv().await {
-                on_dial(event);
-            }
-        });
+    // DIAL is launch-only: it carries no media, so everything a YouTube sender does after
+    // the launch happens between the phone, YouTube's Lounge servers, and the *page* we
+    // are supposed to have opened. A build with no browser has nothing to open, so the
+    // pairing code is never registered and the phone binds to nothing — it sees `running`
+    // and then browses a session that will never play. D16's rule ("advertising a service
+    // with no listener only frustrates senders") is the same rule here, and a missing
+    // launch target is a missing listener.
+    match (config.enable.dial, on_dial) {
+        (true, None) => warn!(
+            "DIAL disabled: this build has no kiosk browser to launch YouTube in \
+             (build with `--features cef`)"
+        ),
+        (false, _) => {}
+        (true, Some(on_dial)) => {
+            let dial = DialService::new(
+                config.advertised_name(ProtocolKind::YouTubeLounge),
+                config.http_base_url(),
+                dial_tx.clone(),
+            )
+            .with_osd(osd.clone());
+            http = http.merge(dial.router());
+            ssdp_devices.push((
+                dial.ssdp_device(&config.uuid),
+                dial.description_path().to_string(),
+            ));
+            info!("enabled: DIAL → YouTube leanback (launch/stop)");
+            tokio::spawn(async move {
+                while let Some(event) = dial_rx.recv().await {
+                    on_dial(event);
+                }
+            });
+        }
     }
 
     // Cast is the first protocol whose adapter owns a real listener, so it advertises
