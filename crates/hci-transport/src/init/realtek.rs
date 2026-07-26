@@ -47,12 +47,32 @@ impl Default for RealtekInit {
 }
 
 impl RealtekInit {
-    /// Realtek's USB vendor id.
+    /// Realtek's own USB vendor id.
     pub const VENDOR: u16 = 0x0BDA;
 
-    /// Products this loader handles. `0x8771` is the RTL8761BU in every cheap dongle;
-    /// `0x8761` is the older RTL8761B.
-    pub const PRODUCTS: &'static [u16] = &[0x8771, 0x8761, 0xa725, 0xb00a];
+    /// Controllers this loader handles, as `(vendor, product)`.
+    ///
+    /// **Realtek chips ship under other companies' USB ids, and this bit us.** The
+    /// TP-Link UB500 in the dev box is an RTL8761BU that reports `2357:0604` — TP-Link's
+    /// vendor id, not Realtek's — so a registry keyed on `0x0BDA` alone falls through to
+    /// [`crate::NoInit`], does nothing, and leaves the dongle without firmware. On Linux
+    /// that is invisible because the kernel already loaded it; on Windows, where nothing
+    /// else will, the device is simply dead.
+    ///
+    /// The list is therefore inherently incomplete: any vendor may rebadge the same part.
+    /// The robust fix is to identify the *chip* over HCI (`Read_Local_Version`'s
+    /// `lmp_subver`, as `btrtl.c` does) when the USB id is unknown, rather than trusting
+    /// the id at all — see the note in [`ControllerInit::matches`] callers.
+    pub const CONTROLLERS: &'static [(u16, u16)] = &[
+        (0x0BDA, 0x8771), // Realtek reference RTL8761BU
+        (0x0BDA, 0x8761), // RTL8761B
+        (0x0BDA, 0xA725),
+        (0x0BDA, 0xB00A),
+        (0x2357, 0x0604), // TP-Link UB500 — verified on the dev box
+        (0x0B05, 0x190E), // ASUS BT500
+        (0x7392, 0xC611), // Edimax BT-8500
+        (0x2550, 0x8761),
+    ];
 }
 
 #[async_trait::async_trait]
@@ -62,7 +82,9 @@ impl ControllerInit for RealtekInit {
     }
 
     fn matches(&self, id: UsbId) -> bool {
-        id.vendor == Self::VENDOR && Self::PRODUCTS.contains(&id.product)
+        Self::CONTROLLERS
+            .iter()
+            .any(|(vendor, product)| *vendor == id.vendor && *product == id.product)
     }
 
     fn required_images(&self) -> &'static [&'static str] {
@@ -78,17 +100,19 @@ impl ControllerInit for RealtekInit {
         debug!(rom_version, "realtek rom version");
 
         let fw = firmware.get(self.firmware_name)?;
-        check_signature(&fw, self.firmware_name)?;
 
-        // The config is appended to the firmware, not sent separately. It is optional —
-        // a controller without one uses its defaults — so a missing file is a debug line
-        // rather than a refusal to start.
-        let mut payload = fw.to_vec();
-        match firmware.get(self.config_name) {
-            Ok(config) => payload.extend_from_slice(&config),
-            Err(e) => debug!(error = %e, "realtek: no config blob; using controller defaults"),
-        }
+        // The config is appended to the *extracted patch*, not to the container, and not
+        // sent separately. It is optional — a controller without one uses its defaults —
+        // so a missing file is a debug line rather than a refusal to start.
+        let config = match firmware.get(self.config_name) {
+            Ok(config) => config.to_vec(),
+            Err(e) => {
+                debug!(error = %e, "realtek: no config blob; using controller defaults");
+                Vec::new()
+            }
+        };
 
+        let payload = build_payload(&fw, &config, rom_version, self.firmware_name)?;
         download(hci, &payload).await?;
         info!(bytes = payload.len(), "realtek firmware loaded");
         Ok(())
@@ -108,24 +132,123 @@ async fn read_rom_version(hci: &dyn HciTransport) -> Result<u8, TransportError> 
     Ok(params.first().copied().unwrap_or(0))
 }
 
-/// Reject an image that is not a Realtek patch container.
+/// Header at the top of an epatch v1 container.
 ///
-/// Downloading an arbitrary file succeeds command-by-command and leaves the controller
-/// wedged, so checking the magic up front turns a mystery into a message.
-fn check_signature(fw: &[u8], name: &str) -> Result<(), TransportError> {
-    let head = fw.get(..8).ok_or_else(|| TransportError::Firmware {
+/// `signature[8]`, `fw_version` (LE32), `num_patches` (LE16) — then three parallel
+/// arrays: chip ids, patch lengths, patch offsets.
+const EPATCH_HEADER_LEN: usize = 14;
+/// Marks the end of the trailing extension section.
+const EXTENSION_SIGNATURE: [u8; 4] = [0x51, 0x04, 0xFD, 0x77];
+
+/// Assemble what actually gets downloaded.
+///
+/// **A Realtek firmware file is a container, not an image.** `rtl8761bu_fw.bin` holds
+/// *two* patches for different chip revisions behind an epatch header, and sending the
+/// whole file is meaningless to the controller. The kernel's `btrtl.c` does four things
+/// we must also do:
+///
+/// 1. pick the patch whose chip id is `rom_version + 1`;
+/// 2. copy just that patch out;
+/// 3. overwrite its **last four bytes** with the container's `fw_version` — the patch
+///    carries a placeholder there, and leaving it makes the controller reject the image;
+/// 4. append the config blob to the extracted patch.
+///
+/// Step 4 is the one that reads like an afterthought and is not: the config is part of
+/// the downloaded payload, not a separate transfer.
+///
+/// # Errors
+/// [`TransportError::Firmware`] if the container is malformed or holds no patch for this
+/// chip revision.
+pub fn build_payload(
+    fw: &[u8],
+    config: &[u8],
+    rom_version: u8,
+    name: &str,
+) -> Result<Vec<u8>, TransportError> {
+    let bad = |detail: String| TransportError::Firmware {
         name: name.to_owned(),
-        detail: "shorter than its 8-byte signature".to_owned(),
-    })?;
-    if head == EPATCH_SIGNATURE || head == RTL_EPATCH_SIGNATURE_V2 {
-        return Ok(());
+        detail,
+    };
+
+    let head = fw
+        .get(..8)
+        .ok_or_else(|| bad("shorter than its 8-byte signature".into()))?;
+    if head == RTL_EPATCH_SIGNATURE_V2 {
+        // Newer parts use a different container. Refusing by name beats parsing it as v1
+        // and downloading nonsense.
+        return Err(bad(
+            "RTBTCore (epatch v2) containers are not supported yet".into()
+        ));
     }
-    Err(TransportError::Firmware {
-        name: name.to_owned(),
-        detail: format!(
-            "not a Realtek patch image (signature {head:02x?}; expected \"Realtech\" or \"RTBTCore\")"
-        ),
-    })
+    if head != EPATCH_SIGNATURE {
+        return Err(bad(format!(
+            "not a Realtek patch container (signature {head:02x?})"
+        )));
+    }
+    if fw.len() < EPATCH_HEADER_LEN + 4 || !fw.ends_with(&EXTENSION_SIGNATURE) {
+        return Err(bad(
+            "missing the trailing extension signature; truncated or not an epatch".into(),
+        ));
+    }
+
+    let fw_version = &fw[8..12];
+    let num_patches = usize::from(u16::from_le_bytes([fw[12], fw[13]]));
+    if num_patches == 0 {
+        return Err(bad("container declares no patches".into()));
+    }
+
+    // Three parallel arrays follow the header: chip ids (u16), lengths (u16), offsets
+    // (u32). Reading them as one interleaved struct is the obvious wrong guess.
+    let ids_at = EPATCH_HEADER_LEN;
+    let lengths_at = ids_at + num_patches * 2;
+    let offsets_at = lengths_at + num_patches * 2;
+    let table_end = offsets_at + num_patches * 4;
+    if fw.len() < table_end {
+        return Err(bad(format!(
+            "patch table runs past the file ({num_patches} patches need {table_end} bytes)"
+        )));
+    }
+
+    // The chip id that matches is the ROM version *plus one*, which is not a typo.
+    let wanted = u16::from(rom_version) + 1;
+    let index = (0..num_patches)
+        .find(|i| {
+            let at = ids_at + i * 2;
+            u16::from_le_bytes([fw[at], fw[at + 1]]) == wanted
+        })
+        .ok_or_else(|| {
+            bad(format!(
+                "no patch for chip id {wanted} (rom version {rom_version}) among {num_patches}"
+            ))
+        })?;
+
+    let length = usize::from(u16::from_le_bytes([
+        fw[lengths_at + index * 2],
+        fw[lengths_at + index * 2 + 1],
+    ]));
+    let offset = u32::from_le_bytes([
+        fw[offsets_at + index * 4],
+        fw[offsets_at + index * 4 + 1],
+        fw[offsets_at + index * 4 + 2],
+        fw[offsets_at + index * 4 + 3],
+    ]) as usize;
+
+    let patch = fw.get(offset..offset + length).ok_or_else(|| {
+        bad(format!(
+            "patch {index} at {offset}+{length} runs past the file"
+        ))
+    })?;
+    if length < 4 {
+        return Err(bad(format!("patch {index} is only {length} bytes")));
+    }
+
+    let mut payload = patch.to_vec();
+    // The patch's last four bytes are a placeholder for the container's firmware
+    // version. Leaving them makes the controller refuse the image.
+    let tail = payload.len() - 4;
+    payload[tail..].copy_from_slice(fw_version);
+    payload.extend_from_slice(config);
+    Ok(payload)
 }
 
 /// The index byte for fragment `n`, with the end flag set on the last one.
@@ -224,7 +347,8 @@ mod tests {
             params.extend_from_slice(&opcode.raw().to_le_bytes());
             params.push(0x00); // status
             if *opcode == READ_ROM_VERSION {
-                params.push(0x0A);
+                // ROM version 0, so the loader looks for chip id 1.
+                params.push(0x00);
             }
             vec![HciPacket::Event {
                 code: code::COMMAND_COMPLETE,
@@ -233,10 +357,11 @@ mod tests {
         })
     }
 
+    /// A container whose extracted patch is exactly `len` bytes — which is what the
+    /// fragmentation tests care about, since the patch is what gets downloaded.
     fn image(len: usize) -> Vec<u8> {
-        let mut fw = RTL_EPATCH_SIGNATURE_V2.to_vec();
-        fw.resize(len.max(8), 0x5A);
-        fw
+        let body = vec![0x5Au8; len.max(4)];
+        container(&[(1, &body)])
     }
 
     fn firmware_with(fw: Vec<u8>) -> FirmwareSet {
@@ -336,19 +461,153 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_image_that_is_not_a_realtek_patch_is_refused_up_front() {
-        // Downloading an arbitrary file succeeds command-by-command and leaves the
-        // controller wedged, so the magic is checked before anything is sent.
-        let err = check_signature(b"NOT-A-PATCH-FILE", "rtl_bt/x.bin").unwrap_err();
-        assert!(format!("{err}").contains("Realtech"), "got: {err}");
-        assert!(check_signature(EPATCH_SIGNATURE, "x").is_ok());
-        assert!(check_signature(RTL_EPATCH_SIGNATURE_V2, "x").is_ok());
+    /// A synthetic epatch container with `n` patches, shaped exactly like a real one.
+    fn container(patches: &[(u16, &[u8])]) -> Vec<u8> {
+        let n = patches.len();
+        let mut fw = EPATCH_SIGNATURE.to_vec();
+        fw.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // fw_version
+        fw.extend_from_slice(&u16::try_from(n).unwrap().to_le_bytes());
+
+        let table = EPATCH_HEADER_LEN + n * 2 + n * 2 + n * 4;
+        let mut offset = table;
+        let mut ids = Vec::new();
+        let mut lengths = Vec::new();
+        let mut offsets = Vec::new();
+        for (chip_id, body) in patches {
+            ids.extend_from_slice(&chip_id.to_le_bytes());
+            lengths.extend_from_slice(&u16::try_from(body.len()).unwrap().to_le_bytes());
+            offsets.extend_from_slice(&u32::try_from(offset).unwrap().to_le_bytes());
+            offset += body.len();
+        }
+        fw.extend_from_slice(&ids);
+        fw.extend_from_slice(&lengths);
+        fw.extend_from_slice(&offsets);
+        for (_, body) in patches {
+            fw.extend_from_slice(body);
+        }
+        fw.extend_from_slice(&EXTENSION_SIGNATURE);
+        fw
     }
 
     #[test]
-    fn a_short_image_is_refused_before_the_signature_check_can_index_past_it() {
-        assert!(check_signature(&[0u8; 4], "x").is_err());
+    fn the_right_patch_is_extracted_for_this_chip_revision() {
+        // A container holds several patches. Sending the whole file — which is what a
+        // naive loader does — hands the controller headers and other revisions' code.
+        let first = [0xA1u8, 0xA2, 0xA3, 0x00, 0x00, 0x00, 0x00];
+        let second = [0xB1u8, 0xB2, 0xB3, 0x00, 0x00, 0x00, 0x00];
+        let fw = container(&[(1, &first), (2, &second)]);
+
+        // Chip id is the ROM version *plus one*, which is not a typo.
+        let payload = build_payload(&fw, &[], 0, "x").unwrap();
+        assert_eq!(
+            &payload[..3],
+            &[0xA1, 0xA2, 0xA3],
+            "rom 0 selects chip id 1"
+        );
+        let payload = build_payload(&fw, &[], 1, "x").unwrap();
+        assert_eq!(
+            &payload[..3],
+            &[0xB1, 0xB2, 0xB3],
+            "rom 1 selects chip id 2"
+        );
+    }
+
+    #[test]
+    fn the_patch_tail_is_replaced_with_the_containers_firmware_version() {
+        // The patch carries a placeholder there; leaving it makes the controller refuse
+        // the image, with no clue as to why.
+        let body = [0xA1u8, 0xA2, 0xA3, 0xFF, 0xFF, 0xFF, 0xFF];
+        let fw = container(&[(1, &body)]);
+        let payload = build_payload(&fw, &[], 0, "x").unwrap();
+        assert_eq!(
+            &payload[payload.len() - 4..],
+            &0xDEAD_BEEFu32.to_le_bytes(),
+            "the last four bytes must be the container's fw_version"
+        );
+    }
+
+    #[test]
+    fn the_config_is_appended_to_the_patch_not_to_the_container() {
+        // The detail that reads like an afterthought and is not: the config blob is part
+        // of the downloaded payload, tacked onto the extracted patch.
+        let body = [0xA1u8, 0xA2, 0xA3, 0x00, 0x00, 0x00, 0x00];
+        let fw = container(&[(1, &body)]);
+        let config = [0x55u8, 0xAB, 0x23, 0x87, 0x00, 0x00];
+        let payload = build_payload(&fw, &config, 0, "x").unwrap();
+
+        assert_eq!(payload.len(), body.len() + config.len());
+        assert_eq!(&payload[body.len()..], &config, "config goes last");
+    }
+
+    #[test]
+    fn a_container_with_no_patch_for_this_chip_says_so() {
+        let body = [0u8; 8];
+        let fw = container(&[(1, &body)]);
+        let err = build_payload(&fw, &[], 9, "rtl_bt/x.bin").unwrap_err();
+        assert!(format!("{err}").contains("chip id 10"), "got: {err}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_container_is_refused_before_anything_is_sent() {
+        // Downloading an arbitrary file succeeds command-by-command and leaves the
+        // controller wedged — which is exactly what happened on the dev box.
+        let err = build_payload(b"NOT-A-PATCH-FILE-AT-ALL", &[], 0, "x").unwrap_err();
+        assert!(
+            format!("{err}").contains("not a Realtek patch container"),
+            "got: {err}"
+        );
+        assert!(build_payload(&[0u8; 4], &[], 0, "x").is_err(), "too short");
+
+        // v2 is refused by name rather than misparsed as v1.
+        let mut v2 = RTL_EPATCH_SIGNATURE_V2.to_vec();
+        v2.extend_from_slice(&[0u8; 32]);
+        let err = build_payload(&v2, &[], 0, "x").unwrap_err();
+        assert!(format!("{err}").contains("epatch v2"), "got: {err}");
+    }
+
+    #[test]
+    fn a_container_missing_its_extension_signature_is_refused() {
+        let body = [0u8; 8];
+        let mut fw = container(&[(1, &body)]);
+        fw.truncate(fw.len() - 4);
+        assert!(build_payload(&fw, &[], 0, "x").is_err());
+    }
+
+    /// The **real** `rtl8761bu_fw.bin` from `linux-firmware`, if this build embedded it.
+    ///
+    /// Synthetic containers prove the parser handles the shape; only the real file proves
+    /// it handles the shape that actually ships.
+    #[test]
+    fn the_real_ub500_firmware_parses() {
+        let firmware = FirmwareSet::embedded();
+        let Ok(fw) = firmware.get("rtl_bt/rtl8761bu_fw.bin") else {
+            eprintln!("no embedded Realtek firmware in this build; skipping");
+            return;
+        };
+        let config = firmware
+            .get("rtl_bt/rtl8761bu_config.bin")
+            .map(|c| c.to_vec())
+            .unwrap_or_default();
+
+        assert_eq!(&fw[..8], EPATCH_SIGNATURE, "the shipping file is epatch v1");
+        let num_patches = u16::from_le_bytes([fw[12], fw[13]]);
+        assert_eq!(num_patches, 2, "the shipping container holds two patches");
+
+        // Both revisions must extract, and each must be far smaller than the container —
+        // which is the whole point: sending the 44 kB file is not sending a patch.
+        for rom_version in [0u8, 1] {
+            let payload = build_payload(&fw, &config, rom_version, "rtl8761bu").unwrap();
+            assert!(!payload.is_empty());
+            assert!(
+                payload.len() < fw.len(),
+                "a patch must be smaller than the container it came from"
+            );
+            assert_eq!(
+                &payload[payload.len() - config.len()..],
+                &config[..],
+                "the config must be the tail of the payload"
+            );
+        }
     }
 
     #[tokio::test]
@@ -377,10 +636,19 @@ mod tests {
     }
 
     #[test]
-    fn the_loader_claims_only_the_realtek_parts_it_knows() {
+    fn the_loader_claims_rebadged_parts_not_just_realtek_branded_ones() {
+        // Found on hardware: the TP-Link UB500 is an RTL8761BU that reports TP-Link's
+        // vendor id. Matching on 0x0BDA alone left it falling through to NoInit, which
+        // does nothing — invisible on Linux, fatal on Windows.
         let rtl = RealtekInit::default();
-        assert!(rtl.matches(UsbId::new(0x0bda, 0x8771)), "RTL8761BU");
+        assert!(rtl.matches(UsbId::new(0x2357, 0x0604)), "TP-Link UB500");
+        assert!(rtl.matches(UsbId::new(0x0bda, 0x8771)), "Realtek reference");
+        assert!(rtl.matches(UsbId::new(0x0b05, 0x190e)), "ASUS BT500");
+
         assert!(!rtl.matches(UsbId::new(0x0bda, 0x0001)));
-        assert!(!rtl.matches(UsbId::new(0x8087, 0x0029)));
+        assert!(
+            !rtl.matches(UsbId::new(0x8087, 0x0029)),
+            "that one is Intel's"
+        );
     }
 }
