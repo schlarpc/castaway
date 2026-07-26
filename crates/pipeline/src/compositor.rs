@@ -105,6 +105,10 @@ impl DirtyRect {
 pub enum LayerId {
     /// The idle/attract background (shown when nothing is casting; video covers it).
     Attract,
+    /// The now-playing card for an audio-only session, which has no pixels of its own.
+    /// Above the attract scene, below video — a sender with pixels outranks a card about
+    /// a sender without them.
+    NowPlaying,
     /// The main cast video/mirroring surface.
     Video,
     /// The CEF browser surface (PiP / YouTube TV surface).

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use castaway_core::{
     ControlTxn, CoreError, DecodedFrame, FrameImage, FrameSource, MediaUri, Pipeline, PixelFormat,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
@@ -28,6 +28,11 @@ pub enum RenderCommand {
     Video(DecodedFrame),
     /// Drop the video layer (playback stopped).
     ClearVideo,
+    /// Show or update the now-playing card. Carries the metadata rather than pixels: a
+    /// 4K RGBA buffer is 33 MB and this is a few hundred bytes that reproduce it.
+    NowPlaying(Box<crate::nowplaying_card::NowPlayingCard>),
+    /// Drop the card (the session ended).
+    ClearNowPlaying,
 }
 
 /// The tokio-side pipeline handle. Implements [`Pipeline`]; owns decode threads and the
@@ -40,10 +45,9 @@ pub struct RenderPipeline {
     /// Whether decode threads may use hardware decode. A *runtime* setting, never a
     /// compile-time one — see [`crate::hwaccel`].
     hw: HwPreference,
-    /// Latest now-playing snapshot, held for the surface that will draw it.
-    now_playing: Mutex<Option<castaway_core::NowPlaying>>,
-    /// Who is connected and over what codec, for the same surface.
-    source: Mutex<castaway_core::SourceDescription>,
+    /// The card as last sent. Held because its two halves arrive on separate calls and
+    /// each render needs both — not as a cache for someone else to read.
+    card: Mutex<crate::nowplaying_card::NowPlayingCard>,
 }
 
 impl RenderPipeline {
@@ -60,28 +64,31 @@ impl RenderPipeline {
                 tx,
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
-                now_playing: Mutex::new(None),
-                source: Mutex::new(castaway_core::SourceDescription::new()),
+                card: Mutex::new(crate::nowplaying_card::NowPlayingCard::default()),
             },
             rx,
         )
     }
 
-    /// What is known about the connected sender: name, address, negotiated codec.
-    ///
-    /// Read by the render loop when it draws the device card.
+    /// The card as it currently stands. For tests and diagnostics.
     #[must_use]
-    pub fn source(&self) -> castaway_core::SourceDescription {
-        self.source
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+    pub fn card(&self) -> crate::nowplaying_card::NowPlayingCard {
+        self.card.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
-    /// The latest now-playing snapshot, if any.
-    #[must_use]
-    pub fn now_playing_snapshot(&self) -> Option<castaway_core::NowPlaying> {
-        self.now_playing.lock().ok().and_then(|g| g.clone())
+    /// Update one half of the card and publish the whole thing.
+    ///
+    /// Both halves arrive on separate calls — metadata per track, the device once per
+    /// session — and the surface needs both, so each update re-sends the pair rather than
+    /// the piece that changed.
+    fn publish_card(&self, edit: impl FnOnce(&mut crate::nowplaying_card::NowPlayingCard)) {
+        let Ok(mut guard) = self.card.lock() else {
+            return;
+        };
+        edit(&mut guard);
+        let _ = self
+            .tx
+            .try_send(RenderCommand::NowPlaying(Box::new(guard.clone())));
     }
 
     /// Pin the hardware-decode choice.
@@ -205,22 +212,14 @@ impl Pipeline for RenderPipeline {
     }
 
     async fn now_playing(&self, snapshot: castaway_core::NowPlaying) -> Result<(), CoreError> {
-        // The metadata itself is real and cheap to hold; what's missing is the surface
-        // that draws it. Keep the latest snapshot so the render loop can pick it up as
-        // soon as that layer exists, and don't lose data in the meantime.
-        if let Ok(mut guard) = self.now_playing.lock() {
-            *guard = Some(snapshot);
-        }
+        self.publish_card(|card| card.track = snapshot);
         Ok(())
     }
 
     async fn source_info(&self, source: castaway_core::SourceDescription) -> Result<(), CoreError> {
-        // Held beside the now-playing snapshot, for the same surface: the device card
-        // says who is connected and over what, above whatever they are playing.
+        // The device line above the track: who is connected, and over what.
         info!(%source, "render pipeline: SOURCE");
-        if let Ok(mut guard) = self.source.lock() {
-            *guard = source;
-        }
+        self.publish_card(|card| card.source = source);
         Ok(())
     }
 
@@ -234,6 +233,10 @@ impl Pipeline for RenderPipeline {
     async fn stop(&self) -> Result<(), CoreError> {
         self.preempt();
         let _ = self.tx.try_send(RenderCommand::ClearVideo);
+        if let Ok(mut guard) = self.card.lock() {
+            *guard = crate::nowplaying_card::NowPlayingCard::default();
+        }
+        let _ = self.tx.try_send(RenderCommand::ClearNowPlaying);
         info!("render pipeline: STOP");
         Ok(())
     }
@@ -425,6 +428,39 @@ impl RenderLoop {
     ///
     /// # Errors
     /// [`PipelineError`] if the image can't be uploaded.
+    /// The size to draw the card at: the surface itself, so text is crisp rather than
+    /// upscaled. Clamped because a zero-sized surface exists briefly during startup.
+    fn card_size(&self) -> (u32, u32) {
+        let (w, h) = self.compositor.target_size();
+        (w.max(640), h.max(360))
+    }
+
+    /// Install the now-playing card as its own layer.
+    ///
+    /// # Errors
+    /// [`PipelineError`] if the texture cannot be uploaded.
+    pub fn set_now_playing(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), PipelineError> {
+        self.compositor.upload_texture(
+            LayerId::NowPlaying,
+            width,
+            height,
+            TexelFormat::Rgba8,
+            rgba,
+        )?;
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::NowPlaying,
+            z: -5,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        Ok(())
+    }
+
     pub fn set_attract(
         &mut self,
         width: u32,
@@ -572,6 +608,25 @@ impl RenderLoop {
                     }
                     return true;
                 }
+                false
+            }
+            RenderCommand::NowPlaying(card) => {
+                // Rendered here rather than upstream: the metadata is a few hundred bytes
+                // and the pixels are tens of megabytes, so the channel carries the small
+                // one and this thread — which owns the surface size — makes the big one.
+                let (w, h) = self.card_size();
+                match crate::nowplaying_card::render(&card, w, h) {
+                    Ok(rgba) => {
+                        if let Err(e) = self.set_now_playing(w, h, &rgba) {
+                            error!(error = %e, "failed to draw the now-playing card");
+                        }
+                    }
+                    Err(e) => error!(error = %e, "failed to render the now-playing card"),
+                }
+                false
+            }
+            RenderCommand::ClearNowPlaying => {
+                self.compositor.remove_layer(LayerId::NowPlaying);
                 false
             }
             RenderCommand::ClearVideo => {
@@ -766,5 +821,61 @@ mod tests {
         let px = rloop.read_rgba().unwrap();
         let non_black = px.chunks_exact(4).any(|p| p[0] > 8 || p[1] > 8 || p[2] > 8);
         assert!(non_black, "composited mirror frame should contain color");
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    #![allow(clippy::unwrap_used)]
+    use castaway_core::{NowPlaying, Pipeline as _, SourceDescription};
+
+    use super::{RenderCommand, RenderPipeline};
+
+    #[tokio::test]
+    async fn both_halves_of_the_card_are_published_together() {
+        // The device and the track arrive on separate calls and the surface needs both.
+        // Publishing only the half that changed would blank the other on every update.
+        let (pipeline, rx) = RenderPipeline::new(8);
+        pipeline
+            .source_info(SourceDescription::new().with_display_name("iPhone"))
+            .await
+            .unwrap();
+        pipeline
+            .now_playing(NowPlaying::default().with_title("Derezzed"))
+            .await
+            .unwrap();
+
+        let mut last = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let RenderCommand::NowPlaying(card) = cmd {
+                last = Some(card);
+            }
+        }
+        let card = last.expect("the card should have been published");
+        assert_eq!(card.track.title.as_deref(), Some("Derezzed"));
+        assert_eq!(card.source.display_name.as_deref(), Some("iPhone"));
+    }
+
+    #[tokio::test]
+    async fn stopping_clears_the_card() {
+        let (pipeline, rx) = RenderPipeline::new(8);
+        pipeline
+            .now_playing(NowPlaying::default().with_title("Derezzed"))
+            .await
+            .unwrap();
+        pipeline.stop().await.unwrap();
+
+        let mut cleared = false;
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, RenderCommand::ClearNowPlaying) {
+                cleared = true;
+            }
+        }
+        assert!(cleared, "the card must not outlive the session");
+        // …and the next session starts blank rather than inheriting the last track.
+        assert_eq!(
+            pipeline.card(),
+            crate::nowplaying_card::NowPlayingCard::default()
+        );
     }
 }

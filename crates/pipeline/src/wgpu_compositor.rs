@@ -1049,6 +1049,9 @@ fn build_programs(device: &wgpu::Device, format: wgpu::TextureFormat) -> Program
 fn default_z(id: LayerId) -> i32 {
     match id {
         LayerId::Attract => -10,
+        // Above the idle scene, below video: a sender with pixels of its own outranks a
+        // card describing a sender without them.
+        LayerId::NowPlaying => -5,
         LayerId::Video => 0,
         LayerId::Browser => 5,
         LayerId::Osd => 10,

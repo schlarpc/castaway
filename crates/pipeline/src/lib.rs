@@ -39,6 +39,8 @@ pub mod ffmpeg_decode;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
 #[cfg(feature = "render")]
+pub mod nowplaying_card;
+#[cfg(feature = "render")]
 pub mod osd;
 #[cfg(feature = "render")]
 pub mod render_pipeline;
