@@ -213,11 +213,40 @@ the reasons are what a future reversal has to argue against.
   Plug into **USB 2.0** and use a short extension cable: USB 3.0 radiated noise desensitises
   2.4 GHz radios and is the single biggest real-world range factor. And when Miracast lands,
   force its P2P group to 5 GHz or a mirroring session will stomp on A2DP (§7.5).
-- **Q22 — LDAC decoder. ANSWERED: feature-gated `libldacdec`, on by default.** libav decodes
-  SBC/AAC/aptX/aptX HD; LDAC has no libav support and AOSP's `libldac` is encoder-only, so
-  decode means the reverse-engineered `libldacdec` over FFI. A build without the `ldac`
-  feature drops the LDAC SEP from the table rather than failing, so the phone negotiates
-  aptX HD or AAC instead — the codec table degrades, the build never breaks.
+- **Q22 — LDAC decoder. REOPENED 2026-07-26: the premise was wrong, and the feature was a
+  lie.** The original answer said LDAC has no libav support and AOSP's `libldac` is
+  encoder-only, so decode means the reverse-engineered `libldacdec` over FFI. The first
+  half holds; the second does not. nixpkgs ships **`ldacbt` 2.0.72**, an open-vela fork of
+  Sony's own library, and it exports a complete decode API — not a reverse-engineered one:
+
+  ```c
+  HANDLE_LDAC_BT ldacBT_get_handle(void);
+  int  ldacBT_init_handle_decode(HANDLE_LDAC_BT, int cm, int sf, int var0, int var1, int var2);
+  int  ldacBT_decode(HANDLE_LDAC_BT, unsigned char *p_bs, unsigned char *p_pcm,
+                     LDACBT_SMPL_FMT_T fmt, int bs_bytes, int *used_bytes, int *wrote_bytes);
+  void ldacBT_free_handle(HANDLE_LDAC_BT);
+  ```
+
+  Two details make it a better fit than expected: `LDACBT_SMPL_FMT_F32` decodes straight to
+  interleaved `f32`, which is exactly what `PcmBlock` holds — no conversion, and it avoids
+  the planar/packed plane-length trap that silenced the right channel on every other codec
+  — and `cm` takes the channel mode we already parse (`LDAC_CCI_MONO/DUAL_CHANNEL/STEREO`).
+  The package ships no headers, so the signatures above come from the source
+  (`inc/ldacBT.h`); do not write them from memory, an FFI signature is wrong silently.
+
+  **Meanwhile the shipped behaviour was the exact failure this question exists to
+  prevent.** `can_decode` answered `cfg!(feature = "ldac")` for LDAC, and the `ldac`
+  feature is `ldac = ["audio"]` — it binds nothing. So a build with the feature on
+  advertised an LDAC endpoint, a sender picked it, and `codec_id` refused every packet:
+  a connected phone, a running session, and silence. Every build on 2026-07-25 had the
+  feature on. Fixed by giving `can_decode` one source of truth — whether a decoder
+  actually exists — so LDAC is simply not advertised today.
+
+  **Parked, not blocked.** What it needs: `ldacbt` in the flake's build inputs and dev
+  shell; an FFI module (the first non-ffmpeg decoder, so `unsafe` with `// SAFETY:` per
+  ground rule 8); `AudioDecoder` refactored to a backend enum, since it currently *is* an
+  `ffmpeg::decoder::Audio`; and `codec_id`/`can_decode` taught that LDAC has a decoder.
+  Then the `ldac` feature means something and the endpoint can come back.
 - **Q23 — Pairing and takeover. ANSWERED: Just Works, keys persisted, last-writer-wins.**
   `NoInputNoOutput` so neither side prompts, link keys persisted to the config dir so a
   repeat guest reconnects silently, and a second phone preempts the first to match the
