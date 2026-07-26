@@ -39,7 +39,16 @@ pub const UBO_FILTERS_URL: &str = "https://ublockorigin.github.io/uAssets/filter
 pub const UBO_SOURCE_BASE: &str = "https://raw.githubusercontent.com/gorhill/uBlock/master/src/js/";
 
 /// How many modules to follow before deciding the import graph is not what we think it is.
+/// uBO's is 34 today.
 const MAX_MODULES: usize = 200;
+
+/// A ceiling on the whole module fetch, not just each request.
+///
+/// Each fetch already has its own timeout, but the count multiplies it: a graph that grew
+/// to the cap, against a slow server, would be twenty minutes of a receiver not finishing
+/// startup. This is the bound that makes "upstream changed" a degradation rather than a
+/// hang. It takes about a second in practice.
+const FETCH_BUDGET: Duration = Duration::from_secs(90);
 
 /// Where the fetched lists are cached.
 #[derive(Debug, Clone)]
@@ -254,10 +263,20 @@ fn fetch_modules(base_url: &str) -> Result<Vec<(String, String)>, String> {
     let mut pending = vec![crate::ubo_scriptlets::ENTRY_MODULE.to_string()];
     let mut seen = std::collections::HashSet::new();
     let mut modules = Vec::new();
+    let deadline = std::time::Instant::now() + FETCH_BUDGET;
 
     while let Some(name) = pending.pop() {
         if !seen.insert(name.clone()) || modules.len() >= MAX_MODULES {
             continue;
+        }
+        if std::time::Instant::now() > deadline {
+            // Partial is not useful here — a graph missing a dependency evaluates to an
+            // error anyway — so say so and let the caller fall back to the cache.
+            return Err(format!(
+                "gave up after {}s fetching uBO's modules ({} of them so far)",
+                FETCH_BUDGET.as_secs(),
+                modules.len()
+            ));
         }
         let source = fetch(&format!("{base_url}{name}"))?;
         for import in imported_modules(&source) {

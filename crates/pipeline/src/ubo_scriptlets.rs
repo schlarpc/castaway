@@ -29,6 +29,18 @@ use serde::Deserialize;
 
 use crate::error::PipelineError;
 
+/// How long the module graph gets to evaluate before it is interrupted.
+///
+/// Evaluating upstream code means running whatever upstream wrote, and a failure that
+/// *hangs* is worse than one that errors: this runs during startup, so an unbounded loop
+/// in a future uBO module would be a receiver that never finishes booting rather than one
+/// that boots without scriptlets. Today's graph takes well under a second.
+const EVAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A ceiling on what the engine may allocate, for the same reason: a runaway allocation
+/// should fail the conversion, not take the box down. The real graph uses a few MB.
+const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
 /// The module every scriptlet is reachable from, as a path under uBO's `src/js/`.
 pub const ENTRY_MODULE: &str = "resources/scriptlets.js";
 
@@ -72,6 +84,12 @@ pub fn convert(modules: &[(String, String)]) -> Result<Vec<Resource>, PipelineEr
 
     let runtime = Runtime::new().map_err(|e| PipelineError::Scriptlets(e.to_string()))?;
     runtime.set_loader(resolver, loader);
+    runtime.set_memory_limit(MEMORY_LIMIT);
+    // Bound the run rather than trusting it to end. The handler is polled by the engine;
+    // returning true unwinds whatever is executing as an exception, which the caller then
+    // reports like any other conversion failure.
+    let deadline = std::time::Instant::now() + EVAL_BUDGET;
+    runtime.set_interrupt_handler(Some(Box::new(move || std::time::Instant::now() > deadline)));
     let context = Context::full(&runtime).map_err(|e| PipelineError::Scriptlets(e.to_string()))?;
 
     let dumped = context.with(|ctx| -> Result<String, PipelineError> {
@@ -274,6 +292,26 @@ builtinScriptlets.push({
         assert!(
             tricky.contains("return [re, s];"),
             "body was cut short: {tricky}"
+        );
+    }
+
+    #[test]
+    fn a_module_that_never_finishes_is_interrupted_rather_than_hanging_startup() {
+        // The failure mode that a graceful-degradation story does not cover: this runs at
+        // startup, so upstream code that loops forever would be a receiver that never
+        // finishes booting. It has to come back as an error.
+        let spinning = vec![(
+            "resources/scriptlets.js".into(),
+            "export const builtinScriptlets = []; while (true) {}".into(),
+        )];
+        let started = std::time::Instant::now();
+        assert!(
+            convert(&spinning).is_err(),
+            "an endless module must fail the conversion"
+        );
+        assert!(
+            started.elapsed() < EVAL_BUDGET + std::time::Duration::from_secs(10),
+            "it should be interrupted near the budget, not run to completion"
         );
     }
 
