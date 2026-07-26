@@ -412,6 +412,29 @@ bugs no scripted test could: the reader blocked forever on whichever IN endpoint
 (a controller with no connection sends events and no ACL at all), and both loaders bounded
 *iterations* over a `recv` that blocks, which is not a bound on anything.
 
+**The Realtek loader is proven end to end** (TP-Link UB500, 2026-07-25). Against a cold,
+unpatched RTL8761BU it read `lmp_subver 0x8761` (the bare core), extracted the correct
+patch, appended the config, downloaded 30210 bytes, and the controller came up at
+`AC:A7:F1:BD:45:19`. Re-reading afterwards gives `lmp_subver 0xd922, hci_rev 0xdfc6` —
+**byte-for-byte what the chip reports after the kernel flashes it**, which is as close to
+a differential check against `btrtl.c` as it is possible to get without a `btmon` trace.
+
+Getting a *cold* chip needs the kernel warded off before the device is replugged, not
+after — `btusb` patches it within milliseconds of enumeration:
+
+```sh
+systemctl stop bluetooth
+echo 0 | sudo tee /sys/bus/usb/drivers_autoprobe        # nothing auto-binds
+echo 3-2.3:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
+# …now physically replug the dongle…
+echo 1 | sudo tee /sys/bus/usb/devices/3-2.3/bConfigurationValue
+```
+
+That last line is not optional and is easy to miss: with autoprobe off the device
+enumerates **unconfigured**, so no interface directories exist and `nusb` fails with a
+sysfs parse error that reads like a permissions problem. Setting the configuration by hand
+creates the interfaces without binding a driver.
+
 **Still unproven: the secure-boot upload itself.** The part only presents as a bootloader
 before something loads firmware into it, and by the time we can claim it the kernel has
 already done so. A logical re-enumeration (`echo 0 > .../authorized`) does *not* clear it —
