@@ -1,6 +1,6 @@
 //! The record server: answers what a phone asks about us.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::element::DataElement;
 use crate::error::SdpError;
@@ -119,12 +119,17 @@ impl SdpServer {
                 attributes,
                 cont,
             } => {
-                let lists = DataElement::Sequence(
-                    self.matching(patterns)
-                        .map(|r| decode_or_empty(&encode_attributes(r, attributes)))
-                        .collect(),
-                );
-                let full = lists.to_bytes().freeze();
+                // Concatenate the encoded attribute lists and wrap them, rather than
+                // decoding each back into a `DataElement` and re-encoding the outer
+                // sequence. That round trip is lossy in exactly the way that matters:
+                // decoding turns a pinned 16-bit attribute id into a plain integer, and
+                // re-encoding writes it in the narrowest width — undoing the pinning and
+                // shifting every element after it.
+                let mut body = BytesMut::with_capacity(256);
+                for record in self.matching(patterns) {
+                    body.extend_from_slice(&encode_attributes(record, attributes));
+                }
+                let full = wrap_sequence(&body);
                 match slice(&full, *max_bytes, cont) {
                     Some((chunk, next)) => SdpResponse::ServiceSearchAttribute {
                         tid: *tid,
@@ -169,21 +174,45 @@ fn element_contains(element: &DataElement, uuid: Uuid) -> bool {
 }
 
 /// Encode the requested attributes of one record as an `[id, value, …]` sequence.
+///
+/// **Attribute identifiers are always 16-bit unsigned integers**, and that width is not
+/// negotiable the way a value's is. Writing them through the ordinary narrowest-width
+/// integer encoder emits `0x0000` as a *one-byte* uint, which shifts every following
+/// element by one and turns the whole record into garbage — a real client reads the
+/// record handle as `0x1` and the rest as `0xffffffff`. Found by pointing BlueZ's
+/// `sdptool` at us; our own parser was lenient enough not to notice.
 fn encode_attributes(record: &ServiceRecord, wanted: &[AttributeRange]) -> Bytes {
-    let mut items = Vec::new();
+    /// Unsigned integer, size index 1 — two bytes.
+    const UINT_16: u8 = (1 << 3) | 1;
+
+    let mut body = BytesMut::with_capacity(64);
     for (id, value) in record.iter() {
         if wanted.iter().any(|r| r.contains(id)) {
-            items.push(DataElement::Uint(u64::from(id)));
-            items.push(value.clone());
+            body.put_u8(UINT_16);
+            body.put_u16(id);
+            value.encode(&mut body);
         }
     }
-    DataElement::Sequence(items).to_bytes().freeze()
+    wrap_sequence(&body)
 }
 
-fn decode_or_empty(bytes: &Bytes) -> DataElement {
-    DataElement::decode(bytes)
-        .map(|(e, _)| e)
-        .unwrap_or_else(|_| DataElement::Sequence(Vec::new()))
+/// Wrap an encoded body in a data-element sequence header.
+fn wrap_sequence(body: &[u8]) -> Bytes {
+    /// Sequence with a one-byte length.
+    const SEQ_U8: u8 = (6 << 3) | 5;
+    /// Sequence with a two-byte length.
+    const SEQ_U16: u8 = (6 << 3) | 6;
+
+    let mut out = BytesMut::with_capacity(body.len() + 3);
+    if let Ok(len) = u8::try_from(body.len()) {
+        out.put_u8(SEQ_U8);
+        out.put_u8(len);
+    } else {
+        out.put_u8(SEQ_U16);
+        out.put_u16(u16::try_from(body.len()).unwrap_or(u16::MAX));
+    }
+    out.extend_from_slice(body);
+    out.freeze()
 }
 
 /// Cut `full` down to what fits, returning the chunk and the token for the rest.

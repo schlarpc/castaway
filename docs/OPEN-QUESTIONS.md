@@ -230,3 +230,22 @@ the reasons are what a future reversal has to argue against.
   back only when the panel UI changes it. Matches what people expect of a Bluetooth speaker —
   the rocker in your hand works. Bidirectional sync was rejected: the phone's 0–127 scale and
   our 0.0–1.0 gain round differently, and two ends mirroring each other chase the rounding.
+
+- **Q25 — The negotiated sample rate never reaches the decoder.** Found on hardware: BlueZ
+  negotiated **aptX at 48 kHz**, but `audio_session::run` builds its decoder with
+  `AudioStreamFormat::default()` — 44.1 kHz. aptX carries no in-band rate, so the decoder
+  believes what it is told and the stream would play ~9% slow, at the wrong pitch, with
+  nothing in any log. The rate is known at `SinkEvent::Configured` and has to travel with
+  the frames. `SessionEvent::Audio` carries only a `FrameSource`, so this needs either a
+  format field on that event or a rate on `EncodedFrame`. Default: put it on the event,
+  since it is a property of the session rather than of each frame.
+
+- **Q26 — AVDTP START never arrives from BlueZ.** The live two-radio test gets as far as
+  aptX/48 kHz configured and the second (media transport) L2CAP channel open, and then
+  stops: no START, no media packets, no further events at all. PipeWire happily streams
+  five seconds into its node and nothing crosses. Suspects, in order: our L2CAP
+  configuration response on the *media* channel leaving BlueZ waiting for something;
+  ACL flow control (we log `NumberOfCompletedPackets` credits but never gate sending on
+  them); or the reader stalling after the second channel opens. Needs a `btmon` capture
+  taken *during* the connect rather than after it — the link idles out in seconds, which
+  is what defeated the first attempts.

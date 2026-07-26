@@ -210,6 +210,34 @@ mod tests {
     }
 
     #[test]
+    fn attribute_ids_are_encoded_as_sixteen_bit_integers() {
+        // The width is fixed by the spec and is not the value's business. Emitting
+        // attribute 0x0000 as a one-byte uint shifts every following element and turns
+        // the record into garbage — BlueZ's sdptool read our handle as 0x1.
+        let server = SdpServer::new().with(a2dp_sink(0x0001_0000, "x"));
+        let mut q = Query::new(
+            1,
+            vec![Uuid::AUDIO_SINK],
+            vec![AttributeRange::Range(0, 0xFFFF)],
+            672,
+        );
+        run(&mut q, &server);
+
+        let records = q.records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].handle(),
+            Some(0x0001_0000),
+            "the record handle must survive the round trip intact"
+        );
+        assert_eq!(
+            records[0].l2cap_psm(attr::PROTOCOL_DESCRIPTOR_LIST),
+            Some(0x0019),
+            "and so must everything after it"
+        );
+    }
+
+    #[test]
     fn a_peer_error_response_surfaces_as_a_typed_error() {
         let server = SdpServer::new();
         let mut q = Query::new(1, vec![Uuid::AUDIO_SINK], vec![], 672);
