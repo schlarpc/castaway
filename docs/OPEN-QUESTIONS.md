@@ -462,3 +462,30 @@ the reasons are what a future reversal has to argue against.
   **Phase 2, open:** an encoder tap. The frame it receives is deliberately shaped like the
   existing `FrameImage::{Cpu, Gpu}` split, so the zero-copy version is a variant rather
   than a redesign of the seam.
+
+- **Q31 — The display sleeping takes the audio sink with it. OPEN.** Observed on the dev
+  box: the panel went into DPMS sleep, and within seconds the GPU's audio codec reported
+  `monitor_present 0` / `eld_valid 0` on every ELD, PipeWire removed the
+  `Navi 31 HDMI/DP Audio` sink, and everything fell back to `Dummy Output`. The DRM
+  connector still read `connected` throughout, so nothing looked wrong from that angle.
+  `kscreen-doctor --dpms on` brought the monitor back and the sink returned immediately.
+  This is a real failure mode for the product, not a dev-box quirk. The deploy target is a
+  wall-mounted panel whose audio *is* the HDMI endpoint, and the most common session —
+  Bluetooth — has no pixels of its own. So the natural sequence is: someone connects a
+  phone, music plays, nobody touches the screen, the panel sleeps, and the music stops.
+  Two things to settle, and they are separable:
+  1. **Keep the panel awake while a session is active.** This is exactly what
+     `control-display` is for, and it is currently the `NullDisplay`: the session manager
+     already calls `power_on` and `select_input` on session start and the log dutifully
+     says `display: power on (null)` while nothing happens. Wiring a real DDC/CEC backend
+     is the fix; the seam is already there and already called.
+  2. **Survive the sink disappearing anyway.** Even with (1), a panel can be switched off
+     at the wall or swapped inputs. Unverified: what our audio session does when its cpal
+     output device vanishes mid-stream. The likely answer is that the stream errors, the
+     session logs "output failed" once, and the phone keeps streaming happily into a
+     decoder writing nowhere — silence with a connected phone and a now-playing card still
+     on screen, which is the worst of the available outcomes. Wants a test that pulls the
+     device out from under a running session.
+  Also worth noting for whoever wires (1): the sink is *removed* and later *re-added* as a
+  new node, so "reconnect to the same device" is not a thing — the audio path has to be
+  re-established against whatever the default is when it comes back.
