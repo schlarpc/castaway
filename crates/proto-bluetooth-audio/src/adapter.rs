@@ -15,14 +15,14 @@ use castaway_core::{
     SessionEvent, SessionSink, SourceAdapter, SourceDescription,
 };
 use substrate_hci::{
-    AclPacket, BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, PacketBoundary,
-    Reassembler,
+    BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, Reassembler,
 };
 use substrate_l2cap::{Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
 use substrate_sdp::{a2dp_sink, avrcp_controller, avrcp_target, SdpServer};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::acl::AclWriter;
 use crate::avctp::{AvcFrame, AvctpMessage, Ctype};
 use crate::avrcp;
 use crate::codec::advertised;
@@ -187,37 +187,6 @@ impl BluetoothAdapter {
             .await
             .map_err(|e| CoreError::Adapter(e.to_string()))
     }
-
-    /// Write an L2CAP PDU, fragmenting to the controller's ACL buffer size.
-    ///
-    /// Fragmentation is not optional: a dongle's ACL buffer is routinely 300-odd bytes
-    /// while an AVDTP capability response or an SDP record comfortably exceeds it, and a
-    /// controller handed an oversized fragment drops it without complaint.
-    async fn send_pdu(
-        &self,
-        handle: ConnectionHandle,
-        pdu: &L2capPdu,
-        acl_mtu: u16,
-    ) -> Result<(), CoreError> {
-        let bytes = pdu
-            .encode()
-            .map_err(|e| CoreError::Adapter(format!("l2cap encode: {e}")))?;
-        let mtu = usize::from(acl_mtu.max(1));
-        for (i, chunk) in bytes.chunks(mtu).enumerate() {
-            let boundary = if i == 0 {
-                PacketBoundary::FirstFlushable
-            } else {
-                PacketBoundary::Continuing
-            };
-            self.send(HciPacket::Acl(AclPacket::new(
-                handle,
-                boundary,
-                Bytes::copy_from_slice(chunk),
-            )))
-            .await?;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
@@ -241,7 +210,10 @@ impl SourceAdapter for BluetoothAdapter {
         }
 
         let mut links: HashMap<u16, Link> = HashMap::new();
-        let mut acl_mtu = host.acl_mtu();
+        // Every outbound PDU goes through here: one writer, paced by the controller's
+        // buffer credits, so nothing is written into a buffer that does not exist and no
+        // two PDUs interleave their fragments (Q26).
+        let acl = AclWriter::spawn(Arc::clone(&self.transport));
 
         loop {
             let packet = match self.transport.recv().await {
@@ -263,9 +235,21 @@ impl SourceAdapter for BluetoothAdapter {
                     };
                     for action in host.on_event(&event) {
                         match &action {
-                            HostAction::Ready { address, .. } => {
-                                acl_mtu = host.acl_mtu();
-                                info!(%address, "bluetooth: discoverable");
+                            HostAction::Ready {
+                                address,
+                                acl_credits,
+                                acl_mtu,
+                            } => {
+                                acl.configure(*acl_credits, *acl_mtu).await;
+                                info!(
+                                    %address,
+                                    acl_credits,
+                                    acl_mtu,
+                                    "bluetooth: discoverable"
+                                );
+                            }
+                            HostAction::Credits { handle, count } => {
+                                acl.completed(*handle, *count).await;
                             }
                             HostAction::LinkUp { handle, peer } => {
                                 info!(%peer, "bluetooth: link up");
@@ -290,6 +274,10 @@ impl SourceAdapter for BluetoothAdapter {
                             }
                             HostAction::LinkDown { handle, peer, .. } => {
                                 info!(%peer, "bluetooth: link down");
+                                // The controller flushed whatever was queued for this
+                                // handle without ever reporting it complete, so the
+                                // credits have to be taken back by hand.
+                                acl.link_down(*handle).await;
                                 if let Some(mut link) = links.remove(&handle.raw()) {
                                     // Reap the whole session: the phone left without a
                                     // teardown handshake, which is the ordinary case.
@@ -307,12 +295,13 @@ impl SourceAdapter for BluetoothAdapter {
                     }
                 }
 
-                HciPacket::Acl(acl) => {
-                    let Some(link) = links.get_mut(&acl.handle.raw()) else {
-                        debug!(handle = %acl.handle, "ACL for an unknown link");
+                HciPacket::Acl(packet) => {
+                    let packet_handle = packet.handle;
+                    let Some(link) = links.get_mut(&packet_handle.raw()) else {
+                        debug!(handle = %packet_handle, "ACL for an unknown link");
                         continue;
                     };
-                    let pdu_bytes = match link.reassembler.push(&acl) {
+                    let pdu_bytes = match link.reassembler.push(&packet) {
                         Ok(Some(bytes)) => bytes,
                         Ok(None) => continue,
                         Err(e) => {
@@ -335,11 +324,11 @@ impl SourceAdapter for BluetoothAdapter {
                         }
                     };
                     self.dispatch(
-                        acl.handle,
+                        packet_handle,
                         events,
-                        links.get_mut(&acl.handle.raw()),
+                        links.get_mut(&packet_handle.raw()),
                         &sink,
-                        acl_mtu,
+                        &acl,
                     )
                     .await?;
                 }
@@ -380,7 +369,7 @@ impl BluetoothAdapter {
         events: Vec<L2capEvent>,
         link: Option<&mut Link>,
         sink: &SessionSink,
-        acl_mtu: u16,
+        acl: &AclWriter,
     ) -> Result<(), CoreError> {
         let Some(link) = link else {
             return Ok(());
@@ -411,7 +400,7 @@ impl BluetoothAdapter {
                         link_sink
                             .emit(SessionEvent::ControlSurface(control))
                             .await?;
-                        self.spawn_control_writer(handle, cid, rx, acl_mtu);
+                        Self::spawn_control_writer(handle, cid, rx, acl.clone());
                         // Ask for metadata straight away rather than waiting for a
                         // notification; a track already playing produces no change event.
                         let transaction = link.next_transaction();
@@ -462,7 +451,7 @@ impl BluetoothAdapter {
         }
 
         for pdu in outbound {
-            self.send_pdu(handle, &pdu, acl_mtu).await?;
+            acl.send(handle, pdu);
         }
         Ok(())
     }
@@ -630,39 +619,21 @@ impl BluetoothAdapter {
     }
 
     /// Pump [`AvrcpControl`] frames onto the AVCTP channel.
+    ///
+    /// Queues through the same [`AclWriter`] as everything else rather than writing to
+    /// the transport directly: two tasks fragmenting onto one handle would interleave
+    /// their fragments, and basic-mode L2CAP has no way to sort that out (Q26).
     fn spawn_control_writer(
-        &self,
         handle: ConnectionHandle,
         cid: Cid,
         mut rx: mpsc::Receiver<AvcFrame>,
-        acl_mtu: u16,
+        acl: AclWriter,
     ) {
-        let transport = Arc::clone(&self.transport);
         tokio::spawn(async move {
             let mut transaction = 0u8;
             while let Some(frame) = rx.recv().await {
-                let pdu = avctp_pdu(cid, transaction, &frame);
+                acl.send(handle, avctp_pdu(cid, transaction, &frame));
                 transaction = (transaction + 1) & 0x0F;
-                let Ok(bytes) = pdu.encode() else { continue };
-                let mtu = usize::from(acl_mtu.max(1));
-                for (i, chunk) in bytes.chunks(mtu).enumerate() {
-                    let boundary = if i == 0 {
-                        PacketBoundary::FirstFlushable
-                    } else {
-                        PacketBoundary::Continuing
-                    };
-                    if transport
-                        .send(HciPacket::Acl(AclPacket::new(
-                            handle,
-                            boundary,
-                            Bytes::copy_from_slice(chunk),
-                        )))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
             }
         });
     }

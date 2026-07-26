@@ -31,7 +31,31 @@ const HANDLE: u16 = 0x000B;
 /// A transport that answers every command with a plausible completion, so bring-up
 /// proceeds without the test scripting eight round trips by hand.
 fn transport() -> Arc<ScriptedTransport> {
-    Arc::new(ScriptedTransport::new().with_responder(|sent| {
+    controller(8, true)
+}
+
+/// Build a scripted controller with `acl_packets` ACL buffers.
+///
+/// `report_completions` decides whether it hands those buffers back the way a real
+/// controller does. Withholding them is how the flow-control path is exercised: a
+/// controller with infinite buffers is a fiction, and it is the fiction under which an
+/// unpaced writer looks like it works (Q26).
+fn controller(acl_packets: u16, report_completions: bool) -> Arc<ScriptedTransport> {
+    Arc::new(ScriptedTransport::new().with_responder(move |sent| {
+        // A real controller frees each ACL buffer and says so. Nothing else ever returns
+        // a credit, so a host that ignores this event stalls after `acl_packets` writes.
+        if let HciPacket::Acl(acl) = sent {
+            if !report_completions {
+                return Vec::new();
+            }
+            let mut params = vec![0x01];
+            params.extend_from_slice(&acl.handle.raw().to_le_bytes());
+            params.extend_from_slice(&1u16.to_le_bytes());
+            return vec![HciPacket::Event {
+                code: code::NUMBER_OF_COMPLETED_PACKETS,
+                params: Bytes::from(params),
+            }];
+        }
         let HciPacket::Command { opcode, .. } = sent else {
             return Vec::new();
         };
@@ -39,9 +63,11 @@ fn transport() -> Arc<ScriptedTransport> {
         params.extend_from_slice(&opcode.raw().to_le_bytes());
         match *opcode {
             substrate_hci::OpCode::READ_BUFFER_SIZE => {
-                // 340-byte ACL buffer, 8 fragments outstanding — a typical dongle, and
-                // small enough that fragmentation is exercised rather than skipped.
-                params.extend_from_slice(&[0x00, 0x54, 0x01, 0xff, 0x08, 0x00, 0x08, 0x00]);
+                // 340-byte ACL buffer — a typical dongle, and small enough that
+                // fragmentation is exercised rather than skipped.
+                params.extend_from_slice(&[0x00, 0x54, 0x01, 0xff]);
+                params.extend_from_slice(&acl_packets.to_le_bytes());
+                params.extend_from_slice(&[0x08, 0x00]);
             }
             substrate_hci::OpCode::READ_BD_ADDR => {
                 params.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
@@ -112,7 +138,13 @@ fn push_pdu(transport: &ScriptedTransport, pdu: &L2capPdu) {
 
 /// Drive the adapter to the point where an ACL link exists, returning the event stream.
 async fn connected() -> (Arc<ScriptedTransport>, mpsc::Receiver<SourceMessage>) {
-    let transport = transport();
+    connected_to(transport()).await
+}
+
+/// The same, against a controller the caller built.
+async fn connected_to(
+    transport: Arc<ScriptedTransport>,
+) -> (Arc<ScriptedTransport>, mpsc::Receiver<SourceMessage>) {
     let adapter = Arc::new(BluetoothAdapter::new(
         Arc::clone(&transport) as Arc<dyn HciTransport>,
         BluetoothConfig {
@@ -335,6 +367,186 @@ async fn sdp_answers_a_query_for_our_sink_record() {
         Some(0x0019),
         "the record must point at the AVDTP PSM"
     );
+}
+
+/// How many ACL fragments the host has written.
+fn acl_count(transport: &ScriptedTransport) -> usize {
+    transport
+        .sent()
+        .iter()
+        .filter(|p| matches!(p, HciPacket::Acl(_)))
+        .count()
+}
+
+/// Whether the host has written an L2CAP configuration *response* — the one PDU whose
+/// loss leaves the peer's half of a channel unconfigured forever.
+fn sent_a_config_response(transport: &ScriptedTransport) -> bool {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
+        .flatten()
+        .any(|sig| matches!(sig, L2capSignal::ConfigurationResponse { .. }))
+}
+
+#[tokio::test]
+async fn writes_wait_for_controller_buffers_instead_of_vanishing_into_them() {
+    // Q26, reproduced: a controller with two ACL buffers that has not yet freed either.
+    // An unpaced host writes a third fragment anyway, the controller discards it without
+    // a word, and the peer waits for a reply that this end believes it sent. On the
+    // bench that lost fragment was an L2CAP configuration response, so BlueZ never
+    // finished configuring the media channel, never sent AVDTP START, and the link
+    // idled out with nothing in any log.
+    let transport = controller(2, false);
+    let (transport, _rx) = connected_to(transport).await;
+
+    // Opening a channel costs exactly the pool: a connection response and our own
+    // configuration request, one fragment each.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::ConnectionRequest {
+                id: 1,
+                psm: Psm::AVDTP,
+                source_cid: Cid::new(0x0040),
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    eventually("the pool to be spent", || {
+        (acl_count(&transport) == 2).then_some(())
+    })
+    .await;
+
+    // Now the phone configures its direction. The reply is the third fragment, and there
+    // is no buffer for it.
+    let sink_cid = sent_pdus(&transport)
+        .into_iter()
+        .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
+        .flatten()
+        .find_map(|sig| match sig {
+            L2capSignal::ConnectionResponse { dest_cid, .. } => Some(dest_cid),
+            _ => None,
+        })
+        .expect("the channel must have been accepted");
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::ConfigurationRequest {
+                id: 3,
+                dest_cid: sink_cid,
+                flags: 0,
+                options: vec![substrate_l2cap::ConfigOption::Mtu(672)],
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+
+    // Give it every chance to write the fragment it must not write.
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        acl_count(&transport),
+        2,
+        "the host must never have more fragments outstanding than the controller has \
+         buffers; the extra one is discarded, not queued"
+    );
+    assert!(
+        !sent_a_config_response(&transport),
+        "the response must be held, not written into a buffer that does not exist"
+    );
+
+    // The controller frees both buffers. The held reply must now go out — waiting is
+    // only correct if it is waiting, not dropping.
+    let mut params = vec![0x01];
+    params.extend_from_slice(&HANDLE.to_le_bytes());
+    params.extend_from_slice(&2u16.to_le_bytes());
+    transport.push(HciPacket::Event {
+        code: code::NUMBER_OF_COMPLETED_PACKETS,
+        params: Bytes::from(params),
+    });
+
+    eventually("the held configuration response", || {
+        sent_a_config_response(&transport).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_dropped_link_gives_its_controller_buffers_back() {
+    // Those fragments are flushed by the controller and never reported complete, so
+    // without reclaiming them the pool shrinks by one credit per phone that leaves
+    // mid-write — and a kiosk that has run for a week eventually stops answering at all.
+    let transport = controller(2, false);
+    let (transport, _rx) = connected_to(transport).await;
+
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::ConnectionRequest {
+                id: 1,
+                psm: Psm::AVDTP,
+                source_cid: Cid::new(0x0040),
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    eventually("the pool to be spent", || {
+        (acl_count(&transport) == 2).then_some(())
+    })
+    .await;
+
+    let mut params = vec![Status::SUCCESS.0];
+    params.extend_from_slice(&HANDLE.to_le_bytes());
+    params.push(Status::REMOTE_USER_TERMINATED.0);
+    transport.push(HciPacket::Event {
+        code: code::DISCONNECTION_COMPLETE,
+        params: Bytes::from(params),
+    });
+
+    // A second phone connects. With the buffers reclaimed it must be answered; without,
+    // the pool is permanently two credits smaller and this write never happens.
+    let addr: BdAddr = PEER.parse().unwrap();
+    let mut params = addr.to_wire().to_vec();
+    params.extend_from_slice(&[0x0C, 0x02, 0x5A]);
+    params.push(0x01);
+    transport.push(HciPacket::Event {
+        code: code::CONNECTION_REQUEST,
+        params: Bytes::from(params),
+    });
+    eventually("the second link", || {
+        (transport
+            .sent_commands()
+            .iter()
+            .filter(|c| **c == substrate_hci::OpCode::ACCEPT_CONNECTION_REQUEST)
+            .count()
+            == 2)
+            .then_some(())
+    })
+    .await;
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::ConnectionRequest {
+                id: 1,
+                psm: Psm::AVDTP,
+                source_cid: Cid::new(0x0040),
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    eventually("the new link to be answered", || {
+        (acl_count(&transport) > 2).then_some(())
+    })
+    .await;
 }
 
 #[tokio::test]

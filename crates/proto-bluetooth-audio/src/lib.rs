@@ -11,6 +11,7 @@
 //! out, and the state machines are driven by the caller.
 #![forbid(unsafe_code)]
 
+pub mod acl;
 pub mod adapter;
 pub mod avctp;
 pub mod avdtp;
@@ -23,6 +24,7 @@ pub mod media;
 pub mod obex;
 pub mod sink;
 
+pub use acl::AclWriter;
 pub use adapter::{BluetoothAdapter, BluetoothConfig};
 pub use avctp::{AvcFrame, AvctpMessage, Ctype};
 pub use avdtp::{Message, MessageType, Seid, Signal, StreamEndpoint};

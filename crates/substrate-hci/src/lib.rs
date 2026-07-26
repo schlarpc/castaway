@@ -21,6 +21,7 @@ pub mod addr;
 pub mod command;
 pub mod error;
 pub mod event;
+pub mod flow;
 pub mod opcode;
 pub mod packet;
 pub mod status;
@@ -32,6 +33,7 @@ pub use command::{
 };
 pub use error::HciError;
 pub use event::{BufferSize, Event, LinkType};
+pub use flow::AclCredits;
 pub use opcode::{Ogf, OpCode};
 pub use packet::{AclPacket, Broadcast, ConnectionHandle, HciPacket, PacketBoundary, PacketType};
 pub use status::Status;

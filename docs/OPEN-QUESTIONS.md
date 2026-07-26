@@ -248,12 +248,39 @@ the reasons are what a future reversal has to argue against.
   channel mode used to be accepted and then decoded as stereo; `CodecCapability::format()`
   requires both and the sink rejects with `INVALID_CODEC_PARAMETER` otherwise.
 
-- **Q26 — AVDTP START never arrives from BlueZ.** The live two-radio test gets as far as
-  aptX/48 kHz configured and the second (media transport) L2CAP channel open, and then
-  stops: no START, no media packets, no further events at all. PipeWire happily streams
-  five seconds into its node and nothing crosses. Suspects, in order: our L2CAP
-  configuration response on the *media* channel leaving BlueZ waiting for something;
-  ACL flow control (we log `NumberOfCompletedPackets` credits but never gate sending on
-  them); or the reader stalling after the second channel opens. Needs a `btmon` capture
-  taken *during* the connect rather than after it — the link idles out in seconds, which
-  is what defeated the first attempts.
+- **Q26 — AVDTP START never arrives from BlueZ. FIXED IN CODE; NOT YET RECONFIRMED ON
+  HARDWARE.** The live two-radio test got as far as aptX/48 kHz configured and the second
+  (media transport) L2CAP channel open, and then stopped: no START, no media packets, no
+  further events at all. PipeWire happily streamed five seconds into its node and nothing
+  crossed.
+  Suspect 2 turned out to be a real and unambiguous defect: **we never gated sending on
+  ACL credits.** `HostAction::Credits` was emitted from `NumberOfCompletedPackets` and
+  dropped on the floor, and `HostAction::Ready`'s `acl_credits` was ignored entirely, so
+  the host wrote as many fragments as it liked into a controller advertising four to
+  eight buffers. A controller with no free buffer discards the fragment and reports
+  nothing — the write returns success — so this is invisible from our end and presents
+  as a peer that went quiet. That is exactly the observed shape: our L2CAP configuration
+  *response* on the media channel is the write immediately after a burst of SDP and AVDTP
+  replies, and losing it leaves BlueZ's half of that channel unconfigured forever, which
+  means no START, no media, and a link that idles out in seconds. It also subsumes
+  suspect 1 — "leaving BlueZ waiting for something" — without the response's *content*
+  being wrong at all.
+  Fixed by routing every outbound PDU through one `AclWriter` task
+  (architecture-substrate.md §11.3a-0) over a pure `substrate_hci::AclCredits` pool:
+  claim a credit per fragment, wait when empty, release on `NumberOfCompletedPackets`,
+  and reclaim on link-down (the controller flushes a dead handle's buffers without ever
+  reporting them complete, so nothing else would return them).
+  Suspect 3 — "the reader stalling" — is structurally excluded rather than diagnosed:
+  enqueueing never blocks, so the loop that *receives* completion events can no longer be
+  parked waiting for the credits those events carry. The same change fixes a second
+  latent bug nobody had hit yet: the actor loop and the AVRCP control writer both
+  fragmented straight onto the transport, and basic-mode L2CAP has no segmentation, so
+  two concurrent PDUs on one handle would have interleaved into two corrupt ones.
+  **What is still unproven:** that this was *the* cause. It is the provably-missing
+  mechanism and it explains every observed symptom, but it was found by reading rather
+  than by capture. The regression test reproduces the failure end to end against a
+  scripted controller with two buffers that withholds completions, and fails without the
+  fix — that establishes the mechanism, not that the bench hit it. If the next hardware
+  run still stalls at the same point, take the `btmon` capture *during* the connect, and
+  the remaining unexamined suspect is whether BlueZ wants something in the configuration
+  response's options that we are not putting there.

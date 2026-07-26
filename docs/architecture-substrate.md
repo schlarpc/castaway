@@ -340,6 +340,29 @@ one-time provisioning step on a kiosk we control, and it also means the machine'
 radio stays available to the OS. Both backends see the same controller-side behaviour, so
 everything above this line is tested once.
 
+### 11.3a-0 One writer, paced by the controller's buffers
+
+`HciTransport::send` is deliberately dumb — it writes a packet and returns. Everything
+that decides *when* a packet may be written lives above it, in a single `AclWriter` task
+that owns the outbound side of every link. Nothing else writes ACL data.
+
+Two things force this, and OPEN-QUESTIONS Q26 is what having neither looks like:
+
+- **Credits.** A controller advertises a fixed number of ACL buffers in
+  `HCI_Read_Buffer_Size` and the host must not exceed them. There is no backpressure to
+  discover the limit with: a dongle handed a fragment it cannot hold discards it and says
+  nothing, the write returns success, and the peer waits forever for a reply this end
+  believes it sent. Buffers come back per handle via `HCI_Number_Of_Completed_Packets`,
+  and a link that drops has its buffers flushed with no completion event at all — so the
+  accounting (`substrate_hci::AclCredits`, pure and unit-tested) has to handle both.
+- **No interleaving.** Basic-mode L2CAP has no SDU segmentation, so a PDU's fragments
+  must reach the peer consecutively. Two tasks fragmenting concurrently onto one handle
+  produce two corrupt PDUs and no error anywhere.
+
+The writer being a *task* rather than a lock is the other half: enqueueing never blocks,
+so the actor loop that receives completion events can never be parked waiting for the
+credits those very events would deliver.
+
 ### 11.3a Controller initialisation is its own seam
 
 Moving packets and *bringing a controller to life* are different problems, and only the
