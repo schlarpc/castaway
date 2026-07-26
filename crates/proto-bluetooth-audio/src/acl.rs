@@ -34,6 +34,16 @@ struct Buffers {
     credits: AclCredits,
     /// Largest ACL fragment the controller accepts.
     mtu: u16,
+    /// Links the controller has told us are gone.
+    ///
+    /// Needed because `link_down` reclaims what is *outstanding*, and jobs already sitting
+    /// in the queue for that handle are not outstanding yet. Without this the writer went
+    /// on to `claim` against a dead handle, inserting an entry that no
+    /// `Number_Of_Completed_Packets` will ever retire and that `link_down` — long since
+    /// fired — will never reclaim. Each occurrence permanently shrank the pool, and with
+    /// the deploy dongle's six credits, six phones walking away mid-write wedged all
+    /// outbound ACL for the life of the process.
+    dead: std::collections::HashSet<u16>,
 }
 
 /// Serialises and paces every outbound ACL PDU.
@@ -77,6 +87,7 @@ impl AclWriter {
             buffers: Arc::new(tokio::sync::Mutex::new(Buffers {
                 credits: AclCredits::new(INITIAL_CREDITS),
                 mtu: INITIAL_MTU,
+                dead: std::collections::HashSet::new(),
             })),
             replenished: Arc::new(Notify::new()),
         };
@@ -114,7 +125,15 @@ impl AclWriter {
     /// Reclaim the buffers the controller flushed when a link dropped. No completion
     /// event ever arrives for those, so nothing else would return them.
     pub async fn link_down(&self, handle: ConnectionHandle) {
-        let reclaimed = self.buffers.lock().await.credits.link_down(handle);
+        let reclaimed = {
+            let mut buffers = self.buffers.lock().await;
+            buffers.dead.insert(handle.raw());
+            buffers.credits.link_down(handle)
+        };
+        // Anything still queued for this handle is now undeliverable, so wake the writer
+        // even when nothing was reclaimed: it may be parked in `claim` for a link that is
+        // never going to return a credit.
+        self.replenished.notify_one();
         if reclaimed > 0 {
             debug!(%handle, reclaimed, "acl: reclaimed buffers from a dead link");
             self.replenished.notify_one();
@@ -127,18 +146,41 @@ impl AclWriter {
     }
 
     /// Wait until one fragment may be sent on `handle`.
-    async fn claim(&self, handle: ConnectionHandle) {
+    ///
+    /// `false` if the link died while waiting — the caller must abandon the PDU rather
+    /// than send it, or it consumes a credit that will never come back.
+    async fn claim(&self, handle: ConnectionHandle) -> bool {
         loop {
-            if self.buffers.lock().await.credits.claim(handle) {
-                return;
+            {
+                let mut buffers = self.buffers.lock().await;
+                if buffers.dead.contains(&handle.raw()) {
+                    return false;
+                }
+                if buffers.credits.claim(handle) {
+                    return true;
+                }
             }
             trace!(%handle, "acl: out of controller buffers; waiting");
             self.replenished.notified().await;
         }
     }
 
+    /// Note a link coming up, so a reused handle is not treated as dead.
+    ///
+    /// Handles are the controller's to allocate and it reuses them freely, so "dead"
+    /// cannot be permanent without eventually refusing to write to a live phone.
+    pub async fn link_up(&self, handle: ConnectionHandle) {
+        self.buffers.lock().await.dead.remove(&handle.raw());
+    }
+
     async fn pump(self, transport: Arc<dyn HciTransport>, mut jobs: mpsc::UnboundedReceiver<Job>) {
         while let Some(Job { handle, pdu }) = jobs.recv().await {
+            // A PDU queued just before the link dropped. Sending it is impossible and
+            // claiming for it leaks a credit, so drop it here.
+            if self.buffers.lock().await.dead.contains(&handle.raw()) {
+                debug!(%handle, "acl: dropping a pdu queued for a dead link");
+                continue;
+            }
             let bytes = match pdu.encode() {
                 Ok(b) => b,
                 Err(e) => {
@@ -155,7 +197,10 @@ impl AclWriter {
                 } else {
                     PacketBoundary::Continuing
                 };
-                self.claim(handle).await;
+                if !self.claim(handle).await {
+                    debug!(%handle, "acl: link died mid-pdu; abandoning the rest");
+                    break;
+                }
                 if let Err(e) = transport
                     .send(HciPacket::Acl(AclPacket::new(
                         handle,
@@ -169,5 +214,79 @@ impl AclWriter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use substrate_hci::{ConnectionHandle, HciPacket, HciTransport};
+    use substrate_l2cap::{Cid, L2capPdu};
+
+    use super::AclWriter;
+
+    /// Accepts everything and remembers nothing. The point here is credit accounting, not
+    /// what reached the wire.
+    #[derive(Debug)]
+    struct Sink;
+
+    #[async_trait::async_trait]
+    impl HciTransport for Sink {
+        async fn send(&self, _packet: HciPacket) -> Result<(), substrate_hci::HciError> {
+            Ok(())
+        }
+        async fn recv(&self) -> Result<HciPacket, substrate_hci::HciError> {
+            std::future::pending().await
+        }
+    }
+
+    fn pdu() -> L2capPdu {
+        L2capPdu::new(Cid::new(0x0040), Bytes::from_static(b"hello"))
+    }
+
+    #[tokio::test]
+    async fn a_pdu_queued_for_a_link_that_just_died_does_not_eat_a_credit() {
+        // The leak the existing end-to-end test cannot reach: it drops a link with
+        // *nothing* queued. `link_down` reclaims what is outstanding, but a job already in
+        // the queue is not outstanding yet — so the writer went on to claim against a dead
+        // handle, inserting an entry no completion event will ever retire and that
+        // `link_down` has already run past. Each one permanently shrank the pool; six of
+        // them on the deploy dongle stopped all outbound ACL for the life of the process.
+        let writer = AclWriter::spawn(Arc::new(Sink));
+        writer.configure(6, 1021).await;
+        let handle = ConnectionHandle::new(0x0001).unwrap();
+        writer.link_up(handle).await;
+
+        writer.link_down(handle).await;
+        for _ in 0..10 {
+            writer.send(handle, pdu());
+        }
+        // Let the writer drain the queue.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            writer.outstanding().await,
+            0,
+            "a dead link's queued pdus must not consume credits"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_handle_is_writable_again() {
+        // Handles belong to the controller and it reuses them, so "dead" cannot be
+        // permanent — the next phone to arrive on that handle must not be refused.
+        let writer = AclWriter::spawn(Arc::new(Sink));
+        writer.configure(6, 1021).await;
+        let handle = ConnectionHandle::new(0x0001).unwrap();
+        writer.link_down(handle).await;
+        writer.link_up(handle).await;
+        writer.send(handle, pdu());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            writer.outstanding().await > 0,
+            "a live link must still be able to send"
+        );
     }
 }

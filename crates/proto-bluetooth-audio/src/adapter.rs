@@ -385,6 +385,10 @@ impl SourceAdapter for BluetoothAdapter {
                             }
                             HostAction::LinkUp { handle, peer } => {
                                 info!(%peer, "bluetooth: link up");
+                                // Controllers reuse handles, so a handle marked dead by a
+                                // previous link has to be cleared or we would refuse to
+                                // write to the phone that just arrived on it.
+                                acl.link_up(*handle).await;
                                 links.insert(
                                     handle.raw(),
                                     Link::new(*peer, self.capabilities.clone()),
