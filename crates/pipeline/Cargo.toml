@@ -43,6 +43,9 @@ cef-dll-sys = { version = "=147.1.0", optional = true }
 adblock = { version = "0.13", optional = true, default-features = false, features = [
     "embedded-domain-resolver",
     "full-regex-handling",
+    # Turns uBlock Origin's own `scriptlets.js` into engine resources, so `##+js(...)`
+    # rules have bodies to inject rather than matching and doing nothing.
+    "resource-assembler",
 ] }
 # Blocking HTTP client to fetch+cache EasyList at startup.
 ureq = { version = "2", optional = true }
@@ -73,6 +76,7 @@ winapi = { version = "0.3", optional = true, features = [
 d3d12 = { version = "22", optional = true }
 
 [dev-dependencies]
+base64.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 

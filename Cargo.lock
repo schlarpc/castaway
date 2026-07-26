@@ -2820,6 +2820,7 @@ dependencies = [
  "adblock",
  "ash",
  "async-trait",
+ "base64",
  "bytemuck",
  "bytes",
  "castaway-core",

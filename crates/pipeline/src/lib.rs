@@ -36,6 +36,8 @@ pub mod cef_browser;
 pub mod easylist;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
+#[cfg(feature = "cef")]
+pub mod filterlists;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
 #[cfg(feature = "render")]
