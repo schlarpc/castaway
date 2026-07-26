@@ -244,6 +244,25 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A stable per-protocol device UUID, derived from the receiver's configured one.
+///
+/// Two UPnP root devices on one host must not share a UUID, and DLNA and DIAL did. Every
+/// `SsdpDevice` advertises `upnp:rootdevice` and the bare `uuid:` target, so an `M-SEARCH`
+/// for `ssdp:all` or `upnp:rootdevice` drew two `200 OK`s with an identical
+/// `USN: uuid:…::upnp:rootdevice` and *different* `LOCATION`s. Control points key on USN
+/// and most dedupe on it, so one description won arbitrarily — and if DLNA's won, the
+/// response carried no `Application-URL` and DIAL was simply invisible. Only the targeted
+/// `ST: urn:dial-multiscreen-org:service:dial:1` search was unaffected, which is exactly
+/// why nothing caught it.
+///
+/// Derived rather than random so it survives a restart: a sender that remembers a device
+/// by UUID should find the same one tomorrow. v5 over the configured UUID's own namespace
+/// keeps that property without needing a second value in the config file.
+fn device_uuid(base: &str, protocol: &str) -> String {
+    let namespace = uuid::Uuid::parse_str(base).unwrap_or(uuid::Uuid::NAMESPACE_URL);
+    uuid::Uuid::new_v5(&namespace, protocol.as_bytes()).to_string()
+}
+
 /// ctrl-c triggers the same shutdown as a kiosk window close: stop the services and
 /// tell the winit loop to exit.
 fn spawn_ctrl_c(
@@ -371,14 +390,12 @@ async fn serve(
             let dial = DialService::new(
                 config.advertised_name(ProtocolKind::YouTubeLounge),
                 config.http_base_url(),
+                device_uuid(&config.uuid, "dial"),
                 dial_tx.clone(),
             )
             .with_osd(osd.clone());
             http = http.merge(dial.router());
-            ssdp_devices.push((
-                dial.ssdp_device(&config.uuid),
-                dial.description_path().to_string(),
-            ));
+            ssdp_devices.push((dial.ssdp_device(), dial.description_path().to_string()));
             info!("enabled: DIAL → YouTube leanback (launch/stop)");
             // Whatever the launched page becomes, a sender arriving later needs to be
             // able to find it. The routes clear this slot themselves on launch and stop;
@@ -802,4 +819,37 @@ fn init_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::device_uuid;
+
+    #[test]
+    fn each_protocol_gets_its_own_device_uuid_and_keeps_it() {
+        // Two UPnP root devices on one host must not share a UUID: both advertise
+        // `upnp:rootdevice` and the bare `uuid:` target, so a shared one produces two
+        // `200 OK`s with the same USN and different LOCATIONs — and a control point that
+        // dedupes on USN (most do) picks one arbitrarily. When it picked DLNA's, the
+        // response had no `Application-URL` and DIAL was invisible.
+        let base = "0f8c1e2a-1111-4000-8000-00000000abcd";
+        let dial = device_uuid(base, "dial");
+        assert_ne!(dial, base, "must not collide with the DLNA root device");
+        assert_ne!(dial, device_uuid(base, "cast"));
+        // Derived, not random: a sender that remembers a device by UUID has to find the
+        // same one after a restart.
+        assert_eq!(dial, device_uuid(base, "dial"));
+        assert!(uuid::Uuid::parse_str(&dial).is_ok(), "must be a real uuid");
+    }
+
+    #[test]
+    fn a_malformed_configured_uuid_still_yields_stable_distinct_ones() {
+        // The config is hand-edited. A typo should degrade to "still works, still
+        // distinct" rather than to two devices sharing an identity again.
+        let dial = device_uuid("not-a-uuid", "dial");
+        let cast = device_uuid("not-a-uuid", "cast");
+        assert_ne!(dial, cast);
+        assert_eq!(dial, device_uuid("not-a-uuid", "dial"));
+    }
 }

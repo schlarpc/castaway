@@ -151,6 +151,11 @@ struct DialInner {
     osd: OnceLock<OsdSink>,
     /// The launched page's Lounge screen id, once something has resolved it.
     screen: ScreenSlot,
+    /// This device's UUID, without the `uuid:` prefix.
+    ///
+    /// Needed by the description as well as the advertisement: UPnP requires `<UDN>`, and
+    /// senders use it to tie the SSDP `USN` to the description they just fetched.
+    uuid: String,
 }
 
 /// The DIAL service. Exposes a [`Router`] to merge and an [`SsdpDevice`] to advertise.
@@ -166,6 +171,7 @@ impl DialService {
     pub fn new(
         friendly_name: impl Into<String>,
         base_url: impl Into<String>,
+        uuid: impl Into<String>,
         events: mpsc::Sender<DialEvent>,
     ) -> Self {
         Self {
@@ -176,6 +182,7 @@ impl DialService {
                 events,
                 osd: OnceLock::new(),
                 screen: ScreenSlot::default(),
+                uuid: uuid.into(),
             }),
         }
     }
@@ -208,9 +215,9 @@ impl DialService {
 
     /// The SSDP device to register with the shared responder.
     #[must_use]
-    pub fn ssdp_device(&self, uuid: impl Into<String>) -> SsdpDevice {
+    pub fn ssdp_device(&self) -> SsdpDevice {
         SsdpDevice {
-            uuid: format!("uuid:{}", uuid.into()),
+            uuid: format!("uuid:{}", self.inner.uuid),
             device_type: "urn:schemas-upnp-org:device:tvdevice:1".to_string(),
             services: vec![DIAL_SERVICE_TYPE.to_string()],
         }
@@ -225,6 +232,12 @@ impl DialService {
 
 async fn device_description(State(st): State<Arc<DialInner>>) -> Response {
     let name = xml_escape(&st.friendly_name);
+    // `<UDN>` is not optional and its absence is not forgiving. UPnP mandates it, and
+    // Chromium's DIAL device-description parser treats an empty unique-id as a parse
+    // failure and drops the device outright — so we were invisible to a whole family of
+    // senders while `curl` and `yt-selfplay`, neither of which reads it, both passed.
+    // Android senders use it to tie the SSDP `USN` back to the description they fetched.
+    let udn = xml_escape(&format!("uuid:{}", st.uuid));
     let xml = format!(
         r#"<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -234,6 +247,7 @@ async fn device_description(State(st): State<Arc<DialInner>>) -> Response {
     <friendlyName>{name}</friendlyName>
     <manufacturer>castaway</manufacturer>
     <modelName>castaway</modelName>
+    <UDN>{udn}</UDN>
   </device>
 </root>"#
     );
@@ -346,7 +360,12 @@ mod tests {
     fn service() -> (DialService, mpsc::Receiver<DialEvent>) {
         let (tx, rx) = mpsc::channel(4);
         (
-            DialService::new("Test & Screen", "http://10.0.0.5:8080", tx),
+            DialService::new(
+                "Test & Screen",
+                "http://10.0.0.5:8080",
+                "0f8c1e2a-0000-4000-8000-000000000001",
+                tx,
+            ),
             rx,
         )
     }
@@ -448,7 +467,13 @@ mod tests {
         use castaway_core::{osd_channel, OsdCommand};
         let (tx, _rx) = mpsc::channel(4);
         let (osd, osd_rx) = osd_channel();
-        let svc = DialService::new("screen", "http://10.0.0.5:8080", tx).with_osd(osd);
+        let svc = DialService::new(
+            "screen",
+            "http://10.0.0.5:8080",
+            "0f8c1e2a-0000-4000-8000-000000000001",
+            tx,
+        )
+        .with_osd(osd);
         svc.router()
             .oneshot(
                 Request::builder()
@@ -576,8 +601,38 @@ mod tests {
     #[test]
     fn ssdp_device_advertises_dial_service() {
         let (svc, _rx) = service();
-        let dev = svc.ssdp_device("dial-uuid");
+        let dev = svc.ssdp_device();
         assert!(dev.services.contains(&DIAL_SERVICE_TYPE.to_string()));
         assert!(dev.targets().iter().any(|t| t.nt == DIAL_SERVICE_TYPE));
+    }
+
+    #[tokio::test]
+    async fn the_description_carries_a_udn_matching_the_advertisement() {
+        // Chromium's DIAL parser drops a device whose description has no unique id, and
+        // Android senders use the UDN to tie the SSDP `USN` to the description they just
+        // fetched — so these two disagreeing is as bad as the tag being missing. Neither
+        // `curl` nor `yt-selfplay` reads it, which is why this went unnoticed.
+        let (svc, _rx) = service();
+        let resp = svc
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/dial/dd.xml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body = String::from_utf8_lossy(&body).to_string();
+        let dev = svc.ssdp_device();
+        assert!(
+            body.contains("<UDN>uuid:0f8c1e2a-0000-4000-8000-000000000001</UDN>"),
+            "no UDN in {body}"
+        );
+        assert!(
+            body.contains(&format!("<UDN>{}</UDN>", dev.uuid)),
+            "the UDN must be the uuid we advertise"
+        );
     }
 }

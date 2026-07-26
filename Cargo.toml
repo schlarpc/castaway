@@ -96,7 +96,7 @@ hyper = "1"
 rtsp-types = "0.1"
 plist = "1"
 url = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # --- tls ---
 # `ring` everywhere, explicitly: it is the backend that already cross-compiles for the
