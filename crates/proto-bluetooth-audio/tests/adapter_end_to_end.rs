@@ -867,7 +867,8 @@ async fn the_device_and_its_codec_are_reported_for_the_screen() {
     assert_eq!(info.address.as_deref(), Some(PEER), "which phone");
     assert_eq!(
         info.link.as_deref(),
-        Some("aptX · 44.1 kHz · joint stereo"),
+        // aptX is constant-rate: 44100 x 2 x 4 bits per sample.
+        Some("aptX · 44.1 kHz · joint stereo · 352 kbps"),
         "what was negotiated"
     );
     // Rendered for a human, both facts on one line.

@@ -300,9 +300,12 @@ impl CodecCapability {
         // reach for when a stream disappoints them. It is a *ceiling*: the encoder varies
         // bitpool per frame within the negotiated range and states it in every frame
         // header, so what actually arrives may be lower (see `Depacketizer::bitpool`).
-        let quality = match self {
-            Self::Sbc { max_bitpool, .. } => format!(" · bitpool ≤{max_bitpool}"),
-            _ => String::new(),
+        let quality = match (self, self.bitrate()) {
+            (Self::Sbc { max_bitpool, .. }, _) => format!(" · bitpool ≤{max_bitpool}"),
+            // AAC's is a ceiling the encoder may undershoot; the others are exact.
+            (Self::Aac { vbr: true, .. }, Some(bps)) => format!(" · ≤{} kbps", bps / 1000),
+            (_, Some(bps)) => format!(" · {} kbps", bps / 1000),
+            (_, None) => String::new(),
         };
         match self.channel_summary() {
             Some(channels) => {
@@ -466,6 +469,27 @@ impl CodecCapability {
     #[must_use]
     pub fn format(&self) -> Option<AudioFormat> {
         AudioFormat::from_hz(self.sample_rate()?, u16::from(self.channel_count()?))
+    }
+
+    /// The stream's bitrate in bits per second, where the configuration fixes one.
+    ///
+    /// Not every codec has an answer here, and the ones that do not are the interesting
+    /// ones. aptX and aptX HD are constant-rate by construction — a fixed 4:1 on 16- and
+    /// 24-bit samples respectively, so four and six bits per sample per channel, with no
+    /// per-frame parameter to observe. AAC negotiates a peak the encoder may undershoot.
+    /// SBC's rate follows a bitpool that moves per frame, and LDAC picks its rate in-band,
+    /// so for those two a number derived from the capability would be a guess — see
+    /// [`crate::media::Depacketizer::bitpool`] for the one that is actually true.
+    #[must_use]
+    pub fn bitrate(&self) -> Option<u32> {
+        let rate = self.sample_rate()?;
+        let channels = u32::from(self.channel_count()?);
+        match self {
+            Self::AptX { .. } => Some(rate * channels * 4),
+            Self::AptXHd { .. } => Some(rate * channels * 6),
+            Self::Aac { bitrate, .. } => (*bitrate != 0).then_some(*bitrate),
+            Self::Sbc { .. } | Self::Ldac { .. } => None,
+        }
     }
 
     /// Encode the Media Codec capability payload (media type onward).
@@ -706,14 +730,28 @@ pub fn advertised(include_ldac: bool) -> Vec<CodecCapability> {
         subbands: 0b11,
         allocations: 0b11,
         min_bitpool: 2,
-        // 53 is the A2DP "high quality" ceiling at 44.1 kHz joint stereo. This is a
-        // ceiling we *advertise*: the sender picks a bitpool per frame within the range
-        // and states it in every frame header, and our decoder reads it from there — so
-        // raising this costs us nothing and simply stops capping a sender that would go
-        // higher ("SBC XQ"). The cost is airtime, which in a busy 2.4 GHz room is the
-        // scarce resource. Provisional pending measurement; watch the `sbc bitpool` log
-        // against a sender that actually uses it.
-        max_bitpool: 76,
+        // 53, and deliberately not higher.
+        //
+        // It is tempting to raise this: it is only a ceiling we advertise, the sender
+        // states its actual bitpool in every frame header, and our decoder reads it from
+        // there — so a bigger number costs us nothing to decode. That reasoning is what
+        // "SBC XQ" appears to be about, and it is wrong twice over.
+        //
+        // First, XQ does not need a raised ceiling. Its canonical configurations are
+        // *dual channel* at bitpool 38/47/51, all of which fit under 53 — the quality
+        // comes from spending the bits on two independently coded channels rather than
+        // from spending more of them.
+        //
+        // Second, a high ceiling is only harmless while senders clamp themselves to 53.
+        // The ones that stop clamping honour it, and then it can break the link: bitpool
+        // 76 joint stereo is a documented interop failure (choppy audio on a Denon
+        // AVR-X2100W, LineageOS gerrit 229310), and the patch that raised it upstream was
+        // abandoned for exactly that. Sinks that advertise a high ceiling and cannot
+        // actually sustain it are a known class of broken device; we should not join it.
+        //
+        // The lever that actually buys quality here is the L2CAP MTU, not this number —
+        // see `Link::new`.
+        max_bitpool: 53,
     });
     caps
 }
@@ -886,7 +924,11 @@ mod tests {
             rates: SampleRates::HZ_48000,
             channels: ChannelModes::JOINT_STEREO,
         };
-        assert_eq!(aptx_hd.describe(), "aptX HD · 48 kHz · joint stereo");
+        // aptX HD is constant-rate: 48000 x 2 channels x 6 bits per sample.
+        assert_eq!(
+            aptx_hd.describe(),
+            "aptX HD · 48 kHz · joint stereo · 576 kbps"
+        );
 
         let sbc = CodecCapability::Sbc {
             rates: SampleRates::HZ_44100,

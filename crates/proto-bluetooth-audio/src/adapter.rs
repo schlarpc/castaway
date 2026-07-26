@@ -133,7 +133,18 @@ struct Link {
 
 impl Link {
     fn new(peer: BdAddr, capabilities: Vec<crate::codec::CodecCapability>) -> Self {
-        let mut mux = Multiplexer::new(672);
+        // The receive MTU we advertise, and the lever that actually decides SBC quality
+        // per unit of airtime. A controller's ACL buffer is 1021 bytes and an L2CAP header
+        // is 4, so 1017 is the largest SDU that still lands in one ACL packet.
+        //
+        // 672 — the L2CAP default — is what we advertised before, and it is expensive: an
+        // XQ-grade SBC stream at 184-byte frames fits three frames per packet there, with
+        // 107 bytes wasted and ~43% of the airtime spent. The same stream at 1017 packs
+        // five frames into one 3-DH5 and spends ~26%. Same bitrate, far less radio, which
+        // is the resource a room full of people is short of. AOSP takes the same view from
+        // the other side: it gates its high-bitrate SBC tier on the negotiated MTU
+        // (`MIN_3MBPS_AVDTP_SAFE_MTU`, 801) rather than on a bitrate number.
+        let mut mux = Multiplexer::new(1017);
         mux.listen(Psm::SDP);
         mux.listen(Psm::AVDTP);
         mux.listen(Psm::AVCTP);
