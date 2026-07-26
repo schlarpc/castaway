@@ -137,8 +137,10 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
 
     // The codec table follows what this build can actually decode. Advertising a codec
     // we cannot decode means the phone picks it and the session is silence rather than a
-    // clean fallback to one we can (Q22).
-    let enable_ldac = decodable().contains(&castaway_core::AudioCodec::Ldac);
+    // clean fallback to one we can (Q22) — and the phone picks the *best* one it shares
+    // with us, so the ones most likely to be missing are exactly the ones it reaches for
+    // first. This used to check LDAC alone, which left aptX HD, aptX and AAC unguarded.
+    let decodable = decodable();
     let codecs = match &config.bluetooth.codecs {
         Some(names) => Some(
             names
@@ -170,14 +172,14 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
                 discoverable: true,
                 ..HostConfig::default()
             },
-            enable_ldac,
+            decodable: decodable.clone(),
             codecs,
             link_keys,
             on_paired: Some(on_paired),
         },
     ));
 
-    info!(controller = %id, ldac = enable_ldac, "enabled: Bluetooth A2DP sink");
+    info!(controller = %id, ?decodable, "enabled: Bluetooth A2DP sink");
 
     Ok((adapter, id))
 }
@@ -364,6 +366,44 @@ fn link_keys_path(state_dir: &Path) -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn we_never_advertise_an_endpoint_this_build_cannot_decode() {
+        // The invariant Q22 actually needs, and the one nothing was checking. The test in
+        // `pipeline` asserts `can_decode` over `decodable_codecs()`, which is true by
+        // construction; it cannot see the advertised table at all, because that lives in
+        // `proto-bluetooth-audio`. This crate is the only one that depends on both.
+        //
+        // It matters because the table is ordered best-first and a sender takes the first
+        // endpoint it shares with us — so an endpoint we cannot decode is not a missed
+        // opportunity, it is the one the phone reaches for. The session then connects,
+        // the card fills in, and nothing comes out of the speakers.
+        let decodable = decodable();
+        for cap in proto_bluetooth_audio::codec::advertised(&decodable) {
+            let codec = cap.audio_codec();
+            assert!(
+                codec == castaway_core::AudioCodec::Sbc || decodable.contains(&codec),
+                "advertising {codec:?}, which this build cannot decode"
+            );
+        }
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn sbc_survives_even_when_nothing_else_does() {
+        // A sink with no SBC endpoint is not an A2DP sink: SBC is mandatory, so a phone
+        // that finds nothing in common simply refuses to connect. That is a worse failure
+        // than silence, and it is what a naive "filter everything" would have produced on
+        // a build with no ffmpeg at all.
+        let table = proto_bluetooth_audio::codec::advertised(&[]);
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table[0].audio_codec(),
+            castaway_core::AudioCodec::Sbc,
+            "SBC is the guaranteed floor"
+        );
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("castaway-bt-{}-{tag}", std::process::id()));

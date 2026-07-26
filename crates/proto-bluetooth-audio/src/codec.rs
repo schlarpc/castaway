@@ -691,38 +691,66 @@ const fn ldac_rate_hz(bits: u8) -> Option<u32> {
     })
 }
 
+/// Every codec this crate has an endpoint for.
+///
+/// Not a claim about what any particular *build* can decode — that is what
+/// [`advertised`] takes, and the app fills it in by asking the pipeline. This is the
+/// upper bound, useful for tests that want the full table rather than whatever the host's
+/// ffmpeg happens to ship.
+pub const ALL: &[AudioCodec] = &[
+    AudioCodec::Sbc,
+    AudioCodec::Aac,
+    AudioCodec::AptX,
+    AudioCodec::AptXHd,
+    AudioCodec::Ldac,
+];
+
 /// The capabilities we advertise, in preference order.
 ///
-/// `include_ldac` reflects the `ldac` build feature: without a decoder we must *not*
-/// advertise the endpoint, because a sender that picks it would stream something we
-/// cannot play and the session would be silence rather than a clean fallback (Q22).
+/// `decodable` is what this build can actually turn into sound. Anything outside it must
+/// *not* be advertised: a sender takes the first endpoint it supports, and this list is
+/// ordered best-first, so an endpoint we cannot decode is not a missed opportunity — it
+/// is the one the phone will pick. The session then runs, the card fills in, and nothing
+/// comes out of the speakers (Q22).
+///
+/// This used to gate LDAC alone, which left the same trap open for the four codecs above
+/// it: an ffmpeg without `aptx_hd` still advertised aptX HD, first in the list.
 #[must_use]
-pub fn advertised(include_ldac: bool) -> Vec<CodecCapability> {
+pub fn advertised(decodable: &[AudioCodec]) -> Vec<CodecCapability> {
     let mut caps = Vec::with_capacity(5);
-    if include_ldac {
+    if decodable.contains(&AudioCodec::Ldac) {
         caps.push(CodecCapability::Ldac {
             // 44.1/48/88.2/96 kHz, stereo + dual + mono.
             rate_bits: 0b11_1100,
             channel_bits: 0b111,
         });
     }
-    caps.push(CodecCapability::AptXHd {
-        rates: SampleRates::COMMON,
-        channels: ChannelModes::STEREO | ChannelModes::JOINT_STEREO,
-    });
-    caps.push(CodecCapability::AptX {
-        rates: SampleRates::COMMON,
-        channels: ChannelModes::STEREO | ChannelModes::JOINT_STEREO,
-    });
-    caps.push(CodecCapability::Aac {
-        // MPEG-4 AAC LC only: the one every phone implements, and the one ffmpeg
-        // decodes without special cases.
-        object_types: 1 << 6,
-        rate_bits: (1 << 4) | (1 << 3), // 44.1 and 48 kHz
-        channel_bits: 0b11,             // 1 or 2 channels
-        vbr: true,
-        bitrate: 320_000,
-    });
+    if decodable.contains(&AudioCodec::AptXHd) {
+        caps.push(CodecCapability::AptXHd {
+            rates: SampleRates::COMMON,
+            channels: ChannelModes::STEREO | ChannelModes::JOINT_STEREO,
+        });
+    }
+    if decodable.contains(&AudioCodec::AptX) {
+        caps.push(CodecCapability::AptX {
+            rates: SampleRates::COMMON,
+            channels: ChannelModes::STEREO | ChannelModes::JOINT_STEREO,
+        });
+    }
+    if decodable.contains(&AudioCodec::Aac) {
+        caps.push(CodecCapability::Aac {
+            // MPEG-4 AAC LC only: the one every phone implements, and the one ffmpeg
+            // decodes without special cases.
+            object_types: 1 << 6,
+            rate_bits: (1 << 4) | (1 << 3), // 44.1 and 48 kHz
+            channel_bits: 0b11,             // 1 or 2 channels
+            vbr: true,
+            bitrate: 320_000,
+        });
+    }
+    // SBC is mandatory for A2DP and its decoder is ours, not ffmpeg's, so it is always
+    // advertised. A sink with no SBC endpoint is not an A2DP sink, and a phone that finds
+    // nothing it can use simply will not connect — which is a worse failure than silence.
     caps.push(CodecCapability::Sbc {
         rates: SampleRates::ALL,
         channels: ChannelModes::ALL,
@@ -769,7 +797,7 @@ mod tests {
 
     #[test]
     fn every_advertised_codec_round_trips() {
-        for cap in advertised(true) {
+        for cap in advertised(ALL) {
             assert_eq!(round_trip(&cap), cap, "{} failed to round-trip", cap.name());
         }
     }
@@ -821,10 +849,15 @@ mod tests {
 
     #[test]
     fn sbc_configuration_narrows_every_field() {
-        let offer = advertised(false)
-            .into_iter()
-            .find(|c| matches!(c, CodecCapability::Sbc { .. }))
-            .unwrap();
+        let offer = advertised(&[
+            AudioCodec::Sbc,
+            AudioCodec::Aac,
+            AudioCodec::AptX,
+            AudioCodec::AptXHd,
+        ])
+        .into_iter()
+        .find(|c| matches!(c, CodecCapability::Sbc { .. }))
+        .unwrap();
         assert!(!offer.is_configuration());
         let CodecCapability::Sbc {
             min_bitpool,
@@ -870,8 +903,13 @@ mod tests {
     fn ldac_is_absent_from_the_table_when_the_decoder_is_not_built() {
         // Advertising an endpoint we cannot decode is worse than not advertising it: the
         // sender picks it and the session is silence rather than a clean fallback (Q22).
-        let with = advertised(true);
-        let without = advertised(false);
+        let with = advertised(ALL);
+        let without = advertised(&[
+            AudioCodec::Sbc,
+            AudioCodec::Aac,
+            AudioCodec::AptX,
+            AudioCodec::AptXHd,
+        ]);
         assert!(with
             .iter()
             .any(|c| c.audio_codec() == castaway_core::AudioCodec::Ldac));
@@ -885,7 +923,7 @@ mod tests {
     fn the_table_is_ordered_best_first_and_always_ends_in_sbc() {
         // Senders pick the first endpoint they also support, so this ordering *is* the
         // quality policy. SBC last because it is the mandatory fallback.
-        let caps = advertised(true);
+        let caps = advertised(ALL);
         let prefs: Vec<u8> = caps.iter().map(CodecCapability::preference).collect();
         let mut sorted = prefs.clone();
         sorted.sort_unstable();
@@ -957,7 +995,7 @@ mod tests {
 
     #[test]
     fn every_advertised_codec_has_a_display_name() {
-        for cap in advertised(true) {
+        for cap in advertised(ALL) {
             let name = cap.display_name();
             assert!(!name.is_empty(), "{} needs a display name", cap.name());
             assert!(

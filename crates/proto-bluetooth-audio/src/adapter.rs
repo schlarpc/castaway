@@ -52,9 +52,13 @@ pub type OnPaired = Arc<dyn Fn(BdAddr, LinkKey) + Send + Sync>;
 pub struct BluetoothConfig {
     /// Controller bring-up settings.
     pub host: HostConfig,
-    /// Whether to advertise the LDAC endpoint. Should mirror the `ldac` build feature —
-    /// advertising a codec we cannot decode makes the session silence (Q22).
-    pub enable_ldac: bool,
+    /// What this build can actually turn into sound.
+    ///
+    /// Not a preference — a capability. A sender takes the first endpoint it supports
+    /// from a best-first list, so an endpoint we cannot decode is the one it will pick,
+    /// and the session becomes silence rather than a clean fallback (Q22). The app fills
+    /// this in by asking the pipeline what decoders the build actually has.
+    pub decodable: Vec<castaway_core::AudioCodec>,
     /// Restrict the advertised endpoints to these codecs. `None` advertises everything
     /// the build supports, which is what a deployment wants.
     ///
@@ -74,7 +78,7 @@ impl std::fmt::Debug for BluetoothConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BluetoothConfig")
             .field("host", &self.host)
-            .field("enable_ldac", &self.enable_ldac)
+            .field("decodable", &self.decodable)
             .field("codecs", &self.codecs)
             .field("link_keys", &self.link_keys.len())
             .field("persists_keys", &self.on_paired.is_some())
@@ -82,15 +86,25 @@ impl std::fmt::Debug for BluetoothConfig {
     }
 }
 
-// Not derivable, despite appearances: `enable_ldac` follows the build feature, and
-// `bool::default()` is `false`. Deriving would compile and quietly disable LDAC in
-// exactly the builds that went to the trouble of enabling it.
+// Not derivable, despite appearances: an empty `decodable` would advertise SBC alone,
+// which is a silent quality regression rather than a compile error. The default is what
+// this crate can decode without help; the app narrows it to what the *build* can.
 #[allow(clippy::derivable_impls)]
 impl Default for BluetoothConfig {
     fn default() -> Self {
+        use castaway_core::AudioCodec;
+        let mut decodable = vec![
+            AudioCodec::Sbc,
+            AudioCodec::Aac,
+            AudioCodec::AptX,
+            AudioCodec::AptXHd,
+        ];
+        if cfg!(feature = "ldac") {
+            decodable.push(AudioCodec::Ldac);
+        }
         Self {
             host: HostConfig::default(),
-            enable_ldac: cfg!(feature = "ldac"),
+            decodable,
             codecs: None,
             link_keys: Vec::new(),
             on_paired: None,
@@ -237,7 +251,7 @@ impl BluetoothAdapter {
         // its volume rocker reaches us (Q24). Publishing one loses half the feature.
         sdp.add(avrcp_controller(0x0001_0001, &name));
         sdp.add(avrcp_target(0x0001_0002, &name));
-        let mut capabilities = advertised(config.enable_ldac);
+        let mut capabilities = advertised(&config.decodable);
         if let Some(allowed) = &config.codecs {
             capabilities.retain(|c| allowed.contains(&c.audio_codec()));
         }

@@ -9,6 +9,15 @@
 use bytes::Bytes;
 use castaway_core::AudioCodec;
 use proto_bluetooth_audio::avdtp::{error_code, Message, MessageType, Seid, Signal};
+/// The table a build with no LDAC decoder offers — the common case, and the one that
+/// proves a sender falls back cleanly instead of picking an endpoint we cannot decode.
+const NO_LDAC: &[castaway_core::AudioCodec] = &[
+    castaway_core::AudioCodec::Sbc,
+    castaway_core::AudioCodec::Aac,
+    castaway_core::AudioCodec::AptX,
+    castaway_core::AudioCodec::AptXHd,
+];
+
 use proto_bluetooth_audio::codec::{advertised, ChannelModes, CodecCapability, SampleRates};
 use proto_bluetooth_audio::media::Depacketizer;
 use proto_bluetooth_audio::sink::{reject_code, SinkEvent, SinkSession, StreamState};
@@ -109,7 +118,7 @@ fn aptx_config() -> CodecCapability {
 
 #[test]
 fn a_phone_walks_the_whole_session_from_discovery_to_streaming() {
-    let mut phone = Phone::new(advertised(true));
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
     assert_eq!(phone.session.state(), StreamState::Idle);
 
     let seid = configure(&mut phone, &aptx_config());
@@ -134,7 +143,7 @@ fn a_phone_walks_the_whole_session_from_discovery_to_streaming() {
 
 #[test]
 fn configuration_reports_the_codec_and_rate_the_decoder_needs() {
-    let mut phone = Phone::new(advertised(true));
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
     let events = {
         configure(&mut phone, &aptx_config());
         phone.send(Signal::GetConfiguration, &[])
@@ -142,7 +151,7 @@ fn configuration_reports_the_codec_and_rate_the_decoder_needs() {
     Phone::accepted(&events);
 
     // The Configured event is what the adapter turns into a Depacketizer + decoder.
-    let mut phone = Phone::new(advertised(true));
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
     let discover = phone.send(Signal::Discover, &[]);
     let seps = Phone::accepted(&discover).payload.clone();
     let seid = Seid::from_shifted(seps[0]).unwrap();
@@ -175,7 +184,7 @@ fn configuration_reports_the_codec_and_rate_the_decoder_needs() {
 fn every_advertised_codec_can_actually_be_configured() {
     // Guards against an endpoint that is advertised but not acceptable — which presents
     // to a user as "it works from my phone but not my friend's" and nothing else.
-    for cap in advertised(true) {
+    for cap in advertised(proto_bluetooth_audio::codec::ALL) {
         let configuration = match &cap {
             CodecCapability::Sbc {
                 min_bitpool,
@@ -211,7 +220,7 @@ fn every_advertised_codec_can_actually_be_configured() {
             // skipped, since the point of this test is that *every* endpoint works.
             other => panic!("no test configuration for {}", other.name()),
         };
-        let mut phone = Phone::new(advertised(true));
+        let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
         let seid = configure(&mut phone, &configuration);
         assert_eq!(
             phone.session.state(),
@@ -229,7 +238,7 @@ fn every_advertised_codec_can_actually_be_configured() {
 fn starting_before_opening_is_rejected_with_bad_state() {
     // A sender that skips OPEN must be told so. Accepting it would leave us streaming
     // over a media channel that was never established.
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     let seid = configure(&mut phone, &aptx_config());
     let code = Phone::rejected(&phone.send(Signal::Start, &[seid.shifted()]));
     assert_eq!(code, error_code::BAD_STATE);
@@ -240,7 +249,7 @@ fn starting_before_opening_is_rejected_with_bad_state() {
 fn a_configuration_that_still_names_a_set_is_rejected() {
     // Several rates left selected means the decoder cannot know the stream's rate, and
     // guessing plays it at the wrong pitch rather than failing. Catch it at negotiation.
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     let ambiguous = CodecCapability::AptX {
         rates: SampleRates::COMMON, // two rates — an offer, not a configuration
         channels: ChannelModes::JOINT_STEREO,
@@ -272,7 +281,7 @@ fn a_configuration_that_still_names_a_set_is_rejected() {
 fn configuring_one_codec_onto_another_codecs_endpoint_is_refused() {
     // Otherwise we would accept the configuration and then hand the stream to the wrong
     // decoder, which produces noise rather than an error.
-    let mut phone = Phone::new(advertised(true));
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
     let discover = phone.send(Signal::Discover, &[]);
     let seps = Phone::accepted(&discover).payload.clone();
 
@@ -297,7 +306,7 @@ fn configuring_one_codec_onto_another_codecs_endpoint_is_refused() {
 
 #[test]
 fn an_unknown_seid_is_rejected_rather_than_defaulting_to_the_first_endpoint() {
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     let code = Phone::rejected(&phone.send(Signal::GetAllCapabilities, &[0x3E << 2]));
     assert_eq!(code, error_code::BAD_ACP_SEID);
 }
@@ -306,7 +315,7 @@ fn an_unknown_seid_is_rejected_rather_than_defaulting_to_the_first_endpoint() {
 fn abort_is_never_rejected_even_from_idle() {
     // ABORT exists for the case where the two ends disagree about state. Refusing it
     // would strand that disagreement permanently.
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     Phone::accepted(&phone.send(Signal::Abort, &[]));
     assert_eq!(phone.session.state(), StreamState::Idle);
 
@@ -321,7 +330,7 @@ fn abort_is_never_rejected_even_from_idle() {
 #[test]
 fn a_dropped_link_closes_a_live_stream() {
     // The phone walks out of the room mid-song: no CLOSE, just a dead link.
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     let seid = configure(&mut phone, &aptx_config());
     Phone::accepted(&phone.send(Signal::Open, &[seid.shifted()]));
     Phone::accepted(&phone.send(Signal::Start, &[seid.shifted()]));
@@ -335,7 +344,7 @@ fn a_dropped_link_closes_a_live_stream() {
 
 #[test]
 fn a_closed_stream_frees_its_endpoint_for_the_next_sender() {
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     let seid = configure(&mut phone, &aptx_config());
     assert!(phone
         .session
@@ -356,7 +365,7 @@ fn the_negotiated_configuration_drives_the_depacketizer() {
     // The join between negotiation and media: aptX gets raw framing, everything else
     // RTP. Deriving it from the configuration rather than guessing per packet is what
     // stops 12 bytes of audio being eaten as a phantom header.
-    let mut phone = Phone::new(advertised(false));
+    let mut phone = Phone::new(advertised(NO_LDAC));
     configure(&mut phone, &aptx_config());
     let config = phone.session.configuration().unwrap();
     let depacketizer = Depacketizer::new(

@@ -154,7 +154,7 @@ async fn connected_to(
     let adapter = Arc::new(BluetoothAdapter::new(
         Arc::clone(&transport) as Arc<dyn HciTransport>,
         BluetoothConfig {
-            enable_ldac: true,
+            decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
             ..BluetoothConfig::default()
         },
     ));
@@ -304,7 +304,7 @@ async fn a_restricted_codec_table_advertises_only_what_it_was_given() {
     let adapter = BluetoothAdapter::new(
         transport() as Arc<dyn HciTransport>,
         BluetoothConfig {
-            enable_ldac: true,
+            decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
             codecs: Some(vec![AudioCodec::Sbc]),
             ..BluetoothConfig::default()
         },
@@ -315,7 +315,7 @@ async fn a_restricted_codec_table_advertises_only_what_it_was_given() {
     let all = BluetoothAdapter::new(
         transport() as Arc<dyn HciTransport>,
         BluetoothConfig {
-            enable_ldac: true,
+            decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
             ..BluetoothConfig::default()
         },
     );
