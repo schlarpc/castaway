@@ -18,7 +18,7 @@
     clippy::cast_possible_wrap
 )]
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use cef::rc::Rc as _;
 use cef::{args::Args, *};
@@ -28,6 +28,13 @@ use crate::attract::{InsetRect, WidgetSlot};
 use crate::cef_adblock::AdBlocker;
 use crate::compositor::{DirtyRect, Transform};
 use crate::error::PipelineError;
+
+/// The ad blocker, swappable while the browser is running.
+///
+/// The live client holds its own handle, so a daily refresh that replaced a plain `Arc`
+/// would update nothing that is actually blocking requests. Everything reads through this
+/// cell instead, and [`crate::filterlists::spawn_daily_refresh`] writes to it.
+pub type SharedBlocker = Arc<RwLock<Arc<AdBlocker>>>;
 
 /// A frame painted by CEF: BGRA8, top-down.
 #[derive(Clone)]
@@ -145,32 +152,50 @@ struct ViewSize {
 
 // --- Render process: scriptlet injection at document start ---
 
-/// The blocker used *inside the render process* to decide what to inject.
+/// The blocker used *inside the render process* to decide what to inject, together with
+/// the cache timestamp it was built from.
 ///
 /// It is a second engine, not the browser process's one, because these are separate
 /// processes: CEF re-execs this binary for the renderer, and `on_context_created` fires
-/// there. Built lazily from the same cache the browser process writes, and only in the
-/// renderer — the browser process never touches this.
-static RENDER_BLOCKER: OnceLock<Option<AdBlocker>> = OnceLock::new();
+/// there. Keyed on the cache stamp so a daily refresh reaches injections too — a renderer
+/// can outlive several refreshes, and one that never re-read would keep injecting the
+/// rules it started with while the browser process blocked by newer ones.
+static RENDER_BLOCKER: OnceLock<Mutex<Option<CachedBlocker>>> = OnceLock::new();
 
-/// The engine for this render process, loaded from cache on first use.
+/// An engine and the cache timestamp it was built from.
+type CachedBlocker = (Option<std::time::SystemTime>, Arc<AdBlocker>);
+
+/// The engine for this render process, rebuilt only when the cached lists have changed.
 ///
-/// Cache-only, never fetching: a renderer is short-lived and must not block page load on
-/// the network. The browser process refreshes the cache at startup, before any renderer
-/// exists, so what is on disk here is what was fetched this boot.
-fn render_blocker() -> Option<&'static AdBlocker> {
-    RENDER_BLOCKER
-        .get_or_init(|| {
-            let paths = crate::filterlists::CachePaths::default();
-            let blocker = crate::filterlists::load_cached_only(&paths)?;
-            info!(
-                target: "castaway::adblock",
-                scriptlets = blocker.scriptlet_count(),
-                "render process ready to inject"
-            );
-            Some(blocker)
-        })
-        .as_ref()
+/// Cache-only, never fetching: a renderer is short-lived relative to the browser process
+/// and must not block a page load on the network. The browser process refreshes the cache;
+/// this notices.
+///
+/// **These log lines are invisible today.** A CEF subprocess spends its whole life inside
+/// `execute_process`, which `main` calls before it installs a tracing subscriber — so
+/// nothing this function logs reaches the journal. Worth knowing before spending an hour
+/// wondering why the renderer is silent (it is not; it is unsubscribed).
+fn render_blocker() -> Option<Arc<AdBlocker>> {
+    let paths = crate::filterlists::CachePaths::default();
+    let stamp = crate::filterlists::cache_stamp(&paths);
+    let cell = RENDER_BLOCKER.get_or_init(|| Mutex::new(None));
+    let mut slot = cell.lock().ok()?;
+
+    if let Some((built_from, blocker)) = slot.as_ref() {
+        if *built_from == stamp {
+            return Some(Arc::clone(blocker));
+        }
+        debug!(target: "castaway::adblock", "cached lists changed; rebuilding for injection");
+    }
+
+    let blocker = Arc::new(crate::filterlists::load_cached_only(&paths)?);
+    info!(
+        target: "castaway::adblock",
+        scriptlets = blocker.scriptlet_count(),
+        "render process ready to inject"
+    );
+    *slot = Some((stamp, Arc::clone(&blocker)));
+    Some(blocker)
 }
 
 #[derive(Clone)]
@@ -332,7 +357,7 @@ wrap_render_handler! {
 
 #[derive(Clone)]
 struct ResourceInner {
-    adblock: Arc<AdBlocker>,
+    adblock: SharedBlocker,
 }
 
 wrap_resource_request_handler! {
@@ -355,7 +380,14 @@ wrap_resource_request_handler! {
                 .map(|f| CefString::from(&f.url()).to_string())
                 .unwrap_or_default();
             let kind = adblock_type(request.resource_type());
-            if self.inner.adblock.should_block(&url, &source, kind) {
+            // Cloned out of the cell so the lock is not held across the decision, which
+            // is what lets a refresh swap the engine without stalling page loads.
+            // A poisoned lock must not turn into a page that loads nothing, so the
+            // request is allowed through rather than cancelled.
+            let Some(blocker) = self.inner.adblock.read().ok().map(|g| Arc::clone(&g)) else {
+                return ReturnValue::CONTINUE;
+            };
+            if blocker.should_block(&url, &source, kind) {
                 ReturnValue::CANCEL
             } else {
                 ReturnValue::CONTINUE
@@ -475,7 +507,7 @@ wrap_client! {
 pub struct Cef {
     args: Args,
     app: App,
-    adblock: Arc<AdBlocker>,
+    adblock: SharedBlocker,
     user_agent: Option<String>,
 }
 
@@ -508,7 +540,7 @@ impl Cef {
             return Ok(None);
         }
         // Browser process: build the ad blocker (parses rules once).
-        let adblock = Arc::new(AdBlocker::with_defaults());
+        let adblock: SharedBlocker = Arc::new(RwLock::new(Arc::new(AdBlocker::with_defaults())));
         Ok(Some(Self {
             args,
             app,
@@ -517,9 +549,20 @@ impl Cef {
         }))
     }
 
-    /// Replace the ad blocker (e.g. loaded from a full EasyList) before creating browsers.
+    /// Replace the ad blocker (e.g. loaded from the real subscriptions).
+    ///
+    /// Safe to call at any time, including while pages are loading: requests read the
+    /// current blocker through a lock rather than holding one from browser-creation time.
     pub fn set_adblock(&mut self, adblock: AdBlocker) {
-        self.adblock = Arc::new(adblock);
+        if let Ok(mut slot) = self.adblock.write() {
+            *slot = Arc::new(adblock);
+        }
+    }
+
+    /// A handle to the blocker cell, for a refresher to swap into later.
+    #[must_use]
+    pub fn adblock_handle(&self) -> SharedBlocker {
+        self.adblock.clone()
     }
 
     /// Set the browser user agent (call before [`Self::initialize`]). Use [`TV_USER_AGENT`]
@@ -638,13 +681,18 @@ impl Cef {
     /// Adblock stats so far: `(requests_seen, requests_blocked)`.
     #[must_use]
     pub fn adblock_stats(&self) -> (u64, u64) {
-        (self.adblock.seen_count(), self.adblock.blocked_count())
+        self.adblock
+            .read()
+            .map_or((0, 0), |b| (b.seen_count(), b.blocked_count()))
     }
 
     /// Diagnostic host tally: `(host, seen, blocked)` most-seen first.
     #[must_use]
     pub fn adblock_hosts(&self) -> Vec<(String, u32, u32)> {
-        self.adblock.host_tally()
+        self.adblock
+            .read()
+            .map(|b| b.host_tally())
+            .unwrap_or_default()
     }
 
     /// Shut CEF down.

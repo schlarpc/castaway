@@ -155,9 +155,12 @@ fn main() -> anyhow::Result<()> {
             // EasyList *and* uBlock Origin's list, plus the scriptlet bundle uBO's
             // `##+js(...)` rules need bodies from. Written to a cache the render
             // processes read, which is how injection reaches the page.
-            cef.set_adblock(pipeline::filterlists::load_or_fetch_all(
-                &pipeline::filterlists::CachePaths::default(),
-            ));
+            let list_cache = pipeline::filterlists::CachePaths::default();
+            cef.set_adblock(pipeline::filterlists::load_or_fetch_all(&list_cache));
+            // The lists change on the order of days and this box stays up for weeks, so
+            // re-fetch daily rather than running whatever it booted with until someone
+            // restarts it. The renderers notice by the cache changing under them.
+            pipeline::filterlists::spawn_daily_refresh(list_cache, cef.adblock_handle());
             cef.initialize()
                 .map_err(|e| anyhow::anyhow!("cef initialize: {e}"))?;
             let host = pipeline::BrowserHost::new(cef, nav_rx);

@@ -18,7 +18,7 @@
 //! keeps them a thing the operator's machine downloads rather than a thing we distribute.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use adblock::resources::Resource;
 use tracing::{info, warn};
@@ -89,6 +89,65 @@ pub fn cache_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir)
         .join("castaway")
+}
+
+/// How often the lists are re-fetched while the receiver runs.
+///
+/// Daily, because these lists change on the order of days and a kiosk stays up for weeks —
+/// without this it would run whatever rules it booted with until someone restarted it.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Re-fetch the subscriptions every [`REFRESH_INTERVAL`], swapping the result in.
+///
+/// A plain thread rather than a tokio task: the work is a blocking fetch and a parse of a
+/// couple of megabytes, which has no business on an async runtime, and this crate has no
+/// runtime of its own to borrow.
+///
+/// Respects [`OFFLINE_ENV`] — a receiver pinned to its cache stays pinned.
+pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::cef_browser::SharedBlocker) {
+    if std::env::var_os(OFFLINE_ENV).is_some() {
+        info!(target: "castaway::adblock", "offline: no periodic refresh");
+        return;
+    }
+    std::thread::Builder::new()
+        .name("adblock-refresh".into())
+        .spawn(move || loop {
+            std::thread::sleep(REFRESH_INTERVAL);
+            // The counters live on the blocker being replaced, so say where they got to
+            // before they go — otherwise a long-running kiosk silently resets them daily.
+            if let Ok(current) = blocker.read() {
+                info!(
+                    target: "castaway::adblock",
+                    seen = current.seen_count(),
+                    blocked = current.blocked_count(),
+                    "refreshing filter lists"
+                );
+            }
+            let refreshed = load_or_fetch_all(&paths);
+            match blocker.write() {
+                Ok(mut slot) => {
+                    *slot = std::sync::Arc::new(refreshed);
+                    info!(target: "castaway::adblock", "filter lists refreshed");
+                }
+                Err(e) => warn!(target: "castaway::adblock", error = %e, "could not swap in refreshed lists"),
+            }
+        })
+        .map_or_else(
+            |e| warn!(target: "castaway::adblock", error = %e, "could not start the refresh thread"),
+            |_| (),
+        );
+}
+
+/// The newest modification time across the cached lists, or `None` if none exist.
+///
+/// How a render process notices a refresh: it holds its own engine built from these files,
+/// and comparing this against what it built from is cheaper than rebuilding to find out.
+#[must_use]
+pub fn cache_stamp(paths: &CachePaths) -> Option<SystemTime> {
+    [&paths.easylist, &paths.ubo_filters, &paths.ubo_scriptlets]
+        .into_iter()
+        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .max()
 }
 
 /// Set this to skip the startup fetch and use whatever is already cached.
@@ -265,6 +324,58 @@ mod tests {
         assert!(
             blocker.should_block("https://ubo-only.example/b.js", page, "script"),
             "so do uBO's — a subscription that silently loses one is worse than none"
+        );
+    }
+
+    #[test]
+    fn a_refresh_reaches_a_blocker_that_is_already_in_use() {
+        // The failure this guards: the live client holds its own handle, so swapping a
+        // plain `Arc` would update nothing that is actually blocking. Everything reads
+        // through the cell, so a refresh has to be visible to a holder taken beforehand.
+        let cell: crate::cef_browser::SharedBlocker = std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(AdBlocker::from_list_text("||before.example^\n")),
+        ));
+        let holder = std::sync::Arc::clone(&cell);
+        let page = "https://site.test/";
+        assert!(holder
+            .read()
+            .unwrap()
+            .should_block("https://before.example/a.js", page, "script"));
+
+        *cell.write().unwrap() =
+            std::sync::Arc::new(AdBlocker::from_list_text("||after.example^\n"));
+
+        let current = holder.read().unwrap();
+        assert!(
+            current.should_block("https://after.example/a.js", page, "script"),
+            "the refreshed rules must be live for a handle taken before the swap"
+        );
+        assert!(
+            !current.should_block("https://before.example/a.js", page, "script"),
+            "and the superseded ones must be gone"
+        );
+    }
+
+    #[test]
+    fn the_cache_stamp_moves_when_a_list_is_rewritten() {
+        // How a render process notices a refresh without rebuilding to find out.
+        let dir = std::env::temp_dir().join("castaway-filterlists-test-stamp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = paths_in(&dir);
+        for p in [&paths.easylist, &paths.ubo_filters, &paths.ubo_scriptlets] {
+            let _ = std::fs::remove_file(p);
+        }
+        assert_eq!(cache_stamp(&paths), None, "no lists, no stamp");
+
+        std::fs::write(&paths.easylist, "||a.example^\n").unwrap();
+        let first = cache_stamp(&paths).expect("a list exists now");
+
+        // Filesystem timestamps are coarse; make the rewrite unambiguously later.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&paths.easylist, "||b.example^\n").unwrap();
+        assert!(
+            cache_stamp(&paths).expect("still exists") > first,
+            "a rewritten list has to look different, or a renderer never re-reads"
         );
     }
 
