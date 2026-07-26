@@ -308,3 +308,28 @@ the reasons are what a future reversal has to argue against.
   (architecture-substrate.md §11.3a-0) means the actor loop and the AVRCP control writer can
   no longer fragment onto one handle concurrently — which basic-mode L2CAP cannot recover
   from — and enqueueing never blocks, so the reader cannot be parked behind a write.
+
+- **Q27 — Party mix: several senders at once. DEFERRED, and wanted.** Two phones connected
+  simultaneously today and both streamed. The result was not a mix, it was two decoders
+  fighting over one output device — fixed by making preemption actually work (Q23's
+  last-writer-wins, which the pipelines had been ignoring). But the *idea* is a good one
+  for this box: a room where two people can both throw audio at the display and get a
+  blend is a better party than one where the second person silences the first.
+  Deferred rather than rejected, because four things stand in the way and none of them is
+  a tweak:
+  - **Clock drift.** Two senders' 44.1 kHz are not the same 44.1 kHz. A mixer needs
+    per-source resampling against the output clock, or the blend glitches periodically as
+    the streams slide against each other. This is the real work.
+  - **Volume authority.** Q24 makes the phone authoritative for absolute volume, which
+    works precisely because there is one of them. Two phones both authoritative over one
+    gain is a fight with no winner; mixing needs per-source gain and a decision about what
+    the panel's volume then means.
+  - **Metadata.** The now-playing surface assumes one source, and
+    `SessionManager.active` is an `Option<SourceId>` — singular by design, not by
+    accident. Two tracks playing needs a card that can say so.
+  - **Transport control.** We publish an AVRCP Controller record and drive *the* sender.
+    With two, the panel's pause button has no obvious target.
+  So it is a session-model change plus a real mixer in the pipeline, not a flag. Worth
+  doing as an explicit opt-in ("party mode") rather than a default: the failure mode of
+  accidental mixing is that two people's music becomes nobody's, and in a hackerspace the
+  person who did not expect it is the one who gets annoyed.
