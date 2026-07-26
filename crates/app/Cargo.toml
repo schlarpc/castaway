@@ -50,6 +50,9 @@ hwaccel = ["render", "pipeline/hwaccel"]
 # A2DP audio decode (libav) with no output device — what CI builds, since a headless
 # box has no sound card and the null sink still proves the whole path ran.
 audio = ["pipeline/audio"]
+# Reach a controller through the kernel's raw HCI socket instead of USB. Linux only.
+# What the no-hardware integration test uses, against a btvirt virtual controller.
+bluetooth-socket = ["hci-transport/socket"]
 # …and the real PCM device (ALSA / WASAPI). What the kiosk ships with.
 audio-out = ["audio", "pipeline/audio-out"]
 # LDAC decode. Off by default: advertising a codec we cannot decode makes the session

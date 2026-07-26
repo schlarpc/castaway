@@ -34,29 +34,7 @@ pub async fn spawn(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let requested = match &config.bluetooth.controller {
-        Some(spec) => Some(parse_usb_id(spec)?),
-        None => None,
-    };
-
-    // Prefer blobs from an explicit directory (so a newer one can be tried without a
-    // rebuild), then whatever `build.rs` embedded.
-    let firmware = match &config.bluetooth.firmware_dir {
-        Some(dir) => FirmwareSet::from_dir(Path::new(dir))
-            .with_context(|| format!("loading firmware from {dir}"))?,
-        None => FirmwareSet::embedded(),
-    };
-    if firmware.is_empty() {
-        warn!(
-            "no bluetooth firmware in this build; only ROM-based controllers will \
-             initialise (see architecture §11.3b)"
-        );
-    }
-
-    let transport = UsbTransport::open_and_init(requested, &firmware)
-        .await
-        .context("opening the bluetooth controller")?;
-    let id = transport.id();
+    let (transport, id) = open_transport(config).await?;
 
     let keys_path = link_keys_path(&config.state_dir());
     let link_keys = load_link_keys(&keys_path);
@@ -80,7 +58,7 @@ pub async fn spawn(
     });
 
     let adapter = Arc::new(BluetoothAdapter::new(
-        Arc::new(transport) as Arc<dyn HciTransport>,
+        transport,
         BluetoothConfig {
             host: HostConfig {
                 name: config.friendly_name.clone(),
@@ -93,7 +71,7 @@ pub async fn spawn(
         },
     ));
 
-    info!(%id, ldac = enable_ldac, "enabled: Bluetooth A2DP sink");
+    info!(controller = %id, ldac = enable_ldac, "enabled: Bluetooth A2DP sink");
 
     let sink = SessionSink::new(SourceId::new(ProtocolKind::Bluetooth, "listener"), event_tx);
     Ok(tokio::spawn(async move {
@@ -106,6 +84,61 @@ pub async fn spawn(
             () = shutdown.notified() => info!("Bluetooth sink stopping"),
         }
     }))
+}
+
+/// Open whichever transport the config names.
+///
+/// Returns the transport and a label for logs. The two are genuinely different animals:
+/// USB claims a device and loads its firmware, the socket attaches to a controller the
+/// kernel has already brought up — which is the only way to reach a *virtual* controller,
+/// and therefore the only way to run the whole stack with no hardware.
+async fn open_transport(config: &Config) -> anyhow::Result<(Arc<dyn HciTransport>, String)> {
+    let spec = config.bluetooth.transport.trim();
+
+    if let Some(index) = spec.strip_prefix("socket:") {
+        #[cfg(all(feature = "bluetooth-socket", target_os = "linux"))]
+        {
+            let index: u16 = index
+                .trim()
+                .parse()
+                .with_context(|| format!("controller index in transport {spec:?}"))?;
+            let transport = hci_transport::socket::SocketTransport::open(index)
+                .with_context(|| format!("attaching to hci{index}"))?;
+            return Ok((Arc::new(transport), format!("hci{index}")));
+        }
+        #[cfg(not(all(feature = "bluetooth-socket", target_os = "linux")))]
+        {
+            let _ = index;
+            anyhow::bail!("transport {spec:?} needs the `bluetooth-socket` feature on Linux");
+        }
+    }
+
+    if spec != "usb" {
+        anyhow::bail!("unknown bluetooth transport {spec:?}; expected \"usb\" or \"socket:N\"");
+    }
+
+    let requested = match &config.bluetooth.controller {
+        Some(spec) => Some(parse_usb_id(spec)?),
+        None => None,
+    };
+    // Prefer blobs from an explicit directory (so a newer one can be tried without a
+    // rebuild), then whatever `build.rs` embedded.
+    let firmware = match &config.bluetooth.firmware_dir {
+        Some(dir) => FirmwareSet::from_dir(Path::new(dir))
+            .with_context(|| format!("loading firmware from {dir}"))?,
+        None => FirmwareSet::embedded(),
+    };
+    if firmware.is_empty() {
+        warn!(
+            "no bluetooth firmware in this build; only ROM-based controllers will \
+             initialise (see architecture §11.3b)"
+        );
+    }
+    let transport = UsbTransport::open_and_init(requested, &firmware)
+        .await
+        .context("opening the bluetooth controller")?;
+    let id = transport.id().to_string();
+    Ok((Arc::new(transport), id))
 }
 
 /// Which codecs the linked pipeline can decode.

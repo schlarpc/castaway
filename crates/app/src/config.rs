@@ -29,11 +29,21 @@ pub struct Config {
 }
 
 /// Bluetooth A2DP sink settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Bluetooth {
+    /// How to reach the controller.
+    ///
+    /// - `"usb"` (default) claims a USB device directly and loads its firmware. The only
+    ///   option on Windows, and the only one that exercises `ControllerInit`.
+    /// - `"socket:N"` attaches to the kernel's `hciN` over `HCI_CHANNEL_USER`. Linux
+    ///   only, and the controller must be down. This is how a *virtual* controller is
+    ///   reached — `btvirt -l2` needs no firmware — which is what makes the
+    ///   no-hardware integration test possible (architecture §11.7).
+    pub transport: String,
     /// Which USB controller to claim, as `vendor:product` the way `lsusb` prints it
     /// (`8087:0029` for an AX200). `None` takes the first Bluetooth device found.
+    /// Ignored when `transport` is a socket.
     pub controller: Option<String>,
     /// A directory of firmware laid out like `linux-firmware`. `None` uses whatever was
     /// embedded at build time (architecture §11.3b).
@@ -85,6 +95,17 @@ impl Default for Config {
             enable: Enable::default(),
             attract_widget_url: Some("https://digitalclock.live/".to_string()),
             bluetooth: Bluetooth::default(),
+        }
+    }
+}
+
+impl Default for Bluetooth {
+    fn default() -> Self {
+        Self {
+            transport: "usb".to_owned(),
+            controller: None,
+            firmware_dir: None,
+            state_dir: None,
         }
     }
 }

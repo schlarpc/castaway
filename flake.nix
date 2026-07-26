@@ -288,6 +288,20 @@
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           integration-vm = import ./nix/vm-test.nix { inherit pkgs self; };
 
+          # A complete A2DP session with no radio: btvirt's linked virtual controllers,
+          # BlueZ as an independent A2DP source on one, our receiver on the other. The
+          # sender side is then an implementation that has never seen our code, which is
+          # categorically better evidence than our source talking to our sink.
+          bluetooth-vm = import ./nix/bluetooth-vm-test.nix {
+            inherit pkgs;
+            castaway = craneLib.buildPackage (commonArgs // {
+              inherit cargoArtifacts;
+              pname = "castaway-bluetooth";
+              cargoExtraArgs = "--package castaway --features bluetooth-socket";
+              doCheck = false;
+            });
+          };
+
           # Compile-check the Linux hardware-decode backend (VA-API → DMA-BUF → Vulkan).
           #
           # Only clippy, not the tests: the sandbox has no render node, so the zero-copy

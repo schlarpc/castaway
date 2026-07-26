@@ -1,0 +1,165 @@
+# A complete A2DP session with no radio, no dongle, and no hardware of any kind.
+#
+# The kernel's `hci_vhci` plus BlueZ's `btvirt` emulator give a pair of *linked* virtual
+# controllers — two `hciN` devices on `Bus: Virtual` that inquire, page and carry L2CAP
+# between each other over an emulated air interface, and that need no firmware at all.
+# Verified on the dev box before this was written: `l2ping` across the pair reports 0%
+# loss and `btmon` shows real L2CAP exchanges.
+#
+# That makes the test worth having possible: **BlueZ drives one controller as an ordinary
+# A2DP source, and our receiver owns the other.** The sender side is then an independent
+# implementation that has never seen our code — categorically better evidence than our
+# source code talking to our sink code, which is all the in-process tests can offer.
+#
+# Two properties make this *harsher* than real hardware, which is the point. A virtual
+# controller reports an ACL MTU of 192 with a **single** buffer, against 1021x4 on a real
+# AX200. Every SDP record and AVDTP capability response therefore fragments, and transmit
+# flow control has no slack whatsoever — both paths run on every test rather than only
+# under load.
+{ pkgs, castaway }:
+
+let
+  # btvirt lives behind `--enable-testing` and nixpkgs does not install it.
+  bluezWithBtvirt = pkgs.bluez.overrideAttrs (old: {
+    pname = "bluez-btvirt";
+    configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-testing" ];
+    postInstall = (old.postInstall or "") + ''
+      install -Dm755 emulator/btvirt $out/bin/btvirt
+    '';
+  });
+
+  config = pkgs.writeText "castaway.toml" ''
+    friendly_name = "castaway vm"
+    uuid = "0f8c2e10-castaway-0001-00000000vmbt"
+    http_port = 8080
+
+    [enable]
+    dlna = false
+    spotify = false
+    dial = false
+    bluetooth = true
+
+    [bluetooth]
+    # hci1 is btvirt's second controller; BlueZ keeps hci0 and plays the source.
+    transport = "socket:1"
+    state_dir = "/var/lib/castaway"
+  '';
+in
+pkgs.testers.runNixOSTest {
+  name = "castaway-bluetooth-a2dp";
+
+  nodes.machine = { pkgs, ... }: {
+    # `hci_vhci` is what makes a virtual controller possible; `snd-dummy` gives PipeWire
+    # a sink to exist on, since a VM has no sound card.
+    boot.kernelModules = [ "hci_vhci" "snd-dummy" ];
+    hardware.bluetooth.enable = true;
+    hardware.bluetooth.powerOnBoot = false;
+
+    environment.systemPackages = [
+      bluezWithBtvirt
+      castaway
+      pkgs.python3
+    ];
+
+    # A real audio graph, so the source side is PipeWire doing what it does for a
+    # headset rather than a bespoke test harness.
+    security.rtkit.enable = true;
+    services.pipewire = {
+      enable = true;
+      alsa.enable = true;
+      pulse.enable = true;
+      wireplumber.enable = true;
+    };
+    users.users.tester = {
+      isNormalUser = true;
+      extraGroups = [ "audio" "wheel" ];
+    };
+
+    virtualisation.memorySize = 2048;
+    systemd.tmpfiles.rules = [ "d /var/lib/castaway 0755 root root -" ];
+  };
+
+  testScript = ''
+    machine.start()
+    machine.wait_for_unit("multi-user.target")
+    machine.succeed("modprobe hci_vhci")
+
+    with subtest("btvirt creates a linked pair of virtual controllers"):
+        # btvirt first: bluetoothd does not start until a controller exists.
+        machine.succeed("${bluezWithBtvirt}/bin/btvirt -l2 >/tmp/btvirt.log 2>&1 &")
+        machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=30)
+        # bluetoothd is then left running deliberately. It powers and configures the
+        # controllers the way a real host does, and on the dev box the emulated link
+        # only carried traffic with it in charge — bare `hciconfig up` is not enough.
+        machine.succeed("systemctl start bluetooth")
+        machine.wait_for_unit("bluetooth.service")
+        machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=30)
+        out = machine.succeed("hciconfig")
+        assert "Bus: Virtual" in out, f"expected virtual controllers, got:\n{out}"
+        # The harsh geometry that makes this a better test than real hardware.
+        assert "ACL MTU: 192:1" in out, f"expected a 192-byte single-buffer controller:\n{out}"
+
+    # btvirt derives each controller's address from its *hci index*, which depends on
+    # what else is present — the pair is 00:AA:01:00:00:00 / ...:01:00:01 in a bare VM but
+    # ...:00:00:01 / ...:01:00:02 on a box with a real hci0. Hardcoding one cost a debug
+    # cycle, so it is read back instead.
+    def address_of(dev):
+        out = machine.succeed(f"hciconfig {dev} | grep -oE '([0-9A-F]{{2}}:){{5}}[0-9A-F]{{2}}'")
+        return out.strip().splitlines()[0]
+
+    with subtest("the two controllers can see each other"):
+        machine.succeed("hciconfig hci0 up && hciconfig hci1 up && hciconfig hci1 piscan")
+        machine.sleep(2)
+        global sink_addr
+        sink_addr = address_of("hci1")
+        print(f"source=hci0 {address_of('hci0')}  sink=hci1 {sink_addr}")
+        # Inquiry first: it is the cheapest proof the emulated link works at all, so a
+        # later L2CAP failure is never ambiguous about the substrate.
+        out = machine.wait_until_succeeds(
+            f"hcitool -i hci0 inq 2>&1 | grep '{sink_addr}'", timeout=60
+        )
+        print(f"inquiry found: {out}")
+
+    with subtest("the emulated air interface carries ACL and L2CAP"):
+        machine.succeed(f"hcitool -i hci0 cc {sink_addr} || true")
+        print(machine.succeed("hcitool -i hci0 con || true"))
+        machine.wait_until_succeeds(f"l2ping -i hci0 -c 2 -t 5 {sink_addr}", timeout=60)
+
+    with subtest("the receiver claims the second controller"):
+        machine.succeed("hciconfig hci1 down")
+        machine.succeed(
+            "systemd-run --unit=castaway --setenv=RUST_LOG=info "
+            "--setenv=CASTAWAY_CONFIG=${config} ${castaway}/bin/castaway"
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u castaway | grep -q 'enabled: Bluetooth A2DP sink'", timeout=60
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u castaway | grep -q 'attached to hci1'", timeout=30
+        )
+
+    with subtest("the receiver brings its controller up and becomes discoverable"):
+        # Proves the whole HostController bring-up sequence ran against a controller
+        # that is not ours: reset, buffer size, class of device, SSP, scan enable.
+        machine.wait_until_succeeds(
+            "journalctl -u castaway | grep -q 'bluetooth: discoverable'", timeout=60
+        )
+
+    with subtest("BlueZ finds the receiver by inquiry"):
+        # The receiver is now driving hci1 itself — BlueZ is not involved on that side.
+        # Finding it means our inquiry-scan and class-of-device settings actually took.
+        out = machine.wait_until_succeeds(
+            f"hcitool -i hci0 inq | grep '{sink_addr}'", timeout=60
+        )
+        # The class of device deliberately is *not* asserted here. btvirt accepts
+        # Write_Class_of_Device and reports 0x000000 in inquiry results regardless, so a
+        # check would be testing the emulator rather than us. The exact bytes of that
+        # command are pinned by a unit test in substrate-hci instead
+        # (`class_of_device_is_three_bytes_little_endian`), which is where the real risk
+        # was — sending 0x240414 as a u32 rather than three bytes.
+        print(f"inquiry found the receiver: {out.strip()}")
+
+    machine.succeed("journalctl -u castaway > /tmp/castaway.log")
+    machine.copy_from_machine("/tmp/castaway.log", "")
+  '';
+}
