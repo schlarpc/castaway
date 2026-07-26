@@ -571,6 +571,54 @@ The derivation carves out ~1.2 MB — Intel `ibt-20-1-3` and `ibt-0041-0041`, Re
 `rtl8761b*` — rather than pulling in the 1.7 GB whole, which keeps the closure sane and
 makes what we ship auditable.
 
+### 11.3a-ii Driving the bench from the other radio
+
+Two radios in one box is the whole test rig: BlueZ owns one and streams *to* castaway,
+which owns the other through `HCI_CHANNEL_USER`. Getting audio to actually cross has
+misled us three separate times, so the recipe is written down.
+
+```sh
+# 1. castaway takes its dongle; BlueZ keeps the other. Only unbind the one.
+echo 3-2.3:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
+sudo chown "$USER" /dev/bus/usb/003/0NN     # so it can run as you, not root
+
+# 2. Pair from BlueZ. A stale key on either side gives br-connection-unknown:
+bluetoothctl remove AC:A7:F1:BD:45:19       # …then scan on, pair, trust, connect
+# br-connection-page-timeout on the first connect is transient; retry.
+
+# 3. Route audio to it — see below, this is the part that bites.
+```
+
+**`--target` and `PIPEWIRE_NODE` do not work, and fail silently.** The stream is created
+with `target.object` set correctly and WirePlumber's policy overrides it, linking to the
+default sink instead. Nothing errors; the BlueZ `MediaTransport1` simply stays `"idle"`,
+no AVDTP START is ever sent, and it looks exactly like the receiver failing to start a
+stream. This is what Q26 spent an afternoon on.
+
+**Do not fix it by making the Bluetooth sink the default.** It works, and it creates a
+feedback loop: castaway's `audio-out` opens whatever the default device is, so it decodes
+the phone's audio and sends it straight back to itself over Bluetooth. It also hijacks the
+machine's audio while it lasts.
+
+Link the ports by hand instead. Unobtrusive, and no policy involved:
+
+```sh
+pw-play tone.wav &
+pw-link -d pw-play:output_FL alsa_output.<default>:playback_FL   # and _FR
+pw-link    pw-play:output_FL bluez_output.AC_A7_F1_BD_45_19.1:playback_FL   # and _FR
+busctl --system get-property org.bluez \
+  /org/bluez/hci0/dev_AC_A7_F1_BD_45_19/sep1/fd0 \
+  org.bluez.MediaTransport1 State          # want "active", not "idle"
+```
+
+`State` is the single most useful thing to check: `"idle"` means nothing has acquired the
+transport and no amount of staring at castaway's logs will explain the silence, because
+the sender has not been asked to send anything.
+
+One thing the bench cannot show you: **BlueZ as a source publishes no AVRCP metadata**, so
+the now-playing card will be correct and nearly empty. Title, artist, album and play state
+need a real phone, or `mpris-proxy` with a player behind it.
+
 ### 11.4 Protocol stack
 
 ```

@@ -29,6 +29,19 @@ pub struct NowPlayingCard {
     pub source: SourceDescription,
 }
 
+/// One laid-out line of the card.
+///
+/// Owns its text: some lines are composed rather than borrowed, and a card is laid out a
+/// handful of times per track, so the allocations are beneath notice.
+struct Line {
+    text: String,
+    px: f32,
+    color: Rgba,
+    bold: bool,
+    /// Space below this line before the next.
+    gap: f32,
+}
+
 /// The design is laid out against this height and scaled; see [`render`].
 const DESIGN_HEIGHT: f32 = 720.0;
 
@@ -90,6 +103,112 @@ const fn state_label(state: PlaybackState) -> Option<&'static str> {
     }
 }
 
+/// Decide what the card says and how, in reading order.
+///
+/// Separate from drawing so it can be tested for *content*: pixels cannot be asserted on
+/// usefully, and content vanishing is exactly what a layout refactor breaks — a card that
+/// draws nothing wrong is not the same as one that draws the right thing.
+fn build_lines(
+    card: &NowPlayingCard,
+    f: &text::Fonts,
+    pal: &Palette,
+    s: f32,
+    avail: f32,
+) -> Vec<Line> {
+    // What the card leads with depends on what it knows. With a track, the device is a
+    // caption above it. Without one — a source that publishes no AVRCP metadata at all,
+    // which is most non-phone senders — a small caption captioning nothing floats alone
+    // in the middle of a two-metre screen and reads as broken rather than as sparse. So
+    // the device becomes the headline and says what it is waiting for.
+    let has_track = card.track.title.is_some();
+    let device = card
+        .source
+        .display_name
+        .clone()
+        .or_else(|| card.source.address.clone());
+    let state = state_label(card.track.state);
+    let mut lines: Vec<Line> = Vec::with_capacity(5);
+
+    let source_line = card.source.to_string();
+    let waiting = "Connected \u{2014} no track information";
+
+    if has_track {
+        if !source_line.is_empty() {
+            lines.push(Line {
+                text: source_line.clone(),
+                px: fit_px(&f.regular, &source_line, 26.0 * s, avail),
+                color: pal.source,
+                bold: false,
+                gap: 46.0 * s,
+            });
+        }
+    } else if let Some(device) = &device {
+        // The device, typeset as the headline it now is.
+        lines.push(Line {
+            text: device.clone(),
+            px: fit_px(&f.bold, device, 72.0 * s, avail),
+            color: pal.title,
+            bold: true,
+            gap: 20.0 * s,
+        });
+        if let Some(link) = &card.source.link {
+            lines.push(Line {
+                text: link.clone(),
+                px: fit_px(&f.regular, link, 36.0 * s, avail),
+                color: pal.artist,
+                bold: false,
+                gap: 34.0 * s,
+            });
+        }
+        lines.push(Line {
+            text: waiting.to_string(),
+            px: 28.0 * s,
+            color: pal.album,
+            bold: false,
+            gap: 0.0,
+        });
+    }
+
+    if let Some(title) = &card.track.title {
+        lines.push(Line {
+            text: title.clone(),
+            px: fit_px(&f.bold, title, 72.0 * s, avail),
+            color: pal.title,
+            bold: true,
+            gap: 20.0 * s,
+        });
+    }
+    if let Some(artist) = &card.track.artist {
+        lines.push(Line {
+            text: artist.clone(),
+            px: fit_px(&f.regular, artist, 44.0 * s, avail),
+            color: pal.artist,
+            bold: false,
+            gap: 14.0 * s,
+        });
+    }
+    if let Some(album) = &card.track.album {
+        lines.push(Line {
+            text: album.clone(),
+            px: fit_px(&f.regular, album, 32.0 * s, avail),
+            color: pal.album,
+            bold: false,
+            gap: 34.0 * s,
+        });
+    }
+    if let Some(state) = state {
+        lines.push(Line {
+            text: state.to_string(),
+            px: 28.0 * s,
+            color: pal.state,
+            bold: false,
+            gap: 0.0,
+        });
+    }
+
+    lines
+}
+
 /// Draw the card at `width` × `height`, returning RGBA8.
 ///
 /// # Errors
@@ -133,63 +252,7 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
     let text_x = art_x + art + 70.0 * s;
     let avail = (w - text_x - margin).max(1.0);
 
-    struct Line<'a> {
-        text: &'a str,
-        px: f32,
-        color: Rgba,
-        bold: bool,
-        /// Space below this line before the next.
-        gap: f32,
-    }
-
-    let source = card.source.to_string();
-    let state = state_label(card.track.state);
-    let mut lines: Vec<Line<'_>> = Vec::with_capacity(5);
-    if !source.is_empty() {
-        lines.push(Line {
-            text: &source,
-            px: fit_px(&f.regular, &source, 26.0 * s, avail),
-            color: pal.source,
-            bold: false,
-            gap: 46.0 * s,
-        });
-    }
-    if let Some(title) = &card.track.title {
-        lines.push(Line {
-            text: title,
-            px: fit_px(&f.bold, title, 72.0 * s, avail),
-            color: pal.title,
-            bold: true,
-            gap: 20.0 * s,
-        });
-    }
-    if let Some(artist) = &card.track.artist {
-        lines.push(Line {
-            text: artist,
-            px: fit_px(&f.regular, artist, 44.0 * s, avail),
-            color: pal.artist,
-            bold: false,
-            gap: 14.0 * s,
-        });
-    }
-    if let Some(album) = &card.track.album {
-        lines.push(Line {
-            text: album,
-            px: fit_px(&f.regular, album, 32.0 * s, avail),
-            color: pal.album,
-            bold: false,
-            gap: 34.0 * s,
-        });
-    }
-    if let Some(state) = state {
-        lines.push(Line {
-            text: state,
-            px: 28.0 * s,
-            color: pal.state,
-            bold: false,
-            gap: 0.0,
-        });
-    }
+    let lines = build_lines(card, &f, &pal, s, avail);
 
     // Total height, so the block can be centred on the art square's midline.
     let total: f32 = lines
@@ -205,7 +268,7 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
         let font = if line.bold { &f.bold } else { &f.regular };
         y += text::ascent(font, line.px);
         text::draw_text(
-            &mut buf, width, height, text_x, y, line.text, line.px, line.color, font,
+            &mut buf, width, height, text_x, y, &line.text, line.px, line.color, font,
         );
         y += line.gap;
     }
@@ -254,6 +317,54 @@ mod tests {
         c.track = c.track.with_title("x".repeat(400));
         let rgba = render(&c, 640, 360).unwrap();
         assert_eq!(rgba.len(), 640 * 360 * 4);
+    }
+
+    /// The card's content, in reading order — straight out of the real builder.
+    fn lines_of(card: &NowPlayingCard) -> Vec<String> {
+        let f = text::fonts().unwrap();
+        build_lines(card, &f, &Palette::default(), 1.0, 1000.0)
+            .into_iter()
+            .map(|l| l.text)
+            .collect()
+    }
+
+    #[test]
+    fn a_card_with_a_track_shows_the_track() {
+        // Regression: a refactor to improve the no-metadata case silently deleted the
+        // title, artist and album, and `render` still returned a correctly-sized buffer.
+        // A card that draws nothing *wrong* is not the same as one that draws the right
+        // thing, which is why this asserts content and not pixels.
+        let mut c = card();
+        c.track = c.track.clone().with_album("TRON");
+        let lines = lines_of(&c);
+        assert!(lines.iter().any(|l| l == "Derezzed"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "Daft Punk"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "TRON"), "{lines:?}");
+        assert!(
+            lines[0].contains("iPhone"),
+            "the device captions the track: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_track_leads_with_the_device() {
+        // What every non-phone sender produces — BlueZ as a source publishes no AVRCP
+        // metadata at all. A small caption captioning nothing, floating mid-screen, reads
+        // as broken rather than sparse, so the device becomes the headline and says why.
+        let bare = NowPlayingCard {
+            track: NowPlaying::default(),
+            source: SourceDescription::new()
+                .with_display_name("bagel")
+                .with_link("aptX HD · 48 kHz"),
+        };
+        let lines = lines_of(&bare);
+        assert_eq!(lines[0], "bagel", "the device leads: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("aptX HD")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("no track information")),
+            "and says why it is sparse: {lines:?}"
+        );
+        assert_eq!(render(&bare, 320, 180).unwrap().len(), 320 * 180 * 4);
     }
 
     #[test]
