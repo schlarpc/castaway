@@ -109,10 +109,16 @@ name that is not one of these is warned about at startup — categories parse le
 the API can add one without breaking a response, which would otherwise make a config typo
 a silent no-op.
 
+`skip_ads = true` also presses the screen's own Skip Ad button once `isSkipEnabled` flips
+— **implemented and unit-tested against a captured ad payload, but the live press has not
+been observed**: YouTube served an *unskippable* 15s pre-roll during capture and no
+skippable one since. The command encoding is verified accepted (200). Unskippable ads
+still play, and nothing is muted — a mute that failed to lift leaves a silent display.
+
 Lookups use the hash-prefix endpoint: the server sees four hex characters of
 `sha256(videoId)` and never the video. The database is CC BY-NC-SA — non-commercial use
 fits, attribution rides on the toast, and segments are deliberately never written to disk
-(that would be redistribution). YouTube's own ads are *not* skipped; nothing mutes.
+(that would be redistribution).
 
 ## Render path — actual pixel output (GPU-verified)
 Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix develop`).
