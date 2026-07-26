@@ -27,6 +27,45 @@ pub struct Config {
     pub attract_widget_url: Option<String>,
     /// Bluetooth A2DP sink settings.
     pub bluetooth: Bluetooth,
+    /// Skipping sponsor segments in YouTube playback.
+    pub sponsorblock: SponsorBlock,
+}
+
+/// SponsorBlock settings.
+///
+/// Defaults are the conservative set. `sponsor`, `selfpromo` and `music_offtopic` are the
+/// categories nobody asks to sit through; `intro`/`outro`/`filler` are left off because
+/// people notice those being cut and disagree about whether they should be.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SponsorBlock {
+    /// Skip segments during YouTube playback. Needs the `cef` build — there is no
+    /// playback to skip without one.
+    pub enabled: bool,
+    /// Which categories to skip.
+    pub categories: Vec<sponsorblock::Category>,
+    /// Ignore segments shorter than this. A sub-second seek is a visible stutter that
+    /// saves nobody anything.
+    pub minimum_seconds: f64,
+    /// Say so on the overlay when a segment is skipped. On by default: a screen that
+    /// silently jumps looks broken, and the toast is also where the database gets the
+    /// credit its licence asks for.
+    pub toast: bool,
+}
+
+impl Default for SponsorBlock {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            categories: vec![
+                sponsorblock::Category::Sponsor,
+                sponsorblock::Category::SelfPromo,
+                sponsorblock::Category::MusicOfftopic,
+            ],
+            minimum_seconds: 1.0,
+            toast: true,
+        }
+    }
 }
 
 impl Config {
@@ -134,6 +173,7 @@ impl Default for Config {
             enable: Enable::default(),
             attract_widget_url: Some("https://digitalclock.live/".to_string()),
             bluetooth: Bluetooth::default(),
+            sponsorblock: SponsorBlock::default(),
         }
     }
 }
@@ -216,6 +256,21 @@ impl Config {
         }
     }
 
+    /// How many configured SponsorBlock categories this build did not recognise.
+    ///
+    /// Categories parse leniently so that a category the API *adds* cannot break the
+    /// parse of a response that also contains ones we know. Config is the other case
+    /// entirely: an unrecognised name there is a typo, and left alone it would quietly
+    /// mean "skip nothing of this kind" for as long as nobody looked.
+    #[must_use]
+    pub fn unknown_sponsorblock_categories(&self) -> usize {
+        self.sponsorblock
+            .categories
+            .iter()
+            .filter(|c| **c == sponsorblock::Category::Unknown)
+            .count()
+    }
+
     /// The advertised interface IPv4 — configured, or auto-detected, or loopback.
     #[must_use]
     pub fn resolved_interface(&self) -> Ipv4Addr {
@@ -269,6 +324,42 @@ mod tests {
         assert!(c.enable.cast);
         // Unspecified flags fall back to their defaults.
         assert!(c.enable.dlna);
+    }
+
+    #[test]
+    fn sponsorblock_categories_come_from_the_toml() {
+        let toml = r#"
+            [sponsorblock]
+            categories = ["sponsor", "intro", "outro"]
+            minimum_seconds = 2.5
+            toast = false
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            c.sponsorblock.categories,
+            vec![
+                sponsorblock::Category::Sponsor,
+                sponsorblock::Category::Intro,
+                sponsorblock::Category::Outro
+            ]
+        );
+        assert!((c.sponsorblock.minimum_seconds - 2.5).abs() < f64::EPSILON);
+        assert!(!c.sponsorblock.toast);
+        // Unmentioned keys keep their defaults.
+        assert!(c.sponsorblock.enabled);
+    }
+
+    #[test]
+    fn a_misspelled_category_is_reported_rather_than_silently_ignored() {
+        // Categories deserialize with a catch-all so a category the API adds cannot fail
+        // the parse of a response. The same leniency applied to *config* would turn a
+        // typo into "skips nothing", silently, forever — so the loader names them.
+        let toml = r#"
+            [sponsorblock]
+            categories = ["sponsor", "sponser"]
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c.unknown_sponsorblock_categories(), 1);
     }
 
     #[test]

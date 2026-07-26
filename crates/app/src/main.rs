@@ -12,6 +12,10 @@
 mod bluetooth;
 mod config;
 mod screen;
+// The skipper attaches to the page we launched, so it exists exactly where a page
+// can: the browser build. Without one, DIAL is not mounted either (D27).
+#[cfg(feature = "cef")]
+mod sponsorblock;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -54,6 +58,16 @@ fn main() -> anyhow::Result<()> {
 
     init_tracing();
     let config = Config::from_env().context("loading config")?;
+    // A category name that is not one of SponsorBlock's parses to "unknown" rather than
+    // failing, which for a *response* is the point and for *config* is a silent typo.
+    if config.unknown_sponsorblock_categories() > 0 {
+        warn!(
+            count = config.unknown_sponsorblock_categories(),
+            "castaway.toml lists SponsorBlock categories this build does not know; \
+             they will never be skipped. Valid: sponsor, selfpromo, interaction, intro, \
+             outro, preview, music_offtopic, filler, exclusive_access"
+        );
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -319,6 +333,17 @@ async fn serve(
             // able to find it. The routes clear this slot themselves on launch and stop;
             // filling it is a network lookup, so it happens out here.
             let screen = dial.screen_slot();
+            // The same screen id, put to a second use: SponsorBlock attaches to our own
+            // page as a remote control and seeks past sponsors. Only where there is a
+            // page to attach to — this arm is the `cef` build by construction (D27).
+            #[cfg(feature = "cef")]
+            if config.sponsorblock.enabled {
+                tokio::spawn(sponsorblock::run(
+                    config.sponsorblock.clone(),
+                    screen.clone(),
+                    osd.clone(),
+                ));
+            }
             tokio::spawn(async move {
                 while let Some(event) = dial_rx.recv().await {
                     if let proto_dial::DialEvent::Launched(params) = &event {

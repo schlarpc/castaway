@@ -25,6 +25,7 @@ hci-transport.workspace = true
 substrate-hci.workspace = true
 proto-airplay.workspace = true
 proto-dial.workspace = true
+sponsorblock.workspace = true
 pipeline.workspace = true
 control-display.workspace = true
 input-touch.workspace = true
@@ -39,6 +40,7 @@ serde_json.workspace = true
 ureq = { workspace = true, optional = true }
 toml = "0.8"
 uuid.workspace = true
+url.workspace = true
 
 [features]
 default = []
