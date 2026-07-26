@@ -435,6 +435,20 @@ enumerates **unconfigured**, so no interface directories exist and `nusb` fails 
 sysfs parse error that reads like a permissions problem. Setting the configuration by hand
 creates the interfaces without binding a driver.
 
+**Never use `echo 0 > .../authorized` to reset a dongle.** It looks like a soft
+power-cycle and is a trap: the write succeeds, the device then autosuspends, and the
+matching `echo 1` fails forever with `can't autoresume for authorization: -22`. The device
+is left deauthorized and *unrecoverable by any software means* — `USBDEVFS_RESET`, hub port
+disable, driver rebind and re-setting the configuration all fail, because none of them can
+resume a deauthorized device. Only physically unplugging it works. This cost two physical
+replugs and was initially misdiagnosed as a firmware-loader fault; the loader was correct
+both times.
+
+To get a *cold* chip, ward the kernel off and then **physically replug** — that is the
+whole procedure, and there is no software substitute for the unplug. Once `btusb` has bound
+a device even briefly, `usbfs` refuses to claim its interfaces afterwards (`EINVAL`), so the
+warding genuinely has to precede the plug rather than follow it.
+
 **Still unproven: the secure-boot upload itself.** The part only presents as a bootloader
 before something loads firmware into it, and by the time we can claim it the kernel has
 already done so. A logical re-enumeration (`echo 0 > .../authorized`) does *not* clear it —
