@@ -25,38 +25,21 @@ use tracing::{info, warn};
 
 use crate::cef_adblock::AdBlocker;
 
-/// `assemble_scriptlet_resources` is deprecated upstream along with the legacy bundle
-/// format it reads. It is still the only thing that can read the revision we pin, and the
-/// pin is deliberate (see [`UBO_SCRIPTLETS_URL`]) — so the deprecation is acknowledged
-/// here rather than silenced across the crate.
-#[allow(deprecated)]
-fn assemble(path: &Path) -> Vec<Resource> {
-    adblock::resources::resource_assembler::assemble_scriptlet_resources(path)
-}
-
 /// The canonical EasyList URL — network-level rules.
 pub const EASYLIST_URL: &str = "https://easylist.to/easylist/easylist.txt";
 
 /// uBlock Origin's own filters: where the `##+js(...)` rules live.
 pub const UBO_FILTERS_URL: &str = "https://ublockorigin.github.io/uAssets/filters/filters.txt";
 
-/// uBlock Origin's scriptlet implementations, which those rules name — **pinned to 1.46.0,
-/// deliberately**.
+/// uBlock Origin's `src/js/`, tracking `master` like the filters do.
 ///
-/// The filter lists above track `master` and update themselves. This one cannot, and the
-/// reason is a format change rather than a choice: `adblock`'s assembler reads uBO's legacy
-/// bundle, where each scriptlet is introduced by a `/// name.js` header. Current uBO ships
-/// ES modules that call `registerScriptlet(fn, { name, dependencies })`, one file per
-/// scriptlet, which the assembler parses into exactly zero resources — silently, since an
-/// unparsed bundle looks the same as an empty one.
-///
-/// So: 1.46.0 is the last revision in the format we can read, and it gives 54 real
-/// scriptlets. The cost is precise and worth stating — rules that name a scriptlet
-/// introduced after 1.46.0 (`trusted-replace-fetch-response` among them) match and inject
-/// nothing. That is a no-op, not a broken page, and the count is logged at startup.
-/// Lifting the pin means writing a converter for uBO's module format (OPEN-QUESTIONS Q36).
-pub const UBO_SCRIPTLETS_URL: &str =
-    "https://raw.githubusercontent.com/gorhill/uBlock/1.46.0/assets/resources/scriptlets.js";
+/// Module paths are relative to *here*, not to `resources/`, because the graph does not
+/// stay inside it — `resources/href-sanitizer.js` imports `../urlskip.js`, and a scriptlet
+/// whose dependency failed to load is one the engine will not inject.
+pub const UBO_SOURCE_BASE: &str = "https://raw.githubusercontent.com/gorhill/uBlock/master/src/js/";
+
+/// How many modules to follow before deciding the import graph is not what we think it is.
+const MAX_MODULES: usize = 200;
 
 /// Where the fetched lists are cached.
 #[derive(Debug, Clone)]
@@ -75,7 +58,7 @@ impl Default for CachePaths {
         Self {
             easylist: dir.join("easylist.txt"),
             ubo_filters: dir.join("ubo-filters.txt"),
-            ubo_scriptlets: dir.join("ubo-scriptlets.js"),
+            ubo_scriptlets: dir.join("ubo-scriptlets.json"),
         }
     }
 }
@@ -164,7 +147,7 @@ pub fn load_or_fetch_all(paths: &CachePaths) -> AdBlocker {
         info!(target: "castaway::adblock", "offline: using the cached lists as they are");
         return load_cached_only(paths).unwrap_or_else(AdBlocker::with_defaults);
     }
-    load_or_fetch_all_from(paths, EASYLIST_URL, UBO_FILTERS_URL, UBO_SCRIPTLETS_URL)
+    load_or_fetch_all_from(paths, EASYLIST_URL, UBO_FILTERS_URL, UBO_SOURCE_BASE)
 }
 
 /// [`load_or_fetch_all`] with the sources as parameters, so a test can point them at
@@ -174,7 +157,7 @@ pub fn load_or_fetch_all_from(
     paths: &CachePaths,
     easylist_url: &str,
     ubo_filters_url: &str,
-    ubo_scriptlets_url: &str,
+    ubo_scriptlets_base: &str,
 ) -> AdBlocker {
     let easylist = text_for("EasyList", easylist_url, &paths.easylist);
     let ubo = text_for("uBO filters", ubo_filters_url, &paths.ubo_filters);
@@ -194,7 +177,7 @@ pub fn load_or_fetch_all_from(
 
     // Scriptlet rules without their bodies are the quiet failure this guards: the rules
     // are in the engine, they match, and nothing happens.
-    match scriptlets(paths, ubo_scriptlets_url) {
+    match scriptlets(paths, ubo_scriptlets_base) {
         Some(resources) if !resources.is_empty() => blocker.use_resources(resources),
         _ => warn!(
             target: "castaway::adblock",
@@ -223,8 +206,7 @@ pub fn load_cached_only(paths: &CachePaths) -> Option<AdBlocker> {
         return None;
     }
     let mut blocker = AdBlocker::from_list_text(&combined);
-    if paths.ubo_scriptlets.exists() {
-        let resources = assemble(&paths.ubo_scriptlets);
+    if let Some(resources) = read_cached_resources(&paths.ubo_scriptlets) {
         if !resources.is_empty() {
             blocker.use_resources(resources);
         }
@@ -232,16 +214,135 @@ pub fn load_cached_only(paths: &CachePaths) -> Option<AdBlocker> {
     Some(blocker)
 }
 
-/// Fetch and assemble uBO's scriptlets into engine resources.
-fn scriptlets(paths: &CachePaths, url: &str) -> Option<Vec<Resource>> {
-    // The assembler reads uBO's own source file, so the fetched text goes to disk first.
-    let _ = text_for("uBO scriptlets", url, &paths.ubo_scriptlets);
-    if !paths.ubo_scriptlets.exists() {
-        return None;
+/// Fetch uBO's scriptlet modules, evaluate them into resources, and cache the result.
+///
+/// The *converted* resources are cached rather than the raw modules: one file instead of
+/// thirty-odd, and a render process then loads them without re-running a JS engine.
+fn scriptlets(paths: &CachePaths, base_url: &str) -> Option<Vec<Resource>> {
+    match fetch_modules(base_url) {
+        Ok(modules) if !modules.is_empty() => match crate::ubo_scriptlets::convert(&modules) {
+            Ok(resources) if !resources.is_empty() => {
+                info!(
+                    target: "castaway::adblock",
+                    modules = modules.len(),
+                    resources = resources.len(),
+                    "evaluated uBO scriptlet modules"
+                );
+                write_cached_resources(&paths.ubo_scriptlets, &resources);
+                return Some(resources);
+            }
+            Ok(_) => warn!(
+                target: "castaway::adblock",
+                "uBO's registry came back empty — upstream has moved"
+            ),
+            Err(e) => {
+                warn!(target: "castaway::adblock", error = %e, "could not evaluate uBO's scriptlets")
+            }
+        },
+        Ok(_) => warn!(target: "castaway::adblock", "no uBO scriptlet modules fetched"),
+        Err(e) => warn!(target: "castaway::adblock", error = %e, "uBO scriptlet fetch failed"),
     }
-    let resources = assemble(&paths.ubo_scriptlets);
-    info!(target: "castaway::adblock", count = resources.len(), "assembled scriptlets");
-    Some(resources)
+    read_cached_resources(&paths.ubo_scriptlets)
+}
+
+/// Follow uBO's import graph from the entry module, fetching each one.
+///
+/// Transitive and relative-path aware: the entry lists the scriptlets but not the shared
+/// helpers they depend on, and those live both beside them (`./safe-self.js`) and above
+/// them (`../urlskip.js`).
+fn fetch_modules(base_url: &str) -> Result<Vec<(String, String)>, String> {
+    let mut pending = vec![crate::ubo_scriptlets::ENTRY_MODULE.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut modules = Vec::new();
+
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) || modules.len() >= MAX_MODULES {
+            continue;
+        }
+        let source = fetch(&format!("{base_url}{name}"))?;
+        for import in imported_modules(&source) {
+            let resolved = resolve_relative(&name, &import);
+            if !seen.contains(&resolved) {
+                pending.push(resolved);
+            }
+        }
+        modules.push((name, source));
+    }
+    Ok(modules)
+}
+
+/// Resolve `./x.js` or `../x.js` against the importing module's path.
+///
+/// Plain string work rather than `Path`: these are URL paths with forward slashes on every
+/// platform, and running them through a Windows `Path` would produce backslashes that the
+/// module resolver does not recognise.
+fn resolve_relative(importer: &str, specifier: &str) -> String {
+    let mut segments: Vec<&str> = importer.split('/').collect();
+    segments.pop(); // the importing file itself
+    for part in specifier.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
+}
+
+/// The relative modules a source imports.
+///
+/// Scans the whole file rather than lines starting with `import`, because uBO writes its
+/// imports across several lines — the path sits on the `} from './safe-self.js';` line,
+/// which begins with neither. Missing those costs every shared dependency, and a scriptlet
+/// whose dependency is absent is one the engine will not inject.
+fn imported_modules(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for quote in ['\'', '"'] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(quote) {
+            let start = from + rel + 1;
+            let Some(end) = source[start..].find(quote).map(|i| start + i) else {
+                break;
+            };
+            let literal = &source[start..end];
+            if literal.ends_with(".js") && (literal.starts_with("./") || literal.starts_with("../"))
+            {
+                out.push(literal.to_string());
+            }
+            from = end + 1;
+        }
+    }
+    out
+}
+
+fn write_cached_resources(path: &Path, resources: &[Resource]) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_string(resources) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                warn!(target: "castaway::adblock", error = %e, "could not cache scriptlets");
+            }
+        }
+        Err(e) => warn!(target: "castaway::adblock", error = %e, "could not encode scriptlets"),
+    }
+}
+
+fn read_cached_resources(path: &Path) -> Option<Vec<Resource>> {
+    let json = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<Vec<Resource>>(&json) {
+        Ok(resources) => {
+            info!(target: "castaway::adblock", count = resources.len(), "using cached scriptlets");
+            Some(resources)
+        }
+        Err(e) => {
+            warn!(target: "castaway::adblock", error = %e, "cached scriptlets did not parse");
+            None
+        }
+    }
 }
 
 /// Fetch `url`, caching to `path`; fall back to whatever was cached before.

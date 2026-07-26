@@ -21,7 +21,7 @@ fn cache_paths() -> CachePaths {
             CachePaths {
                 easylist: dir.join("easylist.txt"),
                 ubo_filters: dir.join("ubo-filters.txt"),
-                ubo_scriptlets: dir.join("ubo-scriptlets.js"),
+                ubo_scriptlets: dir.join("ubo-scriptlets.json"),
             }
         }
         None => {
@@ -30,7 +30,7 @@ fn cache_paths() -> CachePaths {
             CachePaths {
                 easylist: dir.join("easylist.txt"),
                 ubo_filters: dir.join("ubo-filters.txt"),
-                ubo_scriptlets: dir.join("ubo-scriptlets.js"),
+                ubo_scriptlets: dir.join("ubo-scriptlets.json"),
             }
         }
     }

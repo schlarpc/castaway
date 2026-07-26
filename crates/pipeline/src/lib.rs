@@ -48,6 +48,8 @@ pub mod render_pipeline;
 pub mod tap;
 #[cfg(feature = "render")]
 pub mod text;
+#[cfg(feature = "cef")]
+pub mod ubo_scriptlets;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
 

@@ -40,6 +40,12 @@ cef-dll-sys = { version = "=147.1.0", optional = true }
 # Drop the default `single-thread` feature so the Engine is Arc-based (Send+Sync) — CEF
 # calls the resource handler across threads. Keep `embedded-domain-resolver` (needed for
 # URL parsing) and `full-regex-handling`.
+base64 = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# A JS engine, to evaluate uBlock Origin's scriptlet modules and read their own registry
+# rather than parsing them. Cross-builds for the Windows MSVC target (checked).
+rquickjs = { version = "0.9", features = ["loader"], optional = true }
 adblock = { version = "0.13", optional = true, default-features = false, features = [
     "embedded-domain-resolver",
     "full-regex-handling",
@@ -110,7 +116,7 @@ hwaccel = [
     "dep:d3d12",
 ]
 # `cef` needs `render` for the compositor it paints into; adblock is baked in.
-cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock", "dep:ureq"]
+cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock", "dep:ureq", "dep:base64", "dep:serde_json", "dep:serde", "dep:rquickjs"]
 
 [lints]
 workspace = true

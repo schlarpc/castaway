@@ -18,6 +18,14 @@ pub enum PipelineError {
     #[error("decode error: {0}")]
     Decode(String),
 
+    /// uBlock Origin's scriptlet modules could not be evaluated into resources.
+    ///
+    /// Distinct from "no scriptlets": an empty set looks identical to a working one from
+    /// the outside, so a graph that fails to run says so rather than quietly injecting
+    /// nothing.
+    #[error("scriptlet conversion failed: {0}")]
+    Scriptlets(String),
+
     /// Audio decode or output failed.
     #[error("audio: {0}")]
     Audio(String),
