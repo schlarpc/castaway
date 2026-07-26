@@ -472,6 +472,39 @@ whole procedure, and there is no software substitute for the unplug. Once `btusb
 a device even briefly, `usbfs` refuses to claim its interfaces afterwards (`EINVAL`), so the
 warding genuinely has to precede the plug rather than follow it.
 
+**Disable USB autosuspend on the dongle before any hardware run.** The same
+suspend-then-fail-to-resume trap is reachable through ordinary runtime power management,
+with no deauthorization involved. `btusb` ships `enable_autosuspend=Y`, so the UB500 idles
+for `autosuspend_delay_ms` (2000), suspends, and then a resume fails:
+
+```
+usb 3-2-port3: device 3-2.3 not suspended yet
+Bluetooth: hci1: command tx timeout
+Bluetooth: hci1: Failed usb_autopm_get_interface: -16
+```
+
+From there every HCI command times out and the adapter is wedged until it is physically
+replugged — `hciconfig` cannot even read the local name. Nothing in the log blames power
+management until you go looking for it, and the dongle otherwise reports `UP RUNNING`,
+which is why this reads as a firmware or transport fault.
+
+Unlike the deauthorize trap, this one is preventable. On NixOS, per-device so the machine's
+own radio keeps its power management:
+
+```nix
+services.udev.extraRules = ''
+  ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2357", ATTR{idProduct}=="0604", \
+    TEST=="power/control", ATTR{power/control}="on"
+'';
+```
+
+`echo on | sudo tee /sys/bus/usb/devices/<id>/power/control` does the same thing for the
+current plug, and does not survive a replug. This matters beyond the dev box: our Linux
+backend takes the adapter with `HCI_CHANNEL_USER` but `btusb` is still the USB driver
+underneath, so the dongle suspends out from under us exactly the same way. The Windows
+equivalent is USB selective suspend on the WinUSB-bound device, and the kiosk needs it
+turned off there too.
+
 **Still unproven: the secure-boot upload itself.** The part only presents as a bootloader
 before something loads firmware into it, and by the time we can claim it the kernel has
 already done so. A logical re-enumeration (`echo 0 > .../authorized`) does *not* clear it —
