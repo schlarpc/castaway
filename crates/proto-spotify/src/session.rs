@@ -12,6 +12,7 @@
 //!
 //! [`discovery`]: crate::discovery
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +72,42 @@ pub struct ConnectSettings {
     pub initial_volume: f32,
 }
 
+/// Who `getInfo` names as the active user, shared between the zeroconf endpoint and the
+/// session runner.
+///
+/// It has to be shared because the two halves know different things. The endpoint knows a
+/// pairing arrived and answers the phone immediately — it cannot wait for an AP handshake.
+/// Only the runner knows whether the login behind that pairing actually worked, or whether
+/// the session has since ended. Before this, the endpoint set the name and nothing ever
+/// cleared it, so a failed login (a non-Premium account, a stale blob) left the device
+/// claiming to be logged in as someone forever — and `getInfo` is exactly what a phone
+/// reads back to decide whether this device is *theirs*.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveUser(Arc<tokio::sync::Mutex<String>>);
+
+impl ActiveUser {
+    /// The name to report, empty if nobody is logged in.
+    pub async fn get(&self) -> String {
+        self.0.lock().await.clone()
+    }
+
+    /// Claim the device for `who`.
+    pub async fn claim(&self, who: &str) {
+        who.clone_into(&mut *self.0.lock().await);
+    }
+
+    /// Release the device, if `who` is still the one holding it.
+    ///
+    /// Conditional so a session ending late cannot evict whoever paired after it — the
+    /// order those two arrive in is a race we do not control.
+    async fn release(&self, who: &str) {
+        let mut held = self.0.lock().await;
+        if *held == who {
+            held.clear();
+        }
+    }
+}
+
 /// A handle the zeroconf endpoint uses to hand freshly paired credentials to the runner.
 #[derive(Debug, Clone)]
 pub struct ConnectHandle {
@@ -96,6 +133,10 @@ struct LiveSession {
     spirc_task: JoinHandle<()>,
     events_task: JoinHandle<()>,
     queue_task: JoinHandle<()>,
+    /// Set when the *user* ended the session from their phone, as opposed to the session
+    /// dying under us. The difference decides whether we reconnect or stay down, and
+    /// nothing else in the session can tell them apart — see [`run`].
+    hung_up: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for LiveSession {
@@ -110,6 +151,21 @@ impl std::fmt::Debug for LiveSession {
 }
 
 impl LiveSession {
+    /// Resolves when this session is no longer live.
+    ///
+    /// `spirc_task` is the one worth watching: `SpircTask::run` loops
+    /// `while !self.session.is_invalid() && !self.shutdown` and then simply *returns*, so
+    /// its completion is the only signal that the device has left the picker. Nothing
+    /// awaited it before, which is why a Wi-Fi blip was permanent.
+    async fn ended(&mut self) {
+        let _ = (&mut self.spirc_task).await;
+    }
+
+    /// Whether the user ended this session deliberately.
+    fn was_hung_up(&self) -> bool {
+        self.hung_up.load(Ordering::SeqCst)
+    }
+
     /// Stop the session and release the account.
     fn shutdown(self) {
         // Ask politely first: this pauses playback and tells the cloud we are no longer
@@ -129,24 +185,154 @@ impl LiveSession {
 /// on an axum handler that must answer the phone promptly — starting a network login
 /// inline would hold the HTTP response open for the length of an AP handshake.
 #[must_use]
-pub fn spawn(settings: ConnectSettings, sink: SessionSink, osd: Option<OsdSink>) -> ConnectHandle {
+pub fn spawn(
+    settings: ConnectSettings,
+    sink: SessionSink,
+    osd: Option<OsdSink>,
+    active: ActiveUser,
+) -> ConnectHandle {
     // Depth 1: pairings are human-paced, and if two arrive at once only the later one
     // matters — but it must not be dropped, so this is a send, not a try_send.
     let (tx, rx) = mpsc::channel(1);
-    tokio::spawn(run(settings, sink, osd, rx));
+    tokio::spawn(run(settings, sink, osd, rx, active));
     ConnectHandle { tx }
 }
 
+/// How long to wait before rebuilding a session that died, and the ceiling.
+///
+/// The common case is a Wi-Fi blip or an AP restart, where the first retry a couple of
+/// seconds later just works. The uncommon case is the cloud being unreachable for an
+/// afternoon, and there the interval has to grow — a login attempt every two seconds for
+/// four hours is a way to get an account rate-limited.
+const RECONNECT_MIN: Duration = Duration::from_secs(2);
+const RECONNECT_MAX: Duration = Duration::from_secs(120);
+
+/// A session that stayed up this long counts as healthy, so the next failure starts over
+/// at [`RECONNECT_MIN`] rather than inheriting a backoff from hours earlier.
+const HEALTHY_SESSION: Duration = Duration::from_secs(120);
+
+/// How many rebuilds to attempt before concluding the credentials are the problem.
+///
+/// A blob is a *reusable* credential, so it normally outlives any outage — but it can be
+/// revoked, and an account whose password changed will fail every attempt forever.
+/// Retrying to that horizon is worse than stopping and letting the person re-pair, which
+/// takes them four seconds.
+const RECONNECT_ATTEMPTS: u32 = 8;
+
 /// The runner loop: one session at a time, replaced whenever someone new pairs.
+///
+/// Also the thing that keeps a session alive. librespot 0.8 does not re-establish the
+/// access-point session after a keepalive timeout — `librespot-core/src/session.rs` says
+/// so in a `// TODO` — so `SpircTask::run` returns and the device silently leaves every
+/// phone's picker. That is the exact shape D30 exists to avoid ("every break lands as
+/// silence on an unattended panel"), and delegating to librespot does not cover it,
+/// because the reconnect is the part librespot does not do.
+///
+/// A dropped session and a deliberate hang-up look identical from here — both end
+/// `spirc_task` — so `LiveSession::hung_up` carries the distinction back from the event
+/// pump, which is the only place the difference is visible.
 async fn run(
     settings: ConnectSettings,
     sink: SessionSink,
     osd: Option<OsdSink>,
     mut rx: mpsc::Receiver<PairedUser>,
+    active: ActiveUser,
 ) {
     let mut current: Option<LiveSession> = None;
+    /// Credentials worth reconnecting with, and how many times we have tried.
+    struct Standing {
+        user: PairedUser,
+        attempts: u32,
+        backoff: Duration,
+        /// When the session these credentials belong to last came up.
+        up_since: Option<std::time::Instant>,
+    }
+    let mut standing: Option<Standing> = None;
 
-    while let Some(user) = rx.recv().await {
+    loop {
+        // Wait for whichever comes first: someone new pairing, or the live session
+        // ending. With no session up there is nothing to watch, so this is just a recv.
+        let paired = match &mut current {
+            Some(live) => tokio::select! {
+                user = rx.recv() => user,
+                () = live.ended() => {
+                    let live = current.take().unwrap_or_else(|| unreachable!("just matched"));
+                    let deliberate = live.was_hung_up();
+                    live.shutdown();
+                    if deliberate {
+                        // The user pressed Disconnect. Reconnecting would drag them back
+                        // onto a device they just left, which is worse than useless on a
+                        // shared panel — the next person's phone would find it occupied.
+                        info!("spotify: the user disconnected");
+                        if let Some(pending) = standing.take() {
+                            active.release(&pending.user.user_name).await;
+                        }
+                    } else if let Some(pending) = standing.as_mut() {
+                        // A session that stayed up for a good while was healthy; whatever
+                        // just killed it is a new problem, not a continuation of an old
+                        // one, so it gets a fresh budget.
+                        if pending
+                            .up_since
+                            .is_some_and(|t| t.elapsed() >= HEALTHY_SESSION)
+                        {
+                            pending.attempts = 0;
+                            pending.backoff = RECONNECT_MIN;
+                        }
+                        pending.up_since = None;
+                        pending.attempts += 1;
+                        if pending.attempts > RECONNECT_ATTEMPTS {
+                            warn!(
+                                attempts = pending.attempts,
+                                "spotify: giving up on reconnecting; the credentials \
+                                 are probably stale, so re-pair from the app"
+                            );
+                            if let Some(osd) = &osd {
+                                osd.banner(
+                                    "Spotify: disconnected — pair again to resume".to_owned(),
+                                    Duration::from_secs(8),
+                                );
+                            }
+                            if let Some(pending) = standing.take() {
+                                active.release(&pending.user.user_name).await;
+                            }
+                            let _ = sink.emit(SessionEvent::End).await;
+                        } else {
+                            warn!(
+                                attempt = pending.attempts,
+                                retry_in = ?pending.backoff,
+                                "spotify: session ended, reconnecting"
+                            );
+                        }
+                    }
+                    continue;
+                }
+            },
+            None => match standing.as_ref() {
+                // A reconnect is owed. Wait out the backoff, but let a fresh pairing
+                // interrupt it — someone standing at the panel beats a retry timer.
+                Some(pending) => {
+                    let wait = pending.backoff;
+                    tokio::select! {
+                        user = rx.recv() => user,
+                        () = tokio::time::sleep(wait) => {
+                            let Some(pending) = standing.as_mut() else { continue };
+                            pending.backoff = (pending.backoff * 2).min(RECONNECT_MAX);
+                            Some(pending.user.clone())
+                        }
+                    }
+                }
+                None => rx.recv().await,
+            },
+        };
+
+        let Some(user) = paired else { break };
+
+        // A pairing that arrives while a reconnect is owed replaces it, whoever it is —
+        // the person at the panel is the authority on whose music should play.
+        let resuming = standing
+            .as_ref()
+            .is_some_and(|p| p.user.user_name == user.user_name && p.attempts > 0);
+
         // Retire the old session *before* starting the new one. Two Connect sessions on
         // one device id fight over the same registration, and the account that loses is
         // whichever the cloud saw last — which is not necessarily the person standing in
@@ -157,16 +343,35 @@ async fn run(
         }
 
         let user_name = user.user_name.clone();
+        let retained = user.clone();
         match start(&settings, user, &sink).await {
             Ok(live) => {
-                info!(user = %user_name, "spotify: connect session up");
-                if let Some(osd) = &osd {
-                    osd.banner(
-                        format!("Spotify: {user_name} connected"),
-                        Duration::from_secs(4),
-                    );
+                info!(user = %user_name, resuming, "spotify: connect session up");
+                // Only greet a genuinely new arrival. A banner on every reconnect would
+                // turn a flaky uplink into a strobe light on the wall.
+                if !resuming {
+                    if let Some(osd) = &osd {
+                        osd.banner(
+                            format!("Spotify: {user_name} connected"),
+                            Duration::from_secs(4),
+                        );
+                    }
                 }
                 current = Some(live);
+                // The attempt counter is *not* reset here. A login that succeeds and then
+                // dies again in ten seconds is a failing session, not a working one, and
+                // resetting on connect would let it loop forever at the minimum interval.
+                // `HEALTHY_SESSION` is what clears it — see the session-ended arm.
+                let attempts = standing.as_ref().map_or(0, |p| p.attempts);
+                let backoff = standing
+                    .as_ref()
+                    .map_or(RECONNECT_MIN, |p| p.backoff.min(RECONNECT_MAX));
+                standing = Some(Standing {
+                    user: retained,
+                    attempts,
+                    backoff,
+                    up_since: Some(std::time::Instant::now()),
+                });
             }
             Err(e) => {
                 // The overwhelmingly likely causes are a non-Premium account or a stale
@@ -178,6 +383,30 @@ async fn run(
                         format!("Spotify: {user_name} — {e}"),
                         Duration::from_secs(8),
                     );
+                }
+                // A failed *login* is not a failed session: retry it on the same budget,
+                // because "the AP refused us while the uplink was down" and "this account
+                // cannot log in" are indistinguishable from one attempt.
+                match standing.as_mut() {
+                    Some(pending) if pending.user.user_name == user_name => {
+                        pending.attempts += 1;
+                        if pending.attempts > RECONNECT_ATTEMPTS {
+                            standing = None;
+                            // Stop claiming to be logged in as someone we cannot log in
+                            // as. The endpoint set the name optimistically when the
+                            // pairing arrived, because it had to answer the phone before
+                            // the login was attempted; this is where that optimism ends.
+                            active.release(&user_name).await;
+                        }
+                    }
+                    _ => {
+                        standing = Some(Standing {
+                            user: retained,
+                            attempts: 1,
+                            backoff: RECONNECT_MIN,
+                            up_since: None,
+                        });
+                    }
                 }
             }
         }
@@ -296,7 +525,13 @@ async fn start(
     .await
     .map_err(|_| SpotifyError::SessionGone)?;
 
-    let events_task = tokio::spawn(pump_events(events, sink.clone(), session.clone()));
+    let hung_up = Arc::new(AtomicBool::new(false));
+    let events_task = tokio::spawn(pump_events(
+        events,
+        sink.clone(),
+        session.clone(),
+        Arc::clone(&hung_up),
+    ));
     let queue_task = tokio::spawn(pump_queue(cluster_updates, sink.clone(), session.clone()));
     let spirc_task = tokio::spawn(spirc_task);
 
@@ -305,6 +540,7 @@ async fn start(
         spirc_task,
         events_task,
         queue_task,
+        hung_up,
     })
 }
 
@@ -324,6 +560,7 @@ async fn pump_events(
     mut events: mpsc::UnboundedReceiver<PlayerEvent>,
     sink: SessionSink,
     session: Session,
+    hung_up: Arc<AtomicBool>,
 ) {
     let mut snapshot = NowPlaying::new(PlaybackState::Stopped);
     // Which track the current snapshot describes, so late artwork for a track that has
@@ -396,6 +633,44 @@ async fn pump_events(
                 warn!(track = %track_id, "spotify: track unavailable");
                 snapshot.state = PlaybackState::Error;
                 true
+            }
+            PlayerEvent::SessionDisconnected { user_name, .. } => {
+                // The user pressed Disconnect, or moved playback to their headphones.
+                // This used to fall into the wildcard below, so the session manager was
+                // never told: `active` stayed Spotify, the pipeline was never stopped,
+                // the card never cleared, and the PCM thread kept the audio device — the
+                // panel sat on a stale card until someone else cast over it.
+                info!(user = %user_name, "spotify: the user ended the session");
+                hung_up.store(true, Ordering::SeqCst);
+                let _ = sink.emit(SessionEvent::End).await;
+                return;
+            }
+            PlayerEvent::SessionClientChanged {
+                client_name,
+                client_brand_name,
+                client_model_name,
+                ..
+            } => {
+                // The only place the *phone* names itself. Much better than what the card
+                // otherwise shows: `user_name` is a canonical Spotify id, which for any
+                // account made since about 2015 is 25 random characters — rendered at
+                // 28px on a 65-inch screen.
+                let who = [client_name, client_brand_name, client_model_name]
+                    .into_iter()
+                    .find(|s| !s.is_empty());
+                if let Some(who) = who {
+                    debug!(%who, "spotify: controlling client");
+                    if sink
+                        .emit(SessionEvent::SourceInfo(
+                            SourceDescription::new().with_display_name(who),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                false
             }
             // Everything else is either internal to spirc or does not change the card.
             _ => false,
@@ -915,6 +1190,20 @@ mod tests {
             .collect();
         let update = cluster_update(Some(tracks));
         assert_eq!(queue_tracks(&update).unwrap().len(), UP_NEXT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn releasing_the_device_does_not_evict_whoever_paired_next() {
+        // The order a dying session and a fresh pairing arrive in is a race we do not
+        // control. An unconditional release would let alice's session, ending late, hand
+        // bob's phone a device that reports nobody is on it — while bob is playing.
+        let active = ActiveUser::default();
+        active.claim("alice").await;
+        active.claim("bob").await;
+        active.release("alice").await;
+        assert_eq!(active.get().await, "bob");
+        active.release("bob").await;
+        assert_eq!(active.get().await, "");
     }
 
     #[test]

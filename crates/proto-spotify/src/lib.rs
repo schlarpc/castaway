@@ -31,7 +31,6 @@ use axum::routing::get;
 use axum::Router;
 use castaway_core::{OsdSink, ProtocolKind, SessionSink};
 use substrate_mdns::MdnsService;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 pub use crypto::DhKeys;
@@ -47,7 +46,7 @@ pub const CPATH: &str = "/spotify";
 struct SpotifyStateInner {
     keys: DhKeys,
     info: DeviceInfo,
-    active_user: Mutex<String>,
+    active_user: session::ActiveUser,
     /// Where a successful pairing goes. `None` in tests and in builds that only want the
     /// device to appear in the picker without logging anyone in.
     connect: OnceLock<ConnectHandle>,
@@ -76,7 +75,7 @@ impl SpotifyService {
                     remote_name: remote_name.into(),
                     device_id: device_id.into(),
                 },
-                active_user: Mutex::new(String::new()),
+                active_user: session::ActiveUser::default(),
                 connect: OnceLock::new(),
                 osd: OnceLock::new(),
             }),
@@ -97,6 +96,7 @@ impl SpotifyService {
             },
             sink,
             self.state.osd.get().cloned(),
+            self.state.active_user.clone(),
         );
         let _ = self.state.connect.set(handle);
         self
@@ -156,7 +156,7 @@ async fn handle_post(State(st): State<Arc<SpotifyStateInner>>, body: String) -> 
         Some("addUser") => match serde_urlencoded::from_str::<discovery::AddUser>(&body) {
             Ok(req) => match discovery::add_user(&req, &st.keys) {
                 Ok(creds) => {
-                    *st.active_user.lock().await = creds.user_name.clone();
+                    st.active_user.claim(&creds.user_name).await;
                     info!(user = %creds.user_name, blob_len = creds.blob.len(),
                         "Spotify addUser paired");
                     match st.connect.get() {
@@ -200,7 +200,7 @@ async fn handle_post(State(st): State<Arc<SpotifyStateInner>>, body: String) -> 
 }
 
 async fn get_info_response(st: &SpotifyStateInner) -> Response {
-    let active = st.active_user.lock().await.clone();
+    let active = st.active_user.get().await;
     json_ok(discovery::get_info(&st.info, &st.keys, &active))
 }
 
