@@ -39,7 +39,32 @@ const EP_ACL_OUT: u8 = 0x02;
 /// Largest event a controller will send. Interrupt IN transfers are short.
 const EVENT_BUF: usize = 260;
 /// ACL reads are sized for the largest fragment any controller offers.
-const ACL_BUF: usize = 1024;
+///
+/// The four bytes past a round number are the HCI ACL header, and leaving them out is a
+/// live bug rather than a tidiness one. A bulk IN transfer *larger than the buffer it was
+/// given* is an overflow, not a short read — usbfs fails it `-EOVERFLOW`, WinUSB fails the
+/// pipe — and the reader treats every non-STALL error as fatal. So the buffer has to hold
+/// the largest packet we ourselves invite, and we invite a big one on purpose: the
+/// adapter advertises a 1017-byte L2CAP MTU so a full SDU lands in one ACL packet, which
+/// is 1017 + 4 (L2CAP header) + 4 (HCI ACL header) = 1025. At 1024 the first
+/// maximum-size PDU from a phone killed the stack.
+///
+/// The kernel's `btusb` sizes this the same way and for the same reason
+/// (`HCI_MAX_FRAME_SIZE = HCI_MAX_ACL_SIZE + 4`); ours is that, rounded up.
+const ACL_BUF: usize = 1028;
+
+/// The largest L2CAP MTU any of our profile crates advertises, and the headers under it.
+///
+/// A build-time assertion rather than a test, because the failure it guards is a dead
+/// Bluetooth stack on the first big packet — that should not be able to compile. If
+/// `proto-bluetooth-audio` ever raises its MTU past what this buffer holds, the build
+/// stops here instead of the panel going quiet on someone's first long track title.
+const _: () = {
+    const ADVERTISED_L2CAP_MTU: usize = 1017;
+    const L2CAP_HEADER: usize = 4;
+    const HCI_ACL_HEADER: usize = 4;
+    assert!(ACL_BUF >= ADVERTISED_L2CAP_MTU + L2CAP_HEADER + HCI_ACL_HEADER);
+};
 
 /// A controller reached over USB.
 pub struct UsbTransport {
