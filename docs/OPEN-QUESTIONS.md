@@ -213,6 +213,13 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   139 of 148 with no way to tell which nine were missing. Running upstream's own code cannot
   disagree with upstream; parsing it always eventually does.
 
+  **If upstream breaks this, it does not break the receiver.** Verified on a live receiver
+  with the scriptlet source made unusable: it boots, warns, keeps all 89,667 network rules,
+  still blocks ads, and still plays YouTube — only injection is lost. Failures fall back to
+  the last good cached resources, and then to no scriptlets. The one shape that would *not*
+  have degraded is a hang, so the JS runtime carries a 20s interrupt deadline and a 256 MB
+  ceiling, and the module fetch a 90s overall budget.
+
   Checked rather than assumed: the module graph reaches outside `resources/`
   (`resources/href-sanitizer.js` imports `../urlskip.js`), so fetching follows relative
   imports transitively; and QuickJS cross-builds for `x86_64-pc-windows-msvc`, without which
