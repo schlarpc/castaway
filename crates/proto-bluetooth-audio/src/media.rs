@@ -15,6 +15,9 @@ use substrate_rtp::RtpPacket;
 
 use crate::latm::LatmParser;
 
+/// Every SBC frame starts with this.
+const SBC_SYNCWORD: u8 = 0x9C;
+
 use crate::error::AudioError;
 
 /// How a codec's media packets are framed.
@@ -59,6 +62,10 @@ pub struct Depacketizer {
     base_timestamp: Option<u32>,
     /// Monotonic fallback for the raw framing, which carries no timestamps.
     frames_seen: u64,
+    /// The bitpool of the most recent SBC frame, which is not the negotiated ceiling:
+    /// every SBC frame header states its own, and a congested sender lowers it without
+    /// renegotiating anything (A2DP has no feedback path to renegotiate *with*).
+    sbc_bitpool: Option<u8>,
     /// AAC arrives wrapped in a LATM multiplex that has to come off before a decoder can
     /// read it; the parser is stateful because a sender may send the configuration once
     /// and reuse it (RFC 3016 §4.1).
@@ -75,6 +82,7 @@ impl Depacketizer {
             sample_rate: sample_rate.max(1),
             base_timestamp: None,
             frames_seen: 0,
+            sbc_bitpool: None,
             latm: (codec == AudioCodec::Aac).then(LatmParser::new),
         }
     }
@@ -83,6 +91,17 @@ impl Depacketizer {
     #[must_use]
     pub const fn codec(&self) -> AudioCodec {
         self.codec
+    }
+
+    /// The bitpool the most recent SBC frame was coded at, if this is an SBC stream.
+    ///
+    /// Read from the frame header rather than from the negotiation, because they are
+    /// different numbers: the capability exchange settles a min/max *range* and the
+    /// encoder moves within it per frame. A sender whose transmit queue is backing up
+    /// drops this and says nothing — watching it is the only way to see that happen.
+    #[must_use]
+    pub const fn bitpool(&self) -> Option<u8> {
+        self.sbc_bitpool
     }
 
     /// Whether packets for this codec carry an RTP header at all.
@@ -124,6 +143,17 @@ impl Depacketizer {
                     // flags into it). Neither decoder wants it, but leaving it in place
                     // shifts every frame by one byte and decodes to noise.
                     payload = payload.slice(1..);
+                    if self.codec == AudioCodec::Sbc {
+                        // Syncword 0x9C, then one byte of stream parameters, then the
+                        // bitpool this frame was coded at.
+                        if let Some(&bitpool) = payload
+                            .first()
+                            .filter(|b| **b == SBC_SYNCWORD)
+                            .and(payload.get(2))
+                        {
+                            self.sbc_bitpool = Some(bitpool);
+                        }
+                    }
                 }
                 if payload.is_empty() {
                     return Err(AudioError::BadMediaPacket("media packet has no payload"));
@@ -224,6 +254,37 @@ mod tests {
                 "{codec:?} must drop its codec header"
             );
         }
+    }
+
+    /// One SBC frame header: syncword, stream parameters, bitpool, CRC.
+    fn sbc_frame(bitpool: u8) -> Vec<u8> {
+        vec![SBC_SYNCWORD, 0x31, bitpool, 0x00, 0xAA, 0xBB]
+    }
+
+    #[test]
+    fn sbc_bitpool_is_read_from_the_frame_not_the_negotiation() {
+        // The negotiated range is a ceiling; each frame states what it actually used, and
+        // a congested sender lowers it without renegotiating. Reading the wrong one means
+        // a stream can degrade with nothing anywhere saying so.
+        let mut d = Depacketizer::new(AudioCodec::Sbc, 44_100);
+        assert_eq!(d.bitpool(), None, "nothing seen yet");
+
+        let mut payload = vec![0x01]; // SBC's one-byte frame-count header
+        payload.extend_from_slice(&sbc_frame(53));
+        d.push(rtp(0, &payload)).unwrap();
+        assert_eq!(d.bitpool(), Some(53));
+
+        let mut degraded = vec![0x01];
+        degraded.extend_from_slice(&sbc_frame(29));
+        d.push(rtp(1000, &degraded)).unwrap();
+        assert_eq!(d.bitpool(), Some(29), "a drop must be visible");
+    }
+
+    #[test]
+    fn a_non_sbc_stream_reports_no_bitpool() {
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        d.push(rtp(0, &[0xAA, 0xBB, 0xCC])).unwrap();
+        assert_eq!(d.bitpool(), None, "bitpool is an SBC concept");
     }
 
     #[test]

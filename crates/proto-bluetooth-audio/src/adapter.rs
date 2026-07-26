@@ -117,6 +117,8 @@ struct Link {
     audio_tx: Option<mpsc::Sender<EncodedFrame>>,
     /// Whether a `SessionEvent::Audio` has already been emitted for this link.
     session_open: bool,
+    /// Last SBC bitpool we reported, so a change is logged and a steady stream is not.
+    reported_bitpool: Option<u8>,
     /// Metadata accumulated for this link, re-emitted as a full snapshot on change.
     now_playing: NowPlaying,
     /// Next AVCTP transaction label.
@@ -144,6 +146,7 @@ impl Link {
             audio_format: None,
             audio_tx: None,
             session_open: false,
+            reported_bitpool: None,
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
             description: SourceDescription::new().with_address(peer.to_string()),
@@ -608,6 +611,21 @@ impl BluetoothAdapter {
         };
         match depacketizer.push(payload) {
             Ok(frame) => {
+                // A sender that is struggling lowers its bitpool silently — there is no
+                // renegotiation and nothing else says it happened. Logged on change only,
+                // since it is stable for a healthy stream and this is the hot path.
+                let bitpool = depacketizer.bitpool();
+                if bitpool.is_some() && bitpool != link.reported_bitpool {
+                    match link.reported_bitpool {
+                        None => info!(?bitpool, "bluetooth: sbc bitpool"),
+                        Some(was) => info!(
+                            from = was,
+                            to = bitpool.unwrap_or(was),
+                            "bluetooth: sbc bitpool changed"
+                        ),
+                    }
+                    link.reported_bitpool = bitpool;
+                }
                 // `try_send` rather than `send`: blocking here would stall the whole
                 // adapter, including the signaling channel, so a phone could not even
                 // pause. A full queue means decode is behind, which is worth saying.

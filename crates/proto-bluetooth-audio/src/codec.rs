@@ -289,9 +289,19 @@ impl CodecCapability {
             // 44100 reads as 44.1, not 44 — the difference people actually look for.
             format!("{:.1} kHz", f64::from(rate) / 1000.0)
         };
+        // SBC's ceiling is the number that decides how it sounds, and the one people
+        // reach for when a stream disappoints them. It is a *ceiling*: the encoder varies
+        // bitpool per frame within the negotiated range and states it in every frame
+        // header, so what actually arrives may be lower (see `Depacketizer::bitpool`).
+        let quality = match self {
+            Self::Sbc { max_bitpool, .. } => format!(" · bitpool ≤{max_bitpool}"),
+            _ => String::new(),
+        };
         match self.channel_summary() {
-            Some(channels) => format!("{} · {khz} · {channels}", self.display_name()),
-            None => format!("{} · {khz}", self.display_name()),
+            Some(channels) => {
+                format!("{} · {khz} · {channels}{quality}", self.display_name())
+            }
+            None => format!("{} · {khz}{quality}", self.display_name()),
         }
     }
 
@@ -875,7 +885,9 @@ mod tests {
             min_bitpool: 2,
             max_bitpool: 53,
         };
-        assert_eq!(sbc.describe(), "SBC · 44.1 kHz · stereo");
+        // The bitpool ceiling rides along for SBC: it is the number that decides how the
+        // stream sounds, and the first thing to look at when one disappoints.
+        assert_eq!(sbc.describe(), "SBC · 44.1 kHz · stereo · bitpool ≤53");
     }
 
     #[test]
