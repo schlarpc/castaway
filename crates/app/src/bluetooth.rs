@@ -34,6 +34,99 @@ pub async fn spawn(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    // The first attempt is part of startup, so a box with no dongle says so once, at
+    // boot, with a real error — rather than disappearing into a retry loop nobody reads.
+    let first = build(config).await?;
+
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::Bluetooth, "listener"), event_tx);
+    let config = config.clone();
+    Ok(tokio::spawn(async move {
+        supervise(config, first, sink, shutdown).await;
+    }))
+}
+
+/// How long to wait before re-opening a controller that died, and the ceiling.
+///
+/// A dongle that was yanked out of the socket will fail every attempt until someone puts
+/// it back, and that could be a week — so the interval backs off rather than spinning a
+/// USB enumeration every second for a device that is not there.
+const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(2);
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A run that lasted at least this long counts as healthy, so the next failure starts
+/// over at [`RETRY_MIN`]. Without this, a controller that works fine for hours and then
+/// hiccups once inherits the backoff from whatever happened at boot.
+const HEALTHY_RUN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Keep a Bluetooth adapter running for as long as the receiver is up.
+///
+/// The thing this exists to prevent: `run` used to return on the first transport error
+/// and nothing restarted it, so an unplug, a USB reset, or one oversized ACL packet left
+/// Bluetooth dead for the lifetime of the process — with no error anywhere, because the
+/// adapter reported success. A receiver on a wall does not get to be restarted by hand.
+///
+/// Re-opening is the *whole* controller: enumerate, claim, reload firmware, bring up.
+/// Anything less would inherit whatever state wedged the last one, and a replugged dongle
+/// is a different USB device anyway. Link keys survive because they live on disk, so a
+/// phone that paired before the restart does not pair again.
+async fn supervise(
+    config: Config,
+    first: (Arc<BluetoothAdapter>, String),
+    sink: SessionSink,
+    shutdown: Arc<Notify>,
+) {
+    let mut next = Some(first);
+    let mut backoff = RETRY_MIN;
+    loop {
+        let (adapter, id) = match next.take() {
+            Some(ready) => ready,
+            None => {
+                tokio::select! {
+                    () = tokio::time::sleep(backoff) => {}
+                    () = shutdown.notified() => return,
+                }
+                match build(&config).await {
+                    Ok(ready) => ready,
+                    Err(e) => {
+                        warn!(
+                            error = %format!("{e:#}"),
+                            retry_in = ?backoff,
+                            "bluetooth: could not re-open a controller"
+                        );
+                        backoff = (backoff * 2).min(RETRY_MAX);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let started = std::time::Instant::now();
+        tokio::select! {
+            res = Arc::clone(&adapter).run(sink.clone()) => {
+                match res {
+                    Ok(()) => info!(controller = %id, "bluetooth adapter stopped"),
+                    Err(e) => warn!(error = %e, controller = %id, "bluetooth adapter exited"),
+                }
+            }
+            () = shutdown.notified() => {
+                info!("Bluetooth sink stopping");
+                return;
+            }
+        }
+
+        if started.elapsed() >= HEALTHY_RUN {
+            backoff = RETRY_MIN;
+        }
+        info!(retry_in = ?backoff, "bluetooth: re-opening the controller");
+    }
+}
+
+/// Open a controller and build an adapter around it.
+///
+/// Everything here is re-done on every restart on purpose: the firmware set, the codec
+/// table, and the stored link keys are all read fresh, so a replugged dongle of a
+/// different make gets its own firmware and a phone that paired since boot is still known.
+async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String)> {
     let (transport, id) = open_transport(config).await?;
 
     let keys_path = link_keys_path(&config.state_dir());
@@ -86,17 +179,7 @@ pub async fn spawn(
 
     info!(controller = %id, ldac = enable_ldac, "enabled: Bluetooth A2DP sink");
 
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::Bluetooth, "listener"), event_tx);
-    Ok(tokio::spawn(async move {
-        tokio::select! {
-            res = Arc::clone(&adapter).run(sink) => {
-                if let Err(e) = res {
-                    warn!(error = %e, "Bluetooth adapter exited");
-                }
-            }
-            () = shutdown.notified() => info!("Bluetooth sink stopping"),
-        }
-    }))
+    Ok((adapter, id))
 }
 
 /// Resolve a configured codec name.

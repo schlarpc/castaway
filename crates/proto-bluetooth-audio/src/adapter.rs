@@ -329,8 +329,15 @@ impl SourceAdapter for BluetoothAdapter {
             let packet = match received {
                 Ok(p) => p,
                 Err(e) => {
+                    // `Err`, emphatically not `Ok(())`. Returning success here was the
+                    // whole failure: the caller could not tell a dead dongle from a clean
+                    // shutdown, so it did nothing, and Bluetooth stayed dead for the rest
+                    // of the process while the panel looked fine. An unplug, a USB reset,
+                    // a stalled endpoint that would not clear — all of them arrive here,
+                    // and all of them are recoverable by re-opening the controller. Say
+                    // so, and let the supervisor do it.
                     warn!(error = %e, "bluetooth transport ended");
-                    return Ok(());
+                    return Err(CoreError::Adapter(format!("hci transport ended: {e}")));
                 }
             };
 
