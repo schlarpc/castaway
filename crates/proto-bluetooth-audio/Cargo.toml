@@ -21,10 +21,22 @@ tracing.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+# For the ERTM bench only: it drives the real engine against the Linux kernel's L2CAP
+# through a virtual controller, which needs a transport. Nothing in the library depends
+# on it, and the example is gated so a non-Linux build never reaches for it.
+hci-transport = { workspace = true, features = ["socket"] }
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "ertm_echo"
+required-features = ["bench"]
 
 [features]
 default = []
+# Build the benches that need a controller. Off by default: they are Linux-only and
+# exist to be run by hand against `btvirt`, not by CI.
+bench = []
 # Advertise the LDAC endpoint. Gated because advertising a codec we cannot decode is
 # worse than omitting it: the sender picks it and the session is silence (Q22).
 ldac = []

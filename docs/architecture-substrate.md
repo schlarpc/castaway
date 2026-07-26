@@ -708,6 +708,24 @@ asserted on the bytes they emit. Tier-2 puts two of these back-to-back — our s
 scripted *source* over an in-memory L2CAP — so a full pair → discover → configure → stream →
 metadata → cover-art flow runs in CI with no hardware at all.
 
+**Driving ERTM from the kernel.** `proto-bluetooth-audio/examples/ertm_echo.rs` listens on
+a PSM in Enhanced Retransmission Mode and echoes what arrives, so BlueZ's `l2test` — the
+Linux kernel's own L2CAP, as a peer — marks our control field, sequence numbers, frame
+check sequence and segmentation instead of our own decoder marking them. Everything else
+that exercises ERTM judges our frames against ourselves, which cannot catch a shared
+misreading of the spec. Same idea as the openscreen fixtures in Q13, applied to a protocol:
+
+```sh
+sudo btvirt -l2 &
+sudo hciconfig hci2 down
+sudo cargo run -p proto-bluetooth-audio --features bench --example ertm_echo -- 2 4101
+l2test -y -P 4101 -X ertm -N 3 -b 800 -i hci1 00:AA:01:01:00:02
+```
+
+Confirmed 2026-07-26: `l2test` reports `mode 3`, three 800-byte SDUs arrive segmented and
+reassemble, and the echoes go back segmented (the kernel's MPS was 180) and reach its
+application intact.
+
 ### Testing the whole flow with no radio: `btvirt` + `vhci`
 
 **Verified working 2026-07-25.** The kernel's `hci_vhci` driver plus BlueZ's `btvirt`

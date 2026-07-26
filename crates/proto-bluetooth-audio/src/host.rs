@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 
+use tracing::debug;
+
 use substrate_hci::{
     AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, ConnectionHandle, Event,
     IoCapability, LinkKey, LinkType, ScanEnable, Status,
@@ -243,7 +245,26 @@ impl HostController {
             Event::CommandComplete { opcode, params, .. } => {
                 self.on_command_complete(*opcode, params)
             }
-            Event::CommandStatus { .. } => Vec::new(),
+            Event::CommandStatus { status, opcode, .. } => {
+                // Bring-up is a queue with one command in flight, advanced by each
+                // completion. A controller that answers one of them with a *status*
+                // instead — which is what "unknown HCI command" looks like on some, and
+                // what btvirt does for `WriteInquiryScanType` — otherwise stalls that
+                // queue forever: no `Ready`, no `WriteScanEnable`, and a receiver nobody
+                // can find, with no error anywhere to say why.
+                //
+                // Every command in the bring-up sequence is a Command Complete command,
+                // so a status arriving during initialisation means that one is not going
+                // to complete and the next should go out. The optional ones are optional
+                // precisely because this can happen.
+                if self.state == HostState::Initializing {
+                    if !status.is_success() {
+                        debug!(%opcode, %status, "controller refused a bring-up command");
+                    }
+                    return self.advance_bring_up();
+                }
+                Vec::new()
+            }
 
             // --- connection lifecycle ---
             Event::ConnectionRequest {
@@ -392,6 +413,15 @@ impl HostController {
         if self.state != HostState::Initializing {
             return Vec::new();
         }
+        self.advance_bring_up()
+    }
+
+    /// Send the next bring-up command, or declare the controller ready.
+    ///
+    /// Reached from both a completion and a refusal, because the queue has to move either
+    /// way: the sequence is a best effort, and the commands in it that a given controller
+    /// does not implement are the ones documented as optional.
+    fn advance_bring_up(&mut self) -> Vec<HostAction> {
         if self.pending.is_empty() {
             self.state = HostState::Ready;
             return vec![HostAction::Ready {
@@ -456,6 +486,49 @@ mod tests {
             last = next.last().cloned().unwrap();
         }
         all
+    }
+
+    #[test]
+    fn a_controller_that_refuses_an_optional_command_still_becomes_discoverable() {
+        // Found on the virtual bench in five seconds: btvirt answers
+        // `WriteInquiryScanType` with a *command status* of "unknown HCI command" rather
+        // than a completion, and bring-up stopped dead there — no Ready, no
+        // WriteScanEnable, and a receiver nobody can find, with nothing in the log to say
+        // why. Interlaced scan is documented as optional precisely because a controller
+        // may not have it; optional has to mean the queue keeps moving.
+        let mut host = HostController::new(HostConfig::default());
+        let mut all = sent(&host.start());
+        let mut last = all.last().cloned().unwrap();
+        for _ in 0..32 {
+            let refuse = last.opcode() == OpCode::WRITE_INQUIRY_SCAN_TYPE;
+            let actions = if refuse {
+                host.on_event(&Event::CommandStatus {
+                    status: Status(0x01), // unknown HCI command
+                    allowed_packets: 1,
+                    opcode: last.opcode(),
+                })
+            } else {
+                let params: &[u8] = match last.opcode() {
+                    OpCode::READ_BUFFER_SIZE => &[0x00, 0x54, 0x01, 0xff, 0x08, 0x00, 0x08, 0x00],
+                    OpCode::READ_BD_ADDR => &[0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa],
+                    _ => &[0x00],
+                };
+                host.on_event(&complete(last.opcode(), params))
+            };
+            let next = sent(&actions);
+            if next.is_empty() {
+                break;
+            }
+            all.extend(next.clone());
+            last = next.last().cloned().unwrap();
+        }
+
+        let opcodes: Vec<OpCode> = all.iter().map(Command::opcode).collect();
+        assert!(
+            opcodes.contains(&OpCode::WRITE_SCAN_ENABLE),
+            "a refusal must not swallow the rest of the sequence: {opcodes:?}"
+        );
+        assert_eq!(host.state(), HostState::Ready);
     }
 
     #[test]

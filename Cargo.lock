@@ -3029,6 +3029,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "castaway-core",
+ "hci-transport",
  "hex-literal",
  "substrate-hci",
  "substrate-l2cap",
@@ -3037,6 +3038,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

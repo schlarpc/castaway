@@ -386,15 +386,42 @@ the reasons are what a future reversal has to argue against.
   set `CONTROLLER_SUPPORTS_COVER_ART` in the SDP record and then only `debug!` the image
   handle a peer sends back, so album art is advertised and never fetched.
 
-- **Q29 — Cover art needs L2CAP ERTM, and five smaller fixes. IMPLEMENTED, unverified on
-  hardware.** All six items landed, plus the AVRCP Target note at the end. The whole chain
-  now runs end to end in the tier-1 harness with no radio — SDP finds the image server past
-  the browsing channel, the L2CAP channel comes up in ERTM, OBEX connects, attribute 8 is
-  asked for *after* that, and the JPEG comes back through the retransmission engine onto
-  the now-playing card. What that does **not** prove is any of it against a real phone;
-  every fix below was derived from BlueZ's source and the profile specs, and the last time
-  a chain this long was reasoned out rather than captured (Q26) five minutes of `btmon`
-  refuted an afternoon of it. **Take the capture first.**
+- **Q29 — Cover art needs L2CAP ERTM, and five smaller fixes. IMPLEMENTED; ERTM confirmed
+  against the Linux kernel, the cover-art chain still unverified against a phone.** All six
+  items landed, plus the AVRCP Target note at the end. The whole chain runs end to end in
+  the tier-1 harness with no radio — SDP finds the image server past the browsing channel,
+  the L2CAP channel comes up in ERTM, OBEX connects, attribute 8 is asked for *after* that,
+  and the JPEG comes back through the retransmission engine onto the now-playing card.
+  **What the virtual bench then proved, 2026-07-26.** `btvirt -l2` plus BlueZ's `l2test`,
+  which is the kernel's own L2CAP driven as a peer — the Q13 pattern applied to a protocol
+  rather than a codec, and now kept as `examples/ertm_echo.rs`:
+  - **The mode is genuinely negotiated.** `l2test` reports `mode 3` — Enhanced
+    Retransmission — and the trace shows the exchange landing where the spec says it
+    should: their request carries TxWindow 63 / MaxTransmit 3 / retrans 2000 / monitor
+    12000 / MPS 180, ours carries MTU 8192, TxWindow 32, **timeouts zero** (the requester
+    does not get to pick those) and MPS 666, with a 16-bit FCS option.
+  - **Both directions of segmentation and both directions of the checksum work.** Their
+    MPS of 180 forced *us* to segment as well: three 800-byte SDUs arrived as
+    Start/Continuation×3/End and reassembled, and our 600-byte echoes went back the same
+    way and were delivered to their application intact. A wrong FCS, a wrong sequence
+    number or a wrong SAR bit stalls that rather than degrading, and it did not stall.
+  - **Our acknowledgements are accepted.** The trace shows RR with ReqSeq climbing 1..15
+    and the piggybacked ReqSeq on our own I-frames tracking their sequence correctly.
+  - **The interop risk is settled, at least for BlueZ.** It proposes
+    `Mode: Basic (0x00)` *explicitly* on the AVDTP channel — an RFC option naming basic
+    rather than an absent one — and we accept it and carry on to a full AVDTP capability
+    exchange. All four codec endpoints came back and BlueZ parsed every one of them
+    (aptX HD, aptX, AAC, SBC with the right vendor ids and parameters), which is also the
+    first time `codec.rs` has been marked by someone else's parser.
+  What the bench cannot show is the cover-art chain itself: BlueZ as a source serves no
+  image server, so OBEX-over-ERTM against a *phone* is still unproven. **Take that capture
+  before believing the artwork works.**
+  **One bug the bench found in five seconds**, which no scripted test could have: btvirt
+  answers `WriteInquiryScanType` with a command *status* of "unknown HCI command" rather
+  than a completion, and bring-up stopped dead there — no `Ready`, no `WriteScanEnable`, a
+  receiver nobody can find, and nothing in the log to say why. The comment beside that
+  command already claimed a controller without it "carries on regardless"; it did not.
+  A refusal now advances the queue exactly as a completion does.
   What each item turned out to be, now that the sources have been read rather than
   recalled:
   - **The feature bit is confirmed wrong, and the replacement confirmed right.** BlueZ's
