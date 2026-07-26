@@ -207,13 +207,48 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   reboots, and nothing needs changing. Left here as a correction rather than deleted, because
   "the receiver mints a new screen every launch" is a plausible-sounding claim that would have
   sent the next person down a hole.
-- **Q34 — YouTube's own ads are still not handled.** SponsorBlock skips community-submitted
-  segments (D29), but in-stream ads are the player's, not the database's. Two mechanisms
-  exist and neither is implemented: send the Lounge `skipAd` command once a skippable ad
-  reports `isSkipEnabled`, and mute the unskippable ones by driving volume. The first is
-  cheap and safe; the second is why this is a question rather than a task — a mute that
-  fails to lift leaves a silent display, which is worse than the ad it was hiding. Default:
-  implement `skipAd`, leave unskippable ads playing, and revisit if the room disagrees.
+- **Q34 — YouTube's own ads: `skipAd` is in, and the uBlock Origin approach does not port.**
+  `skipAd` is implemented (D29): once an ad reports `isSkipEnabled` we press the screen's own
+  skip button. Unskippable ads play and nothing is muted — a mute that failed to lift leaves
+  a silent display, worse than the ad. Still unobserved live: no skippable ad has been served
+  to a test session, though the command encoding is verified accepted.
+
+  **The obvious next step — port uBO's scriptlets and subscribe to their lists — was
+  investigated and does not do what it looks like it does.** uBO kills YouTube video ads with
+  *scriptlets*, not network rules, because the ad media streams from the same `googlevideo`
+  hosts as the content and the manifest is a field inside JSON the page already fetched.
+  Their rules (fetched 2026-07-26) rewrite the **`/player`** response:
+
+      www.youtube.com##+js(trusted-replace-fetch-response, '"adPlacements"', '"no_ads"', player?)
+      www.youtube.com##+js(trusted-replace-xhr-response, /"adPlacements.*?("adSlots"|…)/gms, $1, /\/player(?:\?.+)?$/)
+
+  Our surface is `tvhtml5`, and **it never requests `/player`.** Captured over CDP against the
+  kiosk's own CEF profile, with a video cast to it exactly as a phone would, during a session
+  where an ad *was* served (`pagead/adview` fired):
+  - the watch data comes from **`/youtubei/v1/next`** (~475–517 KB) and contains **no** ad keys
+    at all — not `adPlacements`, `playerAds`, `adSlots`, or anything matching `*[Aa]d*`;
+  - `/youtubei/v1/browse` *does* carry `adSlotRenderer`, `adSlotMetadata`,
+    `pageTopAdLayoutRenderer`, `adsControlFlowOpportunityReceivedCommand` — but those are the
+    browse feed's *display* ads, not the in-stream one;
+  - the ad-flow traffic is `static.doubleclick.net/instream/ad_status.js`,
+    `googleads.g.doubleclick.net/pagead/id`, `pagead/1p-user-list`, `pagead/adview`, and the
+    TV player bundle `tv-player-ias.vflset/tv-player-ias.js`.
+
+  So subscribing to uBO would buy the *engine* and their generic scriptlets, but their
+  YouTube rules would not match our surface — we would be authoring and maintaining
+  TV-specific rules ourselves, which is the maintenance burden subscribing was meant to
+  avoid. (`adblock` 0.13.2 does have the machinery, for whenever we want it:
+  `Engine::url_cosmetic_resources` → `injected_script`, `use_resources`, a `PermissionMask`
+  gating `trusted-*`, and a `resource_assembler` that reads uBO's repo directly. The missing
+  piece is injection *timing* — scriptlets must hook `fetch`/XHR before page scripts, which
+  needs a render-process `OnContextCreated` handler we do not have. Note uBO's scriptlet
+  bodies are GPLv3: fetch them at runtime rather than vendoring.)
+
+  **What is actually unresolved:** where the in-stream ad manifest reaches the TV player from.
+  Not `next`, not a `/player` call. Answering that is RE work for `~/re-shell` (capture a
+  session while an ad plays and follow `tv-player-ias.js`'s ad control flow), and it decides
+  whether *any* filtering approach can work here or whether `skipAd` plus patience is the
+  ceiling on this surface.
 - **Q35 — SponsorBlock rate limits are unverified.** The API's own wiki is behind bot
   protection; the numbers that surfaced during research came from a *fork's* documentation
   and were not confirmed upstream. Today's usage is one hash-prefix lookup per video change,
