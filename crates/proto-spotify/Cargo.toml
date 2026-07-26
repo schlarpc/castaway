@@ -22,6 +22,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 sha1.workspace = true
 hmac.workspace = true
+pbkdf2 = { version = "0.12", features = ["hmac"], default-features = false }
 aes.workspace = true
 ctr.workspace = true
 base64 = "0.22"

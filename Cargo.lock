@@ -3733,6 +3733,7 @@ dependencies = [
  "librespot-playback",
  "num-bigint",
  "num-traits",
+ "pbkdf2",
  "rand 0.8.7",
  "serde",
  "serde_json",

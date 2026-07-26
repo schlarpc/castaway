@@ -131,6 +131,92 @@ pub fn encrypt_blob(
     Ok(out)
 }
 
+/// Build the *inner* credentials blob — the one a real Spotify sender wraps and posts to
+/// `addUser`, and the one librespot's `Credentials::with_blob` unwraps.
+///
+/// This is the encoder for a format we otherwise only ever decode, and it exists to make
+/// the pairing path testable end to end: with it, a scripted sender can pair with the
+/// receiver, and our understanding of the layout can be checked against librespot's real
+/// decoder rather than against our own decoder (OPEN-QUESTIONS Q10). That is a genuine
+/// cross-implementation check — librespot's side was derived from real senders.
+///
+/// Layout, mirroring the reader exactly: a discarded byte, a discarded length-prefixed
+/// field, a discarded byte, the varint auth type, a discarded byte, then the credential
+/// bytes. The result is zero-padded to a whole AES block, because the decoder walks
+/// `chunks_exact(16)` and would silently leave a trailing partial block encrypted.
+///
+/// # Errors
+/// [`SpotifyError::Crypto`] if key derivation fails.
+pub fn encode_credentials_blob(
+    username: &str,
+    device_id: &str,
+    auth_type: u32,
+    auth_data: &[u8],
+) -> Result<Vec<u8>, SpotifyError> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+
+    let mut plain = Vec::new();
+    plain.push(b'I');
+    write_bytes(&mut plain, username.as_bytes());
+    plain.push(b'P');
+    write_int(&mut plain, auth_type);
+    plain.push(b'Q');
+    write_bytes(&mut plain, auth_data);
+    // Pad to a whole block. Content beyond what the reader consumes is ignored, so zeros
+    // are safe; leaving a partial block is not.
+    while plain.len() % 16 != 0 {
+        plain.push(0);
+    }
+
+    // The chaining step, run backwards. The decoder walks `i` upward applying
+    // `data[l-i-1] ^= data[l-i-0x11]`, and each source byte is itself rewritten later in
+    // that same loop — so inverting it means replaying the identical operation with `i`
+    // descending, not XOR-ing in the same order.
+    let l = plain.len();
+    for i in (0..l.saturating_sub(0x10)).rev() {
+        plain[l - i - 1] ^= plain[l - i - 0x11];
+    }
+
+    let key = blob_key(username, device_id)?;
+    let cipher =
+        aes::Aes192::new_from_slice(&key).map_err(|_| SpotifyError::Crypto("bad AES-192 key"))?;
+    for chunk in plain.chunks_exact_mut(16) {
+        cipher.encrypt_block(chunk.into());
+    }
+    Ok(plain)
+}
+
+/// Derive the AES-192 key that wraps the inner blob: PBKDF2-SHA1 over `SHA1(device_id)`
+/// salted with the username, then hashed again, with the length appended.
+fn blob_key(username: &str, device_id: &str) -> Result<[u8; 24], SpotifyError> {
+    let secret = Sha1::digest(device_id.as_bytes());
+    let mut key = [0u8; 24];
+    pbkdf2::pbkdf2_hmac::<Sha1>(&secret, username.as_bytes(), 0x100, &mut key[0..20]);
+    let hash = Sha1::digest(&key[..20]);
+    key[..20].copy_from_slice(&hash);
+    key[20..].copy_from_slice(&20u32.to_be_bytes());
+    Ok(key)
+}
+
+/// The reader's variable-length integer: seven bits per byte, low byte first, high bit
+/// meaning "one more byte follows". Only ever two bytes wide in practice.
+fn write_int(out: &mut Vec<u8>, value: u32) {
+    #[allow(clippy::cast_possible_truncation)]
+    if value < 0x80 {
+        out.push(value as u8);
+    } else {
+        out.push((value & 0x7f) as u8 | 0x80);
+        out.push((value >> 7) as u8);
+    }
+}
+
+/// A length-prefixed byte string, where the length is a [`write_int`].
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    #[allow(clippy::cast_possible_truncation)]
+    write_int(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
 fn hmac_sha1(key: &[u8], msg: &[u8]) -> Result<Vec<u8>, SpotifyError> {
     let mut mac = <HmacSha1 as Mac>::new_from_slice(key)
         .map_err(|_| SpotifyError::Crypto("invalid HMAC key length"))?;
@@ -151,6 +237,7 @@ fn left_pad(bytes: &[u8], len: usize) -> Vec<u8> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn dh_parties_agree_on_secret() {
@@ -189,5 +276,65 @@ mod tests {
     #[test]
     fn short_blob_rejected() {
         assert!(decrypt_blob(&[0u8; 10], &[0u8; 96]).is_err());
+    }
+
+    /// The check Q10 actually wants, as far as it can be had without a phone.
+    ///
+    /// Every other test in this file round-trips our own code against itself, which
+    /// cannot catch a misunderstanding of the format — only an inconsistency. This one
+    /// hands our encoder's output to *librespot's* decoder, which was derived from real
+    /// senders. It still is not a captured `addUser`, but it is a second opinion.
+    #[test]
+    fn our_inner_blob_is_one_librespot_can_read() {
+        use librespot_core::authentication::Credentials;
+
+        const DEVICE_ID: &str = "0f8c2e10castaway0001000000000001";
+        // AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS — what a real pairing carries.
+        const STORED: u32 = 1;
+        let auth_data = b"reusable-credential-bytes-from-an-APWelcome".to_vec();
+
+        let blob = encode_credentials_blob("alice", DEVICE_ID, STORED, &auth_data).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+
+        let creds = Credentials::with_blob("alice", &b64, DEVICE_ID)
+            .expect("librespot should decode a blob we encoded");
+        assert_eq!(creds.username.as_deref(), Some("alice"));
+        assert_eq!(creds.auth_data, auth_data);
+    }
+
+    #[test]
+    fn the_blob_key_is_bound_to_the_device_and_the_user() {
+        // Both are inputs to the derivation, so a receiver that advertised one device id
+        // and decrypted with another gets an unreadable blob — the failure mode that
+        // looks exactly like "pairing expired" from the phone.
+        use librespot_core::authentication::Credentials;
+
+        let blob = encode_credentials_blob("alice", "device-one", 1, b"creds").unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
+        assert!(Credentials::with_blob("alice", &b64, "device-two").is_err());
+        assert!(Credentials::with_blob("bob", &b64, "device-one").is_err());
+        assert!(Credentials::with_blob("alice", &b64, "device-one").is_ok());
+    }
+
+    #[test]
+    fn a_full_pairing_survives_both_layers() {
+        // The whole sender path: build the inner blob, wrap it the way a phone wraps it
+        // (DH + AES-CTR + HMAC), then unwrap with the receiver's key and decode.
+        use librespot_core::authentication::Credentials;
+
+        const DEVICE_ID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let receiver = DhKeys::from_private_bytes(&[4u8; 95]);
+        let phone = DhKeys::from_private_bytes(&[6u8; 95]);
+        let shared = phone.shared_secret(&receiver.public_key());
+
+        let inner = encode_credentials_blob("alice", DEVICE_ID, 1, b"creds").unwrap();
+        let outer = encrypt_blob(&inner, &shared, &[7u8; 16]).unwrap();
+
+        let recovered = decrypt_blob(&outer, &receiver.shared_secret(&phone.public_key())).unwrap();
+        assert_eq!(recovered, inner);
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&recovered);
+        let creds = Credentials::with_blob("alice", &b64, DEVICE_ID).unwrap();
+        assert_eq!(creds.auth_data, b"creds");
     }
 }
