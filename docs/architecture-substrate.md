@@ -302,7 +302,7 @@ Two things make this smaller than it sounds:
 ```
 substrate-hci/        HCI packet codec (cmd/event/ACL) + the HciTransport trait
 hci-transport/        The backends: Linux HCI_CHANNEL_USER socket, USB/WinUSB via nusb
-substrate-l2cap/      BR/EDR L2CAP: signaling, basic-mode channels, PSM routing
+substrate-l2cap/      BR/EDR L2CAP: signaling, basic + ERTM channels, PSM routing
 substrate-sdp/        SDP data elements, record server, minimal client
 proto-bluetooth-audio/  AVDTP/A2DP + AVCTP/AVRCP + OBEX-BIP cover art
 ```
@@ -625,7 +625,7 @@ need a real phone, or `mpris-proxy` with a player behind it.
  A2DP sink                     AVRCP CT/TG              cover art
  (AVDTP, PSM 0x19)             (AVCTP, PSM 0x17)        (OBEX/BIP, PSM from SDP)
         └──────────────┬────────────────┴────────────────────┘
-                  L2CAP (BR/EDR basic mode)
+                  L2CAP (BR/EDR: basic mode, ERTM for cover art)
                        │
                   HCI ACL / events
                        │
@@ -641,9 +641,17 @@ need a real phone, or `mpris-proxy` with a player behind it.
   (`RegisterNotification`), and takes passthrough commands (play/pause/next/previous) plus
   absolute volume. Both directions matter — see §11.5.
 - **Cover art** is AVRCP 1.6: metadata attribute **8** carries a BIP image handle, fetched by
-  OBEX `GET` (`GetLinkedThumbnail`/`GetImage`) over a *separate* L2CAP channel to the PSM
-  found via SDP. Art arrives asynchronously after the track change, so it is a second event,
-  never part of an atomic track update.
+  OBEX `GET` (`GetLinkedThumbnail`) over a *separate* L2CAP channel to the PSM found via SDP
+  — the one whose second protocol layer is OBEX, since a phone publishes its AVCTP browsing
+  channel in the same list and browsing comes first. That channel runs in **Enhanced
+  Retransmission Mode**: AVRCP 1.6.3 §14 requires GOEP 2.0 and GOEP §7.1.2 requires ERTM, so
+  a basic-mode channel here is refused (Q29). Audio stays in basic mode — A2DP has no use for
+  retransmission, and the mode is decided per PSM before either end proposes anything.
+  The OBEX session is opened when AVCTP connects and held for the life of the link, *before*
+  attribute 8 is ever asked for: a Target strips the image handle from its response when no
+  BIP client is connected, so waiting to see a handle before connecting waits forever.
+  Art arrives asynchronously after the track change, so it is a second event, never part of
+  an atomic track update.
 
 ### 11.5 What this forces into `core` (the new interface)
 
@@ -678,7 +686,7 @@ Alongside it, two additions the existing enums can't express:
 ### 11.6 Audio output
 
 **Image decode for cover art:** JPEG is effectively the only format on this path. BIP fixes
-the *linked thumbnail* (`x-bt/img-thumb`) at 200×200 JPEG with no descriptor to negotiate,
+the *linked thumbnail* (`x-bt/img-thm`) at 200×200 JPEG with no descriptor to negotiate,
 which is why we fetch that rather than `x-bt/img-img` — the full-image form requires
 describing the exact encoding and dimensions wanted, and responders disagree. General decode
 still costs nothing, because ffmpeg is already linked for audio and brings `mjpeg`/`png`/

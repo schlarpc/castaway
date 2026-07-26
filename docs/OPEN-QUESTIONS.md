@@ -386,7 +386,41 @@ the reasons are what a future reversal has to argue against.
   set `CONTROLLER_SUPPORTS_COVER_ART` in the SDP record and then only `debug!` the image
   handle a peer sends back, so album art is advertised and never fetched.
 
-- **Q29 — Cover art needs L2CAP ERTM, and five smaller fixes. OPEN, blocked on ERTM.**
+- **Q29 — Cover art needs L2CAP ERTM, and five smaller fixes. IMPLEMENTED, unverified on
+  hardware.** All six items landed, plus the AVRCP Target note at the end. The whole chain
+  now runs end to end in the tier-1 harness with no radio — SDP finds the image server past
+  the browsing channel, the L2CAP channel comes up in ERTM, OBEX connects, attribute 8 is
+  asked for *after* that, and the JPEG comes back through the retransmission engine onto
+  the now-playing card. What that does **not** prove is any of it against a real phone;
+  every fix below was derived from BlueZ's source and the profile specs, and the last time
+  a chain this long was reasoned out rather than captured (Q26) five minutes of `btmon`
+  refuted an afternoon of it. **Take the capture first.**
+  What each item turned out to be, now that the sources have been read rather than
+  recalled:
+  - **The feature bit is confirmed wrong, and the replacement confirmed right.** BlueZ's
+    `profiles/audio/avrcp.c` has `AVRCP_FEATURE_BROWSING 0x0040` — bit 6, exactly what we
+    were setting for cover art — and `CT_GET_IMAGE_PROP 0x0080` / `CT_GET_IMAGE 0x0100` /
+    `CT_GET_THUMBNAIL 0x0200` at bits 7, 8 and 9. The Controller and Target records do not
+    share a layout past the categories: the Target's cover-art bit is `0x0100`, which is
+    `GetImage` in a Controller record. We claim bit 9 only, since the thumbnail is the one
+    operation we know how to ask for.
+  - **`x-bt/img-thm` and Img-Handle `0x30` both confirmed** against `obexd/client/bip.c`.
+    The handle header is the subtle one: `Name` and `Img-Handle` are both length-prefixed
+    UTF-16 headers, so putting the handle in `Name` encodes perfectly, reads back
+    perfectly, and produces a GET that named no image at all.
+  - **The PSM selection is the same test BlueZ makes** — walk the additional descriptor
+    list for the stack containing an OBEX UUID, then take *that* stack's L2CAP port.
+  - **ERTM converges only if the negotiation is asymmetric.** Both ends propose at once,
+    and the first implementation had both sides adopting whatever the other asked for,
+    which swaps modes forever and never opens the channel. The rule that works: the side
+    that listened holds the mode its service was registered with, the side that dialled
+    adapts. Audio is registered basic, so a sender that now sees the ERTM bit and proposes
+    it for AVDTP gets a counter-proposal rather than a refusal.
+  - **Advertising ERTM is not free**, and this is the interop risk to watch on the bench:
+    the extended-features mask now says bit 3, so senders that previously did not bother
+    may start proposing ERTM for the *audio* channels. They should fall back — AOSP and
+    BlueZ both do — but "should" is the word that cost Q26 an afternoon.
+  Original research below, kept because the reasoning is what made the fixes findable.
   Researched after an iPhone streamed happily and never sent an image handle. The easy
   conclusion — "iOS does not do AVRCP cover art" — is **wrong**, and worth recording as
   wrong because it is the third time today that "the peer does not support it" turned out
@@ -399,35 +433,44 @@ the reasons are what a future reversal has to argue against.
   Accessory Design Guidelines say AVRCP 1.4 and never mention cover art, routing artwork
   through iAP2 — which is where the folklore comes from. iAP2 and CarPlay are separate
   mechanisms we cannot and need not use.
-  **The blocker is ours.** AVRCP 1.6.3 §14 requires GOEP 2.0 for cover art transfer, and
+  **The blocker was ours.** AVRCP 1.6.3 §14 requires GOEP 2.0 for cover art transfer, and
   GOEP §7.1.2 requires the OBEX channel to be configured for **Enhanced Retransmission
-  Mode**. `substrate-l2cap` is basic mode only: it answers the extended-features
-  InformationRequest with a zero mask and refuses by name any non-ignorable config option
-  it does not implement. So when a peer tries to configure the cover-art channel for ERTM
-  we reject it, and every other fix below only gets us as far as that refusal. This also
+  Mode**. `substrate-l2cap` was basic mode only: it answered the extended-features
+  InformationRequest with a zero mask and refused by name any non-ignorable config option
+  it did not implement. So when a peer tried to configure the cover-art channel for ERTM
+  we rejected it, and every other fix below only got us as far as that refusal. This also
   explains Apple Developer Forums 786623, where an iPhone SE advertises Cover Art, OBEX
   CONNECT gets no answer, and "l2cap s-frame response always failed" — S-frames are ERTM.
-  Ordered by dependency:
-  1. **ERTM in `substrate-l2cap`** — the hard one, and it gates the rest.
-  2. `record.rs` — `CONTROLLER_SUPPORTS_COVER_ART = 1 << 6` is reportedly *Supports
-     browsing*, not cover art; cover art is said to be `1 << 9` (GetLinkedThumbnail).
-     Unverified against the spec text here — check before changing, since claiming
-     browsing we do not implement is its own bug.
-  3. `record.rs` — the Controller record's ServiceClassIDList omits `0x110E`.
-  4. `adapter.rs` — OBEX must connect *before* attribute 8 is requested. AOSP's target
-     strips attribute 8 from a response when no BIP client is connected, so the current
-     order can never see a handle even once the rest works.
-  5. `obex.rs` — the type is `x-bt/img-thm` and the handle belongs in the Img-Handle
-     header (0x30), not the OBEX Name header.
-  6. `client.rs::cover_art_psm` — takes the first L2CAP PSM it finds, which on iOS is the
-     *browsing* PSM. It must select the protocol stack whose second layer is OBEX.
+  Ordered by dependency, with what each became:
+  1. **ERTM in `substrate-l2cap`** — the hard one, and it gated the rest. Landed as
+     `ertm.rs`: control field, SAR, CRC-16 FCS over the basic header, REJ/SREJ/RNR, the
+     send window, and the poll ⇄ final exchange, with time passed in by `tick` rather than
+     read from a clock so the retransmission path is a unit test.
+  2. `record.rs` — done, bit 9, and bit 6 is now named `CONTROLLER_SUPPORTS_BROWSING` so
+     the next person cannot set it by accident.
+  3. `record.rs` — done, the Controller record lists `0x110E` and `0x110F`.
+  4. `adapter.rs` — done, and it made the OBEX client a *session*: opened when AVCTP
+     connects, held across tracks, with the metadata asked for twice — the text
+     immediately, so the card does not wait on an SDP query and a second channel, then the
+     full set once BIP is up.
+  5. `obex.rs` — done, both halves.
+  6. `client.rs::cover_art_psm` — done, via `ServiceRecord::l2cap_psm_under`.
   Also noted, unrelated to fetching: our AVRCP **Target** side should tolerate attribute 8
   in an inbound GetElementAttributes and skip ids it does not know rather than reject the
-  PDU — real GM and Hyundai-Kia head units enumerate 1..=8 unconditionally.
-  No public iPhone `0x110C` SDP dump appears to exist anywhere. Capturing one in
-  `~/re-shell` (BlueZ >= 5.81, `bluetoothd --experimental`, `mpris-proxy`, `btmon`) would
-  give both a golden SDP record and a live attribute-8 response — fixtures that do not
-  currently exist publicly, which is exactly what rule 9 asks for.
+  PDU — real GM and Hyundai-Kia head units enumerate 1..=8 unconditionally. **Done, and it
+  was worse than "should".** Nothing separated commands from responses, so an inbound
+  GetElementAttributes *command* was parsed as a response — its eight-byte track
+  identifier reading as an attribute count of zero — and a head unit asking us what was
+  playing silently emptied the card the phone had just filled in.
+  **Still open: the capture.** No public iPhone `0x110C` SDP dump appears to exist
+  anywhere. Taking one in `~/re-shell` (BlueZ >= 5.81, `bluetoothd --experimental`,
+  `mpris-proxy`, `btmon`) would give both a golden SDP record and a live attribute-8
+  response — fixtures that do not currently exist publicly, which is exactly what rule 9
+  asks for, and the only thing that will confirm any of the above. What to look for, in
+  order: does the phone's extended-features response come back with ERTM set; does our
+  configuration request for the image PSM get Success rather than a counter-proposal; does
+  OBEX CONNECT get an answer; and does the metadata response *after* that answer carry
+  attribute 8 when the one before it did not.
 
 - **Q30 — Tapping the composited output: screenshots now, HLS/DASH later. PHASE 1 LANDED.**
   Two wants with one root: a screenshot endpoint (so the panel can be inspected remotely,
