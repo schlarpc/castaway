@@ -160,13 +160,15 @@ fn configuration_reports_the_codec_and_rate_the_decoder_needs() {
     let configured = events
         .iter()
         .find_map(|e| match e {
-            SinkEvent::Configured {
-                codec, sample_rate, ..
-            } => Some((*codec, *sample_rate)),
+            SinkEvent::Configured { codec, format, .. } => Some((*codec, *format)),
             _ => None,
         })
         .expect("configuration must report what to decode with");
-    assert_eq!(configured, (AudioCodec::Ldac, 48_000));
+    // Both halves matter: Q25 was the rate reaching the log and not the decoder, and a
+    // channel count that came from a default rather than the negotiation is the same bug.
+    assert_eq!(configured.0, AudioCodec::Ldac);
+    assert_eq!(configured.1.sample_rate(), 48_000);
+    assert_eq!(configured.1.channels(), 2);
 }
 
 #[test]

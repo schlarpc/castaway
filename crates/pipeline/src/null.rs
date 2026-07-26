@@ -69,8 +69,12 @@ impl Pipeline for NullPipeline {
         Ok(())
     }
 
-    async fn play_audio(&self, source: FrameSource) -> Result<(), CoreError> {
-        info!("null pipeline: AUDIO begin");
+    async fn play_audio(
+        &self,
+        source: FrameSource,
+        format: castaway_core::AudioFormat,
+    ) -> Result<(), CoreError> {
+        info!(%format, "null pipeline: AUDIO begin");
         Self::drain(source, "audio");
         Ok(())
     }

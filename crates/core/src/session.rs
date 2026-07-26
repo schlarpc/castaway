@@ -128,10 +128,13 @@ impl<P: Pipeline> SessionManager<P> {
                 info!(%source, "session: mirror");
                 self.pipeline.mirror(video, audio).await
             }
-            SessionEvent::Audio { source: frames } => {
+            SessionEvent::Audio {
+                source: frames,
+                format,
+            } => {
                 self.begin_session(&source).await?;
-                info!(%source, "session: audio");
-                self.pipeline.play_audio(frames).await
+                info!(%source, %format, "session: audio");
+                self.pipeline.play_audio(frames, format).await
             }
             SessionEvent::NowPlaying(snapshot) => {
                 if self.active.as_ref() == Some(&source) {
@@ -240,6 +243,7 @@ mod tests {
         stop: AtomicUsize,
         control: AtomicUsize,
         audio: AtomicUsize,
+        audio_format: std::sync::Mutex<Option<crate::types::AudioFormat>>,
         snapshots: std::sync::Mutex<Vec<crate::NowPlaying>>,
         description: std::sync::Mutex<SourceDescription>,
     }
@@ -260,8 +264,13 @@ mod tests {
         ) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn play_audio(&self, _s: crate::types::FrameSource) -> Result<(), CoreError> {
+        async fn play_audio(
+            &self,
+            _s: crate::types::FrameSource,
+            format: crate::types::AudioFormat,
+        ) -> Result<(), CoreError> {
             self.0.audio.fetch_add(1, Ordering::SeqCst);
+            *self.0.audio_format.lock().expect("poisoned") = Some(format);
             Ok(())
         }
         async fn now_playing(&self, snapshot: crate::NowPlaying) -> Result<(), CoreError> {
@@ -386,6 +395,8 @@ mod tests {
             source: src.clone(),
             event: SessionEvent::Audio {
                 source: crate::types::FrameSource::Encoded(rx),
+                format: crate::types::AudioFormat::from_hz(48_000, 2)
+                    .expect("48 kHz stereo is a format"),
             },
         }
     }
@@ -398,6 +409,12 @@ mod tests {
         let src = SourceId::new(ProtocolKind::Bluetooth, "aa:bb:cc:dd:ee:ff");
         mgr.handle(audio_msg(&src)).await.unwrap();
         assert_eq!(counts.audio.load(Ordering::SeqCst), 1);
+        // Q25: the negotiated rate must survive the trip to the pipeline. Losing it here
+        // is inaudible in a test and plays 9% slow on a real 48 kHz aptX stream.
+        assert_eq!(
+            *counts.audio_format.lock().unwrap(),
+            crate::types::AudioFormat::from_hz(48_000, 2),
+        );
 
         // Text first, artwork second — the two-snapshot shape cover art actually has.
         let text = crate::NowPlaying::default()

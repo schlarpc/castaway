@@ -231,14 +231,22 @@ the reasons are what a future reversal has to argue against.
   the rocker in your hand works. Bidirectional sync was rejected: the phone's 0–127 scale and
   our 0.0–1.0 gain round differently, and two ends mirroring each other chase the rounding.
 
-- **Q25 — The negotiated sample rate never reaches the decoder.** Found on hardware: BlueZ
-  negotiated **aptX at 48 kHz**, but `audio_session::run` builds its decoder with
-  `AudioStreamFormat::default()` — 44.1 kHz. aptX carries no in-band rate, so the decoder
-  believes what it is told and the stream would play ~9% slow, at the wrong pitch, with
-  nothing in any log. The rate is known at `SinkEvent::Configured` and has to travel with
-  the frames. `SessionEvent::Audio` carries only a `FrameSource`, so this needs either a
-  format field on that event or a rate on `EncodedFrame`. Default: put it on the event,
-  since it is a property of the session rather than of each frame.
+- **Q25 — The negotiated sample rate never reaches the decoder. FIXED.** Found on
+  hardware: BlueZ negotiated **aptX at 48 kHz**, but `audio_session::run` built its
+  decoder with `AudioStreamFormat::default()` — 44.1 kHz. aptX carries no in-band rate,
+  so the decoder believes what it is told and the stream played ~9% slow, at the wrong
+  pitch, with nothing in any log.
+  Fixed as proposed: the format rides on the event, since it is a property of the session
+  rather than of each frame. `castaway_core::AudioFormat` (non-zero rate and channel
+  count) now travels `CodecCapability::format()` → `SinkEvent::Configured` →
+  `SessionEvent::Audio { format }` → `Pipeline::play_audio(source, format)` →
+  `audio_session::run`. The type deliberately has **no `Default`** — that impl was the
+  bug, not the call site — so there is no longer a way to obtain a format without stating
+  both numbers. The end-to-end adapter test now negotiates 48 kHz rather than 44.1 so a
+  regression fails instead of coincidentally matching the old default.
+  Also fixed alongside: a configuration that resolved to a rate but not to a single
+  channel mode used to be accepted and then decoded as stereo; `CodecCapability::format()`
+  requires both and the sink rejects with `INVALID_CODEC_PARAMETER` otherwise.
 
 - **Q26 — AVDTP START never arrives from BlueZ.** The live two-radio test gets as far as
   aptX/48 kHz configured and the second (media transport) L2CAP channel open, and then

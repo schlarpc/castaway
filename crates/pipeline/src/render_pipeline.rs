@@ -172,7 +172,11 @@ impl Pipeline for RenderPipeline {
         }
     }
 
-    async fn play_audio(&self, source: FrameSource) -> Result<(), CoreError> {
+    async fn play_audio(
+        &self,
+        source: FrameSource,
+        format: castaway_core::AudioFormat,
+    ) -> Result<(), CoreError> {
         #[cfg(feature = "audio")]
         {
             let FrameSource::Encoded(rx) = source else {
@@ -180,12 +184,12 @@ impl Pipeline for RenderPipeline {
                     "an audio session must arrive as encoded frames".into(),
                 ));
             };
-            crate::audio_session::spawn(rx, crate::audio_session::default_output());
+            crate::audio_session::spawn(rx, format, crate::audio_session::default_output());
             Ok(())
         }
         #[cfg(not(feature = "audio"))]
         {
-            let _ = source;
+            let _ = (source, format);
             // A typed refusal rather than a silent success: a build without the `audio`
             // feature has no decoder at all, and a phone that pairs, streams and plays
             // to silence is the worst possible thing to diagnose.

@@ -11,7 +11,7 @@ use crate::error::CoreError;
 use crate::event::ControlTxn;
 use crate::nowplaying::NowPlaying;
 use crate::source::SourceDescription;
-use crate::types::{FrameSource, MediaUri};
+use crate::types::{AudioFormat, FrameSource, MediaUri};
 
 /// The media/render backend the session drives. One active session maps to one set of
 /// these calls. Kept minimal and codec/GPU-agnostic so the session layer stays pure.
@@ -30,12 +30,16 @@ pub trait Pipeline: Send + Sync {
     async fn mirror(&self, video: FrameSource, audio: Option<FrameSource>)
         -> Result<(), CoreError>;
 
-    /// Begin a live audio-only session: decode `source` and play it out, with the screen
-    /// showing the now-playing surface rather than video.
+    /// Begin a live audio-only session: decode `source` at `format` and play it out,
+    /// with the screen showing the now-playing surface rather than video.
+    ///
+    /// `format` is not optional and has no default: aptX and aptX HD carry no in-band
+    /// configuration, so the negotiated rate has to arrive from the adapter or the stream
+    /// plays at the wrong pitch (OPEN-QUESTIONS Q25).
     ///
     /// # Errors
     /// [`CoreError::Pipeline`] if the audio session can't be established.
-    async fn play_audio(&self, source: FrameSource) -> Result<(), CoreError>;
+    async fn play_audio(&self, source: FrameSource, format: AudioFormat) -> Result<(), CoreError>;
 
     /// Update the now-playing surface. Called with a full snapshot whenever any part of
     /// the metadata changes, including artwork arriving after the text.

@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::control::RemoteControl;
 use crate::nowplaying::NowPlaying;
 use crate::source::SourceDescription;
-use crate::types::{FrameSource, MediaUri};
+use crate::types::{AudioFormat, FrameSource, MediaUri};
 
 /// What an adapter needs advertised on the network to be discoverable.
 ///
@@ -104,6 +104,13 @@ pub enum SessionEvent {
     Audio {
         /// Encoded audio frames from the adapter.
         source: FrameSource,
+        /// The rate and channel count the adapter negotiated.
+        ///
+        /// On the event rather than on each [`crate::EncodedFrame`] because it is a
+        /// property of the *session*: it is settled once, at configuration, and a codec
+        /// that carries no in-band rate (aptX, aptX HD) gives the decoder no other way to
+        /// learn it (OPEN-QUESTIONS Q25).
+        format: AudioFormat,
     },
     /// Track metadata for the now-playing surface — a full snapshot, re-emitted whenever
     /// any part of it changes (including artwork arriving late).

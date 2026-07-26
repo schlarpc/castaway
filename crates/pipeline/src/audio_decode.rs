@@ -8,14 +8,14 @@
 //! Two of these codecs have **no in-band configuration at all**: aptX and aptX HD are raw
 //! sample streams with no header, so the decoder cannot discover the sample rate or
 //! channel count and must be told. Those come from the AVDTP negotiation, which is
-//! exactly why [`AudioStreamFormat`] is a parameter here rather than something sniffed.
+//! exactly why [`AudioFormat`] is a parameter here rather than something sniffed.
 //! Getting it wrong plays the stream at the wrong pitch instead of failing.
 #![allow(unsafe_code)]
 
 use std::sync::Once;
 use std::time::Duration;
 
-use castaway_core::{AudioCodec, EncodedFrame};
+use castaway_core::{AudioCodec, AudioFormat, EncodedFrame};
 use ffmpeg_next as ffmpeg;
 use tracing::{debug, warn};
 
@@ -31,24 +31,6 @@ fn ensure_init() {
 
 fn map_err(e: ffmpeg::Error) -> PipelineError {
     PipelineError::Decode(e.to_string())
-}
-
-/// The stream shape the AVDTP negotiation settled on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioStreamFormat {
-    /// Sample rate in Hz.
-    pub sample_rate: u32,
-    /// Channel count.
-    pub channels: u16,
-}
-
-impl Default for AudioStreamFormat {
-    fn default() -> Self {
-        Self {
-            sample_rate: 44_100,
-            channels: 2,
-        }
-    }
 }
 
 /// A block of decoded audio.
@@ -121,7 +103,7 @@ pub fn can_decode(codec: AudioCodec) -> bool {
 /// An open decoder for one A2DP stream.
 pub struct AudioDecoder {
     decoder: ffmpeg::decoder::Audio,
-    format: AudioStreamFormat,
+    format: AudioFormat,
     codec: AudioCodec,
 }
 
@@ -140,7 +122,7 @@ impl AudioDecoder {
     /// # Errors
     /// [`PipelineError::Decode`] if this build has no decoder for the codec, or the
     /// decoder refuses to open.
-    pub fn new(codec: AudioCodec, format: AudioStreamFormat) -> Result<Self, PipelineError> {
+    pub fn new(codec: AudioCodec, format: AudioFormat) -> Result<Self, PipelineError> {
         ensure_init();
         let id = codec_id(codec)?;
         let found = ffmpeg::decoder::find(id).ok_or_else(|| {
@@ -164,10 +146,10 @@ impl AudioDecoder {
             // on this ffmpeg. Nothing is read back until `open_as` below.
             unsafe {
                 let raw = context.as_mut_ptr();
-                (*raw).sample_rate = i32::try_from(format.sample_rate).unwrap_or(44_100);
+                (*raw).sample_rate = i32::try_from(format.sample_rate()).unwrap_or(44_100);
                 ffmpeg_sys_next::av_channel_layout_default(
                     std::ptr::addr_of_mut!((*raw).ch_layout),
-                    i32::from(format.channels.max(1)),
+                    i32::from(format.channels()),
                 );
             }
         }
@@ -187,7 +169,7 @@ impl AudioDecoder {
 
     /// The format the stream was negotiated at.
     #[must_use]
-    pub const fn format(&self) -> AudioStreamFormat {
+    pub const fn format(&self) -> AudioFormat {
         self.format
     }
 
@@ -317,7 +299,7 @@ impl AudioDecoder {
 /// [`PipelineError::Decode`] if the decoder cannot be opened at all.
 pub fn decode_audio_stream<N, F>(
     codec: AudioCodec,
-    format: AudioStreamFormat,
+    format: AudioFormat,
     mut next: N,
     mut on_pcm: F,
 ) -> Result<(), PipelineError>
@@ -353,6 +335,11 @@ pub(crate) fn warn_undecodable(codec: AudioCodec) {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// A negotiated format, for tests that already know both numbers are sane.
+    fn format(sample_rate: u32, channels: u16) -> AudioFormat {
+        AudioFormat::from_hz(sample_rate, channels).unwrap()
+    }
 
     /// A one-second 440 Hz sine at `rate`, interleaved stereo.
     fn sine(rate: u32, frames: usize) -> Vec<i16> {
@@ -517,14 +504,7 @@ mod tests {
 
         let mut decoded: Vec<f32> = Vec::new();
         let mut format = None;
-        let mut decoder = AudioDecoder::new(
-            AudioCodec::AptX,
-            AudioStreamFormat {
-                sample_rate: rate,
-                channels: 2,
-            },
-        )
-        .unwrap();
+        let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(rate, 2)).unwrap();
         for frame in &frames {
             decoder
                 .decode(frame, |block| {
@@ -567,7 +547,7 @@ mod tests {
         let mut decoded = Vec::new();
         // SBC is self-describing, so the negotiated format is not needed to open it —
         // but passing the wrong one must not break it either.
-        let mut decoder = AudioDecoder::new(AudioCodec::Sbc, AudioStreamFormat::default()).unwrap();
+        let mut decoder = AudioDecoder::new(AudioCodec::Sbc, format(44_100, 2)).unwrap();
         for frame in &frames {
             decoder
                 .decode(frame, |b| decoded.extend_from_slice(&b.samples))
@@ -585,14 +565,7 @@ mod tests {
     #[test]
     fn a_corrupt_packet_is_skipped_rather_than_ending_the_session() {
         // One bad packet off a radio link must not take the music down.
-        let mut decoder = AudioDecoder::new(
-            AudioCodec::AptX,
-            AudioStreamFormat {
-                sample_rate: 44_100,
-                channels: 2,
-            },
-        )
-        .unwrap();
+        let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(44_100, 2)).unwrap();
         let garbage = EncodedFrame {
             video_codec: None,
             audio_codec: Some(AudioCodec::AptX),
@@ -610,7 +583,7 @@ mod tests {
         if cfg!(feature = "ldac") {
             return;
         }
-        let err = AudioDecoder::new(AudioCodec::Ldac, AudioStreamFormat::default()).unwrap_err();
+        let err = AudioDecoder::new(AudioCodec::Ldac, format(44_100, 2)).unwrap_err();
         assert!(format!("{err}").contains("ldac"), "got: {err}");
         assert!(!can_decode(AudioCodec::Ldac));
     }

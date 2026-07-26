@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use castaway_core::{
-    Advertisement, CoreError, EncodedFrame, FrameSource, NowPlaying, ProtocolKind, SessionEvent,
-    SessionSink, SourceAdapter, SourceDescription,
+    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, NowPlaying, ProtocolKind,
+    SessionEvent, SessionSink, SourceAdapter, SourceDescription,
 };
 use substrate_hci::{
     AclPacket, BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, PacketBoundary,
@@ -101,6 +101,9 @@ struct Link {
     avdtp_media: Option<Cid>,
     avctp: Option<Cid>,
     depacketizer: Option<Depacketizer>,
+    /// What AVDTP negotiated, held from SET_CONFIGURATION until START. aptX carries no
+    /// in-band rate, so this is the decoder's only source of it (OPEN-QUESTIONS Q25).
+    audio_format: Option<AudioFormat>,
     audio_tx: Option<mpsc::Sender<EncodedFrame>>,
     /// Whether a `SessionEvent::Audio` has already been emitted for this link.
     session_open: bool,
@@ -128,6 +131,7 @@ impl Link {
             avdtp_media: None,
             avctp: None,
             depacketizer: None,
+            audio_format: None,
             audio_tx: None,
             session_open: false,
             now_playing: NowPlaying::default(),
@@ -484,15 +488,24 @@ impl BluetoothAdapter {
                 SinkEvent::Reply(reply) => outbound.push(L2capPdu::new(cid, reply.encode())),
                 SinkEvent::Configured {
                     codec,
-                    sample_rate,
+                    format,
                     configuration,
                 } => {
-                    info!(?codec, sample_rate, "bluetooth: stream configured");
-                    link.depacketizer = Some(Depacketizer::new(codec, sample_rate));
+                    info!(?codec, %format, "bluetooth: stream configured");
+                    link.audio_format = Some(format);
+                    link.depacketizer = Some(Depacketizer::new(codec, format.sample_rate()));
                     link.description = std::mem::take(&mut link.description)
                         .merged(SourceDescription::new().with_link(configuration.describe()));
                 }
                 SinkEvent::Started => {
+                    // START cannot precede SET_CONFIGURATION in the sink state machine,
+                    // so a missing format means a bug here rather than a sender problem —
+                    // and starting a session without one would decode at a guessed rate,
+                    // which is exactly what Q25 was.
+                    let Some(format) = link.audio_format else {
+                        warn!("bluetooth: stream started with no negotiated format");
+                        continue;
+                    };
                     if !link.session_open {
                         let (tx, rx) = mpsc::channel(AUDIO_QUEUE_DEPTH);
                         link.audio_tx = Some(tx);
@@ -501,6 +514,7 @@ impl BluetoothAdapter {
                         link_sink
                             .emit(SessionEvent::Audio {
                                 source: FrameSource::Encoded(rx),
+                                format,
                             })
                             .await?;
                         // Only now can the description be delivered: the session
@@ -514,6 +528,7 @@ impl BluetoothAdapter {
                 SinkEvent::Closed => {
                     link.audio_tx = None;
                     link.depacketizer = None;
+                    link.audio_format = None;
                     if link.session_open {
                         link.session_open = false;
                         let link_sink = sink.with_instance(link.peer.to_string());

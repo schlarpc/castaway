@@ -366,9 +366,11 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
     let advertised = proto_bluetooth_audio::avdtp::find_codec_capability(&caps.payload).unwrap();
     assert_eq!(advertised.audio_codec(), AudioCodec::AptX);
 
-    // Configure it down to one rate and one channel mode.
+    // Configure it down to one rate and one channel mode. 48 kHz on purpose: it is what
+    // BlueZ actually picked on hardware, and it is not the rate a defaulted decoder would
+    // have guessed — which is the whole of Q25.
     let chosen = CodecCapability::AptX {
-        rates: SampleRates::HZ_44100,
+        rates: SampleRates::HZ_48000,
         channels: ChannelModes::JOINT_STEREO,
     };
     let codec = chosen.encode();
@@ -392,9 +394,17 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
 
     // The session manager should now see an audio session.
     let msg = eventually("an audio session event", || rx.try_recv().ok()).await;
-    let SessionEvent::Audio { source } = msg.event else {
+    let SessionEvent::Audio { source, format } = msg.event else {
         panic!("expected an audio session, got {:?}", msg.event);
     };
+    // The negotiated rate must reach the pipeline, not a default. aptX has no in-band
+    // rate, so getting this wrong plays the stream ~9% slow and logs nothing (Q25).
+    assert_eq!(
+        format.sample_rate(),
+        48_000,
+        "the negotiated rate must survive"
+    );
+    assert_eq!(format.channels(), 2);
     let FrameSource::Encoded(mut frames) = source else {
         panic!("audio must arrive as encoded frames");
     };

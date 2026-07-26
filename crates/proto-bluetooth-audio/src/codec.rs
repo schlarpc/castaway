@@ -11,7 +11,7 @@
 //! block a phone silently declines.
 
 use bytes::{BufMut, BytesMut};
-use castaway_core::AudioCodec;
+use castaway_core::{AudioCodec, AudioFormat};
 
 use crate::error::AudioError;
 
@@ -410,6 +410,45 @@ impl CodecCapability {
             Self::Aac { rate_bits, .. } => aac_rate_hz(*rate_bits),
             Self::Ldac { rate_bits, .. } => ldac_rate_hz(*rate_bits),
         }
+    }
+
+    /// How many channels a configuration carries, or `None` if it still names a set.
+    ///
+    /// Each codec spells this differently — SBC and the aptX pair use AVDTP channel
+    /// *modes* while AAC and LDAC use their own channel-count bitfields — so the
+    /// translation belongs here rather than at every call site.
+    #[must_use]
+    pub fn channel_count(&self) -> Option<u8> {
+        match self {
+            Self::Sbc { channels, .. }
+            | Self::AptX { channels, .. }
+            | Self::AptXHd { channels, .. } => {
+                channels.is_single().then(|| channels.channel_count())
+            }
+            // 0b10 is one channel and 0b01 is two: the AAC field counts down, not up.
+            Self::Aac { channel_bits, .. } => match channel_bits {
+                0b10 => Some(1),
+                0b01 => Some(2),
+                _ => None,
+            },
+            // Dual channel is two independently-coded channels, not one.
+            Self::Ldac { channel_bits, .. } => match channel_bits {
+                0b100 => Some(1),
+                0b010 | 0b001 => Some(2),
+                _ => None,
+            },
+        }
+    }
+
+    /// The stream shape a configuration settled on.
+    ///
+    /// `None` for an *offer* — a capability that still names a set of rates or channel
+    /// modes has no single answer. This is what the decoder must be told: aptX and aptX
+    /// HD carry no in-band configuration, so a stream decoded at the wrong rate plays at
+    /// the wrong pitch with nothing in any log (OPEN-QUESTIONS Q25).
+    #[must_use]
+    pub fn format(&self) -> Option<AudioFormat> {
+        AudioFormat::from_hz(self.sample_rate()?, u16::from(self.channel_count()?))
     }
 
     /// Encode the Media Codec capability payload (media type onward).

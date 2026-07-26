@@ -2,6 +2,7 @@
 //! bytes become rich types at the boundary and flow inward (ground rule 1).
 
 use std::fmt;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use tokio::sync::mpsc;
 
@@ -165,6 +166,65 @@ pub enum AudioCodec {
     AptXHd,
     /// Sony LDAC (A2DP vendor codec `0x012D/0x00AA`). The only one libav cannot decode.
     Ldac,
+}
+
+/// The shape of an audio stream, as the sender's negotiation settled it.
+///
+/// Deliberately has **no `Default`**. aptX and aptX HD carry no in-band configuration at
+/// all, so a decoder handed the wrong rate plays the stream at the wrong pitch with
+/// nothing in any log to say so — which is exactly what a defaultable format invites
+/// (OPEN-QUESTIONS Q25). The only way to obtain one is to state both fields, so the
+/// negotiated values have to be carried from the protocol to the decoder rather than
+/// re-guessed at the far end.
+///
+/// Both fields are non-zero because neither zero is a stream: a zero rate divides by zero
+/// in every duration calculation and zero channels has no samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFormat {
+    sample_rate: NonZeroU32,
+    channels: NonZeroU16,
+}
+
+impl AudioFormat {
+    /// A format from already-checked parts.
+    #[must_use]
+    pub const fn new(sample_rate: NonZeroU32, channels: NonZeroU16) -> Self {
+        Self {
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// A format from raw wire values, or `None` if either is zero.
+    ///
+    /// The boundary constructor: protocol code parses a rate out of a capability and
+    /// converts here, so a nonsense negotiation is refused where the peer can still be
+    /// told rather than several layers later inside a decoder.
+    #[must_use]
+    pub const fn from_hz(sample_rate: u32, channels: u16) -> Option<Self> {
+        match (NonZeroU32::new(sample_rate), NonZeroU16::new(channels)) {
+            (Some(sample_rate), Some(channels)) => Some(Self::new(sample_rate, channels)),
+            _ => None,
+        }
+    }
+
+    /// Sample rate in Hz.
+    #[must_use]
+    pub const fn sample_rate(self) -> u32 {
+        self.sample_rate.get()
+    }
+
+    /// Channel count.
+    #[must_use]
+    pub const fn channels(self) -> u16 {
+        self.channels.get()
+    }
+}
+
+impl std::fmt::Display for AudioFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} Hz × {}", self.sample_rate(), self.channels())
+    }
 }
 
 /// Decoded-frame pixel layout. `Decoded` frames carry one of these.

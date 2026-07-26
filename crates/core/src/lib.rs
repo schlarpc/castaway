@@ -31,6 +31,7 @@ pub use pipeline::Pipeline;
 pub use session::{SessionConfig, SessionManager};
 pub use source::SourceDescription;
 pub use types::{
-    AudioCodec, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame, FrameImage,
-    FrameSource, FriendlyName, GpuSurface, MediaUri, PixelFormat, ProtocolKind, VideoCodec,
+    AudioCodec, AudioFormat, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame,
+    FrameImage, FrameSource, FriendlyName, GpuSurface, MediaUri, PixelFormat, ProtocolKind,
+    VideoCodec,
 };

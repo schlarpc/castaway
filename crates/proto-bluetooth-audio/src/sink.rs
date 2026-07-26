@@ -6,7 +6,7 @@
 //! against a scripted phone with no radio present.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use castaway_core::AudioCodec;
+use castaway_core::{AudioCodec, AudioFormat};
 
 use crate::avdtp::StreamEndpoint;
 use crate::avdtp::{error_code, find_codec_capability, Message, MessageType, Seid, Signal};
@@ -60,8 +60,9 @@ pub enum SinkEvent {
     Configured {
         /// The negotiated codec.
         codec: AudioCodec,
-        /// Sample rate in Hz.
-        sample_rate: u32,
+        /// The negotiated rate and channel count, which the decoder must be told: aptX
+        /// and aptX HD carry no in-band configuration (OPEN-QUESTIONS Q25).
+        format: AudioFormat,
         /// The full negotiated capability, for anything the decoder needs.
         configuration: Box<CodecCapability>,
     },
@@ -230,7 +231,10 @@ impl SinkSession {
         if capability.audio_codec() != self.endpoints[index].capability.audio_codec() {
             return reject_config(msg, 0x07, error_code::UNSUPPORTED_CONFIGURATION);
         }
-        let Some(sample_rate) = capability.sample_rate() else {
+        // Both halves of the format, not just the rate: a configuration we cannot
+        // resolve to one rate *and* one channel count is one we cannot open a decoder
+        // for, and refusing it here is the last point at which the sender can be told.
+        let Some(format) = capability.format() else {
             return reject_config(msg, 0x07, error_code::INVALID_CODEC_PARAMETER);
         };
 
@@ -242,7 +246,7 @@ impl SinkSession {
             SinkEvent::Reply(Message::accept(msg, Bytes::new())),
             SinkEvent::Configured {
                 codec: capability.audio_codec(),
-                sample_rate,
+                format,
                 configuration: Box::new(capability),
             },
         ]

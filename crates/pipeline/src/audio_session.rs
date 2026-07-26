@@ -8,12 +8,17 @@
 //! already negotiated it and stamps every [`EncodedFrame`] with it, and taking it from
 //! the stream rather than from a second configuration path removes the chance of the two
 //! disagreeing.
+//!
+//! The *format* is the opposite: it cannot come from the stream, because aptX and aptX HD
+//! have no header to carry it. It is a required parameter, handed down from the AVDTP
+//! negotiation via [`castaway_core::SessionEvent::Audio`] — the bug Q25 recorded was this
+//! function inventing 44.1 kHz while the phone was sending 48 (OPEN-QUESTIONS Q25).
 
-use castaway_core::{AudioCodec, EncodedFrame};
+use castaway_core::{AudioCodec, AudioFormat, EncodedFrame};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::audio_decode::{decode_audio_stream, AudioStreamFormat};
+use crate::audio_decode::decode_audio_stream;
 use crate::audio_out::AudioOut;
 #[cfg(any(test, not(feature = "audio-out")))]
 use crate::audio_out::NullAudioOut;
@@ -35,13 +40,17 @@ pub fn default_output() -> Box<dyn AudioOut> {
 }
 
 /// Run a decode → output session on a dedicated thread until the source ends.
-pub fn spawn(frames: mpsc::Receiver<EncodedFrame>, output: Box<dyn AudioOut>) {
-    std::thread::spawn(move || run(frames, output));
+pub fn spawn(frames: mpsc::Receiver<EncodedFrame>, format: AudioFormat, output: Box<dyn AudioOut>) {
+    std::thread::spawn(move || run(frames, format, output));
 }
 
 /// Drive one audio session to completion. Blocking; call it on its own thread.
-pub fn run(mut frames: mpsc::Receiver<EncodedFrame>, mut output: Box<dyn AudioOut>) {
-    // Wait for the first frame so the codec and rate come from the stream itself.
+pub fn run(
+    mut frames: mpsc::Receiver<EncodedFrame>,
+    format: AudioFormat,
+    mut output: Box<dyn AudioOut>,
+) {
+    // Wait for the first frame so the codec comes from the stream itself.
     let Some(first) = frames.blocking_recv() else {
         return;
     };
@@ -49,12 +58,6 @@ pub fn run(mut frames: mpsc::Receiver<EncodedFrame>, mut output: Box<dyn AudioOu
         warn!("audio session: first frame names no codec");
         return;
     };
-
-    // aptX and aptX HD carry no header, so the decoder must be told the format. The
-    // adapter negotiated it; until that is threaded through as configuration, the
-    // A2DP-universal default is the right guess and a wrong one is audible immediately
-    // (the stream plays at the wrong pitch) rather than silently wrong.
-    let format = AudioStreamFormat::default();
 
     let mut started = false;
     let mut pending = Some(first);
@@ -71,6 +74,7 @@ pub fn run(mut frames: mpsc::Receiver<EncodedFrame>, mut output: Box<dyn AudioOu
                 }
                 info!(
                     ?codec,
+                    %format,
                     rate = block.sample_rate,
                     channels = block.channels,
                     "audio session: playing"
@@ -122,12 +126,16 @@ mod tests {
 
     use super::*;
 
+    fn format() -> AudioFormat {
+        AudioFormat::from_hz(44_100, 2).unwrap()
+    }
+
     #[test]
     fn a_session_with_no_frames_exits_instead_of_parking() {
         // The phone connected and never sent anything. The thread must not leak.
         let (tx, rx) = mpsc::channel::<EncodedFrame>(1);
         drop(tx);
-        run(rx, Box::new(NullAudioOut::new()));
+        run(rx, format(), Box::new(NullAudioOut::new()));
     }
 
     #[test]
@@ -143,7 +151,7 @@ mod tests {
         .unwrap();
         drop(tx);
         // Guessing SBC here would decode noise; exiting is the honest answer.
-        run(rx, Box::new(NullAudioOut::new()));
+        run(rx, format(), Box::new(NullAudioOut::new()));
     }
 
     #[test]
