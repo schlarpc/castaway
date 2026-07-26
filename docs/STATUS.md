@@ -71,6 +71,14 @@ or a headless browser.
 which has not happened. The offline half of the same path *is* covered — `tests/pairing.rs`
 drives `getInfo` → DH → blob → `addUser` against the real router in-process.
 
+Automating that one browser step was tried and abandoned, so nobody has to try it again:
+a real (non-headless) Chromium under Xvfb, driven by selenium, reaches
+`challenge.spotify.com/.../recaptcha` — "we need to make sure that you're a human", a
+reCAPTCHA Enterprise anchor plus image `bframe` — immediately after the username step.
+Getting past that means defeating an anti-bot control rather than automating a UI, which
+is out of scope on purpose. The step stays human, stays once, and the harness now writes
+the resulting refresh token into `.env.local` itself rather than asking for a paste.
+
 ## Which package to run
 - `packages.default` — portable, no renderer, no browser. Serves and discovers; **cannot**
   play YouTube, and honestly declines to advertise DIAL (D27). What CI builds.

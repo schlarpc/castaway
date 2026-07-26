@@ -178,11 +178,53 @@ async fn access_token(env: &HashMap<String, String>) -> Result<String, Error> {
         }
     }
 
-    eprintln!("  ! no usable refresh token — a browser has to authorise this once");
+    // This is the one step that cannot be automated, and not for want of trying: driving
+    // a real Chromium through it reaches a reCAPTCHA Enterprise challenge
+    // ("we need to make sure that you're a human") straight after the username. Getting
+    // past that would mean defeating an anti-bot control rather than automating a UI, so
+    // it stays a human step — but only ever once, and the token is written back here so
+    // it is not a copy-paste chore either.
+    eprintln!();
+    eprintln!("  ! No usable refresh token, so this run needs a browser — once.");
+    eprintln!("    Spotify has no device-code flow and gates this login behind a CAPTCHA.");
+    eprintln!("    A URL follows: open it, log in, approve. Every later run is hands-free.");
+    eprintln!();
+
     let token = client.get_access_token_async().await?;
-    println!("\nSave this in .env.local so later runs need no browser:\n");
-    println!("SPOTIFY_REFRESH_TOKEN={}\n", token.refresh_token);
+    match persist_refresh_token(&token.refresh_token) {
+        Ok(path) => eprintln!("  ✓ refresh token written to {path}"),
+        Err(e) => {
+            eprintln!("  ! could not write the refresh token ({e}); save it by hand:");
+            eprintln!("    SPOTIFY_REFRESH_TOKEN={}", token.refresh_token);
+        }
+    }
     Ok(token.access_token)
+}
+
+/// Write the refresh token into `.env.local`, replacing any existing line.
+///
+/// `.env.local` rather than `.env` because that is the gitignored one people actually
+/// keep secrets in, and it is created if missing so the first run needs no setup beyond
+/// a client id.
+fn persist_refresh_token(refresh: &str) -> Result<&'static str, Error> {
+    const PATH: &str = ".env.local";
+    const KEY: &str = "SPOTIFY_REFRESH_TOKEN";
+
+    let existing = std::fs::read_to_string(PATH).unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(KEY))
+        .map(str::to_owned)
+        .collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.push(format!("{KEY}={refresh}"));
+
+    let mut body = lines.join("\n");
+    body.push('\n');
+    std::fs::write(PATH, body)?;
+    Ok(PATH)
 }
 
 /// What a phone holds after logging in: a username and a *reusable* credential.
