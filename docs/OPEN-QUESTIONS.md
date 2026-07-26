@@ -385,3 +385,46 @@ the reasons are what a future reversal has to argue against.
   Worth doing together with the cover-art fetch, which is stubbed at the same call site: we
   set `CONTROLLER_SUPPORTS_COVER_ART` in the SDP record and then only `debug!` the image
   handle a peer sends back, so album art is advertised and never fetched.
+
+- **Q29 — Cover art needs L2CAP ERTM, and five smaller fixes. OPEN, blocked on ERTM.**
+  Researched after an iPhone streamed happily and never sent an image handle. The easy
+  conclusion — "iOS does not do AVRCP cover art" — is **wrong**, and worth recording as
+  wrong because it is the third time today that "the peer does not support it" turned out
+  to be our own bug wearing a disguise (see the aptX HD vendor id).
+  The BlueZ cover-art patch series (Frédéric Danis, Collabora, linux-bluetooth 2024-09-17)
+  states it was tested against **iPhone 14, iPhone 15 Pro and Samsung S23**. BlueZ is an
+  uncertified non-MFi controller with no Apple auth coprocessor, so modern iPhones do
+  publish the OBEX PSM and serve BIP to anyone who asks correctly. Apple's own docs
+  contradict each other — the consumer page claims AVRCP 1.6 with album art, while the MFi
+  Accessory Design Guidelines say AVRCP 1.4 and never mention cover art, routing artwork
+  through iAP2 — which is where the folklore comes from. iAP2 and CarPlay are separate
+  mechanisms we cannot and need not use.
+  **The blocker is ours.** AVRCP 1.6.3 §14 requires GOEP 2.0 for cover art transfer, and
+  GOEP §7.1.2 requires the OBEX channel to be configured for **Enhanced Retransmission
+  Mode**. `substrate-l2cap` is basic mode only: it answers the extended-features
+  InformationRequest with a zero mask and refuses by name any non-ignorable config option
+  it does not implement. So when a peer tries to configure the cover-art channel for ERTM
+  we reject it, and every other fix below only gets us as far as that refusal. This also
+  explains Apple Developer Forums 786623, where an iPhone SE advertises Cover Art, OBEX
+  CONNECT gets no answer, and "l2cap s-frame response always failed" — S-frames are ERTM.
+  Ordered by dependency:
+  1. **ERTM in `substrate-l2cap`** — the hard one, and it gates the rest.
+  2. `record.rs` — `CONTROLLER_SUPPORTS_COVER_ART = 1 << 6` is reportedly *Supports
+     browsing*, not cover art; cover art is said to be `1 << 9` (GetLinkedThumbnail).
+     Unverified against the spec text here — check before changing, since claiming
+     browsing we do not implement is its own bug.
+  3. `record.rs` — the Controller record's ServiceClassIDList omits `0x110E`.
+  4. `adapter.rs` — OBEX must connect *before* attribute 8 is requested. AOSP's target
+     strips attribute 8 from a response when no BIP client is connected, so the current
+     order can never see a handle even once the rest works.
+  5. `obex.rs` — the type is `x-bt/img-thm` and the handle belongs in the Img-Handle
+     header (0x30), not the OBEX Name header.
+  6. `client.rs::cover_art_psm` — takes the first L2CAP PSM it finds, which on iOS is the
+     *browsing* PSM. It must select the protocol stack whose second layer is OBEX.
+  Also noted, unrelated to fetching: our AVRCP **Target** side should tolerate attribute 8
+  in an inbound GetElementAttributes and skip ids it does not know rather than reject the
+  PDU — real GM and Hyundai-Kia head units enumerate 1..=8 unconditionally.
+  No public iPhone `0x110C` SDP dump appears to exist anywhere. Capturing one in
+  `~/re-shell` (BlueZ >= 5.81, `bluetoothd --experimental`, `mpris-proxy`, `btmon`) would
+  give both a golden SDP record and a live attribute-8 response — fixtures that do not
+  currently exist publicly, which is exactly what rule 9 asks for.
