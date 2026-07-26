@@ -14,6 +14,32 @@ use crate::init::{ControllerInit, UsbId};
 
 /// Read the ROM version, which selects which patch in the image applies.
 const READ_ROM_VERSION: OpCode = OpCode::new(0xFC6D);
+/// The standard version read, which `btrtl.c` issues *before* any vendor command.
+const READ_LOCAL_VERSION: OpCode = OpCode::new(0x1001);
+
+/// Realtek's Bluetooth SIG company identifier.
+///
+/// Stable in every state, unlike `lmp_subver`, so this is what actually answers "is this
+/// a Realtek part" — and unlike the USB id, it comes from the silicon rather than from
+/// whichever vendor rebadged it.
+const MANUFACTURER_REALTEK: u16 = 0x005D;
+
+/// `lmp_subver` values that identify an *unpatched* Realtek Bluetooth core.
+///
+/// **These only appear before firmware is loaded.** Once a patch is applied the
+/// controller reports the firmware's own version here instead — a UB500 with the
+/// kernel's firmware in it answers `lmp_subver 0xd922`, `hci_rev 0xdfc6`, which
+/// concatenate to `0xdfc6d922`: precisely the `fw_version` in the epatch header. That is
+/// how an already-patched part is recognised, and it is the difference between skipping
+/// a redundant download and wedging a working dongle.
+const KNOWN_LMP_SUBVER: &[(u16, &str)] = &[
+    (0x8761, "RTL8761A/B"),
+    (0x8723, "RTL8723B"),
+    (0x8821, "RTL8821A"),
+    (0x8822, "RTL8822B"),
+    (0x8852, "RTL8852A"),
+    (0x8703, "RTL8703B"),
+];
 /// Download one firmware fragment.
 const DOWNLOAD: OpCode = OpCode::new(0xFC20);
 
@@ -96,6 +122,41 @@ impl ControllerInit for RealtekInit {
         hci: &dyn HciTransport,
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
+        // Standard command first, exactly as `btrtl.c` does. Two reasons, and both
+        // matter: it identifies the silicon by `lmp_subver` rather than by whatever USB
+        // id the rebadging vendor chose, and — because it is an ordinary HCI command —
+        // a failure here says the *transport* is wrong rather than the vendor sequence,
+        // which is the distinction that cost a wedged dongle to learn.
+        let version = read_local_version(hci).await?;
+        if version.manufacturer != MANUFACTURER_REALTEK {
+            return Err(TransportError::Controller {
+                what: "realtek identification",
+                detail: format!(
+                    "manufacturer {:#06x} is not Realtek ({MANUFACTURER_REALTEK:#06x}); \
+                     refusing rather than downloading firmware to an unknown part",
+                    version.manufacturer
+                ),
+            });
+        }
+
+        let Some((_, chip)) = KNOWN_LMP_SUBVER
+            .iter()
+            .find(|(id, _)| *id == version.lmp_subver)
+        else {
+            // An unrecognised subver on a confirmed Realtek part means firmware is
+            // already loaded: patching rewrites this field to the firmware's own
+            // version. Re-downloading is at best redundant and at worst wedges a
+            // working controller, so this is a no-op exactly as Intel's operational
+            // check is.
+            info!(
+                lmp_subver = version.lmp_subver,
+                hci_rev = version.hci_rev,
+                "realtek controller already patched; nothing to load"
+            );
+            return Ok(());
+        };
+        info!(chip, lmp_subver = version.lmp_subver, "realtek controller");
+
         let rom_version = read_rom_version(hci).await?;
         debug!(rom_version, "realtek rom version");
 
@@ -117,6 +178,50 @@ impl ControllerInit for RealtekInit {
         info!(bytes = payload.len(), "realtek firmware loaded");
         Ok(())
     }
+}
+
+/// What `Read_Local_Version` reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalVersion {
+    /// HCI specification version.
+    pub hci_ver: u8,
+    /// Revision — on a patched Realtek part, the high half of the firmware version.
+    pub hci_rev: u16,
+    /// Bluetooth SIG company identifier. Stable in every state.
+    pub manufacturer: u16,
+    /// LMP subversion — the core id when cold, the firmware version's low half when
+    /// patched.
+    pub lmp_subver: u16,
+}
+
+/// Read the standard local version.
+///
+/// # Errors
+/// [`TransportError`] if the controller does not answer, which means the transport is
+/// broken rather than the vendor sequence.
+async fn read_local_version(hci: &dyn HciTransport) -> Result<LocalVersion, TransportError> {
+    let params = send(
+        hci,
+        Command::Vendor {
+            opcode: READ_LOCAL_VERSION,
+            params: bytes::Bytes::new(),
+        },
+    )
+    .await?;
+    // hci_ver(1), hci_rev(2), lmp_ver(1), manufacturer(2), lmp_subver(2) — after the
+    // status byte the caller already stripped.
+    if params.len() < 8 {
+        return Err(TransportError::Controller {
+            what: "read_local_version",
+            detail: format!("expected 8 bytes, got {}", params.len()),
+        });
+    }
+    Ok(LocalVersion {
+        hci_ver: params[0],
+        hci_rev: u16::from_le_bytes([params[1], params[2]]),
+        manufacturer: u16::from_le_bytes([params[4], params[5]]),
+        lmp_subver: u16::from_le_bytes([params[6], params[7]]),
+    })
 }
 
 /// Read the ROM version byte.
@@ -349,6 +454,9 @@ mod tests {
             if *opcode == READ_ROM_VERSION {
                 // ROM version 0, so the loader looks for chip id 1.
                 params.push(0x00);
+            } else if *opcode == READ_LOCAL_VERSION {
+                // A *cold* RTL8761: manufacturer 0x005d, lmp_subver 0x8761.
+                params.extend_from_slice(&[0x0a, 0xc6, 0x0a, 0x0a, 0x5d, 0x00, 0x61, 0x87]);
             }
             vec![HciPacket::Event {
                 code: code::COMMAND_COMPLETE,
@@ -619,6 +727,83 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err}").contains("rtl8761bu_fw.bin"), "got: {err}");
         assert!(indices(&transport).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_chip_is_refused_rather_than_flashed() {
+        // Downloading firmware to a part we cannot identify is how a device gets
+        // wedged. lmp_subver comes from the silicon, unlike the USB id.
+        let transport = ScriptedTransport::new().with_responder(|sent| {
+            let HciPacket::Command { opcode, .. } = sent else {
+                return Vec::new();
+            };
+            let mut params = vec![0x01];
+            params.extend_from_slice(&opcode.raw().to_le_bytes());
+            params.push(0x00);
+            if *opcode == READ_LOCAL_VERSION {
+                // manufacturer 0x000f — not Realtek at all.
+                params.extend_from_slice(&[0x0a, 0xc6, 0x0a, 0x0a, 0x0f, 0x00, 0x34, 0x12]);
+            }
+            vec![HciPacket::Event {
+                code: code::COMMAND_COMPLETE,
+                params: bytes::Bytes::from(params),
+            }]
+        });
+        let err = RealtekInit::default()
+            .init(&transport, &firmware_with(image(64)))
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("not Realtek"), "got: {err}");
+        assert!(!transport.sent_commands().contains(&DOWNLOAD));
+    }
+
+    #[tokio::test]
+    async fn an_already_patched_controller_is_left_alone() {
+        // Captured from the UB500 in the dev box with the kernel's firmware loaded:
+        // manufacturer is still Realtek, but lmp_subver/hci_rev have become the
+        // firmware version 0xdfc6d922 from the epatch header. Re-downloading to a
+        // working controller is how one gets wedged.
+        let transport = ScriptedTransport::new().with_responder(|sent| {
+            let HciPacket::Command { opcode, .. } = sent else {
+                return Vec::new();
+            };
+            let mut params = vec![0x01];
+            params.extend_from_slice(&opcode.raw().to_le_bytes());
+            params.push(0x00);
+            if *opcode == READ_LOCAL_VERSION {
+                params.extend_from_slice(&[0x0a, 0xc6, 0xdf, 0x0a, 0x5d, 0x00, 0x22, 0xd9]);
+            }
+            vec![HciPacket::Event {
+                code: code::COMMAND_COMPLETE,
+                params: bytes::Bytes::from(params),
+            }]
+        });
+        RealtekInit::default()
+            .init(&transport, &firmware_with(image(64)))
+            .await
+            .unwrap();
+        assert!(
+            !transport.sent_commands().contains(&DOWNLOAD),
+            "a patched controller must not be re-flashed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_standard_version_read_comes_before_any_vendor_command() {
+        // btrtl.c's order, and a better diagnostic: a failure on an ordinary HCI
+        // command says the transport is broken, not the vendor sequence.
+        let transport = controller();
+        RealtekInit::default()
+            .init(&transport, &firmware_with(image(64)))
+            .await
+            .unwrap();
+        let opcodes = transport.sent_commands();
+        let local = opcodes
+            .iter()
+            .position(|o| *o == READ_LOCAL_VERSION)
+            .unwrap();
+        let rom = opcodes.iter().position(|o| *o == READ_ROM_VERSION).unwrap();
+        assert!(local < rom, "standard read must precede the vendor read");
     }
 
     #[tokio::test]

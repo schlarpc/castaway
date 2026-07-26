@@ -88,6 +88,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("claiming {id}…");
     let transport = usb::UsbTransport::open(id)?;
 
+    // Read-only mode: claim and ask the controller what it is, and stop. Nothing is
+    // written, so a chip in an unknown state cannot be made worse — which is the mode
+    // to reach for first, and was not available the day it would have helped.
+    if std::env::args().any(|a| a == "--identify") {
+        println!("reading local version (standard command, no vendor traffic)…");
+        transport.send(Command::ReadLocalVersion.encode()?).await?;
+        let params = expect_complete(&transport, substrate_hci::OpCode::READ_LOCAL_VERSION).await?;
+        // `expect_complete` returns the return parameters *including* the leading status
+        // byte. Forgetting that shifts every field by one, which reads as a plausible
+        // wrong answer rather than an obvious failure — `manufacturer` came back as
+        // 0x5d0a instead of 0x005d.
+        let params = if params.is_empty() {
+            params
+        } else {
+            params[1..].to_vec()
+        };
+        if params.len() >= 8 {
+            let hci_rev = u16::from_le_bytes([params[1], params[2]]);
+            let manufacturer = u16::from_le_bytes([params[4], params[5]]);
+            let lmp_subver = u16::from_le_bytes([params[6], params[7]]);
+            println!("  hci_ver:      {:#04x}", params[0]);
+            println!("  hci_rev:      {hci_rev:#06x}");
+            println!("  manufacturer: {manufacturer:#06x}");
+            println!("  lmp_subver:   {lmp_subver:#06x}");
+        } else {
+            println!("  short response: {params:02x?}");
+        }
+        println!("  raw:          {params:02x?}");
+        println!("\nidentify only; nothing was written");
+        return Ok(());
+    }
+
     println!("initialising…");
     let loader = init::select(init::registry(), id)?;
     println!("  loader: {}", loader.name());
