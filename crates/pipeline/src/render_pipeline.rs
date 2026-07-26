@@ -290,6 +290,12 @@ impl Pipeline for RenderPipeline {
         Ok(())
     }
 
+    async fn up_next(&self, items: Vec<castaway_core::QueueItem>) -> Result<(), CoreError> {
+        info!(queued = items.len(), "render pipeline: UP NEXT");
+        self.publish_card(|card| card.up_next = items);
+        Ok(())
+    }
+
     async fn source_info(&self, source: castaway_core::SourceDescription) -> Result<(), CoreError> {
         // The device line above the track: who is connected, and over what.
         info!(%source, "render pipeline: SOURCE");

@@ -57,16 +57,32 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   with `for i in 0..len - 0x10`, which underflows below one AES block, and our HMAC check
   proves only that the sender completed the Diffie-Hellman — the plaintext length is the
   sender's to choose. `session::start` now length-checks first.
-- **Q38 — The queue is not on screen.** The phone's queue reaches the device and plays in
-  order — that part works, it is inside librespot's connect-state. What the panel cannot
-  show is "next up", because `Spirc` exposes no reader for the track list and
-  `PlayerEvent` carries only the current item. Wanted for a shared display, where the
-  question people actually ask is whose song is next. Needs either an upstream accessor
-  or reading the cluster off the dealer ourselves.
-- **Q39 — Spotify cover art is not fetched.** `NowPlaying.artwork` wants encoded image
-  bytes; librespot's `AudioItem` carries cover *URLs*. The card renders text-only for
-  Spotify today. Fetching wants a small cache and must not block the text on a download —
-  the same shape the Bluetooth path solved with BIP (Q29), by a different route.
+- **Q38 — The queue is on screen. IMPLEMENTED, unproven against a real queue.** Resolved
+  the second way: `Spirc` still exposes no reader, so `proto-spotify` subscribes its *own*
+  listener to `hm://connect-state/v1/cluster` alongside spirc's and reads
+  `player_state.next_tracks`. The dealer keeps a vector of subscribers per URI, so this
+  rides along rather than displacing anything. Surfaces as `SessionEvent::UpNext`, which
+  is deliberately separate from `NowPlaying`: the queue moves when somebody *else* adds a
+  song, with no track change at all. The card shows three and counts the rest.
+
+  What is not yet verified is the naming. Titles come from `ProvidedTrack.metadata`, a
+  reverse-engineered map whose exact keys are not contractual — `title`/`artist_name` are
+  tried first with fallbacks, and the URI is the last resort so a row is never blank. If
+  real queues come through showing `spotify:4iV5W9…`, the keys are wrong and the debug log
+  will say what was actually in the map. Resolving via `Track::get` instead would cost a
+  round trip per queued item, plus another per artist, which is why it is not the default.
+- **Q39 — Cover art is fetched *and* drawn. DONE.** Two halves, and the second was the
+  surprise: the card had never painted artwork for *any* source, Bluetooth included — it
+  drew an empty framed panel and nothing else. So this added the decode (`image`, JPEG and
+  PNG only) and the blit, centre-cropped and nearest-neighbour, which fixes cover art for
+  every protocol rather than only Spotify.
+
+  The fetch rides librespot's own HTTP client, so no second TLS stack for one GET per
+  track. It is spawned rather than awaited: the text must not wait on a download, and a
+  late cover for a track that has already been skipped past is dropped by comparing the
+  track URI rather than pasted onto its successor. A cover that fails to decode leaves the
+  empty panel — it is the least important thing on the card and the most likely to be
+  malformed.
 
 ## Cast
 

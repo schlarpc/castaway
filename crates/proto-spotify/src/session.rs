@@ -22,12 +22,15 @@ use castaway_core::{
 };
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
+use librespot_core::dealer::protocol::Message;
 use librespot_core::{Session, SessionConfig};
 use librespot_metadata::audio::{AudioItem, UniqueFields};
 use librespot_playback::config::PlayerConfig;
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig};
 use librespot_playback::player::{Player, PlayerEvent};
+use librespot_protocol::connect::ClusterUpdate;
+use librespot_protocol::player::ProvidedTrack;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -92,6 +95,7 @@ struct LiveSession {
     spirc: Arc<Spirc>,
     spirc_task: JoinHandle<()>,
     events_task: JoinHandle<()>,
+    queue_task: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for LiveSession {
@@ -100,6 +104,7 @@ impl std::fmt::Debug for LiveSession {
         f.debug_struct("LiveSession")
             .field("spirc_task", &self.spirc_task)
             .field("events_task", &self.events_task)
+            .field("queue_task", &self.queue_task)
             .finish_non_exhaustive()
     }
 }
@@ -114,6 +119,7 @@ impl LiveSession {
         }
         self.spirc_task.abort();
         self.events_task.abort();
+        self.queue_task.abort();
     }
 }
 
@@ -235,6 +241,16 @@ async fn start(
     );
     let events = player.get_player_event_channel();
 
+    // Subscribe to cluster updates *before* Spirc connects, or the first one — the update
+    // that accompanies the transfer that starts playback, and so the first queue we could
+    // show — is gone before anyone is listening.
+    let cluster_updates = session
+        .dealer()
+        .listen_for("hm://connect-state/v1/cluster", |msg| {
+            Message::from_raw::<ClusterUpdate>(msg)
+        })
+        .map_err(|e| SpotifyError::Login(format!("cluster subscription: {e}")))?;
+
     // This is where the network actually happens: AP handshake, login5, dealer connect,
     // and the connect-state registration that makes us visible in the picker. Anything
     // wrong with the account surfaces here, before we have claimed the audio output.
@@ -244,7 +260,7 @@ async fn start(
             initial_volume: volume_to_spotify(settings.initial_volume),
             ..ConnectConfig::default()
         },
-        session,
+        session.clone(),
         credentials,
         player,
         mixer,
@@ -280,13 +296,15 @@ async fn start(
     .await
     .map_err(|_| SpotifyError::SessionGone)?;
 
-    let events_task = tokio::spawn(pump_events(events, sink.clone()));
+    let events_task = tokio::spawn(pump_events(events, sink.clone(), session));
+    let queue_task = tokio::spawn(pump_queue(cluster_updates, sink.clone()));
     let spirc_task = tokio::spawn(spirc_task);
 
     Ok(LiveSession {
         spirc,
         spirc_task,
         events_task,
+        queue_task,
     })
 }
 
@@ -296,13 +314,59 @@ async fn start(
 /// full snapshot re-emitted whenever any part changes, but librespot reports the track
 /// and the position in separate events. Without keeping the last track here, every
 /// position tick would blank the card's text.
-async fn pump_events(mut events: mpsc::UnboundedReceiver<PlayerEvent>, sink: SessionSink) {
+///
+/// Cover art arrives on its own schedule too. librespot hands over image *URLs*, so the
+/// bytes need a fetch, and the text must not wait for it — a card that appears a second
+/// late is much worse than one whose art fills in a second late. So the fetch is spawned
+/// and its result folded in when it lands, exactly the case `NowPlaying` was documented
+/// to expect ("artwork arriving after the text").
+async fn pump_events(
+    mut events: mpsc::UnboundedReceiver<PlayerEvent>,
+    sink: SessionSink,
+    session: Session,
+) {
     let mut snapshot = NowPlaying::new(PlaybackState::Stopped);
+    // Which track the current snapshot describes, so late artwork for a track that has
+    // already been skipped past is dropped rather than pasted onto its successor.
+    let mut current_uri: Option<String> = None;
+    let (art_tx, mut art_rx) = mpsc::channel::<(String, castaway_core::Artwork)>(2);
 
-    while let Some(event) = events.recv().await {
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            Some((uri, artwork)) = art_rx.recv() => {
+                if current_uri.as_deref() != Some(uri.as_str()) {
+                    debug!(%uri, "spotify: cover art arrived for a track we have left");
+                    continue;
+                }
+                snapshot.artwork = Some(artwork);
+                if sink
+                    .emit(SessionEvent::NowPlaying(snapshot.clone()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+
         let changed = match event {
             PlayerEvent::TrackChanged { audio_item } => {
                 apply_track(&mut snapshot, &audio_item);
+                current_uri = Some(audio_item.uri.clone());
+                if let Some(url) = best_cover(&audio_item) {
+                    let (session, art_tx, uri) =
+                        (session.clone(), art_tx.clone(), audio_item.uri.clone());
+                    tokio::spawn(async move {
+                        if let Some(art) = fetch_cover(&session, &url).await {
+                            let _ = art_tx.send((uri, art)).await;
+                        }
+                    });
+                }
                 true
             }
             PlayerEvent::Playing { position_ms, .. } => {
@@ -323,6 +387,7 @@ async fn pump_events(mut events: mpsc::UnboundedReceiver<PlayerEvent>, sink: Ses
             }
             PlayerEvent::Stopped { .. } => {
                 snapshot = NowPlaying::new(PlaybackState::Stopped);
+                current_uri = None;
                 true
             }
             PlayerEvent::Unavailable { track_id, .. } => {
@@ -344,6 +409,143 @@ async fn pump_events(mut events: mpsc::UnboundedReceiver<PlayerEvent>, sink: Ses
         {
             debug!("spotify: session manager gone, stopping event pump");
             return;
+        }
+    }
+}
+
+/// How many queued tracks to forward to the card.
+///
+/// The card shows three and counts the rest, so a handful past that is enough to render
+/// "and N more" honestly without shipping a 500-track playlist through the session bus on
+/// every cluster update.
+const UP_NEXT_LIMIT: usize = 24;
+
+/// Watch the cloud's cluster updates and publish the queue.
+///
+/// This is the one piece of Connect state we read *ourselves* rather than through
+/// `Spirc`, because `Spirc` exposes no accessor for the track list and `PlayerEvent`
+/// carries only the current item (OPEN-QUESTIONS Q38). Subscribing a second listener to
+/// the same dealer URI is supported — the dealer keeps a vector of subscribers per URI —
+/// so this rides alongside spirc's own listener rather than replacing it.
+///
+/// Must be subscribed *before* `Spirc::new` connects, or the first cluster update (the
+/// one that arrives with the transfer that started playback) is missed.
+async fn pump_queue(
+    mut updates: impl futures::Stream<Item = Result<ClusterUpdate, librespot_core::Error>> + Unpin,
+    sink: SessionSink,
+) {
+    use futures::StreamExt as _;
+
+    let mut last: Vec<castaway_core::QueueItem> = Vec::new();
+    while let Some(update) = updates.next().await {
+        let Ok(update) = update else { continue };
+        let items = queue_from_cluster(&update);
+        // Cluster updates arrive for volume changes, device lists and playback position
+        // — most of them leave the queue untouched, and re-rendering the card for each
+        // would be a needless repaint on a screen people are looking at.
+        if items == last {
+            continue;
+        }
+        debug!(queued = items.len(), "spotify: queue changed");
+        last.clone_from(&items);
+        if sink.emit(SessionEvent::UpNext(items)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Extract the upcoming tracks from a cluster update.
+fn queue_from_cluster(update: &ClusterUpdate) -> Vec<castaway_core::QueueItem> {
+    update
+        .cluster
+        .as_ref()
+        .and_then(|c| c.player_state.as_ref())
+        .map(|state| {
+            state
+                .next_tracks
+                .iter()
+                .take(UP_NEXT_LIMIT)
+                .map(queue_item)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Turn one `ProvidedTrack` into something worth putting on a wall.
+///
+/// The names come from the track's `metadata` map rather than from a metadata lookup per
+/// URI: `Track::get` would be one round trip per queued item, and its `artists` are URIs
+/// that would each need another. The map is what the cloud already sent us.
+///
+/// Keys are checked in several spellings because this is reverse-engineered surface and
+/// the exact set is not contractual; the URI is the last resort so a queue entry is never
+/// blank.
+fn queue_item(track: &ProvidedTrack) -> castaway_core::QueueItem {
+    let pick = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| track.metadata.get(*k))
+            .filter(|v| !v.is_empty())
+            .cloned()
+    };
+
+    let title = pick(&["title", "track_title", "name"]).unwrap_or_else(|| {
+        // Better than an empty row: at least it is identifiably *a* track, and the id is
+        // greppable against the log if someone is working out why the name is missing.
+        track
+            .uri
+            .rsplit(':')
+            .next()
+            .map_or_else(|| "Unknown track".to_owned(), |id| format!("spotify:{id}"))
+    });
+
+    let mut item = castaway_core::QueueItem::new(title);
+    if let Some(artist) = pick(&["artist_name", "artist", "album_artist_name"]) {
+        item = item.with_artist(artist);
+    }
+    item
+}
+
+/// Pick the cover worth fetching: the widest one offered.
+///
+/// Chosen by pixel width rather than by librespot's `ImageSize` enum because the panel is
+/// 4K and the art square is roughly a third of its height — every size Spotify offers is
+/// smaller than the space, so "largest available" is always the right answer and needs no
+/// mapping from an enum that could gain a variant.
+fn best_cover(item: &AudioItem) -> Option<String> {
+    item.covers
+        .iter()
+        .max_by_key(|c| c.width)
+        .map(|c| c.url.clone())
+}
+
+/// Fetch cover bytes over librespot's HTTP client.
+///
+/// Returns `None` on any failure, deliberately: a missing cover is a cosmetic gap the
+/// card already draws an empty panel for, and nothing here is worth failing a session or
+/// retrying over.
+async fn fetch_cover(session: &Session, url: &str) -> Option<castaway_core::Artwork> {
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(url)
+        .body(bytes::Bytes::new())
+        .ok()?;
+    match session.http_client().request_body(request).await {
+        Ok(body) if !body.is_empty() => {
+            debug!(bytes = body.len(), %url, "spotify: cover art fetched");
+            // The declared format is a hint the card does not trust — it sniffs the bytes
+            // — but Spotify serves JPEG, so name it honestly.
+            Some(castaway_core::Artwork::new(
+                castaway_core::ImageFormat::Jpeg,
+                body,
+            ))
+        }
+        Ok(_) => {
+            debug!(%url, "spotify: cover art was empty");
+            None
+        }
+        Err(e) => {
+            debug!(error = %e, %url, "spotify: cover art fetch failed");
+            None
         }
     }
 }

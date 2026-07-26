@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::control::RemoteControl;
-use crate::nowplaying::NowPlaying;
+use crate::nowplaying::{NowPlaying, QueueItem};
 use crate::source::SourceDescription;
 use crate::types::{AudioFormat, FrameSource, MediaUri};
 
@@ -115,6 +115,18 @@ pub enum SessionEvent {
     /// Track metadata for the now-playing surface — a full snapshot, re-emitted whenever
     /// any part of it changes (including artwork arriving late).
     NowPlaying(NowPlaying),
+    /// What is queued behind the current track, nearest first.
+    ///
+    /// Separate from [`SessionEvent::NowPlaying`] because it changes on a different
+    /// schedule and from a different source: the queue moves when somebody *else* in the
+    /// room adds a song, with no track change at all, and for Spotify it arrives on the
+    /// cloud's cluster updates rather than from the player. Folding it into the snapshot
+    /// would mean every position tick had to carry the whole queue, and every queue change
+    /// would have to invent a track snapshot to travel in.
+    ///
+    /// An empty vector is meaningful: it says the queue is empty, not that it is unknown.
+    /// A source that cannot see its queue simply never sends this.
+    UpNext(Vec<QueueItem>),
     /// Who connected and what was negotiated. Distinct from [`SessionEvent::NowPlaying`]
     /// because it changes on a different schedule — once per session rather than once
     /// per track — and arrives in pieces as each fact becomes known.

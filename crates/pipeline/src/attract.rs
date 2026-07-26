@@ -131,7 +131,16 @@ impl AttractScene {
     /// A representative scene for previews/tests.
     #[must_use]
     pub fn demo() -> Self {
+        use castaway_core::ProtocolKind;
+
         let name = "dma.space/screen";
+        // Each row names the *advertised* instance, `<name>#<protocol>`, because that is
+        // the string the picker shows — one box appears in four pickers at once and a
+        // bare name makes them indistinguishable. Built from `ProtocolKind::slug()` rather
+        // than written out, so this preview cannot drift from what `app` really
+        // advertises: it did exactly that, and the screenshot told people to look for a
+        // name no picker was showing.
+        let advertised = |kind: ProtocolKind| format!("{name}#{}", kind.slug());
         Self {
             title: name.into(),
             tagline: "Throw anything at the wall — no app to install.".into(),
@@ -139,22 +148,22 @@ impl AttractScene {
                 AttractRow::new(
                     [0x42, 0x85, 0xf4, 0xff],
                     "Chrome / Edge",
-                    format!("Cast \u{2192} {name}"),
+                    format!("Cast \u{2192} {}", advertised(ProtocolKind::Cast)),
                 ),
                 AttractRow::new(
                     [0xff, 0xff, 0xff, 0xff],
                     "iPhone / Mac",
-                    format!("AirPlay \u{2192} {name}"),
+                    format!("AirPlay \u{2192} {}", advertised(ProtocolKind::AirPlay)),
                 ),
                 AttractRow::new(
                     [0x3d, 0xdc, 0x84, 0xff],
                     "Android / VLC",
-                    format!("Cast or DLNA \u{2192} {name}"),
+                    format!("Cast or DLNA \u{2192} {}", advertised(ProtocolKind::Dlna)),
                 ),
                 AttractRow::new(
                     [0x1d, 0xb9, 0x54, 0xff],
                     "Spotify",
-                    format!("Devices \u{2192} {name}"),
+                    format!("Devices \u{2192} {}", advertised(ProtocolKind::Spotify)),
                 ),
                 AttractRow::new(
                     [0xff, 0x00, 0x00, 0xff],
@@ -300,8 +309,17 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
             sq,
             row.accent,
         );
+        // Shrink each half to the room it actually has, the way the title and tagline
+        // already do. The rasterizer clips at the surface edge, not at the widget card,
+        // and these rows sit beside the card at smaller sizes — so an unshrunk detail
+        // runs straight underneath it. That is not hypothetical: the row text is
+        // `<name>#<protocol>`, which is exactly the long form.
+        let label_avail = (detail_x - label_x - 12.0 * s).max(1.0);
+        let detail_avail = (column - detail_x).max(1.0);
+        let label_px = fit_px(&f.bold, &row.label, row_px, label_avail);
+        let detail_px = fit_px(&f.regular, &row.detail, row_px, detail_avail);
         text::draw_text(
-            &mut buf, width, height, label_x, baseline, &row.label, row_px, pal.label, &f.bold,
+            &mut buf, width, height, label_x, baseline, &row.label, label_px, pal.label, &f.bold,
         );
         text::draw_text(
             &mut buf,
@@ -310,7 +328,7 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
             detail_x,
             baseline,
             &row.detail,
-            row_px,
+            detail_px,
             pal.detail,
             &f.regular,
         );

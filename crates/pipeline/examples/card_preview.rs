@@ -1,6 +1,8 @@
 //! Render the now-playing card to a PNG so a human can look at it.
 #![allow(clippy::unwrap_used)]
-use castaway_core::{NowPlaying, PlaybackState, SourceDescription};
+use castaway_core::{
+    Artwork, ImageFormat, NowPlaying, PlaybackState, QueueItem, SourceDescription,
+};
 use pipeline::attract::to_png;
 use pipeline::nowplaying_card::{render, NowPlayingCard};
 
@@ -16,6 +18,7 @@ fn main() {
             .with_display_name("iPhone")
             .with_address("6C:3A:FF:D1:69:3E")
             .with_link("AAC · 44.1 kHz · stereo · \u{2264}256 kbps"),
+        up_next: Vec::new(),
     };
     let (w, h) = (1920, 1080);
     let rgba = render(&card, w, h).unwrap();
@@ -30,6 +33,7 @@ fn main() {
             .with_display_name("bagel")
             .with_address("E0:D4:E8:A3:C0:8B")
             .with_link("aptX HD · 48 kHz · stereo · 576 kbps"),
+        up_next: Vec::new(),
     };
     let out2 = out.replace(".png", "-bare.png");
     let rgba = render(&bare, w, h).unwrap();
@@ -50,9 +54,36 @@ fn main() {
         source: SourceDescription::new()
             .with_display_name("schlarpc")
             .with_link("Spotify Connect · 44100 Hz · stereo"),
+        up_next: Vec::new(),
     };
     let out3 = out.replace(".png", "-spotify.png");
     let rgba = render(&spotify, w, h).unwrap();
     std::fs::write(&out3, to_png(w, h, &rgba).unwrap()).unwrap();
     println!("wrote {out3}");
+
+    // The same session once the cover has been fetched. Pass a PNG/JPEG path as the
+    // second argument to see real art in the panel.
+    if let Some(cover_path) = std::env::args().nth(2) {
+        let bytes = std::fs::read(&cover_path).unwrap();
+        let with_art = NowPlayingCard {
+            track: spotify
+                .track
+                .clone()
+                .with_artwork(Artwork::new(ImageFormat::Png, bytes.into())),
+            source: spotify.source.clone(),
+            // A queue with more in it than the card shows, so the "and N more" tail is
+            // exercised rather than assumed.
+            up_next: vec![
+                QueueItem::new("Come to Daddy").with_artist("Aphex Twin"),
+                QueueItem::new("Roygbiv").with_artist("Boards of Canada"),
+                QueueItem::new("Xtal").with_artist("Aphex Twin"),
+                QueueItem::new("Alberto Balsalm").with_artist("Aphex Twin"),
+                QueueItem::new("Rhubarb").with_artist("Aphex Twin"),
+            ],
+        };
+        let out4 = out.replace(".png", "-spotify-art.png");
+        let rgba = render(&with_art, w, h).unwrap();
+        std::fs::write(&out4, to_png(w, h, &rgba).unwrap()).unwrap();
+        println!("wrote {out4}");
+    }
 }

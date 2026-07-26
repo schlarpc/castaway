@@ -31,6 +31,13 @@ ffmpeg-next = { version = "7.1", optional = true }
 ffmpeg-sys-next = { version = "7.1", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 png = { version = "0.17", optional = true }
+# Decoding cover art for the now-playing card. JPEG and PNG only — that is what AVRCP/BIP
+# and Spotify actually return, and the default feature set drags in a dozen formats plus
+# rayon. Pure Rust, so it does not complicate the Windows cross-build.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+], optional = true }
 # CEF (offscreen browser). Pinned to the CEF 147.0.10 build so it matches the nixpkgs
 # `cef-binary` the flake points CEF_PATH at (flake.nix cefDist). If nixpkgs bumps
 # cef-binary, bump these together.
@@ -91,7 +98,14 @@ default = []
 # `render` = the wgpu Compositor backend (feature can't be named `wgpu` — that's a dep).
 # `kiosk`  = winit fullscreen output driving the compositor.
 # `ffmpeg` = libav decode. `cef` = offscreen browser (still a marker; Q6).
-render = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ab_glyph", "dep:png"]
+render = [
+    "dep:wgpu",
+    "dep:pollster",
+    "dep:bytemuck",
+    "dep:ab_glyph",
+    "dep:png",
+    "dep:image",
+]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
 # `audio` = A2DP/audio decode (libav) plus a PCM output device (cpal). Separate from

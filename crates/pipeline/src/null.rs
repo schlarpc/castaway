@@ -149,6 +149,17 @@ impl Pipeline for NullPipeline {
         Ok(())
     }
 
+    async fn up_next(&self, items: Vec<castaway_core::QueueItem>) -> Result<(), CoreError> {
+        // The titles, not just the count: "3 queued" tells you the plumbing works, and
+        // the names tell you the *right* queue arrived.
+        info!(
+            queued = items.len(),
+            items = ?items.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "null pipeline: UP NEXT"
+        );
+        Ok(())
+    }
+
     async fn source_info(&self, source: SourceDescription) -> Result<(), CoreError> {
         info!(%source, "null pipeline: SOURCE");
         Ok(())

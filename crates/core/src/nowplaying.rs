@@ -13,6 +13,7 @@
 //! shows up as a second snapshot with [`NowPlaying::artwork`] populated rather than
 //! delaying the text.
 
+use std::fmt;
 use std::time::Duration;
 
 /// What the sender is currently doing with the track.
@@ -120,6 +121,48 @@ impl Artwork {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+}
+
+/// One item waiting behind the current track.
+///
+/// Deliberately thin — a title and who it is by. This exists to answer "whose song is
+/// next" on a shared screen, not to mirror the sender's whole queue model, and anything
+/// richer would have to be invented for the protocols that do not supply it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueItem {
+    /// Track title, or the best label the source could give.
+    pub title: String,
+    /// Performing artist, when the source says.
+    pub artist: Option<String>,
+}
+
+impl QueueItem {
+    /// An item with just a title.
+    #[must_use]
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            artist: None,
+        }
+    }
+
+    /// Builder-style artist setter.
+    #[must_use]
+    pub fn with_artist(mut self, artist: impl Into<String>) -> Self {
+        self.artist = Some(artist.into());
+        self
+    }
+}
+
+impl fmt::Display for QueueItem {
+    /// `Title — Artist`, or just the title when nobody said who it is by.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.title)?;
+        if let Some(artist) = &self.artist {
+            write!(f, " \u{2014} {artist}")?;
+        }
+        Ok(())
     }
 }
 

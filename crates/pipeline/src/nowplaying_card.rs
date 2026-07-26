@@ -11,7 +11,8 @@
 //! former through the render channel on every track change would be absurd when the
 //! latter reproduces it exactly.
 
-use castaway_core::{NowPlaying, PlaybackState, SourceDescription};
+use castaway_core::{NowPlaying, PlaybackState, QueueItem, SourceDescription};
+use tracing::debug;
 
 use crate::error::PipelineError;
 use crate::text::{self, Rgba};
@@ -27,6 +28,10 @@ pub struct NowPlayingCard {
     pub track: NowPlaying,
     /// Who is connected, and over what.
     pub source: SourceDescription,
+    /// What is queued behind it, nearest first. Empty when the queue is empty *or* when
+    /// the source cannot see one — the card cannot tell those apart and does not try, it
+    /// simply shows nothing.
+    pub up_next: Vec<QueueItem>,
 }
 
 /// One laid-out line of the card.
@@ -200,13 +205,132 @@ fn build_lines(
         lines.push(Line {
             text: state.to_string(),
             px: 28.0 * s,
+            // Zero when this is the last line, a real gap when the queue follows. Each
+            // line owns the space *below* it, so a trailing gap would push the centred
+            // block visibly off-axis — but leaving it zero when something follows
+            // overlaps the two, which is what this originally did.
+            gap: if card.up_next.is_empty() {
+                0.0
+            } else {
+                40.0 * s
+            },
             color: pal.state,
             bold: false,
-            gap: 0.0,
         });
     }
 
+    // "Up next", below the transport state. On a shared screen this is the question
+    // people actually ask — whose song is on after this one — so it earns space even
+    // though it is nobody's idea of essential playback metadata.
+    //
+    // Capped rather than scrolled. The block is vertically centred against the art square,
+    // so an unbounded list would push the title off-centre and eventually off the panel;
+    // three is what fits beside the art at 720p without crowding it.
+    const MAX_UP_NEXT: usize = 3;
+    if !card.up_next.is_empty() {
+        lines.push(Line {
+            text: "Up next".to_string(),
+            px: 22.0 * s,
+            color: pal.source,
+            bold: true,
+            gap: 12.0 * s,
+        });
+        for item in card.up_next.iter().take(MAX_UP_NEXT) {
+            let text = item.to_string();
+            lines.push(Line {
+                text: text.clone(),
+                px: fit_px(&f.regular, &text, 26.0 * s, avail),
+                color: pal.album,
+                bold: false,
+                gap: 8.0 * s,
+            });
+        }
+        // Say how many were not shown rather than truncating in silence — "and 12 more"
+        // is the difference between a short queue and a hidden one.
+        let hidden = card.up_next.len().saturating_sub(MAX_UP_NEXT);
+        if hidden > 0 {
+            lines.push(Line {
+                text: format!("and {hidden} more"),
+                px: 22.0 * s,
+                color: pal.source,
+                bold: false,
+                gap: 0.0,
+            });
+        }
+    }
+
     lines
+}
+
+/// A decoded cover, square-cropped and ready to scale into the art panel.
+struct Cover {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+/// Decode cover bytes into RGBA.
+///
+/// The declared [`ImageFormat`] is a hint, not a promise — it comes from a MIME type a
+/// peer supplied — so the bytes are sniffed instead. A JPEG labelled PNG should still
+/// appear on the wall.
+fn decode_cover(artwork: &castaway_core::Artwork) -> Result<Cover, PipelineError> {
+    let decoded = image::load_from_memory(&artwork.data)
+        .map_err(|e| PipelineError::Decode(format!("cover art: {e}")))?
+        .to_rgba8();
+    Ok(Cover {
+        width: decoded.width(),
+        height: decoded.height(),
+        rgba: decoded.into_raw(),
+    })
+}
+
+/// Draw `cover` into the square at `(x, y)` of side `side`, centre-cropped.
+///
+/// Nearest-neighbour on purpose: the source is typically 300–640px scaling into a panel
+/// of a similar order, the result is looked at from across a room, and a good resampler
+/// is a dependency and a millisecond this does not need. Centre-crop rather than stretch
+/// because a non-square cover stretched to a square is instantly, distractingly wrong.
+fn draw_cover(buf: &mut [u8], width: u32, height: u32, cover: &Cover, x: f32, y: f32, side: f32) {
+    if cover.width == 0 || cover.height == 0 || side <= 0.0 {
+        return;
+    }
+    let crop = cover.width.min(cover.height);
+    let crop_x = (cover.width - crop) / 2;
+    let crop_y = (cover.height - crop) / 2;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (x0, y0, span) = (x.round() as i64, y.round() as i64, side.round() as i64);
+    for dy in 0..span {
+        let py = y0 + dy;
+        if py < 0 || py >= i64::from(height) {
+            continue;
+        }
+        for dx in 0..span {
+            let px = x0 + dx;
+            if px < 0 || px >= i64::from(width) {
+                continue;
+            }
+            // Map destination pixel back into the cropped source square.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let sx = crop_x + ((dx as u64 * u64::from(crop)) / span.max(1) as u64) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let sy = crop_y + ((dy as u64 * u64::from(crop)) / span.max(1) as u64) as u32;
+            let si = ((sy.min(cover.height - 1) as usize) * cover.width as usize
+                + sx.min(cover.width - 1) as usize)
+                * 4;
+            // `try_from` rather than `as`: both are already proven in range by the guards
+            // above, and saying so with a fallible conversion keeps that proof local
+            // instead of resting on a lint allowance.
+            let (Ok(py), Ok(px)) = (usize::try_from(py), usize::try_from(px)) else {
+                continue;
+            };
+            let di = (py * width as usize + px) * 4;
+            if let (Some(src), Some(dst)) = (cover.rgba.get(si..si + 4), buf.get_mut(di..di + 4)) {
+                dst.copy_from_slice(src);
+            }
+        }
+    }
 }
 
 /// Draw the card at `width` × `height`, returning RGBA8.
@@ -244,6 +368,17 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
         pal.art_edge,
     );
     text::fill_rect(&mut buf, width, height, art_x, art_y, art, art, pal.art_bg);
+
+    // Paint the cover over the panel, if we have one that decodes. A cover that fails to
+    // decode leaves the empty panel rather than taking the whole card down with it —
+    // artwork is the least important thing here and the most likely to be malformed,
+    // since it is whatever bytes a phone or a CDN chose to send.
+    if let Some(artwork) = &card.track.artwork {
+        match decode_cover(artwork) {
+            Ok(cover) => draw_cover(&mut buf, width, height, &cover, art_x, art_y, art),
+            Err(e) => debug!(error = %e, "now-playing card: cover art did not decode"),
+        }
+    }
 
     // The text column, right of the art. Laid out as a block and centred against the
     // art square rather than flowed from the top: a card with no album, or no artist,
@@ -287,7 +422,86 @@ mod tests {
                 .with_title("Derezzed")
                 .with_artist("Daft Punk"),
             source: SourceDescription::new().with_display_name("iPhone"),
+            up_next: Vec::new(),
         }
+    }
+
+    /// The text of every laid-out line, for asserting on content rather than pixels.
+    fn line_texts(card: &NowPlayingCard) -> Vec<String> {
+        let f = text::fonts().unwrap();
+        build_lines(card, &f, &Palette::default(), 1.0, 800.0)
+            .into_iter()
+            .map(|l| l.text)
+            .collect()
+    }
+
+    #[test]
+    fn the_queue_is_listed_nearest_first_under_a_heading() {
+        let mut c = card();
+        c.track.state = PlaybackState::Playing;
+        c.up_next = vec![
+            QueueItem::new("Aerodynamic").with_artist("Daft Punk"),
+            QueueItem::new("Veridis Quo"),
+        ];
+        let texts = line_texts(&c);
+        assert!(texts.contains(&"Up next".to_string()), "{texts:?}");
+        let first = texts.iter().position(|t| t.starts_with("Aerodynamic"));
+        let second = texts.iter().position(|t| t.starts_with("Veridis Quo"));
+        assert!(first < second, "queue order lost: {texts:?}");
+        // An item with no artist must not render a dangling separator.
+        assert!(texts.contains(&"Veridis Quo".to_string()), "{texts:?}");
+    }
+
+    #[test]
+    fn a_long_queue_says_how_much_it_is_hiding() {
+        // Silent truncation would read as a three-song queue, which is a different and
+        // much more annoying claim than "there are more".
+        let mut c = card();
+        c.up_next = (0..7)
+            .map(|i| QueueItem::new(format!("Track {i}")))
+            .collect();
+        let texts = line_texts(&c);
+        assert!(texts.contains(&"and 4 more".to_string()), "{texts:?}");
+    }
+
+    #[test]
+    fn an_empty_queue_adds_no_heading() {
+        // A bare "Up next" over nothing looks like the queue failed to load.
+        let texts = line_texts(&card());
+        assert!(!texts.contains(&"Up next".to_string()), "{texts:?}");
+    }
+
+    #[test]
+    fn the_state_line_makes_room_only_when_the_queue_follows_it() {
+        // Regression: `state` owned a zero gap because it used to be last, so the queue
+        // heading was drawn on top of it.
+        let f = text::fonts().unwrap();
+        let mut c = card();
+        c.track.state = PlaybackState::Playing;
+
+        let gap_of = |card: &NowPlayingCard| {
+            build_lines(card, &f, &Palette::default(), 1.0, 800.0)
+                .into_iter()
+                .find(|l| l.text == "Playing")
+                .map(|l| l.gap)
+                .unwrap()
+        };
+        assert_eq!(gap_of(&c), 0.0, "a trailing line must not pad the block");
+
+        c.up_next = vec![QueueItem::new("Something")];
+        assert!(gap_of(&c) > 0.0, "the queue would overlap the state line");
+    }
+
+    #[test]
+    fn a_cover_that_does_not_decode_leaves_the_panel_empty_rather_than_failing() {
+        // Cover art is the least important thing on the card and the most likely to be
+        // malformed — it is whatever bytes a phone or a CDN chose to send.
+        let mut c = card();
+        c.track = c.track.clone().with_artwork(castaway_core::Artwork::new(
+            castaway_core::ImageFormat::Jpeg,
+            bytes::Bytes::from_static(b"not an image"),
+        ));
+        assert_eq!(render(&c, 640, 360).unwrap().len(), 640 * 360 * 4);
     }
 
     #[test]
@@ -356,6 +570,7 @@ mod tests {
             source: SourceDescription::new()
                 .with_display_name("bagel")
                 .with_link("aptX HD · 48 kHz"),
+            up_next: Vec::new(),
         };
         let lines = lines_of(&bare);
         assert_eq!(lines[0], "bagel", "the device leads: {lines:?}");

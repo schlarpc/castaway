@@ -145,6 +145,16 @@ impl<P: Pipeline> SessionManager<P> {
                     Err(CoreError::NoActiveSession(source.to_string()))
                 }
             }
+            SessionEvent::UpNext(items) => {
+                if self.active.as_ref() == Some(&source) {
+                    info!(%source, queued = items.len(), "session: up next");
+                    self.pipeline.up_next(items).await
+                } else {
+                    // Same reasoning as the metadata case: a backgrounded source must not
+                    // rewrite the queue the room is looking at.
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
             SessionEvent::SourceInfo(info) => {
                 if self.active.as_ref() == Some(&source) {
                     // Merged, not replaced: each update knows only the fact it just
@@ -246,6 +256,7 @@ mod tests {
         audio_format: std::sync::Mutex<Option<crate::types::AudioFormat>>,
         snapshots: std::sync::Mutex<Vec<crate::NowPlaying>>,
         description: std::sync::Mutex<SourceDescription>,
+        up_next: std::sync::Mutex<Vec<crate::QueueItem>>,
     }
 
     #[derive(Clone)]
@@ -275,6 +286,10 @@ mod tests {
         }
         async fn now_playing(&self, snapshot: crate::NowPlaying) -> Result<(), CoreError> {
             self.0.snapshots.lock().expect("poisoned").push(snapshot);
+            Ok(())
+        }
+        async fn up_next(&self, items: Vec<crate::QueueItem>) -> Result<(), CoreError> {
+            *self.0.up_next.lock().expect("poisoned") = items;
             Ok(())
         }
         async fn source_info(&self, info: SourceDescription) -> Result<(), CoreError> {
@@ -387,6 +402,46 @@ mod tests {
             .await;
         assert!(matches!(res, Err(CoreError::NoActiveSession(_))));
         assert_eq!(counts.control.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_queue_reaches_the_pipeline_from_the_active_source() {
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Spotify, "a");
+        mgr.handle(play_msg(&a)).await.unwrap();
+        mgr.handle(SourceMessage {
+            source: a.clone(),
+            event: SessionEvent::UpNext(vec![
+                crate::QueueItem::new("Aerodynamic").with_artist("Daft Punk")
+            ]),
+        })
+        .await
+        .unwrap();
+        let queued = counts.up_next.lock().expect("poisoned");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].title, "Aerodynamic");
+    }
+
+    #[tokio::test]
+    async fn a_backgrounded_source_cannot_rewrite_the_queue() {
+        // Same rule as metadata: whoever is on screen owns the screen. A preempted phone
+        // still pushing cluster updates must not replace the queue the room is reading.
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Spotify, "a");
+        let b = SourceId::new(ProtocolKind::Cast, "b");
+        mgr.handle(play_msg(&a)).await.unwrap();
+        let res = mgr
+            .handle(SourceMessage {
+                source: b,
+                event: SessionEvent::UpNext(vec![crate::QueueItem::new("Intruder")]),
+            })
+            .await;
+        assert!(matches!(res, Err(CoreError::NoActiveSession(_))));
+        assert!(counts.up_next.lock().expect("poisoned").is_empty());
     }
 
     fn audio_msg(src: &SourceId) -> SourceMessage {

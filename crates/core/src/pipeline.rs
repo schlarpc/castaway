@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::error::CoreError;
 use crate::event::ControlTxn;
-use crate::nowplaying::NowPlaying;
+use crate::nowplaying::{NowPlaying, QueueItem};
 use crate::source::SourceDescription;
 use crate::types::{AudioFormat, FrameSource, MediaUri};
 
@@ -47,6 +47,16 @@ pub trait Pipeline: Send + Sync {
     /// # Errors
     /// [`CoreError::Pipeline`] if the surface can't be updated.
     async fn now_playing(&self, snapshot: NowPlaying) -> Result<(), CoreError>;
+
+    /// Update what is queued behind the current track, nearest first.
+    ///
+    /// An empty list means the queue is empty and the surface should say so; a source
+    /// that cannot see its queue never calls this, so the last known list stays on screen
+    /// rather than being blanked by a source that simply does not know.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the surface can't be updated.
+    async fn up_next(&self, items: Vec<QueueItem>) -> Result<(), CoreError>;
 
     /// Update the description of who is connected and how.
     ///

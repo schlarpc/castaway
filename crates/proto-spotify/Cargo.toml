@@ -31,7 +31,12 @@ librespot-core.workspace = true
 librespot-connect.workspace = true
 librespot-playback.workspace = true
 librespot-metadata.workspace = true
+librespot-protocol.workspace = true
 futures.workspace = true
+# Cover-art fetches ride librespot's own HTTP client, which speaks `http` types — so no
+# second TLS stack or connection pool for the sake of one GET per track.
+http = "1"
+bytes.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
