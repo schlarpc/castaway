@@ -146,7 +146,7 @@ pub struct Bluetooth {
 ///
 /// There is deliberately no account here. The receiver holds no credentials: whoever
 /// walks up hands it theirs over zeroconf by picking castaway in their Spotify app, and
-/// they are dropped when the next person pairs (DECISION-LOG D31). A `username`/`password`
+/// they are dropped when the next person pairs (DECISION-LOG D30). A `username`/`password`
 /// pair in this file would be both a downgrade in behaviour and a secret on disk.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]

@@ -393,7 +393,7 @@ impl DecodedFrame {
 /// The audio counterpart of [`DecodedFrame`], and it exists for the same reason: some
 /// sources hand over samples rather than a bitstream, and re-encoding them just to run
 /// them back through a decoder would be pure loss. Spotify is the first — librespot owns
-/// the Vorbis decode and normalisation, so what reaches us is PCM (DECISION-LOG D31).
+/// the Vorbis decode and normalisation, so what reaches us is PCM (DECISION-LOG D30).
 ///
 /// Samples are `f32` in `-1.0..=1.0`, interleaved by channel, because that is what the
 /// output stage already speaks.

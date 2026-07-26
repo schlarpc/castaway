@@ -3,7 +3,7 @@
 //! [`discovery`] gets us credentials without anyone typing a password; this module turns
 //! those credentials into a device that actually plays. The Spotify half — access point,
 //! login5, the dealer WebSocket, connect-state, audio keys, CDN fetch and Vorbis decode —
-//! is librespot's (DECISION-LOG D31). What lives here is the seam: credentials in,
+//! is librespot's (DECISION-LOG D30). What lives here is the seam: credentials in,
 //! [`SessionEvent`]s out, and one session at a time.
 //!
 //! Threading follows ground rule 4. `Spirc` and the player-event pump are ordinary tokio

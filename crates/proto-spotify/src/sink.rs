@@ -2,7 +2,7 @@
 //!
 //! librespot owns the decode (Vorbis, plus normalisation and dithering), so what comes
 //! out the far end is interleaved PCM rather than a bitstream. That is why
-//! [`FrameSource::Pcm`] exists — see DECISION-LOG D31.
+//! [`FrameSource::Pcm`] exists — see DECISION-LOG D30.
 //!
 //! [`FrameSource::Pcm`]: castaway_core::FrameSource::Pcm
 

@@ -6,7 +6,7 @@
 //! picker and complete pairing.
 //!
 //! Post-pairing playback — the access point, the dealer WebSocket, connect-state, and
-//! the audio pull — is librespot's, driven from [`session`] (DECISION-LOG D31). The
+//! the audio pull — is librespot's, driven from [`session`] (DECISION-LOG D30). The
 //! zeroconf half stays ours because it has to share this receiver's single HTTP host and
 //! single mDNS responder, which librespot's own discovery would duplicate.
 //!

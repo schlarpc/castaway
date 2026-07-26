@@ -81,6 +81,17 @@ These are binding engineering constraints for this project. They override genera
    the reference impls to derive wire behavior and crypto flows. Land the *findings* here as
    checked-in fixtures + notes; never add a reference impl as a runtime dependency.
 
+   **Carve-out — cloud-side protocols (D30).** This rule assumes the peer is a *device*
+   speaking a spec that holds still: reimplementing is then a one-time cost that buys an
+   asset we own and can test offline. It does not hold when the peer is a **cloud service
+   that changes unilaterally** — there, owning the wire buys a maintenance treadmill, and
+   every upstream change lands as silence on an unattended panel. Spotify Connect is the
+   one protocol in this project that qualifies, and `proto-spotify` uses the librespot
+   crates for everything above the LAN. Two conditions on any future carve-out: the
+   dependency must be an idiomatic Rust crate (not a shelled-out reference binary), and
+   the *local* surface — discovery, advertisement, anything sharing our single HTTP host
+   or mDNS responder — still has to be ours. Everything else here is still reimplemented.
+
 10. **Commit semi-regularly, straight to `main`.** Commit at independent logical boundaries — often
     several commits within a single feature build-out, each one a coherent, self-contained change.
     Run `cargo fmt` and `cargo clippy --all-targets` (clean) before **every** commit. No feature

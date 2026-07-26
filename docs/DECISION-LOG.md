@@ -14,6 +14,9 @@ tags/types match Google's proto exactly (wire-compatible), and the build needs n
 the proto surface grows a lot we can revisit codegen.
 
 ### D10 — Spotify scope: onboarding + pairing crypto only, playback deferred
+**SUPERSEDED by D30.** Playback landed; the reasoning below (that the remaining stack was
+too large to own) is exactly what D30 resolves by not owning it.
+
 Spotify Connect's full value (dealer WS + CDN audio) is credential-gated (Premium) and a
 large stack. The autonomous slice is the reimplementable, testable part: zeroconf
 advertise + `getInfo` + `addUser` DH pairing and blob decryption (librespot algorithm),
@@ -370,3 +373,48 @@ rewind re-arms but a stale report does not; overlapping submissions merge), and
 `yt-selfplay --expect-skip` proves it end to end from the sender's seat, asserting a
 *discontinuity* — playback advancing further than wall time did — rather than asking
 SponsorBlock the same question the implementation asked.
+
+### D30 — Spotify is the one protocol we do not reimplement
+Ground rule 9 names librespot as an RE source, not a runtime dependency. That rule is
+right for every other protocol here and wrong for this one, so it now carries an
+explicit carve-out (CLAUDE.md rule 9).
+
+The distinction is what the peer *is*. AirPlay, Cast, DLNA and Bluetooth are stable,
+device-side, published-or-well-reversed specs: reimplementing is a one-time cost that
+buys a durable asset we own, can test against fixtures, and can fix on our own schedule.
+Spotify Connect is a cloud service that changes unilaterally and has repeatedly done so —
+login5 replaced password auth, the dealer replaced Mercury, keymaster started returning
+403s, audio key provisioning moved to PlayPlay. Reimplementing that is not a one-time
+cost; it is a subscription to someone else's churn, and every break lands as silence on
+a wall-mounted panel that nobody is watching a log for.
+
+librespot is also not the kind of dependency the rule was written against. It is not a C
+reference binary to shell out to — it is an idiomatic, tokio-based Rust crate family on
+crates.io (`librespot-core`, `-connect`, `-playback`, `-metadata`) with a community that
+absorbs exactly the churn above.
+
+The split is not "use librespot": it is **ours from the LAN, theirs from the cloud**.
+- Ours: `_spotify-connect._tcp`, `getInfo`/`addUser`, the DH + blob decryption. This has
+  to stay ours because it shares the receiver's single HTTP host and single mDNS
+  responder. `librespot-discovery` stands up its own server and its own mDNS responder,
+  which is precisely the "five racing responders" that D7 and architecture §1d exist to
+  prevent.
+- Theirs: access point, login5, dealer WebSocket, connect-state, audio keys, CDN fetch,
+  Vorbis decode.
+- The seam: `proto-spotify::session` — credentials in, `SessionEvent`s out.
+
+What this buys beyond time: the credentials-free onboarding survives. Whoever walks up
+picks castaway in their own Spotify app and the receiver logs in as them; nothing is
+stored, and the next person to pair replaces them. The alternatives all end in an account
+on disk or a QR code to scan.
+
+What it forecloses: we do not own this state machine, so a Spotify change we would want
+to handle differently is an upstream conversation rather than a local patch, and
+`librespot-playback`'s decode/normalisation sits inside our audio path rather than
+alongside it. Both are accepted. The version is pinned in the workspace and moves
+deliberately.
+
+Feature flags matter here. `default-features = false` keeps librespot's own audio
+backends (rodio/cpal/alsa) out — the sink is ours — and `rustls-tls-webpki-roots` keeps
+the tree on `ring` rather than dragging OpenSSL or a second crypto backend into the
+Windows cross-build. Verified: no `aws-lc-rs` in the graph.

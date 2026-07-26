@@ -37,17 +37,36 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Spotify
 
-- **Q9 — Spotify playback backend.** Onboarding is done (advertise → `getInfo` →
-  `addUser` blob decrypt, librespot-compatible). Post-pairing playback needs the
-  "dealer" WebSocket (control) + audio pull from the CDN with the AP-login step that
-  turns the decrypted blob into stored credentials — a large stack that needs a Premium
-  account. Deferred. Current behavior: pairing succeeds, credentials are decrypted and
-  logged, no `SessionEvent` emitted. Confirm you want to invest here vs. leave at
-  "appears in the picker + pairs."
-- **Q10 — Spotify blob wire-validation.** The DH + blob crypto is tested by round-trip
-  (our encrypt vs. decrypt), not against a real Spotify sender. Capture one `addUser`
-  from a real phone to confirm the exact byte framing (iv/ciphertext/hmac split)
-  matches before trusting it live.
+- **Q9 — Spotify playback backend. ANSWERED: librespot, above the LAN only (D30).**
+  Reimplementing was scoped and rejected — not on size but on shape: the peer is a cloud
+  service that changes unilaterally (login5, dealer, keymaster, PlayPlay), so owning the
+  wire buys a treadmill rather than an asset. `proto-spotify::session` now turns a paired
+  blob into a live device: AP login, connect-state registration, transport + queue
+  commands from the phone, PCM into the pipeline, `NowPlaying` on the card, and a
+  `RemoteControl` so the panel can drive back. The zeroconf half stays ours because it
+  shares the single HTTP host and mDNS responder. No account on disk.
+- **Q10 — Spotify blob wire-validation. STILL OPEN, and now the highest-value Spotify
+  test.** The DH + blob crypto is still only round-trip tested (our encrypt vs. our
+  decrypt). Nothing has yet proved a *real* phone's `addUser` framing matches — and the
+  consequence is sharper than before, because the blob now feeds a login instead of a log
+  line. A wrong iv/ciphertext/hmac split fails as "pairing expired", which is
+  indistinguishable from a genuinely stale blob. Capture one `addUser` from a real phone
+  and land it as a fixture.
+
+  Partly mitigated: a malformed blob can no longer panic. `Credentials::with_blob` ends
+  with `for i in 0..len - 0x10`, which underflows below one AES block, and our HMAC check
+  proves only that the sender completed the Diffie-Hellman — the plaintext length is the
+  sender's to choose. `session::start` now length-checks first.
+- **Q38 — The queue is not on screen.** The phone's queue reaches the device and plays in
+  order — that part works, it is inside librespot's connect-state. What the panel cannot
+  show is "next up", because `Spirc` exposes no reader for the track list and
+  `PlayerEvent` carries only the current item. Wanted for a shared display, where the
+  question people actually ask is whose song is next. Needs either an upstream accessor
+  or reading the cluster off the dealer ourselves.
+- **Q39 — Spotify cover art is not fetched.** `NowPlaying.artwork` wants encoded image
+  bytes; librespot's `AudioItem` carries cover *URLs*. The card renders text-only for
+  Spotify today. Fetching wants a small cache and must not block the text on a download —
+  the same shape the Bluetooth path solved with BIP (Q29), by a different route.
 
 ## Cast
 

@@ -19,7 +19,7 @@ integration test.
 | `crypto-fairplay` | Boundary stub. fp-setup typestate; key derivation = `NotImplemented` (Q1). |
 | `proto-dlna` | **Live.** AVTransport/RenderingControl/ConnectionManager SOAP; cast-a-video works. |
 | `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). Dev device key (Q2/Q11). |
-| `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
+| `proto-spotify` | **Live, pairing through playback.** Ours: advertise + `getInfo` + `addUser` DH/blob decrypt, on the shared HTTP host and mDNS responder. librespot's, above the LAN: AP login, dealer, connect-state, audio (D30). Pick castaway in the Spotify app and it logs in as you, plays, honours the phone's transport and queue, and drives back from the panel via `RemoteControl`. No account on disk. Blob framing still unproven against a real phone (Q10); queue and cover art not on screen (Q38/Q39). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
 | `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
 | `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
@@ -196,5 +196,7 @@ ctrl-c → clean CEF/service shutdown. Also fixed en route: 4K-surface wgpu limi
 handler. Still needs the physical box: real display/GPU present path, audio, and touch.
 
 ## Design decisions worth your review
-D7 (router composition vs SourceAdapter), D9 (hand-written prost, no protoc), D10 (Spotify
-scope), D16 (socket protocols advertise-gated). All in DECISION-LOG.md.
+D7 (router composition vs SourceAdapter), D9 (hand-written prost, no protoc), D16 (socket
+protocols advertise-gated), and **D30 (Spotify is the one protocol we do not reimplement
+— a carve-out in ground rule 9, so worth disagreeing with early)**. D30 supersedes D10,
+which deferred Spotify playback. All in DECISION-LOG.md.

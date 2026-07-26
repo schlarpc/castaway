@@ -120,7 +120,7 @@ hkdf = "0.12"
 rand = "0.8"
 
 # --- spotify ---
-# The one protocol we do NOT reimplement (DECISION-LOG D31). Spotify Connect is a cloud
+# The one protocol we do NOT reimplement (DECISION-LOG D30). Spotify Connect is a cloud
 # service that changes unilaterally — login5 replaced password auth, the dealer replaced
 # Mercury, keymaster started 403ing — so owning the wire here buys a maintenance treadmill
 # rather than a durable asset. `rustls-tls-webpki-roots` keeps the cross-build off OpenSSL;
