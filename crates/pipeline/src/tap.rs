@@ -163,6 +163,30 @@ mod integration {
     use crate::wgpu_compositor::TexelFormat;
     use crate::wgpu_compositor::WgpuCompositor;
 
+    /// The path the HTTP endpoint actually takes: a handle, a command down the render
+    /// channel, a tap installed by the loop, a readback, a PNG back.
+    #[test]
+    fn the_screenshot_handle_round_trips_through_the_render_channel() {
+        use crate::render_pipeline::RenderPipeline;
+
+        let Ok(compositor) = WgpuCompositor::new_offscreen(32, 16) else {
+            eprintln!("no GPU adapter here; skipping");
+            return;
+        };
+        let (pipeline, rx) = RenderPipeline::new(4);
+        let handle = pipeline.screenshot_handle();
+        let mut rloop = RenderLoop::new(compositor, rx);
+
+        // The handle blocks until the loop presents, so the loop has to run elsewhere.
+        let shot = std::thread::spawn(move || handle.capture(std::time::Duration::from_secs(5)));
+        for _ in 0..200 {
+            rloop.pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let png = shot.join().unwrap().unwrap();
+        assert_eq!(&png[1..4], b"PNG");
+    }
+
     /// A screenshot of a real composited frame, through the whole seam.
     #[test]
     fn a_tap_captures_what_was_actually_composited() {

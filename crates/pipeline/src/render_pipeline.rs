@@ -33,6 +33,45 @@ pub enum RenderCommand {
     NowPlaying(Box<crate::nowplaying_card::NowPlayingCard>),
     /// Drop the card (the session ended).
     ClearNowPlaying,
+    /// Attach a consumer of composited frames (Q30). Sent as a command rather than set
+    /// on the loop directly because the loop lives on the main thread and everything
+    /// that wants to tap it does not.
+    AddTap(Box<dyn crate::tap::OutputTap>),
+}
+
+/// Asks the render thread to capture what it is showing.
+#[derive(Clone)]
+pub struct ScreenshotHandle {
+    tx: SyncSender<RenderCommand>,
+}
+
+impl std::fmt::Debug for ScreenshotHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScreenshotHandle").finish_non_exhaustive()
+    }
+}
+
+impl ScreenshotHandle {
+    /// Capture the next composited frame as a PNG.
+    ///
+    /// Blocking, with a deadline: the answer arrives on the render thread's own schedule,
+    /// and a panel that has stopped presenting — a wedged compositor, a build with no
+    /// renderer — must fail the request rather than hang the caller forever.
+    ///
+    /// # Errors
+    /// [`PipelineError::Surface`] if the render thread is gone or does not answer in
+    /// time, or whatever the capture itself failed with.
+    pub fn capture(&self, timeout: Duration) -> Result<Vec<u8>, PipelineError> {
+        let (tap, rx) = crate::tap::ScreenshotTap::new();
+        self.tx
+            .try_send(RenderCommand::AddTap(Box::new(tap)))
+            .map_err(|_| {
+                PipelineError::Surface("the render thread is not accepting work".into())
+            })?;
+        rx.recv_timeout(timeout).map_err(|_| {
+            PipelineError::Surface("the render thread did not present in time".into())
+        })?
+    }
 }
 
 /// The tokio-side pipeline handle. Implements [`Pipeline`]; owns decode threads and the
@@ -68,6 +107,18 @@ impl RenderPipeline {
             },
             rx,
         )
+    }
+
+    /// A handle for asking the render thread for a screenshot.
+    ///
+    /// Cheap and clonable, and deliberately separate from the pipeline itself: by the
+    /// time anything wants a screenshot the pipeline has been moved into the session
+    /// manager, and an HTTP handler has no business holding that.
+    #[must_use]
+    pub fn screenshot_handle(&self) -> ScreenshotHandle {
+        ScreenshotHandle {
+            tx: self.tx.clone(),
+        }
     }
 
     /// The card as it currently stands. For tests and diagnostics.
@@ -669,6 +720,10 @@ impl RenderLoop {
                     }
                     Err(e) => error!(error = %e, "failed to render the now-playing card"),
                 }
+                false
+            }
+            RenderCommand::AddTap(tap) => {
+                self.taps.push(tap);
                 false
             }
             RenderCommand::ClearNowPlaying => {

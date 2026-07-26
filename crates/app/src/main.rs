@@ -79,6 +79,7 @@ fn main() -> anyhow::Result<()> {
     {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
+        let shot_handle = render_pipeline.screenshot_handle();
         let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
         let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default())
             .with_osd(osd.clone());
@@ -108,8 +109,20 @@ fn main() -> anyhow::Result<()> {
         let serve_tx = event_tx.clone();
         let serve_shutdown = shutdown.clone();
         let serve_osd = osd.clone();
+        // Taken before the pipeline is handed to the session manager: after that, nothing
+        // out here holds it, and an HTTP handler has no business owning a pipeline anyway.
+        let shot = Some(shot_handle);
         runtime.spawn(async move {
-            if let Err(e) = serve(serve_cfg, serve_tx, serve_shutdown, serve_osd, on_dial).await {
+            if let Err(e) = serve(
+                serve_cfg,
+                serve_tx,
+                serve_shutdown,
+                serve_osd,
+                on_dial,
+                shot,
+            )
+            .await
+            {
                 warn!(error = %e, "service layer exited with error");
             }
         });
@@ -173,7 +186,7 @@ fn main() -> anyhow::Result<()> {
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit);
-        runtime.block_on(serve(config, event_tx, shutdown, osd, log_dial_event))?;
+        runtime.block_on(serve(config, event_tx, shutdown, osd, log_dial_event, None))?;
     }
 
     Ok(())
@@ -229,6 +242,7 @@ async fn serve(
     shutdown: Arc<Notify>,
     osd: castaway_core::OsdSink,
     on_dial: impl Fn(proto_dial::DialEvent) + Send + 'static,
+    screenshot: Option<Screenshot>,
 ) -> anyhow::Result<()> {
     let iface = config.resolved_interface();
     info!(
@@ -351,6 +365,15 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding HTTP host on {addr}"))?;
+    // Mounted last so it cannot be shadowed by a protocol router, and with the handle as
+    // state. A build with no renderer still answers — saying it cannot draw, rather than
+    // 404ing, because "no such endpoint" and "this binary has no compositor" are
+    // different problems and only one is worth chasing.
+    let http = http.route(
+        "/screenshot.png",
+        axum::routing::get(screenshot_route).with_state(screenshot),
+    );
+
     info!(%addr, "HTTP host listening");
     let http_shutdown = shutdown.clone();
     let http_handle = tokio::spawn(async move {
@@ -495,6 +518,76 @@ fn spawn_airplay(
 
 fn spotify_device_id(config: &Config) -> String {
     config.uuid.replace('-', "")
+}
+
+/// The screenshot handle, or an uninhabited stand-in.
+///
+/// Without the `render` feature there is no compositor and so no handle to hold. Making
+/// the type uninhabited rather than `cfg`-ing the route away means the endpoint still
+/// exists and still answers — and the "no renderer" branch is the *only* representable
+/// state, so the compiler agrees rather than the comment claiming it.
+#[cfg(feature = "render")]
+type Screenshot = pipeline::ScreenshotHandle;
+#[cfg(not(feature = "render"))]
+type Screenshot = std::convert::Infallible;
+
+/// `GET /screenshot.png` — what the panel is showing, right now.
+///
+/// Exists so a surface can be reviewed without standing in front of the display, which is
+/// otherwise the only way to see whether a layout change worked.
+///
+/// A build with no renderer still answers, saying it cannot draw rather than 404ing:
+/// "no such endpoint" and "this binary has no compositor" are different problems and only
+/// one of them is worth chasing.
+#[cfg(feature = "render")]
+async fn screenshot_route(
+    axum::extract::State(handle): axum::extract::State<Option<Screenshot>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let Some(handle) = handle else {
+        return no_renderer();
+    };
+    // On a blocking pool: the capture waits for the render thread to present, which is a
+    // frame away at best and never at worst, and a runtime worker must not sit on that.
+    let shot =
+        tokio::task::spawn_blocking(move || handle.capture(std::time::Duration::from_secs(2)))
+            .await;
+    match shot {
+        Ok(Ok(png)) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "image/png")],
+            png,
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("{e}\n"),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+/// The same endpoint in a build with no compositor to photograph.
+#[cfg(not(feature = "render"))]
+async fn screenshot_route(
+    axum::extract::State(_): axum::extract::State<Option<Screenshot>>,
+) -> axum::response::Response {
+    no_renderer()
+}
+
+fn no_renderer() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "this build has no renderer; rebuild with the `render` feature\n",
+    )
+        .into_response()
 }
 
 /// Build the idle/attract image from the enabled protocols. Rendered at 1920×1080 and

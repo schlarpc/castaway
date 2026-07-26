@@ -65,6 +65,8 @@ pub use cef_browser::{BrowserCommand, BrowserHost, BrowserRole, Cef, TV_USER_AGE
 #[cfg(feature = "render")]
 pub use osd::{Banner, OsdController, OsdUpdate};
 #[cfg(feature = "render")]
+pub use render_pipeline::ScreenshotHandle;
+#[cfg(feature = "render")]
 pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
 #[cfg(feature = "render")]
 pub use wgpu_compositor::WgpuCompositor;
