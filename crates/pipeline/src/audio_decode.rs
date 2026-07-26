@@ -207,7 +207,8 @@ impl AudioDecoder {
                 .append(true)
                 .open(&path)
             {
-                let _ = f.write_all(&(frame.data.len() as u32).to_le_bytes());
+                let len = u32::try_from(frame.data.len()).unwrap_or(u32::MAX);
+                let _ = f.write_all(&len.to_le_bytes());
                 let _ = f.write_all(&frame.data);
             }
         }
@@ -288,11 +289,34 @@ impl AudioDecoder {
             }
         };
 
-        // `Frame::plane::<T>()` is unusable for *packed* multi-channel audio — it reports
-        // one channel's worth of length — so both layouts are read through the raw byte
-        // buffer, which is correct for either.
+        // Neither accessor ffmpeg-next offers is usable directly. `Frame::plane::<T>()`
+        // reports one channel's worth of length for *packed* audio, and `Frame::data(n)`
+        // takes its length from `linesize[n]` — which ffmpeg only fills in for plane 0 of
+        // planar audio, leaving every other plane an empty slice. Reading a planar frame
+        // through it therefore yields audio in the left channel and digital silence in
+        // the right, which is audible immediately and invisible to an RMS check over the
+        // interleaved buffer.
+        //
+        // So planar planes are taken from `extended_data` with the length computed here.
+        // `extended_data` rather than `data[]` because it is the documented accessor and
+        // stays valid past eight channels, where `data[]` runs out.
         for ch in 0..channels {
-            let plane = decoded.data(if planar { ch } else { 0 });
+            let plane: &[u8] = if planar {
+                // SAFETY: `decoded` holds a decoder-owned frame that is alive for this
+                // borrow. For planar audio ffmpeg guarantees `extended_data[ch]` is a
+                // valid buffer for every channel it reported, each holding exactly
+                // `samples() * bytes_per_sample` bytes.
+                unsafe {
+                    let raw = decoded.as_ptr();
+                    let ptr = *(*raw).extended_data.add(ch);
+                    if ptr.is_null() {
+                        continue;
+                    }
+                    std::slice::from_raw_parts(ptr, frames * width)
+                }
+            } else {
+                decoded.data(0)
+            };
             for i in 0..frames {
                 let byte = if planar {
                     i * width
@@ -539,12 +563,12 @@ mod tests {
         }
 
         let mut decoded: Vec<f32> = Vec::new();
-        let mut format = None;
+        let mut reported = None;
         let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(rate, 2)).unwrap();
         for frame in &frames {
             decoder
                 .decode(frame, |block| {
-                    format = Some((block.sample_rate, block.channels));
+                    reported = Some((block.sample_rate, block.channels));
                     decoded.extend_from_slice(&block.samples);
                 })
                 .unwrap();
@@ -554,7 +578,7 @@ mod tests {
             .unwrap();
 
         assert!(!decoded.is_empty(), "aptX produced no audio");
-        assert_eq!(format, Some((rate, 2)), "rate and channels must survive");
+        assert_eq!(reported, Some((rate, 2)), "rate and channels must survive");
 
         // aptX is 4:1 and quite faithful; the decoded signal should be close in level to
         // the 12000/32768 ≈ 0.366 peak sine that went in (RMS ≈ 0.259).
@@ -568,6 +592,27 @@ mod tests {
         assert!(
             decoded.iter().any(|s| s.abs() > 0.05),
             "decoded audio is silent"
+        );
+
+        // And *both* channels must carry it. aptX decodes planar, and reading a planar
+        // frame through an accessor that takes its length from `linesize[n]` gives an
+        // empty slice for every plane after the first — audio in the left ear, silence in
+        // the right. The interleaved RMS above still passes with half the samples zeroed,
+        // which is exactly how that shipped.
+        let left = rms(&decoded.iter().step_by(2).copied().collect::<Vec<_>>());
+        let right = rms(&decoded
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>());
+        assert!(
+            right > 0.05,
+            "the right channel is silent: left {left}, right {right}"
+        );
+        assert!(
+            (left - right).abs() < 0.05,
+            "a mono sine should decode evenly: left {left}, right {right}"
         );
     }
 
@@ -663,7 +708,7 @@ mod tests {
                 inner: std::mem::take(&mut out),
                 blocks: std::sync::Arc::clone(&counted),
             };
-            crate::audio_session::run(rx, Box::new(sink));
+            crate::audio_session::run(rx, format(44_100, 2), Box::new(sink));
             let blocks = counted.lock().unwrap().clone();
             blocks
         });
