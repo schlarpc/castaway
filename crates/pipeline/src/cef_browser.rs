@@ -170,6 +170,18 @@ wrap_app! {
                 // windowless rendering.
                 cl.append_switch(Some(&"disable-gpu".into()));
                 cl.append_switch(Some(&"disable-gpu-compositing".into()));
+                // A cast receiver is all autoplay: the sender queues a video over the
+                // Lounge and the page calls play() with no user gesture behind it. This
+                // CEF build already permits that (measured — the self-play harness reaches
+                // PLAYING without this switch), but stock Chromium's default policy does
+                // not: the same page there buffers and drops back to UNSTARTED, binding
+                // and accepting the playlist and then just sitting. Pinned rather than
+                // inherited, because there is no user to gesture at a kiosk and the
+                // failure mode is silent — and the Windows CEF is a different binary.
+                cl.append_switch_with_value(
+                    Some(&"autoplay-policy".into()),
+                    Some(&"no-user-gesture-required".into()),
+                );
             }
         }
     }
