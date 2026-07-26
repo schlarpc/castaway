@@ -201,6 +201,11 @@
           });
 
           castaway = self.packages.${system}.default;
+
+          # A scripted phone, for the one path no VM test can cover: YouTube's Lounge
+          # servers are a third party to the session, so this needs the real internet
+          # and a running receiver. `nix run .#yt-selfplay -- http://<receiver>:8080`.
+          yt-selfplay = import ./nix/yt-selfplay.nix { inherit pkgs; };
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
             # The Windows deploy artifacts, cross-compiled from Linux. `-cef` is the one
@@ -391,6 +396,10 @@
               # wrapper is only *built* on Windows/macOS, but keep the tools available).
               pkgs.cmake
               pkgs.ninja
+
+              # The scripted phone, on PATH: `yt-selfplay http://<receiver>:8080` while a
+              # `--features cef` build runs, to check a YouTube cast really plays.
+              self.packages.${system}.yt-selfplay
 
               # nix-direnv for this flake's shell
               nix-direnv.packages.${system}.default

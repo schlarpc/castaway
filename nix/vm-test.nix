@@ -439,7 +439,6 @@ pkgs.testers.runNixOSTest {
 
     with subtest("SSDP M-SEARCH is answered, and every LOCATION it hands out resolves"):
         replies = sender.succeed(f"ssdp-search ssdp:all 5 {lan}")
-        assert "urn:dial-multiscreen-org:service:dial:1" in replies, replies
         assert "urn:schemas-upnp-org:device:MediaRenderer:1" in replies, replies
 
         locations = sorted({
@@ -454,24 +453,22 @@ pkgs.testers.runNixOSTest {
             assert location.startswith(base), f"LOCATION {location} is not on {base}"
             sender.succeed(f"curl -sSf -o /dev/null {location}")
 
-    with subtest("DIAL launches and stops YouTube"):
-        headers = sender.succeed(f"curl -sSf -D- -o /dev/null {base}/dial/dd.xml").lower()
-        assert f"application-url: {base}/dial/apps/" in headers, headers
-
-        assert "<state>stopped</state>" in sender.succeed(f"curl -sSf {base}/dial/apps/YouTube")
-        launch = sender.succeed(
-            "curl -sSf -D- -o /dev/null -X POST "
-            f"-d 'pairingCode=zt7bq2&theme=cl' {base}/dial/apps/YouTube"
-        ).lower()
-        assert "201 created" in launch, launch
-        assert f"location: {base}/dial/apps/YouTube/run".lower() in launch, launch
-
-        assert "<state>running</state>" in sender.succeed(f"curl -sSf {base}/dial/apps/YouTube")
-        # allowStop="true" promises this works; a sender that disconnects must dismiss it.
-        sender.succeed(f"curl -sSf -X DELETE {base}/dial/apps/YouTube/run")
-        assert "<state>stopped</state>" in sender.succeed(f"curl -sSf {base}/dial/apps/YouTube")
-
-        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'DIAL launched YouTube'")
+    with subtest("a browser-less build does not offer YouTube at all"):
+        # This build has no `cef` feature, so there is no page to launch — and DIAL is
+        # launch-only, so every part of a YouTube cast after the launch happens between
+        # the phone, YouTube's servers, and a page that would never exist. Advertising it
+        # anyway is what D16 forbids: the sender gets a cast target that accepts the
+        # launch, reports `running`, and can never play. So: nothing advertised, nothing
+        # mounted, and a log line saying why.
+        #
+        # The launch/stop semantics themselves are covered by proto-dial's own tests, and
+        # the whole path (launch → the page binds a Lounge session → the screen actually
+        # plays) by `nix run .#yt-selfplay`, which needs the real internet and so cannot
+        # live in here.
+        assert "urn:dial-multiscreen-org:service:dial:1" not in replies, replies
+        sender.succeed(f"curl -sS -o /dev/null -w '%{{http_code}}' {base}/dial/dd.xml | grep -q 404")
+        sender.succeed(f"curl -sS -o /dev/null -w '%{{http_code}}' {base}/dial/apps/YouTube | grep -q 404")
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'DIAL disabled'")
 
     with subtest("DLNA cast-a-video drives the transport and reaches the pipeline"):
         assert sender.succeed(f"dlna-ctl {base} state").strip() == "NO_MEDIA_PRESENT"
