@@ -171,10 +171,10 @@ type CachedBlocker = (Option<std::time::SystemTime>, Arc<AdBlocker>);
 /// and must not block a page load on the network. The browser process refreshes the cache;
 /// this notices.
 ///
-/// **These log lines are invisible today.** A CEF subprocess spends its whole life inside
-/// `execute_process`, which `main` calls before it installs a tracing subscriber — so
-/// nothing this function logs reaches the journal. Worth knowing before spending an hour
-/// wondering why the renderer is silent (it is not; it is unsubscribed).
+/// Its log lines only exist because `main` installs the tracing subscriber *before*
+/// `Cef::bootstrap`: a subprocess never leaves `execute_process`, so a subscriber
+/// installed after it would cover the browser process alone and this whole path — the one
+/// that does the injecting — would be silent.
 fn render_blocker() -> Option<Arc<AdBlocker>> {
     let paths = crate::filterlists::CachePaths::default();
     let stamp = crate::filterlists::cache_stamp(&paths);

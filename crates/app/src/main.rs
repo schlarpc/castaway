@@ -46,16 +46,27 @@ use crate::config::Config;
 const MDNS_HOST: &str = "castaway";
 
 fn main() -> anyhow::Result<()> {
-    // CEF is multi-process: subprocesses re-exec this same binary, so bootstrap must be
-    // the very first thing in main — before tracing, config, or the tokio runtime.
-    // `None` means this invocation *was* a subprocess and has already run to completion.
+    // Tracing first, and *before* CEF bootstrap on purpose. A CEF subprocess re-execs this
+    // binary and then spends its entire life inside `execute_process` — so a subscriber
+    // installed after bootstrap is installed only in the browser process, and everything
+    // the render process logs (scriptlet injection, list reloads) goes nowhere. That is
+    // not a small gap: injection *only* happens over there.
+    //
+    // The ordering rule this bends is real but narrower than it looked: CEF wants
+    // `execute_process` early so a subprocess does no needless work and sees the original
+    // argv. Installing a subscriber touches neither — no argv, no env, no threads — and it
+    // is the whole reason the renderer is observable at all.
+    init_tracing();
+
+    // CEF is multi-process: subprocesses re-exec this same binary, so bootstrap comes
+    // before config and the tokio runtime. `None` means this invocation *was* a subprocess
+    // and has already run to completion.
     #[cfg(feature = "cef")]
     let cef = match pipeline::Cef::bootstrap().map_err(|e| anyhow::anyhow!("cef bootstrap: {e}"))? {
         Some(cef) => cef,
         None => return Ok(()),
     };
 
-    init_tracing();
     let config = Config::from_env().context("loading config")?;
     // A category name that is not one of SponsorBlock's parses to "unknown" rather than
     // failing, which for a *response* is the point and for *config* is a silent typo.

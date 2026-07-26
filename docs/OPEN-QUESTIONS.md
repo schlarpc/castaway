@@ -193,12 +193,15 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   **Nothing else in the tree depends on a startup fetch.** SponsorBlock looks segments up per
   video change and the Lounge screen id is resolved per DIAL launch, so both are already as
   fresh as the thing they describe.
-- **Q37 — the render process logs into the void.** A CEF subprocess spends its whole life
-  inside `execute_process`, which `main` calls *before* installing a tracing subscriber — so
-  every `info!`/`debug!` from the injection path is discarded, and the renderer looks silent
-  when it is merely unsubscribed. This cost real debugging time. The fix is to install the
-  subscriber before `Cef::bootstrap`, which contradicts the "bootstrap must be first thing in
-  main" comment and so wants a deliberate decision rather than a drive-by change.
+- ~~**Q37 — the render process logs into the void.**~~ **FIXED 2026-07-26.** `main` installs
+  the tracing subscriber *before* `Cef::bootstrap`. A CEF subprocess never leaves
+  `execute_process`, so a subscriber installed after it covered the browser process alone and
+  the render process — the one that actually does the injecting — was silent. The ordering rule
+  that seemed to forbid this is narrower than it read: CEF wants `execute_process` early so a
+  subprocess does no needless work and sees the original argv, and installing a subscriber
+  touches neither (no argv, no env, no threads). Verified: the renderer now logs
+  `render process ready to inject scriptlets=38` and `injecting scriptlets url=…`, and a full
+  `yt-selfplay` still passes, so CEF is unbothered by the move.
 - **Q36 — lifting the scriptlet pin.** To track uBO's scriptlets again, something has to read
   their current format: one file per scriptlet under `src/js/resources/`, each ending in
   `registerScriptlet(fn, { name, dependencies })`. That means fetching the directory and
