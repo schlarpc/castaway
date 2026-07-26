@@ -14,6 +14,9 @@
 //! negotiation via [`castaway_core::SessionEvent::Audio`] — the bug Q25 recorded was this
 //! function inventing 44.1 kHz while the phone was sending 48 (OPEN-QUESTIONS Q25).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use castaway_core::{AudioCodec, AudioFormat, EncodedFrame};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -39,9 +42,19 @@ pub fn default_output() -> Box<dyn AudioOut> {
     }
 }
 
-/// Run a decode → output session on a dedicated thread until the source ends.
-pub fn spawn(frames: mpsc::Receiver<EncodedFrame>, format: AudioFormat, output: Box<dyn AudioOut>) {
-    std::thread::spawn(move || run(frames, format, output));
+/// Run a decode → output session on a dedicated thread until the source ends or `stop`
+/// is set.
+///
+/// The flag is not optional. A preempted session whose phone is still streaming will
+/// otherwise decode forever, and two sessions writing to one output device do not mix —
+/// they fight, and it sounds like it.
+pub fn spawn(
+    frames: mpsc::Receiver<EncodedFrame>,
+    format: AudioFormat,
+    output: Box<dyn AudioOut>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || run(frames, format, output, &stop));
 }
 
 /// Drive one audio session to completion. Blocking; call it on its own thread.
@@ -49,6 +62,7 @@ pub fn run(
     mut frames: mpsc::Receiver<EncodedFrame>,
     format: AudioFormat,
     mut output: Box<dyn AudioOut>,
+    stop: &AtomicBool,
 ) {
     // Wait for the first frame so the codec comes from the stream itself.
     let Some(first) = frames.blocking_recv() else {
@@ -65,8 +79,16 @@ pub fn run(
     let result = decode_audio_stream(
         codec,
         format,
-        || pending.take().or_else(|| frames.blocking_recv()),
+        || {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            pending.take().or_else(|| frames.blocking_recv())
+        },
         |block| {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
             if !started {
                 if let Err(e) = output.start(block.sample_rate, block.channels) {
                     warn!(error = %e, "audio session: output refused the stream");
@@ -91,6 +113,9 @@ pub fn run(
         },
     );
 
+    if stop.load(Ordering::Relaxed) {
+        info!(?codec, "audio session: preempted");
+    }
     if let Err(e) = result {
         // The most likely cause is a codec we advertised but cannot decode, which is
         // the failure Q22 exists to prevent — so name it loudly.
@@ -130,12 +155,16 @@ mod tests {
         AudioFormat::from_hz(44_100, 2).unwrap()
     }
 
+    fn running() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn a_session_with_no_frames_exits_instead_of_parking() {
         // The phone connected and never sent anything. The thread must not leak.
         let (tx, rx) = mpsc::channel::<EncodedFrame>(1);
         drop(tx);
-        run(rx, format(), Box::new(NullAudioOut::new()));
+        run(rx, format(), Box::new(NullAudioOut::new()), &running());
     }
 
     #[test]
@@ -151,7 +180,7 @@ mod tests {
         .unwrap();
         drop(tx);
         // Guessing SBC here would decode noise; exiting is the honest answer.
-        run(rx, format(), Box::new(NullAudioOut::new()));
+        run(rx, format(), Box::new(NullAudioOut::new()), &running());
     }
 
     #[test]

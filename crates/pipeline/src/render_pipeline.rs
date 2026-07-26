@@ -184,7 +184,12 @@ impl Pipeline for RenderPipeline {
                     "an audio session must arrive as encoded frames".into(),
                 ));
             };
-            crate::audio_session::spawn(rx, format, crate::audio_session::default_output());
+            // Preempt first: the flag slot holds whichever session is live, video or
+            // audio, because only one source may own the output at a time.
+            self.preempt();
+            let stop = Arc::new(AtomicBool::new(false));
+            self.set_active(Arc::clone(&stop));
+            crate::audio_session::spawn(rx, format, crate::audio_session::default_output(), stop);
             Ok(())
         }
         #[cfg(not(feature = "audio"))]

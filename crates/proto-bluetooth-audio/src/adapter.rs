@@ -360,14 +360,30 @@ impl SourceAdapter for BluetoothAdapter {
                             continue;
                         }
                     };
-                    self.dispatch(
-                        packet_handle,
-                        events,
-                        links.get_mut(&packet_handle.raw()),
-                        &sink,
-                        &acl,
-                    )
-                    .await?;
+                    let started = self
+                        .dispatch(
+                            packet_handle,
+                            events,
+                            links.get_mut(&packet_handle.raw()),
+                            &sink,
+                            &acl,
+                        )
+                        .await?;
+
+                    // One phone at a time owns the speakers (Q23). When one starts, every
+                    // other one that is streaming gets told, rather than being left to
+                    // play into a decoder that has stopped listening.
+                    if let Some(winner) = started {
+                        for (raw, other) in links.iter_mut() {
+                            if other.peer == winner || !other.session_open {
+                                continue;
+                            }
+                            let Ok(other_handle) = ConnectionHandle::new(*raw) else {
+                                continue;
+                            };
+                            self.pause_preempted(other_handle, other, &acl);
+                        }
+                    }
                 }
 
                 other => debug!(?other, "ignoring HCI packet"),
@@ -407,10 +423,13 @@ impl BluetoothAdapter {
         link: Option<&mut Link>,
         sink: &SessionSink,
         acl: &AclWriter,
-    ) -> Result<(), CoreError> {
+    ) -> Result<Option<BdAddr>, CoreError> {
         let Some(link) = link else {
-            return Ok(());
+            return Ok(None);
         };
+        // Set when this link starts streaming, so the *other* links can be told after
+        // this borrow ends.
+        let mut preempt: Option<BdAddr> = None;
         // Signalling PDUs the multiplexer built are already addressed to the peer.
         let mut signalling: Vec<L2capPdu> = Vec::new();
         // Protocol replies are keyed by *our* channel id — the one the incoming event
@@ -490,7 +509,7 @@ impl BluetoothAdapter {
                         if Some(cid) == link.avdtp_media {
                             self.on_media(link, payload).await;
                         } else {
-                            self.on_avdtp(link, cid, &payload, sink, &mut outbound)
+                            self.on_avdtp(link, cid, &payload, sink, &mut outbound, &mut preempt)
                                 .await?;
                         }
                     } else if psm == Psm::AVCTP {
@@ -526,7 +545,30 @@ impl BluetoothAdapter {
                 Err(e) => warn!(error = %e, %cid, "dropping a reply we cannot address"),
             }
         }
-        Ok(())
+        Ok(preempt)
+    }
+
+    /// Tell a phone we are no longer listening to it.
+    ///
+    /// AVRCP pause rather than AVDTP suspend, deliberately. Pausing the *player* is what
+    /// the person holding the phone sees and understands, and a phone that pauses stops
+    /// its own stream and sends us the suspend itself — which keeps our sink state
+    /// machine driven by what it receives, rather than diverging from a command we sent.
+    /// A phone that ignores the keypress costs nothing: the pipeline has already stopped
+    /// decoding it.
+    fn pause_preempted(&self, handle: ConnectionHandle, link: &mut Link, acl: &AclWriter) {
+        let Some(cid) = link.avctp else { return };
+        let Some(peer_cid) = link.mux.channel(cid).map(|c| c.remote_cid) else {
+            return;
+        };
+        info!(peer = %link.peer, "bluetooth: pausing a preempted phone");
+        for frame in avrcp::passthrough(avrcp::operation::PAUSE) {
+            let transaction = link.next_transaction();
+            acl.send(
+                handle,
+                L2capPdu::new(peer_cid, avctp_body(transaction, &frame)),
+            );
+        }
     }
 
     /// AVDTP signaling: drive the sink session and act on what it reports.
@@ -537,6 +579,7 @@ impl BluetoothAdapter {
         payload: &[u8],
         sink: &SessionSink,
         outbound: &mut Vec<(Cid, Bytes)>,
+        preempt: &mut Option<BdAddr>,
     ) -> Result<(), CoreError> {
         let msg = match Message::decode(payload) {
             Ok(m) => m,
@@ -560,6 +603,11 @@ impl BluetoothAdapter {
                         .merged(SourceDescription::new().with_link(configuration.describe()));
                 }
                 SinkEvent::Started => {
+                    // Preempt every other phone on this controller, politely. Two A2DP
+                    // sources feeding one output do not mix — they fight — and the phone
+                    // that loses deserves to be told rather than left streaming into a
+                    // decoder nobody is listening to (Q23: last writer wins).
+                    *preempt = Some(link.peer);
                     // START cannot precede SET_CONFIGURATION in the sink state machine,
                     // so a missing format means a bug here rather than a sender problem —
                     // and starting a session without one would decode at a guessed rate,

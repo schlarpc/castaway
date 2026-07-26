@@ -14,13 +14,26 @@ use tracing::info;
 /// A pipeline that logs every operation and drains mirror frame sources (dropping
 /// frames) so senders don't stall on a full channel.
 #[derive(Default)]
-pub struct NullPipeline;
+pub struct NullPipeline {
+    /// Stop flag for the session in progress, so a preempted one actually ends.
+    active: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+}
 
 impl NullPipeline {
     /// Create a null pipeline.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// End whatever session is running. Two audio sessions writing to one output device
+    /// do not mix, they fight — so a new session must retire the old one first.
+    fn preempt(&self) {
+        if let Ok(mut guard) = self.active.lock() {
+            if let Some(flag) = guard.take() {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Spawn a task that drains a frame source, counting frames it drops.
@@ -79,11 +92,21 @@ impl Pipeline for NullPipeline {
         // the wgpu/winit kiosk just to make sound would mean the headless build can
         // negotiate a whole stream and then silently bin it — which is exactly what it
         // did on the first iPhone that connected.
+        self.preempt();
         #[cfg(feature = "audio")]
         {
             if let FrameSource::Encoded(rx) = source {
                 info!(%format, "null pipeline: AUDIO begin (decoding to the output device)");
-                crate::audio_session::spawn(rx, format, crate::audio_session::default_output());
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Ok(mut guard) = self.active.lock() {
+                    *guard = Some(std::sync::Arc::clone(&stop));
+                }
+                crate::audio_session::spawn(
+                    rx,
+                    format,
+                    crate::audio_session::default_output(),
+                    stop,
+                );
                 return Ok(());
             }
             info!(%format, "null pipeline: AUDIO begin (not encoded frames; draining)");
@@ -123,6 +146,7 @@ impl Pipeline for NullPipeline {
     }
 
     async fn stop(&self) -> Result<(), CoreError> {
+        self.preempt();
         info!("null pipeline: STOP");
         Ok(())
     }
