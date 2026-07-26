@@ -959,6 +959,44 @@ async fn cover_art_is_discovered_then_fetched() {
 }
 
 #[tokio::test]
+async fn we_open_avctp_ourselves_when_the_peer_does_not() {
+    // Android opens AVCTP; an iPhone streams happily and never does. We are the AVRCP
+    // Controller — the end that wants metadata and sends transport commands — so waiting
+    // to be connected to left the now-playing card permanently empty on the phones people
+    // are most likely to walk up with.
+    let (transport, _rx) = connected().await;
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = Seid::from_shifted(discover.payload[4]).unwrap();
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_44100,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 2, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 3, Signal::Open, &[seid.shifted()]).await;
+    // Deliberately never open AVCTP from the phone side.
+    avdtp(&transport, signaling, 4, Signal::Start, &[seid.shifted()]).await;
+
+    eventually("an outgoing avctp connection request", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .filter(|pdu| pdu.cid == Cid::SIGNALING)
+            .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
+            .flatten()
+            .find_map(|sig| match sig {
+                L2capSignal::ConnectionRequest { psm, .. } if psm == Psm::AVCTP => Some(()),
+                _ => None,
+            })
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_dropped_link_ends_the_session() {
     // The phone walks out mid-song. No teardown handshake, just a dead link — and the
     // session manager must be told, or the panel keeps showing a card forever.

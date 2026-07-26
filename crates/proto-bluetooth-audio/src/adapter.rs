@@ -591,8 +591,16 @@ impl BluetoothAdapter {
                         if Some(cid) == link.avdtp_media {
                             self.on_media(link, payload).await;
                         } else {
-                            self.on_avdtp(link, cid, &payload, sink, &mut outbound, &mut preempt)
-                                .await?;
+                            self.on_avdtp(
+                                link,
+                                cid,
+                                &payload,
+                                sink,
+                                &mut outbound,
+                                &mut signalling,
+                                &mut preempt,
+                            )
+                            .await?;
                         }
                     } else if psm == Psm::AVCTP {
                         self.on_avctp(link, cid, &payload, sink, &mut outbound, &mut signalling)
@@ -661,6 +669,7 @@ impl BluetoothAdapter {
         payload: &[u8],
         sink: &SessionSink,
         outbound: &mut Vec<(Cid, Bytes)>,
+        signalling: &mut Vec<L2capPdu>,
         preempt: &mut Option<BdAddr>,
     ) -> Result<(), CoreError> {
         let msg = match Message::decode(payload) {
@@ -715,12 +724,26 @@ impl BluetoothAdapter {
                         link_sink
                             .emit(SessionEvent::SourceInfo(link.description.clone()))
                             .await?;
-                        // …and the control surface, if AVCTP got in first. It usually
-                        // does.
+                        // …and the control surface, if AVCTP got in first.
                         if let Some(control) = &link.control {
                             link_sink
                                 .emit(SessionEvent::ControlSurface(Arc::clone(control)))
                                 .await?;
+                        }
+                    }
+                    // If it did not, open it ourselves. We are the AVRCP *Controller* —
+                    // the end that wants metadata and sends transport commands — so
+                    // waiting to be connected to is the wrong posture. Android opens
+                    // AVCTP; an iPhone streams happily and never does, which left the
+                    // now-playing card permanently empty on exactly the phones people
+                    // are most likely to walk up with.
+                    if link.avctp.is_none() {
+                        match link.mux.connect(Psm::AVCTP) {
+                            Ok((_, events)) => {
+                                debug!("bluetooth: peer opened no avctp; connecting out");
+                                Self::queue_signalling(events, signalling);
+                            }
+                            Err(e) => warn!(error = %e, "no channel for avctp"),
                         }
                     }
                 }
