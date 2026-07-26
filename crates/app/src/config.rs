@@ -51,6 +51,14 @@ pub struct SponsorBlock {
     /// silently jumps looks broken, and the toast is also where the database gets the
     /// credit its licence asks for.
     pub toast: bool,
+    /// Press the screen's own "Skip Ad" button as soon as it lights up.
+    ///
+    /// This is YouTube's ads, not SponsorBlock's segments — a different mechanism that
+    /// happens to ride the same Lounge session, which is why it lives here. It only
+    /// reaches *skippable* ads after their countdown; unskippable ones play, and nothing
+    /// is muted (a mute that failed to lift would leave a silent display, which is worse
+    /// than the ad).
+    pub skip_ads: bool,
 }
 
 impl Default for SponsorBlock {
@@ -64,6 +72,7 @@ impl Default for SponsorBlock {
             ],
             minimum_seconds: 1.0,
             toast: true,
+            skip_ads: true,
         }
     }
 }

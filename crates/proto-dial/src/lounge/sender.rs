@@ -159,6 +159,14 @@ impl Bound {
         self.command_request("seekTo", &[("newTime", &format!("{seconds:.3}"))])
     }
 
+    /// Press the screen's own "Skip Ad" button.
+    ///
+    /// Only does anything once the ad reports `isSkipEnabled` — before the countdown
+    /// elapses, and for ads that are never skippable at all, the screen ignores it.
+    pub fn skip_ad(&mut self) -> LoungeRequest {
+        self.command_request("skipAd", &[])
+    }
+
     /// Note an array id from the screen so a reconnect resumes rather than replays.
     pub fn observe(&mut self, command: &LoungeCommand) {
         self.aid = self.aid.max(command.aid);

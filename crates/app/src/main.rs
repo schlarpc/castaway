@@ -12,9 +12,8 @@
 mod bluetooth;
 mod config;
 mod screen;
-// The skipper attaches to the page we launched, so it exists exactly where a page
-// can: the browser build. Without one, DIAL is not mounted either (D27).
-#[cfg(feature = "cef")]
+// Reading the screen is pure and always compiled; the actor that drives it needs a page
+// to drive, so it exists only in the browser build (D27).
 mod sponsorblock;
 
 use std::net::{Ipv4Addr, SocketAddr};
