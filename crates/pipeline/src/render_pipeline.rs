@@ -1040,7 +1040,7 @@ mod tests {
 #[cfg(test)]
 mod card_tests {
     #![allow(clippy::unwrap_used)]
-    use castaway_core::{FrameSource, MediaUri, NowPlaying, Pipeline as _, SourceDescription};
+    use castaway_core::{MediaUri, NowPlaying, Pipeline as _, SourceDescription};
 
     use super::{RenderCommand, RenderPipeline};
 
@@ -1104,7 +1104,7 @@ mod card_tests {
             let (_tx, rx) = std::sync::mpsc::sync_channel(1);
             pipeline
                 .play_audio(
-                    FrameSource::Pcm(rx),
+                    castaway_core::FrameSource::Pcm(rx),
                     castaway_core::AudioFormat::from_hz(44_100, 2).unwrap(),
                 )
                 .await

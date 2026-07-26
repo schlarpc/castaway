@@ -17,6 +17,38 @@ nothing is the failure mode this project keeps rediscovering, and those are mark
 `CONFIRMED` means the code was read and definitely does not handle the case. `SUSPECTED`
 means the code path is right but the real-world trigger rate or peer behaviour is unproven.
 
+## Status
+
+✅ fixed · 🟡 partly fixed · unmarked = open. Fixed entries are left in place with their
+original wording, because the reason a thing was wrong is worth keeping after it stops
+being wrong.
+
+**All three themes are closed.** Every subsystem is now supervised (G1, G2, G3 — the CEF
+half of G3 is the exception, see below), `Pipeline::control()` does something (G9, G10),
+and the display is handed back when another source takes the session (G6), with the
+outgoing source told to stop sending rather than merely ignored (G37).
+
+Still open and worth taking next, roughly in order:
+
+1. **G5** — a preempted Spotify session can never play again. Still the worst
+   user-visible entry here: the device stays in the picker and produces silence forever.
+   Needs a way to hand the pipeline a fresh `FrameSource::Pcm`, which librespot's `FnOnce`
+   sink builder does not allow without rebuilding the player.
+2. **G3** — CEF lifecycle/load-error handling. The other two supervisors landed; this one
+   needs `LifeSpanHandler`/`LoadHandler` wiring and could not be verified without a real
+   renderer crash.
+3. **G18/G19** — L2CAP RTX timers and `CommandReject`. Both are real interop holes and
+   both want the negative-path test tier G52 describes, which does not exist yet.
+4. **G15** — RECONFIGURE accepted and ignored. Silent wrong-pitch audio.
+5. **G23** — the 110-second blocking startup fetch, which can expire G20's screen-id
+   budget before the browser exists.
+6. **G25/G26** — AVRCP fragmentation and playback position.
+7. **G30** — Broadcom/MediaTek/Qualcomm firmware loaders, and making `registry_strict`
+   the production path so an unknown dongle is an error rather than a silent no-op.
+
+G46 (DRM/4K on the browser path) and G31's `HOME` assumption both want checking on the
+real box rather than more code.
+
 ---
 
 ## The three themes
@@ -50,7 +82,7 @@ display or the audio device, and two cannot take it back afterwards.
 
 ## Tier 1 — silent, permanent, and reachable in normal use
 
-- **G1 — The Spotify session is never supervised. CONFIRMED, silent.**
+- ✅ **G1 — The Spotify session is never supervised. CONFIRMED, silent.**
   `proto-spotify/src/session.rs:301`. `LiveSession` holds three `JoinHandle`s; nothing
   awaits or polls any of them, the only use is `.abort()` in `shutdown()`. Upstream
   `SpircTask::run` loops `while !self.session.is_invalid()` and simply *returns*, and
@@ -59,7 +91,7 @@ display or the audio device, and two cannot take it back afterwards.
   phone's picker, the OSD says nothing, our logs say nothing, and the panel holds the last
   track forever. Recovery is a human re-pairing from the Spotify app.
 
-- **G2 — Any Bluetooth transport error ends the stack for the process lifetime.
+- ✅ **G2 — Any Bluetooth transport error ends the stack for the process lifetime.
   CONFIRMED, silent.** `proto-bluetooth-audio/src/adapter.rs:329` does `warn!` then
   `return Ok(())`, so the caller cannot even distinguish failure from a clean stop;
   `app/src/bluetooth.rs:90` spawns it once with no supervisor and no re-enumeration.
@@ -75,7 +107,7 @@ display or the audio device, and two cannot take it back afterwards.
   published. A `youtube.com/tv` that fails to load — DNS not up at boot, captive portal, a
   leanback deploy that breaks under our pinned TV UA — retries nothing and reports nothing.
 
-- **G4 — The USB ACL read buffer is smaller than the packet we invite. CONFIRMED.**
+- ✅ **G4 — The USB ACL read buffer is smaller than the packet we invite. CONFIRMED.**
   `hci-transport/src/usb.rs:42` sets `ACL_BUF = 1024`, but `adapter.rs:178` advertises a
   1017-byte L2CAP MTU, deliberately, so a full SDU lands in one ACL packet: 1017 + 4
   (L2CAP header) + 4 (HCI ACL header) = **1025**. The kernel's `btusb` uses 1028 for this
@@ -94,7 +126,7 @@ display or the audio device, and two cannot take it back afterwards.
   play/pause, still updates the phone's UI, and is silent forever. The worst entry here,
   because it looks like it works.
 
-- **G6 — The YouTube page never yields the screen. CONFIRMED.**
+- ✅ **G6 — The YouTube page never yields the screen. CONFIRMED.**
   `app/src/main.rs:119-129` is the only producer of `BrowserCommand`, both sends inside the
   DIAL closure; `BrowserRole::Fullscreen` sits at `z=5`, above video (`z=0`) and attract
   (`z=-10`). D28 itself records that nothing sends DIAL `DELETE` in practice. So after the
@@ -103,7 +135,7 @@ display or the audio device, and two cannot take it back afterwards.
   YouTube audio (CEF audio goes straight to the system device — there is no `AudioHandler`
   and no route into the pipeline mixer), and attract mode never returns.
 
-- **G7 — `SessionEvent::End` is never emitted by Spotify. CONFIRMED, silent.**
+- ✅ **G7 — `SessionEvent::End` is never emitted by Spotify. CONFIRMED, silent.**
   `session.rs:401`'s `_ => false` swallows `PlayerEvent::SessionDisconnected` — which is
   exactly "the user pressed Disconnect on their phone" — and `shutdown()` tears down
   without telling the session manager. `core/src/session.rs:192` only clears the card on
@@ -111,7 +143,7 @@ display or the audio device, and two cannot take it back afterwards.
   `pipeline.stop()` is never called, the card never clears, the display is never released,
   and the PCM thread keeps the audio device.
 
-- **G8 — `proto-spotify`'s test target does not compile. CONFIRMED.**
+- ✅ **G8 — `proto-spotify`'s test target does not compile. CONFIRMED.**
   `session.rs:821,829,843,855,864` call `queue_from_cluster`, which the working tree
   deleted in favour of `queue_tracks` + `QueueNames::resolve`. The definition exists
   nowhere. The whole crate's test binary fails to build, so the blob-underflow guard, the
@@ -123,14 +155,14 @@ display or the audio device, and two cannot take it back afterwards.
 
 ## Tier 2 — wrong behaviour a sender will notice
 
-- **G9 — AVRCP absolute volume is accepted and discarded. CONFIRMED (Theme B).**
+- ✅ **G9 — AVRCP absolute volume is accepted and discarded. CONFIRMED (Theme B).**
   `adapter.rs:944` parses `SET_ABSOLUTE_VOLUME`, replies `Accepted`, emits
   `ControlTxn::Volume`, and `render_pipeline.rs:306` logs it. The phone's volume rocker
   does nothing. Worse if the phone enters absolute-volume mode on the strength of our
   category-2 Target record (`record.rs:353`) and stops attenuating locally — then playback
   is pinned at full scale with no working control on either end (that half SUSPECTED).
 
-- **G10 — The panel's own control surface is unreachable by construction. CONFIRMED
+- ✅ **G10 — The panel's own control surface is unreachable by construction. CONFIRMED
   (Theme B).** `core/src/session.rs:99` `SessionManager::remote()` has zero callers outside
   core's own unit tests, and `app/src/main.rs:111` does `runtime.spawn(manager.run(event_rx))`
   where `run(self, …)` *consumes* the manager — so `remote()` cannot be called even in
@@ -139,7 +171,7 @@ display or the audio device, and two cannot take it back afterwards.
   `input-touch` path that module's doc comment describes. STATUS.md:22 claims the panel
   "drives back from the panel via `RemoteControl`".
 
-- **G11 — Inbound AVRCP commands we do not model get no response at all. CONFIRMED.**
+- ✅ **G11 — Inbound AVRCP commands we do not model get no response at all. CONFIRMED.**
   `adapter.rs:842` returns early on three decode failures and `:968` is a bare `_ => {}`.
   Only `GET_ELEMENT_ATTRIBUTES` and `SET_ABSOLUTE_VOLUME` are ever answered. Dropped
   silently: `REGISTER_NOTIFICATION` *as a command* (the guard at `:898` only accepts
@@ -151,7 +183,7 @@ display or the audio device, and two cannot take it back afterwards.
   a full AVCTP transaction timeout, and stacks that gate bring-up on `UNIT INFO` or
   `GetCapabilities` — BlueZ-as-source does both — stall.
 
-- **G12 — Only LDAC is gated on whether we can decode it. CONFIRMED, silent.**
+- ✅ **G12 — Only LDAC is gated on whether we can decode it. CONFIRMED, silent.**
   `app/src/bluetooth.rs:51` computes `enable_ldac` from `decodable_codecs()` and passes
   nothing else, despite the comment three lines above stating the table follows what the
   build can decode. `codec.rs:701` sorts aptX HD and aptX *ahead* of AAC and SBC, and
@@ -161,7 +193,7 @@ display or the audio device, and two cannot take it back afterwards.
   over `decodable_codecs()` rather than over what the adapter actually advertises, so it
   cannot catch this.
 
-- **G13 — `dd.xml` carries no `<UDN>`. CONFIRMED (missing) / SUSPECTED (consequence).**
+- ✅ **G13 — `dd.xml` carries no `<UDN>`. CONFIRMED (missing) / SUSPECTED (consequence).**
   `proto-dial/src/dial.rs:226` emits `deviceType`, `friendlyName`, `manufacturer`,
   `modelName` and stops. UPnP mandates `<UDN>`; Chromium's DIAL device-description parser
   treats an empty unique-id as a parse failure and drops the device, and Android senders
@@ -170,7 +202,7 @@ display or the audio device, and two cannot take it back afterwards.
   never appear in a Chromecast-family picker at all, while `curl` and `yt-selfplay` (which
   never read the UDN) both pass.
 
-- **G14 — DLNA and DIAL advertise the same UUID. CONFIRMED.**
+- ✅ **G14 — DLNA and DIAL advertise the same UUID. CONFIRMED.**
   `app/src/main.rs:299` and `:344` both derive from `config.uuid`, and
   `substrate-ssdp/src/device.rs:30` emits `upnp:rootdevice` plus the bare `uuid:` target
   for each device. An `M-SEARCH` for `ssdp:all` or `upnp:rootdevice` therefore gets two
@@ -191,7 +223,7 @@ display or the audio device, and two cannot take it back afterwards.
   encoder, and we keep decoding at the old rate — wrong pitch or pure noise, nothing
   logged. Same failure class as Q25, through a door Q25 did not close.
 
-- **G16 — Intel's loader ships AX200 firmware to AX210/AX211. CONFIRMED.**
+- ✅ **G16 — Intel's loader ships AX200 firmware to AX210/AX211. CONFIRMED.**
   `hci-transport/src/init/intel.rs:100` fixes `image_stem: "intel/ibt-20-1-3"` on the
   loader rather than deriving it from the TLV version the way `btintel.c` does, while
   `:115` lists AX210 (`0x0032`) and AX211 (`0x0033`) among its products. AX210 needs
@@ -201,7 +233,7 @@ display or the audio device, and two cannot take it back afterwards.
   Related, same file: after `INTEL_RESET` we do not wait for the vendor boot event before
   `LOAD_DDC`, contradicting our own table in architecture-substrate.md §11.3a (SUSPECTED).
 
-- **G17 — Realtek hardcodes one chip's firmware for every part it claims. CONFIRMED.**
+- ✅ **G17 — Realtek hardcodes one chip's firmware for every part it claims. CONFIRMED.**
   `realtek.rs:66` fixes `rtl8761bu_fw.bin`/`_config.bin`, while `:35` names 8723B/8821A/
   8822B/8852A/8703B and `:92` claims `0BDA:8761`, `0BDA:A725`, `0BDA:B00A`. `btrtl.c`
   selects on `lmp_subver` **and `hci_rev`** — `0x8761` with `hci_rev 11` is
@@ -229,7 +261,7 @@ display or the audio device, and two cannot take it back afterwards.
   with no action, so a phone rejecting our configuration request leaves us waiting forever,
   compounding G18.
 
-- **G20 — Screen-id resolution is a one-shot 60s window with no cancellation. CONFIRMED.**
+- 🟡 **G20 — Screen-id resolution is a one-shot 60s window with no cancellation. CONFIRMED.**
   `app/src/main.rs:364`, `app/src/screen.rs:31`. Two defects in the D28 fix: each launch
   spawns `publish_screen_id` with no handle and no generation counter, so a relaunch inside
   60s leaves the old task polling the old pairing code and whichever finishes last wins —
@@ -239,7 +271,7 @@ display or the audio device, and two cannot take it back afterwards.
   for that launch and nothing re-attempts. `screen.rs:69` also uses a bare `ureq::post`
   with **no timeout**, unlike `filterlists::fetch`, so one hung attempt eats the budget.
 
-- **G21 — The SponsorBlock receive channel corrupts itself on the first multi-byte
+- ✅ **G21 — The SponsorBlock receive channel corrupts itself on the first multi-byte
   character and never recovers. CONFIRMED, silent.** `app/src/sponsorblock/actor.rs:233`.
   Three compounding problems: `from_utf8_lossy` on an arbitrary 8192-byte read boundary
   replaces a split UTF-8 sequence with U+FFFD, and the Lounge framing is *character*-counted,
@@ -256,7 +288,7 @@ display or the audio device, and two cannot take it back afterwards.
 
 ## Tier 3 — degraded quality, conformance, and diagnosis
 
-- **G22 — 160 kbps and no loudness normalisation, both by silent default. CONFIRMED.**
+- ✅ **G22 — 160 kbps and no loudness normalisation, both by silent default. CONFIRMED.**
   `session.rs:234` spreads `PlayerConfig::default()`, where upstream `Bitrate::default()`
   is `Bitrate160` and `normalisation: false`. `app/src/config.rs:153` exposes only
   `initial_volume`. A Premium account entitled to 320 plays at 160 on the PA, with
@@ -302,7 +334,7 @@ display or the audio device, and two cannot take it back afterwards.
   at zero for the whole track. Q28's subscription half landed and the position half did
   not, while §11.4 of the architecture doc still claims position.
 
-- **G27 — The now-playing card re-rasterizes at full resolution once per second for a
+- ✅ **G27 — The now-playing card re-rasterizes at full resolution once per second for a
   position it never draws. CONFIRMED.** `session.rs:46` sets `POSITION_INTERVAL = 1s`,
   justified as keeping the card's progress honest. Each `PositionChanged` sets
   `changed = true` (`:382`) → `NowPlaying` → `publish_card` → `nowplaying_card::render` at
@@ -322,7 +354,7 @@ display or the audio device, and two cannot take it back afterwards.
   `Num_HCI_Command_Packets = 1` (SUSPECTED at runtime; a dropped pairing reply during a
   two-phone connect storm presents as one phone hanging in "Connecting…").
 
-- **G29 — ACL credits leak when a write is queued for a handle that has just dropped.
+- ✅ **G29 — ACL credits leak when a write is queued for a handle that has just dropped.
   CONFIRMED.** `proto-bluetooth-audio/src/acl.rs:116`/`:130`. `link_down` reclaims
   outstanding credits but neither purges nor filters jobs already queued for that handle;
   the woken `pump` then calls `claim(dead_handle)`, re-inserting an outstanding entry that
@@ -343,7 +375,7 @@ display or the audio device, and two cannot take it back afterwards.
   takes whatever HCI-class device enumerates first, with no preference for one we have a
   loader and firmware for.
 
-- **G31 — The filter-list cache directory is almost certainly unwritable under the shipped
+- ✅ **G31 — The filter-list cache directory is almost certainly unwritable under the shipped
   NixOS module. SUSPECTED (high confidence), silent.** `filterlists.rs:78` resolves
   `XDG_CACHE_HOME` → `HOME/.cache` → `temp_dir()`, while `flake.nix:573` sets only
   `CASTAWAY_CONFIG` and `RUST_LOG` with `DynamicUser=true`, `ProtectSystem=strict`,
@@ -358,7 +390,7 @@ display or the audio device, and two cannot take it back afterwards.
   — cookies, "watch as guest" — is also non-persistent. Fix is `XDG_CACHE_HOME=%C` or
   `CacheDirectory=castaway` in the unit; worth confirming `HOME` on the box first.
 
-- **G32 — A daily refresh that fetches a >1 KB non-list body destroys the good cache.
+- ✅ **G32 — A daily refresh that fetches a >1 KB non-list body destroys the good cache.
   CONFIRMED, silent.** `filterlists.rs:368`: `text_for` accepts any response over 1024
   bytes, writes it to the cache, and builds the engine from it. A captive-portal
   interstitial, a Cloudflare challenge, or a GitHub error page all clear that bar. The good
@@ -388,7 +420,7 @@ display or the audio device, and two cannot take it back afterwards.
   up there is no D-pad/Enter to drive leanback's 10-foot UI to the code screen. A guest on a
   different VLAN or guest-isolated Wi-Fi has no path to cast at all.
 
-- **G35 — `activeUser` is set before login is attempted and never cleared. CONFIRMED.**
+- ✅ **G35 — `activeUser` is set before login is attempted and never cleared. CONFIRMED.**
   `proto-spotify/src/lib.rs:159` sets it immediately after blob decryption, *before*
   `handle.paired()`, and nothing resets it when `session::start` fails (`session.rs:171`
   only logs and banners) or when the session dies. A non-Premium account or a stale blob
@@ -397,7 +429,7 @@ display or the audio device, and two cannot take it back afterwards.
   concludes it is connected to a device with no session. A second person also sees the first
   person as active after the first person's login failed.
 
-- **G36 — `run_pcm` cannot observe `stop` while parked. CONFIRMED.**
+- ✅ **G36 — `run_pcm` cannot observe `stop` while parked. CONFIRMED.**
   `pipeline/src/audio_session.rs:157` is `while let Ok(block) = frames.recv()` with the
   `stop` check inside the body. Preempted while Spotify is *paused*, the thread blocks in
   `recv()` forever and never reaches `output.stop()` at `:185`, so `CpalAudioOut` keeps its
@@ -405,7 +437,7 @@ display or the audio device, and two cannot take it back afterwards.
   preempt-while-paused; on a box with an exclusive-mode ALSA device the next source's
   `start()` then fails outright.
 
-- **G37 — Bluetooth preemption is advisory only. CONFIRMED.**
+- 🟡 **G37 — Bluetooth preemption is advisory only. CONFIRMED.**
   `adapter.rs:684`: the losing phone gets an AVRCP `PAUSE` passthrough, but no AVDTP
   `SUSPEND` is sent and `session_open`/`audio_tx` stay live, so its media packets keep
   flowing into a backgrounded session. A phone with no AVRCP channel, or one that ignores
@@ -413,7 +445,7 @@ display or the audio device, and two cannot take it back afterwards.
   that actually won. Q27 records two phones fighting over one output; pausing the player
   rather than stopping the stream leaves the underlying condition intact.
 
-- **G38 — The card shows the raw Spotify canonical username. CONFIRMED.**
+- ✅ **G38 — The card shows the raw Spotify canonical username. CONFIRMED.**
   `session.rs:287` uses `user.user_name`, the `addUser` form field, which for any account
   created since roughly 2015 is a 25-character random string. The panel renders
   `Connected — 31l6zbn3kq7wxyz…` at 28px on a 65-inch screen. `PlayerEvent::SessionClientChanged`
