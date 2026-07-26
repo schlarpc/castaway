@@ -484,7 +484,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Spotify Connect onboarding answers getInfo"):
         info = json.loads(sender.succeed(f"curl -sSf '{base}/spotify?action=getInfo'"))
-        assert info["remoteName"] == "${friendlyName}", info
+        # `#spotify`, not the bare name: one box shows up in several pickers at once, and
+        # every advertised surface says which one it is. This assertion predates that and
+        # has been failing ever since — the suffix is the correct expectation.
+        assert info["remoteName"] == "${friendlyName}#spotify", info
         assert info["publicKey"], info
 
     with subtest("a CASTv2 sender launches the media receiver and LOADs a video"):
@@ -506,7 +509,9 @@ pkgs.testers.runNixOSTest {
     with subtest("an AirPlay sender gets OPTIONS, /info, and an honest 501 for pairing"):
         receiver.wait_for_open_port(7000)
         receiver.wait_for_open_port(7011)
-        session = sender.succeed(f"airplay-send {kiosk} 7000 ${friendlyName}")
+        # `#airplay`, not the bare name: every advertised surface says which one it is,
+        # and `/info` reports the same name the picker shows.
+        session = sender.succeed(f"airplay-send {kiosk} 7000 ${friendlyName}#airplay")
         assert "airplay session completed" in session, session
         # `wait_for_open_port` also produces a connect/disconnect pair, so this next line
         # alone is weak. The pairing refusal is the one only a real request can log — it
@@ -522,7 +527,7 @@ pkgs.testers.runNixOSTest {
     with subtest("the RAOP audio port speaks the same RTSP"):
         # Same state machine, different socket — a sender that finds _raop._tcp and gets
         # silence is the failure this catches.
-        assert "airplay session completed" in sender.succeed(f"airplay-send {kiosk} 7011 ${friendlyName}")
+        assert "airplay session completed" in sender.succeed(f"airplay-send {kiosk} 7011 ${friendlyName}#airplay")
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender disconnected channel=\"audio\"'")
 
     with subtest("AirPlay and RAOP are both advertised over mDNS"):
