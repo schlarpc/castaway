@@ -173,13 +173,10 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   into one engine. Offline it uses the cache; with no cache, the compact built-in list.
   `CASTAWAY_FILTERLISTS_OFFLINE=1` pins it to the cache deliberately.
 
-  **What updates and what does not.** Filter *rules* update themselves — every boot pulls the
-  current lists, so new rules arrive without a redeploy. Scriptlet *bodies* do not: they are
-  pinned to uBO **1.46.0**, because `adblock`'s assembler reads uBO's legacy bundle format
-  (`/// name.js` headers) and current uBO ships ES modules calling `registerScriptlet`, which
-  the assembler parses into zero resources — silently. 1.46.0 is the last readable revision
-  and yields 37 real scriptlets. A rule naming anything newer injects nothing: a no-op, not a
-  broken page, and the count is logged at startup and asserted by an `--ignored` test.
+  **Everything updates now.** Filter *rules* and scriptlet *bodies* both track upstream: the
+  rules are fetched as lists, and the scriptlets are obtained by evaluating uBO's own module
+  graph (Q36). The counts are logged at startup and asserted by an `--ignored` test, because
+  the failure mode for both is silence rather than an error.
 
   **Refresh: daily, and it reaches a running receiver.** A background thread re-fetches every
   24h and swaps the engine in; the render processes notice by the cache timestamps changing
@@ -202,99 +199,24 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   touches neither (no argv, no env, no threads). Verified: the renderer now logs
   `render process ready to inject scriptlets=38` and `injecting scriptlets url=…`, and a full
   `yt-selfplay` still passes, so CEF is unbothered by the move.
-- **Q36 — lifting the scriptlet pin.** To track uBO's scriptlets again, something has to read
-  their current format: one file per scriptlet under `src/js/resources/`, each ending in
-  `registerScriptlet(fn, { name, dependencies })`. That means fetching the directory and
-  extracting each function's source plus its dependency functions — a JS-shaped parsing job in
-  Rust, brittle in the way that upstream can break at any time. Options, in the order I would
-  try them: watch for `adblock` to support the new format upstream (Brave has the same problem);
-  write the converter; or hand-write the handful of scriptlets that actually matter for the
-  sites this display shows. Not urgent — the pinned 37 cover the common rules — but it is why
-  "subscribe and get updates forever" is only three-quarters true.
-- **Q18 — YouTube Lounge via CEF (the actual plan).** With CEF working, the Lounge path is: on
-  DIAL launch, navigate the offscreen browser to YouTube's TV surface (`https://www.youtube.com/tv`
-  + the launch params/pairing code) and let the page do Lounge registration + playback itself
-  (architecture §5 "double duty"). This replaces the native bind-channel client (the parser stays
-  useful for a non-CEF fallback). Still to wire (task 16): feed CEF on_paint into the compositor
-  Browser layer, and the DIAL-launch → navigate handoff. YouTube ad-blocking is an arms race —
-  request blocking + JS help, but no guarantees.
-  **ANSWERED 2026-07-26 — the plan works, and it is now tested.** `nix run .#yt-selfplay` drives
-  the whole path with no phone and no human: the page registers the sender's pairing code with
-  YouTube within ~3s of the launch, the session binds, and queued videos actually play (4K
-  screenshots of decoded video on the composited surface). Two things fell out of building it:
-  the leanback page takes its launch parameters as a plain **query string** on
-  `youtube.com/tv?…` (no `#` fragment needed), and **in-stream ads still play** — EasyList
-  blocks ad *requests*, not the ad segments the player itself serves, so a pre-roll ran before
-  a queued video. That is the arms race this bullet predicted; skipping it is a separate
-  mechanism from request blocking.
-- ~~**Q32 — a Linux package with the browser in it.**~~ **DONE 2026-07-26.**
-  `packages.castaway-cef` (`nix/linux-cef.nix`) is the Linux kiosk build: `--features cef`,
-  built against the same flattened `cefDist` the devShell uses — hoisted to `cefDistFor` so
-  the two cannot drift — and wrapped so `CEF_PATH` and `LD_LIBRARY_PATH` are set at *run*
-  time. Both matter: `Cef::initialize` reads `CEF_PATH` at runtime to find the .pak/ICU/
-  locales, and CEF re-execs the same binary for its subprocesses, so the wrapper has to be
-  what runs. `services.castaway.package` documents it as the choice for a real display.
-  `packages.default` stays the portable, browser-less build — the right thing for CI, and now
-  honest about not offering YouTube (D27).
-- ~~**Q33 — the leanback page's storage is per-launch.**~~ **WITHDRAWN 2026-07-26 — the premise
-  was wrong.** The `generate_screen_id` calls that prompted this were from a *bare Chromium*
-  probe run with a throwaway `--user-data-dir`, not from castaway. The kiosk's CEF profile is
-  already persistent: `Cef::initialize` points `root_cache_path` at a stable
-  `~/.cache/castaway/cef` (deliberately, for exactly this class of reason), and the profile on
-  disk has a real `Default/Local Storage`. Measured directly: the screen id survives a full
-  process restart — two separate runs published the same
-  `f970ef4ce158…`. So the id we publish for senders to attach to (D28) is stable across
-  reboots, and nothing needs changing. Left here as a correction rather than deleted, because
-  "the receiver mints a new screen every launch" is a plausible-sounding claim that would have
-  sent the next person down a hole.
-- **Q34 — YouTube's own ads: `skipAd` is in, and the uBlock Origin approach does not port.**
-  `skipAd` is implemented (D29): once an ad reports `isSkipEnabled` we press the screen's own
-  skip button. Unskippable ads play and nothing is muted — a mute that failed to lift leaves
-  a silent display, worse than the ad. Still unobserved live: no skippable ad has been served
-  to a test session, though the command encoding is verified accepted.
+- ~~**Q36 — lifting the scriptlet pin.**~~ **DONE 2026-07-26 — the pin is gone.** Scriptlet
+  code now tracks `master` alongside the rules, by **evaluating** uBO's module graph in
+  QuickJS (`rquickjs`) and reading the `builtinScriptlets` registry uBO builds itself:
+  `fn.toString()` for exact source, dependencies already resolved from functions to names by
+  their own `base.js`. 148 resources against live uBO where the pinned bundle gave 37, and
+  youtube.com's injection went 13,293 → 38,331 bytes.
 
-  **The obvious next step — port uBO's scriptlets and subscribe to their lists — was
-  investigated and does not do what it looks like it does.** uBO kills YouTube video ads with
-  *scriptlets*, not network rules, because the ad media streams from the same `googlevideo`
-  hosts as the content and the manifest is a field inside JSON the page already fetched.
-  Their rules (fetched 2026-07-26) rewrite the **`/player`** response:
+  **A text scanner was tried first and is worth remembering as a cautionary tale.** It was
+  wrong three times in one afternoon — multi-line imports, the `builtinScriptlets.push` form
+  (which is where every `trusted-` scriptlet lives), and brace-matching inside a real function
+  body — and every failure was silent, yielding fewer resources rather than an error. It got
+  139 of 148 with no way to tell which nine were missing. Running upstream's own code cannot
+  disagree with upstream; parsing it always eventually does.
 
-      www.youtube.com##+js(trusted-replace-fetch-response, '"adPlacements"', '"no_ads"', player?)
-      www.youtube.com##+js(trusted-replace-xhr-response, /"adPlacements.*?("adSlots"|…)/gms, $1, /\/player(?:\?.+)?$/)
-
-  Our surface is `tvhtml5`, and **it never requests `/player`.** Captured over CDP against the
-  kiosk's own CEF profile, with a video cast to it exactly as a phone would, during a session
-  where an ad *was* served (`pagead/adview` fired):
-  - the watch data comes from **`/youtubei/v1/next`** (~475–517 KB) and contains **no** ad keys
-    at all — not `adPlacements`, `playerAds`, `adSlots`, or anything matching `*[Aa]d*`;
-  - `/youtubei/v1/browse` *does* carry `adSlotRenderer`, `adSlotMetadata`,
-    `pageTopAdLayoutRenderer`, `adsControlFlowOpportunityReceivedCommand` — but those are the
-    browse feed's *display* ads, not the in-stream one;
-  - the ad-flow traffic is `static.doubleclick.net/instream/ad_status.js`,
-    `googleads.g.doubleclick.net/pagead/id`, `pagead/1p-user-list`, `pagead/adview`, and the
-    TV player bundle `tv-player-ias.vflset/tv-player-ias.js`.
-
-  So subscribing to uBO would buy the *engine* and their generic scriptlets, but their
-  YouTube rules would not match our surface — we would be authoring and maintaining
-  TV-specific rules ourselves, which is the maintenance burden subscribing was meant to
-  avoid. (`adblock` 0.13.2 does have the machinery, for whenever we want it:
-  `Engine::url_cosmetic_resources` → `injected_script`, `use_resources`, a `PermissionMask`
-  gating `trusted-*`, and a `resource_assembler` that reads uBO's repo directly. The missing
-  piece is injection *timing* — scriptlets must hook `fetch`/XHR before page scripts, which
-  needs a render-process `OnContextCreated` handler we do not have. Note uBO's scriptlet
-  bodies are GPLv3: fetch them at runtime rather than vendoring.)
-
-  **What is actually unresolved:** where the in-stream ad manifest reaches the TV player from.
-  Not `next`, not a `/player` call. Answering that is RE work (capture a session
-  while an ad plays and follow `tv-player-ias.js`'s ad control flow), and it decides
-  whether *any* filtering approach can work here or whether `skipAd` plus patience is the
-  ceiling on this surface.
-- **Q35 — SponsorBlock rate limits are unverified.** The API's own wiki is behind bot
-  protection; the numbers that surfaced during research came from a *fork's* documentation
-  and were not confirmed upstream. Today's usage is one hash-prefix lookup per video change,
-  with no cache at all, which is almost certainly fine for one display but is not something
-  we have checked. If it ever needs a cache: in-memory only, per the licence (segments on
-  disk would be redistribution).
+  Checked rather than assumed: the module graph reaches outside `resources/`
+  (`resources/href-sanitizer.js` imports `../urlskip.js`), so fetching follows relative
+  imports transitively; and QuickJS cross-builds for `x86_64-pc-windows-msvc`, without which
+  this would have been the wrong design for the deploy target.
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.

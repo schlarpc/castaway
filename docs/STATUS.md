@@ -173,8 +173,9 @@ The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly a
   `##+js(...)` code inside the page *before its own scripts*, which is the only timing at
   which hooking `fetch`/XHR works. Verified by planting a probe rule and watching it come
   back through the page console (`castaway-injection-ok src=castaway://scriptlets`). Rules
-  auto-update; scriptlet *bodies* are pinned to uBO 1.46.0 (37 of them) because the current
-  bundle format is unreadable by `adblock`'s assembler — see Q17/Q36.
+  auto-update, **and so do the scriptlet bodies**: uBO's module graph is evaluated in QuickJS
+  and its own `builtinScriptlets` registry read back, giving 148 resources (the pinned legacy
+  bundle gave 37) and a 38 KB injection on youtube.com — see Q17/Q36.
 - **Lists refresh daily**, not just at boot, and a *running* receiver picks it up: the engine
   is swapped behind a shared cell, and render processes rebuild when the cache timestamps
   move. Verified by editing the cache under a live receiver and watching a probe rule start
