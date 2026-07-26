@@ -184,6 +184,76 @@ pub fn vendor_command(ctype: Ctype, pdu_id: u8, parameters: &[u8]) -> AvcFrame {
     AvcFrame::panel(ctype, opcode::VENDOR_DEPENDENT, operands.freeze())
 }
 
+/// The `UNIT INFO` response.
+///
+/// A fixed shape: `0x07` filler, then unit type PANEL in the top five bits, then a
+/// 24-bit company id. Trivial to answer and worth answering — BlueZ-as-source asks for it
+/// during AVRCP bring-up and waits, so silence here stalls a connection that is otherwise
+/// fine.
+#[must_use]
+pub fn unit_info() -> AvcFrame {
+    let mut operands = BytesMut::with_capacity(5);
+    operands.put_u8(0x07);
+    // Unit type PANEL (0x09) in bits 7..3, unit id 0.
+    operands.put_u8(0x09 << 3);
+    operands.put_u8(((BT_SIG_COMPANY_ID >> 16) & 0xFF) as u8);
+    operands.put_u8(((BT_SIG_COMPANY_ID >> 8) & 0xFF) as u8);
+    operands.put_u8((BT_SIG_COMPANY_ID & 0xFF) as u8);
+    AvcFrame::panel(Ctype::Stable, opcode::UNIT_INFO, operands.freeze())
+}
+
+/// The `SUBUNIT INFO` response: one PANEL subunit, page 0.
+#[must_use]
+pub fn subunit_info() -> AvcFrame {
+    let mut operands = BytesMut::with_capacity(5);
+    // Page 0, extension code 7.
+    operands.put_u8(0x07);
+    // One PANEL subunit: type in bits 7..3, (count - 1) in bits 2..0.
+    operands.put_u8(0x09 << 3);
+    operands.put_u8(0xFF);
+    operands.put_u8(0xFF);
+    operands.put_u8(0xFF);
+    AvcFrame::panel(Ctype::Stable, opcode::SUBUNIT_INFO, operands.freeze())
+}
+
+/// Events our Target will accept a `REGISTER_NOTIFICATION` for.
+///
+/// Volume is the one that matters: a phone decides whether to hand us absolute-volume
+/// control on the strength of this answer, and a Target that never replies does not get
+/// offered it.
+pub const SUPPORTED_EVENTS: &[u8] = &[event::VOLUME_CHANGED];
+
+/// Build the `GET_CAPABILITIES` response for whatever capability was asked about.
+///
+/// Two capability ids exist: `0x02` is the company-id list and `0x03` is the event list.
+/// Anything else gets an empty list rather than a wrong one.
+#[must_use]
+pub fn capabilities_response(parameters: &[u8]) -> Vec<u8> {
+    const CAP_COMPANY_ID: u8 = 0x02;
+    const CAP_EVENTS_SUPPORTED: u8 = 0x03;
+    match parameters.first().copied() {
+        Some(CAP_COMPANY_ID) => {
+            let mut out = vec![CAP_COMPANY_ID, 1];
+            out.push(((BT_SIG_COMPANY_ID >> 16) & 0xFF) as u8);
+            out.push(((BT_SIG_COMPANY_ID >> 8) & 0xFF) as u8);
+            out.push((BT_SIG_COMPANY_ID & 0xFF) as u8);
+            out
+        }
+        Some(CAP_EVENTS_SUPPORTED) => {
+            let mut out = vec![
+                CAP_EVENTS_SUPPORTED,
+                u8::try_from(SUPPORTED_EVENTS.len()).unwrap_or(0),
+            ];
+            out.extend_from_slice(SUPPORTED_EVENTS);
+            out
+        }
+        other => {
+            let id = other.unwrap_or(0);
+            vec![id, 0]
+        }
+    }
+}
+
 /// A parsed vendor-dependent AVRCP PDU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorPdu {
@@ -493,6 +563,43 @@ mod tests {
     use bytes::BufMut;
 
     use super::*;
+
+    #[test]
+    fn the_target_names_the_events_a_phone_may_subscribe_to() {
+        // A phone decides whether to hand us absolute-volume control on the strength of
+        // this answer. `GET_CAPABILITIES` was defined and never answered, so it heard
+        // nothing — and a Target that does not reply does not get offered the feature the
+        // whole surface exists for.
+        let events = capabilities_response(&[0x03]);
+        assert_eq!(events[0], 0x03, "capability id is echoed");
+        assert_eq!(usize::from(events[1]), SUPPORTED_EVENTS.len());
+        assert!(events[2..].contains(&event::VOLUME_CHANGED));
+
+        // The company-id capability is a different question with a different answer.
+        let companies = capabilities_response(&[0x02]);
+        assert_eq!(companies[0], 0x02);
+        assert_eq!(companies[1], 1);
+
+        // An id we do not know gets an empty list rather than a wrong one.
+        assert_eq!(capabilities_response(&[0x7f]), vec![0x7f, 0]);
+        assert_eq!(capabilities_response(&[]), vec![0, 0]);
+    }
+
+    #[test]
+    fn unit_and_subunit_info_answer_as_a_panel() {
+        // Both fail `VendorPdu::parse`'s seven-operand minimum, so both used to return
+        // silently — and BlueZ-as-source asks for both during AVRCP bring-up and waits.
+        let unit = unit_info();
+        assert_eq!(unit.opcode, opcode::UNIT_INFO);
+        assert_eq!(unit.ctype, Ctype::Stable);
+        assert_eq!(unit.operands[0], 0x07);
+        assert_eq!(unit.operands[1] >> 3, 0x09, "PANEL");
+
+        let subunit = subunit_info();
+        assert_eq!(subunit.opcode, opcode::SUBUNIT_INFO);
+        assert_eq!(subunit.ctype, Ctype::Stable);
+        assert_eq!(subunit.operands[1] >> 3, 0x09, "PANEL");
+    }
 
     /// Build a `GetElementAttributes` response body the way a phone would.
     fn attributes_response(items: &[(u32, &str)]) -> Vec<u8> {

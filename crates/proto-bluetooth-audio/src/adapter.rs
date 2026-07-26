@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::acl::AclWriter;
-use crate::avctp::{AvcFrame, AvctpMessage, Ctype};
+use crate::avctp::{opcode, AvcFrame, AvctpMessage, CommandResponse, Ctype};
 use crate::avrcp;
 use crate::codec::advertised;
 use crate::control::AvrcpControl;
@@ -867,14 +867,64 @@ impl BluetoothAdapter {
         let Ok(msg) = AvctpMessage::decode(payload) else {
             return Ok(());
         };
+        // A *command* we do not answer is not free. AVCTP has no "ignored" — the peer
+        // waits out its transaction timeout, retries, and some stacks abort the link. The
+        // spec's answer is `NOT IMPLEMENTED`, and nothing here was ever constructing one:
+        // three early returns and a bare `_ => {}` meant every opcode outside
+        // GetElementAttributes and SetAbsoluteVolume got silence.
+        let is_command = msg.cr == CommandResponse::Command;
         let Ok(frame) = AvcFrame::decode(&msg.body) else {
+            if is_command {
+                debug!("avrcp: undecodable command frame; answering NOT IMPLEMENTED");
+                out.replies.push((cid, refusal(&msg, 0, Bytes::new())));
+            }
             return Ok(());
         };
+
+        // Non-vendor opcodes. `VendorPdu::parse` needs seven operand bytes, so these all
+        // failed it and returned silently — including the two that stacks gate their
+        // AVRCP bring-up on. BlueZ-as-source asks both.
+        match frame.opcode {
+            opcode::UNIT_INFO if is_command => {
+                out.replies
+                    .push((cid, avctp_response(&msg, &avrcp::unit_info())));
+                return Ok(());
+            }
+            opcode::SUBUNIT_INFO if is_command => {
+                out.replies
+                    .push((cid, avctp_response(&msg, &avrcp::subunit_info())));
+                return Ok(());
+            }
+            opcode::VENDOR_DEPENDENT => {}
+            other if is_command => {
+                debug!(opcode = other, "avrcp: unsupported opcode");
+                out.replies
+                    .push((cid, refusal(&msg, other, frame.operands.clone())));
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+
         let Ok(vendor) = avrcp::VendorPdu::parse(&frame.operands) else {
+            if is_command {
+                out.replies
+                    .push((cid, refusal(&msg, frame.opcode, frame.operands.clone())));
+            }
             return Ok(());
         };
 
         match vendor.pdu_id {
+            avrcp::pdu::GET_CAPABILITIES if is_command => {
+                // "Which events may I subscribe to on your Target?" A phone that asks and
+                // hears nothing does not enable absolute volume, which is the feature
+                // this whole surface exists for.
+                let response = avrcp::vendor_command(
+                    Ctype::Stable,
+                    avrcp::pdu::GET_CAPABILITIES,
+                    &avrcp::capabilities_response(&vendor.parameters),
+                );
+                out.replies.push((cid, avctp_response(&msg, &response)));
+            }
             // Inbound *command*, not a response to ours. Real GM and Hyundai-Kia head
             // units enumerate attributes 1..=8 unconditionally, and this used to fall
             // into the response branch below — where the request's eight-byte track
@@ -966,7 +1016,7 @@ impl BluetoothAdapter {
                     _ => {}
                 }
             }
-            avrcp::pdu::SET_ABSOLUTE_VOLUME => {
+            avrcp::pdu::SET_ABSOLUTE_VOLUME if is_command || frame.ctype == Ctype::Accepted => {
                 // Q24: the phone is authoritative. Accept and mirror it.
                 if let Some(&raw) = vendor.parameters.first() {
                     let fraction = avrcp::volume_to_fraction(raw);
@@ -984,11 +1034,16 @@ impl BluetoothAdapter {
                         avrcp::pdu::SET_ABSOLUTE_VOLUME,
                         &[raw & 0x7F],
                     );
-                    out.replies.push((
-                        cid,
-                        AvctpMessage::response(&msg, response.encode()).encode(),
-                    ));
+                    out.replies.push((cid, avctp_response(&msg, &response)));
                 }
+            }
+            other if is_command => {
+                // A PDU we do not model. Answering keeps the peer's transaction table
+                // moving; staying silent costs it a timeout per attempt and, on stacks
+                // that treat a stalled AVCTP transaction as fatal, the whole link.
+                debug!(pdu = other, "avrcp: unsupported vendor pdu");
+                let response = avrcp::vendor_command(Ctype::NotImplemented, other, &[]);
+                out.replies.push((cid, avctp_response(&msg, &response)));
             }
             _ => {}
         }
@@ -1232,6 +1287,24 @@ fn hex(bytes: &[u8]) -> String {
 /// Wrap an AV/C frame in AVCTP, ready for an L2CAP channel.
 fn avctp_body(transaction: u8, frame: &AvcFrame) -> Bytes {
     AvctpMessage::command(transaction, frame.encode()).encode()
+}
+
+/// Wrap an AV/C frame as the response to `command`, keeping its transaction label.
+///
+/// The label is the whole point: AVCTP matches responses to commands by it, so a reply
+/// with a fresh label is not an answer — it is a second command the peer did not ask for,
+/// and the original still times out.
+fn avctp_response(command: &AvctpMessage, frame: &AvcFrame) -> Bytes {
+    AvctpMessage::response(command, frame.encode()).encode()
+}
+
+/// `NOT IMPLEMENTED`, echoing the opcode and operands the peer sent.
+///
+/// AV/C wants the refusal to carry the frame it refuses, so the peer can tell which of
+/// several in-flight commands was rejected.
+fn refusal(command: &AvctpMessage, opcode: u8, operands: Bytes) -> Bytes {
+    let frame = AvcFrame::panel(Ctype::NotImplemented, opcode, operands);
+    avctp_response(command, &frame)
 }
 
 /// Wrap an AV/C frame in AVCTP and an L2CAP PDU addressed to `peer_cid`.
