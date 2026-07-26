@@ -36,5 +36,9 @@ htmlcov/
 .DS_Store
 
 # Local environment overrides (if any)
-.env.local
+# `.env` holds real Spotify account credentials for the test harness — never commit it.
+# `.env.example` documents the keys and IS committed.
+.env
+.env.*
+!.env.example
 .envrc.local
