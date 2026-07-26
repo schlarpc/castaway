@@ -195,12 +195,19 @@ mod tests {
     }
 
     #[test]
-    fn ldac_appears_only_when_its_feature_is_built() {
-        let has_ldac = decodable_codecs().contains(&AudioCodec::Ldac);
-        assert_eq!(
-            has_ldac,
-            cfg!(feature = "ldac"),
-            "the advertised table must follow the build, not optimism (Q22)"
+    fn the_advertised_table_never_contains_a_codec_we_cannot_decode() {
+        // The invariant Q22 actually needs. The old version of this test asserted the
+        // table followed the *feature flag*, which is what let a build advertise LDAC
+        // with no decoder behind it and hand a phone five minutes of silence.
+        for codec in decodable_codecs() {
+            assert!(
+                crate::audio_decode::can_decode(codec),
+                "{codec:?} is advertised but cannot be decoded"
+            );
+        }
+        assert!(
+            !decodable_codecs().contains(&AudioCodec::Ldac),
+            "no LDAC decoder is bound yet, so it must not be advertised"
         );
     }
 }

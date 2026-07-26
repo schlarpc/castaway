@@ -84,8 +84,12 @@ fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
         AudioCodec::AptXHd => Ok(ffmpeg::codec::Id::APTX_HD),
         AudioCodec::Alac => Ok(ffmpeg::codec::Id::ALAC),
         AudioCodec::Opus => Ok(ffmpeg::codec::Id::OPUS),
+        // libav has no LDAC decoder and AOSP's libldac is encoder-only, so this needs the
+        // reverse-engineered `libldacdec` over FFI. The `ldac` feature reserves the slot;
+        // until something is bound behind it there is no decoder, and `can_decode` must
+        // say so rather than trusting the flag (Q22).
         AudioCodec::Ldac => Err(PipelineError::Decode(
-            "LDAC needs the `ldac` feature; libav has no decoder for it (Q22)".into(),
+            "no LDAC decoder is bound in this build; libav has none (Q22)".into(),
         )),
         other => Err(PipelineError::Decode(format!(
             "no audio decoder mapped for {other:?}"
@@ -100,9 +104,10 @@ fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
 /// than a clean fallback to one we can (Q22).
 #[must_use]
 pub fn can_decode(codec: AudioCodec) -> bool {
-    if codec == AudioCodec::Ldac {
-        return cfg!(feature = "ldac");
-    }
+    // One source of truth, and it is whether a decoder actually exists. This used to
+    // answer `cfg!(feature = "ldac")` for LDAC, which is a different question: the `ldac`
+    // feature reserves the slot but binds no decoder, so a build with it on advertised an
+    // LDAC endpoint and then failed every packet — the exact silence Q22 is about.
     ensure_init();
     codec_id(codec).is_ok_and(|id| ffmpeg::decoder::find(id).is_some())
 }
@@ -658,15 +663,20 @@ mod tests {
     }
 
     #[test]
-    fn ldac_reports_that_it_needs_its_feature_rather_than_failing_obscurely() {
-        // Q22: without the decoder the endpoint must not be advertised at all, so this
-        // path should be unreachable — but if it is reached, the reason must be legible.
-        if cfg!(feature = "ldac") {
-            return;
-        }
+    fn ldac_is_not_claimed_as_decodable_just_because_its_feature_is_on() {
+        // Q22, and the way it actually went wrong: `can_decode` answered the feature flag
+        // rather than "is there a decoder", so a build with `--features ldac` advertised
+        // an LDAC endpoint, a phone picked it, and every packet failed. The feature
+        // reserves the slot; it does not conjure a decoder.
+        assert!(
+            !can_decode(AudioCodec::Ldac),
+            "no LDAC decoder is bound, whatever the feature says"
+        );
         let err = AudioDecoder::new(AudioCodec::Ldac, format(44_100, 2)).unwrap_err();
-        assert!(format!("{err}").contains("ldac"), "got: {err}");
-        assert!(!can_decode(AudioCodec::Ldac));
+        assert!(
+            format!("{err}").to_lowercase().contains("ldac"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -708,7 +718,8 @@ mod tests {
                 inner: std::mem::take(&mut out),
                 blocks: std::sync::Arc::clone(&counted),
             };
-            crate::audio_session::run(rx, format(44_100, 2), Box::new(sink));
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            crate::audio_session::run(rx, format(44_100, 2), Box::new(sink), &stop);
             let blocks = counted.lock().unwrap().clone();
             blocks
         });
