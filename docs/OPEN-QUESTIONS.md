@@ -207,6 +207,19 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   reboots, and nothing needs changing. Left here as a correction rather than deleted, because
   "the receiver mints a new screen every launch" is a plausible-sounding claim that would have
   sent the next person down a hole.
+- **Q34 — YouTube's own ads are still not handled.** SponsorBlock skips community-submitted
+  segments (D29), but in-stream ads are the player's, not the database's. Two mechanisms
+  exist and neither is implemented: send the Lounge `skipAd` command once a skippable ad
+  reports `isSkipEnabled`, and mute the unskippable ones by driving volume. The first is
+  cheap and safe; the second is why this is a question rather than a task — a mute that
+  fails to lift leaves a silent display, which is worse than the ad it was hiding. Default:
+  implement `skipAd`, leave unskippable ads playing, and revisit if the room disagrees.
+- **Q35 — SponsorBlock rate limits are unverified.** The API's own wiki is behind bot
+  protection; the numbers that surfaced during research came from a *fork's* documentation
+  and were not confirmed upstream. Today's usage is one hash-prefix lookup per video change,
+  with no cache at all, which is almost certainly fine for one display but is not something
+  we have checked. If it ever needs a cache: in-memory only, per the licence (segments on
+  disk would be redistribution).
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.

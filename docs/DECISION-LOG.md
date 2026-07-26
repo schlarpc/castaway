@@ -328,3 +328,45 @@ state until then. Stale is worse than empty: it points senders at a screen that 
 
 `yt-selfplay --reconnect` is the regression test, and it is the shape the original tests
 were missing: they all cast onto a *fresh* receiver. The bug lived one cast later.
+
+### D29 — SponsorBlock is a second remote control, not a hook into the player
+The receiver skips sponsors the same way a phone would change the video: it attaches to
+its *own* screen as a `REMOTE_CONTROL` Lounge session, watches `nowPlaying`, and sends
+`seekTo`. This is what iSponsorBlockTV does (read as wire behaviour, not as code — it is
+GPLv3 and we reimplement, ground rule 9), and it turned out to be nearly free here,
+because the screen id was already resolved for DIAL (D28) and the bind-channel framing
+already existed in `proto-dial`.
+
+The alternative was injecting JavaScript into the leanback page through CEF. Rejected:
+reading player state back needs a render-process handler and process messages — more FFI,
+more `unsafe` — and it breaks whenever YouTube reshapes their minified player, which is
+their schedule rather than ours. The Lounge protocol is one we already depend on, so
+riding it adds no new way to break.
+
+The split follows ground rule 3 exactly. `sponsorblock` is pure: hashing, parsing,
+filtering, and *when* to skip. `proto_dial::lounge::sender` is pure: what a controller
+puts on the wire, as a typestate so a command before the handshake does not compile.
+`app` holds what is genuinely I/O — plus dead reckoning, which cannot live anywhere else:
+the screen pushes `nowPlaying` on change rather than on a tick, so between reports the
+position is extrapolated from the wall clock. Without that a skip fires whenever the next
+event happens to arrive instead of at the boundary.
+
+Two decisions that are behavioural commitments rather than structure:
+- **Skip only, never mute.** SponsorBlock's `mute` action would mean driving volume over
+  the Lounge and restoring it exactly; a stuck mute on a wall display is worse than the
+  sponsor. Same reasoning for YouTube's own unskippable ads: they play.
+- **The toast is load-bearing.** A screen that silently jumps looks broken to a room that
+  did not ask for the skip, and the overlay is also where CC BY-NC-SA attribution is
+  actually shown rather than buried in a README.
+
+Privacy and licence are not incidental. Lookups go to the hash-prefix endpoint, so the
+server learns four hex characters of a hash and never the video; the filtering that makes
+that work happens on our side. The database is CC BY-NC-SA: non-commercial use fits a
+hackerspace display, attribution is required, and there is deliberately no way to persist
+segments — writing them to disk is redistribution, which pulls ShareAlike in.
+
+Tested at both tiers: the rules are unit tests against fixtures (a skip fires once; a
+rewind re-arms but a stale report does not; overlapping submissions merge), and
+`yt-selfplay --expect-skip` proves it end to end from the sender's seat, asserting a
+*discontinuity* — playback advancing further than wall time did — rather than asking
+SponsorBlock the same question the implementation asked.

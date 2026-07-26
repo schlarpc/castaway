@@ -21,6 +21,7 @@ integration test.
 | `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). Dev device key (Q2/Q11). |
 | `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
+| `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
 | `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
@@ -86,6 +87,32 @@ Why it asserts what it asserts, all learned the hard way against the live servic
 Its failure message is the point: a receiver that launched nothing fails at "the screen
 never registered our pairing code", which is the exact silent failure DIAL alone cannot
 distinguish from success.
+
+`--expect-skip` proves SponsorBlock end to end, asserting a *discontinuity* — playback
+advancing further than wall time did, which only a seek can do.
+
+## SponsorBlock (`[sponsorblock]` in castaway.toml, needs the `cef` build)
+**Live, verified 2026-07-26** — segments loaded, segment skipped, toast on screen over
+real video. The receiver attaches to its own page as a second Lounge remote and sends
+`seekTo`; there is no hook into the player and no injected JavaScript (D29).
+
+```toml
+[sponsorblock]
+enabled = true
+categories = ["sponsor", "selfpromo", "music_offtopic"]  # the default set
+minimum_seconds = 1.0
+toast = true
+```
+
+Also valid: `interaction`, `intro`, `outro`, `preview`, `filler`, `exclusive_access`. A
+name that is not one of these is warned about at startup — categories parse leniently so
+the API can add one without breaking a response, which would otherwise make a config typo
+a silent no-op.
+
+Lookups use the hash-prefix endpoint: the server sees four hex characters of
+`sha256(videoId)` and never the video. The database is CC BY-NC-SA — non-commercial use
+fits, attribution rides on the toast, and segments are deliberately never written to disk
+(that would be redistribution). YouTube's own ads are *not* skipped; nothing mutes.
 
 ## Render path — actual pixel output (GPU-verified)
 Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix develop`).
