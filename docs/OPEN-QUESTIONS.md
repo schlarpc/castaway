@@ -428,3 +428,37 @@ the reasons are what a future reversal has to argue against.
   `~/re-shell` (BlueZ >= 5.81, `bluetoothd --experimental`, `mpris-proxy`, `btmon`) would
   give both a golden SDP record and a live attribute-8 response — fixtures that do not
   currently exist publicly, which is exactly what rule 9 asks for.
+
+- **Q30 — Tapping the composited output: screenshots now, HLS/DASH later. PHASE 1 LANDED.**
+  Two wants with one root: a screenshot endpoint (so the panel can be inspected remotely,
+  and so anyone working on a surface can see it without standing in front of the display),
+  and a duplicate of the output as a web stream. Both need the same thing — a way to read
+  back what the compositor just drew.
+  **wgpu cannot encode.** It is a WebGPU implementation: graphics and compute, no video
+  encode or decode surface, and none in the spec — browsers put that in WebCodecs, which
+  is a different API. So there is no "NVENC-style encoded readback" to ask wgpu for. An
+  encoded tap has to reach the vendor encoder directly.
+  The good news is that this codebase already does that interop, in the other direction:
+  `pipeline/src/hwaccel` imports decoded hardware frames zero-copy — VA-API → dma-buf →
+  Vulkan external memory on Linux (`dmabuf.rs`, `vulkan_import.rs`), D3D11VA → shared
+  handle → DX12 on Windows (`d3d11va.rs`, `dx12_import.rs`). Encode is that run backwards:
+  pull the native handle out of the wgpu texture (`wgpu-hal`'s `as_hal`), export it, hand
+  it to ffmpeg's `h264_vaapi` / `h264_nvenc` / `h264_amf`. ffmpeg is already linked.
+  Three things stop it being a mirror image, and they are the real work:
+  - **Colour.** Encoders want NV12; the compositor renders RGBA. Converting on the CPU via
+    swscale would waste the entire exercise. It belongs in a wgpu pass writing NV12 planes
+    — and the compositor already does YUV→RGB in its shader, so the inverse is
+    well-trodden here.
+  - **NVENC is not the VA-API path.** On NVIDIA/Linux `h264_nvenc` wants a CUDA or D3D11
+    frames context, so it is `VK_EXT_external_memory_fd` → `cuImportExternalMemory`. A
+    third interop path, not a reuse of the first.
+  - **A stream has its own clock.** The panel presents at display refresh; HLS wants a
+    steady 30/60 with monotonic PTS. And ground rule 4's drop-late-frames rule inverts: a
+    stream cannot drop without a gap, so it duplicates.
+  **Phase 1, done:** an `OutputTap` seam plus a CPU-readback screenshot. The trait asks
+  `wants_frame` *before* the readback, so a tap that declines costs nothing and no taps
+  cost nothing at all — a 4K RGBA copy is 33 MB and must never be on the default path.
+  One readback per frame is shared by every tap that wanted it.
+  **Phase 2, open:** an encoder tap. The frame it receives is deliberately shaped like the
+  existing `FrameImage::{Cpu, Gpu}` split, so the zero-copy version is a variant rather
+  than a redesign of the seam.

@@ -126,54 +126,88 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
     );
     text::fill_rect(&mut buf, width, height, art_x, art_y, art, art, pal.art_bg);
 
-    // The text column, right of the art.
+    // The text column, right of the art. Laid out as a block and centred against the
+    // art square rather than flowed from the top: a card with no album, or no artist,
+    // otherwise leaves a hole where that line would have been and the whole thing drifts
+    // upward as metadata arrives piecemeal.
     let text_x = art_x + art + 70.0 * s;
     let avail = (w - text_x - margin).max(1.0);
 
-    // Who is connected, above the track: small, because it changes once per session while
-    // everything below it changes per song.
-    let source = card.source.to_string();
-    let mut y = art_y + text::ascent(&f.regular, 26.0 * s);
-    if !source.is_empty() {
-        let px = fit_px(&f.regular, &source, 26.0 * s, avail);
-        text::draw_text(
-            &mut buf, width, height, text_x, y, &source, px, pal.source, &f.regular,
-        );
+    struct Line<'a> {
+        text: &'a str,
+        px: f32,
+        color: Rgba,
+        bold: bool,
+        /// Space below this line before the next.
+        gap: f32,
     }
 
-    // Title, artist, album — in the order someone reads them.
-    y += 78.0 * s;
+    let source = card.source.to_string();
+    let state = state_label(card.track.state);
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(5);
+    if !source.is_empty() {
+        lines.push(Line {
+            text: &source,
+            px: fit_px(&f.regular, &source, 26.0 * s, avail),
+            color: pal.source,
+            bold: false,
+            gap: 46.0 * s,
+        });
+    }
     if let Some(title) = &card.track.title {
-        let px = fit_px(&f.bold, title, 72.0 * s, avail);
-        y += text::ascent(&f.bold, px);
-        text::draw_text(
-            &mut buf, width, height, text_x, y, title, px, pal.title, &f.bold,
-        );
-        y += 24.0 * s;
+        lines.push(Line {
+            text: title,
+            px: fit_px(&f.bold, title, 72.0 * s, avail),
+            color: pal.title,
+            bold: true,
+            gap: 20.0 * s,
+        });
     }
     if let Some(artist) = &card.track.artist {
-        let px = fit_px(&f.regular, artist, 44.0 * s, avail);
-        y += text::ascent(&f.regular, px);
-        text::draw_text(
-            &mut buf, width, height, text_x, y, artist, px, pal.artist, &f.regular,
-        );
-        y += 18.0 * s;
+        lines.push(Line {
+            text: artist,
+            px: fit_px(&f.regular, artist, 44.0 * s, avail),
+            color: pal.artist,
+            bold: false,
+            gap: 14.0 * s,
+        });
     }
     if let Some(album) = &card.track.album {
-        let px = fit_px(&f.regular, album, 32.0 * s, avail);
-        y += text::ascent(&f.regular, px);
-        text::draw_text(
-            &mut buf, width, height, text_x, y, album, px, pal.album, &f.regular,
-        );
+        lines.push(Line {
+            text: album,
+            px: fit_px(&f.regular, album, 32.0 * s, avail),
+            color: pal.album,
+            bold: false,
+            gap: 34.0 * s,
+        });
+    }
+    if let Some(state) = state {
+        lines.push(Line {
+            text: state,
+            px: 28.0 * s,
+            color: pal.state,
+            bold: false,
+            gap: 0.0,
+        });
     }
 
-    // Transport state, bottom of the column.
-    if let Some(label) = state_label(card.track.state) {
-        let px = 28.0 * s;
-        let baseline = art_y + art - (10.0 * s);
+    // Total height, so the block can be centred on the art square's midline.
+    let total: f32 = lines
+        .iter()
+        .map(|l| {
+            let font = if l.bold { &f.bold } else { &f.regular };
+            text::ascent(font, l.px) + l.gap
+        })
+        .sum();
+    let mut y = art_y + (art - total) / 2.0;
+
+    for line in &lines {
+        let font = if line.bold { &f.bold } else { &f.regular };
+        y += text::ascent(font, line.px);
         text::draw_text(
-            &mut buf, width, height, text_x, baseline, label, px, pal.state, &f.regular,
+            &mut buf, width, height, text_x, y, line.text, line.px, line.color, font,
         );
+        y += line.gap;
     }
 
     Ok(buf)
