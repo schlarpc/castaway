@@ -32,6 +32,11 @@ const ATTEMPTS: u32 = 20;
 #[cfg(feature = "cef")]
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 
+/// A single lookup's ceiling, chosen so a stalled one costs one attempt rather than all
+/// of them.
+#[cfg(feature = "cef")]
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Resolve the launched page's screen id and publish it into `slot`.
 ///
 /// Best-effort by design: failing to find it costs a sender the attach-without-launch
@@ -66,7 +71,14 @@ pub async fn publish_screen_id(pairing_code: String, slot: ScreenSlot) {
 async fn fetch(pairing_code: String) -> anyhow::Result<Option<ScreenId>> {
     // ureq is blocking, so it does not belong on the runtime (ground rule 4).
     let body = tokio::task::spawn_blocking(move || {
-        match ureq::post(GET_SCREEN).send_form(&[("pairing_code", pairing_code.as_str())]) {
+        // With no timeout — `ureq`'s default — one hung attempt parks this thread for the
+        // rest of the process and eats the entire retry budget, so a launch that could
+        // have resolved on attempt 2 never gets there.
+        let agent = ureq::builder().timeout(LOOKUP_TIMEOUT).build();
+        match agent
+            .post(GET_SCREEN)
+            .send_form(&[("pairing_code", pairing_code.as_str())])
+        {
             Ok(response) => response
                 .into_string()
                 .map(Some)

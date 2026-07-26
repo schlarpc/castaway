@@ -201,7 +201,8 @@ async fn skip(
 async fn post(url: &str, body: String) -> anyhow::Result<String> {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        let response = ureq::post(&url)
+        let response = request_agent()
+            .post(&url)
             .set("Content-Type", "application/x-www-form-urlencoded")
             .send_string(&body)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -210,11 +211,33 @@ async fn post(url: &str, body: String) -> anyhow::Result<String> {
     .await?
 }
 
+/// How long a one-shot request may take before we treat it as lost.
+///
+/// The default `ureq` agent has *no* timeout at all, which is not a slow request — it is
+/// a blocking thread parked in `read()` for the rest of the process. That thread is the
+/// one feeding `commands`, so the receiver never errors, the session loop never returns,
+/// and the reattach path never fires: sponsor skipping stops for good, with at most one
+/// warning line.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A long poll idles by design, so it gets a longer leash than a one-shot request — but
+/// still a finite one. The Lounge sends noop heartbeats, so silence past this is a
+/// connection that went away without saying so.
+const CHANNEL_READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn request_agent() -> ureq::Agent {
+    ureq::builder().timeout(REQUEST_TIMEOUT).build()
+}
+
 /// `Ok(None)` for a 404 — "no segments for this video", not a failure.
 async fn get(url: &str) -> anyhow::Result<Option<String>> {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
-        match ureq::get(&url).set("User-Agent", USER_AGENT).call() {
+        match request_agent()
+            .get(&url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+        {
             Ok(response) => Ok(Some(response.into_string()?)),
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(e) => Err(anyhow::anyhow!("{e}")),
@@ -234,7 +257,11 @@ fn stream_channel(query: &str, out: &mpsc::Sender<LoungeCommand>) {
     use std::io::Read as _;
 
     let url = format!("{LOUNGE}/bc/bind?{query}");
-    let response = match ureq::get(&url).call() {
+    let agent = ureq::builder()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(CHANNEL_READ_TIMEOUT)
+        .build();
+    let response = match agent.get(&url).call() {
         Ok(response) => response,
         Err(e) => {
             warn!(error = %e, "SponsorBlock receive channel refused");
@@ -242,27 +269,77 @@ fn stream_channel(query: &str, out: &mpsc::Sender<LoungeCommand>) {
         }
     };
     let mut reader = response.into_reader();
-    let mut buffered = String::new();
+    // Bytes, not a String, and that is the whole point. The framing is *character*
+    // counted, and `String::from_utf8_lossy` over an arbitrary 8192-byte read boundary
+    // replaces a split multi-byte sequence with U+FFFD — one character where there should
+    // have been one character, but the wrong one, and the bytes after it shifted. Every
+    // subsequent length prefix is then misaligned, permanently. A phone with an emoji in
+    // its name is enough to trigger it, via the device list in `loungeStatus`.
+    let mut buffered: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
         let read = match reader.read(&mut chunk) {
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        buffered.push_str(&String::from_utf8_lossy(&chunk[..read]));
-        let Ok(commands) = parse_chunks(&buffered) else {
+        buffered.extend_from_slice(&chunk[..read]);
+        if buffered.len() > MAX_BUFFERED {
+            // Previously this grew without limit: a parse failure `continue`d without
+            // clearing, so a genuinely malformed frame was re-parsed forever against an
+            // ever-larger buffer. Bailing out lets the session reattach, which is the
+            // recovery path that already exists.
+            warn!(
+                buffered = buffered.len(),
+                "SponsorBlock channel is not framed as expected; reattaching"
+            );
+            return;
+        }
+
+        // Only decode as far as the last *complete* character.
+        let Some(valid_to) = decodable_prefix(&buffered) else {
+            warn!("SponsorBlock channel sent invalid UTF-8; reattaching");
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(&buffered[..valid_to]) else {
+            return;
+        };
+        let Ok(commands) = parse_chunks(text) else {
             // A partial chunk is not a protocol error; wait for the rest.
             continue;
         };
         if commands.is_empty() {
             continue;
         }
-        buffered.clear();
+        // `parse_chunks` only succeeds when it consumed everything it was given, so what
+        // remains is exactly the incomplete tail.
+        buffered.drain(..valid_to);
         for command in commands {
             if out.blocking_send(command).is_err() {
                 return;
             }
         }
+    }
+}
+
+/// How much unparsed channel data to hold before concluding the stream is not framed the
+/// way we think it is.
+const MAX_BUFFERED: usize = 1 << 20;
+
+/// How many leading bytes of `buffered` form complete characters.
+///
+/// `None` means the stream is not UTF-8 at all, which is not something waiting will fix.
+///
+/// Split out from the read loop because the bug it prevents is invisible at the call
+/// site: decoding a partial multi-byte sequence lossily yields a *plausible* string with
+/// one wrong character in it, and the Lounge framing counts characters, so every length
+/// prefix after that point is off by however many bytes were swallowed. There is no
+/// recovery — the channel is desynchronised for as long as it stays open.
+fn decodable_prefix(buffered: &[u8]) -> Option<usize> {
+    match std::str::from_utf8(buffered) {
+        Ok(_) => Some(buffered.len()),
+        // Cut short mid-character: the rest is coming in the next read.
+        Err(e) if e.error_len().is_none() => Some(e.valid_up_to()),
+        Err(_) => None,
     }
 }
 
@@ -312,5 +389,81 @@ async fn lookup(config: &SponsorBlockConfig, video: &VideoId) -> Vec<Segment> {
             warn!(error = %e, "SponsorBlock lookup failed");
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decodable_prefix, MAX_BUFFERED};
+    use proto_dial::parse_chunks;
+
+    /// Feed `body` through the read loop's buffering in `size`-byte reads and return what
+    /// the parser ends up seeing.
+    fn stream_in_reads(body: &str, size: usize) -> Vec<String> {
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut seen = Vec::new();
+        for piece in body.as_bytes().chunks(size) {
+            buffered.extend_from_slice(piece);
+            assert!(buffered.len() <= MAX_BUFFERED);
+            let valid_to = decodable_prefix(&buffered).expect("valid utf-8 overall");
+            let text = std::str::from_utf8(&buffered[..valid_to]).expect("prefix decodes");
+            let Ok(commands) = parse_chunks(text) else {
+                continue;
+            };
+            if commands.is_empty() {
+                continue;
+            }
+            buffered.drain(..valid_to);
+            seen.extend(commands.into_iter().map(|c| c.name));
+        }
+        seen
+    }
+
+    /// A chunk is a character count, a newline, then that many characters of JSON.
+    fn chunk(json: &str) -> String {
+        format!("{}\n{json}", json.chars().count())
+    }
+
+    #[test]
+    fn a_multi_byte_character_split_across_reads_does_not_desynchronise_the_channel() {
+        // The failure this exists to prevent, and it is permanent rather than transient:
+        // `from_utf8_lossy` on a read boundary turns half an emoji into U+FFFD, the
+        // framing counts characters, and every length prefix after that is misaligned for
+        // as long as the channel stays open. Sponsor skipping stops for the rest of the
+        // process. A phone with an emoji in its name is enough, via `loungeStatus`.
+        let body = format!(
+            "{}{}",
+            chunk(r#"[[1,["loungeStatus",{"devices":"🎧 Chaz's Phone"}]]]"#),
+            chunk(r#"[[2,["nowPlaying",{"videoId":"dQw4w9WgXcQ"}]]]"#),
+        );
+        // One byte at a time is the worst case, and guarantees the split.
+        assert_eq!(
+            stream_in_reads(&body, 1),
+            vec!["loungeStatus".to_owned(), "nowPlaying".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_same_body_parses_the_same_however_the_reads_fall() {
+        let body = format!(
+            "{}{}",
+            chunk(r#"[[7,["onStateChange",{"state":"1","current_time":"12.5"}]]]"#),
+            chunk(r#"[[8,["nowPlaying",{"videoId":"héllo·wörld"}]]]"#),
+        );
+        let whole = stream_in_reads(&body, body.len());
+        for size in [1, 2, 3, 5, 8, 13, 64] {
+            assert_eq!(stream_in_reads(&body, size), whole, "reads of {size} bytes");
+        }
+    }
+
+    #[test]
+    fn invalid_utf_8_is_reported_rather_than_waited_on() {
+        // Distinct from a split character: no amount of further reading fixes this, so
+        // the loop has to give up and let the session reattach instead of buffering to
+        // the cap.
+        assert_eq!(decodable_prefix(b"ok"), Some(2));
+        assert_eq!(decodable_prefix(&[0xE2, 0x9C]), Some(0), "split, wait");
+        assert_eq!(decodable_prefix(&[b'h', b'i', 0xE2, 0x9C]), Some(2));
+        assert_eq!(decodable_prefix(&[0xFF, 0xFE]), None, "not utf-8 at all");
     }
 }
