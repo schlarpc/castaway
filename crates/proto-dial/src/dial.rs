@@ -16,6 +16,8 @@ use axum::routing::get;
 use axum::Router;
 use castaway_core::OsdSink;
 use substrate_ssdp::SsdpDevice;
+
+use crate::error::DialError;
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
@@ -51,6 +53,78 @@ impl LaunchParams {
     }
 }
 
+/// The Lounge screen id of the page we launched.
+///
+/// Senders need this to attach to an app that is *already* running: with it they can mint
+/// a lounge token and drive the screen directly, with no launch and no pairing code at
+/// all. Without it, a sender that finds the app running has no way in — the only other
+/// route to a screen is a pairing code it supplied itself, on a launch it therefore has
+/// to make. That is why a real TV publishes this in its app-info XML, and why we do.
+///
+/// Parsed, not trusted: it comes back from a network lookup and goes straight into XML
+/// every sender on the LAN reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenId(String);
+
+impl ScreenId {
+    /// Parse a screen id. The Lounge's are 64 hex characters; the bound here is
+    /// deliberately looser than that (any ASCII alphanumeric, `-`, or `_`) so a format
+    /// change does not break us, and deliberately not "any string".
+    ///
+    /// # Errors
+    /// [`DialError::NotAScreenId`] if it is empty, over 128 characters, or carries
+    /// anything outside that set.
+    pub fn parse(raw: &str) -> Result<Self, DialError> {
+        if raw.is_empty() {
+            return Err(DialError::NotAScreenId("empty"));
+        }
+        if raw.len() > 128 {
+            return Err(DialError::NotAScreenId("too long"));
+        }
+        if !raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(DialError::NotAScreenId("unexpected characters"));
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    /// The id as it goes on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The current screen id, shared between the DIAL routes and whatever resolves it.
+///
+/// It is a slot rather than a constructor argument because the id does not exist yet when
+/// the service is built, or even when a launch is answered: the page has to load and
+/// register with the Lounge first. Empty is the honest state until then.
+#[derive(Clone, Default)]
+pub struct ScreenSlot {
+    inner: Arc<Mutex<Option<ScreenId>>>,
+}
+
+impl ScreenSlot {
+    /// Publish the screen id senders should use to attach.
+    pub async fn set(&self, id: ScreenId) {
+        *self.inner.lock().await = Some(id);
+    }
+
+    /// Forget it — the page is gone, or a new launch is about to replace it. A stale id
+    /// is worse than none: a sender would attach to a screen that no longer exists.
+    pub async fn clear(&self) {
+        *self.inner.lock().await = None;
+    }
+
+    /// The current id, if the page has registered one.
+    pub async fn get(&self) -> Option<ScreenId> {
+        self.inner.lock().await.clone()
+    }
+}
+
 /// A DIAL app-lifecycle event, sent to the app layer over the service's channel.
 #[derive(Debug, Clone)]
 pub enum DialEvent {
@@ -75,6 +149,8 @@ struct DialInner {
     events: mpsc::Sender<DialEvent>,
     /// Optional overlay sink so this adapter can post its own status ("Launching …").
     osd: OnceLock<OsdSink>,
+    /// The launched page's Lounge screen id, once something has resolved it.
+    screen: ScreenSlot,
 }
 
 /// The DIAL service. Exposes a [`Router`] to merge and an [`SsdpDevice`] to advertise.
@@ -99,8 +175,16 @@ impl DialService {
                 base_url: base_url.into(),
                 events,
                 osd: OnceLock::new(),
+                screen: ScreenSlot::default(),
             }),
         }
+    }
+
+    /// The slot holding the launched page's screen id. Whatever resolves the id writes
+    /// here; the app-info route reads it.
+    #[must_use]
+    pub fn screen_slot(&self) -> ScreenSlot {
+        self.inner.screen.clone()
     }
 
     /// Give this adapter an [`OsdSink`] so it can surface its own status on the overlay.
@@ -173,13 +257,23 @@ async fn app_state(State(st): State<Arc<DialInner>>) -> Response {
     } else {
         ("stopped", "")
     };
+    // The screen id is what a sender reads to attach to an app that is already running,
+    // so it is only meaningful while it is. Published under `additionalData`, where the
+    // DIAL spec puts app-specific state and where senders look for it.
+    let additional = match st.screen.get().await.filter(|_| running) {
+        Some(id) => format!(
+            "\n  <additionalData>\n    <screenId>{}</screenId>\n  </additionalData>",
+            xml_escape(id.as_str())
+        ),
+        None => String::new(),
+    };
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <service xmlns="urn:dial-multiscreen-org:schemas:dial" dialVer="2.1">
   <name>{APP_NAME}</name>
   <options allowStop="true"/>
   <state>{state_str}</state>
-  {link}
+  {link}{additional}
 </service>"#
     );
     (StatusCode::OK, [("Content-Type", "text/xml")], xml).into_response()
@@ -187,6 +281,9 @@ async fn app_state(State(st): State<Arc<DialInner>>) -> Response {
 
 async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
     *st.state.lock().await = AppState::Running;
+    // A launch reloads the page, and the new page registers a new screen. Publishing the
+    // old id until the new one resolves would point senders at a screen that is gone.
+    st.screen.clear().await;
     let pairing_code = form_field(&body, "pairingCode");
     info!(pairing = ?pairing_code, "DIAL launched YouTube");
     if let Some(osd) = st.osd.get() {
@@ -208,6 +305,7 @@ async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
 
 async fn stop(State(st): State<Arc<DialInner>>) -> Response {
     *st.state.lock().await = AppState::Stopped;
+    st.screen.clear().await;
     info!("DIAL stopped YouTube");
     let _ = st.events.send(DialEvent::Stopped).await;
     StatusCode::OK.into_response()
@@ -374,6 +472,105 @@ mod tests {
             raw_body: String::new(),
         };
         assert_eq!(params.leanback_url(), "https://www.youtube.com/tv");
+    }
+
+    async fn app_info(app: &Router) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dial/apps/YouTube")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    async fn launch_it(app: &Router) {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dial/apps/YouTube")
+                    .body(Body::from("pairingCode=abcd1234"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_running_app_publishes_the_screen_id_senders_attach_with() {
+        let (svc, _rx) = service();
+        let slot = svc.screen_slot();
+        let app = svc.router();
+
+        // Before a launch there is no page, so nothing to attach to.
+        assert!(!app_info(&app).await.contains("additionalData"));
+
+        launch_it(&app).await;
+        // Launched, but the page has not registered yet: still nothing to publish, and
+        // publishing a guess would send senders to a screen that does not exist.
+        assert!(!app_info(&app).await.contains("additionalData"));
+
+        slot.set(ScreenId::parse("f970ef4ce158e4a15ca9b7f228103591").unwrap())
+            .await;
+        let body = app_info(&app).await;
+        assert!(
+            body.contains("<screenId>f970ef4ce158e4a15ca9b7f228103591</screenId>"),
+            "a running app must publish its screen id: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_screen_id_does_not_outlive_the_page_that_registered_it() {
+        let (svc, _rx) = service();
+        let slot = svc.screen_slot();
+        let app = svc.router();
+        launch_it(&app).await;
+        slot.set(ScreenId::parse("aaaa1111").unwrap()).await;
+        assert!(app_info(&app).await.contains("aaaa1111"));
+
+        // A relaunch reloads the page, and the new page is a new screen.
+        launch_it(&app).await;
+        assert!(
+            !app_info(&app).await.contains("aaaa1111"),
+            "a relaunch must not keep publishing the old screen"
+        );
+
+        slot.set(ScreenId::parse("bbbb2222").unwrap()).await;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/dial/apps/YouTube/run")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = app_info(&app).await;
+        assert!(body.contains("<state>stopped</state>"), "{body}");
+        assert!(
+            !body.contains("additionalData"),
+            "a stopped app has no screen to attach to: {body}"
+        );
+    }
+
+    #[test]
+    fn screen_ids_are_parsed_not_trusted() {
+        assert!(ScreenId::parse("").is_err());
+        assert!(ScreenId::parse(&"a".repeat(129)).is_err());
+        // It lands in XML that every sender on the LAN reads.
+        assert!(ScreenId::parse("abc</screenId><evil>").is_err());
+        assert_eq!(
+            ScreenId::parse("Ab-9_z").unwrap().as_str(),
+            "Ab-9_z",
+            "the character set the Lounge actually uses must survive"
+        );
     }
 
     #[test]

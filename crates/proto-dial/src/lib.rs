@@ -15,7 +15,7 @@ pub mod dial;
 pub mod error;
 pub mod lounge;
 
-pub use dial::{DialEvent, DialService, LaunchParams, DIAL_SERVICE_TYPE};
+pub use dial::{DialEvent, DialService, LaunchParams, ScreenId, ScreenSlot, DIAL_SERVICE_TYPE};
 pub use error::DialError;
 pub use lounge::{parse_chunks, to_event, LoungeCommand};
 
