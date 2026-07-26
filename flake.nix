@@ -581,6 +581,22 @@
                 environment = {
                   CASTAWAY_CONFIG = "${configFile}";
                   RUST_LOG = cfg.logLevel;
+                  # Without this the filter-list cache lands somewhere unwritable and
+                  # *silently* stops working. `cache_dir()` resolves XDG_CACHE_HOME, then
+                  # HOME/.cache; under DynamicUser a dynamic user's home is `/`, so the
+                  # path became /.cache/castaway with ProtectSystem=strict over it. Every
+                  # failure there is swallowed by design (a missing list is not worth
+                  # refusing to boot over), so the receiver looked healthy.
+                  #
+                  # The half that actually breaks is the render process: it loads the
+                  # cache only, never fetches, so with nothing cached it injects no uBO
+                  # scriptlets at all — while the browser process still blocks network
+                  # requests from its in-memory engine. Exactly the silent failure Q17 and
+                  # Q36 were written to prevent, reintroduced by the deployment.
+                  #
+                  # %C is systemd's CacheDirectory root, so this also gives the CEF
+                  # profile (cookies, "watch as guest") somewhere to persist.
+                  XDG_CACHE_HOME = "%C";
                 };
 
                 serviceConfig = {
@@ -592,6 +608,10 @@
                   # needs root or CAP_NET_BIND_SERVICE.
                   DynamicUser = true;
                   StateDirectory = "castaway";
+                  # Backs XDG_CACHE_HOME above: filter lists, uBO scriptlet bodies, and
+                  # the CEF profile. Losing it costs a refetch, not correctness, so it is
+                  # a cache directory rather than state.
+                  CacheDirectory = "castaway";
                   WorkingDirectory = "/var/lib/castaway";
 
                   NoNewPrivileges = true;

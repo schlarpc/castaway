@@ -1095,19 +1095,22 @@ mod card_tests {
             .ok();
         assert_eq!(released.load(Ordering::SeqCst), 1, "a video cast");
 
-        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
-        pipeline
-            .play_audio(
-                FrameSource::Pcm(rx),
-                castaway_core::AudioFormat::from_hz(44_100, 2).unwrap(),
-            )
-            .await
-            .ok();
-        assert_eq!(
-            released.load(Ordering::SeqCst),
-            2,
-            "an audio-only source takes the panel too"
-        );
+        // An audio-only source takes the panel too — a page left on screen keeps making
+        // noise even when nothing about it is visible. Only meaningful in a build that
+        // can play audio at all; without the feature `play_audio` refuses the session, and
+        // a refused session should not dismiss anything.
+        #[cfg(feature = "audio")]
+        {
+            let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+            pipeline
+                .play_audio(
+                    FrameSource::Pcm(rx),
+                    castaway_core::AudioFormat::from_hz(44_100, 2).unwrap(),
+                )
+                .await
+                .ok();
+            assert_eq!(released.load(Ordering::SeqCst), 2, "an audio-only source");
+        }
     }
 
     #[tokio::test]

@@ -367,7 +367,7 @@ fn read_cached_resources(path: &Path) -> Option<Vec<Resource>> {
 /// Fetch `url`, caching to `path`; fall back to whatever was cached before.
 fn text_for(label: &str, url: &str, path: &Path) -> Option<String> {
     match fetch(url) {
-        Ok(text) if text.len() > 1024 => {
+        Ok(text) if text.len() > 1024 && looks_like_a_filter_list(&text) => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
@@ -379,8 +379,11 @@ fn text_for(label: &str, url: &str, path: &Path) -> Option<String> {
         }
         // A 404 page is ~14 bytes and parses as an empty list, so short answers are
         // treated as failures rather than as "this list is empty today".
-        Ok(short) => {
-            warn!(target: "castaway::adblock", %label, bytes = short.len(), "fetch returned too little data");
+        Ok(other) => {
+            warn!(
+                target: "castaway::adblock", %label, bytes = other.len(),
+                "fetch did not return a filter list"
+            );
         }
         Err(e) => warn!(target: "castaway::adblock", %label, error = %e, "fetch failed"),
     }
@@ -391,6 +394,45 @@ fn text_for(label: &str, url: &str, path: &Path) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/// Whether a fetched body is plausibly a filter list rather than something else large.
+///
+/// The size check alone was not enough, and the failure it let through is worse than a
+/// failed fetch. A captive-portal interstitial, a Cloudflare challenge, or a GitHub error
+/// page all clear 1024 bytes comfortably — and the old code wrote whatever it got to the
+/// cache and built the engine from it. So the *good* cached list was destroyed on disk,
+/// the in-memory engine became one built from HTML, and render processes rebuilt from the
+/// poisoned cache on the next stamp change. Ad blocking degraded to nothing and stayed
+/// there across restarts, until some later fetch happened to succeed.
+///
+/// Deliberately loose: a list is allowed to change shape, and this only has to tell a
+/// filter list from a web page. Anything that opens with the `[Adblock` header, or whose
+/// early lines are mostly comments and rules, counts.
+fn looks_like_a_filter_list(text: &str) -> bool {
+    let head = text.lines().take(200);
+    let mut plausible = 0usize;
+    let mut total = 0usize;
+    for line in head {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        total += 1;
+        if line.starts_with('!')
+            || line.starts_with('[')
+            || line.starts_with("||")
+            || line.starts_with("@@")
+            || line.contains("##")
+            || line.contains("#@#")
+            || line.contains("#%#")
+        {
+            plausible += 1;
+        }
+    }
+    // An HTML document has none of these; a filter list is nearly all of them. Half is a
+    // wide margin either way.
+    total > 0 && plausible * 2 >= total
 }
 
 fn fetch(url: &str) -> Result<String, String> {
@@ -406,8 +448,43 @@ fn fetch(url: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn an_error_page_is_not_accepted_as_a_filter_list() {
+        // The failure this closes is worse than a failed fetch: the old size-only check
+        // wrote whatever came back to the cache and built the engine from it, so a
+        // captive portal or a Cloudflare challenge — both comfortably over 1024 bytes —
+        // destroyed the good cached list on disk. Ad blocking then degraded to nothing
+        // and stayed there across restarts.
+        let portal = format!(
+            "<!doctype html><html><head><title>Sign in</title></head><body>{}</body></html>",
+            "<p>Please accept the terms to continue.</p>".repeat(40)
+        );
+        assert!(portal.len() > 1024, "must clear the old size check");
+        assert!(!super::looks_like_a_filter_list(&portal));
+
+        let challenge = "<html>".to_owned() + &"<div>Checking your browser</div>".repeat(60);
+        assert!(!super::looks_like_a_filter_list(&challenge));
+    }
+
+    #[test]
+    fn a_real_list_is_accepted_in_the_shapes_it_actually_arrives_in() {
+        assert!(super::looks_like_a_filter_list(
+            "[Adblock Plus 2.0]\n! Title: EasyList\n||doubleclick.net^\n@@||example.com^"
+        ));
+        // uBO's own list leans on cosmetic rules rather than network ones.
+        assert!(super::looks_like_a_filter_list(
+            "! Title: uBlock filters\nyoutube.com##+js(set, foo, true)\nexample.com##.ad"
+        ));
+        // Comments and blank lines alone still count: a list can be mostly header.
+        assert!(super::looks_like_a_filter_list(
+            "! only comments\n\n! and more"
+        ));
+        assert!(!super::looks_like_a_filter_list(""));
+    }
 
     fn paths_in(dir: &Path) -> CachePaths {
         CachePaths {
