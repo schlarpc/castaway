@@ -37,6 +37,11 @@ futures.workspace = true
 hex-literal.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
+# For the `selfplay` harness only — the scripted controller talks to Spotify's Web API.
+# `rustls-tls-webpki-roots` for the same reason the runtime crates use it: no OpenSSL.
+librespot-oauth = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -3730,11 +3730,13 @@ dependencies = [
  "librespot-connect",
  "librespot-core",
  "librespot-metadata",
+ "librespot-oauth",
  "librespot-playback",
  "num-bigint",
  "num-traits",
  "pbkdf2",
  "rand 0.8.7",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -3744,6 +3746,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -49,6 +49,28 @@ receiver's journal, so the event is proven to cross adapter → session manager 
 - **mDNS**: `_spotify-connect._tcp`, `_googlecast._tcp`, `_airplay._tcp`, and `_raop._tcp`
   are all browsable from the sender with the ports that actually answered.
 
+## A Spotify session, with no phone (`cargo run -p proto-spotify --example selfplay -- http://<receiver>:8080`)
+The Spotify sibling of `yt-selfplay`, and needed for the same reason: Spotify's cloud is a
+third party to every part of a Connect session, so a test that stops at "the receiver
+answered `status: 101`" tests almost none of it. Pairing succeeding says nothing about the
+login behind it — that is the failure this exists to name.
+
+It logs in as the harness account, converts that into the reusable credentials a phone
+would hold, wraps them the way a phone wraps them, POSTs `addUser`, then waits for the
+device to appear in the *account's* device list before transferring playback, queueing a
+second track, checking it really reached the queue, skipping, and checking the queued
+track is now playing. Tracks are chosen at runtime with `market=from_token`, so a
+licensing gap in one market does not look like a receiver bug.
+
+Credentials come from `.env.local` (gitignored; see `.env.example`). One browser visit is
+needed the first time — Spotify has no device-code flow — after which the cached refresh
+token makes every run hands-free. Neither the harness nor the receiver needs an Android VM
+or a headless browser.
+
+**Not yet run end to end**: it needs the Premium account authorised in a browser once,
+which has not happened. The offline half of the same path *is* covered — `tests/pairing.rs`
+drives `getInfo` → DH → blob → `addUser` against the real router in-process.
+
 ## Which package to run
 - `packages.default` — portable, no renderer, no browser. Serves and discovers; **cannot**
   play YouTube, and honestly declines to advertise DIAL (D27). What CI builds.
