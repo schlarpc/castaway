@@ -582,6 +582,7 @@ dependencies = [
  "proto-spotify",
  "serde",
  "serde_json",
+ "sponsorblock",
  "substrate-hci",
  "substrate-mdns",
  "substrate-ssdp",
@@ -590,6 +591,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq 2.12.1",
+ "url",
  "uuid",
 ]
 
@@ -3078,6 +3080,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3773,6 +3776,16 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sponsorblock"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
