@@ -39,6 +39,11 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
   # Big Buck Bunny (Blender Foundation, CC-BY): long enough to still be playing at the
   # end of a dwell, and about as unlikely to be taken down as YouTube gets.
   DEFAULT_VIDEOS = "aqz-KE-bpKQ"
+  # For --expect-skip: carries a community-submitted `music_offtopic` segment over its
+  # first few seconds, so the skip fires immediately instead of minutes in. Segments are
+  # crowd-sourced and can be re-voted, so a failure here is worth checking against
+  # sponsor.ajay.app before believing it is ours.
+  SEGMENTED_VIDEO = "9bZkp7q19f0"
   # Seconds left playing between taps, so the sequence looks like someone browsing
   # rather than three commands in a burst.
   DWELL = 20
@@ -325,15 +330,59 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
       return screens[0]["loungeToken"]
 
 
+  def expect_skip(lounge, video_id, timeout=120):
+      """Watch for the receiver seeking past a segment, from the sender's seat.
+
+      The oracle is a *discontinuity*: playback position that advances further than wall
+      time did. Nothing else on this channel can do that — only a seek. Deliberately not
+      "does the position match a SponsorBlock segment", because then the test and the
+      implementation would be reading the same third-party answer and agreeing with each
+      other rather than with reality."""
+      deadline = time.monotonic() + timeout
+      last = None
+      while time.monotonic() < deadline:
+          answer = {}
+
+          def answered(command):
+              _aid, name, payload = command
+              if name == "nowPlaying" and isinstance(payload, dict) and payload.get("videoId"):
+                  answer.update(payload)
+                  return True
+              return False
+
+          lounge.send("getNowPlaying")
+          if not lounge.listen(15, answered):
+              continue
+          if answer.get("videoId") != video_id:
+              continue
+          try:
+              position = float(answer.get("currentTime") or 0)
+          except ValueError:
+              continue
+          now = time.monotonic()
+          if last is not None:
+              elapsed = now - last[0]
+              jumped = (position - last[1]) - elapsed
+              if jumped > 1.5:
+                  print("   position jumped {:.1f}s further than the {:.1f}s that passed"
+                        .format(position - last[1], elapsed))
+                  return True
+          last = (now, position)
+      return False
+
+
   def main():
       argv = sys.argv[1:]
       reconnect = "--reconnect" in argv
-      argv = [a for a in argv if a != "--reconnect"]
+      skip_check = "--expect-skip" in argv
+      argv = [a for a in argv if a not in ("--reconnect", "--expect-skip")]
       if not argv:
           raise SystemExit(
-              "usage: yt-selfplay [--reconnect] <receiver-base-url> [videoId,videoId,...]")
+              "usage: yt-selfplay [--reconnect] [--expect-skip] <receiver-base-url> "
+              "[videoId,videoId,...]")
       base = argv[0]
-      videos = (argv[1] if len(argv) > 1 else DEFAULT_VIDEOS).split(",")
+      videos = (argv[1] if len(argv) > 1 else
+                (SEGMENTED_VIDEO if skip_check else DEFAULT_VIDEOS)).split(",")
 
       if reconnect:
           # The returning phone: the app is already running, and this sender never
@@ -360,16 +409,28 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
           lounge.send("setPlaylist", videoIds=video, videoId=video, currentIndex=0,
                       currentTime=0, audioOnly="false", params="", playerParams="",
                       listId="")
-          if playing(lounge, video):
+          if skip_check:
+              # Watch from the moment of the tap, not after confirming playback: a
+              # segment at the head of the video is skipped within a second or two, so
+              # anything that waits first misses the very event it is looking for. A
+              # position that jumps is proof of playback as well as of the skip.
+              if expect_skip(lounge, video):
+                  print("tap {}: the receiver skipped a segment".format(n))
+              else:
+                  print("tap {}: nothing was skipped".format(n))
+                  failed.append(video + " (no skip seen)")
+          elif playing(lounge, video):
               print("tap {}: PLAYING".format(n))
           else:
               print("tap {}: never played".format(n))
               failed.append(video)
 
       if failed:
-          print("FAIL: the screen never played " + ", ".join(failed))
+          print("FAIL: " + ", ".join(failed))
           return 1
-      print("PASS: the screen played every video the sender queued")
+      print("PASS: " + ("the receiver skipped a segment in every video"
+                        if skip_check else
+                        "the screen played every video the sender queued"))
       return 0
 
 
