@@ -172,6 +172,29 @@
         let craneLib = cranelibFor system;
         in craneLib.buildDepsOnly (commonArgsFor system);
 
+      # The `cef`/`cef-dll-sys` crates expect a *flattened* CEF distribution (libcef.so +
+      # .pak resources at the root, not the Release/Resources split nixpkgs ships) plus an
+      # `archive.json` to pass their version check. We match the `cef` crate 147.1.0 to
+      # nixpkgs `cef-binary` (147.0.10) so the crates use the already-NixOS-linked
+      # libcef.so instead of downloading their own. Shared by the devShell and the
+      # `castaway-cef` package, which must agree on it.
+      cefDistFor = system:
+        let pkgs = pkgsFor system;
+        in pkgs.runCommand "cef-dist-${pkgs.cef-binary.version}" { } ''
+          mkdir -p $out
+          ln -s ${pkgs.cef-binary}/Release/* $out/
+          ln -s ${pkgs.cef-binary}/Resources/* $out/
+          printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
+        '';
+
+      # The kiosk build with the browser in it — what actually plays YouTube.
+      linuxCefFor = system: import ./nix/linux-cef.nix {
+        pkgs = pkgsFor system;
+        craneLib = cranelibFor system;
+        commonArgs = commonArgsFor system;
+        cefDist = cefDistFor system;
+      };
+
       # Linux → Windows cross-build (x86_64-pc-windows-msvc). Only meaningful from
       # Linux; the sysroot derivation is Linux-only.
       windowsFor = system: import ./nix/windows.nix {
@@ -208,6 +231,11 @@
           yt-selfplay = import ./nix/yt-selfplay.nix { inherit pkgs; };
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
+            # The Linux kiosk build with the browser in it. `default` above has neither a
+            # renderer nor a browser, so it cannot play YouTube at all — it does not even
+            # advertise DIAL (D27). This is the one to deploy on Linux.
+            castaway-cef = linuxCefFor system;
+
             # The Windows deploy artifacts, cross-compiled from Linux. `-cef` is the one
             # that ships; `-render` drops the browser, and the bare build is the toolchain
             # canary — if it stops linking, the toolchain broke, not the media stack.
@@ -349,17 +377,9 @@
         let
           pkgs = pkgsFor system;
           rustToolchain = rustToolchainFor system;
-          # The `cef`/`cef-dll-sys` crates expect a *flattened* CEF distribution
-          # (libcef.so + .pak resources at the root, not the Release/Resources split
-          # nixpkgs ships) plus an `archive.json` to pass their version check. We match
-          # the `cef` crate 147.1.0 to nixpkgs `cef-binary` (147.0.10) so the crates use
-          # the already-NixOS-linked libcef.so instead of downloading their own.
-          cefDist = pkgs.runCommand "cef-dist-${pkgs.cef-binary.version}" { } ''
-            mkdir -p $out
-            ln -s ${pkgs.cef-binary}/Release/* $out/
-            ln -s ${pkgs.cef-binary}/Resources/* $out/
-            printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
-          '';
+          # The same flattened CEF distribution the `castaway-cef` package builds against;
+          # a devShell that disagreed with the package would be a trap.
+          cefDist = cefDistFor system;
         in
         {
           default = pkgs.mkShell {
@@ -479,7 +499,18 @@
                 type = lib.types.package;
                 default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
                 defaultText = lib.literalExpression "castaway.packages.\${system}.default";
-                description = "The castaway package to run.";
+                description = ''
+                  The castaway package to run.
+
+                  The default has no renderer and no browser: it serves and discovers, but
+                  it cannot display anything, and it does not advertise DIAL at all —
+                  YouTube casting is a web page, so a build with nowhere to put one
+                  declines to offer it rather than accepting casts it can never play.
+
+                  For a kiosk on a real display, use
+                  `castaway.packages.''${system}.castaway-cef`, which carries the CEF
+                  browser and the render pipeline.
+                '';
               };
 
               httpPort = lib.mkOption {
