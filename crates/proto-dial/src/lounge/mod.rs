@@ -4,6 +4,8 @@
 //! is the pure parser + command→[`SessionEvent`] mapping (ground rule 3). The HTTP
 //! long-poll client (`gsessionid`/`RID`/`AID`/`SID`) is the actor.
 
+pub mod sender;
+
 use castaway_core::{ControlTxn, MediaUri, SessionEvent};
 use serde_json::Value;
 
