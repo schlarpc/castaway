@@ -266,3 +266,37 @@ Both stay OFF by default, but D16's reason has narrowed: the listeners answer no
 still missing is a real Cast device key (Q2/Q11) and AirPlay pairing (Q1) — so AirPlay
 answers `501` at the pairing gate rather than faking a 200 and leaving a sender waiting
 forever for a media plane that can't start.
+
+### D27 — DIAL is gated on a launch target, and the YouTube path is tested by a scripted phone
+DIAL carries no media. It launches an app and stops it; *everything* else a YouTube sender
+does — pairing, the Lounge session, transport commands, the video itself — happens between
+the phone, YouTube's servers, and the **page** the receiver was supposed to open. So a
+receiver with no browser is not a degraded YouTube target, it is a non-functional one that
+looks fine from the outside: `201 Created`, `<state>running</state>`, an OSD banner saying
+"Launching YouTube…", and a phone sitting on a connected cast that can never play. That is
+worse than not offering it, and it is D16's rule ("advertising a service with no listener
+only frustrates senders") with the launch target as the missing listener.
+
+So `serve` takes `on_dial: Option<impl Fn(DialEvent)>` rather than a function that might be
+a logger, and a `None` means DIAL is neither mounted nor advertised — the config flag can
+ask for it, but a build with nothing to launch it in says so and declines. The type carries
+the requirement, so a future non-CEF launch target (the native bind-channel client the
+lounge parser is still there for) enables DIAL by existing, not by someone remembering to.
+
+The test story splits three ways, by what each tier can honestly prove:
+- **proto-dial's own tests** — launch/stop/state semantics against the router, no sockets.
+- **the two-VM test** — that a browser-less build advertises nothing and says why.
+- **`nix run .#yt-selfplay`** — the whole path, because neither of the above touches the
+  part that actually breaks. It is a scripted phone: invent a pairing code, DIAL-launch it,
+  wait for the receiver's page to register that code with YouTube, bind to the Lounge
+  session as a remote control, queue videos, and assert the screen plays them. It needs the
+  real internet — YouTube's Lounge servers are a third party to the session and there is
+  nothing to fake them with — which is why it is a `nix run`, not a `nix flake check`, and
+  it sits alongside the hardware-only paths ground rule 6 carves out.
+
+Its oracle is the *clock*, not the state code: `onStateChange` reports PLAYING without
+saying which video, so a screen still rolling the previous tap satisfies it — precisely the
+"I browsed and it kept playing the first thing" failure. It asks `getNowPlaying` and
+requires the position to advance on the video it queued. (The documented state set is
+incomplete anyway: `1081` appears with playback plainly running.) And it taps more than
+once, because a cast is a session someone browses, not a single launch.

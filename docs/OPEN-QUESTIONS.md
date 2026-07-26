@@ -178,6 +178,30 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   useful for a non-CEF fallback). Still to wire (task 16): feed CEF on_paint into the compositor
   Browser layer, and the DIAL-launch → navigate handoff. YouTube ad-blocking is an arms race —
   request blocking + JS help, but no guarantees.
+  **ANSWERED 2026-07-26 — the plan works, and it is now tested.** `nix run .#yt-selfplay` drives
+  the whole path with no phone and no human: the page registers the sender's pairing code with
+  YouTube within ~3s of the launch, the session binds, and queued videos actually play (4K
+  screenshots of decoded video on the composited surface). Two things fell out of building it:
+  the leanback page takes its launch parameters as a plain **query string** on
+  `youtube.com/tv?…` (no `#` fragment needed), and **in-stream ads still play** — EasyList
+  blocks ad *requests*, not the ad segments the player itself serves, so a pre-roll ran before
+  a queued video. That is the arms race this bullet predicted; skipping it is a separate
+  mechanism from request blocking.
+- **Q32 — a Linux package with the browser in it.** Confirmed on the bench 2026-07-26 (see
+  below): a build without `--features cef` cannot play YouTube at all, and now says so instead
+  of pretending. But `packages.default` — which is what `services.castaway` deploys and what
+  `nix run` gives you — *is* that build, and there is no Linux `castaway-cef` package to reach
+  for; only `cargo build --features cef` inside the devShell. The Windows side already ships
+  `castaway-windows-cef`. Default: add a Linux `castaway-cef` package (cefDist + `CEF_PATH` +
+  the runtime library path, mirroring the devShell) and a module option to select it, so the
+  deployed thing and the thing that can play YouTube are the same thing. Not done here because
+  it changes what the deploy ships.
+- **Q33 — the leanback page's storage is per-launch.** The page generates a fresh screen id on
+  every DIAL launch (`generate_screen_id` seen in the netlog each time), because CEF has no
+  persistent cache path configured. Real TVs keep theirs in localStorage. Nothing observed
+  actually breaks — the phone re-pairs with the new pairing code on each launch — but a sender
+  that caches a screen id would be talking to one that no longer exists. Worth deciding whether
+  the kiosk should have a persistent CEF cache before someone debugs it the hard way.
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.

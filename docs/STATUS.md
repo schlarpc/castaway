@@ -21,7 +21,7 @@ integration test.
 | `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). Dev device key (Q2/Q11). |
 | `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
-| `proto-dial` | **Live launch** + pure Lounge bind-channel parser/mapping. Lounge HTTP client pending. |
+| `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`). Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. |
@@ -35,8 +35,8 @@ than hidden by loopback. Each of these asserts the sender's view **and** greps t
 receiver's journal, so the event is proven to cross adapter → session manager → pipeline:
 
 - **SSDP**: M-SEARCH answered; every advertised `LOCATION` is fetched from the other host.
-- **DIAL**: `dd.xml` `Application-URL`; launch → `201` + `Location`, state flips
-  stopped → running → stopped on `DELETE`.
+- **DIAL**: that a *browser-less* build advertises nothing, mounts nothing, and says why.
+  Launch/stop semantics are proto-dial's own tests; the real path is `yt-selfplay` below.
 - **DLNA**: `SetAVTransportURI`/`Play`/`Pause`/`Stop` walk
   `NO_MEDIA_PRESENT → PLAYING → PAUSED_PLAYBACK → STOPPED`.
 - **Cast**: a hand-rolled CASTv2 sender does TLS → CONNECT → PING → GET_STATUS → LAUNCH
@@ -47,6 +47,29 @@ receiver's journal, so the event is proven to cross adapter → session manager 
   the session — on both 7000 and 7011.
 - **mDNS**: `_spotify-connect._tcp`, `_googlecast._tcp`, `_airplay._tcp`, and `_raop._tcp`
   are all browsable from the sender with the ports that actually answered.
+
+## A YouTube cast, with no phone (`nix run .#yt-selfplay -- http://<receiver>:8080`)
+The one path a VM test cannot cover: YouTube's Lounge servers are a third party to the
+session, so this needs the real internet and a running `--features cef` receiver. It is a
+scripted phone — DIAL launch with a `pairingCode` it invented, wait for the receiver's
+page to register that code with YouTube, bind to the Lounge session as a remote control,
+queue videos, and assert the screen actually plays them. **Verified 2026-07-26** against
+the CEF kiosk on Xvfb: three taps, each confirmed playing, plus 4K screenshots of real
+decoded video on the composited surface.
+
+Why it asserts what it asserts, both learned the hard way against the live service:
+- **The clock, not the state code.** `onStateChange` says PLAYING without saying *which*
+  video, so a screen still happily rolling the previous tap satisfies it — which is
+  exactly the "I browsed and it kept playing the first thing" failure. It asks
+  `getNowPlaying` and requires the position to *advance* on the video it queued. (The
+  documented state set is also incomplete: `1081` shows up with playback plainly running.)
+- **Every tap, not just the first.** Queueing a second video without `videoId` set is
+  read as an edit of the existing playlist, and the screen keeps playing what it had.
+  Casting is not one launch; it is a session someone browses.
+
+Its failure message is the point: a receiver that launched nothing fails at "the screen
+never registered our pairing code", which is the exact silent failure DIAL alone cannot
+distinguish from success.
 
 ## Render path — actual pixel output (GPU-verified)
 Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix develop`).
