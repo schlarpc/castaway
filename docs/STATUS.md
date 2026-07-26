@@ -175,6 +175,10 @@ The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly a
   back through the page console (`castaway-injection-ok src=castaway://scriptlets`). Rules
   auto-update; scriptlet *bodies* are pinned to uBO 1.46.0 (37 of them) because the current
   bundle format is unreadable by `adblock`'s assembler — see Q17/Q36.
+- **Lists refresh daily**, not just at boot, and a *running* receiver picks it up: the engine
+  is swapped behind a shared cell, and render processes rebuild when the cache timestamps
+  move. Verified by editing the cache under a live receiver and watching a probe rule start
+  injecting with no restart.
 - **YouTube**: `youtube.com/tv` renders the leanback cast-receiver UI (TV UA), with EasyList
   blocking YouTube's ad requests (doubleclick instream `ad_status.js`, googleads id/tracking).
 - `RenderLoop::upload_browser` feeds CEF frames into the compositor `Browser` layer.

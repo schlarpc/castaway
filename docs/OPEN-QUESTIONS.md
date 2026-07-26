@@ -181,9 +181,24 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   and yields 37 real scriptlets. A rule naming anything newer injects nothing: a no-op, not a
   broken page, and the count is logged at startup and asserted by an `--ignored` test.
 
-  **Two refresh gaps worth knowing.** Lists refresh at *startup only* — a kiosk up for a month
-  runs month-old rules until it restarts. And the fetch is unconditional (no `If-Modified-Since`),
-  so every boot re-downloads ~2.7 MB. Both are small fixes when they start to matter.
+  **Refresh: daily, and it reaches a running receiver.** A background thread re-fetches every
+  24h and swaps the engine in; the render processes notice by the cache timestamps changing
+  under them and rebuild. Demonstrated by editing the cached lists under a running receiver and
+  watching a probe rule start injecting without a restart. `CASTAWAY_FILTERLISTS_OFFLINE=1`
+  disables both the startup fetch and the refresh.
+
+  Still unconditional (no `If-Modified-Since`), so each fetch re-downloads ~2.7 MB — once a day
+  rather than once a boot, which is why it has not been worth fixing yet.
+
+  **Nothing else in the tree depends on a startup fetch.** SponsorBlock looks segments up per
+  video change and the Lounge screen id is resolved per DIAL launch, so both are already as
+  fresh as the thing they describe.
+- **Q37 — the render process logs into the void.** A CEF subprocess spends its whole life
+  inside `execute_process`, which `main` calls *before* installing a tracing subscriber — so
+  every `info!`/`debug!` from the injection path is discarded, and the renderer looks silent
+  when it is merely unsubscribed. This cost real debugging time. The fix is to install the
+  subscriber before `Cef::bootstrap`, which contradicts the "bootstrap must be first thing in
+  main" comment and so wants a deliberate decision rather than a drive-by change.
 - **Q36 — lifting the scriptlet pin.** To track uBO's scriptlets again, something has to read
   their current format: one file per scriptlet under `src/js/resources/`, each ending in
   `registerScriptlet(fn, { name, dependencies })`. That means fetching the directory and
