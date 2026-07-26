@@ -21,7 +21,7 @@ integration test.
 | `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). Dev device key (Q2/Q11). |
 | `proto-spotify` | Onboarding live. Advertise + `getInfo` + `addUser` DH/blob decrypt. Playback deferred (Q9). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
-| `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`). Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
+| `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. |
@@ -57,7 +57,14 @@ queue videos, and assert the screen actually plays them. **Verified 2026-07-26**
 the CEF kiosk on Xvfb: three taps, each confirmed playing, plus 4K screenshots of real
 decoded video on the composited surface.
 
-Why it asserts what it asserts, both learned the hard way against the live service:
+`--reconnect` covers the cast that is *not* the first one: a sender that arrives after the
+app is already running never launches it, so it can only find the screen from the
+`<screenId>` in the app-info XML. **That is the bug this hunt actually found** — we
+published nothing, so every cast after the first connected and could never be queued to,
+which is exactly "it doesn't play videos as I browse". Nothing sends DELETE in practice,
+so `running` is where a receiver stays.
+
+Why it asserts what it asserts, all learned the hard way against the live service:
 - **The clock, not the state code.** `onStateChange` says PLAYING without saying *which*
   video, so a screen still happily rolling the previous tap satisfies it — which is
   exactly the "I browsed and it kept playing the first thing" failure. It asks

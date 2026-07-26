@@ -198,10 +198,12 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   it changes what the deploy ships.
 - **Q33 — the leanback page's storage is per-launch.** The page generates a fresh screen id on
   every DIAL launch (`generate_screen_id` seen in the netlog each time), because CEF has no
-  persistent cache path configured. Real TVs keep theirs in localStorage. Nothing observed
-  actually breaks — the phone re-pairs with the new pairing code on each launch — but a sender
-  that caches a screen id would be talking to one that no longer exists. Worth deciding whether
-  the kiosk should have a persistent CEF cache before someone debugs it the hard way.
+  persistent cache path configured. Real TVs keep theirs in localStorage. **Now partly load-
+  bearing:** we publish that id for senders to attach to (D28), and clear it on every launch
+  and stop precisely because it does not survive one. A persistent CEF cache would make the
+  screen stable across launches and reboots, which is what a sender caching an id expects.
+  Nothing observed breaks today — senders re-read the id from the app-info XML — but decide it
+  before someone debugs a phone holding a screen id from last week.
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.

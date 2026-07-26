@@ -300,3 +300,31 @@ saying which video, so a screen still rolling the previous tap satisfies it — 
 requires the position to advance on the video it queued. (The documented state set is
 incomplete anyway: `1081` appears with playback plainly running.) And it taps more than
 once, because a cast is a session someone browses, not a single launch.
+
+### D28 — the receiver publishes its screen id, because the second cast has no other way in
+Reported symptom: casting from a phone connected, but browsing and tapping videos played
+nothing. It reproduced against a `cef` build, so it was not the launch path — that one
+works, and `yt-selfplay` proves it end to end.
+
+What it was: a sender can reach a Lounge screen two ways. It can supply a pairing code —
+but supplying one means making a DIAL launch, which only the *first* sender does. Or it
+can use the screen id, which is enough on its own: `get_lounge_token_batch` mints a token
+from it and the sender drives the screen directly. Verified against the live service
+before any code was written — a screen id alone attaches and plays, no launch, no pairing
+code. A real TV publishes that id under `<additionalData>` in its DIAL app-info XML.
+
+We published nothing. So the first cast worked (it launched, so it held a pairing code),
+the app stayed `running` forever after — nothing sends `DELETE` in practice — and every
+sender arriving afterwards found a running app it could not attach to. Connected, and
+unable to queue anything. The failure is invisible from the DIAL surface alone, which is
+why every test we had passed while a phone in the room did not work.
+
+Resolving the id is I/O, so it splits along ground rule 3: `proto-dial` owns `ScreenId`
+(parsed, not trusted — it lands in XML the whole LAN reads) and a `ScreenSlot` the routes
+clear on launch and stop, and `app` does the `get_screen` lookup off-runtime and fills it.
+A slot rather than a constructor argument because the id genuinely does not exist yet when
+a launch is answered — the page has to load and register first — and empty is the honest
+state until then. Stale is worse than empty: it points senders at a screen that is gone.
+
+`yt-selfplay --reconnect` is the regression test, and it is the shape the original tests
+were missing: they all cast onto a *fresh* receiver. The bug lived one cast later.
