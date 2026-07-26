@@ -540,6 +540,36 @@ asserted on the bytes they emit. Tier-2 puts two of these back-to-back — our s
 scripted *source* over an in-memory L2CAP — so a full pair → discover → configure → stream →
 metadata → cover-art flow runs in CI with no hardware at all.
 
+### Testing the whole flow with no radio: `btvirt` + `vhci`
+
+**Verified working 2026-07-25.** The kernel's `hci_vhci` driver plus BlueZ's `btvirt`
+emulator give a pair of *linked* virtual controllers — `btvirt -l2` creates two `hciN`
+devices on `Bus: Virtual` that page and connect to each other over an emulated air
+interface. Neither needs firmware, so `SocketTransport` attaches straight to one:
+
+```text
+sudo btvirt -l2 &                    # two linked virtual controllers appear
+sudo hciconfig hci2 down             # HCI_CHANNEL_USER is exclusive
+sudo cargo run -p hci-transport --features socket --example vhci -- 2
+```
+
+Confirmed on the dev box: our stack attached to `hci2`, reset it, and read back
+`00:AA:01:01:00:02` — the address `hciconfig` reports for it.
+
+The point of the pair is what goes on the *other* controller: BlueZ with PipeWire's
+`bluez5` module, connected to our sink as an ordinary A2DP **source**. That is an
+independent implementation of the sender side driving our receiver, which is a
+qualitatively better test than our own source code talking to our own sink code.
+
+Two details make this harsher than real hardware, which is a feature: a virtual
+controller reports an **ACL MTU of 192 with a single buffer**, against 1021×4 on the
+AX200. Every SDP record and AVDTP capability response therefore fragments, and transmit
+flow control has no slack at all — both paths get exercised on every run rather than only
+under load.
+
+`btvirt` is not in nixpkgs' `bluez` (it lives behind `--enable-testing`); a small
+`overrideAttrs` builds it, confirmed working.
+
 For byte-level ground truth, **Fuchsia's Bluetooth profile layer is Rust and BSD-3**
 (`src/connectivity/bluetooth/profiles/bt-a2dp`, `bt-avrcp`, `lib/bt-avdtp`) and implements the
 sink role. It is not a dependency — it is pinned as a **differential-test oracle** the way

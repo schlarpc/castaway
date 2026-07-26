@@ -17,6 +17,8 @@ pub mod error;
 pub mod firmware;
 pub mod init;
 
+#[cfg(all(feature = "socket", target_os = "linux"))]
+pub mod socket;
 #[cfg(feature = "usb")]
 pub mod usb;
 

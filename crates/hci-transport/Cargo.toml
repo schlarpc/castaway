@@ -31,13 +31,17 @@ tracing-subscriber.workspace = true
 name = "probe"
 required-features = ["usb"]
 
+[[example]]
+name = "vhci"
+required-features = ["socket"]
+
 [features]
 default = ["usb"]
 # The USB backend. Works on both platforms; the only one Windows can use.
 usb = ["dep:nusb", "dep:futures"]
 # The Linux raw-HCI socket. A convenience for working on the layers above: it hands over
 # a controller the kernel has *already* initialised, so it cannot exercise ControllerInit.
-socket = ["dep:libc"]
+socket = ["dep:libc", "tokio/net"]
 
 [lints]
 workspace = true
