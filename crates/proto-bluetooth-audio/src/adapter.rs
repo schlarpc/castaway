@@ -501,6 +501,21 @@ impl BluetoothAdapter {
                                 &avrcp::get_element_attributes(&avrcp::attribute::ALL),
                             ),
                         ));
+                        // …and subscribe, or the card is a snapshot of this instant and
+                        // nothing ever moves it again. RegisterNotification answers
+                        // INTERIM with the value *now* and CHANGED when it moves, so one
+                        // subscription supplies both the initial play state and every
+                        // transition after it.
+                        for event in [
+                            avrcp::event::PLAYBACK_STATUS_CHANGED,
+                            avrcp::event::TRACK_CHANGED,
+                        ] {
+                            let transaction = link.next_transaction();
+                            outbound.push((
+                                cid,
+                                avctp_body(transaction, &avrcp::register_notification(event, 0)),
+                            ));
+                        }
                     }
                     debug!(%cid, %psm, "l2cap channel open");
                 }
@@ -738,11 +753,15 @@ impl BluetoothAdapter {
             avrcp::pdu::GET_ELEMENT_ATTRIBUTES if !frame.ctype.is_failure() => {
                 if let Ok(parsed) = avrcp::parse_element_attributes(&vendor.parameters) {
                     let changed = !parsed.now_playing.is_same_item(&link.now_playing);
+                    // GetElementAttributes carries no play state, so its default would
+                    // overwrite whatever the subscription told us. Keep ours.
+                    let state = link.now_playing.state;
                     link.now_playing = parsed.now_playing.clone();
+                    link.now_playing.state = state;
                     if link.session_open {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
-                            .emit(SessionEvent::NowPlaying(parsed.now_playing))
+                            .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
                             .await?;
                     }
                     if changed {
@@ -753,6 +772,56 @@ impl BluetoothAdapter {
                             debug!(handle, "bluetooth: cover art available");
                         }
                     }
+                }
+            }
+            avrcp::pdu::REGISTER_NOTIFICATION
+                if matches!(frame.ctype, Ctype::Interim | Ctype::Changed) =>
+            {
+                let Some(&event) = vendor.parameters.first() else {
+                    return Ok(());
+                };
+                // CHANGED ends the subscription — AVRCP notifications are one-shot, so a
+                // stack that does not re-register hears about exactly one track change
+                // and then goes quiet again.
+                let changed = frame.ctype == Ctype::Changed;
+                if changed {
+                    let transaction = link.next_transaction();
+                    outbound.push((
+                        cid,
+                        avctp_body(transaction, &avrcp::register_notification(event, 0)),
+                    ));
+                }
+                match event {
+                    avrcp::event::PLAYBACK_STATUS_CHANGED => {
+                        if let Some(&raw) = vendor.parameters.get(1) {
+                            let state = avrcp::playback_state(raw);
+                            if link.now_playing.state != state {
+                                link.now_playing.state = state;
+                                debug!(?state, "bluetooth: playback state");
+                                if link.session_open {
+                                    let link_sink = sink.with_instance(link.peer.to_string());
+                                    link_sink
+                                        .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
+                                        .await?;
+                                }
+                            }
+                        }
+                    }
+                    avrcp::event::TRACK_CHANGED if changed => {
+                        // The notification carries only a track id, so the metadata has
+                        // to be asked for again — this is the request that keeps the card
+                        // in step with what is actually playing.
+                        debug!("bluetooth: track changed; re-reading metadata");
+                        let transaction = link.next_transaction();
+                        outbound.push((
+                            cid,
+                            avctp_body(
+                                transaction,
+                                &avrcp::get_element_attributes(&avrcp::attribute::ALL),
+                            ),
+                        ));
+                    }
+                    _ => {}
                 }
             }
             avrcp::pdu::SET_ABSOLUTE_VOLUME => {

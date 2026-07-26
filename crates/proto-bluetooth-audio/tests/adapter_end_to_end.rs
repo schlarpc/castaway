@@ -794,6 +794,104 @@ async fn the_control_surface_survives_avctp_connecting_before_the_stream() {
     assert!(saw_control, "the control surface was dropped");
 }
 
+/// Pull every AVRCP vendor PDU id the adapter has sent on `cid`.
+fn sent_avrcp_pdus(transport: &ScriptedTransport) -> Vec<u8> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+        .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+        .filter_map(|frame| proto_bluetooth_audio::VendorPdu::parse(&frame.operands).ok())
+        .map(|v| v.pdu_id)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_adapter_subscribes_to_metadata_changes() {
+    // Without this the now-playing card is a snapshot of the instant AVCTP connected:
+    // skip a track and the screen keeps the old one forever, and the play state stays at
+    // whatever `PlaybackState::default()` happens to be. One request is not a design.
+    let (transport, _rx) = connected().await;
+    let _ = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    let pdus = eventually("the avrcp opening traffic", || {
+        let pdus = sent_avrcp_pdus(&transport);
+        (pdus.len() >= 3).then_some(pdus)
+    })
+    .await;
+    assert!(
+        pdus.contains(&proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES),
+        "metadata must be asked for up front: {pdus:x?}"
+    );
+    assert_eq!(
+        pdus.iter()
+            .filter(|p| **p == proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION)
+            .count(),
+        2,
+        "both playback status and track change must be subscribed: {pdus:x?}"
+    );
+}
+
+/// An AVRCP notification response, as the phone would send it.
+fn notification(
+    transaction: u8,
+    ctype: proto_bluetooth_audio::Ctype,
+    event: u8,
+    body: &[u8],
+) -> Bytes {
+    let mut params = BytesMut::new();
+    params.put_u8(event);
+    params.extend_from_slice(body);
+    let frame = proto_bluetooth_audio::avrcp::vendor_command(
+        ctype,
+        proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION,
+        &params,
+    );
+    proto_bluetooth_audio::AvctpMessage::command(transaction, frame.encode()).encode()
+}
+
+#[tokio::test]
+async fn a_changed_notification_is_re_registered_and_acted_on() {
+    // AVRCP notifications are one-shot: CHANGED ends the subscription. A stack that does
+    // not re-register hears about exactly one track change and then goes quiet, which
+    // looks like it works right up until the second song.
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    eventually("the subscriptions", || {
+        (sent_avrcp_pdus(&transport).len() >= 3).then_some(())
+    })
+    .await;
+
+    let before = sent_avrcp_pdus(&transport).len();
+    // The phone reports the track changed, carrying only a track id.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            notification(
+                1,
+                proto_bluetooth_audio::Ctype::Changed,
+                proto_bluetooth_audio::avrcp::event::TRACK_CHANGED,
+                &[0u8; 8],
+            ),
+        ),
+    );
+
+    let after = eventually("the response to a track change", || {
+        let pdus = sent_avrcp_pdus(&transport);
+        (pdus.len() > before).then_some(pdus)
+    })
+    .await;
+    let new = &after[before..];
+    assert!(
+        new.contains(&proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION),
+        "the subscription must be renewed or this is the last change we ever hear: {new:x?}"
+    );
+    assert!(
+        new.contains(&proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES),
+        "a track change carries only an id, so the metadata must be re-read: {new:x?}"
+    );
+}
+
 #[tokio::test]
 async fn a_dropped_link_ends_the_session() {
     // The phone walks out mid-song. No teardown handshake, just a dead link — and the
