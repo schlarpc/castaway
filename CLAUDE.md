@@ -77,8 +77,8 @@ These are binding engineering constraints for this project. They override genera
    `// SAFETY:` comment stating the invariant it upholds. Keep FFI surface thin and wrapped in safe
    types at the crate boundary.
 
-9. **Reverse engineering happens in `~/re-shell`.** Use that environment (Frida, capture tools,
-   the reference impls) to derive wire behavior and crypto flows. Land the *findings* here as
+9. **Reverse engineering lands as fixtures, not dependencies.** Use capture tools, Frida, and
+   the reference impls to derive wire behavior and crypto flows. Land the *findings* here as
    checked-in fixtures + notes; never add a reference impl as a runtime dependency.
 
 10. **Commit semi-regularly, straight to `main`.** Commit at independent logical boundaries — often
