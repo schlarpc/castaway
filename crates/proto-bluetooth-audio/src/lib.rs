@@ -36,5 +36,5 @@ pub use error::AudioError;
 pub use host::{HostAction, HostConfig, HostController, HostState};
 pub use latm::{LatmParser, StreamMuxConfig};
 pub use media::Depacketizer;
-pub use obex::{CoverArtClient, FetchState};
+pub use obex::{CoverArtSession, FetchState};
 pub use sink::{SinkEvent, SinkSession, StreamState};

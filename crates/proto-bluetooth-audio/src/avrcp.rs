@@ -67,6 +67,22 @@ pub mod attribute {
     /// **The BIP image handle for cover art.** The one field no OS stack surfaces.
     pub const COVER_ART_HANDLE: u32 = 8;
 
+    /// Everything that can be drawn on a card, with no image handle.
+    ///
+    /// The set to ask for before a BIP session exists. AOSP's Target *strips* attribute 8
+    /// from a response when no cover-art client is connected, so asking for it early buys
+    /// nothing — and asking for the text separately means the card appears immediately
+    /// rather than waiting on an SDP query and a second L2CAP channel (Q29).
+    pub const TEXT: [u32; 7] = [
+        TITLE,
+        ARTIST,
+        ALBUM,
+        TRACK_NUMBER,
+        TOTAL_TRACKS,
+        GENRE,
+        PLAYING_TIME,
+    ];
+
     /// Every attribute worth asking for, cover art included.
     pub const ALL: [u32; 8] = [
         TITLE,

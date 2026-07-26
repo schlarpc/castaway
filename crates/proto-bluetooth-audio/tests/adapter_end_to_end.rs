@@ -18,11 +18,16 @@ use castaway_core::{
 use proto_bluetooth_audio::adapter::{BluetoothAdapter, BluetoothConfig};
 use proto_bluetooth_audio::avdtp::{Message, Seid, Signal};
 use proto_bluetooth_audio::codec::{ChannelModes, CodecCapability, SampleRates};
+use proto_bluetooth_audio::obex::{Header as ObexHeader, ObexPacket};
 use substrate_hci::{
     event::code, AclPacket, BdAddr, ConnectionHandle, HciPacket, HciTransport, PacketBoundary,
     ScriptedTransport, Status,
 };
-use substrate_l2cap::{Cid, L2capPdu, Psm, Signal as L2capSignal};
+use substrate_l2cap::ertm::Segmentation;
+use substrate_l2cap::{
+    ChannelMode, Cid, FcsType, Frame, L2capPdu, Psm, RetransmissionConfig, Signal as L2capSignal,
+};
+use substrate_sdp::{DataElement, SdpServer, ServiceRecord, Uuid};
 use tokio::sync::mpsc;
 
 const PEER: &str = "AA:BB:CC:DD:EE:FF";
@@ -907,33 +912,12 @@ async fn a_changed_notification_is_re_registered_and_acted_on() {
     );
 }
 
-#[tokio::test]
-async fn cover_art_is_discovered_then_fetched() {
-    // We advertise CONTROLLER_SUPPORTS_COVER_ART, which is what makes a peer bother to
-    // send an image handle at all. Until now we logged the handle and did nothing with
-    // it, so the card never got a picture. The chain is two round trips the first time:
-    // the image server lives on a PSM only the peer's SDP record knows.
-    let (transport, _rx) = connected().await;
-    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
-    eventually("the avrcp opening traffic", || {
-        (sent_avrcp_pdus(&transport).len() >= 3).then_some(())
-    })
-    .await;
-
-    // The phone answers our metadata request, naming an image handle.
+/// A `GetElementAttributes` response, as a phone would send it.
+fn attributes_response(items: &[(u32, &[u8])]) -> Bytes {
     let mut attrs = BytesMut::new();
-    attrs.put_u8(2); // a real track, plus the handle
-    for (id, value) in [
-        (
-            proto_bluetooth_audio::avrcp::attribute::TITLE,
-            &b"Derezzed"[..],
-        ),
-        (
-            proto_bluetooth_audio::avrcp::attribute::COVER_ART_HANDLE,
-            &b"0000001"[..],
-        ),
-    ] {
-        attrs.put_u32(id);
+    attrs.put_u8(u8::try_from(items.len()).unwrap());
+    for (id, value) in items {
+        attrs.put_u32(*id);
         attrs.put_u16(0x006A); // UTF-8
         attrs.put_u16(u16::try_from(value.len()).unwrap());
         attrs.extend_from_slice(value);
@@ -943,22 +927,201 @@ async fn cover_art_is_discovered_then_fetched() {
         proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES,
         &attrs,
     );
+    proto_bluetooth_audio::AvctpMessage::command(0, frame.encode()).encode()
+}
+
+/// Every signalling command the adapter has sent since `before`.
+fn signals_after(transport: &ScriptedTransport, before: usize) -> Vec<L2capSignal> {
+    sent_pdus(transport)
+        .into_iter()
+        .skip(before)
+        .filter(|pdu| pdu.cid == Cid::SIGNALING)
+        .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
+        .flatten()
+        .collect()
+}
+
+/// Accept an L2CAP connection the adapter opened *outwards*, in `mode`.
+///
+/// The other half of `open_channel`: the cover-art chain is the only place the receiver
+/// dials rather than answers, so the harness has to be able to play the responder.
+/// Returns the identifier the adapter allocated for the channel.
+async fn accept_outgoing(
+    transport: &ScriptedTransport,
+    psm: Psm,
+    phone_cid: u16,
+    mode: ChannelMode,
+) -> Cid {
+    let before = sent_pdus(transport).len();
+    let (id, adapter_cid) = eventually("an outgoing connection request", || {
+        signals_after(transport, 0)
+            .into_iter()
+            .find_map(|sig| match sig {
+                L2capSignal::ConnectionRequest {
+                    id,
+                    psm: p,
+                    source_cid,
+                } if p == psm => Some((id, source_cid)),
+                _ => None,
+            })
+    })
+    .await;
+
     push_pdu(
-        &transport,
+        transport,
         &L2capPdu::new(
-            avctp,
-            proto_bluetooth_audio::AvctpMessage::command(0, frame.encode()).encode(),
+            Cid::SIGNALING,
+            L2capSignal::ConnectionResponse {
+                id,
+                dest_cid: Cid::new(phone_cid),
+                source_cid: adapter_cid,
+                result: substrate_l2cap::ConnectionResult::Success,
+                status: 0,
+            }
+            .encode()
+            .unwrap(),
         ),
     );
 
-    // That must make us go looking for the peer's image server over SDP — an *outgoing*
-    // connection, which is the part that did not exist.
-    let request = eventually("an outgoing sdp connection request", || {
+    // Its configuration request names the mode it wants; the response has to agree, or
+    // the adapter — which is the dialling side, and therefore the one that yields — comes
+    // back down to whatever we asked for instead.
+    let config_id = eventually("its configuration request", || {
+        signals_after(transport, before)
+            .into_iter()
+            .find_map(|sig| match sig {
+                L2capSignal::ConfigurationRequest { id, dest_cid, .. }
+                    if dest_cid == Cid::new(phone_cid) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+    })
+    .await;
+
+    let mut options = vec![substrate_l2cap::ConfigOption::Mtu(672)];
+    if mode == ChannelMode::EnhancedRetransmission {
+        options.push(substrate_l2cap::ConfigOption::Retransmission(
+            RetransmissionConfig::ertm(600),
+        ));
+        options.push(substrate_l2cap::ConfigOption::Fcs(FcsType::Crc16));
+    }
+    push_pdu(
+        transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::ConfigurationResponse {
+                id: config_id,
+                source_cid: adapter_cid,
+                flags: 0,
+                result: substrate_l2cap::ConfigResult::Success,
+                options: options.clone(),
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    push_pdu(
+        transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::ConfigurationRequest {
+                id: 0x5A,
+                dest_cid: adapter_cid,
+                flags: 0,
+                options,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    adapter_cid
+}
+
+/// Wrap an SDU as an ERTM I-frame addressed to the adapter's channel.
+fn ertm_pdu(adapter_cid: Cid, tx_seq: u8, req_seq: u8, payload: &[u8]) -> L2capPdu {
+    L2capPdu::new(
+        adapter_cid,
+        Frame::Information {
+            tx_seq,
+            req_seq,
+            final_bit: false,
+            sar: Segmentation::Unsegmented,
+            sdu_len: None,
+            payload: Bytes::copy_from_slice(payload),
+        }
+        .encode(adapter_cid, FcsType::Crc16),
+    )
+}
+
+/// Every SDU the adapter has sent on an ERTM channel, in order.
+///
+/// Addressed — and checksummed — with the *phone's* identifier for the channel, because
+/// that is the one the adapter puts on a PDU it sends. Decoding with our own is the same
+/// CID mix-up as ever, and here it shows up as every frame failing its checksum.
+fn ertm_sdus(transport: &ScriptedTransport, phone_cid: Cid) -> Vec<Bytes> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter(|pdu| pdu.cid == phone_cid)
+        .filter_map(|pdu| Frame::decode(&pdu.payload, phone_cid, FcsType::Crc16).ok())
+        .filter_map(|frame| match frame {
+            Frame::Information { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Which attribute ids a `GetElementAttributes` command asked for.
+fn requested_attributes(body: &[u8]) -> Option<Vec<u32>> {
+    let msg = proto_bluetooth_audio::AvctpMessage::decode(body).ok()?;
+    let frame = proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok()?;
+    let vendor = proto_bluetooth_audio::VendorPdu::parse(&frame.operands).ok()?;
+    if vendor.pdu_id != proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES {
+        return None;
+    }
+    // Eight bytes of track identifier, a count, then four bytes per attribute.
+    let count = usize::from(*vendor.parameters.get(8)?);
+    Some(
+        (0..count)
+            .filter_map(|i| {
+                let at = 9 + i * 4;
+                let bytes = vendor.parameters.get(at..at + 4)?;
+                Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn the_image_server_is_connected_before_the_handle_is_asked_for() {
+    // The ordering Q29 turned on. AOSP's Target strips attribute 8 from a metadata
+    // response whenever no cover-art client is connected, so a receiver that waits to see
+    // a handle before connecting waits forever — which is exactly what an iPhone streaming
+    // happily and never sending a handle looked like.
+    let (transport, _rx) = connected().await;
+    let _ = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    let first = eventually("the opening metadata request", || {
         sent_pdus(&transport)
             .into_iter()
-            .filter(|pdu| pdu.cid == Cid::SIGNALING)
-            .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
-            .flatten()
+            .find_map(|pdu| requested_attributes(&pdu.payload))
+    })
+    .await;
+    assert!(
+        !first.contains(&proto_bluetooth_audio::avrcp::attribute::COVER_ART_HANDLE),
+        "asking for attribute 8 with no BIP session gets it stripped: {first:?}"
+    );
+    assert!(
+        first.contains(&proto_bluetooth_audio::avrcp::attribute::TITLE),
+        "the text is worth having immediately, without waiting on OBEX"
+    );
+
+    // …and the search for the image server is already under way, on its own initiative
+    // rather than in response to a handle we were never going to be sent.
+    eventually("an outgoing sdp connection request", || {
+        signals_after(&transport, 0)
+            .into_iter()
             .find_map(|sig| match sig {
                 L2capSignal::ConnectionRequest {
                     psm, source_cid, ..
@@ -967,10 +1130,175 @@ async fn cover_art_is_discovered_then_fetched() {
             })
     })
     .await;
-    assert!(
-        request.is_dynamic(),
-        "we should have allocated our own channel id for the query"
+}
+
+#[tokio::test]
+async fn cover_art_is_discovered_connected_and_fetched() {
+    // The whole chain, end to end and with no radio: SDP finds the image server, the
+    // channel comes up in Enhanced Retransmission Mode because GOEP 2.0 says so, OBEX
+    // connects, *then* attribute 8 is asked for, and the JPEG that comes back reaches the
+    // now-playing card.
+    let (transport, mut rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    // A session, so the metadata events are actually delivered rather than dropped for a
+    // source the manager does not consider active.
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = Seid::from_shifted(discover.payload[4]).unwrap();
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_44100,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 2, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 3, Signal::Open, &[seid.shifted()]).await;
+    avdtp(&transport, signaling, 4, Signal::Start, &[seid.shifted()]).await;
+
+    // 1. It goes looking for the image server over SDP, unprompted.
+    let sdp_phone = Cid::new(0x0060);
+    let sdp_cid = accept_outgoing(&transport, Psm::SDP, sdp_phone.raw(), ChannelMode::Basic).await;
+
+    // 2. …and we answer with an AVRCP Target record that publishes one, alongside a
+    //    browsing channel — the shape that used to send the fetch to the wrong PSM.
+    let record = ServiceRecord::new()
+        .with(
+            substrate_sdp::record::attr::SERVICE_RECORD_HANDLE,
+            DataElement::Uint(0x10000),
+        )
+        .with(
+            substrate_sdp::record::attr::SERVICE_CLASS_ID_LIST,
+            DataElement::uuid_seq([Uuid::AV_REMOTE_CONTROL_TARGET]),
+        )
+        .with(
+            substrate_sdp::record::attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST,
+            DataElement::Sequence(vec![
+                DataElement::Sequence(vec![
+                    DataElement::Sequence(vec![
+                        DataElement::Uuid(Uuid::L2CAP),
+                        DataElement::Uint(0x001B),
+                    ]),
+                    DataElement::Sequence(vec![
+                        DataElement::Uuid(Uuid::AVCTP),
+                        DataElement::Uint16(0x0104),
+                    ]),
+                ]),
+                DataElement::Sequence(vec![
+                    DataElement::Sequence(vec![
+                        DataElement::Uuid(Uuid::L2CAP),
+                        DataElement::Uint(0x1005),
+                    ]),
+                    DataElement::Sequence(vec![DataElement::Uuid(Uuid::OBEX)]),
+                ]),
+            ]),
+        );
+    let phone_sdp = SdpServer::new().with(record);
+    let query = eventually("the sdp query", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .find(|pdu| pdu.cid == sdp_phone)
+            .map(|pdu| pdu.payload)
+    })
+    .await;
+    push_pdu(
+        &transport,
+        &L2capPdu::new(sdp_cid, phone_sdp.handle(&query)),
     );
+
+    // 3. The image channel opens — and it must be ERTM, or a GOEP 2.0 responder refuses.
+    let art_phone = Cid::new(0x0061);
+    let art_cid = accept_outgoing(
+        &transport,
+        Psm::new(0x1005).unwrap(),
+        art_phone.raw(),
+        ChannelMode::EnhancedRetransmission,
+    )
+    .await;
+
+    // 4. OBEX CONNECT, carried as an ERTM I-frame with its frame check sequence.
+    let connect = eventually("an obex connect", || {
+        ertm_sdus(&transport, art_phone).into_iter().next()
+    })
+    .await;
+    assert_eq!(connect[0], 0x80, "OBEX CONNECT: {connect:02x?}");
+    let connect_reply = ObexPacket {
+        code: 0xA0,
+        prefix: Bytes::copy_from_slice(&[0x10, 0x00, 0x04, 0x00]),
+        headers: vec![ObexHeader::ConnectionId(7)],
+    }
+    .encode();
+    push_pdu(&transport, &ertm_pdu(art_cid, 0, 1, &connect_reply));
+
+    // 5. *Now* the metadata is re-read, this time asking for the image handle.
+    let asked = eventually("a metadata request that includes attribute 8", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .filter_map(|pdu| requested_attributes(&pdu.payload))
+            .find(|ids| ids.contains(&proto_bluetooth_audio::avrcp::attribute::COVER_ART_HANDLE))
+    })
+    .await;
+    assert_eq!(asked.len(), 8, "all of it, handle included: {asked:?}");
+
+    // 6. The phone answers with a handle, and the image is pulled over the same session.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            attributes_response(&[
+                (proto_bluetooth_audio::avrcp::attribute::TITLE, b"Derezzed"),
+                (
+                    proto_bluetooth_audio::avrcp::attribute::COVER_ART_HANDLE,
+                    b"0000001",
+                ),
+            ]),
+        ),
+    );
+
+    let get = eventually("an obex get for the handle", || {
+        ertm_sdus(&transport, art_phone)
+            .into_iter()
+            .find(|sdu| sdu.first() == Some(&0x83))
+    })
+    .await;
+    let parsed = ObexPacket::decode(&get, 0).unwrap();
+    assert!(
+        parsed
+            .headers
+            .contains(&ObexHeader::ImageHandle("0000001".into())),
+        "the handle goes in Img-Handle, which is what a responder matches on: {:?}",
+        parsed.headers
+    );
+    assert!(
+        parsed
+            .headers
+            .contains(&ObexHeader::Type("x-bt/img-thm".into())),
+        "and the abbreviated BIP type: {:?}",
+        parsed.headers
+    );
+
+    // 7. The thumbnail comes back, and lands on the card.
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    jpeg.resize(64, 0x5A);
+    let image = ObexPacket {
+        code: 0xA0,
+        prefix: Bytes::new(),
+        headers: vec![ObexHeader::EndOfBody(Bytes::from(jpeg.clone()))],
+    }
+    .encode();
+    push_pdu(&transport, &ertm_pdu(art_cid, 1, 1, &image));
+
+    let artwork = eventually("artwork on the now-playing card", || match rx.try_recv() {
+        Ok(msg) => match msg.event {
+            SessionEvent::NowPlaying(now) => now.artwork,
+            _ => None,
+        },
+        Err(_) => None,
+    })
+    .await;
+    assert_eq!(&artwork.data[..], &jpeg[..]);
 }
 
 #[tokio::test]

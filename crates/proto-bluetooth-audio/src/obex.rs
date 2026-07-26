@@ -5,10 +5,15 @@
 //! L2CAP channel to the PSM found in the peer's SDP record. `obexd` has no BIP client, so
 //! this is the piece that does not exist on any OS stack.
 //!
-//! We fetch the **linked thumbnail** rather than the full image. `x-bt/img-thumb` returns
-//! a fixed 200×200 JPEG with no image descriptor to negotiate, which is both simpler and
+//! We fetch the **linked thumbnail** rather than the full image. `x-bt/img-thm` returns a
+//! fixed 200×200 JPEG with no image descriptor to negotiate, which is both simpler and
 //! the right size for a now-playing card; `x-bt/img-img` requires describing the exact
 //! encoding and dimensions wanted and is where interop goes to die.
+//!
+//! The session is opened **once per link and held**, not once per image. That is not an
+//! optimisation: a Target strips attribute 8 from its metadata response when no BIP
+//! client is connected, so a receiver that only connects after seeing a handle never sees
+//! one (Q29). Connecting first is what makes the handle appear.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use castaway_core::{Artwork, ImageFormat};
@@ -48,14 +53,25 @@ pub const COVER_ART_TARGET: [u8; 16] = [
 ];
 
 /// MIME type for the linked-thumbnail form of a cover-art GET.
-pub const TYPE_THUMBNAIL: &str = "x-bt/img-thumb";
+///
+/// `x-bt/img-thm`, not `x-bt/img-thumb`: BIP spells it abbreviated, and a responder that
+/// does not recognise the type answers "bad request" rather than "no such image", which
+/// reads as a broken handle rather than a typo three layers up.
+pub const TYPE_THUMBNAIL: &str = "x-bt/img-thm";
 
 /// An OBEX header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Header {
-    /// Object name — the image handle, for cover art.
+    /// Object name. **Not** where a cover-art handle goes — see [`Header::ImageHandle`].
     Name(String),
+    /// The BIP image handle, in the application-specific header BIP defines for it.
+    ///
+    /// The distinction is load-bearing and easy to miss because both are Unicode text
+    /// headers with identical encoding: the responder matches an image by `Img-Handle`
+    /// and ignores `Name`, so putting the handle in `Name` produces a GET with no handle
+    /// at all. BlueZ's BIP client builds exactly this header (`IMG_HANDLE_TAG 0x30`).
+    ImageHandle(String),
     /// MIME type of the object requested.
     Type(String),
     /// A chunk of the object.
@@ -81,6 +97,9 @@ pub enum Header {
 
 mod hi {
     pub const NAME: u8 = 0x01;
+    /// BIP's `Img-Handle`. In the user-defined range, and a length-prefixed Unicode
+    /// header like `Name` — same encoding, different identifier, different meaning.
+    pub const IMAGE_HANDLE: u8 = 0x30;
     pub const TYPE: u8 = 0x42;
     pub const BODY: u8 = 0x48;
     pub const END_OF_BODY: u8 = 0x49;
@@ -98,6 +117,7 @@ impl Header {
             // UTF-8 produces a handle the responder cannot match, and the request comes
             // back "not found" as though the art did not exist.
             Self::Name(s) => put_unicode(buf, hi::NAME, s),
+            Self::ImageHandle(s) => put_unicode(buf, hi::IMAGE_HANDLE, s),
             // Type, by contrast, is a *byte sequence* of null-terminated ASCII. The two
             // string headers use different encodings, which is easy to miss.
             Self::Type(s) => {
@@ -187,6 +207,7 @@ impl Header {
             };
             out.push(match id {
                 hi::NAME => Self::Name(from_unicode(&value)),
+                hi::IMAGE_HANDLE => Self::ImageHandle(from_unicode(&value)),
                 hi::TYPE => Self::Type(
                     String::from_utf8_lossy(value.strip_suffix(&[0][..]).unwrap_or(&value))
                         .into_owned(),
@@ -270,53 +291,85 @@ impl ObexPacket {
     }
 }
 
-/// Where a cover-art fetch has got to.
+/// Where a cover-art session has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FetchState {
     /// Waiting for the CONNECT response.
     Connecting,
+    /// Connected and idle — ready to be asked for an image.
+    Ready,
     /// Fetching body chunks.
     Fetching,
-    /// The image is complete.
-    Done,
-    /// The peer refused, or has no such image.
+    /// The responder refused the session; nothing more will work on this channel.
     Failed,
 }
 
-/// Fetches one image by handle. A sans-I/O state machine: the caller writes
-/// [`CoverArtClient::next_request`] to the channel and feeds responses back.
+/// One OBEX session to a peer's image server, good for as many images as the link lasts.
+///
+/// A sans-I/O state machine: the caller writes [`CoverArtSession::next_request`] to the
+/// channel and feeds responses back with [`CoverArtSession::feed`].
+///
+/// It is a *session* rather than a fetch because of the ordering AOSP enforces — a Target
+/// strips attribute 8 from its metadata response unless a BIP client is already connected
+/// — so this has to be up before the handle is asked for, and staying up across tracks is
+/// then free (Q29).
 #[derive(Debug)]
-pub struct CoverArtClient {
-    handle: String,
+pub struct CoverArtSession {
     state: FetchState,
+    /// The handle currently being fetched. `None` between images.
+    handle: Option<String>,
     connection_id: Option<u32>,
     body: BytesMut,
     max_packet: u16,
 }
 
-impl CoverArtClient {
-    /// Start a fetch for the image named by an AVRCP attribute-8 handle.
+impl CoverArtSession {
+    /// Open a session, receiving packets of at most `max_packet` bytes.
     #[must_use]
-    pub fn new(handle: impl Into<String>) -> Self {
+    pub fn new(max_packet: u16) -> Self {
         Self {
-            handle: handle.into(),
             state: FetchState::Connecting,
+            handle: None,
             connection_id: None,
             body: BytesMut::new(),
             // 0xFFFF would be legal but a responder may honour it literally and exceed
             // the L2CAP MTU we negotiated; the channel MTU is the real ceiling.
-            max_packet: 0x0400,
+            max_packet: max_packet.clamp(0x00FF, 0x1000),
         }
     }
 
-    /// Where the fetch has got to.
+    /// Where the session has got to.
     #[must_use]
     pub const fn state(&self) -> FetchState {
         self.state
     }
 
-    /// The next packet to send, or `None` when there is nothing left to do.
+    /// Whether the session is connected and free to take an image request.
+    ///
+    /// This is the flag that decides whether asking for attribute 8 is worth doing at
+    /// all: a handle we cannot act on is a handle the Target need not have sent.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self.state, FetchState::Ready)
+    }
+
+    /// Ask for the image named by an AVRCP attribute-8 handle.
+    ///
+    /// Returns `false` if the session is not ready — still connecting, already fetching,
+    /// or dead. Refusing rather than queueing is deliberate: a skipped-through album
+    /// would otherwise build a backlog of images for tracks nobody is on any more.
+    pub fn fetch(&mut self, handle: impl Into<String>) -> bool {
+        if !self.is_ready() {
+            return false;
+        }
+        self.handle = Some(handle.into());
+        self.body.clear();
+        self.state = FetchState::Fetching;
+        true
+    }
+
+    /// The next packet to send, or `None` when there is nothing to say.
     #[must_use]
     pub fn next_request(&self) -> Option<Bytes> {
         match self.state {
@@ -341,12 +394,14 @@ impl CoverArtClient {
                 if let Some(id) = self.connection_id {
                     headers.push(Header::ConnectionId(id));
                 }
-                // Name and Type are only sent on the *first* GET of an object; the
+                // Type and handle are only sent on the *first* GET of an object; the
                 // continuation GETs carry the connection id alone. Repeating them makes
                 // some responders restart the transfer, which never terminates.
                 if self.body.is_empty() {
                     headers.push(Header::Type(TYPE_THUMBNAIL.to_owned()));
-                    headers.push(Header::Name(self.handle.clone()));
+                    if let Some(handle) = &self.handle {
+                        headers.push(Header::ImageHandle(handle.clone()));
+                    }
                 }
                 Some(
                     ObexPacket {
@@ -357,15 +412,16 @@ impl CoverArtClient {
                     .encode(),
                 )
             }
-            FetchState::Done | FetchState::Failed => None,
+            FetchState::Ready | FetchState::Failed => None,
         }
     }
 
-    /// Feed a response packet. Returns the artwork once complete.
+    /// Feed a response packet. Returns the artwork once an image is complete.
     ///
     /// # Errors
     /// [`AudioError::Truncated`] on a malformed packet, or
-    /// [`AudioError::BadMediaPacket`] if the responder refused.
+    /// [`AudioError::BadMediaPacket`] if the responder refused. A refused *image* leaves
+    /// the session usable — plenty of tracks have no art, and the next one may.
     pub fn feed(&mut self, packet: &[u8]) -> Result<Option<Artwork>, AudioError> {
         // A CONNECT response carries four bytes before its headers; every other
         // response carries none.
@@ -385,7 +441,7 @@ impl CoverArtClient {
                         self.connection_id = Some(*id);
                     }
                 }
-                self.state = FetchState::Fetching;
+                self.state = FetchState::Ready;
                 Ok(None)
             }
             FetchState::Fetching => {
@@ -398,7 +454,8 @@ impl CoverArtClient {
                 match pkt.response() {
                     rsp::CONTINUE => Ok(None),
                     rsp::SUCCESS => {
-                        self.state = FetchState::Done;
+                        self.state = FetchState::Ready;
+                        self.handle = None;
                         let data = self.body.split().freeze();
                         if data.is_empty() {
                             return Err(AudioError::BadMediaPacket("cover art response was empty"));
@@ -412,12 +469,17 @@ impl CoverArtClient {
                         Ok(Some(Artwork::new(format, data)))
                     }
                     _ => {
-                        self.state = FetchState::Failed;
+                        // One image the responder would not give us. The session lives:
+                        // the next track gets its own chance rather than inheriting this
+                        // one's bad luck.
+                        self.state = FetchState::Ready;
+                        self.handle = None;
+                        self.body.clear();
                         Err(AudioError::BadMediaPacket("cover art fetch was refused"))
                     }
                 }
             }
-            FetchState::Done | FetchState::Failed => Ok(None),
+            FetchState::Ready | FetchState::Failed => Ok(None),
         }
     }
 }
@@ -488,29 +550,67 @@ mod tests {
         .encode()
     }
 
-    /// Drive a client against a scripted responder, returning the artwork.
+    /// A session that has completed its CONNECT and is waiting to be asked for an image.
+    fn connected() -> CoverArtSession {
+        let mut session = CoverArtSession::new(0x0400);
+        session
+            .feed(&reply(
+                0xA0,
+                &[0x10, 0x00, 0x04, 0x00],
+                vec![Header::ConnectionId(7)],
+            ))
+            .unwrap();
+        assert!(session.is_ready());
+        session
+    }
+
+    /// Drive a session against a scripted responder, returning the artwork.
     fn run(handle: &str, replies: Vec<Bytes>) -> Result<Option<Artwork>, AudioError> {
-        let mut client = CoverArtClient::new(handle);
+        let mut session = connected();
+        assert!(session.fetch(handle));
         let mut art = None;
         for reply in replies {
-            assert!(client.next_request().is_some(), "client stopped early");
-            art = client.feed(&reply)?;
+            assert!(session.next_request().is_some(), "session stopped early");
+            art = session.feed(&reply)?;
         }
         Ok(art)
     }
 
     #[test]
-    fn name_headers_are_utf16_big_endian_and_null_terminated() {
-        // The trap: writing the handle as UTF-8 produces a name the responder cannot
+    fn unicode_headers_are_utf16_big_endian_and_null_terminated() {
+        // The trap: writing the handle as UTF-8 produces a value the responder cannot
         // match, and the fetch fails as "not found" as though there were no art.
         let mut buf = BytesMut::new();
-        Header::Name("0000001".into()).encode(&mut buf);
-        assert_eq!(buf[0], hi::NAME);
+        Header::ImageHandle("0000001".into()).encode(&mut buf);
+        assert_eq!(buf[0], hi::IMAGE_HANDLE);
         assert_eq!(&buf[3..7], &[0x00, b'0', 0x00, b'0'], "UTF-16BE");
         assert_eq!(&buf[buf.len() - 2..], &[0x00, 0x00], "null terminator");
 
         let back = Header::decode_all(&buf).unwrap();
-        assert_eq!(back, vec![Header::Name("0000001".into())]);
+        assert_eq!(back, vec![Header::ImageHandle("0000001".into())]);
+    }
+
+    #[test]
+    fn the_image_handle_goes_in_its_own_header_not_in_name() {
+        // Both are length-prefixed UTF-16 headers, so the mistake encodes perfectly and
+        // reads back perfectly — and the responder, which matches on Img-Handle and
+        // ignores Name, answers a GET that named no image at all.
+        let mut session = connected();
+        assert!(session.fetch("0000001"));
+        let get = ObexPacket::decode(&session.next_request().unwrap(), 0).unwrap();
+        assert!(
+            get.headers.contains(&Header::ImageHandle("0000001".into())),
+            "the handle belongs in Img-Handle (0x30): {:?}",
+            get.headers
+        );
+        assert!(
+            !get.headers.iter().any(|h| matches!(h, Header::Name(_))),
+            "and not in Name, which a BIP responder does not look at"
+        );
+        assert!(
+            get.headers.contains(&Header::Type("x-bt/img-thm".into())),
+            "BIP spells the thumbnail type abbreviated"
+        );
     }
 
     #[test]
@@ -552,11 +652,6 @@ mod tests {
             "0000001",
             vec![
                 reply(
-                    0xA0,
-                    &[0x10, 0x00, 0x04, 0x00],
-                    vec![Header::ConnectionId(7)],
-                ),
-                reply(
                     0x90,
                     &[],
                     vec![Header::Body(Bytes::copy_from_slice(&image[..400]))],
@@ -575,24 +670,18 @@ mod tests {
     }
 
     #[test]
-    fn the_connection_id_is_echoed_on_every_get_but_name_only_on_the_first() {
-        // Repeating Name/Type on continuation GETs makes some responders restart the
-        // transfer, which never terminates.
-        let mut client = CoverArtClient::new("0000001");
-        client
-            .feed(&reply(
-                0xA0,
-                &[0x10, 0x00, 0x04, 0x00],
-                vec![Header::ConnectionId(7)],
-            ))
-            .unwrap();
+    fn the_connection_id_is_echoed_on_every_get_but_the_handle_only_on_the_first() {
+        // Repeating the handle/Type on continuation GETs makes some responders restart
+        // the transfer, which never terminates.
+        let mut client = connected();
+        assert!(client.fetch("0000001"));
 
         let first = ObexPacket::decode(&client.next_request().unwrap(), 0).unwrap();
         assert!(first.headers.contains(&Header::ConnectionId(7)));
         assert!(first
             .headers
             .iter()
-            .any(|h| matches!(h, Header::Name(n) if n == "0000001")));
+            .any(|h| matches!(h, Header::ImageHandle(n) if n == "0000001")));
 
         client
             .feed(&reply(
@@ -604,39 +693,72 @@ mod tests {
         let second = ObexPacket::decode(&client.next_request().unwrap(), 0).unwrap();
         assert!(second.headers.contains(&Header::ConnectionId(7)));
         assert!(
-            !second.headers.iter().any(|h| matches!(h, Header::Name(_))),
-            "continuation GETs must not repeat the name"
+            !second
+                .headers
+                .iter()
+                .any(|h| matches!(h, Header::ImageHandle(_))),
+            "continuation GETs must not repeat the handle"
         );
     }
 
     #[test]
-    fn a_refused_connect_fails_the_fetch_rather_than_hanging() {
-        let mut client = CoverArtClient::new("0000001");
-        assert!(client.feed(&reply(0xC3, &[0, 0, 0, 0], vec![])).is_err());
-        assert_eq!(client.state(), FetchState::Failed);
-        assert!(client.next_request().is_none(), "a failed fetch stops");
+    fn a_refused_connect_fails_the_session_rather_than_hanging() {
+        let mut session = CoverArtSession::new(0x0400);
+        assert!(session.feed(&reply(0xC3, &[0, 0, 0, 0], vec![])).is_err());
+        assert_eq!(session.state(), FetchState::Failed);
+        assert!(session.next_request().is_none(), "a dead session stops");
+        assert!(!session.fetch("0000001"), "and takes no more requests");
     }
 
     #[test]
-    fn a_handle_that_names_nothing_fails_cleanly() {
-        // Plenty of tracks have no art. That must degrade to a text-only card, not to a
-        // stuck fetch.
-        let mut client = CoverArtClient::new("deadbeef");
-        client
-            .feed(&reply(0xA0, &[0x10, 0x00, 0x04, 0x00], vec![]))
-            .unwrap();
-        assert!(client.feed(&reply(0xC4, &[], vec![])).is_err());
-        assert_eq!(client.state(), FetchState::Failed);
+    fn a_handle_that_names_nothing_leaves_the_session_usable() {
+        // Plenty of tracks have no art. That must degrade to a text-only card for *that*
+        // track — tearing the session down would cost every track after it as well, and
+        // rebuilding it takes an SDP query and a channel.
+        let mut session = connected();
+        assert!(session.fetch("deadbeef"));
+        assert!(session.feed(&reply(0xC4, &[], vec![])).is_err());
+        assert!(session.is_ready(), "the next track deserves its own chance");
+        assert!(session.fetch("0000002"));
+    }
+
+    #[test]
+    fn a_second_image_reuses_the_session_rather_than_reconnecting() {
+        // The reason this is a session at all: reconnecting per track would put an OBEX
+        // CONNECT in front of every image, and — worse — a Target strips attribute 8
+        // whenever no BIP client is connected, so the gap between tracks would be a
+        // window in which handles stop arriving.
+        let mut session = connected();
+        for handle in ["0000001", "0000002"] {
+            assert!(session.fetch(handle));
+            let art = session
+                .feed(&reply(
+                    0xA0,
+                    &[],
+                    vec![Header::EndOfBody(Bytes::from(jpeg(64)))],
+                ))
+                .unwrap()
+                .expect("artwork");
+            assert_eq!(art.format, ImageFormat::Jpeg);
+            assert!(session.is_ready());
+        }
+    }
+
+    #[test]
+    fn a_fetch_while_one_is_already_running_is_refused_not_queued() {
+        // A skipped-through album would otherwise build a backlog of images for tracks
+        // nobody is on any more.
+        let mut session = connected();
+        assert!(session.fetch("0000001"));
+        assert!(!session.fetch("0000002"));
     }
 
     #[test]
     fn an_image_in_a_format_we_cannot_decode_is_refused() {
         // Better a text-only card than a decoder failure three layers down.
-        let mut client = CoverArtClient::new("x");
-        client
-            .feed(&reply(0xA0, &[0x10, 0x00, 0x04, 0x00], vec![]))
-            .unwrap();
-        let err = client.feed(&reply(
+        let mut session = connected();
+        assert!(session.fetch("x"));
+        let err = session.feed(&reply(
             0xA0,
             &[],
             vec![Header::EndOfBody(Bytes::from_static(b"RIFF....WEBP"))],

@@ -17,7 +17,7 @@ use castaway_core::{
 use substrate_hci::{
     BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, Reassembler,
 };
-use substrate_l2cap::{Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
+use substrate_l2cap::{ChannelMode, Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
 use substrate_sdp::{a2dp_sink, avrcp_controller, avrcp_target, SdpServer};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -29,7 +29,7 @@ use crate::codec::advertised;
 use crate::control::AvrcpControl;
 use crate::host::{HostAction, HostConfig, HostController};
 use crate::media::Depacketizer;
-use crate::obex::CoverArtClient;
+use crate::obex::{CoverArtSession, FetchState};
 use crate::sink::{SinkEvent, SinkSession};
 use crate::{avdtp, Message};
 
@@ -150,10 +150,13 @@ struct Link {
     art_psm: Option<u16>,
     /// An SDP query in flight to find that PSM, and the channel carrying it.
     art_sdp: Option<(Cid, Box<substrate_sdp::Query>)>,
-    /// An image pull in flight, and the channel carrying it.
-    art_fetch: Option<(Cid, Box<CoverArtClient>)>,
-    /// The image handle we want, held while we work out where to ask for it.
-    art_wanted: Option<String>,
+    /// The OBEX session to the peer's image server, and the channel carrying it.
+    ///
+    /// One per link, not one per image, and brought up *before* attribute 8 is ever asked
+    /// for: a Target strips the image handle from its metadata response when no BIP
+    /// client is connected, so a receiver that waits to see a handle before connecting
+    /// waits forever (Q29).
+    art: Option<(Cid, Box<CoverArtSession>)>,
     /// What we know about this phone: address from link-up, name from the remote-name
     /// request, codec from AVDTP configuration. Each arrives separately.
     description: SourceDescription,
@@ -194,8 +197,7 @@ impl Link {
             control: None,
             art_psm: None,
             art_sdp: None,
-            art_fetch: None,
-            art_wanted: None,
+            art: None,
             description: SourceDescription::new().with_address(peer.to_string()),
         }
     }
@@ -291,8 +293,40 @@ impl SourceAdapter for BluetoothAdapter {
         // two PDUs interleave their fragments (Q26).
         let acl = AclWriter::spawn(Arc::clone(&self.transport));
 
+        // Retransmission timers are the one thing in this actor that is driven by time
+        // rather than by bytes. They are advanced from wall clock on *every* wakeup, not
+        // only on the timer's own, because a link busy with audio would otherwise never
+        // credit its cover-art channel any elapsed time and never notice a peer that has
+        // stopped answering.
+        let mut last_tick = std::time::Instant::now();
         loop {
-            let packet = match self.transport.recv().await {
+            let due = links.values().filter_map(|l| l.mux.next_timeout()).min();
+            let received = tokio::select! {
+                packet = self.transport.recv() => Some(packet),
+                () = sleep_until_due(due) => None,
+            };
+
+            let elapsed = last_tick.elapsed();
+            last_tick = std::time::Instant::now();
+            let ticks: Vec<(ConnectionHandle, Vec<L2capEvent>)> = links
+                .iter_mut()
+                .filter_map(|(raw, link)| {
+                    let events = link.mux.tick(elapsed);
+                    if events.is_empty() {
+                        return None;
+                    }
+                    ConnectionHandle::new(*raw).ok().map(|h| (h, events))
+                })
+                .collect();
+            for (handle, events) in ticks {
+                let link = links.get_mut(&handle.raw());
+                self.dispatch(handle, events, link, &sink, &acl).await?;
+            }
+
+            let Some(received) = received else {
+                continue;
+            };
+            let packet = match received {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(error = %e, "bluetooth transport ended");
@@ -518,14 +552,9 @@ impl BluetoothAdapter {
                         }
                         // Ask for metadata straight away rather than waiting for a
                         // notification; a track already playing produces no change event.
-                        let transaction = link.next_transaction();
-                        out.replies.push((
-                            cid,
-                            avctp_body(
-                                transaction,
-                                &avrcp::get_element_attributes(&avrcp::attribute::ALL),
-                            ),
-                        ));
+                        // The text only: attribute 8 is asked for once the image server
+                        // is connected, because a Target strips it when it is not (Q29).
+                        Self::request_metadata(link, cid, &mut out);
                         // …and subscribe, or the card is a snapshot of this instant and
                         // nothing ever moves it again. RegisterNotification answers
                         // INTERIM with the value *now* and CHANGED when it moves, so one
@@ -541,6 +570,11 @@ impl BluetoothAdapter {
                                 avctp_body(transaction, &avrcp::register_notification(event, 0)),
                             ));
                         }
+                        // …and go and find the peer's image server now, rather than when
+                        // a handle turns up. This is the ordering the whole cover-art
+                        // path hinges on: no BIP client, no attribute 8, no handle to
+                        // have gone looking for.
+                        self.open_cover_art(link, &mut out);
                     }
                     // Our own outgoing channels: the cover-art chain. Both state
                     // machines are pull-driven, so opening one means "ask your question".
@@ -550,9 +584,9 @@ impl BluetoothAdapter {
                                 out.replies.push((cid, request));
                             }
                         }
-                    } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        if let Some((_, client)) = &link.art_fetch {
-                            if let Some(request) = client.next_request() {
+                    } else if link.art.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        if let Some((_, session)) = &link.art {
+                            if let Some(request) = session.next_request() {
                                 out.replies.push((cid, request));
                             }
                         }
@@ -570,11 +604,12 @@ impl BluetoothAdapter {
                         link.avctp = None;
                     } else if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
                         link.art_sdp = None;
-                    } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        // A fetch that dies with the channel is not worth retrying: the
-                        // card already has its text and the next track will ask again.
-                        debug!("cover art: channel closed mid-fetch");
-                        link.art_fetch = None;
+                    } else if link.art.as_ref().is_some_and(|(c, _)| *c == cid) {
+                        // The image server went away. The PSM is remembered, so the next
+                        // track change brings the session back up rather than giving up
+                        // on artwork for the rest of the link.
+                        debug!("cover art: the image session closed");
+                        link.art = None;
                     }
                     debug!(%cid, %psm, "l2cap channel closed");
                 }
@@ -584,7 +619,7 @@ impl BluetoothAdapter {
                     // arrives on it is a response to our query, not a request to answer.
                     if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
                         self.on_cover_art_sdp(link, &payload, &mut out);
-                    } else if link.art_fetch.as_ref().is_some_and(|(c, _)| *c == cid) {
+                    } else if link.art.as_ref().is_some_and(|(c, _)| *c == cid) {
                         self.on_cover_art_data(link, &payload, sink, &mut out)
                             .await?;
                     } else if psm == Psm::SDP {
@@ -839,7 +874,7 @@ impl BluetoothAdapter {
                             // The text card is already on screen; the art lands as a
                             // second snapshot whenever it arrives, or never, without
                             // holding anything up.
-                            self.begin_cover_art(link, handle, out);
+                            Self::fetch_cover_art(link, &handle, out);
                         }
                     }
                 }
@@ -882,14 +917,10 @@ impl BluetoothAdapter {
                         // to be asked for again — this is the request that keeps the card
                         // in step with what is actually playing.
                         debug!("bluetooth: track changed; re-reading metadata");
-                        let transaction = link.next_transaction();
-                        out.replies.push((
-                            cid,
-                            avctp_body(
-                                transaction,
-                                &avrcp::get_element_attributes(&avrcp::attribute::ALL),
-                            ),
-                        ));
+                        Self::request_metadata(link, cid, out);
+                        // A track change is also the moment to try the image server
+                        // again, if it never came up or went away with its channel.
+                        self.open_cover_art(link, out);
                     }
                     _ => {}
                 }
@@ -923,29 +954,42 @@ impl BluetoothAdapter {
         Ok(())
     }
 
-    /// Start fetching an image handle the peer just told us about.
+    /// Ask for the metadata we can currently make use of.
     ///
-    /// Two round trips the first time: the peer's image server lives on a PSM only its
+    /// Attribute 8 only once the image server is connected. Asking earlier is not merely
+    /// useless — AOSP's Target strips the attribute from a response when no BIP client is
+    /// connected, so the early request *teaches us nothing* and the card would wait on a
+    /// second round trip for text it could have had immediately (Q29).
+    fn request_metadata(link: &mut Link, cid: Cid, out: &mut Outbox) {
+        let ready = link.art.as_ref().is_some_and(|(_, s)| s.is_ready());
+        let attributes: &[u32] = if ready {
+            &avrcp::attribute::ALL
+        } else {
+            &avrcp::attribute::TEXT
+        };
+        let transaction = link.next_transaction();
+        out.replies.push((
+            cid,
+            avctp_body(transaction, &avrcp::get_element_attributes(attributes)),
+        ));
+    }
+
+    /// Bring the peer's image server up, so that attribute 8 becomes worth asking for.
+    ///
+    /// Two round trips the first time: the image server lives on a PSM only the peer's
     /// SDP record knows, so we have to ask before we can connect. The PSM is cached for
-    /// the life of the link, so later tracks skip straight to the pull.
-    fn begin_cover_art(&self, link: &mut Link, handle: String, out: &mut Outbox) {
-        if link.art_fetch.is_some() || link.art_sdp.is_some() {
-            // One at a time. A skipped-through album would otherwise open a channel per
-            // track and leave them all half-finished.
-            debug!(handle, "bluetooth: cover art already in flight; skipping");
+    /// the life of the link.
+    fn open_cover_art(&self, link: &mut Link, out: &mut Outbox) {
+        if link.art.is_some() || link.art_sdp.is_some() {
             return;
         }
         if let Some(psm) = link.art_psm {
-            self.connect_cover_art(link, psm, handle, out);
+            self.connect_cover_art(link, psm, out);
             return;
         }
-        let Ok(psm) = Psm::new(Psm::SDP.raw()) else {
-            return;
-        };
-        match link.mux.connect(psm) {
+        match link.mux.connect(Psm::SDP) {
             Ok((cid, events)) => {
-                debug!(handle, "bluetooth: asking where cover art lives");
-                link.art_wanted = Some(handle);
+                debug!("bluetooth: asking where cover art lives");
                 link.art_sdp = Some((cid, Box::new(substrate_sdp::Query::avrcp_target(1))));
                 Self::queue_signalling(events, &mut out.signalling);
             }
@@ -954,18 +998,45 @@ impl BluetoothAdapter {
     }
 
     /// Open the image channel itself, once the PSM is known.
-    fn connect_cover_art(&self, link: &mut Link, psm: u16, handle: String, out: &mut Outbox) {
+    ///
+    /// In Enhanced Retransmission Mode, because that is what GOEP 2.0 requires of a cover
+    /// art channel — a basic-mode channel here is refused by the responder, which is what
+    /// made this whole path unreachable (Q29). A peer that counter-proposes basic mode
+    /// gets it: GOEP 1.x moves a thumbnail perfectly well.
+    fn connect_cover_art(&self, link: &mut Link, psm: u16, out: &mut Outbox) {
         let Ok(psm) = Psm::new(psm) else {
             warn!(psm, "cover art: the peer named a psm that is not one");
             return;
         };
-        match link.mux.connect(psm) {
+        match link
+            .mux
+            .connect_with(psm, ChannelMode::EnhancedRetransmission)
+        {
             Ok((cid, events)) => {
-                debug!(%psm, handle, "bluetooth: fetching cover art");
-                link.art_fetch = Some((cid, Box::new(CoverArtClient::new(handle))));
+                debug!(%psm, "bluetooth: connecting to the image server");
+                let max_packet = link.mux.channel(cid).map_or(0x0400, |c| c.local_mtu);
+                link.art = Some((cid, Box::new(CoverArtSession::new(max_packet))));
                 Self::queue_signalling(events, &mut out.signalling);
             }
-            Err(e) => warn!(error = %e, "cover art: no channel for the image pull"),
+            Err(e) => warn!(error = %e, "cover art: no channel for the image server"),
+        }
+    }
+
+    /// Ask the image server for a handle the peer just gave us.
+    fn fetch_cover_art(link: &mut Link, handle: &str, out: &mut Outbox) {
+        let Some((cid, session)) = &mut link.art else {
+            return;
+        };
+        let cid = *cid;
+        if !session.fetch(handle) {
+            // Either the session is still connecting or an image is already coming. A
+            // skipped-through album would otherwise queue art for tracks nobody is on.
+            debug!(handle, "cover art: not ready for this one");
+            return;
+        }
+        if let Some(request) = session.next_request() {
+            debug!(handle, "bluetooth: fetching cover art");
+            out.replies.push((cid, request));
         }
     }
 
@@ -999,7 +1070,6 @@ impl BluetoothAdapter {
             Err(e) => {
                 debug!(error = %e, "cover art: unreadable sdp response");
                 link.art_sdp = None;
-                link.art_wanted = None;
                 return;
             }
         }
@@ -1011,16 +1081,13 @@ impl BluetoothAdapter {
         );
 
         let Some(psm) = psm else {
-            // Plenty of phones advertise a cover-art handle and no image server. Not an
-            // error, just no picture.
+            // Plenty of senders publish an AVRCP Target and no image server. Not an
+            // error, just no picture — and the card is already on screen with its text.
             debug!("bluetooth: peer serves no cover art");
-            link.art_wanted = None;
             return;
         };
         link.art_psm = Some(psm);
-        if let Some(handle) = link.art_wanted.take() {
-            self.connect_cover_art(link, psm, handle, out);
-        }
+        self.connect_cover_art(link, psm, out);
     }
 
     /// Bytes from the peer's image server.
@@ -1031,14 +1098,20 @@ impl BluetoothAdapter {
         sink: &SessionSink,
         out: &mut Outbox,
     ) -> Result<(), CoreError> {
-        let Some((cid, client)) = &mut link.art_fetch else {
+        let Some((cid, session)) = &mut link.art else {
             return Ok(());
         };
         let cid = *cid;
-        match client.feed(payload) {
+        // Whether this packet is the one that brings the session up decides what we do
+        // next, and it has to be sampled before the packet is fed in.
+        let was_connecting = session.state() == FetchState::Connecting;
+        let result = session.feed(payload);
+        let now_ready = session.is_ready();
+        let next = session.next_request();
+
+        match result {
             Ok(Some(artwork)) => {
                 info!(bytes = artwork.len(), "bluetooth: cover art fetched");
-                link.art_fetch = None;
                 link.now_playing.artwork = Some(artwork);
                 if link.session_open {
                     let link_sink = sink.with_instance(link.peer.to_string());
@@ -1050,13 +1123,20 @@ impl BluetoothAdapter {
             // OBEX is request/response all the way down: every chunk we take has to be
             // asked for.
             Ok(None) => {
-                if let Some(request) = client.next_request() {
+                if let Some(request) = next {
                     out.replies.push((cid, request));
                 }
             }
-            Err(e) => {
-                debug!(error = %e, "cover art: fetch failed");
-                link.art_fetch = None;
+            Err(e) => debug!(error = %e, "cover art: fetch failed"),
+        }
+
+        if was_connecting && now_ready {
+            // The image server is up, which is the moment attribute 8 starts arriving.
+            // Re-reading the metadata now is what turns the text card into one with a
+            // picture; without this the handle would not appear until the next track.
+            if let Some(avctp) = link.avctp {
+                debug!("bluetooth: image server up; re-reading metadata for the handle");
+                Self::request_metadata(link, avctp, out);
             }
         }
         Ok(())
@@ -1080,6 +1160,18 @@ impl BluetoothAdapter {
                 transaction = (transaction + 1) & 0x0F;
             }
         });
+    }
+}
+
+/// Sleep until a retransmission timer is due, or forever if none is.
+///
+/// `pending` rather than a poll interval: with no ERTM channel open there is nothing to
+/// wake up for, and a receiver sitting idle in a hackerspace should be sitting on its
+/// socket rather than counting.
+async fn sleep_until_due(due: Option<std::time::Duration>) {
+    match due {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending().await,
     }
 }
 

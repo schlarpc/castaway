@@ -15,13 +15,13 @@ substrate-l2cap.workspace = true
 substrate-sdp.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 bytes.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 
 [features]
 default = []
