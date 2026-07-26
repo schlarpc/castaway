@@ -74,9 +74,28 @@ impl Pipeline for NullPipeline {
         source: FrameSource,
         format: castaway_core::AudioFormat,
     ) -> Result<(), CoreError> {
-        info!(%format, "null pipeline: AUDIO begin");
-        Self::drain(source, "audio");
-        Ok(())
+        // Audio is the one path this pipeline does for real when the feature is built.
+        // An A2DP sink is audio-only with a now-playing card for a screen, so requiring
+        // the wgpu/winit kiosk just to make sound would mean the headless build can
+        // negotiate a whole stream and then silently bin it — which is exactly what it
+        // did on the first iPhone that connected.
+        #[cfg(feature = "audio")]
+        {
+            if let FrameSource::Encoded(rx) = source {
+                info!(%format, "null pipeline: AUDIO begin (decoding to the output device)");
+                crate::audio_session::spawn(rx, format, crate::audio_session::default_output());
+                return Ok(());
+            }
+            info!(%format, "null pipeline: AUDIO begin (not encoded frames; draining)");
+            Self::drain(source, "audio");
+            Ok(())
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            info!(%format, "null pipeline: AUDIO begin (no `audio` feature; draining)");
+            Self::drain(source, "audio");
+            Ok(())
+        }
     }
 
     async fn now_playing(&self, snapshot: NowPlaying) -> Result<(), CoreError> {

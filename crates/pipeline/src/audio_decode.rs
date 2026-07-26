@@ -190,8 +190,37 @@ impl AudioDecoder {
             i64::try_from(frame.pts.as_micros()).unwrap_or(i64::MAX),
         ));
 
+        // A decoder that refuses everything is a configuration problem, and configuration
+        // problems are solved offline against real bytes rather than with a phone in hand.
+        // Set CASTAWAY_DUMP_AUDIO to a path to capture the raw frames as they arrive.
+        if let Ok(path) = std::env::var("CASTAWAY_DUMP_AUDIO") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(&(frame.data.len() as u32).to_le_bytes());
+                let _ = f.write_all(&frame.data);
+            }
+        }
         if let Err(e) = self.decoder.send_packet(&packet) {
-            debug!(error = %e, codec = ?self.codec, "audio decoder rejected a packet");
+            // The leading bytes identify the framing when a decoder refuses everything:
+            // `fff1`/`fff9` is ADTS, `56ex` is LOAS/LATM with a sync stream, and neither
+            // is raw LATM. Guessing between them is how a stream decodes to nothing.
+            let head: String = frame
+                .data
+                .iter()
+                .take(12)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            debug!(
+                error = %e,
+                codec = ?self.codec,
+                len = frame.data.len(),
+                head = %head,
+                "audio decoder rejected a packet",
+            );
             return Ok(());
         }
         self.drain(&mut on_pcm)
