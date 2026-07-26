@@ -25,8 +25,15 @@ mod codec_type {
 
 /// Vendor identifiers for the non-A2DP codecs.
 mod vendor {
-    /// Qualcomm/APT Licensing.
-    pub const QUALCOMM: u32 = 0x0000_004F;
+    /// APT Licensing Ltd — classic aptX.
+    pub const APT: u32 = 0x0000_004F;
+    /// Qualcomm Technologies International — aptX HD.
+    ///
+    /// Not the same vendor as classic aptX, which is the trap: both are "Qualcomm" to a
+    /// reader and 0x4F belongs to APT Licensing, the company Qualcomm bought. An aptX HD
+    /// endpoint advertised under 0x4F matches nothing — a sender looking for
+    /// (0xD7, 0x0024) never sees it and quietly settles for plain aptX.
+    pub const QUALCOMM: u32 = 0x0000_00D7;
     /// Sony.
     pub const SONY: u32 = 0x0000_012D;
     /// aptX.
@@ -508,7 +515,7 @@ impl CodecCapability {
             }
             Self::AptX { rates, channels } => {
                 buf.put_u8(codec_type::NON_A2DP);
-                put_vendor(&mut buf, vendor::QUALCOMM, vendor::APTX_CODEC);
+                put_vendor(&mut buf, vendor::APT, vendor::APTX_CODEC);
                 buf.put_u8((rates.bits() << 4) | channels.bits());
             }
             Self::AptXHd { rates, channels } => {
@@ -588,7 +595,7 @@ impl CodecCapability {
                 let vendor_id = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
                 let codec_id = u16::from_le_bytes([buf[6], buf[7]]);
                 match (vendor_id, codec_id) {
-                    (vendor::QUALCOMM, vendor::APTX_CODEC) => {
+                    (vendor::APT, vendor::APTX_CODEC) => {
                         need(9)?;
                         Ok(Self::AptX {
                             rates: SampleRates::from_bits(buf[8] >> 4),
