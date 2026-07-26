@@ -18,7 +18,7 @@
     clippy::cast_possible_wrap
 )]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cef::rc::Rc as _;
 use cef::{args::Args, *};
@@ -143,6 +143,78 @@ struct ViewSize {
     dims: Arc<Mutex<(u32, u32)>>,
 }
 
+// --- Render process: scriptlet injection at document start ---
+
+/// The blocker used *inside the render process* to decide what to inject.
+///
+/// It is a second engine, not the browser process's one, because these are separate
+/// processes: CEF re-execs this binary for the renderer, and `on_context_created` fires
+/// there. Built lazily from the same cache the browser process writes, and only in the
+/// renderer — the browser process never touches this.
+static RENDER_BLOCKER: OnceLock<Option<AdBlocker>> = OnceLock::new();
+
+/// The engine for this render process, loaded from cache on first use.
+///
+/// Cache-only, never fetching: a renderer is short-lived and must not block page load on
+/// the network. The browser process refreshes the cache at startup, before any renderer
+/// exists, so what is on disk here is what was fetched this boot.
+fn render_blocker() -> Option<&'static AdBlocker> {
+    RENDER_BLOCKER
+        .get_or_init(|| {
+            let paths = crate::filterlists::CachePaths::default();
+            let blocker = crate::filterlists::load_cached_only(&paths)?;
+            info!(
+                target: "castaway::adblock",
+                scriptlets = blocker.scriptlet_count(),
+                "render process ready to inject"
+            );
+            Some(blocker)
+        })
+        .as_ref()
+}
+
+#[derive(Clone)]
+struct CastawayRenderProcess;
+
+wrap_render_process_handler! {
+    struct RenderProcessBuilder {
+        handler: CastawayRenderProcess,
+    }
+    impl RenderProcessHandler {
+        /// Runs once per frame, *before* the page's own scripts. This is the whole reason
+        /// the render process is involved at all: uBlock Origin's `##+js(...)` rules work
+        /// by hooking things like `fetch` and `XMLHttpRequest` before the page can use
+        /// them, so injecting later — from the browser process, on load-start — would be
+        /// injecting after the thing it needed to intercept had already happened.
+        fn on_context_created(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _context: Option<&mut V8Context>,
+        ) {
+            let Some(frame) = frame else { return };
+            let url = CefString::from(&frame.url()).to_string();
+            // about:blank and the like carry no rules and no risk.
+            if !url.starts_with("http") {
+                return;
+            }
+            let Some(blocker) = render_blocker() else { return };
+            let Some(script) = blocker.injected_script(&url) else { return };
+            debug!(
+                target: "castaway::adblock",
+                %url, bytes = script.len(), "injecting scriptlets"
+            );
+            // The script URL is what shows up in a stack trace from inside the injection,
+            // so name it something a person debugging the page will recognise.
+            frame.execute_java_script(
+                Some(&script.as_str().into()),
+                Some(&"castaway://scriptlets".into()),
+                0,
+            );
+        }
+    }
+}
+
 // --- App: process-wide callbacks (command line tweaks) ---
 
 #[derive(Clone)]
@@ -153,6 +225,12 @@ wrap_app! {
         app: CastawayApp,
     }
     impl App {
+        /// CEF asks every process for this; only the renderer ever calls into it.
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(RenderProcessBuilder::new(CastawayRenderProcess))
+        }
+
+
         fn on_before_command_line_processing(
             &self,
             _process_type: Option<&CefStringUtf16>,

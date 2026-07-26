@@ -152,9 +152,11 @@ fn main() -> anyhow::Result<()> {
         let browser_host = {
             let mut cef = cef;
             cef.set_user_agent(pipeline::TV_USER_AGENT);
-            cef.set_adblock(pipeline::easylist::load_or_fetch(
-                pipeline::easylist::EASYLIST_URL,
-                &pipeline::easylist::default_cache_path(),
+            // EasyList *and* uBlock Origin's list, plus the scriptlet bundle uBO's
+            // `##+js(...)` rules need bodies from. Written to a cache the render
+            // processes read, which is how injection reaches the page.
+            cef.set_adblock(pipeline::filterlists::load_or_fetch_all(
+                &pipeline::filterlists::CachePaths::default(),
             ));
             cef.initialize()
                 .map_err(|e| anyhow::anyhow!("cef initialize: {e}"))?;
