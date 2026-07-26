@@ -581,6 +581,7 @@ dependencies = [
  "proto-dlna",
  "proto-spotify",
  "serde",
+ "serde_json",
  "substrate-hci",
  "substrate-mdns",
  "substrate-ssdp",
@@ -588,6 +589,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "ureq 2.12.1",
  "uuid",
 ]
 

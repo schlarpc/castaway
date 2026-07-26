@@ -11,6 +11,7 @@
 
 mod bluetooth;
 mod config;
+mod screen;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -314,8 +315,17 @@ async fn serve(
                 dial.description_path().to_string(),
             ));
             info!("enabled: DIAL → YouTube leanback (launch/stop)");
+            // Whatever the launched page becomes, a sender arriving later needs to be
+            // able to find it. The routes clear this slot themselves on launch and stop;
+            // filling it is a network lookup, so it happens out here.
+            let screen = dial.screen_slot();
             tokio::spawn(async move {
                 while let Some(event) = dial_rx.recv().await {
+                    if let proto_dial::DialEvent::Launched(params) = &event {
+                        if let Some(code) = params.pairing_code.clone() {
+                            tokio::spawn(screen::publish_screen_id(code, screen.clone()));
+                        }
+                    }
                     on_dial(event);
                 }
             });

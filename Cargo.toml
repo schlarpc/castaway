@@ -85,6 +85,8 @@ prost-build = "0.13"
 
 # --- networking / discovery ---
 mdns-sd = "0.13"
+# Blocking HTTP, used off-runtime via spawn_blocking (EasyList; the Lounge screen lookup).
+ureq = "2"
 axum = "0.8"
 hyper = "1"
 rtsp-types = "0.1"

@@ -35,6 +35,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 axum.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+ureq = { workspace = true, optional = true }
 toml = "0.8"
 uuid.workspace = true
 
@@ -61,7 +63,7 @@ ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
 # CEF offscreen browser in the kiosk (YouTube leanback via DIAL launch). Implies `render`;
 # needs CEF_PATH from the flake devshell. CEF re-execs this binary for subprocesses, so
 # main() bootstraps it before anything else.
-cef = ["render", "hwaccel", "pipeline/cef"]
+cef = ["render", "hwaccel", "pipeline/cef", "dep:ureq"]
 
 [lints]
 workspace = true
