@@ -157,12 +157,29 @@ pub struct Spotify {
     /// comes up at full volume in a shared space is the kind of thing that only happens
     /// once before somebody unplugs it.
     pub initial_volume: f32,
+
+    /// Stream quality: 96, 160 or 320 kbps.
+    ///
+    /// librespot's own default is 160, which is what a Premium account entitled to 320
+    /// was quietly getting — audible on a PA, and discoverable from no log line. 320 here
+    /// because the account decides what it can actually have; asking for more than the
+    /// entitlement costs nothing.
+    pub bitrate: u16,
+
+    /// Apply Spotify's loudness normalisation.
+    ///
+    /// On, because the alternative is track-to-track volume jumps in a shared room, which
+    /// every real Connect speaker smooths out and people reach for the volume knob over.
+    /// librespot defaults this off.
+    pub normalisation: bool,
 }
 
 impl Default for Spotify {
     fn default() -> Self {
         Self {
             initial_volume: 0.5,
+            bitrate: 320,
+            normalisation: true,
         }
     }
 }

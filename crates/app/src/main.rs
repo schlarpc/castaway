@@ -365,7 +365,14 @@ async fn serve(
         // Order matters: the runner clones the overlay sink when it starts, so the OSD
         // has to be attached first or session-level messages never reach the screen.
         .with_osd(osd.clone())
-        .with_playback(sink, config.spotify.initial_volume);
+        .with_playback(
+            sink,
+            proto_spotify::PlaybackQuality {
+                initial_volume: config.spotify.initial_volume,
+                bitrate: config.spotify.bitrate,
+                normalisation: config.spotify.normalisation,
+            },
+        );
         http = http.merge(spotify.router());
         mdns.advertise(&spotify.mdns_service(config.http_port, MDNS_HOST))
             .context("advertising Spotify")?;

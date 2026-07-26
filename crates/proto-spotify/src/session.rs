@@ -26,7 +26,7 @@ use librespot_core::authentication::Credentials;
 use librespot_core::dealer::protocol::Message;
 use librespot_core::{Session, SessionConfig};
 use librespot_metadata::audio::{AudioItem, UniqueFields};
-use librespot_playback::config::PlayerConfig;
+use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::{Mixer, MixerConfig};
 use librespot_playback::player::{Player, PlayerEvent};
@@ -70,6 +70,13 @@ pub struct ConnectSettings {
     pub device_id: String,
     /// Volume the device comes up at, as a fraction of full scale.
     pub initial_volume: f32,
+    /// Stream quality in kbps. Anything other than 96/160/320 falls back to 320 with a
+    /// warning — the set is librespot's, not ours, and a typo should not silently halve
+    /// the bitrate.
+    pub bitrate: u16,
+    /// Apply Spotify's loudness normalisation, so a shared room does not get
+    /// track-to-track volume jumps.
+    pub normalisation: bool,
 }
 
 /// Who `getInfo` names as the active user, shared between the zeroconf endpoint and the
@@ -459,9 +466,24 @@ async fn start(
     );
 
     let (pcm_tx, pcm_rx) = PcmSink::channel();
+    // Both of these are *away* from librespot's defaults, deliberately. `Bitrate160` and
+    // `normalisation: false` are what the struct default gives, and neither is what a
+    // room wants: 160 on an account entitled to 320 is audible on a PA, and unnormalised
+    // playback is the thing that has people reaching for the volume between tracks.
+    let bitrate = match settings.bitrate {
+        96 => Bitrate::Bitrate96,
+        160 => Bitrate::Bitrate160,
+        320 => Bitrate::Bitrate320,
+        other => {
+            warn!(other, "spotify: unknown bitrate, using 320");
+            Bitrate::Bitrate320
+        }
+    };
     let player = Player::new(
         PlayerConfig {
             position_update_interval: Some(POSITION_INTERVAL),
+            bitrate,
+            normalisation: settings.normalisation,
             ..PlayerConfig::default()
         },
         session.clone(),
@@ -616,11 +638,25 @@ async fn pump_events(
                 snapshot.position = Some(Duration::from_millis(u64::from(position_ms)));
                 true
             }
-            PlayerEvent::PositionChanged { position_ms, .. }
-            | PlayerEvent::PositionCorrection { position_ms, .. }
+            PlayerEvent::PositionCorrection { position_ms, .. }
             | PlayerEvent::Seeked { position_ms, .. } => {
+                // A jump someone caused. Worth publishing even though the card does not
+                // draw a scrubber, because it is a discrete event rather than a tick.
                 snapshot.position = Some(Duration::from_millis(u64::from(position_ms)));
                 true
+            }
+            PlayerEvent::PositionChanged { position_ms, .. } => {
+                // Kept in the snapshot, deliberately *not* republished.
+                //
+                // `NowPlaying` goes to `publish_card`, which rasterizes the card at the
+                // compositor's target size and uploads it — at 4K that is a 33 MB texture.
+                // Once a second, forever, for a number the card does not draw: there is no
+                // progress bar and no elapsed time in `nowplaying_card`. It was pure heat.
+                //
+                // When the card grows a scrubber this becomes a real change again, and the
+                // republish should come back with it — ideally repainting only the bar.
+                snapshot.position = Some(Duration::from_millis(u64::from(position_ms)));
+                false
             }
             PlayerEvent::Stopped { .. } => {
                 snapshot = NowPlaying::new(PlaybackState::Stopped);
@@ -1018,6 +1054,8 @@ mod tests {
             device_name: "castaway".into(),
             device_id: "deadbeef".into(),
             initial_volume: 0.5,
+            bitrate: 320,
+            normalisation: true,
         }
     }
 

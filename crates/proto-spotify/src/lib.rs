@@ -54,6 +54,34 @@ struct SpotifyStateInner {
     osd: OnceLock<OsdSink>,
 }
 
+/// How playback should sound, as opposed to how the device is identified.
+///
+/// Separate from [`ConnectSettings`] because these are the app's policy — a room's
+/// choice — rather than anything the pairing handshake depends on.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaybackQuality {
+    /// Volume the device comes up at, `0.0..=1.0`.
+    pub initial_volume: f32,
+    /// Stream quality in kbps: 96, 160 or 320.
+    pub bitrate: u16,
+    /// Apply Spotify's loudness normalisation.
+    pub normalisation: bool,
+}
+
+impl Default for PlaybackQuality {
+    fn default() -> Self {
+        // Not librespot's defaults, which are 160 kbps and no normalisation. Both are
+        // wrong for a shared room: 160 on an account entitled to 320 is audible on a PA,
+        // and unnormalised playback is what has people reaching for the volume between
+        // tracks.
+        Self {
+            initial_volume: 0.5,
+            bitrate: 320,
+            normalisation: true,
+        }
+    }
+}
+
 /// A Spotify Connect onboarding endpoint. Like the other HTTP protocols it exposes a
 /// [`Router`] to merge on the shared host and an [`MdnsService`] to advertise.
 pub struct SpotifyService {
@@ -87,12 +115,14 @@ impl SpotifyService {
     /// The `device_id` handed to the runner is this service's own, and it has to be: it
     /// is what `getInfo` advertised, and the blob is encrypted against it.
     #[must_use]
-    pub fn with_playback(self, sink: SessionSink, initial_volume: f32) -> Self {
+    pub fn with_playback(self, sink: SessionSink, quality: PlaybackQuality) -> Self {
         let handle = session::spawn(
             ConnectSettings {
                 device_name: self.state.info.remote_name.clone(),
                 device_id: self.state.info.device_id.clone(),
-                initial_volume,
+                initial_volume: quality.initial_volume,
+                bitrate: quality.bitrate,
+                normalisation: quality.normalisation,
             },
             sink,
             self.state.osd.get().cloned(),
