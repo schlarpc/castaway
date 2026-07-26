@@ -115,13 +115,19 @@ impl Query {
 
     /// The peer's cover-art PSM, if it published one.
     ///
+    /// Named by its *stack*, not by its position: the additional descriptor list holds
+    /// every extra channel the record offers, and on an iPhone the AVCTP **browsing**
+    /// channel is in there and comes first. Taking the first PSM found opens a browsing
+    /// channel and then speaks OBEX at it — which fails in a way indistinguishable from
+    /// the peer having no cover art at all, and is why an iPhone appeared not to support
+    /// it (Q29).
+    ///
     /// # Errors
     /// A parse error if the response could not be decoded.
     pub fn cover_art_psm(&self) -> Result<Option<u16>, SdpError> {
-        Ok(self
-            .records()?
-            .iter()
-            .find_map(|r| r.l2cap_psm(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST)))
+        Ok(self.records()?.iter().find_map(|r| {
+            r.l2cap_psm_under(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST, Some(Uuid::OBEX))
+        }))
     }
 }
 
@@ -172,6 +178,45 @@ mod tests {
         // The whole point of the client half: this PSM is the only route to album art,
         // and it is exactly what BlueZ never hands up.
         let peer = peer_with_cover_art(0x1005);
+        let mut q = Query::avrcp_target(1);
+        run(&mut q, &peer);
+        assert_eq!(q.cover_art_psm().unwrap(), Some(0x1005));
+    }
+
+    #[test]
+    fn a_query_ignores_a_browsing_channel_published_alongside_the_image_server() {
+        // What an iPhone's Target record actually looks like: two extra stacks, browsing
+        // first. Reading the list in order gets a browsing PSM, an OBEX CONNECT that is
+        // never answered, and a phone that appears not to do cover art.
+        let record = ServiceRecord::new()
+            .with(attr::SERVICE_RECORD_HANDLE, DataElement::Uint(0x10000))
+            .with(
+                attr::SERVICE_CLASS_ID_LIST,
+                DataElement::uuid_seq([Uuid::AV_REMOTE_CONTROL_TARGET]),
+            )
+            .with(
+                attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST,
+                DataElement::Sequence(vec![
+                    DataElement::Sequence(vec![
+                        DataElement::Sequence(vec![
+                            DataElement::Uuid(Uuid::L2CAP),
+                            DataElement::Uint(0x001B),
+                        ]),
+                        DataElement::Sequence(vec![
+                            DataElement::Uuid(Uuid::AVCTP),
+                            DataElement::Uint16(0x0104),
+                        ]),
+                    ]),
+                    DataElement::Sequence(vec![
+                        DataElement::Sequence(vec![
+                            DataElement::Uuid(Uuid::L2CAP),
+                            DataElement::Uint(0x1005),
+                        ]),
+                        DataElement::Sequence(vec![DataElement::Uuid(Uuid::OBEX)]),
+                    ]),
+                ]),
+            );
+        let peer = SdpServer::new().with(record);
         let mut q = Query::avrcp_target(1);
         run(&mut q, &peer);
         assert_eq!(q.cover_art_psm().unwrap(), Some(0x1005));

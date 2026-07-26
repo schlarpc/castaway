@@ -40,14 +40,33 @@ pub mod a2dp_features {
 }
 
 /// AVRCP supported-features bits, as they appear in each role's record.
+///
+/// The two roles do **not** share a bit layout past the four category bits, which is the
+/// trap: bit 6 is "supports browsing" in a Controller record, and the cover-art bits sit
+/// at 7, 8 and 9 — one per BIP operation. Claiming bit 6 for cover art advertises a
+/// browsing channel we do not implement *and* leaves the peer with no reason to send an
+/// image handle, so it fails in both directions at once (Q29).
 pub mod avrcp_features {
     /// Category 1: player/recorder. The category that carries play/pause/next/previous.
     pub const CATEGORY_1_PLAYER: u16 = 1 << 0;
     /// Category 2: monitor/amplifier. The category absolute volume belongs to.
     pub const CATEGORY_2_AMPLIFIER: u16 = 1 << 1;
-    /// Controller supports cover art (AVRCP 1.6). Without this bit the peer will not
-    /// offer us an image handle, and album art never arrives.
-    pub const CONTROLLER_SUPPORTS_COVER_ART: u16 = 1 << 6;
+    /// Controller supports browsing. We do not — the browsing channel is a second AVCTP
+    /// connection and its own PDU set — so this is named to be avoided, not set.
+    pub const CONTROLLER_SUPPORTS_BROWSING: u16 = 1 << 6;
+    /// Controller supports `GetImageProperties`.
+    pub const CONTROLLER_GET_IMAGE_PROPERTIES: u16 = 1 << 7;
+    /// Controller supports `GetImage` — the full-size fetch, which needs an image
+    /// descriptor negotiated per request.
+    pub const CONTROLLER_GET_IMAGE: u16 = 1 << 8;
+    /// Controller supports `GetLinkedThumbnail`. **The bit that gets us album art**:
+    /// without a cover-art bit the peer has no reason to include an image handle in its
+    /// metadata responses, and this is the one operation we implement.
+    pub const CONTROLLER_GET_LINKED_THUMBNAIL: u16 = 1 << 9;
+    /// Target supports cover art. A different bit again, in a different record — ours is
+    /// a volume-only Target, so it is named for reading a peer's record, not writing our
+    /// own.
+    pub const TARGET_SUPPORTS_COVER_ART: u16 = 1 << 8;
 }
 
 /// A parsed or constructed SDP service record.
@@ -112,22 +131,68 @@ impl ServiceRecord {
     /// Find the L2CAP PSM in a protocol descriptor list attribute.
     ///
     /// A descriptor list is a sequence of protocol stacks, each a sequence starting with
-    /// the protocol UUID. For L2CAP the next element is the PSM. This is the lookup that
-    /// finds the peer's cover-art channel, which is the one piece of the album-art path
-    /// no OS stack will hand us.
+    /// the protocol UUID. For L2CAP the next element is the PSM.
     #[must_use]
     pub fn l2cap_psm(&self, attribute: u16) -> Option<u16> {
+        self.l2cap_psm_under(attribute, None)
+    }
+
+    /// The same, restricted to the stack whose layer above L2CAP is `protocol`.
+    ///
+    /// This is the lookup that finds the peer's cover-art channel — the one piece of the
+    /// album-art path no OS stack will hand us — and the restriction is not optional. An
+    /// `AdditionalProtocolDescriptorList` routinely holds *several* stacks: an iPhone
+    /// publishes its AVCTP **browsing** channel there too, and it comes first. Taking the
+    /// first PSM in the list therefore opens a browsing channel and speaks OBEX at it,
+    /// which fails in a way that looks like the peer having no cover art at all (Q29).
+    ///
+    /// BlueZ does exactly this test — `sdp_uuid_to_proto(...) == OBEX_UUID`, then
+    /// `sdp_get_proto_port` on the *same* stack.
+    #[must_use]
+    pub fn l2cap_psm_under(&self, attribute: u16, protocol: Option<Uuid>) -> Option<u16> {
         let list = self.get(attribute)?.as_sequence()?;
-        // `AdditionalProtocolDescriptorList` wraps its stacks in one more layer than
-        // `ProtocolDescriptorList` does, so accept either shape rather than guessing.
-        let stacks = list.iter().flat_map(|entry| match entry.as_sequence() {
-            Some(inner) if inner.first().and_then(DataElement::as_uuid).is_none() => {
-                inner.iter().collect::<Vec<_>>()
+        // `ProtocolDescriptorList` *is* one stack — a sequence of layers, each starting
+        // with a protocol UUID. `AdditionalProtocolDescriptorList` is a sequence of those.
+        // The shapes are told apart by looking one level down rather than by which
+        // attribute was asked for, since peers are not always tidy about it.
+        let is_single_stack = list
+            .first()
+            .and_then(DataElement::as_sequence)
+            .and_then(<[DataElement]>::first)
+            .and_then(DataElement::as_uuid)
+            .is_some();
+        if is_single_stack {
+            let layers: Vec<&DataElement> = list.iter().collect();
+            return Self::psm_from_stack(&layers, protocol);
+        }
+        for stack in list {
+            let Some(layers) = stack.as_sequence() else {
+                continue;
+            };
+            let layers: Vec<&DataElement> = layers.iter().collect();
+            if let Some(psm) = Self::psm_from_stack(&layers, protocol) {
+                return Some(psm);
             }
-            _ => vec![entry],
+        }
+        None
+    }
+
+    /// The PSM of one protocol stack, if its layers are the ones asked for.
+    fn psm_from_stack(layers: &[&DataElement], protocol: Option<Uuid>) -> Option<u16> {
+        let matches_protocol = protocol.is_none_or(|wanted| {
+            layers.iter().skip(1).any(|layer| {
+                layer
+                    .as_sequence()
+                    .and_then(|parts| parts.first())
+                    .and_then(DataElement::as_uuid)
+                    .is_some_and(|uuid| uuid.as_bytes() == wanted.as_bytes())
+            })
         });
-        for stack in stacks {
-            let parts = stack.as_sequence()?;
+        if !matches_protocol {
+            return None;
+        }
+        for layer in layers {
+            let parts = layer.as_sequence()?;
             let Some(proto) = parts.first().and_then(DataElement::as_uuid) else {
                 continue;
             };
@@ -216,28 +281,41 @@ pub fn a2dp_sink(handle: u32, name: &str) -> ServiceRecord {
 /// gets no metadata at all.
 ///
 /// The cover-art bit matters: without
-/// [`avrcp_features::CONTROLLER_SUPPORTS_COVER_ART`] the peer will not include an image
+/// [`avrcp_features::CONTROLLER_GET_LINKED_THUMBNAIL`] the peer will not include an image
 /// handle in its metadata responses, and album art silently never arrives.
+///
+/// The class list carries **both** `0x110E` and `0x110F`. AVRCP defines the generic
+/// A/V Remote Control class as part of every role's record, and a peer that searches for
+/// `0x110E` — which is what the profile says to search for — finds nothing in a record
+/// that lists only the role-specific class.
 #[must_use]
 pub fn avrcp_controller(handle: u32, name: &str) -> ServiceRecord {
-    base(handle, name, vec![Uuid::AV_REMOTE_CONTROL_CONTROLLER])
-        .with(
-            attr::PROTOCOL_DESCRIPTOR_LIST,
-            DataElement::Sequence(vec![
-                proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0017)]),
-                proto(Uuid::AVCTP, vec![DataElement::Uint16(0x0104)]),
-            ]),
-        )
-        .with(
-            attr::BLUETOOTH_PROFILE_DESCRIPTOR_LIST,
-            DataElement::Sequence(vec![profile(Uuid::AV_REMOTE_CONTROL, 0x0106)]),
-        )
-        .with(
-            attr::SUPPORTED_FEATURES,
-            DataElement::Uint16(
-                avrcp_features::CATEGORY_1_PLAYER | avrcp_features::CONTROLLER_SUPPORTS_COVER_ART,
-            ),
-        )
+    base(
+        handle,
+        name,
+        vec![Uuid::AV_REMOTE_CONTROL, Uuid::AV_REMOTE_CONTROL_CONTROLLER],
+    )
+    .with(
+        attr::PROTOCOL_DESCRIPTOR_LIST,
+        DataElement::Sequence(vec![
+            proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0017)]),
+            proto(Uuid::AVCTP, vec![DataElement::Uint16(0x0104)]),
+        ]),
+    )
+    .with(
+        attr::BLUETOOTH_PROFILE_DESCRIPTOR_LIST,
+        DataElement::Sequence(vec![profile(Uuid::AV_REMOTE_CONTROL, 0x0106)]),
+    )
+    .with(
+        attr::SUPPORTED_FEATURES,
+        // Only the thumbnail operation is claimed. Advertising `GetImage` as well
+        // would be free right up until a peer offered a handle we then asked for the
+        // wrong way — the full-image form needs an image descriptor negotiated per
+        // request, and we do not send one.
+        DataElement::Uint16(
+            avrcp_features::CATEGORY_1_PLAYER | avrcp_features::CONTROLLER_GET_LINKED_THUMBNAIL,
+        ),
+    )
 }
 
 /// The AVRCP **Target** record.
@@ -287,14 +365,23 @@ mod tests {
         let ct = avrcp_controller(1, "x");
         let tg = avrcp_target(2, "x");
         assert!(ct.has_class(Uuid::AV_REMOTE_CONTROL_CONTROLLER));
+        assert!(
+            ct.has_class(Uuid::AV_REMOTE_CONTROL),
+            "0x110E is what the profile says to search for; omitting it hides the record"
+        );
         assert!(tg.has_class(Uuid::AV_REMOTE_CONTROL_TARGET));
         assert!(!ct.has_class(Uuid::AV_REMOTE_CONTROL_TARGET));
 
         let ct_features = ct.get(attr::SUPPORTED_FEATURES).unwrap().as_uint().unwrap();
         assert_ne!(
-            ct_features & u64::from(avrcp_features::CONTROLLER_SUPPORTS_COVER_ART),
+            ct_features & u64::from(avrcp_features::CONTROLLER_GET_LINKED_THUMBNAIL),
             0,
             "without the cover-art bit the peer never sends an image handle"
+        );
+        assert_eq!(
+            ct_features & u64::from(avrcp_features::CONTROLLER_SUPPORTS_BROWSING),
+            0,
+            "bit 6 is browsing, which we do not implement — claiming it is its own bug"
         );
         let tg_features = tg.get(attr::SUPPORTED_FEATURES).unwrap().as_uint().unwrap();
         assert_ne!(
@@ -332,8 +419,61 @@ mod tests {
                 ])]),
             );
         assert_eq!(
-            peer.l2cap_psm(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST),
+            peer.l2cap_psm_under(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST, Some(Uuid::OBEX)),
             Some(0x1005)
+        );
+    }
+
+    #[test]
+    fn the_browsing_channel_is_not_mistaken_for_the_image_server() {
+        // The bug that made an iPhone look like it had no cover art. A real AVRCP 1.6
+        // Target publishes *two* extra stacks and browsing comes first, so taking the
+        // first PSM in the list opens a browsing channel and then speaks OBEX at it.
+        let peer = ServiceRecord::new()
+            .with(
+                attr::SERVICE_CLASS_ID_LIST,
+                DataElement::uuid_seq([Uuid::AV_REMOTE_CONTROL_TARGET]),
+            )
+            .with(
+                attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST,
+                DataElement::Sequence(vec![
+                    DataElement::Sequence(vec![
+                        proto(Uuid::L2CAP, vec![DataElement::Uint(0x001B)]),
+                        proto(Uuid::AVCTP, vec![DataElement::Uint16(0x0104)]),
+                    ]),
+                    DataElement::Sequence(vec![
+                        proto(Uuid::L2CAP, vec![DataElement::Uint(0x1005)]),
+                        proto(Uuid::OBEX, vec![]),
+                    ]),
+                ]),
+            );
+        assert_eq!(
+            peer.l2cap_psm_under(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST, Some(Uuid::OBEX)),
+            Some(0x1005),
+            "the image server is the stack whose layer above L2CAP is OBEX"
+        );
+        // …and the unrestricted lookup is exactly the trap, which is why the caller that
+        // wants cover art must not use it.
+        assert_eq!(
+            peer.l2cap_psm(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST),
+            Some(0x001B)
+        );
+    }
+
+    #[test]
+    fn a_peer_with_browsing_but_no_image_server_yields_nothing() {
+        // Plenty of senders publish a browsing channel and no cover art. That must read
+        // as "no picture", not as a PSM to go and fail against.
+        let peer = ServiceRecord::new().with(
+            attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST,
+            DataElement::Sequence(vec![DataElement::Sequence(vec![
+                proto(Uuid::L2CAP, vec![DataElement::Uint(0x001B)]),
+                proto(Uuid::AVCTP, vec![DataElement::Uint16(0x0104)]),
+            ])]),
+        );
+        assert_eq!(
+            peer.l2cap_psm_under(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST, Some(Uuid::OBEX)),
+            None
         );
     }
 

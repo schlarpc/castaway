@@ -214,6 +214,21 @@ async fn open_channel(transport: &ScriptedTransport, psm: Psm, phone_cid: u16) -
             })
     })
     .await;
+    // Its configuration request has to be answered with *its* identifier: a response
+    // carrying someone else's answers a proposal that may already have been withdrawn,
+    // and the adapter is right to ignore it.
+    let config_id = eventually("configuration request", || {
+        sent_pdus(transport)
+            .into_iter()
+            .skip(before)
+            .filter_map(|pdu| L2capSignal::decode_all(&pdu.payload).ok())
+            .flatten()
+            .find_map(|sig| match sig {
+                L2capSignal::ConfigurationRequest { id, .. } => Some(id),
+                _ => None,
+            })
+    })
+    .await;
 
     // Accept its configuration, and configure our own direction.
     push_pdu(
@@ -221,7 +236,7 @@ async fn open_channel(transport: &ScriptedTransport, psm: Psm, phone_cid: u16) -
         &L2capPdu::new(
             Cid::SIGNALING,
             L2capSignal::ConfigurationResponse {
-                id: 2,
+                id: config_id,
                 source_cid: sink_cid,
                 flags: 0,
                 result: substrate_l2cap::ConfigResult::Success,
