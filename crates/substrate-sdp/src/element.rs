@@ -16,7 +16,26 @@ pub enum DataElement {
     /// The nil element.
     Nil,
     /// An unsigned integer, in the smallest width that holds it.
+    ///
+    /// Correct for values whose width is nobody's business — a bitmask, a count. Wrong
+    /// wherever the spec *fixes* the width: see [`DataElement::Uint16`].
     Uint(u64),
+    /// An unsigned integer pinned to 32 bits, whatever its value.
+    ///
+    /// Service record handles are `uint32` by spec; a low-numbered handle would otherwise
+    /// narrow to one or two bytes and shift everything after it.
+    Uint32(u32),
+    /// An unsigned integer pinned to 16 bits, whatever its value.
+    ///
+    /// Some fields have a width the spec fixes and the value cannot narrow. An L2CAP PSM
+    /// is the one that bit us: `0x0019` fits in a byte, so the narrowest-width encoder
+    /// emitted `uint8 0x19`, and a strict peer reading a protocol descriptor that should
+    /// hold a `uint16` finds a malformed record and walks away without a word. BlueZ is
+    /// lenient and read it fine, which is exactly what made it survive so long.
+    ///
+    /// Same family as the attribute-id bug: a value-derived width is a decoding hazard
+    /// wherever the reader knows what width to expect.
+    Uint16(u16),
     /// A signed integer.
     Int(i64),
     /// A UUID.
@@ -55,6 +74,16 @@ impl DataElement {
         match self {
             Self::Nil => buf.put_u8(TYPE_NIL << 3),
             Self::Uint(v) => Self::put_uint(buf, *v),
+            Self::Uint16(v) => {
+                // Size index 1 == two bytes, regardless of how small the value is.
+                buf.put_u8((TYPE_UINT << 3) | 1);
+                buf.put_u16(*v);
+            }
+            Self::Uint32(v) => {
+                // Size index 2 == four bytes.
+                buf.put_u8((TYPE_UINT << 3) | 2);
+                buf.put_u32(*v);
+            }
             Self::Int(v) => Self::put_int(buf, *v),
             Self::Uuid(u) => Self::put_uuid(buf, *u),
             Self::Bool(b) => {
@@ -304,6 +333,8 @@ impl DataElement {
     pub const fn as_uint(&self) -> Option<u64> {
         match self {
             Self::Uint(v) => Some(*v),
+            Self::Uint16(v) => Some(*v as u64),
+            Self::Uint32(v) => Some(*v as u64),
             _ => None,
         }
     }

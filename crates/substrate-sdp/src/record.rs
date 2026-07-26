@@ -159,19 +159,14 @@ fn proto(uuid: Uuid, params: Vec<DataElement>) -> DataElement {
 
 /// A profile descriptor: `[profile uuid, version]`.
 fn profile(uuid: Uuid, version: u16) -> DataElement {
-    DataElement::Sequence(vec![
-        DataElement::Uuid(uuid),
-        DataElement::Uint(u64::from(version)),
-    ])
+    // The version is a fixed-width 16-bit field, not a number that may shrink.
+    DataElement::Sequence(vec![DataElement::Uuid(uuid), DataElement::Uint16(version)])
 }
 
 /// The common tail every record we publish shares.
 fn base(handle: u32, name: &str, classes: Vec<Uuid>) -> ServiceRecord {
     ServiceRecord::new()
-        .with(
-            attr::SERVICE_RECORD_HANDLE,
-            DataElement::Uint(u64::from(handle)),
-        )
+        .with(attr::SERVICE_RECORD_HANDLE, DataElement::Uint32(handle))
         .with(attr::SERVICE_CLASS_ID_LIST, DataElement::uuid_seq(classes))
         .with(
             attr::BROWSE_GROUP_LIST,
@@ -180,10 +175,13 @@ fn base(handle: u32, name: &str, classes: Vec<Uuid>) -> ServiceRecord {
         .with(
             attr::LANGUAGE_BASE_ATTRIBUTE_ID_LIST,
             // English, UTF-8, base 0x0100 — the offsets ServiceName is relative to.
+            // All three are fixed-width 16-bit. The encoding (106) is the trap: it fits
+            // in a byte, so a value-derived width emits a five-byte triplet where the
+            // reader expects six, and a strict parser then cannot resolve ServiceName.
             DataElement::Sequence(vec![
-                DataElement::Uint(0x656e),
-                DataElement::Uint(106),
-                DataElement::Uint(0x0100),
+                DataElement::Uint16(0x656e),
+                DataElement::Uint16(106),
+                DataElement::Uint16(0x0100),
             ]),
         )
         .with(attr::SERVICE_NAME, DataElement::Text(name.to_owned()))
@@ -196,8 +194,8 @@ pub fn a2dp_sink(handle: u32, name: &str) -> ServiceRecord {
         .with(
             attr::PROTOCOL_DESCRIPTOR_LIST,
             DataElement::Sequence(vec![
-                proto(Uuid::L2CAP, vec![DataElement::Uint(0x0019)]),
-                proto(Uuid::AVDTP, vec![DataElement::Uint(0x0103)]),
+                proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0019)]),
+                proto(Uuid::AVDTP, vec![DataElement::Uint16(0x0103)]),
             ]),
         )
         .with(
@@ -206,7 +204,7 @@ pub fn a2dp_sink(handle: u32, name: &str) -> ServiceRecord {
         )
         .with(
             attr::SUPPORTED_FEATURES,
-            DataElement::Uint(u64::from(a2dp_features::SPEAKER)),
+            DataElement::Uint16(a2dp_features::SPEAKER),
         )
 }
 
@@ -226,8 +224,8 @@ pub fn avrcp_controller(handle: u32, name: &str) -> ServiceRecord {
         .with(
             attr::PROTOCOL_DESCRIPTOR_LIST,
             DataElement::Sequence(vec![
-                proto(Uuid::L2CAP, vec![DataElement::Uint(0x0017)]),
-                proto(Uuid::AVCTP, vec![DataElement::Uint(0x0104)]),
+                proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0017)]),
+                proto(Uuid::AVCTP, vec![DataElement::Uint16(0x0104)]),
             ]),
         )
         .with(
@@ -236,9 +234,9 @@ pub fn avrcp_controller(handle: u32, name: &str) -> ServiceRecord {
         )
         .with(
             attr::SUPPORTED_FEATURES,
-            DataElement::Uint(u64::from(
+            DataElement::Uint16(
                 avrcp_features::CATEGORY_1_PLAYER | avrcp_features::CONTROLLER_SUPPORTS_COVER_ART,
-            )),
+            ),
         )
 }
 
@@ -253,8 +251,8 @@ pub fn avrcp_target(handle: u32, name: &str) -> ServiceRecord {
         .with(
             attr::PROTOCOL_DESCRIPTOR_LIST,
             DataElement::Sequence(vec![
-                proto(Uuid::L2CAP, vec![DataElement::Uint(0x0017)]),
-                proto(Uuid::AVCTP, vec![DataElement::Uint(0x0104)]),
+                proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0017)]),
+                proto(Uuid::AVCTP, vec![DataElement::Uint16(0x0104)]),
             ]),
         )
         .with(
@@ -263,7 +261,7 @@ pub fn avrcp_target(handle: u32, name: &str) -> ServiceRecord {
         )
         .with(
             attr::SUPPORTED_FEATURES,
-            DataElement::Uint(u64::from(avrcp_features::CATEGORY_2_AMPLIFIER)),
+            DataElement::Uint16(avrcp_features::CATEGORY_2_AMPLIFIER),
         )
 }
 
