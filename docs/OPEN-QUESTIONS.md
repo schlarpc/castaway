@@ -219,12 +219,36 @@ the reasons are what a future reversal has to argue against.
   feature drops the LDAC SEP from the table rather than failing, so the phone negotiates
   aptX HD or AAC instead — the codec table degrades, the build never breaks.
 - **Q23 — Pairing and takeover. ANSWERED: Just Works, keys persisted, last-writer-wins.**
-  `NoInputNoOutput` so neither side prompts, discoverable whenever no session is active, link
-  keys persisted to the config dir so a repeat guest reconnects silently, and a second phone
-  preempts the first to match the existing `SessionManager`. The accepted cost is that anyone
-  in range can seize the speakers; the panel-confirmation alternative was rejected *for now*
-  because it would block this work behind the touch UI, not because it is worse. Revisit once
-  the panel UI exists.
+  `NoInputNoOutput` so neither side prompts, link keys persisted to the config dir so a
+  repeat guest reconnects silently, and a second phone preempts the first to match the
+  existing `SessionManager`. The accepted cost is that anyone in range can seize the
+  speakers; the panel-confirmation alternative was rejected *for now* because it would
+  block this work behind the touch UI, not because it is worse. Revisit once the panel UI
+  exists.
+  **AMENDED 2026-07-25: discoverable *always*, not "when idle".** The original wording said
+  discoverable whenever no session is active. That is wrong for this box. The whole premise
+  is that anyone in the room can walk up and throw media at the display, and the moment one
+  person is connected is exactly the moment a second person wants to — a receiver that
+  vanishes from every scan list while in use fails at its one job. Being non-discoverable
+  during a session only ever helps a device that is *already* paired, which does not need
+  discovery: it pages us, and that path is unaffected.
+  This was found by testing, not by reading: an Android phone could not see the receiver at
+  all while an iPhone was connected, and found it immediately once that link dropped. Note
+  that nothing had ever called `set_discoverable` — the behaviour came from the radio, not
+  from policy. The controller defaults to an 11.25 ms inquiry window every 1.28 s, under 1%
+  of the radio, and an active A2DP link starves even that. So the box was advertising
+  itself as discoverable and then failing to answer, which is worse than either choice: a
+  user scanning sees nothing and gets no reason why.
+  Bring-up now widens the inquiry scan to a 60 ms window every 640 ms — about 9% of the
+  radio, spent deliberately — and turns on interlaced inquiry and page scan, which covers
+  the frequency train in half the time. Interlaced is optional in the spec; a controller
+  without it answers "unsupported feature" and bring-up carries on. `HostConfig` gained a
+  plain `discoverable` flag in place of `discoverable_when_idle`, since the old name now
+  describes behaviour we deliberately do not want.
+  The cost is real and unmeasured: that 9% is taken from the same radio carrying the audio,
+  in a room where 2.4 GHz is already contended, and it will compete again with Miracast's
+  P2P group (§7.5). If streams start breaking up in a crowded room, this is the first knob
+  to turn back down.
 - **Q24 — Absolute volume. ANSWERED: the phone is authoritative.** We accept
   `SetAbsoluteVolume` from the phone and mirror it into the pipeline's gain; we push volume
   back only when the panel UI changes it. Matches what people expect of a Bluetooth speaker —

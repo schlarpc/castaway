@@ -699,9 +699,14 @@ pub fn advertised(include_ldac: bool) -> Vec<CodecCapability> {
         subbands: 0b11,
         allocations: 0b11,
         min_bitpool: 2,
-        // 53 is the ceiling for "SBC high quality" at 44.1 kHz joint stereo; senders
-        // that offer XQ push higher, and accepting it costs nothing to decode.
-        max_bitpool: 53,
+        // 53 is the A2DP "high quality" ceiling at 44.1 kHz joint stereo. This is a
+        // ceiling we *advertise*: the sender picks a bitpool per frame within the range
+        // and states it in every frame header, and our decoder reads it from there — so
+        // raising this costs us nothing and simply stops capping a sender that would go
+        // higher ("SBC XQ"). The cost is airtime, which in a busy 2.4 GHz room is the
+        // scarce resource. Provisional pending measurement; watch the `sbc bitpool` log
+        // against a sender that actually uses it.
+        max_bitpool: 76,
     });
     caps
 }

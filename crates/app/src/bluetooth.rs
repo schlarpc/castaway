@@ -74,7 +74,7 @@ pub async fn spawn(
         BluetoothConfig {
             host: HostConfig {
                 name: config.friendly_name.clone(),
-                discoverable_when_idle: true,
+                discoverable: true,
                 ..HostConfig::default()
             },
             enable_ldac,

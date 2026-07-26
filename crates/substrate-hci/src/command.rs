@@ -183,6 +183,25 @@ pub enum Command {
     WriteLocalName(String),
     /// Set discoverability/connectability.
     WriteScanEnable(ScanEnable),
+    /// How often, and for how long, the controller listens for inquiries.
+    ///
+    /// Both in 0.625 ms slots, and the window must not exceed the interval. The defaults
+    /// are an 11.25 ms window every 1.28 s — under 1% of the radio — which is why a
+    /// device carrying an audio stream effectively disappears from scan lists.
+    WriteInquiryScanActivity {
+        /// How often a scan starts.
+        interval: u16,
+        /// How long each scan lasts.
+        window: u16,
+    },
+    /// Standard (`false`) or interlaced (`true`) inquiry scan.
+    ///
+    /// Interlaced scanning covers the frequency train in half the time, so a device is
+    /// found roughly twice as fast. Optional in the spec: a controller without it answers
+    /// `Unsupported Feature`, which is not fatal.
+    WriteInquiryScanType(bool),
+    /// Standard (`false`) or interlaced (`true`) page scan. Same trade, for reconnection.
+    WritePageScanType(bool),
     /// Set the device class.
     WriteClassOfDevice(ClassOfDevice),
     /// Set the extended inquiry response payload.
@@ -279,6 +298,9 @@ impl Command {
             Self::SetEventMask(_) => OpCode::SET_EVENT_MASK,
             Self::WriteLocalName(_) => OpCode::WRITE_LOCAL_NAME,
             Self::WriteScanEnable(_) => OpCode::WRITE_SCAN_ENABLE,
+            Self::WriteInquiryScanActivity { .. } => OpCode::WRITE_INQUIRY_SCAN_ACTIVITY,
+            Self::WriteInquiryScanType(_) => OpCode::WRITE_INQUIRY_SCAN_TYPE,
+            Self::WritePageScanType(_) => OpCode::WRITE_PAGE_SCAN_TYPE,
             Self::WriteClassOfDevice(_) => OpCode::WRITE_CLASS_OF_DEVICE,
             Self::WriteExtendedInquiryResponse { .. } => OpCode::WRITE_EXTENDED_INQUIRY_RESPONSE,
             Self::WriteSimplePairingMode(_) => OpCode::WRITE_SIMPLE_PAIRING_MODE,
@@ -325,6 +347,13 @@ impl Command {
                 p.put_bytes(0, LOCAL_NAME_LEN - bytes.len());
             }
             Self::WriteScanEnable(scan) => p.put_u8(scan.bits()),
+            Self::WriteInquiryScanActivity { interval, window } => {
+                p.put_u16_le(*interval);
+                p.put_u16_le(*window);
+            }
+            Self::WriteInquiryScanType(interlaced) | Self::WritePageScanType(interlaced) => {
+                p.put_u8(u8::from(*interlaced));
+            }
             Self::WriteClassOfDevice(cod) => {
                 let raw = cod.raw();
                 // 24-bit little-endian: three bytes, not a u32.
@@ -440,6 +469,29 @@ mod tests {
             Command::WriteLocalName(long).encode(),
             Err(HciError::TooLong { .. })
         ));
+    }
+
+    #[test]
+    fn inquiry_scan_activity_is_two_little_endian_slot_counts() {
+        // Interval then window, both in 0.625 ms slots. Getting the order backwards asks
+        // for a window longer than its interval, which the controller rejects outright.
+        let out = bytes_of(&Command::WriteInquiryScanActivity {
+            interval: 0x0400,
+            window: 0x0060,
+        });
+        assert_eq!(&out[..], &hex!("01 1e 0c 04 00 04 60 00"));
+    }
+
+    #[test]
+    fn interlaced_scan_is_a_single_flag_byte() {
+        assert_eq!(
+            &bytes_of(&Command::WriteInquiryScanType(true))[..],
+            &hex!("01 43 0c 01 01")
+        );
+        assert_eq!(
+            &bytes_of(&Command::WritePageScanType(false))[..],
+            &hex!("01 47 0c 01 00")
+        );
     }
 
     #[test]

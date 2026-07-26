@@ -132,6 +132,12 @@ impl OpCode {
     pub const WRITE_LOCAL_NAME: Self = Self(0x0C13);
     /// Set inquiry-scan and page-scan enable — discoverability and connectability.
     pub const WRITE_SCAN_ENABLE: Self = Self(0x0C1A);
+    /// How often and for how long the controller listens for inquiries.
+    pub const WRITE_INQUIRY_SCAN_ACTIVITY: Self = Self(0x0C1E);
+    /// Standard or interlaced inquiry scan.
+    pub const WRITE_INQUIRY_SCAN_TYPE: Self = Self(0x0C43);
+    /// Standard or interlaced page scan.
+    pub const WRITE_PAGE_SCAN_TYPE: Self = Self(0x0C47);
     /// Set the class of device (we advertise audio rendering).
     pub const WRITE_CLASS_OF_DEVICE: Self = Self(0x0C24);
     /// Set the extended inquiry response (name + service UUIDs in the scan result).
@@ -171,6 +177,9 @@ impl OpCode {
             Self::SET_EVENT_MASK => "set_event_mask",
             Self::WRITE_LOCAL_NAME => "write_local_name",
             Self::WRITE_SCAN_ENABLE => "write_scan_enable",
+            Self::WRITE_INQUIRY_SCAN_ACTIVITY => "write_inquiry_scan_activity",
+            Self::WRITE_INQUIRY_SCAN_TYPE => "write_inquiry_scan_type",
+            Self::WRITE_PAGE_SCAN_TYPE => "write_page_scan_type",
             Self::WRITE_CLASS_OF_DEVICE => "write_class_of_device",
             Self::WRITE_EXTENDED_INQUIRY_RESPONSE => "write_extended_inquiry_response",
             Self::WRITE_SIMPLE_PAIRING_MODE => "write_simple_pairing_mode",

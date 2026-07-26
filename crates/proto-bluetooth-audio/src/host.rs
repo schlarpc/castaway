@@ -89,8 +89,13 @@ pub struct HostConfig {
     pub name: String,
     /// What kind of device we claim to be.
     pub class_of_device: ClassOfDevice,
-    /// Whether to be discoverable when idle.
-    pub discoverable_when_idle: bool,
+    /// Whether to be discoverable at all.
+    ///
+    /// Not "when idle": a receiver anyone in the room should be able to use has to stay
+    /// findable while it is in use, or the second person to want it cannot pair (Q23, as
+    /// amended). Turning this off is for a box that should only ever serve devices that
+    /// already know it.
+    pub discoverable: bool,
 }
 
 impl Default for HostConfig {
@@ -98,10 +103,15 @@ impl Default for HostConfig {
         Self {
             name: "castaway".to_owned(),
             class_of_device: ClassOfDevice::LOUDSPEAKER,
-            discoverable_when_idle: true,
+            discoverable: true,
         }
     }
 }
+
+/// Inquiry scan interval: 1024 slots of 0.625 ms = 640 ms.
+const INQUIRY_SCAN_INTERVAL: u16 = 0x0400;
+/// Inquiry scan window: 96 slots = 60 ms, so ~9% of the radio goes to being findable.
+const INQUIRY_SCAN_WINDOW: u16 = 0x0060;
 
 /// Drives a controller from reset to discoverable, and answers pairing.
 #[derive(Debug)]
@@ -185,6 +195,21 @@ impl HostController {
             Command::WriteClassOfDevice(self.config.class_of_device),
             Command::WriteLocalName(self.config.name.clone()),
             Command::WriteSimplePairingMode(true),
+            // Scan hard enough to be found *while streaming*. The controller defaults to
+            // an 11.25 ms inquiry window every 1.28 s — under 1% of the radio — and an
+            // active A2DP link starves even that, which is why a receiver in use vanishes
+            // from every scan list in the room. For a mains-powered box that anyone
+            // should be able to walk up to, that is the wrong trade: spend ~9% of the
+            // radio on being findable (Q23).
+            Command::WriteInquiryScanActivity {
+                interval: INQUIRY_SCAN_INTERVAL,
+                window: INQUIRY_SCAN_WINDOW,
+            },
+            // Interlaced covers the frequency train in half the time, so discovery is
+            // about twice as fast. Optional in the spec — a controller without it answers
+            // "unsupported feature", and bring-up carries on regardless.
+            Command::WriteInquiryScanType(true),
+            Command::WritePageScanType(true),
             Command::WriteScanEnable(self.idle_scan()),
         ];
         vec![HostAction::Send(Command::Reset)]
@@ -204,7 +229,7 @@ impl HostController {
     }
 
     const fn idle_scan(&self) -> ScanEnable {
-        if self.config.discoverable_when_idle {
+        if self.config.discoverable {
             ScanEnable::DiscoverableAndConnectable
         } else {
             ScanEnable::ConnectableOnly
@@ -690,6 +715,36 @@ mod tests {
                 ScanEnable::DiscoverableAndConnectable
             )]
         );
+    }
+
+    #[test]
+    fn bring_up_scans_hard_enough_to_be_found_while_streaming() {
+        // Q23 as amended: the receiver stays findable while it is in use, which the
+        // controller defaults will not do — an 11.25 ms window every 1.28 s loses to an
+        // active A2DP link, and the box silently disappears from every scan list.
+        let mut host = HostController::new(HostConfig::default());
+        let sent = bring_up(&mut host);
+        assert!(
+            sent.iter().any(|c| matches!(
+                c,
+                Command::WriteInquiryScanActivity { interval, window }
+                    if *window > 0x0012 && window <= interval
+            )),
+            "inquiry scan must be widened past the default: {sent:?}"
+        );
+        assert!(
+            sent.contains(&Command::WriteInquiryScanType(true)),
+            "interlaced scan halves discovery latency"
+        );
+        // …and it must be configured before scanning is switched on, or the first
+        // inquiries are answered with the defaults we are trying to leave behind.
+        let activity = sent
+            .iter()
+            .position(|c| matches!(c, Command::WriteInquiryScanActivity { .. }));
+        let enable = sent
+            .iter()
+            .position(|c| matches!(c, Command::WriteScanEnable(_)));
+        assert!(activity < enable, "activity must precede scan enable");
     }
 
     #[test]
