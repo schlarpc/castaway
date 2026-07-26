@@ -472,10 +472,8 @@ whole procedure, and there is no software substitute for the unplug. Once `btusb
 a device even briefly, `usbfs` refuses to claim its interfaces afterwards (`EINVAL`), so the
 warding genuinely has to precede the plug rather than follow it.
 
-**Disable USB autosuspend on the dongle before any hardware run.** The same
-suspend-then-fail-to-resume trap is reachable through ordinary runtime power management,
-with no deauthorization involved. `btusb` ships `enable_autosuspend=Y`, so the UB500 idles
-for `autosuspend_delay_ms` (2000), suspends, and then a resume fails:
+**This dongle stops answering when idle, and neither stack recovers.** Two symptoms, one
+precondition. Under the kernel's `btusb`, `hci1` wedged after a few minutes of no traffic:
 
 ```
 usb 3-2-port3: device 3-2.3 not suspended yet
@@ -483,13 +481,34 @@ Bluetooth: hci1: command tx timeout
 Bluetooth: hci1: Failed usb_autopm_get_interface: -16
 ```
 
-From there every HCI command times out and the adapter is wedged until it is physically
-replugged — `hciconfig` cannot even read the local name. Nothing in the log blames power
-management until you go looking for it, and the dongle otherwise reports `UP RUNNING`,
-which is why this reads as a firmware or transport fault.
+Under our `usbfs` path the same idle produces a **STALL on the bulk IN endpoint**, roughly
+every few minutes, which used to kill the reader outright (see the `hci-transport` fix:
+clear the halt and re-arm).
 
-Unlike the deauthorize trap, this one is preventable. On NixOS, per-device so the machine's
-own radio keeps its power management:
+**What is established.** The stalls recur with `power/control=on` — autosuspend disabled at
+the device — so power management is *not* the demonstrated cause. Timestamps from one
+session, all with autosuspend off: 22:23, 22:45, 22:47, 22:59, 23:13. An earlier note here
+claimed autosuspend wedges the dongle; that was inferred from the one `usb_autopm_get_interface`
+line coinciding with the timeout, and it does not survive the evidence. The PM failure may
+as easily be a *consequence* — an autoresume that cannot complete because the device has
+already stopped answering — as a cause. Direction is unproven either way.
+
+**What is worth fixing regardless**, and is the real lesson:
+
+- *No recovery path.* `btusb` does not reset the device or retry after
+  `usb_autopm_get_interface` returns `-EBUSY`; every command times out from then on. Ours
+  was no better — a STALL killed the reader and `run` returned `Ok(())`.
+- *The status surface lies.* `hciconfig` still reports `UP RUNNING`, because the HCI layer
+  cannot see that the transport under it is dead. That is why this reads as a firmware or
+  peer fault: on the first iPhone bring-up the adapter had been dead for five minutes and
+  the phone got the blame.
+
+Clearing the halt and re-arming is correct whatever the trigger, and held across four
+recoveries with the session intact. That is the fix; the rest below is precaution.
+
+**Disabling autosuspend is still worth doing** — it removes a variable, and the
+deauthorization trap above is real — but treat it as hygiene rather than the cure. On
+NixOS, per-device so the machine's own radio keeps its power management:
 
 ```nix
 services.udev.extraRules = ''
@@ -498,12 +517,12 @@ services.udev.extraRules = ''
 '';
 ```
 
-`echo on | sudo tee /sys/bus/usb/devices/<id>/power/control` does the same thing for the
-current plug, and does not survive a replug. This matters beyond the dev box: our Linux
-backend takes the adapter with `HCI_CHANNEL_USER` but `btusb` is still the USB driver
-underneath, so the dongle suspends out from under us exactly the same way. The Windows
-equivalent is USB selective suspend on the WinUSB-bound device, and the kiosk needs it
-turned off there too.
+`echo on | sudo tee /sys/bus/usb/devices/<id>/power/control` does the same for the current
+plug and does not survive a replug. Note that `btusb` opts into runtime PM properly
+(`usb_autopm_get_interface` around URB submission, plus suspend/resume callbacks that
+re-arm transfers) — so an ordinary BlueZ adapter exercises this path constantly without
+anyone touching it. The Windows equivalent knob is USB selective suspend on the
+WinUSB-bound device.
 
 **Still unproven: the secure-boot upload itself.** The part only presents as a bootloader
 before something loads firmware into it, and by the time we can claim it the kernel has
