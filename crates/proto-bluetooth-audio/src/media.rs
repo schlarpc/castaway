@@ -13,6 +13,8 @@ use bytes::Bytes;
 use castaway_core::{AudioCodec, EncodedFrame};
 use substrate_rtp::RtpPacket;
 
+use crate::latm::LatmParser;
+
 use crate::error::AudioError;
 
 /// How a codec's media packets are framed.
@@ -30,7 +32,8 @@ impl Framing {
     const fn for_codec(codec: AudioCodec) -> Self {
         match codec {
             // SBC's one-byte header carries fragmentation flags and a frame count; AAC
-            // rides LATM inside plain RTP; LDAC prefixes a frame-count byte.
+            // rides LATM inside plain RTP (unwrapped separately, see `LatmParser`); LDAC
+            // prefixes a frame-count byte.
             AudioCodec::Sbc | AudioCodec::Ldac => Self::RtpWithHeader,
             AudioCodec::Aac | AudioCodec::AptXHd => Self::Rtp,
             // Classic aptX alone has no RTP header. aptX *HD* does — the two differ
@@ -56,6 +59,10 @@ pub struct Depacketizer {
     base_timestamp: Option<u32>,
     /// Monotonic fallback for the raw framing, which carries no timestamps.
     frames_seen: u64,
+    /// AAC arrives wrapped in a LATM multiplex that has to come off before a decoder can
+    /// read it; the parser is stateful because a sender may send the configuration once
+    /// and reuse it (RFC 3016 §4.1).
+    latm: Option<LatmParser>,
 }
 
 impl Depacketizer {
@@ -68,6 +75,7 @@ impl Depacketizer {
             sample_rate: sample_rate.max(1),
             base_timestamp: None,
             frames_seen: 0,
+            latm: (codec == AudioCodec::Aac).then(LatmParser::new),
         }
     }
 
@@ -119,6 +127,13 @@ impl Depacketizer {
                 }
                 if payload.is_empty() {
                     return Err(AudioError::BadMediaPacket("media packet has no payload"));
+                }
+                if let Some(latm) = self.latm.as_mut() {
+                    // A2DP defers its AAC payload format to RFC 3016, which carries
+                    // ISO/IEC 14496-3 AudioMuxElements. Handing one straight to a decoder
+                    // is "invalid data" on every packet — the access unit starts after a
+                    // header whose length depends on the negotiated configuration.
+                    payload = latm.access_unit(&payload)?;
                 }
                 (payload, pts)
             }
@@ -212,19 +227,53 @@ mod tests {
     }
 
     #[test]
-    fn aac_and_aptx_hd_keep_their_whole_rtp_payload() {
-        for codec in [AudioCodec::Aac, AudioCodec::AptXHd] {
-            let mut d = Depacketizer::new(codec, 44_100);
-            let frame = d.push(rtp(0, &[0xAA, 0xBB, 0xCC])).unwrap();
-            assert_eq!(&frame.data[..], &[0xAA, 0xBB, 0xCC], "{codec:?}");
-        }
+    fn aptx_hd_keeps_its_whole_rtp_payload() {
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        let frame = d.push(rtp(0, &[0xAA, 0xBB, 0xCC])).unwrap();
+        assert_eq!(&frame.data[..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    /// One real A2DP AAC payload from an iPhone, straight out of the capture.
+    fn captured_aac() -> Bytes {
+        let data = include_bytes!("../tests/fixtures/a2dp-aac-iphone.bin");
+        let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        Bytes::copy_from_slice(&data[4..4 + len])
+    }
+
+    #[test]
+    fn aac_has_its_latm_multiplex_taken_off() {
+        // Unlike aptX HD, an AAC payload is not the codec stream: A2DP §4.5.4 defers to
+        // RFC 3016, so the RTP payload is an AudioMuxElement and the access unit starts
+        // after a header whose length depends on the negotiated configuration. Passing
+        // the whole thing through is what made every packet "invalid data".
+        let multiplex = captured_aac();
+        let mut d = Depacketizer::new(AudioCodec::Aac, 44_100);
+        let frame = d.push(rtp(0, &multiplex)).unwrap();
+        assert!(
+            frame.data.len() < multiplex.len(),
+            "the multiplex header must be gone"
+        );
+        // This capture's header is nine bytes of StreamMuxConfig plus a one-byte length.
+        assert_eq!(frame.data.len(), multiplex.len() - 10);
+        assert_eq!(&frame.data[..], &multiplex[10..]);
+    }
+
+    #[test]
+    fn an_aac_payload_that_is_not_a_valid_multiplex_is_refused() {
+        // Three arbitrary bytes are not an AudioMuxElement. Accepting them would put
+        // garbage in front of the decoder, which is exactly the failure this path exists
+        // to prevent.
+        let mut d = Depacketizer::new(AudioCodec::Aac, 44_100);
+        assert!(d.push(rtp(0, &[0xAA, 0xBB, 0xCC])).is_err());
     }
 
     #[test]
     fn presentation_time_is_rebased_so_a_stream_starts_at_zero() {
         // Senders start their RTP clock wherever they like. Passing the raw timestamp
         // through would place the first frame hours into the presentation timeline.
-        let mut d = Depacketizer::new(AudioCodec::Aac, 44_100);
+        // aptX HD rather than AAC: this is about the RTP clock, and AAC payloads now have
+        // to be real multiplexes, which would only obscure what is under test.
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
         let first = d.push(rtp(1_000_000, &[1, 2, 3])).unwrap();
         assert_eq!(first.pts, Duration::ZERO);
 
@@ -236,7 +285,7 @@ mod tests {
     fn a_timestamp_wrap_does_not_throw_away_the_clock() {
         // 32-bit RTP timestamps roll over in about a day at 48 kHz — well within a
         // hackerspace's uptime. Plain subtraction would jump the clock by ~27 hours.
-        let mut d = Depacketizer::new(AudioCodec::Aac, 48_000);
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 48_000);
         d.push(rtp(u32::MAX - 47_999, &[1])).unwrap();
         let after_wrap = d.push(rtp(0, &[2])).unwrap();
         assert_eq!(after_wrap.pts, Duration::from_secs(1));

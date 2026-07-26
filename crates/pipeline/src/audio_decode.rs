@@ -5,6 +5,10 @@
 //! gated behind the `ldac` feature and its absence must keep the endpoint out of the
 //! advertised table rather than fail at decode time (OPEN-QUESTIONS Q22).
 //!
+//! AAC arrives here already unwrapped from its LATM multiplex — see
+//! `proto_bluetooth_audio::latm` for why that is a separate step and what happens if it is
+//! skipped.
+//!
 //! Two of these codecs have **no in-band configuration at all**: aptX and aptX HD are raw
 //! sample streams with no header, so the decoder cannot discover the sample rate or
 //! channel count and must be told. Those come from the AVDTP negotiation, which is
@@ -69,10 +73,13 @@ impl PcmBlock {
 fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
     match codec {
         AudioCodec::Sbc => Ok(ffmpeg::codec::Id::SBC),
-        // A2DP carries AAC **LATM-multiplexed**, not ADTS — the plain `AAC` decoder
-        // rejects it, and picking the wrong one looks like a corrupt stream rather than
-        // a configuration mistake.
-        AudioCodec::Aac => Ok(ffmpeg::codec::Id::AAC_LATM),
+        // A2DP does carry AAC inside a LATM multiplex (A2DP §4.5.4 → RFC 3016), but the
+        // multiplex comes off in the depacketizer and what arrives here is a raw access
+        // unit, so this is the plain decoder. `AAC_LATM` is emphatically *not* the right
+        // answer despite the name: ffmpeg's is a LOAS decoder whose first act is to check
+        // for the 11-bit 0x2B7 syncword that RFC 3016 streams do not carry, so it refuses
+        // every packet — and returns AVERROR_INVALIDDATA without logging a thing.
+        AudioCodec::Aac => Ok(ffmpeg::codec::Id::AAC),
         AudioCodec::AptX => Ok(ffmpeg::codec::Id::APTX),
         AudioCodec::AptXHd => Ok(ffmpeg::codec::Id::APTX_HD),
         AudioCodec::Alac => Ok(ffmpeg::codec::Id::ALAC),
