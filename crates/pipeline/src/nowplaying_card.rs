@@ -170,7 +170,14 @@ fn build_lines(
             px: 28.0 * s,
             color: pal.album,
             bold: false,
-            gap: 0.0,
+            // Same rule as the state line: a line owns the space below it, so this is
+            // zero when nothing follows and a real gap when the queue does. Getting this
+            // wrong drew "Up next" on top of the line above it.
+            gap: if card.up_next.is_empty() {
+                0.0
+            } else {
+                40.0 * s
+            },
         });
     }
 
@@ -350,24 +357,35 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
     let s = h / DESIGN_HEIGHT;
     let margin = 90.0 * s;
 
-    // The artwork square, on the left. Drawn as a framed panel even when empty: the card
-    // should not reflow when art arrives a second after the text, because a layout that
-    // jumps is worse than one with a gap in it.
-    let art = (h - margin * 2.0).min(w * 0.34);
+    // The artwork square, on the left. Drawn as a framed panel even when *empty*, so the
+    // card does not reflow when art arrives a second after the text — a layout that jumps
+    // is worse than one with a gap in it.
+    //
+    // But only when there is a track for art to belong to. With no track, no art is
+    // coming, and a large empty square beside "connected, nothing playing" is not a
+    // placeholder, it is just a hole in the middle of a two-metre screen.
+    let expects_art = card.track.title.is_some() || card.track.artwork.is_some();
+    let art = if expects_art {
+        (h - margin * 2.0).min(w * 0.34)
+    } else {
+        0.0
+    };
     let art_x = margin;
     let art_y = (h - art) / 2.0;
-    let edge = (3.0 * s).max(1.0);
-    text::fill_rect(
-        &mut buf,
-        width,
-        height,
-        art_x - edge,
-        art_y - edge,
-        art + edge * 2.0,
-        art + edge * 2.0,
-        pal.art_edge,
-    );
-    text::fill_rect(&mut buf, width, height, art_x, art_y, art, art, pal.art_bg);
+    if expects_art {
+        let edge = (3.0 * s).max(1.0);
+        text::fill_rect(
+            &mut buf,
+            width,
+            height,
+            art_x - edge,
+            art_y - edge,
+            art + edge * 2.0,
+            art + edge * 2.0,
+            pal.art_edge,
+        );
+        text::fill_rect(&mut buf, width, height, art_x, art_y, art, art, pal.art_bg);
+    }
 
     // Paint the cover over the panel, if we have one that decodes. A cover that fails to
     // decode leaves the empty panel rather than taking the whole card down with it —
@@ -384,7 +402,12 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
     // art square rather than flowed from the top: a card with no album, or no artist,
     // otherwise leaves a hole where that line would have been and the whole thing drifts
     // upward as metadata arrives piecemeal.
-    let text_x = art_x + art + 70.0 * s;
+    let text_x = if expects_art {
+        art_x + art + 70.0 * s
+    } else {
+        // No art panel, so the text starts at the margin and gets the whole width.
+        margin
+    };
     let avail = (w - text_x - margin).max(1.0);
 
     let lines = build_lines(card, &f, &pal, s, avail);
@@ -490,6 +513,57 @@ mod tests {
 
         c.up_next = vec![QueueItem::new("Something")];
         assert!(gap_of(&c) > 0.0, "the queue would overlap the state line");
+    }
+
+    #[test]
+    fn the_waiting_line_makes_room_only_when_the_queue_follows_it() {
+        // The state line's bug, in the other branch of the layout: a connected source
+        // with no track drew "Up next" on top of "Connected — no track information".
+        let f = text::fonts().unwrap();
+        let mut bare = NowPlayingCard {
+            track: NowPlaying::default(),
+            source: SourceDescription::new().with_display_name("schlarpc"),
+            up_next: Vec::new(),
+        };
+        let gap_of = |card: &NowPlayingCard| {
+            build_lines(card, &f, &Palette::default(), 1.0, 800.0)
+                .into_iter()
+                .find(|l| l.text.starts_with("Connected"))
+                .map(|l| l.gap)
+                .unwrap()
+        };
+        assert_eq!(gap_of(&bare), 0.0);
+        bare.up_next = vec![QueueItem::new("Something")];
+        assert!(gap_of(&bare) > 0.0, "the queue would overlap the notice");
+    }
+
+    #[test]
+    fn a_card_with_no_track_draws_no_art_panel() {
+        // No track means no art is coming, and a large empty square next to "connected,
+        // nothing playing" is a hole in the screen rather than a placeholder.
+        let (w, h) = (640u32, 360u32);
+        let bare = NowPlayingCard {
+            track: NowPlaying::default(),
+            source: SourceDescription::new().with_display_name("schlarpc"),
+            up_next: vec![QueueItem::new("Something")],
+        };
+        let playing = NowPlayingCard {
+            track: NowPlaying::default().with_title("Alkatraz"),
+            ..bare.clone()
+        };
+
+        // Sample where the art panel's interior would be, left of any text.
+        let probe = |img: &[u8]| {
+            let (x, y) = (60usize, (h / 2) as usize);
+            let i = (y * w as usize + x) * 4;
+            [img[i], img[i + 1], img[i + 2]]
+        };
+        let bare_px = probe(&render(&bare, w, h).unwrap());
+        let playing_px = probe(&render(&playing, w, h).unwrap());
+        assert_ne!(
+            bare_px, playing_px,
+            "the art panel should be absent without a track and present with one"
+        );
     }
 
     #[test]

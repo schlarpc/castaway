@@ -296,8 +296,8 @@ async fn start(
     .await
     .map_err(|_| SpotifyError::SessionGone)?;
 
-    let events_task = tokio::spawn(pump_events(events, sink.clone(), session));
-    let queue_task = tokio::spawn(pump_queue(cluster_updates, sink.clone()));
+    let events_task = tokio::spawn(pump_events(events, sink.clone(), session.clone()));
+    let queue_task = tokio::spawn(pump_queue(cluster_updates, sink.clone(), session.clone()));
     let spirc_task = tokio::spawn(spirc_task);
 
     Ok(LiveSession {
@@ -433,13 +433,22 @@ const UP_NEXT_LIMIT: usize = 24;
 async fn pump_queue(
     mut updates: impl futures::Stream<Item = Result<ClusterUpdate, librespot_core::Error>> + Unpin,
     sink: SessionSink,
+    session: Session,
 ) {
     use futures::StreamExt as _;
 
     let mut last: Vec<castaway_core::QueueItem> = Vec::new();
+    let mut names = QueueNames::default();
     while let Some(update) = updates.next().await {
         let Ok(update) = update else { continue };
-        let items = queue_from_cluster(&update);
+        // An update that carries no player state says nothing about the queue. Treating
+        // that as "the queue is empty" is what blanked a 24-track queue 27 seconds after
+        // it arrived, on an update that was about something else entirely.
+        let Some(tracks) = queue_tracks(&update) else {
+            debug!("spotify: cluster update with no player state, queue unchanged");
+            continue;
+        };
+        let items = names.resolve(&session, tracks).await;
         // Cluster updates arrive for volume changes, device lists and playback position
         // — most of them leave the queue untouched, and re-rendering the card for each
         // would be a needless repaint on a screen people are looking at.
@@ -455,20 +464,136 @@ async fn pump_queue(
 }
 
 /// Extract the upcoming tracks from a cluster update.
-fn queue_from_cluster(update: &ClusterUpdate) -> Vec<castaway_core::QueueItem> {
-    update
-        .cluster
-        .as_ref()
-        .and_then(|c| c.player_state.as_ref())
-        .map(|state| {
-            state
-                .next_tracks
-                .iter()
-                .take(UP_NEXT_LIMIT)
-                .map(queue_item)
-                .collect()
-        })
-        .unwrap_or_default()
+///
+/// `None` means "this update tells us nothing about the queue" — it had no player state,
+/// because it was about volume, or the device list, or a session hand-off. That is
+/// emphatically not the same as an empty queue, and conflating the two blanks the panel.
+/// `Some(vec![])` is the real thing: a player state that genuinely has nothing queued.
+fn queue_tracks(update: &ClusterUpdate) -> Option<&[ProvidedTrack]> {
+    let state = update.cluster.as_ref()?.player_state.as_ref()?;
+
+    // One line, once per change, naming the keys the cloud actually sent. The metadata
+    // map is reverse-engineered surface (OPEN-QUESTIONS Q38) and this is what tells us
+    // whether `title`/`artist_name` are the right guesses without another session.
+    if let Some(first) = state.next_tracks.first() {
+        debug!(
+            keys = ?first.metadata.keys().collect::<Vec<_>>(),
+            uri = %first.uri,
+            "spotify: queued track metadata"
+        );
+    }
+
+    let end = state.next_tracks.len().min(UP_NEXT_LIMIT);
+    Some(&state.next_tracks[..end])
+}
+
+/// How many queued tracks are worth a metadata lookup when the cloud did not name them.
+///
+/// The card shows three and counts the rest, so anything past a small margin is never
+/// read. Each miss is one request, and they are cached for the life of the session.
+const RESOLVE_LIMIT: usize = 6;
+
+/// Names for queued tracks, remembered across cluster updates.
+///
+/// Needed because cluster updates are frequent — volume, position, device list — and
+/// re-resolving the same queue on each one would be a burst of requests per minute for a
+/// list that has not changed.
+#[derive(Default)]
+struct QueueNames {
+    seen: std::collections::HashMap<String, castaway_core::QueueItem>,
+}
+
+impl QueueNames {
+    /// Build the display list, asking Spotify only for the tracks it did not name itself.
+    ///
+    /// Spotify hydrates a queue lazily: the first entries arrive with a full `metadata`
+    /// map and the rest with almost nothing, and which is which changes as the user
+    /// scrolls their queue. So "use the map, and go ask when it is missing" is the only
+    /// version of this that does not sometimes print raw ids on the wall.
+    async fn resolve(
+        &mut self,
+        session: &Session,
+        tracks: &[ProvidedTrack],
+    ) -> Vec<castaway_core::QueueItem> {
+        let mut out = Vec::with_capacity(tracks.len());
+        let mut fetched = 0usize;
+
+        for track in tracks {
+            if let Some(hit) = self.seen.get(&track.uri) {
+                out.push(hit.clone());
+                continue;
+            }
+
+            // Free path: the cloud already told us.
+            if let Some(item) = named_from_metadata(track) {
+                self.seen.insert(track.uri.clone(), item.clone());
+                out.push(item);
+                continue;
+            }
+
+            // Paid path, and rationed. Past the limit the entry is only counted toward
+            // "and N more", never drawn, so a lookup would buy nothing.
+            if fetched < RESOLVE_LIMIT {
+                fetched += 1;
+                if let Some(item) = fetch_track_name(session, &track.uri).await {
+                    self.seen.insert(track.uri.clone(), item.clone());
+                    out.push(item);
+                    continue;
+                }
+            }
+
+            out.push(fallback_item(track));
+        }
+        out
+    }
+}
+
+/// Build an item from the `metadata` map, if it carries a usable title.
+fn named_from_metadata(track: &ProvidedTrack) -> Option<castaway_core::QueueItem> {
+    let title = track
+        .metadata
+        .get("title")
+        .filter(|t| !t.is_empty())?
+        .clone();
+    // An artist name if the map carries one under any spelling we have seen; the album is
+    // the closest honest second line when it carries only `artist_uri`, and absent both
+    // the title stands alone.
+    let mut item = castaway_core::QueueItem::new(title);
+    if let Some(artist) = ARTIST_KEYS
+        .iter()
+        .filter_map(|k| track.metadata.get(*k))
+        .find(|v| !v.is_empty())
+    {
+        item = item.with_artist(artist.clone());
+    } else if let Some(album) = track.metadata.get("album_title").filter(|a| !a.is_empty()) {
+        item = item.with_artist(album.clone());
+    }
+    Some(item)
+}
+
+/// Metadata keys that have carried an artist name.
+///
+/// Several spellings because this is reverse-engineered surface (Q38) and the set is not
+/// contractual — the `queued track metadata` debug line exists to tell us which one the
+/// cloud actually sent. Dropping these in favour of the album alone was a regression: a
+/// queue that used to name the artist started naming the record instead.
+const ARTIST_KEYS: &[&str] = &["artist_name", "artist", "album_artist_name"];
+
+/// Ask Spotify what a track is called. `None` on any failure — a queue row is not worth
+/// failing anything over.
+async fn fetch_track_name(session: &Session, uri: &str) -> Option<castaway_core::QueueItem> {
+    let parsed = librespot_core::SpotifyUri::from_uri(uri).ok()?;
+    let item = AudioItem::get_file(session, parsed).await.ok()?;
+    let mut queued = castaway_core::QueueItem::new(item.name.clone());
+    // Unlike the metadata map, this has real artist names.
+    if let UniqueFields::Track { artists, .. } = &item.unique_fields {
+        let names: Vec<&str> = artists.iter().map(|a| a.name.as_str()).collect();
+        if !names.is_empty() {
+            queued = queued.with_artist(names.join(", "));
+        }
+    }
+    debug!(%uri, title = %item.name, "spotify: resolved a queued track");
+    Some(queued)
 }
 
 /// Turn one `ProvidedTrack` into something worth putting on a wall.
@@ -480,29 +605,16 @@ fn queue_from_cluster(update: &ClusterUpdate) -> Vec<castaway_core::QueueItem> {
 /// Keys are checked in several spellings because this is reverse-engineered surface and
 /// the exact set is not contractual; the URI is the last resort so a queue entry is never
 /// blank.
-fn queue_item(track: &ProvidedTrack) -> castaway_core::QueueItem {
-    let pick = |keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|k| track.metadata.get(*k))
-            .filter(|v| !v.is_empty())
-            .cloned()
-    };
-
-    let title = pick(&["title", "track_title", "name"]).unwrap_or_else(|| {
-        // Better than an empty row: at least it is identifiably *a* track, and the id is
-        // greppable against the log if someone is working out why the name is missing.
+fn fallback_item(track: &ProvidedTrack) -> castaway_core::QueueItem {
+    // Only reached for entries past `RESOLVE_LIMIT`, which the card counts but never
+    // draws. Still better than an empty row: the id is greppable against the log.
+    castaway_core::QueueItem::new(
         track
             .uri
             .rsplit(':')
             .next()
-            .map_or_else(|| "Unknown track".to_owned(), |id| format!("spotify:{id}"))
-    });
-
-    let mut item = castaway_core::QueueItem::new(title);
-    if let Some(artist) = pick(&["artist_name", "artist", "album_artist_name"]) {
-        item = item.with_artist(artist);
-    }
-    item
+            .map_or_else(|| "Unknown track".to_owned(), |id| format!("spotify:{id}")),
+    )
 }
 
 /// Pick the cover worth fetching: the widest one offered.
@@ -690,6 +802,119 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, SpotifyError::Login(_)), "got {err:?}");
+    }
+
+    fn provided(uri: &str, meta: &[(&str, &str)]) -> ProvidedTrack {
+        let mut t = ProvidedTrack::new();
+        t.uri = uri.to_owned();
+        for (k, v) in meta {
+            t.metadata.insert((*k).to_owned(), (*v).to_owned());
+        }
+        t
+    }
+
+    fn cluster_update(state: Option<Vec<ProvidedTrack>>) -> ClusterUpdate {
+        use librespot_protocol::connect::Cluster;
+        use librespot_protocol::player::PlayerState;
+
+        let mut update = ClusterUpdate::new();
+        let mut cluster = Cluster::new();
+        if let Some(tracks) = state {
+            let mut player = PlayerState::new();
+            player.next_tracks = tracks;
+            cluster.player_state = Some(player).into();
+        }
+        update.cluster = Some(cluster).into();
+        update
+    }
+
+    #[test]
+    fn an_update_with_no_player_state_says_nothing_about_the_queue() {
+        // The bug this exists to prevent, observed live: a 24-track queue arrived, then
+        // 27 seconds later an unrelated cluster update blanked the panel. Volume changes
+        // and device-list churn must not be read as "the queue is empty".
+        assert!(queue_tracks(&cluster_update(None)).is_none());
+    }
+
+    #[test]
+    fn a_player_state_with_no_next_tracks_really_is_an_empty_queue() {
+        // The other half: when the state *is* present and says nothing is queued, that is
+        // authoritative and the card should clear.
+        assert_eq!(
+            queue_tracks(&cluster_update(Some(Vec::new()))).map(<[_]>::len),
+            Some(0)
+        );
+    }
+
+    /// The free half of `QueueNames::resolve` — everything that needs no session.
+    fn named(tracks: &[ProvidedTrack]) -> Vec<castaway_core::QueueItem> {
+        tracks
+            .iter()
+            .map(|t| named_from_metadata(t).unwrap_or_else(|| fallback_item(t)))
+            .collect()
+    }
+
+    #[test]
+    fn queued_tracks_keep_their_order_and_their_names() {
+        let update = cluster_update(Some(vec![
+            provided(
+                "spotify:track:aaa",
+                &[("title", "Alkatraz"), ("artist_name", "DEMONDICE")],
+            ),
+            provided("spotify:track:bbb", &[("title", "Second")]),
+        ]));
+        let items = named(queue_tracks(&update).unwrap());
+        assert_eq!(items[0].title, "Alkatraz");
+        assert_eq!(items[0].artist.as_deref(), Some("DEMONDICE"));
+        assert_eq!(items[1].title, "Second");
+        assert_eq!(items[1].artist, None);
+    }
+
+    #[test]
+    fn an_artist_name_is_preferred_over_the_album() {
+        // The regression this exists to catch: a queue that named the artist started
+        // naming the record, because the album became the only second line considered.
+        let track = provided(
+            "spotify:track:ccc",
+            &[
+                ("title", "Alkatraz"),
+                ("album_title", "Cyber Sex Kitten"),
+                ("artist_name", "DEMONDICE"),
+            ],
+        );
+        let item = named_from_metadata(&track).unwrap();
+        assert_eq!(item.artist.as_deref(), Some("DEMONDICE"));
+    }
+
+    #[test]
+    fn the_album_stands_in_when_the_cloud_names_no_artist() {
+        let track = provided(
+            "spotify:track:ddd",
+            &[("title", "Alkatraz"), ("album_title", "Cyber Sex Kitten")],
+        );
+        let item = named_from_metadata(&track).unwrap();
+        assert_eq!(item.artist.as_deref(), Some("Cyber Sex Kitten"));
+    }
+
+    #[test]
+    fn a_track_whose_metadata_has_no_title_still_renders_as_something() {
+        // The keys are reverse-engineered and not contractual (Q38). A blank row would be
+        // indistinguishable from a rendering bug; the id at least identifies the track.
+        let track = provided("spotify:track:1240iIrz36c", &[]);
+        assert!(
+            named_from_metadata(&track).is_none(),
+            "no title means the metadata map cannot name it"
+        );
+        assert_eq!(fallback_item(&track).title, "spotify:1240iIrz36c");
+    }
+
+    #[test]
+    fn a_very_long_queue_is_bounded_before_it_reaches_the_session_bus() {
+        let tracks = (0..200)
+            .map(|i| provided(&format!("spotify:track:{i}"), &[("title", "x")]))
+            .collect();
+        let update = cluster_update(Some(tracks));
+        assert_eq!(queue_tracks(&update).unwrap().len(), UP_NEXT_LIMIT);
     }
 
     #[test]
