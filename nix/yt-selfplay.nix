@@ -290,17 +290,63 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
       return False
 
 
+  def published_screen_id(base):
+      """The screenId the receiver publishes for an already-running app.
+
+      This is the only way a sender that did not launch the app can find the screen —
+      the other route to one is a pairing code, and supplying a pairing code means
+      making a launch. A receiver that never publishes it strands every sender that
+      arrives after the first: the app reads as `running`, the cast connects, and
+      nothing can ever be queued to it."""
+      status, body = http(base.rstrip("/") + "/dial/apps/YouTube")
+      if status != 200:
+          raise SystemExit("GET /dial/apps/YouTube -> {}".format(status))
+      if "<state>running</state>" not in body:
+          raise SystemExit("--reconnect needs the app already running; launch one first")
+      match = re.search(r"<screenId>([^<]+)</screenId>", body)
+      if not match:
+          raise SystemExit(
+              "the running app publishes no <screenId>.\n"
+              "A sender arriving now has no way to attach: it did not launch this app, so it "
+              "holds no pairing code, and the app-info XML offers nothing else. This is the "
+              "connected-but-never-plays failure — the receiver has to publish its screen id.")
+      return match.group(1)
+
+
+  def token_for_screen(screen_id):
+      """A screenId is public; the token to drive it is minted on demand."""
+      status, body = post_form(LOUNGE + "/pairing/get_lounge_token_batch",
+                               {"screen_ids": screen_id})
+      if status != 200:
+          raise SystemExit("get_lounge_token_batch -> {} {}".format(status, body[:200]))
+      screens = json.loads(body).get("screens") or []
+      if not screens or not screens[0].get("loungeToken"):
+          raise SystemExit("no lounge token for screen " + screen_id)
+      return screens[0]["loungeToken"]
+
+
   def main():
-      if len(sys.argv) < 2:
-          raise SystemExit("usage: yt-selfplay <receiver-base-url> [videoId,videoId,...]")
-      base = sys.argv[1]
-      videos = (sys.argv[2] if len(sys.argv) > 2 else DEFAULT_VIDEOS).split(",")
+      argv = sys.argv[1:]
+      reconnect = "--reconnect" in argv
+      argv = [a for a in argv if a != "--reconnect"]
+      if not argv:
+          raise SystemExit(
+              "usage: yt-selfplay [--reconnect] <receiver-base-url> [videoId,videoId,...]")
+      base = argv[0]
+      videos = (argv[1] if len(argv) > 1 else DEFAULT_VIDEOS).split(",")
 
-      pairing_code = str(uuid.uuid4())
-      dial_launch(base, pairing_code)
-      screen = wait_for_screen(pairing_code)
+      if reconnect:
+          # The returning phone: the app is already running, and this sender never
+          # launched it. Everything hangs on the screen id the receiver publishes.
+          screen_id = published_screen_id(base)
+          print("attaching to published screen " + screen_id)
+          token = token_for_screen(screen_id)
+      else:
+          pairing_code = str(uuid.uuid4())
+          dial_launch(base, pairing_code)
+          token = wait_for_screen(pairing_code)["loungeToken"]
 
-      lounge = Lounge(screen["loungeToken"])
+      lounge = Lounge(token)
       lounge.connect()
 
       failed = []
