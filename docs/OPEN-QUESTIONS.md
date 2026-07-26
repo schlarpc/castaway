@@ -362,3 +362,26 @@ the reasons are what a future reversal has to argue against.
   doing as an explicit opt-in ("party mode") rather than a default: the failure mode of
   accidental mixing is that two people's music becomes nobody's, and in a hackerspace the
   person who did not expect it is the one who gets annoyed.
+
+- **Q28 — The now-playing card never updates. OPEN.** It is a single snapshot taken when
+  AVCTP connects, and nothing moves it afterwards. Skip a track and the screen keeps the
+  old one; pause and the state never changes. Confirmed on hardware: one
+  `GET_ELEMENT_ATTRIBUTES` request per session, one `NowPlaying` event, ever.
+  **We register for no AVRCP notifications at all.** `avrcp::register_notification` and
+  `avrcp::get_play_status` are both written and both unused; `pdu::PLAYBACK_STATUS_CHANGED`
+  is defined and never referenced. The adapter's only outbound metadata traffic is that one
+  attribute request. The comment beside it — "ask for metadata straight away rather than
+  waiting for a notification; a track already playing produces no change event" — is
+  justifying a belt-and-braces request alongside a subscription that was never written, so
+  the design was half-finished rather than mis-decided.
+  This is also why `state` reads `Stopped` on a playing stream: nothing populates it, so it
+  is `PlaybackState::default()`. Not a mapping bug — an unasked question. (It happened to
+  be correct in the run that surfaced it, because the phone really was paused, which is a
+  good argument for not trusting a field nobody writes.)
+  The fix is one mechanism for both. `RegisterNotification` answers INTERIM immediately
+  with the current value and CHANGED when it moves, and is one-shot — re-register after
+  each CHANGED. Subscribing to `PLAYBACK_STATUS_CHANGED` therefore yields the true state at
+  connect *and* every transition, and `TRACK_CHANGED` says when to re-request attributes.
+  Worth doing together with the cover-art fetch, which is stubbed at the same call site: we
+  set `CONTROLLER_SUPPORTS_COVER_ART` in the SDP record and then only `debug!` the image
+  handle a peer sends back, so album art is advertised and never fetched.
