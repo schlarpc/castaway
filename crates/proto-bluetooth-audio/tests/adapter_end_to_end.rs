@@ -1509,3 +1509,142 @@ async fn an_sco_request_is_refused_without_disturbing_the_acl_link() {
     })
     .await;
 }
+
+/// The parameter block of a `GetElementAttributes` response, as a Target builds it.
+fn attribute_params(items: &[(u32, &[u8])]) -> BytesMut {
+    let mut attrs = BytesMut::new();
+    attrs.put_u8(u8::try_from(items.len()).unwrap());
+    for (id, value) in items {
+        attrs.put_u32(*id);
+        attrs.put_u16(0x006A); // UTF-8
+        attrs.put_u16(u16::try_from(value.len()).unwrap());
+        attrs.extend_from_slice(value);
+    }
+    attrs
+}
+
+/// One fragment of a vendor-dependent response.
+///
+/// Hand-built rather than going through `vendor_command`, which always writes packet type
+/// 0 (single). The layout is BlueZ's `struct avrcp_header`: three company-id bytes, the
+/// PDU id, the packet type in the low two bits of byte 4, then a big-endian length.
+fn vendor_fragment(pdu_id: u8, packet_type: u8, params: &[u8]) -> Bytes {
+    let mut operands = BytesMut::new();
+    operands.put_u8(0x00);
+    operands.put_u8(0x19);
+    operands.put_u8(0x58); // BT SIG company id
+    operands.put_u8(pdu_id);
+    operands.put_u8(packet_type & 0b11);
+    operands.put_u16(u16::try_from(params.len()).unwrap());
+    operands.extend_from_slice(params);
+    let frame = proto_bluetooth_audio::AvcFrame::panel(
+        proto_bluetooth_audio::Ctype::Stable,
+        0x00, // VENDOR DEPENDENT
+        operands.freeze(),
+    );
+    proto_bluetooth_audio::AvctpMessage::command(0, frame.encode()).encode()
+}
+
+/// The parameter byte of any `REQUEST_CONTINUING_RESPONSE` the adapter has sent.
+fn continuation_requests(transport: &ScriptedTransport) -> Vec<u8> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+        .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+        .filter_map(|frame| proto_bluetooth_audio::VendorPdu::parse(&frame.operands).ok())
+        .filter(|v| v.pdu_id == proto_bluetooth_audio::avrcp::pdu::REQUEST_CONTINUING_RESPONSE)
+        .filter_map(|v| v.parameters.first().copied())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_fragmented_metadata_response_is_reassembled_rather_than_dropped() {
+    // AV/C fixes the packet ceiling at 512 bytes (BlueZ `AVC_MTU`, avctp.h), so a metadata
+    // response fragments on its own terms however large the L2CAP MTU is — a long or CJK
+    // title, or simply all seven text attributes, is enough. Nothing used to read the
+    // packet-type field, so the first fragment was parsed as the whole response, came back
+    // `Truncated`, and was dropped by an `if let Ok(..)`: the card stayed blank for that
+    // track, with nothing at any log level.
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    eventually("the avrcp opening traffic", || {
+        (sent_avrcp_pdus(&transport).len() >= 3).then_some(())
+    })
+    .await;
+
+    let params = attribute_params(&[
+        (
+            proto_bluetooth_audio::avrcp::attribute::TITLE,
+            "整いました".as_bytes(),
+        ),
+        (
+            proto_bluetooth_audio::avrcp::attribute::ARTIST,
+            "DEMONDICE".as_bytes(),
+        ),
+    ]);
+    // Split mid-value, which is what a Target does when the remaining room runs out
+    // partway through an attribute — and the case a naive parser cannot survive.
+    let split = params.len() / 2;
+    let pdu = proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES;
+
+    let before = continuation_requests(&transport).len();
+    push_pdu(
+        &transport,
+        &L2capPdu::new(avctp, vendor_fragment(pdu, 1, &params[..split])),
+    );
+
+    // The peer is holding the rest and will not send it unasked.
+    let asked = eventually("a request for the next fragment", || {
+        let seen = continuation_requests(&transport);
+        (seen.len() > before).then(|| seen[before])
+    })
+    .await;
+    assert_eq!(
+        asked, pdu,
+        "the continuation request names the *original* pdu id, which is what the \
+         Target matches on (BlueZ avrcp_handle_request_continuing)"
+    );
+
+    // The remainder, labelled with the original pdu id — again as BlueZ's Target does
+    // (`pdu->pdu_id = pending->pdu_id`), not with 0x40.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(avctp, vendor_fragment(pdu, 3, &params[split..])),
+    );
+
+    // Ask the adapter back what is playing: its answer is built from the metadata it
+    // just reassembled, so a title here proves the halves were joined *before* parsing.
+    // (Asserting on a `NowPlaying` event instead would need a live audio session, which
+    // this test deliberately does not have — the bug is in the metadata path, not the
+    // media one.)
+    let before = sent_pdus(&transport).len();
+    let request = proto_bluetooth_audio::avrcp::get_element_attributes(
+        &proto_bluetooth_audio::avrcp::attribute::TEXT,
+    );
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            proto_bluetooth_audio::AvctpMessage::command(5, request.encode()).encode(),
+        ),
+    );
+    let answer = eventually("our answer to what is playing", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+            .filter(|msg| msg.cr == CommandResponse::Response)
+            .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+            .find(|frame| frame.ctype == proto_bluetooth_audio::Ctype::Stable)
+    })
+    .await;
+    let vendor = proto_bluetooth_audio::VendorPdu::parse(&answer.operands).unwrap();
+    let parsed =
+        proto_bluetooth_audio::avrcp::parse_element_attributes(&vendor.parameters).unwrap();
+    assert_eq!(
+        parsed.now_playing.title.as_deref(),
+        Some("整いました"),
+        "the halves must be joined before they are parsed"
+    );
+    assert_eq!(parsed.now_playing.artist.as_deref(), Some("DEMONDICE"));
+}

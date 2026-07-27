@@ -40,6 +40,13 @@ use crate::{avdtp, Message};
 /// than silently absorbed, because it means decode is not keeping up.
 const AUDIO_QUEUE_DEPTH: usize = 256;
 
+/// Ceiling on a reassembled AVRCP response.
+///
+/// Generous — a track with cover art, seven text attributes and CJK titles is a few
+/// kilobytes — but finite, because the peer controls how many fragments it sends and an
+/// unbounded buffer keyed on a remote's whim is a buffer a remote can grow forever.
+const MAX_AVRCP_REASSEMBLY: usize = 64 * 1024;
+
 /// Called when a phone pairs, so the caller can persist its link key.
 ///
 /// A callback rather than a path, because this crate must not open files (ground rule
@@ -158,6 +165,12 @@ struct Link {
     /// The handle that lets the panel drive this phone, held until there is a session to
     /// attach it to.
     control: Option<Arc<dyn castaway_core::RemoteControl>>,
+    /// A fragmented AVRCP response being reassembled: the PDU id and what has arrived.
+    ///
+    /// One at a time, because AVRCP allows exactly one continuation in flight per
+    /// direction — the peer holds the remainder keyed by PDU id and hands it over a
+    /// fragment per `REQUEST_CONTINUING_RESPONSE`.
+    avrcp_reassembly: Option<(u8, bytes::BytesMut)>,
     /// Where the peer serves cover art, once its SDP record has told us. Cached for the
     /// life of the link: it does not move between tracks, and asking again per track
     /// would put an SDP round trip in front of every image.
@@ -209,6 +222,7 @@ impl Link {
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
             control: None,
+            avrcp_reassembly: None,
             art_psm: None,
             art_sdp: None,
             art: None,
@@ -929,6 +943,19 @@ impl BluetoothAdapter {
             return Ok(());
         };
 
+        // Reassemble a fragmented *response* before anything reads its parameters.
+        // AV/C fixes the packet ceiling at 512 bytes (BlueZ: `AVC_MTU`, avctp.h) and
+        // AVRCP spends 7 of them on its own header, so a metadata response fragments on
+        // its own terms however large the L2CAP MTU is. Nothing here used to read the
+        // packet-type field, so the first fragment was parsed as the whole response,
+        // failed as truncated, and was dropped in silence — a long or CJK title, or
+        // simply all seven text attributes, left the card blank for that track.
+        let vendor = match self.reassemble(link, cid, &vendor, frame.ctype.is_response(), out) {
+            Some(complete) => complete,
+            // A fragment: absorbed, and a request for the next one is on its way out.
+            None => return Ok(()),
+        };
+
         match vendor.pdu_id {
             avrcp::pdu::GET_CAPABILITIES if is_command => {
                 // "Which events may I subscribe to on your Target?" A phone that asks and
@@ -1064,6 +1091,123 @@ impl BluetoothAdapter {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Fold a fragmented response into a whole one.
+    ///
+    /// Returns `None` while fragments are still outstanding — a continuation request goes
+    /// out instead, because the peer holds the remainder and will not send it unasked.
+    ///
+    /// Two details taken from BlueZ's Target (`profiles/audio/avrcp.c`), since a phone is
+    /// the Target here and its behaviour is what we have to match:
+    ///
+    /// - `avrcp_handle_request_continuing` matches on `pdu->params[0]`, so the request's
+    ///   single parameter is the *original* PDU id, and the fragments that come back are
+    ///   labelled with that id too (`pdu->pdu_id = pending->pdu_id`) — not with 0x40.
+    ///   Keying reassembly on the original id is therefore right.
+    /// - `handle_vendordep_pdu` calls `session_abort_pending_pdu` for any PDU that is not
+    ///   GetElementAttributes or a continuation, so sending anything else mid-exchange
+    ///   makes the Target throw the remainder away. We cannot prevent that, but it is why
+    ///   a `Start` supersedes whatever was in flight rather than being treated as an
+    ///   error: after an abort, the next thing we see is a fresh `Start`.
+    ///
+    /// Commands pass straight through: we never fragment what we send (outbound requests
+    /// are small by construction), so an inbound fragmented *command* is not something
+    /// this direction has to model.
+    fn reassemble(
+        &self,
+        link: &mut Link,
+        cid: Cid,
+        vendor: &avrcp::VendorPdu,
+        is_response: bool,
+        out: &mut Outbox,
+    ) -> Option<avrcp::VendorPdu> {
+        use avrcp::PacketType;
+        // Fragmentation is a property of the AV/C *response*, and the ctype field is what
+        // says which this is — 0x0..=0x7 are command types, 0x8..=0xF response codes. The
+        // AVCTP command/response bit answers a different question (which transaction table
+        // the peer is keeping) and is used for that, above. We never fragment what we
+        // send, so an inbound fragmented command is not a shape this direction models.
+        if !is_response {
+            return Some(vendor.clone());
+        }
+        match vendor.packet_type {
+            PacketType::Single => {
+                // A stray single for a PDU we were reassembling means the peer restarted
+                // the exchange; the partial is worthless.
+                link.avrcp_reassembly = None;
+                Some(vendor.clone())
+            }
+            PacketType::Start | PacketType::Continue => {
+                let buffer = match &mut link.avrcp_reassembly {
+                    // A `Start` supersedes whatever was in flight.
+                    Some((id, _))
+                        if *id != vendor.pdu_id || vendor.packet_type == PacketType::Start =>
+                    {
+                        link.avrcp_reassembly = Some((vendor.pdu_id, bytes::BytesMut::new()));
+                        &mut link.avrcp_reassembly.as_mut()?.1
+                    }
+                    Some((_, buffer)) => buffer,
+                    None => {
+                        link.avrcp_reassembly = Some((vendor.pdu_id, bytes::BytesMut::new()));
+                        &mut link.avrcp_reassembly.as_mut()?.1
+                    }
+                };
+                buffer.extend_from_slice(&vendor.parameters);
+                if buffer.len() > MAX_AVRCP_REASSEMBLY {
+                    // Give up, and *say so* to the peer: a stack that is never told keeps
+                    // the remainder buffered, and some refuse a fresh request for the same
+                    // PDU while one is outstanding — which would break metadata for the
+                    // rest of the session rather than for one track.
+                    warn!(
+                        pdu = vendor.pdu_id,
+                        bytes = buffer.len(),
+                        "avrcp: fragmented response too large; abandoning it"
+                    );
+                    let pdu_id = vendor.pdu_id;
+                    link.avrcp_reassembly = None;
+                    let transaction = link.next_transaction();
+                    out.replies.push((
+                        cid,
+                        avctp_body(transaction, &avrcp::abort_continuing(pdu_id)),
+                    ));
+                    return None;
+                }
+                debug!(
+                    pdu = vendor.pdu_id,
+                    have = buffer.len(),
+                    "avrcp: asking for the next fragment"
+                );
+                let transaction = link.next_transaction();
+                out.replies.push((
+                    cid,
+                    avctp_body(transaction, &avrcp::request_continuing(vendor.pdu_id)),
+                ));
+                None
+            }
+            PacketType::End => {
+                let (id, mut buffer) = link.avrcp_reassembly.take()?;
+                if id != vendor.pdu_id {
+                    debug!(
+                        expected = id,
+                        got = vendor.pdu_id,
+                        "avrcp: end fragment for a different pdu"
+                    );
+                    return None;
+                }
+                buffer.extend_from_slice(&vendor.parameters);
+                debug!(
+                    pdu = id,
+                    bytes = buffer.len(),
+                    "avrcp: response reassembled"
+                );
+                Some(avrcp::VendorPdu {
+                    pdu_id: id,
+                    packet_type: PacketType::Single,
+                    parameters: buffer.freeze(),
+                })
+            }
+        }
     }
 
     /// Ask for the metadata we can currently make use of.

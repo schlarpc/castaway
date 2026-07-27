@@ -28,6 +28,10 @@ pub mod pdu {
     pub const GET_CAPABILITIES: u8 = 0x10;
     /// Read metadata for the current track.
     pub const GET_ELEMENT_ATTRIBUTES: u8 = 0x20;
+    /// Ask for the next fragment of a response.
+    pub const REQUEST_CONTINUING_RESPONSE: u8 = 0x40;
+    /// Abandon a fragmented response, releasing what the peer is holding.
+    pub const ABORT_CONTINUING_RESPONSE: u8 = 0x41;
     /// Read length, position and play state.
     pub const GET_PLAY_STATUS: u8 = 0x30;
     /// Subscribe to a change notification.
@@ -254,12 +258,56 @@ pub fn capabilities_response(parameters: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Where a PDU sits in a fragmented exchange.
+///
+/// Byte 4 of the operands, and it was being skipped entirely — parsed straight past from
+/// the pdu id at 3 to the length at 5..7. A fragmented response was therefore read as if
+/// its *first fragment* were the whole thing, `parse_element_attributes` returned
+/// `Truncated`, and the caller's `if let Ok(..)` dropped it without a word. On any phone
+/// whose metadata does not fit in one PDU — a long title, a CJK one, or simply all seven
+/// text attributes — the now-playing card stayed permanently blank.
+///
+/// AVRCP caps a metadata PDU at 512 bytes regardless of the L2CAP MTU, so this is not
+/// something a bigger MTU avoids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketType {
+    /// The whole PDU is here.
+    Single,
+    /// The first of several; ask for the rest with [`request_continuing`].
+    Start,
+    /// A middle fragment.
+    Continue,
+    /// The last fragment.
+    End,
+}
+
+impl PacketType {
+    /// Decode the two-bit field. Values outside 0..=3 cannot occur — it is masked.
+    #[must_use]
+    const fn from_bits(bits: u8) -> Self {
+        match bits & 0b11 {
+            1 => Self::Start,
+            2 => Self::Continue,
+            3 => Self::End,
+            _ => Self::Single,
+        }
+    }
+
+    /// Whether more fragments are owed after this one.
+    #[must_use]
+    pub const fn expects_more(self) -> bool {
+        matches!(self, Self::Start | Self::Continue)
+    }
+}
+
 /// A parsed vendor-dependent AVRCP PDU.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorPdu {
     /// Which PDU.
     pub pdu_id: u8,
-    /// Its parameters.
+    /// Where this sits in a fragmented exchange.
+    pub packet_type: PacketType,
+    /// Its parameters — this fragment's, if fragmented.
     pub parameters: Bytes,
 }
 
@@ -287,9 +335,29 @@ impl VendorPdu {
         }
         Ok(Self {
             pdu_id: operands[3],
+            packet_type: PacketType::from_bits(operands[4]),
             parameters: Bytes::copy_from_slice(&operands[7..7 + len]),
         })
     }
+}
+
+/// Ask the peer for the next fragment of `pdu_id`'s response.
+///
+/// Without this a fragmented response can only ever be read as its first fragment: the
+/// peer is holding the rest and will not send it unsolicited.
+#[must_use]
+pub fn request_continuing(pdu_id: u8) -> AvcFrame {
+    vendor_command(Ctype::Control, pdu::REQUEST_CONTINUING_RESPONSE, &[pdu_id])
+}
+
+/// Tell the peer to stop holding the rest of `pdu_id`'s response.
+///
+/// Sent when we give up on a reassembly — a peer that is never told keeps the remainder
+/// buffered, and some stacks refuse a *new* request for the same PDU while one is
+/// outstanding, which would leave metadata broken for the rest of the session.
+#[must_use]
+pub fn abort_continuing(pdu_id: u8) -> AvcFrame {
+    vendor_command(Ctype::Control, pdu::ABORT_CONTINUING_RESPONSE, &[pdu_id])
 }
 
 /// Build a `GetElementAttributes` command for the currently playing track.
