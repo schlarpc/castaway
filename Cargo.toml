@@ -20,6 +20,7 @@ members = [
     "crates/substrate-rtsp",
     "crates/crypto-fairplay",
     "crates/crypto-raop",
+    "crates/crypto-playfair",
     "crates/proto-airplay",
     "crates/proto-dial",
     "crates/sponsorblock",
@@ -56,6 +57,7 @@ substrate-rtp = { path = "crates/substrate-rtp" }
 crypto-cast-auth = { path = "crates/crypto-cast-auth" }
 crypto-fairplay = { path = "crates/crypto-fairplay" }
 crypto-raop = { path = "crates/crypto-raop" }
+crypto-playfair = { path = "crates/crypto-playfair" }
 proto-dlna = { path = "crates/proto-dlna" }
 proto-cast = { path = "crates/proto-cast" }
 proto-airplay = { path = "crates/proto-airplay" }

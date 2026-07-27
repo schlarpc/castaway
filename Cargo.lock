@@ -1091,6 +1091,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-playfair"
+version = "0.1.0"
+
+[[package]]
 name = "crypto-raop"
 version = "0.1.0"
 dependencies = [

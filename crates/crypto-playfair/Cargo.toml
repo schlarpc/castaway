@@ -1,0 +1,13 @@
+[package]
+name = "crypto-playfair"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "FairPlay v3 key derivation: the ekey-to-AES unwrap that gates AirPlay mirroring."
+
+[dependencies]
+
+[lints]
+workspace = true
