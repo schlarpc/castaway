@@ -38,6 +38,22 @@ pub struct ControlCapabilities(u16);
 impl ControlCapabilities {
     /// No control at all — the session is playback-only.
     pub const NONE: Self = Self(0);
+
+    /// The raw bits, for storing the set somewhere atomic.
+    ///
+    /// A capability set is not fixed for the life of a session: what a peer supports may
+    /// only be learned after the surface has been published — an AVRCP peer's feature
+    /// bitmask arrives over SDP, which completes after AVCTP does.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// Rebuild from [`Self::bits`].
+    #[must_use]
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
     /// Resume playback ([`ControlTxn::Play`]).
     pub const PLAY: Self = Self(1 << 0);
     /// Pause playback ([`ControlTxn::Pause`]).

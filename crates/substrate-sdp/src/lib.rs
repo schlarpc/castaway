@@ -21,7 +21,7 @@ pub mod record;
 pub mod server;
 pub mod uuid;
 
-pub use client::Query;
+pub use client::{avrcp_feature, Query};
 pub use element::DataElement;
 pub use error::SdpError;
 pub use pdu::{AttributeRange, Continuation, SdpRequest, SdpResponse};

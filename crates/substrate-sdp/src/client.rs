@@ -129,6 +129,34 @@ impl Query {
             r.l2cap_psm_under(attr::ADDITIONAL_PROTOCOL_DESCRIPTOR_LIST, Some(Uuid::OBEX))
         }))
     }
+
+    /// The peer's `SupportedFeatures` bitmask (attribute 0x0311), if it published one.
+    ///
+    /// For an AVRCP record this is what says which *categories* the peer implements, and
+    /// therefore which commands it will not simply reject — see
+    /// [`crate::avrcp_feature`].
+    ///
+    /// # Errors
+    /// [`SdpError`] if the response does not parse as a record list.
+    pub fn supported_features(&self) -> Result<Option<u16>, SdpError> {
+        Ok(self.records()?.iter().find_map(|r| {
+            let raw = r.get(attr::SUPPORTED_FEATURES)?.as_uint()?;
+            u16::try_from(raw).ok()
+        }))
+    }
+}
+
+/// AVRCP `SupportedFeatures` bits, as published in SDP attribute 0x0311.
+///
+/// Only the two category bits matter to us, and they are the two that decide whether a
+/// command is worth sending at all. BlueZ reads the same attribute into `data->features`
+/// and gates on exactly these: "only create player if category 1 is supported"
+/// (`avrcp.c`), and absolute volume on category 2.
+pub mod avrcp_feature {
+    /// Category 1 — Player/Recorder. Transport commands: play, pause, stop, next, prev.
+    pub const CATEGORY_1_PLAYER: u16 = 0x0001;
+    /// Category 2 — Monitor/Amplifier. Volume and mute.
+    pub const CATEGORY_2_AMPLIFIER: u16 = 0x0002;
 }
 
 #[cfg(test)]

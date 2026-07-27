@@ -172,6 +172,9 @@ struct Link {
     /// The handle that lets the panel drive this phone, held until there is a session to
     /// attach it to.
     control: Option<Arc<dyn castaway_core::RemoteControl>>,
+    /// The AVRCP control handle, kept concretely so its capabilities can be narrowed
+    /// when the peer's SDP record turns up.
+    avrcp_control: Option<Arc<AvrcpControl>>,
     /// Media packets this link has failed to depacketize, ever.
     ///
     /// A running count rather than a flag so the log can say whether this is one bad
@@ -235,6 +238,7 @@ impl Link {
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
             control: None,
+            avrcp_control: None,
             media_failures: 0,
             avrcp_reassembly: None,
             art_psm: None,
@@ -586,8 +590,12 @@ impl BluetoothAdapter {
                         // does exist. Dropping it costs the panel every transport control
                         // it has over that phone.
                         let (tx, rx) = mpsc::channel(32);
-                        let control: Arc<dyn castaway_core::RemoteControl> =
-                            Arc::new(AvrcpControl::passthrough(tx));
+                        let avrcp_control = Arc::new(AvrcpControl::passthrough(tx));
+                        // Kept as its own type as well as behind the trait object: the
+                        // peer's feature bitmask arrives later, over SDP, and narrowing
+                        // the set then needs the concrete handle.
+                        link.avrcp_control = Some(Arc::clone(&avrcp_control));
+                        let control: Arc<dyn castaway_core::RemoteControl> = avrcp_control;
                         if link.session_open {
                             let link_sink = sink.with_instance(link.peer.to_string());
                             link_sink
@@ -1433,6 +1441,15 @@ impl BluetoothAdapter {
                 link.art_sdp = None;
                 return;
             }
+        }
+        // The same record carries the peer's `SupportedFeatures`, and the panel should
+        // not offer a button the phone will answer `NOT IMPLEMENTED` to. Architecture
+        // §11.5 always said capabilities come from this bitmask; until now they did not.
+        let features = query.supported_features().ok().flatten();
+        if let Some(control) = &link.avrcp_control {
+            let caps = avrcp::capabilities_from_features(features);
+            debug!(?features, ?caps, "bluetooth: peer avrcp capabilities");
+            control.set_capabilities(caps);
         }
         let psm = query.cover_art_psm().ok().flatten();
         link.art_sdp = None;

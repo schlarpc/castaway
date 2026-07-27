@@ -4,6 +4,9 @@
 //! holds an `Arc<dyn RemoteControl>`; calling `issue()` on it puts AVRCP passthrough
 //! frames on the AVCTP channel, and the phone pauses.
 
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
+
 use castaway_core::{ControlCapabilities, ControlTxn, CoreError, RemoteControl};
 use tokio::sync::mpsc;
 
@@ -17,7 +20,11 @@ use crate::avrcp;
 /// the protocol logic never touches I/O).
 #[derive(Debug, Clone)]
 pub struct AvrcpControl {
-    capabilities: ControlCapabilities,
+    /// Held atomically because it is learned in two stages: AVCTP connects first and the
+    /// surface has to exist by then (a phone can be controlled the moment it is up), but
+    /// the peer's `SupportedFeatures` arrives later over SDP. Narrowing after publication
+    /// is the only order the protocols allow.
+    capabilities: Arc<AtomicU16>,
     frames: mpsc::Sender<AvcFrame>,
 }
 
@@ -27,9 +34,9 @@ impl AvrcpControl {
     /// `capabilities` should come from [`avrcp::capabilities_for_passthrough`], narrowed
     /// by whatever the peer's supported-features bitmask actually claimed.
     #[must_use]
-    pub const fn new(capabilities: ControlCapabilities, frames: mpsc::Sender<AvcFrame>) -> Self {
+    pub fn new(capabilities: ControlCapabilities, frames: mpsc::Sender<AvcFrame>) -> Self {
         Self {
-            capabilities,
+            capabilities: Arc::new(AtomicU16::new(capabilities.bits())),
             frames,
         }
     }
@@ -39,12 +46,22 @@ impl AvrcpControl {
     pub fn passthrough(frames: mpsc::Sender<AvcFrame>) -> Self {
         Self::new(avrcp::capabilities_for_passthrough(), frames)
     }
+
+    /// Narrow (or widen) what the panel may offer, once the peer's SDP record says.
+    ///
+    /// The alternative was to publish nothing until SDP completes, which costs the panel
+    /// every control over a phone whose record we never manage to read — and an
+    /// unreadable record is far commoner than a phone that genuinely controls nothing.
+    pub fn set_capabilities(&self, capabilities: ControlCapabilities) {
+        self.capabilities
+            .store(capabilities.bits(), Ordering::Relaxed);
+    }
 }
 
 #[async_trait::async_trait]
 impl RemoteControl for AvrcpControl {
     fn capabilities(&self) -> ControlCapabilities {
-        self.capabilities
+        ControlCapabilities::from_bits(self.capabilities.load(Ordering::Relaxed))
     }
 
     async fn issue_unchecked(&self, txn: ControlTxn) -> Result<(), CoreError> {

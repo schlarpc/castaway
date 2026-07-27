@@ -153,6 +153,33 @@ pub fn capabilities_for_passthrough() -> ControlCapabilities {
     ControlCapabilities::TRANSPORT | ControlCapabilities::STOP | ControlCapabilities::MUTE
 }
 
+/// What the panel may offer, given what the peer's SDP record says it implements.
+///
+/// The two category bits in `SupportedFeatures` (attribute 0x0311) are what decide
+/// whether a command is worth sending: category 1 is Player/Recorder and carries the
+/// transport keys, category 2 is Monitor/Amplifier and carries volume. BlueZ gates on
+/// exactly these — "only create player if category 1 is supported", and absolute volume
+/// on category 2 — and a phone that never claimed a category answers `NOT IMPLEMENTED`.
+///
+/// `None` for a peer whose record we could not read: assume the usual set rather than
+/// leaving the panel with no buttons at all, since the far commoner reason to see nothing
+/// here is a record we failed to parse, not a phone that genuinely controls nothing.
+#[must_use]
+pub fn capabilities_from_features(features: Option<u16>) -> ControlCapabilities {
+    use substrate_sdp::avrcp_feature;
+    let Some(features) = features else {
+        return capabilities_for_passthrough();
+    };
+    let mut caps = ControlCapabilities::NONE;
+    if features & avrcp_feature::CATEGORY_1_PLAYER != 0 {
+        caps |= ControlCapabilities::TRANSPORT | ControlCapabilities::STOP;
+    }
+    if features & avrcp_feature::CATEGORY_2_AMPLIFIER != 0 {
+        caps |= ControlCapabilities::MUTE;
+    }
+    caps
+}
+
 /// Whether a passthrough operand marks the key as released rather than pressed.
 const RELEASE_BIT: u8 = 0x80;
 
@@ -631,6 +658,57 @@ mod tests {
     use bytes::BufMut;
 
     use super::*;
+
+    #[test]
+    fn the_panel_offers_only_what_the_peer_says_it_implements() {
+        // Architecture §11.5 always said capabilities come from the peer's
+        // `SupportedFeatures` bitmask "so the UI cannot offer a button the phone will
+        // reject". They did not: every phone got the full passthrough set, the button was
+        // pressed, an AV/C `NOT IMPLEMENTED` came back, and nothing in the UI reflected it.
+        //
+        // The two category bits are what BlueZ gates on too — "only create player if
+        // category 1 is supported", and absolute volume on category 2.
+        use substrate_sdp::avrcp_feature::{CATEGORY_1_PLAYER, CATEGORY_2_AMPLIFIER};
+
+        let player_only = capabilities_from_features(Some(CATEGORY_1_PLAYER));
+        assert!(
+            player_only.supports(&ControlTxn::Pause),
+            "category 1 is transport"
+        );
+        assert!(
+            !player_only.supports(&ControlTxn::Mute(true)),
+            "but not volume"
+        );
+
+        let amp_only = capabilities_from_features(Some(CATEGORY_2_AMPLIFIER));
+        assert!(
+            amp_only.supports(&ControlTxn::Mute(true)),
+            "category 2 is volume"
+        );
+        assert!(!amp_only.supports(&ControlTxn::Pause), "but not transport");
+
+        let both = capabilities_from_features(Some(CATEGORY_1_PLAYER | CATEGORY_2_AMPLIFIER));
+        assert!(both.supports(&ControlTxn::Pause));
+        assert!(both.supports(&ControlTxn::Mute(true)));
+
+        // A peer that claims neither category gets no buttons rather than buttons that
+        // do nothing.
+        assert_eq!(
+            capabilities_from_features(Some(0)),
+            ControlCapabilities::NONE
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_leaves_the_panel_usable() {
+        // The commoner reason to have no bitmask is a record we failed to parse, not a
+        // phone that genuinely controls nothing — and a panel with no buttons at all is a
+        // worse answer to that than a button that might be refused.
+        assert_eq!(
+            capabilities_from_features(None),
+            capabilities_for_passthrough()
+        );
+    }
 
     #[test]
     fn the_target_names_the_events_a_phone_may_subscribe_to() {
