@@ -276,24 +276,65 @@ pub fn receiver_status(
 
 /// What the media plane is doing, in the vocabulary a sender's `MEDIA_STATUS` uses.
 ///
-/// The absence of a value — nothing loaded — is modelled as `Option<PlayerState>` at the
-/// call site rather than as an `Idle` variant, because the wire distinguishes them
+/// The absence of a value — nothing *ever* loaded — is modelled as `Option<PlayerState>`
+/// at the call site rather than as a variant, because the wire distinguishes them
 /// structurally: nothing loaded is an *empty* status array, not a status saying idle.
+///
+/// [`Self::Idle`] is a different thing and not the same as that absence: it means an item
+/// was loaded and is over, and it carries *why* — which is the whole of what a sender needs
+/// to advance a queue or to show that a cast failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
     /// Media is loaded and advancing.
     Playing,
     /// Media is loaded and held.
     Paused,
+    /// The item is over, for the reason given.
+    Idle(IdleReason),
 }
 
 impl PlayerState {
     /// The `playerState` string.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Playing => "PLAYING",
             Self::Paused => "PAUSED",
+            Self::Idle(_) => "IDLE",
+        }
+    }
+
+    /// The `idleReason`, present only when idle.
+    #[must_use]
+    pub const fn idle_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Idle(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Why a media session went idle.
+///
+/// The three a receiver produces. `CANCELLED` and `INTERRUPTED` are the sender's own
+/// vocabulary for a stop it asked for and a session another sender took, and neither is
+/// something we conclude on our own — a stop we were told to do is answered where it was
+/// asked for, and preemption is not this item ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleReason {
+    /// The item played to its end.
+    Finished,
+    /// The fetch or the decode failed.
+    Error,
+}
+
+impl IdleReason {
+    /// The `idleReason` string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Finished => "FINISHED",
+            Self::Error => "ERROR",
         }
     }
 }
@@ -314,34 +355,48 @@ pub fn media_status_empty(request_id: i64) -> String {
     .to_string()
 }
 
+/// PAUSE | SEEK | STREAM_VOLUME | STREAM_MUTE.
+///
+/// A *claim*, and one this receiver got wrong for a while: SEEK was advertised here while
+/// `RenderPipeline::control` refused it, so a sender drew a scrubber that did nothing. The
+/// bit set has to track what the pipeline will honour, which is what
+/// `supported_commands_match_what_the_pipeline_honours` holds it to.
+pub const SUPPORTED_MEDIA_COMMANDS: u32 = 15;
+
 /// Build a `MEDIA_STATUS` payload for a loaded media session.
+///
+/// `current_time` is where playback has actually reached. [`None`] means nothing knows yet
+/// — before the first frame, or in a build with no decoder — and is rendered as zero
+/// because the field is not optional on the wire. That is the one place this can still
+/// mislead, and it is bounded: a sender sees it for the length of a fetch.
 #[must_use]
 pub fn media_status(
     request_id: i64,
     media_session_id: i64,
-    player_state: &str,
+    player_state: PlayerState,
+    current_time: Option<std::time::Duration>,
     volume_level: f32,
     muted: bool,
 ) -> String {
+    let mut status = serde_json::json!({
+        "mediaSessionId": media_session_id,
+        "playbackRate": 1,
+        "playerState": player_state.as_str(),
+        "currentTime": current_time.map_or(0.0, |t| t.as_secs_f64()),
+        "supportedMediaCommands": SUPPORTED_MEDIA_COMMANDS,
+        // The session's volume, not a constant: a sender that reads 1.0 back after
+        // setting 0.25 shows a slider that jumps home.
+        "volume": { "level": volume_level, "muted": muted },
+    });
+    // Only when idle, and only then: `idleReason` on a PLAYING status is a field senders
+    // are entitled to read as the item having ended.
+    if let (Some(reason), Some(obj)) = (player_state.idle_reason(), status.as_object_mut()) {
+        obj.insert("idleReason".into(), serde_json::json!(reason));
+    }
     serde_json::json!({
         "type": "MEDIA_STATUS",
         "requestId": request_id,
-        "status": [{
-            "mediaSessionId": media_session_id,
-            "playbackRate": 1,
-            "playerState": player_state,
-            // Always zero, and knowingly so: nothing on the pipeline side reports a
-            // playback position yet, so a sender's scrubber sits at the start for the
-            // whole item. Reporting a made-up position would be worse — the scrubber
-            // would move and mean nothing.
-            "currentTime": 0,
-            // PAUSE | SEEK | STREAM_VOLUME | STREAM_MUTE. This is a claim about what we
-            // answer, so it has to track what `handle_media` and `SET_VOLUME` really do.
-            "supportedMediaCommands": 15,
-            // The session's volume, not a constant: a sender that reads 1.0 back after
-            // setting 0.25 shows a slider that jumps home.
-            "volume": { "level": volume_level, "muted": muted },
-        }],
+        "status": [status],
     })
     .to_string()
 }

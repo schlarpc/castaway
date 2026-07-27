@@ -78,6 +78,12 @@ pub struct CastSession {
     /// so a sender that paused and asked was told playback had resumed, and a sender that
     /// asked before loading anything was told about media that did not exist.
     player_state: Option<messages::PlayerState>,
+    /// Where the pipeline says playback has reached, as of the last time anyone asked.
+    ///
+    /// Pushed in by the actor rather than pulled from here, for the same reason DLNA does
+    /// it: this module is a pure fold over its inputs, and a trait object it called into
+    /// would make every status test depend on a live decoder.
+    position: Option<castaway_core::PlaybackProgress>,
     id_counter: u64,
     auth: Option<Box<dyn DeviceAuthResponder>>,
     /// UDP port the actor pre-bound for mirroring RTP, if mirroring is enabled.
@@ -96,10 +102,75 @@ impl CastSession {
             muted: false,
             media_session_id: 1,
             player_state: None,
+            position: None,
             id_counter: 0,
             auth,
             mirror_port: None,
         }
+    }
+
+    /// Record where the pipeline says playback has reached.
+    ///
+    /// This is the whole of a sender's scrubber. `currentTime` used to be a hardcoded
+    /// zero — knowingly, because nothing on the pipeline side reported a position — so the
+    /// bar sat at the start for the length of every item.
+    pub fn observe_progress(&mut self, progress: Option<castaway_core::PlaybackProgress>) {
+        self.position = progress;
+    }
+
+    /// The pipeline finished with the item, or failed to play it: tell every sender.
+    ///
+    /// Returns the messages to write, which is the point — a Cast sender has no way at all
+    /// to learn what became of the URL it handed us except by being told. Without this the
+    /// status stayed `PLAYING` for the life of the connection, so a sender's queue never
+    /// advanced and a fetch that failed was indistinguishable from a cast that was working.
+    ///
+    /// Broadcast rather than addressed: unsolicited status goes to every sender on the
+    /// connection, and `requestId: 0` is how a sender knows it did not ask for this.
+    pub fn media_ended(&mut self, end: &castaway_core::PlaybackEnd) -> Vec<CastMessage> {
+        // Nothing was loaded, so nothing ended — a decode thread noticing on its own
+        // schedule that it was torn down, after the session it belonged to had gone.
+        if self.player_state.is_none() {
+            return Vec::new();
+        }
+        let reason = if end.is_failure() {
+            messages::IdleReason::Error
+        } else {
+            messages::IdleReason::Finished
+        };
+        self.player_state = Some(messages::PlayerState::Idle(reason));
+        self.position = None;
+        vec![self.media_status_msg(BROADCAST, 0)]
+    }
+
+    /// Apply a transport verb that came from the panel rather than from a sender, and
+    /// return the status that tells every sender about it.
+    ///
+    /// The same reasoning as DLNA's: a finger on the glass and the phone that started the
+    /// cast are two views of one session, and a receiver that moved for one and not the
+    /// other leaves the sender's pause button toggling playback back on.
+    pub fn apply_local_control(&mut self, txn: &ControlTxn) -> Vec<CastMessage> {
+        match txn {
+            ControlTxn::Play => self.player_state = Some(messages::PlayerState::Playing),
+            ControlTxn::Pause => self.player_state = Some(messages::PlayerState::Paused),
+            // Cast's media STOP unloads the item rather than pausing at zero, so the
+            // session goes back to having no media at all — the same thing a sender's own
+            // STOP does.
+            ControlTxn::Stop => {
+                self.player_state = None;
+                self.position = None;
+            }
+            ControlTxn::Volume(level) => self.volume = level.clamp(0.0, 1.0),
+            ControlTxn::Mute(muted) => self.muted = *muted,
+            // A seek moves the position and nothing else; the position is read from the
+            // pipeline, so there is nothing to store.
+            ControlTxn::Seek(_) => {}
+            other => {
+                debug!(?other, "cast: a verb outside the panel's capability set");
+                return Vec::new();
+            }
+        }
+        vec![self.media_status_msg(BROADCAST, 0)]
     }
 
     /// Enable mirroring: the actor pre-binds a UDP socket and passes its `port` so the
@@ -458,7 +529,8 @@ impl CastSession {
             Some(state) => messages::media_status(
                 request_id,
                 self.media_session_id,
-                state.as_str(),
+                state,
+                self.position.map(|p| p.position),
                 self.volume,
                 self.muted,
             ),
@@ -467,6 +539,12 @@ impl CastSession {
         CastMessage::json(source, sender, ns::MEDIA, json)
     }
 }
+
+/// The destination id an unsolicited message is addressed to.
+///
+/// Cast has no per-sender subscription list: a status nobody asked for goes to everybody
+/// on the connection, and `*` is how that is spelled.
+const BROADCAST: &str = "*";
 
 fn auth_err() -> DeviceAuthMessage {
     DeviceAuthMessage {
@@ -730,6 +808,168 @@ mod tests {
         assert_eq!(
             payload(&r.outgoing[0])["status"][0]["playerState"],
             "PAUSED"
+        );
+    }
+
+    /// A sender's scrubber is drawn from `currentTime` and nothing else, and it was a
+    /// hardcoded zero — knowingly, because nothing on the pipeline side reported a position.
+    /// Something does now.
+    #[test]
+    fn the_position_a_sender_draws_its_scrubber_from_is_a_real_one() {
+        let mut s = session();
+        let load = r#"{"type":"LOAD","requestId":1,"media":{"contentId":"http://h/v.mp4"}}"#;
+        s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+            .unwrap();
+
+        s.observe_progress(Some(
+            castaway_core::PlaybackProgress::at(std::time::Duration::from_millis(95_500))
+                .of(std::time::Duration::from_secs(600)),
+        ));
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"GET_STATUS","requestId":2}"#,
+            ))
+            .unwrap();
+        let time = payload(&r.outgoing[0])["status"][0]["currentTime"]
+            .as_f64()
+            .unwrap();
+        assert!((time - 95.5).abs() < 0.01, "currentTime was {time}");
+
+        // Nothing playing is zero rather than absent: the field is not optional on the
+        // wire, and a sender sees this only for the length of a fetch.
+        s.observe_progress(None);
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"GET_STATUS","requestId":3}"#,
+            ))
+            .unwrap();
+        assert_eq!(payload(&r.outgoing[0])["status"][0]["currentTime"], 0.0);
+    }
+
+    /// The gap Cast had and nobody logged: a sender is told `PLAYING` forever, so its queue
+    /// never advances and a URL the box could not fetch is indistinguishable from a cast
+    /// that is working.
+    #[test]
+    fn the_end_of_an_item_is_broadcast_with_the_reason_it_ended() {
+        for (end, want) in [
+            (castaway_core::PlaybackEnd::Finished, "FINISHED"),
+            (
+                castaway_core::PlaybackEnd::Failed("connection refused".into()),
+                "ERROR",
+            ),
+        ] {
+            let mut s = session();
+            let load = r#"{"type":"LOAD","requestId":1,"media":{"contentId":"http://h/v.mp4"}}"#;
+            s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+                .unwrap();
+
+            let out = s.media_ended(&end);
+            assert_eq!(out.len(), 1, "exactly one status, broadcast");
+            // Unsolicited, so it goes to every sender on the connection and carries the
+            // request id a sender reads as "you did not ask for this".
+            assert_eq!(out[0].destination_id, "*");
+            let status = &payload(&out[0])["status"][0];
+            assert_eq!(status["playerState"], "IDLE");
+            assert_eq!(status["idleReason"], want);
+        }
+    }
+
+    /// A decode thread noticing on its own schedule that it was torn down arrives after
+    /// the session it belonged to is gone. Announcing an item that was never loaded would
+    /// have a sender show an error for a cast it never made.
+    #[test]
+    fn an_end_with_nothing_loaded_is_not_announced() {
+        let mut s = session();
+        assert!(s
+            .media_ended(&castaway_core::PlaybackEnd::Finished)
+            .is_empty());
+    }
+
+    /// `supportedMediaCommands` is a claim, and it was a false one: SEEK was advertised
+    /// here while `RenderPipeline::control` refused it, so a sender drew a scrubber that
+    /// did nothing. This holds the bitmask to the capability set the panel is built from,
+    /// which is itself derived from what the pipeline honours.
+    #[test]
+    fn supported_commands_match_what_the_pipeline_honours() {
+        use castaway_core::ControlCapabilities;
+        // PAUSE | SEEK | STREAM_VOLUME | STREAM_MUTE, as Cast numbers them.
+        const PAUSE: u32 = 1;
+        const SEEK: u32 = 1 << 1;
+        const STREAM_VOLUME: u32 = 1 << 2;
+        const STREAM_MUTE: u32 = 1 << 3;
+
+        let caps = crate::control::CastRemote::capabilities();
+        let claimed = messages::SUPPORTED_MEDIA_COMMANDS;
+        for (bit, name, txn) in [
+            (PAUSE, "PAUSE", ControlTxn::Pause),
+            (
+                SEEK,
+                "SEEK",
+                ControlTxn::Seek(std::time::Duration::from_secs(1)),
+            ),
+            (STREAM_VOLUME, "STREAM_VOLUME", ControlTxn::Volume(0.5)),
+            (STREAM_MUTE, "STREAM_MUTE", ControlTxn::Mute(true)),
+        ] {
+            assert_eq!(
+                claimed & bit != 0,
+                ControlCapabilities::supports(caps, &txn),
+                "supportedMediaCommands claims {name} but the pipeline disagrees",
+            );
+        }
+    }
+
+    /// A `LOAD` that says where to start has to start there. Cast senders send this to
+    /// resume, and it was extracted here and then ignored by the pipeline — so resuming a
+    /// film restarted it.
+    #[test]
+    fn a_load_that_names_a_start_position_carries_it_to_the_pipeline() {
+        let mut s = session();
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"LOAD","requestId":1,"currentTime":312.5,
+                    "media":{"contentId":"http://h/film.mp4"}}"#,
+            ))
+            .unwrap();
+        match r.events.first() {
+            Some(SessionEvent::Play { start, .. }) => assert_eq!(
+                *start,
+                Some(std::time::Duration::from_millis(312_500)),
+                "the resume point was dropped"
+            ),
+            other => panic!("expected a play, got {other:?}"),
+        }
+    }
+
+    /// A press on the glass and the phone that started the cast are two views of one
+    /// session. A receiver that moved for one and not the other leaves the sender's pause
+    /// button toggling playback back on.
+    #[test]
+    fn a_control_from_the_panel_is_broadcast_to_the_senders() {
+        let mut s = session();
+        let load = r#"{"type":"LOAD","requestId":1,"media":{"contentId":"http://h/v.mp4"}}"#;
+        s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+            .unwrap();
+
+        let out = s.apply_local_control(&ControlTxn::Pause);
+        assert_eq!(out[0].destination_id, "*");
+        assert_eq!(payload(&out[0])["status"][0]["playerState"], "PAUSED");
+
+        // Cast's STOP unloads rather than pausing at zero, so the status goes back to the
+        // empty array that means "there is no media session here".
+        let out = s.apply_local_control(&ControlTxn::Stop);
+        assert_eq!(
+            payload(&out[0])["status"].as_array().unwrap().len(),
+            0,
+            "a stopped Cast session has no media, not media that is stopped"
         );
     }
 

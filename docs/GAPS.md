@@ -31,9 +31,11 @@ it back by pressing play (G5).
 
 **The DLNA items are closed** (G66, G68–G82), with two named remainders: G77's HEAD probe
 at set time, and the half of G67 that needs a compositor inside a VM. Closing them turned
-up a fourth defect of the family this document is about — G83, a pause that deadlocked the
-thread that asked for it — which had been hiding as a slow test suite rather than as a
-failure. Everything the review found about what is *correct* is in
+up three defects nobody had logged: G83, a pause that deadlocked the thread that asked for
+it and had been hiding as a slow test suite; and G84/G85 in **Cast**, which rides the same
+media-URL path and had the same "told PLAYING forever" gap, plus a seek it advertised and
+refused. G58 fell out with them — one seam answered a position question in two protocols,
+which is what its entry predicted. Everything the review found about what is *correct* is in
 [dlna-conformance.md](dlna-conformance.md), and the eventing section of that file has been
 rewritten: its advice was to refuse `SUBSCRIBE`, and refusing is no longer what we do.
 
@@ -874,13 +876,52 @@ display or the audio device, and two cannot take it back afterwards.
   refuse. Worth doing if someone wants parity with the Spotify strip; not worth doing to
   make the two look the same.
 
-- **G58 — `currentTime` in `MEDIA_STATUS` is always zero. CONFIRMED, not fixed.**
+- ✅ **G58 — `currentTime` in `MEDIA_STATUS` is always zero. CONFIRMED, fixed.**
   Nothing on the pipeline side reports a playback position, so a sender's scrubber sits at
   the start for the whole item and a sender that wants to resume has nothing to resume
   from. Left at zero rather than estimated on purpose: a scrubber that moves and means
   nothing is worse than one that plainly does not move. Fixing it properly means a position
   on the `Pipeline` trait — which the AVRCP side wants too (G26). One gap in two protocols,
   worth doing once.
+
+  Done once, as predicted: `PlaybackReport` was built for G69 and Cast reads the same seam.
+  Not the AVRCP half, and the entry's "two protocols" was one too many — for Bluetooth the
+  *phone* is the player and holds the position, so G26 is a question we ask over AVRCP
+  rather than one we answer from our own clock. Different seam, same symptom.
+
+- ✅ **G84 — A Cast sender is told `PLAYING` forever. CONFIRMED, fixed.** The same defect as
+  G75, in the other protocol where the receiver is the player, and it was in none of the
+  three reviews — `RemoteControl::media_ended` defaults to a no-op, so Cast inherited the
+  old behaviour by saying nothing.
+
+  Consequences identical to DLNA's: a sender's queue never advanced past its first item,
+  and a URL the box could not fetch was indistinguishable at the phone from a cast that was
+  working. Fixed with a broadcast `MEDIA_STATUS` carrying `playerState: IDLE` and an
+  `idleReason` — `FINISHED` or `ERROR`, which is exactly what a sender watches for.
+
+  Reaching the connection took a reverse channel Cast did not have: `CastRemote`, published
+  as a `ControlSurface`. Its shape differs from DLNA's on purpose. DLNA's renderer sits
+  behind a mutex because HTTP handlers arrive on any task; a `CastSession` belongs to one
+  connection, so this *asks the actor* rather than reaching into the session — the session
+  stays single-owner and an unsolicited status cannot interleave with a reply halfway
+  through a frame.
+
+  It also gives the panel a Cast session it can drive, on the same terms as a DLNA one,
+  which was free once the channel existed.
+
+- ✅ **G85 — Cast advertised a seek it refused, and dropped the resume point it was given.
+  CONFIRMED, fixed.** Both were latent, and both stopped being broken as a side effect of
+  G66 rather than by anything done to Cast — which is the argument for testing a claim
+  where it is made.
+
+  `supportedMediaCommands: 15` includes SEEK, under a comment saying the bitmask "has to
+  track what `handle_media` really do[es]". It did not: `session.rs` parsed `SEEK` into a
+  `ControlTxn::Seek` that `RenderPipeline::control` refused, so a sender drew a scrubber
+  that moved and did nothing. This is G78's shape — advertised versus implemented — in a
+  protocol nobody had audited for it, and it is now held to the capability set by a test.
+
+  `LOAD`'s `currentTime` was extracted into `SessionEvent::Play { start }` and then ignored
+  by the pipeline, so a sender resuming a film restarted it.
 
 - **G60 — A scrub drag has no live feedback. CONFIRMED, deliberate for now.**
   The strip seeks on release, so sliding along the bar before lifting picks the target —

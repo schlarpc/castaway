@@ -25,6 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::auth::CastAuthResponder;
+use crate::control::{CastRemote, FromReceiver};
 use crate::error::CastError;
 use crate::rtp_actor::MirrorSocket;
 use crate::session::CastSession;
@@ -224,6 +225,12 @@ pub struct CastReceiver {
     device_id: String,
     identity: TlsIdentity,
     signer: Option<Arc<CastDeviceSigner>>,
+    /// Where playback has reached, for the `currentTime` a sender draws its scrubber from.
+    ///
+    /// Absent in a build with no decoder, which then reports zero — the wire has no slot
+    /// for "unknown", so the honest thing available is the value a sender sees for the
+    /// length of a fetch anyway.
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 }
 
 impl CastReceiver {
@@ -247,7 +254,20 @@ impl CastReceiver {
             device_id: device_id.into(),
             identity,
             signer: None,
+            playback: None,
         })
+    }
+
+    /// Let this receiver ask the pipeline where playback has reached.
+    ///
+    /// Cast is the second protocol in which the receiver *is* the player, so a sender's
+    /// scrubber can only be answered from here. Without it `currentTime` is zero for the
+    /// whole item — which is what it was, knowingly, until the pipeline had a position to
+    /// report at all.
+    #[must_use]
+    pub fn with_playback(mut self, report: Arc<dyn castaway_core::PlaybackReport>) -> Self {
+        self.playback = Some(report);
+        self
     }
 
     /// Answer device-auth challenges with `signer` instead of refusing them. Without a
@@ -303,6 +323,21 @@ impl CastReceiver {
             }
         };
 
+        // The reverse channel. A Cast sender has no way to learn what became of the URL it
+        // handed over except by being told, and the only thing that knows is the pipeline —
+        // which reaches this connection through here. Publishing it also gives the panel a
+        // Cast session it can drive, on the same terms it drives a DLNA one.
+        let (to_actor, from_receiver) = tokio::sync::mpsc::channel(8);
+        if let Err(e) = sink
+            .emit(SessionEvent::ControlSurface(Arc::new(CastRemote::new(
+                to_actor,
+                sink.clone(),
+            ))))
+            .await
+        {
+            debug!(%peer, error = %e, "could not publish the Cast control surface");
+        }
+
         let mut mirror_task: Option<JoinHandle<()>> = None;
         if let Err(e) = self
             .pump(
@@ -312,6 +347,7 @@ impl CastReceiver {
                 peer,
                 &mut rtp,
                 &mut mirror_task,
+                from_receiver,
             )
             .await
         {
@@ -330,6 +366,7 @@ impl CastReceiver {
     }
 
     /// Read frames until the peer closes, folding each through the session.
+    #[allow(clippy::too_many_arguments)]
     async fn pump(
         &self,
         tls: &mut tokio_rustls::server::TlsStream<TcpStream>,
@@ -338,14 +375,29 @@ impl CastReceiver {
         peer: SocketAddr,
         rtp: &mut Option<MirrorSocket>,
         mirror_task: &mut Option<JoinHandle<()>>,
+        mut from_receiver: tokio::sync::mpsc::Receiver<FromReceiver>,
     ) -> Result<(), CastError> {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
         loop {
-            let n = tls
-                .read(&mut chunk)
-                .await
-                .map_err(|e| CastError::Io(e.to_string()))?;
+            // Two sources, one owner. The session is folded from here and nowhere else, so
+            // an unsolicited status and a reply to a sender cannot interleave halfway
+            // through a frame — which is what a shared session behind a mutex would have
+            // to be careful about and this does not.
+            let n = tokio::select! {
+                read = tls.read(&mut chunk) => read.map_err(|e| CastError::Io(e.to_string()))?,
+                Some(request) = from_receiver.recv() => {
+                    let outgoing = match request {
+                        FromReceiver::Ended(end) => {
+                            info!(%peer, %end, "cast: the pipeline finished with the item");
+                            session.media_ended(&end)
+                        }
+                        FromReceiver::Control(txn) => session.apply_local_control(&txn),
+                    };
+                    Self::write_all(tls, &outgoing).await?;
+                    continue;
+                }
+            };
             if n == 0 {
                 return Ok(()); // clean EOF
             }
@@ -359,18 +411,12 @@ impl CastReceiver {
 
             while let Some((msg, consumed)) = framing::try_decode(&buf)? {
                 buf.drain(..consumed);
+                // Where playback has reached, handed to the session as an input so it stays
+                // a pure fold — the same shape `proto-dlna` uses, and what keeps every
+                // status test free of a live decoder.
+                session.observe_progress(self.playback.as_ref().and_then(|p| p.progress()));
                 let reaction = session.handle(&msg)?;
-                for out in &reaction.outgoing {
-                    let bytes = framing::encode(out)?;
-                    tls.write_all(&bytes)
-                        .await
-                        .map_err(|e| CastError::Io(e.to_string()))?;
-                }
-                if !reaction.outgoing.is_empty() {
-                    tls.flush()
-                        .await
-                        .map_err(|e| CastError::Io(e.to_string()))?;
-                }
+                Self::write_all(tls, &reaction.outgoing).await?;
                 for event in reaction.events {
                     let ended = matches!(event, SessionEvent::End);
                     sink.emit(event)
@@ -403,6 +449,23 @@ impl CastReceiver {
                 }
             }
         }
+    }
+
+    /// Frame and write a batch of messages, flushing once at the end.
+    async fn write_all(
+        tls: &mut tokio_rustls::server::TlsStream<TcpStream>,
+        outgoing: &[crate::proto::CastMessage],
+    ) -> Result<(), CastError> {
+        if outgoing.is_empty() {
+            return Ok(());
+        }
+        for out in outgoing {
+            let bytes = framing::encode(out)?;
+            tls.write_all(&bytes)
+                .await
+                .map_err(|e| CastError::Io(e.to_string()))?;
+        }
+        tls.flush().await.map_err(|e| CastError::Io(e.to_string()))
     }
 }
 

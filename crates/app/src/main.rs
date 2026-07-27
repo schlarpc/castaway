@@ -593,8 +593,16 @@ async fn serve(
     // port, and the two can't drift.
     let mut adapter_handles = Vec::new();
     if config.enable.cast {
-        adapter_handles
-            .push(spawn_cast(&config, &mut mdns, event_tx.clone(), shutdown.clone()).await?);
+        adapter_handles.push(
+            spawn_cast(
+                &config,
+                &mut mdns,
+                event_tx.clone(),
+                shutdown.clone(),
+                playback.clone(),
+            )
+            .await?,
+        );
     }
     if config.enable.airplay {
         adapter_handles.push(spawn_airplay(
@@ -689,6 +697,7 @@ async fn spawn_cast(
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let signer = match config
         .cast
@@ -731,6 +740,12 @@ async fn spawn_cast(
     )
     .context("building the CASTv2 receiver")?
     .with_signer(Arc::new(signer));
+    // Cast is the other protocol in which the receiver is the player, so a sender's
+    // scrubber can only be answered from our own clock — the same seam DLNA reads.
+    let receiver = match playback {
+        Some(report) => receiver.with_playback(report),
+        None => receiver,
+    };
 
     advertise_adapter(&receiver, mdns);
     info!("enabled: Google Cast (CASTv2 media-URL LOAD)");
