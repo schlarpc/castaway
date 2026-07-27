@@ -182,7 +182,15 @@ fn main() -> anyhow::Result<()> {
             // `##+js(...)` rules need bodies from. Written to a cache the render
             // processes read, which is how injection reaches the page.
             let list_cache = pipeline::filterlists::CachePaths::default();
-            cef.set_adblock(pipeline::filterlists::load_or_fetch_all(&list_cache));
+            // Whatever is already on disk, or the built-in list — instantly. Fetching
+            // here used to block the main thread for up to ~110 s before CEF even
+            // initialised, while `serve()` was already telling senders the app was
+            // `running`; the refresh thread does it off the startup path and swaps the
+            // engine in behind the shared cell when it lands.
+            cef.set_adblock(
+                pipeline::filterlists::load_cached_only(&list_cache)
+                    .unwrap_or_else(pipeline::cef_adblock::AdBlocker::with_defaults),
+            );
             // The lists change on the order of days and this box stays up for weeks, so
             // re-fetch daily rather than running whatever it booted with until someone
             // restarts it. The renderers notice by the cache changing under them.
@@ -420,10 +428,32 @@ async fn serve(
                 ));
             }
             tokio::spawn(async move {
+                // At most one resolver at a time. Each launch used to spawn one with no
+                // handle, so a relaunch inside the ~60 s budget left the *old* task
+                // polling the *old* pairing code — and whichever finished last won the
+                // slot. A stale writer could overwrite the fresh screen id, or refill a
+                // slot the stop route had just cleared, which reproduces the exact D28
+                // symptom the slot exists to prevent: connected, and unable to queue.
+                let mut resolver: Option<tokio::task::JoinHandle<()>> = None;
                 while let Some(event) = dial_rx.recv().await {
-                    if let proto_dial::DialEvent::Launched(params) = &event {
-                        if let Some(code) = params.pairing_code.clone() {
-                            tokio::spawn(screen::publish_screen_id(code, screen.clone()));
+                    match &event {
+                        proto_dial::DialEvent::Launched(params) => {
+                            if let Some(task) = resolver.take() {
+                                task.abort();
+                            }
+                            if let Some(code) = params.pairing_code.clone() {
+                                resolver = Some(tokio::spawn(screen::publish_screen_id(
+                                    code,
+                                    screen.clone(),
+                                )));
+                            }
+                        }
+                        // The page is going away, so a resolver still hunting for its id
+                        // is hunting for a screen that will not exist.
+                        proto_dial::DialEvent::Stopped => {
+                            if let Some(task) = resolver.take() {
+                                task.abort();
+                            }
                         }
                     }
                     on_dial(event);

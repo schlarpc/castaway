@@ -103,31 +103,54 @@ pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::cef_browser::Share
     }
     std::thread::Builder::new()
         .name("adblock-refresh".into())
-        .spawn(move || loop {
-            std::thread::sleep(REFRESH_INTERVAL);
-            // The counters live on the blocker being replaced, so say where they got to
-            // before they go — otherwise a long-running kiosk silently resets them daily.
-            if let Ok(current) = blocker.read() {
-                info!(
-                    target: "castaway::adblock",
-                    seen = current.seen_count(),
-                    blocked = current.blocked_count(),
-                    "refreshing filter lists"
-                );
-            }
-            let refreshed = load_or_fetch_all(&paths);
-            match blocker.write() {
-                Ok(mut slot) => {
-                    *slot = std::sync::Arc::new(refreshed);
-                    info!(target: "castaway::adblock", "filter lists refreshed");
+        .spawn(move || {
+            // First pass immediately, then daily. The fetch used to happen on the main
+            // thread *before* `cef.initialize()` — 2.7 MB, a 34-module fetch and a QuickJS
+            // evaluation, up to ~110 s of it — while `serve()` was already answering DIAL
+            // with `201 Created` and `<state>running</state>`. A phone could connect, see
+            // `running`, and never be able to queue anything, because the screen-id budget
+            // expired before the browser existed. The engine swaps in behind the shared
+            // cell exactly as the daily refresh does, so starting on the cached (or
+            // built-in) lists costs nothing but a few seconds of weaker blocking.
+            let mut first = true;
+            loop {
+                if !first {
+                    std::thread::sleep(REFRESH_INTERVAL);
                 }
-                Err(e) => warn!(target: "castaway::adblock", error = %e, "could not swap in refreshed lists"),
+                first = false;
+                refresh_once(&paths, &blocker);
             }
         })
         .map_or_else(
             |e| warn!(target: "castaway::adblock", error = %e, "could not start the refresh thread"),
             |_| (),
         );
+}
+
+/// Fetch the lists and swap them in behind the shared cell.
+fn refresh_once(paths: &CachePaths, blocker: &crate::cef_browser::SharedBlocker) {
+    {
+        // The counters live on the blocker being replaced, so say where they got to
+        // before they go — otherwise a long-running kiosk silently resets them daily.
+        if let Ok(current) = blocker.read() {
+            info!(
+                target: "castaway::adblock",
+                seen = current.seen_count(),
+                blocked = current.blocked_count(),
+                "refreshing filter lists"
+            );
+        }
+        let refreshed = load_or_fetch_all(paths);
+        match blocker.write() {
+            Ok(mut slot) => {
+                *slot = std::sync::Arc::new(refreshed);
+                info!(target: "castaway::adblock", "filter lists refreshed");
+            }
+            Err(e) => {
+                warn!(target: "castaway::adblock", error = %e, "could not swap in refreshed lists")
+            }
+        }
+    }
 }
 
 /// The newest modification time across the cached lists, or `None` if none exist.
