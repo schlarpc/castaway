@@ -85,10 +85,25 @@ pub trait ControllerInit: Send + Sync {
     ) -> Result<(), TransportError>;
 }
 
-/// For controllers that need nothing — a correct answer, not a fallback.
+/// Parts that genuinely run from ROM and need no upload.
+///
+/// The distinction this list exists to draw: for a CSR8510, "no firmware" is the right
+/// answer and a silent one is correct. For anything else reaching [`NoInit`], it is a
+/// guess — and on Windows, where nothing else loads firmware, a wrong guess is a radio
+/// that enumerates, answers `HCI_Reset` from its bootloader, and then does nothing at all.
+const ROM_BASED: &[(u16, u16)] = &[
+    (0x0A12, 0x0001), // CSR8510 and the flood of clones
+    (0x0BDA, 0x8771), // handled by the Realtek loader, listed so a fallback is not silent
+];
+
+/// For controllers that need nothing — a correct answer for some parts, a guess for the
+/// rest, and it now says which.
 ///
 /// The CSR8510 and its clones run entirely from ROM. Treating "no firmware" as an error
-/// would refuse a part that works perfectly.
+/// would refuse a part that works perfectly, which is why this is the last entry in
+/// [`registry`] rather than an error. But it used to be *silent* for everything, so
+/// plugging in a MediaTek or Broadcom dongle logged "initialising controller loader=rom"
+/// and produced an inert radio with nothing pointing at the cause.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoInit;
 
@@ -104,10 +119,24 @@ impl ControllerInit for NoInit {
 
     async fn init(
         &self,
-        _id: UsbId,
+        id: UsbId,
         _hci: &dyn HciTransport,
         _firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
+        if !ROM_BASED
+            .iter()
+            .any(|(vendor, product)| *vendor == id.vendor && *product == id.product)
+        {
+            // Loud, because the failure downstream is silent. If this part does need
+            // firmware, everything from here looks fine — it enumerates, it answers
+            // HCI_Reset — and no phone ever connects.
+            tracing::warn!(
+                %id,
+                "no firmware loader for this controller; assuming it runs from ROM. \
+                 If Bluetooth does not work, this is the first thing to doubt — \
+                 supported: Intel AX200/AX201/AX210/AX211, Realtek RTL8761B/BU"
+            );
+        }
         Ok(())
     }
 }

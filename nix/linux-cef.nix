@@ -14,9 +14,29 @@
 #   - LD_LIBRARY_PATH, so the loader finds libcef.so and the Vulkan/Wayland/X11 libraries
 #     that winit and wgpu dlopen. libGL is in there because cefDist's bundled libGLESv2.so
 #     links libGL.so.1; without it CEF's GPU process dies and wgpu's GL probe segfaults.
+#   - CASTAWAY_WIDEVINE_PATH, when the CDM is available, so DRM-gated video plays. Also a
+#     runtime lookup, and also silent when wrong — which is why the Rust side checks for
+#     `manifest.json` rather than trusting the variable.
 { pkgs, craneLib, commonArgs, cefDist }:
 
 let
+  # The Widevine CDM, so DRM-gated YouTube content plays instead of failing silently.
+  #
+  # Unfree and non-redistributable, so this is a `tryEval`: a Nixpkgs without
+  # `allowUnfree` still builds a working receiver, it just cannot play protected streams.
+  # The alternative — a hard dependency — would make the whole package unbuildable for
+  # anyone who has not accepted Google's terms, over a feature most casts never touch.
+  #
+  # nixpkgs lays it out the way Chrome does, so the directory holding `manifest.json` and
+  # `_platform_specific/` is what Chromium's `--widevine-cdm-path` wants.
+  widevine =
+    let
+      attempt = builtins.tryEval (pkgs.widevine-cdm.outPath or null);
+    in
+    if attempt.success && attempt.value != null then
+      "${attempt.value}/share/google/chrome/WidevineCdm"
+    else
+      null;
   # Everything the `cef` feature drags in: it implies `render` and `hwaccel`, so this is
   # the ffmpeg/bindgen set plus CEF's own build tooling.
   cefArgs = {
@@ -61,6 +81,11 @@ let
     pkgs.ffmpeg_7
     pkgs.alsa-lib
   ];
+  # Kept on one line with CEF_PATH rather than on its own continuation: an empty
+  # `optionalString` between two backslash-continued lines leaves a blank line, which ends
+  # the command and turns the next flag into a command of its own.
+  widevineArg =
+    if widevine == null then "" else "--set-default CASTAWAY_WIDEVINE_PATH ${widevine}";
 in
 craneLib.buildPackage (commonArgs // cefArgs // {
   # Its own dependency build: the feature set differs from the default package's, so it
@@ -76,7 +101,7 @@ craneLib.buildPackage (commonArgs // cefArgs // {
   # runs — a subprocess started from an unwrapped path would come up without CEF_PATH.
   postInstall = ''
     wrapProgram $out/bin/castaway \
-      --set-default CEF_PATH ${cefDist} \
+      --set-default CEF_PATH ${cefDist} ${widevineArg} \
       --prefix LD_LIBRARY_PATH : "${runtimeLibs}:${cefDist}"
   '';
 

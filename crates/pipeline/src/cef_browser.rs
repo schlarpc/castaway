@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use cef::rc::Rc as _;
 use cef::{args::Args, *};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::attract::{InsetRect, WidgetSlot};
 use crate::cef_adblock::AdBlocker;
@@ -285,9 +285,54 @@ wrap_app! {
                     Some(&"autoplay-policy".into()),
                     Some(&"no-user-gesture-required".into()),
                 );
+                // Widevine, if this build shipped it. Without a CDM every EME-gated
+                // stream fails, and it fails *quietly* — the page reports an error to its
+                // own console and the panel just does not play, which is indistinguishable
+                // from a network problem. The path comes from the environment rather than
+                // being compiled in because the CDM is an unfree binary: a build that does
+                // not want it simply does not set this, and everything else still works.
+                if let Some(path) = widevine_path() {
+                    info!(target: "castaway::cef", %path, "widevine cdm");
+                    cl.append_switch_with_value(
+                        Some(&"widevine-cdm-path".into()),
+                        Some(&path.as_str().into()),
+                    );
+                } else {
+                    // Said once, at startup, because the alternative is discovering it
+                    // from a leanback console line while standing in front of the panel.
+                    debug!(
+                        target: "castaway::cef",
+                        "no widevine cdm; DRM-protected video will not play"
+                    );
+                }
             }
         }
     }
+}
+
+/// Where this build's Widevine CDM lives, if it has one.
+///
+/// `CASTAWAY_WIDEVINE_PATH` should be the directory holding `manifest.json` and
+/// `_platform_specific/` — the layout Chrome ships and nixpkgs' `widevine-cdm` reproduces
+/// under `share/google/chrome/WidevineCdm`. Set by the packaging wrapper next to
+/// `CEF_PATH`, for the same reason: it is a runtime lookup, not a build-time one.
+fn widevine_path() -> Option<String> {
+    let path = std::env::var("CASTAWAY_WIDEVINE_PATH").ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    // Checked rather than trusted: a stale path silently disables DRM, which is the exact
+    // failure this is meant to remove.
+    if !std::path::Path::new(path).join("manifest.json").is_file() {
+        warn!(
+            target: "castaway::cef",
+            %path,
+            "CASTAWAY_WIDEVINE_PATH has no manifest.json; ignoring it"
+        );
+        return None;
+    }
+    Some(path.to_owned())
 }
 
 // --- RenderHandler: viewport + on_paint ---

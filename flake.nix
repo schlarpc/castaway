@@ -73,7 +73,7 @@
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
         config = {
-          # Two derivations are whitelisted by name rather than flipping `allowUnfree`
+          # Three derivations are whitelisted by name rather than flipping `allowUnfree`
           # wholesale, so anything else unfree still fails the evaluation loudly.
           #
           # - msvc-sysroot: repacks Microsoft's MSVC CRT + Windows SDK, redistributable
@@ -82,8 +82,19 @@
           #   permitted; the vendor licence text just has to travel with the blobs, which
           #   `bluetoothFirmwareFor` copies alongside them. Without this line the failure
           #   surfaces somewhere that looks unrelated (architecture §11.3b).
+          # - widevine-cdm: Google's content-decryption module. Marked non-redistributable,
+          #   so it is fetched and used locally rather than shipped onward — which is what
+          #   a receiver on a wall does anyway. Without it every EME-gated stream fails,
+          #   and fails *quietly*: the page logs to its own console and the panel simply
+          #   does not play, which looks like a network problem. Only the `cef` package
+          #   touches it, and `linux-cef.nix` degrades to no-DRM rather than failing if a
+          #   downstream nixpkgs refuses it.
           allowUnfreePredicate = pkg:
-            builtins.elem (nixpkgs.lib.getName pkg) [ "msvc-sysroot" "linux-firmware" ];
+            builtins.elem (nixpkgs.lib.getName pkg) [
+              "msvc-sysroot"
+              "linux-firmware"
+              "widevine-cdm"
+            ];
         };
       };
 
