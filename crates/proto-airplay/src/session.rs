@@ -9,7 +9,7 @@
 //! them (the transaction shape) is real.
 
 use castaway_core::SessionEvent;
-use crypto_fairplay::{FairPlayError, FairPlaySession, Stage};
+use crypto_fairplay::FairPlaySession;
 use tracing::{debug, warn};
 
 use crate::advert::AirPlayIdentity;
@@ -18,6 +18,9 @@ use crate::info;
 
 /// The binary-plist content type AirPlay uses.
 pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
+
+/// The content type for raw byte bodies — `/fp-setup` replies are not plists.
+pub const OCTET_STREAM_MIME: &str = "application/octet-stream";
 
 /// A response the actor serializes into an RTSP reply.
 #[derive(Debug, Default)]
@@ -130,18 +133,17 @@ impl AirPlaySession {
         Ok(resp)
     }
 
+    /// Answer a `/fp-setup` POST.
+    ///
+    /// Both setup messages are real now, so this no longer guesses which one it is
+    /// holding — the sender's sequence byte says, and `crypto-fairplay` reads it. The
+    /// remaining FairPlay boundary is the `ekey` unwrap, which happens later at `SETUP`
+    /// and not here.
+    ///
+    /// Note the content type: fp-setup bodies are raw bytes, not plists.
     fn fp_setup(&mut self, body: &[u8]) -> AirPlayResponse {
-        let result = match self.fairplay.stage() {
-            Stage::Idle => self.fairplay.setup1(body),
-            Stage::AwaitingSetup2 => self.fairplay.setup2(body),
-            Stage::Complete => Ok(Vec::new()),
-        };
-        match result {
-            Ok(reply) => AirPlayResponse::ok_body(APPLE_PLIST_MIME, reply),
-            Err(FairPlayError::NotImplemented) => {
-                warn!("fp-setup reached the captured-tables boundary (Q1); replying 501");
-                AirPlayResponse::status(501)
-            }
+        match self.fairplay.handle(body) {
+            Ok(reply) => AirPlayResponse::ok_body(OCTET_STREAM_MIME, reply),
             Err(e) => {
                 warn!(error = %e, "fp-setup failed");
                 AirPlayResponse::status(400)
@@ -185,13 +187,29 @@ mod tests {
     }
 
     #[test]
-    fn fp_setup_hits_not_implemented_boundary() {
+    fn fp_setup_answers_the_handshake_rather_than_refusing_it() {
+        // This used to be a 501 on the belief that answering needed captured tables.
+        // It needs a table lookup: byte 14 selects one of four canned 142-byte replies.
         let mut s = session();
-        let mut body = b"FPLY".to_vec();
-        body.push(0x03);
-        body.extend_from_slice(&[0, 0, 0, 0]);
+        let mut body = vec![0u8; 16];
+        body[..4].copy_from_slice(b"FPLY");
+        body[4] = 0x03; // version
+        body[5] = 1; // type
+        body[6] = 1; // sequence: SETUP1
+        body[14] = 2; // mode
         let r = s.handle("POST", "/fp-setup", &body).unwrap();
-        assert_eq!(r.status, 501);
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body.len(), 142);
+        assert_eq!(r.content_type.as_deref(), Some(OCTET_STREAM_MIME));
+    }
+
+    #[test]
+    fn a_malformed_fp_setup_is_a_400_not_a_501() {
+        let mut s = session();
+        let r = s
+            .handle("POST", "/fp-setup", b"not-fairplay-at-all")
+            .unwrap();
+        assert_eq!(r.status, 400);
     }
 
     #[test]

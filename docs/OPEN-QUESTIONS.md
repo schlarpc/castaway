@@ -5,11 +5,28 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Fixtures / reverse engineering (needs captures we do not have yet)
 
-- **Q1 — FairPlay-SAP byte captures.** The AirPlay `/fp-setup` v3 handshake (~568-byte
-  flow) needs real captures from `airplay2-receiver`/UxPlay against a live iOS sender.
-  I've modeled the message *shape* and stubbed the crypto module boundary. Default:
-  `crypto-fairplay` exposes the handshake state machine + typed messages but returns a
-  `NotImplemented` error at the actual key-derivation step until we land a fixture.
+- **Q1 — FairPlay-SAP. Mostly answered, and the remaining part is a licence decision,
+  not a capture.** The premise was wrong in two directions.
+
+  "The ~568-byte flow" is not a message size: it is exactly `4 × 142`, the four canned
+  `/fp-setup` SETUP1 replies. They are published, byte-identical across UxPlay,
+  shairport-sync, pyatv, airplay2-receiver and RPiPlay, and are now **implemented** —
+  along with SETUP2, which turns out to be a 12-byte header plus a verbatim echo of the
+  request's last 20 bytes and contains no cryptography whatsoever. `/fp-setup` answers
+  correctly today rather than returning `501`.
+
+  What is left is one function: unwrapping the 72-byte `ekey` into the 16-byte AES key
+  (`FairPlaySession::decrypt_ekey`). That needs the OmgHax table set (~99 KiB) plus
+  ~1200 lines of algorithm. **It does not need a capture** — airplay2-receiver publishes
+  20 complete `(key message, ekey, expected key)` vectors, so a from-scratch port is
+  verifiable with no hardware at all.
+
+  It needs a *decision*: the tables are extracted Apple constants, UxPlay's own README
+  declines to defend their status, and separately the C and Python sources are GPL while
+  castaway is MIT. `docs/airplay-research.md` §5.3 lays out both halves.
+
+  This gates **mirroring only**. AirPlay 1 audio — the current target — never touches
+  FairPlay; its key arrives RSA-wrapped in the `ANNOUNCE` SDP.
 - **Q2 — Cast device-auth cert material. Still open, and now the *only* thing open.**
   `crypto-cast-auth` needs a real device cert + key to sign the CASTv2 `AuthChallenge`.
   At n=1 this is "a fixed local input" (per hackerspace notes).

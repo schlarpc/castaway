@@ -485,10 +485,13 @@ Line references are to the tree at the time of writing.
 
 Recorded rather than resolved.
 
-- **UxPlay's current bit-27 default.** One pass read `lib/dnssdint.h:33` as shipping bit 27
-  *off* since 1.65 (with README support); another read `uxplay.cpp:2019` as having it back
-  *on*. This matters because bit 27 changes the media key derivation (§4.3), so it must be
-  settled by reading the tree before implementing, not inferred.
+- ~~**UxPlay's current bit-27 default.**~~ **Settled by reading the tree.** At
+  `acfb549` (2026-07-20), `lib/dnssdint.h:32-33` ships `FEATURES_1 "0x5A7FFEE6"` — bit 27
+  **ON** — with `0x527FFEE6` present but commented out, and `uxplay.cpp:1984` documents
+  the default as `0x5A7FFEE6`. So the pairing-bypass is a real, README-documented option
+  that UxPlay does *not* take by default. Anyone reaching for it should note that bit 27
+  also changes the media key derivation (§4.3), and that the off-path is therefore less
+  continuously exercised than the on-path.
 - **Feature-bit names for 26/30/38/48** (§4.2). Positions are evidence; names are folklore.
 - **iOS 18+ behaviour.** shairport-sync issue #1866 (iOS 18 beta connect failure) was closed
   "not planned" with no published root cause. Community reports of iOS 26 degrading mirroring
