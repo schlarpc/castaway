@@ -19,7 +19,7 @@ use substrate_ssdp::SsdpDevice;
 
 use crate::error::DialError;
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 
 /// The DIAL service type senders search for.
 pub const DIAL_SERVICE_TYPE: &str = "urn:dial-multiscreen-org:service:dial:1";
@@ -159,6 +159,11 @@ struct DialInner {
 }
 
 /// The DIAL service. Exposes a [`Router`] to merge and an [`SsdpDevice`] to advertise.
+///
+/// Cheap to clone — everything is behind one `Arc` — so the routes, the advertisement and
+/// anything that needs to change the app state (the browser giving up on a page, say) can
+/// each hold one.
+#[derive(Clone)]
 pub struct DialService {
     inner: Arc<DialInner>,
 }
@@ -184,6 +189,25 @@ impl DialService {
                 screen: ScreenSlot::default(),
                 uuid: uuid.into(),
             }),
+        }
+    }
+
+    /// Mark the app as stopped without a sender having asked.
+    ///
+    /// For the case where the *page* died rather than the cast ending: a crashed
+    /// renderer that we could not recover leaves nothing on screen, and continuing to
+    /// answer `<state>running</state>` with a published screen id invites senders to
+    /// attach to something that is not there. That is the half of a browser crash a
+    /// phone can see.
+    ///
+    /// Does not emit [`DialEvent::Stopped`]: the caller is the thing that gave up, so
+    /// telling it to dismiss a surface it has already dismissed would be a loop.
+    pub async fn abandoned(&self) {
+        let mut state = self.inner.state.lock().await;
+        if *state == AppState::Running {
+            *state = AppState::Stopped;
+            self.inner.screen.clear().await;
+            warn!("DIAL: the launched page is gone; no longer advertising it as running");
         }
     }
 

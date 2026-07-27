@@ -473,6 +473,7 @@ fn adblock_type(rt: ResourceType) -> &'static str {
 #[derive(Clone)]
 struct RequestInner {
     resource_handler: ResourceRequestHandler,
+    health: std::sync::Arc<BrowserHealth>,
 }
 
 wrap_request_handler! {
@@ -480,6 +481,26 @@ wrap_request_handler! {
         inner: RequestInner,
     }
     impl RequestHandler {
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            // The whole reason this handler exists. Without it a dead renderer left the
+            // last painted frame frozen on the panel — indistinguishable from a paused
+            // video — while DIAL still said `running`.
+            tracing::error!(
+                target: "castaway::cef",
+                status = ?status,
+                error_code,
+                detail = %error_string.map(ToString::to_string).unwrap_or_default(),
+                "the render process died"
+            );
+            self.inner.health.note_crash();
+        }
+
         fn resource_request_handler(
             &self,
             _browser: Option<&mut Browser>,
@@ -522,13 +543,122 @@ wrap_display_handler! {
     }
 }
 
-// --- Client: hands CEF our render + request + display handlers ---
+// --- LoadHandler + renderer-death: the browser's own supervision ---
+
+/// What the browser has told us about its health since the host last looked.
+///
+/// Set from CEF's callbacks (browser process, on the CEF thread) and read by
+/// [`BrowserHost::pump`] on the kiosk main thread, so these are atomics rather than a
+/// lock: the pump runs once per redraw and must never block on a handler.
+///
+/// The failure this exists to catch is entirely silent. A sad-tab renderer crash leaves
+/// the *last painted frame* on the panel at z=5 — a still image of a working YouTube page
+/// — while DIAL goes on reporting `running` and the screen id stays published. Nobody in
+/// the room can tell that from a video that is merely paused.
+#[derive(Debug, Default)]
+pub struct BrowserHealth {
+    /// The render process died. Whatever is on screen is a frozen corpse.
+    crashed: std::sync::atomic::AtomicBool,
+    /// The main frame failed to load.
+    load_failed: std::sync::atomic::AtomicBool,
+}
+
+impl BrowserHealth {
+    fn note_crash(&self) {
+        self.crashed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn note_load_failure(&self) {
+        self.load_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A load completed, so whatever went wrong before is over.
+    fn note_healthy(&self) {
+        self.load_failed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.crashed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Take the pending complaint, if there is one.
+    fn take_fault(&self) -> Option<BrowserFault> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.crashed.swap(false, SeqCst) {
+            self.load_failed.store(false, SeqCst);
+            return Some(BrowserFault::RendererGone);
+        }
+        if self.load_failed.swap(false, SeqCst) {
+            return Some(BrowserFault::LoadFailed);
+        }
+        None
+    }
+}
+
+/// Why the browser needs attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserFault {
+    /// The render process died: sad tab, OOM kill, or `chrome://crash`.
+    RendererGone,
+    /// The main frame would not load: DNS down at boot, a captive portal, a deploy that
+    /// breaks under our pinned TV user agent.
+    LoadFailed,
+}
+
+wrap_load_handler! {
+    struct LoadHandlerBuilder {
+        health: std::sync::Arc<BrowserHealth>,
+    }
+    impl LoadHandler {
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            // Subframes fail all the time on a page like YouTube's — an ad iframe we
+            // blocked is a *success* by our lights. Only the main frame means the page
+            // is not there. `ABORTED` is not a failure either: it is what a navigation
+            // that replaced another one reports, so every `Navigate` produces one.
+            let main_frame = frame.as_ref().is_none_or(|f| f.is_main() != 0);
+            if !main_frame || error_code == Errorcode::ABORTED {
+                return;
+            }
+            tracing::warn!(
+                target: "castaway::cef",
+                code = ?error_code,
+                url = %failed_url.map(ToString::to_string).unwrap_or_default(),
+                "{}",
+                error_text.map(ToString::to_string).unwrap_or_default()
+            );
+            self.health.note_load_failure();
+        }
+
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            http_status_code: ::std::os::raw::c_int,
+        ) {
+            if frame.as_ref().is_none_or(|f| f.is_main() != 0) {
+                debug!(target: "castaway::cef", status = http_status_code, "page loaded");
+                self.health.note_healthy();
+            }
+        }
+    }
+}
+
+// --- Client: hands CEF our render + request + display + load handlers ---
 
 #[derive(Clone)]
 struct ClientInner {
     render_handler: RenderHandler,
     request_handler: RequestHandler,
     display_handler: DisplayHandler,
+    load_handler: LoadHandler,
 }
 
 wrap_client! {
@@ -544,6 +674,9 @@ wrap_client! {
         }
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(self.inner.display_handler.clone())
+        }
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(self.inner.load_handler.clone())
         }
     }
 }
@@ -675,6 +808,7 @@ impl Cef {
         width: u32,
         height: u32,
         sink: CefFrameSink,
+        health: std::sync::Arc<BrowserHealth>,
     ) -> Result<CefBrowser, PipelineError> {
         let size = ViewSize {
             dims: Arc::new(Mutex::new((width, height))),
@@ -686,12 +820,17 @@ impl Cef {
         let resource_handler = ResourceRequestHandlerBuilder::new(ResourceInner {
             adblock: self.adblock.clone(),
         });
-        let request_handler = RequestHandlerBuilder::new(RequestInner { resource_handler });
+        let request_handler = RequestHandlerBuilder::new(RequestInner {
+            resource_handler,
+            health: std::sync::Arc::clone(&health),
+        });
         let display_handler = DisplayHandlerBuilder::new();
+        let load_handler = LoadHandlerBuilder::new(health);
         let mut client = ClientBuilder::new(ClientInner {
             render_handler,
             request_handler,
             display_handler,
+            load_handler,
         });
 
         let window_info = WindowInfo {
@@ -890,7 +1029,33 @@ pub struct BrowserHost {
     widget_started: bool,
     /// Primary mouse button held (so moves carry the drag modifier).
     left_down: bool,
+    /// What the handlers have reported about the page.
+    health: std::sync::Arc<BrowserHealth>,
+    /// The URL the browser is meant to be showing, so a crash can be recovered from.
+    current_url: Option<String>,
+    /// Consecutive recovery attempts without a successful load in between.
+    recovery_attempts: u32,
+    /// When the next recovery attempt is due, so a page that fails instantly does not
+    /// spin the retry budget away in one frame at 60 Hz.
+    retry_at: Option<std::time::Instant>,
+    /// Called when recovery is abandoned, so the app can stop telling senders the app is
+    /// running. `None` in tests and in builds that do not care.
+    gave_up: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// How many times to rebuild a page before concluding the problem is not transient.
+///
+/// A renderer crash usually is transient — a sad tab on one page reloads fine. A page
+/// that crashes its renderer three times running is a page we should stop putting on the
+/// wall, because the fourth attempt is the same crash and the panel spends its life
+/// flickering through it.
+const RECOVERY_ATTEMPTS: u32 = 3;
+
+/// Wait before a recovery attempt.
+///
+/// Not zero: a load that fails instantly (no DNS at boot, captive portal) would otherwise
+/// burn the whole budget inside one second, before the network had any chance to come up.
+const RECOVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl BrowserHost {
     /// Wrap an initialized [`Cef`]. `commands` is the channel other threads use to
@@ -907,7 +1072,23 @@ impl BrowserHost {
             widget: None,
             widget_started: false,
             left_down: false,
+            health: std::sync::Arc::new(BrowserHealth::default()),
+            current_url: None,
+            recovery_attempts: 0,
+            retry_at: None,
+            gave_up: None,
         }
+    }
+
+    /// Register what to do when the browser cannot be recovered.
+    ///
+    /// The app uses this to stop DIAL reporting `running` and to clear the published
+    /// screen id. Without it a dead page keeps advertising itself as a live cast target,
+    /// which is the half of the crash that senders can see.
+    #[must_use]
+    pub fn on_recovery_failed(mut self, f: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.gave_up = Some(f);
+        self
     }
 
     /// Paint `url` into the attract scene's reserved card while nothing is casting — a
@@ -947,20 +1128,12 @@ impl BrowserHost {
                 BrowserCommand::Navigate(url) => {
                     self.show(render, &url, BrowserRole::Fullscreen);
                 }
-                BrowserCommand::Hide => match self.widget.clone() {
-                    // Back to the idle widget rather than a hole in the attract card. The
-                    // browser is already warm, so it's a navigation, not a re-create.
-                    Some(url) => self.show(render, &url, BrowserRole::AttractWidget),
-                    None => {
-                        if let Some(browser) = self.browser.take() {
-                            browser.close();
-                        }
-                        self.sink.clear();
-                        render.clear_browser();
-                    }
-                },
+                // Back to the idle widget rather than a hole in the attract card. The
+                // browser is already warm, so it's a navigation, not a re-create.
+                BrowserCommand::Hide => self.hide(render),
             }
         }
+        self.recover(render);
         self.cef.pump();
         if self.browser.is_some() {
             let view = self.role.view(self.size);
@@ -969,6 +1142,93 @@ impl BrowserHost {
             });
             if let Some(Err(e)) = uploaded {
                 tracing::warn!(error = %e, "browser frame upload failed");
+            }
+        }
+    }
+
+    /// Put the page back if it died, or give up loudly.
+    ///
+    /// The failure being recovered from is invisible without this: a dead render process
+    /// leaves the last painted frame on screen at z=5 — a still of a working page — while
+    /// DIAL goes on reporting `running`. Nobody in the room can tell that from a paused
+    /// video, and nothing retried, so the panel stayed that way until someone restarted
+    /// the receiver.
+    fn recover(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        if let Some(fault) = self.health.take_fault() {
+            self.recovery_attempts += 1;
+            if self.recovery_attempts > RECOVERY_ATTEMPTS {
+                tracing::error!(
+                    target: "castaway::cef",
+                    ?fault,
+                    attempts = self.recovery_attempts - 1,
+                    url = %self.current_url.clone().unwrap_or_default(),
+                    "giving up on the page; returning the panel to the idle screen"
+                );
+                self.retry_at = None;
+                self.recovery_attempts = 0;
+                // Hand the screen back rather than leaving a corpse on it, and tell
+                // whoever is advertising this page that it is not there any more.
+                //
+                // Unless the page we gave up on *is* the idle widget: falling back to it
+                // would be navigating straight back to the thing that just crashed three
+                // times, and the panel would spend its life cycling through it. A blank
+                // screen is the honest outcome there.
+                if self.current_url.as_deref() == self.widget.as_deref() {
+                    tracing::error!(
+                        target: "castaway::cef",
+                        "the idle widget is what failed; leaving the browser layer empty"
+                    );
+                    if let Some(browser) = self.browser.take() {
+                        browser.close();
+                    }
+                    self.current_url = None;
+                    self.sink.clear();
+                    render.clear_browser();
+                } else {
+                    self.hide(render);
+                }
+                if let Some(gave_up) = self.gave_up.clone() {
+                    gave_up();
+                }
+                return;
+            }
+            tracing::warn!(
+                target: "castaway::cef",
+                ?fault,
+                attempt = self.recovery_attempts,
+                retry_in = ?RECOVERY_DELAY,
+                "recovering the browser"
+            );
+            self.retry_at = Some(std::time::Instant::now() + RECOVERY_DELAY);
+        }
+
+        let Some(due) = self.retry_at else { return };
+        if std::time::Instant::now() < due {
+            return;
+        }
+        self.retry_at = None;
+        let Some(url) = self.current_url.clone() else {
+            return;
+        };
+        let role = self.role;
+        // Re-navigating is enough for a renderer crash: CEF keeps the browser object and
+        // spawns a new render process for the load. If the browser object itself is gone,
+        // `show` recreates it.
+        tracing::info!(target: "castaway::cef", %url, "reloading after a fault");
+        self.show(render, &url, role);
+    }
+
+    /// Give the panel back: the idle widget if there is one, otherwise nothing at all.
+    fn hide(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        match self.widget.clone() {
+            Some(url) => self.show(render, &url, BrowserRole::AttractWidget),
+            None => {
+                if let Some(browser) = self.browser.take() {
+                    browser.close();
+                }
+                self.current_url = None;
+                self.sink.clear();
+                render.clear_browser();
             }
         }
     }
@@ -989,15 +1249,25 @@ impl BrowserHost {
             render.clear_browser();
         }
         self.role = role;
+        // A deliberate navigation is a fresh start: whatever was failing before is no
+        // longer the page we are on, so it should not spend this page's retry budget.
+        if self.current_url.as_deref() != Some(url) {
+            self.recovery_attempts = 0;
+            self.retry_at = None;
+        }
+        self.current_url = Some(url.to_string());
         match &self.browser {
             Some(browser) => {
                 browser.resize(rect.width, rect.height);
                 browser.load_url(url);
             }
-            None => match self
-                .cef
-                .create_offscreen(url, rect.width, rect.height, self.sink.clone())
-            {
+            None => match self.cef.create_offscreen(
+                url,
+                rect.width,
+                rect.height,
+                self.sink.clone(),
+                std::sync::Arc::clone(&self.health),
+            ) {
                 Ok(browser) => self.browser = Some(browser),
                 Err(e) => tracing::warn!(error = %e, %url, "browser create failed"),
             },
@@ -1247,5 +1517,42 @@ mod tests {
         );
         // latest() still serves the accumulated frame after a consume.
         assert_eq!(sink.latest().map(|f| f.bgra), Some(frame(2, 2, 1)));
+    }
+
+    #[test]
+    fn a_crash_outranks_a_load_failure_and_each_is_reported_once() {
+        // The two faults arrive from different CEF callbacks and can overlap: a renderer
+        // that dies mid-load reports both. A dead renderer is the more serious of the two
+        // and subsumes the other — reporting the load failure as well would spend a
+        // recovery attempt on a page that has no process to load into.
+        let health = BrowserHealth::default();
+        assert_eq!(
+            health.take_fault(),
+            None,
+            "a healthy browser complains about nothing"
+        );
+
+        health.note_load_failure();
+        health.note_crash();
+        assert_eq!(health.take_fault(), Some(BrowserFault::RendererGone));
+        assert_eq!(
+            health.take_fault(),
+            None,
+            "the load failure must not be reported a second time behind the crash"
+        );
+
+        health.note_load_failure();
+        assert_eq!(health.take_fault(), Some(BrowserFault::LoadFailed));
+        assert_eq!(health.take_fault(), None, "faults are taken, not left set");
+    }
+
+    #[test]
+    fn a_successful_load_clears_whatever_went_wrong_before() {
+        // Otherwise a page that failed once and then loaded would still burn a recovery
+        // attempt, and three transient failures over a week would retire a working page.
+        let health = BrowserHealth::default();
+        health.note_crash();
+        health.note_healthy();
+        assert_eq!(health.take_fault(), None);
     }
 }

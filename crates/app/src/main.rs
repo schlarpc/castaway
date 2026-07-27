@@ -100,6 +100,12 @@ fn main() -> anyhow::Result<()> {
         Duration::from_secs(6),
     );
 
+    // The browser lives on the main thread and DIAL lives on the runtime, so a page that
+    // has given up tells DIAL over a channel rather than holding it. Only the `cef` build
+    // has a browser to give up.
+    #[cfg_attr(not(feature = "cef"), allow(unused_variables))]
+    let (abandoned_tx, abandoned_rx) = mpsc::unbounded_channel::<()>();
+
     #[cfg(feature = "render")]
     {
         use pipeline::{OsdController, RenderPipeline};
@@ -164,6 +170,7 @@ fn main() -> anyhow::Result<()> {
                 serve_osd,
                 on_dial,
                 shot,
+                abandoned_rx,
             )
             .await
             {
@@ -198,6 +205,16 @@ fn main() -> anyhow::Result<()> {
             cef.initialize()
                 .map_err(|e| anyhow::anyhow!("cef initialize: {e}"))?;
             let host = pipeline::BrowserHost::new(cef, nav_rx);
+            // If the page dies and will not come back, stop telling senders it is there.
+            // A crashed renderer we could not recover leaves nothing on screen, and DIAL
+            // answering `running` with a published screen id invites a phone to attach to
+            // it — which is the half of a browser crash a sender can actually see.
+            let host = {
+                let tx = abandoned_tx.clone();
+                host.on_recovery_failed(Arc::new(move || {
+                    let _ = tx.send(());
+                }))
+            };
             // The same browser does double duty: a live widget in the idle screen's card
             // until a cast takes it fullscreen, then back to the widget on DIAL stop.
             match &config.attract_widget_url {
@@ -246,7 +263,15 @@ fn main() -> anyhow::Result<()> {
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
         // Headless: no renderer at all, so certainly no browser to launch YouTube in.
         let on_dial: Option<NoLauncher> = None;
-        runtime.block_on(serve(config, event_tx, shutdown, osd, on_dial, None))?;
+        runtime.block_on(serve(
+            config,
+            event_tx,
+            shutdown,
+            osd,
+            on_dial,
+            None,
+            abandoned_rx,
+        ))?;
     }
 
     Ok(())
@@ -335,6 +360,8 @@ async fn serve(
     osd: castaway_core::OsdSink,
     on_dial: Option<impl Fn(proto_dial::DialEvent) + Send + 'static>,
     screenshot: Option<Screenshot>,
+    // Signalled when the kiosk browser has given up on the launched page.
+    mut abandoned: mpsc::UnboundedReceiver<()>,
 ) -> anyhow::Result<()> {
     let iface = config.resolved_interface();
     info!(
@@ -426,6 +453,17 @@ async fn serve(
                     screen.clone(),
                     osd.clone(),
                 ));
+            }
+            // A page that crashed past recovery is not running, whatever DIAL last said.
+            // Left saying `running` with a screen id published, it invites a phone to
+            // attach to a surface that no longer exists.
+            {
+                let dial = dial.clone();
+                tokio::spawn(async move {
+                    while abandoned.recv().await.is_some() {
+                        dial.abandoned().await;
+                    }
+                });
             }
             tokio::spawn(async move {
                 // At most one resolver at a time. Each launch used to spawn one with no

@@ -70,7 +70,13 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     let sink = CefFrameSink::default();
-    let _browser = match cef.create_offscreen(&url, card.width, card.height, sink.clone()) {
+    let _browser = match cef.create_offscreen(
+        &url,
+        card.width,
+        card.height,
+        sink.clone(),
+        std::sync::Arc::default(),
+    ) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("create browser failed: {e}");
