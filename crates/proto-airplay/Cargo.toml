@@ -21,7 +21,7 @@ aes.workspace = true
 cbc.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync", "time"] }
 
 [dev-dependencies]
 # The SDP tests wrap a session key the way a sender does, so the unwrap is exercised

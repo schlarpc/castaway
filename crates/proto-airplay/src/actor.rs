@@ -32,10 +32,11 @@ use tracing::{debug, info, warn};
 
 use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
 use crate::audio::{AudioOutput, AudioStream};
+use crate::clock::{NtpTime, ResendTracker, TimingClient};
 use crate::error::AirPlayError;
 use crate::sdp::RaopCodec;
 use crate::session::{AirPlayRequest, AirPlaySession};
-use crate::transport::ReceiverPorts;
+use crate::transport::{ReceiverPorts, SenderPorts};
 
 /// Cap on a single buffered RTSP message. `/fp-setup` and plist bodies are a few KiB;
 /// `Content-Length` is attacker-controlled, so it gets a bound rather than a buffer that
@@ -446,7 +447,18 @@ async fn run_audio(
     mut stream: AudioStream,
     frames: mpsc::Sender<EncodedFrame>,
     peer_ip: IpAddr,
+    sender_ports: Option<SenderPorts>,
 ) {
+    let mut timing = TimingClient::new();
+    let mut resends = ResendTracker::new();
+    let timing_peer = sender_ports.map(|p| SocketAddr::new(peer_ip, p.timing));
+    let control_peer = sender_ports.map(|p| SocketAddr::new(peer_ip, p.control));
+    let mut probe =
+        tokio::time::interval(std::time::Duration::from_millis(timing.next_interval_ms()));
+    // The first tick is immediate, which is what we want: nothing converts to local time
+    // until a round trip completes, so the sooner the first probe goes the better.
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut our_resend_seq: u16 = 0;
     // One buffer per socket: `select!` polls all three branches, so they cannot share
     // a single mutable borrow.
     let mut audio_buf = vec![0u8; 2048];
@@ -471,6 +483,21 @@ async fn run_audio(
                 debug!("AirPlay audio consumer went away; stopping the receive loop");
                 return;
             }
+            _ = probe.tick() => {
+                if let Some(target) = timing_peer {
+                    let request = timing.build_request(now_ntp());
+                    if let Err(e) = sockets.timing.send_to(&request, target).await {
+                        debug!(error = %e, "could not send a timing request");
+                    }
+                    // The cadence tightens for the first few probes and then backs off.
+                    probe = tokio::time::interval(std::time::Duration::from_millis(
+                        timing.next_interval_ms(),
+                    ));
+                    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    probe.reset();
+                }
+                continue;
+            }
         };
 
         let datagram = match which {
@@ -484,7 +511,21 @@ async fn run_audio(
             Socket::Timing => stream.on_timing(datagram),
         };
         match outcome {
-            Ok(AudioOutput::Frame { frame, .. }) => {
+            Ok(AudioOutput::Frame {
+                frame, sequence, ..
+            }) => {
+                // Ask for anything the gap revealed, before handing the frame on: the
+                // sooner the request goes the likelier the sender still has the packet.
+                if let (Some(gap), Some(target)) = (resends.on_packet(sequence), control_peer) {
+                    our_resend_seq = our_resend_seq.wrapping_add(1);
+                    let request =
+                        crate::audio::resend_request(our_resend_seq, gap.first, gap.count);
+                    if let Err(e) = sockets.control.send_to(&request, target).await {
+                        debug!(error = %e, "could not ask for a resend");
+                    } else {
+                        debug!(first = gap.first, count = gap.count, "asked for a resend");
+                    }
+                }
                 // Latency beats freshness: a full channel means the decoder is behind,
                 // and waiting here would stall sync and timing handling too.
                 if frames.try_send(frame).is_err() {
@@ -494,7 +535,11 @@ async fn run_audio(
             Ok(AudioOutput::Sync(sync)) => {
                 debug!(latency = sync.latency_frames(), "AirPlay sync");
             }
-            Ok(AudioOutput::TimingReply(_)) => {}
+            Ok(AudioOutput::TimingReply(reply)) => {
+                if timing.on_reply(&reply, now_ntp()).is_some() {
+                    debug!(offset_ns = timing.offset_ns(), "AirPlay clock");
+                }
+            }
             // One bad datagram off a radio link must not take the music down.
             Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
         }
@@ -549,5 +594,24 @@ async fn start_audio(
         warn!(%peer, "session manager gone; not starting audio");
         return;
     }
-    tokio::spawn(run_audio(sockets, stream, tx, peer.ip()));
+    tokio::spawn(run_audio(
+        sockets,
+        stream,
+        tx,
+        peer.ip(),
+        session.sender_ports(),
+    ));
+}
+
+/// The wall clock as an NTP timestamp.
+///
+/// A wall clock rather than a monotonic one because the value goes on the wire and the
+/// sender computes a difference against its own; a monotonic reading would be an offset
+/// from an arbitrary boot instant, which is exactly what makes the *sender's* timestamps
+/// unusable as absolute times.
+fn now_ntp() -> NtpTime {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    NtpTime::from_unix_nanos(nanos)
 }
