@@ -752,7 +752,36 @@ display or the audio device, and two cannot take it back afterwards.
   So the scarce thing is the *credential*, not the protocol — that table was signed with a
   real Chromecast's device key, which we cannot produce, should not borrow, and which stops
   working at the end of 2027. Read it as evidence that the sender-side check is weaker than
-  the fused-key story suggests, not as a route we can take.
+  the fused-key story suggests.
+
+  **Reproducing that with a real device — the owner is willing to, including running
+  automation against one for years. The automation is not the part that is hard.** What
+  makes Shanocast's table possible is that its TLS identity is *deterministic*, not that it
+  recorded a lot of traffic: `static_credentials.cc` imports a pinned RSA key instead of
+  `GenerateRsaKeyPair()`, and issues a self-signed cert with a fixed CN
+  (`4aa9ca2e-c340-11ea-8000-18ba395587df`) whose validity window snaps to the same two-day
+  bucket. Fixed key + fixed subject + quantised dates = every future certificate DER is
+  computable today, so every future signed blob is too, and 795 of them fit in 200 KB.
+
+  The catch is what did the signing, and it is structural rather than a matter of effort. A
+  receiver signs `sender_nonce ‖ its own TLS certificate`; Chrome verifies against
+  `nonce_response ‖ peer_cert_der`, where the peer certificate is *ours*. So a genuine
+  Chromecast used as a signing oracle only ever yields signatures whose tail is the
+  Chromecast's certificate — we choose the nonce prefix, never the suffix — and the only way
+  to make that match is to serve that device's certificate, which needs its TLS private key.
+  There is no arrangement of nonces, no volume of recording, and no number of years of
+  automation that gets around it. Shanocast ships signatures precisely *because* the author
+  had the device auth key and chose not to distribute it.
+
+  Which flips the plan: with a real device's credential in hand, none of the Shanocast
+  machinery is needed. Sign on demand and the two-day buckets, the precomputed table and the
+  2027 cliff all disappear — those exist only to make a keyless artifact distributable. And
+  the seam is already built: `CastDeviceSigner` takes key + DER chain as bytes
+  (`crypto-cast-auth/src/lib.rs:91` loads PKCS#8 PEM plus the chain), so this is
+  provisioning, not code. It must stay provisioning: a credential like that belongs on the
+  box beside the other runtime secrets, never as a checked-in fixture — it identifies one
+  specific piece of hardware, and it is the one thing in this project that would be
+  genuinely bad to publish. How you get it off a device you own is out of scope here.
 
 ---
 
