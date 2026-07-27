@@ -746,6 +746,22 @@ impl BluetoothAdapter {
                     configuration,
                 } => {
                     info!(?codec, %format, "bluetooth: stream configured");
+                    // A RECONFIGURE mid-session can change the rate or channel count, and
+                    // the session that is already open was opened *with* the old one — the
+                    // decoder and the output device were both sized by it. Carrying on
+                    // would play the new stream at the old pitch, which is Q25 arriving by
+                    // a second route. Dropping the channel ends that audio session; the
+                    // START that follows the reconfiguration opens a fresh one with the
+                    // right shape.
+                    if link.session_open && link.audio_format != Some(format) {
+                        info!(
+                            was = ?link.audio_format,
+                            now = %format,
+                            "bluetooth: format changed; restarting the audio session"
+                        );
+                        link.audio_tx = None;
+                        link.session_open = false;
+                    }
                     link.audio_format = Some(format);
                     link.depacketizer = Some(Depacketizer::new(codec, format.sample_rate()));
                     link.description = std::mem::take(&mut link.description)

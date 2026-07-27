@@ -159,10 +159,12 @@ impl SinkSession {
             Signal::Suspend => self.on_suspend(msg),
             Signal::Close => self.on_close(msg),
             Signal::Abort => self.on_abort(msg),
-            // Reconfigure, SecurityControl and DelayReport are answered but do nothing:
-            // accepting is correct for a sink that has no content protection and no
-            // reconfigurable parameters, and a general reject makes some senders retry.
-            Signal::Reconfigure | Signal::SecurityControl | Signal::DelayReport => {
+            Signal::Reconfigure => self.on_reconfigure(msg),
+            // SecurityControl and DelayReport are answered but do nothing: accepting is
+            // correct for a sink with no content protection, DELAYREPORT travels SNK→SRC
+            // so an inbound one should not happen, and a general reject makes some
+            // senders retry.
+            Signal::SecurityControl | Signal::DelayReport => {
                 vec![SinkEvent::Reply(Message::accept(msg, Bytes::new()))]
             }
         }
@@ -244,6 +246,69 @@ impl SinkSession {
         self.configuration = Some(capability.clone());
         vec![
             SinkEvent::Reply(Message::accept(msg, Bytes::new())),
+            SinkEvent::Configured {
+                codec: capability.audio_codec(),
+                format,
+                configuration: Box::new(capability),
+            },
+        ]
+    }
+
+    /// RECONFIGURE: the sender is changing the codec block mid-session.
+    ///
+    /// This used to be lumped in with SecurityControl and DelayReport and answered with a
+    /// bare ACCEPT, on the reasoning that a sink "has no reconfigurable parameters". That
+    /// is not true — the codec block is exactly what RECONFIGURE carries, and AOSP sends
+    /// one when the rate or bitpool changes from Developer Options, as do some stacks on
+    /// stream restart. The sender switched its encoder and we kept decoding at the old
+    /// rate: wrong pitch, or noise, with nothing logged. The same failure class as Q25,
+    /// through a door Q25 did not close.
+    ///
+    /// Validated exactly as SET_CONFIGURATION is, because it is the same decision being
+    /// made a second time — and answered with the same category-first reject shape, which
+    /// is what senders read.
+    fn on_reconfigure(&mut self, msg: &Message) -> Vec<SinkEvent> {
+        // Only legal in OPEN. In STREAMING the sender must SUSPEND first, and accepting
+        // it there would swap the decoder out from under audio that is still arriving.
+        if self.state != StreamState::Open {
+            return reject_config(msg, 0, error_code::BAD_STATE);
+        }
+        if msg.payload.is_empty() {
+            return reject_config(msg, 0, error_code::BAD_ACP_SEID);
+        }
+        let Ok(seid) = Seid::from_shifted(msg.payload[0]) else {
+            return reject_config(msg, 0, error_code::BAD_ACP_SEID);
+        };
+        if self.active != Some(seid) {
+            return reject_config(msg, 0, error_code::BAD_ACP_SEID);
+        }
+        let Some(index) = self.endpoints.iter().position(|s| s.seid == seid) else {
+            return reject_config(msg, 0, error_code::BAD_ACP_SEID);
+        };
+
+        let capability = match find_codec_capability(&msg.payload[1..]) {
+            Ok(cap) => cap,
+            Err(_) => return reject_config(msg, 0x07, error_code::UNSUPPORTED_CONFIGURATION),
+        };
+        if !capability.is_configuration() {
+            return reject_config(msg, 0x07, error_code::INVALID_CODEC_PARAMETER);
+        }
+        // RECONFIGURE may change the codec's *parameters*, never the codec itself — that
+        // needs a CLOSE and a new SET_CONFIGURATION. Accepting a codec switch here would
+        // leave the endpoint describing one thing and the decoder doing another.
+        if capability.audio_codec() != self.endpoints[index].capability.audio_codec() {
+            return reject_config(msg, 0x07, error_code::UNSUPPORTED_CONFIGURATION);
+        }
+        let Some(format) = capability.format() else {
+            return reject_config(msg, 0x07, error_code::INVALID_CODEC_PARAMETER);
+        };
+
+        self.configuration = Some(capability.clone());
+        vec![
+            SinkEvent::Reply(Message::accept(msg, Bytes::new())),
+            // Same event as the first configuration: the caller's job is identical —
+            // rebuild the decoder for these parameters — and giving it a second name
+            // would just be a second path to keep correct.
             SinkEvent::Configured {
                 codec: capability.audio_codec(),
                 format,

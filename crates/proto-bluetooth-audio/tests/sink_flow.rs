@@ -378,3 +378,105 @@ fn the_negotiated_configuration_drives_the_depacketizer() {
         "classic aptX carries no RTP header"
     );
 }
+
+/// The RECONFIGURE payload shape: acceptor SEID, then the media codec capability.
+fn reconfigure_payload(seid: Seid, capability: &CodecCapability) -> Vec<u8> {
+    let codec = capability.encode();
+    let mut out = vec![seid.shifted(), 0x07];
+    out.push(u8::try_from(codec.len()).unwrap());
+    out.extend_from_slice(&codec);
+    out
+}
+
+#[test]
+fn reconfigure_changes_the_negotiated_format_instead_of_being_waved_through() {
+    // The bug: RECONFIGURE was lumped in with SecurityControl and DelayReport and
+    // answered with a bare ACCEPT, on the reasoning that a sink has no reconfigurable
+    // parameters. The codec block is exactly what it carries. AOSP sends one when the
+    // rate changes from Developer Options — the sender switched its encoder, we kept
+    // decoding at the old rate, and the room got the wrong pitch with nothing logged.
+    let mut phone = Phone::new(advertised(NO_LDAC));
+    let seid = configure(&mut phone, &aptx_config());
+    Phone::accepted(&phone.send(Signal::Open, &[seid.shifted()]));
+
+    let at_48k = CodecCapability::AptX {
+        rates: SampleRates::HZ_48000,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let events = phone.send(Signal::Reconfigure, &reconfigure_payload(seid, &at_48k));
+    Phone::accepted(&events);
+
+    let configured = events
+        .iter()
+        .find_map(|e| match e {
+            SinkEvent::Configured { format, .. } => Some(*format),
+            _ => None,
+        })
+        .expect("a reconfiguration must tell the caller to rebuild its decoder");
+    assert_eq!(
+        configured.sample_rate(),
+        48_000,
+        "the decoder must follow the sender's new rate"
+    );
+
+    // …and the sink reports the new configuration, not the one it was first given.
+    let got = phone.send(Signal::GetConfiguration, &[seid.shifted()]);
+    let payload = Phone::accepted(&got).payload.clone();
+    let echoed = proto_bluetooth_audio::avdtp::find_codec_capability(&payload).unwrap();
+    assert_eq!(echoed.format().unwrap().sample_rate(), 48_000);
+}
+
+#[test]
+fn reconfigure_cannot_switch_codec_or_arrive_at_the_wrong_time() {
+    let mut phone = Phone::new(advertised(NO_LDAC));
+    let seid = configure(&mut phone, &aptx_config());
+
+    // Only legal in OPEN. In CONFIGURED there is no stream to reconfigure yet, and in
+    // STREAMING accepting one would swap the decoder out from under audio still arriving.
+    let at_48k = CodecCapability::AptX {
+        rates: SampleRates::HZ_48000,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let too_early = phone.send(Signal::Reconfigure, &reconfigure_payload(seid, &at_48k));
+    assert_eq!(Phone::rejected(&too_early), error_code::BAD_STATE);
+
+    Phone::accepted(&phone.send(Signal::Open, &[seid.shifted()]));
+    Phone::accepted(&phone.send(Signal::Start, &[seid.shifted()]));
+    let while_streaming = phone.send(Signal::Reconfigure, &reconfigure_payload(seid, &at_48k));
+    assert_eq!(Phone::rejected(&while_streaming), error_code::BAD_STATE);
+
+    Phone::accepted(&phone.send(Signal::Suspend, &[seid.shifted()]));
+
+    // The codec itself may not change — that needs a CLOSE and a fresh SET_CONFIGURATION.
+    // Accepting it would leave the endpoint describing one thing and the decoder another.
+    let different_codec = CodecCapability::Sbc {
+        rates: SampleRates::HZ_44100,
+        channels: ChannelModes::JOINT_STEREO,
+        block_lengths: 0b1000,
+        subbands: 0b01,
+        allocations: 0b01,
+        min_bitpool: 2,
+        max_bitpool: 53,
+    };
+    let swapped = phone.send(
+        Signal::Reconfigure,
+        &reconfigure_payload(seid, &different_codec),
+    );
+    assert_eq!(
+        Phone::rejected(&swapped),
+        error_code::UNSUPPORTED_CONFIGURATION
+    );
+
+    // A capability that still names a *set* is ambiguous — the same rule
+    // SET_CONFIGURATION enforces, and for the same reason: guessing a rate plays the
+    // stream at the wrong pitch rather than failing.
+    let ambiguous = CodecCapability::AptX {
+        rates: SampleRates::COMMON,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let vague = phone.send(Signal::Reconfigure, &reconfigure_payload(seid, &ambiguous));
+    assert_eq!(Phone::rejected(&vague), error_code::INVALID_CODEC_PARAMETER);
+
+    // After all that, the stream is still usable at its original configuration.
+    assert_eq!(phone.session.state(), StreamState::Open);
+}
