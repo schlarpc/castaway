@@ -861,8 +861,19 @@ const RESOLVE_LIMIT: usize = 6;
 /// list that has not changed.
 #[derive(Default)]
 struct QueueNames {
-    seen: std::collections::HashMap<String, castaway_core::QueueItem>,
+    /// What we know a URI is called. `None` records a lookup that *failed*, which is as
+    /// worth remembering as one that worked.
+    seen: std::collections::HashMap<String, Option<castaway_core::QueueItem>>,
+    /// Insertion order, so the oldest entry can be dropped when the map is full.
+    order: std::collections::VecDeque<String>,
 }
+
+/// How many resolved names to keep.
+///
+/// Unbounded before, and the map is keyed by whatever a room queues over an evening — so
+/// it grew for as long as the session lasted. Generous enough that nothing is re-fetched
+/// in practice; finite because a cache keyed on other people's choices should be.
+const RESOLVE_CACHE: usize = 512;
 
 impl QueueNames {
     /// Build the display list, asking Spotify only for the tracks it did not name itself.
@@ -880,32 +891,53 @@ impl QueueNames {
         let mut fetched = 0usize;
 
         for track in tracks {
+            // A remembered *failure* counts as remembered. Recording only successes meant
+            // a track whose lookup failed — region-locked, or a transient 5xx — was
+            // retried on every cluster update, and those arrive on volume changes, device
+            // list churn and hand-offs. Six awaited round trips per update, for a name
+            // that was never going to come, inline in the loop that feeds the card.
             if let Some(hit) = self.seen.get(&track.uri) {
-                out.push(hit.clone());
+                out.push(hit.clone().unwrap_or_else(|| fallback_item(track)));
                 continue;
             }
 
             // Free path: the cloud already told us.
             if let Some(item) = named_from_metadata(track) {
-                self.seen.insert(track.uri.clone(), item.clone());
+                self.remember(&track.uri, Some(item.clone()));
                 out.push(item);
                 continue;
             }
 
             // Paid path, and rationed. Past the limit the entry is only counted toward
-            // "and N more", never drawn, so a lookup would buy nothing.
+            // "and N more", never drawn, so a lookup would buy nothing — and is not
+            // recorded as a failure either, since it was never attempted.
             if fetched < RESOLVE_LIMIT {
                 fetched += 1;
-                if let Some(item) = fetch_track_name(session, &track.uri).await {
-                    self.seen.insert(track.uri.clone(), item.clone());
-                    out.push(item);
-                    continue;
+                match fetch_track_name(session, &track.uri).await {
+                    Some(item) => {
+                        self.remember(&track.uri, Some(item.clone()));
+                        out.push(item);
+                        continue;
+                    }
+                    None => self.remember(&track.uri, None),
                 }
             }
 
             out.push(fallback_item(track));
         }
         out
+    }
+
+    /// Record what a URI resolved to, evicting the oldest entry when full.
+    fn remember(&mut self, uri: &str, item: Option<castaway_core::QueueItem>) {
+        if self.seen.insert(uri.to_owned(), item).is_none() {
+            self.order.push_back(uri.to_owned());
+            while self.order.len() > RESOLVE_CACHE {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.seen.remove(&oldest);
+                }
+            }
+        }
     }
 }
 
@@ -1278,6 +1310,60 @@ mod tests {
             .collect();
         let update = cluster_update(Some(tracks));
         assert_eq!(queue_tracks(&update).unwrap().len(), UP_NEXT_LIMIT);
+    }
+
+    #[test]
+    fn a_failed_lookup_is_remembered_so_it_is_not_retried_every_update() {
+        // Recording only successes meant a track whose lookup failed — region-locked, or
+        // a transient 5xx — was retried on every cluster update, and those arrive on
+        // volume changes, device-list churn and hand-offs. Six awaited round trips per
+        // update, for a name that was never going to come.
+        let mut names = QueueNames::default();
+        names.remember("spotify:track:gone", None);
+        assert!(
+            names.seen.contains_key("spotify:track:gone"),
+            "a failure is as worth remembering as a success"
+        );
+        // …and it still renders as something, rather than as nothing.
+        let track = provided("spotify:track:gone", &[]);
+        let hit = names.seen.get(&track.uri).unwrap().clone();
+        assert_eq!(
+            hit.unwrap_or_else(|| fallback_item(&track)).title,
+            "spotify:gone"
+        );
+    }
+
+    #[test]
+    fn the_name_cache_does_not_grow_for_the_life_of_the_session() {
+        // Keyed by whatever a room queues over an evening, and unbounded — so it grew for
+        // as long as the panel stayed up.
+        let mut names = QueueNames::default();
+        for i in 0..(RESOLVE_CACHE + 50) {
+            names.remember(&format!("spotify:track:{i}"), None);
+        }
+        assert_eq!(names.seen.len(), RESOLVE_CACHE);
+        assert_eq!(names.order.len(), RESOLVE_CACHE);
+        assert!(
+            !names.seen.contains_key("spotify:track:0"),
+            "the oldest entry should have been evicted first"
+        );
+        assert!(
+            names
+                .seen
+                .contains_key(&format!("spotify:track:{}", RESOLVE_CACHE + 49)),
+            "and the newest kept"
+        );
+    }
+
+    #[test]
+    fn remembering_a_uri_twice_does_not_grow_the_eviction_queue() {
+        // A re-resolved URI must not push a second entry, or the queue outgrows the map
+        // and eviction starts dropping live entries.
+        let mut names = QueueNames::default();
+        names.remember("spotify:track:a", None);
+        names.remember("spotify:track:a", None);
+        assert_eq!(names.order.len(), 1);
+        assert_eq!(names.seen.len(), 1);
     }
 
     #[tokio::test]
