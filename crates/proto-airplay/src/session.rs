@@ -13,11 +13,12 @@
 //! [`crypto_fairplay`]). Pairing still returns `501`, and neither is on the path to
 //! audio: AirPlay 1's key arrives in the `ANNOUNCE` body, not from FairPlay.
 
-use castaway_core::{SessionEvent, SourceDescription};
+use castaway_core::{ControlTxn, NowPlaying, SessionEvent, SourceDescription};
 use crypto_fairplay::FairPlaySession;
 use tracing::{debug, info as log_info, warn};
 
 use crate::advert::AirPlayIdentity;
+use crate::control::ControlUpdate;
 use crate::error::AirPlayError;
 use crate::info;
 use crate::sdp::AnnounceParams;
@@ -225,7 +226,8 @@ impl AirPlaySession {
             ("ANNOUNCE", _) => self.announce(body),
             ("SETUP", _) => self.setup(req),
             ("RECORD", _) => self.record(),
-            ("SET_PARAMETER" | "GET_PARAMETER", _) => AirPlayResponse::ok(),
+            ("SET_PARAMETER", _) => self.set_parameter(req),
+            ("GET_PARAMETER", _) => AirPlayResponse::ok(),
             ("FLUSH", _) => AirPlayResponse::ok(),
             ("TEARDOWN", _) => {
                 self.raop = RaopState::Idle;
@@ -336,6 +338,47 @@ impl AirPlaySession {
         };
         self.raop = RaopState::Recording(params);
         AirPlayResponse::ok().header("Audio-Latency", "11025")
+    }
+
+    /// Handle `SET_PARAMETER`: volume, progress, metadata and artwork.
+    ///
+    /// A body we cannot use is answered `200` rather than refused. These are the
+    /// sender pushing decoration at the now-playing card; none of it is load-bearing,
+    /// and a receiver that fails a session over an unrecognised metadata tag is worse
+    /// than one that ignores it.
+    fn set_parameter(&mut self, req: &AirPlayRequest<'_>) -> AirPlayResponse {
+        let content_type = req.header("Content-Type");
+        let update = match crate::control::parse_set_parameter(content_type, req.body) {
+            Ok(u) => u,
+            Err(e) => {
+                debug!(error = %e, "ignoring a SET_PARAMETER we cannot use");
+                return AirPlayResponse::ok();
+            }
+        };
+
+        let mut resp = AirPlayResponse::ok();
+        resp.event = match update {
+            ControlUpdate::Volume(v) => {
+                log_info!(fraction = v.as_fraction(), "AirPlay volume");
+                Some(SessionEvent::Control(ControlTxn::Volume(v.as_fraction())))
+            }
+            ControlUpdate::Metadata(now) => Some(SessionEvent::NowPlaying(*now)),
+            ControlUpdate::Progress(progress) => {
+                // Progress is in RTP timestamps, so it only means anything once
+                // ANNOUNCE has said what the sample rate is.
+                self.raop.params().map(|params| {
+                    let (position, duration) = progress.as_seconds(params.codec.sample_rate());
+                    let mut now = NowPlaying::default();
+                    now.position = Some(std::time::Duration::from_secs_f64(position.max(0.0)));
+                    now.duration = Some(std::time::Duration::from_secs_f64(duration.max(0.0)));
+                    SessionEvent::NowPlaying(now)
+                })
+            }
+            // Artwork rides on the next metadata snapshot rather than as an event of its
+            // own; it arrives separately from and usually after the tags it belongs to.
+            ControlUpdate::Artwork(_) | ControlUpdate::Ignored => None,
+        };
+        resp
     }
 
     /// Answer a `/fp-setup` POST.
@@ -703,6 +746,92 @@ mod tests {
             .status,
             415
         );
+    }
+
+    #[test]
+    fn a_volume_change_reaches_the_pipeline() {
+        let mut s = session();
+        let headers = vec![("Content-Type".to_string(), "text/parameters".to_string())];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "SET_PARAMETER",
+                path: "rtsp://x/s",
+                headers: &headers,
+                body: b"volume: -15.0\r\n",
+            })
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let Some(SessionEvent::Control(ControlTxn::Volume(v))) = r.event else {
+            panic!("expected a volume change, got {:?}", r.event)
+        };
+        assert!((v - 0.5).abs() < 1e-6, "{v}");
+    }
+
+    #[test]
+    fn track_metadata_reaches_the_now_playing_card() {
+        let mut s = session();
+        let mut items = b"minm".to_vec();
+        items.extend_from_slice(&6u32.to_be_bytes());
+        items.extend_from_slice(b"Xtal\0\0");
+        let mut body = b"mlit".to_vec();
+        body.extend_from_slice(&u32::try_from(items.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(&items);
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-dmap-tagged".to_string(),
+        )];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "SET_PARAMETER",
+                path: "rtsp://x/s",
+                headers: &headers,
+                body: &body,
+            })
+            .unwrap();
+        assert!(matches!(r.event, Some(SessionEvent::NowPlaying(_))));
+    }
+
+    #[test]
+    fn progress_needs_the_rate_announce_settled() {
+        // Progress is in RTP timestamps, so before ANNOUNCE there is no rate to convert
+        // it with — and inventing 44100 would put a wrong duration on the card.
+        let mut s = session();
+        let headers = vec![("Content-Type".to_string(), "text/parameters".to_string())];
+        let req = AirPlayRequest {
+            method: "SET_PARAMETER",
+            path: "rtsp://x/s",
+            headers: &headers,
+            body: b"progress: 1000/45100/265600\r\n",
+        };
+        assert!(s.handle(&req).unwrap().event.is_none());
+
+        s.handle(&AirPlayRequest::new(
+            "ANNOUNCE",
+            "rtsp://x/s",
+            ANNOUNCE_BODY.as_bytes(),
+        ))
+        .unwrap();
+        let Some(SessionEvent::NowPlaying(now)) = s.handle(&req).unwrap().event else {
+            panic!("expected progress once the rate is known")
+        };
+        assert_eq!(now.position, Some(std::time::Duration::from_secs(1)));
+        assert_eq!(now.duration, Some(std::time::Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn a_set_parameter_we_cannot_use_is_still_answered_ok() {
+        // Decoration for the now-playing card, none of it load-bearing. Failing a
+        // session over an unrecognised metadata body would be worse than ignoring it.
+        let mut s = session();
+        let r = s
+            .handle(&AirPlayRequest::new(
+                "SET_PARAMETER",
+                "rtsp://x/s",
+                b"whatever",
+            ))
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.event.is_none());
     }
 
     #[test]

@@ -87,6 +87,36 @@ pub enum SdpError {
     },
 }
 
+/// Failures parsing a `SET_PARAMETER` body.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlError {
+    /// No `Content-Type`, so there is no way to know which of the three body formats
+    /// this is. Guessing would parse a DMAP blob as text and produce nonsense.
+    #[error("SET_PARAMETER has no Content-Type")]
+    NoContentType,
+
+    /// A content type this endpoint does not carry.
+    #[error("unsupported SET_PARAMETER content type: {0}")]
+    UnsupportedContentType(String),
+
+    /// A `text/parameters` body was not text.
+    #[error("SET_PARAMETER body is not UTF-8")]
+    NotUtf8,
+
+    /// The `volume:` value was not a number.
+    #[error("malformed volume value")]
+    BadVolume,
+
+    /// The `progress:` value was not three timestamps.
+    #[error("malformed progress value")]
+    BadProgress,
+
+    /// A DMAP container could not be walked at all.
+    #[error("malformed DMAP metadata")]
+    MalformedDmap,
+}
+
 /// Failures parsing a `SETUP` `Transport` header.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]

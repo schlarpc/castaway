@@ -20,6 +20,7 @@
 pub mod actor;
 pub mod advert;
 pub mod audio;
+pub mod control;
 pub mod error;
 pub mod info;
 pub mod sdp;
@@ -30,7 +31,8 @@ use castaway_core::ProtocolKind;
 
 pub use actor::AirPlayReceiver;
 pub use advert::{AirPlayIdentity, Features, AIRPLAY_PORT};
-pub use error::{AirPlayError, SdpError, TransportError};
+pub use control::{ControlUpdate, Progress, Volume};
+pub use error::{AirPlayError, ControlError, SdpError, TransportError};
 pub use sdp::{AlacConfig, AnnounceParams, RaopCodec, SessionKey, StreamCrypto};
 pub use session::{AirPlayResponse, AirPlaySession};
 pub use transport::{ReceiverPorts, SenderPorts};
