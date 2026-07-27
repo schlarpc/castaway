@@ -599,6 +599,19 @@
                 description = ''
                   Contents of `castaway.toml`, as a Nix attrset. See `crates/app/src/config.rs`
                   for the full schema; unset keys take the binary's own defaults.
+
+                  This generates a file in the Nix store, which is world-readable. Secrets
+                  belong outside it — `cast.credential` takes *paths* for exactly this
+                  reason, so point them at files placed on the box (a Cast device
+                  credential identifies one specific piece of hardware) rather than
+                  inlining anything here:
+
+                  ```nix
+                  services.castaway.settings.cast.credential = {
+                    key_file = "/var/lib/castaway/cast-device.pem";
+                    certificate_file = "/var/lib/castaway/cast-device.der";
+                  };
+                  ```
                 '';
               };
 

@@ -28,6 +28,17 @@ integration test.
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. |
 
+## Verified against the other implementation (`nix flake check`, no hardware)
+Two checks compile openscreen — the reference implementation of Cast — and put our code
+and theirs on opposite sides of the wire. Neither needs a sender, a network, or a person.
+
+- `openscreen-rtp-fixtures`: openscreen's `RtpPacketizer` + `FrameCrypto` generate the
+  golden mirroring stream our receiver is tested against (Q12/Q13).
+- `openscreen-device-auth`: openscreen's *sender-side* verifier judges device-auth
+  responses we produced (D31). Eight vectors. The one that matters says we fail against
+  the roots senders ship, and fail only for the root — a provisioned credential (Q2) is
+  the whole remaining distance to an official sender.
+
 ## Verified working end-to-end (tier-2 VM test, no human in the loop)
 `nix build .#checks.x86_64-linux.integration-vm` boots the receiver from the real NixOS
 module in one VM and drives it from a *second* VM over a real LAN with scripted senders —
