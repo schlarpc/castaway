@@ -69,7 +69,8 @@ Suggested stack: Rust or Go for a single static binary; GStreamer (or a custom p
 | Protocol | Discovery | Control | Media | Notes | Crib from | Effort |
 |---|---|---|---|---|---|---|
 | **DLNA MediaRenderer** | SSDP | SOAP AVTransport/RenderingControl | HTTP pull | pure conformance, no crypto | gmrender-resurrect, Rygel | **Low** |
-| **Cast media receiver** | mDNS | CASTv2 `LOAD <url>` | HLS/DASH/MP4 (your player) | needs device-auth; DRM'd content out of scope | openscreen, CAF docs | Med (shares Cast auth) |
+| **Cast media receiver** | mDNS | CASTv2 `LOAD <url>` | HLS/DASH/MP4 (your player) | needs device-auth; this is the Default Media Receiver (`CC1AD845`) role only — see below for hosting *other* apps | openscreen, CAF docs | Med (shares Cast auth) |
+| **Cast app receiver** (branded senders) | mDNS | CASTv2 `LAUNCH <appId>` → host the vendor's web receiver | whatever that app streams — in practice DASH/HLS `avc1`+`mp4a`, usually Widevine | **Intended, not built (GAPS.md G56).** Needs a codec-enabled CEF (G55), the undocumented CAF platform IPC, and a device-auth chain official senders will accept — that last one gates the rest | CAF docs, capture | High |
 | **AirPlay Video/AV** | mDNS | RTSP URL handoff | HLS | the iOS "AirPlay a YouTube/Netflix video" path (not mirroring) | AirPlay RE docs | Med |
 
 ### C. App-launch / control-handoff (sender is a remote; device plays its own stream)

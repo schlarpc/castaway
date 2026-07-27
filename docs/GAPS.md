@@ -84,11 +84,14 @@ Still open, roughly in the order they are worth taking:
    either link, the likeliest cause is the harness rather than the adapter — but that is a
    guess, and the case Q27 records stays unproven either way. Also still missing: a bonded
    phone reconnecting after restart, and a self-contained YouTube regression test (G54).
-4. **G55** — no H.264/AAC in the browser, which needs a CEF built from source with
-   `proprietary_codecs=true ffmpeg_branding=Chrome`. There is no prebuilt to switch to, so
-   this is a build project rather than a patch: chromium-scale compute, and for the deploy
-   artifact either a Windows build host or a Chromium Linux→Windows cross setup. Decide
-   before it is discovered on the wall by a live stream that will not start.
+4. **G56, and G55 underneath it** — hosting third-party Cast receiver apps is intended, and
+   it is the thing that makes the browser's missing H.264/AAC a blocker rather than a
+   YouTube-live annoyance: commercial receivers are all `avc1`+`mp4a`. G55 needs a CEF
+   built from source with `proprietary_codecs=true ffmpeg_branding=Chrome` — no prebuilt
+   enables them (checked: OBS, JetBrains/JCEF, and every codec-enabled build repo found
+   publishes recipes, not binaries), so it is chromium-scale compute plus either a Windows
+   build host or a Chromium Linux→Windows cross setup. Sequence it behind G56's device-auth
+   experiment, which is an afternoon and can invalidate the whole branch.
 
 The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
 What was grounded in BlueZ 5.86 rather than in memory, since a phone is the Target and its
@@ -656,7 +659,52 @@ display or the audio device, and two cannot take it back afterwards.
   gets H.264 through the OS decoder but **not** AAC, which has no OS-decoder path in
   Chromium (upstream cef#3559) — only `ffmpeg_branding=Chrome` gets both.
   Our own ffmpeg pipeline is unaffected: AirPlay/Cast/DLNA/Bluetooth decode H.264 and AAC
-  normally. This is a browser-only gap.
+  normally. This is a browser-only gap — but see G56, which is the feature that turns it
+  from a YouTube-live annoyance into a prerequisite.
+
+- **G56 — A branded Cast sender launches an app we cannot host, and we answer "running"
+  anyway. CONFIRMED, and intended to be implemented.**
+  `session.rs:304` `launch()` takes whatever `appId` it is handed, stores it, and echoes it
+  back in `RECEIVER_STATUS` with a fresh session and transport id. Nothing distinguishes
+  `CC1AD845` — the Default Media Receiver, whose `LOAD` we genuinely implement natively
+  (`session.rs:224` → `SessionEvent::Play` → our ffmpeg) — from Netflix, Spotify, HBO or
+  any other sender that launches *its own* web receiver. Those senders get a status saying
+  their app started, open a virtual connection to the transport id, start talking on their
+  custom namespace, and receive silence: a connected session on the phone and a black
+  panel. Today's Cast support is the media-URL role only; the app-hosting role is missing
+  and is not currently declined out loud.
+
+  The intent is to host the vendor's receiver page in CEF, the way a real Chromecast does.
+  What that needs, roughly in dependency order:
+
+  1. `appId` → receiver URL resolution (Google's app registry, or a pinned local map).
+  2. A browser surface for it. We have one, but the screen-ownership and preemption paths
+     assume a single page whose lifetime is DIAL's — a Cast-launched app is a second
+     owner with a different lifetime.
+  3. **The platform side of the Cast receiver SDK.** A CAF page expects to talk to a
+     *platform* over a local IPC channel, through which it receives the sender connection,
+     custom-namespace traffic, media commands and volume. That protocol is undocumented;
+     it is the largest unknown here and lands as captured fixtures per ground rule 9, not
+     as a dependency.
+  4. Relaying custom namespaces both directions between the CASTv2 sender connection and
+     the page, including the media namespace once the app owns it rather than us.
+  5. **Codecs — blocked on G55.** Commercial receivers stream DASH/HLS with `avc1`+`mp4a`.
+     Today's CEF plays neither, so every one of these apps would fail at the last step even
+     if 1–4 were perfect. This is what promotes G55 from "worth doing" to "do it first".
+  6. DRM — Widevine now ships (G46), but note its VMP limit: an unsigned CEF host cannot
+     obtain licences from services that require a verified media path, which is most of the
+     commercial ones. Expect Netflix/Disney+ to refuse even with codecs in place.
+
+  **Prove this before building any of it, because it may make the whole item moot:**
+  device-auth. Official senders enforce the receiver's certificate chain to the Google Cast
+  Root CA, whose key is fused into licensed silicon (casting-landscape-report.md:77); open
+  senders skip the check, which is why our current Cast support works at all.
+  `crypto-cast-auth/src/lib.rs:106` says it plainly — our chain is "for local dev/tests
+  only — a real sender wants a chain". The branded apps are exactly the senders that
+  enforce. So the first experiment is the cheapest one: point the Netflix or Spotify app at
+  the receiver and see whether it will open a session at all. If it refuses at auth, no
+  amount of browser or codec work changes the outcome, and the honest scope of this item
+  collapses to "apps whose senders do not enforce device-auth".
 
 ---
 
