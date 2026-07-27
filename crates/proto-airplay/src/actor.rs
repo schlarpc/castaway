@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
 use crate::audio::{AudioOutput, AudioStream};
-use crate::clock::{NtpTime, ResendTracker, TimingClient};
+use crate::clock::{NtpTime, ResendTracker, StreamOrigin, TimingClient};
 use crate::error::AirPlayError;
 use crate::mirror::{MirrorKeys, MirrorOutput, MirrorStream};
 use crate::session::{AirPlayRequest, AirPlaySession};
@@ -176,6 +176,8 @@ async fn pump(
     // in later: a sender negotiates mirroring audio *after* its video is already
     // flowing, so the channel has to exist before there is anything to put in it.
     let mut mirror_audio_tx: Option<mpsc::Sender<EncodedFrame>> = None;
+    // Shared by the mirror's two planes so they present on one timeline.
+    let mirror_origin = Arc::new(StreamOrigin::new());
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
     loop {
@@ -265,7 +267,9 @@ async fn pump(
                 // Re-binding by address instead would race whatever took the port in
                 // between, and we have already told the sender that number.
                 if let Some(listener) = mirror_listener.take() {
-                    mirror_audio_tx = start_mirroring(*keys, listener, sink, peer).await;
+                    mirror_audio_tx =
+                        start_mirroring(*keys, listener, Arc::clone(&mirror_origin), sink, peer)
+                            .await;
                 }
             }
 
@@ -600,8 +604,9 @@ async fn run_audio(
                     debug!(offset_ns = timing.offset_ns(), "AirPlay clock");
                 }
             }
-            // Priming packets are the sender saying "not yet", not a fault.
-            Err(crate::audio::AudioError::Priming) => {}
+            // Neither of these is a fault: the sender saying "not yet", and audio that
+            // arrived before a sync packet could place it on the shared timeline.
+            Err(crate::audio::AudioError::Priming | crate::audio::AudioError::AwaitingSync) => {}
             // One bad datagram off a radio link must not take the music down.
             Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
         }
@@ -702,6 +707,7 @@ fn now_ntp() -> NtpTime {
 async fn start_mirroring(
     keys: MirrorKeys,
     listener: TcpListener,
+    origin: Arc<StreamOrigin>,
     sink: &SessionSink,
     peer: SocketAddr,
 ) -> Option<mpsc::Sender<EncodedFrame>> {
@@ -730,7 +736,7 @@ async fn start_mirroring(
         warn!(%peer, "session manager gone; not starting mirroring");
         return None;
     }
-    tokio::spawn(run_mirroring(listener, keys, tx, peer));
+    tokio::spawn(run_mirroring(listener, keys, origin, tx, peer));
     Some(audio_tx)
 }
 
@@ -738,6 +744,7 @@ async fn start_mirroring(
 async fn run_mirroring(
     listener: TcpListener,
     keys: MirrorKeys,
+    origin: Arc<StreamOrigin>,
     frames: mpsc::Sender<EncodedFrame>,
     peer: SocketAddr,
 ) {
@@ -747,7 +754,7 @@ async fn run_mirroring(
     };
     info!(%from, "AirPlay mirroring data channel connected");
 
-    let mut mirror = MirrorStream::new(&keys);
+    let mut mirror = MirrorStream::new(&keys, origin);
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
     let mut chunk = vec![0u8; 1 << 16];
     loop {

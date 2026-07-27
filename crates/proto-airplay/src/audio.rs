@@ -36,12 +36,14 @@
 //!
 //! Get any of those wrong and audio still "plays" — as static.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aes::cipher::{BlockDecryptMut as _, KeyIvInit as _};
 use bytes::Bytes;
 use castaway_core::{AudioCodec, EncodedFrame};
 
+use crate::clock::{StreamOrigin, SyncAnchor, SECONDS_1900_TO_1970};
 use crate::sdp::{AnnounceParams, RaopCodec, StreamCrypto};
 
 /// AES-128-CBC decryptor.
@@ -94,6 +96,15 @@ pub enum AudioError {
     /// A payload type this socket should never carry.
     #[error("unexpected RTP payload type {0}")]
     UnexpectedType(u8),
+
+    /// Audio arrived before any sync packet placed it on the sender's clock.
+    ///
+    /// Only reachable for a mirroring session, which is the only one that has to share a
+    /// timeline with anything. The sender emits a sync packet at stream start, so this
+    /// is the first packet or two — dropping them costs a few milliseconds and is the
+    /// honest alternative to guessing an origin that video would then disagree with.
+    #[error("audio arrived before the stream was anchored to the sender's clock")]
+    AwaitingSync,
 
     /// A stream-priming packet, which carries no audio.
     ///
@@ -157,7 +168,12 @@ pub struct AudioStream {
     crypto: StreamCrypto,
     audio_codec: Option<AudioCodec>,
     /// The RTP timestamp of the first audio packet, so `pts` can be relative to it.
+    /// Used only when this stream stands alone; a mirroring session shares an origin.
     first_timestamp: Option<u32>,
+    /// The origin shared with the video plane, when there is one.
+    origin: Option<Arc<StreamOrigin>>,
+    /// The latest sync packet, which is what puts audio on the sender's clock.
+    anchor: Option<SyncAnchor>,
 }
 
 impl AudioStream {
@@ -175,7 +191,20 @@ impl AudioStream {
                 RaopCodec::AacEld { .. } => Some(AudioCodec::Aac),
             },
             first_timestamp: None,
+            origin: None,
+            anchor: None,
         }
+    }
+
+    /// Share a timeline with the video plane of a mirroring session.
+    ///
+    /// Without this the two planes each measure from their own first frame, which throws
+    /// away the only thing that relates them. With it, audio waits for a sync packet
+    /// before it can place itself — see [`AudioError::AwaitingSync`].
+    #[must_use]
+    pub fn with_origin(mut self, origin: Arc<StreamOrigin>) -> Self {
+        self.origin = Some(origin);
+        self
     }
 
     /// The negotiated codec.
@@ -208,7 +237,19 @@ impl AudioStream {
         // (see `parse_sync`), and a resend carries its own complete packet.
         let (kind, _) = split_rtp(datagram)?;
         match kind.payload_type {
-            payload_type::SYNC => parse_sync(datagram).map(AudioOutput::Sync),
+            payload_type::SYNC => parse_sync(datagram).map(|sync| {
+                // The anchor is what a shared timeline is built on, so it is recorded
+                // here rather than left for the caller to remember.
+                self.anchor = Some(SyncAnchor {
+                    rtp: sync.rtp_anchor,
+                    // The timing channel's stamps carry the 1900 epoch and the mirroring
+                    // header's do not; stripping it is what puts them in one domain.
+                    sender_ns: crate::clock::NtpTime::from_raw(sync.sender_ntp)
+                        .as_nanos()
+                        .saturating_sub(SECONDS_1900_TO_1970 * 1_000_000_000),
+                });
+                AudioOutput::Sync(sync)
+            }),
             payload_type::RESEND_REPLY => self.resend_reply(datagram),
             other => Err(AudioError::UnexpectedType(other)),
         }
@@ -253,12 +294,23 @@ impl AudioStream {
         // `pts` is documented as time since stream start, and the RTP timestamp is a
         // frame counter at the sample rate — so the origin is whatever arrived first.
         // `wrapping_sub` because the counter wraps at 2^32 (about 27 hours at 44.1 kHz).
-        let first = *self.first_timestamp.get_or_insert(kind.timestamp);
-        let elapsed_frames = kind.timestamp.wrapping_sub(first);
-        let pts = Duration::from_nanos(
-            u64::from(elapsed_frames).saturating_mul(1_000_000_000)
-                / u64::from(self.codec.sample_rate().max(1)),
-        );
+        let pts = match &self.origin {
+            // Sharing a timeline with video: place this frame on the sender's clock and
+            // measure from the session's origin, not this stream's first packet.
+            Some(origin) => {
+                let anchor = self.anchor.ok_or(AudioError::AwaitingSync)?;
+                origin.pts(anchor.sender_ns_of(kind.timestamp, self.codec.sample_rate()))
+            }
+            // Standing alone, so there is nothing to be out of step with.
+            None => {
+                let first = *self.first_timestamp.get_or_insert(kind.timestamp);
+                let elapsed_frames = kind.timestamp.wrapping_sub(first);
+                Duration::from_nanos(
+                    u64::from(elapsed_frames).saturating_mul(1_000_000_000)
+                        / u64::from(self.codec.sample_rate().max(1)),
+                )
+            }
+        };
 
         Ok(AudioOutput::Frame {
             sequence: kind.sequence,
@@ -532,6 +584,64 @@ mod tests {
         };
         assert_eq!(frame.audio_codec, Some(AudioCodec::Aac));
         assert_eq!(frame.data.as_ref(), plain.as_slice());
+    }
+
+    #[test]
+    fn a_shared_origin_puts_audio_on_the_same_timeline_as_video() {
+        // The bug this closes: each plane used to measure from its own first frame, so
+        // the offset between them was whatever the two streams happened to start at.
+        use crate::clock::StreamOrigin;
+        use crate::sdp::SessionKey;
+        let origin = std::sync::Arc::new(StreamOrigin::new());
+
+        // Video anchors the session at 50 s of sender uptime.
+        assert_eq!(origin.pts(50_000_000_000), Duration::ZERO);
+
+        let params = AnnounceParams::mirror_aac_eld(SessionKey::from_bytes([1u8; 16]), [2u8; 16]);
+        let mut s = AudioStream::new(&params).with_origin(std::sync::Arc::clone(&origin));
+
+        // A sync packet says RTP 1_000_000 was 50.5 s of sender uptime.
+        let mut sync = vec![0x80, 0xD4, 0, 0];
+        sync.extend_from_slice(&0u32.to_be_bytes());
+        // `from_unix_nanos` adds the 1900 epoch, which is exactly what a sender's sync
+        // packet carries and what the parser strips back off.
+        let ntp = crate::clock::NtpTime::from_unix_nanos(50_500_000_000);
+        sync.extend_from_slice(&ntp.raw().to_be_bytes());
+        sync.extend_from_slice(&1_000_000u32.to_be_bytes());
+        s.on_control(&sync).unwrap();
+
+        // So an audio frame at that RTP presents half a second after the video did.
+        let out = s
+            .on_audio(&audio_packet(1_000_000, b"sixteen bytes!!!"))
+            .unwrap();
+        let AudioOutput::Frame { frame, .. } = out else {
+            panic!("expected a frame")
+        };
+        let drift = frame.pts.as_millis().abs_diff(500);
+        assert!(drift < 5, "audio landed at {:?}, not 500 ms", frame.pts);
+    }
+
+    #[test]
+    fn mirror_audio_before_a_sync_packet_is_dropped_rather_than_guessed() {
+        // It cannot be placed on the shared timeline, and inventing an origin would put
+        // it wherever it happened to start — which is exactly the bug being fixed.
+        use crate::clock::StreamOrigin;
+        use crate::sdp::SessionKey;
+        let params = AnnounceParams::mirror_aac_eld(SessionKey::from_bytes([1u8; 16]), [2u8; 16]);
+        let mut s = AudioStream::new(&params).with_origin(std::sync::Arc::new(StreamOrigin::new()));
+        assert_eq!(
+            s.on_audio(&audio_packet(0, b"sixteen bytes!!!"))
+                .unwrap_err(),
+            AudioError::AwaitingSync
+        );
+    }
+
+    #[test]
+    fn an_audio_only_session_needs_no_anchor_because_it_syncs_with_nothing() {
+        // The AirPlay 1 flow has no second plane, so it keeps measuring from its own
+        // first packet and never waits for a sync packet to start playing.
+        let mut s = plain_stream();
+        assert!(s.on_audio(&audio_packet(1_000, b"aaaa")).is_ok());
     }
 
     #[test]

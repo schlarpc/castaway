@@ -32,13 +32,14 @@
 //! keystream at all.
 
 use std::fmt;
-use std::time::Duration;
+use std::sync::Arc;
 
 use aes::cipher::{KeyIvInit as _, StreamCipher as _};
 use bytes::Bytes;
 use castaway_core::{EncodedFrame, VideoCodec};
 use sha2::{Digest as _, Sha512};
 
+use crate::clock::StreamOrigin;
 use crate::error::MirrorError;
 
 /// AES-128-CTR, big-endian 128-bit counter — the same primitive Cast mirroring uses,
@@ -164,23 +165,27 @@ pub struct MirrorStream {
     cipher: Aes128Ctr,
     /// SPS/PPS from the last type-1 packet, waiting for the access unit they describe.
     pending_parameter_sets: Option<(u64, Vec<u8>)>,
-    /// The first timestamp seen, so `pts` can be relative to it.
-    first_timestamp: Option<u64>,
+    /// The origin shared with this session's audio plane.
+    origin: Arc<StreamOrigin>,
     /// Whether the sender has told us it is suspending.
     suspended: bool,
 }
 
 impl MirrorStream {
-    /// Start a stream with the derived keys.
+    /// Start a stream with the derived keys, measuring against `origin`.
+    ///
+    /// The origin is shared with the audio plane so the two land on one timeline; the
+    /// video header is already in the sender's nanosecond domain, so this plane needs no
+    /// conversion to get there.
     #[must_use]
-    pub fn new(keys: &MirrorKeys) -> Self {
+    pub fn new(keys: &MirrorKeys, origin: Arc<StreamOrigin>) -> Self {
         Self {
             // One cipher for the life of the connection. RustCrypto's `StreamCipher`
             // tracks the position within a block, so the carry-buffer dance the original
             // needs disappears — and restarting it is not expressible.
             cipher: Aes128Ctr::new(&keys.key.into(), &keys.iv.into()),
             pending_parameter_sets: None,
-            first_timestamp: None,
+            origin,
             suspended: false,
         }
     }
@@ -281,11 +286,10 @@ impl MirrorStream {
         };
         framed.shrink_to_fit();
 
-        let first = *self.first_timestamp.get_or_insert(header.timestamp);
         // The header's clock counts nanoseconds since the sender booted, so a difference
         // is the only meaningful reading of it. `EncodedFrame::pts` is documented as time
-        // since stream start, which is exactly that.
-        let pts = Duration::from_nanos(header.timestamp.saturating_sub(first));
+        // since stream start, which is exactly what the shared origin produces.
+        let pts = self.origin.pts(header.timestamp);
 
         out.push(MirrorOutput::Frame(Box::new(EncodedFrame {
             video_codec: Some(VideoCodec::H264),
@@ -414,6 +418,8 @@ fn parameter_sets(record: &[u8]) -> Result<Vec<u8>, MirrorError> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    use std::time::Duration;
+
     use super::*;
 
     fn keys() -> MirrorKeys {
@@ -478,7 +484,7 @@ mod tests {
 
     #[test]
     fn a_codec_config_yields_geometry_and_arms_the_parameter_sets() {
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         // version, profile, compat, level, lengthSize, numSPS, spsLen, SPS, numPPS, ppsLen, PPS
         let record = [
             &[1u8, 100, 0xc0, 40, 0xff, 0xe1][..],
@@ -502,7 +508,7 @@ mod tests {
 
     #[test]
     fn parameter_sets_are_prepended_to_the_access_unit_that_shares_their_timestamp() {
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let record = [
             &[1u8, 100, 0xc0, 40, 0xff, 0xe1][..],
             &3u16.to_be_bytes()[..],
@@ -542,7 +548,7 @@ mod tests {
 
     #[test]
     fn avcc_becomes_annex_b_without_changing_length() {
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let plain = access_unit(1, b"not-a-keyframe");
         let mut au = plain.clone();
         sender_cipher().apply_keystream(&mut au);
@@ -564,7 +570,7 @@ mod tests {
     fn the_keystream_runs_unbroken_across_messages() {
         // The detail that makes this different from Cast: restarting the counter per
         // frame would decode the first frame and turn everything after it into noise.
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut cipher = sender_cipher();
         let mut buf = Vec::new();
         let mut expected = Vec::new();
@@ -594,7 +600,7 @@ mod tests {
     fn non_video_payloads_do_not_consume_keystream() {
         // A heartbeat between two frames must not shift the cipher, or every frame after
         // it decodes to noise.
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut cipher = sender_cipher();
         let plain = access_unit(1, b"aaaaaaaaaaaaaaaa");
         let mut au = plain.clone();
@@ -613,7 +619,7 @@ mod tests {
 
     #[test]
     fn pts_is_measured_from_the_first_message_not_from_the_senders_uptime() {
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut cipher = sender_cipher();
         let mut buf = Vec::new();
         // The sender's clock counts from its own boot — hours in.
@@ -636,7 +642,7 @@ mod tests {
 
     #[test]
     fn a_partial_message_is_left_in_the_buffer() {
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut au = access_unit(1, b"0123456789abcdef");
         sender_cipher().apply_keystream(&mut au);
         let whole = message(payload_type::VIDEO, 0, 0, &au);
@@ -654,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_suspend_flag_is_reported_once_and_resumes() {
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut buf = message(payload_type::HEARTBEAT, 0, FLAG_SUSPEND, &[]);
         assert!(matches!(
             s.feed(&mut buf).unwrap().as_slice(),
@@ -676,7 +682,7 @@ mod tests {
         // What a sender sends when it wants HEVC and we did not advertise bit 42. It is
         // a refusal, and reporting it as such is the difference between a diagnosable
         // failure and a stream that simply never starts.
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut buf = message(payload_type::CODEC_CONFIG, 0, 0, &[]);
         assert!(matches!(s.feed(&mut buf), Err(MirrorError::CodecRefused)));
     }
@@ -685,7 +691,7 @@ mod tests {
     fn a_payload_that_does_not_decrypt_is_refused_rather_than_decoded() {
         // Wrong key: the NAL walk will not land on the end of the buffer, and H.264's
         // forbidden-zero bit is very likely set. Either way it must not reach a decoder.
-        let mut s = MirrorStream::new(&keys());
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
         let mut buf = message(payload_type::VIDEO, 0, 0, &[0xff; 64]);
         assert!(matches!(
             s.feed(&mut buf),

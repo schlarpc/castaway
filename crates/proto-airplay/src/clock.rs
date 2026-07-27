@@ -23,6 +23,81 @@
 //! a customer.
 
 use std::collections::VecDeque;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// The instant both planes of one session measure from.
+///
+/// A mirroring session is two streams that must land on one timeline, and until this
+/// existed each picked its own origin at its own first frame — so even with perfectly
+/// correct timestamps the relationship between them was discarded before anything
+/// downstream could use it, and audio sat wherever it happened to start relative to
+/// video.
+///
+/// Whichever plane produces a frame first sets the origin; the other measures from the
+/// same point. Both must already be in the **sender's** nanosecond domain — the video
+/// header is there natively, and audio gets there through a sync anchor.
+#[derive(Debug, Default)]
+pub struct StreamOrigin(OnceLock<u64>);
+
+impl StreamOrigin {
+    /// A fresh, unanchored origin.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convert a sender-clock timestamp into a presentation time for this session.
+    ///
+    /// `saturating_sub` because a frame from *before* the origin is possible when the
+    /// two planes start within a packet of each other — it presents at zero rather than
+    /// wrapping to seventy years.
+    pub fn pts(&self, sender_ns: u64) -> Duration {
+        let origin = *self.0.get_or_init(|| sender_ns);
+        Duration::from_nanos(sender_ns.saturating_sub(origin))
+    }
+
+    /// Whether anything has anchored it yet.
+    #[must_use]
+    pub fn is_anchored(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+/// What a sync packet establishes: this RTP frame number was that instant on the
+/// sender's clock.
+///
+/// The one thing that lets audio be placed on the same timeline as video. Audio counts
+/// frames and video counts nanoseconds, and nothing else in the protocol relates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncAnchor {
+    /// The RTP timestamp the anchor refers to.
+    pub rtp: u32,
+    /// The sender's clock at that instant, in nanoseconds since *its* boot — the same
+    /// domain the mirroring header uses, with the 1900 epoch already removed.
+    pub sender_ns: u64,
+}
+
+impl SyncAnchor {
+    /// Where an RTP timestamp falls on the sender's clock.
+    ///
+    /// RTP timestamps wrap at 2^32 — about 27 hours at 44.1 kHz — so the difference is
+    /// read as *signed* serial arithmetic. Comparing instead would put every frame after
+    /// a wrap a day and a half in the past.
+    #[must_use]
+    pub fn sender_ns_of(&self, rtp: u32, sample_rate: u32) -> u64 {
+        let raw = rtp.wrapping_sub(self.rtp);
+        let delta_frames = if raw > u32::MAX / 2 {
+            -i64::from(u32::MAX - raw) - 1
+        } else {
+            i64::from(raw)
+        };
+        let rate = i64::from(sample_rate.max(1));
+        let delta_ns = delta_frames.saturating_mul(1_000_000_000) / rate;
+        let base = i64::try_from(self.sender_ns).unwrap_or(i64::MAX);
+        u64::try_from(base.saturating_add(delta_ns).max(0)).unwrap_or(0)
+    }
+}
 
 /// Payload type for a timing request (we send these).
 const PT_TIMING_REQUEST: u8 = 82;
@@ -282,6 +357,52 @@ impl ResendTracker {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn an_origin_is_set_by_whichever_plane_speaks_first() {
+        let o = StreamOrigin::new();
+        assert!(!o.is_anchored());
+        // Video, say, at 50 s of sender uptime.
+        assert_eq!(o.pts(50_000_000_000), Duration::ZERO);
+        assert!(o.is_anchored());
+        // Audio 16 ms later measures from the *same* point, which is the whole purpose.
+        assert_eq!(o.pts(50_016_000_000), Duration::from_millis(16));
+    }
+
+    #[test]
+    fn a_frame_from_before_the_origin_presents_at_zero() {
+        // Reachable when the two planes start within a packet of each other. Without the
+        // saturation this wraps to seventy years and the frame never presents.
+        let o = StreamOrigin::new();
+        o.pts(1_000_000_000);
+        assert_eq!(o.pts(999_000_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_sync_anchor_places_rtp_on_the_senders_clock() {
+        // The only thing in the protocol that relates a frame counter to nanoseconds.
+        let a = SyncAnchor {
+            rtp: 1_000_000,
+            sender_ns: 50_000_000_000,
+        };
+        assert_eq!(a.sender_ns_of(1_000_000, 44_100), 50_000_000_000);
+        // 44100 frames later is one second later.
+        assert_eq!(a.sender_ns_of(1_044_100, 44_100), 51_000_000_000);
+        // …and 44100 earlier is one second before.
+        assert_eq!(a.sender_ns_of(955_900, 44_100), 49_000_000_000);
+    }
+
+    #[test]
+    fn an_rtp_wrap_does_not_throw_the_anchor_a_day_and_a_half_out() {
+        // RTP wraps every ~27 hours at 44.1 kHz. Read as unsigned, a frame just after
+        // the wrap looks like 2^32 frames in the future.
+        let a = SyncAnchor {
+            rtp: u32::MAX - 44_099,
+            sender_ns: 50_000_000_000,
+        };
+        // 44100 frames on, having wrapped through zero: exactly one second later.
+        assert_eq!(a.sender_ns_of(0, 44_100), 51_000_000_000);
+    }
 
     #[test]
     fn ntp_round_trips_through_nanoseconds() {
