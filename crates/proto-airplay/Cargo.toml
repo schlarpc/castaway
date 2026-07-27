@@ -15,6 +15,7 @@ crypto-fairplay.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 plist.workspace = true
+base64.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
 
