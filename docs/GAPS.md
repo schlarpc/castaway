@@ -56,10 +56,11 @@ Still open, roughly in the order they are worth taking:
    considers the browser created, and killing the render process by hand is unreliable to
    target (the zygote rewrites its forks' argv and this build sets no `CrRendererMain`
    thread name). Needs one run on the real box with a renderer killed under a live cast.
-2. **G45/G49/G50** — the remaining Spotify items: queue-resolution retries, shuffle and
-   repeat, local files.
-3. **G48** — DIAL REST conformance (CORS, 200-on-relaunch, percent-decoding, `MX`).
-4. **G53 (partly) / G54** — SUSPEND→re-START and RECONFIGURE→re-START are covered now,
+2. **G49/G50** — shuffle/repeat and local files. Both are display-and-control gaps rather
+   than playback ones (spirc honours the phone internally either way), and both want a
+   decision before code: `ControlTxn` would gain variants that only Spotify can serve, and
+   a receiver that holds no user files arguably *should* not play local ones.
+3. **G53 (partly) / G54** — SUSPEND→re-START and RECONFIGURE→re-START are covered now,
    both mutation-checked. Two phones streaming *concurrently* is not: the harness gained
    per-link reassembly and a per-handle push, but the second link's AVDTP signalling still
    goes unanswered in the test and I did not find out why before stopping. Since the
@@ -67,7 +68,7 @@ Still open, roughly in the order they are worth taking:
    either link, the likeliest cause is the harness rather than the adapter — but that is a
    guess, and the case Q27 records stays unproven either way. Also still missing: a bonded
    phone reconnecting after restart, and a self-contained YouTube regression test (G54).
-5. **G30 (Windows half)** — a Widevine CDM for the deploy artifact, which means extracting
+4. **G30 (Windows half)** — a Widevine CDM for the deploy artifact, which means extracting
    from a Chrome-for-Windows installer: a redistribution decision, not a patch.
 
 The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
@@ -532,7 +533,7 @@ display or the audio device, and two cannot take it back afterwards.
   GENERAL REJECT carrying the transaction label — is never emitted (`MessageType::GeneralReject`
   is never constructed anywhere).
 
-- **G45 — Queue name resolution can become a per-update RPC storm, awaited inline.
+- ✅ **G45 — Queue name resolution can become a per-update RPC storm, awaited inline.
   SUSPECTED.** `session.rs:513`: `QueueNames::resolve` inserts into `self.seen` only on
   success, so a track whose `AudioItem::get_file` fails (region-locked, transient 5xx) is
   retried on every cluster update, up to `RESOLVE_LIMIT = 6` sequential awaited round trips
@@ -558,7 +559,7 @@ display or the audio device, and two cannot take it back afterwards.
   `Firmware::File` → `std::fs::read` (`firmware.rs:32`) is likewise called from inside the
   async `init()` of both loaders.
 
-- **G48 — DIAL REST conformance details. CONFIRMED.**
+- ✅ **G48 — DIAL REST conformance details. CONFIRMED.**
   No CORS headers anywhere (`dial.rs:198`), which DIAL 2.1 requires of the REST service
   (`Access-Control-Allow-Origin`, exposing `Location`) — browser-based senders fail, native
   phone apps do not care. `POST` always returns 201 (`:303`) where the spec wants 200 on a
