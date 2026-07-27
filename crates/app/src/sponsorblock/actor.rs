@@ -42,8 +42,24 @@ pub async fn run(config: SponsorBlockConfig, screen: ScreenSlot, osd: OsdSink) {
         "SponsorBlock: {}",
         sponsorblock::ATTRIBUTION
     );
+    // One identity for the life of the process, not one per attach.
+    //
+    // The channel's long poll returns EOF routinely — BrowserChannel does it as a matter
+    // of course — so a fresh `Uuid::new_v4()` per cycle meant the Lounge's connected-device
+    // list filled up with "castaway SponsorBlock" entries, each visible in the phone's cast
+    // UI, and YouTube may put a connect toast on screen for every one. A stable id makes a
+    // reattach look like what it is: the same remote, still here.
+    let identity = SenderIdentity {
+        device_id: uuid::Uuid::new_v4().to_string(),
+        name: "castaway SponsorBlock".to_string(),
+    };
+    // Segment state outlives the channel for the same reason. It belongs to the *video*,
+    // not to the connection: rebuilding it per reattach re-fetched the segments and
+    // forgot which had already been skipped, so a reattach mid-video could skip a
+    // sponsor the viewer had already sat through.
+    let mut planner = Planner::new();
     loop {
-        match session(&config, &screen, &osd).await {
+        match session(&config, &screen, &osd, &identity, &mut planner).await {
             Ok(()) => debug!("SponsorBlock session ended; will re-attach"),
             Err(e) => warn!(error = %e, "SponsorBlock session failed; will re-attach"),
         }
@@ -58,16 +74,14 @@ async fn session(
     config: &SponsorBlockConfig,
     screen: &ScreenSlot,
     osd: &OsdSink,
+    identity: &SenderIdentity,
+    planner: &mut Planner,
 ) -> anyhow::Result<()> {
     let screen_id = wait_for_screen(screen).await;
     let token = lounge_token(&screen_id).await?;
 
-    let identity = SenderIdentity {
-        device_id: uuid::Uuid::new_v4().to_string(),
-        name: "castaway SponsorBlock".to_string(),
-    };
     // The RID seed is ours to choose; the Lounge only requires that it advance.
-    let mut unbound = Unbound::new(token, identity, 20000);
+    let mut unbound = Unbound::new(token, identity.clone(), 20000);
     let request = unbound.bind_request();
     let response = post(&format!("{LOUNGE}/bc/bind?{}", request.query), request.body).await?;
     let mut sender = unbound.bound(&response)?;
@@ -77,7 +91,6 @@ async fn session(
     let receive = sender.receive_request();
     tokio::task::spawn_blocking(move || stream_channel(&receive.query, &commands_tx));
 
-    let mut planner = Planner::new();
     let mut clock: Option<PlaybackClock> = None;
     // One press per ad: the screen reports the state repeatedly while the button is up,
     // and a press per report would be a burst of commands for one skip.
