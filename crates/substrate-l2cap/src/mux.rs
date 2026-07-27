@@ -236,6 +236,12 @@ struct Outstanding {
     retries: u8,
 }
 
+/// Bit 0 of a configuration request's flags: "more options follow in another request".
+///
+/// Uncommon but legal, and the failure it produces when ignored is the confusing kind —
+/// a channel both ends believe is configured, differently.
+const CONTINUATION_FLAG: u16 = 0x0001;
+
 /// The response timeout (RTX). The spec allows 1–60 seconds.
 ///
 /// Toward the short end: everything we send a request for is on a local radio link with a
@@ -681,9 +687,9 @@ impl Multiplexer {
             Signal::ConfigurationRequest {
                 id,
                 dest_cid,
+                flags,
                 options,
-                ..
-            } => self.on_config_request(id, dest_cid, &options),
+            } => self.on_config_request(id, dest_cid, flags, &options),
             Signal::ConfigurationResponse {
                 id,
                 source_cid,
@@ -878,8 +884,20 @@ impl Multiplexer {
         &mut self,
         id: u8,
         dest_cid: Cid,
+        flags: u16,
         options: &[ConfigOption],
     ) -> Result<Vec<L2capEvent>, L2capError> {
+        // Bit 0 is the continuation flag: the peer is sending its option list across
+        // several requests because it did not fit in one. It was being destructured away,
+        // so a partial list was answered `Success` with C=0 and the channel opened while
+        // the peer was still describing it — both ends then believing different things
+        // about a channel that is nominally up, which shows as "connects, then the first
+        // data PDU is dropped".
+        //
+        // The options in a continued request still apply; what must not happen is
+        // *completing* the configuration. So accumulate, answer with the same flag, and
+        // let the final C=0 request finish the exchange.
+        let continues = flags & CONTINUATION_FLAG != 0;
         let receive_mps = self.receive_mps();
         let basic_mtu = self.local_mtu;
         let Some(ch) = self.channels.get(&dest_cid.raw()) else {
@@ -1010,19 +1028,29 @@ impl Multiplexer {
             response.push(ConfigOption::Fcs(ch.parameters.fcs));
         }
 
-        if let ChannelState::WaitConfig { incoming_done, .. } = &mut ch.state {
-            *incoming_done = true;
+        // A continued request is answered — with the flag echoed, so the peer knows we
+        // followed — but does not *complete* the incoming direction. Only the final
+        // request, the one with C=0, does that.
+        if !continues {
+            if let ChannelState::WaitConfig { incoming_done, .. } = &mut ch.state {
+                *incoming_done = true;
+            }
         }
-        let repropose = ch.mode != ch.proposed_mode;
+        let repropose = !continues && ch.mode != ch.proposed_mode;
         let attempts = ch.config_attempts;
 
         let mut out = vec![Self::signal(&Signal::ConfigurationResponse {
             id,
             source_cid: remote_cid,
-            flags: 0,
+            flags: if continues { CONTINUATION_FLAG } else { 0 },
             result: ConfigResult::Success,
             options: response,
         })?];
+        if continues {
+            // Nothing else to do until the rest arrives: promoting now would open a
+            // channel the peer is still describing.
+            return Ok(out);
+        }
         if repropose {
             if attempts >= MAX_CONFIG_ATTEMPTS {
                 return Ok(self.fail_configuration(dest_cid));
@@ -1113,13 +1141,29 @@ impl Multiplexer {
     /// Give up on a channel whose configuration will not converge.
     fn fail_configuration(&mut self, cid: Cid) -> Vec<L2capEvent> {
         self.ertm.remove(&cid.raw());
-        match self.channels.remove(&cid.raw()) {
-            Some(ch) => vec![L2capEvent::ChannelClosed {
-                cid: ch.local_cid,
-                psm: ch.psm,
-            }],
-            None => Vec::new(),
+        let Some(ch) = self.channels.remove(&cid.raw()) else {
+            return Vec::new();
+        };
+        let mut events = Vec::with_capacity(2);
+        // Tell the peer, rather than just forgetting locally. `fail_channel` already did
+        // this and these two paths disagreed: a channel abandoned here left the phone
+        // holding a half-open one until its own RTX gave up, and a retry in the meantime
+        // collides with a CID we now consider free.
+        let id = self.alloc_id();
+        let request = Signal::DisconnectionRequest {
+            id,
+            dest_cid: ch.remote_cid,
+            source_cid: ch.local_cid,
+        };
+        if let Ok(event) = Self::signal(&request) {
+            events.push(event);
+            self.awaiting(id, cid.raw(), request);
         }
+        events.push(L2capEvent::ChannelClosed {
+            cid: ch.local_cid,
+            psm: ch.psm,
+        });
+        events
     }
 
     /// Open the channel only once *both* directions are configured.

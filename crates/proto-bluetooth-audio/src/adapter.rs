@@ -785,7 +785,20 @@ impl BluetoothAdapter {
         let msg = match Message::decode(payload) {
             Ok(m) => m,
             Err(e) => {
-                debug!(error = %e, "undecodable AVDTP message");
+                // A signal we do not implement, or a fragmented one. Either way the peer
+                // is owed an answer: AVDTP has no "ignored", so silence costs it a signal
+                // timeout, a retry, and usually the link.
+                if let Some((transaction, signal_id)) = avdtp::Message::refusable_header(payload) {
+                    debug!(
+                        error = %e,
+                        signal_id,
+                        "avdtp: refusing a signal we do not implement"
+                    );
+                    out.replies
+                        .push((cid, avdtp::Message::general_reject(transaction, signal_id)));
+                } else {
+                    debug!(error = %e, "undecodable AVDTP message");
+                }
                 return Ok(());
             }
         };

@@ -480,3 +480,40 @@ fn reconfigure_cannot_switch_codec_or_arrive_at_the_wrong_time() {
     // After all that, the stream is still usable at its original configuration.
     assert_eq!(phone.session.state(), StreamState::Open);
 }
+
+#[test]
+fn a_signal_we_do_not_implement_is_refused_rather_than_ignored() {
+    // AVDTP has no "ignored": a peer that gets silence waits out its signal timeout,
+    // retries, and typically aborts the link. The spec's answer is General Reject, and
+    // nothing in the crate constructed one — an unknown signal id just logged at `debug!`
+    // and returned.
+    //
+    // The refusal is built from the two header bytes rather than a parsed message,
+    // because the case it exists for is the one where parsing failed.
+    let transaction = 0x0A;
+    let unknown_signal = 0x0E; // outside AVDTP's 0x01..=0x0D
+    let reject = Message::general_reject(transaction, unknown_signal);
+
+    assert_eq!(reject.len(), 2, "a general reject is the header alone");
+    assert_eq!(
+        reject[0] >> 4,
+        transaction,
+        "it must carry the transaction label, or the peer cannot match it"
+    );
+    assert_eq!(reject[0] & 0b11, 0b01, "message type GEN_REJECT");
+    assert_eq!(reject[1], unknown_signal, "and name the signal refused");
+}
+
+#[test]
+fn only_commands_are_refused() {
+    // Refusing a *response* would be a message the peer has no transaction open for.
+    let command = [0xA0, 0x0E]; // transaction 10, message type 0b00
+    assert_eq!(Message::refusable_header(&command), Some((0x0A, 0x0E)));
+
+    let response = [0xA2, 0x0E]; // message type 0b10, ResponseAccept
+    assert_eq!(Message::refusable_header(&response), None);
+
+    // Nothing to address a refusal to.
+    assert_eq!(Message::refusable_header(&[0xA0]), None);
+    assert_eq!(Message::refusable_header(&[]), None);
+}

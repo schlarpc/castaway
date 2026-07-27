@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use substrate_l2cap::signaling::Signal;
+use substrate_l2cap::signaling::{ConfigOption, Signal};
 use substrate_l2cap::{ChannelMode, Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
 
 /// A dynamic PSM of the shape a phone publishes its image server on.
@@ -709,4 +709,95 @@ fn random_bytes_into_the_signalling_channel_do_not_panic() {
         }
         let _ = mux.handle_pdu(&L2capPdu::new(Cid::SIGNALING, Bytes::from(bytes)));
     }
+}
+
+#[test]
+fn a_configuration_split_across_requests_does_not_open_the_channel_early() {
+    // Bit 0 of the flags is "more options follow". It was destructured away, so a partial
+    // option list was answered Success with C=0 and the channel opened while the peer was
+    // still describing it — both ends then believing different things about a channel
+    // that is nominally up, which shows as "connects, then the first data PDU is dropped".
+    let mut mux = Multiplexer::new(672);
+    mux.listen(Psm::AVDTP);
+
+    // Connect first, so there is a channel to configure.
+    let connect = Signal::ConnectionRequest {
+        id: 1,
+        psm: Psm::AVDTP,
+        source_cid: Cid::new(0x0041),
+    }
+    .encode()
+    .expect("encode");
+    let events = mux
+        .handle_pdu(&L2capPdu::new(Cid::SIGNALING, connect))
+        .expect("connect");
+    let ours = events
+        .iter()
+        .filter_map(|e| match e {
+            L2capEvent::Send(pdu) => Signal::decode_all(&pdu.payload).ok(),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|s| match s {
+            Signal::ConnectionResponse { dest_cid, .. } => Some(dest_cid),
+            _ => None,
+        })
+        .expect("a connection response");
+
+    // First half of the configuration, flagged as continued.
+    let partial = Signal::ConfigurationRequest {
+        id: 2,
+        dest_cid: ours,
+        flags: 0x0001,
+        options: vec![ConfigOption::Mtu(512)],
+    }
+    .encode()
+    .expect("encode");
+    let events = mux
+        .handle_pdu(&L2capPdu::new(Cid::SIGNALING, partial))
+        .expect("partial config");
+
+    let replies: Vec<Signal> = events
+        .iter()
+        .filter_map(|e| match e {
+            L2capEvent::Send(pdu) => Signal::decode_all(&pdu.payload).ok(),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let echoed = replies
+        .iter()
+        .find_map(|s| match s {
+            Signal::ConfigurationResponse { flags, .. } => Some(*flags),
+            _ => None,
+        })
+        .expect("a configuration response");
+    assert_eq!(
+        echoed & 0x0001,
+        0x0001,
+        "the continuation flag must be echoed so the peer knows we followed: {replies:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, L2capEvent::ChannelOpen { .. })),
+        "the channel must not open while the peer is still describing it"
+    );
+
+    // The rest, C=0 — now it may complete.
+    let rest = Signal::ConfigurationRequest {
+        id: 3,
+        dest_cid: ours,
+        flags: 0,
+        options: vec![],
+    }
+    .encode()
+    .expect("encode");
+    let events = mux
+        .handle_pdu(&L2capPdu::new(Cid::SIGNALING, rest))
+        .expect("final config");
+    assert!(
+        events.iter().any(|e| matches!(e, L2capEvent::Send(_))),
+        "the final request is still answered: {events:?}"
+    );
 }

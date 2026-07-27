@@ -186,6 +186,38 @@ pub struct Message {
 }
 
 impl Message {
+    /// The refusal for a signal we do not implement at all.
+    ///
+    /// Encoded straight from the two header bytes rather than from a parsed `Message`,
+    /// because the case this exists for is precisely the one where parsing failed: an
+    /// unknown signal id has no `Signal` to put in a struct. AVDTP's General Reject is
+    /// the header alone — transaction label, message type 0b01, and the signal id being
+    /// refused, with no payload (BlueZ `avdtp_unknown_cmd`, which sends `NULL, 0`).
+    ///
+    /// Refusing matters because AVDTP has no "ignored": a peer that gets silence waits
+    /// out its signal timeout, retries, and typically aborts the link.
+    #[must_use]
+    pub fn general_reject(transaction: u8, signal_id: u8) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2);
+        buf.put_u8((transaction << 4) | MessageType::GeneralReject.bits());
+        buf.put_u8(signal_id);
+        buf.freeze()
+    }
+
+    /// Read the header of a message we could not parse: its transaction label, whether it
+    /// is a command, and the signal id it named.
+    ///
+    /// `None` for anything too short to have a header, where there is nothing to address
+    /// a refusal to.
+    #[must_use]
+    pub fn refusable_header(buf: &[u8]) -> Option<(u8, u8)> {
+        let header = *buf.first()?;
+        let signal_id = *buf.get(1)?;
+        // Only a *command* is owed a refusal; refusing a response would be a message the
+        // peer has no transaction open for.
+        (MessageType::from_bits(header) == MessageType::Command).then_some((header >> 4, signal_id))
+    }
+
     /// Build a command.
     #[must_use]
     pub fn command(transaction: u8, signal: Signal, payload: Bytes) -> Self {
