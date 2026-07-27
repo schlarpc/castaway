@@ -23,9 +23,11 @@ tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time"
 tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
+x509-parser.workspace = true
 
 [lints]
 workspace = true

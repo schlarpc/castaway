@@ -9,13 +9,15 @@
 //! actor keeps its certificate DER and hands it to [`CastAuthResponder`] per connection.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use castaway_core::{
     Advertisement, CoreError, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
 };
 use crypto_cast_auth::CastDeviceSigner;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -33,14 +35,53 @@ use crate::{framing, CAST_PORT, CAST_SERVICE_TYPE};
 /// sender claims.
 const MAX_FRAME: usize = 1 << 20;
 
-/// The receiver's TLS identity: a self-signed certificate plus its key.
+/// How far in the future the TLS certificate's `notAfter` is set.
+///
+/// This is a protocol constraint, not a policy preference. A Cast sender does not treat
+/// the receiver's TLS certificate as web PKI — it never builds a chain for it — but it
+/// *does* repurpose the X.509 validity window as the expiry of the device-auth signature
+/// that covers it, and rejects any peer certificate whose `notAfter` is more than four
+/// days out (`kMaxSelfSignedCertLifetimeInDays`, openscreen
+/// `cast/sender/channel/cast_auth_util.cc`, the same code Chrome runs). rcgen's default
+/// window is 1975→4096, which fails that check before device auth is even considered —
+/// so an official sender walks away from a receiver that is otherwise perfectly correct,
+/// and nothing on either side says why. Two days leaves two days of headroom for a
+/// sender whose clock runs ahead of ours.
+const TLS_CERT_VALID_FOR: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// How far `notBefore` is backdated. Nothing bounds this — the four-day rule is on
+/// `notAfter` alone — so it is set purely to tolerate a sender whose clock trails ours,
+/// which would otherwise see a certificate that is not valid yet.
+const TLS_CERT_BACKDATE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Reissue once this much of the window is left. A receiver on a wall panel runs for
+/// months; a certificate that is correct at boot and silently expires on day two is a
+/// worse failure than never having had one, because the panel goes on looking healthy.
+const TLS_CERT_RENEW_WITH: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The receiver's TLS identity: one long-lived key plus a deliberately short-lived
+/// self-signed certificate, reissued as it ages.
 ///
 /// Self-signed is correct here, not a shortcut — every Cast receiver ships one, and
 /// senders don't build a chain to a trust root. What matters is that the same DER bytes
-/// the sender sees are the bytes the device-auth signature covers.
+/// the sender sees are the bytes the device-auth signature covers, and that the window
+/// in those bytes satisfies [`TLS_CERT_VALID_FOR`].
+///
+/// The key is kept across reissues rather than regenerated, which is what makes rotation
+/// cheap enough to do on the accept path: issuing a certificate is microseconds, and only
+/// key generation is slow.
 pub struct TlsIdentity {
-    cert_der: CertificateDer<'static>,
+    key: rcgen::KeyPair,
     key_der: PrivateKeyDer<'static>,
+    subject_alt_names: Vec<String>,
+    current: Mutex<Issued>,
+}
+
+/// The certificate in force, and when it stops being worth serving.
+struct Issued {
+    config: Arc<rustls::ServerConfig>,
+    cert_der: Vec<u8>,
+    renew_at: SystemTime,
 }
 
 impl TlsIdentity {
@@ -49,35 +90,113 @@ impl TlsIdentity {
     /// # Errors
     /// [`CastError::Tls`] if certificate generation fails.
     pub fn self_signed(subject_alt_names: &[String]) -> Result<Self, CastError> {
-        let key = rcgen::generate_simple_self_signed(subject_alt_names.to_vec())
+        Self::self_signed_at(subject_alt_names, SystemTime::now())
+    }
+
+    /// [`TlsIdentity::self_signed`] with the clock supplied, so a test can assert on the
+    /// validity window without depending on when it runs.
+    ///
+    /// # Errors
+    /// [`CastError::Tls`] if certificate generation fails.
+    pub fn self_signed_at(
+        subject_alt_names: &[String],
+        now: SystemTime,
+    ) -> Result<Self, CastError> {
+        let key = rcgen::KeyPair::generate().map_err(|e| CastError::Tls(e.to_string()))?;
+        let key_der = PrivateKeyDer::try_from(key.serialize_der())
             .map_err(|e| CastError::Tls(e.to_string()))?;
-        let key_der = PrivateKeyDer::try_from(key.signing_key.serialize_der())
-            .map_err(|e| CastError::Tls(e.to_string()))?;
+        let issued = Self::issue(&key, &key_der, subject_alt_names, now)?;
         Ok(Self {
-            cert_der: key.cert.der().clone(),
+            key,
             key_der,
+            subject_alt_names: subject_alt_names.to_vec(),
+            current: Mutex::new(issued),
         })
     }
 
-    /// The certificate DER — what the device-auth response signs over.
-    #[must_use]
-    pub fn cert_der(&self) -> &[u8] {
-        self.cert_der.as_ref()
+    /// The certificate and acceptor to serve a connection arriving at `now` with,
+    /// reissuing first if the current one is close enough to expiry that a sender would
+    /// start refusing it.
+    ///
+    /// Reissue failure is deliberately not fatal: an aging certificate still authenticates
+    /// this connection, and dropping senders because renewal failed would trade a
+    /// degrading fault for an immediate one.
+    fn current_at(&self, now: SystemTime) -> (TlsAcceptor, Vec<u8>) {
+        let mut current = match self.current.lock() {
+            Ok(guard) => guard,
+            // The only way this is poisoned is a panic while holding it, and everything
+            // under the lock is infallible cloning. Recover rather than propagate.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if now >= current.renew_at {
+            match Self::issue(&self.key, &self.key_der, &self.subject_alt_names, now) {
+                Ok(fresh) => {
+                    debug!("reissued the Cast TLS certificate");
+                    *current = fresh;
+                }
+                Err(e) => warn!(error = %e, "could not reissue the Cast TLS certificate"),
+            }
+        }
+        (
+            TlsAcceptor::from(Arc::clone(&current.config)),
+            current.cert_der.clone(),
+        )
     }
 
-    fn server_config(&self) -> Result<rustls::ServerConfig, CastError> {
+    /// The certificate DER in force — what the device-auth response signs over.
+    #[must_use]
+    pub fn cert_der(&self) -> Vec<u8> {
+        self.current_at(SystemTime::now()).1
+    }
+
+    fn issue(
+        key: &rcgen::KeyPair,
+        key_der: &PrivateKeyDer<'static>,
+        subject_alt_names: &[String],
+        now: SystemTime,
+    ) -> Result<Issued, CastError> {
+        let mut params = rcgen::CertificateParams::new(subject_alt_names.to_vec())
+            .map_err(|e| CastError::Tls(e.to_string()))?;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "castaway");
+        params.not_before = offset_date_time(now - TLS_CERT_BACKDATE)?;
+        params.not_after = offset_date_time(now + TLS_CERT_VALID_FOR)?;
+        let cert = params
+            .self_signed(key)
+            .map_err(|e| CastError::Tls(e.to_string()))?;
+
         // Name the provider rather than taking `ServerConfig::builder()`'s process-default
         // path: that one *panics* if no default is installed and the crate features are
         // ambiguous, and a library crate doesn't get to panic (ground rule 7).
-        rustls::ServerConfig::builder_with_provider(Arc::new(
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|e| CastError::Tls(e.to_string()))?
         .with_no_client_auth()
-        .with_single_cert(vec![self.cert_der.clone()], self.key_der.clone_key())
-        .map_err(|e| CastError::Tls(e.to_string()))
+        .with_single_cert(
+            vec![CertificateDer::from(cert.der().to_vec())],
+            key_der.clone_key(),
+        )
+        .map_err(|e| CastError::Tls(e.to_string()))?;
+
+        Ok(Issued {
+            config: Arc::new(config),
+            cert_der: cert.der().to_vec(),
+            renew_at: now + TLS_CERT_VALID_FOR - TLS_CERT_RENEW_WITH,
+        })
     }
+}
+
+/// `SystemTime` in the shape rcgen wants.
+fn offset_date_time(at: SystemTime) -> Result<OffsetDateTime, CastError> {
+    let secs = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| CastError::Tls(e.to_string()))?
+        .as_secs();
+    let secs = i64::try_from(secs).map_err(|e| CastError::Tls(e.to_string()))?;
+    OffsetDateTime::from_unix_timestamp(secs).map_err(|e| CastError::Tls(e.to_string()))
 }
 
 /// A listening CASTv2 receiver: one TLS listener, one [`CastSession`] per connection.
@@ -85,29 +204,30 @@ pub struct CastReceiver {
     listen: SocketAddr,
     friendly_name: String,
     device_id: String,
-    acceptor: TlsAcceptor,
-    tls_cert_der: Vec<u8>,
+    identity: TlsIdentity,
     signer: Option<Arc<CastDeviceSigner>>,
 }
 
 impl CastReceiver {
     /// Build a receiver listening on `listen` with the given TLS `identity`.
     ///
+    /// The identity is owned rather than borrowed because it is not a fixed value: its
+    /// certificate is short-lived by protocol requirement (see [`TLS_CERT_VALID_FOR`])
+    /// and is reissued as connections arrive.
+    ///
     /// # Errors
-    /// [`CastError::Tls`] if the identity can't be turned into a rustls server config.
+    /// Currently infallible; kept fallible because construction reaches TLS setup.
     pub fn new(
         listen: SocketAddr,
         friendly_name: impl Into<String>,
         device_id: impl Into<String>,
-        identity: &TlsIdentity,
+        identity: TlsIdentity,
     ) -> Result<Self, CastError> {
-        let config = identity.server_config()?;
         Ok(Self {
             listen,
             friendly_name: friendly_name.into(),
             device_id: device_id.into(),
-            acceptor: TlsAcceptor::from(Arc::new(config)),
-            tls_cert_der: identity.cert_der().to_vec(),
+            identity,
             signer: None,
         })
     }
@@ -133,7 +253,10 @@ impl CastReceiver {
         if let Err(e) = stream.set_nodelay(true) {
             debug!(%peer, error = %e, "could not disable Nagle");
         }
-        let mut tls = match self.acceptor.accept(stream).await {
+        // Taken per connection, not once at startup: the certificate rotates, and the
+        // device-auth signature has to cover the one this sender is actually looking at.
+        let (acceptor, tls_cert_der) = self.identity.current_at(SystemTime::now());
+        let mut tls = match acceptor.accept(stream).await {
             Ok(tls) => tls,
             Err(e) => {
                 warn!(%peer, error = %e, "CASTv2 TLS handshake failed");
@@ -143,7 +266,7 @@ impl CastReceiver {
         info!(%peer, "CASTv2 sender connected");
 
         let auth = self.signer.clone().map(|signer| {
-            Box::new(CastAuthResponder::new(signer, self.tls_cert_der.clone()))
+            Box::new(CastAuthResponder::new(signer, tls_cert_der))
                 as Box<dyn crate::session::DeviceAuthResponder>
         });
         let mut session = CastSession::new(auth);
@@ -327,7 +450,7 @@ mod tests {
         TlsIdentity::self_signed(&["castaway.local".to_string()]).unwrap()
     }
 
-    fn receiver(identity: &TlsIdentity) -> CastReceiver {
+    fn receiver(identity: TlsIdentity) -> CastReceiver {
         CastReceiver::new(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             "Lab TV",
@@ -341,17 +464,66 @@ mod tests {
     fn self_signed_identity_yields_a_usable_server_config() {
         let id = identity();
         assert!(!id.cert_der().is_empty());
-        assert!(id.server_config().is_ok());
+        assert!(!id.current_at(SystemTime::now()).1.is_empty());
+    }
+
+    /// The window is the whole point of issuing our own certificate rather than taking
+    /// rcgen's default one: a sender rejects a peer certificate valid for longer than
+    /// four days, and rcgen's default runs to the year 4096.
+    #[test]
+    fn tls_certificate_expires_inside_the_senders_four_day_limit() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let id = TlsIdentity::self_signed_at(&["castaway.local".to_string()], now).unwrap();
+        let der = id.current_at(now).1;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+
+        let not_after = cert.validity().not_after.timestamp();
+        let not_before = cert.validity().not_before.timestamp();
+        let now_secs = 1_800_000_000i64;
+
+        assert!(
+            not_after - now_secs < 4 * 24 * 60 * 60,
+            "notAfter is {} days out; a sender caps this at four",
+            (not_after - now_secs) / 86_400
+        );
+        assert!(not_after > now_secs, "the certificate must not be expired");
+        assert!(
+            not_before < now_secs,
+            "notBefore must be in the past, or a sender whose clock trails ours sees a \
+             certificate that is not yet valid"
+        );
+    }
+
+    /// A receiver that runs past its certificate's life must not keep serving the expired
+    /// one: senders would refuse a panel that had been working for two days, with nothing
+    /// on either side saying why.
+    #[test]
+    fn the_certificate_is_reissued_before_it_expires() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let id = TlsIdentity::self_signed_at(&["castaway.local".to_string()], now).unwrap();
+        let first = id.current_at(now).1;
+        assert_eq!(
+            first,
+            id.current_at(now).1,
+            "not reissued while still fresh"
+        );
+
+        let later = now + TLS_CERT_VALID_FOR;
+        let second = id.current_at(later).1;
+        assert_ne!(first, second, "the aging certificate was served again");
+
+        let (_, cert) = x509_parser::parse_x509_certificate(&second).unwrap();
+        let later_secs = 1_800_000_000i64 + i64::try_from(TLS_CERT_VALID_FOR.as_secs()).unwrap();
+        assert!(cert.validity().not_after.timestamp() > later_secs);
     }
 
     #[test]
     fn advertisement_carries_the_listening_port_and_name() {
-        let id = identity();
         let r = CastReceiver::new(
             SocketAddr::from(([0, 0, 0, 0], 8009)),
             "Lab TV",
             "0f8c2e10",
-            &id,
+            identity(),
         )
         .unwrap();
         let ads = r.advertisements();
@@ -374,7 +546,6 @@ mod tests {
 
     #[test]
     fn kind_is_cast() {
-        let id = identity();
-        assert_eq!(receiver(&id).kind(), ProtocolKind::Cast);
+        assert_eq!(receiver(identity()).kind(), ProtocolKind::Cast);
     }
 }
