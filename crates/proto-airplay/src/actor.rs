@@ -15,22 +15,27 @@
 //! flow, a `SETUP` carrying a stream of type 110 is mirroring — and it is the session
 //! state machine's business to know, not the actor's.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use castaway_core::{
-    Advertisement, CoreError, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
+    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, ProtocolKind, SessionEvent,
+    SessionSink, SourceAdapter,
 };
 use substrate_rtsp::rtsp_types::headers::{HeaderName, CONTENT_TYPE, CSEQ, SERVER};
 use substrate_rtsp::rtsp_types::{Message, Response, StatusCode, Version};
 use substrate_rtsp::{ByteTransform, Identity, RtspMessage};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
+use crate::audio::{AudioOutput, AudioStream};
 use crate::error::AirPlayError;
-use crate::session::AirPlaySession;
+use crate::sdp::RaopCodec;
+use crate::session::{AirPlayRequest, AirPlaySession};
+use crate::transport::ReceiverPorts;
 
 /// Cap on a single buffered RTSP message. `/fp-setup` and plist bodies are a few KiB;
 /// `Content-Length` is attacker-controlled, so it gets a bound rather than a buffer that
@@ -76,13 +81,36 @@ impl AirPlayReceiver {
         }
         info!(%peer, "AirPlay sender connected");
 
+        let mut audio_sockets: Option<AudioSockets> = None;
         let mut session = AirPlaySession::new(self.identity.clone());
+        // Bind before serving so a SETUP answers with ports that are already listening.
+        let local_ip = stream
+            .local_addr()
+            .map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip());
+        match AudioSockets::bind(local_ip).await {
+            Ok((sockets, ports)) => {
+                session.set_local_ports(ports);
+                audio_sockets = Some(sockets);
+            }
+            // Without them a SETUP can only be refused, but /info and the handshake
+            // still work — so the connection is served rather than dropped.
+            Err(e) => warn!(%peer, error = %e, "could not bind the RAOP audio sockets"),
+        }
         // Identity today: the encrypted control channel starts only after pair-verify,
         // which is not implemented (Q1). The seam is here so landing pairing is a swap
         // of this transform, not a rewrite of the loop.
         let mut transform: Box<dyn ByteTransform> = Box::new(Identity);
 
-        if let Err(e) = pump(&mut stream, &mut session, &mut *transform, &sink, peer).await {
+        if let Err(e) = pump(
+            &mut stream,
+            &mut session,
+            &mut *transform,
+            &sink,
+            peer,
+            &mut audio_sockets,
+        )
+        .await
+        {
             warn!(%peer, error = %e, "AirPlay connection ended with an error");
         }
         // A dropped connection is a finished session, however it ended: tell the manager
@@ -119,6 +147,7 @@ async fn pump(
     transform: &mut dyn ByteTransform,
     sink: &SessionSink,
     peer: SocketAddr,
+    audio_sockets: &mut Option<AudioSockets>,
 ) -> Result<(), AirPlayError> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
@@ -168,6 +197,16 @@ async fn pump(
                 .await
                 .map_err(|e| AirPlayError::Connection(e.to_string()))?;
 
+            // RECORD is the sender saying it is about to stream. Starting the audio
+            // task is driven from here rather than from the session, because the pure
+            // core owns no sockets and should not be handed a channel just to hand one
+            // back (ground rule 3).
+            if session.is_recording() {
+                if let Some(sockets) = audio_sockets.take() {
+                    start_audio(session, sockets, sink, peer).await;
+                }
+            }
+
             if let Some(event) = reply.event {
                 let ended = matches!(event, SessionEvent::End);
                 sink.emit(event)
@@ -202,7 +241,19 @@ fn dispatch(
     };
     let method = substrate_rtsp::method_name(req.method()).to_string();
     let path = substrate_rtsp::request_path(req);
-    let resp = session.handle(&method, &path, req.body())?;
+    // Collected rather than borrowed: the protocol puts load-bearing values in headers
+    // (`Transport`, `Apple-Challenge`, `RTP-Info`) and the pure core has to see them
+    // without depending on `rtsp-types`.
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
+        .collect();
+    let resp = session.handle(&AirPlayRequest {
+        method: &method,
+        path: &path,
+        headers: &headers,
+        body: req.body(),
+    })?;
 
     let mut builder = Response::builder(Version::V1_0, StatusCode::from(resp.status))
         .header(SERVER, format!("{SERVER_HEADER_PREFIX}{SOURCE_VERSION}"));
@@ -348,4 +399,154 @@ mod tests {
         let bytes = substrate_rtsp::write(&reply.message).unwrap();
         assert!(String::from_utf8_lossy(&bytes).starts_with("RTSP/1.0 501"));
     }
+}
+
+/// The three UDP sockets one RAOP audio session runs on.
+///
+/// Bound *before* the connection is served, so a `SETUP` can answer with ports that are
+/// already listening. The alternative — answering with numbers we intend to bind — is
+/// how a receiver ends up advertising a port nothing is on, and the sender's audio goes
+/// into the void with the RTSP exchange looking perfect.
+struct AudioSockets {
+    audio: UdpSocket,
+    control: UdpSocket,
+    timing: UdpSocket,
+}
+
+impl AudioSockets {
+    /// Bind all three on ephemeral ports of `host`.
+    async fn bind(host: IpAddr) -> std::io::Result<(Self, ReceiverPorts)> {
+        let audio = UdpSocket::bind(SocketAddr::new(host, 0)).await?;
+        let control = UdpSocket::bind(SocketAddr::new(host, 0)).await?;
+        let timing = UdpSocket::bind(SocketAddr::new(host, 0)).await?;
+        let ports = ReceiverPorts {
+            audio: audio.local_addr()?.port(),
+            control: control.local_addr()?.port(),
+            timing: timing.local_addr()?.port(),
+        };
+        Ok((
+            Self {
+                audio,
+                control,
+                timing,
+            },
+            ports,
+        ))
+    }
+}
+
+/// Receive audio, control and timing datagrams until the session ends.
+///
+/// One task owns the depacketiser, rather than one per socket, so [`AudioStream`] needs
+/// no lock: `select!` only decides which socket produced bytes: every protocol decision
+/// still happens in the pure core (ground rule 3).
+async fn run_audio(
+    sockets: AudioSockets,
+    mut stream: AudioStream,
+    frames: mpsc::Sender<EncodedFrame>,
+    peer_ip: IpAddr,
+) {
+    // One buffer per socket: `select!` polls all three branches, so they cannot share
+    // a single mutable borrow.
+    let mut audio_buf = vec![0u8; 2048];
+    let mut control_buf = vec![0u8; 2048];
+    let mut timing_buf = vec![0u8; 2048];
+    loop {
+        // Which socket, and how many bytes. Nothing is parsed here.
+        let (which, len) = tokio::select! {
+            r = sockets.audio.recv_from(&mut audio_buf) => match r {
+                Ok((n, _)) => (Socket::Audio, n),
+                Err(e) => { warn!(error = %e, "AirPlay audio socket failed"); return; }
+            },
+            r = sockets.control.recv_from(&mut control_buf) => match r {
+                Ok((n, _)) => (Socket::Control, n),
+                Err(e) => { warn!(error = %e, "AirPlay control socket failed"); return; }
+            },
+            r = sockets.timing.recv_from(&mut timing_buf) => match r {
+                Ok((n, _)) => (Socket::Timing, n),
+                Err(e) => { warn!(error = %e, "AirPlay timing socket failed"); return; }
+            },
+            () = frames.closed() => {
+                debug!("AirPlay audio consumer went away; stopping the receive loop");
+                return;
+            }
+        };
+
+        let datagram = match which {
+            Socket::Audio => &audio_buf[..len],
+            Socket::Control => &control_buf[..len],
+            Socket::Timing => &timing_buf[..len],
+        };
+        let outcome = match which {
+            Socket::Audio => stream.on_audio(datagram),
+            Socket::Control => stream.on_control(datagram),
+            Socket::Timing => stream.on_timing(datagram),
+        };
+        match outcome {
+            Ok(AudioOutput::Frame { frame, .. }) => {
+                // Latency beats freshness: a full channel means the decoder is behind,
+                // and waiting here would stall sync and timing handling too.
+                if frames.try_send(frame).is_err() {
+                    debug!("AirPlay audio buffer full; dropping a packet");
+                }
+            }
+            Ok(AudioOutput::Sync(sync)) => {
+                debug!(latency = sync.latency_frames(), "AirPlay sync");
+            }
+            Ok(AudioOutput::TimingReply(_)) => {}
+            // One bad datagram off a radio link must not take the music down.
+            Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
+        }
+    }
+}
+
+/// Which socket a datagram arrived on.
+#[derive(Debug, Clone, Copy)]
+enum Socket {
+    Audio,
+    Control,
+    Timing,
+}
+
+/// Hand the negotiated stream to the pipeline and start receiving it.
+async fn start_audio(
+    session: &AirPlaySession,
+    sockets: AudioSockets,
+    sink: &SessionSink,
+    peer: SocketAddr,
+) {
+    let Some(params) = session.announced() else {
+        warn!(%peer, "RECORD with nothing announced; not starting audio");
+        return;
+    };
+    let codec = params.codec;
+    let Some(format) = AudioFormat::from_hz(codec.sample_rate(), u16::from(codec.channels()))
+    else {
+        warn!(%peer, "announced format has a zero rate or channel count");
+        return;
+    };
+    // ALAC cannot open a decoder without this; PCM needs no decoder at all.
+    let config = match codec {
+        RaopCodec::Alac(alac) => Some(bytes::Bytes::from(alac.magic_cookie().to_vec())),
+        RaopCodec::Pcm { .. } => None,
+    };
+
+    // Bounded: a full channel means the decoder is behind, and the receive loop drops
+    // rather than stalling the sockets that carry sync and timing.
+    let (tx, rx) = mpsc::channel(512);
+    let stream = AudioStream::new(params);
+    info!(%peer, %format, "AirPlay audio starting");
+    if sink
+        .emit(SessionEvent::Audio {
+            source: FrameSource::Encoded(rx),
+            format,
+            config,
+        })
+        .await
+        .is_err()
+    {
+        warn!(%peer, "session manager gone; not starting audio");
+        return;
+    }
+    tokio::spawn(run_audio(sockets, stream, tx, peer.ip()));
 }

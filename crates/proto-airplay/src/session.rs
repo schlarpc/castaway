@@ -21,12 +21,52 @@ use crate::advert::AirPlayIdentity;
 use crate::error::AirPlayError;
 use crate::info;
 use crate::sdp::AnnounceParams;
+use crate::transport::{ReceiverPorts, SenderPorts};
 
 /// The binary-plist content type AirPlay uses.
 pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
 
 /// The content type for raw byte bodies — `/fp-setup` replies are not plists.
 pub const OCTET_STREAM_MIME: &str = "application/octet-stream";
+
+/// One request, as the actor received it.
+///
+/// Headers are here because the protocol puts load-bearing values in them and not in
+/// bodies: `Transport` carries the ports a `SETUP` negotiates, `Apple-Challenge` the
+/// nonce an `OPTIONS` must answer, `RTP-Info` the flush point of a `FLUSH`.
+#[derive(Debug, Clone, Copy)]
+pub struct AirPlayRequest<'a> {
+    /// The method, upper-case (`OPTIONS`, `SETUP`, `POST`…).
+    pub method: &'a str,
+    /// The request-URI path (`/info`, `/fp-setup`…).
+    pub path: &'a str,
+    /// The headers, in the order they arrived.
+    pub headers: &'a [(String, String)],
+    /// The body.
+    pub body: &'a [u8],
+}
+
+impl<'a> AirPlayRequest<'a> {
+    /// A request with no headers — the common shape in tests.
+    #[must_use]
+    pub const fn new(method: &'a str, path: &'a str, body: &'a [u8]) -> Self {
+        Self {
+            method,
+            path,
+            headers: &[],
+            body,
+        }
+    }
+
+    /// Look a header up case-insensitively, as RTSP requires.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&'a str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
 
 /// A response the actor serializes into an RTSP reply.
 #[derive(Debug, Default)]
@@ -107,6 +147,10 @@ pub struct AirPlaySession {
     identity: AirPlayIdentity,
     fairplay: FairPlaySession,
     raop: RaopState,
+    /// The ports the actor bound for this session, set before any SETUP arrives.
+    local_ports: Option<ReceiverPorts>,
+    /// Where the sender wants us to send resend and timing requests.
+    sender_ports: Option<SenderPorts>,
 }
 
 impl AirPlaySession {
@@ -117,7 +161,33 @@ impl AirPlaySession {
             identity,
             fairplay: FairPlaySession::new(),
             raop: RaopState::default(),
+            local_ports: None,
+            sender_ports: None,
         }
+    }
+
+    /// Tell the session which ports the actor bound for it.
+    ///
+    /// Called before the connection is served, so a `SETUP` can answer with ports that
+    /// are already listening rather than numbers we intend to bind later.
+    pub fn set_local_ports(&mut self, ports: ReceiverPorts) {
+        self.local_ports = Some(ports);
+    }
+
+    /// Whether `RECORD` has arrived and the sender is streaming.
+    ///
+    /// The actor watches this to know when to start the audio tasks: the pure core
+    /// cannot start them itself (it owns no sockets) and should not be handed a channel
+    /// just to pass one back.
+    #[must_use]
+    pub const fn is_recording(&self) -> bool {
+        matches!(self.raop, RaopState::Recording(_))
+    }
+
+    /// Where to send resend and timing requests, once a `SETUP` has said.
+    #[must_use]
+    pub const fn sender_ports(&self) -> Option<SenderPorts> {
+        self.sender_ports
     }
 
     /// What `ANNOUNCE` negotiated, if it has happened.
@@ -132,12 +202,8 @@ impl AirPlaySession {
     /// # Errors
     /// [`AirPlayError`] only for genuinely malformed bodies we must reject; handshake
     /// gates that aren't implemented return a `501` response, not an `Err`.
-    pub fn handle(
-        &mut self,
-        method: &str,
-        path: &str,
-        body: &[u8],
-    ) -> Result<AirPlayResponse, AirPlayError> {
+    pub fn handle(&mut self, req: &AirPlayRequest<'_>) -> Result<AirPlayResponse, AirPlayError> {
+        let (method, path, body) = (req.method, req.path, req.body);
         debug!(%method, %path, body = body.len(), "airplay request");
         let resp = match (method, path) {
             ("OPTIONS", _) => AirPlayResponse::ok().header(
@@ -157,12 +223,13 @@ impl AirPlaySession {
             ("POST" | "GET", "/feedback") => AirPlayResponse::ok(),
             ("POST", "/audioMode") => AirPlayResponse::ok(),
             ("ANNOUNCE", _) => self.announce(body),
-            ("SETUP", _) => self.setup(),
+            ("SETUP", _) => self.setup(req),
             ("RECORD", _) => self.record(),
             ("SET_PARAMETER" | "GET_PARAMETER", _) => AirPlayResponse::ok(),
             ("FLUSH", _) => AirPlayResponse::ok(),
             ("TEARDOWN", _) => {
                 self.raop = RaopState::Idle;
+                self.sender_ports = None;
                 // `Connection: close` is not decoration: shairport-sync answers TEARDOWN
                 // with it and then closes the socket, and a sender that does not see it
                 // may hold the connection open expecting to reuse the session.
@@ -212,19 +279,43 @@ impl AirPlaySession {
     /// and it is the honest one: there is no format to set up transport for. The
     /// lenient `200` this used to return told the sender everything was fine and then
     /// nothing ever played.
-    fn setup(&mut self) -> AirPlayResponse {
+    fn setup(&mut self, req: &AirPlayRequest<'_>) -> AirPlayResponse {
+        let Some(header) = req.header("Transport") else {
+            warn!("SETUP with no Transport header");
+            return AirPlayResponse::status(400);
+        };
+        let sender = match crate::transport::parse_transport(header) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "refusing SETUP");
+                return AirPlayResponse::status(461);
+            }
+        };
+        let Some(local) = self.local_ports else {
+            // The actor binds before a session ever sees a SETUP. Reaching here means
+            // the wiring is wrong, not that the sender is.
+            warn!("SETUP with no bound ports; the actor did not supply them");
+            return AirPlayResponse::status(500);
+        };
+
         let (RaopState::Announced(params) | RaopState::SetUp(params)) =
             std::mem::take(&mut self.raop)
         else {
             warn!("SETUP before ANNOUNCE: nothing has been announced to set up");
             return AirPlayResponse::status(451);
         };
-        // Transport negotiation — binding the three UDP sockets and naming their ports
-        // back — lands with the audio actor. Until then this records the transition and
-        // sends no Transport header, which a sender will notice; it is not yet a
-        // working SETUP, only a correctly-ordered one.
+
+        self.sender_ports = Some(sender);
         self.raop = RaopState::SetUp(params);
+        log_info!(
+            audio = local.audio,
+            control = local.control,
+            timing = local.timing,
+            "AirPlay transport agreed"
+        );
         AirPlayResponse::ok()
+            .header("Transport", &crate::transport::format_transport(local))
+            .header("Session", "1")
     }
 
     /// Handle `RECORD`: the sender is about to stream.
@@ -271,7 +362,18 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    /// A session with ports already bound, as the actor always supplies.
     fn session() -> AirPlaySession {
+        let mut s = bare_session();
+        s.set_local_ports(ReceiverPorts {
+            audio: 6000,
+            control: 6001,
+            timing: 6002,
+        });
+        s
+    }
+
+    fn bare_session() -> AirPlaySession {
         AirPlaySession::new(AirPlayIdentity {
             name: "TV".into(),
             device_id: "AA:BB:CC:DD:EE:FF".into(),
@@ -283,7 +385,7 @@ mod tests {
     #[test]
     fn options_lists_public_methods() {
         let mut s = session();
-        let r = s.handle("OPTIONS", "*", &[]).unwrap();
+        let r = s.handle(&AirPlayRequest::new("OPTIONS", "*", &[])).unwrap();
         assert_eq!(r.status, 200);
         assert!(r
             .headers
@@ -294,7 +396,7 @@ mod tests {
     #[test]
     fn info_returns_binary_plist() {
         let mut s = session();
-        let r = s.handle("GET", "/info", &[]).unwrap();
+        let r = s.handle(&AirPlayRequest::new("GET", "/info", &[])).unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.content_type.as_deref(), Some(APPLE_PLIST_MIME));
         assert!(r.body.starts_with(b"bplist00"));
@@ -311,7 +413,9 @@ mod tests {
         body[5] = 1; // type
         body[6] = 1; // sequence: SETUP1
         body[14] = 2; // mode
-        let r = s.handle("POST", "/fp-setup", &body).unwrap();
+        let r = s
+            .handle(&AirPlayRequest::new("POST", "/fp-setup", &body))
+            .unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body.len(), 142);
         assert_eq!(r.content_type.as_deref(), Some(OCTET_STREAM_MIME));
@@ -321,7 +425,11 @@ mod tests {
     fn a_malformed_fp_setup_is_a_400_not_a_501() {
         let mut s = session();
         let r = s
-            .handle("POST", "/fp-setup", b"not-fairplay-at-all")
+            .handle(&AirPlayRequest::new(
+                "POST",
+                "/fp-setup",
+                b"not-fairplay-at-all",
+            ))
             .unwrap();
         assert_eq!(r.status, 400);
     }
@@ -329,7 +437,9 @@ mod tests {
     #[test]
     fn teardown_emits_end_and_closes_the_connection() {
         let mut s = session();
-        let r = s.handle("TEARDOWN", "rtsp://x/stream", &[]).unwrap();
+        let r = s
+            .handle(&AirPlayRequest::new("TEARDOWN", "rtsp://x/stream", &[]))
+            .unwrap();
         assert!(matches!(r.event, Some(SessionEvent::End)));
         assert!(
             r.headers
@@ -337,6 +447,15 @@ mod tests {
                 .any(|(k, v)| *k == "Connection" && v == "close"),
             "TEARDOWN must tell the sender the connection is over"
         );
+    }
+
+    /// The headers an iOS `SETUP` carries.
+    fn setup_headers() -> Vec<(String, String)> {
+        vec![(
+            "Transport".into(),
+            "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=6001;timing_port=6002"
+                .into(),
+        )]
     }
 
     /// The SDP body an iOS sender announces ALAC with.
@@ -349,11 +468,28 @@ mod tests {
     /// Drive a session through ANNOUNCE → SETUP → RECORD.
     fn recording_session() -> AirPlaySession {
         let mut s = session();
-        s.handle("ANNOUNCE", "rtsp://x/s", ANNOUNCE_BODY.as_bytes())
+        s.handle(&AirPlayRequest::new(
+            "ANNOUNCE",
+            "rtsp://x/s",
+            ANNOUNCE_BODY.as_bytes(),
+        ))
+        .unwrap();
+        do_setup(&mut s);
+        s.handle(&AirPlayRequest::new("RECORD", "rtsp://x/s", &[]))
             .unwrap();
-        s.handle("SETUP", "rtsp://x/s", &[]).unwrap();
-        s.handle("RECORD", "rtsp://x/s", &[]).unwrap();
         s
+    }
+
+    /// Drive one SETUP with a well-formed Transport header.
+    fn do_setup(s: &mut AirPlaySession) -> AirPlayResponse {
+        let headers = setup_headers();
+        s.handle(&AirPlayRequest {
+            method: "SETUP",
+            path: "rtsp://x/s",
+            headers: &headers,
+            body: &[],
+        })
+        .unwrap()
     }
 
     #[test]
@@ -361,7 +497,11 @@ mod tests {
         let mut s = session();
         assert!(s.announced().is_none());
         let r = s
-            .handle("ANNOUNCE", "rtsp://x/s", ANNOUNCE_BODY.as_bytes())
+            .handle(&AirPlayRequest::new(
+                "ANNOUNCE",
+                "rtsp://x/s",
+                ANNOUNCE_BODY.as_bytes(),
+            ))
             .unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(s.announced().unwrap().codec.sample_rate(), 44100);
@@ -373,7 +513,11 @@ mod tests {
         // way Bluetooth does with its negotiated codec.
         let mut s = session();
         let r = s
-            .handle("ANNOUNCE", "rtsp://x/s", ANNOUNCE_BODY.as_bytes())
+            .handle(&AirPlayRequest::new(
+                "ANNOUNCE",
+                "rtsp://x/s",
+                ANNOUNCE_BODY.as_bytes(),
+            ))
             .unwrap();
         let Some(SessionEvent::SourceInfo(desc)) = r.event else {
             panic!("ANNOUNCE should describe the source, got {:?}", r.event)
@@ -388,28 +532,51 @@ mod tests {
     fn setup_before_announce_is_refused_rather_than_answered_ok() {
         // The lenient 200 this used to return said "fine" and then nothing played.
         let mut s = session();
-        assert_eq!(s.handle("SETUP", "rtsp://x/s", &[]).unwrap().status, 451);
+        assert_eq!(do_setup(&mut s).status, 451);
     }
 
     #[test]
     fn record_before_setup_is_refused() {
         let mut s = session();
-        s.handle("ANNOUNCE", "rtsp://x/s", ANNOUNCE_BODY.as_bytes())
-            .unwrap();
-        assert_eq!(s.handle("RECORD", "rtsp://x/s", &[]).unwrap().status, 455);
+        s.handle(&AirPlayRequest::new(
+            "ANNOUNCE",
+            "rtsp://x/s",
+            ANNOUNCE_BODY.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(
+            s.handle(&AirPlayRequest::new("RECORD", "rtsp://x/s", &[]))
+                .unwrap()
+                .status,
+            455
+        );
     }
 
     #[test]
     fn the_happy_order_gets_through_and_reports_our_latency() {
         let mut s = session();
         assert_eq!(
-            s.handle("ANNOUNCE", "rtsp://x/s", ANNOUNCE_BODY.as_bytes())
-                .unwrap()
-                .status,
+            s.handle(&AirPlayRequest::new(
+                "ANNOUNCE",
+                "rtsp://x/s",
+                ANNOUNCE_BODY.as_bytes()
+            ))
+            .unwrap()
+            .status,
             200
         );
-        assert_eq!(s.handle("SETUP", "rtsp://x/s", &[]).unwrap().status, 200);
-        let rec = s.handle("RECORD", "rtsp://x/s", &[]).unwrap();
+        let setup = do_setup(&mut s);
+        assert_eq!(setup.status, 200);
+        // The reply has to name the ports actually bound; a sender that reads
+        // server_port=0 treats the session as failed.
+        assert!(setup
+            .headers
+            .iter()
+            .any(|(k, v)| *k == "Transport" && v.contains("server_port=6000")));
+        assert_eq!(s.sender_ports().unwrap().control, 6001);
+        let rec = s
+            .handle(&AirPlayRequest::new("RECORD", "rtsp://x/s", &[]))
+            .unwrap();
         assert_eq!(rec.status, 200);
         assert!(rec
             .headers
@@ -423,10 +590,81 @@ mod tests {
         // format, or a sender that re-announces gets whatever the last one used.
         let mut s = recording_session();
         assert!(s.announced().is_some());
-        s.handle("TEARDOWN", "rtsp://x/s", &[]).unwrap();
+        s.handle(&AirPlayRequest::new("TEARDOWN", "rtsp://x/s", &[]))
+            .unwrap();
         assert!(s.announced().is_none());
         // And SETUP is refused again, because nothing has been announced since.
-        assert_eq!(s.handle("SETUP", "rtsp://x/s", &[]).unwrap().status, 451);
+        assert_eq!(do_setup(&mut s).status, 451);
+        assert!(s.sender_ports().is_none(), "transport is forgotten too");
+    }
+
+    #[test]
+    fn a_setup_with_no_transport_header_is_refused() {
+        let mut s = session();
+        s.handle(&AirPlayRequest::new(
+            "ANNOUNCE",
+            "rtsp://x/s",
+            ANNOUNCE_BODY.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(
+            s.handle(&AirPlayRequest::new("SETUP", "rtsp://x/s", &[]))
+                .unwrap()
+                .status,
+            400
+        );
+    }
+
+    #[test]
+    fn a_setup_whose_transport_omits_a_port_is_461() {
+        // 461 Unsupported Transport. We cannot send resend or timing requests without
+        // it, so agreeing would give a session that plays and then drifts.
+        let mut s = session();
+        s.handle(&AirPlayRequest::new(
+            "ANNOUNCE",
+            "rtsp://x/s",
+            ANNOUNCE_BODY.as_bytes(),
+        ))
+        .unwrap();
+        let headers = vec![(
+            "Transport".into(),
+            "RTP/AVP/UDP;unicast;mode=record;timing_port=6002".to_string(),
+        )];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "SETUP",
+                path: "rtsp://x/s",
+                headers: &headers,
+                body: &[],
+            })
+            .unwrap();
+        assert_eq!(r.status, 461);
+    }
+
+    #[test]
+    fn a_session_whose_ports_were_never_bound_says_so_rather_than_promising_zero() {
+        // Reaching this means the actor wiring is wrong, not the sender — so it is a
+        // 500, and it must never be a Transport header naming ports nobody is on.
+        let mut s = bare_session();
+        s.handle(&AirPlayRequest::new(
+            "ANNOUNCE",
+            "rtsp://x/s",
+            ANNOUNCE_BODY.as_bytes(),
+        ))
+        .unwrap();
+        assert_eq!(do_setup(&mut s).status, 500);
+    }
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        let headers = vec![("TRANSPORT".to_string(), "x".to_string())];
+        let req = AirPlayRequest {
+            method: "SETUP",
+            path: "*",
+            headers: &headers,
+            body: &[],
+        };
+        assert_eq!(req.header("Transport"), Some("x"));
     }
 
     #[test]
@@ -436,9 +674,13 @@ mod tests {
         let mut s = session();
         let body = format!("{ANNOUNCE_BODY}a=rsaaeskey:QUJDREVGR0hJSktMTU5PUA\r\n");
         assert_eq!(
-            s.handle("ANNOUNCE", "rtsp://x/s", body.as_bytes())
-                .unwrap()
-                .status,
+            s.handle(&AirPlayRequest::new(
+                "ANNOUNCE",
+                "rtsp://x/s",
+                body.as_bytes()
+            ))
+            .unwrap()
+            .status,
             456
         );
         assert!(
@@ -452,9 +694,13 @@ mod tests {
         let mut s = session();
         let body = ANNOUNCE_BODY.replace("AppleLossless", "opus/48000/2");
         assert_eq!(
-            s.handle("ANNOUNCE", "rtsp://x/s", body.as_bytes())
-                .unwrap()
-                .status,
+            s.handle(&AirPlayRequest::new(
+                "ANNOUNCE",
+                "rtsp://x/s",
+                body.as_bytes()
+            ))
+            .unwrap()
+            .status,
             415
         );
     }
@@ -462,6 +708,11 @@ mod tests {
     #[test]
     fn pairing_is_501_for_now() {
         let mut s = session();
-        assert_eq!(s.handle("POST", "/pair-setup", &[]).unwrap().status, 501);
+        assert_eq!(
+            s.handle(&AirPlayRequest::new("POST", "/pair-setup", &[]))
+                .unwrap()
+                .status,
+            501
+        );
     }
 }

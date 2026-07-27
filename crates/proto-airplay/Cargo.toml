@@ -21,13 +21,14 @@ aes.workspace = true
 cbc.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync"] }
 
 [dev-dependencies]
 # The SDP tests wrap a session key the way a sender does, so the unwrap is exercised
 # end to end rather than mocked.
 rsa.workspace = true
 sha1.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]
 workspace = true
