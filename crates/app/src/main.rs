@@ -236,6 +236,30 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
+        // A finger on the panel's transport strip has to reach whoever is actually
+        // playing — the phone over AVRCP, or Spotify's cloud. The kiosk owns the main
+        // thread and the remote is an async handle on the runtime, so the two are joined
+        // by a callback that hops threads.
+        //
+        // `issue` rather than `issue_unchecked`: the strip is built from the same
+        // capability set, so a refusal here means the two have drifted, and that is worth
+        // a log line rather than a command the peer silently drops.
+        let controls: Option<pipeline::kiosk::ControlSink> = {
+            let remote = remote.clone();
+            let handle = runtime.handle().clone();
+            Some(Arc::new(move |txn: castaway_core::ControlTxn| {
+                let Some(peer) = remote.get() else {
+                    debug!(?txn, "transport: nothing is playing, so nothing to control");
+                    return;
+                };
+                handle.spawn(async move {
+                    if let Err(e) = peer.issue(txn.clone()).await {
+                        warn!(error = %e, ?txn, "transport: the source refused the control");
+                    }
+                });
+            }))
+        };
+
         // Registered after `cef.initialize()` on purpose: Chromium installs its own
         // SIGINT handler during init, which would silently replace an earlier one.
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
@@ -253,12 +277,19 @@ fn main() -> anyhow::Result<()> {
             attract,
             Some(osd_controller),
             Some(kiosk_exit),
+            controls,
             browser_host,
         )
         .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         #[cfg(not(feature = "cef"))]
-        pipeline::kiosk::run(rx, attract, Some(osd_controller), Some(kiosk_exit))
-            .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        pipeline::kiosk::run(
+            rx,
+            attract,
+            Some(osd_controller),
+            Some(kiosk_exit),
+            controls,
+        )
+        .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
     }
 

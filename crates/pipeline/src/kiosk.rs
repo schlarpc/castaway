@@ -26,6 +26,13 @@ use crate::wgpu_compositor::WgpuCompositor;
 /// An idle-scene image to show before/between casts: `(width, height, rgba8)`.
 pub type AttractImage = (u32, u32, Vec<u8>);
 
+/// Where a press on the transport strip goes.
+///
+/// A callback rather than a handle, because the two live on different threads and in
+/// different crates: this loop owns the main thread (architecture §6) and the session's
+/// `RemoteControl` is an async handle on the tokio runtime. The app closes over both.
+pub type ControlSink = Arc<dyn Fn(castaway_core::ControlTxn) + Send + Sync>;
+
 struct KioskApp {
     rx: Option<Receiver<RenderCommand>>,
     attract: Option<AttractImage>,
@@ -39,6 +46,9 @@ struct KioskApp {
     cursor: (f64, f64),
     /// Current window size, for normalizing input coordinates.
     size: (u32, u32),
+    /// Where a press on the transport strip goes. `None` in a build with no session to
+    /// drive — the strip is then never drawn either, since nothing publishes capabilities.
+    controls: Option<ControlSink>,
     /// The main-thread CEF host (this loop is CEF's message pump — architecture §6).
     #[cfg(feature = "cef")]
     browser: Option<crate::cef_browser::BrowserHost>,
@@ -58,6 +68,28 @@ impl KioskApp {
         }
     }
 
+    /// Offer a press or release to the transport strip.
+    ///
+    /// Returns whether the strip *consumed* it. Consuming is separate from acting: a
+    /// touch on the scrub track of a source that cannot seek produces no transaction and
+    /// must still be swallowed, or it falls through to the browser underneath and scrolls
+    /// a page nobody was looking at.
+    fn offer_to_transport(&mut self, x: f32, y: f32, phase: crate::transport::TouchPhase) -> bool {
+        let Some(render) = self.render.as_ref() else {
+            return false;
+        };
+        if !render.transport_owns(x, y) {
+            return false;
+        }
+        if let Some(txn) = render.transport_action(x, y, phase) {
+            if let Some(sink) = self.controls.as_ref() {
+                info!(?txn, "transport: a finger on the panel");
+                sink(txn);
+            }
+        }
+        true
+    }
+
     fn route_input(&mut self, event: &WindowEvent) {
         let size = self.size;
         match event {
@@ -74,6 +106,18 @@ impl KioskApp {
                 };
                 let down = state.is_pressed();
                 let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
+                // The strip gets first refusal on the primary button — it is drawn over
+                // whatever else is on screen, so it has to receive over it too.
+                if button == PointerButton::Left {
+                    let phase = if down {
+                        crate::transport::TouchPhase::Press
+                    } else {
+                        crate::transport::TouchPhase::Release
+                    };
+                    if self.offer_to_transport(x, y, phase) {
+                        return;
+                    }
+                }
                 if let Some(sink) = self.input_sink() {
                     sink.pointer(PointerEvent::Button { x, y, button, down });
                 }
@@ -87,6 +131,19 @@ impl KioskApp {
             }
             WindowEvent::Touch(touch) => {
                 let event = translate_touch(touch, size);
+                let phase = match event.phase {
+                    TouchPhase::Down => Some(crate::transport::TouchPhase::Press),
+                    TouchPhase::Up => Some(crate::transport::TouchPhase::Release),
+                    // A move is neither: the strip acts on the two ends of a contact, and
+                    // swallowing moves would break a drag that started on the browser and
+                    // happened to pass over the strip.
+                    TouchPhase::Move | TouchPhase::Cancel => None,
+                };
+                if let Some(phase) = phase {
+                    if self.offer_to_transport(event.x, event.y, phase) {
+                        return;
+                    }
+                }
                 if let Some(sink) = self.input_sink() {
                     sink.touch(event);
                 }
@@ -257,6 +314,7 @@ pub fn run(
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,
+    controls: Option<ControlSink>,
 ) -> Result<(), PipelineError> {
     let mut app = KioskApp {
         rx: Some(rx),
@@ -264,6 +322,7 @@ pub fn run(
         osd,
         window: None,
         render: None,
+        controls,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),
@@ -285,6 +344,7 @@ pub fn run_with_browser(
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,
+    controls: Option<ControlSink>,
     browser: crate::cef_browser::BrowserHost,
 ) -> Result<(), PipelineError> {
     let mut app = KioskApp {
@@ -293,6 +353,7 @@ pub fn run_with_browser(
         osd,
         window: None,
         render: None,
+        controls,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),

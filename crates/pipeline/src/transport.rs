@@ -64,6 +64,20 @@ pub fn placement(width: u32, height: u32) -> (f32, f32, f32, f32) {
     ((w - sw) / 2.0, h - sh, sw, sh)
 }
 
+/// Map a panel-normalized point (`0.0..=1.0`, as touch and pointer events arrive) into
+/// strip-local pixels.
+///
+/// A free function rather than a method on the render loop so it can be tested without a
+/// GPU. It is the seam between "where a finger is on a 65-inch panel" and "which button",
+/// and it is the kind of arithmetic that is wrong by an offset for months because
+/// everything still *looks* right — the buttons are drawn correctly, they just answer to
+/// a different part of the glass.
+#[must_use]
+pub fn to_strip_local(x: f32, y: f32, width: u32, height: u32) -> (f32, f32) {
+    let (ox, oy, _, _) = placement(width, height);
+    (x * width as f32 - ox, y * height as f32 - oy)
+}
+
 /// A control the strip can offer.
 ///
 /// Deliberately *not* one-to-one with [`ControlTxn`]: one button means different
@@ -292,8 +306,34 @@ pub struct Layout {
     glyph: f32,
 }
 
+/// When in a touch's life it is being asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    /// A finger went down, or a button was pressed.
+    Press,
+    /// A finger lifted, or a button was released.
+    Release,
+}
+
 impl Layout {
-    /// What a touch at strip-local `(x, y)` landed on.
+    /// What a touch at this phase should act on, if anything.
+    ///
+    /// Buttons fire on press and the scrub track on release, and the asymmetry is the
+    /// point. A button wants to feel immediate — on a wall panel, a control that waits
+    /// for the lift feels broken. A seek is the opposite: firing on press would make a
+    /// finger placed anywhere near the bar jump the track before it had moved, so the
+    /// release position is the one the user actually chose, and sliding before lifting
+    /// adjusts it for free.
+    #[must_use]
+    pub fn hit_for(&self, x: f32, y: f32, phase: TouchPhase) -> Option<TransportHit> {
+        match (self.hit(x, y), phase) {
+            (Some(TransportHit::Press(c)), TouchPhase::Press) => Some(TransportHit::Press(c)),
+            (Some(TransportHit::Scrub(f)), TouchPhase::Release) => Some(TransportHit::Scrub(f)),
+            _ => None,
+        }
+    }
+
+    /// What a touch at strip-local `(x, y)` landed on, ignoring phase.
     #[must_use]
     pub fn hit(&self, x: f32, y: f32) -> Option<TransportHit> {
         for (control, rect) in &self.buttons {
@@ -1108,6 +1148,62 @@ mod tests {
                 assert!(disjoint, "{a:?} overlaps {b:?}");
             }
         }
+    }
+
+    /// Buttons on press, seeks on release. A seek that fired on press would jump the
+    /// track the moment a finger landed near the bar, before it had moved anywhere.
+    #[test]
+    fn buttons_fire_on_press_and_seeks_on_release() {
+        let m = model();
+        let l = layout(&m, 1600, 240);
+        let (bx, by) = l.buttons[0].1.center();
+        assert!(l.hit_for(bx, by, TouchPhase::Press).is_some());
+        assert!(l.hit_for(bx, by, TouchPhase::Release).is_none());
+
+        let track = l.track_touch.unwrap();
+        let (tx, ty) = track.center();
+        assert!(l.hit_for(tx, ty, TouchPhase::Press).is_none());
+        assert!(matches!(
+            l.hit_for(tx, ty, TouchPhase::Release),
+            Some(TransportHit::Scrub(_))
+        ));
+    }
+
+    /// The panel is 3840×2160 and the strip is a rectangle somewhere near the bottom of
+    /// it. A press in the middle of the play button, expressed the way a touch event
+    /// actually arrives, has to come out as the play button.
+    #[test]
+    fn a_normalized_panel_touch_lands_on_the_button_under_it() {
+        let (w, h) = (3840u32, 2160u32);
+        let (ox, oy, sw, sh) = placement(w, h);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let l = layout(&model(), sw.round() as u32, sh.round() as u32);
+
+        for (control, rect) in &l.buttons {
+            let (lx, ly) = rect.center();
+            // Back out to panel-normalized, the way an event would have arrived.
+            let (nx, ny) = ((ox + lx) / w as f32, (oy + ly) / h as f32);
+            let (bx, by) = to_strip_local(nx, ny, w, h);
+            assert_eq!(
+                l.hit(bx, by),
+                Some(TransportHit::Press(*control)),
+                "{control:?} at panel ({nx}, {ny}) mapped to ({bx}, {by}) and missed"
+            );
+        }
+    }
+
+    /// A touch on the card above the strip is not the strip's. Consuming it would eat
+    /// input meant for whatever else is on screen.
+    #[test]
+    fn a_touch_above_the_strip_misses_it() {
+        let (w, h) = (3840u32, 2160u32);
+        let l = layout(&model(), 2380, 432);
+        let (bx, by) = to_strip_local(0.5, 0.2, w, h);
+        assert!(
+            by < 0.0,
+            "a touch at a fifth of the way down is above the strip"
+        );
+        assert!(l.hit(bx, by).is_none());
     }
 
     #[test]

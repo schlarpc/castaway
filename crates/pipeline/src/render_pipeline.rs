@@ -782,13 +782,33 @@ impl RenderLoop {
     /// has no business knowing about scrub fractions, and the mapping needs the model
     /// this loop is holding anyway.
     #[must_use]
-    pub fn transport_action(&self, x: f32, y: f32) -> Option<castaway_core::ControlTxn> {
+    pub fn transport_action(
+        &self,
+        x: f32,
+        y: f32,
+        phase: crate::transport::TouchPhase,
+    ) -> Option<castaway_core::ControlTxn> {
         let state = self.transport.as_ref()?;
         let (sw, sh) = self.compositor.target_size();
-        let (px, py) = (x * sw as f32, y * sh as f32);
-        let (ox, oy, _, _) = state.placement;
-        let hit = state.layout.hit(px - ox, py - oy)?;
+        let (lx, ly) = crate::transport::to_strip_local(x, y, sw, sh);
+        let hit = state.layout.hit_for(lx, ly, phase)?;
         state.model.action(hit)
+    }
+
+    /// Whether a panel-normalized point is over the transport strip at all.
+    ///
+    /// The input router needs this separately from [`RenderLoop::transport_action`]: a
+    /// touch that lands on the strip but produces no transaction — the scrub track on a
+    /// source that cannot seek — must still be *consumed*, or it falls through to the
+    /// browser underneath and scrolls a page nobody was looking at.
+    #[must_use]
+    pub fn transport_owns(&self, x: f32, y: f32) -> bool {
+        let Some(state) = self.transport.as_ref() else {
+            return false;
+        };
+        let (sw, sh) = self.compositor.target_size();
+        let (lx, ly) = crate::transport::to_strip_local(x, y, sw, sh);
+        state.layout.hit(lx, ly).is_some()
     }
 
     /// Install the now-playing card as its own layer.
