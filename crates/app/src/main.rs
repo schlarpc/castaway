@@ -615,16 +615,36 @@ async fn spawn_cast(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    // RSA-2048 keygen takes seconds; it belongs on a blocking thread, not stalling the
-    // runtime while the other adapters are trying to come up (ground rule 4).
-    let signer = tokio::task::spawn_blocking(CastDeviceSigner::generate_dev)
-        .await
-        .context("joining Cast device-key generation")?
-        .context("generating the Cast device key")?;
-    warn!(
-        "Cast device auth uses a self-generated dev key; senders that verify the Google \
-         chain will reject it (Q2/Q11)"
-    );
+    let signer = match config
+        .cast
+        .credential
+        .load()
+        .context("loading the configured Cast device credential")?
+    {
+        Some(credential) => {
+            info!("Cast device auth uses the provisioned device credential");
+            CastDeviceSigner::from_pkcs8_pem(
+                &credential.key_pem,
+                credential.certificate_der,
+                credential.intermediates_der,
+            )
+            .context("parsing the provisioned Cast device key")?
+        }
+        None => {
+            // RSA-2048 keygen takes seconds; it belongs on a blocking thread, not stalling
+            // the runtime while the other adapters are trying to come up (ground rule 4).
+            let dev = tokio::task::spawn_blocking(CastDeviceSigner::generate_dev)
+                .await
+                .context("joining Cast device-key generation")?
+                .context("generating the Cast device key")?;
+            warn!(
+                "Cast device auth uses a self-generated dev credential; senders that verify \
+                 the Google chain — which is every official one — will reject it. Set \
+                 cast.credential in castaway.toml to provision a real one (Q2/Q11)"
+            );
+            dev.signer
+        }
+    };
 
     let identity = TlsIdentity::self_signed(&["castaway.local".to_string()])
         .context("generating the Cast TLS identity")?;
@@ -632,7 +652,7 @@ async fn spawn_cast(
         proto_cast::actor::default_listen_addr(),
         config.advertised_name(ProtocolKind::Cast).as_str(),
         config.uuid.replace('-', ""),
-        &identity,
+        identity,
     )
     .context("building the CASTv2 receiver")?
     .with_signer(Arc::new(signer));

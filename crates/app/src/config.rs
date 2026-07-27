@@ -31,6 +31,101 @@ pub struct Config {
     pub spotify: Spotify,
     /// Skipping sponsor segments in YouTube playback.
     pub sponsorblock: SponsorBlock,
+    /// Google Cast settings.
+    pub cast: Cast,
+}
+
+/// Google Cast settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Cast {
+    /// The device credential CASTv2 authenticates with.
+    pub credential: CastCredential,
+}
+
+/// Where the Cast device credential comes from.
+///
+/// Leaving this unset generates one at startup, which is fine for everything on the LAN
+/// that skips device auth and useless for everything that does not: an official sender
+/// only accepts a chain rooted in Google's Cast device CA, whose key is fused into
+/// licensed silicon. Getting such a credential means extracting it from hardware you own;
+/// what this section does is make that a matter of provisioning rather than of code.
+///
+/// The paths are read at startup and never copied anywhere. Point them at files the
+/// service user can read and nothing else can — a device credential identifies one
+/// specific piece of hardware, and it is the one secret in this project that would be
+/// genuinely bad to publish. It does not belong in the Nix store, which is world-readable.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CastCredential {
+    /// PKCS#8 PEM holding the device's RSA private key.
+    pub key_file: Option<PathBuf>,
+    /// The device (leaf) certificate, DER. Signed by the key in `key_file`.
+    pub certificate_file: Option<PathBuf>,
+    /// Intermediate certificates, DER, ordered leaf-ward first — the path from the
+    /// device certificate up to (but not including) the root a sender already trusts.
+    #[serde(default)]
+    pub intermediate_files: Vec<PathBuf>,
+}
+
+/// A device credential read off disk.
+pub struct LoadedCredential {
+    /// PKCS#8 PEM for the device key.
+    pub key_pem: String,
+    /// The device (leaf) certificate, DER.
+    pub certificate_der: Vec<u8>,
+    /// Intermediates, DER, leaf-ward first.
+    pub intermediates_der: Vec<Vec<u8>>,
+}
+
+impl CastCredential {
+    /// The key and certificate, or `None` when no credential is configured.
+    ///
+    /// A half-configured credential is an error rather than a fallback: someone who set
+    /// one of these two meant to authenticate, and quietly booting with a self-signed dev
+    /// key would look identical to success right up until a sender refused the panel.
+    ///
+    /// # Errors
+    /// If only one of the two files is set, or any of them cannot be read.
+    pub fn load(&self) -> anyhow::Result<Option<LoadedCredential>> {
+        let (key_file, certificate_file) = match (&self.key_file, &self.certificate_file) {
+            (Some(k), Some(c)) => (k, c),
+            (None, None) => return Ok(None),
+            (Some(_), None) => anyhow::bail!(
+                "cast.credential.key_file is set but certificate_file is not; a key with no \
+                 certificate cannot answer a device-auth challenge"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "cast.credential.certificate_file is set but key_file is not; there is nothing \
+                 to sign with"
+            ),
+        };
+        let key_pem = std::fs::read_to_string(key_file)
+            .with_context(|| format!("reading the Cast device key from {}", key_file.display()))?;
+        let certificate_der = std::fs::read(certificate_file).with_context(|| {
+            format!(
+                "reading the Cast device certificate from {}",
+                certificate_file.display()
+            )
+        })?;
+        let intermediates_der = self
+            .intermediate_files
+            .iter()
+            .map(|p| {
+                std::fs::read(p).with_context(|| {
+                    format!(
+                        "reading a Cast intermediate certificate from {}",
+                        p.display()
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Some(LoadedCredential {
+            key_pem,
+            certificate_der,
+            intermediates_der,
+        }))
+    }
 }
 
 /// SponsorBlock settings.
@@ -228,6 +323,7 @@ impl Default for Config {
             bluetooth: Bluetooth::default(),
             spotify: Spotify::default(),
             sponsorblock: SponsorBlock::default(),
+            cast: Cast::default(),
         }
     }
 }
