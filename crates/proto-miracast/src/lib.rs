@@ -21,6 +21,7 @@ pub mod p2p;
 pub mod params;
 pub mod session;
 pub mod ts;
+pub mod uibc;
 pub mod video;
 
 use castaway_core::ProtocolKind;
@@ -41,6 +42,10 @@ pub use session::{
     WfdResponse, WfdSession, DEFAULT_CONTROL_PORT,
 };
 pub use ts::{Pid, StreamType, TsDemux, TS_PACKET_LEN};
+pub use uibc::{
+    GenericInput, HidcMessage, InputCategory, Pointer, Scroll, SourcePixel, UibcFrame,
+    VideoGeometry,
+};
 pub use video::{
     pick_best_format, H264Codec, NegotiatedVideo, Profile, ResolutionIndex, ResolutionMask,
     ResolutionTable, VideoFormats, VideoMode,
