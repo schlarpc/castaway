@@ -61,6 +61,34 @@ mod payload_type {
     pub const STATS: u8 = 5;
 }
 
+/// A video codec a mirroring sender may be offered.
+///
+/// Which of these we advertise is a *policy* decision — feature bit 42 — and it changes
+/// what the sender encodes. Getting it wrong is not a decode error: with the bit set and
+/// no HEVC path the sender emits an empty codec-config packet and simply stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MirrorCodec {
+    /// H.264. Every sender can produce it, and it is what a sender falls back to.
+    H264,
+    /// HEVC. Offered only when feature bit 42 is set, and what a Mac sends for a
+    /// desktop above 1080p.
+    Hevc,
+}
+
+impl MirrorCodec {
+    /// The name as it is normally written.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+}
+
+/// The `hvcC` marker that distinguishes an HEVC configuration record from an `avcC`.
+const HVCC_MARKER: &[u8; 4] = b"hvc1";
+
 /// Flag bit meaning "the sender is suspending this stream" (screen locked, app closed).
 const FLAG_SUSPEND: u16 = 0x40;
 
@@ -169,6 +197,8 @@ pub struct MirrorStream {
     origin: Arc<StreamOrigin>,
     /// Whether the sender has told us it is suspending.
     suspended: bool,
+    /// Which codec the last configuration record named.
+    codec: Option<MirrorCodec>,
 }
 
 impl MirrorStream {
@@ -187,6 +217,7 @@ impl MirrorStream {
             pending_parameter_sets: None,
             origin,
             suspended: false,
+            codec: None,
         }
     }
 
@@ -246,7 +277,22 @@ impl MirrorStream {
                 if payload.is_empty() {
                     return Err(MirrorError::CodecRefused);
                 }
-                let (sets, geometry) = (parameter_sets(payload)?, header.geometry);
+                // The record says which codec this is, and the sender picks based on what
+                // we advertised — so this is where a mismatch between policy and
+                // capability shows up, rather than as noise from the decoder.
+                let codec = if payload.len() > 8 && &payload[4..8] == HVCC_MARKER {
+                    MirrorCodec::Hevc
+                } else {
+                    MirrorCodec::H264
+                };
+                if self.codec.replace(codec) != Some(codec) {
+                    tracing::info!(codec = codec.display_name(), "AirPlay mirroring codec");
+                }
+                let sets = match codec {
+                    MirrorCodec::H264 => avc_parameter_sets(payload)?,
+                    MirrorCodec::Hevc => hevc_parameter_sets(payload)?,
+                };
+                let geometry = header.geometry;
                 self.pending_parameter_sets = Some((header.timestamp, sets));
                 out.push(MirrorOutput::Geometry(geometry));
                 Ok(())
@@ -271,7 +317,11 @@ impl MirrorStream {
         let mut data = payload.to_vec();
         self.cipher.apply_keystream(&mut data);
 
-        let keyframe = to_annex_b(&mut data)?;
+        // HEVC reads its NAL type from different bits, so the codec has to be known
+        // before an access unit can be classified. A video packet before any
+        // configuration record is a stream we cannot describe.
+        let codec = self.codec.unwrap_or(MirrorCodec::H264);
+        let keyframe = to_annex_b(&mut data, codec)?;
 
         // The type-1 packet that precedes a keyframe carries the same timestamp; its
         // SPS/PPS belong in-band at the front of this access unit, which is what the
@@ -345,7 +395,7 @@ impl Header {
 /// worth keeping, since it runs on every frame.
 ///
 /// Returns whether the access unit contains an IDR.
-fn to_annex_b(data: &mut [u8]) -> Result<bool, MirrorError> {
+fn to_annex_b(data: &mut [u8], codec: MirrorCodec) -> Result<bool, MirrorError> {
     let mut offset = 0usize;
     let mut keyframe = false;
     while offset < data.len() {
@@ -364,13 +414,17 @@ fn to_annex_b(data: &mut [u8]) -> Result<bool, MirrorError> {
         if nal_end > data.len() {
             return Err(MirrorError::MalformedAccessUnit);
         }
-        // The cheapest decryption-failure detector there is: H.264 reserves this bit.
+        // The cheapest decryption-failure detector there is: both codecs reserve this bit.
         if data[end] & 0x80 != 0 {
             return Err(MirrorError::MalformedAccessUnit);
         }
-        if data[end] & 0x1f == 5 {
-            keyframe = true;
-        }
+        // The NAL type lives in different bits in each: five bits in H.264, six shifted
+        // by one in HEVC. Reading the wrong ones misses every keyframe, and the pipeline
+        // waits for a keyframe before it will decode anything at all.
+        keyframe |= match codec {
+            MirrorCodec::H264 => data[end] & 0x1f == 5,
+            MirrorCodec::Hevc => matches!((data[end] & 0x7e) >> 1, 16..=21),
+        };
         data[offset..end].copy_from_slice(&[0, 0, 0, 1]);
         offset = nal_end;
     }
@@ -384,7 +438,7 @@ fn to_annex_b(data: &mut [u8]) -> Result<bool, MirrorError> {
 }
 
 /// Pull SPS and PPS out of an `AVCDecoderConfigurationRecord` as Annex-B.
-fn parameter_sets(record: &[u8]) -> Result<Vec<u8>, MirrorError> {
+fn avc_parameter_sets(record: &[u8]) -> Result<Vec<u8>, MirrorError> {
     // configurationVersion(1) profile(1) compat(1) level(1) lengthSize(1) numSPS(1)
     let sps_len_at = 6usize;
     let read_u16 = |at: usize| -> Result<usize, MirrorError> {
@@ -412,6 +466,49 @@ fn parameter_sets(record: &[u8]) -> Result<Vec<u8>, MirrorError> {
     out.extend_from_slice(sps);
     out.extend_from_slice(&[0, 0, 0, 1]);
     out.extend_from_slice(pps);
+    Ok(out)
+}
+
+/// Pull VPS, SPS and PPS out of an `hvcC` record as Annex-B.
+///
+/// A different shape from `avcC`: the parameter sets are in an array of arrays, each
+/// introduced by a type byte and a count, rather than a flat SPS-then-PPS pair. The
+/// walk is written defensively because the offsets are the least corroborated thing in
+/// this module — one reference implementation, no second source.
+fn hevc_parameter_sets(record: &[u8]) -> Result<Vec<u8>, MirrorError> {
+    // The array count sits at a fixed offset in the record; each entry is
+    // `type(1) count(2) [ len(2) nal ]*`.
+    const ARRAYS_AT: usize = 22;
+    let num_arrays = usize::from(
+        *record
+            .get(ARRAYS_AT)
+            .ok_or(MirrorError::MalformedCodecConfig)?,
+    );
+    let mut out = Vec::with_capacity(record.len());
+    let mut at = ARRAYS_AT + 1;
+    for _ in 0..num_arrays {
+        let count = record
+            .get(at + 1..at + 3)
+            .map(|s| usize::from(u16::from_be_bytes([s[0], s[1]])))
+            .ok_or(MirrorError::MalformedCodecConfig)?;
+        at += 3;
+        for _ in 0..count {
+            let len = record
+                .get(at..at + 2)
+                .map(|s| usize::from(u16::from_be_bytes([s[0], s[1]])))
+                .ok_or(MirrorError::MalformedCodecConfig)?;
+            at += 2;
+            let nal = record
+                .get(at..at + len)
+                .ok_or(MirrorError::MalformedCodecConfig)?;
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(nal);
+            at += len;
+        }
+    }
+    if out.is_empty() {
+        return Err(MirrorError::MalformedCodecConfig);
+    }
     Ok(out)
 }
 
@@ -544,6 +641,80 @@ mod tests {
             &[0, 0, 0, 1],
             "the AU's own start code"
         );
+    }
+
+    /// An `hvcC` record with one VPS, one SPS and one PPS.
+    fn hvcc_record() -> Vec<u8> {
+        let mut r = vec![0u8; 22];
+        r[4..8].copy_from_slice(b"hvc1");
+        r.push(3); // three arrays
+        for (ty, nal) in [
+            (32u8, &[0x40, 0x01][..]),
+            (33, &[0x42, 0x01][..]),
+            (34, &[0x44, 0x01][..]),
+        ] {
+            r.push(ty);
+            r.extend_from_slice(&1u16.to_be_bytes());
+            r.extend_from_slice(&u16::try_from(nal.len()).unwrap().to_be_bytes());
+            r.extend_from_slice(nal);
+        }
+        r
+    }
+
+    #[test]
+    fn an_hvcc_record_yields_all_three_parameter_sets() {
+        // A different shape from avcC: arrays of arrays rather than a flat SPS/PPS pair,
+        // and HEVC needs the VPS too.
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
+        let mut buf = message(payload_type::CODEC_CONFIG, 100, 0, &hvcc_record());
+        let out = s.feed(&mut buf).unwrap();
+        assert!(matches!(out.as_slice(), [MirrorOutput::Geometry(_)]));
+
+        // The sets are prepended to the access unit at the same timestamp.
+        let mut nal = vec![(19 << 1) & 0x7e]; // IDR_W_RADL
+        nal.extend_from_slice(b"hevc-idr");
+        let mut au = u32::try_from(nal.len()).unwrap().to_be_bytes().to_vec();
+        au.extend_from_slice(&nal);
+        sender_cipher().apply_keystream(&mut au);
+        let mut buf = message(payload_type::VIDEO, 100, 0, &au);
+        let out = s.feed(&mut buf).unwrap();
+        let [MirrorOutput::Frame(f)] = out.as_slice() else {
+            panic!("expected a frame, got {out:?}")
+        };
+        // VPS, SPS, PPS, then the access unit — four start codes in all.
+        assert!(f.data.windows(4).filter(|w| w == b"\0\0\0\x01").count() >= 4);
+        assert_eq!(&f.data[..4], &[0, 0, 0, 1]);
+        assert_eq!(&f.data[4..6], &[0x40, 0x01], "VPS first");
+        assert!(f.keyframe, "HEVC NAL type 19 is an IDR");
+    }
+
+    #[test]
+    fn hevc_keyframes_are_read_from_the_right_bits() {
+        // H.264 takes five bits and HEVC six shifted by one. Reading the wrong ones
+        // misses every keyframe, and the pipeline waits for one before decoding at all.
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
+        let mut buf = message(payload_type::CODEC_CONFIG, 0, 0, &hvcc_record());
+        s.feed(&mut buf).unwrap();
+
+        let mut cipher = sender_cipher();
+        for (nal_type, expect_key) in [(19u8, true), (1, false)] {
+            let mut nal = vec![(nal_type << 1) & 0x7e];
+            nal.extend_from_slice(b"payload!");
+            let mut au = u32::try_from(nal.len()).unwrap().to_be_bytes().to_vec();
+            au.extend_from_slice(&nal);
+            cipher.apply_keystream(&mut au);
+            let mut buf = message(payload_type::VIDEO, 0, 0, &au);
+            let out = s.feed(&mut buf).unwrap();
+            let frame = out.iter().find_map(|o| match o {
+                MirrorOutput::Frame(f) => Some(f),
+                _ => None,
+            });
+            assert_eq!(
+                frame.expect("a frame").keyframe,
+                expect_key,
+                "HEVC NAL type {nal_type}"
+            );
+        }
     }
 
     #[test]

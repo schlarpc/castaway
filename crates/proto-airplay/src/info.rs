@@ -54,10 +54,14 @@ pub fn info_plist(ident: &AirPlayIdentity) -> Result<Vec<u8>, AirPlayError> {
     // the sender on H.264, which is the only codec decoded here.
     let mut display = Dictionary::new();
     display.insert("uuid".into(), Value::String(ident.pairing_id.clone()));
-    display.insert("widthPixels".into(), Value::Integer(1920i64.into()));
-    display.insert("heightPixels".into(), Value::Integer(1080i64.into()));
-    display.insert("width".into(), Value::Integer(1920i64.into()));
-    display.insert("height".into(), Value::Integer(1080i64.into()));
+    // 16:9 against the advertised height. Width is nominal — the sender adjusts it to
+    // however the device is being held and reports what it chose in the stream header.
+    let height = i64::from(ident.mirror_height);
+    let width = height * 16 / 9;
+    display.insert("widthPixels".into(), Value::Integer(width.into()));
+    display.insert("heightPixels".into(), Value::Integer(height.into()));
+    display.insert("width".into(), Value::Integer(width.into()));
+    display.insert("height".into(), Value::Integer(height.into()));
     // Millimetres, and 0 means "unknown" — which is what every real receiver reports.
     display.insert("widthPhysical".into(), Value::Integer(0i64.into()));
     display.insert("heightPhysical".into(), Value::Integer(0i64.into()));
@@ -94,6 +98,8 @@ mod tests {
             device_id: "AA:BB:CC:DD:EE:FF".into(),
             host: "castaway".into(),
             pairing_id: "de159742-c022-4514-915b-203cb99f8b71".into(),
+            offer_hevc: false,
+            mirror_height: 1080,
         }
     }
 

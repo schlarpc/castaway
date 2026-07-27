@@ -27,12 +27,46 @@ pub struct Config {
     pub attract_widget_url: Option<String>,
     /// Bluetooth A2DP sink settings.
     pub bluetooth: Bluetooth,
+    /// AirPlay settings.
+    pub airplay: AirPlay,
     /// Spotify Connect settings.
     pub spotify: Spotify,
     /// Skipping sponsor segments in YouTube playback.
     pub sponsorblock: SponsorBlock,
     /// Google Cast settings.
     pub cast: Cast,
+}
+
+/// AirPlay settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AirPlay {
+    /// Offer HEVC mirroring as well as H.264 (feature bit 42).
+    ///
+    /// Off by default, and that default is the safe one: what a sender encodes is
+    /// decided entirely by what we advertise, and a sender that picks HEVC against a
+    /// build with no HEVC path sends an empty codec-config packet and stops — which
+    /// looks exactly like a mirror that never started rather than like a codec problem.
+    ///
+    /// It is a knob rather than a constant so both paths can be exercised against one
+    /// device in one sitting; there is no other way to see the second one at all.
+    pub offer_hevc: bool,
+    /// The mirroring height to advertise, in pixels.
+    ///
+    /// The sender treats *height* as the controlling dimension and fits the width to
+    /// however the device is being held, so this is a budget rather than a geometry.
+    /// 1080 keeps senders on H.264; 2160 is what makes a Mac reach for HEVC, and is
+    /// only worth asking for alongside `offer_hevc`.
+    pub mirror_height: u32,
+}
+
+impl Default for AirPlay {
+    fn default() -> Self {
+        Self {
+            offer_hevc: false,
+            mirror_height: 1080,
+        }
+    }
 }
 
 /// Google Cast settings.
@@ -334,6 +368,7 @@ impl Default for Config {
             enable: Enable::default(),
             attract_widget_url: Some("https://digitalclock.live/".to_string()),
             bluetooth: Bluetooth::default(),
+            airplay: AirPlay::default(),
             spotify: Spotify::default(),
             sponsorblock: SponsorBlock::default(),
             cast: Cast::default(),

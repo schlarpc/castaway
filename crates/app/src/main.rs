@@ -810,6 +810,8 @@ fn spawn_airplay(
         // `pi` is a stable per-protocol UUID, which is what every real receiver
         // advertises; reusing the device id here is the Roku/Samsung outlier behaviour.
         pairing_id: device_uuid(&config.uuid, "airplay"),
+        offer_hevc: config.airplay.offer_hevc,
+        mirror_height: config.airplay.mirror_height,
     });
 
     advertise_adapter(&receiver, mdns);

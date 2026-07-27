@@ -398,6 +398,8 @@ mod tests {
             device_id: "AA:BB:CC:DD:EE:FF".into(),
             host: "castaway".into(),
             pairing_id: "de159742-c022-4514-915b-203cb99f8b71".into(),
+            offer_hevc: false,
+            mirror_height: 1080,
         }
     }
 

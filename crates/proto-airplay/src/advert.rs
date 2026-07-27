@@ -129,6 +129,13 @@ impl Features {
 ///   mirroring's FairPlay is negotiated through `/fp-setup` rather than through these.
 const FEATURE_BITS: &[u8] = &[7, 9, 18, 19, 22, 30];
 
+/// Feature bit 42: the sender may encode HEVC as well as H.264.
+///
+/// Conditional rather than constant, because it is a *policy* and the failure it causes
+/// is silent: set it with no HEVC decoder and a Mac sends an empty codec-config packet
+/// and stalls, which looks exactly like a mirror that never started.
+const FEATURE_SCREEN_MULTI_CODEC: u8 = 42;
+
 /// Identity used to build the AirPlay/RAOP advertisements.
 #[derive(Debug, Clone)]
 pub struct AirPlayIdentity {
@@ -143,13 +150,29 @@ pub struct AirPlayIdentity {
     /// Every real Apple and third-party device advertises a UUID here; only Roku and
     /// Samsung put a MAC in it, and they are the outliers.
     pub pairing_id: String,
+    /// Whether to offer HEVC mirroring as well as H.264.
+    ///
+    /// A knob rather than a constant so both can be exercised against one device in one
+    /// sitting: what a sender encodes is decided entirely by what we advertise, so this
+    /// is the only way to see the other path at all.
+    pub offer_hevc: bool,
+    /// The mirroring height to advertise, in pixels.
+    ///
+    /// The sender treats *height* as the controlling dimension and adjusts width to
+    /// however the device is being held, so this is a budget rather than a geometry.
+    /// 1080 keeps senders on H.264; 2160 is what makes a Mac reach for HEVC.
+    pub mirror_height: u32,
 }
 
 impl AirPlayIdentity {
     /// The feature mask this receiver advertises.
     #[must_use]
     pub fn features(&self) -> Features {
-        Features::from_bits(FEATURE_BITS)
+        let mut bits = FEATURE_BITS.to_vec();
+        if self.offer_hevc {
+            bits.push(FEATURE_SCREEN_MULTI_CODEC);
+        }
+        Features::from_bits(&bits)
     }
 
     /// The `_airplay._tcp` advertisement.
@@ -236,6 +259,8 @@ mod tests {
             device_id: "AA:BB:CC:DD:EE:FF".into(),
             host: "castaway".into(),
             pairing_id: "de159742-c022-4514-915b-203cb99f8b71".into(),
+            offer_hevc: false,
+            mirror_height: 1080,
         }
     }
 
@@ -319,6 +344,27 @@ mod tests {
             f.has(7),
             "bit 7 (screen) is required to be offered a mirror"
         );
+    }
+
+    #[test]
+    fn hevc_is_offered_only_when_it_is_asked_for() {
+        // The failure this guards is silent: a sender that picks HEVC against a build
+        // with no HEVC path sends an empty codec-config packet and simply stops.
+        let mut id = ident();
+        assert!(!id.features().has(42), "HEVC is off unless asked for");
+        id.offer_hevc = true;
+        assert!(id.features().has(42));
+        // …and nothing else moved with it.
+        assert!(id.features().has(7) && id.features().has(9));
+    }
+
+    #[test]
+    fn the_advertised_height_is_what_was_configured() {
+        // The sender treats height as the controlling dimension, so this is the knob
+        // that decides whether a Mac reaches for HEVC at all.
+        let mut id = ident();
+        id.mirror_height = 2160;
+        assert_eq!(id.mirror_height, 2160);
     }
 
     #[test]
