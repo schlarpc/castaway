@@ -124,7 +124,8 @@
         "nixpkgs": "nixpkgs",
         "openscreen-src": "openscreen-src",
         "rust-overlay": "rust-overlay",
-        "systems": "systems"
+        "systems": "systems",
+        "widevine-windows-src": "widevine-windows-src"
       }
     },
     "rust-overlay": {
@@ -181,6 +182,18 @@
         "owner": "numtide",
         "repo": "treefmt-nix",
         "type": "github"
+      }
+    },
+    "widevine-windows-src": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-ubYC8yxAOvhZ/KvlMf/3rKcVGGAEZLo5lzjBOWsmRsA=",
+        "type": "file",
+        "url": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/acddvywyhts76ngei465tcu7besa_4.10.3050.0/oimompecagnajdejgnnjijobebaeigek_4.10.3050.0_win64_adoev3c5ys462nbqhaead57zg2pa.crx3"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/acddvywyhts76ngei465tcu7besa_4.10.3050.0/oimompecagnajdejgnnjijobebaeigek_4.10.3050.0_win64_adoev3c5ys462nbqhaead57zg2pa.crx3"
       }
     }
   },

@@ -39,6 +39,19 @@
       flake = false;
     };
 
+    # The Widevine CDM for the Windows artifact — the CRX3 Chrome's own component updater
+    # installs, pinned to the version nixpkgs pins for Linux. See nix/widevine-windows.nix
+    # for the query that regenerates this URL, and why we ship a CDM at all rather than
+    # letting the component updater fetch one at runtime (offline first boot, one known
+    # version, no five-minute window where casting a rental silently does nothing).
+    #
+    # Unfree, so unpacking it is gated by `allowUnfreePredicate` below; the *fetch* is not,
+    # because a flake input is fetched whenever this flake is evaluated.
+    widevine-windows-src = {
+      url = "file+https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/acddvywyhts76ngei465tcu7besa_4.10.3050.0/oimompecagnajdejgnnjijobebaeigek_4.10.3050.0_win64_adoev3c5ys462nbqhaead57zg2pa.crx3";
+      flake = false;
+    };
+
     # Chromium's Open Screen Protocol library — the reference implementation of Cast
     # Streaming, and the only authoritative description of its RTP framing and crypto.
     #
@@ -62,6 +75,7 @@
     , nix-direnv
     , ffmpeg-windows-src
     , cef-windows-src
+    , widevine-windows-src
     , openscreen-src
     , ...
     }:
@@ -73,7 +87,7 @@
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
         config = {
-          # Three derivations are whitelisted by name rather than flipping `allowUnfree`
+          # Four derivations are whitelisted by name rather than flipping `allowUnfree`
           # wholesale, so anything else unfree still fails the evaluation loudly.
           #
           # - msvc-sysroot: repacks Microsoft's MSVC CRT + Windows SDK, redistributable
@@ -82,18 +96,20 @@
           #   permitted; the vendor licence text just has to travel with the blobs, which
           #   `bluetoothFirmwareFor` copies alongside them. Without this line the failure
           #   surfaces somewhere that looks unrelated (architecture §11.3b).
-          # - widevine-cdm: Google's content-decryption module. Marked non-redistributable,
-          #   so it is fetched and used locally rather than shipped onward — which is what
-          #   a receiver on a wall does anyway. Without it every EME-gated stream fails,
-          #   and fails *quietly*: the page logs to its own console and the panel simply
-          #   does not play, which looks like a network problem. Only the `cef` package
-          #   touches it, and `linux-cef.nix` degrades to no-DRM rather than failing if a
-          #   downstream nixpkgs refuses it.
+          # - widevine-cdm / widevine-cdm-windows: Google's content-decryption module, one
+          #   per deploy platform. Marked non-redistributable, so they are fetched and used
+          #   locally rather than shipped onward — which is what a receiver on a wall does
+          #   anyway. Without one every EME-gated stream fails, and fails *quietly*: the
+          #   page logs to its own console and the panel simply does not play, which looks
+          #   like a network problem. Only the `cef` packages touch them, and both
+          #   `cefDistFor` and `windows.nix` degrade to no-DRM rather than failing if a
+          #   downstream nixpkgs refuses them.
           allowUnfreePredicate = pkg:
             builtins.elem (nixpkgs.lib.getName pkg) [
               "msvc-sysroot"
               "linux-firmware"
               "widevine-cdm"
+              "widevine-cdm-windows"
             ];
         };
       };
@@ -189,12 +205,36 @@
       # nixpkgs `cef-binary` (147.0.10) so the crates use the already-NixOS-linked
       # libcef.so instead of downloading their own. Shared by the devShell and the
       # `castaway-cef` package, which must agree on it.
+      # The Widevine CDM belongs *here*, beside libcef, and not next to our own binary:
+      # Chromium scans `DIR_COMPONENT_PREINSTALLED` for `WidevineCdm/`, which resolves to
+      # `base::DIR_ASSETS` → `DIR_MODULE` → the directory of the module holding Chromium's
+      # code. On Linux that is libcef.so's directory, i.e. this distribution — on Windows
+      # it is the folder holding both, which is why `windows.nix` stages it beside the .exe.
+      #
+      # `tryEval` because the CDM is unfree: a nixpkgs without `allowUnfree` still builds a
+      # working receiver, it just cannot play protected streams. A hard dependency would
+      # make the package unbuildable for anyone who has not accepted Google's terms, over a
+      # feature most casts never touch.
+      widevineLinuxFor = system:
+        let
+          pkgs = pkgsFor system;
+          attempt = builtins.tryEval (pkgs.widevine-cdm.outPath or null);
+        in
+        if attempt.success && attempt.value != null then
+          "${attempt.value}/share/google/chrome/WidevineCdm"
+        else
+          null;
+
       cefDistFor = system:
-        let pkgs = pkgsFor system;
-        in pkgs.runCommand "cef-dist-${pkgs.cef-binary.version}" { } ''
+        let
+          pkgs = pkgsFor system;
+          widevine = widevineLinuxFor system;
+        in
+        pkgs.runCommand "cef-dist-${pkgs.cef-binary.version}" { } ''
           mkdir -p $out
           ln -s ${pkgs.cef-binary}/Release/* $out/
           ln -s ${pkgs.cef-binary}/Resources/* $out/
+          ${pkgs.lib.optionalString (widevine != null) "ln -s ${widevine} $out/WidevineCdm"}
           printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
         '';
 
@@ -215,6 +255,7 @@
         rustToolchain = rustToolchainFor system;
         ffmpegSrc = ffmpeg-windows-src;
         cefSrc = cef-windows-src;
+        widevineSrc = widevine-windows-src;
       };
 
     in

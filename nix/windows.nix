@@ -13,7 +13,7 @@
 #
 # `ffmpegSrc`/`cefSrc` are the raw archives, pinned as flake inputs so they land in
 # flake.lock; the derivations beside this file unpack and rearrange them.
-{ pkgs, craneLib, commonArgs, rustToolchain, ffmpegSrc, cefSrc }:
+{ pkgs, craneLib, commonArgs, rustToolchain, ffmpegSrc, cefSrc, widevineSrc }:
 
 let
   inherit (pkgs) lib;
@@ -29,6 +29,17 @@ let
   sysroot = pkgs.callPackage ./msvc-sysroot.nix { };
   ffmpeg = pkgs.callPackage ./ffmpeg-windows.nix { src = ffmpegSrc; };
   cef = pkgs.callPackage ./cef-windows.nix { src = cefSrc; };
+
+  # The Widevine CDM, staged beside the .exe so DRM-gated video plays on a panel that has
+  # never been online. `tryEval` for the same reason as the Linux side (flake.nix
+  # `widevineLinuxFor`): the CDM is unfree, and a build that cannot have it should be a
+  # receiver without DRM rather than no receiver at all.
+  widevine =
+    let
+      attempt = builtins.tryEval
+        ((pkgs.callPackage ./widevine-windows.nix { src = widevineSrc; }).outPath or null);
+    in
+    if attempt.success && attempt.value != null then attempt.value else null;
 
   includeDirs = [
     "${sysroot}/crt/include"
@@ -283,6 +294,12 @@ let
       ${cef}/Resources/*.pak ${cef}/Resources/icudtl.dat
     install -Dm644 -t "$out/bin/locales/" ${cef}/Resources/locales/*.pak
     install -Dm644 ${./castaway.exe.manifest} "$out/bin/castaway.exe.manifest"
+  '' + lib.optionalString (widevine != null) ''
+    # Beside libcef.dll, because that is what `DIR_COMPONENT_PREINSTALLED` resolves to —
+    # Chromium's component updater finds `WidevineCdm/` there at startup and registers it
+    # with no network and no restart. Copied rather than symlinked: the deploy box has no
+    # /nix/store for a link to point into.
+    cp -r --no-preserve=mode,ownership ${widevine}/WidevineCdm "$out/bin/"
   '';
 
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-

@@ -91,7 +91,11 @@ stdenvNoCC.mkDerivation {
     description = "Widevine Content Decryption Module ${version} for Windows x64";
     homepage = "https://www.widevine.com/";
     license = lib.licenses.unfree;
-    platforms = [ "x86_64-windows" ];
+    # The *payload* is for Windows; the derivation is a Linux-side unzip, so this is
+    # `all` like cef-windows.nix. Naming the target platform here would make `checkMeta`
+    # refuse it on the cross-builder — and because the caller wraps this in `tryEval`,
+    # the refusal would land as a silently DRM-less artifact rather than an error.
+    platforms = lib.platforms.all;
     sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
   };
 }
