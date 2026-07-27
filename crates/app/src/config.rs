@@ -35,6 +35,45 @@ pub struct Config {
     pub sponsorblock: SponsorBlock,
     /// Google Cast settings.
     pub cast: Cast,
+    /// Miracast / Wi-Fi Display settings.
+    pub miracast: Miracast,
+}
+
+/// Miracast settings.
+///
+/// Miracast is the one protocol here that needs a radio rather than a socket: it forms a
+/// Wi-Fi Direct group instead of riding the LAN, which means a driver that supports
+/// `P2P-GO` alongside the station interface, a wpa_supplicant we can talk to, and a DHCP
+/// server on the group interface. `docs/miracast-protocol-notes.md` §7.6 has the checks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Miracast {
+    /// The wpa_supplicant-managed interface to form the group on — the *parent*, not the
+    /// `p2p-*` group interface, which does not exist until the group starts.
+    pub interface: String,
+    /// Where wpa_supplicant's control sockets live.
+    pub control_dir: String,
+    /// Operating frequency in MHz. `None` lets wpa_supplicant choose, which in practice
+    /// means a 2.4 GHz social channel — the busiest part of the spectrum, and the one
+    /// place mirroring has no slack.
+    pub freq_mhz: Option<u16>,
+    /// The UDP port to receive RTP on. Advertised in M3 and echoed in `SETUP`.
+    pub rtp_port: u16,
+    /// Maximum throughput to advertise, in Mbps.
+    pub max_throughput_mbps: u16,
+}
+
+impl Default for Miracast {
+    fn default() -> Self {
+        Self {
+            interface: "wlan0".to_owned(),
+            control_dir: "/run/wpa_supplicant".to_owned(),
+            freq_mhz: None,
+            // What lazycast uses and what every capture shows; nothing requires it.
+            rtp_port: 1028,
+            max_throughput_mbps: 200,
+        }
+    }
 }
 
 /// AirPlay settings.
@@ -343,6 +382,11 @@ pub struct Enable {
     /// Bluetooth A2DP sink. Off by default: it claims a USB controller exclusively, so
     /// turning it on without a dedicated one takes the box's Bluetooth away.
     pub bluetooth: bool,
+    /// Miracast sink. Off by default, and for a heavier reason than the others: it takes
+    /// the Wi-Fi radio into group-owner mode. On a box whose upstream is that same radio
+    /// the two roles time-share, and mirroring — the one workload with no slack — is what
+    /// pays for it (architecture §7.5). Turn it on with Ethernet upstream.
+    pub miracast: bool,
 }
 
 impl Default for Enable {
@@ -354,6 +398,7 @@ impl Default for Enable {
             cast: false,
             airplay: false,
             bluetooth: false,
+            miracast: false,
         }
     }
 }
@@ -372,6 +417,7 @@ impl Default for Config {
             spotify: Spotify::default(),
             sponsorblock: SponsorBlock::default(),
             cast: Cast::default(),
+            miracast: Miracast::default(),
         }
     }
 }

@@ -24,6 +24,7 @@ proto-bluetooth-audio.workspace = true
 hci-transport.workspace = true
 substrate-hci.workspace = true
 proto-airplay.workspace = true
+proto-miracast.workspace = true
 proto-dial.workspace = true
 sponsorblock.workspace = true
 pipeline.workspace = true

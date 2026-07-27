@@ -33,6 +33,7 @@ use proto_airplay::AirPlayReceiver;
 use proto_cast::{CastReceiver, TlsIdentity};
 use proto_dial::DialService;
 use proto_dlna::DlnaService;
+use proto_miracast::MiracastAdapter;
 use proto_spotify::SpotifyService;
 use substrate_mdns::MdnsResponder;
 use substrate_ssdp::{Responder, ResponderConfig, SsdpDevice};
@@ -612,6 +613,19 @@ async fn serve(
             shutdown.clone(),
         ));
     }
+    if config.enable.miracast {
+        // Miracast has no IP discovery to register: it advertises itself in an 802.11
+        // beacon, which neither the mDNS nor the SSDP responder can carry (architecture
+        // §1e). A radio that cannot be a group owner is logged and skipped rather than
+        // fatal, for the same reason as Bluetooth below — a receiver that can still do
+        // AirPlay should not refuse to start because of a Wi-Fi driver.
+        match spawn_miracast(&config, event_tx.clone(), shutdown.clone()) {
+            Ok(handle) => adapter_handles.push(handle),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Miracast unavailable; continuing without it");
+            }
+        }
+    }
     if config.enable.bluetooth {
         // Bluetooth is its own discovery layer — inquiry scan and SDP records, no mDNS —
         // so nothing is registered with the responder here.
@@ -795,6 +809,52 @@ fn advertise_adapter(adapter: &dyn SourceAdapter, mdns: &mut MdnsResponder) {
     }
 }
 
+/// Bring up the Wi-Fi Direct group and run the Miracast sink until `shutdown`.
+///
+/// Nothing is registered with the shared responders: the advertisement is an 802.11
+/// beacon that wpa_supplicant transmits, not a service record. The failure this returns
+/// early on is a capability set that cannot be built, which is a configuration error
+/// rather than a radio one — the radio's own failures surface inside the backend, where
+/// they can name the driver.
+fn spawn_miracast(
+    config: &Config,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let caps = proto_miracast::SinkCapabilities::sink_default(config.miracast.rtp_port)
+        .context("building the Miracast sink capabilities")?;
+    let backend = Arc::new(proto_miracast::LinuxMiracastBackend::new(
+        proto_miracast::P2pConfig {
+            control_dir: config.miracast.control_dir.clone().into(),
+            interface: config.miracast.interface.clone(),
+            device_name: config.advertised_name(ProtocolKind::Miracast),
+            freq_mhz: config.miracast.freq_mhz,
+            max_throughput_mbps: config.miracast.max_throughput_mbps,
+        },
+        caps,
+    ));
+    let adapter = Arc::new(MiracastAdapter::new(
+        backend,
+        config.advertised_name(ProtocolKind::Miracast),
+    ));
+    info!(
+        interface = %config.miracast.interface,
+        rtp_port = config.miracast.rtp_port,
+        "enabled: Miracast (Wi-Fi Direct group owner)"
+    );
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "p2p"), event_tx);
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            res = Arc::clone(&adapter).run(sink) => {
+                if let Err(e) = res {
+                    warn!(error = %e, "Miracast adapter exited");
+                }
+            }
+            () = shutdown.notified() => info!("Miracast stopping"),
+        }
+    }))
+}
+
 /// Stand up the AirPlay/RAOP RTSP listeners, advertise what they ask for, and run them
 /// until `shutdown`. Returns the actor's join handle so shutdown can wait on it.
 fn spawn_airplay(
@@ -952,6 +1012,13 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
             [0x1d, 0xb9, 0x54, 0xff],
             "Spotify",
             detail("Devices", ProtocolKind::Spotify),
+        ));
+    }
+    if config.enable.miracast {
+        rows.push(AttractRow::new(
+            [0x00, 0xa4, 0xef, 0xff],
+            "Windows",
+            detail("Win+K", ProtocolKind::Miracast),
         ));
     }
     if config.enable.bluetooth {

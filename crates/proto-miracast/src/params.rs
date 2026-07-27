@@ -778,7 +778,57 @@ pub struct SinkCapabilities {
     pub uibc: Option<String>,
 }
 
+/// The `wfd_video_formats` value this sink advertises.
+///
+/// Assembled from the values that demonstrably work rather than from what the panel can
+/// do, and every field is load-bearing:
+///
+/// - **CEA `0001FFFF` — bits 0..=16, including the low ones.** Stock AOSP caps itself at
+///   CEA index 5 (1280×720p30) and answers a sink that advertises only 1080p with *"Sink
+///   and source share no commonly supported video formats"*. The floor costs nothing and
+///   is the difference between working and not.
+/// - **Profile `03`** — CBP *and* CHP. A source picks the lower of the two sides' floors
+///   rather than an intersection, so advertising only CHP invites a CBP stream we never
+///   claimed ([`crate::video::pick_best_format`]).
+/// - **VESA capped at bit 28.** Bits 29–31 are reserved in R1, and the two later specs
+///   that filled them in disagree with each other.
+/// - **One tuple, ending `none none`.** AOSP's parser walks a hard-coded 60-byte stride
+///   and `CHECK_LE`s the length — an `abort()`, not an error return, so a short or
+///   differently-padded value kills `mediaserver` on the phone.
+pub const SINK_VIDEO_FORMATS: &str =
+    "00 00 03 10 0001FFFF 1FFFFFFF 00000FFF 00 0000 0000 00 none none";
+
+/// The `wfd_uibc_capability` this sink advertises.
+///
+/// `port=none` is correct and not a placeholder: the sink says *what* it can send, and the
+/// **source** fills in where. Both categories are offered because Windows advertises HIDC
+/// only, and GENERIC is the only thing an Android fork would use.
+pub const SINK_UIBC_CAPABILITY: &str = "input_category_list=GENERIC, HIDC;     generic_cap_list=Mouse, SingleTouch, MultiTouch;     hidc_cap_list=Keyboard/USB, Mouse/USB, MultiTouch/USB;port=none";
+
 impl SinkCapabilities {
+    /// The advertisement this sink makes, on `rtp_port`.
+    ///
+    /// # Errors
+    /// [`ParamError`] only if `rtp_port` is zero or [`SINK_VIDEO_FORMATS`] has been edited
+    /// into something ungrammatical — both of which are programming errors rather than
+    /// wire conditions, and both of which would otherwise surface as a dead session.
+    pub fn sink_default(rtp_port: u16) -> Result<Self, ParamError> {
+        Ok(Self {
+            video_formats: VideoFormats::parse(SINK_VIDEO_FORMATS)?,
+            audio_codecs: AudioCodecs::sink_default(),
+            client_rtp_ports: ClientRtpPorts::new(RtpProfile::UdpUnicast, rtp_port)?,
+            // Not a limitation we regret: both open-source sinks and Windows' own sink
+            // answer `none`, and every source proceeds with an unencrypted stream.
+            content_protection: ContentProtection::None,
+            connector_type: ConnectorType::Hdmi,
+            // We do send M13, and saying so is what fixes the classic "black screen for
+            // the first few seconds, audio fine" — AOSP's encoder is otherwise fifteen
+            // seconds from its next IDR.
+            idr_request: true,
+            uibc: Some(SINK_UIBC_CAPABILITY.to_owned()),
+        })
+    }
+
     /// Answer an M3 request: emit exactly the parameters it named, in the order it named
     /// them, and nothing else.
     ///
@@ -850,6 +900,31 @@ mod tests {
             idr_request: true,
             uibc: None,
         }
+    }
+
+    #[test]
+    fn the_advertised_video_formats_keep_the_low_cea_bits() {
+        // Stock AOSP will never exceed CEA index 5 — 1280x720p30 — and answers a sink
+        // that advertises only 1080p with "no commonly supported video formats".
+        use crate::video::{ResolutionIndex, ResolutionTable};
+        let caps = SinkCapabilities::sink_default(1028).unwrap();
+        let cea = caps.video_formats.codecs[0].cea;
+        for index in 0..=5u8 {
+            let mode = ResolutionIndex::new(ResolutionTable::Cea, index).unwrap();
+            assert!(cea.contains(mode), "CEA bit {index} is what Android can do");
+        }
+        // And the value re-emits exactly, because AOSP aborts on a short one.
+        assert_eq!(caps.video_formats.to_string(), SINK_VIDEO_FORMATS);
+    }
+
+    #[test]
+    fn the_advertised_uibc_line_says_none_for_the_port() {
+        // The sink says what it can send; the source says where. A numeric port here
+        // would be the sink advertising a listener it does not have.
+        let caps = SinkCapabilities::sink_default(1028).unwrap();
+        let uibc = caps.uibc.as_deref().unwrap();
+        assert!(uibc.ends_with("port=none"), "{uibc}");
+        assert!(uibc.contains("GENERIC") && uibc.contains("HIDC"));
     }
 
     #[test]
