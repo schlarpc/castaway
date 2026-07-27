@@ -367,6 +367,17 @@
             inherit pkgs;
             openscreenSrc = openscreen-src;
           };
+
+          # The same idea pointed the other way: compile openscreen's *sender-side*
+          # device-auth verifier and let it judge the auth responses this receiver
+          # produces. It is what turns "an official sender would reject us, and here is
+          # the line of C++ that says so" into an executed result — including which of
+          # the sender's many checks we already pass, so a provisioned credential has
+          # exactly one case left to flip.
+          openscreen-device-auth = import ./nix/openscreen-device-auth.nix {
+            inherit pkgs;
+            openscreenSrc = openscreen-src;
+          };
         }
         # Tier-2: whole adapters driven by scripted senders from a second VM over a real
         # LAN (ground rule 6). Linux-only — nixosTest needs KVM and a NixOS guest.

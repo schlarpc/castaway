@@ -103,6 +103,24 @@ impl TlsIdentity {
         now: SystemTime,
     ) -> Result<Self, CastError> {
         let key = rcgen::KeyPair::generate().map_err(|e| CastError::Tls(e.to_string()))?;
+        Self::from_key_at(&key.serialize_der(), subject_alt_names, now)
+    }
+
+    /// [`TlsIdentity::self_signed_at`] with the key supplied as PKCS#8 DER.
+    ///
+    /// Exists so the device-auth vectors can be byte-reproducible: certificate issuance
+    /// is deterministic, so fixing the key and the clock fixes the certificate, and
+    /// therefore fixes the signature the vectors are checked against.
+    ///
+    /// # Errors
+    /// [`CastError::Tls`] if the key cannot be parsed or the certificate not issued.
+    pub fn from_key_at(
+        key_pkcs8_der: &[u8],
+        subject_alt_names: &[String],
+        now: SystemTime,
+    ) -> Result<Self, CastError> {
+        let key =
+            rcgen::KeyPair::try_from(key_pkcs8_der).map_err(|e| CastError::Tls(e.to_string()))?;
         let key_der = PrivateKeyDer::try_from(key.serialize_der())
             .map_err(|e| CastError::Tls(e.to_string()))?;
         let issued = Self::issue(&key, &key_der, subject_alt_names, now)?;

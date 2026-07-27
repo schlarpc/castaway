@@ -3714,6 +3714,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "async-trait",
+ "base64",
  "bytes",
  "castaway-core",
  "crypto-cast-auth",
@@ -3721,6 +3722,7 @@ dependencies = [
  "hex-literal",
  "prost",
  "rcgen",
+ "rsa",
  "rustls 0.23.42",
  "serde",
  "serde_json",

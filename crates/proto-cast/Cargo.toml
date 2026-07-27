@@ -28,6 +28,8 @@ time.workspace = true
 [dev-dependencies]
 hex-literal.workspace = true
 x509-parser.workspace = true
+rsa.workspace = true
+base64.workspace = true
 
 [lints]
 workspace = true

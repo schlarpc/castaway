@@ -75,6 +75,7 @@ pub struct SignedAuth {
 }
 
 /// Signs Cast device-auth challenges with a fixed device key + certificate chain.
+#[derive(Clone)]
 pub struct CastDeviceSigner {
     key: RsaPrivateKey,
     client_cert_der: Vec<u8>,
