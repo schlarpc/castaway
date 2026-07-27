@@ -627,6 +627,80 @@ mod tests {
         assert!(rms(&decoded) > 0.05, "SBC output is silent");
     }
 
+    /// An output that remembers how loud what it was given actually was.
+    #[derive(Default)]
+    struct Speaker {
+        frames: std::sync::atomic::AtomicU64,
+        peak: std::sync::Mutex<f32>,
+    }
+
+    impl crate::audio_out::AudioOut for std::sync::Arc<Speaker> {
+        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
+            Ok(())
+        }
+        fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
+            self.frames.fetch_add(
+                block.frame_count() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let loudest = block.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            if let Ok(mut peak) = self.peak.lock() {
+                *peak = peak.max(loudest);
+            }
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[test]
+    fn encoded_frames_from_a_phone_reach_the_output_as_sound() {
+        // The assertion nothing anywhere was making: that a single audio sample left the
+        // box. Every test up to here proved a *layer* — the adapter emits `EncodedFrame`s,
+        // the decoder turns bytes into samples, the session does not hang — and none of
+        // them proved the join. `selfplay` has the same hole from the other end: it
+        // asserts Spotify's cloud reports `is_playing`, which is echoed back from our own
+        // state machine and is true of a receiver making no noise at all.
+        //
+        // SBC because it is the one codec every sender falls back to and the one we are
+        // required to support, so this runs on any build that can decode anything.
+        let rate = 44_100;
+        let frames = encode(AudioCodec::Sbc, rate, &sine(rate, 44_100));
+        if frames.is_empty() {
+            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(frames.len() + 1);
+        for frame in frames {
+            tx.blocking_send(frame).unwrap();
+        }
+        drop(tx);
+
+        let speaker = std::sync::Arc::new(Speaker::default());
+        crate::audio_session::run(
+            rx,
+            format(rate, 2),
+            Box::new(std::sync::Arc::clone(&speaker)),
+            &std::sync::atomic::AtomicBool::new(false),
+            &crate::audio_session::Gain::default(),
+        );
+
+        let played = speaker.frames.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(played > 0, "not one sample frame reached the output");
+        // A second of audio in, near enough a second of audio out — a session that
+        // decoded one frame and stopped would satisfy a bare `> 0`.
+        assert!(
+            played > u64::from(rate) / 2,
+            "only {played} frames of a one-second clip reached the output"
+        );
+        // …and it was *sound*, not a correctly-shaped block of zeros, which is what a
+        // wrong sample format or a mis-set gain produces.
+        assert!(
+            *speaker.peak.lock().unwrap() > 0.05,
+            "the output received silence"
+        );
+    }
+
     #[test]
     fn a_corrupt_packet_is_skipped_rather_than_ending_the_session() {
         // One bad packet off a radio link must not take the music down.
