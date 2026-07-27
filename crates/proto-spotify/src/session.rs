@@ -140,6 +140,8 @@ struct LiveSession {
     spirc_task: JoinHandle<()>,
     events_task: JoinHandle<()>,
     queue_task: JoinHandle<()>,
+    /// Serves the sink's requests for a fresh PCM channel after a preemption.
+    reattach_task: JoinHandle<()>,
     /// Set when the *user* ended the session from their phone, as opposed to the session
     /// dying under us. The difference decides whether we reconnect or stay down, and
     /// nothing else in the session can tell them apart — see [`run`].
@@ -183,6 +185,7 @@ impl LiveSession {
         self.spirc_task.abort();
         self.events_task.abort();
         self.queue_task.abort();
+        self.reattach_task.abort();
     }
 }
 
@@ -465,7 +468,9 @@ async fn start(
             .map_err(|e| SpotifyError::Login(format!("mixer: {e}")))?,
     );
 
-    let (pcm_tx, pcm_rx) = PcmSink::channel();
+    let (pcm_link, pcm_requests) = crate::sink::PcmLink::new();
+    let pcm_rx = pcm_link.attach();
+    let sink_link = Arc::clone(&pcm_link);
     // Both of these are *away* from librespot's defaults, deliberately. `Bitrate160` and
     // `normalisation: false` are what the struct default gives, and neither is what a
     // room wants: 160 on an account entitled to 320 is audible on a PA, and unnormalised
@@ -488,7 +493,7 @@ async fn start(
         },
         session.clone(),
         mixer.get_soft_volume(),
-        move || Box::new(PcmSink::new(pcm_tx)),
+        move || Box::new(PcmSink::new(sink_link)),
     );
     let events = player.get_player_event_channel();
 
@@ -547,6 +552,18 @@ async fn start(
     .await
     .map_err(|_| SpotifyError::SessionGone)?;
 
+    // Serve the sink's requests for a fresh channel. This is what makes preemption
+    // survivable: the pipeline takes our audio away, and when someone presses play again
+    // librespot's `start()` asks here, we emit a new `Audio` event, and the session
+    // manager hands Spotify the panel back — the same path as starting playback, because
+    // from the room's point of view that is what just happened.
+    let reattach_task = tokio::spawn(serve_reattach(
+        pcm_requests,
+        Arc::clone(&pcm_link),
+        sink.clone(),
+        format,
+    ));
+
     let hung_up = Arc::new(AtomicBool::new(false));
     let events_task = tokio::spawn(pump_events(
         events,
@@ -562,8 +579,41 @@ async fn start(
         spirc_task,
         events_task,
         queue_task,
+        reattach_task,
         hung_up,
     })
+}
+
+/// Hand the pipeline a new PCM channel whenever the sink asks for one.
+///
+/// One request per preemption, not per block: the sink coalesces, and the channel it gets
+/// back lasts until something takes the panel again.
+///
+/// Emitting `SessionEvent::Audio` is deliberately the *same* event a session start uses.
+/// The session manager's arbitration is last-writer-wins, so this preempts whoever holds
+/// the panel — which is the correct reading of "the person whose phone this is just
+/// pressed play".
+async fn serve_reattach(
+    mut requests: mpsc::UnboundedReceiver<()>,
+    link: Arc<crate::sink::PcmLink>,
+    sink: SessionSink,
+    format: castaway_core::AudioFormat,
+) {
+    while requests.recv().await.is_some() {
+        // Coalesce anything that piled up while we were not looking, so a burst of failed
+        // writes does not produce a burst of session hand-offs.
+        while requests.try_recv().is_ok() {}
+        info!("spotify: reattaching audio to the pipeline");
+        let source = FrameSource::Pcm(link.attach());
+        if sink
+            .emit(SessionEvent::Audio { source, format })
+            .await
+            .is_err()
+        {
+            debug!("spotify: session manager gone; stopping the reattach server");
+            return;
+        }
+    }
 }
 
 /// Translate librespot's player events into the now-playing surface.
