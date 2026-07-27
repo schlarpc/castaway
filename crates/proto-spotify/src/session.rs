@@ -19,7 +19,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use castaway_core::{FrameSource, OsdSink};
 use castaway_core::{
-    NowPlaying, PcmFrame, PlaybackState, SessionEvent, SessionSink, SourceDescription,
+    NowPlaying, PcmFrame, PlaybackState, RepeatMode, SessionEvent, SessionSink, SourceDescription,
 };
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
@@ -77,6 +77,17 @@ pub struct ConnectSettings {
     /// Apply Spotify's loudness normalisation, so a shared room does not get
     /// track-to-track volume jumps.
     pub normalisation: bool,
+    /// Directories searched for tracks the user synced from their own files.
+    ///
+    /// Empty by default, and that default is a real position rather than an oversight: a
+    /// receiver holds nobody's music library, so a playlist with local files is one whose
+    /// local entries this device genuinely cannot play. What it must not do is *look*
+    /// like it can — before this existed the card rendered a local track in full and then
+    /// the player emitted `Unavailable` and skipped, which reads as the receiver dropping
+    /// songs at random.
+    ///
+    /// Point it at a share the panel can reach and those tracks play like any other.
+    pub local_file_directories: Vec<std::path::PathBuf>,
 }
 
 /// Who `getInfo` names as the active user, shared between the zeroconf endpoint and the
@@ -489,6 +500,7 @@ async fn start(
             position_update_interval: Some(POSITION_INTERVAL),
             bitrate,
             normalisation: settings.normalisation,
+            local_file_directories: settings.local_file_directories.clone(),
             ..PlayerConfig::default()
         },
         session.clone(),
@@ -757,6 +769,23 @@ async fn pump_events(
                     }
                 }
                 false
+            }
+            PlayerEvent::ShuffleChanged { shuffle } => {
+                snapshot.shuffle = Some(shuffle);
+                true
+            }
+            PlayerEvent::RepeatChanged { context, track } => {
+                // Spotify keeps two independent flags; `RepeatMode` is one answer. Track
+                // wins when both are set, because that is what the listener will actually
+                // hear — the current song, forever.
+                snapshot.repeat = Some(if track {
+                    RepeatMode::Track
+                } else if context {
+                    RepeatMode::Context
+                } else {
+                    RepeatMode::Off
+                });
+                true
             }
             // Everything else is either internal to spirc or does not change the card.
             _ => false,
@@ -1138,6 +1167,7 @@ mod tests {
             initial_volume: 0.5,
             bitrate: 320,
             normalisation: true,
+            local_file_directories: Vec::new(),
         }
     }
 

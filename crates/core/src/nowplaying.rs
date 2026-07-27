@@ -47,6 +47,47 @@ impl PlaybackState {
     }
 }
 
+/// How the sender repeats when the current item ends.
+///
+/// An enum rather than a boolean because the two repeat modes are genuinely different
+/// answers to "what happens next", and every sender that has repeat at all has both:
+/// repeating one track forever and repeating the album are different requests, and a
+/// `bool` would force whoever renders the button to guess which one is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RepeatMode {
+    /// Play to the end of the queue and stop.
+    #[default]
+    Off,
+    /// Repeat the current item.
+    Track,
+    /// Repeat the whole queue or context.
+    Context,
+}
+
+impl RepeatMode {
+    /// The next mode when someone presses the repeat button.
+    ///
+    /// Off → Context → Track → Off, which is the order every music app uses: the common
+    /// want is "keep this playlist going", and repeat-one is the deliberate extra press.
+    #[must_use]
+    pub const fn cycled(self) -> Self {
+        match self {
+            Self::Off => Self::Context,
+            Self::Context => Self::Track,
+            // Including the catch-all: this enum is non-exhaustive, and a mode we do not
+            // know about should still get the user back to a state they recognise.
+            _ => Self::Off,
+        }
+    }
+
+    /// Whether repeat is on at all, in any mode.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// Image encodings a peer may hand us for cover art.
 ///
 /// A closed enum rather than a MIME string: the decoder has to match on it anyway, and
@@ -192,6 +233,15 @@ pub struct NowPlaying {
     pub state: PlaybackState,
     /// Cover art, once fetched. Absent on the first snapshot for a track.
     pub artwork: Option<Artwork>,
+    /// Whether the sender is shuffling, when it says so.
+    ///
+    /// `None` and `Some(false)` are different facts and the panel treats them
+    /// differently: a source that never reports shuffle gets no shuffle button, while one
+    /// that reports it off gets a dimmed one. Rendering "off" for "unknown" would offer a
+    /// control that does nothing.
+    pub shuffle: Option<bool>,
+    /// How the sender repeats, when it says so. `None` as for [`NowPlaying::shuffle`].
+    pub repeat: Option<RepeatMode>,
 }
 
 impl NowPlaying {
@@ -246,6 +296,20 @@ impl NowPlaying {
     #[must_use]
     pub fn with_artwork(mut self, artwork: Artwork) -> Self {
         self.artwork = Some(artwork);
+        self
+    }
+
+    /// Builder-style shuffle setter.
+    #[must_use]
+    pub fn with_shuffle(mut self, shuffle: bool) -> Self {
+        self.shuffle = Some(shuffle);
+        self
+    }
+
+    /// Builder-style repeat setter.
+    #[must_use]
+    pub fn with_repeat(mut self, repeat: RepeatMode) -> Self {
+        self.repeat = Some(repeat);
         self
     }
 }

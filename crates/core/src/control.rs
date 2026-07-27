@@ -72,6 +72,10 @@ impl ControlCapabilities {
     pub const PREVIOUS: Self = Self(1 << 7);
     /// Replace the play queue ([`ControlTxn::SetQueue`]).
     pub const SET_QUEUE: Self = Self(1 << 8);
+    /// Turn shuffle on or off ([`ControlTxn::Shuffle`]).
+    pub const SHUFFLE: Self = Self(1 << 9);
+    /// Set the repeat mode ([`ControlTxn::Repeat`]).
+    pub const REPEAT: Self = Self(1 << 10);
 
     /// The four transport verbs every AVRCP peer worth the name implements.
     pub const TRANSPORT: Self =
@@ -115,6 +119,8 @@ impl ControlCapabilities {
             ControlTxn::Next => Self::NEXT,
             ControlTxn::Previous => Self::PREVIOUS,
             ControlTxn::SetQueue { .. } => Self::SET_QUEUE,
+            ControlTxn::Shuffle(_) => Self::SHUFFLE,
+            ControlTxn::Repeat(_) => Self::REPEAT,
         }
     }
 

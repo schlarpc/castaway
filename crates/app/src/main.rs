@@ -419,6 +419,7 @@ async fn serve(
                 initial_volume: config.spotify.initial_volume,
                 bitrate: config.spotify.bitrate,
                 normalisation: config.spotify.normalisation,
+                local_file_directories: config.spotify.local_file_directories.clone(),
             },
         );
         http = http.merge(spotify.router());

@@ -58,7 +58,7 @@ struct SpotifyStateInner {
 ///
 /// Separate from [`ConnectSettings`] because these are the app's policy — a room's
 /// choice — rather than anything the pairing handshake depends on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PlaybackQuality {
     /// Volume the device comes up at, `0.0..=1.0`.
     pub initial_volume: f32,
@@ -66,6 +66,9 @@ pub struct PlaybackQuality {
     pub bitrate: u16,
     /// Apply Spotify's loudness normalisation.
     pub normalisation: bool,
+    /// Directories to search for the user's own synced files. Empty means a playlist's
+    /// local tracks cannot play here — see [`session::ConnectSettings`].
+    pub local_file_directories: Vec<std::path::PathBuf>,
 }
 
 impl Default for PlaybackQuality {
@@ -78,6 +81,7 @@ impl Default for PlaybackQuality {
             initial_volume: 0.5,
             bitrate: 320,
             normalisation: true,
+            local_file_directories: Vec::new(),
         }
     }
 }
@@ -123,6 +127,7 @@ impl SpotifyService {
                 initial_volume: quality.initial_volume,
                 bitrate: quality.bitrate,
                 normalisation: quality.normalisation,
+                local_file_directories: quality.local_file_directories,
             },
             sink,
             self.state.osd.get().cloned(),

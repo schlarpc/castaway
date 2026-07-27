@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::control::RemoteControl;
-use crate::nowplaying::{NowPlaying, QueueItem};
+use crate::nowplaying::{NowPlaying, QueueItem, RepeatMode};
 use crate::source::SourceDescription;
 use crate::types::{AudioFormat, FrameSource, MediaUri};
 
@@ -72,6 +72,16 @@ pub enum ControlTxn {
         /// Index of the item to start on.
         start_index: usize,
     },
+    /// Turn shuffle on or off.
+    ///
+    /// Absolute rather than a toggle, deliberately. The panel and the phone both hold a
+    /// view of this and they can disagree — a toggle applied to a stale view turns
+    /// shuffle *on* when the user meant to turn it off, and the only feedback is the
+    /// music. Saying which state is wanted makes a lost or reordered command harmless.
+    Shuffle(bool),
+    /// Set how the sender repeats. Absolute, for the same reason as
+    /// [`ControlTxn::Shuffle`].
+    Repeat(RepeatMode),
 }
 
 /// The internal command every protocol adapter emits. The session manager consumes

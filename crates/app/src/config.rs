@@ -267,6 +267,18 @@ pub struct Spotify {
     /// every real Connect speaker smooths out and people reach for the volume knob over.
     /// librespot defaults this off.
     pub normalisation: bool,
+
+    /// Directories to search for tracks a user synced from their own files.
+    ///
+    /// Empty by default, and the default is a position rather than an omission: this
+    /// receiver holds nobody's music library, so a playlist's local files genuinely
+    /// cannot play here. What was wrong before is that it did not *say* so — the card
+    /// rendered the local track in full, the player then found nothing and skipped, and
+    /// from the room that reads as the panel dropping songs at random (G50).
+    ///
+    /// Point this at a share the panel can read and those tracks play like any other.
+    /// Paths are handed to librespot as-is.
+    pub local_file_directories: Vec<PathBuf>,
 }
 
 impl Default for Spotify {
@@ -275,6 +287,7 @@ impl Default for Spotify {
             initial_volume: 0.5,
             bitrate: 320,
             normalisation: true,
+            local_file_directories: Vec::new(),
         }
     }
 }

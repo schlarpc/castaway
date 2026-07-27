@@ -18,7 +18,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use castaway_core::{ControlCapabilities, ControlTxn, CoreError, RemoteControl};
+use castaway_core::{ControlCapabilities, ControlTxn, CoreError, RemoteControl, RepeatMode};
 use librespot_connect::Spirc;
 use tracing::warn;
 
@@ -51,6 +51,23 @@ impl SpotifyRemote {
             .or(ControlCapabilities::VOLUME)
             .or(ControlCapabilities::NEXT)
             .or(ControlCapabilities::PREVIOUS)
+            .or(ControlCapabilities::SHUFFLE)
+            .or(ControlCapabilities::REPEAT)
+    }
+}
+
+/// Spotify keeps repeat as two independent flags — repeat-the-context and
+/// repeat-the-track — where [`RepeatMode`] is one three-valued answer. Setting *both*
+/// on every change is what keeps them in step: sending only the flag that turned on
+/// would leave the other one set from a previous mode, so asking for repeat-one after
+/// repeat-all would get a device that does both and agrees with neither button.
+const fn repeat_flags(mode: RepeatMode) -> (bool, bool) {
+    match mode {
+        RepeatMode::Context => (true, false),
+        RepeatMode::Track => (false, true),
+        // Includes the non-exhaustive catch-all: a mode we do not understand turns
+        // repeat off rather than leaving whatever was set before.
+        _ => (false, false),
     }
 }
 
@@ -82,6 +99,15 @@ impl RemoteControl for SpotifyRemote {
             ControlTxn::Volume(level) => spirc.set_volume(volume_to_spotify(*level)),
             ControlTxn::Next => spirc.next(),
             ControlTxn::Previous => spirc.prev(),
+            ControlTxn::Shuffle(on) => spirc.shuffle(*on),
+            ControlTxn::Repeat(mode) => {
+                let (context, track) = repeat_flags(*mode);
+                // Both, always, and the context flag first so a mode change never passes
+                // through a state where both are set.
+                spirc
+                    .repeat(context)
+                    .and_then(|()| spirc.repeat_track(track))
+            }
             // Unreachable via `issue`, which checks capabilities first — but this is a
             // trait method anyone can call directly, and a silent success here would look
             // like a queue that was accepted and then ignored.
@@ -128,6 +154,8 @@ mod tests {
             ControlTxn::Volume(0.5),
             ControlTxn::Next,
             ControlTxn::Previous,
+            ControlTxn::Shuffle(true),
+            ControlTxn::Repeat(RepeatMode::Context),
         ] {
             assert!(caps.supports(&txn), "{txn:?} should be advertised");
         }
@@ -142,6 +170,16 @@ mod tests {
             items: Vec::new(),
             start_index: 0,
         }));
+    }
+
+    /// The two Spotify flags are set on every repeat change, never just the one that
+    /// turned on — otherwise switching from repeat-all to repeat-one leaves both set and
+    /// the device agrees with neither button on the panel.
+    #[test]
+    fn every_repeat_mode_states_both_flags() {
+        assert_eq!(repeat_flags(RepeatMode::Off), (false, false));
+        assert_eq!(repeat_flags(RepeatMode::Context), (true, false));
+        assert_eq!(repeat_flags(RepeatMode::Track), (false, true));
     }
 
     #[test]

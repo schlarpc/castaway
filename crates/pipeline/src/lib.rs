@@ -48,6 +48,7 @@ pub mod render_pipeline;
 pub mod tap;
 #[cfg(feature = "render")]
 pub mod text;
+pub mod transport;
 #[cfg(feature = "cef")]
 pub mod ubo_scriptlets;
 #[cfg(feature = "render")]
