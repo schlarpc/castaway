@@ -12,12 +12,19 @@ castaway-core.workspace = true
 substrate-mdns.workspace = true
 substrate-rtsp.workspace = true
 crypto-fairplay.workspace = true
+crypto-raop.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 plist.workspace = true
 base64.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+
+[dev-dependencies]
+# The SDP tests wrap a session key the way a sender does, so the unwrap is exercised
+# end to end rather than mocked.
+rsa.workspace = true
+sha1.workspace = true
 
 [lints]
 workspace = true

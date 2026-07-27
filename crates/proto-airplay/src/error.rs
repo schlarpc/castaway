@@ -67,6 +67,14 @@ pub enum SdpError {
         attribute: &'static str,
     },
 
+    /// `a=rsaaeskey:` would not unwrap with the AirPort key.
+    ///
+    /// Almost always means the sender wrapped the key with FairPlay (`et=3`/`et=5`)
+    /// rather than RSA — which it should only do if we advertised those, so seeing this
+    /// is a sign the advertisement and the code have drifted apart.
+    #[error("could not unwrap the session key from a=rsaaeskey:")]
+    KeyUnwrap,
+
     /// Exactly one of `rsaaeskey`/`aesiv` was present.
     ///
     /// Worth its own variant because it is the failure that would otherwise be silent:
@@ -95,6 +103,10 @@ impl SdpError {
             // 415 Unsupported Media Type: the body was understood, the codec is not one
             // we decode.
             Self::UnsupportedCodec(_) => 415,
+            // The sender offered a key we cannot read, which is the same shape of
+            // problem as declaring half an encryption: it thinks there is a shared key
+            // and there is not.
+            Self::KeyUnwrap => 456,
             Self::NotUtf8
             | Self::MissingRtpmap
             | Self::BadFmtp

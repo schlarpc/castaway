@@ -16,6 +16,8 @@
 //! Making that an enum at the boundary means no later stage can ask "is there a key"
 //! and get a half-answer.
 
+use std::fmt;
+
 use crate::error::SdpError;
 
 /// Defaults for the twelve `a=fmtp:` integers, in wire order.
@@ -135,19 +137,25 @@ impl RaopCodec {
     }
 }
 
-/// An AES key still wrapped in whatever the sender wrapped it in.
+/// An unwrapped AES-128 session key.
 ///
-/// A newtype rather than a `Vec<u8>` so it cannot be mistaken for key material that is
-/// ready to use: unwrapping `rsaaeskey` needs a private key this receiver does not
-/// carry, so a value of this type is precisely "a key we cannot yet read".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WrappedAesKey(Vec<u8>);
+/// A newtype for one reason: its [`fmt::Debug`] does not print the key. `AnnounceParams`
+/// derives `Debug` and gets logged, and a session key in the journal is a session key on
+/// disk. Reaching the bytes takes an explicit [`SessionKey::expose`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SessionKey([u8; 16]);
 
-impl WrappedAesKey {
-    /// The wrapped bytes, as they arrived.
+impl SessionKey {
+    /// The key material. Named to be conspicuous at the call site.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn expose(&self) -> &[u8; 16] {
         &self.0
+    }
+}
+
+impl fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SessionKey(<redacted>)")
     }
 }
 
@@ -160,9 +168,9 @@ pub enum StreamCrypto {
     None,
     /// Both present: AES-128-CBC, with the IV reset from `iv` for *every* packet.
     Aes {
-        /// The still-wrapped session key.
-        key: WrappedAesKey,
-        /// The initialisation vector, which is not wrapped.
+        /// The session key, already unwrapped.
+        key: SessionKey,
+        /// The initialisation vector, which arrives unwrapped.
         iv: [u8; 16],
     },
 }
@@ -263,8 +271,14 @@ impl AnnounceParams {
         // play noise, so it is refused rather than silently treated as plaintext.
         let crypto = match (wrapped_key, iv) {
             (None, None) => StreamCrypto::None,
-            (Some(key), Some(iv)) => StreamCrypto::Aes {
-                key: WrappedAesKey(key),
+            (Some(wrapped), Some(iv)) => StreamCrypto::Aes {
+                // Unwrap here rather than downstream: a key that cannot be unwrapped
+                // makes the whole announcement useless, and the sender should be told
+                // now — while it can still pick something else — rather than after it
+                // has started streaming into a decoder that will emit static.
+                key: SessionKey(
+                    crypto_raop::unwrap_aes_key(&wrapped).map_err(|_| SdpError::KeyUnwrap)?,
+                ),
                 iv,
             },
             (Some(_), None) => return Err(SdpError::HalfEncrypted { missing: "aesiv" }),
@@ -424,27 +438,83 @@ mod tests {
         assert!(AnnounceParams::parse(body.as_bytes()).is_ok());
     }
 
+    /// Wrap a session key the way a sender does, so the test exercises the real unwrap.
+    fn wrap_for_us(session_key: &[u8; 16]) -> String {
+        use base64::Engine as _;
+        use rsa::pkcs1::DecodeRsaPrivateKey as _;
+        // The public half of the key `crypto-raop` carries: exactly what an iPhone
+        // encrypts to.
+        let private =
+            rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../../crypto-raop/src/airport.pem"))
+                .unwrap();
+        let public = rsa::RsaPublicKey::from(&private);
+        let wrapped = public
+            .encrypt(
+                &mut rsa::rand_core::OsRng,
+                rsa::Oaep::new::<sha1::Sha1>(),
+                session_key,
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(wrapped)
+    }
+
     #[test]
-    fn both_encryption_attributes_present_is_encrypted() {
-        // 16 zero bytes, base64, padding stripped the way senders send it.
+    fn both_encryption_attributes_present_yields_an_unwrapped_key() {
+        // End to end: a key wrapped the way a sender wraps it comes back out usable.
+        let session_key = *b"0123456789abcdef";
         let body = format!(
             "{IOS_ALAC}a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
-            "QUJDREVGR0hJSktMTU5PUA", "QUJDREVGR0hJSktMTU5PUA"
+            wrap_for_us(&session_key),
+            "QUJDREVGR0hJSktMTU5PUA"
         );
         let p = AnnounceParams::parse(body.as_bytes()).unwrap();
         let StreamCrypto::Aes { key, iv } = &p.crypto else {
             panic!("expected AES, got {:?}", p.crypto)
         };
         assert_eq!(iv, b"ABCDEFGHIJKLMNOP");
-        assert_eq!(key.as_bytes(), b"ABCDEFGHIJKLMNOP");
+        assert_eq!(key.expose(), &session_key);
         assert!(p.crypto.is_encrypted());
+    }
+
+    #[test]
+    fn a_key_we_cannot_unwrap_is_refused_rather_than_used() {
+        // A FairPlay-wrapped key reaching the RSA path would otherwise decrypt the
+        // stream into static, with nothing in any log to say why.
+        let body = format!(
+            "{IOS_ALAC}a=rsaaeskey:{}\r\na=aesiv:QUJDREVGR0hJSktMTU5PUA\r\n",
+            "QUJD".repeat(86)
+        );
+        assert!(matches!(
+            AnnounceParams::parse(body.as_bytes()),
+            Err(SdpError::KeyUnwrap)
+        ));
+    }
+
+    #[test]
+    fn a_session_key_does_not_appear_in_debug_output() {
+        // AnnounceParams is logged. A key in the journal is a key on disk.
+        let session_key = *b"0123456789abcdef";
+        let body = format!(
+            "{IOS_ALAC}a=rsaaeskey:{}\r\na=aesiv:QUJDREVGR0hJSktMTU5PUA\r\n",
+            wrap_for_us(&session_key)
+        );
+        let p = AnnounceParams::parse(body.as_bytes()).unwrap();
+        let rendered = format!("{p:?}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(
+            !rendered.contains("0123456789abcdef"),
+            "the key leaked into Debug: {rendered}"
+        );
     }
 
     #[test]
     fn exactly_one_encryption_attribute_is_refused() {
         // The case that matters: a sender that believes it negotiated encryption talking
         // to a receiver that would play noise. shairport-sync answers 456 to this.
-        let only_key = format!("{IOS_ALAC}a=rsaaeskey:QUJDREVGR0hJSktMTU5PUA\r\n");
+        let only_key = format!(
+            "{IOS_ALAC}a=rsaaeskey:{}\r\n",
+            wrap_for_us(b"0123456789abcdef")
+        );
         assert!(matches!(
             AnnounceParams::parse(only_key.as_bytes()),
             Err(SdpError::HalfEncrypted { missing: "aesiv" })
@@ -460,7 +530,10 @@ mod tests {
 
     #[test]
     fn an_iv_of_the_wrong_length_is_refused() {
-        let body = format!("{IOS_ALAC}a=rsaaeskey:QUJD\r\na=aesiv:QUJD\r\n");
+        let body = format!(
+            "{IOS_ALAC}a=rsaaeskey:{}\r\na=aesiv:QUJD\r\n",
+            wrap_for_us(b"0123456789abcdef")
+        );
         assert!(matches!(
             AnnounceParams::parse(body.as_bytes()),
             Err(SdpError::BadLength { attribute: "aesiv" })

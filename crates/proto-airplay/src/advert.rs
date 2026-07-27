@@ -194,10 +194,13 @@ impl AirPlayIdentity {
             // its encoder from.
             .with_txt("cn", "0,1")
             .with_txt("da", "true")
-            // Encryption: 0 = none, and only none. `et=3,5` (FairPlay) is what this
-            // used to claim, which sent every iPhone into `/fp-setup` and a 501. This
-            // becomes `0,1` when the RSA key unwrap lands, and not before.
-            .with_txt("et", "0")
+            // Encryption: 0 = none, 1 = RSA. Not 3 or 5 (FairPlay), which is what this
+            // used to claim and which sent every iPhone into `/fp-setup` and a 501 —
+            // `crypto-fairplay` still cannot derive that key. RSA it can: the session
+            // key arrives in `a=rsaaeskey:` and `crypto-raop` unwraps it.
+            .with_txt("et", "0,1")
+            // Encryption key present. Travels with `et=1`.
+            .with_txt("ek", "1")
             // Metadata: text, artwork, progress. Unlike `et`, this is safe to advertise
             // ahead of handling it — `md` makes the sender *push* extra SET_PARAMETER
             // bodies we may ignore, where `et` would make it *encrypt* with something
@@ -312,9 +315,10 @@ mod tests {
     #[test]
     fn raop_advertises_no_encryption_it_cannot_perform() {
         // `et=0,3,5` is what shipped before: it advertised FairPlay, so an iPhone
-        // picked FairPlay, and the session died at `/fp-setup`.
+        // picked FairPlay, and the session died at `/fp-setup`. RSA (1) we can do;
+        // FairPlay (3, 5) still needs a key derivation that does not exist.
         let s = ident().raop_service();
-        assert_eq!(txt_of(&s, "et").as_deref(), Some("0"));
+        assert_eq!(txt_of(&s, "et").as_deref(), Some("0,1"));
     }
 
     #[test]

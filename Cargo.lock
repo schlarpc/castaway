@@ -1073,6 +1073,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-raop"
+version = "0.1.0"
+dependencies = [
+ "rsa",
+ "sha1",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "ctr"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3683,7 +3692,10 @@ dependencies = [
  "base64",
  "castaway-core",
  "crypto-fairplay",
+ "crypto-raop",
  "plist",
+ "rsa",
+ "sha1",
  "substrate-mdns",
  "substrate-rtsp",
  "thiserror 2.0.19",

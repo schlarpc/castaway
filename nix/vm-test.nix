@@ -675,7 +675,7 @@ pkgs.testers.runNixOSTest {
         # the only symptom is a device that appears in the picker and then does nothing.
         # These records were, verbatim, a Denon AVR-X3500H's.
         raop = sender.succeed("avahi-browse -rpt _raop._tcp")
-        assert "et=0" in raop and "et=0,3,5" not in raop, raop  # no FairPlay
+        assert "et=0,1" in raop and "et=0,3,5" not in raop, raop  # RSA yes, FairPlay no
         assert "cn=0,1" in raop and "cn=0,1,2,3" not in raop, raop  # no AAC we don't offer
         airplay = sender.succeed("avahi-browse -rpt _airplay._tcp")
         # No `pk`: an empty one publishes an identity a sender cannot verify against.

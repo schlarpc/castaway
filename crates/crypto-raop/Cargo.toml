@@ -1,0 +1,16 @@
+[package]
+name = "crypto-raop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The two RSA operations AirPlay 1 / RAOP needs: unwrapping the session key from an ANNOUNCE, and signing an Apple-Challenge."
+
+[dependencies]
+thiserror.workspace = true
+rsa.workspace = true
+sha1.workspace = true
+
+[lints]
+workspace = true
