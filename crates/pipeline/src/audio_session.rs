@@ -265,6 +265,17 @@ pub fn run_pcm(
             info!("pcm session: preempted");
             break;
         }
+        // Hold the block rather than dropping it: a pause must be resumable from where
+        // it stopped, and this thread not consuming is also what stalls the demuxer
+        // behind it (the queue it reads from is bounded on purpose).
+        while clock.is_some_and(crate::clock::MediaClock::is_paused) {
+            if stop.load(Ordering::Relaxed) {
+                info!("pcm session: preempted while paused");
+                output.stop();
+                return;
+            }
+            std::thread::sleep(STOP_POLL);
+        }
         let shape = (block.sample_rate, block.channels);
         if open_as != Some(shape) {
             if open_as.is_some() {

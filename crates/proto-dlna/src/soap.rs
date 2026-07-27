@@ -83,6 +83,19 @@ impl SoapAction {
                         current_arg = None; // recorded; ignore until next arg element
                     }
                 }
+                // CDATA is character data too, and control points really do wrap the DIDL
+                // blob in it — it is the natural way to embed an XML document in an XML
+                // document without escaping every angle bracket. This used to fall into
+                // the catch-all below, so the argument was recorded as empty and the card
+                // came up blank with nothing logged. Not unescaped, because the whole
+                // point of CDATA is that its content is already literal.
+                Event::CData(c) => {
+                    if let Some(name) = &current_arg {
+                        let text = String::from_utf8_lossy(c.as_ref()).into_owned();
+                        args.push((name.clone(), text));
+                        current_arg = None;
+                    }
+                }
                 Event::End(_) => {
                     if in_body && action.is_some() {
                         if depth_in_action == 0 {
@@ -98,10 +111,22 @@ impl SoapAction {
                     }
                 }
                 Event::Empty(e) => {
-                    // Self-closing arg like <Speed/> — record empty value.
-                    if in_body && action.is_some() {
-                        let local = local_name(e.name().as_ref());
+                    if !in_body {
+                        continue;
+                    }
+                    let local = local_name(e.name().as_ref());
+                    if action.is_some() {
+                        // A self-closing argument like <Speed/> — record an empty value.
                         args.push((local, String::new()));
+                    } else {
+                        // The *action itself*, self-closed: `<u:GetProtocolInfo/>` is the
+                        // same document as `<u:GetProtocolInfo></u:GetProtocolInfo>`, and
+                        // this arm used to be gated on an action already being open — so
+                        // the zero-argument form of a required action fell through to the
+                        // malformed-SOAP error and came back as HTTP 500 on legal XML.
+                        // There are no arguments to collect, so the scan is done.
+                        action = Some(local);
+                        break;
                     }
                 }
                 Event::Eof => break,
@@ -165,7 +190,11 @@ fn local_name(qname: &[u8]) -> String {
 }
 
 /// Minimal XML text escaping for response bodies.
-fn xml_escape(s: &str) -> String {
+/// Escape text for inclusion in an XML document.
+///
+/// Used by the SOAP responses here and by the device description, which was interpolating
+/// a user-supplied friendly name raw.
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -195,6 +224,44 @@ mod tests {
         </u:SetAVTransportURI>
       </s:Body>
     </s:Envelope>"#;
+
+    /// `<u:GetProtocolInfo/>` and `<u:GetProtocolInfo></u:GetProtocolInfo>` are the same
+    /// document. The self-closing form used to reach the malformed-SOAP path and come back
+    /// as HTTP 500 on legal XML, for a *required* action.
+    #[test]
+    fn a_self_closing_action_element_is_the_same_as_an_empty_one() {
+        let envelope = concat!(
+            r#"<?xml version="1.0"?><s:Envelope "#,
+            r#"xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>"#,
+            r#"<u:GetProtocolInfo xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1"/>"#,
+            "</s:Body></s:Envelope>",
+        );
+        let a = SoapAction::parse(envelope).unwrap();
+        assert_eq!(a.name, "GetProtocolInfo");
+        assert!(a.args.is_empty());
+    }
+
+    /// A control point embedding the DIDL blob in CDATA is doing the natural thing for
+    /// putting XML inside XML. This used to be dropped, giving a blank card in silence.
+    #[test]
+    fn cdata_argument_text_is_captured() {
+        let envelope = concat!(
+            r#"<?xml version="1.0"?><s:Envelope "#,
+            r#"xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>"#,
+            r#"<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">"#,
+            "<InstanceID>0</InstanceID><CurrentURI>http://h/a.mp3</CurrentURI>",
+            "<CurrentURIMetaData><![CDATA[<DIDL-Lite><item>",
+            "<dc:title>Cdata Title</dc:title></item></DIDL-Lite>]]></CurrentURIMetaData>",
+            "</u:SetAVTransportURI></s:Body></s:Envelope>",
+        );
+        let a = SoapAction::parse(envelope).unwrap();
+        let blob = a.arg("CurrentURIMetaData").unwrap();
+        assert!(blob.starts_with("<DIDL-Lite>"), "{blob}");
+        assert_eq!(
+            crate::didl::parse(blob).title.as_deref(),
+            Some("Cdata Title")
+        );
+    }
 
     #[test]
     fn parses_action_and_args() {

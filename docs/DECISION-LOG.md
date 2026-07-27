@@ -518,3 +518,44 @@ Three smaller calls inside it:
 
 What it does not do: draw a live preview while a scrub drag is in progress (G60), or
 offer shuffle and repeat over Bluetooth, which passthrough cannot express (G59).
+
+### D34 — Audio is the master clock on the media-URL path
+Adding sound to `Play(url)` (G61) turned out to require a clock, because that path never
+had one. Nothing in it was real-time: the decoder never slept, the compositor presented
+whatever it was last handed, and frames landed in a three-deep channel that dropped the
+rest. Playback speed was decode speed. Whatever else was decided, *something* had to
+become the clock.
+
+Audio, and not as a coin toss. A video frame arriving late can be dropped and one
+arriving early can be held, and at 24–60 Hz nobody sees either. Audio has no equivalent
+slack — stretching it changes the pitch and gapping it is a click — and both are obvious
+across a room. So the audio thread paces itself to real time and publishes where it has
+got to; video waits for it.
+
+It earns the name at two scales, which is what makes it more than a policy label:
+
+- **Coarse.** Decoded audio goes into a *bounded* queue drained by a real-time consumer.
+  A full queue blocks the demuxer, and with it the video decoder, so audio throttles the
+  entire session before any per-frame reasoning happens. The queue bound is load-bearing,
+  not a tuning knob.
+- **Fine.** `MediaClock` publishes the audio's queue position minus the output lead not
+  yet heard, and each frame is held until due. A frame slightly late is still shown — it
+  is the best picture available; one hopelessly late is dropped, because catching up frame
+  by frame never finishes.
+
+Three consequences worth stating so they are not rediscovered:
+
+- The output lead lives in `clock.rs` and `audio_session` uses it, rather than each
+  keeping a copy. Two copies drift, and the symptom is lip sync quietly wrong by exactly
+  the difference — the kind of wrong people notice and cannot describe.
+- With no audio stream there is nothing to follow, so the clock seeds off the first frame
+  and runs on the wall. Same policy, stated twice, rather than a special case.
+- Pause freezes the clock rather than signalling three threads (G63). Everything is
+  already waiting on it, so one flag stops the chain in step and resuming lands where it
+  left off. A clock that kept running while the room was silent would resume by dumping
+  every frame it had "missed".
+
+Explicitly *not* used for live mirroring. A Cast or AirPlay pixel stream is paced by its
+sender, and ground rule 4 says to drop late frames there rather than wait: holding a
+mirrored frame to match a clock adds latency to the one path where latency is the
+complaint.

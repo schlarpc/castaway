@@ -47,6 +47,13 @@ pub const OUTPUT_LEAD: Duration = Duration::from_millis(250);
 #[derive(Debug, Default)]
 pub struct MediaClock {
     inner: Mutex<Option<Anchor>>,
+    /// Where the clock was frozen, if it is paused.
+    ///
+    /// A paused clock must *stop*, not keep interpolating: it is what video waits on and
+    /// what the position readout is drawn from, so a clock that ran while the room was
+    /// silent would resume by dumping every frame it had "missed" and would show a
+    /// position the music never reached.
+    paused_at: Mutex<Option<Duration>>,
 }
 
 /// The last thing the master said, and when it said it.
@@ -117,9 +124,51 @@ impl MediaClock {
         *guard = Some(anchor);
     }
 
+    /// Freeze or release the clock.
+    ///
+    /// Resuming re-anchors to the frozen position, so the time spent paused does not
+    /// count as playback — otherwise every pause would leave the picture that much
+    /// behind the sound for the rest of the item.
+    pub fn set_paused(&self, paused: bool) {
+        let mut frozen = match self.paused_at.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match (paused, *frozen) {
+            (true, None) => *frozen = self.now(),
+            (false, Some(position)) => {
+                *frozen = None;
+                // Re-anchor as a *presented* position rather than a queued one: the
+                // output's buffer was drained by the pause, so there is nothing
+                // unheard left to discount.
+                self.set(Anchor {
+                    media: position,
+                    at: Instant::now(),
+                    buffered: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the clock is currently frozen.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        match self.paused_at.lock() {
+            Ok(g) => g.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+
     /// Media time as of now, or `None` before the clock has started.
     #[must_use]
     pub fn now(&self) -> Option<Duration> {
+        if let Some(frozen) = match self.paused_at.lock() {
+            Ok(g) => *g,
+            Err(poisoned) => *poisoned.into_inner(),
+        } {
+            return Some(frozen);
+        }
         self.now_at(Instant::now())
     }
 
@@ -228,6 +277,32 @@ mod tests {
         c.observe_audio(Duration::from_secs(10)); // heard: ~9.75s
         assert!(!c.is_hopeless(Duration::from_millis(9_600)));
         assert!(c.is_hopeless(Duration::from_secs(5)));
+    }
+
+    /// A paused clock stops. If it kept running, resuming would dump every frame it had
+    /// "missed" and the position readout would show a place the music never reached.
+    #[test]
+    fn pausing_freezes_the_clock_and_resuming_does_not_replay_the_gap() {
+        let c = MediaClock::new();
+        c.observe_audio(Duration::from_secs(10));
+        let at_pause = c.now().unwrap();
+        c.set_paused(true);
+        assert!(c.is_paused());
+
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            c.now().unwrap(),
+            at_pause,
+            "a frozen clock must not advance"
+        );
+
+        c.set_paused(false);
+        assert!(!c.is_paused());
+        let after = c.now().unwrap();
+        assert!(
+            after >= at_pause && after < at_pause + Duration::from_millis(60),
+            "resumed at {after:?} from {at_pause:?}: the pause was counted as playback"
+        );
     }
 
     #[test]

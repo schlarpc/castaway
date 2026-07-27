@@ -92,6 +92,12 @@ pub struct RenderPipeline {
     /// The card as last sent. Held because its two halves arrive on separate calls and
     /// each render needs both — not as a cache for someone else to read.
     card: Mutex<crate::nowplaying_card::NowPlayingCard>,
+    /// The clock of the URL session in flight, so transport control can reach it.
+    ///
+    /// `Pause` on this path is not a message to a sender — we *are* the player — so it
+    /// is applied by freezing the clock, which halts the video thread and the audio
+    /// thread and, through the bounded queue between them, the demuxer as well.
+    playback: Mutex<Option<Arc<crate::clock::MediaClock>>>,
     /// Called when another source takes the screen, so a browser that is covering the
     /// panel gives it back.
     ///
@@ -123,6 +129,7 @@ impl RenderPipeline {
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
                 card: Mutex::new(crate::nowplaying_card::NowPlayingCard::default()),
+                playback: Mutex::new(None),
                 release_screen: Mutex::new(None),
                 #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
@@ -234,6 +241,9 @@ impl Pipeline for RenderPipeline {
         // and because a build with no audio feature must still compile to *something*
         // that plays the picture.
         let clock = Arc::new(crate::clock::MediaClock::new());
+        if let Ok(mut held) = self.playback.lock() {
+            *held = Some(Arc::clone(&clock));
+        }
         #[cfg(all(feature = "ffmpeg", feature = "audio"))]
         let audio_tx = {
             let (atx, arx) = std::sync::mpsc::sync_channel(crate::ffmpeg_decode::AUDIO_QUEUE);
@@ -427,9 +437,52 @@ impl Pipeline for RenderPipeline {
                 let _ = muted;
                 Ok(())
             }
-            // Transport against a live decode is a follow-up. Refused rather than logged
-            // as success, so a caller can tell the difference — `UnsupportedControl` is
-            // the typed way to say "not on this pipeline" (ground rule 7).
+            // Pause and resume a URL session by freezing its clock. Everything downstream
+            // is already waiting on it: the video thread holds each frame until its turn,
+            // the audio thread stops feeding the device, and the demuxer stalls behind the
+            // bounded queue between them. One flag stops the whole chain in step, which is
+            // what makes resuming land where it left off rather than lurching.
+            ControlTxn::Pause | ControlTxn::Play => {
+                let paused = matches!(txn, ControlTxn::Pause);
+                let held = self
+                    .playback
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(Arc::clone));
+                match held {
+                    Some(clock) => {
+                        clock.set_paused(paused);
+                        info!(paused, "render pipeline: transport");
+                        Ok(())
+                    }
+                    // Nothing is playing from a URL. Mirroring and audio-only sessions are
+                    // driven by their sender, which pauses at its end, so there is nothing
+                    // here to act on and saying so is better than a silent success.
+                    None => Err(CoreError::UnsupportedControl(format!("{txn:?}"))),
+                }
+            }
+            // Stop tears the session down rather than merely freezing it. This used to
+            // fall through to the refusal below while `proto-dlna` advertised STOP to the
+            // panel and mapped the AVTransport `Stop` action onto it — so pressing stop,
+            // on the phone or on the glass, moved the transport state to STOPPED and left
+            // the video playing with sound, with both views then agreeing on a lie. The
+            // only way out was to cast something else.
+            ControlTxn::Stop => {
+                self.preempt();
+                if let Ok(mut held) = self.playback.lock() {
+                    *held = None;
+                }
+                let _ = self.tx.try_send(RenderCommand::ClearVideo);
+                if let Ok(mut guard) = self.card.lock() {
+                    *guard = crate::nowplaying_card::NowPlayingCard::default();
+                }
+                let _ = self.tx.try_send(RenderCommand::ClearNowPlaying);
+                info!("render pipeline: STOP (transport)");
+                Ok(())
+            }
+            // Seek needs the demuxer to move, which `decode_av` cannot do yet — refused
+            // rather than logged as success so a caller can tell the difference, and so
+            // the panel does not draw a scrub knob for it (GAPS G66).
             other => {
                 info!(?other, "render pipeline: CONTROL (unsupported)");
                 Err(CoreError::UnsupportedControl(format!("{other:?}")))
@@ -439,6 +492,11 @@ impl Pipeline for RenderPipeline {
 
     async fn stop(&self) -> Result<(), CoreError> {
         self.preempt();
+        // Release the clock with the session: a resumed pause on a session that has ended
+        // would otherwise unfreeze threads that are already gone.
+        if let Ok(mut held) = self.playback.lock() {
+            *held = None;
+        }
         let _ = self.tx.try_send(RenderCommand::ClearVideo);
         if let Ok(mut guard) = self.card.lock() {
             *guard = crate::nowplaying_card::NowPlayingCard::default();

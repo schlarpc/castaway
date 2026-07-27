@@ -674,8 +674,9 @@ display or the audio device, and two cannot take it back afterwards.
   Note the ordering trap for a fix: `ffmpeg_branding=Chromium` with `proprietary_codecs=true`
   gets H.264 through the OS decoder but **not** AAC, which has no OS-decoder path in
   Chromium (upstream cef#3559) — only `ffmpeg_branding=Chrome` gets both.
-  Our own ffmpeg pipeline is unaffected: AirPlay/Cast/DLNA/Bluetooth decode H.264 and AAC
-  normally. This is a browser-only gap — but see G56, which is the feature that turns it
+  Our own ffmpeg pipeline is unaffected *as to codecs*: AirPlay/Cast/DLNA/Bluetooth decode
+  H.264 and AAC normally. It was not unaffected as to audio reaching the speakers at all —
+  see G61, which this entry's original wording got wrong. This is a browser-only gap — but see G56, which is the feature that turns it
   from a YouTube-live annoyance into a prerequisite.
 
   Three routes, and none of them is "buy a build" — nobody sells a codec-enabled CEF:
@@ -878,6 +879,196 @@ display or the audio device, and two cannot take it back afterwards.
   correct and slightly blind: you learn where you landed when the music moves. Fixing it
   means a drag-preview repaint path with its own rate limit, which is worth having and is
   not worth blocking the control on.
+
+- ✅ **G61 — The media-URL path decoded video and dropped the sound. CONFIRMED
+  (measured), fixed.** `ffmpeg_decode::url_session` took `best(Type::Video)` and
+  `continue`d past every other stream, so the audio track was demuxed and discarded, and a
+  URL with *no* video failed outright with `Err("no video stream")` — while the DLNA sink
+  advertised `http-get:*:audio/*:*` to every control point on the LAN. Measured before the
+  fix, not inferred:
+
+      tone.mp3 → frames=0  Err(Decode("no video stream"))
+      av.mp4   → frames=20 Ok(())   ← the AAC track went nowhere
+
+  This was the whole media-URL path, so **Cast `LOAD` and AirPlay video were silent too**,
+  not only DLNA. Note that GAPS.md previously asserted the opposite in G55 ("our own ffmpeg
+  pipeline is unaffected: AirPlay/Cast/DLNA/Bluetooth decode H.264 and AAC normally"); that
+  was true of Bluetooth alone, which takes the separate `play_audio`/`PcmFrame` route.
+
+  Fixed by `decode_av`, which demuxes both streams. An audio-only URL is now a music
+  session that raises the card, carrying the container's own title/artist/album — a bare
+  URL from Cast or AirPlay brings no metadata of its own — and its duration.
+
+- ✅ **G62 — Nothing in the media-URL path was real-time. CONFIRMED, fixed.**
+  Found while fixing G61 and worse than it. The decoder never slept, the compositor showed
+  whatever it was last handed, and frames landed in a three-deep channel that dropped the
+  rest, so *playback speed was decode speed*: a two-hour film would have decoded as fast as
+  the disk could feed it. Nothing caught it because the VM test casts an unresolvable URL at
+  a null pipeline, and the readback tests assert on pixels rather than on time.
+
+  Fixed with an audio-master clock (D34). `tests/media_url_av.rs` asserts that one second
+  of silent video now takes about a second rather than fifty milliseconds.
+
+- ✅ **G63 — Pause did not pause. CONFIRMED, fixed.** `RenderPipeline::control` refused
+  `Play`/`Pause`/`Stop` for a URL session, so DLNA's transport state said
+  `PAUSED_PLAYBACK` while the media played on — and the VM test agreed with it, because it
+  asserts the state machine and never the pipeline. Pausing now freezes the media clock,
+  which halts the video thread, the audio thread, and the demuxer stalled behind the
+  bounded queue between them, in step.
+
+- ✅ **G64 — DIDL-Lite was stored and never read. CONFIRMED, fixed.**
+  `SetAVTransportURI` kept `CurrentURIMetaData` to echo back at `GetMediaInfo` and nothing
+  ever looked inside, so a DLNA cast put a title on nobody's screen while Bluetooth and
+  Spotify both drew a full card. Parsed now, and published behind the `Play` that makes
+  DLNA the active source — it cannot go earlier, because the session manager drops metadata
+  from a source that does not hold the screen.
+
+  The join worth knowing about: the blob is an XML document travelling as *text* inside
+  another XML document, so it arrives escaped and must be unescaped exactly once. One too
+  few and the parser sees `&lt;DIDL-Lite&gt;`; one too many and a title containing an
+  ampersand corrupts the document. Both halves were correct in isolation, so the test drives
+  the whole path — real SOAP envelope in, `NowPlaying` out.
+
+- ✅ **G65 — `image/*` was advertised with nothing to render a still. CONFIRMED, fixed.**
+  A control point reads `GetProtocolInfo` to decide what it may send, so the claim got
+  photos pushed to a panel that would flash one frame and end. Removed from the sink rather
+  than faked — the same rule D16 applies to advertisement and D32 to app launches. Showing
+  stills properly (a dwell, a slideshow) is unbuilt and unclaimed.
+
+- **G66 — A URL session cannot seek. CONFIRMED, not fixed.**
+  `decode_av` reads packets forward and has no `av_seek_frame`, so `ControlTxn::Seek` is
+  refused. The consequences are honest rather than hidden — the DLNA control surface omits
+  `SEEK`, so the panel's scrubber draws without a knob and takes no touches — but a control
+  point's own seek bar does nothing, which is the more visible half. Needs a seek that
+  flushes both decoders and re-anchors the clock.
+
+- **G67 — The DLNA media plane has never been exercised by any test. CONFIRMED.**
+  The VM test casts `http://example.invalid/clip.mp4` at a build with no decoder in it
+  (`packages.default` is the null pipeline), so nothing has ever been fetched or decoded
+  through DLNA in CI. G61–G63 all lived in that blind spot.
+
+  Partly closed: `tests/media_url_av.rs` now decodes real files, and one case serves over
+  real HTTP — which is what catches an ffmpeg built without the `http` protocol, a build
+  that decodes every local file perfectly and fails every real cast. What is still missing
+  is the *integration* claim, and it is not cheap: asserting frames and audio inside the VM
+  needs a `render` build, and `render` pulls in the winit kiosk, so the VM would need Xvfb
+  and a software Vulkan ICD. Worth doing — it would be the first CI proof of the render
+  pipeline at all — but it is a nix lift, not an afternoon.
+
+### Found by the spec review (2026-07-27)
+
+A subagent was given the AVTransport/RenderingControl/ConnectionManager templates, UDA
+1.1, the UPnP AV schemas and the Rygel/gmrender sources, and asked to be adversarial. It
+found things reading the code alone had not, cleared two of its own claims, and caught a
+bug introduced *by* the work it was reviewing. Every finding below was re-verified here
+against the cited source before acting.
+
+- ✅ **G68 — Answering `SUBSCRIBE` with 200 and never sending an event is worse than
+  refusing. CONFIRMED, fixed.** `service.rs` returned `200 OK` with an invented `SID` and
+  no `NOTIFY` ever followed; the comment said the quiet part — *"so control points consider
+  the subscription established, even though we don't push events"*.
+
+  That is backwards, and the mechanism is specific. `async_upnp_client` — the library Home
+  Assistant's `dlna_dmr` runs on — guards its whole polling fallback on `is_subscribed`,
+  and documents the alternative itself (*"Device rejected subscription request. State
+  variables will need to be polled."*). By accepting, we **disabled** their polling:
+  transport state, volume and mute froze at whatever they were when the control point
+  connected, forever, on a device that went on looking healthy. Control points that poll
+  regardless — BubbleUPnP, foobar2000, Kodi, VLC — were unaffected.
+
+  Now returns 501. Real GENA — a subscriber table, per-subscription UUID `SID`s, the
+  mandatory initial NOTIFY (UDA 1.1 §4.3: *"MUST be sent, even if the control point
+  unsubscribes before the message is delivered"*), `SEQ` from 0, renewals, and `LastChange`
+  for both services — is the real answer and is not built. The SCPDs also declare
+  `sendEvents="yes"` on `TransportState`, which AVTransport §2.3.1 says no conforming
+  publisher ever events directly; they want fixing with it.
+
+- ✅ **G69 — `GetPositionInfo` returned a plausible zero where the spec has a sentinel.
+  CONFIRMED, partly fixed.** `0:00:00` parses as a real position; §2.2.22 requires
+  `NOT_IMPLEMENTED` when a service cannot supply the value, and control points map that to
+  "draw no progress bar". So every control point drew `0:00 / 0:00` pinned to the left for
+  the whole item — and one that advances its queue on `RelTime >= TrackDuration` sees
+  `0 >= 0`.
+
+  Position is *never* evented (§2.3.1 excludes it from `LastChange`), so this action is the
+  entire position channel and control points poll it once a second while playing.
+
+  The sentinel is correct now. What is still missing is the answer: `pipeline::clock`
+  holds a real position and `MediaLayout` a real duration, but no seam carries either back
+  across the `Pipeline` trait. That is the remaining half of this entry.
+
+- ✅ **G70 — A friendly name containing `&` made the receiver invisible. CONFIRMED,
+  fixed.** `descriptions.rs` interpolated `friendly_name` and `uuid` into the device
+  description raw. Name the panel `Bar & Grill` and the XML is not well-formed, so every
+  control point's parser rejects it: the device answers M-SEARCH, serves its `LOCATION`
+  with a 200, appears in no picker anywhere, and logs nothing. The VM test cannot catch it
+  either — it asserts the `LOCATION` returns 200, never that the body parses.
+
+- ✅ **G71 — Both XML parsers dropped CDATA. CONFIRMED, fixed.** Wrapping the DIDL blob in
+  `<![CDATA[…]]>` is the natural way to put an XML document inside an XML document, and
+  both `soap.rs` and `didl.rs` let it fall into a catch-all — recording the argument as
+  empty and producing a blank card in silence. `didl.rs`'s comment claimed to tolerate
+  CDATA while the code discarded it.
+
+- ✅ **G72 — A self-closing action element was answered with HTTP 500. CONFIRMED, fixed.**
+  `<u:GetProtocolInfo/>` and `<u:GetProtocolInfo></u:GetProtocolInfo>` are the same
+  document; the `Event::Empty` arm was gated on an action already being open, so the
+  zero-argument form of a *required* action reached the malformed-SOAP path.
+
+- ✅ **G73 — `SetAVTransportURI` mid-playback was a no-op, so queues never advanced.
+  CONFIRMED, fixed.** §2.4.1.3 says the transport state does not change when it is
+  `PLAYING` — meaning it goes on playing *the new resource*. That is exactly how control
+  points advance a queue: set the next URI, send no second `Play`. Album track 1 → track 2
+  showed the new title and PLAYING on the phone while the panel played track 1 to the end
+  and froze on its last frame.
+
+- ✅ **G74 — `Stop` was advertised to the panel and never reached the media. CONFIRMED,
+  fixed — and introduced by the work being reviewed.** `proto-dlna`'s control surface
+  advertised `ControlCapabilities::STOP` while `RenderPipeline::control` handled only
+  `Play`/`Pause`; `Stop` fell through to the refusal arm. Pressing stop on the phone *or*
+  on the glass moved the transport state to `STOPPED` and left the video playing with
+  sound — both views then agreeing on a lie, with no escape but casting something else.
+
+  Worth recording how it survived: the test `only_what_the_pipeline_can_actually_do_is_
+  advertised` asserted STOP *was* offered, so it locked the bug in rather than catching it,
+  and the doc comment beside it stated the rule it was breaking. A test written from the
+  same misunderstanding as the code is worth less than no test.
+
+- **G75 — Nothing reports end-of-media or a failed fetch. CONFIRMED, not fixed.**
+  The decode thread logs and exits; no `SessionEvent::End`, no `ClearVideo`, no transport
+  state change. `CurrentTransportStatus` is hardcoded `OK`. Two failures follow: a URL the
+  box cannot fetch leaves the phone reading **PLAYING / OK forever** with the attract scene
+  back on the panel and nothing saying the fetch failed; and a video that ends normally
+  freezes on its last frame with the session never ending, so a queued playlist never
+  advances. §2.2.2 provides `ERROR_OCCURRED` for exactly this. This is the largest
+  remaining DLNA item.
+
+- **G76 — Audio-device failure silently kills video. CONFIRMED, not fixed.**
+  `av_session` treats a failed audio send as end-of-stream, and `run_pcm` drops its receiver
+  when the output refuses the stream — so where the device is absent, busy, or held in
+  exclusive mode, a *video* cast produces a flash and nothing, while the phone says PLAYING.
+  Should degrade to silent video with a warning.
+
+- **G77 — The media fetch has no timeouts and no DLNA headers. CONFIRMED, not fixed.**
+  `ffmpeg::format::input` is called with no options, so `avformat_open_input` against a
+  black-holed server blocks the decode thread indefinitely in a region where the stop flag
+  is never checked, leaking a thread per retry. Separately, Rygel's DMR HEADs the URI on
+  `SetAVTransportURI` and returns `714 Illegal MIME-type` on mismatch — which is the right
+  home for the missing set-time validation, and turns G75's silent-forever-PLAYING into a
+  synchronous fault the phone can show.
+
+- **G78 — SCPDs do not match the implementation, in both directions. CONFIRMED, not
+  fixed.** `GetDeviceCapabilities` and `GetTransportSettings` are implemented and *not*
+  advertised (a control point will not call what the SCPD omits); `Seek`/`Next`/`Previous`
+  are advertised and refused at runtime. `A_ARG_TYPE_SeekMode` has no `allowedValueList`,
+  which is purely declarative and is why Home Assistant renders no seek bar at all.
+
+- **G79 — The error-code table is four entries deep. CONFIRMED, not fixed.**
+  `718 Invalid InstanceID` is in every AVTransport action's table and `InstanceID` is never
+  read at all, so a control point addressing instance 1 silently drives instance 0.
+  `SetAVTransportURI` defines 714/715/716/737/738/739 and validates nothing; `Seek` defines
+  710/711 and ignores `Unit` entirely; `Play` returns 402 where `701` is meant. Unimplemented
+  optional actions should return `602`, not `401`.
 
 ---
 

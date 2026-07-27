@@ -73,6 +73,7 @@ let
     import urllib.request
 
     SERVICE = "urn:schemas-upnp-org:service:AVTransport:1"
+    CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 
     base = sys.argv[1].rstrip("/")
     command = sys.argv[2]
@@ -83,21 +84,26 @@ let
         return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-    def soap(action, body=""):
+    def soap(action, body="", service=SERVICE, path="/dlna/control/AVTransport",
+             instance=True):
+        # `InstanceID` belongs to AVTransport and RenderingControl; ConnectionManager
+        # actions take no instance, and sending one is how this script first got a fault
+        # back and blamed the receiver for it.
+        head = "<InstanceID>0</InstanceID>" if instance else ""
         envelope = (
             '<?xml version="1.0" encoding="utf-8"?>'
             '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"'
             ' s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
             "<s:Body>"
-            '<u:{action} xmlns:u="{service}"><InstanceID>0</InstanceID>{body}</u:{action}>'
+            '<u:{action} xmlns:u="{service}">{head}{body}</u:{action}>'
             "</s:Body></s:Envelope>"
-        ).format(action=action, service=SERVICE, body=body)
+        ).format(action=action, service=service, head=head, body=body)
         request = urllib.request.Request(
-            base + "/dlna/control/AVTransport",
+            base + path,
             data=envelope.encode(),
             headers={
                 "Content-Type": 'text/xml; charset="utf-8"',
-                "SOAPAction": '"{}#{}"'.format(SERVICE, action),
+                "SOAPAction": '"{}#{}"'.format(service, action),
             },
         )
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -111,6 +117,38 @@ let
                 escape(argument)
             ),
         )
+    elif command == "set-with-metadata":
+        # What a real control point sends: the URI *and* a DIDL-Lite blob describing it.
+        # Escaped once here because it travels as text inside the SOAP body — which is
+        # exactly the nesting a receiver has to get right to show a title at all.
+        didl = (
+            '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
+            ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
+            ' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+            '<item id="1" parentID="0" restricted="1">'
+            "<dc:title>Windowlicker</dc:title>"
+            "<upnp:artist>Aphex Twin</upnp:artist>"
+            "<upnp:album>Windowlicker</upnp:album>"
+            "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
+            '<res protocolInfo="http-get:*:audio/mpeg:*" duration="0:06:06.000">{}'
+            "</res></item></DIDL-Lite>"
+        ).format(escape(argument))
+        soap(
+            "SetAVTransportURI",
+            "<CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>".format(
+                escape(argument), escape(didl)
+            ),
+        )
+    elif command == "protocol-info":
+        info = soap(
+            "GetProtocolInfo",
+            service=CONNECTION_MANAGER,
+            path="/dlna/control/ConnectionManager",
+            instance=False,
+        )
+        match = re.search(r"<Sink>([^<]*)</Sink>", info)
+        print(match.group(1) if match else "")
+        sys.exit(0)
     elif command == "play":
         soap("Play", "<Speed>1</Speed>")
     elif command in ("pause", "stop"):
@@ -530,6 +568,38 @@ pkgs.testers.runNixOSTest {
         # prove the event crossed the whole stack: adapter → session manager → pipeline.
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'session: play'")
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'null pipeline: PLAY'")
+
+    with subtest("DLNA metadata and panel controls reach the pipeline"):
+        # A control point sends DIDL-Lite alongside the URI, and the receiver stored it
+        # and never looked inside — so a DLNA cast put a title on nobody's screen while
+        # Bluetooth and Spotify both drew a full card. The blob travels escaped inside the
+        # SOAP body, so this also exercises that nesting rather than a bare document.
+        sender.succeed(f"dlna-ctl {base} set-with-metadata http://example.invalid/song.mp3")
+        assert sender.succeed(f"dlna-ctl {base} play").strip() == "PLAYING"
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q 'null pipeline: NOW PLAYING.*Windowlicker'"
+        )
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q 'null pipeline: NOW PLAYING.*Aphex Twin'"
+        )
+
+        # DLNA is renderer-is-player, so the panel's transport strip has to be able to
+        # drive it. The control surface is what decides whether those buttons are drawn
+        # at all, and it is published behind the play that takes the screen.
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q 'session: control surface up.*dlna'"
+        )
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'null pipeline: CONTROLS'")
+        sender.succeed(f"dlna-ctl {base} stop")
+
+    with subtest("the sink advertises only what this receiver can render"):
+        # A control point reads GetProtocolInfo to decide what it may send. image/* was
+        # claimed with nothing to render a still, which gets a photo pushed to the panel
+        # and a blank screen back.
+        sink = sender.succeed(f"dlna-ctl {base} protocol-info").strip()
+        assert "video/*" in sink, sink
+        assert "audio/*" in sink, sink
+        assert "image/" not in sink, sink
 
     with subtest("Spotify Connect onboarding answers getInfo"):
         info = json.loads(sender.succeed(f"curl -sSf '{base}/spotify?action=getInfo'"))

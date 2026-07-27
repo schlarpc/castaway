@@ -266,7 +266,7 @@ where
             if index == *vi {
                 decoder.send_packet(&packet).map_err(map_err)?;
                 hw.check_negotiation()?;
-                match drain_paced(decoder, hw, &mut scaler, *time_base, clock, on_frame)? {
+                match drain_paced(decoder, hw, &mut scaler, *time_base, clock, stop, on_frame)? {
                     Drained::Continue => {}
                     Drained::Stopped => return Ok(SessionEnd::Finished),
                     Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
@@ -306,7 +306,7 @@ where
     if let (Some(decoder), Some((_, time_base, _))) = (video_decoder.as_mut(), &video) {
         decoder.send_eof().map_err(map_err)?;
         if let Drained::Restart =
-            drain_paced(decoder, hw, &mut scaler, *time_base, clock, on_frame)?
+            drain_paced(decoder, hw, &mut scaler, *time_base, clock, stop, on_frame)?
         {
             return Ok(SessionEnd::RebuildInSoftware);
         }
@@ -786,12 +786,14 @@ where
 /// A frame that is merely late is still shown — it is the best picture available. One that
 /// is hopelessly late is dropped, because presenting it only puts the next one further
 /// behind, and a decoder losing that race never wins it back frame by frame.
+#[allow(clippy::too_many_arguments)]
 fn drain_paced<F>(
     decoder: &mut ffmpeg::decoder::Video,
     hw: &mut HwAttempt,
     scaler: &mut Option<ffmpeg::software::scaling::Context>,
     time_base: ffmpeg::Rational,
     clock: &crate::clock::MediaClock,
+    stop: &dyn Fn() -> bool,
     on_frame: &mut F,
 ) -> Result<Drained, PipelineError>
 where
@@ -799,6 +801,9 @@ where
 {
     let mut decoded = ffmpeg::frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
+        if stop() {
+            return Ok(Drained::Stopped);
+        }
         let pts = frame_pts(decoded.pts(), time_base);
         // Seeds the wall clock for a file with no audio, and does nothing once audio has
         // anchored it — the first caller wins.
@@ -807,14 +812,28 @@ where
         if clock.is_hopeless(pts) {
             continue;
         }
-        // Sleep in slices so a preemption is not stuck behind a long hold. A frame is
-        // rarely more than a frame-interval early; the cap only matters for a file whose
-        // timestamps jump.
-        while let Some(wait) = clock.wait_for(pts) {
-            std::thread::sleep(wait.min(Duration::from_millis(50)));
-            if wait <= Duration::from_millis(50) {
-                break;
+        // Sleep in slices so neither a preemption nor a pause is stuck behind a long
+        // hold. A frame is rarely more than a frame-interval early, so the cap normally
+        // costs nothing; it earns its keep on a paused session, where the clock has
+        // stopped and this frame's turn never comes until it starts again.
+        //
+        // `stop` is checked inside the wait, not merely around it, and that is the whole
+        // reason the wait is sliced. A *paused* session's clock never advances, so a frame
+        // that is waiting for its turn waits forever — and preemption (someone else casts)
+        // would then leak this thread and its decoder, one per paused session, in silence.
+        const SLICE: Duration = Duration::from_millis(50);
+        loop {
+            if stop() {
+                return Ok(Drained::Stopped);
             }
+            if clock.is_paused() {
+                std::thread::sleep(SLICE);
+                continue;
+            }
+            let Some(wait) = clock.wait_for(pts) else {
+                break;
+            };
+            std::thread::sleep(wait.min(SLICE));
         }
 
         let frame = match hw.export(&mut decoded, pts) {

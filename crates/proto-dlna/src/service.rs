@@ -39,7 +39,9 @@ impl ServiceKind {
 
 /// Shared handler state.
 pub(crate) struct DlnaState {
-    pub(crate) renderer: Mutex<Renderer>,
+    /// Shared with [`crate::control::DlnaRemote`], so a press on the panel and a poll
+    /// from the control point are looking at the same transport state.
+    pub(crate) renderer: Arc<Mutex<Renderer>>,
     pub(crate) sink: SessionSink,
     pub(crate) friendly_name: String,
     /// Bare UUID (no `uuid:` prefix).
@@ -121,9 +123,28 @@ async fn handle_control(
 
     match outcome {
         Ok(out) => {
-            if let Some(event) = out.event {
+            for event in out.events {
+                // A fresh `Play` is the moment this source takes the screen, and so the
+                // moment the panel may drive it. Published right behind the play itself
+                // because the session manager drops a control surface from a source that
+                // does not hold the screen — the same ordering the metadata needs.
+                let started = matches!(event, castaway_core::SessionEvent::Play { .. });
                 if let Err(e) = st.sink.emit(event).await {
                     warn!(error = %e, "failed to emit DLNA session event");
+                    continue;
+                }
+                if started {
+                    let remote =
+                        crate::control::DlnaRemote::new(Arc::clone(&st.renderer), st.sink.clone());
+                    if let Err(e) = st
+                        .sink
+                        .emit(castaway_core::SessionEvent::ControlSurface(Arc::new(
+                            remote,
+                        )))
+                        .await
+                    {
+                        warn!(error = %e, "failed to publish the DLNA control surface");
+                    }
                 }
             }
             post_control_osd(st, &action);
@@ -154,23 +175,28 @@ fn post_control_osd(st: &DlnaState, action: &SoapAction) {
     }
 }
 
-async fn subscribe_ack(headers: HeaderMap) -> Response {
-    // Reply with a plausible SID + timeout so control points consider the subscription
-    // established, even though we don't push events. Echo NT/callback presence loosely.
-    let mut resp = StatusCode::OK.into_response();
-    let h = resp.headers_mut();
-    // A stable-ish SID derived from the callback header, or a fixed placeholder.
-    let sid = headers
-        .get("SID")
-        .and_then(|v| v.to_str().ok())
-        .map_or_else(|| "uuid:castaway-sub-0".to_string(), ToString::to_string);
-    if let Ok(v) = sid.parse() {
-        h.insert("SID", v);
-    }
-    if let Ok(v) = "Second-1800".parse() {
-        h.insert("TIMEOUT", v);
-    }
-    resp
+async fn subscribe_ack(_headers: HeaderMap) -> Response {
+    // 501, not 200 — and the difference is not pedantry, it is the whole behaviour.
+    //
+    // This used to answer 200 with an invented `SID` "so control points consider the
+    // subscription established, even though we don't push events". That is exactly
+    // backwards. A control point that believes it is subscribed *stops polling*:
+    // `async_upnp_client` — which Home Assistant's dlna_dmr runs on — guards its entire
+    // polling fallback on `is_subscribed`, and documents the alternative itself
+    // ("Device rejected subscription request. State variables will need to be polled").
+    // So accepting the subscription and then going silent froze transport state, volume
+    // and mute at whatever they were when the control point connected, forever, while the
+    // device went on looking perfectly healthy.
+    //
+    // Refusing puts every such control point back on its polling path, which works today.
+    // Implementing GENA properly — a subscriber table, per-subscription UUID SIDs, the
+    // mandatory initial NOTIFY, SEQ from 0, renewals, and `LastChange` for AVTransport and
+    // RenderingControl — is GAPS G68 and is the real answer.
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "castaway does not implement GENA eventing; poll instead",
+    )
+        .into_response()
 }
 
 fn xml_ok(body: String) -> Response {

@@ -218,3 +218,107 @@ fn a_silent_video_is_paced_by_the_wall_clock_not_the_cpu() {
         r.elapsed
     );
 }
+
+/// Media arrives over **HTTP**, not from a file, on every path that matters: DLNA hands
+/// us a control point's URL, Cast `LOAD` hands us a CDN's, AirPlay the same. So the one
+/// thing worth proving beyond decoding is that the decoder can *fetch*.
+///
+/// This is not hypothetical plumbing. libavformat's protocol set is a build-time choice,
+/// and an ffmpeg without the `http` protocol compiled in decodes every local file in this
+/// suite perfectly and fails every real cast — with "Protocol not found", from inside the
+/// decode thread, which reaches a person in the room as a receiver that accepts the cast
+/// and shows nothing.
+#[test]
+fn media_is_fetched_over_http_not_just_opened_from_disk() {
+    use std::io::{Read as _, Write as _};
+
+    let path = tmp("served.mp4");
+    if !make(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=160x120:rate=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+        ],
+        &path,
+    ) {
+        eprintln!("skipping: ffmpeg unavailable");
+        return;
+    }
+    let body = std::fs::read(&path).unwrap();
+
+    // A single-shot HTTP/1.0 server on an ephemeral port. Enough for libavformat, which
+    // issues a plain GET and reads to EOF; anything more would be testing our own server.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = body.clone();
+    let server = std::thread::spawn(move || {
+        let mut requests = 0usize;
+        // Two connections at most: libavformat may probe and then fetch.
+        for _ in 0..2 {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            requests += 1;
+            let header = format!(
+                "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: video/mp4\r\n\r\n",
+                served.len()
+            );
+            if sock.write_all(header.as_bytes()).is_err() || sock.write_all(&served).is_err() {
+                break;
+            }
+            let _ = sock.flush();
+            drop(sock);
+            if requests >= 1 {
+                break;
+            }
+        }
+        requests
+    });
+
+    let url = format!("http://127.0.0.1:{port}/served.mp4");
+    let clock = Arc::new(MediaClock::new());
+    let (tx, rx) = sync_channel::<castaway_core::PcmFrame>(4096);
+    let clock_for_audio = Arc::clone(&clock);
+    let drain = std::thread::spawn(move || {
+        let mut samples = 0usize;
+        while let Ok(block) = rx.recv() {
+            clock_for_audio.observe_audio(block.pts + block.duration());
+            samples += block.samples.len();
+        }
+        samples
+    });
+
+    let mut frames = 0usize;
+    let mut layout = MediaLayout::default();
+    let result = decode_av(
+        &url,
+        HwPreference::SoftwareOnly,
+        &clock,
+        Some(tx),
+        &|| false,
+        |l| layout = l.clone(),
+        |_frame| {
+            frames += 1;
+            true
+        },
+    );
+    let samples = drain.join().unwrap();
+    let requests = server.join().unwrap();
+
+    result.expect("the media could not be fetched over http");
+    assert!(requests > 0, "the decoder never made an HTTP request");
+    assert!(layout.has_video && layout.has_audio, "{layout:?}");
+    assert!(frames > 0, "no frames came back from an HTTP source");
+    assert!(samples > 0, "no audio came back from an HTTP source");
+}

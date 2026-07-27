@@ -83,8 +83,14 @@ pub fn device_description(friendly_name: &str, uuid: &str) -> String {
   </device>
 </root>"#,
         dev_type = service_types::MEDIA_RENDERER,
-        name = friendly_name,
-        uuid = uuid,
+        // Escaped, not interpolated raw. A panel named `Bar & Grill` otherwise produced
+        // XML that is not well-formed, so every control point's parser rejected the
+        // description — the device answered M-SEARCH, served its LOCATION with a 200, and
+        // appeared in no picker anywhere, logging nothing. The VM test could not catch it
+        // either, because it asserts the LOCATION returns 200 and never that the body
+        // parses.
+        name = crate::soap::xml_escape(friendly_name),
+        uuid = crate::soap::xml_escape(uuid),
         avt_type = service_types::AVTRANSPORT,
         rc_type = service_types::RENDERING_CONTROL,
         cm_type = service_types::CONNECTION_MANAGER,

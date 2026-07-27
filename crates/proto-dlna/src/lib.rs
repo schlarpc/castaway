@@ -8,7 +8,9 @@
 //! XML fixtures; [`service`] is the axum shell that turns HTTP into calls on them.
 #![forbid(unsafe_code)]
 
+pub mod control;
 pub mod descriptions;
+pub mod didl;
 pub mod error;
 pub mod service;
 pub mod soap;
@@ -44,7 +46,7 @@ impl DlnaService {
     ) -> Self {
         Self {
             state: Arc::new(DlnaState {
-                renderer: Mutex::new(Renderer::default()),
+                renderer: Arc::new(Mutex::new(Renderer::default())),
                 sink,
                 friendly_name: friendly_name.into(),
                 uuid: uuid.into(),
