@@ -478,3 +478,43 @@ to at all. Advertised, discoverable, authenticating — and absent from the pick
 Hosting the vendor receivers stays G56 and stays unbuilt. This decision is only that
 declining out loud beats claiming success, which is the same call D16 made for
 advertise-gating and D27 made for DIAL without a browser.
+
+### D33 — The panel's transport is drawn from capabilities, not from protocols
+The C6522QT is a touch screen that, until now, could only be touched to drive the CEF
+browser. An audio session — Spotify, or a phone over Bluetooth — put a card on the wall
+you could look at and not touch, while the controls stayed on whichever device had
+started it. `RemoteControl` had existed since Bluetooth landed; nothing on the panel was
+wired to it.
+
+The design decision worth recording is what decides *which* buttons exist. Not the
+protocol: the session's `ControlCapabilities`. A Bluetooth phone advertises what AVRCP
+passthrough can express and gets previous / play-pause / next; a Spotify session
+advertises shuffle and repeat as well and gets six buttons and a draggable scrubber.
+There is no per-protocol branch in the renderer, and there is no way to add one without
+noticing — the strip is built by asking the capability set, and `RemoteControl::issue`
+refuses anything outside it independently. So the panel cannot offer a control the sender
+will refuse, which is the same rule D16 applied to advertisement and D32 to app launches.
+
+Three smaller calls inside it:
+
+- **One layout, two consumers.** `transport::layout` produces the rectangles; the
+  renderer draws into them and `Layout::hit` tests against them. A button cannot be drawn
+  where it cannot be pressed, or pressed where nothing is drawn. `to_strip_local` is a
+  free function for the same reason — the panel-normalized → strip-local mapping is
+  testable without a GPU, and its failure mode is the quiet one where the buttons still
+  look right and answer to a different part of the glass.
+
+- **Absolute intent, not toggles.** A press becomes a transaction against the state
+  *currently on screen*: the play button sends `Pause` because the panel is showing
+  "playing". Shuffle sends the wanted state rather than a flip. A stale view then costs
+  one wrong-looking press instead of a control that means the opposite of its glyph.
+
+- **Its own layer, its own cadence.** The card repaints per track and the scrubber per
+  second; at 4K those are a 33 MB upload and a 4 MB one. `proto-spotify` had already
+  refused to republish the position tick for exactly this reason and was right to. The
+  strip advances from the local clock between snapshots, keeps the source's reading as the
+  base rather than restamping, and only moves while playback is active — a paused track
+  whose position crept forward would send a seek nobody asked for.
+
+What it does not do: draw a live preview while a scrub drag is in progress (G60), or
+offer shuffle and repeat over Bluetooth, which passthrough cannot express (G59).

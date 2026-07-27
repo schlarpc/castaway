@@ -19,14 +19,28 @@ integration test.
 | `crypto-fairplay` | Boundary stub. fp-setup typestate; key derivation = `NotImplemented` (Q1). |
 | `proto-dlna` | **Live.** AVTransport/RenderingControl/ConnectionManager SOAP; cast-a-video works. |
 | `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). App launches we cannot host are declined rather than faked, and `GET_APP_AVAILABILITY` is answered (D32). Device auth is differential-tested against openscreen's *sender* (D31): correct in every respect a real sender checks except the trust root, which needs a provisioned credential (Q2). |
-| `proto-spotify` | **Live, pairing through playback.** Ours: advertise + `getInfo` + `addUser` DH/blob decrypt, on the shared HTTP host and mDNS responder. librespot's, above the LAN: AP login, dealer, connect-state, audio (D30). Pick castaway in the Spotify app and it logs in as you, plays, honours the phone's transport and queue, and drives back from the panel via `RemoteControl`. No account on disk. Blob framing still unproven against a real phone (Q10). Queue and cover art now render (Q38/Q39). |
+| `proto-spotify` | **Live, pairing through playback, with shuffle/repeat both ways.** Ours: advertise + `getInfo` + `addUser` DH/blob decrypt, on the shared HTTP host and mDNS responder. librespot's, above the LAN: AP login, dealer, connect-state, audio (D30). Pick castaway in the Spotify app and it logs in as you, plays, honours the phone's transport and queue, and drives back from the panel via `RemoteControl`. No account on disk. Blob framing still unproven against a real phone (Q10). Queue and cover art now render (Q38/Q39). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
 | `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
 | `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
-| `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. |
+| `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to CEF *or* to the panel's transport strip, whichever owns the point touched (D33). |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. |
+
+## The panel's own controls (`cargo run -p pipeline --features render --example card_preview <out.png> [cover.png]`)
+A transport strip under the now-playing card: previous / play-pause / next, plus shuffle
+and repeat when the source reports them, plus a scrubber with elapsed and total that
+accepts a touch to seek. Spotify and Bluetooth share it, because they share the card —
+which buttons appear is decided by the session's `ControlCapabilities` and nothing else
+(D33), so a phone gets what AVRCP passthrough can express and a Spotify session gets the
+lot. A source with no duration gets elapsed time and no bar rather than a scrubber drawn
+against a guess.
+
+The preview writes PNGs of the real renderer for a person to look at. The logic under it
+— layout, hit test, and press → `ControlTxn` — is pure and tested without a rasterizer,
+including the panel-normalized → strip-local mapping, whose failure mode is the quiet one
+where the buttons still draw correctly and answer to a different part of the glass.
 
 ## Verified against the other implementation (`nix flake check`, no hardware)
 Two checks compile openscreen — the reference implementation of Cast — and put our code

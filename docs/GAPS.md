@@ -609,12 +609,17 @@ display or the audio device, and two cannot take it back afterwards.
   honours the phone internally — so this is a panel display/control gap, not a silent
   playback failure. Noted so it is not mistaken for one.
 
-- **G50 — Local-file tracks are rendered but cannot play. SUSPECTED.**
+- ✅ **G50 — Local-file tracks are rendered but cannot play. SUSPECTED, fixed.**
   `session.rs:671` carefully renders `UniqueFields::Local`, but `PlayerConfig::default()`
   leaves `local_file_directories` empty and there is no config surface. A playlist with
   synced local files gets a correctly-rendered card for a track that emits
   `PlayerEvent::Unavailable` and skips. Arguably correct for a receiver that holds no user
   files — but the metadata handling implies otherwise.
+
+  `spotify.local_file_directories` in `castaway.toml` now reaches `PlayerConfig`. Empty
+  stays the default and remains the right position — this receiver holds nobody's library
+  — but the *silence* was the bug, not the emptiness: from the room, a card rendered in
+  full followed by an instant skip reads as the panel dropping songs at random.
 
 ---
 
@@ -847,6 +852,17 @@ display or the audio device, and two cannot take it back afterwards.
   carrying both a level and a mute is one message meaning two things, and dropping the
   second is how a mute that never lifts happens.
 
+- **G59 — Bluetooth has no shuffle or repeat, and the panel says so by omission.
+  CONFIRMED, scoped.** AVRCP *passthrough* — the only control surface
+  `proto-bluetooth-audio` implements — cannot express either: they live in the
+  PlayerApplicationSettings PDUs (`0x11`–`0x14`), which are a separate feature set with
+  their own attribute/value negotiation. `operation_for` correctly returns `None` for both
+  rather than mapping them to a nearest equivalent, so the capability set omits them and
+  the transport strip simply does not draw those two buttons for a phone. That is the
+  designed outcome, not a bug: the panel physically cannot offer a control the peer would
+  refuse. Worth doing if someone wants parity with the Spotify strip; not worth doing to
+  make the two look the same.
+
 - **G58 — `currentTime` in `MEDIA_STATUS` is always zero. CONFIRMED, not fixed.**
   Nothing on the pipeline side reports a playback position, so a sender's scrubber sits at
   the start for the whole item and a sender that wants to resume has nothing to resume
@@ -854,6 +870,14 @@ display or the audio device, and two cannot take it back afterwards.
   nothing is worse than one that plainly does not move. Fixing it properly means a position
   on the `Pipeline` trait — which the AVRCP side wants too (G26). One gap in two protocols,
   worth doing once.
+
+- **G60 — A scrub drag has no live feedback. CONFIRMED, deliberate for now.**
+  The strip seeks on release, so sliding along the bar before lifting picks the target —
+  but the bar does not follow the finger while it is down, because that would mean
+  repainting the strip on every move event rather than once a second. The result is
+  correct and slightly blind: you learn where you landed when the music moves. Fixing it
+  means a drag-preview repaint path with its own rate limit, which is worth having and is
+  not worth blocking the control on.
 
 ---
 
