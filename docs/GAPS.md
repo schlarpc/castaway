@@ -828,6 +828,33 @@ display or the audio device, and two cannot take it back afterwards.
   success until a sender refused the panel. The acceptance test is already written: drop
   the credential in and `dev-chain-google-roots` is the one vector that changes verdict.
 
+- **G57 — ✅ The Cast media plane answered several questions with the same lie. CONFIRMED,
+  fixed.** Three of them, found by reading `handle_media` next to what a sender does with
+  the answers:
+  - `SET_VOLUME` on the receiver namespace fell into the unhandled-debug branch. Chrome's
+    cast dialog has a volume slider; it moved and nothing happened, and the status read
+    back still said 1.0, so it also snapped home and looked broken.
+  - `GET_STATUS` on the media namespace answered `PLAYING` unconditionally — before
+    anything was loaded, and after a `PAUSE`. A sender's transport bar draws itself from
+    that reply, so it showed playback running against a paused picture, and a scrubber
+    for media that did not exist.
+  - `MEDIA_STATUS` reported a hardcoded `volume: {level: 1.0, muted: false}` regardless of
+    what the session had been set to.
+
+  All three now come from tracked state, with `PlayerState` as an `Option` because the
+  wire distinguishes "nothing loaded" structurally — an empty `status` array — rather than
+  with an `IDLE` value. `Reaction` grew from one event to a list on the way: a `SET_VOLUME`
+  carrying both a level and a mute is one message meaning two things, and dropping the
+  second is how a mute that never lifts happens.
+
+- **G58 — `currentTime` in `MEDIA_STATUS` is always zero. CONFIRMED, not fixed.**
+  Nothing on the pipeline side reports a playback position, so a sender's scrubber sits at
+  the start for the whole item and a sender that wants to resume has nothing to resume
+  from. Left at zero rather than estimated on purpose: a scrubber that moves and means
+  nothing is worse than one that plainly does not move. Fixing it properly means a position
+  on the `Pipeline` trait — which the AVRCP side wants too (G26). One gap in two protocols,
+  worth doing once.
+
 ---
 
 ## Documentation drift

@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::error::CastError;
 use crate::messages::{
     self, ns, App, AppAvailabilityRequest, Envelope, LaunchRefusal, LaunchRequest, LoadRequest,
-    RunningApp,
+    RunningApp, SetVolumeRequest,
 };
 use crate::proto::{
     auth_error, AuthError, AuthResponse, CastMessage, DeviceAuthMessage, PayloadType,
@@ -32,8 +32,13 @@ pub trait DeviceAuthResponder: Send + Sync {
 pub struct Reaction {
     /// Messages to write back on the channel.
     pub outgoing: Vec<CastMessage>,
-    /// A session event to forward to the session manager, if any.
-    pub event: Option<SessionEvent>,
+    /// Session events to forward to the session manager, in order.
+    ///
+    /// A list rather than an `Option` because one message really can mean two things to
+    /// the manager — a `SET_VOLUME` carrying both a level and a mute flag is the case
+    /// that forced it — and silently dropping the second is how a mute that never lifts
+    /// happens.
+    pub events: Vec<SessionEvent>,
     /// A negotiated mirroring config the actor should start receiving on. The session
     /// can't emit [`SessionEvent::Mirror`] itself (that needs an I/O-fed frame channel),
     /// so it surfaces the config and the actor wires the RTP receiver + `FrameSource`.
@@ -45,7 +50,7 @@ impl Reaction {
     fn reply(outgoing: Vec<CastMessage>) -> Self {
         Self {
             outgoing,
-            event: None,
+            events: Vec::new(),
             start_mirror: None,
         }
     }
@@ -54,7 +59,7 @@ impl Reaction {
     fn reply_with(outgoing: Vec<CastMessage>, event: SessionEvent) -> Self {
         Self {
             outgoing,
-            event: Some(event),
+            events: vec![event],
             start_mirror: None,
         }
     }
@@ -67,6 +72,12 @@ pub struct CastSession {
     volume: f32,
     muted: bool,
     media_session_id: i64,
+    /// What the media plane is doing, or `None` when nothing has been loaded.
+    ///
+    /// Tracked rather than assumed: `GET_STATUS` used to answer `PLAYING` unconditionally,
+    /// so a sender that paused and asked was told playback had resumed, and a sender that
+    /// asked before loading anything was told about media that did not exist.
+    player_state: Option<messages::PlayerState>,
     id_counter: u64,
     auth: Option<Box<dyn DeviceAuthResponder>>,
     /// UDP port the actor pre-bound for mirroring RTP, if mirroring is enabled.
@@ -84,6 +95,7 @@ impl CastSession {
             volume: 1.0,
             muted: false,
             media_session_id: 1,
+            player_state: None,
             id_counter: 0,
             auth,
             mirror_port: None,
@@ -236,10 +248,29 @@ impl CastSession {
                 self.launch(&req);
                 Ok(self.reply_receiver_status(&sender, req.request_id))
             }
+            "SET_VOLUME" => {
+                let req: SetVolumeRequest =
+                    serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                // Apply before replying: the `RECEIVER_STATUS` a sender reads back is how
+                // its slider learns where it ended up, so echoing the old value makes the
+                // control snap home and look broken on top of doing nothing.
+                let mut events = Vec::new();
+                if let Some(level) = req.volume.level {
+                    self.volume = level.clamp(0.0, 1.0);
+                    events.push(SessionEvent::Control(ControlTxn::Volume(self.volume)));
+                }
+                if let Some(muted) = req.volume.muted {
+                    self.muted = muted;
+                    events.push(SessionEvent::Control(ControlTxn::Mute(muted)));
+                }
+                let mut r = self.reply_receiver_status(&sender, req.request_id);
+                r.events = events;
+                Ok(r)
+            }
             "STOP" => {
                 self.app = None;
                 let mut r = self.reply_receiver_status(&sender, env.request_id.unwrap_or(0));
-                r.event = Some(SessionEvent::End);
+                r.events.push(SessionEvent::End);
                 Ok(r)
             }
             other => {
@@ -267,16 +298,29 @@ impl CastSession {
                     .current_time
                     .filter(|t| *t > 0.0)
                     .map(std::time::Duration::from_secs_f64);
+                self.player_state = Some(messages::PlayerState::Playing);
                 Ok(Reaction::reply_with(
-                    vec![self.media_status_msg(&sender, request_id, "PLAYING")],
+                    vec![self.media_status_msg(&sender, request_id)],
                     SessionEvent::Play { source: uri, start },
                 ))
             }
-            "PLAY" => Ok(self.media_control(&sender, request_id, "PLAYING", ControlTxn::Play)),
-            "PAUSE" => Ok(self.media_control(&sender, request_id, "PAUSED", ControlTxn::Pause)),
+            "PLAY" => Ok(self.media_control(
+                &sender,
+                request_id,
+                Some(messages::PlayerState::Playing),
+                ControlTxn::Play,
+            )),
+            "PAUSE" => Ok(self.media_control(
+                &sender,
+                request_id,
+                Some(messages::PlayerState::Paused),
+                ControlTxn::Pause,
+            )),
             "STOP" => {
-                let mut r = self.media_control(&sender, request_id, "IDLE", ControlTxn::Stop);
-                r.event = Some(SessionEvent::Control(ControlTxn::Stop));
+                // Cast's media STOP unloads the item rather than pausing at zero, so the
+                // session goes back to having no media at all.
+                let mut r = self.media_control(&sender, request_id, None, ControlTxn::Stop);
+                r.events.push(SessionEvent::Control(ControlTxn::Stop));
                 Ok(r)
             }
             "SEEK" => {
@@ -285,10 +329,12 @@ impl CastSession {
                     .and_then(|v| v.get("currentTime").and_then(serde_json::Value::as_f64))
                     .unwrap_or(0.0);
                 let txn = ControlTxn::Seek(std::time::Duration::from_secs_f64(secs.max(0.0)));
-                Ok(self.media_control(&sender, request_id, "PLAYING", txn))
+                // A seek does not resume a paused item; keep whatever state we were in.
+                let state = self.player_state;
+                Ok(self.media_control(&sender, request_id, state, txn))
             }
             "GET_STATUS" => Ok(Reaction::reply(vec![
-                self.media_status_msg(&sender, request_id, "PLAYING")
+                self.media_status_msg(&sender, request_id)
             ])),
             other => {
                 debug!(kind = %other, "unhandled media message");
@@ -336,7 +382,7 @@ impl CastSession {
                 crate::mirror::WEBRTC_NS,
                 answer,
             )],
-            event: None,
+            events: Vec::new(),
             start_mirror: Some(config),
         })
     }
@@ -385,25 +431,35 @@ impl CastSession {
     }
 
     fn media_control(
-        &self,
+        &mut self,
         sender: &str,
         request_id: i64,
-        player_state: &str,
+        player_state: Option<messages::PlayerState>,
         txn: ControlTxn,
     ) -> Reaction {
+        self.player_state = player_state;
         Reaction::reply_with(
-            vec![self.media_status_msg(sender, request_id, player_state)],
+            vec![self.media_status_msg(sender, request_id)],
             SessionEvent::Control(txn),
         )
     }
 
-    fn media_status_msg(&self, sender: &str, request_id: i64, player_state: &str) -> CastMessage {
+    fn media_status_msg(&self, sender: &str, request_id: i64) -> CastMessage {
         // Media status is sent from the transport id when an app is running.
         let source = self
             .app
             .as_ref()
             .map_or(self.receiver_id.as_str(), |a| a.transport_id.as_str());
-        let json = messages::media_status(request_id, self.media_session_id, player_state);
+        let json = match self.player_state {
+            Some(state) => messages::media_status(
+                request_id,
+                self.media_session_id,
+                state.as_str(),
+                self.volume,
+                self.muted,
+            ),
+            None => messages::media_status_empty(request_id),
+        };
         CastMessage::json(source, sender, ns::MEDIA, json)
     }
 }
@@ -561,6 +617,169 @@ mod tests {
         assert_eq!(App::classify("233637DE"), App::Unhostable); // YouTube's own receiver
     }
 
+    /// Chrome's cast dialog has a volume slider. Unhandled, it moved and nothing happened
+    /// — and the status the sender read back still said 1.0, so the control snapped home
+    /// and looked broken on top of doing nothing.
+    #[test]
+    fn set_volume_reaches_the_pipeline_and_the_status_agrees() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"type":"SET_VOLUME","requestId":3,"volume":{"level":0.25}}"#,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            r.events.first(),
+            Some(SessionEvent::Control(ControlTxn::Volume(v))) if (*v - 0.25).abs() < f32::EPSILON
+        ));
+        let p = payload(&r.outgoing[0]);
+        assert!((p["status"]["volume"]["level"].as_f64().unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn set_volume_carries_mute_separately() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"type":"SET_VOLUME","requestId":4,"volume":{"muted":true}}"#,
+            ))
+            .unwrap();
+        assert!(matches!(
+            r.events.first(),
+            Some(SessionEvent::Control(ControlTxn::Mute(true)))
+        ));
+        assert_eq!(payload(&r.outgoing[0])["status"]["volume"]["muted"], true);
+    }
+
+    /// The case that made `Reaction` carry a list: one message meaning two things. With a
+    /// single slot the mute would have been dropped, and a mute that never arrives is a
+    /// mute that never lifts.
+    #[test]
+    fn a_level_and_a_mute_in_one_message_both_reach_the_pipeline() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"type":"SET_VOLUME","requestId":5,"volume":{"level":0.5,"muted":true}}"#,
+            ))
+            .unwrap();
+        assert_eq!(r.events.len(), 2, "{:?}", r.events);
+    }
+
+    #[test]
+    fn a_volume_outside_the_range_is_clamped_not_forwarded() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"type":"SET_VOLUME","requestId":6,"volume":{"level":9.0}}"#,
+            ))
+            .unwrap();
+        assert!(matches!(
+            r.events.first(),
+            Some(SessionEvent::Control(ControlTxn::Volume(v))) if (*v - 1.0).abs() < f32::EPSILON
+        ));
+    }
+
+    /// Nothing loaded is an empty status array, not a status object claiming to play.
+    /// The old unconditional `PLAYING` told a sender's UI to show a transport bar for
+    /// media that did not exist.
+    #[test]
+    fn media_status_with_nothing_loaded_is_empty() {
+        let mut s = session();
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"GET_STATUS","requestId":1}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["status"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    /// And having paused, asking must not be told playback resumed.
+    #[test]
+    fn media_status_reports_the_state_we_are_actually_in() {
+        let mut s = session();
+        let load = r#"{"type":"LOAD","requestId":1,"media":{"contentId":"http://h/v.mp4"}}"#;
+        s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+            .unwrap();
+        s.handle(&recv_msg(
+            ns::MEDIA,
+            "sender-0",
+            "receiver-0",
+            r#"{"type":"PAUSE","requestId":2}"#,
+        ))
+        .unwrap();
+
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"GET_STATUS","requestId":3}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["status"][0]["playerState"],
+            "PAUSED"
+        );
+    }
+
+    /// A seek is not a resume. Reporting PLAYING for a seek while paused would have the
+    /// sender's UI show playback running against a still picture.
+    #[test]
+    fn seeking_while_paused_stays_paused() {
+        let mut s = session();
+        let load = r#"{"type":"LOAD","requestId":1,"media":{"contentId":"http://h/v.mp4"}}"#;
+        s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+            .unwrap();
+        s.handle(&recv_msg(
+            ns::MEDIA,
+            "sender-0",
+            "receiver-0",
+            r#"{"type":"PAUSE","requestId":2}"#,
+        ))
+        .unwrap();
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"SEEK","requestId":3,"currentTime":30}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["status"][0]["playerState"],
+            "PAUSED"
+        );
+    }
+
+    /// Cast's media STOP unloads rather than pausing at zero, so what follows is a session
+    /// with no media — an empty array, not `IDLE`, which the wire does not have a slot for.
+    #[test]
+    fn media_stop_leaves_no_media_session() {
+        let mut s = session();
+        let load = r#"{"type":"LOAD","requestId":1,"media":{"contentId":"http://h/v.mp4"}}"#;
+        s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+            .unwrap();
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"STOP","requestId":2}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["status"].as_array().unwrap().len(),
+            0
+        );
+    }
+
     #[test]
     fn ping_gets_pong() {
         let mut s = session();
@@ -625,7 +844,7 @@ mod tests {
                 r#"{"type":"LOAD","requestId":2,"media":{"contentId":"https://x/v.mp4","contentType":"video/mp4","streamType":"BUFFERED"}}"#,
             ))
             .unwrap();
-        match r.event {
+        match r.events.first() {
             Some(SessionEvent::Play { source, .. }) => {
                 assert_eq!(source.to_string(), "https://x/v.mp4");
             }
@@ -646,7 +865,7 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(
-            r.event,
+            r.events.first(),
             Some(SessionEvent::Control(ControlTxn::Pause))
         ));
     }
@@ -662,7 +881,7 @@ mod tests {
                 r#"{"type":"CLOSE"}"#,
             ))
             .unwrap();
-        assert!(matches!(r.event, Some(SessionEvent::End)));
+        assert!(matches!(r.events.first(), Some(SessionEvent::End)));
     }
 
     #[test]

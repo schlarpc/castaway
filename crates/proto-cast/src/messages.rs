@@ -141,6 +141,32 @@ pub struct AppAvailabilityRequest {
     pub app_ids: Vec<String>,
 }
 
+/// A `SET_VOLUME` request on the receiver namespace.
+///
+/// Both fields are optional and senders really do send them separately — a slider drag
+/// carries `level`, the mute button carries `muted` — so this is deliberately lenient
+/// rather than a tagged union. Note that openscreen's *receiver* does not implement
+/// `SET_VOLUME` at all (it reports a hardcoded level 1.0), so unlike the rest of this
+/// module the shape here is taken from sender behaviour rather than from a reference
+/// receiver, and parses anything either form can produce.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetVolumeRequest {
+    /// Request id.
+    #[serde(rename = "requestId")]
+    pub request_id: i64,
+    /// The change being asked for.
+    pub volume: VolumeChange,
+}
+
+/// The `volume` object inside a `SET_VOLUME`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VolumeChange {
+    /// New output level, `0.0..=1.0`.
+    pub level: Option<f32>,
+    /// New mute state.
+    pub muted: Option<bool>,
+}
+
 /// A `LOAD` request on the media namespace.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadRequest {
@@ -248,9 +274,55 @@ pub fn receiver_status(
     .to_string()
 }
 
-/// Build a `MEDIA_STATUS` payload for the current player state.
+/// What the media plane is doing, in the vocabulary a sender's `MEDIA_STATUS` uses.
+///
+/// The absence of a value — nothing loaded — is modelled as `Option<PlayerState>` at the
+/// call site rather than as an `Idle` variant, because the wire distinguishes them
+/// structurally: nothing loaded is an *empty* status array, not a status saying idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerState {
+    /// Media is loaded and advancing.
+    Playing,
+    /// Media is loaded and held.
+    Paused,
+}
+
+impl PlayerState {
+    /// The `playerState` string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Playing => "PLAYING",
+            Self::Paused => "PAUSED",
+        }
+    }
+}
+
+/// Build a `MEDIA_STATUS` for a session with nothing loaded.
+///
+/// An empty `status` array is the answer, not a status object saying `IDLE`: a sender
+/// reads the array's emptiness as "there is no media session here". Reporting `PLAYING`
+/// with nothing loaded — which this receiver used to do for every `GET_STATUS` — tells a
+/// sender's UI to show a transport bar for media that does not exist.
 #[must_use]
-pub fn media_status(request_id: i64, media_session_id: i64, player_state: &str) -> String {
+pub fn media_status_empty(request_id: i64) -> String {
+    serde_json::json!({
+        "type": "MEDIA_STATUS",
+        "requestId": request_id,
+        "status": [],
+    })
+    .to_string()
+}
+
+/// Build a `MEDIA_STATUS` payload for a loaded media session.
+#[must_use]
+pub fn media_status(
+    request_id: i64,
+    media_session_id: i64,
+    player_state: &str,
+    volume_level: f32,
+    muted: bool,
+) -> String {
     serde_json::json!({
         "type": "MEDIA_STATUS",
         "requestId": request_id,
@@ -258,9 +330,17 @@ pub fn media_status(request_id: i64, media_session_id: i64, player_state: &str) 
             "mediaSessionId": media_session_id,
             "playbackRate": 1,
             "playerState": player_state,
+            // Always zero, and knowingly so: nothing on the pipeline side reports a
+            // playback position yet, so a sender's scrubber sits at the start for the
+            // whole item. Reporting a made-up position would be worse — the scrubber
+            // would move and mean nothing.
             "currentTime": 0,
+            // PAUSE | SEEK | STREAM_VOLUME | STREAM_MUTE. This is a claim about what we
+            // answer, so it has to track what `handle_media` and `SET_VOLUME` really do.
             "supportedMediaCommands": 15,
-            "volume": { "level": 1.0, "muted": false },
+            // The session's volume, not a constant: a sender that reads 1.0 back after
+            // setting 0.25 shows a slider that jumps home.
+            "volume": { "level": volume_level, "muted": muted },
         }],
     })
     .to_string()

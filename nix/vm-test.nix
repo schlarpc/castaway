@@ -323,6 +323,22 @@ let
     media = expect(MEDIA, "MEDIA_STATUS")
     assert media["status"][0]["playerState"] == "PAUSED", media
 
+    # Having paused, asking must not be told playback resumed. The status a sender reads
+    # back is what its transport bar draws itself from.
+    send("receiver-0", MEDIA, {"type": "GET_STATUS", "requestId": 5})
+    media = expect(MEDIA, "MEDIA_STATUS")
+    assert media["status"][0]["playerState"] == "PAUSED", media
+
+    # The volume slider in a sender's cast dialog. Unanswered, it moves and nothing
+    # happens; answered with a stale level, it snaps back and looks broken as well.
+    send("receiver-0", RECEIVER, {
+        "type": "SET_VOLUME",
+        "requestId": 6,
+        "volume": {"level": 0.25},
+    })
+    status = expect(RECEIVER, "RECEIVER_STATUS")
+    assert abs(status["status"]["volume"]["level"] - 0.25) < 1e-6, status
+
     # CLOSE to the receiver ends the session; the actor must emit End for it.
     send("receiver-0", CONNECTION, {"type": "CLOSE"})
     tls.close()
@@ -544,6 +560,11 @@ pkgs.testers.runNixOSTest {
         receiver.succeed(
             "journalctl -u castaway --no-pager | grep -q "
             "'declining a LAUNCH for an app this receiver cannot host'"
+        )
+        # The sender saw its own volume echoed; this proves the change also crossed into
+        # the pipeline rather than being applied to session state and stopping there.
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q 'null pipeline: CONTROL.*Volume'"
         )
 
     with subtest("an AirPlay sender gets OPTIONS, /info, and an honest 501 for pairing"):

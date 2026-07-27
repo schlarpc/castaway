@@ -371,7 +371,7 @@ impl CastReceiver {
                         .await
                         .map_err(|e| CastError::Io(e.to_string()))?;
                 }
-                if let Some(event) = reaction.event {
+                for event in reaction.events {
                     let ended = matches!(event, SessionEvent::End);
                     sink.emit(event)
                         .await
