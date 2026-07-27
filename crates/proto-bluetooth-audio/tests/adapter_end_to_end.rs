@@ -836,20 +836,72 @@ async fn the_adapter_subscribes_to_metadata_changes() {
 
     let pdus = eventually("the avrcp opening traffic", || {
         let pdus = sent_avrcp_pdus(&transport);
-        (pdus.len() >= 3).then_some(pdus)
+        (pdus.len() >= 5).then_some(pdus)
     })
     .await;
     assert!(
         pdus.contains(&proto_bluetooth_audio::avrcp::pdu::GET_ELEMENT_ATTRIBUTES),
         "metadata must be asked for up front: {pdus:x?}"
     );
-    assert_eq!(
-        pdus.iter()
-            .filter(|p| **p == proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION)
-            .count(),
-        2,
-        "both playback status and track change must be subscribed: {pdus:x?}"
+    assert!(
+        pdus.contains(&proto_bluetooth_audio::avrcp::pdu::GET_PLAY_STATUS),
+        "duration comes from nowhere else — POS_CHANGED carries only a position: {pdus:x?}"
     );
+
+    // The events themselves, not just how many: a count passes just as happily when the
+    // wrong three are subscribed.
+    let events = registered_events(&transport);
+    for (event, what) in [
+        (
+            proto_bluetooth_audio::avrcp::event::PLAYBACK_STATUS_CHANGED,
+            "play state",
+        ),
+        (
+            proto_bluetooth_audio::avrcp::event::TRACK_CHANGED,
+            "track changes",
+        ),
+        (
+            proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED,
+            "position",
+        ),
+    ] {
+        assert!(
+            events.iter().any(|(id, _)| *id == event),
+            "{what} must be subscribed: {events:x?}"
+        );
+    }
+
+    // The interval field is in seconds and only PLAYBACK_POS_CHANGED uses it. Zero there
+    // would mean "never report", which is a scrubber that does not move.
+    let (_, interval) = events
+        .iter()
+        .find(|(id, _)| *id == proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED)
+        .expect("position is subscribed");
+    assert!(
+        *interval > 0,
+        "a zero reporting interval never reports: {events:x?}"
+    );
+}
+
+/// Every `(event id, reporting interval)` the adapter has registered for.
+///
+/// The parameters are always five bytes — one event id and a big-endian interval — even
+/// for events that ignore the interval (BlueZ `AVRCP_REGISTER_NOTIFICATION_PARAM_LENGTH`).
+fn registered_events(transport: &ScriptedTransport) -> Vec<(u8, u32)> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+        .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+        .filter_map(|frame| proto_bluetooth_audio::VendorPdu::parse(&frame.operands).ok())
+        .filter(|v| v.pdu_id == proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION)
+        .filter_map(|v| {
+            let raw = v.parameters.get(1..5)?;
+            Some((
+                *v.parameters.first()?,
+                u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            ))
+        })
+        .collect()
 }
 
 /// An AVRCP notification response, as the phone would send it.
@@ -1647,4 +1699,80 @@ async fn a_fragmented_metadata_response_is_reassembled_rather_than_dropped() {
         "the halves must be joined before they are parsed"
     );
     assert_eq!(parsed.now_playing.artist.as_deref(), Some("DEMONDICE"));
+}
+
+#[tokio::test]
+async fn position_reaches_the_card_and_not_applicable_is_not_shown_as_49_days() {
+    // The scrubber sat at zero for the whole track: `event::PLAYBACK_POS_CHANGED` and
+    // `get_play_status()` were both defined and referenced from nowhere, so duration
+    // arrived (attribute 7) and position never did.
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    eventually("the avrcp opening traffic", || {
+        (sent_avrcp_pdus(&transport).len() >= 5).then_some(())
+    })
+    .await;
+
+    // 0xFFFFFFFF is the spec's "not applicable" — a live stream, or a player that does
+    // not know — and rendering it literally is a track 49 days long.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            notification(
+                7,
+                proto_bluetooth_audio::Ctype::Changed,
+                proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED,
+                &u32::MAX.to_be_bytes(),
+            ),
+        ),
+    );
+    // Then a real one: 1500 ms into the track.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            notification(
+                8,
+                proto_bluetooth_audio::Ctype::Changed,
+                proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED,
+                &1500_u32.to_be_bytes(),
+            ),
+        ),
+    );
+
+    // Ask ourselves what is playing: the answer is built from what we recorded.
+    let before = sent_pdus(&transport).len();
+    let request = proto_bluetooth_audio::avrcp::get_element_attributes(
+        &proto_bluetooth_audio::avrcp::attribute::TEXT,
+    );
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            proto_bluetooth_audio::AvctpMessage::command(9, request.encode()).encode(),
+        ),
+    );
+    eventually("our answer, proving the position was taken", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+            .filter(|msg| msg.cr == CommandResponse::Response)
+            .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+            .find(|frame| frame.ctype == proto_bluetooth_audio::Ctype::Stable)
+    })
+    .await;
+
+    // A CHANGED notification ends the subscription (AVRCP notifications are one-shot), so
+    // position must be re-registered or it moves exactly twice and then stops.
+    let events = registered_events(&transport);
+    assert!(
+        events
+            .iter()
+            .filter(|(id, _)| *id == proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED)
+            .count()
+            > 1,
+        "position must be re-subscribed after each CHANGED: {events:x?}"
+    );
 }

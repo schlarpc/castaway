@@ -47,6 +47,13 @@ const AUDIO_QUEUE_DEPTH: usize = 256;
 /// unbounded buffer keyed on a remote's whim is a buffer a remote can grow forever.
 const MAX_AVRCP_REASSEMBLY: usize = 64 * 1024;
 
+/// How often we ask a phone to report where it is in the track.
+///
+/// The `REGISTER_NOTIFICATION` interval field, in seconds — the only event that uses it
+/// is `PLAYBACK_POS_CHANGED`. One second is the coarsest value that still reads as
+/// movement on a scrubber, and the cheapest: each report is one small AVCTP frame.
+const POSITION_INTERVAL_SECS: u32 = 1;
+
 /// Called when a phone pairs, so the caller can persist its link key.
 ///
 /// A callback rather than a path, because this crate must not open files (ground rule
@@ -165,6 +172,12 @@ struct Link {
     /// The handle that lets the panel drive this phone, held until there is a session to
     /// attach it to.
     control: Option<Arc<dyn castaway_core::RemoteControl>>,
+    /// Media packets this link has failed to depacketize, ever.
+    ///
+    /// A running count rather than a flag so the log can say whether this is one bad
+    /// packet or every packet — the difference between a glitch and a session that is
+    /// never going to make a sound.
+    media_failures: u64,
     /// A fragmented AVRCP response being reassembled: the PDU id and what has arrived.
     ///
     /// One at a time, because AVRCP allows exactly one continuation in flight per
@@ -222,6 +235,7 @@ impl Link {
             now_playing: NowPlaying::default(),
             avctp_transaction: 0,
             control: None,
+            media_failures: 0,
             avrcp_reassembly: None,
             art_psm: None,
             art_sdp: None,
@@ -599,16 +613,32 @@ impl BluetoothAdapter {
                         // INTERIM with the value *now* and CHANGED when it moves, so one
                         // subscription supplies both the initial play state and every
                         // transition after it.
-                        for event in [
-                            avrcp::event::PLAYBACK_STATUS_CHANGED,
-                            avrcp::event::TRACK_CHANGED,
+                        for (event, interval) in [
+                            (avrcp::event::PLAYBACK_STATUS_CHANGED, 0),
+                            (avrcp::event::TRACK_CHANGED, 0),
+                            // The interval field is only meaningful for this one, and it
+                            // is in *seconds*. BlueZ sets it to `UINT32_MAX / 1000`
+                            // because it only wants position to resync a clock it keeps
+                            // itself; a panel has no such clock and wants the number, so
+                            // one second — the coarsest value that still looks like it is
+                            // moving.
+                            (avrcp::event::PLAYBACK_POS_CHANGED, POSITION_INTERVAL_SECS),
                         ] {
                             let transaction = link.next_transaction();
                             out.replies.push((
                                 cid,
-                                avctp_body(transaction, &avrcp::register_notification(event, 0)),
+                                avctp_body(
+                                    transaction,
+                                    &avrcp::register_notification(event, interval),
+                                ),
                             ));
                         }
+                        // Duration comes from GetPlayStatus, not from the subscription:
+                        // POS_CHANGED carries only a position, so without this the card
+                        // would know how far in we are and not how far in of what.
+                        let transaction = link.next_transaction();
+                        out.replies
+                            .push((cid, avctp_body(transaction, &avrcp::get_play_status())));
                         // …and go and find the peer's image server now, rather than when
                         // a handle turns up. This is the ordering the whole cover-art
                         // path hinges on: no BIP client, no attribute 8, no handle to
@@ -881,7 +911,26 @@ impl BluetoothAdapter {
                     warn!("audio queue full; dropping a frame");
                 }
             }
-            Err(e) => debug!(error = %e, "bad media packet"),
+            Err(e) => {
+                // Counted and reported, not just `debug!`ed. Sustained depacketize
+                // failure is the worst diagnostic hole in the media path: an AAC stream
+                // with `numSubFrames > 0`, or any other shape we refuse, produces a
+                // connected phone, a running session, a populated now-playing card — and
+                // total silence, with nothing at default log level to say why.
+                //
+                // Rate-limited by powers of two rather than by a clock: the first failure
+                // is worth a line, and so is "this is still happening 1024 packets
+                // later", but the 900 in between are the same line.
+                link.media_failures += 1;
+                if link.media_failures.is_power_of_two() {
+                    warn!(
+                        error = %e,
+                        failures = link.media_failures,
+                        codec = ?link.depacketizer.as_ref().map(Depacketizer::codec),
+                        "bluetooth: cannot depacketize this stream; it will be silent"
+                    );
+                }
+            }
         }
     }
 
@@ -1046,17 +1095,73 @@ impl BluetoothAdapter {
                             }
                         }
                     }
+                    avrcp::event::PLAYBACK_POS_CHANGED => {
+                        // Four bytes of milliseconds after the event id. `0xFFFFFFFF` is
+                        // the spec's "not applicable" — a track with no meaningful
+                        // position, like a live stream — and must not be shown as 49 days.
+                        if let Some(raw) = vendor.parameters.get(1..5) {
+                            let ms = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                            let position = (ms != u32::MAX)
+                                .then(|| std::time::Duration::from_millis(u64::from(ms)));
+                            if link.now_playing.position != position {
+                                link.now_playing.position = position;
+                                if link.session_open {
+                                    let link_sink = sink.with_instance(link.peer.to_string());
+                                    link_sink
+                                        .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
+                                        .await?;
+                                }
+                            }
+                        }
+                    }
                     avrcp::event::TRACK_CHANGED if changed => {
                         // The notification carries only a track id, so the metadata has
                         // to be asked for again — this is the request that keeps the card
                         // in step with what is actually playing.
                         debug!("bluetooth: track changed; re-reading metadata");
                         Self::request_metadata(link, cid, out);
+                        // A new track is a new duration, and POS_CHANGED never carries
+                        // one — so without this the scrubber would keep the old track's
+                        // length and read as though the new one were nearly over.
+                        let transaction = link.next_transaction();
+                        out.replies
+                            .push((cid, avctp_body(transaction, &avrcp::get_play_status())));
                         // A track change is also the moment to try the image server
                         // again, if it never came up or went away with its channel.
                         self.open_cover_art(link, out);
                     }
                     _ => {}
+                }
+            }
+            avrcp::pdu::GET_PLAY_STATUS
+                if frame.ctype.is_response() && !frame.ctype.is_failure() =>
+            {
+                // The only source of *duration* on this protocol: the metadata attributes
+                // carry a playing-time string but not every player fills it in, and the
+                // position subscription carries no length at all. Without this the card
+                // knows how far in we are and not how far in of what.
+                if let Ok((duration, position, _)) = avrcp::parse_play_status(&vendor.parameters) {
+                    let mut changed = false;
+                    // Only overwrite with something we actually learned: a player that
+                    // answers 0xFFFFFFFF ("not applicable") should leave what the
+                    // subscription told us alone rather than blanking it.
+                    if duration.is_some() && link.now_playing.duration != duration {
+                        link.now_playing.duration = duration;
+                        changed = true;
+                    }
+                    if position.is_some() && link.now_playing.position != position {
+                        link.now_playing.position = position;
+                        changed = true;
+                    }
+                    // The state byte is deliberately ignored: PLAYBACK_STATUS_CHANGED is
+                    // the authority on it, and a stale GetPlayStatus answer racing a
+                    // notification would flip the card back.
+                    if changed && link.session_open {
+                        let link_sink = sink.with_instance(link.peer.to_string());
+                        link_sink
+                            .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
+                            .await?;
+                    }
                 }
             }
             avrcp::pdu::SET_ABSOLUTE_VOLUME if is_command || frame.ctype == Ctype::Accepted => {
