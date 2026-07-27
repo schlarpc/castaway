@@ -48,16 +48,21 @@ Still open, roughly in the order they are worth taking:
    considers the browser created, and killing the render process by hand is unreliable to
    target (the zygote rewrites its forks' argv and this build sets no `CrRendererMain`
    thread name). Needs one run on the real box with a renderer killed under a live cast.
-2. **G25/G26** — AVRCP metadata fragmentation and playback position. Fragmentation is the
-   one that bites: a long or CJK title leaves the card permanently blank.
-3. **G39** — `ControlCapabilities` derived from the peer's feature bitmask, so the panel
-   stops offering buttons a phone will reject.
-4. **G40** — no counter or rate-limited warning for sustained depacketize failure. The
-   worst remaining diagnostic hole in the media path.
-5. **G41/G42/G43/G44** — the smaller L2CAP and AVDTP conformance items.
-6. **G33** — SponsorBlock reattaching as a brand-new remote each time.
-7. **G51/G53/G54** — the test tiers: audio egress asserted anywhere, streaming error paths
+2. **G41/G42/G43/G44** — the smaller L2CAP and AVDTP conformance items.
+3. **G33** — SponsorBlock reattaching as a brand-new remote each time.
+4. **G45/G49/G50** — the remaining Spotify items: queue-resolution retries, shuffle and
+   repeat, local files.
+5. **G48** — DIAL REST conformance (CORS, 200-on-relaunch, percent-decoding, `MX`).
+6. **G51/G53/G54** — the test tiers: audio egress asserted anywhere, streaming error paths
    in `adapter_end_to_end`, and a self-contained YouTube regression test.
+
+The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
+What was grounded in BlueZ 5.86 rather than in memory, since a phone is the Target and its
+behaviour is the one we have to match: the packet-type field's position and values, the
+continuation request's parameter and the id its fragments carry, both continuation PDUs'
+ctype, the Target's abort-on-other-PDU rule, the fixed five-byte notification-registration
+parameter, the nine-byte `GetPlayStatus` layout, and the two category bits in attribute
+0x0311.
 
 G31's `HOME` assumption and G46's 4K decode both want checking on the real box rather
 than more code.
@@ -327,7 +332,7 @@ display or the audio device, and two cannot take it back afterwards.
   decode + cpal buffer depth (250 ms `LEAD` plus the ring) with no way to compensate. Also
   a conformance failure against the profile version we publish.
 
-- **G25 — AVRCP vendor-PDU fragmentation is not handled. CONFIRMED (code), SUSPECTED
+- ✅ **G25 — AVRCP vendor-PDU fragmentation is not handled. CONFIRMED (code), SUSPECTED
   (frequency).** `avrcp.rs:200`: `VendorPdu::parse` reads `operands[3]` (pdu_id) and
   `operands[5..7]` (length) and never looks at `operands[4]`, the packet type
   (0=single/1=start/2=continue/3=end). There is no `REQUEST_CONTINUING_RESPONSE` (0x40) or
@@ -339,7 +344,7 @@ display or the audio device, and two cannot take it back afterwards.
   at 450 bytes (`avrcp.rs:274`) rather than fragmenting, which is deliberate and documented
   but clips the card a head unit asks us for.
 
-- **G26 — Playback position never moves. CONFIRMED.**
+- ✅ **G26 — Playback position never moves. CONFIRMED.**
   `avrcp::get_play_status()` (`avrcp.rs:341`) and `event::PLAYBACK_POS_CHANGED`
   (`avrcp.rs:46`) are referenced from nowhere outside their own unit tests; only
   `PLAYBACK_STATUS_CHANGED` and `TRACK_CHANGED` are registered (`adapter.rs:563`). Track
@@ -465,7 +470,7 @@ display or the audio device, and two cannot take it back afterwards.
   carries `client_name`/`client_brand_name`/`client_model_name` — the actual phone, the best
   possible display name — and is discarded by the same wildcard as G7.
 
-- **G39 — `ControlCapabilities` is not derived from the peer's AVRCP features. CONFIRMED.**
+- ✅ **G39 — `ControlCapabilities` is not derived from the peer's AVRCP features. CONFIRMED.**
   `adapter.rs:536` always builds `AvrcpControl::passthrough(tx)`. The peer's
   `SUPPORTED_FEATURES` *is* fetched — `Query::avrcp_target` asks for the full attribute
   range — and only `cover_art_psm()` is read from the response. Architecture §11.5 states
@@ -474,7 +479,7 @@ display or the audio device, and two cannot take it back afterwards.
   play/pause/next/prev/stop/mute for every phone, the button is pressed, an AV/C
   `NOT_IMPLEMENTED` comes back, and nothing in the UI reflects it.
 
-- **G40 — AAC with `numSubFrames > 0` fails every packet, silently. CONFIRMED.**
+- ✅ **G40 — AAC with `numSubFrames > 0` fails every packet, silently. CONFIRMED.**
   `latm.rs:201` refuses multi-subframe multiplexes and `adapter.rs:829` logs the resulting
   `BadMediaPacket` at `debug!`. A sender that packs several access units per
   `AudioMuxElement` produces a connected phone, a running session, a populated now-playing
