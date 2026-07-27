@@ -272,6 +272,39 @@ let
     status = expect(RECEIVER, "RECEIVER_STATUS")
     assert not status["status"].get("applications"), status
 
+    # What a sender asks before it will offer this device as somewhere to cast to. The
+    # reply keys off "responseType", not "type", so it needs its own matcher — and a
+    # receiver that never answers is one that never appears in the picker.
+    send("receiver-0", RECEIVER, {
+        "type": "GET_APP_AVAILABILITY",
+        "requestId": 10,
+        "appId": ["CC1AD845", "0F5096E8", "CA5E8412"],
+    })
+    for _ in range(10):
+        message = recv()
+        payload = json.loads(message["payload"]) if message["payload"] else {}
+        if payload.get("responseType") == "GET_APP_AVAILABILITY":
+            break
+    else:
+        raise SystemExit("never saw a GET_APP_AVAILABILITY response")
+    availability = payload["availability"]
+    print("<- availability {}".format(availability))
+    assert availability["CC1AD845"] == "APP_AVAILABLE", availability
+    assert availability["0F5096E8"] == "APP_AVAILABLE", availability
+    # Somebody else's web receiver. We cannot host it and must not claim otherwise.
+    assert availability["CA5E8412"] == "APP_UNAVAILABLE", availability
+
+    # And the same honesty on launch. Answering RECEIVER_STATUS here is the G56 failure:
+    # the sender opens a connection to a transport id nothing is listening on, and the
+    # room gets a connected phone and a black panel.
+    send("receiver-0", RECEIVER, {"type": "LAUNCH", "requestId": 11, "appId": "CA5E8412"})
+    refusal = expect(RECEIVER, "LAUNCH_ERROR")
+    assert refusal["reason"] == "NOT_FOUND", refusal
+
+    send("receiver-0", RECEIVER, {"type": "GET_STATUS", "requestId": 12})
+    status = expect(RECEIVER, "RECEIVER_STATUS")
+    assert not status["status"].get("applications"), status
+
     send("receiver-0", RECEIVER, {"type": "LAUNCH", "requestId": 2, "appId": "CC1AD845"})
     status = expect(RECEIVER, "RECEIVER_STATUS")
     apps = status["status"]["applications"]
@@ -505,6 +538,13 @@ pkgs.testers.runNixOSTest {
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'CASTv2 sender connected'")
         # The CLOSE must land as a session End, not a leaked session holding the screen.
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'CASTv2 sender disconnected'")
+        # The sender asserted it got LAUNCH_ERROR for an app we cannot host; this proves
+        # the refusal was a decision the session took and said out loud, rather than a
+        # message that happened to have the right shape.
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q "
+            "'declining a LAUNCH for an app this receiver cannot host'"
+        )
 
     with subtest("an AirPlay sender gets OPTIONS, /info, and an honest 501 for pairing"):
         receiver.wait_for_open_port(7000)

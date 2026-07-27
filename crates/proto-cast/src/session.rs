@@ -8,7 +8,10 @@ use prost::Message as _;
 use tracing::{debug, warn};
 
 use crate::error::CastError;
-use crate::messages::{self, ns, Envelope, LaunchRequest, LoadRequest, RunningApp};
+use crate::messages::{
+    self, ns, App, AppAvailabilityRequest, Envelope, LaunchRefusal, LaunchRequest, LoadRequest,
+    RunningApp,
+};
 use crate::proto::{
     auth_error, AuthError, AuthResponse, CastMessage, DeviceAuthMessage, PayloadType,
 };
@@ -190,9 +193,46 @@ impl CastSession {
         let sender = msg.source_id.clone();
         match env.r#type.as_str() {
             "GET_STATUS" => Ok(self.reply_receiver_status(&sender, env.request_id.unwrap_or(0))),
+            "GET_APP_AVAILABILITY" => {
+                let req: AppAvailabilityRequest =
+                    serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                let answers: Vec<(String, bool)> = req
+                    .app_ids
+                    .into_iter()
+                    .map(|id| {
+                        let can = self.can_host(App::classify(&id));
+                        (id, can)
+                    })
+                    .collect();
+                debug!(?answers, "answering app availability");
+                Ok(Reaction::reply(vec![CastMessage::json(
+                    &self.receiver_id,
+                    &sender,
+                    ns::RECEIVER,
+                    messages::app_availability(req.request_id, &answers),
+                )]))
+            }
             "LAUNCH" => {
                 let req: LaunchRequest =
                     serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                let app = App::classify(&req.app_id);
+                if let Some(refusal) = self.refusal_for(app) {
+                    // Saying "running" to a launch we cannot serve is the worst answer
+                    // available: the sender opens a connection to a transport id that
+                    // will never speak, and the room sees a connected phone and a black
+                    // panel. Refuse in the sender's own vocabulary instead.
+                    warn!(
+                        app_id = %req.app_id,
+                        reason = refusal.reason(),
+                        "declining a LAUNCH for an app this receiver cannot host"
+                    );
+                    return Ok(Reaction::reply(vec![CastMessage::json(
+                        &self.receiver_id,
+                        &sender,
+                        ns::RECEIVER,
+                        messages::launch_error(req.request_id, refusal),
+                    )]));
+                }
                 self.launch(&req);
                 Ok(self.reply_receiver_status(&sender, req.request_id))
             }
@@ -301,6 +341,26 @@ impl CastSession {
         })
     }
 
+    /// Whether this receiver can host `app` right now — the answer a sender's availability
+    /// query gets, and the answer that decides whether it offers this device at all.
+    fn can_host(&self, app: App) -> bool {
+        self.refusal_for(app).is_none()
+    }
+
+    /// `None` when we can host it; otherwise why not.
+    ///
+    /// Mirroring is conditional on the actor having bound an RTP socket, and the
+    /// distinction matters to whoever reads the log: "we do not have that app" and "we
+    /// have it and could not bind a socket" are different faults with different fixes.
+    fn refusal_for(&self, app: App) -> Option<LaunchRefusal> {
+        match app {
+            App::DefaultMedia => None,
+            App::Streaming if self.mirror_port.is_some() => None,
+            App::Streaming => Some(LaunchRefusal::SystemError),
+            App::Unhostable => Some(LaunchRefusal::NotFound),
+        }
+    }
+
     fn launch(&mut self, req: &LaunchRequest) {
         self.id_counter += 1;
         let n = self.id_counter;
@@ -380,6 +440,125 @@ mod tests {
 
     fn recv_msg(ns: &str, source: &str, dest: &str, json: &str) -> CastMessage {
         CastMessage::json(source, dest, ns, json.to_string())
+    }
+
+    fn payload(msg: &CastMessage) -> serde_json::Value {
+        serde_json::from_str(msg.payload_utf8.as_deref().unwrap()).unwrap()
+    }
+
+    fn receiver_request(json: &str) -> CastMessage {
+        recv_msg(ns::RECEIVER, "sender-0", "receiver-0", json)
+    }
+
+    /// A sender asks what this device can run *before* offering it in a picker. Leaving
+    /// this unanswered is not a missing feature but an invisible one: the query times out
+    /// and the receiver simply never appears as somewhere to cast to.
+    #[test]
+    fn app_availability_is_answered_for_what_we_host() {
+        let mut s = session().with_mirror_port(51_234);
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":548,"type":"GET_APP_AVAILABILITY","appId":["CC1AD845","0F5096E8"]}"#,
+            ))
+            .unwrap();
+
+        let p = payload(&r.outgoing[0]);
+        assert_eq!(p["requestId"], 548);
+        // `responseType`, not `type` — a sender does not recognise it under the other key.
+        assert_eq!(p["responseType"], "GET_APP_AVAILABILITY");
+        assert_eq!(p["availability"]["CC1AD845"], "APP_AVAILABLE");
+        assert_eq!(p["availability"]["0F5096E8"], "APP_AVAILABLE");
+    }
+
+    #[test]
+    fn app_availability_declines_apps_we_cannot_host() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":1,"type":"GET_APP_AVAILABILITY","appId":["CA5E8412"]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["availability"]["CA5E8412"],
+            "APP_UNAVAILABLE"
+        );
+    }
+
+    /// Mirroring availability is not a constant: the actor binds the RTP socket, and
+    /// without one there is nowhere for the stream to land. Claiming it anyway buys a
+    /// sender that starts a session and sees nothing.
+    #[test]
+    fn mirroring_is_unavailable_without_an_rtp_socket() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":2,"type":"GET_APP_AVAILABILITY","appId":["0F5096E8"]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["availability"]["0F5096E8"],
+            "APP_UNAVAILABLE"
+        );
+    }
+
+    /// The G56 failure, from the sender's side: launching Netflix used to get a status
+    /// saying it had started, a session id, and a transport id nothing was listening on.
+    #[test]
+    fn launching_an_app_we_cannot_host_is_refused_rather_than_faked() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":7,"type":"LAUNCH","appId":"CA5E8412"}"#,
+            ))
+            .unwrap();
+
+        let p = payload(&r.outgoing[0]);
+        assert_eq!(p["type"], "LAUNCH_ERROR");
+        assert_eq!(p["reason"], "NOT_FOUND");
+        assert_eq!(p["requestId"], 7);
+        assert!(
+            s.app.is_none(),
+            "a refused launch must not leave an application running"
+        );
+    }
+
+    /// Same refusal, different cause, and the sender is told which: we do have the
+    /// streaming receiver, we just have nowhere to receive.
+    #[test]
+    fn launching_mirroring_without_a_socket_says_system_error() {
+        let mut s = session();
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":8,"type":"LAUNCH","appId":"85CDB22F"}"#,
+            ))
+            .unwrap();
+        assert_eq!(payload(&r.outgoing[0])["reason"], "SYSTEM_ERROR");
+    }
+
+    #[test]
+    fn launching_the_streaming_receiver_succeeds_when_mirroring_is_possible() {
+        let mut s = session().with_mirror_port(51_234);
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":9,"type":"LAUNCH","appId":"0F5096E8"}"#,
+            ))
+            .unwrap();
+        assert!(payload_is_type(&r.outgoing[0], "RECEIVER_STATUS"));
+        assert_eq!(s.app.as_ref().unwrap().app_id, "0F5096E8");
+    }
+
+    /// The Android and iOS streaming ids are the same feature as the desktop pair. A
+    /// receiver that knows only some of them works from one sender and not another, for
+    /// no reason anybody in the room could work out.
+    #[test]
+    fn every_streaming_app_id_is_recognised() {
+        for id in [
+            "0F5096E8", "85CDB22F", "674A0243", "8E6C866D", "96084372", "BFD92C23",
+        ] {
+            assert_eq!(App::classify(id), App::Streaming, "{id} not recognised");
+        }
+        assert_eq!(App::classify("CC1AD845"), App::DefaultMedia);
+        assert_eq!(App::classify("233637DE"), App::Unhostable); // YouTube's own receiver
     }
 
     #[test]

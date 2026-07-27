@@ -90,8 +90,19 @@ Still open, roughly in the order they are worth taking:
    built from source with `proprietary_codecs=true ffmpeg_branding=Chrome` — no prebuilt
    enables them (checked: OBS, JetBrains/JCEF, and every codec-enabled build repo found
    publishes recipes, not binaries), so it is chromium-scale compute plus either a Windows
-   build host or a Chromium Linux→Windows cross setup. Sequence it behind G56's device-auth
-   experiment, which is an afternoon and can invalidate the whole branch.
+   build host or a Chromium Linux→Windows cross setup.
+
+   The device-auth experiment this was sequenced behind **has been run**, and it did not
+   invalidate the branch: `checks.openscreen-device-auth` shows our auth response is
+   correct in every respect a real sender checks except the trust root, so the branch is
+   gated on one provisionable input rather than on an unknown. The lying half of G56 is
+   also fixed — unhostable apps are declined out loud now, and `GET_APP_AVAILABILITY` is
+   answered, which is what decides whether the receiver appears in a Cast picker at all.
+
+   **The next thing here is not code.** It is a real Cast device credential
+   (OPEN-QUESTIONS Q2), which turns the one failing vector into a passing one and is the
+   difference between a receiver Chrome ignores and one it will talk to. The seam is
+   built; what is missing is the key.
 
 The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
 What was grounded in BlueZ 5.86 rather than in memory, since a phone is the Target and its
@@ -730,16 +741,43 @@ display or the audio device, and two cannot take it back afterwards.
      either way: VMP is not what gates this item — device-auth below is, and it stops the
      sender before a licence is ever requested.
 
-  **Prove this before building any of it, because it may make the whole item moot:**
-  device-auth. Official senders enforce the receiver's certificate chain to the Google Cast
-  Root CA, whose key is fused into licensed silicon (casting-landscape-report.md:77); open
-  senders skip the check, which is why our current Cast support works at all.
-  `crypto-cast-auth/src/lib.rs:106` says it plainly — our chain is "for local dev/tests
-  only — a real sender wants a chain". The branded apps are exactly the senders that
-  enforce. So the first experiment is the cheapest one: point the Netflix or Spotify app at
-  the receiver and see whether it will open a session at all. If it refuses at auth, no
-  amount of browser or codec work changes the outcome, and the honest scope of this item
-  collapses to "apps whose senders do not enforce device-auth".
+  🟡 **The lying half is fixed.** `App::classify` sorts an `appId` into the Default Media
+  Receiver, a Cast Streaming (mirroring) receiver, or somebody else's web receiver;
+  the third gets `LAUNCH_ERROR`/`NOT_FOUND` instead of a fabricated `RECEIVER_STATUS`, and
+  `GET_APP_AVAILABILITY` — previously unanswered — reports the same classification. Both
+  are driven over a real socket by the two-VM test. Hosting the vendor receivers, items
+  1–6 above, is still unbuilt. See D32.
+
+  Answering availability turned out to matter more than the launch refusal did: a sender
+  asks what a device can run *before* it offers it, so ignoring the query means the
+  receiver never appears in the picker at all. It was advertising, discoverable and
+  authenticating, and still not a thing you could pick.
+
+  **The device-auth experiment this entry demanded has been run — and did not need a
+  branded sender.** `checks.openscreen-device-auth` compiles openscreen's sender-side
+  verifier, which is the code Chrome runs, and judges auth responses this receiver really
+  produced (D31). The result, as eight checked-in vectors:
+
+  - Given a trust store containing our root, a real sender **accepts** us. Chain order,
+    key usage, digest, signed-blob layout — all already correct.
+  - Against the roots senders ship, we fail as `kCastV2CertNotSignedByTrustedCa`, and only
+    that. The credential is the entire gap, which is what makes provisioning worth doing.
+  - So this item does **not** collapse. Nothing about the browser or codec work is
+    invalidated; it is gated on one input, not on an unknown.
+
+  Two unrelated failures fell out of running it, both of the *silent* kind, both now
+  fixed and regression-locked:
+
+  - ✅ **The TLS certificate was valid until the year 4096.** A sender treats the peer
+    certificate's validity window as the device-auth signature's expiry and rejects
+    anything more than four days out (`kMaxSelfSignedCertLifetimeInDays`). rcgen's default
+    is 1975→4096, so every official sender was refusing us *before* device auth was
+    considered. `TlsIdentity` now issues a two-day certificate and reissues it as it ages
+    — the second half matters as much as the first, since a two-day certificate on a panel
+    that runs for months is the same failure with a delay.
+  - ✅ **The mDNS TXT record had no `st` key.** openscreen's `ReceiverInfoFromDnsSdInstance`
+    rejects the entire record without it. A sender that parses strictly never opened a
+    socket, and from the room that is indistinguishable from the receiver being off.
 
   What the gate is *not* is a strong nonce check, at least in Chrome. Verified in M147
   `cast_auth_util.cc`: `VerifySenderNonce` records `kSenderNonceMissing`/`kSenderNonceMismatch`
@@ -782,6 +820,13 @@ display or the audio device, and two cannot take it back afterwards.
   box beside the other runtime secrets, never as a checked-in fixture — it identifies one
   specific piece of hardware, and it is the one thing in this project that would be
   genuinely bad to publish. How you get it off a device you own is out of scope here.
+
+  ✅ **And it is now literally provisioning.** `[cast.credential]` in `castaway.toml` takes
+  a PKCS#8 key, a device certificate and any intermediates; absent, startup falls back to
+  the dev credential and says so. Half-configured is a hard error rather than a fallback,
+  because booting on a dev key after someone supplied a real one would look exactly like
+  success until a sender refused the panel. The acceptance test is already written: drop
+  the credential in and `dev-chain-google-roots` is the one vector that changes verdict.
 
 ---
 

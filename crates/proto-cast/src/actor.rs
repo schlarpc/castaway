@@ -425,6 +425,18 @@ impl SourceAdapter for CastReceiver {
                 // 5 = video out + audio out, "05" = the CASTv2 generation we speak.
                 ("ca".to_string(), "5".to_string()),
                 ("ve".to_string(), "05".to_string()),
+                // Receiver status flag, and it is *mandatory* — openscreen's
+                // `ReceiverInfoFromDnsSdInstance` rejects the whole record with
+                // "Missing receiver status flag" when `st` is absent, so a sender that
+                // parses records strictly drops this device before opening a socket. A
+                // discovery failure and a protocol failure look identical from the room:
+                // the panel is simply not in the list.
+                //
+                // 0 is idle, 1 is busy. This is fixed at idle because the advertisement
+                // is built once at startup; a receiver that is playing still says idle,
+                // which costs a sender the "someone is already casting" hint and nothing
+                // else. Flipping it live needs re-advertisement on every session change.
+                ("st".to_string(), "0".to_string()),
             ],
         }]
     }
@@ -557,6 +569,15 @@ mod tests {
                 assert_eq!(*port, 8009);
                 assert!(txt.contains(&("fn".to_string(), "Lab TV".to_string())));
                 assert!(txt.contains(&("id".to_string(), "0f8c2e10".to_string())));
+                // Every key openscreen's record parser treats as mandatory. Miss one
+                // and a strict sender discards the advertisement entirely, which in
+                // the room is indistinguishable from the receiver being switched off.
+                for key in ["id", "ve", "ca", "st", "fn"] {
+                    assert!(
+                        txt.iter().any(|(k, _)| k == key),
+                        "the {key} TXT key is required; without it the record is dropped"
+                    );
+                }
             }
             other => panic!("expected an mDNS advertisement, got {other:?}"),
         }

@@ -23,6 +23,79 @@ pub mod ns {
 /// URLs. Advertising support for it is what makes the "Cast a video" button work.
 pub const DEFAULT_MEDIA_RECEIVER_APP_ID: &str = "CC1AD845";
 
+/// The Cast Streaming receiver app ids — the apps a sender launches when it intends to
+/// *mirror* to us rather than hand us a URL.
+///
+/// From openscreen's `cast/common/public/cast_streaming_app_ids.h`, which is where the
+/// senders get them too. All six are listed rather than the desktop pair alone because a
+/// receiver that recognises only some of them is a receiver that works from Chrome and
+/// not from a phone, for no reason a person in the room could deduce.
+const STREAMING_APP_IDS: [&str; 6] = [
+    "0F5096E8", // audio + video
+    "85CDB22F", // audio only
+    "674A0243", // Android mirroring, audio + video
+    "8E6C866D", // Android mirroring, audio only
+    "96084372", // Android app streaming
+    "BFD92C23", // iOS app streaming
+];
+
+/// What this receiver can do with an `appId` a sender asks about or launches.
+///
+/// An enum rather than a boolean because the two things we support are not the same
+/// thing: one is a media URL we play ourselves, the other is an RTP stream we terminate,
+/// and a third category exists that we must decline. Modelling it this way is what makes
+/// the decline exhaustive — a new app id has to be classified before it can be answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum App {
+    /// The Default Media Receiver: the sender hands us a media URL and our own pipeline
+    /// plays it.
+    DefaultMedia,
+    /// A Cast Streaming receiver: the sender mirrors to us over RTP.
+    Streaming,
+    /// Somebody else's web receiver — Netflix, Spotify, YouTube's own Cast app. Hosting
+    /// these means running the vendor's receiver page and speaking the Cast receiver
+    /// SDK's platform protocol to it, which is GAPS.md G56 and is not built.
+    Unhostable,
+}
+
+impl App {
+    /// Classify an `appId` from the wire.
+    #[must_use]
+    pub fn classify(app_id: &str) -> Self {
+        if app_id.eq_ignore_ascii_case(DEFAULT_MEDIA_RECEIVER_APP_ID) {
+            Self::DefaultMedia
+        } else if STREAMING_APP_IDS
+            .iter()
+            .any(|id| app_id.eq_ignore_ascii_case(id))
+        {
+            Self::Streaming
+        } else {
+            Self::Unhostable
+        }
+    }
+}
+
+/// Why a `LAUNCH` was refused, in the sender's own vocabulary
+/// (`cast/common/channel/message_util.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchRefusal {
+    /// This receiver does not have that application at all.
+    NotFound,
+    /// We do host it, but cannot right now — mirroring asked for with no RTP socket.
+    SystemError,
+}
+
+impl LaunchRefusal {
+    /// The `reason` string a sender expects.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotFound => "NOT_FOUND",
+            Self::SystemError => "SYSTEM_ERROR",
+        }
+    }
+}
+
 /// Peek the `type` and `requestId` of any JSON payload without full typing.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Envelope {
@@ -52,6 +125,20 @@ pub struct LaunchRequest {
     /// The app id the sender wants launched.
     #[serde(rename = "appId")]
     pub app_id: String,
+}
+
+/// A `GET_APP_AVAILABILITY` request on the receiver namespace.
+///
+/// `appId` is an array here and a bare string in `LAUNCH` — same key, different shape,
+/// which is why this is its own type rather than a field reused from [`LaunchRequest`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppAvailabilityRequest {
+    /// Request id.
+    #[serde(rename = "requestId")]
+    pub request_id: i64,
+    /// The app ids the sender is asking about.
+    #[serde(rename = "appId")]
+    pub app_ids: Vec<String>,
 }
 
 /// A `LOAD` request on the media namespace.
@@ -87,6 +174,43 @@ pub struct MediaInfo {
 #[must_use]
 pub fn pong() -> String {
     "{\"type\":\"PONG\"}".to_string()
+}
+
+/// Build the `GET_APP_AVAILABILITY` reply for the app ids asked about.
+///
+/// Note the key is `responseType`, not `type` — a sender matches this reply by request id
+/// and would not recognise it under the wrong key. Shape taken from openscreen's
+/// `ApplicationAgent::HandleGetAppAvailability`.
+#[must_use]
+pub fn app_availability(request_id: i64, availability: &[(String, bool)]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = availability
+        .iter()
+        .map(|(id, available)| {
+            let value = if *available {
+                "APP_AVAILABLE"
+            } else {
+                "APP_UNAVAILABLE"
+            };
+            (id.clone(), serde_json::Value::String(value.to_string()))
+        })
+        .collect();
+    serde_json::json!({
+        "requestId": request_id,
+        "responseType": "GET_APP_AVAILABILITY",
+        "availability": map,
+    })
+    .to_string()
+}
+
+/// Build a `LAUNCH_ERROR` payload — the answer to a launch we will not perform.
+#[must_use]
+pub fn launch_error(request_id: i64, refusal: LaunchRefusal) -> String {
+    serde_json::json!({
+        "requestId": request_id,
+        "type": "LAUNCH_ERROR",
+        "reason": refusal.reason(),
+    })
+    .to_string()
 }
 
 /// Build a `RECEIVER_STATUS` payload. `app` is `Some` when an application is running.

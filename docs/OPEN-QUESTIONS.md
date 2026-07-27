@@ -10,10 +10,27 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   I've modeled the message *shape* and stubbed the crypto module boundary. Default:
   `crypto-fairplay` exposes the handshake state machine + typed messages but returns a
   `NotImplemented` error at the actual key-derivation step until we land a fixture.
-- **Q2 — Cast device-auth cert material.** `crypto-cast-auth` needs a real gen-1 device
-  cert + key to sign the CASTv2 `AuthChallenge`. At n=1 this is "a fixed local input"
-  (per hackerspace notes). Default: signer trait takes cert/key as configured bytes;
-  ships with a self-signed dev cert for tests, real material provisioned out of band.
+- **Q2 — Cast device-auth cert material. Still open, and now the *only* thing open.**
+  `crypto-cast-auth` needs a real device cert + key to sign the CASTv2 `AuthChallenge`.
+  At n=1 this is "a fixed local input" (per hackerspace notes).
+
+  What changed: this is no longer a guess about what a sender wants. `checks.openscreen-
+  device-auth` runs openscreen's sender-side verifier — Chrome's own logic — over auth
+  responses we really produce, and the verdicts are unambiguous. Told to trust our dev
+  root, a real sender **accepts** the response; against the roots senders ship it fails
+  as `kCastV2CertNotSignedByTrustedCa` and nothing else. Chain order, key usage, digest,
+  the signed-blob layout: all already right.
+
+  So the answer to "what do we need for Chrome to cast to this" is one file, not a
+  project. `[cast.credential]` in `castaway.toml` reads a PKCS#8 key, a device
+  certificate and any intermediates; drop a real one in and the single failing vector
+  flips. Nothing in the code has to change.
+
+  It stays out of the repository. A device credential identifies one specific piece of
+  hardware and is the one secret here that would be genuinely bad to publish — on the box
+  beside the other runtime secrets, never in the Nix store, never as a fixture. How you
+  get one off hardware you own is out of scope for these docs (GAPS.md G56 records why no
+  amount of automation against a device substitutes for holding its key).
 - **Q3 — YouTube Lounge bind-channel transcript.** Need a real `yt-cast-receiver`
   session capture (the BrowserChannel framing: `RID`/`AID`/`SID`/`gsessionid`, chunked
   length-prefixed JSON). I've implemented the documented framing + command parser;
@@ -86,11 +103,18 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Cast
 
-- **Q11 — Device-auth is required even for media-URL LOAD.** The pure Cast session
-  answers `AuthChallenge` via a `DeviceAuthResponder` trait; without a signer it returns
-  `AuthError`, which real senders may reject before LOAD. So even the "simple" media path
-  needs `crypto-cast-auth` (task 5 / Q2) wired with real cert material to work against
-  Chrome. Local testing can use a dev cert; Chrome may still refuse an untrusted chain.
+- **Q11 — Device-auth is required even for media-URL LOAD. RESOLVED as to mechanism;
+  the credential is Q2.** The pure Cast session answers `AuthChallenge` via a
+  `DeviceAuthResponder`; without a signer it returns `AuthError`, which real senders
+  reject before LOAD. "Chrome may still refuse an untrusted chain" is no longer a
+  maybe — it does, measurably, and for exactly one reason
+  (`kCastV2CertNotSignedByTrustedCa`). Everything else about the response verifies.
+
+  Two things found on the way there, both fixed, both worth remembering because neither
+  was about the chain and both presented as total silence: the TLS certificate's validity
+  window has to be under four days or a sender rejects the peer certificate before
+  looking at device auth, and the `_googlecast._tcp` TXT record must carry `st` or a
+  strict sender discards the advertisement and never connects at all.
 
 ## Deferred (per docs, not blockers)
 

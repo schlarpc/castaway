@@ -18,7 +18,7 @@ integration test.
 | `crypto-cast-auth` | Done. RSA device-auth signer (SHA1/256, PKCS1v15). |
 | `crypto-fairplay` | Boundary stub. fp-setup typestate; key derivation = `NotImplemented` (Q1). |
 | `proto-dlna` | **Live.** AVTransport/RenderingControl/ConnectionManager SOAP; cast-a-video works. |
-| `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). Dev device key (Q2/Q11). |
+| `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). App launches we cannot host are declined rather than faked, and `GET_APP_AVAILABILITY` is answered (D32). Device auth is differential-tested against openscreen's *sender* (D31): correct in every respect a real sender checks except the trust root, which needs a provisioned credential (Q2). |
 | `proto-spotify` | **Live, pairing through playback.** Ours: advertise + `getInfo` + `addUser` DH/blob decrypt, on the shared HTTP host and mDNS responder. librespot's, above the LAN: AP login, dealer, connect-state, audio (D30). Pick castaway in the Spotify app and it logs in as you, plays, honours the phone's transport and queue, and drives back from the panel via `RemoteControl`. No account on disk. Blob framing still unproven against a real phone (Q10). Queue and cover art now render (Q38/Q39). |
 | `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
 | `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
@@ -40,9 +40,11 @@ receiver's journal, so the event is proven to cross adapter → session manager 
   Launch/stop semantics are proto-dial's own tests; the real path is `yt-selfplay` below.
 - **DLNA**: `SetAVTransportURI`/`Play`/`Pause`/`Stop` walk
   `NO_MEDIA_PRESENT → PLAYING → PAUSED_PLAYBACK → STOPPED`.
-- **Cast**: a hand-rolled CASTv2 sender does TLS → CONNECT → PING → GET_STATUS → LAUNCH
-  `CC1AD845` → LOAD → PAUSE → CLOSE; the LOAD reaches the pipeline and the CLOSE ends the
-  session.
+- **Cast**: a hand-rolled CASTv2 sender does TLS → CONNECT → PING → GET_STATUS →
+  GET_APP_AVAILABILITY → a refused LAUNCH → LAUNCH `CC1AD845` → LOAD → PAUSE → CLOSE. The
+  availability reply and the `LAUNCH_ERROR` are asserted from the sender's side *and* in
+  the journal, because the failure they prevent — claiming an app we cannot host — looks
+  like success on the wire; the LOAD reaches the pipeline and the CLOSE ends the session.
 - **AirPlay**: pipelined `OPTIONS` + `GET /info` in one write (bare-path URIs), the `/info`
   binary plist parses, pairing answers `501` rather than faking success, `TEARDOWN` ends
   the session — on both 7000 and 7011.
@@ -185,7 +187,11 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 4. ~~**Q20** — hardware-accelerated decode.~~ **Done on Linux**, proven zero-copy by an
    offscreen readback test; the Windows D3D11VA bridge is written and cross-compiled but
    unverified until the Dell.
-5. **Q2/Q11** — real Cast device cert for Chrome to accept auth.
+5. **Q2** — a real Cast device credential, and now the only thing between this receiver
+   and an official sender. ~~Q11~~ is resolved as to mechanism: `checks.openscreen-device-auth`
+   compiles openscreen's sender-side verifier and shows our auth response passing every
+   check but the trust root. `[cast.credential]` reads one off disk; the acceptance test
+   is already written and currently red by design.
 6. ~~**Q12/Q13** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
    receive path is differential-tested against openscreen's `RtpPacketizer` +
    `FrameCrypto`, compiled from a pinned checkout by the `openscreen-rtp-fixtures` check.

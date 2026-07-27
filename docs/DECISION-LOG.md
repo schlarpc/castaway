@@ -418,3 +418,63 @@ Feature flags matter here. `default-features = false` keeps librespot's own audi
 backends (rodio/cpal/alsa) out — the sink is ours — and `rustls-tls-webpki-roots` keeps
 the tree on `ring` rather than dragging OpenSSL or a second crypto backend into the
 Windows cross-build. Verified: no `aws-lc-rs` in the graph.
+
+### D31 — Compile the sender rather than reason about it
+The question "will Chrome accept this receiver's device auth?" had been answered by
+reading `cast_auth_util.cc`. That answer was right, and it was the wrong shape. Source
+reading gives one bit — "no" — when the useful thing is the vector: which of the
+sender's many checks already pass, which one fails, and whether the failure is the
+credential we cannot get or something we could have fixed this afternoon.
+
+So `checks.openscreen-device-auth` compiles openscreen's sender-side verifier —
+`cast/sender/channel/cast_auth_util.cc` plus the path builder under
+`cast/common/certificate/`, the code Chrome runs — and has it judge auth responses this
+receiver really produced. It is Q13's pattern with the arrow reversed: there openscreen
+generates bytes and our receiver consumes them; here we generate and openscreen rules.
+Ground rule 9 forbids reference implementations in the shipping binary and says nothing
+about using them as oracles, which is the whole of why this is allowed.
+
+The immediate return paid for it twice over. Two failures were found that had nothing to
+do with the missing credential, and that no amount of further source reading would have
+surfaced in the right order:
+
+- The receiver's TLS certificate carried rcgen's default 1975→4096 validity window, and
+  a sender rejects any peer certificate whose `notAfter` is more than four days out.
+  Every official sender was walking away *before* device auth was considered.
+- The `_googlecast._tcp` TXT record had no `st` key, which openscreen's record parser
+  treats as mandatory: the whole advertisement is discarded. A discovery failure and a
+  protocol failure are indistinguishable from the room — the panel is simply not listed.
+
+Both are the project's signature failure mode: a receiver that looks completely healthy
+and is refused by everything, with nothing on either side saying why. Both are now
+regression-locked, the first as a vector, the second as an assertion on the advertisement.
+
+What it does not do is prove Chrome specifically. openscreen is the reference
+implementation of the same logic, not the binary on anybody's laptop, and Chrome's
+discovery stack is its own code. The honest claim is: our device-auth response is correct
+in every respect the reference sender checks except the trust root, and that is now a
+result rather than a belief.
+
+### D32 — Decline app launches we cannot host, in the sender's own vocabulary
+`launch()` accepted any `appId` and answered `RECEIVER_STATUS` with a fresh session and
+transport id. For `CC1AD845` that is true. For Netflix, Spotify or YouTube's own receiver
+it is a lie with consequences: the sender opens a virtual connection to a transport id
+nothing is listening on, starts talking on a custom namespace, and gets silence. A
+connected phone and a black panel (GAPS.md G56).
+
+`App::classify` now sorts an `appId` into what we can actually do with it — a media URL
+we play ourselves, an RTP stream we terminate, or somebody else's web receiver — and an
+enum rather than a boolean because those first two are genuinely different roles. What we
+cannot host gets `LAUNCH_ERROR` / `NOT_FOUND`; what we could host but cannot right now —
+mirroring with no RTP socket bound — gets `SYSTEM_ERROR`. Both strings are openscreen's,
+because a sender's error handling is written against its own vocabulary and an invented
+one degrades to "unknown failure".
+
+The same classification answers `GET_APP_AVAILABILITY`, which had been ignored entirely.
+That was the more expensive omission: a sender asks what a device can run *before*
+offering it, so an unanswered query means the receiver never appears as somewhere to cast
+to at all. Advertised, discoverable, authenticating — and absent from the picker.
+
+Hosting the vendor receivers stays G56 and stays unbuilt. This decision is only that
+declining out loud beats claiming success, which is the same call D16 made for
+advertise-gating and D27 made for DIAL without a browser.
