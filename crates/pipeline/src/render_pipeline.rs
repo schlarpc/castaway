@@ -89,6 +89,8 @@ impl ScreenshotHandle {
 /// clock.
 struct UrlPlayback {
     clock: Arc<crate::clock::MediaClock>,
+    /// Where a `Seek` is left for the decode thread to pick up.
+    seek: Arc<crate::seek::SeekControl>,
     /// Filled in from the container, on the decode thread, before the first frame.
     /// [`None`] for a live stream, which has no end and must not be given one.
     duration: Arc<Mutex<Option<Duration>>>,
@@ -375,6 +377,13 @@ impl Pipeline for RenderPipeline {
         // and because a build with no audio feature must still compile to *something*
         // that plays the picture.
         let clock = Arc::new(crate::clock::MediaClock::new());
+        let seek = Arc::new(crate::seek::SeekControl::new());
+        // A start offset is a seek that happens before the first frame. Cast `LOAD` and
+        // AirPlay both carry one — "resume where I was" — and it used to be accepted and
+        // then quietly ignored, so resuming a film restarted it.
+        if let Some(start) = start.filter(|s| !s.is_zero()) {
+            seek.request(start);
+        }
         // Empty until the container has been opened, which happens on the decode thread.
         // A control point polling in the meantime is told the length is unknown, which is
         // true, rather than zero, which it would draw as a bar with no room in it.
@@ -382,6 +391,7 @@ impl Pipeline for RenderPipeline {
         if let Ok(mut held) = self.playback.lock() {
             *held = Some(UrlPlayback {
                 clock: Arc::clone(&clock),
+                seek: Arc::clone(&seek),
                 duration: Arc::clone(&duration),
             });
         }
@@ -399,7 +409,10 @@ impl Pipeline for RenderPipeline {
                 crate::audio_session::default_output(),
                 Arc::clone(&stop),
                 Arc::clone(&self.gain),
-                Some(Arc::clone(&clock)),
+                Some(crate::audio_session::PacedSession {
+                    clock: Arc::clone(&clock),
+                    seek: Arc::clone(&seek),
+                }),
             );
             Some(atx)
         };
@@ -417,7 +430,7 @@ impl Pipeline for RenderPipeline {
 
         // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
         std::thread::spawn(move || {
-            let result = decode_into(&uri, hw, &tx, &stop, &clock, &duration, audio_tx);
+            let result = decode_into(&uri, hw, &tx, &stop, &clock, &seek, &duration, audio_tx);
 
             // Preemption is not completion. When another source has taken the screen the
             // stop flag is what ended this decode, and the layers on screen belong to
@@ -540,8 +553,9 @@ impl Pipeline for RenderPipeline {
                         crate::audio_session::default_output(),
                         stop,
                         Arc::clone(&self.gain),
-                        // Bluetooth/Spotify PCM: the sender is the clock and there is
-                        // no video to synchronise, so nothing reads a media clock.
+                        // Bluetooth/Spotify PCM: the sender is the clock, there is no
+                        // video to synchronise, and a seek is the phone's business — so
+                        // there is no paced session to share.
                         None,
                     );
                     Ok(())
@@ -640,6 +654,26 @@ impl Pipeline for RenderPipeline {
                     None => Err(CoreError::UnsupportedControl(format!("{txn:?}"))),
                 }
             }
+            // Seek is left for the decode thread rather than done here, because moving a
+            // demuxer is a blocking libav call and this is a runtime worker. Returning
+            // once it is *requested* rather than once it has happened is also what the
+            // caller wants: an AVTransport `Seek` is answered synchronously over HTTP, and
+            // a control point that waited for a network seek to complete would time out.
+            ControlTxn::Seek(position) => {
+                let held = self
+                    .playback
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|s| Arc::clone(&s.seek)));
+                match held {
+                    Some(seek) => {
+                        seek.request(position);
+                        info!(?position, "render pipeline: seek");
+                        Ok(())
+                    }
+                    None => Err(CoreError::UnsupportedControl(format!("{txn:?}"))),
+                }
+            }
             // Stop tears the session down rather than merely freezing it. This used to
             // fall through to the refusal below while `proto-dlna` advertised STOP to the
             // panel and mapped the AVTransport `Stop` action onto it — so pressing stop,
@@ -659,9 +693,10 @@ impl Pipeline for RenderPipeline {
                 info!("render pipeline: STOP (transport)");
                 Ok(())
             }
-            // Seek needs the demuxer to move, which `decode_av` cannot do yet — refused
-            // rather than logged as success so a caller can tell the difference, and so
-            // the panel does not draw a scrub knob for it (GAPS G66).
+            // Next, previous, shuffle, repeat, set-queue: a renderer handed one URL has no
+            // playlist for any of them to move through. Refused rather than logged as a
+            // success so a caller can tell the difference — and so the panel does not draw
+            // a button that does nothing.
             other => {
                 info!(?other, "render pipeline: CONTROL (unsupported)");
                 Err(CoreError::UnsupportedControl(format!("{other:?}")))
@@ -694,6 +729,7 @@ fn decode_into(
     tx: &SyncSender<RenderCommand>,
     stop: &Arc<AtomicBool>,
     clock: &crate::clock::MediaClock,
+    seek: &crate::seek::SeekControl,
     duration: &Mutex<Option<Duration>>,
     audio_tx: Option<std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
 ) -> Result<(), PipelineError> {
@@ -703,6 +739,7 @@ fn decode_into(
             uri,
             hw,
             clock,
+            Some(seek),
             audio_tx,
             &|| stop.load(Ordering::SeqCst),
             |layout| {
@@ -735,7 +772,7 @@ fn decode_into(
     }
     #[cfg(not(feature = "ffmpeg"))]
     {
-        let _ = (uri, hw, tx, stop, clock, duration, audio_tx);
+        let _ = (uri, hw, tx, stop, clock, seek, duration, audio_tx);
         Err(PipelineError::Decode(
             "decode requires the `ffmpeg` feature".into(),
         ))

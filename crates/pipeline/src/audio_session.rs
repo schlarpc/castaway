@@ -20,11 +20,13 @@ use std::time::Duration;
 
 use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio_decode::decode_audio_stream;
 use crate::audio_out::AudioOut;
-#[cfg(any(test, not(feature = "audio-out")))]
+// Not test-only or headless-only any more: it is also what a *real* output falls back to
+// when the device refuses the stream, so that a missing sound card costs the sound and not
+// the picture.
 use crate::audio_out::NullAudioOut;
 
 /// Output gain, shared between the thread that is playing and whoever holds the remote.
@@ -212,6 +214,20 @@ pub fn run(
     output.stop();
 }
 
+/// What a media-URL session shares with the thread that plays its sound.
+///
+/// One value rather than two arguments because the two are inseparable: both exist only
+/// for the path where *we* are the player and neither means anything for the paths where
+/// the sender is. Bluetooth and Spotify pass [`None`] — the phone is the clock, and there
+/// is nothing here to seek.
+#[derive(Clone)]
+pub struct PacedSession {
+    /// The clock this thread drives, by publishing how far it has submitted.
+    pub clock: Arc<crate::clock::MediaClock>,
+    /// The seek handshake this thread has to answer, by throwing away what it had queued.
+    pub seek: Arc<crate::seek::SeekControl>,
+}
+
 /// Spawn a PCM playback session on a dedicated thread. The audio-only sibling of
 /// [`spawn`], for adapters that arrive already decoded.
 pub fn spawn_pcm(
@@ -219,9 +235,9 @@ pub fn spawn_pcm(
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
     gain: Arc<Gain>,
-    clock: Option<Arc<crate::clock::MediaClock>>,
+    session: Option<PacedSession>,
 ) {
-    std::thread::spawn(move || run_pcm(frames, output, &stop, &gain, clock.as_deref()));
+    std::thread::spawn(move || run_pcm(frames, output, &stop, &gain, session.as_ref()));
 }
 
 /// Drive one already-decoded audio session to completion. Blocking; call it on its own
@@ -236,8 +252,9 @@ pub fn run_pcm(
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
     gain: &Gain,
-    clock: Option<&crate::clock::MediaClock>,
+    session: Option<&PacedSession>,
 ) {
+    let clock = session.map(|s| s.clock.as_ref());
     // What the output device is currently open as, not what the first block said: a
     // source may change rate between tracks, and writing 48 kHz samples into a device
     // opened at 44.1 plays them at the wrong pitch rather than failing.
@@ -245,6 +262,31 @@ pub fn run_pcm(
     let mut pace = Pace::default();
 
     loop {
+        // Everything queued is from before a seek, so drop it. Checked here, at the top of
+        // every block, because this is the only thread that can: the demuxer cannot reach
+        // into a channel it has already written to, and without this a seek plays roughly
+        // a second of wherever playback used to be before arriving where it was sent.
+        //
+        // Acknowledged even when there was nothing to drop — the decode thread is waiting
+        // on that acknowledgement before it pushes the first block of the new position,
+        // and silence would cost it the whole grace period on every seek.
+        if let Some(seek) = session.map(|s| s.seek.as_ref()) {
+            if let Some(epoch) = seek.flush_wanted() {
+                let mut dropped = 0usize;
+                while frames.try_recv().is_ok() {
+                    dropped += 1;
+                }
+                debug!(dropped, "pcm session: discarded pre-seek audio");
+                // The device's own buffer holds the same staleness, so it is reopened on
+                // the next block rather than played out first.
+                if open_as.is_some() {
+                    output.stop();
+                    open_as = None;
+                }
+                pace = Pace::default();
+                seek.flushed(epoch);
+            }
+        }
         // `recv_timeout`, not `recv`, so `stop` is observable while nothing is arriving.
         // A session preempted while its source was *paused* has no next block to wake on,
         // so a plain `recv` parked here forever: the thread leaked and — worse — the
@@ -283,11 +325,24 @@ pub fn run_pcm(
                 output.stop();
             }
             if let Err(e) = output.start(shape.0, shape.1) {
+                // Silence, not a black screen. Ending here dropped the receiver, which
+                // ended the demuxer behind it, which ended the *video* — so on a box whose
+                // sound card was absent, busy, or held in exclusive mode, a video cast
+                // produced a flash and nothing while the phone said PLAYING.
+                //
+                // A null sink keeps time exactly as the real one does, so the picture
+                // plays on, paced, with one line saying why it is quiet.
                 warn!(error = %e, rate = shape.0, channels = shape.1,
-                    "pcm session: output refused the stream");
-                break;
+                    "pcm session: the output refused the stream; playing on in silence");
+                output = Box::new(NullAudioOut::new());
+                if output.start(shape.0, shape.1).is_err() {
+                    // Unreachable in practice — the null sink accepts everything — but a
+                    // library crate does not get to assume that on a runtime path.
+                    break;
+                }
+            } else {
+                info!(rate = shape.0, channels = shape.1, "pcm session: playing");
             }
-            info!(rate = shape.0, channels = shape.1, "pcm session: playing");
             open_as = Some(shape);
             pace = Pace::default();
         }
@@ -295,8 +350,14 @@ pub fn run_pcm(
         let through = block.pts + played;
         gain.apply(&mut block);
         if let Err(e) = output.write(&block) {
-            warn!(error = %e, "pcm session: output failed");
-            break;
+            // Same reasoning as a refused start, one step later: a device that goes away
+            // mid-session — unplugged, or claimed by something else — must cost the sound
+            // and not the picture.
+            warn!(error = %e, "pcm session: the output failed; playing on in silence");
+            output = Box::new(NullAudioOut::new());
+            if output.start(shape.0, shape.1).is_err() || output.write(&block).is_err() {
+                break;
+            }
         }
         // Published *before* the pacing sleep, not after: this says how far the stream
         // has been submitted, and the sleep that follows is precisely the mechanism that

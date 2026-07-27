@@ -137,10 +137,12 @@ pub const AUDIO_QUEUE: usize = 64;
 /// # Errors
 /// [`PipelineError::Decode`] on open/decode failure. A file with neither audio nor video
 /// is an error; a file with only one of them is not.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_av<F, O>(
     uri: &str,
     preference: HwPreference,
     clock: &crate::clock::MediaClock,
+    seek: Option<&crate::seek::SeekControl>,
     audio: Option<std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
     stop: &dyn Fn() -> bool,
     mut on_open: O,
@@ -158,6 +160,7 @@ where
             uri,
             &mut hw,
             clock,
+            seek,
             audio.as_ref(),
             stop,
             &mut |layout: &MediaLayout| {
@@ -185,6 +188,7 @@ fn av_session<F, O>(
     uri: &str,
     hw: &mut HwAttempt,
     clock: &crate::clock::MediaClock,
+    seek: Option<&crate::seek::SeekControl>,
     audio_tx: Option<&std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
     stop: &dyn Fn() -> bool,
     on_open: &mut O,
@@ -194,7 +198,7 @@ where
     F: FnMut(DecodedFrame) -> bool,
     O: FnMut(&MediaLayout),
 {
-    let mut ictx = ffmpeg::format::input(&uri).map_err(map_err)?;
+    let mut ictx = open_input(uri)?;
 
     let video = ictx
         .streams()
@@ -256,17 +260,51 @@ where
     };
     let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
 
-    for (stream, packet) in ictx.packets() {
+    // A manual loop rather than `for … in ictx.packets()`, because a seek needs `&mut
+    // ictx` and the iterator holds it for the length of the loop. Taking the iterator one
+    // packet at a time costs nothing — it is a wrapper around `av_read_frame` — and is
+    // what makes moving the demuxer expressible at all.
+    loop {
         if stop() {
             return Ok(SessionEnd::Finished);
         }
+        if let Some(control) = seek {
+            if let Some(target) = control.take() {
+                do_seek(
+                    &mut ictx,
+                    video_decoder.as_mut(),
+                    #[cfg(feature = "audio")]
+                    audio_decoder.as_mut(),
+                    clock,
+                    control,
+                    // Nothing to throw away, and nobody to answer: waiting out the grace
+                    // period on every seek of a silent file would be a quarter-second of
+                    // dead scrubber bought for nothing.
+                    layout.has_audio,
+                    target,
+                );
+            }
+        }
+
+        let Some((stream, packet)) = ictx.packets().next() else {
+            break;
+        };
         let index = stream.index();
 
         if let (Some((vi, time_base, _)), Some(decoder)) = (&video, video_decoder.as_mut()) {
             if index == *vi {
                 decoder.send_packet(&packet).map_err(map_err)?;
                 hw.check_negotiation()?;
-                match drain_paced(decoder, hw, &mut scaler, *time_base, clock, stop, on_frame)? {
+                match drain_paced(
+                    decoder,
+                    hw,
+                    &mut scaler,
+                    *time_base,
+                    clock,
+                    seek,
+                    stop,
+                    on_frame,
+                )? {
                     Drained::Continue => {}
                     Drained::Stopped => return Ok(SessionEnd::Finished),
                     Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
@@ -305,13 +343,142 @@ where
     // Flush the video decoder so the last frames of the item are not left inside it.
     if let (Some(decoder), Some((_, time_base, _))) = (video_decoder.as_mut(), &video) {
         decoder.send_eof().map_err(map_err)?;
-        if let Drained::Restart =
-            drain_paced(decoder, hw, &mut scaler, *time_base, clock, stop, on_frame)?
-        {
+        if let Drained::Restart = drain_paced(
+            decoder,
+            hw,
+            &mut scaler,
+            *time_base,
+            clock,
+            seek,
+            stop,
+            on_frame,
+        )? {
             return Ok(SessionEnd::RebuildInSoftware);
         }
     }
     Ok(SessionEnd::Finished)
+}
+
+/// Move the demuxer to `target` and put everything downstream back in step.
+///
+/// The order is the whole substance of it:
+///
+/// 1. **The demuxer moves**, to the last key frame at or before the target. Not past it:
+///    a decoder fed inter frames whose reference pictures it never saw produces garbage,
+///    and overshooting a seek is also the wrong answer to what was asked.
+/// 2. **Both decoders are flushed**, or the pictures and blocks still inside them come out
+///    labelled with the old position and are either dropped as hopelessly late or held for
+///    a turn that has already passed.
+/// 3. **The audio already queued is dropped**, by the thread that owns it. This is the
+///    step whose absence is inaudible in a test and unmistakable in a room: the queue
+///    holds around a second of decoded sound from where playback used to be.
+/// 4. **The clock is re-anchored**, last, once nothing stale is left to move it back.
+///
+/// A seek that libavformat refuses is logged and otherwise ignored: playback carries on
+/// from where it was, which is a control point's scrubber springing back — visibly wrong,
+/// but far better than a torn-down session for a file that simply is not seekable.
+fn do_seek(
+    ictx: &mut ffmpeg::format::context::Input,
+    video_decoder: Option<&mut ffmpeg::decoder::Video>,
+    #[cfg(feature = "audio")] audio_decoder: Option<&mut ffmpeg::decoder::Audio>,
+    clock: &crate::clock::MediaClock,
+    control: &crate::seek::SeekControl,
+    has_audio: bool,
+    target: Duration,
+) {
+    let Ok(ts) = i64::try_from(target.as_micros()) else {
+        warn!(?target, "seek: target is further away than time itself");
+        return;
+    };
+    // `..ts`, so the demuxer lands at or before the target rather than after it. With no
+    // stream index the timestamp is in `AV_TIME_BASE` units, which is microseconds.
+    if let Err(e) = ictx.seek(ts, ..ts) {
+        warn!(?target, error = %e, "seek: the demuxer would not move");
+        return;
+    }
+    if let Some(decoder) = video_decoder {
+        decoder.flush();
+    }
+    #[cfg(feature = "audio")]
+    if let Some(decoder) = audio_decoder {
+        decoder.flush();
+    }
+    if has_audio {
+        control.flush_audio();
+    }
+    clock.seek_to(target);
+}
+
+/// How long a network read may stall before the fetch is abandoned, in microseconds.
+///
+/// Not a tuning knob — the absence of one was a thread leak. `avformat_open_input` with no
+/// options blocks forever against a black-holed server, in a region where the stop flag is
+/// never looked at, so every cast at an unreachable host left a decode thread parked for
+/// the life of the process. Thirty seconds is long enough that a slow first byte from a
+/// loaded NAS is not mistaken for a dead one, and short enough that a wedged fetch is over
+/// before anybody has finished asking why nothing happened.
+const NETWORK_TIMEOUT_US: &str = "30000000";
+
+/// How long libavformat may spend re-establishing a dropped connection.
+///
+/// Reconnection is on because the failure it prevents is the one this project keeps
+/// finding: a Wi-Fi blip forty minutes into a film ends playback with a log line, and the
+/// panel goes back to idle with nobody able to say why.
+const RECONNECT_DELAY_MAX_S: &str = "5";
+
+/// What castaway calls itself to an HTTP server.
+///
+/// The UPnP shape — `OS/version UPnP/1.0 product/version` — because a DLNA server may use
+/// it to decide what it will serve, and several are known to serve a reduced set to a
+/// client they cannot place.
+const USER_AGENT: &str = concat!("Linux/1.0 UPnP/1.0 castaway/", env!("CARGO_PKG_VERSION"),);
+
+/// Open `uri` for demuxing, with the options a network fetch needs.
+///
+/// Applied only to network URIs. A local file has no socket to time out and no headers to
+/// carry, and handing libavformat options its protocol does not recognise earns a warning
+/// per open for nothing.
+fn open_input(uri: &str) -> Result<ffmpeg::format::context::Input, PipelineError> {
+    if !is_network_uri(uri) {
+        return ffmpeg::format::input(&uri).map_err(map_err);
+    }
+    let mut options = ffmpeg::Dictionary::new();
+    // Applies to the socket underneath whatever protocol this is, so it covers the
+    // connect *and* a stall mid-stream.
+    options.set("rw_timeout", NETWORK_TIMEOUT_US);
+    // The HTTP/TCP protocols' own name for the same idea; they read this one, not
+    // `rw_timeout`, on some builds.
+    options.set("timeout", NETWORK_TIMEOUT_US);
+    options.set("user_agent", USER_AGENT);
+    options.set("reconnect", "1");
+    options.set("reconnect_streamed", "1");
+    options.set("reconnect_delay_max", RECONNECT_DELAY_MAX_S);
+    // The two headers that make this a DLNA client rather than an anonymous GET.
+    //
+    // `getcontentFeatures.dlna.org` asks the server to describe what it is about to send;
+    // `transferMode.dlna.org: Streaming` is the mode for audio and video, as against
+    // `Interactive` for images and `Background` for a bulk copy. Neither is mandatory, and
+    // servers that key their behaviour off them are common enough that omitting them means
+    // being served a different thing than every other renderer on the LAN gets.
+    options.set(
+        "headers",
+        "getcontentFeatures.dlna.org: 1\r\ntransferMode.dlna.org: Streaming\r\n",
+    );
+    ffmpeg::format::input_with_dictionary(&uri, options).map_err(map_err)
+}
+
+/// Whether this URI is fetched over a network, rather than opened from the filesystem.
+///
+/// Deliberately a scheme test rather than "not a file": libavformat speaks a long list of
+/// protocols, and the ones worth timing out are the ones with a peer at the other end.
+fn is_network_uri(uri: &str) -> bool {
+    let Some((scheme, _)) = uri.split_once("://") else {
+        return false;
+    };
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "rtsp" | "rtmp" | "rtmps" | "rtp" | "udp" | "tcp" | "mms" | "mmsh"
+    )
 }
 
 /// The container's duration, when it has one. A live stream reports nothing usable, which
@@ -354,7 +521,7 @@ fn url_session<F>(
 where
     F: FnMut(DecodedFrame) -> bool,
 {
-    let mut ictx = ffmpeg::format::input(&uri).map_err(map_err)?;
+    let mut ictx = open_input(uri)?;
     let input = ictx
         .streams()
         .best(ffmpeg::media::Type::Video)
@@ -793,16 +960,26 @@ fn drain_paced<F>(
     scaler: &mut Option<ffmpeg::software::scaling::Context>,
     time_base: ffmpeg::Rational,
     clock: &crate::clock::MediaClock,
+    seek: Option<&crate::seek::SeekControl>,
     stop: &dyn Fn() -> bool,
     on_frame: &mut F,
 ) -> Result<Drained, PipelineError>
 where
     F: FnMut(DecodedFrame) -> bool,
 {
+    // A seek is waiting to be served, so nothing this decoder is still holding is worth
+    // presenting. Returning rather than draining is what lets the seek happen *now*: the
+    // frames in here belong to the old position and the packet loop is where the demuxer
+    // can move.
+    let seek_pending = || seek.is_some_and(crate::seek::SeekControl::pending);
+
     let mut decoded = ffmpeg::frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
         if stop() {
             return Ok(Drained::Stopped);
+        }
+        if seek_pending() {
+            return Ok(Drained::Continue);
         }
         let pts = frame_pts(decoded.pts(), time_base);
         // Seeds the wall clock for a file with no audio, and does nothing once audio has
@@ -821,10 +998,18 @@ where
         // reason the wait is sliced. A *paused* session's clock never advances, so a frame
         // that is waiting for its turn waits forever — and preemption (someone else casts)
         // would then leak this thread and its decoder, one per paused session, in silence.
+        //
+        // A seek is checked in the same place and for the same reason, with one extra
+        // twist: scrubbing a *paused* session is the ordinary way people find a spot, and
+        // that is precisely the state where the clock never advances, so a frame waiting
+        // its turn would swallow the seek until somebody pressed play.
         const SLICE: Duration = Duration::from_millis(50);
         loop {
             if stop() {
                 return Ok(Drained::Stopped);
+            }
+            if seek_pending() {
+                return Ok(Drained::Continue);
             }
             if clock.is_paused() {
                 std::thread::sleep(SLICE);

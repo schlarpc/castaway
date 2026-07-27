@@ -41,6 +41,14 @@
         <argument><name>CurrentPresetNameList</name><direction>out</direction><relatedStateVariable>PresetNameList</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <!-- Implemented, and previously not advertised: a control point calls neither. -->
+    <action>
+      <name>SelectPreset</name>
+      <argumentList>
+        <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><name>PresetName</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_PresetName</relatedStateVariable></argument>
+      </argumentList>
+    </action>
   </actionList>
   <serviceStateTable>
     <stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>
@@ -48,6 +56,12 @@
     <stateVariable sendEvents="no"><name>Mute</name><dataType>boolean</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>PresetNameList</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>
+    <!--
+      One channel, declared. The panel has one pair of speakers and one gain, so a control
+      point asking for `LF` is asking for something that does not exist here — the list is
+      what tells it so before it tries.
+    -->
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_Channel</name><dataType>string</dataType><allowedValueList><allowedValue>Master</allowedValue></allowedValueList></stateVariable>
+    <stateVariable sendEvents="no"><name>A_ARG_TYPE_PresetName</name><dataType>string</dataType><allowedValueList><allowedValue>FactoryDefaults</allowedValue></allowedValueList></stateVariable>
   </serviceStateTable>
 </scpd>

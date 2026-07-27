@@ -63,6 +63,7 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
         path.to_str().unwrap(),
         HwPreference::SoftwareOnly,
         &clock,
+        None,
         want_audio.then_some(tx),
         &|| false,
         |l| layout = l.clone(),
@@ -305,6 +306,7 @@ fn media_is_fetched_over_http_not_just_opened_from_disk() {
         &url,
         HwPreference::SoftwareOnly,
         &clock,
+        None,
         Some(tx),
         &|| false,
         |l| layout = l.clone(),
@@ -323,6 +325,154 @@ fn media_is_fetched_over_http_not_just_opened_from_disk() {
     assert!(samples > 0, "no audio came back from an HTTP source");
 }
 
+/// A seek moves the demuxer, and the frames that come back are from where it was sent.
+///
+/// Driven as a *start offset* — a seek requested before the first packet is read — because
+/// that is both the deterministic way to assert it and a real case in its own right: Cast
+/// `LOAD` and AirPlay both carry "resume from here", which used to be accepted and then
+/// ignored, so resuming a film restarted it.
+#[test]
+fn a_seek_lands_where_it_was_sent_rather_than_where_it_was() {
+    let path = tmp("seekable.mp4");
+    // A key frame every half second, so the seek has somewhere near the target to land.
+    // With libx264's default keyint a four-second clip has exactly one, at the start, and
+    // every seek would legitimately land back at zero.
+    if !make(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=4:size=160x120:rate=10",
+            "-c:v",
+            "libx264",
+            "-g",
+            "5",
+        ],
+        &path,
+    ) {
+        eprintln!("skipping: ffmpeg unavailable");
+        return;
+    }
+
+    let clock = Arc::new(MediaClock::new());
+    let seek = Arc::new(pipeline::seek::SeekControl::new());
+    seek.request(Duration::from_secs(3));
+
+    let mut times: Vec<Duration> = Vec::new();
+    decode_av(
+        path.to_str().unwrap(),
+        HwPreference::SoftwareOnly,
+        &clock,
+        Some(&seek),
+        None,
+        &|| false,
+        |_l| {},
+        |frame| {
+            times.push(frame.pts);
+            true
+        },
+    )
+    .unwrap();
+
+    let first = *times.first().expect("no frames came back after a seek");
+    assert!(
+        first >= Duration::from_millis(2_500),
+        "the seek did not move the demuxer: first frame at {first:?}",
+    );
+    // …and the tail of the file is still there, so the seek landed inside it rather than
+    // running it off the end.
+    assert!(
+        times.len() >= 5,
+        "only {} frames after seeking to 3s of a 4s clip",
+        times.len()
+    );
+    assert!(
+        times.windows(2).all(|w| w[1] >= w[0]),
+        "timestamps went backwards after the seek"
+    );
+}
+
+/// A seek interrupts a *paused* session. Scrubbing while paused is the ordinary way people
+/// find a spot, and it is exactly the state where the clock never advances — so a frame
+/// waiting its turn would hold the seek until somebody pressed play.
+#[test]
+fn a_paused_session_can_still_be_scrubbed() {
+    let path = tmp("scrub-paused.mp4");
+    if !make(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=4:size=160x120:rate=10",
+            "-c:v",
+            "libx264",
+            "-g",
+            "5",
+        ],
+        &path,
+    ) {
+        eprintln!("skipping: ffmpeg unavailable");
+        return;
+    }
+
+    let clock = Arc::new(MediaClock::new());
+    let seek = Arc::new(pipeline::seek::SeekControl::new());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Paused from the outset, so the decode thread parks on the very first frame.
+    clock.set_paused(true);
+
+    let decoder = std::thread::spawn({
+        let (clock, seek, stop, path) = (
+            Arc::clone(&clock),
+            Arc::clone(&seek),
+            Arc::clone(&stop),
+            path.clone(),
+        );
+        move || {
+            let mut times: Vec<Duration> = Vec::new();
+            let _ = decode_av(
+                path.to_str().unwrap(),
+                HwPreference::SoftwareOnly,
+                &clock,
+                Some(&seek),
+                None,
+                &|| stop.load(std::sync::atomic::Ordering::SeqCst),
+                |_l| {},
+                |frame| {
+                    times.push(frame.pts);
+                    true
+                },
+            );
+            times
+        }
+    });
+
+    // Give it long enough to be well and truly parked on a frame it cannot present, then
+    // scrub. A session that could not be interrupted here would never see this.
+    std::thread::sleep(Duration::from_millis(300));
+    seek.request(Duration::from_secs(3));
+
+    // The seek re-anchors the clock even though the session is still paused, which is what
+    // makes the position readout follow the scrub.
+    let mut moved = false;
+    for _ in 0..400 {
+        if clock.now().is_some_and(|p| p >= Duration::from_secs(3)) {
+            moved = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let times = decoder.join().unwrap();
+    assert!(
+        moved,
+        "the scrub never reached the decoder; it is stuck behind a frame waiting for a \
+         clock that is frozen. last frames: {times:?}",
+    );
+    assert!(clock.is_paused(), "and the session is still paused");
+}
+
 /// The pipeline says how far through it is, and says when it is done.
 ///
 /// Both halves of the same absence. The decode thread used to log and exit, so a DLNA
@@ -335,7 +485,7 @@ fn media_is_fetched_over_http_not_just_opened_from_disk() {
 /// sends when its decode thread finishes.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_pipeline_reports_where_it_is_and_that_it_finished() {
-    use castaway_core::{MediaUri, PlaybackEnd, PlaybackReport as _, Pipeline as _};
+    use castaway_core::{MediaUri, Pipeline as _, PlaybackEnd, PlaybackReport as _};
 
     let path = tmp("reported.mp4");
     if !make(
@@ -393,7 +543,7 @@ async fn the_pipeline_reports_where_it_is_and_that_it_finished() {
 /// exactly why it has to be reported rather than merely logged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_url_that_cannot_be_fetched_is_reported_as_a_failure() {
-    use castaway_core::{MediaUri, PlaybackEnd, Pipeline as _};
+    use castaway_core::{MediaUri, Pipeline as _, PlaybackEnd};
 
     let (pipe, _render_rx) = pipeline::RenderPipeline::new(3);
     let (ends_tx, mut ends_rx) = castaway_core::playback::end_channel();

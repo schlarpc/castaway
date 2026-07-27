@@ -41,20 +41,17 @@ impl DlnaRemote {
     ///
     /// Derived from what the *pipeline* will actually honour for a URL session, not from
     /// what the AVTransport service template lists. `RenderPipeline::control` freezes the
-    /// media clock for play/pause and applies volume and mute to the output gain, and
-    /// refuses everything else — so those are the buttons, and no others appear.
+    /// media clock for play/pause, moves the demuxer for a seek, and applies volume and
+    /// mute to the output gain — so those are the buttons, and no others appear.
     ///
-    /// Deliberately absent:
-    /// - `SEEK`, because `decode_av` cannot move the demuxer yet (GAPS G61). The scrubber
-    ///   still draws, because knowing how far through you are is worth having; it just
-    ///   takes no touches.
-    /// - `NEXT`/`PREVIOUS`, because a renderer has no playlist to move through.
-    ///   `SetNextAVTransportURI` is a queue of exactly one and is not that.
+    /// Deliberately absent: `NEXT`/`PREVIOUS`, because a renderer has no playlist to move
+    /// through. `SetNextAVTransportURI` is a queue of exactly one and is not that.
     #[must_use]
     pub const fn capabilities() -> ControlCapabilities {
         ControlCapabilities::PLAY
             .or(ControlCapabilities::PAUSE)
             .or(ControlCapabilities::STOP)
+            .or(ControlCapabilities::SEEK)
             .or(ControlCapabilities::VOLUME)
             .or(ControlCapabilities::MUTE)
     }
@@ -90,6 +87,11 @@ impl RemoteControl for DlnaRemote {
                     }
                 }
                 ControlTxn::Mute(muted) => renderer.muted = *muted,
+                // A seek does not change the transport state — playing stays playing and
+                // paused stays paused, which is §2.4.11 and is also what a scrubbed,
+                // paused session has to do to be usable. The *position* moves, and that
+                // is answered from the pipeline's clock rather than stored here.
+                ControlTxn::Seek(_) => {}
                 other => {
                     // Unreachable through `issue`, which checks the capability set first.
                     // Refusing rather than succeeding silently keeps a direct caller
@@ -151,14 +153,13 @@ mod tests {
             ControlTxn::Play,
             ControlTxn::Pause,
             ControlTxn::Stop,
+            ControlTxn::Seek(Duration::from_secs(1)),
             ControlTxn::Volume(0.5),
             ControlTxn::Mute(true),
         ] {
             assert!(caps.supports(&txn), "{txn:?} should be offered");
         }
-        // Seek needs the demuxer to move, which it cannot yet (G61); a renderer has no
-        // playlist for next/previous to move through.
-        assert!(!caps.supports(&ControlTxn::Seek(Duration::from_secs(1))));
+        // A renderer handed one URL has no playlist for next/previous to move through.
         assert!(!caps.supports(&ControlTxn::Next));
         assert!(!caps.supports(&ControlTxn::Previous));
     }
@@ -203,9 +204,30 @@ mod tests {
     async fn a_verb_outside_the_set_is_refused_rather_than_dropped() {
         let (remote, _renderer, mut rx) = remote();
         assert!(matches!(
-            remote.issue(ControlTxn::Seek(Duration::from_secs(5))).await,
+            remote.issue(ControlTxn::Next).await,
             Err(CoreError::UnsupportedControl(_))
         ));
         assert!(rx.try_recv().is_err(), "nothing reached the pipeline");
+    }
+
+    /// A seek moves the position and nothing else. A paused session that resumed itself
+    /// because somebody dragged the scrubber would be a panel that starts playing when
+    /// you were only looking for a spot.
+    #[tokio::test]
+    async fn a_seek_from_the_panel_does_not_disturb_the_transport_state() {
+        let (remote, renderer, mut rx) = remote();
+        renderer.lock().await.state = TransportState::PausedPlayback;
+
+        remote
+            .issue(ControlTxn::Seek(Duration::from_secs(90)))
+            .await
+            .unwrap();
+        assert_eq!(renderer.lock().await.state, TransportState::PausedPlayback);
+
+        let msg = rx.recv().await.unwrap();
+        assert!(matches!(
+            msg.event,
+            SessionEvent::Control(ControlTxn::Seek(d)) if d == Duration::from_secs(90)
+        ));
     }
 }

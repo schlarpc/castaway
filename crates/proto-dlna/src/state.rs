@@ -122,6 +122,80 @@ fn upnp_time(d: Duration) -> String {
     )
 }
 
+/// AVTransport actions that exist in the service template, are optional, and that this
+/// renderer does not implement — so they answer 602 rather than 401.
+///
+/// Recording, in every spelling it has: a panel is a renderer and there is nothing here to
+/// record onto. `SetPlayMode` is the interesting omission — shuffle and repeat over one
+/// URI mean nothing, and `GetTransportSettings` says `NORMAL` for the same reason.
+const AVT_OPTIONAL: &[&str] = &[
+    "Record",
+    "SetPlayMode",
+    "SetRecordQualityMode",
+    "GetDRMState",
+    "SetStaticPlaylist",
+    "SetStreamingPlaylist",
+    "GetPlaylistInfo",
+    "GetSyncOffset",
+    "AdjustSyncOffset",
+    "SetSyncOffset",
+    "SyncPlay",
+    "SyncStop",
+    "SyncPause",
+    "SetRecordTimeMode",
+    "GetStateVariables",
+    "SetStateVariables",
+];
+
+/// RenderingControl actions that exist, are optional, and are not implemented here.
+///
+/// Everything a *display* would expose and a receiver has no business touching — the panel
+/// is somebody else's hardware and its brightness is set on the panel — plus the dB volume
+/// scale, which is optional and which no control point requires.
+const RC_OPTIONAL: &[&str] = &[
+    "GetVolumeDB",
+    "SetVolumeDB",
+    "GetVolumeDBRange",
+    "GetLoudness",
+    "SetLoudness",
+    "GetBrightness",
+    "SetBrightness",
+    "GetContrast",
+    "SetContrast",
+    "GetSharpness",
+    "SetSharpness",
+    "GetColorTemperature",
+    "SetColorTemperature",
+    "GetRedVideoGain",
+    "SetRedVideoGain",
+    "GetGreenVideoGain",
+    "SetGreenVideoGain",
+    "GetBlueVideoGain",
+    "SetBlueVideoGain",
+    "GetRedVideoBlackLevel",
+    "SetRedVideoBlackLevel",
+    "GetGreenVideoBlackLevel",
+    "SetGreenVideoBlackLevel",
+    "GetBlueVideoBlackLevel",
+    "SetBlueVideoBlackLevel",
+    "GetHorizontalKeystone",
+    "SetHorizontalKeystone",
+    "GetVerticalKeystone",
+    "SetVerticalKeystone",
+    "GetStateVariables",
+    "SetStateVariables",
+];
+
+/// ConnectionManager actions that exist, are optional, and are not implemented here.
+///
+/// Both halves of the non-default connection model. Leaving them unimplemented is
+/// deliberate and load-bearing rather than a gap: CM:1 §5.1.1.2 makes
+/// `PrepareForConnection` optional for HTTP, and several control points use its *absence*
+/// to detect the DLNA default-connection model — so implementing it would change behaviour
+/// for the worse. Only the code was wrong, and 602 is the one that says "not implemented"
+/// rather than "no such action".
+const CM_OPTIONAL: &[&str] = &["PrepareForConnection", "ConnectionComplete"];
+
 /// The MediaRenderer state. One instance per `InstanceID 0` (we support a single one,
 /// which covers every real control point).
 #[derive(Debug, Clone)]
@@ -134,6 +208,9 @@ pub struct Renderer {
     pub current_uri_metadata: String,
     /// The queued next URI, if any.
     pub next_uri: Option<String>,
+    /// The DIDL-Lite blob that came with it, so `Next` can put the right title on the card
+    /// rather than the previous track's.
+    pub next_uri_metadata: String,
     /// Volume, 0–100 (UPnP scale).
     pub volume: u8,
     /// Mute flag.
@@ -156,6 +233,7 @@ impl Default for Renderer {
             current_uri: None,
             current_uri_metadata: String::new(),
             next_uri: None,
+            next_uri_metadata: String::new(),
             volume: 50,
             muted: false,
             status: TransportStatus::default(),
@@ -232,11 +310,20 @@ impl Renderer {
     /// Dispatch an AVTransport action.
     ///
     /// # Errors
-    /// [`DlnaError`] for unknown actions, missing/invalid arguments.
+    /// [`DlnaError`] for unknown actions, missing/invalid arguments, a transition the
+    /// transport cannot make, or an `InstanceID` this renderer does not have.
     pub fn av_transport(&mut self, action: &SoapAction) -> Result<Outcome, DlnaError> {
+        action.require_instance_zero()?;
         match action.name.as_str() {
             "SetAVTransportURI" => {
                 let uri = action.require("CurrentURI")?.to_string();
+                // Checked before it is stored, so a URI we could never fetch is refused
+                // while the control point is still listening. §2.4.1's own error table has
+                // 716 for exactly this; without it, an unsupported scheme was accepted,
+                // answered 200, and then failed inside a decode thread minutes later.
+                if castaway_core::MediaUri::parse(&uri).is_err() {
+                    return Err(DlnaError::ResourceNotFound(uri));
+                }
                 self.current_uri_metadata = action.arg("CurrentURIMetaData").unwrap_or("").into();
                 self.current_uri = Some(uri.clone());
                 // A new item is a new verdict: whatever went wrong with the last URL says
@@ -264,14 +351,29 @@ impl Renderer {
                 }
             }
             "SetNextAVTransportURI" => {
-                self.next_uri = Some(action.require("NextURI")?.to_string());
+                let uri = action.require("NextURI")?.to_string();
+                // An empty `NextURI` is how a control point *clears* what it staged, and
+                // is not an error — §2.4.2.
+                self.next_uri = if uri.is_empty() {
+                    self.next_uri_metadata.clear();
+                    None
+                } else {
+                    if castaway_core::MediaUri::parse(&uri).is_err() {
+                        return Err(DlnaError::ResourceNotFound(uri));
+                    }
+                    self.next_uri_metadata = action.arg("NextURIMetaData").unwrap_or("").into();
+                    Some(uri)
+                };
                 Ok(Outcome::empty())
             }
             "Play" => {
+                // 701, not 402. "Play with nothing set" is a transition the transport
+                // cannot make, not a malformed request — and a control point reading 402
+                // concludes its own message was wrong and stops rather than setting a URI.
                 let uri = self
                     .current_uri
                     .clone()
-                    .ok_or(DlnaError::InvalidArgument("Play without media"))?;
+                    .ok_or(DlnaError::TransitionNotAvailable("Play with no media set"))?;
                 let resuming = self.state == TransportState::PausedPlayback;
                 self.state = TransportState::Playing;
                 self.status = TransportStatus::Ok;
@@ -291,13 +393,51 @@ impl Renderer {
                 Ok(with_event(ControlTxn::Stop))
             }
             "Seek" => {
+                // The unit was previously ignored, so `REL_COUNT` — a *counter* position,
+                // in a counter we answer §2.2.24's sentinel for — was parsed as a clock
+                // time and jumped playback somewhere arbitrary. §2.4.11 defines 710 for a
+                // mode this renderer does not implement, and the SCPD now says which two
+                // it does.
+                match action.arg("Unit").unwrap_or("REL_TIME") {
+                    "REL_TIME" | "ABS_TIME" => {}
+                    _ => return Err(DlnaError::SeekModeNotSupported),
+                }
                 let target = action.require("Target")?;
-                let pos = parse_upnp_time(target)
-                    .ok_or(DlnaError::InvalidArgument("Seek Target not H:MM:SS"))?;
+                let pos = parse_upnp_time(target).ok_or(DlnaError::IllegalSeekTarget)?;
                 Ok(with_event(ControlTxn::Seek(pos)))
             }
-            "Next" => Ok(with_event(ControlTxn::Next)),
-            "Previous" => Ok(with_event(ControlTxn::Previous)),
+            // Next and Previous are *required* actions, so they stay advertised — but a
+            // renderer handed one URL has no playlist, and emitting a `ControlTxn::Next`
+            // the pipeline then refuses was the SCPD promising something nothing could do.
+            //
+            // What a renderer does have is `SetNextAVTransportURI`: a queue of exactly
+            // one, staged by the control point, which is precisely what Next should
+            // advance to. Anything else is 701 — the transition is not available from
+            // here, which is true and is the code §2.4.9 defines for it.
+            "Next" => match self.next_uri.take() {
+                Some(uri) => {
+                    self.current_uri = Some(uri.clone());
+                    self.current_uri_metadata = std::mem::take(&mut self.next_uri_metadata);
+                    self.state = TransportState::Playing;
+                    self.status = TransportStatus::Ok;
+                    self.position = None;
+                    Ok(Outcome::with_events(self.start(&uri)?))
+                }
+                None => Err(DlnaError::TransitionNotAvailable(
+                    "nothing is staged behind the current item",
+                )),
+            },
+            "Previous" => Err(DlnaError::TransitionNotAvailable(
+                "a renderer keeps no history to go back through",
+            )),
+            // Optional (§2.4.12), and the one action whose whole job is to stop a control
+            // point offering a button this transport would refuse — the same idea as our
+            // own `ControlCapabilities`, in the shape UPnP defines for it. Cheap to answer
+            // correctly and actively unhelpful to leave out.
+            "GetCurrentTransportActions" => Ok(Outcome::args(vec![(
+                "Actions".into(),
+                self.available_actions(),
+            )])),
             "GetTransportInfo" => Ok(Outcome::args(vec![
                 ("CurrentTransportState".into(), self.state.as_upnp().into()),
                 // Not hardcoded `OK` any more. A URL the box cannot fetch used to leave a
@@ -369,7 +509,7 @@ impl Renderer {
                     self.current_uri_metadata.clone(),
                 ),
                 ("NextURI".into(), self.next_uri.clone().unwrap_or_default()),
-                ("NextURIMetaData".into(), String::new()),
+                ("NextURIMetaData".into(), self.next_uri_metadata.clone()),
                 ("PlayMedium".into(), "NETWORK".into()),
                 ("RecordMedium".into(), "NOT_IMPLEMENTED".into()),
                 ("WriteStatus".into(), "NOT_IMPLEMENTED".into()),
@@ -383,15 +523,53 @@ impl Renderer {
                 ("PlayMode".into(), "NORMAL".into()),
                 ("RecQualityMode".into(), "NOT_IMPLEMENTED".into()),
             ])),
+            // Real actions of this service that this renderer does not implement, which is
+            // 602 and not 401. The distinction reaches a control point: 602 says "this
+            // device does not do that", 401 says "no such action", and the second reads as
+            // a broken device rather than a limited one.
+            other if AVT_OPTIONAL.contains(&other) => {
+                Err(DlnaError::OptionalActionNotImplemented(other.to_string()))
+            }
             other => Err(DlnaError::InvalidAction(other.to_string())),
         }
+    }
+
+    /// Which transport verbs would succeed right now, as `GetCurrentTransportActions`
+    /// spells them (§2.4.12).
+    ///
+    /// Derived from the state rather than listed, for the same reason our own
+    /// `ControlCapabilities` is: an answer that is a constant is an answer that is wrong in
+    /// most states, and every button it wrongly offers is a fault the person pressing it
+    /// has to interpret.
+    fn available_actions(&self) -> String {
+        let mut actions: Vec<&str> = Vec::new();
+        match self.state {
+            TransportState::NoMediaPresent => {}
+            TransportState::Playing => actions.extend(["Pause", "Stop", "Seek"]),
+            TransportState::PausedPlayback => actions.extend(["Play", "Stop", "Seek"]),
+            TransportState::Stopped | TransportState::Transitioning => actions.push("Play"),
+        }
+        if self.next_uri.is_some() {
+            actions.push("Next");
+        }
+        actions.join(",")
     }
 
     /// Dispatch a RenderingControl action.
     ///
     /// # Errors
-    /// [`DlnaError`] for unknown actions or invalid arguments.
+    /// [`DlnaError`] for unknown actions, invalid arguments, or an `InstanceID` this
+    /// renderer does not have.
     pub fn rendering_control(&mut self, action: &SoapAction) -> Result<Outcome, DlnaError> {
+        action.require_instance_zero()?;
+        // The panel has one pair of speakers and one gain, which is what the SCPD's
+        // `allowedValueList` says. Applying an `LF`-only volume to the master would be the
+        // wrong thing done confidently, and the control point would have no way to tell.
+        if let Some(channel) = action.arg("Channel") {
+            if !channel.trim().is_empty() && channel != "Master" {
+                return Err(DlnaError::InvalidArgument("only the Master channel exists"));
+            }
+        }
         match action.name.as_str() {
             "GetVolume" => Ok(Outcome::args(vec![(
                 "CurrentVolume".into(),
@@ -419,7 +597,17 @@ impl Renderer {
                 "CurrentPresetNameList".into(),
                 "FactoryDefaults".into(),
             )])),
-            "SelectPreset" => Ok(Outcome::empty()),
+            // The one preset `ListPresets` names. Anything else is a name this device does
+            // not have, and answering `Ok` to it would be agreeing to a change nobody made.
+            "SelectPreset" => match action.require("PresetName")? {
+                "FactoryDefaults" => Ok(Outcome::empty()),
+                _ => Err(DlnaError::InvalidArgument(
+                    "the only preset is FactoryDefaults",
+                )),
+            },
+            other if RC_OPTIONAL.contains(&other) => {
+                Err(DlnaError::OptionalActionNotImplemented(other.to_string()))
+            }
             other => Err(DlnaError::InvalidAction(other.to_string())),
         }
     }
@@ -427,7 +615,8 @@ impl Renderer {
     /// Dispatch a ConnectionManager action.
     ///
     /// # Errors
-    /// [`DlnaError::InvalidAction`] for unknown actions.
+    /// [`DlnaError::InvalidAction`] for unknown actions;
+    /// [`DlnaError::OptionalActionNotImplemented`] for the optional connection model.
     pub fn connection_manager(&self, action: &SoapAction) -> Result<Outcome, DlnaError> {
         // What this renderer will actually take.
         //
@@ -486,6 +675,9 @@ impl Renderer {
                 ("Direction".into(), "Input".into()),
                 ("Status".into(), "OK".into()),
             ])),
+            other if CM_OPTIONAL.contains(&other) => {
+                Err(DlnaError::OptionalActionNotImplemented(other.to_string()))
+            }
             other => Err(DlnaError::InvalidAction(other.to_string())),
         }
     }
@@ -908,5 +1100,365 @@ mod tests {
         let mut r = Renderer::default();
         let err = r.av_transport(&action("Frobnicate", &[])).unwrap_err();
         assert_eq!(err.upnp_code(), 401);
+    }
+
+    /// The SCPD is a promise, and until now it was one nobody kept in either direction:
+    /// `Seek`, `Next` and `Previous` were advertised and refused at runtime, while
+    /// `GetDeviceCapabilities` and `GetTransportSettings` were implemented and advertised
+    /// nowhere — which is the same as not implementing them, because a control point does
+    /// not call what the SCPD omits.
+    ///
+    /// So this walks the actual XML we serve. Adding an action to the document without
+    /// implementing it, or the reverse, fails here rather than on somebody's phone.
+    #[test]
+    fn every_advertised_action_is_answered_and_every_answered_action_is_advertised() {
+        // A renderer far enough along that state-dependent actions are legal: media set,
+        // playing, with something staged behind it so `Next` has somewhere to go.
+        let mut r = Renderer::default();
+        r.av_transport(&action(
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://h/a.mp4")],
+        ))
+        .unwrap();
+        r.av_transport(&action("Play", &[])).unwrap();
+        r.av_transport(&action(
+            "SetNextAVTransportURI",
+            &[("NextURI", "http://h/b.mp4")],
+        ))
+        .unwrap();
+
+        // Arguments each action needs to get past its own validation. Everything else
+        // takes none.
+        let args: &[(&str, &[(&str, &str)])] = &[
+            ("SetAVTransportURI", &[("CurrentURI", "http://h/a.mp4")]),
+            ("SetNextAVTransportURI", &[("NextURI", "http://h/b.mp4")]),
+            ("Seek", &[("Unit", "REL_TIME"), ("Target", "0:00:10")]),
+            ("SetVolume", &[("DesiredVolume", "40")]),
+            ("SetMute", &[("DesiredMute", "0")]),
+            ("SelectPreset", &[("PresetName", "FactoryDefaults")]),
+            ("GetCurrentConnectionInfo", &[("ConnectionID", "0")]),
+        ];
+        let args_for = |name: &str| -> &[(&str, &str)] {
+            args.iter()
+                .find(|(n, _)| *n == name)
+                .map_or(&[], |(_, a)| *a)
+        };
+
+        let services: [(&str, &str); 3] = [
+            ("AVTransport", crate::descriptions::AVTRANSPORT_SCPD),
+            (
+                "RenderingControl",
+                crate::descriptions::RENDERING_CONTROL_SCPD,
+            ),
+            (
+                "ConnectionManager",
+                crate::descriptions::CONNECTION_MANAGER_SCPD,
+            ),
+        ];
+
+        for (service, scpd) in services {
+            let advertised = scpd_action_names(scpd);
+            assert!(
+                !advertised.is_empty(),
+                "{service}'s SCPD lists no actions at all"
+            );
+            for name in &advertised {
+                let a = action(name, args_for(name));
+                let outcome = match service {
+                    "AVTransport" => r.av_transport(&a),
+                    "RenderingControl" => r.rendering_control(&a),
+                    _ => r.connection_manager(&a),
+                };
+                // 401 "no such action" and 602 "optional, not implemented" are the two
+                // answers an *advertised* action must never give. Anything else — even a
+                // 701 for a transition that is not available right now — is this service
+                // implementing what it published.
+                if let Err(e) = outcome {
+                    assert!(
+                        !matches!(e.upnp_code(), 401 | 602),
+                        "{service}.{name} is advertised in the SCPD and answers {}: {e}",
+                        e.upnp_code(),
+                    );
+                }
+            }
+
+            // …and the other direction. Listed by hand because there is no reflection to
+            // ask the `match` with, which is exactly why the drift happened.
+            let implemented: &[&str] = match service {
+                "AVTransport" => &[
+                    "SetAVTransportURI",
+                    "SetNextAVTransportURI",
+                    "Play",
+                    "Pause",
+                    "Stop",
+                    "Seek",
+                    "Next",
+                    "Previous",
+                    "GetTransportInfo",
+                    "GetPositionInfo",
+                    "GetMediaInfo",
+                    "GetDeviceCapabilities",
+                    "GetTransportSettings",
+                    "GetCurrentTransportActions",
+                ],
+                "RenderingControl" => &[
+                    "GetVolume",
+                    "SetVolume",
+                    "GetMute",
+                    "SetMute",
+                    "ListPresets",
+                    "SelectPreset",
+                ],
+                _ => &[
+                    "GetProtocolInfo",
+                    "GetCurrentConnectionIDs",
+                    "GetCurrentConnectionInfo",
+                ],
+            };
+            for name in implemented {
+                assert!(
+                    advertised.iter().any(|a| a == name),
+                    "{service}.{name} is implemented and not in the SCPD, so nothing will \
+                     ever call it",
+                );
+            }
+        }
+    }
+
+    /// The `<name>` of each `<action>` in an SCPD, in document order.
+    fn scpd_action_names(scpd: &str) -> Vec<String> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(scpd);
+        reader.config_mut().trim_text(true);
+        let mut names = Vec::new();
+        // Depth inside `<action>`, so only the action's own `<name>` is taken and not the
+        // `<name>` of each of its arguments.
+        let (mut in_action, mut depth, mut want_name) = (false, 0i32, false);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(e)) => {
+                    let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                    if local == "action" {
+                        in_action = true;
+                        depth = 0;
+                    } else if in_action {
+                        depth += 1;
+                        want_name = depth == 1 && local == "name";
+                    }
+                }
+                Ok(Event::Text(t)) if want_name => {
+                    names.push(t.unescape().unwrap_or_default().into_owned());
+                    want_name = false;
+                }
+                Ok(Event::End(e)) => {
+                    let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                    if local == "action" {
+                        in_action = false;
+                    } else if in_action {
+                        depth -= 1;
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("the SCPD we serve is not well-formed XML: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        names
+    }
+
+    /// This renderer has one virtual instance. A control point addressing a second one was
+    /// silently driving the first, so it believed it had started a transport it had not.
+    #[test]
+    fn an_instance_this_renderer_does_not_have_is_refused() {
+        let mut r = Renderer::default();
+        let err = r
+            .av_transport(&action("GetTransportInfo", &[("InstanceID", "1")]))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 718);
+
+        let err = r
+            .rendering_control(&action("GetVolume", &[("InstanceID", "2")]))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 718);
+
+        // Instance 0, spelled either way, is this renderer.
+        assert!(r
+            .av_transport(&action("GetTransportInfo", &[("InstanceID", "0")]))
+            .is_ok());
+        assert!(r.av_transport(&action("GetTransportInfo", &[])).is_ok());
+    }
+
+    /// `Play` with nothing set is a transition the transport cannot make, not a malformed
+    /// request. A control point reading 402 concludes *its own message* was wrong.
+    #[test]
+    fn play_with_no_media_is_a_transport_failure_not_an_argument_one() {
+        let mut r = Renderer::default();
+        let err = r.av_transport(&action("Play", &[])).unwrap_err();
+        assert_eq!(err.upnp_code(), 701);
+    }
+
+    /// `REL_COUNT` is a position in a *counter* we do not keep — and it used to be parsed
+    /// as a clock time, so a control point that asked for counter 30 jumped to 30 seconds.
+    #[test]
+    fn a_seek_unit_we_do_not_implement_is_refused_rather_than_reinterpreted() {
+        let mut r = Renderer::default();
+        let err = r
+            .av_transport(&action(
+                "Seek",
+                &[("Unit", "REL_COUNT"), ("Target", "0:00:30")],
+            ))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 710);
+
+        let err = r
+            .av_transport(&action(
+                "Seek",
+                &[("Unit", "ABS_TIME"), ("Target", "later")],
+            ))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 711);
+
+        // Both units we advertise really work.
+        for unit in ["REL_TIME", "ABS_TIME"] {
+            let out = r
+                .av_transport(&action("Seek", &[("Unit", unit), ("Target", "0:02:03")]))
+                .unwrap();
+            assert!(matches!(
+                out.events.first(),
+                Some(SessionEvent::Control(ControlTxn::Seek(d))) if *d == Duration::from_secs(123)
+            ));
+        }
+    }
+
+    /// `PrepareForConnection` must stay unimplemented — control points read its absence as
+    /// the DLNA default-connection model — but 401 says "no such action", which reads as a
+    /// broken device rather than a limited one.
+    #[test]
+    fn an_optional_action_we_do_not_implement_says_so_with_602() {
+        let r = Renderer::default();
+        let err = r
+            .connection_manager(&action("PrepareForConnection", &[]))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 602);
+
+        let mut r = Renderer::default();
+        assert_eq!(
+            r.av_transport(&action("SetPlayMode", &[]))
+                .unwrap_err()
+                .upnp_code(),
+            602
+        );
+        assert_eq!(
+            r.rendering_control(&action("SetLoudness", &[]))
+                .unwrap_err()
+                .upnp_code(),
+            602
+        );
+    }
+
+    /// `SetNextAVTransportURI` is a queue of exactly one, and `Next` is what advances into
+    /// it. Emitting a control the pipeline then refused meant a required action that never
+    /// worked; with nothing staged, 701 says why.
+    #[test]
+    fn next_advances_into_the_staged_uri_and_otherwise_says_it_cannot() {
+        let mut r = Renderer::default();
+        r.av_transport(&action(
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://h/1.mp3")],
+        ))
+        .unwrap();
+        r.av_transport(&action("Play", &[])).unwrap();
+        assert_eq!(
+            r.av_transport(&action("Next", &[]))
+                .unwrap_err()
+                .upnp_code(),
+            701,
+            "nothing is staged, so there is nowhere to advance to"
+        );
+
+        r.av_transport(&action(
+            "SetNextAVTransportURI",
+            &[("NextURI", "http://h/2.mp3"), ("NextURIMetaData", "")],
+        ))
+        .unwrap();
+        let out = r.av_transport(&action("Next", &[])).unwrap();
+        match out.events.first() {
+            Some(SessionEvent::Play { source, .. }) => {
+                assert_eq!(source.to_string(), "http://h/2.mp3");
+            }
+            other => panic!("expected a play for the staged URI, got {other:?}"),
+        }
+        // …and the staged slot is empty again, so a second Next has nowhere to go.
+        assert!(r.av_transport(&action("Next", &[])).is_err());
+        assert_eq!(r.current_uri.as_deref(), Some("http://h/2.mp3"));
+    }
+
+    /// `GetCurrentTransportActions` exists to stop a control point offering a button this
+    /// transport would refuse — so a constant answer is worse than none.
+    #[test]
+    fn the_available_actions_follow_the_state() {
+        let mut r = Renderer::default();
+        let actions = |r: &mut Renderer| {
+            r.av_transport(&action("GetCurrentTransportActions", &[]))
+                .unwrap()
+                .out_args
+                .iter()
+                .find(|(k, _)| k == "Actions")
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(actions(&mut r), "", "nothing is possible with no media");
+
+        r.av_transport(&action(
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://h/a.mp4")],
+        ))
+        .unwrap();
+        assert_eq!(actions(&mut r), "Play");
+
+        r.av_transport(&action("Play", &[])).unwrap();
+        assert_eq!(actions(&mut r), "Pause,Stop,Seek");
+
+        r.av_transport(&action("Pause", &[])).unwrap();
+        assert_eq!(actions(&mut r), "Play,Stop,Seek");
+
+        r.av_transport(&action(
+            "SetNextAVTransportURI",
+            &[("NextURI", "http://h/b.mp4")],
+        ))
+        .unwrap();
+        assert_eq!(actions(&mut r), "Play,Stop,Seek,Next");
+    }
+
+    /// A URI nothing could ever fetch is refused while the control point is still
+    /// listening, rather than accepted and then failed inside a decode thread.
+    #[test]
+    fn a_uri_we_could_never_fetch_is_refused_at_the_time_it_is_set() {
+        let mut r = Renderer::default();
+        let err = r
+            .av_transport(&action(
+                "SetAVTransportURI",
+                &[("CurrentURI", "not even a uri")],
+            ))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 716);
+        assert!(r.current_uri.is_none(), "and nothing was stored");
+    }
+
+    /// The panel has one gain. Applying a left-channel volume to it would be the wrong
+    /// thing done confidently, with no way for the control point to tell.
+    #[test]
+    fn a_channel_this_device_does_not_have_is_refused() {
+        let mut r = Renderer::default();
+        let err = r
+            .rendering_control(&action(
+                "SetVolume",
+                &[("Channel", "LF"), ("DesiredVolume", "80")],
+            ))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 402);
+        assert_eq!(r.volume, 50, "and the master was left alone");
     }
 }

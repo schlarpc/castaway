@@ -35,6 +35,30 @@ impl SoapAction {
         self.arg(name).ok_or(DlnaError::MissingArgument(name))
     }
 
+    /// Refuse an action addressed to a virtual instance this renderer does not have.
+    ///
+    /// Every AVTransport and RenderingControl action carries an `InstanceID`, this
+    /// renderer has exactly one — 0 — and the argument was read by nothing at all. A
+    /// control point addressing instance 1 therefore drove instance 0 in silence: it
+    /// believed it had created a second transport, and what actually happened was that the
+    /// first one started playing.
+    ///
+    /// A missing or unparseable `InstanceID` is treated as 0 rather than refused. Every
+    /// real control point sends it and sends `0`, and the ones that leave it out of a
+    /// zero-argument getter are not asking about a second instance.
+    ///
+    /// # Errors
+    /// [`DlnaError::InvalidInstanceId`] for anything other than instance 0.
+    pub fn require_instance_zero(&self) -> Result<(), DlnaError> {
+        match self.arg("InstanceID") {
+            None => Ok(()),
+            Some(id) => match id.trim() {
+                "" | "0" => Ok(()),
+                other => Err(DlnaError::InvalidInstanceId(other.to_string())),
+            },
+        }
+    }
+
     /// Parse a SOAP control request body.
     ///
     /// # Errors

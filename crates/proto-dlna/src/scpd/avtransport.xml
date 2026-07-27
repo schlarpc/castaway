@@ -60,6 +60,39 @@
         <argument><name>AbsCount</name><direction>out</direction><relatedStateVariable>AbsoluteCounterPosition</relatedStateVariable></argument>
       </argumentList>
     </action>
+    <!--
+      Implemented and, until now, not advertised — which is the same as not implemented: a
+      control point will not call what the SCPD omits, so `GetDeviceCapabilities` and
+      `GetTransportSettings` were dead code that answered nobody.
+    -->
+    <action>
+      <name>GetDeviceCapabilities</name>
+      <argumentList>
+        <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><name>PlayMedia</name><direction>out</direction><relatedStateVariable>PossiblePlaybackStorageMedia</relatedStateVariable></argument>
+        <argument><name>RecMedia</name><direction>out</direction><relatedStateVariable>PossibleRecordStorageMedia</relatedStateVariable></argument>
+        <argument><name>RecQualityModes</name><direction>out</direction><relatedStateVariable>PossibleRecordQualityModes</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action>
+      <name>GetTransportSettings</name>
+      <argumentList>
+        <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><name>PlayMode</name><direction>out</direction><relatedStateVariable>CurrentPlayMode</relatedStateVariable></argument>
+        <argument><name>RecQualityMode</name><direction>out</direction><relatedStateVariable>CurrentRecordQualityMode</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <!--
+      Optional (§2.4.12), and worth answering: it is UPnP's own version of the rule that a
+      UI must not offer a button the transport would refuse.
+    -->
+    <action>
+      <name>GetCurrentTransportActions</name>
+      <argumentList>
+        <argument><name>InstanceID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><name>Actions</name><direction>out</direction><relatedStateVariable>CurrentTransportActions</relatedStateVariable></argument>
+      </argumentList>
+    </action>
     <action>
       <name>GetMediaInfo</name>
       <argumentList>
@@ -77,8 +110,22 @@
     </action>
   </actionList>
   <serviceStateTable>
-    <stateVariable sendEvents="yes"><name>TransportState</name><dataType>string</dataType></stateVariable>
+    <!--
+      `LastChange` is the only evented variable, and that is the spec's shape rather than
+      ours: §2.3.1 says a conforming AVTransport publisher never events its state variables
+      directly — every change is wrapped in a LastChange document. `TransportState` used to
+      carry sendEvents="yes" here, which promised something no control point expects and
+      no publisher may do.
+    -->
+    <stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>TransportState</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>TransportStatus</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>CurrentPlayMode</name><dataType>string</dataType><defaultValue>NORMAL</defaultValue></stateVariable>
+    <stateVariable sendEvents="no"><name>CurrentRecordQualityMode</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>PossiblePlaybackStorageMedia</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>PossibleRecordStorageMedia</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>PossibleRecordQualityModes</name><dataType>string</dataType></stateVariable>
+    <stateVariable sendEvents="no"><name>CurrentTransportActions</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>TransportPlaySpeed</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AVTransportURI</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>AVTransportURIMetaData</name><dataType>string</dataType></stateVariable>
@@ -98,7 +145,22 @@
     <stateVariable sendEvents="no"><name>RecordStorageMedium</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>RecordMediumWriteStatus</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_InstanceID</name><dataType>ui4</dataType></stateVariable>
-    <stateVariable sendEvents="no"><name>A_ARG_TYPE_SeekMode</name><dataType>string</dataType></stateVariable>
+    <!--
+      The allowedValueList is not decoration. It is purely declarative — nothing in the
+      protocol enforces it — and it is what Home Assistant reads to decide whether to draw
+      a seek bar at all, so omitting it hid the scrubber on a renderer that could seek.
+      Both time units, neither counter unit: `REL_TIME` and `ABS_TIME` are positions in the
+      media, which is what a demuxer seek is; `REL_COUNT`/`ABS_COUNT` are counter positions
+      we do not track and answer with the §2.2.24 sentinel.
+    -->
+    <stateVariable sendEvents="no">
+      <name>A_ARG_TYPE_SeekMode</name>
+      <dataType>string</dataType>
+      <allowedValueList>
+        <allowedValue>REL_TIME</allowedValue>
+        <allowedValue>ABS_TIME</allowedValue>
+      </allowedValueList>
+    </stateVariable>
     <stateVariable sendEvents="no"><name>A_ARG_TYPE_SeekTarget</name><dataType>string</dataType></stateVariable>
   </serviceStateTable>
 </scpd>

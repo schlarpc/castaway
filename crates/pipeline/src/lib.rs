@@ -45,6 +45,7 @@ pub mod nowplaying_card;
 pub mod osd;
 #[cfg(feature = "render")]
 pub mod render_pipeline;
+pub mod seek;
 #[cfg(feature = "render")]
 pub mod tap;
 #[cfg(feature = "render")]
