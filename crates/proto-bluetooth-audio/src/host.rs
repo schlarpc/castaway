@@ -517,7 +517,7 @@ mod tests {
         let peer = BdAddr::new([1, 2, 3, 4, 5, 6]);
         let handle = ConnectionHandle::new(0x0002).unwrap();
         host.load_link_keys([(peer, LinkKey::new([0xAB; 16]))]);
-        host.on_event(&Event::ConnectionComplete {
+        let _ = host.on_event(&Event::ConnectionComplete {
             status: Status::SUCCESS,
             handle,
             addr: peer,
@@ -548,7 +548,7 @@ mod tests {
         let peer = BdAddr::new([1, 2, 3, 4, 5, 6]);
         let handle = ConnectionHandle::new(0x0002).unwrap();
         host.load_link_keys([(peer, LinkKey::new([0xAB; 16]))]);
-        host.on_event(&Event::ConnectionComplete {
+        let _ = host.on_event(&Event::ConnectionComplete {
             status: Status::SUCCESS,
             handle,
             addr: peer,

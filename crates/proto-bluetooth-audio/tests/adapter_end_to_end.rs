@@ -119,10 +119,16 @@ async fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 
 /// Every complete L2CAP PDU the adapter has written, reassembled from ACL fragments.
 fn sent_pdus(transport: &ScriptedTransport) -> Vec<L2capPdu> {
-    let mut reassembler = substrate_hci::Reassembler::new();
+    // One reassembler *per link*, as the adapter itself keeps. Sharing a single one across
+    // handles silently mis-assembles the moment two phones are connected: fragments from
+    // one link land in the other's partial PDU and neither ever completes, which reads as
+    // "the adapter stopped answering" rather than as a bug in the test harness.
+    let mut reassemblers: std::collections::HashMap<u16, substrate_hci::Reassembler> =
+        std::collections::HashMap::new();
     let mut out = Vec::new();
     for packet in transport.sent() {
         if let HciPacket::Acl(acl) = packet {
+            let reassembler = reassemblers.entry(acl.handle.raw()).or_default();
             if let Ok(Some(bytes)) = reassembler.push(&acl) {
                 if let Ok(pdu) = L2capPdu::decode(&bytes) {
                     out.push(pdu);
@@ -134,6 +140,16 @@ fn sent_pdus(transport: &ScriptedTransport) -> Vec<L2capPdu> {
 }
 
 /// Feed one complete L2CAP PDU to the adapter as a single ACL fragment.
+/// Push an L2CAP PDU on a specific ACL link. Kept parameterised because the helpers
+/// above it are, and a test that needs a second link should not have to reinvent it.
+fn push_pdu_on(transport: &ScriptedTransport, handle: u16, pdu: &L2capPdu) {
+    transport.push(HciPacket::Acl(AclPacket::new(
+        ConnectionHandle::new(handle).unwrap(),
+        PacketBoundary::FirstFlushable,
+        pdu.encode().unwrap(),
+    )));
+}
+
 fn push_pdu(transport: &ScriptedTransport, pdu: &L2capPdu) {
     transport.push(HciPacket::Acl(AclPacket::new(
         ConnectionHandle::new(HANDLE).unwrap(),
@@ -192,9 +208,20 @@ async fn connected_to(
 
 /// Open an L2CAP channel to `psm` from the phone side. Returns (our cid, their cid).
 async fn open_channel(transport: &ScriptedTransport, psm: Psm, phone_cid: u16) -> (Cid, Cid) {
+    open_channel_on(transport, HANDLE, psm, phone_cid).await
+}
+
+/// The same, on a nominated ACL link.
+async fn open_channel_on(
+    transport: &ScriptedTransport,
+    handle: u16,
+    psm: Psm,
+    phone_cid: u16,
+) -> (Cid, Cid) {
     let before = sent_pdus(transport).len();
-    push_pdu(
+    push_pdu_on(
         transport,
+        handle,
         &L2capPdu::new(
             Cid::SIGNALING,
             L2capSignal::ConnectionRequest {
@@ -277,9 +304,22 @@ async fn avdtp(
     signal: Signal,
     payload: &[u8],
 ) -> Message {
+    avdtp_on(transport, HANDLE, cid, transaction, signal, payload).await
+}
+
+/// The same, on a nominated ACL link.
+async fn avdtp_on(
+    transport: &ScriptedTransport,
+    handle: u16,
+    cid: Cid,
+    transaction: u8,
+    signal: Signal,
+    payload: &[u8],
+) -> Message {
     let before = sent_pdus(transport).len();
-    push_pdu(
+    push_pdu_on(
         transport,
+        handle,
         &L2capPdu::new(
             cid,
             Message::command(transaction, signal, Bytes::copy_from_slice(payload)).encode(),
@@ -1774,5 +1814,156 @@ async fn position_reaches_the_card_and_not_applicable_is_not_shown_as_49_days() 
             .count()
             > 1,
         "position must be re-subscribed after each CHANGED: {events:x?}"
+    );
+}
+
+/// Drive a phone from connected to streaming, returning the pieces a test needs after.
+///
+/// Extracted so the *post*-START paths can be exercised at all: everything before this
+/// point had tests and everything after it — suspend, restart, reconfigure, a second
+/// phone — had none, which is how a stream that could never resume would have gone
+/// unnoticed.
+async fn stream_up(
+    transport: &ScriptedTransport,
+    signaling_cid: u16,
+    media_cid: u16,
+) -> (Cid, Cid, Seid) {
+    let (signaling, _) = open_channel(transport, Psm::AVDTP, signaling_cid).await;
+    let discover = avdtp(transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = eventually("an aptX endpoint", || {
+        discover
+            .payload
+            .chunks(2)
+            .filter_map(|c| Seid::from_shifted(c[0]).ok())
+            .nth(2)
+    })
+    .await;
+
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_48000,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(transport, signaling, 3, Signal::SetConfiguration, &set).await;
+    avdtp(transport, signaling, 4, Signal::Open, &[seid.shifted()]).await;
+
+    let (media, _) = open_channel(transport, Psm::AVDTP, media_cid).await;
+    avdtp(transport, signaling, 5, Signal::Start, &[seid.shifted()]).await;
+    (signaling, media, seid)
+}
+
+/// One aptX media packet, distinguishable by its first byte.
+fn media_packet(marker: u8) -> Bytes {
+    let mut payload = BytesMut::new();
+    payload.put_slice(&[marker, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28]);
+    payload.freeze()
+}
+
+#[tokio::test]
+async fn a_stream_that_is_suspended_can_be_started_again() {
+    // Pausing on the phone sends SUSPEND, pressing play sends START. `sink_flow.rs`
+    // covers that at the state-machine level and nothing covered it end to end — so a
+    // resume that silently produced no more audio, which is the shape of most of the bugs
+    // in this file, would have gone unnoticed.
+    let (transport, mut rx) = connected().await;
+    let (signaling, media, seid) = stream_up(&transport, 0x0040, 0x0041).await;
+
+    let msg = eventually("an audio session event", || rx.try_recv().ok()).await;
+    let SessionEvent::Audio { source, .. } = msg.event else {
+        panic!("expected an audio session, got {:?}", msg.event);
+    };
+    let FrameSource::Encoded(mut frames) = source else {
+        panic!("audio must arrive as encoded frames");
+    };
+
+    push_pdu(&transport, &L2capPdu::new(media, media_packet(0x11)));
+    let first = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("a frame before the pause")
+        .expect("open");
+    assert_eq!(first.data[0], 0x11);
+
+    // Pause.
+    let reply = avdtp(&transport, signaling, 6, Signal::Suspend, &[seid.shifted()]).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "a suspend from OPEN is legal"
+    );
+
+    // Play again. The configuration survives a suspend, so this needs no re-negotiation.
+    let reply = avdtp(&transport, signaling, 7, Signal::Start, &[seid.shifted()]).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "a restart after suspend must be accepted, or the phone can never resume"
+    );
+
+    push_pdu(&transport, &L2capPdu::new(media, media_packet(0x22)));
+    let second = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("audio must flow again after a restart")
+        .expect("the session must not have been torn down by the pause");
+    assert_eq!(
+        second.data[0], 0x22,
+        "and it must be the *new* packet, not a replay"
+    );
+}
+
+#[tokio::test]
+async fn a_reconfigured_stream_gets_a_session_at_the_new_rate() {
+    // The adapter half of RECONFIGURE. `sink_flow.rs` proves the state machine validates
+    // and accepts it; this proves the *consequence* — that the audio session opened at the
+    // old rate is torn down and a new one opened at the new one. Without that the sink
+    // agrees to 44.1 kHz, the phone re-encodes, and the decoder and output device are both
+    // still sized for 48: the room gets the wrong pitch and nothing is logged.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _media, seid) = stream_up(&transport, 0x0040, 0x0041).await;
+
+    let msg = eventually("the first audio session", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::Audio { .. }))
+    })
+    .await;
+    let SessionEvent::Audio { format, .. } = msg.event else {
+        unreachable!("filtered")
+    };
+    assert_eq!(format.sample_rate(), 48_000);
+
+    // Back to OPEN — RECONFIGURE is only legal there — then change the rate.
+    avdtp(&transport, signaling, 6, Signal::Suspend, &[seid.shifted()]).await;
+    let at_44k = CodecCapability::AptX {
+        rates: SampleRates::HZ_44100,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = at_44k.encode();
+    let mut payload = vec![seid.shifted(), 0x07];
+    payload.push(u8::try_from(codec.len()).unwrap());
+    payload.extend_from_slice(&codec);
+    let reply = avdtp(&transport, signaling, 7, Signal::Reconfigure, &payload).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept
+    );
+
+    // Play again: the session that opens must be the *new* shape.
+    avdtp(&transport, signaling, 8, Signal::Start, &[seid.shifted()]).await;
+    let msg = eventually("a session at the reconfigured rate", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::Audio { .. }))
+    })
+    .await;
+    let SessionEvent::Audio { format, .. } = msg.event else {
+        unreachable!("filtered")
+    };
+    assert_eq!(
+        format.sample_rate(),
+        44_100,
+        "the decoder must follow the sender's new rate, not the one it opened with"
     );
 }

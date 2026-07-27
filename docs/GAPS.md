@@ -59,9 +59,14 @@ Still open, roughly in the order they are worth taking:
 2. **G45/G49/G50** — the remaining Spotify items: queue-resolution retries, shuffle and
    repeat, local files.
 3. **G48** — DIAL REST conformance (CORS, 200-on-relaunch, percent-decoding, `MX`).
-4. **G53/G54** — the remaining test tiers: streaming error paths in `adapter_end_to_end`
-   (SUSPEND→re-START, two phones at once, a bonded phone reconnecting), and a
-   self-contained YouTube regression test.
+4. **G53 (partly) / G54** — SUSPEND→re-START and RECONFIGURE→re-START are covered now,
+   both mutation-checked. Two phones streaming *concurrently* is not: the harness gained
+   per-link reassembly and a per-handle push, but the second link's AVDTP signalling still
+   goes unanswered in the test and I did not find out why before stopping. Since the
+   production preemption path (`pause_preempted`) is reached from the same `dispatch` for
+   either link, the likeliest cause is the harness rather than the adapter — but that is a
+   guess, and the case Q27 records stays unproven either way. Also still missing: a bonded
+   phone reconnecting after restart, and a self-contained YouTube regression test (G54).
 5. **G30 (Windows half)** — a Widevine CDM for the deploy artifact, which means extracting
    from a Chrome-for-Windows installer: a redistribution decision, not a patch.
 
@@ -597,7 +602,7 @@ display or the audio device, and two cannot take it back afterwards.
   or any fuzz of random bytes into `handle_pdu`. `ertm.rs` is the exception and is well
   covered on error paths.
 
-- **G53 — `adapter_end_to_end.rs` (1511 lines) is thorough about bring-up and silent about
+- 🟡 **G53 — `adapter_end_to_end.rs` (1511 lines) is thorough about bring-up and silent about
   streaming.** One full aptX stream that pushes **exactly one media packet**. Never
   exercised: SUSPEND→re-START, CLOSE→reconfigure, RECONFIGURE at all, ABORT over the wire,
   two phones streaming concurrently, inbound `SET_ABSOLUTE_VOLUME`, inbound
