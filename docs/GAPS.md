@@ -42,9 +42,12 @@ Decisions taken, so nobody re-litigates them from the entry text alone:
 
 Still open, roughly in the order they are worth taking:
 
-1. **G3** — CEF lifecycle/load-error handling, the one supervisor still missing. Needs
-   `LifeSpanHandler`/`LoadHandler` wiring, and cannot be honestly verified without
-   provoking a real renderer crash.
+1. **G3 (partly done)** — the handlers and the recovery policy are in. `on_load_end` and
+   `on_load_error` are observed firing; the policy is unit-tested. What is *not* verified
+   is `on_render_process_terminated`: `chrome://crash` kills the renderer before CEF
+   considers the browser created, and killing the render process by hand is unreliable to
+   target (the zygote rewrites its forks' argv and this build sets no `CrRendererMain`
+   thread name). Needs one run on the real box with a renderer killed under a live cast.
 2. **G25/G26** — AVRCP metadata fragmentation and playback position. Fragmentation is the
    one that bites: a long or CJK title leaves the card permanently blank.
 3. **G39** — `ControlCapabilities` derived from the peer's feature bitmask, so the panel
@@ -109,7 +112,7 @@ display or the audio device, and two cannot take it back afterwards.
   The architecture doc names this as the lesson from the wedged UB500 — the STALL half was
   fixed, the exit-and-never-return half was not.
 
-- **G3 — No CEF lifecycle, load-error, or renderer-death handling. CONFIRMED, silent.**
+- 🟡 **G3 — No CEF lifecycle, load-error, or renderer-death handling. CONFIRMED, silent.**
   `pipeline/src/cef_browser.rs:489`: the `Client` provides render/request/display handlers
   and no `LifeSpanHandler`, no `LoadHandler` (`on_load_error`/`on_load_end`), no
   `on_render_process_terminated`. A sad-tab renderer crash freezes the last painted frame
