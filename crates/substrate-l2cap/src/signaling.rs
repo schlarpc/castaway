@@ -241,6 +241,36 @@ impl ConfigOption {
     }
 }
 
+/// Why a command was refused. The spec's `Command Reject` reason codes.
+pub mod reject_reason {
+    /// The command code is not one we implement, or the command did not parse.
+    pub const NOT_UNDERSTOOD: u16 = 0x0000;
+    /// The command was larger than our signalling MTU.
+    pub const MTU_EXCEEDED: u16 = 0x0001;
+    /// The command named a channel id that means nothing on this link.
+    pub const INVALID_CID: u16 = 0x0002;
+}
+
+/// One command we could not act on, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandRefusal {
+    /// The id of the command being refused, so the peer can match it.
+    pub id: u8,
+    /// One of [`reject_reason`].
+    pub reason: u16,
+}
+
+/// What a C-frame decoded to: the commands we understood, and the refusals owed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecodedFrame {
+    /// Commands to act on, in the order they arrived.
+    pub signals: Vec<Signal>,
+    /// `Command Reject`s to send back.
+    pub rejects: Vec<CommandRefusal>,
+    /// The frame ended mid-command, so anything after that point was not parsed.
+    pub truncated: bool,
+}
+
 /// A signaling command. `id` correlates a response with its request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -529,6 +559,51 @@ impl Signal {
             buf = &buf[4 + len..];
         }
         Ok(out)
+    }
+
+    /// Decode a whole C-frame, keeping what parses and noting what the peer is owed a
+    /// refusal for.
+    ///
+    /// [`Self::decode_all`] fails the entire frame on one bad command, which throws away
+    /// well-formed commands packed alongside it — the very packing this module went to
+    /// the trouble of supporting — and leaves the peer with silence where the spec
+    /// requires `Command Reject`. A phone that packs an unrecognised command (`Create
+    /// Channel`, `Move Channel`, anything future) with a `ConnectionRequest` would never
+    /// get its channel, and never learn why.
+    ///
+    /// A truncated header or body stops parsing: past that point the stream cannot be
+    /// resynchronised, because command boundaries come from lengths inside it.
+    #[must_use]
+    pub fn decode_frame(mut buf: &[u8]) -> DecodedFrame {
+        let mut frame = DecodedFrame::default();
+        while !buf.is_empty() {
+            if buf.len() < 4 {
+                // No id to address a rejection to; nothing useful to say.
+                frame.truncated = true;
+                break;
+            }
+            let (code, id) = (buf[0], buf[1]);
+            let len = usize::from(u16::from_le_bytes([buf[2], buf[3]]));
+            if buf.len() < 4 + len {
+                frame.truncated = true;
+                frame.rejects.push(CommandRefusal {
+                    id,
+                    reason: reject_reason::NOT_UNDERSTOOD,
+                });
+                break;
+            }
+            match Self::decode_one(code, id, &buf[4..4 + len]) {
+                Ok(sig) => frame.signals.push(sig),
+                // The length was well-formed even though the command was not, so the next
+                // command is still findable and the frame is worth continuing.
+                Err(_) => frame.rejects.push(CommandRefusal {
+                    id,
+                    reason: reject_reason::NOT_UNDERSTOOD,
+                }),
+            }
+            buf = &buf[4 + len..];
+        }
+        frame
     }
 
     fn decode_one(code: u8, id: u8, body: &[u8]) -> Result<Self, L2capError> {

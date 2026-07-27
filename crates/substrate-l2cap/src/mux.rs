@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
+use tracing::debug;
 
 use crate::error::L2capError;
 use crate::ertm::{
@@ -208,8 +209,41 @@ pub struct Multiplexer {
     next_id: u8,
     /// Local CID awaiting a response, keyed by the signaling id we used.
     pending: HashMap<u8, u16>,
+    /// Requests we have sent and not yet had answered, with their response timers.
+    outstanding: HashMap<u8, Outstanding>,
     local_mtu: u16,
 }
+
+/// A signalling request awaiting its response.
+///
+/// Nothing timed these before, so a `ConnectionRequest` or `ConfigurationRequest` the peer
+/// simply never answered left the channel in `WaitConnectRsp`/`WaitConfig` forever: no
+/// retransmission, no `ChannelClosed`, the CID never freed, the caller never told. That is
+/// a hang rather than a failure, and it bit the channels *we* dial — a phone that ignores
+/// our SDP or AVCTP connect left cover art and the outbound AVRCP channel permanently
+/// dead for that link, because the code that opens them waits on a flag that never clears.
+#[derive(Debug)]
+struct Outstanding {
+    /// The local channel this request belongs to, so a give-up can tear it down.
+    raw_cid: u16,
+    /// The request itself, kept so it can be sent again — the spec wants at least one
+    /// retransmission before the channel is abandoned, and a lost packet is much more
+    /// likely than a peer that will never answer.
+    request: Signal,
+    /// Time left on the current attempt.
+    remaining: Duration,
+    /// Retransmissions used so far.
+    retries: u8,
+}
+
+/// The response timeout (RTX). The spec allows 1–60 seconds.
+///
+/// Toward the short end: everything we send a request for is on a local radio link with a
+/// device in the same room, and the cost of being wrong is one retransmission.
+const RTX: Duration = Duration::from_secs(4);
+
+/// How many times to resend before concluding the peer is not going to answer.
+const RTX_RETRIES: u8 = 2;
 
 impl Default for Multiplexer {
     fn default() -> Self {
@@ -228,6 +262,7 @@ impl Multiplexer {
             next_cid: Cid::DYNAMIC_START,
             next_id: 1,
             pending: HashMap::new(),
+            outstanding: HashMap::new(),
             local_mtu,
         }
     }
@@ -359,11 +394,16 @@ impl Multiplexer {
         self.pending.insert(id, local_cid.raw());
         Ok((
             local_cid,
-            vec![Self::signal(&Signal::ConnectionRequest {
-                id,
-                psm,
-                source_cid: local_cid,
-            })?],
+            vec![{
+                let request = Signal::ConnectionRequest {
+                    id,
+                    psm,
+                    source_cid: local_cid,
+                };
+                let event = Self::signal(&request)?;
+                self.awaiting(id, local_cid.raw(), request);
+                event
+            }],
         ))
     }
 
@@ -422,11 +462,14 @@ impl Multiplexer {
         ch.state = ChannelState::WaitDisconnect;
         let (dest, src) = (ch.remote_cid, ch.local_cid);
         self.ertm.remove(&cid.raw());
-        Ok(vec![Self::signal(&Signal::DisconnectionRequest {
+        let request = Signal::DisconnectionRequest {
             id,
             dest_cid: dest,
             source_cid: src,
-        })?])
+        };
+        let event = Self::signal(&request)?;
+        self.awaiting(id, cid.raw(), request);
+        Ok(vec![event])
     }
 
     /// The ACL link went away: every channel on it is gone.
@@ -440,6 +483,7 @@ impl Multiplexer {
             })
             .collect();
         self.pending.clear();
+        self.outstanding.clear();
         self.ertm.clear();
         closed
     }
@@ -450,7 +494,29 @@ impl Multiplexer {
     /// reason the caller can sleep on its socket rather than spinning on a tick.
     #[must_use]
     pub fn next_timeout(&self) -> Option<Duration> {
-        self.ertm.values().filter_map(Ertm::next_timeout).min()
+        self.ertm
+            .values()
+            .filter_map(Ertm::next_timeout)
+            .chain(self.outstanding.values().map(|o| o.remaining))
+            .min()
+    }
+
+    /// Note that we have sent `request` and are waiting for its answer.
+    fn awaiting(&mut self, id: u8, raw_cid: u16, request: Signal) {
+        self.outstanding.insert(
+            id,
+            Outstanding {
+                raw_cid,
+                request,
+                remaining: RTX,
+                retries: 0,
+            },
+        );
+    }
+
+    /// A response arrived (or the request became moot): stop timing it.
+    fn answered(&mut self, id: u8) {
+        self.outstanding.remove(&id);
     }
 
     /// Advance every retransmission engine by `elapsed`.
@@ -460,6 +526,35 @@ impl Multiplexer {
     pub fn tick(&mut self, elapsed: Duration) -> Vec<L2capEvent> {
         let mut events = Vec::new();
         let mut failed = Vec::new();
+
+        // Response timers first: a peer that has stopped answering should be given up on
+        // in bounded time rather than held open against a CID nobody will ever free.
+        let mut expired = Vec::new();
+        for (id, out) in &mut self.outstanding {
+            out.remaining = out.remaining.saturating_sub(elapsed);
+            if out.remaining.is_zero() {
+                expired.push(*id);
+            }
+        }
+        for id in expired {
+            let Some(out) = self.outstanding.get_mut(&id) else {
+                continue;
+            };
+            if out.retries < RTX_RETRIES {
+                out.retries += 1;
+                out.remaining = RTX;
+                let request = out.request.clone();
+                if let Ok(event) = Self::signal(&request) {
+                    events.push(event);
+                }
+            } else {
+                let raw_cid = out.raw_cid;
+                self.outstanding.remove(&id);
+                self.pending.remove(&id);
+                failed.push(Cid::new(raw_cid));
+            }
+        }
+
         for (raw, ertm) in &mut self.ertm {
             let out = ertm.tick(elapsed);
             let Some(ch) = self.channels.get(raw) else {
@@ -485,8 +580,27 @@ impl Multiplexer {
     /// have open.
     pub fn handle_pdu(&mut self, pdu: &L2capPdu) -> Result<Vec<L2capEvent>, L2capError> {
         if pdu.cid == Cid::SIGNALING {
+            // Per-command, not per-frame. Failing the whole C-frame on one bad command
+            // discarded well-formed commands packed alongside it — the packing this crate
+            // went to the trouble of supporting — and left the peer with silence where
+            // the spec requires `Command Reject`. A phone that packs an unrecognised
+            // command with a `ConnectionRequest` never got its channel and never learned
+            // why.
+            let frame = Signal::decode_frame(&pdu.payload);
             let mut out = Vec::new();
-            for sig in Signal::decode_all(&pdu.payload)? {
+            for refusal in &frame.rejects {
+                debug!(
+                    id = refusal.id,
+                    reason = refusal.reason,
+                    "l2cap: rejecting a command"
+                );
+                out.push(Self::signal(&Signal::CommandReject {
+                    id: refusal.id,
+                    reason: refusal.reason,
+                    data: Bytes::new(),
+                })?);
+            }
+            for sig in frame.signals {
                 out.extend(self.handle_signal(sig)?);
             }
             return Ok(out);
@@ -596,9 +710,10 @@ impl Multiplexer {
                 }
                 Ok(out)
             }
-            Signal::DisconnectionResponse { source_cid, .. } => {
+            Signal::DisconnectionResponse { id, source_cid, .. } => {
                 // The peer named our channel by *its* source CID in the response's
                 // dest field; our own CID is the one we sent as source.
+                self.answered(id);
                 let mut out = Vec::new();
                 self.ertm.remove(&source_cid.raw());
                 if let Some(ch) = self.channels.remove(&source_cid.raw()) {
@@ -629,9 +744,19 @@ impl Multiplexer {
                     data,
                 })?])
             }
-            Signal::EchoResponse { .. }
-            | Signal::InformationResponse { .. }
-            | Signal::CommandReject { .. } => Ok(Vec::new()),
+            Signal::CommandReject { id, reason, .. } => {
+                // The peer refused something we sent. Swallowing this meant waiting out
+                // the response timer for an answer that is never coming — and before
+                // there *was* a response timer, waiting forever.
+                let Some(out) = self.outstanding.remove(&id) else {
+                    return Ok(Vec::new());
+                };
+                let cid = Cid::new(out.raw_cid);
+                self.pending.remove(&id);
+                debug!(%cid, reason, "l2cap: peer rejected our command");
+                Ok(self.fail_channel(cid))
+            }
+            Signal::EchoResponse { .. } | Signal::InformationResponse { .. } => Ok(Vec::new()),
         }
     }
 
@@ -700,6 +825,7 @@ impl Multiplexer {
             .get(&id)
             .copied()
             .unwrap_or_else(|| source_cid.raw());
+        self.answered(id);
         let Some(ch) = self.channels.get_mut(&local_raw) else {
             return Ok(Vec::new());
         };
@@ -737,12 +863,15 @@ impl Multiplexer {
             )));
             options.push(ConfigOption::Fcs(ch.parameters.fcs));
         }
-        Self::signal(&Signal::ConfigurationRequest {
+        let request = Signal::ConfigurationRequest {
             id: config_id,
             dest_cid: ch.remote_cid,
             flags: 0,
             options,
-        })
+        };
+        let event = Self::signal(&request)?;
+        self.awaiting(config_id, raw_cid, request);
+        Ok(event)
     }
 
     fn on_config_request(

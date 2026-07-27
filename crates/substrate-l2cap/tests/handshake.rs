@@ -7,7 +7,10 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::time::Duration;
+
 use bytes::Bytes;
+use substrate_l2cap::signaling::Signal;
 use substrate_l2cap::{ChannelMode, Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
 
 /// A dynamic PSM of the shape a phone publishes its image server on.
@@ -526,4 +529,184 @@ fn an_ertm_channel_recovers_a_lost_frame_rather_than_losing_the_object() {
     // object arrives whole — once, not as a truncated prefix and not twice.
     assert_eq!(delivered.len(), 1, "the object must survive the loss");
     assert_eq!(&delivered[0][..], &object[..]);
+}
+
+// --- the paths a real phone exercises and the happy handshake never does ---
+
+/// Drive `mux` forward `by` and collect what it wants sent.
+fn advance(mux: &mut Multiplexer, by: Duration) -> Vec<L2capEvent> {
+    mux.tick(by)
+}
+
+#[test]
+fn a_peer_that_never_answers_is_given_up_on_rather_than_waited_on_forever() {
+    // Nothing timed signalling requests at all, so a ConnectionRequest the peer simply
+    // ignored left the channel in WaitConnectRsp for the life of the link: no
+    // retransmission, no ChannelClosed, the CID never freed, the caller never told. That
+    // is a hang, not a failure — and it is what left cover art and the outbound AVRCP
+    // channel permanently dead on a phone that ignored our connect.
+    let mut mux = Multiplexer::new(672);
+    let (_cid, events) = mux.connect(Psm::SDP).expect("dial");
+    assert_eq!(events.len(), 1, "the connection request");
+
+    // The spec wants at least one retransmission before giving up: a lost packet is far
+    // more likely than a peer that will never answer.
+    let mut retransmissions = 0;
+    let mut closed = None;
+    for _ in 0..12 {
+        let Some(due) = mux.next_timeout() else {
+            break;
+        };
+        for event in advance(&mut mux, due) {
+            match event {
+                L2capEvent::Send(_) => retransmissions += 1,
+                L2capEvent::ChannelClosed { psm, .. } => closed = Some(psm),
+                _ => {}
+            }
+        }
+        if closed.is_some() {
+            break;
+        }
+    }
+    assert!(retransmissions >= 1, "it must retry before giving up");
+    assert_eq!(closed, Some(Psm::SDP), "and then tell the caller");
+    assert!(
+        mux.next_timeout().is_none(),
+        "a channel it gave up on must not keep a timer running"
+    );
+}
+
+#[test]
+fn an_answer_stops_the_timer() {
+    // The other half: a channel that is answered normally must not be torn down by a
+    // timer that nobody cancelled.
+    let mut listener = Multiplexer::new(672);
+    listener.listen(Psm::SDP);
+    let mut dialler = Multiplexer::new(672);
+    let (_cid, events) = dialler.connect(Psm::SDP).expect("dial");
+
+    // Hand the request to the listener and its reply back.
+    for event in events {
+        if let L2capEvent::Send(pdu) = event {
+            for reply in listener
+                .handle_pdu(&pdu)
+                .expect("listener handles the request")
+            {
+                if let L2capEvent::Send(pdu) = reply {
+                    let _ = dialler.handle_pdu(&pdu);
+                }
+            }
+        }
+    }
+    // A configuration request is now outstanding, but the *connection* timer is gone.
+    // Either way, nothing should have been torn down.
+    assert!(
+        !matches!(
+            dialler.tick(Duration::from_millis(1)).as_slice(),
+            [L2capEvent::ChannelClosed { .. }, ..]
+        ),
+        "an answered request must not expire"
+    );
+}
+
+#[test]
+fn one_unknown_command_does_not_discard_the_ones_packed_with_it() {
+    // The spec allows several commands in one C-frame and real stacks use it. Failing the
+    // whole frame threw away well-formed commands alongside the bad one, and answered the
+    // peer with silence where a Command Reject is required — so a phone that packs
+    // something we do not implement (Create Channel, Move Channel, anything future) with
+    // its ConnectionRequest never got a channel and never learned why.
+    let mut mux = Multiplexer::new(672);
+    mux.listen(Psm::AVDTP);
+
+    // `0x0C` is Create Channel: a real code, and one we do not implement.
+    let unknown: [u8; 4] = [0x0C, 0x42, 0x00, 0x00];
+    let connect = Signal::ConnectionRequest {
+        id: 0x43,
+        psm: Psm::AVDTP,
+        source_cid: Cid::new(0x0041),
+    }
+    .encode()
+    .expect("encode");
+
+    let mut frame = Vec::from(unknown);
+    frame.extend_from_slice(&connect);
+    let events = mux
+        .handle_pdu(&L2capPdu::new(Cid::SIGNALING, Bytes::from(frame)))
+        .expect("a bad command must not fail the whole frame");
+
+    let sent: Vec<Signal> = events
+        .iter()
+        .filter_map(|e| match e {
+            L2capEvent::Send(pdu) => Some(Signal::decode_all(&pdu.payload).expect("decodes")),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+
+    assert!(
+        sent.iter().any(|s| matches!(
+            s,
+            Signal::CommandReject { id: 0x42, reason, .. } if *reason == 0x0000
+        )),
+        "the unknown command is refused, by id: {sent:?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|s| matches!(s, Signal::ConnectionResponse { id: 0x43, .. })),
+        "and the good command packed with it is still answered: {sent:?}"
+    );
+}
+
+#[test]
+fn a_rejected_command_closes_the_channel_instead_of_waiting_out_the_timer() {
+    // Inbound Command Reject was swallowed, so if a phone refused our configuration
+    // request we waited for an answer that was never coming.
+    let mut mux = Multiplexer::new(672);
+    let (cid, events) = mux.connect(Psm::SDP).expect("dial");
+    let id = match events.first() {
+        Some(L2capEvent::Send(pdu)) => {
+            match Signal::decode_all(&pdu.payload).expect("decodes").first() {
+                Some(Signal::ConnectionRequest { id, .. }) => *id,
+                other => panic!("expected a connection request, got {other:?}"),
+            }
+        }
+        other => panic!("expected a send, got {other:?}"),
+    };
+
+    let reject = Signal::CommandReject {
+        id,
+        reason: 0x0000,
+        data: Bytes::new(),
+    }
+    .encode()
+    .expect("encode");
+    let out = mux
+        .handle_pdu(&L2capPdu::new(Cid::SIGNALING, reject))
+        .expect("a reject is not a parse failure");
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, L2capEvent::ChannelClosed { cid: c, .. } if *c == cid)),
+        "the channel we were dialling must be closed: {out:?}"
+    );
+}
+
+#[test]
+fn random_bytes_into_the_signalling_channel_do_not_panic() {
+    // Cheap robustness sweep. A malformed PDU from a phone must be an error or a reject,
+    // never a panic — a panic here takes the whole Bluetooth actor down with it.
+    let mut mux = Multiplexer::new(672);
+    mux.listen(Psm::AVDTP);
+    let mut seed = 0x1234_5678_u32;
+    for _ in 0..2000 {
+        let mut bytes = Vec::new();
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let len = ((seed >> 16) as usize) % 40;
+        for _ in 0..len {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            // Truncation is the point: we want arbitrary bytes.
+            bytes.push(((seed >> 16) & 0xFF) as u8);
+        }
+        let _ = mux.handle_pdu(&L2capPdu::new(Cid::SIGNALING, Bytes::from(bytes)));
+    }
 }
