@@ -59,7 +59,8 @@ const POSITION_INTERVAL_SECS: u32 = 1;
 /// A callback rather than a path, because this crate must not open files (ground rule
 /// 2): where the config directory lives is the app's business, and keeping it out of
 /// here is what lets the whole adapter be tested with no filesystem at all.
-pub type OnPaired = Arc<dyn Fn(BdAddr, LinkKey) + Send + Sync>;
+/// `None` means "forget this peer's key": it was tried and the peer refused it.
+pub type OnPaired = Arc<dyn Fn(BdAddr, Option<LinkKey>) + Send + Sync>;
 
 /// Configuration for the Bluetooth adapter.
 #[derive(Clone)]
@@ -542,13 +543,25 @@ impl BluetoothAdapter {
                 .map_err(|e| CoreError::Adapter(format!("hci encode: {e}")))?;
             self.send(packet).await?;
         }
-        if let HostAction::Paired { peer, key } = action {
-            info!(%peer, "bluetooth: paired");
-            // Persistence is the app's job — it owns the config directory — so the key
-            // goes out through a callback rather than to a path this crate knows.
-            if let Some(on_paired) = &self.config.on_paired {
-                on_paired(*peer, *key);
+        match action {
+            HostAction::Paired { peer, key } => {
+                info!(%peer, "bluetooth: paired");
+                // Persistence is the app's job — it owns the config directory — so the
+                // key goes out through a callback rather than to a path this crate knows.
+                if let Some(on_paired) = &self.config.on_paired {
+                    on_paired(*peer, Some(*key));
+                }
             }
+            HostAction::Unpaired { peer } => {
+                // Forgotten in memory already; this drops it from disk, or the phone that
+                // could not authenticate with it cannot authenticate after a reboot
+                // either — the loop just becomes durable.
+                info!(%peer, "bluetooth: forgetting a stale link key");
+                if let Some(on_paired) = &self.config.on_paired {
+                    on_paired(*peer, None);
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

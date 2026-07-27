@@ -159,8 +159,8 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
     // session over.
     let store_path = keys_path.clone();
     let on_paired: proto_bluetooth_audio::adapter::OnPaired = Arc::new(move |addr, key| {
-        if let Err(e) = store_link_key(&store_path, addr, &key) {
-            warn!(error = %format!("{e:#}"), %addr, "could not persist the link key");
+        if let Err(e) = store_link_key(&store_path, addr, key.as_ref()) {
+            warn!(error = %format!("{e:#}"), %addr, "could not update the stored link key");
         }
     });
 
@@ -325,7 +325,11 @@ fn parse_link_key(line: &str) -> Option<(BdAddr, LinkKey)> {
 ///
 /// # Errors
 /// If the state directory cannot be created or written.
-fn store_link_key(path: &Path, addr: BdAddr, key: &LinkKey) -> anyhow::Result<()> {
+/// Write `key` for `addr`, or remove the entry entirely when it is `None`.
+///
+/// Removal matters as much as storage: a key the peer has stopped accepting must not
+/// survive a restart, or the connect/authenticate/fail loop it causes becomes permanent.
+fn store_link_key(path: &Path, addr: BdAddr, key: Option<&LinkKey>) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
@@ -340,14 +344,16 @@ fn store_link_key(path: &Path, addr: BdAddr, key: &LinkKey) -> anyhow::Result<()
         .filter(|line| parse_link_key(line).is_none_or(|(stored, _)| stored != addr))
         .map(str::to_owned)
         .collect();
-    kept.push(format!(
-        "{addr} {}",
-        key.as_bytes().iter().fold(String::new(), |mut acc, b| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
-    ));
+    if let Some(key) = key {
+        kept.push(format!(
+            "{addr} {}",
+            key.as_bytes().iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+        ));
+    }
 
     let mut file =
         std::fs::File::create(path).with_context(|| format!("writing {}", path.display()))?;
@@ -432,7 +438,7 @@ mod tests {
         let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let key = LinkKey::new([0xAB; 16]);
 
-        store_link_key(&path, addr, &key).unwrap();
+        store_link_key(&path, addr, Some(&key)).unwrap();
         let loaded = load_link_keys(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, addr);
@@ -448,8 +454,8 @@ mod tests {
         let path = link_keys_path(&dir);
         let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
 
-        store_link_key(&path, addr, &LinkKey::new([0x11; 16])).unwrap();
-        store_link_key(&path, addr, &LinkKey::new([0x22; 16])).unwrap();
+        store_link_key(&path, addr, Some(&LinkKey::new([0x11; 16]))).unwrap();
+        store_link_key(&path, addr, Some(&LinkKey::new([0x22; 16]))).unwrap();
 
         let loaded = load_link_keys(&path);
         assert_eq!(loaded.len(), 1, "one entry per peer");
@@ -463,8 +469,8 @@ mod tests {
         let path = link_keys_path(&dir);
         let a: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let b: BdAddr = "11:22:33:44:55:66".parse().unwrap();
-        store_link_key(&path, a, &LinkKey::new([0x11; 16])).unwrap();
-        store_link_key(&path, b, &LinkKey::new([0x22; 16])).unwrap();
+        store_link_key(&path, a, Some(&LinkKey::new([0x11; 16]))).unwrap();
+        store_link_key(&path, b, Some(&LinkKey::new([0x22; 16]))).unwrap();
 
         let loaded = load_link_keys(&path);
         assert_eq!(loaded.len(), 2);

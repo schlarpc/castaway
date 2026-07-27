@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use substrate_hci::{
     AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, ConnectionHandle, Event,
@@ -74,6 +74,15 @@ pub enum HostAction {
         peer: BdAddr,
         /// The key.
         key: LinkKey,
+    },
+    /// A stored link key turned out to be stale and has been forgotten; the caller should
+    /// drop it from disk too.
+    ///
+    /// Without this the key survives a restart and the phone that cannot authenticate with
+    /// it cannot authenticate after a reboot either — the loop just becomes durable.
+    Unpaired {
+        /// The peer whose key is no longer valid.
+        peer: BdAddr,
     },
     /// The controller freed ACL buffers; this many fragments may be sent again.
     Credits {
@@ -379,6 +388,55 @@ impl HostController {
                 }
             }
 
+            Event::AuthenticationComplete { status, handle } => {
+                let peer = self.connections.get(&handle.raw()).copied();
+                if status.is_success() {
+                    debug!(?peer, "bluetooth: authenticated");
+                    return Vec::new();
+                }
+                // A stale link key is the overwhelmingly likely cause: the phone was
+                // factory reset, or forgot us, so the key we replied to `LinkKeyRequest`
+                // with no longer matches. Keeping it produces a silent connect/authenticate
+                // /disconnect loop — the phone tries, fails, tries again — with nothing in
+                // the log beyond `link down`, because both events were falling into the
+                // wildcard below.
+                //
+                // Dropping it costs one re-pairing, which is four seconds of someone's
+                // attention. Keeping it costs a phone that can never connect again.
+                match peer.filter(|addr| self.link_keys.contains_key(addr)) {
+                    Some(addr) => {
+                        warn!(
+                            %addr, ?status,
+                            "bluetooth: authentication failed with a stored link key; \
+                             forgetting it so the next attempt pairs afresh"
+                        );
+                        self.link_keys.remove(&addr);
+                        vec![HostAction::Unpaired { peer: addr }]
+                    }
+                    _ => {
+                        warn!(?peer, ?status, "bluetooth: authentication failed");
+                        Vec::new()
+                    }
+                }
+            }
+
+            Event::EncryptionChange {
+                status,
+                handle,
+                enabled,
+            } => {
+                let peer = self.connections.get(&handle.raw()).copied();
+                if status.is_success() {
+                    debug!(?peer, enabled, "bluetooth: encryption changed");
+                } else {
+                    // Not fatal by itself — the link survives — but it is the difference
+                    // between a session that is protected and one that only looks it, and
+                    // it was invisible.
+                    warn!(?peer, ?status, "bluetooth: encryption change failed");
+                }
+                Vec::new()
+            }
+
             Event::NumberOfCompletedPackets(pairs) => pairs
                 .iter()
                 .map(|(handle, count)| HostAction::Credits {
@@ -445,6 +503,65 @@ mod tests {
     use substrate_hci::{event::code, OpCode};
 
     use super::*;
+
+    #[test]
+    fn a_link_key_the_phone_no_longer_accepts_is_forgotten() {
+        // The failure this ends: a phone that was factory reset, or that forgot us, no
+        // longer has the key we reply to `LinkKeyRequest` with. Authentication fails, the
+        // link drops, the phone tries again — forever — and both events were falling into
+        // the wildcard, so the log said nothing beyond `link down`.
+        //
+        // Forgetting costs one re-pairing, which is four seconds of someone's attention.
+        // Keeping it costs a phone that can never connect again.
+        let mut host = HostController::new(HostConfig::default());
+        let peer = BdAddr::new([1, 2, 3, 4, 5, 6]);
+        let handle = ConnectionHandle::new(0x0002).unwrap();
+        host.load_link_keys([(peer, LinkKey::new([0xAB; 16]))]);
+        host.on_event(&Event::ConnectionComplete {
+            status: Status::SUCCESS,
+            handle,
+            addr: peer,
+            link_type: LinkType::Acl,
+            encryption_enabled: false,
+        });
+        assert!(host.knows(peer), "the key is there to begin with");
+
+        let actions = host.on_event(&Event::AuthenticationComplete {
+            status: Status(0x05), // authentication failure
+            handle,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, HostAction::Unpaired { peer: p } if *p == peer)),
+            "the caller must be told, or the key survives on disk and the loop \
+             outlives a reboot: {actions:?}"
+        );
+        assert!(!host.knows(peer), "and it is gone from memory too");
+    }
+
+    #[test]
+    fn a_successful_authentication_keeps_the_key() {
+        // The obvious other half: normal reconnection of a bonded phone authenticates
+        // successfully every time, and forgetting the key then would make bonding useless.
+        let mut host = HostController::new(HostConfig::default());
+        let peer = BdAddr::new([1, 2, 3, 4, 5, 6]);
+        let handle = ConnectionHandle::new(0x0002).unwrap();
+        host.load_link_keys([(peer, LinkKey::new([0xAB; 16]))]);
+        host.on_event(&Event::ConnectionComplete {
+            status: Status::SUCCESS,
+            handle,
+            addr: peer,
+            link_type: LinkType::Acl,
+            encryption_enabled: false,
+        });
+        let actions = host.on_event(&Event::AuthenticationComplete {
+            status: Status::SUCCESS,
+            handle,
+        });
+        assert!(actions.is_empty(), "nothing to do: {actions:?}");
+        assert!(host.knows(peer));
+    }
 
     /// A command-complete for `opcode` with the given return parameters.
     fn complete(opcode: OpCode, params: &[u8]) -> Event {
