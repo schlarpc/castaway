@@ -121,6 +121,46 @@ pub enum ControlError {
     MalformedDmap,
 }
 
+/// Failures on the mirroring data channel.
+///
+/// Unlike the audio errors, these are **fatal to the connection**. The video stream is a
+/// TCP byte stream with one continuous AES-CTR keystream over it, so a message we cannot
+/// frame means sync is lost and nothing after it can be trusted — where a bad UDP audio
+/// datagram is just one packet to skip.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MirrorError {
+    /// Fewer bytes than the fixed header.
+    #[error("mirror header is {0} bytes, expected 128")]
+    ShortHeader(usize),
+
+    /// A payload length that cannot be a real frame.
+    #[error("mirror payload length {0} is implausible")]
+    PayloadTooLarge(usize),
+
+    /// A payload type this receiver does not model.
+    #[error("unknown mirror payload type {0}")]
+    UnknownPayloadType(u8),
+
+    /// The AVCC length chain did not walk cleanly to the end of the payload.
+    ///
+    /// Almost always means the payload did not decrypt: with the wrong key the lengths
+    /// are noise and the walk overruns. It is the cheapest wrong-key detector available.
+    #[error("malformed access unit (did the payload decrypt?)")]
+    MalformedAccessUnit,
+
+    /// The `AVCDecoderConfigurationRecord` was truncated.
+    #[error("malformed codec configuration record")]
+    MalformedCodecConfig,
+
+    /// An empty codec-config payload: the sender wants a codec we did not advertise.
+    ///
+    /// In practice HEVC, when feature bit 42 is clear. Naming it is the difference
+    /// between a diagnosable refusal and a stream that silently never starts.
+    #[error("the sender offered a codec we did not advertise (HEVC?)")]
+    CodecRefused,
+}
+
 /// Failures parsing a `SETUP` `Transport` header.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
