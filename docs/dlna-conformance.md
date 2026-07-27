@@ -20,7 +20,8 @@ Each of these looks like an omission or a mistake and is neither. The citation i
 | Thing | Why it is right |
 |---|---|
 | `GetCurrentConnectionInfo` returning `RcsID=0`, `AVTransportID=0`, `PeerConnectionID=-1`, `Direction="Input"`, `Status="OK"`, and `CurrentConnectionIDs = "0"` | ConnectionManager:1 §2.2.3: *"If optional action PrepareForConnection is not implemented then this state variable should be set to '0'."* This is the prescribed default-connection shape, not a stub. |
-| `PrepareForConnection` left unimplemented | CM:1 §5.1.1.2: *"This action is optional for the HTTP protocol."* Several control points use its **absence** to detect the DLNA default-connection model, so implementing it would change behaviour for the worse. Only the error code is wrong (should be 602, not 401 — G79). |
+| `PrepareForConnection` left unimplemented | CM:1 §5.1.1.2: *"This action is optional for the HTTP protocol."* Several control points use its **absence** to detect the DLNA default-connection model, so implementing it would change behaviour for the worse. The error code was the only thing wrong and is now 602 rather than 401 (G79). |
+| `Previous` answering 701, and `Next` answering 701 unless something is staged | Both are *required* actions, so dropping them from the SCPD would be a conformance regression — but a renderer handed one URL has no playlist. `SetNextAVTransportURI` is the only queue it has, so `Next` advances into that and nothing else does. 701 "Transition not available" is the code §2.4.9 defines for exactly this, and it is a true statement rather than a stub. |
 | `X_DLNADOC` saying `DMR-1.50`, not 1.51 | Rygel ships a `Dlna150Hacks` class that string-replaces `-1.51`→`-1.50` per-User-Agent because control points choke on 1.51. Do not "upgrade". Do not add `M-DMR` either — that is for devices advertising a reduced mandatory media-format set, which a fixed panel is not. |
 | The namespace `urn:schemas-dlna-org:device-1-0` having **no** trailing slash | Distinct from the *metadata* namespace `urn:schemas-dlna-org:metadata-1-0/`, which does have one. They look like a typo of each other and are not. |
 | Omitting `iconList` | UDA 1.1 §2.3 makes it REQUIRED *if and only if the device has icons*. We have none. |
@@ -34,8 +35,10 @@ Each of these looks like an omission or a mistake and is neither. The citation i
 
 The spec does not describe what breaks. This does.
 
-**Nobody depends on GENA except Home Assistant, and it depends on its absence being
-honest.** Behaviour against a renderer that answers `SUBSCRIBE` with 200 and then never
+**Nobody depended on GENA except Home Assistant, and it depended on the absence being
+honest.** This table is what made the case for refusing `SUBSCRIBE` outright — and it is
+kept because it is still the reason eventing has to be *correct* rather than merely
+present. Behaviour against a renderer that answers `SUBSCRIBE` with 200 and then never
 sends an event:
 
 | Control point | Behaviour |
@@ -47,8 +50,28 @@ sends an event:
 | VLC, Symfonium, `dlnap` | Fine — poll. |
 | Windows "Cast to device" | **Unproven.** WHCK EVENT-01 requires `LastChange` and justifies it as *"The controller implemented in Windows 8 relies on AVT and RCS LastChange events to make decisions about devices"*, but that it de-lists a silent renderer was not substantiated. Needs a real Windows box. |
 
-Hence G68's fix: refusing with 501 is *better* than accepting, because it puts the one
-control point that cares back onto a path that works.
+That is why G68's *first* fix was to refuse with 501: it is better than accepting,
+because it puts the one control point that cares back onto a path that works.
+
+**Superseded — the renderer now events for real** (subscriber table, initial NOTIFY, `SEQ`,
+renewals, `LastChange` for AVT and RCS). What the table above still tells you is where the
+risk moved to. Home Assistant will now take our events and *not* poll, so a `LastChange`
+that is wrong or missing is a frozen entity again by a different route — the failure this
+table describes, reintroduced by getting the replacement wrong rather than by not having
+one. Two specifics follow from that:
+
+- **Publish on a diff, not on a mutation.** A control point polling `GetTransportInfo`
+  twice a second must not produce two events, and no setter may be able to forget to raise
+  one. Both fall out of computing what changed where the state is already in hand.
+- **Keep position and duration out of `LastChange`.** §2.3.1 excludes position; duration
+  follows it here because both are read from the pipeline per request rather than stored,
+  so either one would make the diff differ on every poll — an event a second, per
+  subscriber, for a number nobody asked to be pushed. Control points poll
+  `GetPositionInfo` for these, which is what that action is for.
+
+The Windows row stays **unproven** in the direction that matters: WHCK EVENT-01 is now
+satisfied in shape, but whether Windows "Cast to device" is happy with our documents has
+still never been observed on a real Windows box.
 
 **Other places practice diverges from the text:**
 
@@ -63,8 +86,18 @@ control point that cares back onto a path that works.
 - **`DLNA.ORG_OP`'s first digit is TIME-seek and the second is BYTE-seek** — confirmed
   three ways (libdlna, anacrolix/dms, Rygel) and the most commonly inverted detail in the
   stack. It means *arbitrary* random access; *limited* seek is separate
-  (`lop-npt`/`lop-bytes` in the flags). When seek lands (G66), modelling those as distinct
-  capabilities with `sp-flag` making seek unrepresentable is the ground-rule-1 shape.
+  (`lop-npt`/`lop-bytes` in the flags).
+
+  Seek has landed (G66) and did **not** need this, which is worth saying plainly so the
+  next person does not go looking: we are a *renderer*, so `DLNA.ORG_OP` is something a
+  server tells us, not something we publish. Our seek moves libavformat's demuxer, and
+  whether that works is a property of the container and the transport rather than of a flag.
+  Where the flags would earn their keep is the reverse direction — reading
+  `contentFeatures.dlna.org` off the server's response to decide whether to *offer* seek for
+  a given item, instead of offering it and finding out. We now ask for that header
+  (`getcontentFeatures.dlna.org: 1`) and do not read the answer. Modelling those as distinct
+  capabilities, with `sp-flag` making seek unrepresentable, is still the ground-rule-1
+  shape when somebody wants it.
 - **`res@bitrate` is specified in bytes/second** and almost universally emitted as
   bits/second. Be lenient if it is ever read.
 - **A MIME-only `protocolInfo` entry (no `DLNA.ORG_PN`) is legal and testable** under WHCK
@@ -83,6 +116,24 @@ Kept because both readings sounded plausible, and only the primary source settle
   input."** Wrong, and the opposite of the truth: `av:duration.cds1` is
   `[-+]?[0-9]+(:[0-5][0-9]){2}…`, so the sign is normative and *we* were violating it.
   Became G81.
+
+## What changed after this review
+
+The defects it found are closed — G66 and G68–G82, less G77's HEAD probe and the compositor
+half of G67, both recorded in GAPS with their reasons. Two things are worth carrying
+forward from *how* they closed rather than from what they were.
+
+**The obvious-looking fix was the wrong one a third time.** G68 said "implement GENA", and
+the first correct step was the opposite: refuse. The table above is why. Getting to the real
+implementation meant keeping the property that made refusing right — that a control point is
+never told something we cannot back up.
+
+**Closing them turned up a defect none of them named.** `MediaClock::set_paused` took a lock
+and then called a function that takes the same lock, so the first pause of any session
+deadlocked the thread that asked — a tokio worker on the box, and the whole test suite here.
+It had been hiding as a slow `cargo test --workspace` through two verification gates. It is
+GAPS G83, and its lesson is the one this file exists for: the failure mode was silence, and
+silence is indistinguishable from working.
 
 ## What the citations are worth
 

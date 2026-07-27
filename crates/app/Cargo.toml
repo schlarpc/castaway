@@ -42,6 +42,10 @@ toml = "0.8"
 uuid.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+# Driving the DLNA media plane end to end: a real SOAP envelope into the real router.
+tower = { version = "0.5", features = ["util"] }
+
 [features]
 default = []
 # Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)

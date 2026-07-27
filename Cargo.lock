@@ -600,6 +600,7 @@ dependencies = [
  "substrate-ssdp",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ureq 2.12.1",

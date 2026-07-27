@@ -29,6 +29,14 @@ reaches the speakers (G9, G10), and the display is handed back when another sour
 the session (G6) — with the outgoing source told to stop sending (G37) and able to take
 it back by pressing play (G5).
 
+**The DLNA items are closed** (G66, G68–G82), with two named remainders: G77's HEAD probe
+at set time, and the half of G67 that needs a compositor inside a VM. Closing them turned
+up a fourth defect of the family this document is about — G83, a pause that deadlocked the
+thread that asked for it — which had been hiding as a slow test suite rather than as a
+failure. Everything the review found about what is *correct* is in
+[dlna-conformance.md](dlna-conformance.md), and the eventing section of that file has been
+rewritten: its advice was to refuse `SUBSCRIBE`, and refusing is no longer what we do.
+
 Decisions taken, so nobody re-litigates them from the entry text alone:
 
 - **G34 — scoped out.** Guests get put on a network that can see the receiver. Cross-VLAN
@@ -66,6 +74,8 @@ Decisions taken, so nobody re-litigates them from the entry text alone:
 
 Still open, roughly in the order they are worth taking:
 
+0. **G67's last claim, and G77's HEAD probe** — the two DLNA remainders, both small and
+   both named in their entries. Everything else in that block is done.
 1. **G3 (partly done)** — the handlers and the recovery policy are in. `on_load_end` and
    `on_load_error` are observed firing; the policy is unit-tested. What is *not* verified
    is `on_render_process_terminated`: `chrome://crash` kills the renderer before CEF
@@ -935,14 +945,26 @@ display or the audio device, and two cannot take it back afterwards.
   than faked — the same rule D16 applies to advertisement and D32 to app launches. Showing
   stills properly (a dwell, a slideshow) is unbuilt and unclaimed.
 
-- **G66 — A URL session cannot seek. CONFIRMED, not fixed.**
+- ✅ **G66 — A URL session cannot seek. CONFIRMED, fixed.**
   `decode_av` reads packets forward and has no `av_seek_frame`, so `ControlTxn::Seek` is
   refused. The consequences are honest rather than hidden — the DLNA control surface omits
   `SEEK`, so the panel's scrubber draws without a knob and takes no touches — but a control
   point's own seek bar does nothing, which is the more visible half. Needs a seek that
   flushes both decoders and re-anchors the clock.
 
-- **G67 — The DLNA media plane has never been exercised by any test. CONFIRMED.**
+  It needed one more thing than that, and it is the step that is easy to leave out and
+  impossible to miss afterwards: **the audio already queued has to be thrown away.** The
+  channel between the demuxer and the speaker holds about a second of decoded sound from
+  where playback used to be, and only the output thread can drop it — so `SeekControl` is a
+  three-thread handshake (ask, move, acknowledge) rather than a flag, bounded so a
+  video-only session with nobody to answer does not hang the decode thread.
+
+  Two things fell out. A seek has to interrupt a frame *waiting its turn*, which is exactly
+  what scrubbing a paused session is — the clock never advances there, so the frame's turn
+  never comes. And `play`'s `start` offset, which Cast `LOAD` and AirPlay both send and
+  which was accepted and then ignored, is the same mechanism: resuming a film restarted it.
+
+- 🟡 **G67 — The DLNA media plane has never been exercised by any test. CONFIRMED.**
   The VM test casts `http://example.invalid/clip.mp4` at a build with no decoder in it
   (`packages.default` is the null pipeline), so nothing has ever been fetched or decoded
   through DLNA in CI. G61–G63 all lived in that blind spot.
@@ -954,6 +976,18 @@ display or the audio device, and two cannot take it back afterwards.
   needs a `render` build, and `render` pulls in the winit kiosk, so the VM would need Xvfb
   and a software Vulkan ICD. Worth doing — it would be the first CI proof of the render
   pipeline at all — but it is a nix lift, not an afternoon.
+
+  **The claim is now made, outside the VM.** `crates/app/tests/dlna_media_plane.rs` drives
+  a real SOAP envelope into the real router, through the real session manager, into a real
+  `RenderPipeline` fetching a real HTTP URL with a real demuxer — and asserts frames
+  reached the compositor's channel, that the position a control point polls is a position
+  in the item, and that when the item ends the transport says `STOPPED` / `OK`. A second
+  case casts at a refused port and asserts `ERROR_OCCURRED`, which is the failure that
+  reads exactly like a healthy session unless the receiver says otherwise.
+
+  What is left is narrower than the entry originally described: the *compositor*. Frames
+  are counted off the render channel rather than presented, because a GPU is the one thing
+  a CI sandbox has not got. That, and only that, is still the nix lift.
 
 ### Found by the spec review (2026-07-27)
 
@@ -971,7 +1005,7 @@ bug introduced *by* the work it was reviewing. Every finding below was re-verifi
 against the cited source before acting.
 
 - ✅ **G68 — Answering `SUBSCRIBE` with 200 and never sending an event is worse than
-  refusing. CONFIRMED, fixed.** `service.rs` returned `200 OK` with an invented `SID` and
+  refusing. CONFIRMED, fixed twice — first by refusing, and now by eventing.** `service.rs` returned `200 OK` with an invented `SID` and
   no `NOTIFY` ever followed; the comment said the quiet part — *"so control points consider
   the subscription established, even though we don't push events"*.
 
@@ -983,15 +1017,33 @@ against the cited source before acting.
   connected, forever, on a device that went on looking healthy. Control points that poll
   regardless — BubbleUPnP, foobar2000, Kodi, VLC — were unaffected.
 
-  Now returns 501. Real GENA — a subscriber table, per-subscription UUID `SID`s, the
-  mandatory initial NOTIFY (UDA 1.1 §4.3: *"MUST be sent, even if the control point
-  unsubscribes before the message is delivered"*), `SEQ` from 0, renewals, and `LastChange`
-  for both services — is the real answer and is not built. The SCPDs also declare
-  `sendEvents="yes"` on `TransportState`, which AVTransport §2.3.1 says no conforming
-  publisher ever events directly; they want fixing with it.
+  It then returned 501, which put every such control point back on its polling path — and
+  was always a placeholder. **Real GENA is now built**: a subscriber table, per-subscription
+  UUID `SID`s, the mandatory initial NOTIFY (UDA 1.1 §4.3: *"MUST be sent, even if the
+  control point unsubscribes before the message is delivered"*), `SEQ` from 0 and never
+  back to it, renewals, `UNSUBSCRIBE`, expiry, and `LastChange` for both services. The
+  SCPDs were fixed with it: `TransportState` no longer declares `sendEvents="yes"`, which
+  AVTransport §2.3.1 says no conforming publisher may do, and `LastChange` is the only
+  evented variable of the two.
+
+  Three notes for whoever touches it next. The two eventing models really are different —
+  AVT and RCS wrap everything in one `LastChange` whose value is an XML document travelling
+  as *text*, escaped exactly once; ConnectionManager events its variables plainly, and
+  getting that backwards sends a subscriber a document it never asked for. Position stays
+  out (§2.3.1) and duration follows it, because both are read from the pipeline per request
+  rather than stored, so either one would make the change-diff differ on every poll — an
+  event a second, per subscriber, for a number nobody asked to be pushed. And publishing is
+  a **diff** against what was last sent rather than an event raised from each mutation,
+  which is what makes it safe to call from every request handler and impossible for a
+  setter to forget.
+
+  Delivery is hand-written over `TcpStream`: a GENA callback is plain http on the LAN by
+  construction — one request, one status line, no body, no redirects, no TLS — so a client
+  library would be a dependency bought for something that fits on a screen. It is bounded
+  in both directions, and three consecutive failures retire a subscriber that has gone.
 
 - ✅ **G69 — `GetPositionInfo` returned a plausible zero where the spec has a sentinel.
-  CONFIRMED, partly fixed.** `0:00:00` parses as a real position; §2.2.22 requires
+  CONFIRMED, fixed.** `0:00:00` parses as a real position; §2.2.22 requires
   `NOT_IMPLEMENTED` when a service cannot supply the value, and control points map that to
   "draw no progress bar". So every control point drew `0:00 / 0:00` pinned to the left for
   the whole item — and one that advances its queue on `RelTime >= TrackDuration` sees
@@ -1000,9 +1052,16 @@ against the cited source before acting.
   Position is *never* evented (§2.3.1 excludes it from `LastChange`), so this action is the
   entire position channel and control points poll it once a second while playing.
 
-  The sentinel is correct now. What is still missing is the answer: `pipeline::clock`
-  holds a real position and `MediaLayout` a real duration, but no seam carries either back
-  across the `Pipeline` trait. That is the remaining half of this entry.
+  The sentinel is correct now, **and so is the answer.** `PlaybackReport` carries the
+  pipeline's clock and the container's duration back across the `Pipeline` trait — pulled
+  rather than pushed, because a control point polls this about once a second and position
+  is excluded from `LastChange`, so a push would be a timer pretending to be an event. Both
+  `RelTime` and `AbsTime` are answered, because control points disagree about which they
+  read and a renderer that answers one loses half the field.
+
+  The sentinel is still what comes back before the first frame and after the item ends,
+  which is the honest answer to both: a zero would be drawn as "at the start" of something
+  that has not begun.
 
 - ✅ **G70 — A friendly name containing `&` made the receiver invisible. CONFIRMED,
   fixed.** `descriptions.rs` interpolated `friendly_name` and `uuid` into the device
@@ -1041,7 +1100,7 @@ against the cited source before acting.
   and the doc comment beside it stated the rule it was breaking. A test written from the
   same misunderstanding as the code is worth less than no test.
 
-- **G75 — Nothing reports end-of-media or a failed fetch. CONFIRMED, not fixed.**
+- ✅ **G75 — Nothing reports end-of-media or a failed fetch. CONFIRMED, fixed.**
   The decode thread logs and exits; no `SessionEvent::End`, no `ClearVideo`, no transport
   state change. `CurrentTransportStatus` is hardcoded `OK`. Two failures follow: a URL the
   box cannot fetch leaves the phone reading **PLAYING / OK forever** with the attract scene
@@ -1050,23 +1109,37 @@ against the cited source before acting.
   advances. §2.2.2 provides `ERROR_OCCURRED` for exactly this. This is the largest
   remaining DLNA item.
 
-  🟡 **Half fixed.** The screen now returns to idle when a decode ends or fails, instead
-  of freezing on the last frame or leaving the attract scene up over silence, and the log
-  distinguishes finished / failed / preempted — preemption is not completion, and clearing
-  the layers there would blank the session that had just taken the screen. What is still
-  missing is telling anyone: the control point still reads PLAYING/OK and a queue still
-  does not advance. That needs a completion channel back *up* from the pipeline, which
-  does not exist — `Pipeline` is driven by the session manager and has no path the other
-  way. The natural shape is an `ActiveHandle` mirroring the existing `RemoteHandle`, which
-  was added for exactly this "unreachable by construction" problem.
+  ✅ **Fixed.** The screen returns to idle when a decode ends or fails, instead of freezing
+  on the last frame or leaving the attract scene up over silence, and the log distinguishes
+  finished / failed / preempted — preemption is not completion, and clearing the layers
+  there would blank the session that had just taken the screen.
 
-- **G76 — Audio-device failure silently kills video. CONFIRMED, not fixed.**
+  And somebody is now told. `PlaybackEnd` is pushed up a channel the session manager owns,
+  which supplies the half the pipeline cannot — *which source* handed it the URL — and
+  routes it to that source's `RemoteControl::media_ended`. For DLNA that moves the transport
+  to `STOPPED` with §2.2.2's `ERROR_OCCURRED` on a failure, so a queue advances and a failed
+  fetch is visible on the phone; for Bluetooth and Spotify it is a no-op, because there the
+  sender is the player and already knows.
+
+  The report carries a **ticket**, and that is not defensive coding: a decode thread checks
+  its stop flag and *then* reports, and another source can take the screen in between —
+  unguarded, that report would tear down the session that had just started, occasionally,
+  for no visible reason. Every preemption retires the ticket.
+
+- ✅ **G76 — Audio-device failure silently kills video. CONFIRMED, fixed.**
   `av_session` treats a failed audio send as end-of-stream, and `run_pcm` drops its receiver
   when the output refuses the stream — so where the device is absent, busy, or held in
   exclusive mode, a *video* cast produces a flash and nothing, while the phone says PLAYING.
   Should degrade to silent video with a warning.
 
-- **G77 — The media fetch has no timeouts and no DLNA headers. CONFIRMED, not fixed.**
+  It does now, and the fix is smaller than the failure: `run_pcm` swaps in the null sink
+  rather than giving up. The null sink keeps time exactly as the real one does — it is what
+  the headless CI build has always used — so the picture plays on, paced, with one line
+  saying why it is quiet. Applied to a mid-session `write` failure as well as a refused
+  `start`, because a device that is unplugged or claimed by something else halfway through
+  is the same problem one step later.
+
+- 🟡 **G77 — The media fetch has no timeouts and no DLNA headers. CONFIRMED, mostly fixed.**
   `ffmpeg::format::input` is called with no options, so `avformat_open_input` against a
   black-holed server blocks the decode thread indefinitely in a region where the stop flag
   is never checked, leaking a thread per retry. Separately, Rygel's DMR HEADs the URI on
@@ -1074,11 +1147,38 @@ against the cited source before acting.
   home for the missing set-time validation, and turns G75's silent-forever-PLAYING into a
   synchronous fault the phone can show.
 
-- **G78 — SCPDs do not match the implementation, in both directions. CONFIRMED, not
+  **The fetch is bounded now.** Network URIs — and only network URIs, since a local file has
+  no socket to time out — carry `rw_timeout`/`timeout`, reconnection across a Wi-Fi blip
+  (`reconnect`, `reconnect_streamed`), a UPnP-shaped user agent, and the two DLNA request
+  headers that make this a renderer rather than an anonymous GET:
+  `getcontentFeatures.dlna.org: 1` and `transferMode.dlna.org: Streaming`.
+
+  **The HEAD probe is deliberately not done, and this is the remainder.** `MediaUri`
+  validation at set time already answers 716 for a URI nothing could fetch, and a fetch that
+  fails is now reported as `ERROR_OCCURRED` rather than PLAYING forever — so what a HEAD
+  buys is turning an asynchronous fault into a synchronous one, plus a real 714 on a MIME
+  mismatch. Worth having. Not worth an HTTP client in `proto-dlna` on its own, so it waits
+  for a second reason to want one.
+
+- ✅ **G78 — SCPDs do not match the implementation, in both directions. CONFIRMED,
   fixed.** `GetDeviceCapabilities` and `GetTransportSettings` are implemented and *not*
   advertised (a control point will not call what the SCPD omits); `Seek`/`Next`/`Previous`
   are advertised and refused at runtime. `A_ARG_TYPE_SeekMode` has no `allowedValueList`,
   which is purely declarative and is why Home Assistant renders no seek bar at all.
+
+  Both directions are closed, and `Next` is the interesting one: it is a *required* action,
+  so removing it from the SCPD would have been a conformance regression, and a renderer
+  handed one URL has no playlist. What it does have is `SetNextAVTransportURI` — a queue of
+  exactly one — so `Next` advances into that, carrying its metadata with it, and answers 701
+  when there is nothing staged. `Previous` answers 701 always: a renderer keeps no history.
+  `GetCurrentTransportActions` was added while here; it is UPnP's own version of the rule
+  that a UI must not offer a button the transport would refuse, and it is derived from the
+  state rather than constant.
+
+  The test that keeps this closed walks the XML we actually serve, in both directions —
+  every advertised action must answer something other than 401/602, and every implemented
+  action must appear in the document. Adding one without the other now fails here rather
+  than on somebody's phone.
 
 - ✅ **G80 — `SinkProtocolInfo` published only globs, so BubbleUPnP matched nothing.
   CONFIRMED, fixed.** The sink advertised `http-get:*:video/*:*,http-get:*:audio/*:*` and
@@ -1126,12 +1226,50 @@ against the cited source before acting.
   test — which is the argument for the review, not against it: the slicing existed
   *precisely* so cancellation could be seen, and the check was still omitted.
 
-- **G79 — The error-code table is four entries deep. CONFIRMED, not fixed.**
+- ✅ **G83 — Pausing deadlocked the thread that asked, every time. CONFIRMED (measured),
+  fixed.** Found while closing G66, and the reason the last two verification gates were
+  killed on their timeout rather than failing.
+
+  `MediaClock` kept the anchor and the freeze under a lock each, and `set_paused` took the
+  freeze lock and then called `now()`, which takes the same lock. A `std::sync::Mutex` is
+  not reentrant: **the first pause of any session deadlocked whichever thread asked for
+  it, for the life of the process.** On the box that is a tokio worker, so
+  `RenderPipeline::control` never returns and the runtime is one worker down for good — and
+  the panel and the phone both go on looking healthy, which is this document's whole
+  subject. In the suite it was `cargo test --workspace` hanging, which reads as a slow test
+  run rather than as a bug, and is why it survived two gates.
+
+  Introduced by the pause work in G63, exactly as G82 was, and by the same mechanism:
+  correct-looking code whose failure mode is silence rather than an error.
+
+  The fix is not "call `now()` earlier". It is one lock over one piece of state, which makes
+  the reentrant call unwritable rather than merely absent. Two things fell out of holding
+  them together: a pause that arrives *before the first frame* is now honoured — "paused"
+  and "paused at a position" were the same field, so a control point sending
+  `SetAVTransportURI`, `Play` and `Pause` faster than the fetch got playback anyway — and
+  `seek_to` moves a paused session underneath its own pause, which is what scrubbing to find
+  a spot is.
+
+  The regression test runs `set_paused` on another thread against a deadline, because a test
+  that hangs reports nothing and reads as infrastructure. This one names the bug.
+
+- ✅ **G79 — The error-code table is four entries deep. CONFIRMED, fixed.**
   `718 Invalid InstanceID` is in every AVTransport action's table and `InstanceID` is never
   read at all, so a control point addressing instance 1 silently drives instance 0.
   `SetAVTransportURI` defines 714/715/716/737/738/739 and validates nothing; `Seek` defines
   710/711 and ignores `Unit` entirely; `Play` returns 402 where `701` is meant. Unimplemented
   optional actions should return `602`, not `401`.
+
+  All of it, plus the `Channel` argument RenderingControl carries and this device has one
+  of. The distinction that matters most is 402 versus 701: the first tells a control point
+  its own *message* was wrong and it should stop, the second tells it the message was fine
+  and the transport could not do that from where it is — so `Play` with no media used to
+  read as a client bug rather than as "set a URI first".
+
+  Worth recording what did **not** change: `PrepareForConnection` is still unimplemented,
+  because several control points read its absence as the DLNA default-connection model.
+  Only the code was wrong. 602 says "this device does not do that"; 401 said "no such
+  action", which reads as a device that is broken rather than one that is limited.
 
 ---
 
