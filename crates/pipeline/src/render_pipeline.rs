@@ -196,6 +196,13 @@ pub struct RenderPipeline {
     playback: Arc<Mutex<Option<UrlPlayback>>>,
     /// Where an item that finished or failed gets reported, if anything asked to hear.
     ends: Mutex<Option<Arc<EndReport>>>,
+    /// Where audio goes. `None` opens the default device.
+    ///
+    /// A factory rather than a device, because each session takes its own. It is also
+    /// the only way to observe that a session's audio *reached* an output, which is the
+    /// assertion that would have caught mirror audio being silently discarded.
+    #[cfg(feature = "audio")]
+    audio_output: Mutex<Option<crate::audio_out::AudioOutputFactory>>,
     /// Called when another source takes the screen, so a browser that is covering the
     /// panel gives it back.
     ///
@@ -231,13 +238,33 @@ impl RenderPipeline {
                 ends: Mutex::new(None),
                 release_screen: Mutex::new(None),
                 #[cfg(feature = "audio")]
+                audio_output: Mutex::new(None),
+                #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
             },
             rx,
         )
     }
 
-    /// A handle for asking the render thread for a screenshot.
+    /// Use `factory` for audio output instead of the default device.
+    #[cfg(feature = "audio")]
+    #[must_use]
+    pub fn with_audio_output(self, factory: crate::audio_out::AudioOutputFactory) -> Self {
+        if let Ok(mut slot) = self.audio_output.lock() {
+            *slot = Some(factory);
+        }
+        self
+    }
+
+    /// A fresh output device for one session.
+    #[cfg(feature = "audio")]
+    fn audio_output(&self) -> Box<dyn crate::audio_out::AudioOut> {
+        self.audio_output
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|f| f()))
+            .unwrap_or_else(crate::audio_session::default_output)
+    }
     ///
     /// Cheap and clonable, and deliberately separate from the pipeline itself: by the
     /// time anything wants a screenshot the pipeline has been moved into the session
@@ -406,7 +433,7 @@ impl Pipeline for RenderPipeline {
             let (atx, arx) = std::sync::mpsc::sync_channel(crate::ffmpeg_decode::AUDIO_QUEUE);
             crate::audio_session::spawn_pcm(
                 arx,
-                crate::audio_session::default_output(),
+                self.audio_output(),
                 Arc::clone(&stop),
                 Arc::clone(&self.gain),
                 Some(crate::audio_session::PacedSession {
@@ -516,7 +543,7 @@ impl Pipeline for RenderPipeline {
                             arx,
                             audio.format,
                             audio.config,
-                            crate::audio_session::default_output(),
+                            self.audio_output(),
                             Arc::clone(&stop),
                             Arc::clone(&self.gain),
                         );
@@ -563,7 +590,7 @@ impl Pipeline for RenderPipeline {
                         rx,
                         format,
                         config,
-                        crate::audio_session::default_output(),
+                        self.audio_output(),
                         stop,
                         Arc::clone(&self.gain),
                     );
@@ -574,7 +601,7 @@ impl Pipeline for RenderPipeline {
                 FrameSource::Pcm(rx) => {
                     crate::audio_session::spawn_pcm(
                         rx,
-                        crate::audio_session::default_output(),
+                        self.audio_output(),
                         stop,
                         Arc::clone(&self.gain),
                         // Bluetooth/Spotify PCM: the sender is the clock, there is no
@@ -1713,6 +1740,7 @@ mod card_tests {
                 .play_audio(
                     castaway_core::FrameSource::Pcm(rx),
                     castaway_core::AudioFormat::from_hz(44_100, 2).unwrap(),
+                    None,
                 )
                 .await
                 .ok();
@@ -1740,6 +1768,92 @@ mod card_tests {
         assert_eq!(
             pipeline.card(),
             crate::nowplaying_card::NowPlayingCard::default()
+        );
+    }
+    #[cfg(all(feature = "audio", feature = "ffmpeg"))]
+    use std::sync::Arc;
+
+    /// An output that remembers whether anything was actually played through it.
+    #[cfg(all(feature = "audio", feature = "ffmpeg"))]
+    #[derive(Default)]
+    struct Speaker {
+        frames: std::sync::atomic::AtomicU64,
+    }
+
+    #[cfg(all(feature = "audio", feature = "ffmpeg"))]
+    impl crate::audio_out::AudioOut for Arc<Speaker> {
+        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), crate::error::PipelineError> {
+            Ok(())
+        }
+        fn write(
+            &mut self,
+            block: &crate::audio_decode::PcmBlock,
+        ) -> Result<(), crate::error::PipelineError> {
+            self.frames.fetch_add(
+                block.frame_count() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[cfg(all(feature = "audio", feature = "ffmpeg"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mirrors_audio_reaches_the_output_on_the_render_path_too() {
+        // The same assertion as `null::tests`, against the pipeline that actually had the
+        // bug: this one took the field as `_audio` and discarded every frame. The null
+        // build having the test is not enough, because the null build is not the one that
+        // runs on the panel.
+        //
+        // No GPU is needed: `new` hands back the receiver the render loop would consume,
+        // and this test simply holds it.
+        let rate = 44_100;
+        let frames = crate::audio_decode::tests::encode(
+            castaway_core::AudioCodec::Sbc,
+            rate,
+            &crate::audio_decode::tests::sine(rate, 44_100),
+        );
+        if frames.is_empty() {
+            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+            return;
+        }
+
+        let (atx, arx) = tokio::sync::mpsc::channel(frames.len() + 1);
+        for frame in frames {
+            atx.send(frame).await.unwrap();
+        }
+        drop(atx);
+
+        let speaker = Arc::new(Speaker::default());
+        let for_factory = Arc::clone(&speaker);
+        let (pipeline, _rx) = RenderPipeline::new(4);
+        let pipeline =
+            pipeline.with_audio_output(Arc::new(move || Box::new(Arc::clone(&for_factory))));
+
+        let (_vtx, vrx) = tokio::sync::mpsc::channel(1);
+        pipeline
+            .mirror(
+                castaway_core::FrameSource::Encoded(vrx),
+                Some(castaway_core::MirrorAudio {
+                    source: castaway_core::FrameSource::Encoded(arx),
+                    format: crate::audio_decode::tests::format(rate, 2),
+                    config: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..200 {
+            if speaker.frames.load(std::sync::atomic::Ordering::SeqCst) > u64::from(rate) / 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let played = speaker.frames.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            played > u64::from(rate) / 2,
+            "only {played} frames of the mirror's audio reached the output"
         );
     }
 }
