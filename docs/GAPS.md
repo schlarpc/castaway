@@ -662,6 +662,26 @@ display or the audio device, and two cannot take it back afterwards.
   normally. This is a browser-only gap — but see G56, which is the feature that turns it
   from a YouTube-live annoyance into a prerequisite.
 
+  Three routes, and none of them is "buy a build" — nobody sells a codec-enabled CEF:
+  1. **Build CEF ourselves** with those GN args. Keeps the architecture exactly as it is;
+     costs chromium-scale compute per bump, and for the deploy artifact either a Windows
+     build host or a Chromium Linux→Windows cross setup. Gets codecs. Cannot get VMP:
+     signing a custom build needs castLabs' *commercial* Widevine 3PL certification.
+  2. **Replace the browser layer with Electron.** Its official builds already set
+     `ffmpeg_branding="Chrome"` and `proprietary_codecs=true` (`build/args/all.gn`), so
+     codecs come free and maintained. castLabs' fork (ECS, `castlabs/electron-releases`)
+     adds Widevine and ships VMP-signed development builds, with *free* production signing
+     via their EVS service — the only route to a VMP-verified host that does not require a
+     Google licence agreement. Two further upsides worth checking rather than assuming:
+     Electron's offscreen mode can hand back GPU shared textures rather than the CPU
+     `on_paint` copies this entry's 4K concern is about, and ECS tracks Chromium far ahead
+     of our pinned CEF. The cost is the real one: `cef_browser.rs`/`cef_adblock.rs` get
+     rewritten, the process model inverts (Electron owns its process; we drive it over IPC
+     rather than embedding it), a Node runtime joins an otherwise Rust appliance, and EVS
+     signing is a network service in the build — which is a hole in ground rule 6's
+     reproducibility, since the signature is tied to exact bytes.
+  3. **Accept it.** Correct while the browser only loads leanback and a clock.
+
 - **G56 — A branded Cast sender launches an app we cannot host, and we answer "running"
   anyway. CONFIRMED, and intended to be implemented.**
   `session.rs:304` `launch()` takes whatever `appId` it is handed, stores it, and echoes it
@@ -691,9 +711,19 @@ display or the audio device, and two cannot take it back afterwards.
   5. **Codecs — blocked on G55.** Commercial receivers stream DASH/HLS with `avc1`+`mp4a`.
      Today's CEF plays neither, so every one of these apps would fail at the last step even
      if 1–4 were perfect. This is what promotes G55 from "worth doing" to "do it first".
-  6. DRM — Widevine now ships (G46), but note its VMP limit: an unsigned CEF host cannot
-     obtain licences from services that require a verified media path, which is most of the
-     commercial ones. Expect Netflix/Disney+ to refuse even with codecs in place.
+  6. DRM — Widevine now ships (G46), with an unknown attached: VMP. An unsigned CEF host
+     cannot prove a verified media path, and the `.sig` files that would prove it are
+     issued over exact binaries — free via castLabs' EVS, but only for packages derived
+     from *their* Electron fork, so not for any CEF we build (that needs the paid 3PL
+     certification). Which means: if VMP turns out to bind, the free way to a signed host
+     is G55 route 2, not a better CEF. What that *costs* is
+     not established. Host verification is compiled in on Windows and macOS only — it is
+     absent from the Linux build entirely, yet the commercial services play in Chrome on
+     Linux — so VMP is evidently an input to per-service licence policy (often resolution
+     tiers) rather than a universal gate. Whether a given service refuses, downgrades, or
+     ignores it is undocumented and wants measuring, not assuming. Note the ordering
+     either way: VMP is not what gates this item — device-auth below is, and it stops the
+     sender before a licence is ever requested.
 
   **Prove this before building any of it, because it may make the whole item moot:**
   device-auth. Official senders enforce the receiver's certificate chain to the Google Cast
