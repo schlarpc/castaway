@@ -14,6 +14,7 @@
 //! that differs across it is who owns the radio.
 #![forbid(unsafe_code)]
 
+pub mod actor;
 pub mod error;
 pub mod ie;
 pub mod media;
@@ -26,6 +27,7 @@ pub mod video;
 
 use castaway_core::ProtocolKind;
 
+pub use actor::{bind_rtp, connect_control, run_session, MiracastAdapter};
 pub use error::{IeError, MiracastError, ParamError};
 pub use ie::{
     DeviceInformation, DeviceType, ExtendedCapability, SessionAvailability, Subelement,

@@ -807,8 +807,16 @@ impl SinkCapabilities {
                 | ParamName::I2c
                 | ParamName::StandbyResumeCapability
                 | ParamName::PreferredDisplayMode => Some("none".to_owned()),
-                // Everything else is either source-to-sink only or a vendor parameter we
-                // do not implement. Leave it out.
+                // A `microsoft_*` parameter is answered `none` even though we implement
+                // none of them: `none` is the documented "not supported" value for every
+                // one of them, and Windows asks about several in its M3. Omitting them is
+                // legal but answering is what the known-working sinks do.
+                ParamName::Unknown(name) if name.starts_with("microsoft_") => {
+                    Some("none".to_owned())
+                }
+                // Everything else is either source-to-sink only or a vendor parameter with
+                // no documented "not supported" value. Leave it out — inventing a
+                // plausible answer is strictly worse than silence.
                 _ => None,
             };
             if let Some(value) = value {
@@ -862,11 +870,10 @@ mod tests {
         let requested = ParamBody::parse(M3_REQUEST).unwrap().requested_names();
         let response = caps().respond_to(&requested);
         let text = String::from_utf8(response).unwrap();
-        // Two vendor parameters were asked for and cannot be answered; they are omitted
-        // rather than answered `none`, which is what MiracleCast does and what neither
-        // Android nor Windows minds.
-        assert!(!text.contains("microsoft_cursor"));
-        assert!(!text.contains("microsoft_latency"));
+        // `microsoft_*` gets an explicit `none` — that is the documented "not supported"
+        // value for each of them, and Windows asks about several.
+        assert!(text.contains("microsoft_cursor: none"));
+        assert!(text.contains("microsoft_latency_management_capability: none"));
         let names: Vec<&str> = text
             .lines()
             .filter_map(|l| l.split(':').next())
@@ -883,6 +890,8 @@ mod tests {
                 "wfd_display_edid",
                 "wfd_connector_type",
                 "wfd_idr_request_capability",
+                "microsoft_latency_management_capability",
+                "microsoft_cursor",
             ]
         );
     }
@@ -896,7 +905,7 @@ mod tests {
         assert!(body.ends_with(b"\r\n"));
         assert_eq!(
             body.windows(2).filter(|w| *w == b"\r\n").count(),
-            8,
+            10,
             "one terminator per emitted parameter"
         );
         let idr = render_body(&[(ParamName::IdrRequest, None)]);
