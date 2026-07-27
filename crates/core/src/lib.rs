@@ -25,7 +25,7 @@ pub use adapter::{MiracastBackend, SessionSink, SourceAdapter, SourceId, SourceM
 pub use control::{ControlCapabilities, RemoteControl};
 pub use display::{DisplayControl, DisplayInput};
 pub use error::CoreError;
-pub use event::{Advertisement, ControlTxn, SessionEvent};
+pub use event::{Advertisement, ControlTxn, MirrorAudio, SessionEvent};
 pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState, QueueItem, RepeatMode};
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::Pipeline;

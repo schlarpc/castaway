@@ -88,12 +88,13 @@ impl Pipeline for NullPipeline {
     async fn mirror(
         &self,
         video: FrameSource,
-        audio: Option<FrameSource>,
+        audio: Option<castaway_core::MirrorAudio>,
     ) -> Result<(), CoreError> {
         info!("null pipeline: MIRROR begin");
         Self::drain(video, "video");
         if let Some(audio) = audio {
-            Self::drain(audio, "audio");
+            info!(format = %audio.format, "null pipeline: MIRROR audio");
+            Self::drain(audio.source, "audio");
         }
         Ok(())
     }

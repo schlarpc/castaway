@@ -396,22 +396,36 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
         .expect("a dataPort in the reply");
     assert_ne!(data_port, 0, "a zero dataPort means nothing is listening");
 
-    // The pipeline is told to expect a mirror.
+    // The pipeline is told to expect a mirror — and its audio arrives *with* it, not as
+    // a session of its own, which would preempt the picture it belongs to.
     let mut frames = None;
+    let mut audio_frames = None;
     for _ in 0..8 {
         let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
         else {
             break;
         };
-        if let SessionEvent::Mirror { video, .. } = msg.event {
+        if let SessionEvent::Mirror { video, audio } = msg.event {
             let FrameSource::Encoded(rx) = video else {
                 panic!("expected encoded frames")
             };
             frames = Some(rx);
+            let audio = audio.expect("a mirror announces its audio channel up front");
+            // AAC-ELD will not open a decoder without its AudioSpecificConfig.
+            assert_eq!(
+                audio.config.expect("a codec config").as_ref(),
+                &[0xf8, 0xe8, 0x50, 0x00]
+            );
+            assert_eq!(audio.format.sample_rate(), 44_100);
+            let FrameSource::Encoded(arx) = audio.source else {
+                panic!("expected encoded audio frames")
+            };
+            audio_frames = Some(arx);
             break;
         }
     }
     let mut frames = frames.expect("SETUP should have started a mirroring session");
+    let mut audio_frames = audio_frames.expect("the mirror should carry an audio channel");
 
     // Now encrypt video with the key the real derivation must have produced.
     let aes_key: [u8; 16] = unhex(FP_EXPECTED_AES_KEY).try_into().unwrap();
@@ -511,27 +525,6 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
         .and_then(|d| d.get("dataPort"))
         .and_then(plist::Value::as_unsigned_integer)
         .expect("a dataPort for the audio stream");
-
-    let mut audio_frames = None;
-    for _ in 0..8 {
-        let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
-        else {
-            break;
-        };
-        if let SessionEvent::Audio { source, config, .. } = msg.event {
-            // AAC-ELD will not open a decoder without its AudioSpecificConfig.
-            assert_eq!(
-                config.expect("a codec config").as_ref(),
-                &[0xf8, 0xe8, 0x50, 0x00]
-            );
-            let FrameSource::Encoded(rx) = source else {
-                panic!("expected encoded frames")
-            };
-            audio_frames = Some(rx);
-            break;
-        }
-    }
-    let mut audio_frames = audio_frames.expect("the audio SETUP should start a session");
 
     // The audio key is the FairPlay one with the `eiv` verbatim — no SHA-512 derivation,
     // which is the video stream's alone. Encrypt the way a sender does and check it lands.

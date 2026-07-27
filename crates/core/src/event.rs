@@ -101,8 +101,14 @@ pub enum SessionEvent {
     Mirror {
         /// Video frame source.
         video: FrameSource,
-        /// Optional accompanying audio frame source.
-        audio: Option<FrameSource>,
+        /// Optional accompanying audio.
+        ///
+        /// A whole [`MirrorAudio`] rather than a bare source, because a decoder cannot be
+        /// opened from frames alone: AAC-ELD and ALAC both need out-of-band configuration,
+        /// and no mirroring codec states its sample rate in-band. This field was an
+        /// `Option<FrameSource>` and the render pipeline ignored it outright, so Cast
+        /// mirroring depacketized Opus for years and dropped every frame.
+        audio: Option<MirrorAudio>,
     },
     /// A live audio-only session: the adapter pushes encoded audio it has already
     /// depacketized, and there is no video and no URL.
@@ -159,4 +165,19 @@ pub enum SessionEvent {
     Control(ControlTxn),
     /// The source session has ended; release the pipeline and drop the source.
     End,
+}
+
+/// The audio half of a mirroring session.
+///
+/// Carried with the video rather than sent as a separate [`SessionEvent::Audio`] for a
+/// reason that is not tidiness: an audio session *preempts* whatever is on screen, so a
+/// mirror that announced its audio separately would tear down its own picture.
+#[derive(Debug)]
+pub struct MirrorAudio {
+    /// Encoded audio frames from the adapter.
+    pub source: FrameSource,
+    /// The rate and channel count the adapter negotiated.
+    pub format: AudioFormat,
+    /// Codec configuration the decoder cannot open without, if the codec needs one.
+    pub config: Option<bytes::Bytes>,
 }

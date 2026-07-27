@@ -443,6 +443,19 @@ impl CastReceiver {
                     );
                     let (video, audio, receive_loop) = socket.start(&config);
                     *mirror_task = Some(tokio::spawn(receive_loop.run()));
+                    // Cast mirror audio is Opus at 48 kHz stereo, which is self-describing
+                    // in-band — so no codec configuration, unlike AirPlay's AAC-ELD. Until
+                    // now this source was handed over as a bare `FrameSource` and the render
+                    // pipeline discarded it without a word.
+                    let audio = audio.and_then(|source| {
+                        castaway_core::AudioFormat::from_hz(48_000, 2).map(|format| {
+                            castaway_core::MirrorAudio {
+                                source,
+                                format,
+                                config: None,
+                            }
+                        })
+                    });
                     sink.emit(SessionEvent::Mirror { video, audio })
                         .await
                         .map_err(|e| CastError::Io(e.to_string()))?;

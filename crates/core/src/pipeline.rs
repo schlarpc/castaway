@@ -28,8 +28,11 @@ pub trait Pipeline: Send + Sync {
     ///
     /// # Errors
     /// [`CoreError::Pipeline`] if the mirror session can't be established.
-    async fn mirror(&self, video: FrameSource, audio: Option<FrameSource>)
-        -> Result<(), CoreError>;
+    async fn mirror(
+        &self,
+        video: FrameSource,
+        audio: Option<crate::event::MirrorAudio>,
+    ) -> Result<(), CoreError>;
 
     /// Begin a live audio-only session: decode `source` at `format` and play it out,
     /// with the screen showing the now-playing surface rather than video.

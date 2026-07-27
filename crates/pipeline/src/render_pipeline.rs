@@ -473,7 +473,7 @@ impl Pipeline for RenderPipeline {
     async fn mirror(
         &self,
         video: FrameSource,
-        _audio: Option<FrameSource>,
+        audio: Option<castaway_core::MirrorAudio>,
     ) -> Result<(), CoreError> {
         self.release_screen();
         self.preempt();
@@ -504,6 +504,28 @@ impl Pipeline for RenderPipeline {
                 info!("render pipeline: MIRROR (encoded frames → decode → compositor)");
                 let stop = Arc::new(AtomicBool::new(false));
                 self.set_active(stop.clone());
+                // The audio half shares the video's stop flag, because it is the same
+                // session: ending one has to end the other. It also deliberately does
+                // *not* go through `play_audio`, which preempts — a mirror announcing
+                // its audio that way would tear down its own picture.
+                #[cfg(feature = "audio")]
+                if let Some(audio) = audio {
+                    if let FrameSource::Encoded(arx) = audio.source {
+                        info!(format = %audio.format, "render pipeline: MIRROR audio");
+                        crate::audio_session::spawn(
+                            arx,
+                            audio.format,
+                            audio.config,
+                            crate::audio_session::default_output(),
+                            Arc::clone(&stop),
+                            Arc::clone(&self.gain),
+                        );
+                    } else {
+                        warn!("mirror audio is not encoded frames; ignoring it");
+                    }
+                }
+                #[cfg(not(feature = "audio"))]
+                let _ = audio;
                 let tx = self.tx.clone();
                 let hw = self.hw;
                 // Same reasoning as `play`: decode blocks, so it gets an OS thread of its

@@ -172,6 +172,10 @@ async fn pump(
     audio_sockets: &mut Option<AudioSockets>,
     mirror_listener: &mut Option<TcpListener>,
 ) -> Result<(), AirPlayError> {
+    // The sending half of the mirror's audio channel, created with the video and filled
+    // in later: a sender negotiates mirroring audio *after* its video is already
+    // flowing, so the channel has to exist before there is anything to put in it.
+    let mut mirror_audio_tx: Option<mpsc::Sender<EncodedFrame>> = None;
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
     loop {
@@ -233,11 +237,26 @@ async fn pump(
             // A mirroring SETUP that named the stream leaves the keys behind; the
             // sender is about to dial the data port we advertised.
             // Audio negotiated alongside a mirroring session. It rides the same UDP
-            // sockets the AirPlay 1 flow uses, so it consumes the same bound set.
-            if let Some(params) = session.take_mirror_audio() {
+            // sockets the AirPlay 1 flow uses, and feeds the channel already handed to
+            // the pipeline with the video — *not* a session of its own, which would
+            // preempt the picture it belongs to.
+            if let (Some(params), Some(tx)) = (session.take_mirror_audio(), mirror_audio_tx.take())
+            {
                 if let Some(sockets) = audio_sockets.take() {
-                    start_negotiated_audio(&params, sockets, session.sender_ports(), sink, peer)
+                    let stream = AudioStream::new(&params);
+                    info!(%peer, link = %params.describe(), "AirPlay mirroring audio starting");
+                    let _ = sink
+                        .emit(SessionEvent::SourceInfo(
+                            castaway_core::SourceDescription::new().with_link(params.describe()),
+                        ))
                         .await;
+                    tokio::spawn(run_audio(
+                        sockets,
+                        stream,
+                        tx,
+                        peer.ip(),
+                        session.sender_ports(),
+                    ));
                 }
             }
 
@@ -246,7 +265,7 @@ async fn pump(
                 // Re-binding by address instead would race whatever took the port in
                 // between, and we have already told the sender that number.
                 if let Some(listener) = mirror_listener.take() {
-                    start_mirroring(*keys, listener, sink, peer).await;
+                    mirror_audio_tx = start_mirroring(*keys, listener, sink, peer).await;
                 }
             }
 
@@ -679,26 +698,40 @@ fn now_ntp() -> NtpTime {
 /// The listener is not awaited here — a sender dials it a moment after reading the
 /// `SETUP` reply, and blocking the RTSP pump until it does would stall the very
 /// connection the sender is still talking on.
+/// Returns the sender for the mirror's audio channel, for whenever it is negotiated.
 async fn start_mirroring(
     keys: MirrorKeys,
     listener: TcpListener,
     sink: &SessionSink,
     peer: SocketAddr,
-) {
+) -> Option<mpsc::Sender<EncodedFrame>> {
     let (tx, rx) = mpsc::channel(8);
+    // The audio channel is created now even though nothing will feed it until a later
+    // SETUP — if one ever comes. A mirror with no audio simply leaves it silent, which
+    // costs one idle channel and avoids the alternative: announcing the audio as its own
+    // session, which preempts and tears down the picture.
+    let (audio_tx, audio_rx) = mpsc::channel(512);
+    let format = AudioFormat::from_hz(44_100, 2)?;
     info!(%peer, "AirPlay mirroring starting");
     if sink
         .emit(SessionEvent::Mirror {
             video: FrameSource::Encoded(rx),
-            audio: None,
+            audio: Some(castaway_core::MirrorAudio {
+                source: FrameSource::Encoded(audio_rx),
+                format,
+                // Mirroring offers exactly one audio codec, so unlike the SDP path there
+                // is nothing to discover: AAC-ELD, and always this configuration.
+                config: Some(bytes::Bytes::from(crate::sdp::AAC_ELD_CONFIG.to_vec())),
+            }),
         })
         .await
         .is_err()
     {
         warn!(%peer, "session manager gone; not starting mirroring");
-        return;
+        return None;
     }
     tokio::spawn(run_mirroring(listener, keys, tx, peer));
+    Some(audio_tx)
 }
 
 /// Accept the sender's data connection and feed frames until it ends.

@@ -411,7 +411,7 @@ mod tests {
         async fn mirror(
             &self,
             _v: crate::types::FrameSource,
-            _a: Option<crate::types::FrameSource>,
+            _a: Option<crate::event::MirrorAudio>,
         ) -> Result<(), CoreError> {
             Ok(())
         }
