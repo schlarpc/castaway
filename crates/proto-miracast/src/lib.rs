@@ -17,6 +17,7 @@
 pub mod error;
 pub mod media;
 pub mod p2p;
+pub mod params;
 pub mod ts;
 pub mod video;
 
@@ -25,6 +26,10 @@ use castaway_core::ProtocolKind;
 pub use error::{IeError, MiracastError, ParamError};
 pub use media::{MediaReceiver, MP2T_PAYLOAD_TYPE};
 pub use p2p::{MacAddr, WpaCommand, WpaEvent, WpaReply};
+pub use params::{
+    AudioCodecs, AudioFormat, ClientRtpPorts, ConnectorType, ContentProtection, ParamBody,
+    ParamName, PresentationUrls, RtpProfile, SinkCapabilities, TriggerMethod,
+};
 pub use ts::{Pid, StreamType, TsDemux, TS_PACKET_LEN};
 pub use video::{
     pick_best_format, H264Codec, NegotiatedVideo, Profile, ResolutionIndex, ResolutionMask,
