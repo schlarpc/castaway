@@ -741,6 +741,19 @@ display or the audio device, and two cannot take it back afterwards.
   amount of browser or codec work changes the outcome, and the honest scope of this item
   collapses to "apps whose senders do not enforce device-auth".
 
+  What the gate is *not* is a strong nonce check, at least in Chrome. Verified in M147
+  `cast_auth_util.cc`: `VerifySenderNonce` records `kSenderNonceMissing`/`kSenderNonceMismatch`
+  and a UMA bucket, then returns a result whose `success()` reads only `error_type` — which
+  it never sets. Verification then runs `VerifyCredentials(response, nonce_response +
+  peer_cert_der)`, rebuilding the signed blob from the nonce the *response echoed*, so a
+  receiver that echoes nothing is checked against the TLS cert alone. Shanocast is built on
+  exactly this: it drops the echo, pins its TLS private key so the cert is deterministic,
+  and ships 795 precomputed signatures indexed by two-day bucket (2023-08-15 → 2027-12-21).
+  So the scarce thing is the *credential*, not the protocol — that table was signed with a
+  real Chromecast's device key, which we cannot produce, should not borrow, and which stops
+  working at the end of 2027. Read it as evidence that the sender-side check is weaker than
+  the fused-key story suggests, not as a route we can take.
+
 ---
 
 ## Documentation drift
