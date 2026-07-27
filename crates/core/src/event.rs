@@ -121,6 +121,14 @@ pub enum SessionEvent {
         /// that carries no in-band rate (aptX, aptX HD) gives the decoder no other way to
         /// learn it (OPEN-QUESTIONS Q25).
         format: AudioFormat,
+        /// The codec's out-of-band configuration, if the protocol carried one.
+        ///
+        /// Here for the same reason as `format`, and for a sharper one: some decoders
+        /// will not *open* without it. ALAC (AirPlay 1) needs its 36-byte magic cookie,
+        /// AAC-ELD its `AudioSpecificConfig`; libavcodec rejects the former outright
+        /// rather than failing on the first packet. `None` for codecs that describe
+        /// themselves in-band, which is every A2DP codec.
+        config: Option<bytes::Bytes>,
     },
     /// Track metadata for the now-playing surface — a full snapshot, re-emitted whenever
     /// any part of it changes (including artwork arriving late).

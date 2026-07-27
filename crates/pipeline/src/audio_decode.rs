@@ -110,10 +110,24 @@ impl std::fmt::Debug for AudioDecoder {
 impl AudioDecoder {
     /// Open a decoder for `codec` at the negotiated `format`.
     ///
+    /// `config` is the codec's out-of-band configuration — libav calls it *extradata*.
+    /// Pass `None` for codecs that describe themselves in-band; pass `Some` when the
+    /// protocol carried the configuration separately from the samples:
+    ///
+    /// - **ALAC** (AirPlay 1) *must* have it. libavcodec's `alac_decode_init` checks for
+    ///   at least 36 bytes and returns `AVERROR_INVALIDDATA` without them, so an ALAC
+    ///   decoder opened with `None` does not fail later, it fails to open at all. The
+    ///   bytes are `AlacConfig::magic_cookie` in `proto-airplay`.
+    /// - **AAC-ELD** (AirPlay mirroring audio) needs its 4-byte `AudioSpecificConfig`.
+    ///
     /// # Errors
-    /// [`PipelineError::Decode`] if this build has no decoder for the codec, or the
-    /// decoder refuses to open.
-    pub fn new(codec: AudioCodec, format: AudioFormat) -> Result<Self, PipelineError> {
+    /// [`PipelineError::Decode`] if this build has no decoder for the codec, the
+    /// configuration cannot be allocated, or the decoder refuses to open.
+    pub fn new(
+        codec: AudioCodec,
+        format: AudioFormat,
+        config: Option<&[u8]>,
+    ) -> Result<Self, PipelineError> {
         ensure_init();
         let id = codec_id(codec)?;
         let found = ffmpeg::decoder::find(id).ok_or_else(|| {
@@ -142,6 +156,33 @@ impl AudioDecoder {
                     std::ptr::addr_of_mut!((*raw).ch_layout),
                     i32::from(format.channels()),
                 );
+            }
+        }
+
+        if let Some(config) = config {
+            // libav takes ownership: `avcodec_free_context` calls `av_freep` on
+            // `extradata`, so it has to come from libav's allocator rather than being a
+            // pointer into our slice. The trailing padding is what the bitstream readers
+            // over-read into; `av_mallocz` zeroes it, which is what they expect.
+            let padding =
+                usize::try_from(ffmpeg_sys_next::AV_INPUT_BUFFER_PADDING_SIZE).unwrap_or(64);
+            // SAFETY: `context` is a freshly allocated, not-yet-opened AVCodecContext we
+            // exclusively own. `buf` is a fresh libav allocation of `len + padding`
+            // bytes, so the copy of `len` bytes is in bounds, and we hand it to the
+            // context which becomes its owner. `extradata_size` is set to the copied
+            // length only, excluding the padding, as libav requires.
+            unsafe {
+                let raw = context.as_mut_ptr();
+                let len = config.len();
+                let buf = ffmpeg_sys_next::av_mallocz(len + padding).cast::<u8>();
+                if buf.is_null() {
+                    return Err(PipelineError::Decode(
+                        "could not allocate decoder extradata".into(),
+                    ));
+                }
+                std::ptr::copy_nonoverlapping(config.as_ptr(), buf, len);
+                (*raw).extradata = buf;
+                (*raw).extradata_size = i32::try_from(len).unwrap_or(0);
             }
         }
 
@@ -355,6 +396,7 @@ pub(crate) fn pcm_from_frame(decoded: &ffmpeg::frame::Audio) -> Result<PcmBlock,
 pub fn decode_audio_stream<N, F>(
     codec: AudioCodec,
     format: AudioFormat,
+    config: Option<&[u8]>,
     mut next: N,
     mut on_pcm: F,
 ) -> Result<(), PipelineError>
@@ -362,7 +404,7 @@ where
     N: FnMut() -> Option<EncodedFrame>,
     F: FnMut(PcmBlock) -> bool,
 {
-    let mut decoder = AudioDecoder::new(codec, format)?;
+    let mut decoder = AudioDecoder::new(codec, format, config)?;
     let mut running = true;
     while running {
         let Some(frame) = next() else { break };
@@ -559,7 +601,7 @@ mod tests {
 
         let mut decoded: Vec<f32> = Vec::new();
         let mut reported = None;
-        let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(rate, 2)).unwrap();
+        let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(rate, 2), None).unwrap();
         for frame in &frames {
             decoder
                 .decode(frame, |block| {
@@ -623,7 +665,7 @@ mod tests {
         let mut decoded = Vec::new();
         // SBC is self-describing, so the negotiated format is not needed to open it —
         // but passing the wrong one must not break it either.
-        let mut decoder = AudioDecoder::new(AudioCodec::Sbc, format(44_100, 2)).unwrap();
+        let mut decoder = AudioDecoder::new(AudioCodec::Sbc, format(44_100, 2), None).unwrap();
         for frame in &frames {
             decoder
                 .decode(frame, |b| decoded.extend_from_slice(&b.samples))
@@ -691,6 +733,7 @@ mod tests {
         crate::audio_session::run(
             rx,
             format(rate, 2),
+            None,
             Box::new(std::sync::Arc::clone(&speaker)),
             &std::sync::atomic::AtomicBool::new(false),
             &crate::audio_session::Gain::default(),
@@ -712,10 +755,44 @@ mod tests {
         );
     }
 
+    /// The 36-byte ALAC magic cookie for 44.1 kHz / 16-bit / stereo, 352-frame packets
+    /// — the shape `AlacConfig::magic_cookie` builds from an AirPlay `a=fmtp:` line.
+    fn alac_magic_cookie() -> Vec<u8> {
+        let mut c = vec![0u8; 36];
+        c[0..4].copy_from_slice(&36u32.to_be_bytes());
+        c[4..8].copy_from_slice(b"alac");
+        c[12..16].copy_from_slice(&352u32.to_be_bytes()); // frameLength
+        c[17] = 16; // bitDepth
+        c[18] = 40; // pb
+        c[19] = 10; // mb
+        c[20] = 14; // kb
+        c[21] = 2; // channels
+        c[22..24].copy_from_slice(&255u16.to_be_bytes()); // maxRun
+        c[32..36].copy_from_slice(&44_100u32.to_be_bytes());
+        c
+    }
+
+    #[test]
+    fn alac_opens_with_its_magic_cookie_and_not_without_it() {
+        // The whole reason `config` exists. libavcodec's alac_decode_init requires at
+        // least 36 bytes of extradata and returns AVERROR_INVALIDDATA otherwise, so the
+        // failure is at *open*, not on the first packet — an AirPlay session would have
+        // negotiated, decrypted and then had nowhere to send its audio.
+        let cookie = alac_magic_cookie();
+        assert!(
+            AudioDecoder::new(AudioCodec::Alac, format(44_100, 2), Some(&cookie)).is_ok(),
+            "ALAC should open when handed its magic cookie"
+        );
+        assert!(
+            AudioDecoder::new(AudioCodec::Alac, format(44_100, 2), None).is_err(),
+            "ALAC without extradata must fail loudly at open, not silently later"
+        );
+    }
+
     #[test]
     fn a_corrupt_packet_is_skipped_rather_than_ending_the_session() {
         // One bad packet off a radio link must not take the music down.
-        let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(44_100, 2)).unwrap();
+        let mut decoder = AudioDecoder::new(AudioCodec::AptX, format(44_100, 2), None).unwrap();
         let garbage = EncodedFrame {
             video_codec: None,
             audio_codec: Some(AudioCodec::AptX),
@@ -736,7 +813,7 @@ mod tests {
             !can_decode(AudioCodec::Ldac),
             "no LDAC decoder is bound, whatever the feature says"
         );
-        let err = AudioDecoder::new(AudioCodec::Ldac, format(44_100, 2)).unwrap_err();
+        let err = AudioDecoder::new(AudioCodec::Ldac, format(44_100, 2), None).unwrap_err();
         assert!(
             format!("{err}").to_lowercase().contains("ldac"),
             "got: {err}"
@@ -786,6 +863,7 @@ mod tests {
             crate::audio_session::run(
                 rx,
                 format(44_100, 2),
+                None,
                 Box::new(sink),
                 &stop,
                 &crate::audio_session::Gain::default(),

@@ -252,10 +252,11 @@ impl<P: Pipeline> SessionManager<P> {
             SessionEvent::Audio {
                 source: frames,
                 format,
+                config,
             } => {
                 self.begin_session(&source).await?;
                 info!(%source, %format, "session: audio");
-                self.pipeline.play_audio(frames, format).await
+                self.pipeline.play_audio(frames, format, config).await
             }
             SessionEvent::NowPlaying(snapshot) => {
                 if self.active.as_ref() == Some(&source) {
@@ -418,6 +419,7 @@ mod tests {
             &self,
             _s: crate::types::FrameSource,
             format: crate::types::AudioFormat,
+            _config: Option<bytes::Bytes>,
         ) -> Result<(), CoreError> {
             self.0.audio.fetch_add(1, Ordering::SeqCst);
             *self.0.audio_format.lock().expect("poisoned") = Some(format);
@@ -600,6 +602,7 @@ mod tests {
                 source: crate::types::FrameSource::Encoded(rx),
                 format: crate::types::AudioFormat::from_hz(48_000, 2)
                     .expect("48 kHz stereo is a format"),
+                config: None,
             },
         }
     }

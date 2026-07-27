@@ -546,6 +546,9 @@ async fn start(
     sink.emit(SessionEvent::Audio {
         source: FrameSource::Pcm(pcm_rx),
         format,
+        // PCM from librespot: nothing to configure a decoder with, because there is no
+        // decoder.
+        config: None,
     })
     .await
     .map_err(|_| SpotifyError::SessionGone)?;
@@ -618,7 +621,11 @@ async fn serve_reattach(
         info!("spotify: reattaching audio to the pipeline");
         let source = FrameSource::Pcm(link.attach());
         if sink
-            .emit(SessionEvent::Audio { source, format })
+            .emit(SessionEvent::Audio {
+                source,
+                format,
+                config: None,
+            })
             .await
             .is_err()
         {

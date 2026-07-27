@@ -137,17 +137,19 @@ pub fn default_output() -> Box<dyn AudioOut> {
 pub fn spawn(
     frames: mpsc::Receiver<EncodedFrame>,
     format: AudioFormat,
+    config: Option<bytes::Bytes>,
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
     gain: Arc<Gain>,
 ) {
-    std::thread::spawn(move || run(frames, format, output, &stop, &gain));
+    std::thread::spawn(move || run(frames, format, config.as_deref(), output, &stop, &gain));
 }
 
 /// Drive one audio session to completion. Blocking; call it on its own thread.
 pub fn run(
     mut frames: mpsc::Receiver<EncodedFrame>,
     format: AudioFormat,
+    config: Option<&[u8]>,
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
     gain: &Gain,
@@ -167,6 +169,7 @@ pub fn run(
     let result = decode_audio_stream(
         codec,
         format,
+        config,
         || {
             if stop.load(Ordering::Relaxed) {
                 return None;
@@ -477,6 +480,7 @@ mod tests {
         run(
             rx,
             format(),
+            None,
             Box::new(NullAudioOut::new()),
             &running(),
             &Gain::default(),
@@ -499,6 +503,7 @@ mod tests {
         run(
             rx,
             format(),
+            None,
             Box::new(NullAudioOut::new()),
             &running(),
             &Gain::default(),

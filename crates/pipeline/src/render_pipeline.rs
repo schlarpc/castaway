@@ -522,6 +522,7 @@ impl Pipeline for RenderPipeline {
         &self,
         source: FrameSource,
         format: castaway_core::AudioFormat,
+        config: Option<bytes::Bytes>,
     ) -> Result<(), CoreError> {
         #[cfg(feature = "audio")]
         {
@@ -539,6 +540,7 @@ impl Pipeline for RenderPipeline {
                     crate::audio_session::spawn(
                         rx,
                         format,
+                        config,
                         crate::audio_session::default_output(),
                         stop,
                         Arc::clone(&self.gain),

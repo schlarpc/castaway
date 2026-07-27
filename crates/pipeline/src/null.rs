@@ -102,7 +102,11 @@ impl Pipeline for NullPipeline {
         &self,
         source: FrameSource,
         format: castaway_core::AudioFormat,
+        config: Option<bytes::Bytes>,
     ) -> Result<(), CoreError> {
+        // Only the `audio` build has a decoder to configure.
+        #[cfg(not(feature = "audio"))]
+        let _ = config;
         // Audio is the one path this pipeline does for real when the feature is built.
         // An A2DP sink is audio-only with a now-playing card for a screen, so requiring
         // the wgpu/winit kiosk just to make sound would mean the headless build can
@@ -120,6 +124,7 @@ impl Pipeline for NullPipeline {
                 crate::audio_session::spawn(
                     rx,
                     format,
+                    config,
                     crate::audio_session::default_output(),
                     stop,
                     std::sync::Arc::new(crate::audio_session::Gain::default()),

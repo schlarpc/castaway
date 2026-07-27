@@ -868,6 +868,8 @@ impl BluetoothAdapter {
                             .emit(SessionEvent::Audio {
                                 source: FrameSource::Encoded(rx),
                                 format,
+                                // Every A2DP codec describes itself in-band.
+                                config: None,
                             })
                             .await?;
                         // Only now can the description be delivered: the session

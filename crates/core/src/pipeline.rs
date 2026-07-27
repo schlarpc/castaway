@@ -40,7 +40,18 @@ pub trait Pipeline: Send + Sync {
     ///
     /// # Errors
     /// [`CoreError::Pipeline`] if the audio session can't be established.
-    async fn play_audio(&self, source: FrameSource, format: AudioFormat) -> Result<(), CoreError>;
+    /// Play an audio-only source.
+    ///
+    /// `config` is the codec configuration the protocol negotiated out of band, if
+    /// there was one. Some decoders will not *open* without it — ALAC needs its 36-byte
+    /// magic cookie, AAC-ELD its `AudioSpecificConfig` — so it travels with the source
+    /// rather than being discovered from the frames.
+    async fn play_audio(
+        &self,
+        source: FrameSource,
+        format: AudioFormat,
+        config: Option<bytes::Bytes>,
+    ) -> Result<(), CoreError>;
 
     /// Update the now-playing surface. Called with a full snapshot whenever any part of
     /// the metadata changes, including artwork arriving after the text.

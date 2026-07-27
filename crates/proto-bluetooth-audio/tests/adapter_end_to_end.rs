@@ -772,7 +772,7 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
 
     // The session manager should now see an audio session.
     let msg = eventually("an audio session event", || rx.try_recv().ok()).await;
-    let SessionEvent::Audio { source, format } = msg.event else {
+    let SessionEvent::Audio { source, format, .. } = msg.event else {
         panic!("expected an audio session, got {:?}", msg.event);
     };
     // The negotiated rate must reach the pipeline, not a default. aptX has no in-band
