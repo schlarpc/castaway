@@ -34,6 +34,13 @@ pub trait AudioOut: Send {
     fn stop(&mut self);
 }
 
+/// How a pipeline obtains an audio output device.
+///
+/// A factory rather than a device, because each session takes its own: two sessions
+/// writing to one device fight rather than mix. It is also the seam a test uses to
+/// observe that samples actually left the box — see `null::tests`.
+pub type AudioOutputFactory = std::sync::Arc<dyn Fn() -> Box<dyn AudioOut> + Send + Sync>;
+
 /// Counts what it is given and plays nothing.
 #[derive(Debug, Default)]
 pub struct NullAudioOut {

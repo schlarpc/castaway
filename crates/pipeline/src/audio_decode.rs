@@ -429,17 +429,17 @@ pub(crate) fn warn_undecodable(codec: AudioCodec) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
     /// A negotiated format, for tests that already know both numbers are sane.
-    fn format(sample_rate: u32, channels: u16) -> AudioFormat {
+    pub(crate) fn format(sample_rate: u32, channels: u16) -> AudioFormat {
         AudioFormat::from_hz(sample_rate, channels).unwrap()
     }
 
     /// A one-second 440 Hz sine at `rate`, interleaved stereo.
-    fn sine(rate: u32, frames: usize) -> Vec<i16> {
+    pub(crate) fn sine(rate: u32, frames: usize) -> Vec<i16> {
         let mut out = Vec::with_capacity(frames * 2);
         for n in 0..frames {
             #[allow(clippy::cast_precision_loss)]
@@ -512,7 +512,7 @@ mod tests {
     ///
     /// Returns an empty vec if this build has no encoder for the codec, so the tests
     /// skip rather than fail on an ffmpeg compiled without it.
-    fn encode(codec: AudioCodec, rate: u32, pcm: &[i16]) -> Vec<EncodedFrame> {
+    pub(crate) fn encode(codec: AudioCodec, rate: u32, pcm: &[i16]) -> Vec<EncodedFrame> {
         ensure_init();
         let id = codec_id(codec).unwrap();
         let Some(found) = ffmpeg::encoder::find(id) else {

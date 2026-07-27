@@ -17,6 +17,9 @@ use tracing::info;
 pub struct NullPipeline {
     /// Stop flag for the session in progress, so a preempted one actually ends.
     active: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Where audio goes. `None` opens the default device.
+    #[cfg(feature = "audio")]
+    audio_output: Option<crate::audio_out::AudioOutputFactory>,
 }
 
 impl NullPipeline {
@@ -24,6 +27,22 @@ impl NullPipeline {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use `factory` for audio output instead of the default device.
+    #[cfg(feature = "audio")]
+    #[must_use]
+    pub fn with_audio_output(mut self, factory: crate::audio_out::AudioOutputFactory) -> Self {
+        self.audio_output = Some(factory);
+        self
+    }
+
+    /// A fresh output device for one session.
+    #[cfg(feature = "audio")]
+    fn audio_output(&self) -> Box<dyn crate::audio_out::AudioOut> {
+        self.audio_output
+            .as_ref()
+            .map_or_else(crate::audio_session::default_output, |f| f())
     }
 
     /// End whatever session is running. Two audio sessions writing to one output device
@@ -91,11 +110,35 @@ impl Pipeline for NullPipeline {
         audio: Option<castaway_core::MirrorAudio>,
     ) -> Result<(), CoreError> {
         info!("null pipeline: MIRROR begin");
-        Self::drain(video, "video");
+        // The audio half is *played*, not drained. A headless build is the default one,
+        // and a mirror that made no sound because the screen was null would be the same
+        // silent failure this whole field had before it carried a format.
+        #[cfg(feature = "audio")]
         if let Some(audio) = audio {
-            info!(format = %audio.format, "null pipeline: MIRROR audio");
+            if let FrameSource::Encoded(rx) = audio.source {
+                info!(format = %audio.format, "null pipeline: MIRROR audio (decoding)");
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Ok(mut guard) = self.active.lock() {
+                    *guard = Some(std::sync::Arc::clone(&stop));
+                }
+                crate::audio_session::spawn(
+                    rx,
+                    audio.format,
+                    audio.config,
+                    self.audio_output(),
+                    stop,
+                    std::sync::Arc::new(crate::audio_session::Gain::default()),
+                );
+            } else {
+                info!("null pipeline: MIRROR audio is not encoded frames; draining");
+                Self::drain(audio.source, "audio");
+            }
+        }
+        #[cfg(not(feature = "audio"))]
+        if let Some(audio) = audio {
             Self::drain(audio.source, "audio");
         }
+        Self::drain(video, "video");
         Ok(())
     }
 
@@ -126,7 +169,7 @@ impl Pipeline for NullPipeline {
                     rx,
                     format,
                     config,
-                    crate::audio_session::default_output(),
+                    self.audio_output(),
                     stop,
                     std::sync::Arc::new(crate::audio_session::Gain::default()),
                 );
@@ -209,6 +252,105 @@ mod tests {
             .unwrap();
         p.control(ControlTxn::Pause).await.unwrap();
         p.stop().await.unwrap();
+    }
+
+    /// An output that remembers whether anything was actually played through it.
+    #[cfg(feature = "audio")]
+    #[derive(Default)]
+    struct Speaker {
+        frames: std::sync::atomic::AtomicU64,
+    }
+
+    #[cfg(feature = "audio")]
+    impl crate::audio_out::AudioOut for std::sync::Arc<Speaker> {
+        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), crate::error::PipelineError> {
+            Ok(())
+        }
+        fn write(
+            &mut self,
+            block: &crate::audio_decode::PcmBlock,
+        ) -> Result<(), crate::error::PipelineError> {
+            self.frames.fetch_add(
+                block.frame_count() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[cfg(all(feature = "audio", feature = "ffmpeg"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mirrors_audio_reaches_the_output_as_sound() {
+        // The assertion whose absence let a real bug live for the whole life of Cast
+        // mirroring: `SessionEvent::Mirror` has always carried an `audio` field, the
+        // render pipeline took it as `_audio`, and every frame was discarded. Nothing
+        // caught it, because every test around it proved a *layer* — the adapter emits
+        // frames, the depacketiser decrypts them, the channel receives them — and a
+        // pipeline that accepts frames and bins them satisfies all of those.
+        //
+        // So this one asserts the only thing that distinguishes wired-up from dropped:
+        // that a sample left the box.
+        //
+        // SBC because it is the codec every build can decode; what is under test is the
+        // wiring, not the codec.
+        let rate = 44_100;
+        let frames = crate::audio_decode::tests::encode(
+            castaway_core::AudioCodec::Sbc,
+            rate,
+            &crate::audio_decode::tests::sine(rate, 44_100),
+        );
+        if frames.is_empty() {
+            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+            return;
+        }
+
+        let (atx, arx) = mpsc::channel(frames.len() + 1);
+        for frame in frames {
+            atx.send(frame).await.unwrap();
+        }
+        drop(atx);
+
+        let speaker = std::sync::Arc::new(Speaker::default());
+        let for_factory = std::sync::Arc::clone(&speaker);
+        let pipeline = NullPipeline::new().with_audio_output(std::sync::Arc::new(move || {
+            Box::new(std::sync::Arc::clone(&for_factory))
+        }));
+
+        // Video is present but empty: a mirror is video by definition, and the audio has
+        // to play regardless of whether any picture ever arrives.
+        let (_vtx, vrx) = mpsc::channel(1);
+        pipeline
+            .mirror(
+                FrameSource::Encoded(vrx),
+                Some(castaway_core::MirrorAudio {
+                    source: FrameSource::Encoded(arx),
+                    format: crate::audio_decode::tests::format(rate, 2),
+                    config: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The session runs on its own thread; wait for it to drain rather than sleeping
+        // a fixed amount.
+        for _ in 0..200 {
+            if speaker.frames.load(std::sync::atomic::Ordering::SeqCst) > u64::from(rate) / 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let played = speaker.frames.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            played > 0,
+            "not one sample frame of the mirror's audio reached the output"
+        );
+        // A second in, near enough a second out — a session that decoded one frame and
+        // stopped would satisfy a bare `> 0`.
+        assert!(
+            played > u64::from(rate) / 2,
+            "only {played} frames of a one-second clip reached the output"
+        );
     }
 
     #[tokio::test]
