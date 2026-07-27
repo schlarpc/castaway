@@ -42,18 +42,36 @@ pub const OUTPUT_LEAD: Duration = Duration::from_millis(250);
 /// Where a session has got to, in media time.
 ///
 /// Cheap to read from the video thread and cheap to write from the audio thread — one
-/// mutex around two words, taken once per audio block (tens of times a second) and once
+/// mutex around a few words, taken once per audio block (tens of times a second) and once
 /// per video frame.
+///
+/// **One** mutex, and that is load-bearing rather than tidy. The anchor and the freeze
+/// used to have a lock each, and `set_paused` took the freeze lock and then called `now()`,
+/// which takes it again: a `std::sync::Mutex` is not reentrant, so the first pause of any
+/// session deadlocked the thread that asked for it, permanently. On the box that is a tokio
+/// worker gone for the life of the process; here it was the whole test suite timing out
+/// rather than failing. Two locks over one piece of state is what made that expressible —
+/// with one, it cannot be written.
 #[derive(Debug, Default)]
 pub struct MediaClock {
-    inner: Mutex<Option<Anchor>>,
-    /// Where the clock was frozen, if it is paused.
+    state: Mutex<State>,
+}
+
+/// Everything the clock knows, under the one lock.
+#[derive(Debug, Default, Clone, Copy)]
+struct State {
+    /// The last thing the master said, or `None` before anything has.
+    anchor: Option<Anchor>,
+    /// Whether the clock is frozen.
     ///
-    /// A paused clock must *stop*, not keep interpolating: it is what video waits on and
-    /// what the position readout is drawn from, so a clock that ran while the room was
-    /// silent would resume by dumping every frame it had "missed" and would show a
-    /// position the music never reached.
-    paused_at: Mutex<Option<Duration>>,
+    /// Separate from `frozen`, because "paused" and "paused *somewhere*" are different
+    /// facts: a session can be paused before its first frame has been decoded, and
+    /// conflating the two made that pause a silent no-op — a control point that sent
+    /// SetAVTransportURI, Play and Pause in quick succession got playback anyway.
+    paused: bool,
+    /// Where it froze. `None` while `paused` means the clock had not started yet, and the
+    /// first anchor to arrive is what it freezes at.
+    frozen: Option<Duration>,
 }
 
 /// The last thing the master said, and when it said it.
@@ -68,11 +86,44 @@ struct Anchor {
     buffered: bool,
 }
 
+impl State {
+    /// Where the anchor says the media is at `at`, ignoring any freeze.
+    fn running_at(&self, at: Instant) -> Option<Duration> {
+        let anchor = self.anchor?;
+        let position = anchor.media + at.saturating_duration_since(anchor.at);
+        Some(if anchor.buffered {
+            // What is queued minus what has not been heard yet. Saturating rather than
+            // wrapping: at the very start less than a lead's worth has been submitted, and
+            // the honest answer there is "the beginning", not a negative time.
+            position.saturating_sub(OUTPUT_LEAD)
+        } else {
+            position
+        })
+    }
+
+    /// Take a new anchor, and freeze on it if a pause is waiting for somewhere to land.
+    fn anchor_at(&mut self, anchor: Anchor) {
+        self.anchor = Some(anchor);
+        if self.paused && self.frozen.is_none() {
+            self.frozen = self.running_at(anchor.at);
+        }
+    }
+}
+
 impl MediaClock {
     /// A clock that has not started.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The state, recovering a poisoned lock rather than failing on it — a panic somewhere
+    /// else is not a reason to stop telling the video thread what time it is.
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Record that audio through `media` has been handed to the output.
@@ -86,7 +137,7 @@ impl MediaClock {
     /// [`MediaClock::observe_audio`] with the instant supplied, so a test can assert on
     /// the interpolation exactly rather than within a tolerance.
     pub fn observe_audio_at(&self, media: Duration, at: Instant) {
-        self.set(Anchor {
+        self.state().anchor_at(Anchor {
             media,
             at,
             buffered: true,
@@ -103,12 +154,9 @@ impl MediaClock {
 
     /// [`MediaClock::start_video_master`] with the instant supplied, for tests.
     pub fn start_video_master_at(&self, first_frame: Duration, at: Instant) {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.is_none() {
-            *guard = Some(Anchor {
+        let mut state = self.state();
+        if state.anchor.is_none() {
+            state.anchor_at(Anchor {
                 media: first_frame,
                 at,
                 buffered: false,
@@ -116,59 +164,67 @@ impl MediaClock {
         }
     }
 
-    fn set(&self, anchor: Anchor) {
-        let mut guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Some(anchor);
-    }
-
     /// Freeze or release the clock.
     ///
     /// Resuming re-anchors to the frozen position, so the time spent paused does not
     /// count as playback — otherwise every pause would leave the picture that much
     /// behind the sound for the rest of the item.
+    ///
+    /// Pausing before the first frame is honoured rather than dropped. The clock has
+    /// nowhere to freeze yet, so it freezes on whatever arrives first; what matters
+    /// immediately is that [`MediaClock::is_paused`] says so, because that is what holds
+    /// the video thread.
     pub fn set_paused(&self, paused: bool) {
-        let mut frozen = match self.paused_at.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match (paused, *frozen) {
-            (true, None) => *frozen = self.now(),
-            (false, Some(position)) => {
-                *frozen = None;
-                // Re-anchor as a *presented* position rather than a queued one: the
-                // output's buffer was drained by the pause, so there is nothing
-                // unheard left to discount.
-                self.set(Anchor {
-                    media: position,
-                    at: Instant::now(),
-                    buffered: false,
-                });
-            }
-            _ => {}
+        let mut state = self.state();
+        if state.paused == paused {
+            return;
+        }
+        state.paused = paused;
+        if paused {
+            state.frozen = state.running_at(Instant::now());
+        } else if let Some(position) = state.frozen.take() {
+            // Re-anchor as a *presented* position rather than a queued one: the output's
+            // buffer was drained by the pause, so there is nothing unheard left to discount.
+            state.anchor = Some(Anchor {
+                media: position,
+                at: Instant::now(),
+                buffered: false,
+            });
+        }
+    }
+
+    /// Move the clock to `position`, because the media moved there.
+    ///
+    /// Unlike [`MediaClock::start_video_master`] this is not idempotent — a seek is
+    /// precisely the case where the clock must be overruled rather than left alone. The
+    /// new anchor is a *presented* position, not a queued one: everything that had been
+    /// submitted to the output was thrown away with the seek, so there is nothing unheard
+    /// left to discount.
+    ///
+    /// A paused session keeps its pause and moves underneath it. Scrubbing while paused is
+    /// how people find a spot, and resuming has to start from the spot they found rather
+    /// than the one they left.
+    pub fn seek_to(&self, position: Duration) {
+        let mut state = self.state();
+        state.anchor = Some(Anchor {
+            media: position,
+            at: Instant::now(),
+            buffered: false,
+        });
+        if state.paused {
+            state.frozen = Some(position);
         }
     }
 
     /// Whether the clock is currently frozen.
     #[must_use]
     pub fn is_paused(&self) -> bool {
-        match self.paused_at.lock() {
-            Ok(g) => g.is_some(),
-            Err(poisoned) => poisoned.into_inner().is_some(),
-        }
+        self.state().paused
     }
 
     /// Media time as of now, or `None` before the clock has started.
     #[must_use]
     pub fn now(&self) -> Option<Duration> {
-        if let Some(frozen) = match self.paused_at.lock() {
-            Ok(g) => *g,
-            Err(poisoned) => *poisoned.into_inner(),
-        } {
-            return Some(frozen);
-        }
         self.now_at(Instant::now())
     }
 
@@ -176,21 +232,11 @@ impl MediaClock {
     /// without sleeping.
     #[must_use]
     pub fn now_at(&self, at: Instant) -> Option<Duration> {
-        let guard = match self.inner.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let anchor = (*guard)?;
-        let elapsed = at.saturating_duration_since(anchor.at);
-        let position = anchor.media + elapsed;
-        Some(if anchor.buffered {
-            // What is queued minus what has not been heard yet. Saturating rather than
-            // wrapping: at the very start less than a lead's worth has been submitted, and
-            // the honest answer there is "the beginning", not a negative time.
-            position.saturating_sub(OUTPUT_LEAD)
-        } else {
-            position
-        })
+        let state = self.state();
+        if state.paused {
+            return state.frozen;
+        }
+        state.running_at(at)
     }
 
     /// How long to wait before presenting a frame at `pts`, or `None` if it is due now.
@@ -279,15 +325,57 @@ mod tests {
         assert!(c.is_hopeless(Duration::from_secs(5)));
     }
 
+    /// Pausing has to *return*.
+    ///
+    /// It did not: `set_paused` held the freeze lock and then called `now()`, which takes
+    /// the same lock, and a `std::sync::Mutex` is not reentrant — so the first pause of
+    /// any session deadlocked the thread that asked for it, for good. On the box that is a
+    /// tokio worker; in the suite it was the whole test run timing out.
+    ///
+    /// Written as "on another thread, with a deadline" rather than as a plain call,
+    /// because the failure mode is a hang. A test that hangs reports nothing and reads as
+    /// an infrastructure problem; this one names the bug.
+    #[test]
+    fn pausing_returns_rather_than_deadlocking_the_thread_that_asked() {
+        let clock = std::sync::Arc::new(MediaClock::new());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let clock = std::sync::Arc::clone(&clock);
+            move || {
+                clock.observe_audio(Duration::from_secs(5));
+                clock.set_paused(true);
+                clock.set_paused(false);
+                clock.set_paused(true);
+                let _ = done_tx.send(());
+            }
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "set_paused never came back — the clock has deadlocked on its own lock",
+        );
+        worker.join().expect("the pausing thread panicked");
+        assert!(clock.is_paused());
+    }
+
     /// A paused clock stops. If it kept running, resuming would dump every frame it had
     /// "missed" and the position readout would show a place the music never reached.
     #[test]
     fn pausing_freezes_the_clock_and_resuming_does_not_replay_the_gap() {
         let c = MediaClock::new();
         c.observe_audio(Duration::from_secs(10));
-        let at_pause = c.now().unwrap();
+        let before_pause = c.now().unwrap();
         c.set_paused(true);
         assert!(c.is_paused());
+
+        // Where it actually froze, read once. Not compared against the reading taken
+        // *before* the pause: the clock is still running between those two lines, so the
+        // difference is real elapsed time and asserting them equal would be asserting that
+        // two statements execute at the same instant.
+        let at_pause = c.now().unwrap();
+        assert!(
+            at_pause >= before_pause && at_pause - before_pause < Duration::from_millis(50),
+            "froze at {at_pause:?} from {before_pause:?}"
+        );
 
         std::thread::sleep(Duration::from_millis(120));
         assert_eq!(
@@ -327,6 +415,71 @@ mod tests {
         c.start_video_master(Duration::from_secs(1));
         c.start_video_master(Duration::from_secs(50));
         assert!(c.now().unwrap() < Duration::from_secs(2));
+    }
+
+    /// A seek overrules the clock, where the first-frame seed deliberately does not.
+    /// Without it every frame after a jump forward is "hopelessly late" and dropped, and
+    /// every frame after a jump back waits for a turn that is minutes away.
+    #[test]
+    fn a_seek_moves_the_clock_where_a_seed_would_not() {
+        let c = MediaClock::new();
+        c.observe_audio(Duration::from_secs(10));
+        c.seek_to(Duration::from_secs(600));
+        let now = c.now().unwrap();
+        assert!(
+            now >= Duration::from_secs(600) && now < Duration::from_secs(601),
+            "landed at {now:?}"
+        );
+        // No output lead to discount: the seek threw away everything that was queued.
+        assert!(!c.is_hopeless(Duration::from_secs(600)));
+    }
+
+    /// Pausing before the first frame has been decoded is an ordinary thing for a control
+    /// point to do — `SetAVTransportURI`, `Play`, `Pause`, faster than a fetch — and it
+    /// used to be dropped on the floor, because "paused" was stored as "paused *at* a
+    /// position" and there was no position yet. The session played on.
+    #[test]
+    fn a_pause_that_arrives_before_the_first_frame_still_pauses() {
+        let c = MediaClock::new();
+        c.set_paused(true);
+        assert!(
+            c.is_paused(),
+            "the pause was dropped for want of a position"
+        );
+        assert_eq!(c.now(), None, "and there is still nothing to report");
+
+        // The first thing to arrive is where it freezes, rather than starting it running.
+        c.start_video_master(Duration::from_secs(7));
+        assert!(c.is_paused());
+        assert_eq!(c.now(), Some(Duration::from_secs(7)));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(c.now(), Some(Duration::from_secs(7)), "it must not advance");
+
+        c.set_paused(false);
+        let after = c.now().unwrap();
+        assert!(
+            after >= Duration::from_secs(7) && after < Duration::from_millis(7_100),
+            "resumed at {after:?} rather than where it was held"
+        );
+    }
+
+    /// Scrubbing while paused is how people find a spot; resuming has to start from the
+    /// spot they found, not the one they left.
+    #[test]
+    fn seeking_while_paused_moves_the_frozen_position() {
+        let c = MediaClock::new();
+        c.observe_audio(Duration::from_secs(10));
+        c.set_paused(true);
+        c.seek_to(Duration::from_secs(120));
+        assert!(c.is_paused());
+        assert_eq!(c.now(), Some(Duration::from_secs(120)));
+
+        c.set_paused(false);
+        let after = c.now().unwrap();
+        assert!(
+            after >= Duration::from_secs(120) && after < Duration::from_secs(121),
+            "resumed at {after:?} rather than where the scrub landed"
+        );
     }
 
     /// Audio takes over from a video-master seed: a file whose audio starts late should
