@@ -719,7 +719,14 @@
                   1900
                   # mDNS: Spotify Connect, Cast, and AirPlay/RAOP advertisements.
                   5353
-                ];
+                ]
+                # Miracast's RTP port. Note there is no TCP rule to add: the sink is the
+                # RTSP *client* and dials out to the source's 7236, so nothing listens on
+                # 7236 here. The rule is per-interface-less on purpose — the P2P group
+                # interface does not exist until the group starts and is named
+                # unpredictably (`p2p-wlan0-N`).
+                ++ lib.optional (cfg.settings.enable.miracast or false)
+                  (cfg.settings.miracast.rtp_port or 1028);
               };
             };
           };
