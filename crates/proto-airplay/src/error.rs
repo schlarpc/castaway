@@ -87,6 +87,22 @@ pub enum SdpError {
     },
 }
 
+/// Failures parsing a `SETUP` `Transport` header.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportError {
+    /// The transport was not `RTP/AVP/UDP`.
+    #[error("Transport is not RTP/AVP/UDP")]
+    NotUdp,
+
+    /// A port we need in order to talk back was not named.
+    #[error("Transport omits {name}")]
+    MissingPort {
+        /// Which parameter.
+        name: &'static str,
+    },
+}
+
 impl SdpError {
     /// The RTSP status to answer an `ANNOUNCE` this error came from.
     ///

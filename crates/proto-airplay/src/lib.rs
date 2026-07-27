@@ -24,14 +24,16 @@ pub mod error;
 pub mod info;
 pub mod sdp;
 pub mod session;
+pub mod transport;
 
 use castaway_core::ProtocolKind;
 
 pub use actor::AirPlayReceiver;
 pub use advert::{AirPlayIdentity, Features, AIRPLAY_PORT};
-pub use error::{AirPlayError, SdpError};
-pub use sdp::{AlacConfig, AnnounceParams, RaopCodec, StreamCrypto};
+pub use error::{AirPlayError, SdpError, TransportError};
+pub use sdp::{AlacConfig, AnnounceParams, RaopCodec, SessionKey, StreamCrypto};
 pub use session::{AirPlayResponse, AirPlaySession};
+pub use transport::{ReceiverPorts, SenderPorts};
 
 /// The protocol kind for AirPlay sources.
 #[must_use]
