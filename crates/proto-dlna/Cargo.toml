@@ -13,13 +13,13 @@ substrate-ssdp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util"] }
 axum.workspace = true
 quick-xml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

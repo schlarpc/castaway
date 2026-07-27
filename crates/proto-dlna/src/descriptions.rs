@@ -25,6 +25,8 @@ pub mod paths {
     pub const AVT_EVENT: &str = "/dlna/event/AVTransport";
     /// RenderingControl GENA event endpoint.
     pub const RC_EVENT: &str = "/dlna/event/RenderingControl";
+    /// ConnectionManager GENA event endpoint.
+    pub const CM_EVENT: &str = "/dlna/event/ConnectionManager";
 }
 
 /// Service type URNs.
@@ -77,7 +79,7 @@ pub fn device_description(friendly_name: &str, uuid: &str) -> String {
         <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
         <SCPDURL>{cm_scpd}</SCPDURL>
         <controlURL>{cm_control}</controlURL>
-        <eventSubURL>/dlna/event/ConnectionManager</eventSubURL>
+        <eventSubURL>{cm_event}</eventSubURL>
       </service>
     </serviceList>
   </device>
@@ -102,6 +104,7 @@ pub fn device_description(friendly_name: &str, uuid: &str) -> String {
         cm_control = paths::CM_CONTROL,
         avt_event = paths::AVT_EVENT,
         rc_event = paths::RC_EVENT,
+        cm_event = paths::CM_EVENT,
     )
 }
 

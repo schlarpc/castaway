@@ -12,6 +12,8 @@ pub mod control;
 pub mod descriptions;
 pub mod didl;
 pub mod error;
+pub mod gena;
+pub mod notify;
 pub mod service;
 pub mod soap;
 pub mod state;
@@ -52,8 +54,17 @@ impl DlnaService {
                 uuid: uuid.into(),
                 osd: OnceLock::new(),
                 playback: OnceLock::new(),
+                subscribers: std::sync::Mutex::new(crate::gena::Subscribers::new()),
+                published: std::sync::Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// The shared state behind this service, for tests that drive it directly rather than
+    /// through HTTP.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> Arc<DlnaState> {
+        Arc::clone(&self.state)
     }
 
     /// Give this renderer an [`OsdSink`] so volume/mute changes show on the overlay.
@@ -120,6 +131,8 @@ impl DlnaService {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    use std::time::Duration;
+
     use super::*;
     use castaway_core::SourceId;
     use tokio::sync::mpsc;
@@ -193,5 +206,211 @@ mod tests {
             msg.event,
             castaway_core::SessionEvent::Play { .. }
         ));
+    }
+
+    /// A control point that subscribes gets told things — which is the entire claim, and
+    /// the one this service used to make falsely.
+    ///
+    /// Driven over a real socket rather than against the handler, because the half that was
+    /// missing is the half that leaves the process: a `SUBSCRIBE` that returns a `SID` and
+    /// is never followed by a `NOTIFY` looks identical, from inside, to one that works.
+    ///
+    /// The subscriber here is what a control point is — a listener on a port it names in
+    /// its `CALLBACK` header — and it asserts on the two things that make an event usable:
+    /// `SEQ 0` carrying the *complete* state, and a later `SEQ` carrying the change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscriber_is_sent_the_initial_state_and_then_every_change() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tower::ServiceExt;
+
+        // A control point's callback listener: collect each NOTIFY, answer 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (events_tx, mut events_rx) = mpsc::channel::<String>(8);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let events_tx = events_tx.clone();
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    // One read: the whole NOTIFY goes out in a single write.
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        seen.extend_from_slice(&buf[..n]);
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = events_tx
+                        .send(String::from_utf8_lossy(&seen).into_owned())
+                        .await;
+                });
+            }
+        });
+
+        let (svc, _rx) = service();
+        let app = svc.router();
+
+        let subscribed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(paths::AVT_EVENT)
+                    .header("CALLBACK", format!("<http://127.0.0.1:{port}/cb>"))
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", "Second-1800")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscribed.status(), StatusCode::OK);
+        let sid = subscribed
+            .headers()
+            .get("SID")
+            .and_then(|v| v.to_str().ok())
+            .expect("a subscription with no SID is one the control point cannot renew")
+            .to_string();
+        assert!(sid.starts_with("uuid:"));
+        // The lease is ours to set, and a control point renews against it.
+        assert_eq!(subscribed.headers().get("TIMEOUT").unwrap(), "Second-1800");
+
+        // The initial event: mandatory (UDA 1.1 §4.3), SEQ 0, and carrying the complete
+        // state rather than a change — everything after it is a delta against this.
+        let initial = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("no initial NOTIFY arrived")
+            .unwrap();
+        assert!(initial.starts_with("NOTIFY /cb HTTP/1.1\r\n"));
+        assert!(initial.contains(&format!("SID: {sid}\r\n")));
+        assert!(initial.contains("SEQ: 0\r\n"));
+        assert!(initial.contains("NTS: upnp:propchange\r\n"));
+        assert!(initial.contains("&lt;TransportState val=&quot;NO_MEDIA_PRESENT&quot;/&gt;"));
+
+        // Now change something the subscriber cares about.
+        let set_uri = r#"<?xml version="1.0"?>
+        <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+        <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+        <InstanceID>0</InstanceID><CurrentURI>http://10.0.0.9/v.mp4</CurrentURI>
+        </u:SetAVTransportURI></s:Body></s:Envelope>"#;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(paths::AVT_CONTROL)
+                    .body(Body::from(set_uri))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let changed = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("a state change reached no subscriber")
+            .unwrap();
+        assert!(changed.contains("SEQ: 1\r\n"), "sequence must advance");
+        assert!(changed.contains("&lt;TransportState val=&quot;STOPPED&quot;/&gt;"));
+        assert!(changed.contains("v.mp4"));
+
+        // …and unsubscribing stops it. A control point that has gone away and a control
+        // point that said so are different, and only the second should be instant.
+        let gone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("UNSUBSCRIBE")
+                    .uri(paths::AVT_EVENT)
+                    .header("SID", &sid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::OK);
+
+        // A stale SID is 412, not 404: that is how a control point learns to start over.
+        let stale = app
+            .oneshot(
+                Request::builder()
+                    .method("UNSUBSCRIBE")
+                    .uri(paths::AVT_EVENT)
+                    .header("SID", &sid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    /// Renewal is how a subscription outlives its lease, and a control point that cannot
+    /// renew has to tear down and re-subscribe — which costs it the whole state again.
+    #[tokio::test]
+    async fn a_subscription_can_be_renewed_and_an_unknown_one_cannot() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let (svc, _rx) = service();
+        let app = svc.router();
+
+        // No callback listener here on purpose: the initial NOTIFY will fail to deliver,
+        // and a subscription must survive that — one unreachable delivery is not the same
+        // as a subscriber that has gone.
+        let subscribed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(paths::RC_EVENT)
+                    .header("CALLBACK", "<http://127.0.0.1:1/cb>")
+                    .header("NT", "upnp:event")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscribed.status(), StatusCode::OK);
+        let sid = subscribed
+            .headers()
+            .get("SID")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let renewed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(paths::RC_EVENT)
+                    .header("SID", &sid)
+                    .header("TIMEOUT", "Second-300")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed.status(), StatusCode::OK);
+        assert_eq!(renewed.headers().get("SID").unwrap(), sid.as_str());
+
+        let unknown = app
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(paths::RC_EVENT)
+                    .header("SID", "uuid:not-ours")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::PRECONDITION_FAILED);
     }
 }

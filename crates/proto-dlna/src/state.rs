@@ -122,6 +122,55 @@ fn upnp_time(d: Duration) -> String {
     )
 }
 
+/// What this renderer will actually take.
+///
+/// A function rather than a constant inside the action that answers it, because two
+/// separate things have to agree on it: `GetProtocolInfo` answers with it, and a GENA
+/// subscriber to ConnectionManager is *evented* with it — and a device whose picker
+/// entry and whose event stream disagreed about what it accepts would be worse than
+/// one that got either wrong on its own.
+///
+/// Two things are load-bearing in the list, and both were learned the hard way by
+/// gmrender-resurrect rather than by us:
+///
+/// 1. **Globs are not enough.** `upnp_connmgr.c` says it verbatim — "BubbleUPnP does not
+///    seem to match generic `audio/*` types, but only matches mime-types _exactly_". A
+///    glob-only sink therefore matches *nothing* on one of the most widely used control
+///    points there is: the panel appears in its picker and then refuses every item, which
+///    is the exact failure shape this project keeps finding. So the common types are
+///    enumerated as well as globbed.
+/// 2. **`x-` and non-`x-` are both needed.** The same file documents controllers
+///    disagreeing about `audio/x-m4a` vs `audio/m4a` vs `audio/mp4`, and about
+///    `audio/mpeg` vs `audio/x-mpeg`. Emitting one spelling loses whichever half of the
+///    field picked the other.
+///
+/// The globs stay in front because controllers that *do* honour them get the widest
+/// answer, and the enumeration is what the strict ones read. `image/*` is absent because
+/// nothing renders a still (G65).
+///
+/// These are MIME-only entries with no `DLNA.ORG_PN` profile, which is legal and testable
+/// — but note it obliges us to decode everything in the certification table for each MIME
+/// we name, so this list should grow only as the decoder does.
+pub(crate) const fn sink_protocol_info() -> &'static str {
+    concat!(
+        "http-get:*:video/*:*,http-get:*:audio/*:*,",
+        // Audio, enumerated for the exact-matchers.
+        "http-get:*:audio/mpeg:*,http-get:*:audio/x-mpeg:*,",
+        "http-get:*:audio/mp4:*,http-get:*:audio/m4a:*,http-get:*:audio/x-m4a:*,",
+        "http-get:*:audio/aac:*,http-get:*:audio/x-aac:*,",
+        "http-get:*:audio/flac:*,http-get:*:audio/x-flac:*,",
+        "http-get:*:audio/ogg:*,http-get:*:audio/x-ogg:*,",
+        "http-get:*:audio/vorbis:*,http-get:*:audio/opus:*,",
+        "http-get:*:audio/wav:*,http-get:*:audio/x-wav:*,",
+        "http-get:*:audio/L16:*,",
+        // Video.
+        "http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,",
+        "http-get:*:video/mpeg:*,http-get:*:video/quicktime:*,",
+        "http-get:*:video/x-msvideo:*,http-get:*:video/avi:*,",
+        "http-get:*:video/webm:*,http-get:*:video/x-m4v:*",
+    )
+}
+
 /// AVTransport actions that exist in the service template, are optional, and that this
 /// renderer does not implement — so they answer 602 rather than 401.
 ///
@@ -541,7 +590,7 @@ impl Renderer {
     /// `ControlCapabilities` is: an answer that is a constant is an answer that is wrong in
     /// most states, and every button it wrongly offers is a fault the person pressing it
     /// has to interpret.
-    fn available_actions(&self) -> String {
+    pub(crate) fn available_actions(&self) -> String {
         let mut actions: Vec<&str> = Vec::new();
         match self.state {
             TransportState::NoMediaPresent => {}
@@ -618,50 +667,10 @@ impl Renderer {
     /// [`DlnaError::InvalidAction`] for unknown actions;
     /// [`DlnaError::OptionalActionNotImplemented`] for the optional connection model.
     pub fn connection_manager(&self, action: &SoapAction) -> Result<Outcome, DlnaError> {
-        // What this renderer will actually take.
-        //
-        // Two things are load-bearing here, and both were learned the hard way by
-        // gmrender-resurrect rather than by us:
-        //
-        // 1. **Globs are not enough.** `upnp_connmgr.c` says it verbatim — "BubbleUPnP
-        //    does not seem to match generic `audio/*` types, but only matches mime-types
-        //    _exactly_". A glob-only sink therefore matches *nothing* on one of the most
-        //    widely used control points there is: the panel appears in its picker and
-        //    then refuses every item, which is the exact failure shape this project keeps
-        //    finding. So the common types are enumerated as well as globbed.
-        // 2. **`x-` and non-`x-` are both needed.** The same file documents controllers
-        //    disagreeing about `audio/x-m4a` vs `audio/m4a` vs `audio/mp4`, and about
-        //    `audio/mpeg` vs `audio/x-mpeg`. Emitting one spelling loses whichever half
-        //    of the field picked the other.
-        //
-        // The globs stay in front because controllers that *do* honour them get the
-        // widest answer, and the enumeration is what the strict ones read. `image/*` is
-        // absent because nothing renders a still (G65).
-        //
-        // These are MIME-only entries with no `DLNA.ORG_PN` profile, which is legal and
-        // testable — but note it obliges us to decode everything in the certification
-        // table for each MIME we name, so this list should grow only as the decoder does.
-        const SINK: &str = concat!(
-            "http-get:*:video/*:*,http-get:*:audio/*:*,",
-            // Audio, enumerated for the exact-matchers.
-            "http-get:*:audio/mpeg:*,http-get:*:audio/x-mpeg:*,",
-            "http-get:*:audio/mp4:*,http-get:*:audio/m4a:*,http-get:*:audio/x-m4a:*,",
-            "http-get:*:audio/aac:*,http-get:*:audio/x-aac:*,",
-            "http-get:*:audio/flac:*,http-get:*:audio/x-flac:*,",
-            "http-get:*:audio/ogg:*,http-get:*:audio/x-ogg:*,",
-            "http-get:*:audio/vorbis:*,http-get:*:audio/opus:*,",
-            "http-get:*:audio/wav:*,http-get:*:audio/x-wav:*,",
-            "http-get:*:audio/L16:*,",
-            // Video.
-            "http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,",
-            "http-get:*:video/mpeg:*,http-get:*:video/quicktime:*,",
-            "http-get:*:video/x-msvideo:*,http-get:*:video/avi:*,",
-            "http-get:*:video/webm:*,http-get:*:video/x-m4v:*",
-        );
         match action.name.as_str() {
             "GetProtocolInfo" => Ok(Outcome::args(vec![
                 ("Source".into(), String::new()),
-                ("Sink".into(), SINK.into()),
+                ("Sink".into(), sink_protocol_info().into()),
             ])),
             "GetCurrentConnectionIDs" => {
                 Ok(Outcome::args(vec![("ConnectionIDs".into(), "0".into())]))
@@ -669,7 +678,7 @@ impl Renderer {
             "GetCurrentConnectionInfo" => Ok(Outcome::args(vec![
                 ("RcsID".into(), "0".into()),
                 ("AVTransportID".into(), "0".into()),
-                ("ProtocolInfo".into(), SINK.into()),
+                ("ProtocolInfo".into(), sink_protocol_info().into()),
                 ("PeerConnectionManager".into(), String::new()),
                 ("PeerConnectionID".into(), "-1".into()),
                 ("Direction".into(), "Input".into()),

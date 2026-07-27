@@ -23,18 +23,26 @@ use tracing::{debug, info};
 use crate::state::{Renderer, TransportState};
 
 /// A [`RemoteControl`] over a live DLNA session.
+///
+/// Holds the whole service state rather than the two pieces it strictly needs, because a
+/// press on the glass has three consequences and not two: the transport state moves, the
+/// transaction goes to the pipeline, and every GENA subscriber has to be told — and a
+/// remote that could do the first two but not the third would leave a subscribed control
+/// point convinced the session was still playing.
 pub struct DlnaRemote {
-    renderer: Arc<Mutex<Renderer>>,
-    /// Where the transaction goes once the transport state has been updated: into the
-    /// session manager, which routes it to the pipeline that is actually playing.
-    sink: castaway_core::SessionSink,
+    state: Arc<crate::service::DlnaState>,
 }
 
 impl DlnaRemote {
-    /// Wrap the renderer state and the session's event sink.
+    /// Wrap the service's shared state.
     #[must_use]
-    pub const fn new(renderer: Arc<Mutex<Renderer>>, sink: castaway_core::SessionSink) -> Self {
-        Self { renderer, sink }
+    pub(crate) const fn new(state: Arc<crate::service::DlnaState>) -> Self {
+        Self { state }
+    }
+
+    /// The renderer this remote drives.
+    fn renderer(&self) -> &Mutex<Renderer> {
+        &self.state.renderer
     }
 
     /// What a DLNA session lets the panel do.
@@ -75,7 +83,7 @@ impl RemoteControl for DlnaRemote {
         // ours is 0.0–1.0; the renderer holds the UPnP one because that is what it has to
         // answer `GetVolume` with.
         {
-            let mut renderer = self.renderer.lock().await;
+            let mut renderer = self.renderer().lock().await;
             match &txn {
                 ControlTxn::Play => renderer.state = TransportState::Playing,
                 ControlTxn::Pause => renderer.state = TransportState::PausedPlayback,
@@ -102,7 +110,12 @@ impl RemoteControl for DlnaRemote {
         }
 
         debug!(?txn, "dlna: transport from the panel");
-        self.sink
+        // Subscribers hear about a press on the glass exactly as they hear about one on
+        // the phone. Leaving this out is the same bug as never eventing at all, restricted
+        // to the half of the transport a person is standing in front of.
+        self.publish().await;
+        self.state
+            .sink
             .emit(castaway_core::SessionEvent::Control(txn))
             .await
             .map_err(|e| CoreError::Adapter(format!("dlna control: {e}")))
@@ -118,8 +131,26 @@ impl RemoteControl for DlnaRemote {
         // this was an ending or a failure — §2.2.2's `ERROR_OCCURRED` is for exactly the
         // URL that could not be fetched, which until now read as PLAYING / OK forever.
         info!(%end, "dlna: the pipeline finished with the item");
-        self.renderer.lock().await.media_ended(&end);
+        self.renderer().lock().await.media_ended(&end);
+        // The event this exists for. A subscriber that is *not* polling — which is the
+        // whole point of having subscribed — has no other way to learn that the item is
+        // over, so without this the eventing path reproduces exactly the gap the polling
+        // path had.
+        self.publish().await;
         Ok(())
+    }
+}
+
+impl DlnaRemote {
+    /// Tell every subscriber what changed, if anything did.
+    async fn publish(&self) {
+        crate::service::publish_if_changed(&self.state, crate::gena::EventedService::AvTransport)
+            .await;
+        crate::service::publish_if_changed(
+            &self.state,
+            crate::gena::EventedService::RenderingControl,
+        )
+        .await;
     }
 }
 
@@ -139,9 +170,11 @@ mod tests {
         mpsc::Receiver<SourceMessage>,
     ) {
         let (tx, rx) = mpsc::channel(8);
-        let renderer = Arc::new(Mutex::new(Renderer::default()));
         let sink = SessionSink::new(SourceId::new(ProtocolKind::Dlna, "test"), tx);
-        (DlnaRemote::new(Arc::clone(&renderer), sink), renderer, rx)
+        let service = crate::DlnaService::new("Test TV", "abcd-1234", sink);
+        let state = service.state();
+        let renderer = Arc::clone(&state.renderer);
+        (DlnaRemote::new(state), renderer, rx)
     }
 
     /// The capability set must not promise more than `RenderPipeline::control` honours
