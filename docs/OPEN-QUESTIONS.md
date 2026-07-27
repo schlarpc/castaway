@@ -152,13 +152,35 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   which changes what to build next rather than merely how confident to be:
 
   - **Q7a — does this box's radio support `P2P-GO` alongside the station interface?**
-    A static driver allowlist cannot answer it: for four driver families (mt76 CNM,
-    ath10k OCS, ath11k dual-stations, brcmfmac MCHAN/RSDB) the answer depends on
-    firmware. The check that *does* answer it is parsing
-    `NL80211_ATTR_INTERFACE_COMBINATIONS` and requiring a combination with `P2P_GO` and
-    `STATION` in different limit buckets. Worth doing, and the ground-rule-1 version
-    makes `LinuxMiracastBackend` unconstructible without the parsed capability. Not
-    built: it needs a netlink dependency this workspace does not yet have.
+    Partly answered, and the answer is encouraging for the *dev* box: iwlwifi advertises
+    `num_different_channels = 2` for STA + P2P-GO and has since v4.19, confirmed against
+    the AX200 in this machine. Using a **P2P-GO vif rather than an AP vif is
+    load-bearing** — the AP-containing combination is the single-channel one, so the two
+    look interchangeable and are not. rtw88 cannot do this at all (no P2P iftypes in the
+    driver); mt76, ath10k, ath11k and brcmfmac are firmware-gated in ways that make any
+    static chipset allowlist wrong.
+
+    So the check to build is still the interface-combination parse, and it is four
+    independent facts rather than a boolean: `P2P_GO` in the supported modes, `#channels`
+    in the combination, `remain_on_channel`/`start_p2p_device`, and management-frame RX.
+    MiracleCast conflates them into one loose grep, which is the documented origin of its
+    largest bug cluster. Parsing `NL80211_ATTR_INTERFACE_COMBINATIONS` into a typed
+    capability at startup makes "this adapter cannot host a sink" unrepresentable rather
+    than a surprise mid-negotiation — the ground-rule-1 version makes
+    `LinuxMiracastBackend` unconstructible without it. Not built: it needs a netlink
+    dependency this workspace does not yet have.
+
+  - **Q7d — NetworkManager cannot host this, and that is structural.** Its Wi-Fi P2P
+    support is source-only by design; the sink-capability merge request was closed
+    unmerged, and it welds `go_intent` and never calls `GroupAdd`. castaway is a
+    *receiver*, so the deployment has to set the phy unmanaged and drive
+    `fi.w1.wpa_supplicant1` (or its control socket, which is what `backend_linux` does)
+    directly. That is a NixOS module decision, not a code one, and nothing in this repo
+    makes it yet.
+
+    The good news alongside it: nothing needs patching or vendoring. hostap 2.11 ships
+    `CONFIG_P2P`, `CONFIG_AP` and `CONFIG_WIFI_DISPLAY` enabled in its `defconfig`, and
+    NixOS's binary demonstrably has the WFD code compiled in.
   - **Q7b — 5 GHz is blocked on this kernel.** `CONFIG_CFG80211_REG_RELAX_NO_IR` is not
     set on the NixOS kernel here (verified in `/proc/config.gz`, 6.18.33), and
     `cfg80211_ir_permissive_chan()` needs both it and the driver's own relax flag. So a
