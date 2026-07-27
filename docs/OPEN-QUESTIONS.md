@@ -18,18 +18,22 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   request's last 20 bytes and contains no cryptography whatsoever. `/fp-setup` answers
   correctly today rather than returning `501`.
 
-  What is left is one function: unwrapping the 72-byte `ekey` into the 16-byte AES key
-  (`FairPlaySession::decrypt_ekey`). That needs the OmgHax table set (~99 KiB) plus
-  ~1200 lines of algorithm. **It does not need a capture** — airplay2-receiver publishes
-  20 complete `(key message, ekey, expected key)` vectors, so a from-scratch port is
-  verifiable with no hardware at all.
+  The other half — unwrapping the 72-byte `ekey` into the 16-byte AES key — is
+  `crypto-playfair`. It needed the OmgHax table set (~99 KiB) plus ~1200 lines of
+  algorithm, and **it never needed a capture**: airplay2-receiver publishes 20 complete
+  `(key message, ekey, expected key)` vectors, which is what verifies the port. The
+  tables are generated and `garble` transpiled rather than retyped, because a
+  transcription slip there produces a wrong key and a session that shows static rather
+  than failing loudly.
 
-  It needs a *decision*: the tables are extracted Apple constants, UxPlay's own README
-  declines to defend their status, and separately the C and Python sources are GPL while
-  castaway is MIT. `docs/airplay-research.md` §5.3 lays out both halves.
+  What it *did* need was a decision, and that was taken deliberately: the material is
+  GPL where this workspace is MIT, and UxPlay's own README declines to defend its status
+  with respect to Apple. It lives behind one crate boundary so the question has one place
+  to be revisited. `docs/airplay-research.md` §5.3 has the reasoning.
 
-  This gates **mirroring only**. AirPlay 1 audio — the current target — never touches
-  FairPlay; its key arrives RSA-wrapped in the `ANNOUNCE` SDP.
+  Note this was only ever a gate on **mirroring**. AirPlay 1 audio never touches
+  FairPlay; its key arrives RSA-wrapped in the `ANNOUNCE` SDP and `crypto-raop` unwraps
+  it.
 - **Q2 — Cast device-auth cert material. Still open, and now the *only* thing open.**
   `crypto-cast-auth` needs a real device cert + key to sign the CASTv2 `AuthChallenge`.
   At n=1 this is "a fixed local input" (per hackerspace notes).
