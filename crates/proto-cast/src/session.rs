@@ -269,6 +269,10 @@ impl CastSession {
             }
             "STOP" => {
                 self.app = None;
+                // The media session belonged to the application. Leaving the player state
+                // behind would have a later GET_STATUS describe playback inside an app
+                // that is no longer running.
+                self.player_state = None;
                 let mut r = self.reply_receiver_status(&sender, env.request_id.unwrap_or(0));
                 r.events.push(SessionEvent::End);
                 Ok(r)
@@ -772,6 +776,35 @@ mod tests {
                 "sender-0",
                 "receiver-0",
                 r#"{"type":"STOP","requestId":2}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["status"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    /// Stopping the application ends the media session with it — otherwise a later
+    /// GET_STATUS describes playback inside an app that is no longer running.
+    #[test]
+    fn stopping_the_app_ends_the_media_session_too() {
+        let mut s = session();
+        s.handle(&receiver_request(
+            r#"{"requestId":1,"type":"LAUNCH","appId":"CC1AD845"}"#,
+        ))
+        .unwrap();
+        let load = r#"{"type":"LOAD","requestId":2,"media":{"contentId":"http://h/v.mp4"}}"#;
+        s.handle(&recv_msg(ns::MEDIA, "sender-0", "receiver-0", load))
+            .unwrap();
+        s.handle(&receiver_request(r#"{"requestId":3,"type":"STOP"}"#))
+            .unwrap();
+
+        let r = s
+            .handle(&recv_msg(
+                ns::MEDIA,
+                "sender-0",
+                "receiver-0",
+                r#"{"type":"GET_STATUS","requestId":4}"#,
             ))
             .unwrap();
         assert_eq!(
