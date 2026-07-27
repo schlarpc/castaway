@@ -18,11 +18,23 @@ use crypto_fairplay::FairPlaySession;
 use tracing::{debug, info as log_info, warn};
 
 use crate::advert::AirPlayIdentity;
+use std::net::IpAddr;
+
 use crate::control::ControlUpdate;
 use crate::error::AirPlayError;
 use crate::info;
 use crate::sdp::AnnounceParams;
 use crate::transport::{ReceiverPorts, SenderPorts};
+
+/// Parse an `AA:BB:CC:DD:EE:FF` device id into six bytes.
+fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = text.split(':');
+    for slot in &mut out {
+        *slot = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
+}
 
 /// The binary-plist content type AirPlay uses.
 pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
@@ -150,6 +162,8 @@ pub struct AirPlaySession {
     raop: RaopState,
     /// The ports the actor bound for this session, set before any SETUP arrives.
     local_ports: Option<ReceiverPorts>,
+    /// The address the sender reached us on, for `Apple-Challenge`.
+    local_addr: Option<IpAddr>,
     /// Where the sender wants us to send resend and timing requests.
     sender_ports: Option<SenderPorts>,
 }
@@ -163,8 +177,17 @@ impl AirPlaySession {
             fairplay: FairPlaySession::new(),
             raop: RaopState::default(),
             local_ports: None,
+            local_addr: None,
             sender_ports: None,
         }
+    }
+
+    /// Tell the session which address the sender reached us on.
+    ///
+    /// Needed to answer an `Apple-Challenge`: the signature covers the address and MAC,
+    /// so a response captured from one receiver cannot be replayed for another.
+    pub fn set_local_addr(&mut self, addr: IpAddr) {
+        self.local_addr = Some(addr);
     }
 
     /// Tell the session which ports the actor bound for it.
@@ -207,11 +230,7 @@ impl AirPlaySession {
         let (method, path, body) = (req.method, req.path, req.body);
         debug!(%method, %path, body = body.len(), "airplay request");
         let resp = match (method, path) {
-            ("OPTIONS", _) => AirPlayResponse::ok().header(
-                "Public",
-                "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, \
-                 SET_PARAMETER, POST, GET",
-            ),
+            ("OPTIONS", _) => self.options(req),
             ("GET", "/info") => {
                 AirPlayResponse::ok_body(APPLE_PLIST_MIME, info::info_plist(&self.identity)?)
             }
@@ -245,6 +264,45 @@ impl AirPlaySession {
             }
         };
         Ok(resp)
+    }
+
+    /// Handle `OPTIONS`, answering an `Apple-Challenge` if the sender sent one.
+    ///
+    /// iTunes and macOS will not proceed without a valid `Apple-Response`; iOS is more
+    /// forgiving. A challenge we cannot sign is left unanswered rather than answered
+    /// wrongly — a sender that checks will reject a bad signature anyway, and one that
+    /// does not will carry on.
+    fn options(&self, req: &AirPlayRequest<'_>) -> AirPlayResponse {
+        let mut resp = AirPlayResponse::ok().header(
+            "Public",
+            "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, \
+             SET_PARAMETER, POST, GET",
+        );
+        let Some(challenge) = req.header("Apple-Challenge") else {
+            return resp;
+        };
+        match self.apple_response(challenge) {
+            Ok(response) => resp = resp.header("Apple-Response", &response),
+            Err(e) => warn!(error = %e, "could not answer the Apple-Challenge"),
+        }
+        resp
+    }
+
+    /// Sign one `Apple-Challenge`.
+    fn apple_response(&self, challenge: &str) -> Result<String, AirPlayError> {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD_NO_PAD;
+        let raw = engine
+            .decode(challenge.trim().trim_end_matches('='))
+            .map_err(|_| AirPlayError::Malformed("Apple-Challenge is not base64"))?;
+        let addr = self.local_addr.ok_or(AirPlayError::Malformed(
+            "no local address for the signature",
+        ))?;
+        let mac = parse_mac(&self.identity.device_id)
+            .ok_or(AirPlayError::Malformed("device id is not a MAC"))?;
+        let signature = crypto_raop::sign_apple_challenge(&raw, addr, mac)?;
+        // Senders send and expect the padding stripped.
+        Ok(engine.encode(signature))
     }
 
     /// Handle `ANNOUNCE`: the only message that states the audio format.
@@ -746,6 +804,63 @@ mod tests {
             .status,
             415
         );
+    }
+
+    #[test]
+    fn an_apple_challenge_is_answered_with_a_signature() {
+        // iTunes and macOS will not proceed without this.
+        let mut s = session();
+        s.set_local_addr("10.0.0.9".parse().unwrap());
+        let headers = vec![(
+            "Apple-Challenge".to_string(),
+            "MDEyMzQ1Njc4OWFiY2RlZg".to_string(),
+        )];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "OPTIONS",
+                path: "*",
+                headers: &headers,
+                body: &[],
+            })
+            .unwrap();
+        let response = r
+            .headers
+            .iter()
+            .find(|(k, _)| *k == "Apple-Response")
+            .map(|(_, v)| v.clone())
+            .expect("a challenge must be answered");
+        // 256 bytes of signature, base64 with the padding stripped the way senders send.
+        assert!(response.len() > 300, "{response}");
+        assert!(!response.contains('='), "padding should be stripped");
+    }
+
+    #[test]
+    fn an_options_without_a_challenge_is_unchanged() {
+        let mut s = session();
+        let r = s.handle(&AirPlayRequest::new("OPTIONS", "*", &[])).unwrap();
+        assert_eq!(r.status, 200);
+        assert!(!r.headers.iter().any(|(k, _)| *k == "Apple-Response"));
+    }
+
+    #[test]
+    fn a_challenge_we_cannot_bind_to_an_address_is_left_unanswered() {
+        // Better than a signature over the wrong address: a sender that checks would
+        // reject it anyway, and one that does not carries on regardless.
+        let mut s = bare_session();
+        let headers = vec![(
+            "Apple-Challenge".to_string(),
+            "MDEyMzQ1Njc4OWFiY2RlZg".to_string(),
+        )];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "OPTIONS",
+                path: "*",
+                headers: &headers,
+                body: &[],
+            })
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(!r.headers.iter().any(|(k, _)| *k == "Apple-Response"));
     }
 
     #[test]

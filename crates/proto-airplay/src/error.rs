@@ -18,6 +18,10 @@ pub enum AirPlayError {
     #[error("fairplay: {0}")]
     FairPlay(#[from] crypto_fairplay::FairPlayError),
 
+    /// One of the RAOP RSA operations failed.
+    #[error("raop crypto: {0}")]
+    RaopCrypto(#[from] crypto_raop::RaopCryptoError),
+
     /// An `ANNOUNCE` session description could not be understood.
     #[error("announce: {0}")]
     Sdp(#[from] SdpError),

@@ -87,6 +87,7 @@ impl AirPlayReceiver {
         let local_ip = stream
             .local_addr()
             .map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip());
+        session.set_local_addr(local_ip);
         match AudioSockets::bind(local_ip).await {
             Ok((sockets, ports)) => {
                 session.set_local_ports(ports);
