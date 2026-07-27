@@ -559,3 +559,51 @@ Explicitly *not* used for live mirroring. A Cast or AirPlay pixel stream is pace
 sender, and ground rule 4 says to drop late frames there rather than wait: holding a
 mirrored frame to match a clock adds latency to the one path where latency is the
 complaint.
+
+### D35 — Miracast: reimplement the protocol, defer the radio, and say which is which
+`proto-miracast` lands as the complete wire protocol with no working link under it, which
+looks like the wrong half to build first. It is the right one, and the reasoning is worth
+keeping because it will come up again for the Windows backend.
+
+The protocol and the link fail for unrelated reasons and are testable by unrelated means.
+Everything above the link — the information element, the `wfd-kv` grammar, M1–M16, the
+transport stream, UIBC — is deterministic, fixture-testable, and *the same on every
+platform*. The link is driver-dependent, needs root and a radio, and is the one part that
+differs between Linux and Windows. Building them together would have produced a system
+where a failure is ambiguous: no picture could mean a driver, a negotiation, a demuxer, or
+a bug in any of them. Built apart, the protocol is provably correct before a radio is ever
+involved, and the remaining unknown is exactly one layer thick.
+
+Four decisions inside it, each of which had a plausible alternative:
+
+- **Our own TS demuxer rather than ffmpeg's `rtp_mpegts`.** architecture-substrate.md §1a
+  correctly notes libav will eat the stream whole, and that would have been less code. It
+  also hands libav the socket, which ground rule 3 forbids, and it hides the elementary
+  stream — but an IDR arriving is what answers a source's `wfd_idr_request`, and that
+  request is the *only* loss-recovery primitive WFD has. With AOSP's encoder putting IDRs
+  fifteen seconds apart, giving that up to save 400 lines is a bad trade.
+
+- **Autonomous group owner, no GO negotiation.** Windows wants intent 14, Android insists
+  on 0, and two peers at 15 is a defined hard failure — every negotiating strategy loses
+  against one of the two senders we actually have. Bringing the group up unilaterally
+  deletes the negotiation state machine rather than tuning it.
+
+- **`wfd_content_protection: none`.** HDCP 2.x is the one crypto module in this project we
+  are choosing not to build. Both open-source sinks answer `none`, Windows' *own* sink
+  answers `none`, and both platforms proceed with an unencrypted stream. What it costs is
+  DRM-locked video, which a hackerspace panel was never going to play anyway.
+
+- **The negotiation oracle.** AOSP's format chooser is reimplemented in `video.rs` so tests
+  can assert what an Android source *would* pick from a given advertisement. That was not
+  planned; it fell out of needing to test the negotiation without a phone, and it
+  immediately earned its place by surfacing something no amount of reading had: the
+  resolution is an intersection but the profile and level are **not** — a source reads the
+  lowest bit of each side and takes the minimum, so it can settle on a profile the sink
+  never claimed. That is why the sink advertises both H.264 profiles and why
+  `NegotiatedVideo::sink_can_decode` is a question the M4 handler asks rather than an
+  assumption it makes.
+
+What is deferred with eyes open: Miracast-over-Infrastructure (MS-MICE) is documented and
+unbuilt — it removes the P2P *data* path but not the beacon, so it does not rescue us from
+the driver question, and it is only worth building once a group forms. See OPEN-QUESTIONS
+Q7 and Q26 for what has to be true before either can be promised on the deploy target.

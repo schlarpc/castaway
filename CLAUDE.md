@@ -17,6 +17,7 @@ The design docs are the spec — read them before touching a subsystem:
 - **docs/dlna-conformance.md** — the DLNA/UPnP conformance record: what is confirmed
   correct and must not be "fixed", where real control points diverge from the spec, and
   what the citations are worth. Read before changing `proto-dlna`.
+- **docs/miracast-protocol-notes.md** — the WFD/Miracast protocol record `proto-miracast` is built from: the information element, the `wfd-kv` grammar, the M1–M16 exchange, MPEG2-TS-over-RTP, UIBC, and what real Windows and Android senders actually do. Read before changing `proto-miracast`; §7 is the platform reality and is where the project's remaining risk lives.
 - **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`, MSVC), the CEF/ffmpeg escape hatches, and the testing matrix.
 
 Reference implementations named in the docs (UxPlay, openscreen, librespot, yt-cast-receiver, …)

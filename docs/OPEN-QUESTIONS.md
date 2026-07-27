@@ -142,9 +142,46 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Deferred (per docs, not blockers)
 
-- **Q7 — Miracast backend.** `proto-miracast` deferred (rule: get everything else
-  working first; Wi-Fi P2P is the yak). Trait `MiracastBackend` lives in `core`; no
-  backend impl yet. `backend-windows` is the intended first impl (cross-build).
+- **Q7 — Miracast: the protocol is done; the radio is the question.** `proto-miracast`
+  now implements the whole wire protocol — IE, `wfd-kv`, M1–M16, TS demux, UIBC — and a
+  Linux `MiracastBackend` that talks to wpa_supplicant. What has never happened is a
+  Wi-Fi Direct group forming. The protocol layers are fixture-tested and the control
+  interface is parsed from captured strings, so the untested surface is small and
+  well-bounded; it is also the part that needs hardware, root, and a cooperative driver.
+  `docs/miracast-protocol-notes.md` §7.6 has the commands. Three sub-questions, each of
+  which changes what to build next rather than merely how confident to be:
+
+  - **Q7a — does this box's radio support `P2P-GO` alongside the station interface?**
+    A static driver allowlist cannot answer it: for four driver families (mt76 CNM,
+    ath10k OCS, ath11k dual-stations, brcmfmac MCHAN/RSDB) the answer depends on
+    firmware. The check that *does* answer it is parsing
+    `NL80211_ATTR_INTERFACE_COMBINATIONS` and requiring a combination with `P2P_GO` and
+    `STATION` in different limit buckets. Worth doing, and the ground-rule-1 version
+    makes `LinuxMiracastBackend` unconstructible without the parsed capability. Not
+    built: it needs a netlink dependency this workspace does not yet have.
+  - **Q7b — 5 GHz is blocked on this kernel.** `CONFIG_CFG80211_REG_RELAX_NO_IR` is not
+    set on the NixOS kernel here (verified in `/proc/config.gz`, 6.18.33), and
+    `cfg80211_ir_permissive_chan()` needs both it and the driver's own relax flag. So a
+    GO on any NO-IR 5 GHz channel is refused regardless of what the adapter advertises,
+    and `[miracast] freq_mhz` can only usefully name a 2.4 GHz channel until that is a
+    kernel override in the flake. Decide whether 5 GHz matters enough to carry a custom
+    kernel.
+  - **Q7c — who serves DHCP on the group interface?** As group owner we are expected to,
+    and the peer's IP is not something wpa_supplicant reports — the backend reads it from
+    the neighbour table, which is empty until the peer has an address. Nothing in this
+    repo starts a DHCP server. The NixOS module needs to, or the backend needs to hand
+    out one address itself.
+
+- **Q26 — Can a third-party app be a Miracast sink on Windows at all?** The deploy target
+  is Windows, and the answer is not obviously yes. `WFDStartDisplaySink` — the Win32 API
+  that does exactly this — ended client support at Windows 10.
+  `Windows.Media.Miracast.MiracastReceiver` requires `CoreApplicationView`, which
+  Microsoft documents as unsupported in desktop apps. The promising path is
+  `WiFiDirectAdvertisement`, which exposes both `IsAutonomousGroupOwnerEnabled` and
+  `InformationElements` — enough to stand up our own group with our own WFD IE and run
+  *this* sink over it, same architecture as Linux. Unknown: whether it works unpackaged,
+  and which capability it needs. That spike is the thing to run before promising Miracast
+  on the deploy target; `docs/miracast-protocol-notes.md` §7.7 has the detail.
 - **Q8 — Zero-copy decode path.** MVP is decode→CPU AVFrame→wgpu upload. DXGI shared
   handle / dmabuf import is explicitly post-MVP. Not touching until the CPU path runs.
 
