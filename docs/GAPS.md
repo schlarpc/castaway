@@ -665,8 +665,12 @@ display or the audio device, and two cannot take it back afterwards.
   Three routes, and none of them is "buy a build" — nobody sells a codec-enabled CEF:
   1. **Build CEF ourselves** with those GN args. Keeps the architecture exactly as it is;
      costs chromium-scale compute per bump, and for the deploy artifact either a Windows
-     build host or a Chromium Linux→Windows cross setup. Gets codecs. Cannot get VMP:
-     signing a custom build needs castLabs' *commercial* Widevine 3PL certification.
+     build host or a Chromium Linux→Windows cross setup. Gets codecs. VMP is *not* ruled
+     out here — CEF looks for `<exe>.sig` and `libcef.dll.sig` and feeds each present pair
+     to the CDM (`libcef/common/cdm_host_file_path.cc`), so the plumbing is designed in and
+     what is missing is only a signing arrangement: castLabs' free EVS is scoped to their
+     own Electron fork, so a CEF build means their *commercial* 3PL certification (or a
+     Widevine agreement direct with Google).
   2. **Replace the browser layer with Electron.** Its official builds already set
      `ffmpeg_branding="Chrome"` and `proprietary_codecs=true` (`build/args/all.gn`), so
      codecs come free and maintained. castLabs' fork (ECS, `castlabs/electron-releases`)
@@ -713,10 +717,11 @@ display or the audio device, and two cannot take it back afterwards.
      if 1–4 were perfect. This is what promotes G55 from "worth doing" to "do it first".
   6. DRM — Widevine now ships (G46), with an unknown attached: VMP. An unsigned CEF host
      cannot prove a verified media path, and the `.sig` files that would prove it are
-     issued over exact binaries — free via castLabs' EVS, but only for packages derived
-     from *their* Electron fork, so not for any CEF we build (that needs the paid 3PL
-     certification). Which means: if VMP turns out to bind, the free way to a signed host
-     is G55 route 2, not a better CEF. What that *costs* is
+     issued over exact binaries by someone Widevine trusts. CEF *accepts* them —
+     `libcef/common/cdm_host_file_path.cc` passes `<exe>.sig` and `libcef.dll.sig` to the
+     CDM when they exist — so this is a signing arrangement rather than a code problem, and
+     staying on CEF does not forfeit VMP. It only changes who signs: castLabs' free EVS is
+     scoped to their Electron fork, so CEF means paid 3PL certification. What VMP *costs* is
      not established. Host verification is compiled in on Windows and macOS only — it is
      absent from the Linux build entirely, yet the commercial services play in Chrome on
      Linux — so VMP is evidently an input to per-service licence policy (often resolution
