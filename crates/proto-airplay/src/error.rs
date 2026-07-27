@@ -78,3 +78,28 @@ pub enum SdpError {
         missing: &'static str,
     },
 }
+
+impl SdpError {
+    /// The RTSP status to answer an `ANNOUNCE` this error came from.
+    ///
+    /// A refused announcement is not a dead connection — the sender may reasonably
+    /// try again with something else — so each of these is a status code rather than a
+    /// dropped socket, and the code is chosen to tell the sender *which* thing it got
+    /// wrong.
+    #[must_use]
+    pub const fn rtsp_status(&self) -> u16 {
+        match self {
+            // 456 Header Field Not Valid for Resource is what shairport-sync answers to
+            // a half-declared encryption, and it is the one a sender can act on.
+            Self::HalfEncrypted { .. } => 456,
+            // 415 Unsupported Media Type: the body was understood, the codec is not one
+            // we decode.
+            Self::UnsupportedCodec(_) => 415,
+            Self::NotUtf8
+            | Self::MissingRtpmap
+            | Self::BadFmtp
+            | Self::BadBase64 { .. }
+            | Self::BadLength { .. } => 400,
+        }
+    }
+}

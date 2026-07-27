@@ -82,6 +82,66 @@ by writing code. Path C buys a panel nothing that A does not.
 
 ---
 
+## 2.2 Climbing the ladder: do AirPlay 1 and 2 coexist?
+
+**Yes, on one device, and that is what real devices do.** The Denon AVR-X3500H, Sonos
+Symfonisk, Apple TV 4K and HomePod captures all advertise `_airplay._tcp` and
+`_raop._tcp` at once, and shairport-sync's AirPlay 2 build still serves AirPlay 1 — its
+release notes call it "the Classic AirPlay feature of AP2".
+
+Three facts make coexistence work:
+
+1. **The sender picks the generation from the advertisement.** pyatv's
+   `get_protocol_version` keys AP2-vs-AP1 off features bit 38 or 48
+   (`utils.py:241-256`), and owntone additionally gates buffered audio on
+   `srcvers >= 354.54.6` and PTP on `srcvers >= 366` (`airplay.c:419-420`).
+2. **The flows diverge at the sender's first move and never interleave.** AirPlay 1
+   opens with `ANNOUNCE` + SDP; AirPlay 2 opens with `SETUP` + a binary plist. So a
+   receiver dispatches on what arrives, not on a configured mode — which is why
+   `actor.rs` deliberately does not let the socket decide which media plane a session is.
+3. **The one thing that is not additive is the `_raop._tcp` TXT dialect.** Classic
+   carries `txtvers`/`ch`/`sr`/`ss`/`et`/`cn`; the AP2 form drops those and adds
+   `ft`/`pk`/`ov`. That record gets switched, not extended.
+
+### But the ladder forks — mirroring is not on the AirPlay 2 branch
+
+This is the part worth knowing before planning around it:
+
+```
+                     AP1 audio, et=0          ← where we are
+                          │
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+   AP1 audio, et=1                 AP2 audio
+   (RSA unwrap; needs the          (HomeKit transient pairing + ChaCha
+    leaked AirPort private          control channel + SETUP plist + PTP)
+    key — §5.3 problem 3)          no FairPlay, no licence question
+          │                               │
+          ▼                               ▼
+   AP1 mirroring                   AP2 mirroring
+   (FairPlay / OmgHax)             ✗ nobody open-source has ever done this
+```
+
+Mirroring in the open world is **exclusively** the AirPlay 1 legacy path — UxPlay and
+RPiPlay both, and both need the OmgHax unwrap. shairport-sync and airplay2-receiver are
+audio-only by design. So "get to AirPlay 2" and "get mirroring" are different directions
+from here, not successive rungs, and AP2 does not bring mirroring closer.
+
+### What AirPlay 2 would cost
+
+- HomeKit transient pairing: ~800–1000 lines, but **every constant is known** (§4) and
+  pyatv's client drives it, so it is verifiable in CI with no hardware.
+- The ChaCha20-Poly1305 framed control channel: small, and the seam already exists in
+  `substrate-rtsp`'s `ByteTransform`.
+- The two-phase `SETUP` plist and stream types 96/103.
+- **PTP — the long pole.** A full IEEE-1588 slave. shairport-sync does not implement it
+  at all; it shells out to a separate daemon (`nqptp`) that needs *exclusive* UDP 319 and
+  320, which is also why shairport-sync cannot run in AP2 mode on macOS. This wants its
+  own `substrate-ptp` crate on its own schedule, and it should not block anything else.
+
+The UxPlay-shaped alternative — AP2 with `timingProtocol: NTP` instead of PTP — trades
+PTP for FairPlay, so it is not actually cheaper.
+
 ## 3. Q1 is largely retired
 
 `OPEN-QUESTIONS.md` Q1 says FairPlay-SAP "needs real captures from `airplay2-receiver`/UxPlay
