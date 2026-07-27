@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use crate::control::ControlCapabilities;
 use crate::error::CoreError;
 use crate::event::ControlTxn;
 use crate::nowplaying::{NowPlaying, QueueItem};
@@ -63,6 +64,21 @@ pub trait Pipeline: Send + Sync {
     /// # Errors
     /// [`CoreError::Pipeline`] if the surface can't be updated.
     async fn source_info(&self, source: SourceDescription) -> Result<(), CoreError>;
+
+    /// Tell the surface which transport verbs the active session will honour.
+    ///
+    /// Separate from [`Pipeline::now_playing`] because it changes on a different schedule
+    /// and from a different place: metadata moves per track, while the capability set is
+    /// settled once the peer's control channel comes up — which for Bluetooth is a second
+    /// L2CAP channel that routinely connects *after* audio is already flowing.
+    ///
+    /// This is what lets the panel draw transport controls at all, and what stops it
+    /// drawing one the sender would refuse. [`ControlCapabilities::NONE`] means the
+    /// session has no reverse channel and the surface should offer nothing.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the surface can't be updated.
+    async fn controls(&self, capabilities: ControlCapabilities) -> Result<(), CoreError>;
 
     /// Apply a transport-control transaction to the active session.
     ///

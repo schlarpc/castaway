@@ -1132,6 +1132,9 @@ fn default_z(id: LayerId) -> i32 {
         // Above the idle scene, below video: a sender with pixels of its own outranks a
         // card describing a sender without them.
         LayerId::NowPlaying => -5,
+        // Between the card and video: it belongs to the card, and a video sender covers
+        // both.
+        LayerId::Transport => -4,
         LayerId::Video => 0,
         LayerId::Browser => 5,
         LayerId::Osd => 10,

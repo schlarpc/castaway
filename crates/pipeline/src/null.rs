@@ -168,6 +168,14 @@ impl Pipeline for NullPipeline {
         Ok(())
     }
 
+    async fn controls(
+        &self,
+        capabilities: castaway_core::ControlCapabilities,
+    ) -> Result<(), CoreError> {
+        info!(?capabilities, "null pipeline: CONTROLS");
+        Ok(())
+    }
+
     async fn control(&self, txn: ControlTxn) -> Result<(), CoreError> {
         info!(?txn, "null pipeline: CONTROL");
         Ok(())

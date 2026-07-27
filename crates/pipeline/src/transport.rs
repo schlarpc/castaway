@@ -39,6 +39,31 @@ use castaway_core::{ControlCapabilities, ControlTxn, NowPlaying, PlaybackState, 
 #[cfg(feature = "render")]
 pub use paint::render;
 
+/// How much of the surface's width the strip spans, centred.
+///
+/// Not the full width: the strip sits under a card whose text column is already inset,
+/// and a control bar running edge to edge on a 65-inch panel reads as a system UI rather
+/// than as part of what is playing. It also keeps the texture small — see the module
+/// docs on why this is its own layer.
+pub const STRIP_WIDTH_FRACTION: f32 = 0.62;
+
+/// How much of the surface's height the strip occupies, at the bottom.
+pub const STRIP_HEIGHT_FRACTION: f32 = 0.20;
+
+/// Where the strip sits on a `width` × `height` surface, in pixels: `(x, y, w, h)`.
+///
+/// One definition, used by the compositor placement, by the card's reserved space, and by
+/// the touch router's conversion from panel coordinates into strip-local ones. Three
+/// consumers of one number is exactly the situation that goes wrong when it is written
+/// out three times.
+#[must_use]
+pub fn placement(width: u32, height: u32) -> (f32, f32, f32, f32) {
+    let (w, h) = (width as f32, height as f32);
+    let sw = w * STRIP_WIDTH_FRACTION;
+    let sh = h * STRIP_HEIGHT_FRACTION;
+    ((w - sw) / 2.0, h - sh, sw, sh)
+}
+
 /// A control the strip can offer.
 ///
 /// Deliberately *not* one-to-one with [`ControlTxn`]: one button means different
@@ -378,8 +403,6 @@ pub fn format_time(d: Duration) -> String {
 /// it should not need a GPU to test.
 #[cfg(feature = "render")]
 mod paint {
-    use std::time::Duration;
-
     use castaway_core::RepeatMode;
 
     use super::{format_time, layout, Rect, TransportControl, TransportModel};
@@ -774,6 +797,7 @@ mod paint {
     }
 
     /// Skip: a triangle against a bar. `forward` points right (next), otherwise left (prev).
+    #[allow(clippy::too_many_arguments)]
     fn skip_glyph(
         buf: &mut [u8],
         width: u32,
@@ -812,7 +836,12 @@ mod paint {
         );
     }
 
-    /// Shuffle: two crossing paths with arrowheads on the right.
+    /// Shuffle: two crossing paths, each running horizontally before and after the
+    /// crossing, with arrowheads on the right.
+    ///
+    /// The horizontal runs are what make this read as *shuffle* rather than as a cross:
+    /// two bare diagonals are an X, and an X on a wall panel is "close" or "error" to
+    /// everyone who walks past it.
     fn shuffle_glyph(
         buf: &mut [u8],
         width: u32,
@@ -824,9 +853,10 @@ mod paint {
     ) {
         let s = size * 0.46;
         let t = size * 0.075;
-        let (l, r) = (cx - s, cx + s * 0.55);
-        let (top, bot) = (cy - s * 0.55, cy + s * 0.55);
-        let head = size * 0.16;
+        let (l, r) = (cx - s, cx + s * 0.62);
+        let (top, bot) = (cy - s * 0.5, cy + s * 0.5);
+        let stub = s * 0.34;
+        let head = size * 0.15;
         fill_sdf(
             buf,
             width,
@@ -834,19 +864,21 @@ mod paint {
             bounds_around(cx, cy, size + 2.0),
             color,
             |px, py| {
-                let cross_a = sd_segment(px, py, l, top, r, bot) - t;
-                let cross_b = sd_segment(px, py, l, bot, r, top) - t;
-                let arrow_a = sd_triangle(
-                    px,
-                    py,
-                    [(r, bot - head), (r, bot + head), (r + head * 1.5, bot)],
-                );
-                let arrow_b = sd_triangle(
-                    px,
-                    py,
-                    [(r, top - head), (r, top + head), (r + head * 1.5, top)],
-                );
-                cross_a.min(cross_b).min(arrow_a).min(arrow_b)
+                // Each path: a horizontal entry, the diagonal that crosses the other, and
+                // a horizontal run into its arrowhead.
+                let path = |ay: f32, by: f32| {
+                    sd_segment(px, py, l, ay, l + stub, ay)
+                        .min(sd_segment(px, py, l + stub, ay, r - stub, by))
+                        .min(sd_segment(px, py, r - stub, by, r, by))
+                        - t
+                };
+                let arrow = |y: f32| {
+                    sd_triangle(px, py, [(r, y - head), (r, y + head), (r + head * 1.5, y)])
+                };
+                path(top, bot)
+                    .min(path(bot, top))
+                    .min(arrow(top))
+                    .min(arrow(bot))
             },
         );
     }

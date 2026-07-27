@@ -11,7 +11,7 @@
 //! former through the render channel on every track change would be absurd when the
 //! latter reproduces it exactly.
 
-use castaway_core::{NowPlaying, PlaybackState, QueueItem, SourceDescription};
+use castaway_core::{ControlCapabilities, NowPlaying, PlaybackState, QueueItem, SourceDescription};
 use tracing::debug;
 
 use crate::error::PipelineError;
@@ -32,6 +32,23 @@ pub struct NowPlayingCard {
     /// the source cannot see one — the card cannot tell those apart and does not try, it
     /// simply shows nothing.
     pub up_next: Vec<QueueItem>,
+    /// What the active session will honour, which decides whether a transport strip is
+    /// drawn along the bottom and therefore how much room the card has.
+    pub controls: ControlCapabilities,
+}
+
+impl NowPlayingCard {
+    /// The transport strip this card implies, if any.
+    #[must_use]
+    pub fn transport(&self) -> crate::transport::TransportModel {
+        crate::transport::TransportModel::from_now_playing(&self.track, self.controls)
+    }
+
+    /// Whether a transport strip will be drawn under this card.
+    #[must_use]
+    pub fn has_transport(&self) -> bool {
+        !self.transport().is_empty()
+    }
 }
 
 /// One laid-out line of the card.
@@ -78,6 +95,32 @@ impl Default for Palette {
             art_bg: [0x11, 0x1a, 0x30, 0xff],
         }
     }
+}
+
+/// The card's background colours over a vertical slice of the panel, `0.0..=1.0`.
+///
+/// Exists so a layer drawn *over* part of the card — the transport strip — can continue
+/// the same gradient instead of painting a band across it. The card owns the palette, so
+/// it owns this answer.
+#[must_use]
+pub fn background_span(from: f32, to: f32) -> (crate::text::Rgba, crate::text::Rgba) {
+    let pal = Palette::default();
+    let at = |t: f32| -> crate::text::Rgba {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |a: u8, b: u8| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                (f32::from(a) * (1.0 - t) + f32::from(b) * t).round() as u8
+            }
+        };
+        [
+            mix(pal.bg_top[0], pal.bg_bottom[0]),
+            mix(pal.bg_top[1], pal.bg_bottom[1]),
+            mix(pal.bg_top[2], pal.bg_bottom[2]),
+            0xff,
+        ]
+    };
+    (at(from), at(to))
 }
 
 /// Shrink `px` until `text` fits `avail`, so a long title lays out instead of overrunning.
@@ -349,10 +392,21 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
     let pal = Palette::default();
 
     let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
+    // The gradient still spans the *whole* surface, strip included: the strip paints its
+    // own slice of the same ramp, so the two layers meet without a seam.
     text::fill_gradient(&mut buf, width, height, pal.bg_top, pal.bg_bottom);
 
     let w = width as f32;
-    let h = height as f32;
+    // The card lays out against the space the transport strip is *not* using. Without
+    // this the vertically-centred block runs underneath the controls, which reads as a
+    // layout bug rather than as an overlay — and the two are drawn on separate layers, so
+    // nothing else would ever notice the collision.
+    let reserved = if card.has_transport() {
+        height as f32 * crate::transport::STRIP_HEIGHT_FRACTION
+    } else {
+        0.0
+    };
+    let h = height as f32 - reserved;
     // Scale relative to a 720p design so the layout holds at any panel resolution.
     let s = h / DESIGN_HEIGHT;
     let margin = 90.0 * s;
@@ -446,6 +500,7 @@ mod tests {
                 .with_artist("Daft Punk"),
             source: SourceDescription::new().with_display_name("iPhone"),
             up_next: Vec::new(),
+            controls: ControlCapabilities::NONE,
         }
     }
 
@@ -524,6 +579,7 @@ mod tests {
             track: NowPlaying::default(),
             source: SourceDescription::new().with_display_name("schlarpc"),
             up_next: Vec::new(),
+            controls: ControlCapabilities::NONE,
         };
         let gap_of = |card: &NowPlayingCard| {
             build_lines(card, &f, &Palette::default(), 1.0, 800.0)
@@ -546,6 +602,7 @@ mod tests {
             track: NowPlaying::default(),
             source: SourceDescription::new().with_display_name("schlarpc"),
             up_next: vec![QueueItem::new("Something")],
+            controls: ControlCapabilities::NONE,
         };
         let playing = NowPlayingCard {
             track: NowPlaying::default().with_title("Alkatraz"),
@@ -645,6 +702,7 @@ mod tests {
                 .with_display_name("bagel")
                 .with_link("aptX HD · 48 kHz"),
             up_next: Vec::new(),
+            controls: ControlCapabilities::NONE,
         };
         let lines = lines_of(&bare);
         assert_eq!(lines[0], "bagel", "the device leads: {lines:?}");

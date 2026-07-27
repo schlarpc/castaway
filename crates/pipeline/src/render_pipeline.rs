@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use castaway_core::{
     ControlTxn, CoreError, DecodedFrame, FrameImage, FrameSource, MediaUri, Pipeline, PixelFormat,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::compositor::{Compositor, DirtyRect, Layer, LayerId, Transform};
 use crate::error::PipelineError;
@@ -341,6 +341,15 @@ impl Pipeline for RenderPipeline {
         Ok(())
     }
 
+    async fn controls(
+        &self,
+        capabilities: castaway_core::ControlCapabilities,
+    ) -> Result<(), CoreError> {
+        info!(?capabilities, "render pipeline: CONTROLS");
+        self.publish_card(|card| card.controls = capabilities);
+        Ok(())
+    }
+
     async fn up_next(&self, items: Vec<castaway_core::QueueItem>) -> Result<(), CoreError> {
         info!(queued = items.len(), "render pipeline: UP NEXT");
         self.publish_card(|card| card.up_next = items);
@@ -507,6 +516,50 @@ pub struct RenderLoop {
     /// back — so past a threshold the render thread records the verdict where the *next*
     /// session's decoder will find it.
     failed_imports: u32,
+    /// The transport strip currently on screen, if any.
+    transport: Option<TransportState>,
+}
+
+/// The transport strip's state on the render thread.
+///
+/// It is kept here rather than re-sent per tick because the scrubber has to *move*
+/// between metadata updates. Sources report a position roughly once a second, and a bar
+/// that only ever advances when a message arrives visibly stutters; worse, a source that
+/// reports position and nothing else would republish the whole card each time, which at
+/// 4K is a 33 MB upload for a number (`proto-spotify::session` refused to do that, and
+/// was right to).
+struct TransportState {
+    /// The model as the source last described it.
+    model: crate::transport::TransportModel,
+    /// The layout that model produced, in strip-local pixels — kept so a touch can be
+    /// tested against exactly what was drawn.
+    layout: crate::transport::Layout,
+    /// Where the strip sits on the surface: `(x, y, w, h)` in pixels.
+    placement: (f32, f32, f32, f32),
+    /// When `model.position` was taken, so elapsed time can be added to it.
+    taken_at: std::time::Instant,
+    /// The position last painted, so a repaint happens when the readout changes rather
+    /// than on every frame.
+    painted: Option<Duration>,
+}
+
+impl TransportState {
+    /// The position as of now: what the source said, plus the time since it said it.
+    ///
+    /// Only advanced while playback is actually active — a paused track whose position
+    /// crept forward would be a scrubber that lies, and lies in the direction that makes
+    /// a seek land somewhere the user did not ask for.
+    fn live_position(&self) -> Option<Duration> {
+        let base = self.model.position?;
+        if !self.model.state.is_active() {
+            return Some(base);
+        }
+        let advanced = base + self.taken_at.elapsed();
+        Some(match self.model.duration {
+            Some(total) => advanced.min(total),
+            None => advanced,
+        })
+    }
 }
 
 impl RenderLoop {
@@ -520,6 +573,7 @@ impl RenderLoop {
             has_video: false,
             taps: Vec::new(),
             failed_imports: 0,
+            transport: None,
         }
     }
 
@@ -598,6 +652,143 @@ impl RenderLoop {
     fn card_size(&self) -> (u32, u32) {
         let (w, h) = self.compositor.target_size();
         (w.max(640), h.max(360))
+    }
+
+    /// Install (or remove) the transport strip for `model`.
+    ///
+    /// Painting the strip is cheap next to the card — a fraction of the surface, no cover
+    /// art, no text layout beyond two clock readings — which is the whole reason it is a
+    /// separate layer and can be repainted every second.
+    fn set_transport(&mut self, model: &crate::transport::TransportModel, w: u32, h: u32) {
+        if model.is_empty() {
+            self.compositor.remove_layer(LayerId::Transport);
+            self.transport = None;
+            return;
+        }
+        let placement = crate::transport::placement(w, h);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (pw, ph) = (
+            placement.2.round().max(1.0) as u32,
+            placement.3.round().max(1.0) as u32,
+        );
+
+        // Keep the existing timestamp when the source has repeated a position it already
+        // gave us. The card republishes for reasons that have nothing to do with playback
+        // — a queue update, the device naming itself — and restamping on those would rewind
+        // the scrubber by however long had passed since the real reading.
+        let taken_at = match self.transport.as_ref() {
+            Some(prev) if prev.model.position == model.position => prev.taken_at,
+            _ => std::time::Instant::now(),
+        };
+
+        match self.paint_transport(model, pw, ph, placement.1, h) {
+            Ok(()) => {
+                self.transport = Some(TransportState {
+                    layout: crate::transport::layout(model, pw, ph),
+                    model: model.clone(),
+                    placement,
+                    taken_at,
+                    painted: model.position,
+                });
+            }
+            Err(e) => error!(error = %e, "failed to draw the transport strip"),
+        }
+    }
+
+    /// Rasterize `model` into the strip's texture and place the layer.
+    ///
+    /// `strip_y`/`surface_h` are only for the background: the strip continues the card's
+    /// gradient rather than sitting on it, so it has to know which slice of the ramp it
+    /// covers. Anything else draws a visible band across a two-metre screen.
+    fn paint_transport(
+        &mut self,
+        model: &crate::transport::TransportModel,
+        width: u32,
+        height: u32,
+        strip_y: f32,
+        surface_h: u32,
+    ) -> Result<(), PipelineError> {
+        let (top, bottom) =
+            crate::nowplaying_card::background_span(strip_y / surface_h.max(1) as f32, 1.0);
+        let rgba = crate::transport::render(model, width, height, top, bottom)?;
+        self.compositor.upload_texture(
+            LayerId::Transport,
+            width,
+            height,
+            TexelFormat::Rgba8Srgb,
+            &rgba,
+        )?;
+        let (x, y, w, h) = crate::transport::placement(
+            self.compositor.target_size().0,
+            self.compositor.target_size().1,
+        );
+        let (sw, sh) = self.compositor.target_size();
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::Transport,
+            // Above the card, below video.
+            z: -4,
+            opacity: 1.0,
+            transform: Transform {
+                scale_x: w / sw.max(1) as f32,
+                scale_y: h / sh.max(1) as f32,
+                offset_x: x / sw.max(1) as f32,
+                offset_y: y / sh.max(1) as f32,
+            },
+        });
+        Ok(())
+    }
+
+    /// Advance the scrubber if a visible second has passed.
+    ///
+    /// Gated on the *rendered* value changing rather than on a timer: the readout is
+    /// whole seconds and the bar is a few hundred pixels wide, so repainting faster than
+    /// the display changes is upload for no visible difference.
+    ///
+    /// The source's own reading stays the base — only what is painted moves — so a
+    /// snapshot arriving mid-second corrects the drift instead of compounding with it.
+    fn tick_transport(&mut self) {
+        let Some(state) = self.transport.as_ref() else {
+            return;
+        };
+        if !state.model.state.is_active() {
+            return;
+        }
+        let Some(live) = state.live_position() else {
+            return;
+        };
+        if state.painted.map(|p| p.as_secs()) == Some(live.as_secs()) {
+            return;
+        }
+
+        let mut painting = state.model.clone();
+        painting.position = Some(live);
+        let (_, y, w, h) = state.placement;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (pw, ph) = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
+        let surface_h = self.compositor.target_size().1;
+        match self.paint_transport(&painting, pw, ph, y, surface_h) {
+            Ok(()) => {
+                if let Some(state) = self.transport.as_mut() {
+                    state.painted = Some(live);
+                }
+            }
+            Err(e) => debug!(error = %e, "transport strip tick did not repaint"),
+        }
+    }
+
+    /// What a touch at panel-normalized `(x, y)` means, if the strip is on screen.
+    ///
+    /// Returns the transaction rather than the hit: the caller is the input router and
+    /// has no business knowing about scrub fractions, and the mapping needs the model
+    /// this loop is holding anyway.
+    #[must_use]
+    pub fn transport_action(&self, x: f32, y: f32) -> Option<castaway_core::ControlTxn> {
+        let state = self.transport.as_ref()?;
+        let (sw, sh) = self.compositor.target_size();
+        let (px, py) = (x * sw as f32, y * sh as f32);
+        let (ox, oy, _, _) = state.placement;
+        let hit = state.layout.hit(px - ox, py - oy)?;
+        state.model.action(hit)
     }
 
     /// Install the now-playing card as its own layer.
@@ -699,6 +890,7 @@ impl RenderLoop {
                 applied += 1;
             }
         }
+        self.tick_transport();
         self.update_osd();
         self.present_and_serve_taps();
         applied
@@ -719,6 +911,7 @@ impl RenderLoop {
                 }
             }
         }
+        self.tick_transport();
         self.update_osd();
         self.present_and_serve_taps();
         applied
@@ -832,6 +1025,7 @@ impl RenderLoop {
                     }
                     Err(e) => error!(error = %e, "failed to render the now-playing card"),
                 }
+                self.set_transport(&card.transport(), w, h);
                 false
             }
             RenderCommand::AddTap(tap) => {
@@ -840,6 +1034,10 @@ impl RenderLoop {
             }
             RenderCommand::ClearNowPlaying => {
                 self.compositor.remove_layer(LayerId::NowPlaying);
+                // The strip belongs to the card. Leaving it would offer controls for a
+                // session that has ended, wired to a remote that has been dropped.
+                self.compositor.remove_layer(LayerId::Transport);
+                self.transport = None;
                 false
             }
             RenderCommand::ClearVideo => {

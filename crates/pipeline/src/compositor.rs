@@ -109,6 +109,10 @@ pub enum LayerId {
     /// Above the attract scene, below video — a sender with pixels outranks a card about
     /// a sender without them.
     NowPlaying,
+    /// The touchable transport strip under the now-playing card. Above the card and
+    /// below video, for the same reason the card is: a sender with pixels of its own
+    /// outranks controls for a sender without them.
+    Transport,
     /// The main cast video/mirroring surface.
     Video,
     /// The CEF browser surface (PiP / YouTube TV surface).

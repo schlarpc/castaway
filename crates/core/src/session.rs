@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::adapter::{SourceId, SourceMessage};
-use crate::control::RemoteControl;
+use crate::control::{ControlCapabilities, RemoteControl};
 use crate::display::{DisplayControl, DisplayInput};
 use crate::error::CoreError;
 use crate::event::{ControlTxn, SessionEvent};
@@ -224,9 +224,12 @@ impl<P: Pipeline> SessionManager<P> {
             }
             SessionEvent::ControlSurface(remote) => {
                 if self.active.as_ref() == Some(&source) {
-                    info!(%source, caps = ?remote.capabilities(), "session: control surface up");
+                    let caps = remote.capabilities();
+                    info!(%source, ?caps, "session: control surface up");
                     self.remote.set(Some(remote));
-                    Ok(())
+                    // The surface hears about this too: it is what decides whether the
+                    // panel draws transport controls, and which ones.
+                    self.pipeline.controls(caps).await
                 } else {
                     Err(CoreError::NoActiveSession(source.to_string()))
                 }
@@ -244,6 +247,9 @@ impl<P: Pipeline> SessionManager<P> {
                     info!(%source, "session: end");
                     self.active = None;
                     self.remote.set(None);
+                    // Controls go with the session that published them. Leaving them on
+                    // screen would offer buttons wired to a peer that has gone.
+                    let _ = self.pipeline.controls(ControlCapabilities::NONE).await;
                     self.description = SourceDescription::new();
                     if let Some(osd) = &self.osd {
                         osd.clear();
@@ -318,6 +324,7 @@ mod tests {
         snapshots: std::sync::Mutex<Vec<crate::NowPlaying>>,
         description: std::sync::Mutex<SourceDescription>,
         up_next: std::sync::Mutex<Vec<crate::QueueItem>>,
+        controls: std::sync::Mutex<Option<ControlCapabilities>>,
     }
 
     #[derive(Clone)]
@@ -355,6 +362,10 @@ mod tests {
         }
         async fn source_info(&self, info: SourceDescription) -> Result<(), CoreError> {
             *self.0.description.lock().expect("poisoned") = info;
+            Ok(())
+        }
+        async fn controls(&self, capabilities: ControlCapabilities) -> Result<(), CoreError> {
+            *self.0.controls.lock().expect("poisoned") = Some(capabilities);
             Ok(())
         }
         async fn control(&self, _txn: ControlTxn) -> Result<(), CoreError> {
