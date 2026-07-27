@@ -19,6 +19,7 @@
 
 pub mod actor;
 pub mod advert;
+pub mod audio;
 pub mod error;
 pub mod info;
 pub mod sdp;
