@@ -37,8 +37,16 @@ Decisions taken, so nobody re-litigates them from the entry text alone:
   Intel, and porting three firmware sequences for hardware nobody will plug in is not a
   good trade. The *silent* half is fixed — an unrecognised controller now says so instead
   of getting `NoInit` and producing an inert radio with nothing pointing at the cause.
-- **G46 — Widevine is packaged.** DRM-gated content plays. The 4K software-decode concern
-  in the same entry is untouched and still wants measuring on the real panel.
+- **G46 — Widevine is packaged on Linux only, which is not the deploy target.** nixpkgs'
+  `widevine-cdm` ships `_platform_specific/linux_x64/libwidevinecdm.so` and declares
+  `meta.platforms = [x86_64-linux aarch64-linux]`, so `packages.castaway-cef` plays
+  DRM-gated content and `packages.castaway-windows-cef` — the artifact that actually
+  ships — does not. Chrome for Windows carries `widevinecdm.dll` under
+  `_platform_specific/win_x64/`, so closing this means extracting from a Chrome installer
+  at build time: a decision about redistribution terms and a large build-time fetch,
+  not a patch. Until then the Windows build says so once at startup rather than failing
+  silently. The 4K software-decode concern in the same entry is untouched and still wants
+  measuring on the real panel.
 
 Still open, roughly in the order they are worth taking:
 

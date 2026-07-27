@@ -118,6 +118,18 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "cef")]
         let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
 
+        // Said once, at startup, because the alternative is discovering it from a
+        // leanback console line while standing in front of the panel. nixpkgs' CDM is
+        // Linux-only (`meta.platforms`), so the Windows deploy artifact reaches here —
+        // and the failure it produces is a video that silently does not start.
+        #[cfg(feature = "cef")]
+        if !pipeline::cef_browser::has_widevine() {
+            warn!(
+                "no Widevine CDM in this build: DRM-protected video (rentals, some \
+                 higher-tier streams) will not play. Everything else is unaffected."
+            );
+        }
+
         // Whoever casts next gets the panel. Nothing but DIAL `DELETE` used to dismiss
         // the leanback page, and nothing sends `DELETE` (D28) — so the first YouTube cast
         // owned the screen for the rest of the process, with later DLNA/Cast video

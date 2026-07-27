@@ -310,6 +310,16 @@ wrap_app! {
     }
 }
 
+/// Whether this build has a Widevine CDM, for a caller that wants to say so once.
+///
+/// Exposed because the per-process command-line hook is the wrong place to be loud: it
+/// runs in the browser process *and* every subprocess, so a warning there is four
+/// warnings. The app checks this once at startup instead.
+#[must_use]
+pub fn has_widevine() -> bool {
+    widevine_path().is_some()
+}
+
 /// Where this build's Widevine CDM lives, if it has one.
 ///
 /// `CASTAWAY_WIDEVINE_PATH` should be the directory holding `manifest.json` and
