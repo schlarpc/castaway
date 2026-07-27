@@ -16,12 +16,14 @@
 
 pub mod error;
 pub mod media;
+pub mod p2p;
 pub mod ts;
 
 use castaway_core::ProtocolKind;
 
 pub use error::{IeError, MiracastError, ParamError};
 pub use media::{MediaReceiver, MP2T_PAYLOAD_TYPE};
+pub use p2p::{MacAddr, WpaCommand, WpaEvent, WpaReply};
 pub use ts::{Pid, StreamType, TsDemux, TS_PACKET_LEN};
 
 /// The protocol kind for Miracast sources.
