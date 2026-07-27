@@ -33,6 +33,7 @@ use tracing::{debug, info, warn};
 use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
 use crate::audio::{AudioOutput, AudioStream};
 use crate::clock::{NtpTime, ResendTracker, StreamOrigin, TimingClient};
+use crate::diagnostics::SessionDiagnostics;
 use crate::error::AirPlayError;
 use crate::mirror::{MirrorKeys, MirrorOutput, MirrorStream};
 use crate::session::{AirPlayRequest, AirPlaySession};
@@ -178,10 +179,15 @@ async fn pump(
     let mut mirror_audio_tx: Option<mpsc::Sender<EncodedFrame>> = None;
     // Shared by the mirror's two planes so they present on one timeline.
     let mirror_origin = Arc::new(StreamOrigin::new());
+    // Counters every task in this session writes to, and a reporter reads. See
+    // `diagnostics` for why this exists rather than debug logging.
+    let diagnostics = Arc::new(SessionDiagnostics::new());
+    let reporter = tokio::spawn(report_session(Arc::clone(&diagnostics)));
     // FLUSH arrives on the RTSP connection and has to reach the audio task, which is
     // elsewhere. `watch` rather than a channel: only the newest flush point matters, and
     // a task that missed one because it was busy should not then act on a stale one.
     let (flush_tx, flush_rx) = tokio::sync::watch::channel(None);
+    let _reporter = ReporterGuard(reporter);
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
     loop {
@@ -240,7 +246,15 @@ async fn pump(
 
             if session.is_recording() {
                 if let Some(sockets) = audio_sockets.take() {
-                    start_audio(session, sockets, flush_rx.clone(), sink, peer).await;
+                    start_audio(
+                        session,
+                        sockets,
+                        flush_rx.clone(),
+                        Arc::clone(&diagnostics),
+                        sink,
+                        peer,
+                    )
+                    .await;
                 }
             }
 
@@ -267,6 +281,7 @@ async fn pump(
                         peer.ip(),
                         session.sender_ports(),
                         flush_rx.clone(),
+                        Arc::clone(&diagnostics),
                     ));
                 }
             }
@@ -276,9 +291,15 @@ async fn pump(
                 // Re-binding by address instead would race whatever took the port in
                 // between, and we have already told the sender that number.
                 if let Some(listener) = mirror_listener.take() {
-                    mirror_audio_tx =
-                        start_mirroring(*keys, listener, Arc::clone(&mirror_origin), sink, peer)
-                            .await;
+                    mirror_audio_tx = start_mirroring(
+                        *keys,
+                        listener,
+                        Arc::clone(&mirror_origin),
+                        Arc::clone(&diagnostics),
+                        sink,
+                        peer,
+                    )
+                    .await;
                 }
             }
 
@@ -524,6 +545,7 @@ async fn run_audio(
     peer_ip: IpAddr,
     sender_ports: Option<SenderPorts>,
     mut flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
+    diagnostics: Arc<SessionDiagnostics>,
 ) {
     let mut timing = TimingClient::new();
     let mut resends = ResendTracker::new();
@@ -610,30 +632,39 @@ async fn run_audio(
                     if let Err(e) = sockets.control.send_to(&request, target).await {
                         debug!(error = %e, "could not ask for a resend");
                     } else {
+                        diagnostics.resend(gap.count);
                         debug!(first = gap.first, count = gap.count, "asked for a resend");
                     }
                 }
                 // Latency beats freshness: a full channel means the decoder is behind,
                 // and waiting here would stall sync and timing handling too.
+                diagnostics.audio_frame(frame.pts);
                 if frames.try_send(frame).is_err() {
+                    diagnostics.audio_drop();
                     debug!("AirPlay audio buffer full; dropping a packet");
                 }
             }
             Ok(AudioOutput::Sync(sync)) => {
+                diagnostics.sender_latency(sync.latency_frames());
                 debug!(latency = sync.latency_frames(), "AirPlay sync");
             }
             Ok(AudioOutput::TimingReply(reply)) => {
-                if timing.on_reply(&reply, now_ntp()).is_some() {
+                if let Some(sample) = timing.on_reply(&reply, now_ntp()) {
+                    diagnostics.timing_sample(
+                        timing.offset_ns().unwrap_or(sample.offset_ns),
+                        sample.delay_ns,
+                    );
                     debug!(offset_ns = timing.offset_ns(), "AirPlay clock");
                 }
             }
             // Neither of these is a fault: the sender saying "not yet", and audio that
             // arrived before a sync packet could place it on the shared timeline.
-            Err(
-                crate::audio::AudioError::Priming
-                | crate::audio::AudioError::AwaitingSync
-                | crate::audio::AudioError::Stale,
-            ) => {}
+            Err(crate::audio::AudioError::Priming) => {}
+            // Both of these are expected at session start or after a seek, and both are
+            // worth counting: a figure that keeps climbing means something is wrong with
+            // the anchor or the flush point rather than with one packet.
+            Err(crate::audio::AudioError::AwaitingSync) => diagnostics.audio_awaiting_sync(),
+            Err(crate::audio::AudioError::Stale) => diagnostics.audio_stale(),
             // One bad datagram off a radio link must not take the music down.
             Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
         }
@@ -653,6 +684,7 @@ async fn start_audio(
     session: &AirPlaySession,
     sockets: AudioSockets,
     flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
+    diagnostics: Arc<SessionDiagnostics>,
     sink: &SessionSink,
     peer: SocketAddr,
 ) {
@@ -661,7 +693,7 @@ async fn start_audio(
         return;
     };
     let ports = session.sender_ports();
-    start_negotiated_audio(params, sockets, ports, flush, sink, peer).await;
+    start_negotiated_audio(params, sockets, ports, flush, diagnostics, sink, peer).await;
 }
 
 /// Start an audio receive session for whatever was negotiated.
@@ -674,6 +706,7 @@ async fn start_negotiated_audio(
     sockets: AudioSockets,
     sender_ports: Option<SenderPorts>,
     flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
+    diagnostics: Arc<SessionDiagnostics>,
     sink: &SessionSink,
     peer: SocketAddr,
 ) {
@@ -718,6 +751,7 @@ async fn start_negotiated_audio(
         peer.ip(),
         sender_ports,
         flush,
+        diagnostics,
     ));
 }
 
@@ -744,6 +778,7 @@ async fn start_mirroring(
     keys: MirrorKeys,
     listener: TcpListener,
     origin: Arc<StreamOrigin>,
+    diagnostics: Arc<SessionDiagnostics>,
     sink: &SessionSink,
     peer: SocketAddr,
 ) -> Option<mpsc::Sender<EncodedFrame>> {
@@ -772,7 +807,7 @@ async fn start_mirroring(
         warn!(%peer, "session manager gone; not starting mirroring");
         return None;
     }
-    tokio::spawn(run_mirroring(listener, keys, origin, tx, peer));
+    tokio::spawn(run_mirroring(listener, keys, origin, tx, peer, diagnostics));
     Some(audio_tx)
 }
 
@@ -783,6 +818,7 @@ async fn run_mirroring(
     origin: Arc<StreamOrigin>,
     frames: mpsc::Sender<EncodedFrame>,
     peer: SocketAddr,
+    diagnostics: Arc<SessionDiagnostics>,
 ) {
     let Ok((mut stream, from)) = listener.accept().await else {
         warn!(%peer, "no mirroring data connection arrived");
@@ -819,10 +855,12 @@ async fn run_mirroring(
         for output in outputs {
             match output {
                 MirrorOutput::Frame(frame) => {
+                    diagnostics.video_frame(frame.pts);
                     // Drop late rather than stall: latency beats freshness, and this is
                     // safe *here* because the frame has already been decrypted — the
                     // keystream has moved on regardless of whether we keep the bytes.
                     if frames.try_send(*frame).is_err() {
+                        diagnostics.video_drop();
                         debug!("mirroring buffer full; dropping a frame");
                     }
                 }
@@ -839,4 +877,37 @@ async fn run_mirroring(
         }
     }
     info!(%peer, "AirPlay mirroring ended");
+}
+
+/// How often a live session reports itself.
+///
+/// Slow enough that a two-minute test is a dozen readable lines rather than a wall, and
+/// fast enough that a skew that drifts is visibly drifting rather than one number at the
+/// end.
+const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Log the session's counters until the session ends.
+async fn report_session(diagnostics: Arc<SessionDiagnostics>) {
+    let mut tick = tokio::time::interval(REPORT_EVERY);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let snapshot = diagnostics.snapshot();
+        // Nothing has happened on either plane: a control-only connection, which is most
+        // of them. Reporting zeroes every five seconds would bury the sessions that
+        // matter.
+        if snapshot.video_frames == 0 && snapshot.audio_frames == 0 {
+            continue;
+        }
+        snapshot.log();
+    }
+}
+
+/// Stops the reporter when the connection it belongs to ends.
+struct ReporterGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ReporterGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
