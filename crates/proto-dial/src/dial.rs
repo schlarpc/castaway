@@ -235,6 +235,7 @@ impl DialService {
             )
             .route("/dial/apps/YouTube/run", axum::routing::delete(stop))
             .with_state(self.inner.clone())
+            .layer(axum::middleware::map_response(add_cors))
     }
 
     /// The SSDP device to register with the shared responder.
@@ -252,6 +253,27 @@ impl DialService {
     pub fn description_path(&self) -> &'static str {
         "/dial/dd.xml"
     }
+}
+
+/// DIAL 2.1 requires the REST service to answer CORS, and to *expose* `Location`.
+///
+/// A browser-based sender cannot otherwise read the header that tells it where the running
+/// app is: `Location` is not among the headers a cross-origin response exposes by default.
+/// Native phone apps do not care; anything driving DIAL over XHR does.
+///
+/// `*` rather than a list of origins: they are whatever page a guest happens to have open,
+/// we have no list to check against, and there is nothing behind these routes worth
+/// guarding with one — every one of them is already reachable by anybody on the LAN.
+async fn add_cors(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        "Access-Control-Allow-Origin",
+        axum::http::HeaderValue::from_static("*"),
+    );
+    response.headers_mut().insert(
+        "Access-Control-Expose-Headers",
+        axum::http::HeaderValue::from_static("Location"),
+    );
+    response
 }
 
 async fn device_description(State(st): State<Arc<DialInner>>) -> Response {
@@ -318,7 +340,16 @@ async fn app_state(State(st): State<Arc<DialInner>>) -> Response {
 }
 
 async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
-    *st.state.lock().await = AppState::Running;
+    // DIAL distinguishes starting an app from re-launching one that is already up: 201
+    // Created for the first, 200 OK for the second. Senders read it — a 201 means "I made
+    // this", and answering it for an app that was already running invites a client to
+    // believe it owns a session someone else started.
+    let relaunch = {
+        let mut state = st.state.lock().await;
+        let was_running = *state == AppState::Running;
+        *state = AppState::Running;
+        was_running
+    };
     // A launch reloads the page, and the new page registers a new screen. Publishing the
     // old id until the new one resolves would point senders at a screen that is gone.
     st.screen.clear().await;
@@ -338,7 +369,12 @@ async fn launch(State(st): State<Arc<DialInner>>, body: String) -> Response {
         "{}/dial/apps/YouTube/run",
         st.base_url.trim_end_matches('/')
     );
-    (StatusCode::CREATED, [("Location", location)], "").into_response()
+    let status = if relaunch {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    (status, [("Location", location)], "").into_response()
 }
 
 async fn stop(State(st): State<Arc<DialInner>>) -> Response {
@@ -369,8 +405,52 @@ fn xml_escape(s: &str) -> String {
 fn form_field(body: &str, key: &str) -> Option<String> {
     body.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| v.replace('+', " "))
+        (k == key).then(|| percent_decode(v))
     })
+}
+
+/// Decode an `application/x-www-form-urlencoded` value.
+///
+/// `+` is a space and `%XX` is a byte. Only the first half was handled, so a pairing code
+/// carrying an escaped character resolved the wrong screen — latent, because today's
+/// senders use plain alphanumerics, and silent when it does happen: the screen lookup
+/// simply never matches and the phone can never queue anything.
+///
+/// Invalid escapes are left as written rather than dropped. A sender that means a literal
+/// `%` has produced a value we should pass through unharmed, and mangling it further is
+/// not an improvement on mangling it once.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -416,6 +496,93 @@ mod tests {
         assert!(
             body.contains("<friendlyName>Test &amp; Screen</friendlyName>"),
             "dd.xml should carry the escaped friendly name: {body}"
+        );
+    }
+
+    #[test]
+    fn a_form_value_is_percent_decoded_not_just_plus_decoded() {
+        // Latent but silent: only `+` was handled, so a pairing code carrying an escaped
+        // character resolved the wrong screen — the lookup simply never matched and the
+        // phone could never queue anything. Today's senders use plain alphanumerics,
+        // which is why nothing noticed.
+        assert_eq!(
+            form_field("pairingCode=ab%2Dcd&v=x", "pairingCode").as_deref(),
+            Some("ab-cd")
+        );
+        assert_eq!(
+            form_field("name=Chaz%27s+Phone", "name").as_deref(),
+            Some("Chaz's Phone"),
+            "both encodings appear in one value"
+        );
+        // A literal percent a sender meant to send survives rather than being eaten.
+        assert_eq!(form_field("v=100%", "v").as_deref(), Some("100%"));
+        assert_eq!(form_field("v=%zz", "v").as_deref(), Some("%zz"));
+        // Multi-byte UTF-8 arrives as escapes and must be reassembled, not decoded byte
+        // by byte into replacement characters.
+        assert_eq!(form_field("v=%E6%95%B4", "v").as_deref(), Some("\u{6574}"));
+    }
+
+    #[tokio::test]
+    async fn relaunching_a_running_app_answers_200_rather_than_201() {
+        // 201 Created means "I made this". Answering it for an app that was already
+        // running invites a sender to believe it owns a session someone else started.
+        let (svc, _rx) = service();
+        let launch = |body: &'static str| {
+            let app = svc.router();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/dial/apps/YouTube")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let first = launch("pairingCode=one").await;
+        assert_eq!(
+            first.status(),
+            StatusCode::CREATED,
+            "the app was not running"
+        );
+        // Either way the sender is told where the running app is.
+        assert!(first.headers().get("Location").is_some());
+
+        let again = launch("pairingCode=two").await;
+        assert_eq!(
+            again.status(),
+            StatusCode::OK,
+            "a relaunch is not a creation"
+        );
+        assert!(again.headers().get("Location").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_rest_service_answers_cors_and_exposes_location() {
+        // DIAL 2.1 asks for both. Without `Access-Control-Expose-Headers`, a
+        // browser-based sender cannot read `Location` at all — it is not exposed by
+        // default on a cross-origin response — so it cannot find the app it just started.
+        let (svc, _rx) = service();
+        let resp = svc
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/dial/apps/YouTube")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get("Access-Control-Allow-Origin").unwrap(),
+            "*"
+        );
+        assert_eq!(
+            resp.headers().get("Access-Control-Expose-Headers").unwrap(),
+            "Location"
         );
     }
 
