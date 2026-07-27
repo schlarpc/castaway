@@ -5,7 +5,7 @@
 //! own blocking thread; this [`RenderPipeline`] is the tokio-side handle that connects
 //! them over a bounded channel that **drops frames when full** (latency > freshness).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use castaway_core::{
     ControlTxn, CoreError, DecodedFrame, FrameImage, FrameSource, MediaUri, Pipeline, PixelFormat,
+    PlaybackEnd, PlaybackProgress, PlaybackReport,
 };
 use tracing::{debug, error, info, warn};
 
@@ -79,6 +80,95 @@ impl ScreenshotHandle {
     }
 }
 
+/// The URL session in flight: where it has got to, and how long it turns out to be.
+///
+/// One value rather than two fields on the pipeline because they are only ever read
+/// together, and because they are established at different moments by different threads —
+/// the clock at `play`, the length once the decode thread has opened the container — so
+/// keeping them adjacent is what stops a stale length being reported against a fresh
+/// clock.
+struct UrlPlayback {
+    clock: Arc<crate::clock::MediaClock>,
+    /// Filled in from the container, on the decode thread, before the first frame.
+    /// [`None`] for a live stream, which has no end and must not be given one.
+    duration: Arc<Mutex<Option<Duration>>>,
+}
+
+/// Where the pipeline reports that an item finished or failed, and the guard that keeps a
+/// late decode thread from ending somebody else's session.
+///
+/// The guard is not paranoia. A decode thread checks its stop flag and *then* reports;
+/// between those two instants another source can take the screen, and an unguarded report
+/// would tear down the session that just started — a cast that ends itself for no visible
+/// reason, at random, once in a while. So each session takes a ticket and every preemption
+/// moves the counter on.
+struct EndReport {
+    tx: tokio::sync::mpsc::Sender<PlaybackEnd>,
+    current: AtomicU64,
+}
+
+impl EndReport {
+    /// The ticket the session starting now should quote when it ends.
+    fn ticket(&self) -> u64 {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    /// Retire the current ticket, so whoever holds it can no longer end a session.
+    fn invalidate(&self) {
+        self.current.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Report an end, if the reporting session is still the current one.
+    fn report(&self, ticket: u64, end: PlaybackEnd) {
+        if self.ticket() != ticket {
+            debug!(
+                ?end,
+                "playback end from a session that has already been replaced"
+            );
+            return;
+        }
+        // `try_send` rather than `blocking_send`: this runs on a decode thread, ends are
+        // one per session against a channel with room for several, and a library crate
+        // must not have a panicking send on a runtime-reachable path (ground rule 7).
+        if let Err(e) = self.tx.try_send(end) {
+            warn!(error = %e, "nothing took the end-of-media report");
+        }
+    }
+}
+
+/// Reads where the URL session has got to, without owning the pipeline that plays it.
+///
+/// Exists for the same reason [`ScreenshotHandle`] does: by the time an adapter wants to
+/// answer "how far through is this", the pipeline has been moved into the session manager
+/// and there is no `&self` left anywhere. A DLNA control point polls `GetPositionInfo`
+/// about once a second for the whole item, so this has to be cheap and it has to be
+/// reachable from an HTTP handler.
+#[derive(Clone)]
+pub struct PlaybackHandle {
+    playback: Arc<Mutex<Option<UrlPlayback>>>,
+}
+
+impl std::fmt::Debug for PlaybackHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaybackHandle")
+            .field("playing", &self.progress().is_some())
+            .finish()
+    }
+}
+
+impl PlaybackReport for PlaybackHandle {
+    fn progress(&self) -> Option<PlaybackProgress> {
+        let held = self.playback.lock().ok()?;
+        let session = held.as_ref()?;
+        // `None` before the first frame or the first audio block, and that is the honest
+        // answer: a control point asking during the fetch should be told nothing rather
+        // than zero, which it would draw as "at the start" of an item that has not begun.
+        let position = session.clock.now()?;
+        let duration = session.duration.lock().ok().and_then(|d| *d);
+        Some(PlaybackProgress { position, duration })
+    }
+}
+
 /// The tokio-side pipeline handle. Implements [`Pipeline`]; owns decode threads and the
 /// sender half of the render channel.
 pub struct RenderPipeline {
@@ -92,12 +182,18 @@ pub struct RenderPipeline {
     /// The card as last sent. Held because its two halves arrive on separate calls and
     /// each render needs both — not as a cache for someone else to read.
     card: Mutex<crate::nowplaying_card::NowPlayingCard>,
-    /// The clock of the URL session in flight, so transport control can reach it.
+    /// The URL session in flight, so transport control and the position readout can both
+    /// reach it.
     ///
     /// `Pause` on this path is not a message to a sender — we *are* the player — so it
     /// is applied by freezing the clock, which halts the video thread and the audio
     /// thread and, through the bounded queue between them, the demuxer as well.
-    playback: Mutex<Option<Arc<crate::clock::MediaClock>>>,
+    ///
+    /// An `Arc` because [`PlaybackHandle`] shares it: the pipeline is moved into the
+    /// session manager and the adapter that needs the position is not.
+    playback: Arc<Mutex<Option<UrlPlayback>>>,
+    /// Where an item that finished or failed gets reported, if anything asked to hear.
+    ends: Mutex<Option<Arc<EndReport>>>,
     /// Called when another source takes the screen, so a browser that is covering the
     /// panel gives it back.
     ///
@@ -129,7 +225,8 @@ impl RenderPipeline {
                 active: Mutex::new(None),
                 hw: HwPreference::Auto,
                 card: Mutex::new(crate::nowplaying_card::NowPlayingCard::default()),
-                playback: Mutex::new(None),
+                playback: Arc::new(Mutex::new(None)),
+                ends: Mutex::new(None),
                 release_screen: Mutex::new(None),
                 #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
@@ -148,6 +245,37 @@ impl RenderPipeline {
         ScreenshotHandle {
             tx: self.tx.clone(),
         }
+    }
+
+    /// A reader of the URL session's position and length.
+    ///
+    /// Taken before the pipeline is handed to the session manager, for the same reason as
+    /// [`Self::screenshot_handle`]: an adapter that has to answer "how far through is
+    /// this" has no business owning a pipeline, and after the move there is nothing to
+    /// ask anyway.
+    #[must_use]
+    pub fn playback_handle(&self) -> PlaybackHandle {
+        PlaybackHandle {
+            playback: Arc::clone(&self.playback),
+        }
+    }
+
+    /// Report finished and failed items to `tx`.
+    ///
+    /// Without this the decode thread logged and exited and told nobody, so a DLNA
+    /// control point went on reading PLAYING / OK for a URL the box could not fetch, and a
+    /// queued playlist waiting for the item to end waited for the life of the process.
+    pub fn set_playback_ends(&self, tx: tokio::sync::mpsc::Sender<PlaybackEnd>) {
+        if let Ok(mut held) = self.ends.lock() {
+            *held = Some(Arc::new(EndReport {
+                tx,
+                current: AtomicU64::new(0),
+            }));
+        }
+    }
+
+    fn end_report(&self) -> Option<Arc<EndReport>> {
+        self.ends.lock().ok().and_then(|held| held.clone())
     }
 
     /// The card as it currently stands. For tests and diagnostics.
@@ -214,6 +342,12 @@ impl RenderPipeline {
                 flag.store(true, Ordering::SeqCst);
             }
         }
+        // Whatever decode thread is still alive belongs to a session that is over, so
+        // retire its ticket: a thread that had already passed its stop-flag check must
+        // not end the session that is taking the screen right now.
+        if let Some(report) = self.end_report() {
+            report.invalidate();
+        }
     }
 
     fn set_active(&self, flag: Arc<AtomicBool>) {
@@ -241,9 +375,22 @@ impl Pipeline for RenderPipeline {
         // and because a build with no audio feature must still compile to *something*
         // that plays the picture.
         let clock = Arc::new(crate::clock::MediaClock::new());
+        // Empty until the container has been opened, which happens on the decode thread.
+        // A control point polling in the meantime is told the length is unknown, which is
+        // true, rather than zero, which it would draw as a bar with no room in it.
+        let duration = Arc::new(Mutex::new(None));
         if let Ok(mut held) = self.playback.lock() {
-            *held = Some(Arc::clone(&clock));
+            *held = Some(UrlPlayback {
+                clock: Arc::clone(&clock),
+                duration: Arc::clone(&duration),
+            });
         }
+        // Taken after `preempt`, so it is this session's number and not the outgoing
+        // session's.
+        let ends = self.end_report().map(|r| {
+            let ticket = r.ticket();
+            (r, ticket)
+        });
         #[cfg(all(feature = "ffmpeg", feature = "audio"))]
         let audio_tx = {
             let (atx, arx) = std::sync::mpsc::sync_channel(crate::ffmpeg_decode::AUDIO_QUEUE);
@@ -270,7 +417,7 @@ impl Pipeline for RenderPipeline {
 
         // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
         std::thread::spawn(move || {
-            let result = decode_into(&uri, hw, &tx, &stop, &clock, audio_tx);
+            let result = decode_into(&uri, hw, &tx, &stop, &clock, &duration, audio_tx);
 
             // Preemption is not completion. When another source has taken the screen the
             // stop flag is what ended this decode, and the layers on screen belong to
@@ -280,24 +427,32 @@ impl Pipeline for RenderPipeline {
                 return;
             }
 
-            match result {
-                Ok(()) => info!(%uri, "decode ended: media finished"),
+            let end = match result {
+                Ok(()) => {
+                    info!(%uri, "decode ended: media finished");
+                    PlaybackEnd::Finished
+                }
                 // The URL was unreachable, the server refused it, or it held nothing this
                 // build can decode. Named at `warn` because it is the whole explanation
                 // for a panel that accepted a cast and showed nothing.
-                Err(e) => warn!(%uri, error = %e, "decode ended: playback failed"),
-            }
+                Err(e) => {
+                    warn!(%uri, error = %e, "decode ended: playback failed");
+                    PlaybackEnd::Failed(e.to_string())
+                }
+            };
 
             // Either way the item is over, so the screen goes back to idle. Without this
             // the last decoded frame stayed frozen on a two-metre panel indefinitely, and
             // a failed fetch left the attract scene up with nothing saying why.
-            //
-            // What this does *not* yet do is tell the session manager or the adapter, so a
-            // DLNA control point still reads PLAYING and a queue still does not advance —
-            // that needs a completion channel back up from the pipeline, which is the rest
-            // of GAPS G75.
             let _ = tx.try_send(RenderCommand::ClearVideo);
             let _ = tx.try_send(RenderCommand::ClearNowPlaying);
+
+            // …and tell whoever pushed the URL. Clearing the screen is what the room sees;
+            // this is what the phone sees, and without it a control point read PLAYING / OK
+            // forever and a queued playlist never advanced past the first track.
+            if let Some((report, ticket)) = ends {
+                report.report(ticket, end);
+            }
         });
         Ok(())
     }
@@ -472,7 +627,7 @@ impl Pipeline for RenderPipeline {
                     .playback
                     .lock()
                     .ok()
-                    .and_then(|guard| guard.as_ref().map(Arc::clone));
+                    .and_then(|guard| guard.as_ref().map(|s| Arc::clone(&s.clock)));
                 match held {
                     Some(clock) => {
                         clock.set_paused(paused);
@@ -532,12 +687,14 @@ impl Pipeline for RenderPipeline {
 }
 
 /// Decode `uri` into render commands until EOF or `stop` is set.
+#[allow(clippy::too_many_arguments)]
 fn decode_into(
     uri: &str,
     hw: HwPreference,
     tx: &SyncSender<RenderCommand>,
     stop: &Arc<AtomicBool>,
     clock: &crate::clock::MediaClock,
+    duration: &Mutex<Option<Duration>>,
     audio_tx: Option<std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
 ) -> Result<(), PipelineError> {
     #[cfg(feature = "ffmpeg")]
@@ -549,6 +706,13 @@ fn decode_into(
             audio_tx,
             &|| stop.load(Ordering::SeqCst),
             |layout| {
+                // How long the item is, as soon as anyone can know: the container is the
+                // only party that has it, and a control point's progress bar is drawn from
+                // it. Absent for a live stream, which is exactly the case that must not be
+                // given a length.
+                if let Ok(mut held) = duration.lock() {
+                    *held = layout.duration;
+                }
                 // A file with no video is music, not a failure. Tell the surface so it
                 // puts a card up instead of leaving the idle scene under silence — and
                 // carry whatever the container's tags said, since a bare URL from Cast or
@@ -571,7 +735,7 @@ fn decode_into(
     }
     #[cfg(not(feature = "ffmpeg"))]
     {
-        let _ = (uri, hw, tx, stop, clock, audio_tx);
+        let _ = (uri, hw, tx, stop, clock, duration, audio_tx);
         Err(PipelineError::Decode(
             "decode requires the `ffmpeg` feature".into(),
         ))

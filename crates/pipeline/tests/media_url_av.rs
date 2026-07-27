@@ -322,3 +322,98 @@ fn media_is_fetched_over_http_not_just_opened_from_disk() {
     assert!(frames > 0, "no frames came back from an HTTP source");
     assert!(samples > 0, "no audio came back from an HTTP source");
 }
+
+/// The pipeline says how far through it is, and says when it is done.
+///
+/// Both halves of the same absence. The decode thread used to log and exit, so a DLNA
+/// control point was told `PLAYING` / `OK` for the life of the process and drew its
+/// scrubber against a sentinel — a phone showing a healthy session over a panel that had
+/// gone back to idle, with a queued playlist stuck on its first track.
+///
+/// Drives the real [`pipeline::RenderPipeline`] rather than the decoder underneath it,
+/// because the seam under test is the pipeline's: the clock it owns, and the report it
+/// sends when its decode thread finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pipeline_reports_where_it_is_and_that_it_finished() {
+    use castaway_core::{MediaUri, PlaybackEnd, PlaybackReport as _, Pipeline as _};
+
+    let path = tmp("reported.mp4");
+    if !make(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=160x120:rate=10",
+            "-c:v",
+            "libx264",
+        ],
+        &path,
+    ) {
+        eprintln!("skipping: ffmpeg unavailable");
+        return;
+    }
+
+    let (pipe, _render_rx) = pipeline::RenderPipeline::new(3);
+    let (ends_tx, mut ends_rx) = castaway_core::playback::end_channel();
+    pipe.set_playback_ends(ends_tx);
+    let progress = pipe.playback_handle();
+
+    // Nothing to report before anything is playing, and that is the answer a control
+    // point must get: a zero here is drawn as "at the start" of an item that has not begun.
+    assert!(progress.progress().is_none());
+
+    let uri = MediaUri::parse(&format!("file://{}", path.display())).unwrap();
+    pipe.play(uri, None).await.unwrap();
+
+    // The clock is seeded by the first frame, so a position appears shortly after the
+    // decoder opens the file — and it is a *position*, not a total.
+    let mut seen = None;
+    for _ in 0..600 {
+        if let Some(p) = progress.progress() {
+            seen = Some(p);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = seen.expect("the pipeline never reported a position for a playing item");
+    assert!(
+        seen.duration.is_some(),
+        "the container knows how long this is; the scrubber needs it"
+    );
+
+    let end = tokio::time::timeout(Duration::from_secs(20), ends_rx.recv())
+        .await
+        .expect("the pipeline never said the item had ended")
+        .expect("the end channel closed instead");
+    assert_eq!(end, PlaybackEnd::Finished);
+}
+
+/// A URL the box cannot fetch is the failure this reporting exists for. It is
+/// indistinguishable, from the phone, from a receiver that is playing perfectly — which is
+/// exactly why it has to be reported rather than merely logged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_url_that_cannot_be_fetched_is_reported_as_a_failure() {
+    use castaway_core::{MediaUri, PlaybackEnd, Pipeline as _};
+
+    let (pipe, _render_rx) = pipeline::RenderPipeline::new(3);
+    let (ends_tx, mut ends_rx) = castaway_core::playback::end_channel();
+    pipe.set_playback_ends(ends_tx);
+
+    // A port nothing is listening on, on the loopback: refused immediately rather than
+    // waiting out a DNS or connect timeout, so the test does not depend on the network.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    let uri = MediaUri::parse(&format!("http://127.0.0.1:{port}/nothing.mp4")).unwrap();
+    pipe.play(uri, None).await.unwrap();
+
+    let end = tokio::time::timeout(Duration::from_secs(30), ends_rx.recv())
+        .await
+        .expect("an unfetchable URL was never reported")
+        .expect("the end channel closed instead");
+    assert!(
+        matches!(end, PlaybackEnd::Failed(_)),
+        "a refused connection is a failure, not a finish: {end:?}"
+    );
+}

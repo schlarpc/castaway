@@ -111,6 +111,11 @@ fn main() -> anyhow::Result<()> {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
         let shot_handle = render_pipeline.screenshot_handle();
+        // Taken here for the same reason as the screenshot handle: after the pipeline is
+        // moved into the session manager, nothing out here holds it, and the DLNA service
+        // that has to answer "how far through is this" is built inside `serve`.
+        let playback: Arc<dyn castaway_core::PlaybackReport> =
+            Arc::new(render_pipeline.playback_handle());
 
         // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
@@ -143,9 +148,17 @@ fn main() -> anyhow::Result<()> {
             }));
         }
 
+        // The decode thread noticing that a URL finished, or could not be fetched at all,
+        // is the only party that knows — and until this channel existed it logged and
+        // exited, leaving a DLNA control point reading PLAYING / OK for the rest of the
+        // process and a queued playlist stuck on its first track.
+        let (ends_tx, ends_rx) = castaway_core::playback::end_channel();
+        render_pipeline.set_playback_ends(ends_tx);
+
         let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
         let manager = SessionManager::new(render_pipeline, Some(display), SessionConfig::default())
-            .with_osd(osd.clone());
+            .with_osd(osd.clone())
+            .with_playback_ends(ends_rx);
         let remote = manager.remote_handle();
         runtime.spawn(manager.run(event_rx));
 
@@ -172,9 +185,10 @@ fn main() -> anyhow::Result<()> {
         let serve_tx = event_tx.clone();
         let serve_shutdown = shutdown.clone();
         let serve_osd = osd.clone();
-        // Taken before the pipeline is handed to the session manager: after that, nothing
-        // out here holds it, and an HTTP handler has no business owning a pipeline anyway.
-        let shot = Some(shot_handle);
+        let handles = PipelineHandles {
+            screenshot: Some(shot_handle),
+            playback: Some(playback),
+        };
         runtime.spawn(async move {
             if let Err(e) = serve(
                 serve_cfg,
@@ -182,7 +196,7 @@ fn main() -> anyhow::Result<()> {
                 serve_shutdown,
                 serve_osd,
                 on_dial,
-                shot,
+                handles,
                 abandoned_rx,
             )
             .await
@@ -307,13 +321,16 @@ fn main() -> anyhow::Result<()> {
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
         // Headless: no renderer at all, so certainly no browser to launch YouTube in.
         let on_dial: Option<NoLauncher> = None;
+        // No renderer in this build: no screenshot to take, and nothing with a position
+        // to report, so the DLNA service answers `GetPositionInfo` with the spec's
+        // sentinel — which is the truth here, not a shortcut.
         runtime.block_on(serve(
             config,
             event_tx,
             shutdown,
             osd,
             on_dial,
-            None,
+            PipelineHandles::default(),
             abandoned_rx,
         ))?;
     }
@@ -392,6 +409,22 @@ fn drain_osd_to_log(rx: &castaway_core::OsdReceiver) {
 #[cfg(not(feature = "cef"))]
 type NoLauncher = fn(proto_dial::DialEvent);
 
+/// What the service layer can ask of the pipeline, if there is one.
+///
+/// Bundled rather than passed as loose arguments because both halves have the same
+/// lifecycle and the same reason for existing: they are taken *before* the pipeline is
+/// moved into the session manager, because after that nothing out here holds it. A build
+/// with no renderer supplies [`Default::default`] and every field is honestly absent.
+#[derive(Default, Clone)]
+struct PipelineHandles {
+    /// What the panel is showing, for `GET /screenshot.png`.
+    screenshot: Option<Screenshot>,
+    /// Where the media-URL session has got to, for the protocols in which the receiver is
+    /// the player and has to report its own position. Absent in a build with no decoder,
+    /// which then honestly answers "no such information" rather than inventing a zero.
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+}
+
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
 /// protocols, and run until `shutdown` is signalled. `osd` is cloned to each adapter so
 /// they can surface their own status on the overlay; DIAL launch/stop events are handed
@@ -403,10 +436,14 @@ async fn serve(
     shutdown: Arc<Notify>,
     osd: castaway_core::OsdSink,
     on_dial: Option<impl Fn(proto_dial::DialEvent) + Send + 'static>,
-    screenshot: Option<Screenshot>,
+    handles: PipelineHandles,
     // Signalled when the kiosk browser has given up on the launched page.
     mut abandoned: mpsc::UnboundedReceiver<()>,
 ) -> anyhow::Result<()> {
+    let PipelineHandles {
+        screenshot,
+        playback,
+    } = handles;
     let iface = config.resolved_interface();
     info!(
         name = %config.friendly_name,
@@ -427,6 +464,12 @@ async fn serve(
             sink,
         )
         .with_osd(osd.clone());
+        // DLNA is the protocol where the receiver *is* the player, so the scrubber a
+        // control point draws can only be answered from our own clock.
+        let dlna = match playback.clone() {
+            Some(report) => dlna.with_playback(report),
+            None => dlna,
+        };
         http = http.merge(dlna.router());
         ssdp_devices.push((dlna.ssdp_device(), dlna.description_path().to_string()));
         info!("enabled: DLNA MediaRenderer");

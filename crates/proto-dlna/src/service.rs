@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
-use castaway_core::{OsdSink, SessionSink};
+use castaway_core::{OsdSink, PlaybackReport, SessionSink};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -48,6 +48,12 @@ pub(crate) struct DlnaState {
     pub(crate) uuid: String,
     /// Optional overlay sink for transport feedback ("Volume 60%", "Muted").
     pub(crate) osd: OnceLock<OsdSink>,
+    /// Where playback has got to, asked of the pipeline on each control request.
+    ///
+    /// Absent in a build with no decoder in it, which is the honest configuration for the
+    /// null pipeline: it never fetches anything, so it has no position to report and
+    /// `GetPositionInfo` correctly answers with the spec's sentinel.
+    pub(crate) playback: OnceLock<Arc<dyn PlaybackReport>>,
 }
 
 /// Build the DLNA router over shared state.
@@ -114,6 +120,11 @@ async fn handle_control(
 
     let outcome = {
         let mut r = st.renderer.lock().await;
+        // Where the pipeline says we are, handed to the state machine as an *input* so
+        // that module stays a pure function of what it is given (ground rule 3). Asked
+        // per request rather than cached: `GetPositionInfo` is polled about once a second
+        // for the whole item and a cached answer would be a scrubber a second behind.
+        r.observe_progress(st.playback.get().and_then(|p| p.progress()));
         match kind {
             ServiceKind::AvTransport => r.av_transport(&action),
             ServiceKind::RenderingControl => r.rendering_control(&action),

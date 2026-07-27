@@ -19,7 +19,7 @@ pub mod state;
 use std::sync::{Arc, OnceLock};
 
 use axum::Router;
-use castaway_core::{Advertisement, OsdSink, ProtocolKind, SessionSink};
+use castaway_core::{Advertisement, OsdSink, PlaybackReport, ProtocolKind, SessionSink};
 use substrate_ssdp::SsdpDevice;
 use tokio::sync::Mutex;
 
@@ -51,6 +51,7 @@ impl DlnaService {
                 friendly_name: friendly_name.into(),
                 uuid: uuid.into(),
                 osd: OnceLock::new(),
+                playback: OnceLock::new(),
             }),
         }
     }
@@ -59,6 +60,18 @@ impl DlnaService {
     #[must_use]
     pub fn with_osd(self, osd: OsdSink) -> Self {
         let _ = self.state.osd.set(osd);
+        self
+    }
+
+    /// Let this renderer ask the pipeline where playback has reached.
+    ///
+    /// For DLNA the receiver *is* the player, so the position a control point draws its
+    /// scrubber from can only come from here. Without it `GetPositionInfo` answers with
+    /// the spec's `NOT_IMPLEMENTED` sentinel, which is honest and is what a build with no
+    /// decoder in it should say — but it means no phone ever shows progress.
+    #[must_use]
+    pub fn with_playback(self, report: Arc<dyn PlaybackReport>) -> Self {
+        let _ = self.state.playback.set(report);
         self
     }
 

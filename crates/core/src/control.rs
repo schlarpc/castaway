@@ -177,6 +177,28 @@ pub trait RemoteControl: Send + Sync + fmt::Debug {
         }
         self.issue_unchecked(txn).await
     }
+
+    /// The media this source handed to the pipeline has ended, or failed to play.
+    ///
+    /// Defaulted to nothing, and most sources should leave it that way: for Bluetooth and
+    /// Spotify the *phone* is the player, it knows perfectly well when a track ended, and
+    /// telling it would be telling it something it told us.
+    ///
+    /// It matters for the sources where the receiver is the player — a DLNA control point
+    /// that pushed a URL, a Cast sender that sent `LOAD`. Those protocols oblige us to
+    /// report the transport state, and without this the answer stayed `PLAYING` for a URL
+    /// the box could not even fetch: the phone showed a healthy session over a blank
+    /// panel, and a queued playlist waiting for the item to end waited forever.
+    ///
+    /// Best-effort by contract. A source that has already gone gets its error logged and
+    /// dropped, because the session is ending either way.
+    ///
+    /// # Errors
+    /// Adapter-specific failure, as [`CoreError::Adapter`].
+    async fn media_ended(&self, end: crate::playback::PlaybackEnd) -> Result<(), CoreError> {
+        let _ = end;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

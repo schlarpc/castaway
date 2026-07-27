@@ -16,9 +16,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use castaway_core::{ControlCapabilities, ControlTxn, CoreError, RemoteControl};
+use castaway_core::{ControlCapabilities, ControlTxn, CoreError, PlaybackEnd, RemoteControl};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::state::{Renderer, TransportState};
 
@@ -104,6 +104,20 @@ impl RemoteControl for DlnaRemote {
             .emit(castaway_core::SessionEvent::Control(txn))
             .await
             .map_err(|e| CoreError::Adapter(format!("dlna control: {e}")))
+    }
+
+    async fn media_ended(&self, end: PlaybackEnd) -> Result<(), CoreError> {
+        // DLNA is one of the two protocols where this is not a no-op, because here the
+        // receiver is the player: the control point pushed a URL and has no way at all to
+        // learn what became of it except by asking us.
+        //
+        // The transport state is the whole answer. It moves to STOPPED, which is what a
+        // queue watches for before sending the next track, and the status carries whether
+        // this was an ending or a failure — §2.2.2's `ERROR_OCCURRED` is for exactly the
+        // URL that could not be fetched, which until now read as PLAYING / OK forever.
+        info!(%end, "dlna: the pipeline finished with the item");
+        self.renderer.lock().await.media_ended(&end);
+        Ok(())
     }
 }
 

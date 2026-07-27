@@ -19,6 +19,7 @@ use crate::error::CoreError;
 use crate::event::{ControlTxn, SessionEvent};
 use crate::osd::{OsdMessage, OsdSink};
 use crate::pipeline::Pipeline;
+use crate::playback::PlaybackEnd;
 use crate::source::SourceDescription;
 
 /// Configuration the session manager needs that isn't per-event.
@@ -49,6 +50,10 @@ pub struct SessionManager<P: Pipeline> {
     active: Option<SourceId>,
     remote: RemoteHandle,
     description: SourceDescription,
+    /// The pipeline saying an item ended or failed. Closed unless somebody called
+    /// [`SessionManager::with_playback_ends`] — see there for why it is a receiver the manager
+    /// owns rather than another `SessionEvent`.
+    ended: tokio::sync::mpsc::Receiver<PlaybackEnd>,
 }
 
 /// A shared view of the active source's control surface.
@@ -99,6 +104,11 @@ impl<P: Pipeline> SessionManager<P> {
         display: Option<Box<dyn DisplayControl>>,
         config: SessionConfig,
     ) -> Self {
+        // A channel whose sender is dropped on the spot: `recv()` then answers `None`
+        // immediately and forever, which `select!` reads as a dead branch. A manager
+        // nobody wired a pipeline-end channel into therefore behaves exactly as it did
+        // before there was one, with no `Option` to unwrap on the hot path.
+        let (_closed, ended) = tokio::sync::mpsc::channel(1);
         Self {
             pipeline,
             display,
@@ -107,7 +117,23 @@ impl<P: Pipeline> SessionManager<P> {
             active: None,
             remote: RemoteHandle::default(),
             description: SourceDescription::new(),
+            ended,
         }
+    }
+
+    /// Listen for the pipeline saying that the item it was given ended or failed.
+    ///
+    /// Separate from the [`SourceMessage`] stream on purpose. That stream is tagged with
+    /// the source that produced the event, and the pipeline has no source: it is the one
+    /// party in the system that knows a fetch failed and cannot say on whose behalf. The
+    /// manager supplies the missing half — it is the only thing that knows which source is
+    /// currently active — so the routing lives here rather than in the caller.
+    ///
+    /// Pair it with [`crate::playback::end_channel`], whose sender goes to the pipeline.
+    #[must_use]
+    pub fn with_playback_ends(mut self, ends: tokio::sync::mpsc::Receiver<PlaybackEnd>) -> Self {
+        self.ended = ends;
+        self
     }
 
     /// Attach an OSD sink so the manager posts "Now casting from …" banners. Without one,
@@ -151,14 +177,59 @@ impl<P: Pipeline> SessionManager<P> {
     }
 
     /// Consume the event stream until it closes, arbitrating sources.
+    ///
+    /// Also drains whatever the pipeline says about the item in flight, if anything was
+    /// wired to [`Self::with_playback_ends`]. Both are handled by the same task because both
+    /// mutate the same active-source state, and a lock around it would be a lock the
+    /// actor model exists to avoid.
     pub async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<SourceMessage>) {
-        while let Some(msg) = rx.recv().await {
-            if let Err(e) = self.handle(msg).await {
-                warn!(error = %e, "session manager dropped an event");
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if let Err(e) = self.handle(msg).await {
+                        warn!(error = %e, "session manager dropped an event");
+                    }
+                }
+                // A dropped sender makes this `None` forever, which disables the branch
+                // rather than spinning on it — see `with_playback_ends`.
+                Some(end) = self.ended.recv() => {
+                    self.media_ended(end).await;
+                }
             }
         }
         // Stream closed: best-effort teardown.
         let _ = self.pipeline.stop().await;
+    }
+
+    /// The pipeline finished, or failed to play, whatever the active source handed it.
+    ///
+    /// Tells that source first and ends the session second, and the order is the point:
+    /// the source's own protocol state has to be corrected *before* its control surface is
+    /// dropped, or a DLNA control point is left polling a transport that still says
+    /// PLAYING with nobody able to say otherwise.
+    async fn media_ended(&mut self, end: PlaybackEnd) {
+        let Some(source) = self.active.clone() else {
+            // Nothing is active, so this is the tail of a session that already ended —
+            // a decode thread noticing on its own schedule that it was torn down.
+            debug!(%end, "session: media ended with no active source");
+            return;
+        };
+        info!(%source, %end, "session: the pipeline finished with the item");
+        if let Some(remote) = self.remote.get() {
+            if let Err(e) = remote.media_ended(end).await {
+                debug!(%source, error = %e, "session: the source would not take the end report");
+            }
+        }
+        if let Err(e) = self
+            .handle(SourceMessage {
+                source,
+                event: SessionEvent::End,
+            })
+            .await
+        {
+            warn!(error = %e, "session: could not end the session cleanly");
+        }
     }
 
     /// Handle a single tagged event. Public for unit testing.
@@ -383,6 +454,7 @@ mod tests {
     struct FakeRemote {
         caps: ControlCapabilities,
         sent: std::sync::Mutex<Vec<ControlTxn>>,
+        ends: std::sync::Mutex<Vec<crate::playback::PlaybackEnd>>,
     }
 
     #[async_trait::async_trait]
@@ -392,6 +464,10 @@ mod tests {
         }
         async fn issue_unchecked(&self, txn: ControlTxn) -> Result<(), CoreError> {
             self.sent.lock().expect("poisoned").push(txn);
+            Ok(())
+        }
+        async fn media_ended(&self, end: crate::playback::PlaybackEnd) -> Result<(), CoreError> {
+            self.ends.lock().expect("poisoned").push(end);
             Ok(())
         }
     }
@@ -608,6 +684,7 @@ mod tests {
             event: SessionEvent::ControlSurface(Arc::new(FakeRemote {
                 caps: ControlCapabilities::TRANSPORT,
                 sent: std::sync::Mutex::new(Vec::new()),
+                ends: std::sync::Mutex::new(Vec::new()),
             })),
         })
         .await
@@ -667,6 +744,7 @@ mod tests {
         let remote = Arc::new(FakeRemote {
             caps: ControlCapabilities::TRANSPORT,
             sent: std::sync::Mutex::new(Vec::new()),
+            ends: std::sync::Mutex::new(Vec::new()),
         });
         mgr.handle(audio_msg(&a)).await.unwrap();
         mgr.handle(SourceMessage {
@@ -700,6 +778,7 @@ mod tests {
             event: SessionEvent::ControlSurface(Arc::new(FakeRemote {
                 caps: ControlCapabilities::NONE,
                 sent: std::sync::Mutex::new(Vec::new()),
+                ends: std::sync::Mutex::new(Vec::new()),
             })),
         })
         .await
@@ -731,5 +810,90 @@ mod tests {
             Some(crate::osd::OsdCommand::Show(_))
         ));
         assert_eq!(osd_rx.try_recv(), Some(crate::osd::OsdCommand::Clear));
+    }
+
+    /// The half of a media-URL session nothing could report: the pipeline knowing the item
+    /// is over. A DLNA control point polling `GetTransportInfo` was told PLAYING forever
+    /// and a queued playlist waiting on the item to end waited for the life of the
+    /// process, so the source that pushed the URL has to be told before its handle is
+    /// dropped.
+    #[tokio::test]
+    async fn a_finished_item_reaches_the_source_that_pushed_it_and_ends_the_session() {
+        let counts = Arc::new(Counts::default());
+        let (ends, end_rx) = crate::playback::end_channel();
+        let mgr = SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default())
+            .with_playback_ends(end_rx);
+        let remote = Arc::new(FakeRemote {
+            caps: ControlCapabilities::PLAY,
+            sent: std::sync::Mutex::new(Vec::new()),
+            ends: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let a = SourceId::new(ProtocolKind::Dlna, "a");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(play_msg(&a)).await.unwrap();
+        tx.send(SourceMessage {
+            source: a,
+            event: SessionEvent::ControlSurface(remote.clone()),
+        })
+        .await
+        .unwrap();
+        let running = tokio::spawn(mgr.run(rx));
+
+        // The two inputs are separate channels, so the end has to be sent *after* the
+        // surface has demonstrably been taken up — `controls()` is what the manager calls
+        // when it accepts one. In production the ordering is not in doubt: the surface is
+        // published behind the `Play` and decode ends much later.
+        settle(|| counts.controls.lock().expect("poisoned").is_some()).await;
+
+        ends.send(PlaybackEnd::Failed("connection refused".into()))
+            .await
+            .unwrap();
+        settle(|| !remote.ends.lock().expect("poisoned").is_empty()).await;
+
+        assert_eq!(
+            &*remote.ends.lock().unwrap(),
+            &[PlaybackEnd::Failed("connection refused".into())],
+            "the control point has to be able to stop saying PLAYING",
+        );
+        // …and the session ended with it, rather than leaving a card up over nothing.
+        settle(|| counts.stop.load(Ordering::SeqCst) >= 1).await;
+
+        drop(tx);
+        drop(ends);
+        running.await.unwrap();
+    }
+
+    /// Wait for an actor on another task to have got somewhere, or fail the test.
+    ///
+    /// A bounded spin rather than a fixed sleep: the manager runs as its own task, so
+    /// "has it handled that yet" has no synchronous answer, and a sleep long enough to be
+    /// reliable on a loaded CI box is long enough to be a waste on every other run.
+    async fn settle(mut done: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the session manager never got there");
+    }
+
+    /// A decode thread noticing on its own schedule that it was torn down arrives after
+    /// the session it belonged to is gone. Ending "the active session" then would tear
+    /// down whoever took the screen in the meantime.
+    #[tokio::test]
+    async fn an_end_with_nothing_active_is_ignored() {
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        // Straight at the handler rather than through `run`: the thing under test is the
+        // guard, and routing it through a task would make "nothing happened" a race
+        // rather than an assertion.
+        mgr.media_ended(PlaybackEnd::Finished).await;
+
+        assert!(mgr.active().is_none());
+        assert_eq!(counts.stop.load(Ordering::SeqCst), 0);
     }
 }
