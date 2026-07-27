@@ -35,7 +35,6 @@ use crate::audio::{AudioOutput, AudioStream};
 use crate::clock::{NtpTime, ResendTracker, TimingClient};
 use crate::error::AirPlayError;
 use crate::mirror::{MirrorKeys, MirrorOutput, MirrorStream};
-use crate::sdp::RaopCodec;
 use crate::session::{AirPlayRequest, AirPlaySession};
 use crate::transport::{ReceiverPorts, SenderPorts};
 
@@ -233,6 +232,15 @@ async fn pump(
 
             // A mirroring SETUP that named the stream leaves the keys behind; the
             // sender is about to dial the data port we advertised.
+            // Audio negotiated alongside a mirroring session. It rides the same UDP
+            // sockets the AirPlay 1 flow uses, so it consumes the same bound set.
+            if let Some(params) = session.take_mirror_audio() {
+                if let Some(sockets) = audio_sockets.take() {
+                    start_negotiated_audio(&params, sockets, session.sender_ports(), sink, peer)
+                        .await;
+                }
+            }
+
             if let Some(keys) = session.take_mirror_keys() {
                 // One data channel per session: the listener is *moved* into the task.
                 // Re-binding by address instead would race whatever took the port in
@@ -573,6 +581,8 @@ async fn run_audio(
                     debug!(offset_ns = timing.offset_ns(), "AirPlay clock");
                 }
             }
+            // Priming packets are the sender saying "not yet", not a fault.
+            Err(crate::audio::AudioError::Priming) => {}
             // One bad datagram off a radio link must not take the music down.
             Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
         }
@@ -598,23 +608,44 @@ async fn start_audio(
         warn!(%peer, "RECORD with nothing announced; not starting audio");
         return;
     };
+    let ports = session.sender_ports();
+    start_negotiated_audio(params, sockets, ports, sink, peer).await;
+}
+
+/// Start an audio receive session for whatever was negotiated.
+///
+/// Shared between the AirPlay 1 flow and the audio that accompanies mirroring: the two
+/// negotiate through completely different messages and then produce the same thing — a
+/// codec, a key, and three sockets obeying identical payload rules.
+async fn start_negotiated_audio(
+    params: &crate::sdp::AnnounceParams,
+    sockets: AudioSockets,
+    sender_ports: Option<SenderPorts>,
+    sink: &SessionSink,
+    peer: SocketAddr,
+) {
     let codec = params.codec;
     let Some(format) = AudioFormat::from_hz(codec.sample_rate(), u16::from(codec.channels()))
     else {
         warn!(%peer, "announced format has a zero rate or channel count");
         return;
     };
-    // ALAC cannot open a decoder without this; PCM needs no decoder at all.
-    let config = match codec {
-        RaopCodec::Alac(alac) => Some(bytes::Bytes::from(alac.magic_cookie().to_vec())),
-        RaopCodec::Pcm { .. } => None,
-    };
+    // ALAC and AAC-ELD cannot open a decoder without this; PCM needs no decoder at all.
+    let config = codec.codec_config().map(bytes::Bytes::from);
+    let link = params.describe();
 
     // Bounded: a full channel means the decoder is behind, and the receive loop drops
     // rather than stalling the sockets that carry sync and timing.
     let (tx, rx) = mpsc::channel(512);
     let stream = AudioStream::new(params);
-    info!(%peer, %format, "AirPlay audio starting");
+    info!(%peer, %link, "AirPlay audio starting");
+    // Say what was negotiated before the stream event, so the card is populated by the
+    // time the first frame lands.
+    let _ = sink
+        .emit(SessionEvent::SourceInfo(
+            castaway_core::SourceDescription::new().with_link(link),
+        ))
+        .await;
     if sink
         .emit(SessionEvent::Audio {
             source: FrameSource::Encoded(rx),
@@ -627,13 +658,7 @@ async fn start_audio(
         warn!(%peer, "session manager gone; not starting audio");
         return;
     }
-    tokio::spawn(run_audio(
-        sockets,
-        stream,
-        tx,
-        peer.ip(),
-        session.sender_ports(),
-    ));
+    tokio::spawn(run_audio(sockets, stream, tx, peer.ip(), sender_ports));
 }
 
 /// The wall clock as an NTP timestamp.

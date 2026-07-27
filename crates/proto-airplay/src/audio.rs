@@ -56,6 +56,9 @@ const RESEND_PREFIX_LEN: usize = 4;
 /// AES operates on 16-byte blocks.
 const AES_BLOCK: usize = 16;
 
+/// The marker payload an AAC-ELD sender sends before it has audio to send.
+const AAC_ELD_PRIMING: &[u8] = &[0x00, 0x68, 0x34, 0x00];
+
 /// RTP payload types, as the 7-bit field (marker bit already masked off).
 pub mod payload_type {
     /// Audio data.
@@ -91,6 +94,14 @@ pub enum AudioError {
     /// A payload type this socket should never carry.
     #[error("unexpected RTP payload type {0}")]
     UnexpectedType(u8),
+
+    /// A stream-priming packet, which carries no audio.
+    ///
+    /// Not really an error — it is the sender saying "not yet" — but it travels as one
+    /// so the caller's existing drop-and-continue path handles it without a second
+    /// branch. Logged at debug rather than warn for the same reason.
+    #[error("stream-priming packet, no audio yet")]
+    Priming,
 }
 
 /// A sync packet: the sender telling us which frame should be playing when.
@@ -161,6 +172,7 @@ impl AudioStream {
                 // PCM needs no decoder, so it carries no codec tag; the pipeline is told
                 // the format instead.
                 RaopCodec::Pcm { .. } => Some(AudioCodec::Pcm),
+                RaopCodec::AacEld { .. } => Some(AudioCodec::Aac),
             },
             first_timestamp: None,
         }
@@ -230,6 +242,12 @@ impl AudioStream {
 
     /// Decrypt (if needed) and package one audio payload.
     fn audio_packet(&mut self, kind: RtpKind, payload: &[u8]) -> Result<AudioOutput, AudioError> {
+        // A mirroring sender emits priming packets before its clock is up: a bare header
+        // with no payload, or a four-byte marker. Feeding either to a decoder produces an
+        // error per packet for the first second of every session.
+        if payload.is_empty() || payload == AAC_ELD_PRIMING {
+            return Err(AudioError::Priming);
+        }
         let data = self.decrypt(payload);
 
         // `pts` is documented as time since stream start, and the RTP timestamp is a
@@ -493,6 +511,46 @@ mod tests {
         let mut p = vec![0x80, 0xD4];
         p.extend_from_slice(&[0u8; 18]);
         assert_eq!(s.on_audio(&p).unwrap_err(), AudioError::UnexpectedType(84));
+    }
+
+    #[test]
+    fn mirror_audio_frames_are_tagged_aac_and_decrypt_with_the_media_key() {
+        use crate::sdp::SessionKey;
+        let key = *b"0123456789abcdef";
+        let iv = *b"ABCDEFGHIJKLMNOP";
+        let params = AnnounceParams::mirror_aac_eld(SessionKey::from_bytes(key), iv);
+        let mut s = AudioStream::new(&params);
+
+        // A real AAC-ELD access unit starts 0x8c..0x8e; the sanity check prior art uses.
+        let mut plain = vec![0x8cu8];
+        plain.extend_from_slice(b"an-aac-eld-access-unit-payload");
+        let cipher = encrypt_like_a_sender(&key, &iv, &plain);
+
+        let out = s.on_audio(&audio_packet(0, &cipher)).unwrap();
+        let AudioOutput::Frame { frame, .. } = out else {
+            panic!("expected a frame")
+        };
+        assert_eq!(frame.audio_codec, Some(AudioCodec::Aac));
+        assert_eq!(frame.data.as_ref(), plain.as_slice());
+    }
+
+    #[test]
+    fn priming_packets_are_not_treated_as_broken_audio() {
+        // A mirroring sender emits these before its clock is up. Without this they would
+        // be a decoder error per packet for the first second of every session.
+        use crate::sdp::SessionKey;
+        let params = AnnounceParams::mirror_aac_eld(SessionKey::from_bytes([1u8; 16]), [2u8; 16]);
+        let mut s = AudioStream::new(&params);
+        assert_eq!(
+            s.on_audio(&audio_packet(0, &[0x00, 0x68, 0x34, 0x00]))
+                .unwrap_err(),
+            AudioError::Priming
+        );
+        // A header with no payload at all is the same thing.
+        assert_eq!(
+            s.on_audio(&audio_packet(0, &[])).unwrap_err(),
+            AudioError::Priming
+        );
     }
 
     #[test]

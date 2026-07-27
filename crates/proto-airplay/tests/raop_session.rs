@@ -300,7 +300,7 @@ fn mirror_message(kind: u8, timestamp: u64, payload: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn a_mirroring_session_negotiates_and_video_reaches_the_pipeline() {
+async fn a_mirroring_session_delivers_both_video_and_its_audio() {
     let (tx, mut events) = mpsc::channel(64);
     let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -471,4 +471,100 @@ async fn a_mirroring_session_negotiates_and_video_reaches_the_pipeline() {
     // The keystream ran on, so the second frame only decrypts if it was never restarted.
     assert!(second.data.ends_with(b"an-access-unit-payload"));
     assert_eq!(second.pts, Duration::from_nanos(17_000));
+
+    // --- and now the audio that rides alongside it ---
+
+    let mut s0 = plist::Dictionary::new();
+    s0.insert("type".into(), plist::Value::Integer(96i64.into()));
+    s0.insert("ct".into(), plist::Value::Integer(8i64.into()));
+    s0.insert("spf".into(), plist::Value::Integer(480i64.into()));
+    let mut d = plist::Dictionary::new();
+    d.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+    );
+    let body = plist_body(d);
+    let mut req = format!(
+        "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 4\r\nContent-Type: \
+         application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(&body);
+    stream.write_all(&req).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+    let body_at = head.find("\r\n\r\n").expect("a header/body split") + 4;
+    let reply: plist::Value = plist::from_bytes(&buf[body_at..n]).expect("a plist reply");
+    let audio_port = reply
+        .as_dictionary()
+        .and_then(|d| d.get("streams"))
+        .and_then(plist::Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|d| d.get("dataPort"))
+        .and_then(plist::Value::as_unsigned_integer)
+        .expect("a dataPort for the audio stream");
+
+    let mut audio_frames = None;
+    for _ in 0..8 {
+        let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            break;
+        };
+        if let SessionEvent::Audio { source, config, .. } = msg.event {
+            // AAC-ELD will not open a decoder without its AudioSpecificConfig.
+            assert_eq!(
+                config.expect("a codec config").as_ref(),
+                &[0xf8, 0xe8, 0x50, 0x00]
+            );
+            let FrameSource::Encoded(rx) = source else {
+                panic!("expected encoded frames")
+            };
+            audio_frames = Some(rx);
+            break;
+        }
+    }
+    let mut audio_frames = audio_frames.expect("the audio SETUP should start a session");
+
+    // The audio key is the FairPlay one with the `eiv` verbatim — no SHA-512 derivation,
+    // which is the video stream's alone. Encrypt the way a sender does and check it lands.
+    let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let mut plain = vec![0x8cu8];
+    plain.extend_from_slice(b"an-aac-eld-access-unit!!");
+    let mut cipher_text = plain.clone();
+    let n = cipher_text.len() - (cipher_text.len() % 16);
+    let mut enc = cbc::Encryptor::<aes::Aes128>::new(&aes_key.into(), &[0u8; 16].into());
+    let chunks = aes::cipher::inout::InOutBuf::from(&mut cipher_text[..n])
+        .into_chunks::<aes::cipher::consts::U16>()
+        .0
+        .into_out();
+    use aes::cipher::BlockEncryptMut as _;
+    enc.encrypt_blocks_mut(chunks);
+
+    let mut packet = vec![0x80, 0x60, 0, 1];
+    packet.extend_from_slice(&0u32.to_be_bytes());
+    packet.extend_from_slice(&0u32.to_be_bytes());
+    packet.extend_from_slice(&cipher_text);
+    sender
+        .send_to(
+            &packet,
+            SocketAddr::from(([127, 0, 0, 1], u16::try_from(audio_port).unwrap())),
+        )
+        .await
+        .unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), audio_frames.recv())
+        .await
+        .expect("an audio frame arrived")
+        .expect("the channel is open");
+    assert_eq!(frame.data.as_ref(), plain.as_slice());
 }

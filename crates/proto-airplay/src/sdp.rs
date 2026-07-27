@@ -94,6 +94,13 @@ impl AlacConfig {
     }
 }
 
+/// The `AudioSpecificConfig` for AirPlay's AAC-ELD: AOT 39 (ER AAC ELD), 44.1 kHz,
+/// stereo, 480-sample frames.
+///
+/// Four bytes, and always these four — every mirroring sender uses the same profile, so
+/// unlike ALAC's cookie there is nothing to derive from the negotiation.
+pub const AAC_ELD_CONFIG: [u8; 4] = [0xf8, 0xe8, 0x50, 0x00];
+
 /// What the sender is about to put on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaopCodec {
@@ -101,6 +108,16 @@ pub enum RaopCodec {
     Alac(AlacConfig),
     /// Uncompressed 16-bit PCM. `a=rtpmap:96 L16/44100/2`.
     Pcm {
+        /// Sample rate in Hz.
+        sample_rate: u32,
+        /// Channel count.
+        channels: u8,
+    },
+    /// AAC Enhanced Low Delay — the codec a *mirroring* session's audio uses.
+    ///
+    /// It never appears in an SDP body: mirroring negotiates through `SETUP` plists, and
+    /// this is the one codec that path offers.
+    AacEld {
         /// Sample rate in Hz.
         sample_rate: u32,
         /// Channel count.
@@ -114,7 +131,7 @@ impl RaopCodec {
     pub const fn sample_rate(&self) -> u32 {
         match self {
             Self::Alac(c) => c.sample_rate,
-            Self::Pcm { sample_rate, .. } => *sample_rate,
+            Self::Pcm { sample_rate, .. } | Self::AacEld { sample_rate, .. } => *sample_rate,
         }
     }
 
@@ -123,7 +140,7 @@ impl RaopCodec {
     pub const fn channels(&self) -> u8 {
         match self {
             Self::Alac(c) => c.channels,
-            Self::Pcm { channels, .. } => *channels,
+            Self::Pcm { channels, .. } | Self::AacEld { channels, .. } => *channels,
         }
     }
 
@@ -133,8 +150,36 @@ impl RaopCodec {
         match self {
             Self::Alac(_) => "ALAC",
             Self::Pcm { .. } => "PCM",
+            Self::AacEld { .. } => "AAC-ELD",
         }
     }
+
+    /// The out-of-band configuration a decoder needs to open, if any.
+    ///
+    /// libavcodec will not open ALAC without its 36-byte cookie or AAC-ELD without its
+    /// `AudioSpecificConfig`; PCM needs no decoder at all. Keeping this beside the codec
+    /// means the actor never has to know which is which.
+    #[must_use]
+    pub fn codec_config(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Alac(c) => Some(c.magic_cookie().to_vec()),
+            Self::AacEld { .. } => Some(AAC_ELD_CONFIG.to_vec()),
+            Self::Pcm { .. } => None,
+        }
+    }
+}
+
+/// Which AirPlay flow negotiated a stream.
+///
+/// Only for saying so on screen: the two arrive through completely different
+/// negotiations — an `ANNOUNCE` with an SDP body against a `SETUP` with a plist — so
+/// nothing downstream has to branch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    /// The AirPlay 1 audio flow.
+    AirPlay1,
+    /// Audio riding alongside a mirroring session.
+    Mirroring,
 }
 
 /// An unwrapped AES-128 session key.
@@ -146,6 +191,12 @@ impl RaopCodec {
 pub struct SessionKey([u8; 16]);
 
 impl SessionKey {
+    /// Wrap already-unwrapped key material.
+    #[must_use]
+    pub const fn from_bytes(key: [u8; 16]) -> Self {
+        Self(key)
+    }
+
     /// The key material. Named to be conspicuous at the call site.
     #[must_use]
     pub const fn expose(&self) -> &[u8; 16] {
@@ -186,6 +237,8 @@ impl StreamCrypto {
 /// Everything an `ANNOUNCE` body settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnounceParams {
+    /// Which flow negotiated this stream.
+    pub generation: Generation,
     /// The negotiated codec and its parameters.
     pub codec: RaopCodec,
     /// Whether the payload is encrypted, and with what.
@@ -197,6 +250,29 @@ pub struct AnnounceParams {
 }
 
 impl AnnounceParams {
+    /// The audio stream that rides alongside a mirroring session.
+    ///
+    /// Mirroring negotiates its audio through a `SETUP` plist rather than an SDP body,
+    /// and offers exactly one codec — so unlike [`Self::parse`] there is nothing to
+    /// discover. The key is the FairPlay-unwrapped one, and the IV is the `eiv` from the
+    /// same `SETUP` that carried the wrapped key; the payload rules are AirPlay 1's,
+    /// which is why this reuses the same depacketiser.
+    #[must_use]
+    pub const fn mirror_aac_eld(key: SessionKey, iv: [u8; 16]) -> Self {
+        Self {
+            generation: Generation::Mirroring,
+            codec: RaopCodec::AacEld {
+                sample_rate: 44_100,
+                channels: 2,
+            },
+            crypto: StreamCrypto::Aes { key, iv },
+            // A mirroring sender declares its latency in the sync packets rather than
+            // here; observed values are around 7497 frames against ALAC's 77175.
+            min_latency: None,
+            max_latency: None,
+        }
+    }
+
     /// A human-readable summary of what was negotiated, for the on-screen device card.
     ///
     /// The AirPlay counterpart of `proto-bluetooth-audio`'s `Codec::describe`, and it
@@ -220,8 +296,12 @@ impl AnnounceParams {
             2 => "stereo".to_string(),
             n => format!("{n} channels"),
         };
+        let generation = match self.generation {
+            Generation::AirPlay1 => "AirPlay 1",
+            Generation::Mirroring => "AirPlay mirroring",
+        };
         format!(
-            "AirPlay 1 · {} · {khz} · {channels}",
+            "{generation} · {} · {khz} · {channels}",
             self.codec.display_name()
         )
     }
@@ -290,6 +370,7 @@ impl AnnounceParams {
         };
 
         Ok(Self {
+            generation: Generation::AirPlay1,
             codec,
             crypto,
             min_latency,
@@ -559,6 +640,27 @@ mod tests {
         assert_eq!(c[17], 16, "bit depth");
         assert_eq!(c[21], 2, "channels");
         assert_eq!(u32::from_be_bytes([c[32], c[33], c[34], c[35]]), 44100);
+    }
+
+    #[test]
+    fn mirror_audio_carries_the_config_its_decoder_needs() {
+        // AAC-ELD will not open without its AudioSpecificConfig, and unlike ALAC's
+        // cookie there is nothing to derive — every mirroring sender uses this profile.
+        let p = AnnounceParams::mirror_aac_eld(SessionKey::from_bytes([7u8; 16]), [9u8; 16]);
+        assert_eq!(p.codec.codec_config().unwrap(), AAC_ELD_CONFIG.to_vec());
+        assert_eq!(p.codec.sample_rate(), 44_100);
+        assert!(p.crypto.is_encrypted(), "mirror audio is always encrypted");
+    }
+
+    #[test]
+    fn mirror_audio_says_it_is_mirroring_not_airplay_1() {
+        // Both flows end in the same depacketiser, so the card is the only place the
+        // difference is visible at all.
+        let p = AnnounceParams::mirror_aac_eld(SessionKey::from_bytes([7u8; 16]), [9u8; 16]);
+        assert_eq!(
+            p.describe(),
+            "AirPlay mirroring · AAC-ELD · 44.1 kHz · stereo"
+        );
     }
 
     #[test]

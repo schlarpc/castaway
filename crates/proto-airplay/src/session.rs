@@ -24,7 +24,7 @@ use crate::control::ControlUpdate;
 use crate::error::AirPlayError;
 use crate::info;
 use crate::mirror::{MirrorKeys, StreamConnectionId};
-use crate::sdp::AnnounceParams;
+use crate::sdp::{AnnounceParams, SessionKey};
 use crate::transport::{ReceiverPorts, SenderPorts};
 
 /// Parse an `AA:BB:CC:DD:EE:FF` device id into six bytes.
@@ -42,6 +42,9 @@ pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
 
 /// The `streams` entry type that means screen mirroring.
 const MIRROR_STREAM: i64 = 110;
+
+/// The `streams` entry type for the realtime audio that accompanies mirroring.
+const MIRROR_AUDIO_STREAM: i64 = 96;
 
 /// Serialize a reply dictionary as a binary plist.
 fn plist_response(dict: &plist::Dictionary) -> AirPlayResponse {
@@ -158,6 +161,23 @@ enum MirrorState {
     Ready(Box<MirrorKeys>),
 }
 
+/// The FairPlay-unwrapped media key for a mirroring session.
+///
+/// Kept beside [`MirrorState`] rather than inside it because it outlives the video
+/// negotiation: a third `SETUP` asking for the session's *audio* needs the same key, and
+/// by then the video keys have been handed to the data-channel task.
+#[derive(Clone, Copy)]
+struct MirrorMediaKey {
+    key: SessionKey,
+    iv: [u8; 16],
+}
+
+impl std::fmt::Debug for MirrorMediaKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MirrorMediaKey(<redacted>)")
+    }
+}
+
 /// How far the AirPlay 1 audio flow has got.
 ///
 /// `ANNOUNCE` → `SETUP` → `RECORD`, and each step needs what the one before it settled:
@@ -202,6 +222,12 @@ pub struct AirPlaySession {
     mirror: MirrorState,
     /// The TCP port the actor bound for the mirroring data channel.
     mirror_data_port: Option<u16>,
+    /// The unwrapped media key, once a mirroring `SETUP` has provided one.
+    mirror_media_key: Option<MirrorMediaKey>,
+    /// Audio negotiated alongside a mirroring session, waiting for the actor.
+    mirror_audio: Option<Box<AnnounceParams>>,
+    /// The `eiv` from the first mirroring `SETUP`, until the key is unwrapped.
+    pending_eiv: Option<[u8; 16]>,
 }
 
 impl AirPlaySession {
@@ -217,6 +243,9 @@ impl AirPlaySession {
             sender_ports: None,
             mirror: MirrorState::default(),
             mirror_data_port: None,
+            mirror_media_key: None,
+            mirror_audio: None,
+            pending_eiv: None,
         }
     }
 
@@ -245,6 +274,14 @@ impl AirPlaySession {
                 None
             }
         }
+    }
+
+    /// The audio stream a mirroring session negotiated, once it has.
+    ///
+    /// Taken rather than borrowed, for the same reason as the video keys: the actor
+    /// moves it into the receive task.
+    pub fn take_mirror_audio(&mut self) -> Option<Box<AnnounceParams>> {
+        self.mirror_audio.take()
     }
 
     /// Tell the session which ports the actor bound for it.
@@ -455,7 +492,23 @@ impl AirPlaySession {
         };
 
         if let Some(streams) = dict.get("streams").and_then(plist::Value::as_array) {
-            return self.mirror_streams(streams);
+            // One SETUP names one plane. Video comes first and audio, if the sender wants
+            // it, in a later request — so which this is, is read from the entry rather
+            // than from how far the negotiation has got.
+            let named = |ty: i64| {
+                streams
+                    .iter()
+                    .filter_map(plist::Value::as_dictionary)
+                    .find(|d| d.get("type").and_then(plist::Value::as_signed_integer) == Some(ty))
+            };
+            if let Some(stream) = named(MIRROR_STREAM) {
+                return self.mirror_streams(stream);
+            }
+            if named(MIRROR_AUDIO_STREAM).is_some() {
+                return self.mirror_audio_stream();
+            }
+            warn!("mirroring SETUP names no stream we serve");
+            return AirPlayResponse::status(400);
         }
 
         let Some(ekey) = dict.get("ekey").and_then(plist::Value::as_data) else {
@@ -466,6 +519,17 @@ impl AirPlaySession {
             warn!(len = ekey.len(), "ekey is not 72 bytes");
             return AirPlayResponse::status(400);
         };
+        // `eiv` is the media IV and arrives unwrapped. It is kept now because the audio
+        // stream needs it later, by which time this SETUP is long gone.
+        let Some(eiv) = dict
+            .get("eiv")
+            .and_then(plist::Value::as_data)
+            .and_then(|d| <[u8; 16]>::try_from(d).ok())
+        else {
+            warn!("mirroring SETUP has no 16-byte eiv");
+            return AirPlayResponse::status(400);
+        };
+        self.pending_eiv = Some(eiv);
         self.mirror = MirrorState::KeyMaterial {
             ekey: Box::new(ekey),
         };
@@ -483,20 +547,10 @@ impl AirPlaySession {
     }
 
     /// The second mirroring `SETUP`: derive the stream keys and name the data port.
-    fn mirror_streams(&mut self, streams: &[plist::Value]) -> AirPlayResponse {
+    fn mirror_streams(&mut self, stream: &plist::Dictionary) -> AirPlayResponse {
         let MirrorState::KeyMaterial { ekey } = std::mem::take(&mut self.mirror) else {
             warn!("mirroring streams SETUP before any key material");
             return AirPlayResponse::status(451);
-        };
-        let Some(stream) = streams
-            .iter()
-            .filter_map(plist::Value::as_dictionary)
-            .find(|d| {
-                d.get("type").and_then(plist::Value::as_signed_integer) == Some(MIRROR_STREAM)
-            })
-        else {
-            warn!("no mirroring stream in the SETUP");
-            return AirPlayResponse::status(400);
         };
         let Some(port) = self.mirror_data_port else {
             warn!("no mirroring data port was bound");
@@ -518,6 +572,14 @@ impl AirPlaySession {
             return AirPlayResponse::status(451);
         };
         let aes_key = crypto_playfair::decrypt_key(key_message, &ekey);
+        // Kept for the audio stream, which uses the same key with the `eiv` verbatim
+        // rather than the SHA-512 derivation the video stream needs.
+        if let Some(iv) = self.pending_eiv.take() {
+            self.mirror_media_key = Some(MirrorMediaKey {
+                key: SessionKey::from_bytes(aes_key),
+                iv,
+            });
+        }
         self.mirror = MirrorState::Ready(Box::new(MirrorKeys::derive(&aes_key, id)));
         log_info!(%id, port, "AirPlay mirroring stream ready");
 
@@ -531,6 +593,45 @@ impl AirPlaySession {
         reply.insert(
             "streams".into(),
             plist::Value::Array(vec![plist::Value::Dictionary(stream_reply)]),
+        );
+        plist_response(&reply)
+    }
+
+    /// Answer a `SETUP` asking for the audio that rides alongside a mirroring session.
+    ///
+    /// It arrives on the same UDP sockets the AirPlay 1 audio flow uses and obeys the
+    /// same payload rules, so the reply names those ports and the depacketiser is the
+    /// same one — only the codec and the key differ.
+    fn mirror_audio_stream(&mut self) -> AirPlayResponse {
+        let Some(media) = self.mirror_media_key else {
+            warn!("mirroring audio SETUP before the video stream provided a key");
+            return AirPlayResponse::status(451);
+        };
+        let Some(ports) = self.local_ports else {
+            warn!("no audio ports were bound");
+            return AirPlayResponse::status(500);
+        };
+        let params = AnnounceParams::mirror_aac_eld(media.key, media.iv);
+        log_info!(link = %params.describe(), "AirPlay mirroring audio negotiated");
+        self.mirror_audio = Some(Box::new(params));
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert(
+            "type".into(),
+            plist::Value::Integer(MIRROR_AUDIO_STREAM.into()),
+        );
+        stream.insert(
+            "dataPort".into(),
+            plist::Value::Integer(i64::from(ports.audio).into()),
+        );
+        stream.insert(
+            "controlPort".into(),
+            plist::Value::Integer(i64::from(ports.control).into()),
+        );
+        let mut reply = plist::Dictionary::new();
+        reply.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
         );
         plist_response(&reply)
     }
