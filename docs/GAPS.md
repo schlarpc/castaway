@@ -37,16 +37,32 @@ Decisions taken, so nobody re-litigates them from the entry text alone:
   Intel, and porting three firmware sequences for hardware nobody will plug in is not a
   good trade. The *silent* half is fixed — an unrecognised controller now says so instead
   of getting `NoInit` and producing an inert radio with nothing pointing at the cause.
-- **G46 — Widevine is packaged on Linux only, which is not the deploy target.** nixpkgs'
-  `widevine-cdm` ships `_platform_specific/linux_x64/libwidevinecdm.so` and declares
-  `meta.platforms = [x86_64-linux aarch64-linux]`, so `packages.castaway-cef` plays
-  DRM-gated content and `packages.castaway-windows-cef` — the artifact that actually
-  ships — does not. Chrome for Windows carries `widevinecdm.dll` under
-  `_platform_specific/win_x64/`, so closing this means extracting from a Chrome installer
-  at build time: a decision about redistribution terms and a large build-time fetch,
-  not a patch. Until then the Windows build says so once at startup rather than failing
-  silently. The 4K software-decode concern in the same entry is untouched and still wants
-  measuring on the real panel.
+- **G46 — Widevine: closed, and the diagnosis it was closed on was wrong.** The entry
+  assumed Linux worked and Windows did not. Neither worked, and neither for the stated
+  reason: `--widevine-cdm-path` **does not exist in CEF 147** — it is an Electron switch,
+  with zero occurrences in either `libcef.so` or `libcef.dll` — so `CASTAWAY_WIDEVINE_PATH`,
+  the switch, and the nixpkgs `widevine-cdm` dependency were all inert. DRM appeared to
+  work on the dev box because Chromium's *component updater* had quietly downloaded a CDM
+  into `~/.cache/castaway/cef/WidevineCdm/4.10.3050.0/` on an earlier run.
+  Both artifacts now stage `WidevineCdm/` beside libcef, which is the only directory
+  Chromium scans (`DIR_COMPONENT_PREINSTALLED` → `DIR_ASSETS` → `DIR_MODULE`), so a panel
+  that has never been online still plays protected video. The platform split is recorded
+  in `crates/pipeline/src/widevine.rs`: Windows registers a found CDM live from
+  `ComponentReady`, Linux only at startup via a hint file we now write ourselves.
+  Verified end to end on Linux — fresh profile plus staged CDM makes
+  `requestMediaKeySystemAccess('com.widevine.alpha')` succeed on the *first* launch, and
+  the same fresh profile without it fails. The Windows half follows the same mechanism on
+  the easier path and still wants one run on the box.
+  Two limits found while closing it, neither fatal and both worth knowing:
+  **VMP** — CDM host verification is compiled into the Windows build only
+  (`media/cdm/cdm_host_files.cc`, absent on Linux) and we ship no `.sig` files, so
+  verification fails; per `cdm_module.cc` that is recorded to UMA and otherwise ignored,
+  so the CDM still loads, but services demanding a verified media path (Netflix/Disney+
+  class) will refuse licences. YouTube's software-secure path does not.
+  **Codecs** — see G55: DRM playback is VP9/AV1 only, because this CEF build has no
+  H.264/AAC at all.
+  The 4K software-decode concern in the same entry is untouched and still wants measuring
+  on the real panel.
 
 Still open, roughly in the order they are worth taking:
 
@@ -68,8 +84,11 @@ Still open, roughly in the order they are worth taking:
    either link, the likeliest cause is the harness rather than the adapter — but that is a
    guess, and the case Q27 records stays unproven either way. Also still missing: a bonded
    phone reconnecting after restart, and a self-contained YouTube regression test (G54).
-4. **G30 (Windows half)** — a Widevine CDM for the deploy artifact, which means extracting
-   from a Chrome-for-Windows installer: a redistribution decision, not a patch.
+4. **G55** — no H.264/AAC in the browser, which needs a CEF built from source with
+   `proprietary_codecs=true ffmpeg_branding=Chrome`. There is no prebuilt to switch to, so
+   this is a build project rather than a patch: chromium-scale compute, and for the deploy
+   artifact either a Windows build host or a Chromium Linux→Windows cross setup. Decide
+   before it is discovered on the wall by a live stream that will not start.
 
 The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
 What was grounded in BlueZ 5.86 rather than in memory, since a phone is the Target and its
@@ -79,8 +98,8 @@ ctype, the Target's abort-on-other-PDU rule, the fixed five-byte notification-re
 parameter, the nine-byte `GetPlayStatus` layout, and the two category bits in attribute
 0x0311.
 
-G31's `HOME` assumption and G46's 4K decode both want checking on the real box rather
-than more code.
+G31's `HOME` assumption, G46's 4K decode, and G46's Windows CDM registration all want
+checking on the real box rather than more code.
 
 ---
 
@@ -619,6 +638,25 @@ display or the audio device, and two cannot take it back afterwards.
   surface dismissal, two senders on one screen, pause/seek/volume from the sender,
   add-to-queue, a relaunch inside the screen-id window (G20), or `--expect-skip` over a
   channel that has reattached.
+
+- **G55 — The browser cannot play H.264 or AAC, at all. CONFIRMED (measured).**
+  Found while closing G46. In the CEF build both artifacts run,
+  `MediaSource.isTypeSupported` and `video.canPlayType` are false/`""` for
+  `video/mp4; codecs="avc1.*"` and `audio/mp4; codecs="mp4a.40.2"`, while VP9, AV1, Opus
+  and MP3 all pass. This is not configuration: upstream's automated CEF distributions are
+  built without `proprietary_codecs=true ffmpeg_branding=Chrome` (patent licensing), the
+  codecs are compiled out of Blink's mime registry, and no runtime switch can bring them
+  back. Every prebuilt CEF is in the same position, and no maintained third-party build
+  with codecs exists — the only fix is a CEF built from source with those GN args.
+  Impact is narrow *today* and unbounded tomorrow: the browser only ever loads
+  `youtube.com/tv` and the clock page, and YouTube negotiates by capability, so VOD plays
+  VP9/AV1 (`yt-selfplay` proves it). The exposure is live streams and low-view content,
+  where YouTube's only rendition is often H.264 with AAC audio, and any future DIAL app.
+  Note the ordering trap for a fix: `ffmpeg_branding=Chromium` with `proprietary_codecs=true`
+  gets H.264 through the OS decoder but **not** AAC, which has no OS-decoder path in
+  Chromium (upstream cef#3559) — only `ffmpeg_branding=Chrome` gets both.
+  Our own ffmpeg pipeline is unaffected: AirPlay/Cast/DLNA/Bluetooth decode H.264 and AAC
+  normally. This is a browser-only gap.
 
 ---
 
