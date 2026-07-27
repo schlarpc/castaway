@@ -37,6 +37,11 @@ pub enum RenderCommand {
     /// on the loop directly because the loop lives on the main thread and everything
     /// that wants to tap it does not.
     AddTap(Box<dyn crate::tap::OutputTap>),
+    /// The URL that was opened turned out to be audio-only, with whatever the container
+    /// tags said about it. The surface answers with a now-playing card rather than a
+    /// black screen over music.
+    #[cfg(feature = "ffmpeg")]
+    UrlAudioOnly(Box<crate::ffmpeg_decode::MediaLayout>),
 }
 
 /// Asks the render thread to capture what it is showing.
@@ -223,9 +228,39 @@ impl Pipeline for RenderPipeline {
         let tx = self.tx.clone();
         let uri = source.to_string();
         let hw = self.hw;
+
+        // The session's clock, and the audio sink that drives it. Both live here rather
+        // than inside the decoder because only this type owns the gain and the output —
+        // and because a build with no audio feature must still compile to *something*
+        // that plays the picture.
+        let clock = Arc::new(crate::clock::MediaClock::new());
+        #[cfg(all(feature = "ffmpeg", feature = "audio"))]
+        let audio_tx = {
+            let (atx, arx) = std::sync::mpsc::sync_channel(crate::ffmpeg_decode::AUDIO_QUEUE);
+            crate::audio_session::spawn_pcm(
+                arx,
+                crate::audio_session::default_output(),
+                Arc::clone(&stop),
+                Arc::clone(&self.gain),
+                Some(Arc::clone(&clock)),
+            );
+            Some(atx)
+        };
+        #[cfg(not(all(feature = "ffmpeg", feature = "audio")))]
+        let audio_tx = {
+            // Said once per session rather than never: a build without the feature plays
+            // video silently, and silence that nobody announced is the failure mode this
+            // whole path was suffering from in the first place.
+            warn!(
+                "this build has no audio support, so playback will be silent; rebuild \
+                 with the `audio` feature"
+            );
+            None
+        };
+
         // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
         std::thread::spawn(move || {
-            let result = decode_into(&uri, hw, &tx, &stop);
+            let result = decode_into(&uri, hw, &tx, &stop, &clock, audio_tx);
             if let Err(e) = result {
                 warn!(error = %e, "decode ended with error");
             }
@@ -316,6 +351,9 @@ impl Pipeline for RenderPipeline {
                         crate::audio_session::default_output(),
                         stop,
                         Arc::clone(&self.gain),
+                        // Bluetooth/Spotify PCM: the sender is the clock and there is
+                        // no video to synchronise, so nothing reads a media clock.
+                        None,
                     );
                     Ok(())
                 }
@@ -417,23 +455,41 @@ fn decode_into(
     hw: HwPreference,
     tx: &SyncSender<RenderCommand>,
     stop: &Arc<AtomicBool>,
+    clock: &crate::clock::MediaClock,
+    audio_tx: Option<std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
 ) -> Result<(), PipelineError> {
     #[cfg(feature = "ffmpeg")]
     {
-        crate::ffmpeg_decode::decode(uri, hw, |frame| {
-            if stop.load(Ordering::SeqCst) {
-                return false;
-            }
-            // Drop on full (bounded queue) but stop if the render loop is gone.
-            !matches!(
-                tx.try_send(RenderCommand::Video(frame)),
-                Err(TrySendError::Disconnected(_))
-            )
-        })
+        crate::ffmpeg_decode::decode_av(
+            uri,
+            hw,
+            clock,
+            audio_tx,
+            &|| stop.load(Ordering::SeqCst),
+            |layout| {
+                // A file with no video is music, not a failure. Tell the surface so it
+                // puts a card up instead of leaving the idle scene under silence — and
+                // carry whatever the container's tags said, since a bare URL from Cast or
+                // AirPlay brings no metadata of its own.
+                if !layout.has_video {
+                    let _ = tx.try_send(RenderCommand::UrlAudioOnly(Box::new(layout.clone())));
+                }
+            },
+            |frame| {
+                if stop.load(Ordering::SeqCst) {
+                    return false;
+                }
+                // Drop on full (bounded queue) but stop if the render loop is gone.
+                !matches!(
+                    tx.try_send(RenderCommand::Video(frame)),
+                    Err(TrySendError::Disconnected(_))
+                )
+            },
+        )
     }
     #[cfg(not(feature = "ffmpeg"))]
     {
-        let _ = (uri, hw, tx, stop);
+        let _ = (uri, hw, tx, stop, clock, audio_tx);
         Err(PipelineError::Decode(
             "decode requires the `ffmpeg` feature".into(),
         ))
@@ -1050,6 +1106,32 @@ impl RenderLoop {
             }
             RenderCommand::AddTap(tap) => {
                 self.taps.push(tap);
+                false
+            }
+            #[cfg(feature = "ffmpeg")]
+            RenderCommand::UrlAudioOnly(layout) => {
+                // Music from a URL. Everything the container knew, so the card says what
+                // is playing rather than sitting blank over sound — and a duration, so the
+                // scrubber has something honest to draw against.
+                let mut track =
+                    castaway_core::NowPlaying::new(castaway_core::PlaybackState::Playing);
+                track.title = layout.title.clone();
+                track.artist = layout.artist.clone();
+                track.album = layout.album.clone();
+                track.duration = layout.duration;
+                let (w, h) = self.card_size();
+                let card = crate::nowplaying_card::NowPlayingCard {
+                    track,
+                    ..Default::default()
+                };
+                match crate::nowplaying_card::render(&card, w, h) {
+                    Ok(rgba) => {
+                        if let Err(e) = self.set_now_playing(w, h, &rgba) {
+                            error!(error = %e, "failed to draw the music card");
+                        }
+                    }
+                    Err(e) => error!(error = %e, "failed to render the music card"),
+                }
                 false
             }
             RenderCommand::ClearNowPlaying => {

@@ -32,6 +32,7 @@ pub mod attract;
 pub mod cef_adblock;
 #[cfg(feature = "cef")]
 pub mod cef_browser;
+pub mod clock;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
 #[cfg(feature = "cef")]

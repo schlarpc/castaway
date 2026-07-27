@@ -239,14 +239,25 @@ impl AudioDecoder {
     }
 
     /// Convert whatever the decoder produced into interleaved f32.
-    ///
-    /// Done by hand rather than through swresample. Every one of these decoders has its
-    /// own native layout — aptX comes out planar s32, SBC packed s16, AAC planar float —
-    /// and a resampler would be the obvious tool, but ffmpeg 7's channel-layout rework
-    /// leaves `swr` comparing a legacy layout mask against a frame carrying the new
-    /// `AVChannelLayout`, so it rejects its own decoder's output with "Input changed".
-    /// The conversion is a dozen lines and has no state to get out of sync.
     fn convert(&mut self, decoded: &ffmpeg::frame::Audio) -> Result<PcmBlock, PipelineError> {
+        pcm_from_frame(decoded)
+    }
+}
+
+/// Convert whatever a libav audio decoder produced into interleaved f32.
+///
+/// Done by hand rather than through swresample. Every decoder has its own native layout —
+/// aptX comes out planar s32, SBC packed s16, AAC planar float — and a resampler would be
+/// the obvious tool, but ffmpeg 7's channel-layout rework leaves `swr` comparing a legacy
+/// layout mask against a frame carrying the new `AVChannelLayout`, so it rejects its own
+/// decoder's output with "Input changed". The conversion is a dozen lines and has no state
+/// to get out of sync.
+///
+/// A free function because both audio paths need exactly this: the A2DP decoder above, and
+/// the media-URL demuxer in [`crate::ffmpeg_decode`]. The knowledge in the comments below
+/// was expensive and should not be discovered twice.
+pub(crate) fn pcm_from_frame(decoded: &ffmpeg::frame::Audio) -> Result<PcmBlock, PipelineError> {
+    {
         use ffmpeg::format::sample::Type;
         use ffmpeg::format::Sample;
 

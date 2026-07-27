@@ -219,8 +219,9 @@ pub fn spawn_pcm(
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
     gain: Arc<Gain>,
+    clock: Option<Arc<crate::clock::MediaClock>>,
 ) {
-    std::thread::spawn(move || run_pcm(frames, output, &stop, &gain));
+    std::thread::spawn(move || run_pcm(frames, output, &stop, &gain, clock.as_deref()));
 }
 
 /// Drive one already-decoded audio session to completion. Blocking; call it on its own
@@ -235,6 +236,7 @@ pub fn run_pcm(
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
     gain: &Gain,
+    clock: Option<&crate::clock::MediaClock>,
 ) {
     // What the output device is currently open as, not what the first block said: a
     // source may change rate between tracks, and writing 48 kHz samples into a device
@@ -279,10 +281,21 @@ pub fn run_pcm(
             pace = Pace::default();
         }
         let played = block.duration();
+        let through = block.pts + played;
         gain.apply(&mut block);
         if let Err(e) = output.write(&block) {
             warn!(error = %e, "pcm session: output failed");
             break;
+        }
+        // Published *before* the pacing sleep, not after: this says how far the stream
+        // has been submitted, and the sleep that follows is precisely the mechanism that
+        // keeps submission within `LEAD` of the speaker. Publishing after would make the
+        // clock jump in whole-block steps at the moment the thread wakes.
+        //
+        // Only the media-URL path passes a clock; A2DP and Spotify have no video to
+        // synchronise and nothing reads it.
+        if let Some(clock) = clock {
+            clock.observe_audio(through);
         }
         pace.wait_for(played);
     }
@@ -300,7 +313,11 @@ const STOP_POLL: Duration = Duration::from_millis(200);
 ///
 /// This is the buffer that absorbs a scheduling hiccup on either side. Too small and any
 /// stall is a dropout; too large and a pause takes that long to actually go quiet.
-const LEAD: Duration = Duration::from_millis(250);
+///
+/// Shared with [`crate::clock`] rather than restated: the media clock subtracts exactly
+/// this to turn what has been submitted into what has been heard, and two copies would
+/// drift into lip sync that is quietly off by the difference.
+const LEAD: Duration = crate::clock::OUTPUT_LEAD;
 
 /// A gap this big means the stream stopped rather than merely stuttered — a pause, a
 /// buffering stall, a track that took a while to load — so the clock restarts instead of
@@ -470,6 +487,7 @@ mod tests {
             Box::new(NullAudioOut::new()),
             &running(),
             &Gain::default(),
+            None,
         );
     }
 
@@ -520,6 +538,7 @@ mod tests {
                 }),
                 &running(),
                 &gain,
+                None,
             );
             let got = *peak.lock().unwrap();
             assert!(
@@ -563,6 +582,7 @@ mod tests {
             }),
             &running(),
             &Gain::default(),
+            None,
         );
 
         assert_eq!(
@@ -593,6 +613,7 @@ mod tests {
             }),
             &running(),
             &Gain::default(),
+            None,
         );
 
         assert_eq!(
@@ -629,6 +650,7 @@ mod tests {
             Box::new(NullAudioOut::new()),
             &running(),
             &Gain::default(),
+            None,
         );
         let taken = start.elapsed();
 
@@ -678,6 +700,7 @@ mod tests {
             }),
             &stop,
             &Gain::default(),
+            None,
         );
 
         assert_eq!(

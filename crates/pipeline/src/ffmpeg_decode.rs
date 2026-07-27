@@ -88,6 +88,263 @@ where
     }
 }
 
+/// What streams a media URL turned out to have, and what the container says it is.
+///
+/// Reported before playback starts because the answer changes what the panel shows: a
+/// file with no video stream is *music*, and the receiver should put a now-playing card
+/// up rather than fail with "no video stream" — which is what it used to do, while
+/// advertising `http-get:*:audio/*:*` to every control point on the LAN.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaLayout {
+    /// Whether a video stream was found.
+    pub has_video: bool,
+    /// Whether an audio stream was found.
+    pub has_audio: bool,
+    /// Total duration, when the container knows it.
+    pub duration: Option<Duration>,
+    /// `title` from the container tags, if any.
+    pub title: Option<String>,
+    /// `artist`.
+    pub artist: Option<String>,
+    /// `album`.
+    pub album: Option<String>,
+}
+
+/// How many decoded audio blocks may be queued for the output.
+///
+/// This bound is load-bearing, not a tuning knob: the audio thread consumes in real time,
+/// so a full queue blocks the demuxer, and *that* is what paces the whole session. Without
+/// it a two-hour film decodes as fast as the disk can feed it. Roughly a second of audio
+/// at typical block sizes — enough to absorb a scheduling hiccup, short enough that a
+/// preempted session goes quiet promptly.
+pub const AUDIO_QUEUE: usize = 64;
+
+/// Decode `uri`, presenting video against `clock` and sending decoded audio to `audio`.
+///
+/// The pacing story in one place, because it is the thing that was missing entirely:
+///
+/// - Audio blocks go into a **bounded** channel that a real-time consumer drains. When it
+///   fills, this function blocks, and with it the demuxer and the video decoder. Audio is
+///   therefore the throttle for the whole session, which is what "audio master" means
+///   before it means anything about lip sync.
+/// - Video frames are then held individually until [`MediaClock`] says they are due, so
+///   they land against the audio rather than merely at the same average rate.
+/// - With no audio stream there is nothing to be paced by, so the clock is seeded from
+///   the first frame and runs off the wall instead.
+///
+/// `on_open` is called once, before any frame, with what the container turned out to hold.
+///
+/// # Errors
+/// [`PipelineError::Decode`] on open/decode failure. A file with neither audio nor video
+/// is an error; a file with only one of them is not.
+pub fn decode_av<F, O>(
+    uri: &str,
+    preference: HwPreference,
+    clock: &crate::clock::MediaClock,
+    audio: Option<std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
+    stop: &dyn Fn() -> bool,
+    mut on_open: O,
+    mut on_frame: F,
+) -> Result<(), PipelineError>
+where
+    F: FnMut(DecodedFrame) -> bool,
+    O: FnMut(&MediaLayout),
+{
+    ensure_init();
+    let mut hw = HwAttempt::new(preference);
+    let mut opened = false;
+    loop {
+        match av_session(
+            uri,
+            &mut hw,
+            clock,
+            audio.as_ref(),
+            stop,
+            &mut |layout: &MediaLayout| {
+                // Only the first time round: a mid-session software fallback reopens the
+                // file, and telling the pipeline "here is a new item" would restart the
+                // card and the metadata for something that never stopped playing.
+                if !opened {
+                    opened = true;
+                    on_open(layout);
+                }
+            },
+            &mut on_frame,
+        )? {
+            SessionEnd::Finished => return Ok(()),
+            SessionEnd::RebuildInSoftware => {
+                warn!(uri, "decode: restarting playback in software mid-stream");
+            }
+        }
+    }
+}
+
+/// One decoder incarnation over a demuxed URL, video and audio together.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn av_session<F, O>(
+    uri: &str,
+    hw: &mut HwAttempt,
+    clock: &crate::clock::MediaClock,
+    audio_tx: Option<&std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
+    stop: &dyn Fn() -> bool,
+    on_open: &mut O,
+    on_frame: &mut F,
+) -> Result<SessionEnd, PipelineError>
+where
+    F: FnMut(DecodedFrame) -> bool,
+    O: FnMut(&MediaLayout),
+{
+    let mut ictx = ffmpeg::format::input(&uri).map_err(map_err)?;
+
+    let video = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .map(|s| (s.index(), s.time_base(), s.parameters()));
+    // Only claimed when this build can actually decode it: `has_audio` drives whether the
+    // panel shows a music card, and a build with no decoder saying "yes, audio" would put
+    // a card up over silence.
+    #[cfg(feature = "audio")]
+    let audio = audio_tx.and(
+        ictx.streams()
+            .best(ffmpeg::media::Type::Audio)
+            .map(|s| (s.index(), s.time_base(), s.parameters())),
+    );
+    #[cfg(not(feature = "audio"))]
+    let audio: Option<(usize, ffmpeg::Rational, ffmpeg::codec::Parameters)> = {
+        let _ = &audio_tx;
+        None
+    };
+
+    let layout = MediaLayout {
+        has_video: video.is_some(),
+        has_audio: audio.is_some(),
+        duration: container_duration(&ictx),
+        title: tag(&ictx, "title"),
+        artist: tag(&ictx, "artist"),
+        album: tag(&ictx, "album"),
+    };
+    if !layout.has_video && !layout.has_audio {
+        return Err(PipelineError::Decode(
+            "the media has neither a video nor an audio stream".into(),
+        ));
+    }
+    on_open(&layout);
+
+    let mut video_decoder = match &video {
+        Some((_, _, parameters)) => {
+            let mut ctx = ffmpeg::codec::context::Context::from_parameters(parameters.clone())
+                .map_err(map_err)?;
+            let codec_id = ctx.id();
+            if hw.wants_hardware() {
+                // SAFETY: the context has been filled from stream parameters but not
+                // opened — `.decoder().video()` below is what opens it — and it will be
+                // opened with the decoder for `codec_id`.
+                unsafe { hw.attach(ctx.as_mut_ptr().cast(), codec_id) }?;
+            }
+            Some(ctx.decoder().video().map_err(map_err)?)
+        }
+        None => None,
+    };
+    #[cfg(feature = "audio")]
+    let mut audio_decoder = match &audio {
+        Some((_, _, parameters)) => {
+            let ctx = ffmpeg::codec::context::Context::from_parameters(parameters.clone())
+                .map_err(map_err)?;
+            Some(ctx.decoder().audio().map_err(map_err)?)
+        }
+        None => None,
+    };
+    let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
+
+    for (stream, packet) in ictx.packets() {
+        if stop() {
+            return Ok(SessionEnd::Finished);
+        }
+        let index = stream.index();
+
+        if let (Some((vi, time_base, _)), Some(decoder)) = (&video, video_decoder.as_mut()) {
+            if index == *vi {
+                decoder.send_packet(&packet).map_err(map_err)?;
+                hw.check_negotiation()?;
+                match drain_paced(decoder, hw, &mut scaler, *time_base, clock, on_frame)? {
+                    Drained::Continue => {}
+                    Drained::Stopped => return Ok(SessionEnd::Finished),
+                    Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
+                }
+                continue;
+            }
+        }
+
+        #[cfg(feature = "audio")]
+        if let (Some((ai, time_base, _)), Some(decoder), Some(tx)) =
+            (&audio, audio_decoder.as_mut(), audio_tx)
+        {
+            if index == *ai {
+                decoder.send_packet(&packet).map_err(map_err)?;
+                let mut decoded = ffmpeg::frame::Audio::empty();
+                while decoder.receive_frame(&mut decoded).is_ok() {
+                    let mut block = crate::audio_decode::pcm_from_frame(&decoded)?;
+                    // The decoder's timestamps are in the stream's time base; the clock
+                    // and the card both speak `Duration`.
+                    block.pts = decoded
+                        .pts()
+                        .map(|p| rescale_to_duration(p, *time_base))
+                        .unwrap_or(block.pts);
+                    // Blocking, deliberately: this is the throttle for the whole session
+                    // (see `AUDIO_QUEUE`). A `try_send` here would drop audio to keep
+                    // reading, which is the one thing audio must never do.
+                    if tx.send(block).is_err() {
+                        // The output went away — a preemption, or the device failed.
+                        return Ok(SessionEnd::Finished);
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush the video decoder so the last frames of the item are not left inside it.
+    if let (Some(decoder), Some((_, time_base, _))) = (video_decoder.as_mut(), &video) {
+        decoder.send_eof().map_err(map_err)?;
+        if let Drained::Restart =
+            drain_paced(decoder, hw, &mut scaler, *time_base, clock, on_frame)?
+        {
+            return Ok(SessionEnd::RebuildInSoftware);
+        }
+    }
+    Ok(SessionEnd::Finished)
+}
+
+/// The container's duration, when it has one. A live stream reports nothing usable, which
+/// is exactly the case the scrubber must not draw a bar for.
+fn container_duration(ictx: &ffmpeg::format::context::Input) -> Option<Duration> {
+    let raw = ictx.duration();
+    if raw <= 0 {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Some(Duration::from_micros(
+        (raw as u64).saturating_mul(1_000_000) / u64::try_from(ffmpeg::ffi::AV_TIME_BASE).ok()?,
+    ))
+}
+
+fn tag(ictx: &ffmpeg::format::context::Input, key: &str) -> Option<String> {
+    ictx.metadata()
+        .get(key)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// A stream timestamp in its own time base, as a [`Duration`].
+///
+/// Only the audio half needs it — video timestamps go through [`frame_pts`] — so it is
+/// gated with the audio half rather than left as dead code in a video-only build.
+#[cfg(feature = "audio")]
+fn rescale_to_duration(pts: i64, time_base: ffmpeg::Rational) -> Duration {
+    let seconds = f64::from(time_base) * pts as f64;
+    Duration::from_secs_f64(seconds.max(0.0))
+}
+
 /// One decoder incarnation over a demuxed URL.
 fn url_session<F>(
     uri: &str,
@@ -508,6 +765,60 @@ where
             Export::Gpu(frame) => frame,
             // A tolerated export failure: the mirror is better served by a dropped frame
             // than by a stall.
+            Export::Dropped => continue,
+            Export::Restart => return Ok(Drained::Restart),
+            Export::Software => scale_to_rgba(&decoded, scaler, pts)?,
+        };
+        if !on_frame(frame) {
+            return Ok(Drained::Stopped);
+        }
+    }
+    Ok(Drained::Continue)
+}
+
+/// [`drain`], with each frame held until the media clock says it is due.
+///
+/// The waiting is the difference between "the frames came out in order" and "the picture
+/// matches the sound". It happens here rather than in the render loop because this is the
+/// thread that can afford to sleep: the render loop presents whatever it was last handed
+/// and must never block on a decoder.
+///
+/// A frame that is merely late is still shown — it is the best picture available. One that
+/// is hopelessly late is dropped, because presenting it only puts the next one further
+/// behind, and a decoder losing that race never wins it back frame by frame.
+fn drain_paced<F>(
+    decoder: &mut ffmpeg::decoder::Video,
+    hw: &mut HwAttempt,
+    scaler: &mut Option<ffmpeg::software::scaling::Context>,
+    time_base: ffmpeg::Rational,
+    clock: &crate::clock::MediaClock,
+    on_frame: &mut F,
+) -> Result<Drained, PipelineError>
+where
+    F: FnMut(DecodedFrame) -> bool,
+{
+    let mut decoded = ffmpeg::frame::Video::empty();
+    while decoder.receive_frame(&mut decoded).is_ok() {
+        let pts = frame_pts(decoded.pts(), time_base);
+        // Seeds the wall clock for a file with no audio, and does nothing once audio has
+        // anchored it — the first caller wins.
+        clock.start_video_master(pts);
+
+        if clock.is_hopeless(pts) {
+            continue;
+        }
+        // Sleep in slices so a preemption is not stuck behind a long hold. A frame is
+        // rarely more than a frame-interval early; the cap only matters for a file whose
+        // timestamps jump.
+        while let Some(wait) = clock.wait_for(pts) {
+            std::thread::sleep(wait.min(Duration::from_millis(50)));
+            if wait <= Duration::from_millis(50) {
+                break;
+            }
+        }
+
+        let frame = match hw.export(&mut decoded, pts) {
+            Export::Gpu(frame) => frame,
             Export::Dropped => continue,
             Export::Restart => return Ok(Drained::Restart),
             Export::Software => scale_to_rgba(&decoded, scaler, pts)?,
