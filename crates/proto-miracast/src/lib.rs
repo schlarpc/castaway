@@ -15,6 +15,11 @@
 #![forbid(unsafe_code)]
 
 pub mod actor;
+/// The Linux Wi-Fi Direct backend. Unix-only: it speaks to a wpa_supplicant control
+/// socket, which has no equivalent elsewhere (ground rule 5 — the seam is
+/// [`castaway_core::MiracastBackend`], and this is one impl of it).
+#[cfg(unix)]
+pub mod backend_linux;
 pub mod error;
 pub mod ie;
 pub mod media;
@@ -28,6 +33,8 @@ pub mod video;
 use castaway_core::ProtocolKind;
 
 pub use actor::{bind_rtp, connect_control, run_session, MiracastAdapter};
+#[cfg(unix)]
+pub use backend_linux::{LinuxMiracastBackend, P2pConfig, WpaControl};
 pub use error::{IeError, MiracastError, ParamError};
 pub use ie::{
     DeviceInformation, DeviceType, ExtendedCapability, SessionAvailability, Subelement,
