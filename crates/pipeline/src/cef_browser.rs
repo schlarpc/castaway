@@ -285,64 +285,39 @@ wrap_app! {
                     Some(&"autoplay-policy".into()),
                     Some(&"no-user-gesture-required".into()),
                 );
-                // Widevine, if this build shipped it. Without a CDM every EME-gated
-                // stream fails, and it fails *quietly* — the page reports an error to its
-                // own console and the panel just does not play, which is indistinguishable
-                // from a network problem. The path comes from the environment rather than
-                // being compiled in because the CDM is an unfree binary: a build that does
-                // not want it simply does not set this, and everything else still works.
-                if let Some(path) = widevine_path() {
-                    info!(target: "castaway::cef", %path, "widevine cdm");
-                    cl.append_switch_with_value(
-                        Some(&"widevine-cdm-path".into()),
-                        Some(&path.as_str().into()),
-                    );
-                } else {
-                    // Said once, at startup, because the alternative is discovering it
-                    // from a leanback console line while standing in front of the panel.
-                    debug!(
-                        target: "castaway::cef",
-                        "no widevine cdm; DRM-protected video will not play"
-                    );
-                }
+                // Nothing here for Widevine on purpose: `--widevine-cdm-path` is an
+                // Electron switch, absent from CEF 147's `libcef` on both platforms, and
+                // appending it only looked like configuration. The CDM is found by path
+                // instead — see `crate::widevine`, driven from `initialize()`.
             }
         }
     }
 }
 
-/// Whether this build has a Widevine CDM, for a caller that wants to say so once.
+/// Whether this build can play EME-gated video, for a caller that wants to say so once.
 ///
 /// Exposed because the per-process command-line hook is the wrong place to be loud: it
 /// runs in the browser process *and* every subprocess, so a warning there is four
 /// warnings. The app checks this once at startup instead.
 #[must_use]
 pub fn has_widevine() -> bool {
-    widevine_path().is_some()
+    crate::widevine::available(&stable_cache_dir(), cef_module_dir().as_deref()).is_some()
 }
 
-/// Where this build's Widevine CDM lives, if it has one.
+/// The directory Chromium treats as `DIR_ASSETS` — where `libcef` lives, and therefore
+/// where its component updater looks for a preinstalled CDM.
 ///
-/// `CASTAWAY_WIDEVINE_PATH` should be the directory holding `manifest.json` and
-/// `_platform_specific/` — the layout Chrome ships and nixpkgs' `widevine-cdm` reproduces
-/// under `share/google/chrome/WidevineCdm`. Set by the packaging wrapper next to
-/// `CEF_PATH`, for the same reason: it is a runtime lookup, not a build-time one.
-fn widevine_path() -> Option<String> {
-    let path = std::env::var("CASTAWAY_WIDEVINE_PATH").ok()?;
-    let path = path.trim();
-    if path.is_empty() {
-        return None;
+/// `CEF_PATH` when the packaging sets it: the Linux kiosk build points it at the flattened
+/// distribution, which is where `libcef.so` actually is (not beside our binary). Otherwise
+/// the executable's own directory, which is how the Windows artifact ships — `libcef.dll`
+/// and `castaway.exe` in one folder — and how a dev build behaves.
+fn cef_module_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("CEF_PATH") {
+        Some(path) if !path.is_empty() => Some(std::path::PathBuf::from(path)),
+        _ => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
     }
-    // Checked rather than trusted: a stale path silently disables DRM, which is the exact
-    // failure this is meant to remove.
-    if !std::path::Path::new(path).join("manifest.json").is_file() {
-        warn!(
-            target: "castaway::cef",
-            %path,
-            "CASTAWAY_WIDEVINE_PATH has no manifest.json; ignoring it"
-        );
-        return None;
-    }
-    Some(path.to_owned())
 }
 
 // --- RenderHandler: viewport + on_paint ---
@@ -769,6 +744,23 @@ impl Cef {
         // which would re-ask on every kiosk restart.
         let cache = stable_cache_dir();
         let _ = std::fs::create_dir_all(&cache);
+        // Before CEF starts, because on Linux the CDM is registered during startup and
+        // never again in this process — see `crate::widevine`. Said out loud either way:
+        // "the video does not start" and "there is no CDM" look identical on a wall.
+        match crate::widevine::configure(&cache, cef_module_dir().as_deref()) {
+            Some(source) => info!(
+                target: "castaway::cef",
+                source = source.kind(),
+                version = %source.cdm().version(),
+                dir = %source.cdm().dir().display(),
+                "widevine cdm"
+            ),
+            None => warn!(
+                target: "castaway::cef",
+                "no widevine cdm; DRM-protected video will not play until the component \
+                 updater fetches one"
+            ),
+        }
         // Point CEF at the flattened distribution's resources (.pak/ICU/locales). The
         // build copies them next to the *crate* binary, but a subprocess/example binary
         // may live elsewhere, so set them explicitly from CEF_PATH when available.

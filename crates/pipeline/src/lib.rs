@@ -52,6 +52,8 @@ pub mod text;
 pub mod ubo_scriptlets;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
+#[cfg(feature = "cef")]
+pub mod widevine;
 
 pub use browser::{BrowserSurface, NullBrowser};
 pub use color::YuvMatrix;

@@ -119,14 +119,15 @@ fn main() -> anyhow::Result<()> {
         let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
 
         // Said once, at startup, because the alternative is discovering it from a
-        // leanback console line while standing in front of the panel. nixpkgs' CDM is
-        // Linux-only (`meta.platforms`), so the Windows deploy artifact reaches here —
-        // and the failure it produces is a video that silently does not start.
+        // leanback console line while standing in front of the panel. Both deploy
+        // artifacts stage a CDM beside libcef, so reaching this means the staging was
+        // dropped or the profile is on read-only storage — not that the build is Windows.
         #[cfg(feature = "cef")]
         if !pipeline::cef_browser::has_widevine() {
             warn!(
-                "no Widevine CDM in this build: DRM-protected video (rentals, some \
-                 higher-tier streams) will not play. Everything else is unaffected."
+                "no Widevine CDM staged: DRM-protected video (rentals, some higher-tier \
+                 streams) will not play until Chromium's component updater fetches one, \
+                 which needs the network. Everything else is unaffected."
             );
         }
 

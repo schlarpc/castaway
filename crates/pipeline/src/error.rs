@@ -42,4 +42,10 @@ pub enum PipelineError {
     /// A GPU surface could not be imported into the compositor's device.
     #[error("gpu surface import failed: {0}")]
     GpuImport(String),
+
+    /// The Widevine CDM could not be pointed out to the browser. Never fatal — the panel
+    /// runs, it just cannot play EME-gated video — but reported rather than swallowed,
+    /// because that failure is otherwise indistinguishable from a network problem.
+    #[error("widevine: {0}")]
+    Widevine(String),
 }
