@@ -178,6 +178,10 @@ async fn pump(
     let mut mirror_audio_tx: Option<mpsc::Sender<EncodedFrame>> = None;
     // Shared by the mirror's two planes so they present on one timeline.
     let mirror_origin = Arc::new(StreamOrigin::new());
+    // FLUSH arrives on the RTSP connection and has to reach the audio task, which is
+    // elsewhere. `watch` rather than a channel: only the newest flush point matters, and
+    // a task that missed one because it was busy should not then act on a stale one.
+    let (flush_tx, flush_rx) = tokio::sync::watch::channel(None);
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
     loop {
@@ -230,9 +234,13 @@ async fn pump(
             // task is driven from here rather than from the session, because the pure
             // core owns no sockets and should not be handed a channel just to hand one
             // back (ground rule 3).
+            if let Some(point) = session.take_flush() {
+                let _ = flush_tx.send(Some(point));
+            }
+
             if session.is_recording() {
                 if let Some(sockets) = audio_sockets.take() {
-                    start_audio(session, sockets, sink, peer).await;
+                    start_audio(session, sockets, flush_rx.clone(), sink, peer).await;
                 }
             }
 
@@ -258,6 +266,7 @@ async fn pump(
                         tx,
                         peer.ip(),
                         session.sender_ports(),
+                        flush_rx.clone(),
                     ));
                 }
             }
@@ -512,6 +521,7 @@ async fn run_audio(
     frames: mpsc::Sender<EncodedFrame>,
     peer_ip: IpAddr,
     sender_ports: Option<SenderPorts>,
+    mut flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
 ) {
     let mut timing = TimingClient::new();
     let mut resends = ResendTracker::new();
@@ -546,6 +556,17 @@ async fn run_audio(
             () = frames.closed() => {
                 debug!("AirPlay audio consumer went away; stopping the receive loop");
                 return;
+            }
+            Ok(()) = flush.changed() => {
+                if let Some(point) = *flush.borrow_and_update() {
+                    // Both halves of the fix: stop playing what the sender has left
+                    // behind, and stop asking it to resend across a gap it made on
+                    // purpose.
+                    stream.flush(point);
+                    resends.reset();
+                    debug!(rtp = ?point.rtp, "AirPlay audio flushed");
+                }
+                continue;
             }
             _ = probe.tick() => {
                 if let Some(target) = timing_peer {
@@ -606,7 +627,11 @@ async fn run_audio(
             }
             // Neither of these is a fault: the sender saying "not yet", and audio that
             // arrived before a sync packet could place it on the shared timeline.
-            Err(crate::audio::AudioError::Priming | crate::audio::AudioError::AwaitingSync) => {}
+            Err(
+                crate::audio::AudioError::Priming
+                | crate::audio::AudioError::AwaitingSync
+                | crate::audio::AudioError::Stale,
+            ) => {}
             // One bad datagram off a radio link must not take the music down.
             Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
         }
@@ -625,6 +650,7 @@ enum Socket {
 async fn start_audio(
     session: &AirPlaySession,
     sockets: AudioSockets,
+    flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
     sink: &SessionSink,
     peer: SocketAddr,
 ) {
@@ -633,7 +659,7 @@ async fn start_audio(
         return;
     };
     let ports = session.sender_ports();
-    start_negotiated_audio(params, sockets, ports, sink, peer).await;
+    start_negotiated_audio(params, sockets, ports, flush, sink, peer).await;
 }
 
 /// Start an audio receive session for whatever was negotiated.
@@ -645,6 +671,7 @@ async fn start_negotiated_audio(
     params: &crate::sdp::AnnounceParams,
     sockets: AudioSockets,
     sender_ports: Option<SenderPorts>,
+    flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
     sink: &SessionSink,
     peer: SocketAddr,
 ) {
@@ -682,7 +709,14 @@ async fn start_negotiated_audio(
         warn!(%peer, "session manager gone; not starting audio");
         return;
     }
-    tokio::spawn(run_audio(sockets, stream, tx, peer.ip(), sender_ports));
+    tokio::spawn(run_audio(
+        sockets,
+        stream,
+        tx,
+        peer.ip(),
+        sender_ports,
+        flush,
+    ));
 }
 
 /// The wall clock as an NTP timestamp.

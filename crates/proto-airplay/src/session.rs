@@ -228,6 +228,8 @@ pub struct AirPlaySession {
     mirror_audio: Option<Box<AnnounceParams>>,
     /// The `eiv` from the first mirroring `SETUP`, until the key is unwrapped.
     pending_eiv: Option<[u8; 16]>,
+    /// A `FLUSH` the actor has not yet passed to the audio task.
+    pending_flush: Option<crate::audio::FlushPoint>,
 }
 
 impl AirPlaySession {
@@ -246,6 +248,7 @@ impl AirPlaySession {
             mirror_media_key: None,
             mirror_audio: None,
             pending_eiv: None,
+            pending_flush: None,
         }
     }
 
@@ -274,6 +277,11 @@ impl AirPlaySession {
                 None
             }
         }
+    }
+
+    /// A `FLUSH` the audio task has not been told about yet.
+    pub fn take_flush(&mut self) -> Option<crate::audio::FlushPoint> {
+        self.pending_flush.take()
     }
 
     /// The audio stream a mirroring session negotiated, once it has.
@@ -341,7 +349,19 @@ impl AirPlaySession {
             ("RECORD", _) => self.record(),
             ("SET_PARAMETER", _) => self.set_parameter(req),
             ("GET_PARAMETER", _) => AirPlayResponse::ok(),
-            ("FLUSH", _) => AirPlayResponse::ok(),
+            ("FLUSH", _) => {
+                // `RTP-Info` is where the sender says the new position starts. Ignoring
+                // it was the audible half of a skip: a moment of the old position plays
+                // before the new audio arrives.
+                if let Some(header) = req.header("RTP-Info") {
+                    let point = crate::audio::FlushPoint::parse(header);
+                    log_info!(rtp = ?point.rtp, seq = ?point.seq, "AirPlay FLUSH");
+                    self.pending_flush = Some(point);
+                } else {
+                    debug!("FLUSH with no RTP-Info; nothing to discard from");
+                }
+                AirPlayResponse::ok()
+            }
             ("TEARDOWN", _) => {
                 self.raop = RaopState::Idle;
                 self.sender_ports = None;
@@ -1205,6 +1225,42 @@ mod tests {
             .unwrap();
         assert_eq!(r.status, 200);
         assert!(r.event.is_none());
+    }
+
+    #[test]
+    fn a_flush_carries_its_restart_point_to_the_actor() {
+        let mut s = session();
+        let headers = vec![(
+            "RTP-Info".to_string(),
+            "seq=1234;rtptime=567890".to_string(),
+        )];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "FLUSH",
+                path: "rtsp://x/s",
+                headers: &headers,
+                body: &[],
+            })
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let point = s
+            .take_flush()
+            .expect("the flush point must reach the audio task");
+        assert_eq!(point.rtp, Some(567_890));
+        // Taken once: a second read must not replay a flush that has been acted on.
+        assert!(s.take_flush().is_none());
+    }
+
+    #[test]
+    fn a_flush_without_rtp_info_is_still_answered() {
+        // Nothing to discard from, but refusing it would end a session over a header a
+        // sender is not required to send.
+        let mut s = session();
+        let r = s
+            .handle(&AirPlayRequest::new("FLUSH", "rtsp://x/s", &[]))
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(s.take_flush().is_none());
     }
 
     #[test]

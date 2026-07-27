@@ -106,6 +106,10 @@ pub enum AudioError {
     #[error("audio arrived before the stream was anchored to the sender's clock")]
     AwaitingSync,
 
+    /// Audio from before a `FLUSH`, queued for a position the sender has already left.
+    #[error("audio predates the last FLUSH")]
+    Stale,
+
     /// A stream-priming packet, which carries no audio.
     ///
     /// Not really an error — it is the sender saying "not yet" — but it travels as one
@@ -113,6 +117,38 @@ pub enum AudioError {
     /// branch. Logged at debug rather than warn for the same reason.
     #[error("stream-priming packet, no audio yet")]
     Priming,
+}
+
+/// Where a `FLUSH` told us the stream restarts.
+///
+/// A seek or a track change: everything the sender queued before this point is stale, and
+/// playing it is a moment of the *old* position before the new audio arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlushPoint {
+    /// The RTP timestamp the new position starts at, from `RTP-Info: rtptime=`.
+    pub rtp: Option<u32>,
+    /// The sequence number it starts at, from `RTP-Info: seq=`.
+    ///
+    /// shairport-sync reads only `rtptime` and UxPlay only `seq`; senders send both, so
+    /// both are taken and each is used for what it is good for — the timestamp decides
+    /// which audio is stale, the sequence number stops the gap being read as loss.
+    pub seq: Option<u16>,
+}
+
+impl FlushPoint {
+    /// Parse an `RTP-Info` header.
+    #[must_use]
+    pub fn parse(header: &str) -> Self {
+        let mut point = Self::default();
+        for part in header.split(';').map(str::trim) {
+            if let Some(v) = part.strip_prefix("rtptime=") {
+                point.rtp = v.trim().parse().ok();
+            } else if let Some(v) = part.strip_prefix("seq=") {
+                point.seq = v.trim().parse().ok();
+            }
+        }
+        point
+    }
 }
 
 /// A sync packet: the sender telling us which frame should be playing when.
@@ -174,6 +210,10 @@ pub struct AudioStream {
     origin: Option<Arc<StreamOrigin>>,
     /// The latest sync packet, which is what puts audio on the sender's clock.
     anchor: Option<SyncAnchor>,
+    /// Where the stream restarted, if a `FLUSH` said so.
+    flush: Option<FlushPoint>,
+    /// How many packets have been discarded as pre-flush.
+    stale_dropped: u64,
 }
 
 impl AudioStream {
@@ -193,6 +233,8 @@ impl AudioStream {
             first_timestamp: None,
             origin: None,
             anchor: None,
+            flush: None,
+            stale_dropped: 0,
         }
     }
 
@@ -211,6 +253,23 @@ impl AudioStream {
     #[must_use]
     pub const fn codec(&self) -> &RaopCodec {
         &self.codec
+    }
+
+    /// Note that the sender flushed: everything before `point` is stale.
+    ///
+    /// The stale audio is still in flight — it was sent before the seek — so it is
+    /// discarded on arrival rather than after being played. Without this a skip plays a
+    /// moment of the old position first, which is the audible half of the bug; the other
+    /// half is that the sequence jump looks like loss and provokes a resend request for
+    /// packets that will never come.
+    pub fn flush(&mut self, point: FlushPoint) {
+        self.flush = Some(point);
+    }
+
+    /// How many packets have been dropped as stale since the last `FLUSH`.
+    #[must_use]
+    pub const fn stale_dropped(&self) -> u64 {
+        self.stale_dropped
     }
 
     /// Handle a datagram from the **audio** socket.
@@ -283,6 +342,16 @@ impl AudioStream {
 
     /// Decrypt (if needed) and package one audio payload.
     fn audio_packet(&mut self, kind: RtpKind, payload: &[u8]) -> Result<AudioOutput, AudioError> {
+        // Anything from before the flush point is audio the sender queued for a position
+        // it has already left. Serial arithmetic, not comparison: the timestamp wraps.
+        if let Some(from) = self.flush.and_then(|f| f.rtp) {
+            if kind.timestamp.wrapping_sub(from) > u32::MAX / 2 {
+                self.stale_dropped = self.stale_dropped.saturating_add(1);
+                return Err(AudioError::Stale);
+            }
+            // Caught up: stop testing every packet for the rest of the session.
+            self.flush = None;
+        }
         // A mirroring sender emits priming packets before its clock is up: a bare header
         // with no payload, or a four-byte marker. Feeding either to a decoder produces an
         // error per packet for the first second of every session.
@@ -661,6 +730,63 @@ mod tests {
             s.on_audio(&audio_packet(0, &[])).unwrap_err(),
             AudioError::Priming
         );
+    }
+
+    #[test]
+    fn a_flush_discards_the_audio_the_sender_has_left_behind() {
+        // What a skip on the phone looks like: packets for the old position are already
+        // in flight. Playing them is a moment of the previous track before the new one.
+        let mut s = plain_stream();
+        s.on_audio(&audio_packet(1_000, b"old-audio-aaaa")).unwrap();
+        s.flush(FlushPoint {
+            rtp: Some(50_000),
+            seq: Some(7),
+        });
+        assert_eq!(
+            s.on_audio(&audio_packet(1_352, b"stale-aaaaaaaa"))
+                .unwrap_err(),
+            AudioError::Stale
+        );
+        assert_eq!(s.stale_dropped(), 1);
+        // …and the audio from the new position plays.
+        assert!(s.on_audio(&audio_packet(50_000, b"new-audio-aaaa")).is_ok());
+    }
+
+    #[test]
+    fn a_flush_across_the_rtp_wrap_does_not_discard_the_whole_stream() {
+        // Serial arithmetic again: read as a comparison, a flush point just below the
+        // wrap makes every packet after it look stale for the next 27 hours.
+        let mut s = plain_stream();
+        s.flush(FlushPoint {
+            rtp: Some(u32::MAX - 100),
+            seq: None,
+        });
+        // A packet 200 frames on, having wrapped through zero, is *after* the point.
+        assert!(s.on_audio(&audio_packet(99, b"after-the-wrap")).is_ok());
+    }
+
+    #[test]
+    fn once_the_stream_catches_up_the_flush_stops_being_tested() {
+        let mut s = plain_stream();
+        s.flush(FlushPoint {
+            rtp: Some(1_000),
+            seq: None,
+        });
+        assert!(s.on_audio(&audio_packet(1_000, b"at-the-point!!")).is_ok());
+        // A late straggler from before the point is now let through rather than dropped
+        // — the sender has moved on and so have we.
+        assert!(s.on_audio(&audio_packet(500, b"a-late-packet!")).is_ok());
+    }
+
+    #[test]
+    fn rtp_info_is_parsed_the_way_both_reference_receivers_read_it() {
+        // shairport-sync reads only rtptime and UxPlay only seq; senders send both.
+        let p = FlushPoint::parse("seq=1234;rtptime=567890");
+        assert_eq!(p.seq, Some(1234));
+        assert_eq!(p.rtp, Some(567_890));
+        // A header with only one of them is still usable.
+        assert_eq!(FlushPoint::parse("rtptime=42").rtp, Some(42));
+        assert_eq!(FlushPoint::parse("seq=9").seq, Some(9));
     }
 
     #[test]
