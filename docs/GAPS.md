@@ -19,35 +19,45 @@ means the code path is right but the real-world trigger rate or peer behaviour i
 
 ## Status
 
-✅ fixed · 🟡 partly fixed · unmarked = open. Fixed entries are left in place with their
+✅ fixed · 🟡 partly fixed · ⛔ scoped out · unmarked = open. Fixed entries keep their
 original wording, because the reason a thing was wrong is worth keeping after it stops
-being wrong.
+being wrong — several of these were made independently in two or three subsystems, and
+the next protocol will be tempted to make them again.
 
-**All three themes are closed.** Every subsystem is now supervised (G1, G2, G3 — the CEF
-half of G3 is the exception, see below), `Pipeline::control()` does something (G9, G10),
-and the display is handed back when another source takes the session (G6), with the
-outgoing source told to stop sending rather than merely ignored (G37).
+**All three themes are closed.** Every subsystem is supervised (G1, G2), `Pipeline::control()`
+reaches the speakers (G9, G10), and the display is handed back when another source takes
+the session (G6) — with the outgoing source told to stop sending (G37) and able to take
+it back by pressing play (G5).
 
-Still open and worth taking next, roughly in order:
+Decisions taken, so nobody re-litigates them from the entry text alone:
 
-1. **G5** — a preempted Spotify session can never play again. Still the worst
-   user-visible entry here: the device stays in the picker and produces silence forever.
-   Needs a way to hand the pipeline a fresh `FrameSource::Pcm`, which librespot's `FnOnce`
-   sink builder does not allow without rebuilding the player.
-2. **G3** — CEF lifecycle/load-error handling. The other two supervisors landed; this one
-   needs `LifeSpanHandler`/`LoadHandler` wiring and could not be verified without a real
-   renderer crash.
-3. **G18/G19** — L2CAP RTX timers and `CommandReject`. Both are real interop holes and
-   both want the negative-path test tier G52 describes, which does not exist yet.
-4. **G15** — RECONFIGURE accepted and ignored. Silent wrong-pitch audio.
-5. **G23** — the 110-second blocking startup fetch, which can expire G20's screen-id
-   budget before the browser exists.
-6. **G25/G26** — AVRCP fragmentation and playback position.
-7. **G30** — Broadcom/MediaTek/Qualcomm firmware loaders, and making `registry_strict`
-   the production path so an unknown dongle is an error rather than a silent no-op.
+- **G34 — scoped out.** Guests get put on a network that can see the receiver. Cross-VLAN
+  TV-code pairing is not worth the keyboard/D-pad input path it would need.
+- **G30 — partly.** No Broadcom/MediaTek/Qualcomm loaders: the deploy box is Realtek or
+  Intel, and porting three firmware sequences for hardware nobody will plug in is not a
+  good trade. The *silent* half is fixed — an unrecognised controller now says so instead
+  of getting `NoInit` and producing an inert radio with nothing pointing at the cause.
+- **G46 — Widevine is packaged.** DRM-gated content plays. The 4K software-decode concern
+  in the same entry is untouched and still wants measuring on the real panel.
 
-G46 (DRM/4K on the browser path) and G31's `HOME` assumption both want checking on the
-real box rather than more code.
+Still open, roughly in the order they are worth taking:
+
+1. **G3** — CEF lifecycle/load-error handling, the one supervisor still missing. Needs
+   `LifeSpanHandler`/`LoadHandler` wiring, and cannot be honestly verified without
+   provoking a real renderer crash.
+2. **G25/G26** — AVRCP metadata fragmentation and playback position. Fragmentation is the
+   one that bites: a long or CJK title leaves the card permanently blank.
+3. **G39** — `ControlCapabilities` derived from the peer's feature bitmask, so the panel
+   stops offering buttons a phone will reject.
+4. **G40** — no counter or rate-limited warning for sustained depacketize failure. The
+   worst remaining diagnostic hole in the media path.
+5. **G41/G42/G43/G44** — the smaller L2CAP and AVDTP conformance items.
+6. **G33** — SponsorBlock reattaching as a brand-new remote each time.
+7. **G51/G53/G54** — the test tiers: audio egress asserted anywhere, streaming error paths
+   in `adapter_end_to_end`, and a self-contained YouTube regression test.
+
+G31's `HOME` assumption and G46's 4K decode both want checking on the real box rather
+than more code.
 
 ---
 
@@ -116,7 +126,7 @@ display or the audio device, and two cannot take it back afterwards.
   treated as fatal — so one maximum-size PDU from a phone triggers G2. Off by the four
   bytes of HCI header.
 
-- **G5 — A preempted Spotify session can never play again. CONFIRMED, silent.**
+- ✅ **G5 — A preempted Spotify session can never play again. CONFIRMED, silent.**
   `proto-spotify/src/session.rs:278` emits `SessionEvent::Audio` with the PCM receiver
   exactly once, in `start()`. On preempt the receiver drops, `PcmSink::write` returns
   `NotConnected`, librespot calls `handle_pause()` and keeps running — but `Player::new`'s
@@ -212,7 +222,7 @@ display or the audio device, and two cannot take it back afterwards.
   targeted `ST: urn:dial-multiscreen-org:service:dial:1` path is unaffected, which is why
   nothing has caught it.
 
-- **G15 — RECONFIGURE is accepted and ignored. CONFIRMED, silent.**
+- ✅ **G15 — RECONFIGURE is accepted and ignored. CONFIRMED, silent.**
   `sink.rs:162` lumps `Reconfigure` in with `SecurityControl`/`DelayReport` and accepts
   with an empty payload: no state check (it is only legal in OPEN), no parse of the new
   capability, no `is_configuration()` validation, no codec-identity check, no
@@ -242,7 +252,7 @@ display or the audio device, and two cannot take it back afterwards.
   the download succeeds command-by-command and the radio then misbehaves or is bricked —
   which the file's own comments name as the worst case.
 
-- **G18 — No L2CAP RTX/ERTX response timers. CONFIRMED, silent.**
+- ✅ **G18 — No L2CAP RTX/ERTX response timers. CONFIRMED, silent.**
   `substrate-l2cap/src/mux.rs:452`: `next_timeout` consults only `self.ertm`. No signalling
   request has a timer, so a `ConnectionRequest` or `ConfigurationRequest` the peer never
   answers leaves the channel in `WaitConnectRsp`/`WaitConfig` forever — no retransmission,
@@ -252,7 +262,7 @@ display or the audio device, and two cannot take it back afterwards.
   forever while it is `Some`, so a phone that ignores our SDP or AVCTP connect leaves cover
   art and the outbound AVRCP control channel permanently dead for that link.
 
-- **G19 — No `CommandReject` is ever constructed, and one bad command discards the whole
+- ✅ **G19 — No `CommandReject` is ever constructed, and one bad command discards the whole
   C-frame. CONFIRMED.** `mux.rs:487`/`:632`, `signaling.rs:633`. An unknown signalling code
   (`Create Channel 0x0C`, `Move Channel 0x0E`, anything future) or a truncated command
   makes `Signal::decode_all` return `Err`, and `handle_pdu`'s `?` discards **every** command
@@ -261,7 +271,7 @@ display or the audio device, and two cannot take it back afterwards.
   with no action, so a phone rejecting our configuration request leaves us waiting forever,
   compounding G18.
 
-- 🟡 **G20 — Screen-id resolution is a one-shot 60s window with no cancellation. CONFIRMED.**
+- ✅ **G20 — Screen-id resolution is a one-shot 60s window with no cancellation. CONFIRMED.**
   `app/src/main.rs:364`, `app/src/screen.rs:31`. Two defects in the D28 fix: each launch
   spawns `publish_screen_id` with no handle and no generation counter, so a relaunch inside
   60s leaves the old task polling the old pairing code and whichever finishes last wins —
@@ -295,7 +305,7 @@ display or the audio device, and two cannot take it back afterwards.
   track-to-track loudness jumps every real Connect speaker smooths out, and neither is
   discoverable from any log line.
 
-- **G23 — Startup blocks the main thread on a 2.7 MB fetch + QuickJS eval before the
+- ✅ **G23 — Startup blocks the main thread on a 2.7 MB fetch + QuickJS eval before the
   browser exists. CONFIRMED.** `app/src/main.rs:169`, `filterlists.rs:51` (90s budget),
   `ubo_scriptlets.rs:36` (20s budget). `serve()` is spawned *first*, so DIAL answers `201
   Created` and `<state>running</state>` and posts "Launching YouTube…" while
@@ -364,7 +374,7 @@ display or the audio device, and two cannot take it back afterwards.
   connect, get an L2CAP connection response, and then nothing. The existing test
   (`adapter_end_to_end.rs:533`) drops a link with nothing queued, so it does not reach this.
 
-- **G30 — Vendor coverage is Intel + Realtek only, and an unknown dongle silently gets
+- 🟡 **G30 — Vendor coverage is Intel + Realtek only, and an unknown dongle silently gets
   `NoInit`. CONFIRMED, silent.** `hci-transport/src/init/mod.rs:114`. No Broadcom
   (`hci_bcm` `.hcd` patchram), no MediaTek (MT7921/7922, extremely common in current
   dongles), no Qualcomm/Atheros. `registry_strict()` exists and is tested but is **never
@@ -411,7 +421,7 @@ display or the audio device, and two cannot take it back afterwards.
   id and an in-place resume — the `Bound` typestate already tracks `aid` for exactly this —
   fixes both.
 
-- **G34 — Manual TV-code pairing is unreachable. CONFIRMED.**
+- ⛔ **G34 — Manual TV-code pairing is unreachable. CONFIRMED.**
   `app/src/main.rs:180`, `pipeline/src/kiosk.rs:61`.
   hackerspace-receiver-build.md:79 names two pairing modes, same-LAN DIAL and cross-network
   TV code (`youtube.com/pair`); only the first exists. At idle the browser shows
@@ -508,7 +518,7 @@ display or the audio device, and two cannot take it back afterwards.
   device-list churn, and hand-offs. `seen` is also never evicted, so a long shared-panel
   session accumulates a `QueueItem` per URI ever queued (certain, but slow).
 
-- **G46 — DRM, 4K, and codec reality on the browser path. SUSPECTED.**
+- ✅ **G46 — DRM, 4K, and codec reality on the browser path. SUSPECTED.**
   `cef_browser.rs:266` sets `disable-gpu` + `disable-gpu-compositing`, so **all decode is
   software** and every frame is a CPU `on_paint` copy of the full viewport — at 3840×2160
   that is ~33 MB per frame before the compositor upload, with `windowless_frame_rate: 60`.
@@ -562,7 +572,7 @@ display or the audio device, and two cannot take it back afterwards.
   current working diff is fixing (a `blocking_send` panic on the first block, and
   turbo-advance pacing) live entirely below the layer `selfplay` observes.
 
-- **G52 — `substrate-l2cap::mux` has no `#[cfg(test)]` module at all** (1048 lines); all
+- ✅ **G52 — `substrate-l2cap::mux` has no `#[cfg(test)]` module at all** (1048 lines); all
   coverage is `tests/handshake.rs`, two cooperating multiplexers on the happy path. Not
   covered anywhere: a peer that never answers (there is no timer to test — G18), a
   `CommandReject`, an unknown signalling code mid-PDU, `ConfigResult::Rejected`, exceeding
