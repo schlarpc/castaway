@@ -3,10 +3,17 @@
 //! and per request does exactly three things — parse, hand to the session, write back
 //! what the session decided. No protocol decisions live here (ground rule 3).
 //!
-//! Two listeners, one dispatch. `_airplay._tcp` (7000) carries screen mirroring and
-//! `/info`; `_raop._tcp` (7011) carries the audio flow (`ANNOUNCE`/`SETUP`/`RECORD`).
-//! They are the same RTSP grammar over the same state machine, so the split is only in
-//! which socket a sender knocks on — and that's what gets tagged onto the session.
+//! One listener, one dispatch. `_airplay._tcp` and `_raop._tcp` are both advertised on
+//! 7000 and answered by the same socket, because that is what every reference
+//! implementation does — shairport-sync and UxPlay each register both services on a
+//! single port, and airplay2-receiver publishes no RAOP service at all. This used to
+//! bind a second listener on 7011, which is not a control port at all: 7011 is the
+//! AirPlay 1 **UDP timing** port.
+//!
+//! So which media plane a session belongs to is not something the socket can say. It is
+//! decided by what the sender negotiates — an `ANNOUNCE` with an SDP body is the audio
+//! flow, a `SETUP` carrying a stream of type 110 is mirroring — and it is the session
+//! state machine's business to know, not the actor's.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +28,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, RAOP_PORT};
+use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
 use crate::error::AirPlayError;
 use crate::session::AirPlaySession;
 
@@ -31,73 +38,43 @@ use crate::session::AirPlaySession;
 const MAX_MESSAGE: usize = 1 << 20;
 
 /// What senders see in the `Server` header. AirPlay clients sniff this for the feature
-/// generation, so it tracks the `srcvers` in the mDNS advertisement.
-const SERVER_HEADER: &str = "AirTunes/377.40.00";
+/// generation, so it tracks the `srcvers` in the mDNS advertisement — shairport-sync
+/// parses exactly this number out of a sender's `User-Agent` to decide how to compute
+/// latency, and senders do the reverse to us. Built from [`SOURCE_VERSION`] so the two
+/// cannot drift; they were `377.40.00` here and `220.68` there a moment ago.
+const SERVER_HEADER_PREFIX: &str = "AirTunes/";
 
-/// Which listener a connection arrived on. The two ports mean different media planes,
-/// so a session that came in on one is not interchangeable with the other — an enum
-/// rather than a `bool` or a bare port number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Channel {
-    /// `_airplay._tcp`: screen mirroring, `/info`, pairing, FairPlay.
-    AirPlay,
-    /// `_raop._tcp`: the AirTunes audio flow.
-    Raop,
-}
-
-impl Channel {
-    /// The short tag that ends up in the [`castaway_core::SourceId`]. It names the media
-    /// plane rather than the service, because the [`ProtocolKind`] already says
-    /// "airplay" — a source reads `airplay/mirror/10.0.0.7:1234`, not `airplay/airplay/…`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AirPlay => "mirror",
-            Self::Raop => "audio",
-        }
-    }
-}
-
-/// A listening AirPlay receiver: two TCP listeners, one [`AirPlaySession`] per
+/// A listening AirPlay receiver: one TCP listener, one [`AirPlaySession`] per
 /// connection.
 pub struct AirPlayReceiver {
     identity: AirPlayIdentity,
-    airplay_addr: SocketAddr,
-    raop_addr: SocketAddr,
+    addr: SocketAddr,
 }
 
 impl AirPlayReceiver {
-    /// Build a receiver for `identity` on the default AirPlay/RAOP ports.
+    /// Build a receiver for `identity` on the default AirPlay port.
     #[must_use]
     pub fn new(identity: AirPlayIdentity) -> Self {
         Self {
             identity,
-            airplay_addr: SocketAddr::from(([0, 0, 0, 0], AIRPLAY_PORT)),
-            raop_addr: SocketAddr::from(([0, 0, 0, 0], RAOP_PORT)),
+            addr: SocketAddr::from(([0, 0, 0, 0], AIRPLAY_PORT)),
         }
     }
 
-    /// Override the listen addresses (tests bind an ephemeral port).
+    /// Override the listen address (tests bind an ephemeral port).
     #[must_use]
-    pub fn with_addrs(mut self, airplay: SocketAddr, raop: SocketAddr) -> Self {
-        self.airplay_addr = airplay;
-        self.raop_addr = raop;
+    pub fn with_addr(mut self, addr: SocketAddr) -> Self {
+        self.addr = addr;
         self
     }
 
     /// Serve one accepted connection to completion.
-    async fn serve(
-        &self,
-        mut stream: TcpStream,
-        peer: SocketAddr,
-        channel: Channel,
-        sink: SessionSink,
-    ) {
+    async fn serve(&self, mut stream: TcpStream, peer: SocketAddr, sink: SessionSink) {
         // Nagle would sit on the small control messages this protocol is made of.
         if let Err(e) = stream.set_nodelay(true) {
             debug!(%peer, error = %e, "could not disable Nagle");
         }
-        info!(channel = channel.as_str(), %peer, "AirPlay sender connected");
+        info!(%peer, "AirPlay sender connected");
 
         let mut session = AirPlaySession::new(self.identity.clone());
         // Identity today: the encrypted control channel starts only after pair-verify,
@@ -112,30 +89,25 @@ impl AirPlayReceiver {
         // so the pipeline doesn't hold the screen for a sender that walked away.
         let _ = sink.emit(SessionEvent::End).await;
         let _ = stream.shutdown().await;
-        info!(channel = channel.as_str(), %peer, "AirPlay sender disconnected");
+        info!(%peer, "AirPlay sender disconnected");
     }
 
     /// Accept connections on `listener` until it fails fatally, serving each in its own
     /// task tagged with the peer and the channel it arrived on.
-    async fn accept_loop(
-        self: Arc<Self>,
-        listener: TcpListener,
-        channel: Channel,
-        sink: SessionSink,
-    ) {
+    async fn accept_loop(self: Arc<Self>, listener: TcpListener, sink: SessionSink) {
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 // One failed accept (fd limit, RST between accept and return) shouldn't
                 // take the listener down; the next sender deserves a try.
                 Err(e) => {
-                    warn!(error = %e, channel = channel.as_str(), "AirPlay accept failed");
+                    warn!(error = %e, "AirPlay accept failed");
                     continue;
                 }
             };
             let this = Arc::clone(&self);
-            let conn_sink = sink.with_instance(format!("{}/{peer}", channel.as_str()));
-            tokio::spawn(async move { this.serve(stream, peer, channel, conn_sink).await });
+            let conn_sink = sink.with_instance(peer.to_string());
+            tokio::spawn(async move { this.serve(stream, peer, conn_sink).await });
         }
     }
 }
@@ -233,7 +205,7 @@ fn dispatch(
     let resp = session.handle(&method, &path, req.body())?;
 
     let mut builder = Response::builder(Version::V1_0, StatusCode::from(resp.status))
-        .header(SERVER, SERVER_HEADER);
+        .header(SERVER, format!("{SERVER_HEADER_PREFIX}{SOURCE_VERSION}"));
     // Echoing CSeq is what lets the sender match this reply to its request; without it
     // every sender treats the exchange as timed out.
     if let Some(cseq) = substrate_rtsp::cseq(msg) {
@@ -266,32 +238,25 @@ impl SourceAdapter for AirPlayReceiver {
         // default: an advertisement naming a port nothing answers is the failure this
         // prevents.
         [
-            (self.identity.airplay_service(), self.airplay_addr.port()),
-            (self.identity.raop_service(), self.raop_addr.port()),
+            self.identity.airplay_service(),
+            self.identity.raop_service(),
         ]
         .into_iter()
-        .map(|(svc, port)| Advertisement::MdnsService {
+        .map(|svc| Advertisement::MdnsService {
             ty: svc.service_type,
             instance: svc.instance,
-            port,
+            port: self.addr.port(),
             txt: svc.txt,
         })
         .collect()
     }
 
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), CoreError> {
-        let airplay = TcpListener::bind(self.airplay_addr).await.map_err(|e| {
-            CoreError::Adapter(format!("binding AirPlay on {}: {e}", self.airplay_addr))
-        })?;
-        let raop = TcpListener::bind(self.raop_addr)
+        let listener = TcpListener::bind(self.addr)
             .await
-            .map_err(|e| CoreError::Adapter(format!("binding RAOP on {}: {e}", self.raop_addr)))?;
-        info!(airplay = %self.airplay_addr, raop = %self.raop_addr, "AirPlay RTSP listeners ready");
-
-        // Two accept loops, one task each; neither can starve the other.
-        let raop_side = Arc::clone(&self).accept_loop(raop, Channel::Raop, sink.clone());
-        let airplay_side = self.accept_loop(airplay, Channel::AirPlay, sink);
-        tokio::join!(airplay_side, raop_side);
+            .map_err(|e| CoreError::Adapter(format!("binding AirPlay on {}: {e}", self.addr)))?;
+        info!(addr = %self.addr, "AirPlay RTSP listener ready");
+        self.accept_loop(listener, sink).await;
         Ok(())
     }
 }
@@ -306,15 +271,13 @@ mod tests {
             name: "Lab TV".into(),
             device_id: "AA:BB:CC:DD:EE:FF".into(),
             host: "castaway".into(),
+            pairing_id: "de159742-c022-4514-915b-203cb99f8b71".into(),
         }
     }
 
     #[test]
-    fn advertises_both_services_on_the_ports_it_binds() {
-        let r = AirPlayReceiver::new(identity()).with_addrs(
-            SocketAddr::from(([0, 0, 0, 0], 17000)),
-            SocketAddr::from(([0, 0, 0, 0], 17011)),
-        );
+    fn advertises_both_services_on_the_one_port_it_binds() {
+        let r = AirPlayReceiver::new(identity()).with_addr(SocketAddr::from(([0, 0, 0, 0], 17000)));
         let ads = r.advertisements();
         assert_eq!(ads.len(), 2);
         let ports: Vec<u16> = ads
@@ -324,7 +287,9 @@ mod tests {
                 other => panic!("expected an mDNS advertisement, got {other:?}"),
             })
             .collect();
-        assert_eq!(ports, vec![17000, 17011]);
+        // Both services, one port — and the port actually bound, not the default. An
+        // advertisement naming a port nothing answers is the failure this prevents.
+        assert_eq!(ports, vec![17000, 17000]);
     }
 
     #[test]

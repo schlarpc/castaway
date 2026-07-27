@@ -115,7 +115,10 @@ impl AirPlaySession {
             ("SET_PARAMETER" | "GET_PARAMETER", _) => AirPlayResponse::ok(),
             ("FLUSH", _) => AirPlayResponse::ok(),
             ("TEARDOWN", _) => {
-                let mut r = AirPlayResponse::ok();
+                // `Connection: close` is not decoration: shairport-sync answers TEARDOWN
+                // with it and then closes the socket, and a sender that does not see it
+                // may hold the connection open expecting to reuse the session.
+                let mut r = AirPlayResponse::ok().header("Connection", "close");
                 r.event = Some(SessionEvent::End);
                 r
             }
@@ -157,6 +160,7 @@ mod tests {
             name: "TV".into(),
             device_id: "AA:BB:CC:DD:EE:FF".into(),
             host: "castaway".into(),
+            pairing_id: "de159742-c022-4514-915b-203cb99f8b71".into(),
         })
     }
 
@@ -191,10 +195,16 @@ mod tests {
     }
 
     #[test]
-    fn teardown_emits_end() {
+    fn teardown_emits_end_and_closes_the_connection() {
         let mut s = session();
         let r = s.handle("TEARDOWN", "rtsp://x/stream", &[]).unwrap();
         assert!(matches!(r.event, Some(SessionEvent::End)));
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| *k == "Connection" && v == "close"),
+            "TEARDOWN must tell the sender the connection is over"
+        );
     }
 
     #[test]

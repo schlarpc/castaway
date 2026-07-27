@@ -20,7 +20,7 @@ integration test.
 | `proto-dlna` | **Live.** AVTransport/RenderingControl/ConnectionManager SOAP; cast-a-video works. |
 | `proto-cast` | **Live, both paths.** Framing, JSON, device-auth, media LOAD, and a TLS actor on 8009 driven end-to-end in the VM test. Mirroring is complete: OFFER/ANSWER negotiation, RTP reassembly, RTCP feedback, AES-CTR decrypt, and a UDP actor — differential-tested against openscreen's own packetizer (Q12/Q13). App launches we cannot host are declined rather than faked, and `GET_APP_AVAILABILITY` is answered (D32). Device auth is differential-tested against openscreen's *sender* (D31): correct in every respect a real sender checks except the trust root, which needs a provisioned credential (Q2). |
 | `proto-spotify` | **Live, pairing through playback, with shuffle/repeat both ways.** Ours: advertise + `getInfo` + `addUser` DH/blob decrypt, on the shared HTTP host and mDNS responder. librespot's, above the LAN: AP login, dealer, connect-state, audio (D30). Pick castaway in the Spotify app and it logs in as you, plays, honours the phone's transport and queue, and drives back from the panel via `RemoteControl`. No account on disk. Blob framing still unproven against a real phone (Q10). Queue and cover art now render (Q38/Q39). |
-| `proto-airplay` | **Control plane live.** Ads + `/info` + RTSP dispatch, served over real sockets on 7000/7011. Media plane still gated on FairPlay/pairing (Q1) — pairing answers `501`. |
+| `proto-airplay` | **Control plane live, advertisement now honest.** Ads + `/info` + RTSP dispatch on 7000 (one listener; both services). The features mask, `et`, `cn` and `pk` used to promise HomeKit pairing, MFi auth, FairPlay, buffered audio and PTP — it was a Denon speaker's record, copied whole — so every real sender picked a flow that ends in `501`. Now it advertises only AirPlay 1 audio, which needs neither pairing nor FairPlay. No media plane yet: a sender connects and nothing plays. See `docs/airplay-research.md`. |
 | `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
 | `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
@@ -81,7 +81,10 @@ receiver's journal, so the event is proven to cross adapter → session manager 
   like success on the wire; the LOAD reaches the pipeline and the CLOSE ends the session.
 - **AirPlay**: pipelined `OPTIONS` + `GET /info` in one write (bare-path URIs), the `/info`
   binary plist parses, pairing answers `501` rather than faking success, `TEARDOWN` ends
-  the session — on both 7000 and 7011.
+  the session. Plus what the advertisement does *not* say: no FairPlay in `et`, no codec
+  in `cn` we do not decode, no empty `pk`. Those assertions exist because the failure they
+  catch is silent — a bit we cannot honour makes a real iPhone appear to find us and then
+  do nothing at all.
 - **mDNS**: `_spotify-connect._tcp`, `_googlecast._tcp`, `_airplay._tcp`, and `_raop._tcp`
   are all browsable from the sender with the ports that actually answered.
 

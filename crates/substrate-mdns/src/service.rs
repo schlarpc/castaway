@@ -2,8 +2,6 @@
 //! `mdns_sd::ServiceInfo`. Validation lives here so the responder never registers a
 //! malformed type.
 
-use std::collections::HashMap;
-
 use mdns_sd::ServiceInfo;
 
 use crate::error::MdnsError;
@@ -77,14 +75,18 @@ impl MdnsService {
     pub fn to_service_info(&self) -> Result<ServiceInfo, MdnsError> {
         let ty_domain = self.qualified_type()?;
         let host_name = format!("{}.local.", self.host.trim_end_matches('.'));
-        let props: HashMap<String, String> = self.txt.iter().cloned().collect();
+        // A slice, not a `HashMap`: the map's iteration order is randomised per process,
+        // so the emitted TXT record came out in a different order on every run. DNS-SD
+        // does not care, but it makes the record non-reproducible — and AirPlay's
+        // `/info` can be asked to return the raw TXT bytes back to the sender, which is
+        // something worth being able to pin with a byte-exact fixture (ground rule 6).
         let info = ServiceInfo::new(
             &ty_domain,
             &self.instance,
             &host_name,
             "", // addresses filled by enable_addr_auto()
             self.port,
-            props,
+            &self.txt[..],
         )
         .map_err(|e| MdnsError::ServiceInfo(e.to_string()))?
         .enable_addr_auto();

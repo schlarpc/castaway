@@ -639,7 +639,6 @@ pkgs.testers.runNixOSTest {
 
     with subtest("an AirPlay sender gets OPTIONS, /info, and an honest 501 for pairing"):
         receiver.wait_for_open_port(7000)
-        receiver.wait_for_open_port(7011)
         # `#airplay`, not the bare name: every advertised surface says which one it is,
         # and `/info` reports the same name the picker shows.
         session = sender.succeed(f"airplay-send {kiosk} 7000 ${friendlyName}#airplay")
@@ -648,20 +647,14 @@ pkgs.testers.runNixOSTest {
         # alone is weak. The pairing refusal is the one only a real request can log — it
         # proves the sender's 501 came from the state machine, not from a closed socket.
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay pairing not implemented (Q1) path=/pair-setup'")
-        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender connected channel=\"mirror\"'")
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender connected'")
         # The connection must be *closed*, not leaked: the actor emits End and logs this
         # on the way out. It can't be asserted as 'session: end' the way Cast is — the
         # manager only logs that for the active source, and AirPlay never becomes active
-        # while the media plane is gated on pairing (Q1).
-        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender disconnected channel=\"mirror\"'")
+        # while there is no media plane.
+        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender disconnected'")
 
-    with subtest("the RAOP audio port speaks the same RTSP"):
-        # Same state machine, different socket — a sender that finds _raop._tcp and gets
-        # silence is the failure this catches.
-        assert "airplay session completed" in sender.succeed(f"airplay-send {kiosk} 7011 ${friendlyName}#airplay")
-        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender disconnected channel=\"audio\"'")
-
-    with subtest("AirPlay and RAOP are both advertised over mDNS"):
+    with subtest("AirPlay and RAOP are advertised, on the one port that answers"):
         airplay = sender.succeed("avahi-browse -rpt _airplay._tcp")
         assert "${friendlyName}" in airplay, airplay
         assert ";7000;" in airplay, airplay
@@ -670,7 +663,25 @@ pkgs.testers.runNixOSTest {
         # avahi's parsable output escapes the '@' as its octal code, so match that —
         # written \\064 because a bare \064 is a Python octal escape and means "4".
         assert "\\064${friendlyName}" in raop, raop
-        assert ";7011;" in raop, raop
+        # Both services on 7000. This used to say 7011, which is not a control port at
+        # all — it is the AirPlay 1 UDP timing port — so a sender that believed the
+        # advertisement and dialled RAOP's "own" port was reaching a listener that only
+        # existed because we had bound one there to match the lie.
+        assert ";7000;" in raop, raop
+
+    with subtest("the advertisement promises nothing the receiver cannot serve"):
+        # The failure this catches is silent and total: a feature bit or an `et` value
+        # we do not implement sends a real iPhone down a flow that ends in a 501, and
+        # the only symptom is a device that appears in the picker and then does nothing.
+        # These records were, verbatim, a Denon AVR-X3500H's.
+        raop = sender.succeed("avahi-browse -rpt _raop._tcp")
+        assert "et=0" in raop and "et=0,3,5" not in raop, raop  # no FairPlay
+        assert "cn=0,1" in raop and "cn=0,1,2,3" not in raop, raop  # no AAC we don't offer
+        airplay = sender.succeed("avahi-browse -rpt _airplay._tcp")
+        # No `pk`: an empty one publishes an identity a sender cannot verify against.
+        assert "pk=" not in airplay, airplay
+        # `pi` is a UUID, not the device id echoed back.
+        assert "pi=" in airplay, airplay
 
     with subtest("Cast is advertised over mDNS with the port that answered"):
         txt = sender.succeed("avahi-browse -rpt _googlecast._tcp")

@@ -807,15 +807,18 @@ fn spawn_airplay(
         name: config.advertised_name(ProtocolKind::AirPlay),
         device_id: derive_mac(&config.uuid),
         host: MDNS_HOST.to_string(),
+        // `pi` is a stable per-protocol UUID, which is what every real receiver
+        // advertises; reusing the device id here is the Roku/Samsung outlier behaviour.
+        pairing_id: device_uuid(&config.uuid, "airplay"),
     });
 
     advertise_adapter(&receiver, mdns);
-    info!("enabled: AirPlay (RTSP control on 7000/7011)");
+    info!("enabled: AirPlay (RTSP control on 7000)");
     // Say this once, plainly: the control plane answers, the media plane can't start.
-    // A sender will find us, connect, and stall at pairing rather than mirror.
+    // A sender will find us, connect, and get an honest refusal rather than silence.
     warn!(
-        "AirPlay control is live, but pairing and FairPlay-SAP are not implemented — \
-           mirroring will not start (Q1)"
+        "AirPlay control is live, but no media plane is implemented yet — a sender will \
+           connect and no audio will play"
     );
 
     let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "listener"), event_tx);
@@ -994,6 +997,13 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).
+///
+/// The first octet is forced to a **locally-administered unicast** address. Taking UUID
+/// hex verbatim leaves the low bit of octet 0 — the multicast bit — set about half the
+/// time, and a multicast address is not a legal device identity. It does not have to
+/// match a real interface (UxPlay generates a random one when it cannot find the real
+/// MAC), but it does have to be a syntactically valid MAC, and it has to be stable:
+/// a collision with another instance is reported by the responder as a name conflict.
 fn derive_mac(uuid: &str) -> String {
     let hex: String = uuid
         .chars()
@@ -1001,13 +1011,17 @@ fn derive_mac(uuid: &str) -> String {
         .take(12)
         .collect();
     let padded = format!("{hex:0<12}");
-    padded
+    let mut octets: Vec<String> = padded
         .as_bytes()
         .chunks(2)
         .map(|c| String::from_utf8_lossy(c).to_string())
-        .collect::<Vec<_>>()
-        .join(":")
-        .to_uppercase()
+        .collect();
+    if let Some(first) = octets.first_mut() {
+        // Clear the multicast bit, set the locally-administered bit.
+        let byte = u8::from_str_radix(first, 16).unwrap_or(0) & 0xFE | 0x02;
+        *first = format!("{byte:02x}");
+    }
+    octets.join(":").to_uppercase()
 }
 
 fn init_tracing() {
