@@ -23,6 +23,7 @@ use std::net::IpAddr;
 use crate::control::ControlUpdate;
 use crate::error::AirPlayError;
 use crate::info;
+use crate::mirror::{MirrorKeys, StreamConnectionId};
 use crate::sdp::AnnounceParams;
 use crate::transport::{ReceiverPorts, SenderPorts};
 
@@ -38,6 +39,19 @@ fn parse_mac(text: &str) -> Option<[u8; 6]> {
 
 /// The binary-plist content type AirPlay uses.
 pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
+
+/// The `streams` entry type that means screen mirroring.
+const MIRROR_STREAM: i64 = 110;
+
+/// Serialize a reply dictionary as a binary plist.
+fn plist_response(dict: &plist::Dictionary) -> AirPlayResponse {
+    let mut buf = Vec::new();
+    if plist::to_writer_binary(&mut buf, dict).is_err() {
+        warn!("could not serialize a plist reply");
+        return AirPlayResponse::status(500);
+    }
+    AirPlayResponse::ok_body(APPLE_PLIST_MIME, buf)
+}
 
 /// The content type for raw byte bodies — `/fp-setup` replies are not plists.
 pub const OCTET_STREAM_MIME: &str = "application/octet-stream";
@@ -125,6 +139,25 @@ impl AirPlayResponse {
     }
 }
 
+/// How far a mirroring negotiation has got.
+///
+/// Separate from [`RaopState`] because the two are alternatives, not stages: a session
+/// is audio *or* mirroring, decided by which shape of `SETUP` arrives, and a state that
+/// could be both would be a state no sender ever puts us in.
+#[derive(Debug, Default)]
+enum MirrorState {
+    /// No mirroring `SETUP` seen.
+    #[default]
+    Idle,
+    /// The first `SETUP` gave us the wrapped key; waiting for the stream to be named.
+    KeyMaterial {
+        /// The FairPlay-wrapped AES key from the `ekey` field.
+        ekey: Box<[u8; crypto_playfair::EKEY_LEN]>,
+    },
+    /// The second `SETUP` named the stream; the data channel can start.
+    Ready(Box<MirrorKeys>),
+}
+
 /// How far the AirPlay 1 audio flow has got.
 ///
 /// `ANNOUNCE` → `SETUP` → `RECORD`, and each step needs what the one before it settled:
@@ -166,6 +199,9 @@ pub struct AirPlaySession {
     local_addr: Option<IpAddr>,
     /// Where the sender wants us to send resend and timing requests.
     sender_ports: Option<SenderPorts>,
+    mirror: MirrorState,
+    /// The TCP port the actor bound for the mirroring data channel.
+    mirror_data_port: Option<u16>,
 }
 
 impl AirPlaySession {
@@ -179,6 +215,8 @@ impl AirPlaySession {
             local_ports: None,
             local_addr: None,
             sender_ports: None,
+            mirror: MirrorState::default(),
+            mirror_data_port: None,
         }
     }
 
@@ -188,6 +226,25 @@ impl AirPlaySession {
     /// so a response captured from one receiver cannot be replayed for another.
     pub fn set_local_addr(&mut self, addr: IpAddr) {
         self.local_addr = Some(addr);
+    }
+
+    /// Tell the session which TCP port the actor bound for the mirroring data channel.
+    pub fn set_mirror_data_port(&mut self, port: u16) {
+        self.mirror_data_port = Some(port);
+    }
+
+    /// The derived mirroring keys, once a `SETUP` has named the stream.
+    ///
+    /// Taken rather than borrowed: the actor moves them into the data-channel task, and
+    /// a second `SETUP` should re-derive rather than reuse.
+    pub fn take_mirror_keys(&mut self) -> Option<Box<MirrorKeys>> {
+        match std::mem::take(&mut self.mirror) {
+            MirrorState::Ready(keys) => Some(keys),
+            other => {
+                self.mirror = other;
+                None
+            }
+        }
     }
 
     /// Tell the session which ports the actor bound for it.
@@ -340,6 +397,12 @@ impl AirPlaySession {
     /// lenient `200` this used to return told the sender everything was fine and then
     /// nothing ever played.
     fn setup(&mut self, req: &AirPlayRequest<'_>) -> AirPlayResponse {
+        // Which media plane this is, is decided by the shape of the request: a binary
+        // plist body is the mirroring negotiation, a `Transport` header is RAOP audio.
+        // Nothing about the socket says which, because both arrive on the same one.
+        if req.body.starts_with(b"bplist00") {
+            return self.mirror_setup(req.body);
+        }
         let Some(header) = req.header("Transport") else {
             warn!("SETUP with no Transport header");
             return AirPlayResponse::status(400);
@@ -376,6 +439,100 @@ impl AirPlaySession {
         AirPlayResponse::ok()
             .header("Transport", &crate::transport::format_transport(local))
             .header("Session", "1")
+    }
+
+    /// Handle the mirroring `SETUP`, in its two phases.
+    ///
+    /// The first carries `ekey`/`eiv` and is answered with our timing port. The second
+    /// names the stream and is answered with the TCP port its video should be sent to.
+    fn mirror_setup(&mut self, body: &[u8]) -> AirPlayResponse {
+        let Ok(value) = plist::Value::from_reader(std::io::Cursor::new(body)) else {
+            warn!("mirroring SETUP body is not a plist");
+            return AirPlayResponse::status(400);
+        };
+        let Some(dict) = value.as_dictionary() else {
+            return AirPlayResponse::status(400);
+        };
+
+        if let Some(streams) = dict.get("streams").and_then(plist::Value::as_array) {
+            return self.mirror_streams(streams);
+        }
+
+        let Some(ekey) = dict.get("ekey").and_then(plist::Value::as_data) else {
+            warn!("mirroring SETUP has neither ekey nor streams");
+            return AirPlayResponse::status(400);
+        };
+        let Ok(ekey) = <[u8; crypto_playfair::EKEY_LEN]>::try_from(ekey) else {
+            warn!(len = ekey.len(), "ekey is not 72 bytes");
+            return AirPlayResponse::status(400);
+        };
+        self.mirror = MirrorState::KeyMaterial {
+            ekey: Box::new(ekey),
+        };
+        log_info!("AirPlay mirroring key material received");
+
+        let mut reply = plist::Dictionary::new();
+        // Our own timing port, and no event channel: UxPlay returns 0 here and mirrors
+        // from iOS 12 through iOS 18, so implementing one would be work with no customer.
+        reply.insert(
+            "timingPort".into(),
+            plist::Value::Integer(i64::from(self.local_ports.map_or(0, |p| p.timing)).into()),
+        );
+        reply.insert("eventPort".into(), plist::Value::Integer(0i64.into()));
+        plist_response(&reply)
+    }
+
+    /// The second mirroring `SETUP`: derive the stream keys and name the data port.
+    fn mirror_streams(&mut self, streams: &[plist::Value]) -> AirPlayResponse {
+        let MirrorState::KeyMaterial { ekey } = std::mem::take(&mut self.mirror) else {
+            warn!("mirroring streams SETUP before any key material");
+            return AirPlayResponse::status(451);
+        };
+        let Some(stream) = streams
+            .iter()
+            .filter_map(plist::Value::as_dictionary)
+            .find(|d| {
+                d.get("type").and_then(plist::Value::as_signed_integer) == Some(MIRROR_STREAM)
+            })
+        else {
+            warn!("no mirroring stream in the SETUP");
+            return AirPlayResponse::status(400);
+        };
+        let Some(port) = self.mirror_data_port else {
+            warn!("no mirroring data port was bound");
+            return AirPlayResponse::status(500);
+        };
+
+        // The plist integer is signed; the id is not. Reinterpreting the bit pattern is
+        // the whole point of the newtype (see `StreamConnectionId`).
+        let id = stream
+            .get("streamConnectionID")
+            .and_then(plist::Value::as_signed_integer)
+            .map_or_else(
+                || StreamConnectionId::new(0),
+                StreamConnectionId::from_plist_signed,
+            );
+
+        let Some(key_message) = self.fairplay.key_message() else {
+            warn!("mirroring SETUP before /fp-setup completed");
+            return AirPlayResponse::status(451);
+        };
+        let aes_key = crypto_playfair::decrypt_key(key_message, &ekey);
+        self.mirror = MirrorState::Ready(Box::new(MirrorKeys::derive(&aes_key, id)));
+        log_info!(%id, port, "AirPlay mirroring stream ready");
+
+        let mut stream_reply = plist::Dictionary::new();
+        stream_reply.insert("type".into(), plist::Value::Integer(MIRROR_STREAM.into()));
+        stream_reply.insert(
+            "dataPort".into(),
+            plist::Value::Integer(i64::from(port).into()),
+        );
+        let mut reply = plist::Dictionary::new();
+        reply.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream_reply)]),
+        );
+        plist_response(&reply)
     }
 
     /// Handle `RECORD`: the sender is about to stream.

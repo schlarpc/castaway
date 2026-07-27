@@ -5,8 +5,11 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Fixtures / reverse engineering (needs captures we do not have yet)
 
-- **Q1 — FairPlay-SAP. Mostly answered, and the remaining part is a licence decision,
-  not a capture.** The premise was wrong in two directions.
+- **Q1 — FairPlay-SAP. RESOLVED.** The premise was wrong in two directions, and both
+  halves are now implemented: `/fp-setup` answers correctly, and `crypto-playfair`
+  performs the `ekey`→AES unwrap, verified against the twenty published vectors covering
+  all four modes. Mirroring works end to end in CI. What follows is the record of why it
+  was never a capture problem.
 
   "The ~568-byte flow" is not a message size: it is exactly `4 × 142`, the four canned
   `/fp-setup` SETUP1 replies. They are published, byte-identical across UxPlay,

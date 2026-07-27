@@ -97,6 +97,8 @@ impl Features {
 /// Positions are evidence; names are folklore. Naming them in a Rust type would bake a
 /// guess into the code, so each is documented with what setting it *obliges us to do*.
 ///
+/// - **7** — screen mirroring. Without it no sender ever offers a screen, however much
+///   of the mirroring stack exists behind it.
 /// - **9** — audio. Load-bearing for visibility: with it clear, owntone-class senders
 ///   drop the device from the picker entirely rather than showing it as broken.
 /// - **18** — PCM audio format. Matches `cn=0`.
@@ -107,11 +109,11 @@ impl Features {
 ///
 /// Deliberately **not** set, and why:
 ///
-/// - **7** (screen) — nothing here serves a mirroring stream, so no sender should ever
-///   offer one. This is the bit to set when that changes.
 /// - **11** (retransmit) — the resend request on the control port is not implemented;
 ///   we drop instead. Every real device sets this, and we still should not until we do.
-/// - **12/14/2** (FairPlay) — `/fp-setup` cannot derive a key.
+/// - **42** (multi-codec screen) — HEVC is not decoded here. With it clear a sender
+///   sends H.264; with it set and no HEVC path, the sender emits an empty codec-config
+///   packet and stalls, which is why `MirrorError::CodecRefused` exists to name it.
 /// - **20** (AAC-LC) — not offered in `cn`.
 /// - **26** (MFi) — would promise `/auth-setup` against a coprocessor we do not have.
 ///   shairport-sync *removed* this bit in 4.3 for exactly this reason.
@@ -123,7 +125,9 @@ impl Features {
 /// - **38/43/46/48** (HomeKit) — `/pair-setup` answers 501.
 /// - **51** (unified pair-setup + MFi) — nobody open-source has made it work; the
 ///   observed failure is iOS giving up at Pair-Setup [2/5].
-const FEATURE_BITS: &[u8] = &[9, 18, 19, 22, 30];
+/// - **12/14/2** (FairPlay-in-`et`) — the *audio* path still advertises `et=0,1`, and
+///   mirroring's FairPlay is negotiated through `/fp-setup` rather than through these.
+const FEATURE_BITS: &[u8] = &[7, 9, 18, 19, 22, 30];
 
 /// Identity used to build the AirPlay/RAOP advertisements.
 #[derive(Debug, Clone)]
@@ -287,11 +291,11 @@ mod tests {
         // every iPhone in the room", so they get a test rather than a comment.
         let f = ident().features();
         for (bit, why) in [
-            (7u8, "screen mirroring"),
-            (11, "retransmit"),
+            (11u8, "retransmit"),
             (12, "FairPlay SAP v2.5"),
             (14, "FairPlay"),
             (20, "AAC-LC, which `cn` does not offer"),
+            (42, "HEVC mirroring, which has no decoder here"),
             (26, "MFi auth"),
             (
                 27,
@@ -308,8 +312,13 @@ mod tests {
                 "bit {bit} promises {why}, which is not implemented"
             );
         }
-        // And the one that must be set, or senders drop us from the picker entirely.
+        // And the ones that must be set: 9 or senders drop us from the picker
+        // entirely, 7 or none of them ever offers a screen.
         assert!(f.has(9), "bit 9 (audio) is required to appear at all");
+        assert!(
+            f.has(7),
+            "bit 7 (screen) is required to be offered a mirror"
+        );
     }
 
     #[test]

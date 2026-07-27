@@ -47,11 +47,35 @@ pub fn info_plist(ident: &AirPlayIdentity) -> Result<Vec<u8>, AirPlayError> {
     dict.insert("pi".into(), Value::String(ident.pairing_id.clone()));
     dict.insert("vv".into(), Value::Integer(2i64.into()));
 
-    // No `displays` array. It describes a mirroring surface, and nothing here serves
-    // one; advertising a screen we will not accept a stream for is the same class of
-    // lie as the FairPlay bits in the TXT record. When mirroring lands this returns,
-    // and `refreshRate` is a `Real` holding the frame *period* (1/60), not the integer
-    // `60` that used to sit here — 60 reads as a sixty-second frame.
+    // The mirroring surface. A sender reads *height* to choose an encode format and
+    // adjusts width to however the device is being held — orientation is not negotiated,
+    // it is reported back in the type-1 packet's header floats — so this advertises a
+    // height budget rather than a fixed geometry. 1080 with feature bit 42 clear keeps
+    // the sender on H.264, which is the only codec decoded here.
+    let mut display = Dictionary::new();
+    display.insert("uuid".into(), Value::String(ident.pairing_id.clone()));
+    display.insert("widthPixels".into(), Value::Integer(1920i64.into()));
+    display.insert("heightPixels".into(), Value::Integer(1080i64.into()));
+    display.insert("width".into(), Value::Integer(1920i64.into()));
+    display.insert("height".into(), Value::Integer(1080i64.into()));
+    // Millimetres, and 0 means "unknown" — which is what every real receiver reports.
+    display.insert("widthPhysical".into(), Value::Integer(0i64.into()));
+    display.insert("heightPhysical".into(), Value::Integer(0i64.into()));
+    // `refreshRate` is a frame **period**, not a rate: 1/60, as a real. The integer 60
+    // that used to be the whole of this block reads as a sixty-second frame.
+    display.insert("refreshRate".into(), Value::Real(1.0 / 60.0));
+    display.insert("maxFPS".into(), Value::Integer(30i64.into()));
+    // Overscan would inset the picture for a CRT-era TV and waste resolution on a flat
+    // panel, and rotation must agree with feature bit 8, which is clear.
+    display.insert("overscanned".into(), Value::Boolean(false));
+    display.insert("rotation".into(), Value::Boolean(false));
+    // A separate, small bitmask from the device features; nobody has decoded it, and
+    // every implementation reports 14 or 30.
+    display.insert("features".into(), Value::Integer(14i64.into()));
+    dict.insert(
+        "displays".into(),
+        Value::Array(vec![Value::Dictionary(display)]),
+    );
 
     let mut buf = Vec::new();
     plist::to_writer_binary(&mut buf, &Value::Dictionary(dict))
@@ -139,8 +163,31 @@ mod tests {
     }
 
     #[test]
-    fn no_display_is_offered_while_there_is_no_mirroring() {
-        assert!(!parsed(&ident()).contains_key("displays"));
+    fn the_display_block_describes_a_surface_a_sender_can_address() {
+        let dict = parsed(&ident());
+        let displays = dict.get("displays").unwrap().as_array().unwrap();
+        let d = displays[0].as_dictionary().unwrap();
+        // Without a uuid it is not a display the sender can name.
+        assert!(d.get("uuid").unwrap().as_string().is_some());
+        assert_eq!(
+            d.get("heightPixels").unwrap().as_unsigned_integer(),
+            Some(1080)
+        );
+        for key in ["widthPixels", "maxFPS", "overscanned", "widthPhysical"] {
+            assert!(d.contains_key(key), "missing `{key}`");
+        }
+    }
+
+    #[test]
+    fn refresh_rate_is_a_period_not_a_rate() {
+        // The defect this replaces: an integer 60 here reads as a sixty-second frame.
+        let dict = parsed(&ident());
+        let d = dict.get("displays").unwrap().as_array().unwrap()[0]
+            .as_dictionary()
+            .unwrap();
+        let rate = d.get("refreshRate").unwrap();
+        assert!(rate.as_real().is_some(), "must be a Real, got {rate:?}");
+        assert!((rate.as_real().unwrap() - 1.0 / 60.0).abs() < 1e-9);
     }
 
     #[test]

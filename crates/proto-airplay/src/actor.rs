@@ -34,6 +34,7 @@ use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
 use crate::audio::{AudioOutput, AudioStream};
 use crate::clock::{NtpTime, ResendTracker, TimingClient};
 use crate::error::AirPlayError;
+use crate::mirror::{MirrorKeys, MirrorOutput, MirrorStream};
 use crate::sdp::RaopCodec;
 use crate::session::{AirPlayRequest, AirPlaySession};
 use crate::transport::{ReceiverPorts, SenderPorts};
@@ -89,6 +90,25 @@ impl AirPlayReceiver {
             .local_addr()
             .map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip());
         session.set_local_addr(local_ip);
+        // The mirroring data channel is a second TCP listener, bound now for the same
+        // reason the UDP sockets are: a SETUP has to answer with a port that already
+        // exists, not one we intend to create.
+        let mut mirror_listener = match TcpListener::bind(SocketAddr::new(local_ip, 0)).await {
+            Ok(listener) => match listener.local_addr() {
+                Ok(addr) => {
+                    session.set_mirror_data_port(addr.port());
+                    Some(listener)
+                }
+                Err(e) => {
+                    warn!(%peer, error = %e, "mirror listener has no address");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(%peer, error = %e, "could not bind the mirroring data port");
+                None
+            }
+        };
         match AudioSockets::bind(local_ip).await {
             Ok((sockets, ports)) => {
                 session.set_local_ports(ports);
@@ -110,6 +130,7 @@ impl AirPlayReceiver {
             &sink,
             peer,
             &mut audio_sockets,
+            &mut mirror_listener,
         )
         .await
         {
@@ -150,6 +171,7 @@ async fn pump(
     sink: &SessionSink,
     peer: SocketAddr,
     audio_sockets: &mut Option<AudioSockets>,
+    mirror_listener: &mut Option<TcpListener>,
 ) -> Result<(), AirPlayError> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
@@ -206,6 +228,17 @@ async fn pump(
             if session.is_recording() {
                 if let Some(sockets) = audio_sockets.take() {
                     start_audio(session, sockets, sink, peer).await;
+                }
+            }
+
+            // A mirroring SETUP that named the stream leaves the keys behind; the
+            // sender is about to dial the data port we advertised.
+            if let Some(keys) = session.take_mirror_keys() {
+                // One data channel per session: the listener is *moved* into the task.
+                // Re-binding by address instead would race whatever took the port in
+                // between, and we have already told the sender that number.
+                if let Some(listener) = mirror_listener.take() {
+                    start_mirroring(*keys, listener, sink, peer).await;
                 }
             }
 
@@ -614,4 +647,95 @@ fn now_ntp() -> NtpTime {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     NtpTime::from_unix_nanos(nanos)
+}
+
+/// Hand the mirroring stream to the pipeline and start receiving it.
+///
+/// The listener is not awaited here — a sender dials it a moment after reading the
+/// `SETUP` reply, and blocking the RTSP pump until it does would stall the very
+/// connection the sender is still talking on.
+async fn start_mirroring(
+    keys: MirrorKeys,
+    listener: TcpListener,
+    sink: &SessionSink,
+    peer: SocketAddr,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    info!(%peer, "AirPlay mirroring starting");
+    if sink
+        .emit(SessionEvent::Mirror {
+            video: FrameSource::Encoded(rx),
+            audio: None,
+        })
+        .await
+        .is_err()
+    {
+        warn!(%peer, "session manager gone; not starting mirroring");
+        return;
+    }
+    tokio::spawn(run_mirroring(listener, keys, tx, peer));
+}
+
+/// Accept the sender's data connection and feed frames until it ends.
+async fn run_mirroring(
+    listener: TcpListener,
+    keys: MirrorKeys,
+    frames: mpsc::Sender<EncodedFrame>,
+    peer: SocketAddr,
+) {
+    let Ok((mut stream, from)) = listener.accept().await else {
+        warn!(%peer, "no mirroring data connection arrived");
+        return;
+    };
+    info!(%from, "AirPlay mirroring data channel connected");
+
+    let mut mirror = MirrorStream::new(&keys);
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
+    let mut chunk = vec![0u8; 1 << 16];
+    loop {
+        let n = tokio::select! {
+            r = stream.read(&mut chunk) => match r {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => { debug!(error = %e, "mirroring read failed"); break }
+            },
+            () = frames.closed() => {
+                debug!("mirroring consumer went away");
+                break;
+            }
+        };
+        buf.extend_from_slice(&chunk[..n]);
+
+        let outputs = match mirror.feed(&mut buf) {
+            Ok(o) => o,
+            // Fatal by design: the keystream is continuous, so a message we cannot
+            // frame means everything after it would be noise.
+            Err(e) => {
+                warn!(error = %e, "mirroring stream lost sync; ending it");
+                break;
+            }
+        };
+        for output in outputs {
+            match output {
+                MirrorOutput::Frame(frame) => {
+                    // Drop late rather than stall: latency beats freshness, and this is
+                    // safe *here* because the frame has already been decrypted — the
+                    // keystream has moved on regardless of whether we keep the bytes.
+                    if frames.try_send(*frame).is_err() {
+                        debug!("mirroring buffer full; dropping a frame");
+                    }
+                }
+                MirrorOutput::Geometry(g) => {
+                    info!(
+                        encoded = ?g.encoded,
+                        source = ?g.source,
+                        "AirPlay mirroring geometry"
+                    );
+                }
+                MirrorOutput::Suspend => info!("AirPlay mirroring suspended by the sender"),
+                MirrorOutput::Resume => info!("AirPlay mirroring resumed"),
+            }
+        }
+    }
+    info!(%peer, "AirPlay mirroring ended");
 }
