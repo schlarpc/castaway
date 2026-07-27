@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod ie;
 pub mod media;
 pub mod p2p;
 pub mod params;
@@ -25,6 +26,10 @@ pub mod video;
 use castaway_core::ProtocolKind;
 
 pub use error::{IeError, MiracastError, ParamError};
+pub use ie::{
+    DeviceInformation, DeviceType, ExtendedCapability, SessionAvailability, Subelement,
+    SubelementId, WfdInformationElement,
+};
 pub use media::{MediaReceiver, MP2T_PAYLOAD_TYPE};
 pub use p2p::{MacAddr, WpaCommand, WpaEvent, WpaReply};
 pub use params::{
