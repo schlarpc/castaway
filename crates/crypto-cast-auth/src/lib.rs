@@ -11,12 +11,16 @@
 #![forbid(unsafe_code)]
 
 use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
 use sha2::Sha256;
 use thiserror::Error;
+
+mod dev;
+
+pub use dev::DevCredential;
 
 /// Errors from the signer.
 #[derive(Debug, Error)]
@@ -33,6 +37,10 @@ pub enum CastAuthError {
     /// Key generation failed (dev mode).
     #[error("key generation failed: {0}")]
     KeyGen(String),
+
+    /// A development certificate could not be issued (dev mode).
+    #[error("dev certificate generation failed: {0}")]
+    DevCert(String),
 }
 
 /// Hash algorithm requested by the challenge.
@@ -102,19 +110,64 @@ impl CastDeviceSigner {
         Ok(Self::new(key, client_cert_der, intermediates_der))
     }
 
-    /// Generate an ephemeral 2048-bit key with a placeholder "certificate" (the public
-    /// key's DER stands in). For local dev/tests only — a real sender wants a chain
-    /// rooted in Google's device CA (OPEN-QUESTIONS Q2).
+    /// Generate an ephemeral development credential: a self-signed dev root and a
+    /// device certificate issued under it, with the extensions a Cast sender's path
+    /// builder insists on. For local dev/tests only — a real sender only trusts a chain
+    /// rooted in Google's device CA (OPEN-QUESTIONS Q2), and the returned
+    /// [`DevCredential::root_ca_der`] is exactly the thing it will not have.
+    ///
+    /// The point of issuing real X.509 here rather than a placeholder byte string is
+    /// that the *rest* of the auth response then becomes testable: chain order, digest
+    /// choice, key usage and the signed-blob layout are all verifiable against a real
+    /// sender implementation, leaving the missing credential as the only open item.
     ///
     /// # Errors
-    /// [`CastAuthError::KeyGen`] if RSA key generation fails.
-    pub fn generate_dev() -> Result<Self, CastAuthError> {
+    /// [`CastAuthError::KeyGen`] if RSA key generation fails, [`CastAuthError::DevCert`]
+    /// if certificate issuance does.
+    pub fn generate_dev() -> Result<DevCredential, CastAuthError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CastAuthError::DevCert(e.to_string()))?;
+        Self::generate_dev_at(
+            i64::try_from(now.as_secs()).map_err(|e| CastAuthError::DevCert(e.to_string()))?,
+        )
+    }
+
+    /// [`CastDeviceSigner::generate_dev`] with the clock supplied, so the certificate
+    /// windows a test asserts on do not depend on when the test runs.
+    ///
+    /// # Errors
+    /// As [`CastDeviceSigner::generate_dev`].
+    pub fn generate_dev_at(now_unix: i64) -> Result<DevCredential, CastAuthError> {
         let mut rng = rand::thread_rng();
-        let key =
+        let root_key =
             RsaPrivateKey::new(&mut rng, 2048).map_err(|e| CastAuthError::KeyGen(e.to_string()))?;
-        // Placeholder cert bytes: not a real X.509, fine for signature round-trips.
-        let cert = b"castaway-dev-device-cert".to_vec();
-        Ok(Self::new(key, cert, Vec::new()))
+        let device_key =
+            RsaPrivateKey::new(&mut rng, 2048).map_err(|e| CastAuthError::KeyGen(e.to_string()))?;
+        dev::issue(&root_key, &device_key, now_unix)
+    }
+
+    /// [`CastDeviceSigner::generate_dev_at`] with the keys supplied too. With fixed keys
+    /// and a fixed clock the whole credential — and therefore the whole auth response —
+    /// is byte-identical every run, which is what lets the device-auth vectors be checked
+    /// in and compared rather than merely regenerated.
+    ///
+    /// # Errors
+    /// [`CastAuthError::DevCert`] if certificate issuance fails.
+    pub fn dev_from_keys(
+        root_key: &RsaPrivateKey,
+        device_key: &RsaPrivateKey,
+        now_unix: i64,
+    ) -> Result<DevCredential, CastAuthError> {
+        dev::issue(root_key, device_key, now_unix)
+    }
+
+    /// PKCS#8 DER for the device key, so a caller that has to hand the key to another
+    /// library (rcgen, in the dev-credential path) does not need the key type.
+    fn pkcs8_der(key: &RsaPrivateKey) -> Result<Vec<u8>, CastAuthError> {
+        key.to_pkcs8_der()
+            .map(|d| d.as_bytes().to_vec())
+            .map_err(|e| CastAuthError::DevCert(e.to_string()))
     }
 
     /// The device public key (for verifying our own signatures in tests).
@@ -175,9 +228,15 @@ mod tests {
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
 
+    /// Generating two RSA-2048 keys is slow enough that the tests share one credential.
+    fn dev() -> &'static DevCredential {
+        static DEV: std::sync::OnceLock<DevCredential> = std::sync::OnceLock::new();
+        DEV.get_or_init(|| CastDeviceSigner::generate_dev_at(1_800_000_000).unwrap())
+    }
+
     #[test]
     fn signature_verifies_sha256() {
-        let signer = CastDeviceSigner::generate_dev().unwrap();
+        let signer = &dev().signer;
         let tls_cert = b"the-tls-server-cert-der";
         let nonce = [0xABu8; 16];
         let signed = signer
@@ -193,7 +252,7 @@ mod tests {
 
     #[test]
     fn signature_verifies_without_nonce_sha1() {
-        let signer = CastDeviceSigner::generate_dev().unwrap();
+        let signer = &dev().signer;
         let tls_cert = b"cert";
         let signed = signer.sign(tls_cert, None, HashAlgo::Sha1).unwrap();
         let vk = VerifyingKey::<Sha1>::new(signer.public_key());
@@ -203,7 +262,7 @@ mod tests {
 
     #[test]
     fn wrong_message_fails_verification() {
-        let signer = CastDeviceSigner::generate_dev().unwrap();
+        let signer = &dev().signer;
         let signed = signer.sign(b"cert-a", None, HashAlgo::Sha256).unwrap();
         let vk = VerifyingKey::<Sha256>::new(signer.public_key());
         let sig = Signature::try_from(signed.signature.as_slice()).unwrap();
@@ -213,12 +272,65 @@ mod tests {
     #[test]
     fn carries_cert_chain() {
         let signer = CastDeviceSigner::new(
-            CastDeviceSigner::generate_dev().unwrap().key,
+            dev().signer.key.clone(),
             vec![1, 2, 3],
             vec![vec![4, 5], vec![6]],
         );
         let signed = signer.sign(b"x", None, HashAlgo::Sha256).unwrap();
         assert_eq!(signed.client_auth_certificate, vec![1, 2, 3]);
         assert_eq!(signed.intermediate_certificate.len(), 2);
+    }
+
+    /// The dev credential used to be the byte string `castaway-dev-device-cert`, which no
+    /// sender can parse — so every requirement past parsing went untested. These assert on
+    /// the DER a sender actually reads, and each one is a rejection reason in openscreen's
+    /// `boringssl_trust_store.cc`.
+    #[test]
+    fn dev_device_cert_satisfies_the_path_builder() {
+        let (_, cert) = x509_parser::parse_x509_certificate(&dev().signer.client_cert_der).unwrap();
+
+        let usage = cert
+            .key_usage()
+            .unwrap()
+            .expect("a leaf with no key usage extension is rejected outright")
+            .value;
+        assert!(usage.digital_signature(), "leaf needs digitalSignature");
+
+        // sha256WithRSAEncryption. Only the two RSA OIDs are accepted; rcgen's default
+        // ECDSA leaf would be refused for its signature algorithm alone.
+        assert_eq!(
+            cert.signature_algorithm.algorithm.to_id_string(),
+            "1.2.840.113549.1.1.11"
+        );
+    }
+
+    #[test]
+    fn dev_root_can_issue() {
+        let (_, root) = x509_parser::parse_x509_certificate(&dev().root_ca_der).unwrap();
+        let constraints = root
+            .basic_constraints()
+            .unwrap()
+            .expect("an issuer with no basicConstraints is rejected")
+            .value;
+        assert!(constraints.ca, "the root must assert the CA bit");
+        assert!(
+            root.key_usage().unwrap().unwrap().value.key_cert_sign(),
+            "an issuer whose key usage omits keyCertSign is rejected"
+        );
+    }
+
+    /// Same keys plus same clock must give the same bytes, or the checked-in device-auth
+    /// vectors could not be compared against a fresh run.
+    #[test]
+    fn dev_credential_is_deterministic() {
+        let root = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let device = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let a = CastDeviceSigner::dev_from_keys(&root, &device, 1_800_000_000).unwrap();
+        let b = CastDeviceSigner::dev_from_keys(&root, &device, 1_800_000_000).unwrap();
+        assert_eq!(a.root_ca_der, b.root_ca_der);
+        assert_eq!(
+            a.signer.client_cert_der, b.signer.client_cert_der,
+            "certificate issuance must not introduce randomness"
+        );
     }
 }

@@ -105,6 +105,10 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+# Certificate validity windows. Present transitively via rcgen; named here because
+# `proto-cast` and `crypto-cast-auth` set `notBefore`/`notAfter` deliberately rather
+# than taking rcgen's 1975→4096 default (see `TlsIdentity` for why that matters).
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 # --- crypto ---
 chacha20poly1305 = "0.10"
@@ -135,6 +139,9 @@ librespot-protocol = "0.8"
 # --- dev / test ---
 hex-literal = "0.4"
 tokio-test = "0.4"
+# Reads back the certificates we issue, so the tests assert on the DER a sender parses
+# rather than on the parameters we handed rcgen.
+x509-parser = "0.18"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

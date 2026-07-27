@@ -65,7 +65,7 @@ mod tests {
 
     #[test]
     fn responder_produces_a_signed_response() {
-        let signer = Arc::new(CastDeviceSigner::generate_dev().unwrap());
+        let signer = Arc::new(CastDeviceSigner::generate_dev().unwrap().signer);
         let responder = CastAuthResponder::new(signer, b"tls-cert".to_vec());
         let challenge = AuthChallenge {
             signature_algorithm: None,
