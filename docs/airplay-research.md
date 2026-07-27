@@ -74,7 +74,11 @@ advertisement.** A receiver cannot simultaneously tell iOS "I do HomeKit transie
 and "I do no pairing at all". Sequencing A → B means changing the advertisement between
 milestones, which is cheap; trying to serve both at once is not.
 
-**Open decision: A first, or B first?** §7 sketches both.
+**Decided: A first.** The advertisement, `/info` and the `/fp-setup` handshake are done;
+what follows is §7's Path A build order. Path B is not abandoned — nothing landed for A
+forecloses it, and the bit to set when mirroring works is named in `advert.rs` — but it
+carries a licence decision (§5.3) that should be made deliberately rather than arrived at
+by writing code. Path C buys a panel nothing that A does not.
 
 ---
 
