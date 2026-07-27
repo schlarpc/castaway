@@ -56,13 +56,14 @@ Still open, roughly in the order they are worth taking:
    considers the browser created, and killing the render process by hand is unreliable to
    target (the zygote rewrites its forks' argv and this build sets no `CrRendererMain`
    thread name). Needs one run on the real box with a renderer killed under a live cast.
-2. **G41/G42/G43/G44** — the smaller L2CAP and AVDTP conformance items.
-3. **G33** — SponsorBlock reattaching as a brand-new remote each time.
-4. **G45/G49/G50** — the remaining Spotify items: queue-resolution retries, shuffle and
+2. **G45/G49/G50** — the remaining Spotify items: queue-resolution retries, shuffle and
    repeat, local files.
-5. **G48** — DIAL REST conformance (CORS, 200-on-relaunch, percent-decoding, `MX`).
-6. **G51/G53/G54** — the test tiers: audio egress asserted anywhere, streaming error paths
-   in `adapter_end_to_end`, and a self-contained YouTube regression test.
+3. **G48** — DIAL REST conformance (CORS, 200-on-relaunch, percent-decoding, `MX`).
+4. **G53/G54** — the remaining test tiers: streaming error paths in `adapter_end_to_end`
+   (SUSPEND→re-START, two phones at once, a bonded phone reconnecting), and a
+   self-contained YouTube regression test.
+5. **G30 (Windows half)** — a Widevine CDM for the deploy artifact, which means extracting
+   from a Chrome-for-Windows installer: a redistribution decision, not a patch.
 
 The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
 What was grounded in BlueZ 5.86 rather than in memory, since a phone is the Target and its
@@ -426,7 +427,7 @@ display or the audio device, and two cannot take it back afterwards.
   succeeds. The 1024-byte heuristic anticipates the 404-page case but not large garbage; a
   content sniff (`[Adblock` header, or a `||`-rule ratio) closes it.
 
-- **G33 — Every SponsorBlock reattach is a brand-new remote control on the user's screen.
+- ✅ **G33 — Every SponsorBlock reattach is a brand-new remote control on the user's screen.
   CONFIRMED.** `app/src/sponsorblock/actor.rs:57`: `session()` mints a fresh
   `Uuid::new_v4()` device id and lounge token every cycle, and the cycle ends whenever the
   long poll returns EOF, which BrowserChannel does routinely. The Lounge's connected-device
@@ -495,7 +496,7 @@ display or the audio device, and two cannot take it back afterwards.
   diagnostic hole in the media path: **`on_media` has no counter and no rate-limited warning
   for sustained depacketize failure**, only `debug!`.
 
-- **G41 — Authentication and encryption events are parsed and dropped. CONFIRMED.**
+- ✅ **G41 — Authentication and encryption events are parsed and dropped. CONFIRMED.**
   `proto-bluetooth-audio/src/host.rs:390`'s `_ => Vec::new()` swallows
   `AuthenticationComplete` and `EncryptionChange`. We never call `AuthenticationRequested`
   or `SetConnectionEncryption` (both `Command` variants exist, unused), never require
@@ -505,20 +506,20 @@ display or the audio device, and two cannot take it back afterwards.
   severity: usually self-heals when the phone re-initiates SSP and `LinkKeyNotification`
   overwrites, but it is invisible while it lasts.
 
-- **G42 — Configuration continuation (the C-bit) is parsed and ignored. CONFIRMED (code),
+- ✅ **G42 — Configuration continuation (the C-bit) is parsed and ignored. CONFIRMED (code),
   SUSPECTED (frequency).** `mux.rs:567` destructures `flags` away and every response is
   built with `flags: 0`. A peer sending a multi-part `ConfigurationRequest` (C=1) gets a
   `Success` for a partial option list and `incoming_done` is set, so we open the channel
   while the peer is still sending options. C=1 is uncommon but legal, and the result is the
   classic "connects, then the first data PDU is dropped".
 
-- **G43 — Abandoned channels are not torn down toward the peer. CONFIRMED.**
+- ✅ **G43 — Abandoned channels are not torn down toward the peer. CONFIRMED.**
   `mux.rs:985` `fail_configuration` removes the channel locally and emits `ChannelClosed`
   but sends no `DisconnectionRequest` — while `fail_channel` at `:532` does. The phone keeps
   a half-open channel until its own RTX gives up, and a retry then collides with a CID we
   consider free.
 
-- **G44 — Undecodable AVDTP signaling gets no reply. CONFIRMED (low-medium).**
+- ✅ **G44 — Undecodable AVDTP signaling gets no reply. CONFIRMED (low-medium).**
   `adapter.rs:708`: a `Message::decode` failure logs at `debug!` and returns, covering
   unknown signal ids and *any fragmented AVDTP signaling packet*. The peer waits out its
   signal timeout, retries, and typically aborts the link. Low risk in practice because our
@@ -580,7 +581,7 @@ display or the audio device, and two cannot take it back afterwards.
 
 ## Test-coverage gaps (why none of the above was caught)
 
-- **G51 — No test asserts that a single audio sample ever left the box, for any protocol.**
+- ✅ **G51 — No test asserts that a single audio sample ever left the box, for any protocol.**
   `proto-spotify/examples/selfplay.rs:497` polls `GET /v1/me/player` and asserts
   `is_playing == true` — a field echoed back from the device's *own* connect-state PUT,
   i.e. from spirc's state machine. Nothing asserts `PcmSink::write` was called, that
