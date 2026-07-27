@@ -600,6 +600,7 @@ dependencies = [
  "proto-cast",
  "proto-dial",
  "proto-dlna",
+ "proto-miracast",
  "proto-spotify",
  "serde",
  "serde_json",
