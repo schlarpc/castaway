@@ -14,6 +14,9 @@ The design docs are the spec — read them before touching a subsystem:
 
 - **docs/hackerspace-receiver-build.md** — the "why", protocol surface, crypto/auth modules, effort tiers, build priority.
 - **docs/architecture-substrate.md** — what is *actually* shared vs. what only looks shared; the Cargo workspace layout; the core traits (`SourceAdapter`, `SessionEvent`, `FrameSource`); pipeline and threading model.
+- **docs/dlna-conformance.md** — the DLNA/UPnP conformance record: what is confirmed
+  correct and must not be "fixed", where real control points diverge from the spec, and
+  what the citations are worth. Read before changing `proto-dlna`.
 - **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`, MSVC), the CEF/ffmpeg escape hatches, and the testing matrix.
 
 Reference implementations named in the docs (UxPlay, openscreen, librespot, yt-cast-receiver, …)

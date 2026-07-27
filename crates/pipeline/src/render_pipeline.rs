@@ -271,9 +271,33 @@ impl Pipeline for RenderPipeline {
         // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
         std::thread::spawn(move || {
             let result = decode_into(&uri, hw, &tx, &stop, &clock, audio_tx);
-            if let Err(e) = result {
-                warn!(error = %e, "decode ended with error");
+
+            // Preemption is not completion. When another source has taken the screen the
+            // stop flag is what ended this decode, and the layers on screen belong to
+            // whoever took it — clearing them here would blank the new session.
+            if stop.load(Ordering::SeqCst) {
+                debug!(%uri, "decode ended: preempted");
+                return;
             }
+
+            match result {
+                Ok(()) => info!(%uri, "decode ended: media finished"),
+                // The URL was unreachable, the server refused it, or it held nothing this
+                // build can decode. Named at `warn` because it is the whole explanation
+                // for a panel that accepted a cast and showed nothing.
+                Err(e) => warn!(%uri, error = %e, "decode ended: playback failed"),
+            }
+
+            // Either way the item is over, so the screen goes back to idle. Without this
+            // the last decoded frame stayed frozen on a two-metre panel indefinitely, and
+            // a failed fetch left the attract scene up with nothing saying why.
+            //
+            // What this does *not* yet do is tell the session manager or the adapter, so a
+            // DLNA control point still reads PLAYING and a queue still does not advance —
+            // that needs a completion channel back up from the pipeline, which is the rest
+            // of GAPS G75.
+            let _ = tx.try_send(RenderCommand::ClearVideo);
+            let _ = tx.try_send(RenderCommand::ClearNowPlaying);
         });
         Ok(())
     }

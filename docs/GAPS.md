@@ -957,6 +957,13 @@ display or the audio device, and two cannot take it back afterwards.
 
 ### Found by the spec review (2026-07-27)
 
+> The defects are below. **Everything else the review produced is in
+> [dlna-conformance.md](dlna-conformance.md)** — what is confirmed *correct* and must not
+> be "fixed", how real control points behave where the spec is silent, the two claims the
+> review withdrew, what the citations are worth, and where the primary sources are kept.
+> Read that before changing anything in `proto-dlna` that looks wrong: twice during the
+> review, the obvious-looking fix was itself the mistake.
+
 A subagent was given the AVTransport/RenderingControl/ConnectionManager templates, UDA
 1.1, the UPnP AV schemas and the Rygel/gmrender sources, and asked to be adversarial. It
 found things reading the code alone had not, cleared two of its own claims, and caught a
@@ -1043,6 +1050,16 @@ against the cited source before acting.
   advances. §2.2.2 provides `ERROR_OCCURRED` for exactly this. This is the largest
   remaining DLNA item.
 
+  🟡 **Half fixed.** The screen now returns to idle when a decode ends or fails, instead
+  of freezing on the last frame or leaving the attract scene up over silence, and the log
+  distinguishes finished / failed / preempted — preemption is not completion, and clearing
+  the layers there would blank the session that had just taken the screen. What is still
+  missing is telling anyone: the control point still reads PLAYING/OK and a queue still
+  does not advance. That needs a completion channel back *up* from the pipeline, which
+  does not exist — `Pipeline` is driven by the session manager and has no path the other
+  way. The natural shape is an `ActiveHandle` mirroring the existing `RemoteHandle`, which
+  was added for exactly this "unreachable by construction" problem.
+
 - **G76 — Audio-device failure silently kills video. CONFIRMED, not fixed.**
   `av_session` treats a failed audio send as end-of-stream, and `run_pcm` drops its receiver
   when the output refuses the stream — so where the device is absent, busy, or held in
@@ -1062,6 +1079,52 @@ against the cited source before acting.
   advertised (a control point will not call what the SCPD omits); `Seek`/`Next`/`Previous`
   are advertised and refused at runtime. `A_ARG_TYPE_SeekMode` has no `allowedValueList`,
   which is purely declarative and is why Home Assistant renders no seek bar at all.
+
+- ✅ **G80 — `SinkProtocolInfo` published only globs, so BubbleUPnP matched nothing.
+  CONFIRMED, fixed.** The sink advertised `http-get:*:video/*:*,http-get:*:audio/*:*` and
+  no concrete types. gmrender-resurrect's `upnp_connmgr.c` records why that fails, verbatim:
+
+  > `// BubbleUPnP does not seem to match generic "audio/*" types,`
+  > `// but only matches mime-types _exactly_, so we add some here.`
+
+  gmrender registers the glob *and* an explicit enumeration precisely because the glob
+  matches nothing there. On one of the most widely deployed DLNA control points, this
+  receiver therefore appeared in the picker and refused every single item — advertised,
+  discoverable, authenticating, and unable to be given anything. The single most severe
+  finding of the review, and one no amount of testing against our own scripted control
+  point could have produced.
+
+  Fixed by enumerating the common audio and video types behind the globs, with both `x-`
+  and non-`x-` spellings — the same file documents controllers disagreeing about
+  `audio/x-m4a` vs `audio/m4a` vs `audio/mp4`. Note the obligation this carries: a
+  MIME-only entry with no `DLNA.ORG_PN` is legal and testable, but obliges the renderer to
+  decode everything in the certification table for that MIME, so the list should grow only
+  as the decoder does.
+
+- ✅ **G81 — `res@duration` rejected the conformant leading sign. CONFIRMED, fixed.**
+  Our parser refused `+0:03:45`, on the assumption that the sign was a broken server being
+  tolerated. It is not: `av:duration.cds1` in `http://www.upnp.org/schemas/av/av.xsd` is
+  `[-+]?[0-9]+(:[0-5][0-9]){2}(\.[0-9]+)?`, so we were violating the spec rather than
+  being lenient about a violation of it. Also fixed with it: `F0/F1` is a *rational*
+  fraction (`0:03:25.7/10` is 25.7 seconds) whose prose requires `F0 < F1` — unenforceable
+  by the pattern, so it is checked in code — and the minute and second fields are exactly
+  two digits, since accepting `0:3:45` means accepting `0:345:00`.
+
+  Worth keeping as a caution: this was found by fetching the normative schema, after the
+  reviewing agent had first reported the opposite. Both readings sounded plausible; only
+  the XSD settled it.
+
+- ✅ **G82 — A paused-then-preempted URL session leaked its decode thread. CONFIRMED,
+  fixed.** `drain_paced` holds each frame until the media clock says it is due, and sleeps
+  in slices so that cancellation can be observed — but the wait loop checked only whether
+  the clock was *paused*, never the stop flag. A paused session's clock never advances, so
+  a frame waiting for its turn waits forever; preempt that session by casting something
+  else and the decode thread spun at 20 Hz indefinitely, holding its decoder and keeping
+  the clock alive. One leaked thread per occurrence, in silence.
+
+  Introduced by the pause work in G63 and found by re-reading the diff rather than by any
+  test — which is the argument for the review, not against it: the slicing existed
+  *precisely* so cancellation could be seen, and the check was still omitted.
 
 - **G79 — The error-code table is four entries deep. CONFIRMED, not fixed.**
   `718 Invalid InstanceID` is in every AVTransport action's table and `InstanceID` is never

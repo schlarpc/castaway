@@ -42,6 +42,15 @@ The preview writes PNGs of the real renderer for a person to look at. The logic 
 including the panel-normalized → strip-local mapping, whose failure mode is the quiet one
 where the buttons still draw correctly and answer to a different part of the glass.
 
+## DLNA conformance
+`docs/dlna-conformance.md` records a spec-grounded adversarial review of `proto-dlna` and
+the media path it feeds — held against AVTransport/RenderingControl/ConnectionManager, UDA
+1.1, the UPnP AV schemas, and the Rygel and gmrender-resurrect sources rather than against
+memory. The defects it found are GAPS.md G68–G82; that file holds the rest, which is the
+larger half: what is correct and must not be "fixed", how real control points diverge from
+the text, and what the citations are worth (DLNA Guidelines Part 1 is paywalled, so every
+`7.x` section number in these docs is secondhand).
+
 ## Verified against the other implementation (`nix flake check`, no hardware)
 Two checks compile openscreen — the reference implementation of Cast — and put our code
 and theirs on opposite sides of the wire. Neither needs a sender, a network, or a person.
