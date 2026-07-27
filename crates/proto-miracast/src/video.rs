@@ -99,7 +99,10 @@ pub struct VideoMode {
 }
 
 impl VideoMode {
-    const fn new(width: u16, height: u16, fps: u8, interlaced: bool) -> Self {
+    /// A mode from its parts. Public so tests and callers can name the mode they expect
+    /// rather than the index they think it lives at.
+    #[must_use]
+    pub const fn new(width: u16, height: u16, fps: u8, interlaced: bool) -> Self {
         Self {
             width,
             height,

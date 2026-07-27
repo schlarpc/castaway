@@ -18,6 +18,7 @@ pub mod error;
 pub mod media;
 pub mod p2p;
 pub mod params;
+pub mod session;
 pub mod ts;
 pub mod video;
 
@@ -29,6 +30,10 @@ pub use p2p::{MacAddr, WpaCommand, WpaEvent, WpaReply};
 pub use params::{
     AudioCodecs, AudioFormat, ClientRtpPorts, ConnectorType, ContentProtection, ParamBody,
     ParamName, PresentationUrls, RtpProfile, SinkCapabilities, TriggerMethod,
+};
+pub use session::{
+    NegotiatedConfig, OutgoingRequest, OutgoingResponse, SessionState, SinkOutput, WfdRequest,
+    WfdResponse, WfdSession, DEFAULT_CONTROL_PORT,
 };
 pub use ts::{Pid, StreamType, TsDemux, TS_PACKET_LEN};
 pub use video::{

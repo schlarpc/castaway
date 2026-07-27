@@ -29,7 +29,17 @@ pub enum MiracastError {
         state: &'static str,
     },
 
-    /// The source and sink share no video format, so there is nothing to negotiate.
+    /// The source's M4 named a video format we never advertised.
+    ///
+    /// Its own category rather than "malformed", because it is a *conforming* source
+    /// doing something surprising rather than a broken one: AOSP picks the profile and
+    /// level from the lower of the two sides' floors rather than from an intersection,
+    /// so it can land on a profile the sink never claimed. See
+    /// [`crate::video::pick_best_format`].
+    #[error("the source chose a video format the sink never advertised: {0}")]
+    UnadvertisedFormat(String),
+
+    /// The M4 named no video format at all, so there is nothing to decode.
     #[error("no common video format with the source")]
     NoCommonVideoFormat,
 
