@@ -1,0 +1,24 @@
+[package]
+name = "proto-miracast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Miracast / Wi-Fi Display sink: the WFD information element, the wfd-kv parameter grammar, the M1-M16 RTSP state machine, and MPEG2-TS-over-RTP depacketization."
+
+[dependencies]
+castaway-core.workspace = true
+substrate-rtsp.workspace = true
+substrate-rtp.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

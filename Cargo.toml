@@ -23,6 +23,7 @@ members = [
     "crates/crypto-playfair",
     "crates/proto-airplay",
     "crates/proto-dial",
+    "crates/proto-miracast",
     "crates/sponsorblock",
     "crates/pipeline",
     "crates/control-display",
@@ -62,6 +63,7 @@ proto-dlna = { path = "crates/proto-dlna" }
 proto-cast = { path = "crates/proto-cast" }
 proto-airplay = { path = "crates/proto-airplay" }
 proto-dial = { path = "crates/proto-dial" }
+proto-miracast = { path = "crates/proto-miracast" }
 proto-spotify = { path = "crates/proto-spotify" }
 sponsorblock = { path = "crates/sponsorblock" }
 pipeline = { path = "crates/pipeline" }

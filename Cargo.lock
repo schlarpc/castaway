@@ -3810,6 +3810,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-miracast"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "castaway-core",
+ "substrate-rtp",
+ "substrate-rtsp",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "proto-spotify"
 version = "0.1.0"
 dependencies = [
