@@ -101,9 +101,12 @@ impl KioskApp {
             sink.cancel_all();
         }
         if let Some(render) = self.render.as_mut() {
-            if render.shell_home() {
-                info!("shell: home");
-            }
+            render.shell_home();
+            // Bring the shell in front. If something is playing it is demoted to a
+            // corner rather than stopped — someone pressing Home in the middle of a film
+            // has not asked for it to end.
+            render.set_shell_foreground(true);
+            info!("shell: home");
         }
     }
 
@@ -146,6 +149,19 @@ impl KioskApp {
 
         match event.phase {
             TouchPhase::Down => {
+                // A tap on the demoted video puts it back. It is the only thing on
+                // screen that means "give this the panel again".
+                if self
+                    .render
+                    .as_ref()
+                    .is_some_and(|r| r.hit_pip(event.x, event.y))
+                {
+                    if let Some(render) = self.render.as_mut() {
+                        render.set_shell_foreground(false);
+                        info!("shell: handing the panel back to what is playing");
+                    }
+                    return true;
+                }
                 let contact = Contact::new(event.x, event.y);
                 let on_pill = crate::overlay::hit_pill(w.max(1), h.max(1), event.x, event.y)
                     && self
@@ -198,6 +214,7 @@ impl KioskApp {
             ScreenHit::Push(screen) => {
                 info!(screen = screen.name(), "shell: a finger on the panel");
                 render.shell_push(screen);
+                render.set_shell_foreground(true);
             }
             ScreenHit::Back => {
                 render.shell_back();
@@ -290,6 +307,9 @@ impl KioskApp {
                 // Any touch raises the pill. Someone who does not know the gesture has to
                 // be shown the way out without knowing to ask for it.
                 self.wake_pill();
+                if let Some(render) = self.render.as_mut() {
+                    render.note_touch();
+                }
 
                 // The navigation layer sees every phase, and sees them first. It is the
                 // only thing above a fullscreen cast, so it is the only thing that can

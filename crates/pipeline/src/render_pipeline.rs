@@ -24,6 +24,13 @@ use crate::wgpu_compositor::{TexelFormat, WgpuCompositor};
 
 /// A command sent from the tokio/decode side to the render thread. (OSD is a separate
 /// channel — see [`castaway_core::osd`] / [`crate::osd`] — so any source can post it.)
+/// Which corner a demoted video goes to. Bottom-right: the shell's own content runs down
+/// the left, and the home pill owns the bottom-left.
+const PIP_CORNER: u8 = 3;
+
+/// How long after a touch the panel counts as in use, for the idle return (#27).
+const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub enum RenderCommand {
     /// Upload a decoded frame as the video layer.
     Video(DecodedFrame),
@@ -793,6 +800,11 @@ impl Pipeline for RenderPipeline {
             *guard = crate::nowplaying_card::NowPlayingCard::default();
         }
         let _ = self.tx.try_send(RenderCommand::ClearNowPlaying);
+        // Nothing is playing and nobody is connected, so put the panel back where a
+        // person expects to find it (#27). The render loop declines if the panel was
+        // touched recently — an ending session is no reason to close a screen someone is
+        // reading.
+        let _ = self.tx.try_send(RenderCommand::ShellHome);
         info!("render pipeline: STOP");
         Ok(())
     }
@@ -923,6 +935,12 @@ pub struct RenderLoop {
     compositor: WgpuCompositor,
     rx: Receiver<RenderCommand>,
     osd: Option<crate::osd::OsdController>,
+    /// Whether the shell is in front: someone is navigating, so a playing video is
+    /// demoted to a corner rather than covering the screens they are using (D38, #28).
+    shell_front: bool,
+    /// When the panel was last touched, so an ending session does not yank someone out
+    /// of a screen they are reading (#27).
+    last_touch: Option<std::time::Instant>,
     /// The shell's screen stack (D38), kept so the current screen can be redrawn at a
     /// new size and so navigation has somewhere to live. `None` for a renderer nothing
     /// has given a Home to — the offscreen test harness, a headless tap.
@@ -990,6 +1008,8 @@ impl RenderLoop {
             compositor,
             rx,
             osd: None,
+            shell_front: false,
+            last_touch: None,
             shell: None,
             has_video: false,
             taps: Vec::new(),
@@ -1376,6 +1396,69 @@ impl RenderLoop {
         self.compositor.layer_size(LayerId::Attract)
     }
 
+    /// Note that a finger touched the panel.
+    ///
+    /// Used by the idle policy: an ending session returns the panel Home, but not out
+    /// from under someone who is using it.
+    pub fn note_touch(&mut self) {
+        self.last_touch = Some(std::time::Instant::now());
+    }
+
+    /// Bring the shell in front, or hand the screen back to what is playing.
+    ///
+    /// The shell draws *below* video, so navigating while something plays would
+    /// otherwise be invisible. Rather than hiding the video — someone pressing Home in
+    /// the middle of a film has not asked for it to stop — it is demoted to a corner,
+    /// which is what the compositor's PiP transform has been there for since the
+    /// beginning (architecture §4).
+    pub fn set_shell_foreground(&mut self, front: bool) {
+        if self.shell_front == front {
+            return;
+        }
+        self.shell_front = front;
+        self.place_video();
+    }
+
+    /// Whether the shell is in front.
+    #[must_use]
+    pub const fn shell_foreground(&self) -> bool {
+        self.shell_front
+    }
+
+    /// Where the demoted video sits, in panel-normalized coordinates. `None` when it is
+    /// not demoted, or when there is no video.
+    #[must_use]
+    pub fn pip_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        (self.shell_front && self.has_video).then(|| {
+            let t = Transform::pip(PIP_CORNER);
+            (t.offset_x, t.offset_y, t.scale_x, t.scale_y)
+        })
+    }
+
+    /// Whether a panel-normalized point is on the demoted video.
+    #[must_use]
+    pub fn hit_pip(&self, x: f32, y: f32) -> bool {
+        self.pip_rect()
+            .is_some_and(|(ox, oy, sx, sy)| x >= ox && y >= oy && x <= ox + sx && y <= oy + sy)
+    }
+
+    /// Put the video layer where the current mode says it goes.
+    fn place_video(&mut self) {
+        if !self.has_video {
+            return;
+        }
+        let transform = if self.shell_front {
+            Transform::pip(PIP_CORNER)
+        } else {
+            Transform::default()
+        };
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::Video,
+            opacity: 1.0,
+            transform,
+        });
+    }
+
     /// Draw the home pill and place it as the shell's overlay layer.
     ///
     /// # Errors
@@ -1578,12 +1661,11 @@ impl RenderLoop {
                 }
                 if landed.is_ok() {
                     if !self.has_video {
-                        self.compositor.upsert_layer(Layer {
-                            id: LayerId::Video,
-                            opacity: 1.0,
-                            transform: Transform::default(),
-                        });
                         self.has_video = true;
+                        // Placed by the current mode, not unconditionally full-screen: a
+                        // cast that starts while someone is navigating should arrive in
+                        // the corner rather than covering what they are reading.
+                        self.place_video();
                     }
                     return true;
                 }
@@ -1625,7 +1707,15 @@ impl RenderLoop {
                 false
             }
             RenderCommand::ShellHome => {
-                self.shell_home();
+                // The idle return (#27). Not while someone is using the panel: a session
+                // ending is no reason to close a picker out from under them.
+                let busy = self.last_touch.is_some_and(|t| t.elapsed() < IDLE_GRACE);
+                if busy {
+                    debug!("shell: staying put, the panel was touched recently");
+                } else {
+                    self.shell_home();
+                    self.set_shell_foreground(false);
+                }
                 false
             }
             RenderCommand::AddTap(tap) => {
