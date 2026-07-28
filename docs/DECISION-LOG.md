@@ -768,3 +768,70 @@ worst case, recorded so it is recognized if met: the linked core turns out to ne
 per-platform threading or timing care we have not done, the panel shows a black screen
 with a healthy control stream, and the debugging happens inside a C library we chose not
 to learn.
+
+### D38 — The app shell is native, and the panel gets a home to return to
+`docs/app-shell.md` is the design; this is what was decided and what it cost.
+
+The panel had no way to *offer* anything. Every protocol until GameStream was
+sender-initiated — someone picks the screen on their phone and the receiver accepts what
+arrives — so the panel never had to ask a question and never grew a way to ask one. D37
+broke that: as a Moonlight client the panel chooses the host and the app, and with nowhere
+to choose from, the choice went into `castaway.toml`. The one protocol that could be
+walk-up became the only one that is not.
+
+Eight issues turn out to be waiting on the same missing thing, which is why #23 has no
+body — it could not be written until something needed it. #33's picker, #28's PiP, #27's
+"kick back to home screen", #29's intercom-over-PiP, #11's file picker, #12's device
+selection, #15's visualizer, and #24's theming all need a screen model, and #16 will need
+the same escape hatch from a fullscreen browser that YouTube does.
+
+**Native, not a web page.** Three facts decided it. There is exactly *one* browser
+instance and it is spoken for — YouTube leanback today, Cast app surfaces tomorrow — so a
+web shell would contend with cast content for the same window and put navigation inside a
+process whose crash takes it away. `castaway-portable` has no browser at all and must
+still have a UI. And the argument *against* native turned out to be wrong: an antialiased
+SDF rasteriser (circle, rounded box, segment, triangle) already exists in `transport.rs`,
+and `nowplaying_card.rs` can already draw an arbitrary decoded image centre-cropped into a
+square. Both are private, so the work is promoting them, not writing them. The cost, stated
+plainly: no CSS, no layout engine, no free animation curves, and #24's mascot-and-flourish
+ambitions are more work than they would be in a page.
+
+**A swipe and a pill, from the left edge.** Left rather than bottom because the transport
+strip already claims the bottom-centre 62%×20% of the glass and takes touches first. Both
+affordances rather than one: the pill is discoverable for a guest who has never used the
+panel, the gesture is fast for someone who has, and they cost the same hit-test.
+
+**The landmine, recorded because it is invisible until it isn't.** Stealing a contact
+mid-drag leaves Electron holding a `touchStart` that never ends, and the browser host
+keeps that contact in its map for the life of the session — so the page believes a finger
+is down forever. Every stolen id needs a synthesised touch-cancel. The plumbing exists end
+to end and *nothing has ever sent it*, so it is untested; it is the first test to write,
+not the last.
+
+**What lands first is invisible.** `LayerId` is a closed six-variant enum drawn by sorting
+on `z`, and `NowPlaying` already collides with the browser's attract-widget role at
+`z = -5`, resolved by `HashMap` iteration order. That is nondeterministic today and
+harmless only because the two never coexist. A shell adds surfaces, so layer identity gets
+reworked *before* any screen is built on it — no visible change, and the riskiest commit in
+the sequence.
+
+**Two pre-existing bugs surfaced by the mapping**, neither caused by this work and both
+recorded in the design doc: the browser's coordinate mapper clamps out-of-rect touches
+instead of rejecting them, so on the idle screen a touch anywhere on the 65-inch panel is
+squashed into the small clock card and delivered to that page; and `transport_owns`
+answers from its layout rect without knowing whether the strip is visible, so a video
+session that also publishes metadata could leave an invisible strip swallowing part of the
+glass. The second is not proven reachable and wants a test before a fix.
+
+**Deferred with eyes open.** The font stays DejaVu. dma.space uses Inter, and switching
+moves every glyph on every existing surface and invalidates the golden-image tests — that
+belongs to the theming work, not smuggled in with the shell. Brand assets are vendored at
+`crates/pipeline/assets/brand/` with provenance recorded; they were ripped from the live
+site rather than handed over as a kit, and the gold in the palette is authored in oklch
+outside sRGB, so the hex we render is duller than intended.
+
+**The gate.** The honest worst case, recorded so it is recognised if met: the native shell
+turns into a widget toolkit. Screens are hand-composed the way the now-playing card is, and
+if that becomes painful the answer is more primitives, not a framework — if we find
+ourselves writing a layout engine, this decision reopens and the web shell deserves
+another look with the one-browser problem solved some other way.
