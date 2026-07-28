@@ -868,7 +868,9 @@ the reasons are what a future reversal has to argue against.
 - **Q43 — no session has been run against a real host, and the streaming half is where
   that matters.** The `gamestream-vm` check pairs with a real Sunshine and lists its apps,
   so everything up to and including `/launch` is proven against the reference
-  implementation. Past that point nothing is: the linked core is proven to link and answer
+  implementation — including that `/launch` is refused with a 503 ("Is a display connected
+  and turned on?") rather than a 400, which is what tells us the query itself was
+  well-formed. Past that point nothing is: the linked core is proven to link and answer
   its own queries, and that is all. What is unverified is the whole media plane — RTSP
   setup against a host that actually has an encoder, the ENet control stream, FEC recovery,
   A/V pacing, and whether our `EncodedFrame` handoff feeds the pipeline something it
