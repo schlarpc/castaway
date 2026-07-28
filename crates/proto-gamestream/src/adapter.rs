@@ -323,6 +323,27 @@ impl GameStreamAdapter {
         Ok(())
     }
 
+    /// What a host offers, for the panel's picker (D38).
+    ///
+    /// Read-only and safe to call from a UI press: it opens no session and starts
+    /// nothing. A host we have not paired with answers [`GameStreamError::NotPaired`]
+    /// rather than an empty list, because "no apps" and "we are not allowed to ask" are
+    /// different things to show someone.
+    ///
+    /// # Errors
+    /// [`GameStreamError`] as the NVHTTP client reports it — the host's own words where
+    /// there are any.
+    pub async fn apps_for(&self, host: &str) -> Result<Vec<crate::nvhttp::App>, GameStreamError> {
+        let client = self.client_for(host).await?;
+        let info = client.server_info().await?;
+        if !info.paired {
+            return Err(GameStreamError::NotPaired {
+                host: client.host().to_string(),
+            });
+        }
+        client.apps().await
+    }
+
     /// Pair-if-needed, launch, and hand the streams to the session manager.
     async fn handle_start(
         &self,

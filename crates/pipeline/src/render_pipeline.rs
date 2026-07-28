@@ -34,14 +34,23 @@ pub enum RenderCommand {
     NowPlaying(Box<crate::nowplaying_card::NowPlayingCard>),
     /// Drop the card (the session ended).
     ClearNowPlaying,
-    /// Show a shell screen — the idle Home screen, and later the pickers.
+    /// Set or refresh the Home screen.
     ///
     /// Carries the *model*, like `NowPlaying` and for the same reasons: a 4K RGBA buffer
     /// is 33 MB down a bounded channel, and only the render thread knows the true surface
     /// size. The idle screen used to be rasterised once at startup at a hardcoded
     /// 3840x2160 and GPU-upscaled to whatever the panel actually was; now it is drawn at
     /// the size it will be shown, and can change while the receiver is running (D38).
-    Screen(Box<crate::shell::Screen>),
+    Home(Box<crate::attract::AttractScene>),
+    /// Push a shell screen — a picker the app built, in answer to a tile press.
+    PushScreen(Box<crate::shell::Screen>),
+    /// Replace the screen on top, or push if at Home. What a picker's own refreshes use,
+    /// so `back` stays one step regardless of how many times the list updated.
+    ReplaceScreen(Box<crate::shell::Screen>),
+    /// Go back one shell screen.
+    ShellBack,
+    /// Return the shell to Home. What the idle policy and a finished session use.
+    ShellHome,
     /// Attach a consumer of composited frames (Q30). Sent as a command rather than set
     /// on the loop directly because the loop lives on the main thread and everything
     /// that wants to tap it does not.
@@ -234,6 +243,15 @@ impl RenderPipeline {
     /// Hardware decode is attempted when the build and the box support it; see
     /// [`Self::with_hw_preference`] to pin it either way.
     #[must_use]
+    /// A second handle on the command channel.
+    ///
+    /// For the parts of `app` that drive the *shell* rather than playback — they need to
+    /// push screens without owning the pipeline, and the pipeline is moved into the
+    /// session manager at startup.
+    pub fn commands(&self) -> std::sync::mpsc::SyncSender<RenderCommand> {
+        self.tx.clone()
+    }
+
     pub fn new(depth: usize) -> (Self, Receiver<RenderCommand>) {
         let (tx, rx) = sync_channel(depth.max(1));
         (
@@ -905,9 +923,10 @@ pub struct RenderLoop {
     compositor: WgpuCompositor,
     rx: Receiver<RenderCommand>,
     osd: Option<crate::osd::OsdController>,
-    /// The shell screen currently underneath everything, kept so it can be redrawn at a
-    /// new size (D38). `None` for a renderer nothing has given a screen to.
-    screen: Option<crate::shell::Screen>,
+    /// The shell's screen stack (D38), kept so the current screen can be redrawn at a
+    /// new size and so navigation has somewhere to live. `None` for a renderer nothing
+    /// has given a Home to — the offscreen test harness, a headless tap.
+    shell: Option<crate::shell::ScreenStack>,
     has_video: bool,
     /// Consumers of the composited output — screenshots, and later a stream tee. Empty
     /// on the default path, which is the point: a readback is a full-surface copy.
@@ -971,7 +990,7 @@ impl RenderLoop {
             compositor,
             rx,
             osd: None,
-            screen: None,
+            shell: None,
             has_video: false,
             taps: Vec::new(),
             failed_imports: 0,
@@ -1524,11 +1543,27 @@ impl RenderLoop {
                 self.set_transport(&card.transport(), w, h);
                 false
             }
-            RenderCommand::Screen(screen) => {
-                self.screen = Some(*screen);
-                if let Err(e) = self.paint_screen() {
-                    error!(error = %e, "failed to draw the shell screen");
+            RenderCommand::Home(scene) => {
+                self.set_home(*scene);
+                false
+            }
+            RenderCommand::PushScreen(screen) => {
+                self.shell_push(*screen);
+                false
+            }
+            RenderCommand::ReplaceScreen(screen) => {
+                if let Some(stack) = &mut self.shell {
+                    stack.replace_top(*screen);
+                    self.repaint_shell();
                 }
+                false
+            }
+            RenderCommand::ShellBack => {
+                self.shell_back();
+                false
+            }
+            RenderCommand::ShellHome => {
+                self.shell_home();
                 false
             }
             RenderCommand::AddTap(tap) => {
@@ -1603,12 +1638,78 @@ impl RenderLoop {
         }
     }
 
-    /// Show a shell screen, drawing it at the current surface size.
+    /// Set or refresh the Home screen, keeping whatever is stacked above it.
     ///
-    /// The in-process equivalent of [`RenderCommand::Screen`], for the kiosk, which owns
-    /// the loop directly and has no reason to go through a channel to reach itself.
-    pub fn set_screen(&mut self, screen: crate::shell::Screen) {
-        self.screen = Some(screen);
+    /// Refreshing must not navigate: Home is rebuilt whenever the receiver's state
+    /// changes, and a host appearing on the LAN should not close a picker someone is
+    /// reading.
+    pub fn set_home(&mut self, scene: crate::attract::AttractScene) {
+        match &mut self.shell {
+            Some(stack) => stack.update_home(scene),
+            None => self.shell = Some(crate::shell::ScreenStack::new(scene)),
+        }
+        self.repaint_shell();
+    }
+
+    /// Push a screen on top of the current one.
+    pub fn shell_push(&mut self, screen: crate::shell::Screen) {
+        if let Some(stack) = &mut self.shell {
+            stack.push(screen);
+            self.repaint_shell();
+        }
+    }
+
+    /// Go back one screen. Returns whether anything moved.
+    pub fn shell_back(&mut self) -> bool {
+        let moved = self
+            .shell
+            .as_mut()
+            .is_some_and(crate::shell::ScreenStack::pop);
+        if moved {
+            self.repaint_shell();
+        }
+        moved
+    }
+
+    /// Return to Home. Returns whether anything moved.
+    pub fn shell_home(&mut self) -> bool {
+        let moved = self
+            .shell
+            .as_mut()
+            .is_some_and(crate::shell::ScreenStack::go_home);
+        if moved {
+            self.repaint_shell();
+        }
+        moved
+    }
+
+    /// How deep the shell is; `1` is Home. For tests and logs.
+    #[must_use]
+    pub fn shell_depth(&self) -> usize {
+        self.shell
+            .as_ref()
+            .map_or(0, crate::shell::ScreenStack::depth)
+    }
+
+    /// What a panel-normalized touch would hit on the current shell screen.
+    ///
+    /// `None` when the shell is covered there: its screens sit at the bottom of the
+    /// stack, so a cast, a fullscreen browser or the now-playing card is in front of
+    /// them and owns that part of the glass. Same rule the transport strip follows.
+    #[must_use]
+    pub fn shell_hit(&self, x: f32, y: f32) -> Option<crate::shell::ScreenHit> {
+        let stack = self.shell.as_ref()?;
+        if self
+            .compositor
+            .covered_above(crate::compositor::LayerId::Attract, x, y)
+        {
+            return None;
+        }
+        let (w, h) = self.compositor.target_size();
+        stack.current().hit(w.max(1), h.max(1), x, y)
+    }
+
+    fn repaint_shell(&mut self) {
         if let Err(e) = self.paint_screen() {
             error!(error = %e, "failed to draw the shell screen");
         }
@@ -1619,7 +1720,7 @@ impl RenderLoop {
     /// No-op when no screen has been set — a renderer driven only by casts (the offscreen
     /// test harness, a headless tap) never has one, and should not get a background.
     fn paint_screen(&mut self) -> Result<(), PipelineError> {
-        let Some(screen) = self.screen.as_ref() else {
+        let Some(screen) = self.shell.as_ref().map(crate::shell::ScreenStack::current) else {
             return Ok(());
         };
         let (w, h) = self.compositor.target_size();

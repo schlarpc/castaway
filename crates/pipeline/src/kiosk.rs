@@ -33,6 +33,14 @@ pub type AttractImage = crate::attract::AttractScene;
 /// `RemoteControl` is an async handle on the tokio runtime. The app closes over both.
 pub type ControlSink = Arc<dyn Fn(castaway_core::ControlTxn) + Send + Sync>;
 
+/// Where a shell press the panel cannot answer itself goes (D38).
+///
+/// Most presses are answered locally — a service tile opens that service's screen, back
+/// goes back — with no round trip, because a panel that waits on a network round trip to
+/// redraw feels broken. This is for the rest: a tile that means "go and do something",
+/// and a picker row, which only `app` can interpret.
+pub type ShellSink = Arc<dyn Fn(crate::shell::ShellEvent) + Send + Sync>;
+
 struct KioskApp {
     rx: Option<Receiver<RenderCommand>>,
     attract: Option<AttractImage>,
@@ -49,6 +57,7 @@ struct KioskApp {
     /// Where a press on the transport strip goes. `None` in a build with no session to
     /// drive — the strip is then never drawn either, since nothing publishes capabilities.
     controls: Option<ControlSink>,
+    shell_sink: Option<ShellSink>,
     /// The main-thread CEF host (this loop is CEF's message pump — architecture §6).
     #[cfg(feature = "electron")]
     browser: Option<crate::electron_browser::ElectronHost>,
@@ -66,6 +75,44 @@ impl KioskApp {
         {
             None
         }
+    }
+
+    /// Offer a press to the shell.
+    ///
+    /// Returns whether the shell consumed it. Consuming is separate from acting, for the
+    /// same reason it is on the transport strip: a press that lands on a screen the shell
+    /// owns must not fall through to a browser underneath, whether or not anything
+    /// happened.
+    fn offer_to_shell(&mut self, x: f32, y: f32) -> bool {
+        use crate::shell::{ScreenHit, ShellEvent};
+        let Some(render) = self.render.as_mut() else {
+            return false;
+        };
+        let Some(hit) = render.shell_hit(x, y) else {
+            return false;
+        };
+        match hit {
+            ScreenHit::Push(screen) => {
+                info!(screen = screen.name(), "shell: a finger on the panel");
+                render.shell_push(screen);
+            }
+            ScreenHit::Back => {
+                render.shell_back();
+            }
+            ScreenHit::Event(event) => {
+                // Handed over rather than answered: only `app` knows what a host or a
+                // file is.
+                if let Some(sink) = self.shell_sink.as_ref() {
+                    match &event {
+                        ShellEvent::Tile(id) | ShellEvent::Item(id) => {
+                            info!(%id, "shell: handing a press to the app");
+                        }
+                    }
+                    sink(event);
+                }
+            }
+        }
+        true
     }
 
     /// Offer a press or release to the transport strip.
@@ -117,6 +164,12 @@ impl KioskApp {
                     if self.offer_to_transport(x, y, phase) {
                         return;
                     }
+                    // The shell sits under everything, so it only sees a press where
+                    // nothing is covering it — `shell_hit` enforces that. Presses only:
+                    // a release is the end of an interaction the press already claimed.
+                    if down && self.offer_to_shell(x, y) {
+                        return;
+                    }
                 }
                 if let Some(sink) = self.input_sink() {
                     sink.pointer(PointerEvent::Button { x, y, button, down });
@@ -143,6 +196,10 @@ impl KioskApp {
                     if self.offer_to_transport(event.x, event.y, phase) {
                         return;
                     }
+                }
+                if matches!(event.phase, TouchPhase::Down) && self.offer_to_shell(event.x, event.y)
+                {
+                    return;
                 }
                 if let Some(sink) = self.input_sink() {
                     sink.touch(event);
@@ -239,7 +296,7 @@ impl ApplicationHandler for KioskApp {
                 // Sent as a command rather than installed directly, so the surface is
                 // drawn at the size the compositor actually has and follows every later
                 // resize — the old path baked it once at a hardcoded 4K (D38).
-                render.set_screen(crate::shell::Screen::Home(scene));
+                render.set_home(scene);
             }
             if let Some(osd) = self.osd.take() {
                 render = render.with_osd(osd);
@@ -316,6 +373,7 @@ pub fn run(
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,
     controls: Option<ControlSink>,
+    shell_sink: Option<ShellSink>,
 ) -> Result<(), PipelineError> {
     let mut app = KioskApp {
         rx: Some(rx),
@@ -324,6 +382,7 @@ pub fn run(
         window: None,
         render: None,
         controls,
+        shell_sink,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),
@@ -346,6 +405,7 @@ pub fn run_with_browser(
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,
     controls: Option<ControlSink>,
+    shell_sink: Option<ShellSink>,
     browser: crate::electron_browser::ElectronHost,
 ) -> Result<(), PipelineError> {
     let mut app = KioskApp {
@@ -355,6 +415,7 @@ pub fn run_with_browser(
         window: None,
         render: None,
         controls,
+        shell_sink,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),

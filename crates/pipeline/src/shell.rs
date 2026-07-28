@@ -165,6 +165,18 @@ impl ScreenStack {
         moved
     }
 
+    /// Replace the screen on top, or push if we are at Home.
+    ///
+    /// What "answer the press now, fill it in when the network does" needs: the first
+    /// update pushes a "looking…" screen, and the ones after it replace that rather than
+    /// burying it, so `back` still means one step rather than one step per refresh.
+    pub fn replace_top(&mut self, screen: Screen) {
+        match self.above.last_mut() {
+            Some(top) => *top = screen,
+            None => self.above.push(screen),
+        }
+    }
+
     /// Replace what Home shows, wherever we currently are.
     ///
     /// Home is rebuilt when the receiver's state changes — a protocol going down, a host
@@ -223,6 +235,21 @@ mod tests {
         assert_eq!(s.depth(), 1);
         // Already home: nothing moved, still not an error.
         assert!(!s.go_home());
+    }
+
+    #[test]
+    fn replacing_the_top_does_not_deepen_the_stack() {
+        // The bug this prevents: a picker that refreshes by pushing needs one `back` per
+        // refresh to escape, which on a busy network is unbounded.
+        let mut s = stack();
+        s.replace_top(Screen::Home(AttractScene::demo()));
+        assert_eq!(s.depth(), 2, "the first replace pushes");
+        for _ in 0..10 {
+            s.replace_top(Screen::Home(AttractScene::demo()));
+        }
+        assert_eq!(s.depth(), 2, "the rest replace");
+        assert!(s.pop());
+        assert_eq!(s.depth(), 1, "one back is enough");
     }
 
     #[test]

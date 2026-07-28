@@ -12,6 +12,10 @@
 mod bluetooth;
 mod config;
 mod screen;
+// The panel's own navigation: what happens when someone presses something the shell
+// could not answer itself. Only meaningful where there is a panel.
+#[cfg(feature = "render")]
+mod shell_nav;
 // Reading the screen is pure and always compiled; the actor that drives it needs a page
 // to drive, so it exists only in the browser build (D27).
 mod sponsorblock;
@@ -96,6 +100,13 @@ fn main() -> anyhow::Result<()> {
     {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
+        // A second handle on the render channel, for the shell: it pushes screens in
+        // answer to panel presses, and the pipeline itself is about to be moved into the
+        // session manager.
+        let render_tx = render_pipeline.commands();
+        // Panel presses the shell could not answer locally. Small: these are taps by a
+        // person, not a stream.
+        let (shell_event_tx, shell_event_rx) = mpsc::channel::<pipeline::shell::ShellEvent>(8);
         let shot_handle = render_pipeline.screenshot_handle();
         // Taken here for the same reason as the screenshot handle: after the pipeline is
         // moved into the session manager, nothing out here holds it, and the DLNA service
@@ -161,6 +172,10 @@ fn main() -> anyhow::Result<()> {
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
             playback: Some(playback),
+            shell: Some(ShellChannels {
+                events: shell_event_rx,
+                render: render_tx.clone(),
+            }),
         };
         runtime.spawn(async move {
             if let Err(e) = serve(
@@ -267,6 +282,23 @@ fn main() -> anyhow::Result<()> {
             }))
         };
 
+        // Presses the panel cannot answer itself. Most of the shell is local — a
+        // service tile opens that service's screen with no round trip — so this only
+        // sees the ones that mean "go and do something": Moonlight's tile, and the rows
+        // of the pickers it opens.
+        let shell_sink: Option<pipeline::kiosk::ShellSink> = {
+            let handle = runtime.handle().clone();
+            let shell_tx = shell_event_tx.clone();
+            Some(Arc::new(move |event: pipeline::shell::ShellEvent| {
+                let tx = shell_tx.clone();
+                handle.spawn(async move {
+                    if tx.send(event).await.is_err() {
+                        debug!("shell: nothing is listening for panel presses");
+                    }
+                });
+            }))
+        };
+
         // Chromium's SIGINT handler used to be installed into *this* process during
         // `cef_initialize`, silently replacing ours, so this had to come after it. The
         // browser owns its own signals now.
@@ -287,6 +319,7 @@ fn main() -> anyhow::Result<()> {
             Some(osd_controller),
             Some(kiosk_exit),
             controls,
+            shell_sink,
             browser_host,
         )
         .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
@@ -297,6 +330,7 @@ fn main() -> anyhow::Result<()> {
             Some(osd_controller),
             Some(kiosk_exit),
             controls,
+            shell_sink,
         )
         .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
@@ -410,7 +444,9 @@ type NoLauncher = fn(proto_dial::DialEvent);
 /// lifecycle and the same reason for existing: they are taken *before* the pipeline is
 /// moved into the session manager, because after that nothing out here holds it. A build
 /// with no renderer supplies [`Default::default`] and every field is honestly absent.
-#[derive(Default, Clone)]
+/// Not `Clone`: the shell's event receiver is single-consumer, which is the honest
+/// shape — two things reading panel presses would each get half of them.
+#[derive(Default)]
 struct PipelineHandles {
     /// What the panel is showing, for `GET /screenshot.png`.
     screenshot: Option<Screenshot>,
@@ -418,6 +454,25 @@ struct PipelineHandles {
     /// the player and has to report its own position. Absent in a build with no decoder,
     /// which then honestly answers "no such information" rather than inventing a zero.
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+    /// Panel presses the shell could not answer itself (D38), and the channel back to
+    /// the render loop for the screens they produce.
+    ///
+    /// Both halves travel together because they are one conversation: a press arrives,
+    /// something is looked up, a screen goes back. Absent in a build with no renderer,
+    /// where there is no panel to press.
+    #[cfg(feature = "render")]
+    shell: Option<ShellChannels>,
+}
+
+/// The shell's two ends, as seen from the service side.
+#[cfg(feature = "render")]
+struct ShellChannels {
+    /// Presses from the panel.
+    events: mpsc::Receiver<pipeline::shell::ShellEvent>,
+    /// Screens to show in answer. Bounded and drop-on-full like every other render
+    /// command — a shell update that cannot get through is one frame of staleness, not a
+    /// reason to block the runtime.
+    render: std::sync::mpsc::SyncSender<pipeline::render_pipeline::RenderCommand>,
 }
 
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
@@ -438,6 +493,8 @@ async fn serve(
     let PipelineHandles {
         screenshot,
         playback,
+        #[cfg(feature = "render")]
+        shell,
     } = handles;
     let iface = config.resolved_interface();
     info!(
@@ -587,6 +644,17 @@ async fn serve(
     // itself: what goes in the TXT record comes from the same object that answers the
     // port, and the two can't drift.
     let mut adapter_handles = Vec::new();
+    // Kept so the panel's shell can ask what has been discovered and ask for a launch.
+    // Unread in a build with no panel, which is honest rather than dead: the adapter
+    // still runs, there is just nothing to press.
+    #[cfg_attr(
+        not(feature = "render"),
+        allow(unused_assignments, unused_variables, unused_mut)
+    )]
+    let mut gamestream: Option<(
+        Arc<proto_gamestream::GameStreamAdapter>,
+        mpsc::Sender<proto_gamestream::GameStreamCommand>,
+    )> = None;
     if config.enable.cast {
         adapter_handles.push(
             spawn_cast(
@@ -613,7 +681,15 @@ async fn serve(
         // and Bluetooth — an unwritable state directory should not stop a receiver that
         // can still do everything else.
         match spawn_gamestream(&config, event_tx.clone(), shutdown.clone()) {
-            Ok(handle) => adapter_handles.push(handle),
+            Ok(wiring) => {
+                adapter_handles.push(wiring.task);
+                // Only the panel reads these back. A build with no renderer still runs
+                // the adapter — there is simply nothing to press.
+                #[cfg(feature = "render")]
+                {
+                    gamestream = Some((wiring.adapter, wiring.commands));
+                }
+            }
             Err(e) => {
                 warn!(error = %format!("{e:#}"), "GameStream unavailable; continuing without it");
             }
@@ -645,6 +721,24 @@ async fn serve(
                 warn!(error = %format!("{e:#}"), "Bluetooth sink unavailable; continuing without it")
             }
         }
+    }
+
+    // The panel's shell: presses it could not answer itself, and the screens that answer
+    // them. Only started where there is a panel — a headless build has nothing to press.
+    #[cfg(feature = "render")]
+    if let Some(ShellChannels { events, render }) = shell {
+        let (adapter, commands) = match &gamestream {
+            Some((a, c)) => (Some(Arc::clone(a)), c.clone()),
+            // A closed sender, so a press on a tile for an adapter that never started
+            // fails fast and says so on the panel rather than hanging.
+            None => {
+                let (tx, _rx) = mpsc::channel(1);
+                (None, tx)
+            }
+        };
+        adapter_handles.push(tokio::spawn(shell_nav::run(
+            events, render, adapter, commands,
+        )));
     }
 
     // SSDP responder.
@@ -829,11 +923,22 @@ fn advertise_adapter(adapter: &dyn SourceAdapter, mdns: &mut MdnsResponder) {
 /// — it dials out (D37). Its only source of intent today is this config, which can ask
 /// it to pair with a host at startup and to begin streaming from one; the command
 /// channel it is built with is the seam a panel-side chooser would drive instead.
+/// Its two extra halves are read only by the panel's shell; a build with no renderer
+/// still runs the adapter and simply has nothing to press.
+#[cfg_attr(not(feature = "render"), allow(dead_code))]
+struct GameStreamWiring {
+    task: tokio::task::JoinHandle<()>,
+    /// Held so the shell can ask it what it has discovered, and so its command channel
+    /// stays open for presses that arrive long after startup.
+    adapter: Arc<proto_gamestream::GameStreamAdapter>,
+    commands: mpsc::Sender<proto_gamestream::GameStreamCommand>,
+}
+
 fn spawn_gamestream(
     config: &Config,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<GameStreamWiring> {
     let gs = &config.gamestream;
     let store = proto_gamestream::PairingStore::new(gs.state_dir.clone());
     let prefs = proto_gamestream::SessionPreferences {
@@ -889,20 +994,24 @@ fn spawn_gamestream(
         "enabled: GameStream client (browsing for Sunshine hosts)"
     );
     let sink = SessionSink::new(SourceId::new(ProtocolKind::GameStream, "client"), event_tx);
-    Ok(tokio::spawn(async move {
-        // The sender is held for the task's lifetime so the adapter's command channel
-        // stays open; dropping it would end the adapter as soon as the queued commands
-        // were drained.
-        let _command_tx = command_tx;
+    let running = Arc::clone(&adapter);
+    let task = tokio::spawn(async move {
         tokio::select! {
-            res = Arc::clone(&adapter).run(sink) => {
+            res = Arc::clone(&running).run(sink) => {
                 if let Err(e) = res {
                     warn!(error = %e, "GameStream adapter exited");
                 }
             }
             () = shutdown.notified() => info!("GameStream client stopping"),
         }
-    }))
+    });
+    // The command sender goes back to the caller rather than being held here: the panel
+    // sends on it whenever someone presses a host, which is long after startup.
+    Ok(GameStreamWiring {
+        task,
+        adapter,
+        commands: command_tx,
+    })
 }
 
 fn spawn_miracast(
