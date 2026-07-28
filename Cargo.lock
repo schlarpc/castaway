@@ -508,6 +508,7 @@ dependencies = [
  "proto-cast",
  "proto-dial",
  "proto-dlna",
+ "proto-gamestream",
  "proto-miracast",
  "proto-spotify",
  "serde",

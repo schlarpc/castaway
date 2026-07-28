@@ -20,6 +20,7 @@
 //! the C library; without it this crate is pure Rust and fully testable.
 #![deny(unsafe_code)]
 
+pub mod adapter;
 pub mod client;
 pub mod discovery;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod pairing;
 #[cfg(feature = "stream")]
 pub mod stream;
 
+pub use adapter::{GameStreamAdapter, GameStreamCommand, PairingStore, SessionPreferences};
 pub use client::{generate_session_keys, GameStreamClient};
 pub use discovery::HostCandidate;
 pub use error::GameStreamError;

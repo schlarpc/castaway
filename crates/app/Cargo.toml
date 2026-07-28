@@ -25,6 +25,7 @@ hci-transport.workspace = true
 substrate-hci.workspace = true
 proto-airplay.workspace = true
 proto-miracast.workspace = true
+proto-gamestream.workspace = true
 proto-dial.workspace = true
 sponsorblock.workspace = true
 pipeline.workspace = true
@@ -71,6 +72,11 @@ ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
 # `render` and `hwaccel` for the zero-copy frame import. Unlike the CEF build it replaced,
 # this binary is *not* also the browser's subprocess entry point, so main() is ordinary.
 electron = ["render", "hwaccel", "audio", "pipeline/electron", "dep:ureq"]
+# Link moonlight-common-c so the GameStream client can actually stream (D37). Off by
+# default deliberately: the library is GPL-3.0 against this MIT tree, and it needs
+# MOONLIGHT_COMMON_C_LIB_DIR at link time. Without it the client still discovers,
+# pairs, and lists apps — it just declines to start a session it could not display.
+gamestream = ["proto-gamestream/stream"]
 
 [lints]
 workspace = true

@@ -37,10 +37,74 @@ pub struct Config {
     pub cast: Cast,
     /// Miracast / Wi-Fi Display settings.
     pub miracast: Miracast,
+    /// GameStream / Sunshine client settings.
+    pub gamestream: GameStream,
     /// Where the browser subprocess lives (D36). Defaults work for a Nix-built artifact
     /// and for running from the repo, so most deployments never set these.
     #[serde(default)]
     pub browser: Browser,
+}
+
+/// GameStream / Sunshine client settings.
+///
+/// The inverted protocol (D37): the panel is the Moonlight client, so there is nothing
+/// to advertise and nothing arrives unbidden. A host must be paired with first, which
+/// means someone typing a PIN into *the host's* UI while we hold a request open.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct GameStream {
+    /// Where the client certificate and the per-host pairings live. This directory is
+    /// the credential: a host trusts exactly one certificate, so losing it means
+    /// re-pairing with every host. Must be writable and persistent, and readable only
+    /// by the service user.
+    pub state_dir: PathBuf,
+    /// Pair with this host at startup, using `pair_pin`. Both must be set; the PIN is
+    /// consumed once and pairing is persisted, so this is meant to be removed from the
+    /// config afterwards rather than left in place.
+    pub pair_host: Option<String>,
+    /// The PIN to type into the host's own UI during that pairing.
+    pub pair_pin: Option<String>,
+    /// Start streaming from this host as soon as the receiver is up. Off unless set:
+    /// a panel that launches a game at boot is a panel nobody asked.
+    pub autostart_host: Option<String>,
+    /// Which app to launch. `None` takes whatever the host lists first, which on
+    /// Sunshine is the desktop.
+    pub autostart_app: Option<String>,
+    /// Requested stream width in pixels.
+    pub width: u32,
+    /// Requested stream height in pixels.
+    pub height: u32,
+    /// Requested frame rate.
+    pub fps: u32,
+    /// Video bitrate in kbps, inclusive of FEC overhead.
+    pub bitrate_kbps: u32,
+    /// Let the host change the game's own resolution to match the request.
+    pub optimize_settings: bool,
+    /// Also play the audio on the host's speakers.
+    pub play_audio_on_host: bool,
+    /// Offer HEVC when the host supports it. Off by default for the same reason
+    /// AirPlay's HEVC offer is: the decode path is proven on H.264, and a codec we
+    /// negotiate but decode badly looks like a broken host.
+    pub allow_hevc: bool,
+}
+
+impl Default for GameStream {
+    fn default() -> Self {
+        Self {
+            state_dir: PathBuf::from("/var/lib/castaway/gamestream"),
+            pair_host: None,
+            pair_pin: None,
+            autostart_host: None,
+            autostart_app: None,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 20_000,
+            optimize_settings: false,
+            play_audio_on_host: false,
+            allow_hevc: false,
+        }
+    }
 }
 
 /// Miracast settings.
@@ -409,6 +473,10 @@ pub struct Enable {
     /// Bluetooth A2DP sink. Off by default: it claims a USB controller exclusively, so
     /// turning it on without a dedicated one takes the box's Bluetooth away.
     pub bluetooth: bool,
+    /// GameStream / Sunshine client. Off by default because it is the one protocol
+    /// where the panel dials *out*: it needs a host to have been paired with, which is
+    /// a deliberate act, and it is useless until then.
+    pub gamestream: bool,
     /// Miracast sink. Off by default, and for a heavier reason than the others: it takes
     /// the Wi-Fi radio into group-owner mode. On a box whose upstream is that same radio
     /// the two roles time-share, and mirroring — the one workload with no slack — is what
@@ -425,6 +493,7 @@ impl Default for Enable {
             cast: false,
             airplay: false,
             bluetooth: false,
+            gamestream: false,
             miracast: false,
         }
     }
@@ -446,6 +515,7 @@ impl Default for Config {
             sponsorblock: SponsorBlock::default(),
             cast: Cast::default(),
             miracast: Miracast::default(),
+            gamestream: GameStream::default(),
         }
     }
 }

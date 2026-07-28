@@ -607,6 +607,18 @@ async fn serve(
             shutdown.clone(),
         ));
     }
+    if config.enable.gamestream {
+        // The inverted protocol (D37): nothing to advertise, because the panel is the
+        // client. Logged and skipped rather than fatal for the same reason as Miracast
+        // and Bluetooth — an unwritable state directory should not stop a receiver that
+        // can still do everything else.
+        match spawn_gamestream(&config, event_tx.clone(), shutdown.clone()) {
+            Ok(handle) => adapter_handles.push(handle),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "GameStream unavailable; continuing without it");
+            }
+        }
+    }
     if config.enable.miracast {
         // Miracast has no IP discovery to register: it advertises itself in an 802.11
         // beacon, which neither the mDNS nor the SSDP responder can carry (architecture
@@ -810,6 +822,89 @@ fn advertise_adapter(adapter: &dyn SourceAdapter, mdns: &mut MdnsResponder) {
 /// early on is a capability set that cannot be built, which is a configuration error
 /// rather than a radio one — the radio's own failures surface inside the backend, where
 /// they can name the driver.
+/// Start the GameStream client: browse for hosts, hold the pairing store, and act on
+/// commands. Returns the actor's join handle so shutdown can wait on it.
+///
+/// Unlike every other adapter here this one advertises nothing and waits for no sender
+/// — it dials out (D37). Its only source of intent today is this config, which can ask
+/// it to pair with a host at startup and to begin streaming from one; the command
+/// channel it is built with is the seam a panel-side chooser would drive instead.
+fn spawn_gamestream(
+    config: &Config,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let gs = &config.gamestream;
+    let store = proto_gamestream::PairingStore::new(gs.state_dir.clone());
+    let prefs = proto_gamestream::SessionPreferences {
+        width: gs.width,
+        height: gs.height,
+        fps: gs.fps,
+        bitrate_kbps: gs.bitrate_kbps,
+        optimize_settings: gs.optimize_settings,
+        play_audio_on_host: gs.play_audio_on_host,
+        allow_hevc: gs.allow_hevc,
+    };
+    // Deep enough that a startup pair and a startup start both queue without the
+    // adapter having to be running yet.
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let adapter = Arc::new(
+        proto_gamestream::GameStreamAdapter::new(store, prefs, command_rx)
+            .context("loading the GameStream client identity")?,
+    );
+
+    // A half-configured pairing is an error rather than a silent no-op: someone who
+    // set one of these two meant to pair, and starting without it looks identical to
+    // success until the first session is attempted.
+    match (&gs.pair_host, &gs.pair_pin) {
+        (Some(host), Some(pin)) => {
+            command_tx
+                .try_send(proto_gamestream::GameStreamCommand::Pair {
+                    host: host.clone(),
+                    pin: pin.clone(),
+                })
+                .context("queueing the configured GameStream pairing")?;
+        }
+        (None, None) => {}
+        (Some(_), None) => anyhow::bail!(
+            "gamestream.pair_host is set but pair_pin is not; pairing needs the PIN that \
+             will be typed into the host's own UI"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "gamestream.pair_pin is set but pair_host is not; there is no host to pair with"
+        ),
+    }
+
+    if let Some(host) = &gs.autostart_host {
+        command_tx
+            .try_send(proto_gamestream::GameStreamCommand::Start {
+                host: host.clone(),
+                app: gs.autostart_app.clone(),
+            })
+            .context("queueing the configured GameStream session")?;
+    }
+
+    info!(
+        state_dir = %gs.state_dir.display(),
+        "enabled: GameStream client (browsing for Sunshine hosts)"
+    );
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::GameStream, "client"), event_tx);
+    Ok(tokio::spawn(async move {
+        // The sender is held for the task's lifetime so the adapter's command channel
+        // stays open; dropping it would end the adapter as soon as the queued commands
+        // were drained.
+        let _command_tx = command_tx;
+        tokio::select! {
+            res = Arc::clone(&adapter).run(sink) => {
+                if let Err(e) = res {
+                    warn!(error = %e, "GameStream adapter exited");
+                }
+            }
+            () = shutdown.notified() => info!("GameStream client stopping"),
+        }
+    }))
+}
+
 fn spawn_miracast(
     config: &Config,
     event_tx: mpsc::Sender<SourceMessage>,
@@ -1031,6 +1126,26 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
             [0x00, 0xa4, 0xef, 0xff],
             "Windows",
             detail("Win+K", ProtocolKind::Miracast),
+        ));
+    }
+    if config.enable.gamestream {
+        // The one row that is not an instruction to a phone: GameStream runs the other
+        // way round, so what a person needs to know is the host's name, not ours. The
+        // configured host is the honest answer; without one there is nothing to tell
+        // them yet, so the row says so rather than naming a picker entry that does not
+        // exist.
+        let host = config
+            .gamestream
+            .autostart_host
+            .as_deref()
+            .or(config.gamestream.pair_host.as_deref());
+        rows.push(AttractRow::new(
+            [0x76, 0xb9, 0x00, 0xff],
+            "Gaming PC",
+            match host {
+                Some(host) => format!("Moonlight \u{2192} {host}"),
+                None => "Moonlight \u{2192} pair a host first".to_string(),
+            },
         ));
     }
     if config.enable.bluetooth {
