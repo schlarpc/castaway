@@ -1087,6 +1087,26 @@ impl input_touch::InputSink for ElectronHost {
         }
     }
 
+    fn cancel_all(&mut self) {
+        // Every contact the browser thinks is down, told to stop. Without this a page
+        // keeps a phantom finger for the life of the session: the browser host holds a
+        // contact map keyed by id and only an end or a cancel removes an entry.
+        let ids: Vec<u32> = self.contacts.drain().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(e) = &self.electron else { return };
+        for id in ids {
+            e.send(&ToBrowser::Touch {
+                id,
+                phase: crate::browser_proto::TouchPhase::Cancel,
+                x: 0.0,
+                y: 0.0,
+            });
+        }
+        self.left_down = false;
+    }
+
     fn pointer(&mut self, event: input_touch::PointerEvent) {
         use crate::browser_proto::PointerKind;
         use input_touch::PointerEvent;

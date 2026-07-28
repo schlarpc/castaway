@@ -9,7 +9,6 @@
 #![allow(clippy::unwrap_used)]
 
 use pipeline::render_pipeline::{RenderCommand, RenderLoop};
-use pipeline::shell::Screen;
 
 #[test]
 fn a_screen_is_drawn_at_the_surface_size_not_stretched_to_it() {
@@ -17,9 +16,9 @@ fn a_screen_is_drawn_at_the_surface_size_not_stretched_to_it() {
     let (w, h) = (960, 540);
     let mut render = RenderLoop::offscreen(w, h, rx).unwrap();
 
-    tx.try_send(RenderCommand::Screen(Box::new(Screen::Home(
+    tx.try_send(RenderCommand::Home(Box::new(
         pipeline::attract::AttractScene::demo(),
-    ))))
+    )))
     .unwrap();
     render.pump();
 
@@ -40,9 +39,9 @@ fn resizing_redraws_the_screen_rather_than_stretching_it() {
     let (tx, rx) = std::sync::mpsc::sync_channel(4);
     // Start small, then grow — the case that used to leave an upscaled surface behind.
     let mut render = RenderLoop::offscreen(320, 180, rx).unwrap();
-    tx.try_send(RenderCommand::Screen(Box::new(Screen::Home(
+    tx.try_send(RenderCommand::Home(Box::new(
         pipeline::attract::AttractScene::demo(),
-    ))))
+    )))
     .unwrap();
     render.pump();
     assert_eq!(

@@ -137,11 +137,9 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
     let (gx, gy) = plate.center();
     crate::attract::draw_tile_glyph(
         &mut buf,
-        width,
-        height,
+        (width, height),
         screen.tile.glyph,
-        gx,
-        gy,
+        (gx, gy),
         plate.h * 0.30,
         screen.tile.accent,
     );

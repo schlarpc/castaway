@@ -179,6 +179,7 @@ pub fn layout(picker: &Picker, width: u32, height: u32) -> Layout {
     // where they are not drawn. Scrolling is deliberately not here yet — see the module
     // note in docs/app-shell.md about what a long list needs.
     let room = (height as f32 - list_top - 80.0 * s).max(0.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let capacity = ((room + row_gap) / (row_h + row_gap)).floor().max(0.0) as usize;
 
     let rows = picker

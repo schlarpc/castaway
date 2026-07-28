@@ -47,6 +47,8 @@ pub mod nowplaying_card;
 #[cfg(feature = "render")]
 pub mod osd;
 #[cfg(feature = "render")]
+pub mod overlay;
+#[cfg(feature = "render")]
 pub mod picker;
 #[cfg(feature = "render")]
 pub mod render_pipeline;

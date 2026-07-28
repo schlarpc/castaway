@@ -641,35 +641,6 @@ mod paint {
     // free at any size — these are drawn once per repaint at whatever the panel's scale is.
     // ---------------------------------------------------------------------------
 
-    /// Rasterize a shape over its bounding box, `sd` returning signed distance in pixels
-    /// (negative inside).
-    fn fill_sdf<F: Fn(f32, f32) -> f32>(
-        buf: &mut [u8],
-        width: u32,
-        height: u32,
-        bounds: Rect,
-        color: Rgba,
-        sd: F,
-    ) {
-        #[allow(clippy::cast_possible_truncation)]
-        let (x0, y0) = (bounds.x.floor() as i32, bounds.y.floor() as i32);
-        #[allow(clippy::cast_possible_truncation)]
-        let (x1, y1) = (
-            (bounds.x + bounds.w).ceil() as i32,
-            (bounds.y + bounds.h).ceil() as i32,
-        );
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let d = sd(px as f32 + 0.5, py as f32 + 0.5);
-                // Half-pixel band around the edge: coverage 1 well inside, 0 well outside.
-                let coverage = (0.5 - d).clamp(0.0, 1.0);
-                if coverage > 0.0 {
-                    text::blend_over(buf, width, height, px, py, color, coverage);
-                }
-            }
-        }
-    }
-
     /// A small dot under a toggle that is on. Colour alone is not enough on a panel seen from
     /// across a room and at an angle, and it is the one cue that survives a bad viewing angle.
     fn active_dot(

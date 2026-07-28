@@ -58,6 +58,13 @@ struct KioskApp {
     /// drive — the strip is then never drawn either, since nothing publishes capabilities.
     controls: Option<ControlSink>,
     shell_sink: Option<ShellSink>,
+    /// Live touch contacts, for the edge swipe. Nothing else in the tree tracked these:
+    /// ids were carried faithfully to the browser and then forgotten (D38).
+    contacts: std::collections::HashMap<u32, crate::overlay::Contact>,
+    /// When the home pill was last raised, or `None` when it is not showing.
+    pill_since: Option<std::time::Instant>,
+    /// Whether the pill's texture is currently a layer, so the fade only uploads once.
+    pill_drawn: bool,
     /// The main-thread CEF host (this loop is CEF's message pump — architecture §6).
     #[cfg(feature = "electron")]
     browser: Option<crate::electron_browser::ElectronHost>,
@@ -74,6 +81,102 @@ impl KioskApp {
         #[cfg(not(feature = "electron"))]
         {
             None
+        }
+    }
+
+    /// Raise the home pill, or keep it up. Any touch does this: it is the affordance for
+    /// someone who does not know the gesture, so it has to appear for someone who does
+    /// not know to ask for it.
+    fn wake_pill(&mut self) {
+        self.pill_since = Some(std::time::Instant::now());
+    }
+
+    /// Go back to Home, from the pill or the gesture.
+    ///
+    /// Cancels whatever the browser thinks is down first. The panel is being taken away
+    /// from it mid-touch by definition — the gesture *is* a touch — and a contact that
+    /// never ends leaves the page believing a finger is down forever.
+    fn go_home(&mut self) {
+        if let Some(sink) = self.input_sink() {
+            sink.cancel_all();
+        }
+        if let Some(render) = self.render.as_mut() {
+            if render.shell_home() {
+                info!("shell: home");
+            }
+        }
+    }
+
+    /// Update the pill layer for this frame. Cheap: while it is up and unchanging this
+    /// writes one 32-byte uniform, and it only rasterizes when it first appears.
+    fn tick_pill(&mut self) {
+        let Some(since) = self.pill_since else {
+            return;
+        };
+        let opacity = crate::overlay::pill_opacity(since.elapsed());
+        let Some(render) = self.render.as_mut() else {
+            return;
+        };
+        if opacity <= 0.0 {
+            render.clear_home_pill();
+            self.pill_since = None;
+            self.pill_drawn = false;
+            return;
+        }
+        if !self.pill_drawn {
+            if let Err(e) = render.draw_home_pill() {
+                warn!(error = %e, "could not draw the home pill");
+                self.pill_since = None;
+                return;
+            }
+            self.pill_drawn = true;
+        }
+        render.set_home_pill_opacity(opacity);
+    }
+
+    /// The navigation layer: the home pill, and the reserved left edge the swipe starts
+    /// from. Returns whether it consumed the event.
+    ///
+    /// Runs before everything, including a fullscreen browser, because it is the only way
+    /// out of one. The cost is a sliver of the left edge that pages underneath never see
+    /// — deliberate, and the reason the strip is thin.
+    fn route_navigation(&mut self, event: &input_touch::TouchEvent) -> bool {
+        use crate::overlay::Contact;
+        let (w, h) = self.size;
+
+        match event.phase {
+            TouchPhase::Down => {
+                let contact = Contact::new(event.x, event.y);
+                let on_pill = crate::overlay::hit_pill(w.max(1), h.max(1), event.x, event.y)
+                    && self
+                        .render
+                        .as_ref()
+                        .is_some_and(RenderLoop::home_pill_present);
+                if on_pill {
+                    self.go_home();
+                    return true;
+                }
+                let reserved = contact.from_edge;
+                self.contacts.insert(event.id, contact);
+                // A contact starting in the reserved edge is never forwarded, so the
+                // shell never has to steal one mid-drag — which is the case that leaves a
+                // page holding a finger forever.
+                reserved
+            }
+            TouchPhase::Move => {
+                let Some(contact) = self.contacts.get_mut(&event.id) else {
+                    return false;
+                };
+                if contact.is_home_swipe(event.x, event.y) {
+                    contact.fired = true;
+                    self.go_home();
+                    return true;
+                }
+                contact.from_edge
+            }
+            TouchPhase::Up | TouchPhase::Cancel => {
+                self.contacts.remove(&event.id).is_some_and(|c| c.from_edge)
+            }
         }
     }
 
@@ -184,6 +287,17 @@ impl KioskApp {
             }
             WindowEvent::Touch(touch) => {
                 let event = translate_touch(touch, size);
+                // Any touch raises the pill. Someone who does not know the gesture has to
+                // be shown the way out without knowing to ask for it.
+                self.wake_pill();
+
+                // The navigation layer sees every phase, and sees them first. It is the
+                // only thing above a fullscreen cast, so it is the only thing that can
+                // offer a way out of one.
+                if self.route_navigation(&event) {
+                    return;
+                }
+
                 let phase = match event.phase {
                     TouchPhase::Down => Some(crate::transport::TouchPhase::Press),
                     TouchPhase::Up => Some(crate::transport::TouchPhase::Release),
@@ -334,6 +448,7 @@ impl ApplicationHandler for KioskApp {
                 if let (Some(host), Some(r)) = (&mut self.browser, &mut self.render) {
                     host.pump(r);
                 }
+                self.tick_pill();
                 if let Some(r) = &mut self.render {
                     r.pump();
                 }
@@ -383,6 +498,9 @@ pub fn run(
         render: None,
         controls,
         shell_sink,
+        contacts: std::collections::HashMap::new(),
+        pill_since: None,
+        pill_drawn: false,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),
@@ -416,6 +534,9 @@ pub fn run_with_browser(
         render: None,
         controls,
         shell_sink,
+        contacts: std::collections::HashMap::new(),
+        pill_since: None,
+        pill_drawn: false,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),

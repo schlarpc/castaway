@@ -1376,6 +1376,68 @@ impl RenderLoop {
         self.compositor.layer_size(LayerId::Attract)
     }
 
+    /// Draw the home pill and place it as the shell's overlay layer.
+    ///
+    /// # Errors
+    /// [`PipelineError`] if the pill cannot be rasterized or uploaded.
+    pub fn draw_home_pill(&mut self) -> Result<(), PipelineError> {
+        let (w, h) = self.compositor.target_size();
+        let (w, h) = (w.max(1), h.max(1));
+        let (rgba, rect) = crate::overlay::render_pill(w, h)?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (pw, ph) = (rect.w.ceil() as u32, rect.h.ceil() as u32);
+        self.compositor.upload_texture(
+            LayerId::ShellOverlay,
+            pw,
+            ph,
+            TexelFormat::Rgba8Srgb,
+            &rgba,
+        )?;
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::ShellOverlay,
+            opacity: 1.0,
+            // One texel per device pixel, like every other authored surface.
+            transform: Transform {
+                scale_x: rect.w / w as f32,
+                scale_y: rect.h / h as f32,
+                offset_x: rect.x / w as f32,
+                offset_y: rect.y / h as f32,
+            },
+        });
+        Ok(())
+    }
+
+    /// Fade the pill without redrawing it — a uniform write, not a 4K upload.
+    pub fn set_home_pill_opacity(&mut self, opacity: f32) {
+        if !self.compositor.has_layer(LayerId::ShellOverlay) {
+            return;
+        }
+        let (w, h) = self.compositor.target_size();
+        let (w, h) = (w.max(1), h.max(1));
+        let rect = crate::overlay::pill_rect(w, h);
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::ShellOverlay,
+            opacity: opacity.clamp(0.0, 1.0),
+            transform: Transform {
+                scale_x: rect.w / w as f32,
+                scale_y: rect.h / h as f32,
+                offset_x: rect.x / w as f32,
+                offset_y: rect.y / h as f32,
+            },
+        });
+    }
+
+    /// Drop the pill.
+    pub fn clear_home_pill(&mut self) {
+        self.compositor.remove_layer(LayerId::ShellOverlay);
+    }
+
+    /// Whether the home pill is currently composited.
+    #[must_use]
+    pub fn home_pill_present(&self) -> bool {
+        self.compositor.has_layer(LayerId::ShellOverlay)
+    }
+
     /// Whether a browser frame is currently composited.
     ///
     /// Exists for the end-to-end test: "did a frame become a layer" is the question that

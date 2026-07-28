@@ -108,6 +108,13 @@ pub trait InputSink {
     fn touch(&mut self, event: TouchEvent);
     /// A mouse/pointer update.
     fn pointer(&mut self, event: PointerEvent);
+    /// Abandon every contact this sink currently believes is down.
+    ///
+    /// Needed because a sink can lose the panel mid-gesture — the shell navigates away
+    /// while fingers are still on the glass — and a contact that never ends leaves the
+    /// far side believing a finger is down for the rest of the session. The default is a
+    /// no-op for sinks that keep no such state.
+    fn cancel_all(&mut self) {}
 }
 
 /// A source of touch events. The backend spawns a reader and forwards events on the

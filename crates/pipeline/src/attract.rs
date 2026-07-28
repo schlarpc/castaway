@@ -340,7 +340,6 @@ struct Palette {
     title: Rgba,
     tagline: Rgba,
     label: Rgba,
-    detail: Rgba,
     footer: Rgba,
     card_edge: Rgba,
     card_bg: Rgba,
@@ -355,7 +354,6 @@ impl Default for Palette {
             title: [0xff, 0xff, 0xff, 0xff],
             tagline: [0x4f, 0xd1, 0xc5, 0xff],
             label: [0xe8, 0xec, 0xf4, 0xff],
-            detail: [0x9a, 0xa4, 0xb8, 0xff],
             footer: [0x55, 0x5e, 0x72, 0xff],
             card_edge: [0x22, 0x2d, 0x44, 0xff],
             card_bg: [0x02, 0x03, 0x07, 0xff],
@@ -524,7 +522,7 @@ fn draw_tile(
     // Glyph sits above centre; the label takes the bottom third.
     let gy = cy - rect.h * 0.10;
     let g = rect.h * 0.26;
-    draw_tile_glyph(buf, width, height, tile.glyph, cx, gy, g, tile.accent);
+    draw_tile_glyph(buf, (width, height), tile.glyph, (cx, gy), g, tile.accent);
 
     let label_px = 22.0 * s;
     let avail = rect.w - 12.0 * s;
@@ -549,14 +547,14 @@ fn draw_tile(
 /// opens should look like the tile that opened it.
 pub(crate) fn draw_tile_glyph(
     buf: &mut [u8],
-    width: u32,
-    height: u32,
+    surface: (u32, u32),
     glyph: TileGlyph,
-    cx: f32,
-    cy: f32,
+    at: (f32, f32),
     g: f32,
     color: Rgba,
 ) {
+    let (width, height) = surface;
+    let (cx, cy) = at;
     use crate::shape::{self, Rect};
 
     // A "screen" is the base of three of these; drawn once and reused so Cast, AirPlay

@@ -248,6 +248,7 @@ mod draw {
     /// A helper rather than two `sd_segment` calls at each site, because the two segments
     /// have to *share* their meeting vertex and it is easy to write two that do not — which
     /// draws two parallel slashes that look nothing like an arrow and read as a glitch.
+    #[allow(clippy::too_many_arguments)]
     pub fn chevron(
         buf: &mut [u8],
         width: u32,
