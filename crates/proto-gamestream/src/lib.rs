@@ -20,6 +20,7 @@
 //! the C library; without it this crate is pure Rust and fully testable.
 #![deny(unsafe_code)]
 
+pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod http;
@@ -29,7 +30,12 @@ pub mod pairing;
 #[cfg(feature = "stream")]
 pub mod stream;
 
+pub use client::{generate_session_keys, GameStreamClient};
+pub use discovery::HostCandidate;
 pub use error::GameStreamError;
+pub use identity::ClientIdentity;
+pub use nvhttp::{App, LaunchParams, ServerInfo, UniqueId};
+pub use pairing::PairedServer;
 
 /// The mDNS service type GameStream hosts (Sunshine, GFE) advertise.
 pub const NVSTREAM_SERVICE_TYPE: &str = "_nvstream._tcp";
