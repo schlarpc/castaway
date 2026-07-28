@@ -77,11 +77,16 @@ impl WidgetSlot {
                 // viewport isn't letterboxed inside a stripe. Clamped so a small or
                 // portrait surface yields a valid (if cramped) rect rather than a
                 // zero-sized texture.
-                let card_w = (w * 3 / 10).clamp(1, w);
+                //
+                // Sized as a *minimised app* rather than an ornament: this is where the
+                // dashboard lives when nothing is streaming, so it has to be readable
+                // from across the room, not merely present.
+                let card_w = (w * 42 / 100).clamp(1, w);
                 let card_h = (card_w * 9 / 16).clamp(1, h);
+                let top = margin.min(h.saturating_sub(card_h));
                 Some(InsetRect {
                     x: w.saturating_sub(margin.saturating_add(card_w)),
-                    y: margin.min(h - card_h),
+                    y: top,
                     width: card_w,
                     height: card_h,
                 })
@@ -464,7 +469,7 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     // DMA-chan, bottom-right, behind nothing and in the way of nothing: the corner the
     // tiles and the widget card both leave empty.
     if scene.mascot {
-        draw_mascot(&mut buf, width, height, s);
+        draw_mascot(&mut buf, width, height, s, slot);
     }
 
     // Tiles: what the panel can start itself. Drawn from the same layout the hit test
@@ -512,22 +517,39 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
 /// The mascot, decoded from the vendored PNG and drawn at a height proportional to the
 /// panel. Decoding per render is fine: Home is drawn on navigation and resize, not per
 /// frame.
-fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32) {
+fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<InsetRect>) {
     const MASCOT: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
     let Ok(img) = image::load_from_memory(MASCOT) else {
         return;
     };
-    let target_h = (360.0 * s) as u32;
+    let target_h = (276.0 * s) as u32;
     if target_h == 0 {
         return;
     }
     let img = img.to_rgba8();
     let (iw, ih) = (img.width().max(1), img.height().max(1));
     let target_w = (target_h as f32 * iw as f32 / ih as f32) as u32;
-    let (ox, oy) = (
-        width as f32 - target_w as f32 - 70.0 * s,
-        height as f32 - target_h as f32 - 60.0 * s,
-    );
+
+    // She leans on the panel: elbows on its top edge, legs dangling behind it. Everything
+    // below that edge lands inside the card's rect, which the browser layer covers
+    // exactly — so the part that would be "behind" the panel is hidden by it, for free.
+    //
+    // ARM_LINE is how far down her drawing her arms sit; putting that line on the card's
+    // top edge is what makes her rest on it rather than float above or sink into it.
+    const ARM_LINE: f32 = 0.62;
+    let (ox, oy) = match card {
+        Some(card) => (
+            card.x as f32 + card.width as f32 * 0.62,
+            // Never above the top of the panel: her antennae are the tallest thing she
+            // has and clipping them looks like a broken sprite rather than a lean.
+            (card.y as f32 - target_h as f32 * ARM_LINE).max(6.0 * s),
+        ),
+        // No panel to lean on: stand her in the corner instead.
+        None => (
+            width as f32 - target_w as f32 - 70.0 * s,
+            height as f32 - target_h as f32 - 60.0 * s,
+        ),
+    };
     for py in 0..target_h {
         for px in 0..target_w {
             // Nearest-neighbour, like the album-art path: the source is far larger than
@@ -965,6 +987,11 @@ mod tests {
         let scene = AttractScene {
             title: "a-very-long-receiver-name.example.invalid".into(),
             widget: WidgetSlot::RightCard,
+            // Without the mascot, who now leans on the card's top edge and *deliberately*
+            // overlaps it — the browser layer covers that rect exactly, so her legs are
+            // hidden behind the panel she is sitting on. This test is about text, which
+            // has nowhere to hide.
+            mascot: false,
             ..AttractScene::demo()
         };
         let img = render(&scene, w, h).unwrap();
