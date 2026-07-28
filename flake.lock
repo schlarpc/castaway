@@ -72,6 +72,57 @@
         "type": "github"
       }
     },
+    "moonlight-common-c-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784774738,
+        "narHash": "sha256-kj4qAW0Onfw9BLxvxBhW1/3+JoPABbu4/SDeDm2fKa4=",
+        "owner": "moonlight-stream",
+        "repo": "moonlight-common-c",
+        "rev": "e41355ea01670fd4c830b384009d31dd0339a705",
+        "type": "github"
+      },
+      "original": {
+        "owner": "moonlight-stream",
+        "repo": "moonlight-common-c",
+        "rev": "e41355ea01670fd4c830b384009d31dd0339a705",
+        "type": "github"
+      }
+    },
+    "moonlight-enet-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783827668,
+        "narHash": "sha256-OPV4y7NgNV6V84BytsYKmMdULd0kN9dBPQ/+YfpcAVg=",
+        "owner": "cgutman",
+        "repo": "enet",
+        "rev": "aca87840b57f045a1f7f9299e4b1b9b8e2a5e2f1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "cgutman",
+        "repo": "enet",
+        "rev": "aca87840b57f045a1f7f9299e4b1b9b8e2a5e2f1",
+        "type": "github"
+      }
+    },
+    "moonlight-nanors-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784385519,
+        "narHash": "sha256-kmmfCWbU02MAEKXtIXYfi0GXamz1HEDgJp8dCj7aaEQ=",
+        "owner": "sleepybishop",
+        "repo": "nanors",
+        "rev": "b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sleepybishop",
+        "repo": "nanors",
+        "rev": "b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a",
+        "type": "github"
+      }
+    },
     "nix-direnv": {
       "inputs": {
         "flake-parts": "flake-parts",
@@ -133,6 +184,9 @@
         "electron-linux-src": "electron-linux-src",
         "electron-windows-src": "electron-windows-src",
         "ffmpeg-windows-src": "ffmpeg-windows-src",
+        "moonlight-common-c-src": "moonlight-common-c-src",
+        "moonlight-enet-src": "moonlight-enet-src",
+        "moonlight-nanors-src": "moonlight-nanors-src",
         "nix-direnv": "nix-direnv",
         "nixpkgs": "nixpkgs",
         "openscreen-src": "openscreen-src",

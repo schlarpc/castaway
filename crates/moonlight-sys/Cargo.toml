@@ -1,0 +1,14 @@
+[package]
+name = "moonlight-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "FFI bindings to moonlight-common-c, the linked GameStream client core: LiStartConnection and the callback structs it feeds (D37). Bindings are pregenerated and pinned; the moonlight-bindings flake check regenerates and diffs them."
+links = "moonlight-common-c"
+
+[dependencies]
+
+[lints]
+workspace = true

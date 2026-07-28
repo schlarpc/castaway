@@ -29,6 +29,9 @@ pub enum ProtocolKind {
     Spotify,
     /// Bluetooth A2DP sink (+ AVRCP). Audio-only, and the only source that needs no LAN.
     Bluetooth,
+    /// GameStream / Sunshine client (Moonlight role) — the one protocol where the
+    /// panel dials out to a host instead of being discovered by a sender.
+    GameStream,
 }
 
 impl ProtocolKind {
@@ -45,6 +48,7 @@ impl ProtocolKind {
             ProtocolKind::YouTubeLounge => "youtube",
             ProtocolKind::Spotify => "spotify",
             ProtocolKind::Bluetooth => "bluetooth",
+            ProtocolKind::GameStream => "gamestream",
         }
     }
 }

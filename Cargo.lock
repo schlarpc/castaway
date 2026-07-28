@@ -2506,6 +2506,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "moonlight-sys"
+version = "0.1.0"
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3486,6 +3490,35 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "proto-gamestream"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "castaway-core",
+ "hex-literal",
+ "moonlight-sys",
+ "quick-xml 0.37.5",
+ "rand 0.8.7",
+ "rcgen",
+ "rsa",
+ "rustls 0.23.42",
+ "serde",
+ "sha1",
+ "sha2",
+ "substrate-mdns",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "tracing",
+ "ureq",
+ "url",
 ]
 
 [[package]]

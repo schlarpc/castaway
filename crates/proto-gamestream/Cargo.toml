@@ -1,0 +1,45 @@
+[package]
+name = "proto-gamestream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "GameStream / Sunshine client: mDNS host discovery, the NVHTTP pairing and launch API with its gen-7 crypto, and the safe wrapper around the linked moonlight-common-c streaming core (D37)."
+repository.workspace = true
+
+[dependencies]
+castaway-core.workspace = true
+substrate-mdns.workspace = true
+moonlight-sys = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync", "time"] }
+quick-xml.workspace = true
+serde.workspace = true
+ureq.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+time.workspace = true
+rsa.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+aes.workspace = true
+rand.workspace = true
+url.workspace = true
+axum.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[features]
+# The streaming session itself — links moonlight-common-c via moonlight-sys, so it
+# needs MOONLIGHT_COMMON_C_LIB_DIR at link time (the devShell and Nix builds set it).
+# Discovery, pairing, and the NVHTTP client are pure Rust and always compile.
+stream = ["dep:moonlight-sys"]
+
+[lints]
+workspace = true

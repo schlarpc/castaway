@@ -24,6 +24,8 @@ members = [
     "crates/proto-airplay",
     "crates/proto-dial",
     "crates/proto-miracast",
+    "crates/moonlight-sys",
+    "crates/proto-gamestream",
     "crates/sponsorblock",
     "crates/pipeline",
     "crates/control-display",
@@ -64,6 +66,8 @@ proto-cast = { path = "crates/proto-cast" }
 proto-airplay = { path = "crates/proto-airplay" }
 proto-dial = { path = "crates/proto-dial" }
 proto-miracast = { path = "crates/proto-miracast" }
+moonlight-sys = { path = "crates/moonlight-sys" }
+proto-gamestream = { path = "crates/proto-gamestream" }
 proto-spotify = { path = "crates/proto-spotify" }
 sponsorblock = { path = "crates/sponsorblock" }
 pipeline = { path = "crates/pipeline" }

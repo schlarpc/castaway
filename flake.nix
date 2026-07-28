@@ -82,6 +82,27 @@
       url = "git+https://chromium.googlesource.com/openscreen?rev=b13215d275c0c1661cf3d7c19f55ad7f59020938";
       flake = false;
     };
+
+    # moonlight-common-c and its two submodules — the GameStream client core we link
+    # instead of reimplementing (D37). Three inputs rather than one because the
+    # upstream CMake build fetches the submodules from the network, which a Nix build
+    # cannot do; nix/moonlight-common-c.nix grafts them in.
+    #
+    # Note the licence asymmetry: moonlight-common-c is GPL-3.0 while this workspace is
+    # MIT, so the `stream` feature that links it is opt-in and off in the portable
+    # build. See D37.
+    moonlight-common-c-src = {
+      url = "github:moonlight-stream/moonlight-common-c/e41355ea01670fd4c830b384009d31dd0339a705";
+      flake = false;
+    };
+    moonlight-enet-src = {
+      url = "github:cgutman/enet/aca87840b57f045a1f7f9299e4b1b9b8e2a5e2f1";
+      flake = false;
+    };
+    moonlight-nanors-src = {
+      url = "github:sleepybishop/nanors/b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a";
+      flake = false;
+    };
   };
 
   outputs =
@@ -96,6 +117,9 @@
     , electron-linux-src
     , electron-windows-src
     , openscreen-src
+    , moonlight-common-c-src
+    , moonlight-enet-src
+    , moonlight-nanors-src
     , ...
     }:
     let
@@ -243,6 +267,16 @@
         src = electron-linux-src;
       };
 
+      # The GameStream client core we link rather than reimplement (D37). Static
+      # archives + the public header; `moonlight-sys/build.rs` finds them through
+      # `MOONLIGHT_COMMON_C_LIB_DIR`.
+      moonlightCommonCFor = system: import ./nix/moonlight-common-c.nix {
+        pkgs = pkgsFor system;
+        src = moonlight-common-c-src;
+        enetSrc = moonlight-enet-src;
+        nanorsSrc = moonlight-nanors-src;
+      };
+
       # The full kiosk build — renderer, browser, audio, Bluetooth. `packages.default` on
       # Linux, so it is what `nix run .` gives you.
       linuxKioskFor = system: import ./nix/linux-kiosk.nix {
@@ -293,6 +327,11 @@
           # servers are a third party to the session, so this needs the real internet
           # and a running receiver. `nix run .#yt-selfplay -- http://<receiver>:8080`.
           yt-selfplay = import ./nix/yt-selfplay.nix { inherit pkgs; };
+
+          # The linked GameStream core (D37), exposed on its own so it can be built and
+          # cached independently — and so a bump can be checked before anything that
+          # links it is rebuilt.
+          moonlight-common-c = moonlightCommonCFor system;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
             # On Linux the default is the real receiver: every optional feature except
@@ -522,6 +561,8 @@
               # ALSA dev libs for `cpal`, the PCM output behind the `audio-out` feature.
               # Linux-only: the Windows build reaches WASAPI through the OS.
               pkgs.alsa-lib
+              # libcrypto, for the GameStream core's AES-GCM/CBC (D37).
+              pkgs.openssl
               # Runtime libs for the `render`/`kiosk` pipeline features (wgpu + winit).
               pkgs.vulkan-loader
               pkgs.wayland
@@ -535,6 +576,12 @@
             # Where `hci-transport`'s build.rs finds controller firmware to embed.
             # Windows has no /lib/firmware, so blobs travel inside the binary.
             CASTAWAY_FIRMWARE_DIR = "${bluetoothFirmwareFor system}";
+
+            # Where `moonlight-sys`'s build.rs finds the linked GameStream core (D37).
+            # Two entries: the library's own archives, and OpenSSL, which its
+            # PlatformCrypto.c needs and which nothing else in the link line provides.
+            MOONLIGHT_COMMON_C_LIB_DIR =
+              "${moonlightCommonCFor system}/lib:${pkgs.openssl.out}/lib";
 
             # Environment variables for development
             RUST_BACKTRACE = "1";
