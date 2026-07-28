@@ -821,38 +821,56 @@ fn spawn_miracast(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let caps = proto_miracast::SinkCapabilities::sink_default(config.miracast.rtp_port)
-        .context("building the Miracast sink capabilities")?;
-    let backend = Arc::new(proto_miracast::LinuxMiracastBackend::new(
-        proto_miracast::P2pConfig {
-            control_dir: config.miracast.control_dir.clone().into(),
-            interface: config.miracast.interface.clone(),
-            device_name: config.advertised_name(ProtocolKind::Miracast),
-            freq_mhz: config.miracast.freq_mhz,
-            max_throughput_mbps: config.miracast.max_throughput_mbps,
-        },
-        caps,
-    ));
-    let adapter = Arc::new(MiracastAdapter::new(
-        backend,
-        config.advertised_name(ProtocolKind::Miracast),
-    ));
-    info!(
-        interface = %config.miracast.interface,
-        rtp_port = config.miracast.rtp_port,
-        "enabled: Miracast (Wi-Fi Direct group owner)"
-    );
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "p2p"), event_tx);
-    Ok(tokio::spawn(async move {
-        tokio::select! {
-            res = Arc::clone(&adapter).run(sink) => {
-                if let Err(e) = res {
-                    warn!(error = %e, "Miracast adapter exited");
+    // D35 split the protocol from the radio precisely because they fail for unrelated
+    // reasons: `proto-miracast` is portable and fixture-tested, while bringing up the
+    // Wi-Fi Direct group is driver-specific and exists only for Linux
+    // (`LinuxMiracastBackend` is `#[cfg(unix)]`). Refusing here rather than failing to
+    // compile keeps the Windows artifact buildable, and the caller already treats this
+    // as "log it and carry on" — a receiver that can still do AirPlay should not refuse
+    // to start over a backend nobody has written yet.
+    #[cfg(not(unix))]
+    {
+        let _ = (config, event_tx, shutdown);
+        anyhow::bail!(
+            "Miracast has no backend on this platform: only the Linux Wi-Fi Direct group \
+             owner is implemented (see docs/miracast-protocol-notes.md §7 and D35)"
+        )
+    }
+    #[cfg(unix)]
+    {
+        let caps = proto_miracast::SinkCapabilities::sink_default(config.miracast.rtp_port)
+            .context("building the Miracast sink capabilities")?;
+        let backend = Arc::new(proto_miracast::LinuxMiracastBackend::new(
+            proto_miracast::P2pConfig {
+                control_dir: config.miracast.control_dir.clone().into(),
+                interface: config.miracast.interface.clone(),
+                device_name: config.advertised_name(ProtocolKind::Miracast),
+                freq_mhz: config.miracast.freq_mhz,
+                max_throughput_mbps: config.miracast.max_throughput_mbps,
+            },
+            caps,
+        ));
+        let adapter = Arc::new(MiracastAdapter::new(
+            backend,
+            config.advertised_name(ProtocolKind::Miracast),
+        ));
+        info!(
+            interface = %config.miracast.interface,
+            rtp_port = config.miracast.rtp_port,
+            "enabled: Miracast (Wi-Fi Direct group owner)"
+        );
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "p2p"), event_tx);
+        Ok(tokio::spawn(async move {
+            tokio::select! {
+                res = Arc::clone(&adapter).run(sink) => {
+                    if let Err(e) = res {
+                        warn!(error = %e, "Miracast adapter exited");
+                    }
                 }
+                () = shutdown.notified() => info!("Miracast stopping"),
             }
-            () = shutdown.notified() => info!("Miracast stopping"),
-        }
-    }))
+        }))
+    }
 }
 
 /// Stand up the AirPlay/RAOP RTSP listeners, advertise what they ask for, and run them

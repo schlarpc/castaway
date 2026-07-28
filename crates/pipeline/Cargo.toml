@@ -73,6 +73,10 @@ cpal = { version = "0.15", optional = true }
 # drift from the wgpu we link.
 [target.'cfg(unix)'.dependencies]
 ash = { version = "0.38", optional = true }
+# `pidfd_open`/`pidfd_getfd` for pulling browser frame descriptors (hwaccel::remote_handle).
+# Declared through libc rather than an `extern "C"` block because the syscall numbers are
+# per-architecture and getting one wrong is a silent call to something else entirely.
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", optional = true, features = [
@@ -83,6 +87,9 @@ winapi = { version = "0.3", optional = true, features = [
     "dxgiformat",
     "dxgitype",
     "handleapi",
+    # `DuplicateHandle` needs `GetCurrentProcess` as its target: pulling the browser's
+    # shared-texture handles into this process (D36, hwaccel::remote_handle).
+    "processthreadsapi",
     "winerror",
     "winnt",
 ] }
@@ -138,6 +145,7 @@ hwaccel = [
     "render",
     "dep:ffmpeg-sys-next",
     "dep:ash",
+    "dep:libc",
     "dep:winapi",
     "dep:d3d12",
 ]

@@ -257,21 +257,16 @@ impl VulkanImporter {
     pub fn import_single_plane(
         &mut self,
         device: &wgpu::Device,
-        width: u32,
-        height: u32,
+        geometry: super::FrameGeometry,
         modifier: u64,
         plane: super::dmabuf::PlaneLayout,
-        format: wgpu::TextureFormat,
         owner: std::sync::Arc<dyn GpuSurface>,
     ) -> Result<wgpu::Texture, PipelineError> {
-        let vk_format = match format {
+        let geometry = geometry.validate()?;
+        let vk_format = match geometry.format {
             wgpu::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
-            wgpu::TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
-            other => {
-                return Err(PipelineError::GpuImport(format!(
-                    "single-plane import supports BGRA8/RGBA8, not {other:?}"
-                )))
-            }
+            // Validated above, so this arm is the RGBA one and nothing else can reach it.
+            _ => vk::Format::R8G8B8A8_UNORM,
         };
 
         let fd = dup_fd(plane.fd)?;
@@ -294,8 +289,8 @@ impl VulkanImporter {
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk_format)
             .extent(vk::Extent3D {
-                width,
-                height,
+                width: geometry.width,
+                height: geometry.height,
                 depth: 1,
             })
             .mip_levels(1)
@@ -331,18 +326,14 @@ impl VulkanImporter {
         unsafe { self.device.bind_image_memory2(&infos) }
             .map_err(|e| PipelineError::GpuImport(format!("vkBindImageMemory2: {e}")))?;
 
-        let extent = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
+        let extent = geometry.extent();
         let hal_desc = wgpu::hal::TextureDescriptor {
             label: Some("imported-browser-frame"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format,
+            format: geometry.format,
             usage: wgpu::hal::TextureUses::RESOURCE,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
             view_formats: vec![],
@@ -363,7 +354,7 @@ impl VulkanImporter {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format,
+                    format: geometry.format,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },

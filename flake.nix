@@ -52,6 +52,30 @@
       flake = false;
     };
 
+    # castLabs "Electron for Content Security" — the browser runtime (D36), pinned on
+    # *both* platforms rather than taking nixpkgs' Electron on Linux. Same Chromium major
+    # everywhere is the point: developing against one Chrome and shipping another means
+    # every codec, DRM and offscreen behaviour verified in CI was verified against a
+    # browser we do not ship.
+    #
+    # ECS rather than upstream Electron because it is the only route to a VMP-signable
+    # Widevine host that does not require a Google licence agreement (GAPS G55/G56). Both
+    # archives carry H.264/AAC — measured for linux-x64 with `browser-host/codec-probe.js`,
+    # and inferred for win32-x64 from the same decoder long-names in `ffmpeg.dll`, which is
+    # as far as a Linux builder can get.
+    #
+    # MIT-licensed, so unlike the CDM these need no unfree gate. Bump both together or the
+    # platforms drift, which is the whole thing this pin exists to prevent.
+    electron-linux-src = {
+      url = "file+https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0+wvcus-linux-x64.zip";
+      flake = false;
+    };
+
+    electron-windows-src = {
+      url = "file+https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0+wvcus-win32-x64.zip";
+      flake = false;
+    };
+
     # Chromium's Open Screen Protocol library — the reference implementation of Cast
     # Streaming, and the only authoritative description of its RTP framing and crypto.
     #
@@ -76,6 +100,8 @@
     , ffmpeg-windows-src
     , cef-windows-src
     , widevine-windows-src
+    , electron-linux-src
+    , electron-windows-src
     , openscreen-src
     , ...
     }:
@@ -239,6 +265,13 @@
           printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
         '';
 
+      # The browser runtime (D36). Same pinned ECS archive as the Windows artifact stages,
+      # patchelf'd for NixOS.
+      electronLinuxFor = system: import ./nix/electron-linux.nix {
+        pkgs = pkgsFor system;
+        src = electron-linux-src;
+      };
+
       # The full kiosk build — renderer, browser, audio, Bluetooth. `packages.default` on
       # Linux, so it is what `nix run .` gives you.
       linuxKioskFor = system: import ./nix/linux-kiosk.nix {
@@ -299,6 +332,12 @@
             # The name this build shipped under before it became the default. Kept so
             # existing `packages.${system}.castaway-cef` references keep resolving.
             castaway-cef = self.packages.${system}.default;
+
+            # The browser runtime the port targets (D36). Exposed on its own so it can be
+            # run against the probes in `browser-host/` — `nix run .#electron -- \
+            # browser-host/codec-probe.js` is how a version bump gets checked before it
+            # is trusted.
+            electron = electronLinuxFor system;
 
             # The Windows deploy artifacts, cross-compiled from Linux. `-cef` is the one
             # that ships; `-render` drops the browser, and the bare build is the toolchain

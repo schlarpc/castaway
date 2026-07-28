@@ -27,6 +27,30 @@
         "type": "github"
       }
     },
+    "electron-linux-src": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-44NT3eD+i01fiPmfFDewlPOwN4c2YdmzzFrkHNX1cn8=",
+        "type": "file",
+        "url": "https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0%2Bwvcus-linux-x64.zip"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0%2Bwvcus-linux-x64.zip"
+      }
+    },
+    "electron-windows-src": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-3G7QK2IfGPOPQN8MJsG9NaezdZUGgl1EkpnO1TVZUnA=",
+        "type": "file",
+        "url": "https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0%2Bwvcus-win32-x64.zip"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0%2Bwvcus-win32-x64.zip"
+      }
+    },
     "ffmpeg-windows-src": {
       "flake": false,
       "locked": {
@@ -119,6 +143,8 @@
       "inputs": {
         "cef-windows-src": "cef-windows-src",
         "crane": "crane",
+        "electron-linux-src": "electron-linux-src",
+        "electron-windows-src": "electron-windows-src",
         "ffmpeg-windows-src": "ffmpeg-windows-src",
         "nix-direnv": "nix-direnv",
         "nixpkgs": "nixpkgs",

@@ -161,6 +161,117 @@ impl Dx12Importer {
     }
 }
 
+/// One imported browser frame: the texture, plus everything that must outlive it.
+///
+/// This type exists because of an asymmetry in wgpu rather than in Windows.
+/// `wgpu::hal::vulkan::Device::texture_from_raw` accepts a drop guard, so the Linux path
+/// can hand ownership to wgpu and let its resource tracking decide when the frame is
+/// retired. The DX12 entry point takes no guard, so there is nowhere to hang it — which
+/// means the lifetime has to be visible to the caller instead of hidden.
+///
+/// Holding this *is* the frame's lifetime. `OpenSharedHandle` aliases the browser's own
+/// buffer rather than copying it, so dropping this before the GPU has finished sampling
+/// lets Chromium recycle the pixels out from under a frame still on screen — the same
+/// tearing bug [`super::dmabuf`] documents for VA-API surfaces, with the same shape and
+/// the same "only under load, only on some drivers" symptom. Drop it, then ack release
+/// to the browser; not the other way round.
+pub struct ImportedFrame {
+    /// The sampleable texture.
+    pub texture: wgpu::Texture,
+    /// Our reference to the shared resource. Released when this drops.
+    _resource: d3d12::Resource,
+    /// The duplicated NT handle. `OpenSharedHandle` does not need it kept open, but the
+    /// frame's owner may carry other state, so it rides along and closes here.
+    _owner: std::sync::Arc<dyn GpuSurface>,
+}
+
+impl std::fmt::Debug for ImportedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedFrame")
+            .field("size", &self.texture.size())
+            .field("format", &self.texture.format())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Dx12Importer {
+    /// Import a single-plane BGRA/RGBA shared texture — the shape an offscreen browser
+    /// delivers (D36/Q40).
+    ///
+    /// The Windows counterpart of
+    /// [`super::vulkan_import::VulkanImporter::import_single_plane`], and shorter for the
+    /// same reason the NV12 pair is: `OpenSharedHandle` needs no layout description, so
+    /// there is no Windows equivalent of the DRM-modifier trap that makes a wrong import
+    /// render plausible garbage. Whatever the handle describes — tiling, swizzle — is
+    /// carried inside it.
+    ///
+    /// Deliberately **not** cached, where the decoder path's [`Self::import`] caches by
+    /// handle value. That cache works because the decoder's own pool hands back a stable
+    /// set of handles; here the handle is a duplicate we minted this frame, so its value
+    /// is fresh every time and a cache keyed on it would never hit while growing without
+    /// bound. Opening per frame is the correct starting point; if the box shows it costs
+    /// real time, the fix is to key a cache on the *browser-side* handle value, which
+    /// means carrying it separately rather than inferring it from ours.
+    ///
+    /// **Compile-checked, not hardware-verified** — see the note in [`super::d3d11va`].
+    /// Note this one has never had a GPU under it *and* has never had a browser over it,
+    /// so a first run on the box is testing two unproven layers at once; prove the
+    /// decoder bridge first so a failure names one of them.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if the format is not BGRA8/RGBA8 or the device
+    /// refuses the handle.
+    pub fn import_single_plane(
+        device: &wgpu::Device,
+        geometry: super::FrameGeometry,
+        handle: HANDLE,
+        owner: std::sync::Arc<dyn GpuSurface>,
+    ) -> Result<ImportedFrame, PipelineError> {
+        let geometry = geometry.validate()?;
+
+        // SAFETY: the device is live, and `handle` is an NT handle owned by `owner`,
+        // which outlives this call and is moved into the returned frame.
+        let resource = unsafe { open_shared(device, handle) }?;
+
+        let extent = geometry.extent();
+        // SAFETY: the resource was opened on this device and is a 2D texture with one mip
+        // and one sample, matching the descriptor. No drop guard is passed because
+        // `ImportedFrame` owns the resource; wgpu must not release it.
+        let hal_texture = unsafe {
+            wgpu::hal::dx12::Device::texture_from_raw(
+                resource.clone(),
+                geometry.format,
+                wgpu::TextureDimension::D2,
+                extent,
+                1,
+                1,
+            )
+        };
+        // SAFETY: built from this device's own resource, matching the descriptor below.
+        let texture = unsafe {
+            device.create_texture_from_hal::<Dx12>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("imported-browser-frame"),
+                    size: extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: geometry.format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            )
+        };
+
+        Ok(ImportedFrame {
+            texture,
+            _resource: resource,
+            _owner: owner,
+        })
+    }
+}
+
 /// `ID3D12Device::OpenSharedHandle` on the wgpu device's underlying D3D12 device.
 ///
 /// # Safety

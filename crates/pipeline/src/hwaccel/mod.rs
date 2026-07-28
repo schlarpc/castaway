@@ -37,6 +37,69 @@ pub mod ffmpeg_hw;
 #[cfg(feature = "hwaccel")]
 pub use export::SurfaceExporter;
 
+// The browser frame path (D36): getting a GPU handle out of the browser process is the
+// same problem on both platforms, so it is one module with a `cfg` pair inside rather
+// than a per-platform module like the decode backends below.
+#[cfg(feature = "hwaccel")]
+pub mod remote_handle;
+
+/// What a browser frame *is*, independent of how the platform hands it over.
+///
+/// Exists so the two `import_single_plane` entry points agree on their common half. What
+/// differs between them is only the platform's description of *where the pixels are* — a
+/// DRM modifier and plane layout on Linux, an NT handle on Windows — and keeping the
+/// shared half in one type makes that the only difference.
+#[cfg(feature = "render")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameGeometry {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Channel order as the producer wrote it. Browser output is BGRA on both platforms
+    /// in practice, but reading it from the producer rather than assuming is what keeps a
+    /// silent R/B swap from being possible.
+    pub format: wgpu::TextureFormat,
+}
+
+#[cfg(feature = "render")]
+impl FrameGeometry {
+    /// Reject anything the single-plane import cannot describe.
+    ///
+    /// # Errors
+    /// [`crate::error::PipelineError::GpuImport`] for a non-RGBA-family format or a
+    /// degenerate size — both of which import *successfully* if waved through and then
+    /// render garbage.
+    pub fn validate(self) -> Result<Self, crate::error::PipelineError> {
+        if !matches!(
+            self.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+        ) {
+            return Err(crate::error::PipelineError::GpuImport(format!(
+                "single-plane import supports BGRA8/RGBA8, not {:?}",
+                self.format
+            )));
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(crate::error::PipelineError::GpuImport(format!(
+                "browser frame has unusable dimensions {}x{}",
+                self.width, self.height
+            )));
+        }
+        Ok(self)
+    }
+
+    /// The `wgpu` extent for this frame.
+    #[must_use]
+    pub const fn extent(self) -> wgpu::Extent3d {
+        wgpu::Extent3d {
+            width: self.width,
+            height: self.height,
+            depth_or_array_layers: 1,
+        }
+    }
+}
+
 #[cfg(all(feature = "hwaccel", unix))]
 pub mod dmabuf;
 #[cfg(all(feature = "hwaccel", unix))]

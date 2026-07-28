@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use castaway_core::{ColorInfo, GpuSurface};
 use pipeline::hwaccel::dmabuf::PlaneLayout;
 use pipeline::hwaccel::vulkan_import::VulkanImporter;
+use pipeline::hwaccel::FrameGeometry;
 
 /// How long to consume frames before declaring a verdict.
 const RUN_FOR: Duration = Duration::from_secs(15);
@@ -301,15 +302,17 @@ fn import_and_sample(
     let texture = importer
         .import_single_plane(
             device,
-            paint.width,
-            paint.height,
+            FrameGeometry {
+                width: paint.width,
+                height: paint.height,
+                format,
+            },
             modifier,
             PlaneLayout {
                 fd: raw,
                 offset: plane.offset,
                 pitch: plane.stride,
             },
-            format,
             Arc::new(FrameOwner(local)),
         )
         .map_err(|e| format!("import: {e}"))?;
