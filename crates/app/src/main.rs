@@ -1114,7 +1114,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
     if config.enable.cast {
         tiles.push(service(
             "cast",
-            "Cast",
+            "Google Cast",
             TileGlyph::Cast,
             [0x42, 0x85, 0xf4, 0xff],
             "Cast a tab, or your whole screen.",
@@ -1206,7 +1206,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         // a host picker (D38), so there is nothing to tell anyone here.
         tiles.push(Tile {
             id: "gamestream".to_string(),
-            label: "Gaming PC".to_string(),
+            label: "Moonlight".to_string(),
             glyph: TileGlyph::Gamepad,
             accent: [0x02, 0xab, 0xfc, 0xff],
             detail: None,

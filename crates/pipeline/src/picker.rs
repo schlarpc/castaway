@@ -392,7 +392,7 @@ mod tests {
     use super::*;
 
     fn picker() -> Picker {
-        Picker::loading("Gaming PC", "Looking for hosts…").with_items(
+        Picker::loading("Moonlight", "Looking for hosts…").with_items(
             vec![
                 PickerItem::new("a", "somepc").with_detail("10.0.0.7"),
                 PickerItem::new("b", "loungebox").with_detail("10.0.0.9"),

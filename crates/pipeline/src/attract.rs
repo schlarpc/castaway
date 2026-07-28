@@ -199,7 +199,7 @@ impl AttractScene {
             tiles: vec![
                 Tile {
                     id: "cast".into(),
-                    label: "Cast".into(),
+                    label: "Google Cast".into(),
                     glyph: TileGlyph::Cast,
                     accent: [0x42, 0x85, 0xf4, 0xff],
                     detail: Some(ServiceDetail {
@@ -263,7 +263,7 @@ impl AttractScene {
                 },
                 Tile {
                     id: "gamestream".into(),
-                    label: "Gaming PC".into(),
+                    label: "Moonlight".into(),
                     glyph: TileGlyph::Gamepad,
                     accent: [0x02, 0xab, 0xfc, 0xff],
                     // No detail: this one the panel goes and does, so the press becomes

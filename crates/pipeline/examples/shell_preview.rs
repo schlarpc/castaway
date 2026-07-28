@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // A picker mid-flight, and one that found nothing.
-    let hosts = Picker::loading("Gaming PC", "Looking for hosts…")
+    let hosts = Picker::loading("Moonlight", "Looking for hosts…")
         .with_subtitle("Moonlight hosts on this network")
         .with_items(
             vec![
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     write("picker", pipeline::picker::render(&hosts, w, h)?)?;
 
-    let empty = Picker::loading("Gaming PC", "…").with_items(
+    let empty = Picker::loading("Moonlight", "…").with_items(
         vec![],
         "No hosts found. Is Sunshine running, and on this network?",
     );

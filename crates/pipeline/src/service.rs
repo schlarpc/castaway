@@ -255,7 +255,7 @@ mod tests {
         ServiceScreen {
             tile: Tile {
                 id: "cast".into(),
-                label: "Cast".into(),
+                label: "Google Cast".into(),
                 glyph: TileGlyph::Cast,
                 accent: [0x42, 0x85, 0xf4, 0xff],
                 detail: None,
