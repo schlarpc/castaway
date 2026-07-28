@@ -15,6 +15,7 @@
 use crate::error::PipelineError;
 use crate::shape::{self, Rect};
 use crate::text::{self, Rgba};
+use crate::theme;
 
 /// The design height every dimension scales from, matching the shell's screens.
 const DESIGN_HEIGHT: f32 = 720.0;
@@ -111,9 +112,9 @@ impl Default for Palette {
             // over an arbitrary video frame, which may be any colour at all.
             plate: [0x0d, 0x14, 0x28, 0xf2],
             // dma.space blue.
-            edge: [0x02, 0xab, 0xfc, 0xff],
-            glyph: [0xff, 0xff, 0xff, 0xff],
-            label: [0xe8, 0xec, 0xf4, 0xff],
+            edge: theme::BLUE,
+            glyph: theme::TEXT,
+            label: theme::TEXT_BODY,
         }
     }
 }

@@ -13,6 +13,7 @@ use crate::attract::{ServiceDetail, Tile};
 use crate::error::PipelineError;
 use crate::shape::{self, Rect};
 use crate::text::{self, Rgba};
+use crate::theme;
 
 /// The design height every dimension scales from, matching the other screens.
 const DESIGN_HEIGHT: f32 = 720.0;
@@ -64,16 +65,16 @@ struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            bg_top: [0x0d, 0x14, 0x28, 0xff],
-            bg_bottom: [0x03, 0x05, 0x0b, 0xff],
-            title: [0xff, 0xff, 0xff, 0xff],
-            headline: [0x4f, 0xd1, 0xc5, 0xff],
-            step: [0xe8, 0xec, 0xf4, 0xff],
-            step_num: [0x55, 0x5e, 0x72, 0xff],
-            back: [0x9a, 0xa4, 0xb8, 0xff],
-            look_for_label: [0x9a, 0xa4, 0xb8, 0xff],
-            look_for: [0xff, 0xff, 0xff, 0xff],
-            plate: [0x15, 0x1e, 0x35, 0xff],
+            bg_top: theme::BG_TOP,
+            bg_bottom: theme::BG_BOTTOM,
+            title: theme::TEXT,
+            headline: theme::ACCENT,
+            step: theme::TEXT_BODY,
+            step_num: theme::TEXT_FAINT,
+            back: theme::TEXT_DIM,
+            look_for_label: theme::TEXT_DIM,
+            look_for: theme::TEXT,
+            plate: theme::PLATE,
         }
     }
 }

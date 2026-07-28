@@ -35,7 +35,14 @@ The site uses **Inter** (body and headings) and **Spline Sans Mono** (monospace)
 crate embeds **DejaVu Sans / Sans-Bold** and every rendered surface is measured against
 it, including golden-image tests.
 
-Switching is *not* free — it moves every glyph on every existing surface and invalidates
-those tests — so it is deliberately deferred to the theming work rather than smuggled in
-with the shell. Both fonts are SIL OFL and can be vendored the same way DejaVu is when
-that happens.
+**Attempted and blocked.** Both Inter and Spline Sans Mono are packaged only as *variable*
+fonts (`InterVariable.ttf`, `Inter[opsz,wght].ttf`), and `ab_glyph` — the rasterizer this
+crate uses — renders a variable font's default instance with no way to select a weight
+axis. Loading Inter for both `regular` and `bold` would draw both at Regular, and the
+screens lean on that contrast: every title, tile label and row heading is bold against
+dim body text.
+
+Getting there needs one of: a static-instance build of Inter vendored here (the upstream
+release ships them, nixpkgs does not), or a rasterizer with variable-font axis support.
+Neither is hard; both are a different piece of work from a palette. The palette landed
+(`pipeline::theme`); the typeface is still DejaVu.

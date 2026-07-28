@@ -62,6 +62,8 @@ pub mod shell;
 pub mod tap;
 #[cfg(feature = "render")]
 pub mod text;
+#[cfg(feature = "render")]
+pub mod theme;
 pub mod transport;
 #[cfg(feature = "electron")]
 pub mod ubo_scriptlets;

@@ -12,6 +12,7 @@ use ab_glyph::FontRef;
 use crate::compositor::Transform;
 use crate::error::PipelineError;
 use crate::text::{self, Rgba};
+use crate::theme;
 
 /// The design resolution the layout is authored against; every dimension scales from it,
 /// so the scene looks the same at 720p and 4K but is rasterized natively.
@@ -215,7 +216,7 @@ impl AttractScene {
                     id: "airplay".into(),
                     label: "AirPlay".into(),
                     glyph: TileGlyph::AirPlay,
-                    accent: [0xff, 0xff, 0xff, 0xff],
+                    accent: theme::TEXT,
                     detail: Some(ServiceDetail {
                         headline: "Mirror an iPhone, iPad or Mac.".into(),
                         steps: vec![
@@ -265,7 +266,7 @@ impl AttractScene {
                     id: "gamestream".into(),
                     label: "Moonlight".into(),
                     glyph: TileGlyph::Gamepad,
-                    accent: [0x02, 0xab, 0xfc, 0xff],
+                    accent: theme::BLUE,
                     // No detail: this one the panel goes and does, so the press becomes
                     // an event and `app` opens a host picker.
                     detail: None,
@@ -349,15 +350,15 @@ struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Self {
-            bg_top: [0x0d, 0x14, 0x28, 0xff],
-            bg_bottom: [0x03, 0x05, 0x0b, 0xff],
-            title: [0xff, 0xff, 0xff, 0xff],
-            tagline: [0x4f, 0xd1, 0xc5, 0xff],
-            label: [0xe8, 0xec, 0xf4, 0xff],
-            footer: [0x55, 0x5e, 0x72, 0xff],
-            card_edge: [0x22, 0x2d, 0x44, 0xff],
-            card_bg: [0x02, 0x03, 0x07, 0xff],
-            tile_bg: [0x15, 0x1e, 0x35, 0xff],
+            bg_top: theme::BG_TOP,
+            bg_bottom: theme::BG_BOTTOM,
+            title: theme::TEXT,
+            tagline: theme::ACCENT,
+            label: theme::TEXT_BODY,
+            footer: theme::TEXT_FAINT,
+            card_edge: theme::EDGE,
+            card_bg: theme::WELL,
+            tile_bg: theme::PLATE,
         }
     }
 }
@@ -568,7 +569,7 @@ pub(crate) fn draw_tile_glyph(
         };
         shape::rounded_outline(buf, width, height, body, g * 0.16, g * 0.16, color);
     };
-    let hole = [0x0d, 0x14, 0x28, 0xff];
+    let hole = theme::BG_TOP;
 
     match glyph {
         TileGlyph::Cast => {

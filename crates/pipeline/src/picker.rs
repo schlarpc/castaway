@@ -12,6 +12,7 @@
 use crate::error::PipelineError;
 use crate::shape::{self, Rect};
 use crate::text::{self, Rgba};
+use crate::theme;
 
 /// The design height every dimension scales from, matching the idle screen's.
 const DESIGN_HEIGHT: f32 = 720.0;
@@ -270,17 +271,17 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             // Same ramp as the idle screen: the picker is the same surface, one level in.
-            bg_top: [0x0d, 0x14, 0x28, 0xff],
-            bg_bottom: [0x03, 0x05, 0x0b, 0xff],
-            title: [0xff, 0xff, 0xff, 0xff],
-            subtitle: [0x4f, 0xd1, 0xc5, 0xff],
-            row_bg: [0x15, 0x1e, 0x35, 0xff],
-            row_title: [0xe8, 0xec, 0xf4, 0xff],
-            row_detail: [0x9a, 0xa4, 0xb8, 0xff],
-            back: [0x9a, 0xa4, 0xb8, 0xff],
-            status: [0x9a, 0xa4, 0xb8, 0xff],
+            bg_top: theme::BG_TOP,
+            bg_bottom: theme::BG_BOTTOM,
+            title: theme::TEXT,
+            subtitle: theme::ACCENT,
+            row_bg: theme::PLATE,
+            row_title: theme::TEXT_BODY,
+            row_detail: theme::TEXT_DIM,
+            back: theme::TEXT_DIM,
+            status: theme::TEXT_DIM,
             // dma.space coral, for the one state that is bad news.
-            failed: [0xf5, 0x61, 0x5f, 0xff],
+            failed: theme::CORAL,
         }
     }
 }
