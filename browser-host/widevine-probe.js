@@ -16,6 +16,7 @@
 
 const { app, BrowserWindow, components, dialog } = require('electron');
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 
 dialog.showErrorBox = (t, c) => process.stderr.write(`widevine-probe: ${t}: ${c}\n`);
@@ -44,18 +45,38 @@ function findCdm(dir) {
   return hits;
 }
 
+// Kept because it is what located the hang that this probe's own bug caused: without
+// it, 'no output for 120s' names nothing. Opt-in so a normal run stays quiet.
+const step = (m) => {
+  if (process.env.WV_TRACE) process.stderr.write(`widevine-probe: step ${m}\n`);
+};
+
 app.whenReady().then(async () => {
+  step('app-ready');
   const out = { userDataDir: app.getPath('userData') };
 
   const t0 = Date.now();
   let readyErr = null;
   try {
-    // The API the ECS docs point at. If this blocks on a network fetch, the elapsed
-    // time on a cold profile says so.
-    await components.whenReady();
+    // `components.whenReady()` blocks on a *network fetch* when the profile has no CDM —
+    // measured, not assumed. On a panel with no route to Google that is an unbounded wait
+    // on a path the receiver awaits, so it gets a deadline here and must get one in the
+    // host app too. Losing the race is not fatal: a pre-staged CDM is already on disk,
+    // and DRM-less playback is much better than a receiver that never finishes starting.
+    const DEADLINE_MS = Number(process.env.WV_DEADLINE_MS || 20000);
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`whenReady exceeded ${DEADLINE_MS}ms`)), DEADLINE_MS);
+    });
+    try {
+      await Promise.race([components.whenReady(), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (e) {
     readyErr = String(e);
   }
+  step('components-done');
   out.whenReadyMs = Date.now() - t0;
   out.whenReadyError = readyErr;
   try {
@@ -64,12 +85,26 @@ app.whenReady().then(async () => {
     out.status = `status() threw: ${e}`;
   }
 
+  step('scanning-cdm');
   out.cdmPathsUnderUserData = findCdm(out.userDataDir);
   out.cdmPathsBesideBinary = findCdm(path.dirname(process.execPath));
 
+  // EME is gated on a **secure context**, and a `data:` URL is not one — asking there
+  // throws rather than reporting "no CDM", which reads exactly like a staging failure.
+  // A loopback origin is trustworthy by definition, so the probe serves itself one.
+  step('serving-loopback');
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<title>wv</title>');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}/`;
+
+  step('creating-window');
   const win = new BrowserWindow({ show: false, webPreferences: { offscreen: true } });
-  await win.loadURL('data:text/html,<title>wv</title>');
+  await win.loadURL(origin);
   // The question that actually matters: can a page get a Widevine key system?
+  step('requesting-key-system');
   out.keySystemAccess = await win.webContents.executeJavaScript(`
     navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{
       initDataTypes: ['cenc'],
@@ -79,6 +114,8 @@ app.whenReady().then(async () => {
              e => ({ ok: false, error: String(e) }))
   `);
 
+  out.origin = origin;
+  server.close();
   process.stdout.write(JSON.stringify(out, null, 2) + '\n');
   app.exit(out.keySystemAccess && out.keySystemAccess.ok ? 0 : 1);
 });

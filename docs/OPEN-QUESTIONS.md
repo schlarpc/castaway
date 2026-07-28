@@ -448,18 +448,38 @@ during the port, in the order they can kill or reshape it.
   already pins (`cefDist` stages it today), with `widevine-windows-src` as its Windows
   counterpart. Uniform layout, only the `_platform_specific` leaf differs.
 
-  **Still to prove, and it is exactly G46's test:** that a *pre-staged* CDM at that path
-  satisfies a cold launch with **no network** — i.e. copy the pinned CDM in, run offline,
-  and assert `requestMediaKeySystemAccess('com.widevine.alpha')` resolves on the first
-  launch. `browser-host/widevine-probe.js` is written to be that test; it has been run
-  online (CDM fetched, path confirmed) but not yet in a network namespace against a
-  pre-staged profile. Until that passes, "the panel plays DRM with no internet" is an
-  expectation, not a result — and G46 exists because that exact expectation was false
-  once already.
+  **G46's property is proven under this mechanism — 2026-07-28.**
+  `browser-host/stage-widevine.sh` copies the pinned CDM into a cold profile and
+  `browser-host/widevine-probe.js` judges it, run under `unshare -r -n` so there is
+  genuinely no route to Google:
 
-  Note also that `components.whenReady()` **blocks** on a cold profile while it fetches.
-  On a panel with no route to Google that is a hang on a path the receiver awaits, so the
-  host app needs a deadline around it regardless of pre-staging.
+  | profile | network | `whenReady` | `requestMediaKeySystemAccess` |
+  |---|---|---|---|
+  | pre-staged | **none** | 5 ms, no error | ✅ `com.widevine.alpha` |
+  | empty | **none** | 32 ms, `Failed to install required components` | ❌ `NotSupportedError` |
+  | empty | yes | 493 ms (fetches) | ✅ `com.widevine.alpha` |
+
+  The middle row is the point: the test can fail, so the top row means something. Five
+  milliseconds also says the CDM was *found* rather than fetched — this is not a cache
+  hit dressed up as offline support.
+
+  The staging layout is ECS's own, read off a run that fetched rather than from docs:
+  `WidevineCdm/<version>/{manifest.json,_platform_specific/<plat>/}` plus a
+  `latest-component-updated-widevine-cdm` marker holding an **absolute** path to the
+  version directory. Absolute is why staging is a startup step and not something the Nix
+  store can hold — the same reason the CEF path had to write its own hint file (G46).
+
+  **Correction to an earlier claim in this entry: `components.whenReady()` does not
+  hang.** With no network it fails in 32 ms and says why. The apparent hang that produced
+  that claim was the probe's own bug — it loaded a `data:` URL, which is not a
+  **secure context**, so `requestMediaKeySystemAccess` *threw* instead of returning a
+  verdict, and the unhandled rejection meant `app.exit()` never ran. Two lessons worth
+  keeping: EME needs a trustworthy origin (the probe now serves itself one over
+  loopback), and a probe that hangs is a bug in the probe until proven otherwise — the
+  same conclusion the codec static-check reached from the other direction. The deadline
+  around `whenReady()` stays anyway, because a *reachable but slow* component server is
+  still a wait on a path the receiver awaits, but it is defence rather than the fix it
+  was described as.
 
   The EVS signing flow itself is answered — free, signup, PyPI `castlabs-evs`,
   `sign-pkg` over the directory containing the executable, **after** Authenticode on
