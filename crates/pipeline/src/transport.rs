@@ -107,32 +107,12 @@ pub enum TransportHit {
     Scrub(f32),
 }
 
-/// A rectangle in strip-local pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rect {
-    /// Left edge.
-    pub x: f32,
-    /// Top edge.
-    pub y: f32,
-    /// Width.
-    pub w: f32,
-    /// Height.
-    pub h: f32,
-}
-
-impl Rect {
-    /// Whether `(px, py)` is inside.
-    #[must_use]
-    pub fn contains(&self, px: f32, py: f32) -> bool {
-        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
-    }
-
-    /// The middle of the rectangle.
-    #[must_use]
-    pub fn center(&self) -> (f32, f32) {
-        (self.x + self.w / 2.0, self.y + self.h / 2.0)
-    }
-}
+/// An axis-aligned rectangle in pixels.
+///
+/// The shell and the transport strip lay out with the same rectangle type, because they
+/// draw with the same primitives and hit-test with the same rule (D33's "one layout
+/// serves both"). Re-exported rather than redefined so the two cannot drift.
+pub use crate::shape::Rect;
 
 /// Everything the strip draws and decides from.
 ///
@@ -508,19 +488,19 @@ mod paint {
         if let Some(track) = l.track {
             let fraction = model.scrub_fraction().unwrap_or(0.0);
             let radius = track.h / 2.0;
-            rounded_bar(&mut buf, width, height, track, radius, pal.track);
+            crate::shape::rounded_rect(&mut buf, width, height, track, radius, pal.track);
             let played = Rect {
                 w: (track.w * fraction).max(0.0),
                 ..track
             };
             if played.w > 0.0 {
-                rounded_bar(&mut buf, width, height, played, radius, pal.track_fill);
+                crate::shape::rounded_rect(&mut buf, width, height, played, radius, pal.track_fill);
             }
             // The knob, only when it can be dragged. On a source that cannot seek the bar is
             // a progress indicator, and a knob would invite a gesture that does nothing.
             if model.is_seekable() {
                 let (_, cy) = track.center();
-                disc(
+                crate::shape::disc(
                     &mut buf,
                     width,
                     height,
@@ -583,7 +563,7 @@ mod paint {
             match control {
                 TransportControl::PlayPause => {
                     let r = l.glyph * 0.78;
-                    disc(&mut buf, width, height, cx, cy, r * 2.0, pal.disc);
+                    crate::shape::disc(&mut buf, width, height, cx, cy, r * 2.0, pal.disc);
                     if model.state.is_active() {
                         pause_glyph(&mut buf, width, height, cx, cy, l.glyph * 0.72, pal.on_disc);
                     } else {
@@ -690,69 +670,6 @@ mod paint {
         }
     }
 
-    fn sd_circle(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
-        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r
-    }
-
-    /// Signed distance to a rounded box centred at `(cx, cy)` with half-extents `(hx, hy)`.
-    fn sd_round_box(px: f32, py: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32) -> f32 {
-        let dx = (px - cx).abs() - (hx - r);
-        let dy = (py - cy).abs() - (hy - r);
-        let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
-        outside + dx.max(dy).min(0.0) - r
-    }
-
-    /// Signed distance to a line segment.
-    fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-        let (pax, pay) = (px - ax, py - ay);
-        let (bax, bay) = (bx - ax, by - ay);
-        let denom = bax.mul_add(bax, bay * bay).max(f32::EPSILON);
-        let t = (pax.mul_add(bax, pay * bay) / denom).clamp(0.0, 1.0);
-        (pax - bax * t).hypot(pay - bay * t)
-    }
-
-    /// Signed distance to a triangle (used for the play/skip arrowheads).
-    fn sd_triangle(px: f32, py: f32, p: [(f32, f32); 3]) -> f32 {
-        // Distance to the nearest edge, signed by a winding test. Cheaper and clearer than
-        // the exact analytic form, and identical once quantized to a pixel.
-        let d = sd_segment(px, py, p[0].0, p[0].1, p[1].0, p[1].1)
-            .min(sd_segment(px, py, p[1].0, p[1].1, p[2].0, p[2].1))
-            .min(sd_segment(px, py, p[2].0, p[2].1, p[0].0, p[0].1));
-        let inside = {
-            let sign = |a: (f32, f32), b: (f32, f32)| {
-                (b.0 - a.0).mul_add(py - a.1, -((b.1 - a.1) * (px - a.0)))
-            };
-            let (s0, s1, s2) = (sign(p[0], p[1]), sign(p[1], p[2]), sign(p[2], p[0]));
-            (s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0) || (s0 <= 0.0 && s1 <= 0.0 && s2 <= 0.0)
-        };
-        if inside {
-            -d
-        } else {
-            d
-        }
-    }
-
-    fn bounds_around(cx: f32, cy: f32, size: f32) -> Rect {
-        Rect {
-            x: cx - size,
-            y: cy - size,
-            w: size * 2.0,
-            h: size * 2.0,
-        }
-    }
-
-    fn disc(buf: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, diameter: f32, color: Rgba) {
-        let r = diameter / 2.0;
-        fill_sdf(
-            buf,
-            width,
-            height,
-            bounds_around(cx, cy, r + 2.0),
-            color,
-            |px, py| sd_circle(px, py, cx, cy, r),
-        );
-    }
-
     /// A small dot under a toggle that is on. Colour alone is not enough on a panel seen from
     /// across a room and at an angle, and it is the one cue that survives a bad viewing angle.
     fn active_dot(
@@ -764,26 +681,7 @@ mod paint {
         glyph: f32,
         color: Rgba,
     ) {
-        disc(buf, width, height, cx, cy, glyph * 0.16, color);
-    }
-
-    fn rounded_bar(buf: &mut [u8], width: u32, height: u32, rect: Rect, radius: f32, color: Rgba) {
-        let (cx, cy) = rect.center();
-        let (hx, hy) = (rect.w / 2.0, rect.h / 2.0);
-        let r = radius.min(hx).min(hy);
-        fill_sdf(
-            buf,
-            width,
-            height,
-            Rect {
-                x: rect.x - 1.0,
-                y: rect.y - 1.0,
-                w: rect.w + 2.0,
-                h: rect.h + 2.0,
-            },
-            color,
-            |px, py| sd_round_box(px, py, cx, cy, hx, hy, r),
-        );
+        crate::shape::disc(buf, width, height, cx, cy, glyph * 0.16, color);
     }
 
     fn play_glyph(
@@ -801,13 +699,13 @@ mod paint {
         // disc, because its visual mass is toward the flat edge.
         let x = cx - w * 0.35 + size * 0.06;
         let pts = [(x, cy - h), (x, cy + h), (x + w * 2.0, cy)];
-        fill_sdf(
+        crate::shape::fill_sdf(
             buf,
             width,
             height,
-            bounds_around(cx, cy, size + 2.0),
+            crate::shape::Rect::around(cx, cy, size + 2.0),
             color,
-            |px, py| sd_triangle(px, py, pts),
+            |px, py| crate::shape::sd_triangle(px, py, pts),
         );
     }
 
@@ -825,13 +723,15 @@ mod paint {
         let gap = size * 0.19;
         for sign in [-1.0f32, 1.0] {
             let bx = cx + sign * (gap + bar_w / 2.0);
-            fill_sdf(
+            crate::shape::fill_sdf(
                 buf,
                 width,
                 height,
-                bounds_around(cx, cy, size + 2.0),
+                crate::shape::Rect::around(cx, cy, size + 2.0),
                 color,
-                |px, py| sd_round_box(px, py, bx, cy, bar_w / 2.0, bar_h, bar_w * 0.28),
+                |px, py| {
+                    crate::shape::sd_round_box(px, py, bx, cy, bar_w / 2.0, bar_h, bar_w * 0.28)
+                },
             );
         }
     }
@@ -856,14 +756,14 @@ mod paint {
         let back = cx - dir * w * 0.5;
         let pts = [(back, cy - h), (back, cy + h), (tip, cy)];
         let bar_x = cx + dir * (w * 0.62 + bar_w * 0.9);
-        fill_sdf(
+        crate::shape::fill_sdf(
             buf,
             width,
             height,
-            bounds_around(cx, cy, size + 2.0),
+            crate::shape::Rect::around(cx, cy, size + 2.0),
             color,
             |px, py| {
-                sd_triangle(px, py, pts).min(sd_round_box(
+                crate::shape::sd_triangle(px, py, pts).min(crate::shape::sd_round_box(
                     px,
                     py,
                     bar_x,
@@ -897,23 +797,27 @@ mod paint {
         let (top, bot) = (cy - s * 0.5, cy + s * 0.5);
         let stub = s * 0.34;
         let head = size * 0.15;
-        fill_sdf(
+        crate::shape::fill_sdf(
             buf,
             width,
             height,
-            bounds_around(cx, cy, size + 2.0),
+            crate::shape::Rect::around(cx, cy, size + 2.0),
             color,
             |px, py| {
                 // Each path: a horizontal entry, the diagonal that crosses the other, and
                 // a horizontal run into its arrowhead.
                 let path = |ay: f32, by: f32| {
-                    sd_segment(px, py, l, ay, l + stub, ay)
-                        .min(sd_segment(px, py, l + stub, ay, r - stub, by))
-                        .min(sd_segment(px, py, r - stub, by, r, by))
+                    crate::shape::sd_segment(px, py, l, ay, l + stub, ay)
+                        .min(crate::shape::sd_segment(px, py, l + stub, ay, r - stub, by))
+                        .min(crate::shape::sd_segment(px, py, r - stub, by, r, by))
                         - t
                 };
                 let arrow = |y: f32| {
-                    sd_triangle(px, py, [(r, y - head), (r, y + head), (r + head * 1.5, y)])
+                    crate::shape::sd_triangle(
+                        px,
+                        py,
+                        [(r, y - head), (r, y + head), (r + head * 1.5, y)],
+                    )
                 };
                 path(top, bot)
                     .min(path(bot, top))
@@ -936,22 +840,23 @@ mod paint {
         let s = size * 0.44;
         let t = size * 0.075;
         let head = size * 0.15;
-        fill_sdf(
+        crate::shape::fill_sdf(
             buf,
             width,
             height,
-            bounds_around(cx, cy, size + 2.0),
+            crate::shape::Rect::around(cx, cy, size + 2.0),
             color,
             |px, py| {
                 // The ring, minus a notch at the top right where the arrowhead goes.
-                let ring = (sd_round_box(px, py, cx, cy, s, s * 0.82, s * 0.45).abs()) - t;
+                let ring =
+                    (crate::shape::sd_round_box(px, py, cx, cy, s, s * 0.82, s * 0.45).abs()) - t;
                 let notch_x = cx + s * 0.25;
                 let notched = if px > notch_x && py < cy - s * 0.35 {
                     f32::MAX
                 } else {
                     ring
                 };
-                let arrow = sd_triangle(
+                let arrow = crate::shape::sd_triangle(
                     px,
                     py,
                     [
