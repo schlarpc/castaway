@@ -390,7 +390,13 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     let pal = Palette::default();
 
     let mut buf = vec![0u8; (width * height * 4) as usize];
-    text::fill_gradient(&mut buf, width, height, pal.bg_top, pal.bg_bottom);
+    // The season colours the room, not a band across it. A stripe was the first attempt
+    // and it read as a decoration stuck on top; the background is the thing that makes a
+    // panel across a room feel different without asking anyone to look at it.
+    match scene.season {
+        Some(season) => text::fill_gradient_stops(&mut buf, width, height, &season.gradient()),
+        None => text::fill_gradient(&mut buf, width, height, pal.bg_top, pal.bg_bottom),
+    }
 
     let w = width as f32;
     // Scale everything relative to a 720p design so it looks right at any resolution.
@@ -454,26 +460,6 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
         pal.tagline,
         &f.regular,
     );
-
-    // The seasonal stripe, full width along the very top. It was under the title and
-    // ran into the tiles' heading; up here it collides with nothing and reads as a band
-    // across the panel rather than an underline that lost its word.
-    if let Some(season) = scene.season {
-        let bar_h = 10.0 * s;
-        let seg = width as f32 / season.stripe.len() as f32;
-        for (i, colour) in season.stripe.iter().enumerate() {
-            text::fill_rect(
-                &mut buf,
-                width,
-                height,
-                seg * i as f32,
-                0.0,
-                seg + 1.0,
-                bar_h,
-                *colour,
-            );
-        }
-    }
 
     // DMA-chan, bottom-right, behind nothing and in the way of nothing: the corner the
     // tiles and the widget card both leave empty.

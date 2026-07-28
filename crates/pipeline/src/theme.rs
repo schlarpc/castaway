@@ -65,8 +65,50 @@ pub const ACCENT: Rgba = [0x4f, 0xd1, 0xc5, 0xff];
 pub struct Season {
     /// What to call it, for a log line and for anyone wondering why the screen changed.
     pub name: &'static str,
-    /// The stripe drawn under the title, left to right.
-    pub stripe: &'static [Rgba],
+    /// The hues the season is made of, top to bottom.
+    ///
+    /// Not drawn as-is: [`Self::gradient`] mixes them most of the way into the panel's
+    /// own dark ramp first. A flag at full strength is a lightbox, and everything on
+    /// these screens is white text.
+    pub hues: &'static [Rgba],
+}
+
+/// How much of a season's hue survives the mix into the background. Low on purpose: the
+/// point is a room that feels different, not a screen nobody can read.
+const SEASON_STRENGTH: f32 = 0.22;
+
+impl Season {
+    /// The background ramp for this season: its hues, each pulled most of the way toward
+    /// the panel's own dark gradient at the height it sits.
+    #[must_use]
+    pub fn gradient(self) -> Vec<Rgba> {
+        let n = self.hues.len().max(1);
+        self.hues
+            .iter()
+            .enumerate()
+            .map(|(i, hue)| {
+                // Keep the vertical fall of the normal background, so a seasonal screen
+                // is still darker at the bottom rather than uniformly tinted.
+                let t = i as f32 / (n.saturating_sub(1).max(1)) as f32;
+                let base = [
+                    mix(BG_TOP[0], BG_BOTTOM[0], t),
+                    mix(BG_TOP[1], BG_BOTTOM[1], t),
+                    mix(BG_TOP[2], BG_BOTTOM[2], t),
+                ];
+                [
+                    mix(base[0], hue[0], SEASON_STRENGTH),
+                    mix(base[1], hue[1], SEASON_STRENGTH),
+                    mix(base[2], hue[2], SEASON_STRENGTH),
+                    0xff,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn mix(a: u8, b: u8, t: f32) -> u8 {
+    (f32::from(a) + (f32::from(b) - f32::from(a)) * t.clamp(0.0, 1.0)).clamp(0.0, 255.0) as u8
 }
 
 /// Pride, in the six-colour flag.
@@ -99,16 +141,16 @@ pub const fn season(month: u32, day: u32) -> Option<Season> {
     match (month, day) {
         (6, _) => Some(Season {
             name: "pride",
-            stripe: &PRIDE,
+            hues: &PRIDE,
         }),
         // The run-up, not the day: a decoration that appears on the 25th has missed it.
         (12, 1..=26) => Some(Season {
             name: "christmas",
-            stripe: &YULE,
+            hues: &YULE,
         }),
         (10, 24..=31) => Some(Season {
             name: "halloween",
-            stripe: &HALLOWEEN,
+            hues: &HALLOWEEN,
         }),
         _ => None,
     }
@@ -131,10 +173,33 @@ mod tests {
     }
 
     #[test]
-    fn every_stripe_has_colours_to_draw() {
+    fn a_seasonal_background_stays_dark_enough_to_read_white_text_on() {
+        // The whole risk of tinting the background: a flag at full strength is a
+        // lightbox, and every screen here is white text on this ramp.
         for (m, d) in [(6, 15), (12, 10), (10, 28)] {
             let s = season(m, d).expect("a season");
-            assert!(!s.stripe.is_empty(), "{} has no colours", s.name);
+            let g = s.gradient();
+            assert!(!g.is_empty(), "{} has no colours", s.name);
+            for stop in g {
+                let luma = 0.2126f32.mul_add(
+                    f32::from(stop[0]),
+                    0.7152f32.mul_add(f32::from(stop[1]), 0.0722 * f32::from(stop[2])),
+                );
+                assert!(
+                    luma < 90.0,
+                    "{} stop {stop:?} is too bright to read on (luma {luma})",
+                    s.name
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_season_still_falls_darker_toward_the_bottom() {
+        // Otherwise it reads as a flat wash rather than the panel's own background
+        // wearing a colour.
+        let g = season(6, 15).expect("pride").gradient();
+        let luma = |c: Rgba| f32::from(c[0]) + f32::from(c[1]) + f32::from(c[2]);
+        assert!(luma(g[0]) > luma(g[g.len() - 1]));
     }
 }

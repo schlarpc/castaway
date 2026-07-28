@@ -86,6 +86,47 @@ fn quant(v: f32) -> u8 {
 }
 
 /// Fill a rectangle with source-over compositing (honours the color's alpha).
+/// Fill with a vertical gradient through several stops, dithered like the two-stop one.
+///
+/// Exists for the seasonal backgrounds (#24): a flag is more than two colours, and
+/// approximating one with a stripe put a band across the screen instead of colouring it.
+/// Fewer than two stops falls back to a flat fill of the first.
+pub fn fill_gradient_stops(buf: &mut [u8], width: u32, height: u32, stops: &[Rgba]) {
+    match stops {
+        [] => return,
+        [only] => {
+            fill_gradient(buf, width, height, *only, *only);
+            return;
+        }
+        _ => {}
+    }
+    let segments = stops.len() - 1;
+    let h = height.max(1) as f32;
+    for y in 0..height {
+        // Where this row falls across the whole ramp, then which pair of stops that is
+        // between and how far along.
+        let t = (y as f32 / h) * segments as f32;
+        let i = (t.floor() as usize).min(segments - 1);
+        let f = t - i as f32;
+        let (a, b) = (stops[i], stops[i + 1]);
+        let row = [
+            lerp_f(a[0], b[0], f),
+            lerp_f(a[1], b[1], f),
+            lerp_f(a[2], b[2], f),
+        ];
+        for x in 0..width {
+            // The same ordered dither as the two-stop ramp, and for the same reason: a
+            // seasonal background is just as dark, so it bands just as readily.
+            let d = dither_offset(x, y);
+            let i = ((y * width + x) * 4) as usize;
+            buf[i] = quant(row[0] + d);
+            buf[i + 1] = quant(row[1] + d);
+            buf[i + 2] = quant(row[2] + d);
+            buf[i + 3] = 255;
+        }
+    }
+}
+
 pub fn fill_rect(
     buf: &mut [u8],
     width: u32,
