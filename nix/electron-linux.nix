@@ -93,10 +93,13 @@ pkgs.stdenv.mkDerivation {
     libxcb
   ];
 
-  # `chrome-sandbox` is setuid-root in a normal install and cannot be here — a Nix store
-  # file cannot carry setuid. Chromium falls back to the *namespace* sandbox, which needs
-  # no helper and is available on this kernel; see G86 for why running the browser
-  # unsandboxed is not an option we are keeping.
+  # `chrome-sandbox` is setuid-root in a normal install and cannot be here: a Nix store
+  # file cannot carry setuid. Chromium then uses the **namespace** sandbox, which needs no
+  # helper — but it still wants `CHROME_DEVEL_SANDBOX` pointed at the binary, and without
+  # it the zygote fails to launch and Chromium aborts with "GPU process isn't usable".
+  # That failure is why this is set rather than reaching for `--no-sandbox`: G86 is the
+  # record of what running this browser unsandboxed looks like, and the whole Windows
+  # sandbox argument in D36 is void if Linux quietly gives it up.
   #
   # autoPatchelf would otherwise fail on the sandbox helper and the crashpad handler,
   # neither of which we invoke through a path it can rewrite.
@@ -111,7 +114,8 @@ pkgs.stdenv.mkDerivation {
 
     mkdir -p $out/bin
     makeWrapper $out/libexec/electron/electron $out/bin/electron \
-      --prefix LD_LIBRARY_PATH : "${runtimeLibs}"
+      --prefix LD_LIBRARY_PATH : "${runtimeLibs}" \
+      --set-default CHROME_DEVEL_SANDBOX $out/libexec/electron/chrome-sandbox
 
     runHook postInstall
   '';

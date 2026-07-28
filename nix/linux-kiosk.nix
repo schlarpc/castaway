@@ -84,7 +84,11 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
     # The browser host app travels with the binary. It is ours and dependency-free, so
     # this is a copy rather than a node_modules tree.
     mkdir -p $out/share/castaway
-    cp -r ${../browser-host} $out/share/castaway/browser-host
+    # `--no-preserve=mode` plus a chmod: files copied straight from the store arrive
+    # read-only, and the toolchain-reference stripper rewrites in place, so it fails on
+    # them with a permission error that names a temp file rather than the cause.
+    cp -r --no-preserve=mode,ownership ${../browser-host} $out/share/castaway/browser-host
+    chmod -R u+w $out/share/castaway/browser-host
   '';
 
   meta = commonArgs.meta or { } // {
