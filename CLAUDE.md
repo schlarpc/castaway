@@ -18,6 +18,7 @@ The design docs are the spec — read them before touching a subsystem:
   correct and must not be "fixed", where real control points diverge from the spec, and
   what the citations are worth. Read before changing `proto-dlna`.
 - **docs/miracast-protocol-notes.md** — the WFD/Miracast protocol record `proto-miracast` is built from: the information element, the `wfd-kv` grammar, the M1–M16 exchange, MPEG2-TS-over-RTP, UIBC, and what real Windows and Android senders actually do. Read before changing `proto-miracast`; §7 is the platform reality and is where the project's remaining risk lives.
+- **docs/gamestream-protocol-notes.md** — the GameStream/Moonlight record. The one *inverted* protocol (we are the client) and the one that is half-linked rather than reimplemented: NVHTTP + pairing are ours, the streaming core is moonlight-common-c (D37). Read before changing `proto-gamestream`; §6 is where its remaining risk lives.
 - **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`, MSVC), the CEF/ffmpeg escape hatches, and the testing matrix.
 
 Reference implementations named in the docs (UxPlay, openscreen, librespot, yt-cast-receiver, …)
@@ -94,7 +95,19 @@ These are binding engineering constraints for this project. They override genera
    crates for everything above the LAN. Two conditions on any future carve-out: the
    dependency must be an idiomatic Rust crate (not a shelled-out reference binary), and
    the *local* surface — discovery, advertisement, anything sharing our single HTTP host
-   or mDNS responder — still has to be ours. Everything else here is still reimplemented.
+   or mDNS responder — still has to be ours.
+
+   **Carve-out — the GameStream streaming core (D37).** The second and, for now, last
+   exception, and a different one: the peer *is* a device speaking a stable spec, so the
+   rule's own logic says reimplement. It was overridden deliberately on volume and shape
+   — the streaming half is ~15k lines of C whose correctness is FEC recovery under real
+   loss and A/V pacing under real jitter. The split holds the line where it matters: the
+   LAN-facing half (mDNS, NVHTTP, pairing crypto, the adapter) is ours and is tested
+   against the reference implementation's own vectors; only the post-`/launch` media
+   plane is linked, behind an off-by-default feature, and it is GPL against this MIT
+   tree. Do not read this as a general licence to link — read D37 for what it cost.
+
+   Everything else here is still reimplemented.
 
 10. **Commit semi-regularly, straight to `main`.** Commit at independent logical boundaries — often
     several commits within a single feature build-out, each one a coherent, self-contained change.

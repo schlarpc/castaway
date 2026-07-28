@@ -6,7 +6,7 @@ Snapshot for our next sync. Companion to DECISION-LOG.md (why) and OPEN-QUESTION
 running binary, and `nix build .#checks.x86_64-linux.integration-vm` passes the two-VM
 integration test.
 
-## What exists (16 crates, workspace per architecture-substrate.md §2)
+## What exists (18 crates, workspace per architecture-substrate.md §2)
 
 | Crate | State |
 |---|---|
@@ -26,6 +26,8 @@ integration test.
 | `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
 | `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
 | `proto-miracast` | **The whole protocol, none of the radio.** The WFD information element (byte-identical to what MiracleCast and lazycast put on the air), the `wfd-kv` parameter language as one type per parameter, the M1–M16 exchange with its two independent CSeq counters, MPEG2-TS-over-RTP demuxed to `EncodedFrame`, UIBC touch/HIDC encoding with a coordinate type that cannot carry panel pixels, and a tokio actor driven end-to-end by a scripted source over real sockets. AOSP's format chooser is reimplemented as an oracle, so what an Android phone *would* pick is asserted in tests rather than guessed. Off by default in `app`. **Not done:** the Wi-Fi Direct link itself — the Linux backend's wpa_supplicant sequence is written and its parsing tested, but no group has ever been formed (Q7); Miracast-over-Infrastructure (MS-MICE) is documented and unimplemented; HDCP is deliberately `none`. |
+| `moonlight-sys` | **Bindings, pinned and checked in.** FFI to moonlight-common-c, the linked GameStream core (D37). Regenerated from the same revision Nix builds; struct layouts guarded by bindgen's compile-time size/offset asserts. |
+| `proto-gamestream` | **Paired and launching; never yet streamed.** The one *inverted* protocol — the panel is the Moonlight client, so it browses and dials rather than advertising and waiting. Ours: mDNS host discovery, the NVHTTP API as request builders + rich response types, the gen-7 pairing handshake as a typestate machine, the client identity, per-host pairing persistence, and the adapter. Verified against Sunshine's own checked-in vectors (its `clientchallenge` ciphertext, its phase-4 hash, its `clientpairingsecret` signature) and driven through all four phases over real sockets against a scripted host. Linked, behind the off-by-default `stream` feature: RTSP, ENet control, FEC'd RTP video, encrypted Opus audio, input. **Not done:** no session has ever run against a real Sunshine host — everything between "the host said 200 to /launch" and pixels is unverified. There is **no chooser**, so a session can only be started from config, which makes this operator-configured rather than walk-up (D37 records that as deferred, not designed). The linked half is GPL-3.0 against this MIT tree, so `castaway-portable` does not link it. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to CEF *or* to the panel's transport strip, whichever owns the point touched (D33). |
@@ -276,8 +278,40 @@ ctrl-c → clean CEF/service shutdown. Also fixed en route: 4K-surface wgpu limi
 3840×2160 — would have crashed on first boot) and ctrl-c being swallowed by Chromium's SIGINT
 handler. Still needs the physical box: real display/GPU present path, audio, and touch.
 
+## GameStream (`[gamestream]` in castaway.toml, `--features gamestream` to actually stream)
+The panel as a Moonlight client. Off by default: it is useless until a host has been
+paired with, which is a deliberate act.
+
+```toml
+[enable]
+gamestream = true
+
+[gamestream]
+state_dir = "/var/lib/castaway/gamestream"   # the credential — persistent, mode 0600
+pair_host = "10.0.0.7"                        # remove after pairing succeeds once
+pair_pin  = "1234"                            # typed into *Sunshine's* web UI, not ours
+autostart_host = "10.0.0.7"                   # optional; unset means nothing starts
+autostart_app  = "Desktop"                    # optional; unset takes the host's first app
+width = 1920
+height = 1080
+fps = 60
+bitrate_kbps = 20000
+```
+
+Pairing is a person walking to the PC: we hold a request open while they type the PIN into
+Sunshine's UI. The PIN in the config is what we will send to match it; it is consumed once
+and the resulting certificate is persisted per host, so both `pair_*` keys are meant to be
+removed afterwards rather than left in place.
+
+**The missing piece is the chooser.** Nothing in this codebase can yet put a list of hosts
+on the panel and take a touch on it, so the only way to start a session is the config above
+— operator-configured, not walk-up. That is the next work, and it is what would make this
+protocol feel like the rest of the receiver.
+
 ## Design decisions worth your review
 D7 (router composition vs SourceAdapter), D9 (hand-written prost, no protoc), D16 (socket
-protocols advertise-gated), and **D30 (Spotify is the one protocol we do not reimplement
+protocols advertise-gated), **D37 (GameStream links the Moonlight streaming core rather
+than reimplementing it — a second carve-out from ground rule 9, made on instruction, and
+one that puts GPL code behind an opt-in feature)**, and **D30 (Spotify is the one protocol we do not reimplement
 — a carve-out in ground rule 9, so worth disagreeing with early)**. D30 supersedes D10,
 which deferred Spotify playback. All in DECISION-LOG.md.

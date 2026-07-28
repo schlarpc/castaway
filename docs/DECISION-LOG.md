@@ -700,3 +700,71 @@ deploy-critical and is proven separately on the box. The honest worst case, reco
 it is recognized if met: shared-texture import turns out flaky on a platform we ship, the
 fallback is software OSR frames crossing a process boundary — worse than today's
 in-process copy — and this decision reopens.
+
+### D37 — GameStream: link the Moonlight core, own everything on the LAN
+The GameStream/Sunshine receiver (#33) is split down the middle. `proto-gamestream`
+implements the LAN-facing half — mDNS host discovery, the NVHTTP API, the gen-7 pairing
+crypto, the client identity, the adapter — and **links** moonlight-common-c for
+everything past `/launch`: the RTSP handshake, the ENet control stream, FEC'd RTP video,
+encrypted Opus audio, and input encoding.
+
+That is a second carve-out from ground rule 9, alongside D30, and it was a direct
+instruction rather than a derivation — worth recording as such, because the reasoning
+that justifies D30 does *not* transfer cleanly. Sunshine is not a cloud service that
+changes unilaterally; it is a device-ish peer speaking a spec that mostly holds still,
+which is exactly the case rule 9 says to reimplement. What argues for linking anyway is
+volume and shape: the streaming half is ~15k lines of C whose correctness is measured in
+FEC recovery under real loss and A/V pacing under real jitter — properties a fixture
+suite models badly and a hackerspace LAN exercises immediately. The pairing half, by
+contrast, is a few hundred lines with published golden vectors, and is where the
+protocol's interesting decisions live.
+
+**What the split buys, concretely.** The half we own is the half that is testable without
+hardware, and it is tested against Sunshine's own checked-in vectors rather than against
+itself: the AES key derived from salt+PIN reproduces its `clientchallenge` ciphertext, the
+X.509 `signatureValue` extraction reproduces its phase-4 hash, and its golden
+`clientpairingsecret` signature verifies. Two upstream notes found doing that, recorded so
+nobody re-derives them: the comment beside that vector claims the third hashed field is the
+ASCII `"SECRET  "` — it is not, it is the 16-byte client secret — and Sunshine's own test
+overrides the server challenge to *eight* bytes where a real one is sixteen, which works
+only because nothing in the hash is length-prefixed.
+
+**What it costs, priced rather than waved at.**
+- **Licence.** moonlight-common-c is GPL-3.0; this workspace is MIT. Linking it makes the
+  combined binary GPL-3.0 if distributed. Per the build notes' scope (n=1, private, no
+  redistribution) that is moot in practice, but it is not nothing, so the `stream` feature
+  is **opt-in and off in `castaway-portable`** — the build CI produces stays MIT-clean, and
+  turning it on is a deliberate act. Same quarantine logic as `crypto-playfair`, one level
+  up.
+- **A C library in the closure.** Built static from a pinned revision with its two
+  submodules grafted in (the upstream CMake fetches them from the network, which a Nix
+  build cannot). Bindings are pregenerated and checked in against that same revision.
+- **A process singleton.** `LiStartConnection` is documented not thread-safe, keeps global
+  state, and several of its callbacks take no context pointer — so the safe wrapper owns a
+  global and refuses a second concurrent session rather than letting two sets of callbacks
+  race one static. This is a real constraint on the design, not an implementation detail:
+  one GameStream session per receiver, by construction.
+
+**The inversion, which is the part with no precedent here.** Every other adapter is a
+receiver: it advertises, waits, and learns what to do from whoever connected. This one
+browses and dials, which forced two new things. `substrate-mdns` grew a browse API (it was
+advertise-only). And `SourceAdapter::run(sink)` is push-only with no reverse channel, so
+the adapter is constructed with a command channel instead. Config is its only sender today;
+the channel exists so a panel-side chooser becomes the second one without touching the
+adapter.
+
+**What is deferred with eyes open.** There is no chooser. A person cannot walk up to the
+panel and pick a host, because nothing in this codebase can yet put a list on screen and
+take a touch on it (the idle scene is a bitmap rendered once at startup, and the transport
+strip is scoped to the active session). Until that exists, the only way to start a session
+is config, and the honest consequence is that GameStream is operator-configured rather than
+walk-up — the opposite of this project's whole premise. That gap is the next piece of work,
+not a property of this design.
+
+**The gate.** No session has been run against a real Sunshine host. The pairing half is
+proven against Sunshine's vectors and against a scripted host over real sockets; the
+streaming half is proven to link and answer its own queries, and nothing more. The honest
+worst case, recorded so it is recognized if met: the linked core turns out to need
+per-platform threading or timing care we have not done, the panel shows a black screen
+with a healthy control stream, and the debugging happens inside a C library we chose not
+to learn.
