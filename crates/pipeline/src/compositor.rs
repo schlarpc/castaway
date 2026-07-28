@@ -34,6 +34,19 @@ impl Default for Transform {
 }
 
 impl Transform {
+    /// Whether this placement covers a normalized surface point.
+    ///
+    /// Used to answer "is that layer actually visible here", which is not the same
+    /// question as "does that layer exist" — a letterboxed video leaves the bars
+    /// uncovered, and something underneath is genuinely on screen there.
+    #[must_use]
+    pub fn covers(self, x: f32, y: f32) -> bool {
+        x >= self.offset_x
+            && y >= self.offset_y
+            && x <= self.offset_x + self.scale_x
+            && y <= self.offset_y + self.scale_y
+    }
+
     /// A picture-in-picture transform: quarter-size in the given corner (0=TL,1=TR,2=BL,3=BR).
     #[must_use]
     pub fn pip(corner: u8) -> Self {
@@ -186,7 +199,22 @@ pub trait Compositor: Send {
     fn remove_layer(&mut self, id: LayerId);
     /// Composite all layers and present one frame.
     fn present(&mut self);
+    /// Whether an opaque layer drawn *above* `id` covers the normalized surface point —
+    /// i.e. whether `id` is hidden there.
+    ///
+    /// Exists because "is this control visible" is a question the input router has to be
+    /// able to ask. A control that is covered must not keep answering to touches: the
+    /// transport strip sits below video, so a video session that also published metadata
+    /// left an invisible strip swallowing the bottom of the glass.
+    ///
+    /// Only near-opaque layers count as covering; a translucent one still shows what is
+    /// under it, and a partly-placed one (a letterboxed video, a PiP) covers only where
+    /// it actually is.
+    fn covered_above(&self, id: LayerId, x: f32, y: f32) -> bool;
 }
+
+/// Opacity at or above which a layer is treated as hiding what is under it.
+pub(crate) const OPAQUE_ENOUGH: f32 = 0.99;
 
 /// A no-op compositor that logs operations — the default when the `wgpu` feature is off.
 #[derive(Default)]
@@ -206,6 +234,12 @@ impl Compositor for NullCompositor {
 
     fn remove_layer(&mut self, id: LayerId) {
         self.layers.retain(|l| l.id != id);
+    }
+
+    fn covered_above(&self, id: LayerId, x: f32, y: f32) -> bool {
+        self.layers
+            .iter()
+            .any(|l| l.id > id && l.opacity >= OPAQUE_ENOUGH && l.transform.covers(x, y))
     }
 
     fn present(&mut self) {
@@ -304,6 +338,67 @@ mod tests {
         // ...and video still covers both, per the doc comments on those variants.
         assert!(LayerId::Video > LayerId::Transport);
         assert!(LayerId::Transport > LayerId::NowPlaying);
+    }
+
+    #[test]
+    fn coverage_is_geometric_not_merely_presence() {
+        // Why `covered_above` asks where a layer *is* rather than whether it exists: a
+        // partly-placed layer — a PiP, or a letterboxed video — leaves what is under it
+        // genuinely on screen, and a control there must keep working.
+        let mut c = NullCompositor::default();
+        c.upsert_layer(Layer {
+            id: LayerId::Transport,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        c.upsert_layer(Layer {
+            id: LayerId::Video,
+            opacity: 1.0,
+            // Top half only.
+            transform: Transform {
+                scale_x: 1.0,
+                scale_y: 0.5,
+                offset_x: 0.0,
+                offset_y: 0.0,
+            },
+        });
+        assert!(
+            c.covered_above(LayerId::Transport, 0.5, 0.25),
+            "under the video"
+        );
+        assert!(
+            !c.covered_above(LayerId::Transport, 0.5, 0.9),
+            "below its bottom edge"
+        );
+    }
+
+    #[test]
+    fn a_translucent_layer_does_not_hide_what_is_under_it() {
+        let mut c = NullCompositor::default();
+        c.upsert_layer(Layer {
+            id: LayerId::Video,
+            opacity: 0.5,
+            transform: Transform::default(),
+        });
+        assert!(!c.covered_above(LayerId::Transport, 0.5, 0.5));
+    }
+
+    #[test]
+    fn a_layer_below_never_covers_one_above() {
+        let mut c = NullCompositor::default();
+        c.upsert_layer(Layer {
+            id: LayerId::Attract,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        assert!(!c.covered_above(LayerId::ShellOverlay, 0.5, 0.5));
+        // ...which is the property that keeps the navigation affordance reachable.
+        c.upsert_layer(Layer {
+            id: LayerId::BrowserFullscreen,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        assert!(!c.covered_above(LayerId::ShellOverlay, 0.5, 0.5));
     }
 
     #[test]

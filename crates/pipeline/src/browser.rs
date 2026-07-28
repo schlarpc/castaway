@@ -1,6 +1,6 @@
 //! The browser surface. A real backend is CEF in offscreen-rendering mode (behind the
 //! `cef` feature): it renders a page to a pixel buffer (`OnPaint`) fed into the
-//! compositor as the [`crate::compositor::LayerId::Browser`] layer, doubling as PiP and
+//! compositor as one of the two browser layers, doubling as PiP and
 //! the YouTube Lounge playback surface (architecture §5). MVP is the CPU `OnPaint` path;
 //! GPU shared-texture OSR is aspirational (cef#4057/#3730).
 //!
@@ -138,14 +138,40 @@ impl BrowserRole {
 }
 
 #[cfg(feature = "render")]
-/// Map window-normalized coordinates into a browser view-space pixel position. Free
-/// function (not a method) so the inset mapping is testable without a live CEF instance.
+/// Map window-normalized coordinates into a browser view-space pixel position, clamped
+/// into the viewport.
+///
+/// Clamping is right for a contact the browser already owns: a drag that wanders off the
+/// card still needs coherent moves and an end, and the alternative is a page that thinks
+/// a finger is down forever.
+///
+/// It is *wrong* for deciding whether a contact belongs to the browser at all — clamping
+/// answers "yes" for every point on the panel. Use [`hit_view_px`] for that.
+///
+/// Free function (not a method) so the inset mapping is testable without a live browser.
+#[must_use]
 pub fn to_view_px(rect: InsetRect, surface: (u32, u32), x: f32, y: f32) -> (f32, f32) {
-    // Clamped into the viewport rather than dropped when outside: the browser still
-    // needs the move that leaves the card to end a hover or a drag.
     let vx = (x * surface.0.max(1) as f32 - rect.x as f32).clamp(0.0, rect.width as f32);
     let vy = (y * surface.1.max(1) as f32 - rect.y as f32).clamp(0.0, rect.height as f32);
     (vx, vy)
+}
+
+#[cfg(feature = "render")]
+/// Map window-normalized coordinates into the viewport, or `None` if the point is
+/// outside it.
+///
+/// This is the one to use when deciding whether an input belongs to the browser. When the
+/// browser is the idle screen's clock card it occupies a corner of a 65-inch panel, and
+/// clamping instead of rejecting delivered a touch *anywhere on the glass* into that
+/// card. `proto-miracast`'s `map_from_panel` has always done it this way.
+#[must_use]
+pub fn hit_view_px(rect: InsetRect, surface: (u32, u32), x: f32, y: f32) -> Option<(f32, f32)> {
+    let px = x * surface.0.max(1) as f32;
+    let py = y * surface.1.max(1) as f32;
+    let vx = px - rect.x as f32;
+    let vy = py - rect.y as f32;
+    (vx >= 0.0 && vy >= 0.0 && vx <= rect.width as f32 && vy <= rect.height as f32)
+        .then_some((vx, vy))
 }
 
 #[cfg(test)]
@@ -159,5 +185,47 @@ mod tests {
         b.load_url("https://www.youtube.com/tv");
         assert_eq!(b.last_url(), Some("https://www.youtube.com/tv"));
         assert!(!b.is_real());
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn a_touch_outside_the_widget_card_is_rejected_not_squashed_into_it() {
+        // The bug this is here for: on the idle screen the browser is a clock card in a
+        // corner, and the clamping mapper answered "yes, at the nearest edge" for a touch
+        // anywhere on a 65-inch panel — so tapping the far side of the room's screen
+        // poked the clock.
+        let surface = (3840, 2160);
+        let rect = super::super::attract::WidgetSlot::RightCard
+            .rect(surface.0, surface.1)
+            .expect("the right card reserves a rect");
+
+        // Bottom-left corner of the panel, nowhere near the top-right card.
+        assert_eq!(hit_view_px(rect, surface, 0.05, 0.95), None);
+        // The clamping mapper is what used to decide this, and still says yes — which is
+        // correct for its job and wrong for this one.
+        let clamped = to_view_px(rect, surface, 0.05, 0.95);
+        assert!(clamped.0 >= 0.0 && clamped.1 >= 0.0);
+
+        // A point actually inside the card maps to the same place either way.
+        let inside_x = (rect.x as f32 + rect.width as f32 / 2.0) / surface.0 as f32;
+        let inside_y = (rect.y as f32 + rect.height as f32 / 2.0) / surface.1 as f32;
+        let hit = hit_view_px(rect, surface, inside_x, inside_y).expect("inside the card");
+        let clamped = to_view_px(rect, surface, inside_x, inside_y);
+        assert!((hit.0 - clamped.0).abs() < 0.5 && (hit.1 - clamped.1).abs() < 0.5);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn a_fullscreen_browser_accepts_the_whole_panel() {
+        // The role that must not change behaviour: its rect is the surface, so every
+        // point is inside it and nothing is newly dropped.
+        let surface = (1920, 1080);
+        let rect = BrowserRole::Fullscreen.view(surface).rect;
+        for (x, y) in [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (0.01, 0.99)] {
+            assert!(
+                hit_view_px(rect, surface, x, y).is_some(),
+                "fullscreen must accept ({x}, {y})"
+            );
+        }
     }
 }

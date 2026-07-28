@@ -1048,6 +1048,17 @@ impl Compositor for WgpuCompositor {
         self.layers.remove(&id);
     }
 
+    fn covered_above(&self, id: LayerId, x: f32, y: f32) -> bool {
+        self.layers.values().any(|s| {
+            s.meta.id > id
+                // A layer with no texture yet is registered but not drawn, so it hides
+                // nothing.
+                && s.gpu.is_some()
+                && s.meta.opacity >= crate::compositor::OPAQUE_ENOUGH
+                && s.meta.transform.covers(x, y)
+        })
+    }
+
     fn present(&mut self) {
         match &self.target {
             Target::Offscreen { texture, .. } => {

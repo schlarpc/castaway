@@ -691,7 +691,13 @@ pub struct ElectronHost {
     /// when the next arrives; holding a short queue is what makes release-after-retire
     /// expressible without stalling on the GPU.
     inflight: VecDeque<InFlight>,
+    /// Whether the left button is held, and therefore whether the browser owns the
+    /// pointer even where it strays outside its viewport.
     left_down: bool,
+    /// Touch contacts the browser owns — the ones whose press landed inside its
+    /// viewport. Tracked per id because ownership is a property of the whole contact,
+    /// not of each event.
+    contacts: std::collections::HashSet<u32>,
     /// When the next session line is due.
     next_report: std::time::Instant,
 }
@@ -736,6 +742,7 @@ impl ElectronHost {
             gave_up: None,
             inflight: VecDeque::new(),
             left_down: false,
+            contacts: std::collections::HashSet::new(),
             next_report: std::time::Instant::now(),
         }
     }
@@ -969,9 +976,16 @@ impl ElectronHost {
         }
     }
 
-    /// Map a normalized panel coordinate into browser view pixels.
+    /// Map a normalized panel coordinate into browser view pixels, clamped. For a
+    /// contact the browser already owns.
     fn to_view(&self, x: f32, y: f32) -> (f32, f32) {
         crate::browser::to_view_px(self.role.view(self.size).rect, self.size, x, y)
+    }
+
+    /// Map a normalized panel coordinate, or `None` if it is outside the viewport. For
+    /// deciding whether an input belongs to the browser at all.
+    fn hit_view(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        crate::browser::hit_view_px(self.role.view(self.size).rect, self.size, x, y)
     }
 
     /// One structured line every 5 s while the browser has audio, mirroring the mirroring
@@ -1038,6 +1052,30 @@ impl ElectronHost {
 /// fling behave as they did embedded.
 impl input_touch::InputSink for ElectronHost {
     fn touch(&mut self, event: input_touch::TouchEvent) {
+        use input_touch::TouchPhase;
+        // A contact belongs to the browser only if it *started* inside the viewport, and
+        // then it belongs to it until it ends. Two failures this prevents, and the second
+        // is the nastier one:
+        //
+        //  - When the browser is the idle screen's clock card, a touch anywhere on the
+        //    65-inch panel used to be clamped into that corner and delivered to the page.
+        //  - Deciding per-event instead of per-contact would drop the *end* of a drag
+        //    that wandered off the card, and the page would believe a finger was down for
+        //    the rest of the session.
+        let owned = match event.phase {
+            TouchPhase::Down => {
+                let inside = self.hit_view(event.x, event.y).is_some();
+                if inside {
+                    self.contacts.insert(event.id);
+                }
+                inside
+            }
+            TouchPhase::Move => self.contacts.contains(&event.id),
+            TouchPhase::Up | TouchPhase::Cancel => self.contacts.remove(&event.id),
+        };
+        if !owned {
+            return;
+        }
         let (x, y) = self.to_view(event.x, event.y);
         if let Some(e) = &self.electron {
             e.send(&ToBrowser::Touch {
@@ -1055,6 +1093,11 @@ impl input_touch::InputSink for ElectronHost {
         let Some(e) = &self.electron else { return };
         match event {
             PointerEvent::Move { x, y } => {
+                // While a button is held the browser owns the pointer wherever it goes;
+                // otherwise a hover only counts inside the viewport.
+                if !self.left_down && self.hit_view(x, y).is_none() {
+                    return;
+                }
                 let (x, y) = self.to_view(x, y);
                 e.send(&ToBrowser::Pointer {
                     kind: PointerKind::Move,
@@ -1066,6 +1109,14 @@ impl input_touch::InputSink for ElectronHost {
                 x, y, down, button, ..
             } => {
                 if button != input_touch::PointerButton::Left {
+                    return;
+                }
+                // Press must land inside; release is delivered iff the press was ours,
+                // for the same reason a touch's end is.
+                if down && self.hit_view(x, y).is_none() {
+                    return;
+                }
+                if !down && !self.left_down {
                     return;
                 }
                 self.left_down = down;
@@ -1082,6 +1133,10 @@ impl input_touch::InputSink for ElectronHost {
                 });
             }
             PointerEvent::Wheel { x, y, dx, dy } => {
+                // A scroll goes to whatever is under the cursor, so it has to be over us.
+                if self.hit_view(x, y).is_none() {
+                    return;
+                }
                 let (x, y) = self.to_view(x, y);
                 let Some(e) = &self.electron else { return };
                 e.send(&ToBrowser::Wheel { x, y, dx, dy });

@@ -1177,6 +1177,15 @@ impl RenderLoop {
         phase: crate::transport::TouchPhase,
     ) -> Option<castaway_core::ControlTxn> {
         let state = self.transport.as_ref()?;
+        // Same coverage rule as `transport_owns`, and it has to be repeated rather than
+        // assumed: the two are called independently by the router, and a covered strip
+        // that still *acted* would pause someone's video when they touched the video.
+        if self
+            .compositor
+            .covered_above(crate::compositor::LayerId::Transport, x, y)
+        {
+            return None;
+        }
         let (sw, sh) = self.compositor.target_size();
         let (lx, ly) = crate::transport::to_strip_local(x, y, sw, sh);
         let hit = state.layout.hit_for(lx, ly, phase)?;
@@ -1194,6 +1203,16 @@ impl RenderLoop {
         let Some(state) = self.transport.as_ref() else {
             return false;
         };
+        // A covered strip owns nothing. It sits below video, so a session that publishes
+        // metadata *and* pixels — a DLNA video with tags, say — used to leave an
+        // invisible strip swallowing the bottom of the glass and answering to presses
+        // aimed at whatever was actually on screen.
+        if self
+            .compositor
+            .covered_above(crate::compositor::LayerId::Transport, x, y)
+        {
+            return false;
+        }
         let (sw, sh) = self.compositor.target_size();
         let (lx, ly) = crate::transport::to_strip_local(x, y, sw, sh);
         state.layout.hit(lx, ly).is_some()
