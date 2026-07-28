@@ -1338,8 +1338,39 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
             config.http_base_url().replace("http://", "")
         ),
         widget,
+        // What today is, asked once at build time rather than baked: the panel is up for
+        // weeks, so the screen has to be able to change season without a restart — which
+        // it does, because Home is rebuilt whenever the receiver's state changes.
+        season: seasonal_accent(),
+        mascot: true,
     };
     Some(scene)
+}
+
+/// What season it is, from the wall clock (#24). Only where there is a screen to
+/// decorate.
+///
+/// Wall clock rather than a config flag: nobody is going to remember to turn Pride on in
+/// June and off in July, and a decoration that needs an edit is a decoration that never
+/// appears.
+#[cfg(feature = "render")]
+fn seasonal_accent() -> Option<pipeline::theme::Season> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    // Civil date from a Unix timestamp, Howard Hinnant's algorithm. A date crate for
+    // three lines of arithmetic that never has to handle a timezone is not worth the
+    // dependency — the panel's seasons are day-grained and it is on UTC.
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let _ = era;
+    pipeline::theme::season(month, day)
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).

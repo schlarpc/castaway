@@ -12,7 +12,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use input_touch::{InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};

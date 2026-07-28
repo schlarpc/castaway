@@ -101,6 +101,11 @@ pub struct AttractScene {
     pub footer: String,
     /// Room reserved for the live web widget (the CEF clock layer).
     pub widget: WidgetSlot,
+    /// A seasonal stripe under the title, if today is one (#24). `None` most of the
+    /// year; the app decides, so the renderer stays pure and testable on any date.
+    pub season: Option<crate::theme::Season>,
+    /// Whether to draw DMA-chan in the corner.
+    pub mascot: bool,
     /// Things the panel can start *itself*, as tappable tiles (D38).
     ///
     /// The rows above and these are two different kinds of thing, and the screen is
@@ -197,6 +202,8 @@ impl AttractScene {
             tagline: "Throw anything at the wall — no app to install.".into(),
             footer: "castaway  •  DLNA / mDNS on 10.0.0.5:8080".into(),
             widget: WidgetSlot::RightCard,
+            season: crate::theme::season(6, 15),
+            mascot: true,
             tiles: vec![
                 Tile {
                     id: "cast".into(),
@@ -448,6 +455,32 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
         &f.regular,
     );
 
+    // The seasonal stripe, full width along the very top. It was under the title and
+    // ran into the tiles' heading; up here it collides with nothing and reads as a band
+    // across the panel rather than an underline that lost its word.
+    if let Some(season) = scene.season {
+        let bar_h = 10.0 * s;
+        let seg = width as f32 / season.stripe.len() as f32;
+        for (i, colour) in season.stripe.iter().enumerate() {
+            text::fill_rect(
+                &mut buf,
+                width,
+                height,
+                seg * i as f32,
+                0.0,
+                seg + 1.0,
+                bar_h,
+                *colour,
+            );
+        }
+    }
+
+    // DMA-chan, bottom-right, behind nothing and in the way of nothing: the corner the
+    // tiles and the widget card both leave empty.
+    if scene.mascot {
+        draw_mascot(&mut buf, width, height, s);
+    }
+
     // Tiles: what the panel can start itself. Drawn from the same layout the hit test
     // uses, so the two cannot disagree about where a tile is (D33).
     let tiles = tile_layout(scene, width, height);
@@ -488,6 +521,48 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     );
 
     Ok(buf)
+}
+
+/// The mascot, decoded from the vendored PNG and drawn at a height proportional to the
+/// panel. Decoding per render is fine: Home is drawn on navigation and resize, not per
+/// frame.
+fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32) {
+    const MASCOT: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
+    let Ok(img) = image::load_from_memory(MASCOT) else {
+        return;
+    };
+    let target_h = (360.0 * s) as u32;
+    if target_h == 0 {
+        return;
+    }
+    let img = img.to_rgba8();
+    let (iw, ih) = (img.width().max(1), img.height().max(1));
+    let target_w = (target_h as f32 * iw as f32 / ih as f32) as u32;
+    let (ox, oy) = (
+        width as f32 - target_w as f32 - 70.0 * s,
+        height as f32 - target_h as f32 - 60.0 * s,
+    );
+    for py in 0..target_h {
+        for px in 0..target_w {
+            // Nearest-neighbour, like the album-art path: the source is far larger than
+            // the target, so the sampling artefacts a filter would fix are not visible.
+            let sx = px * iw / target_w.max(1);
+            let sy = py * ih / target_h.max(1);
+            let p = img.get_pixel(sx.min(iw - 1), sy.min(ih - 1)).0;
+            if p[3] == 0 {
+                continue;
+            }
+            text::blend_over(
+                buf,
+                width,
+                height,
+                (ox + px as f32) as i32,
+                (oy + py as f32) as i32,
+                [p[0], p[1], p[2], 0xff],
+                f32::from(p[3]) / 255.0,
+            );
+        }
+    }
 }
 
 /// Draw one tile: a rounded plate, its glyph, and a label under it.
