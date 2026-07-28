@@ -136,12 +136,17 @@ impl StreamSession {
             return Err(e);
         }
 
+        // The negotiated Opus configuration is read *after* the handshake, not guessed
+        // before it: `audio_init` fires from inside `LiStartConnection`, which has
+        // already returned by here. A host that chose something other than 48 kHz
+        // stereo would otherwise be labelled stereo and resampled against the wrong
+        // rate — audible as pitch, with nothing in the logs about it.
+        let format = with_sinks(|sinks| sinks.audio_format.lock().ok().and_then(|f| *f))
+            .flatten()
+            .unwrap_or_else(fallback_format);
         let audio = MirrorAudio {
             source: FrameSource::Encoded(audio_rx),
-            // The negotiated Opus configuration arrives in the audio init callback;
-            // 48 kHz stereo is what a default GameStream session negotiates and what
-            // the callback overwrites if the host chose otherwise.
-            format: AudioFormat::from_hz(48_000, 2).unwrap_or_else(fallback_format),
+            format,
             // Opus carries its own configuration in-band.
             config: None,
         };

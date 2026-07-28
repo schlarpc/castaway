@@ -67,6 +67,30 @@ and theirs on opposite sides of the wire. Neither needs a sender, a network, or 
   the roots senders ship, and fail only for the root — a provisioned credential (Q2) is
   the whole remaining distance to an official sender.
 
+## Verified against the reference implementation itself (`gamestream-vm`)
+The GameStream check is the only one here where the *reference implementation is the
+peer*, not a script of ours. `nix build .#checks.x86_64-linux.gamestream-vm` boots plain
+nixpkgs `sunshine` in one VM and our `gs-probe` in another, and pairs them over a real
+LAN with no hardware and no person — `sunshine -0` takes the PIN on stdin, which is what
+replaces someone typing it into its web UI.
+
+It exists because the unit tests cannot fail in the one way that matters. Those check our
+pairing crypto against Sunshine's own checked-in vectors, which proves we agree with the
+vectors; and `tests/pairing_over_http.rs` drives a scripted host, which is *our reading*
+of Sunshine's source on both sides of the wire. Only the real program can say the reading
+was right.
+
+What it asserts, each failing differently: the four-phase handshake completes and the
+certificate persists; the host itself, over mutual TLS, reports us as paired; an
+HTTPS-only endpoint answers with a non-empty app list; the host self-identifies as
+Sunshine (every GFE-only workaround hangs off that bit); the `/launch` query is
+well-formed enough to be *judged* rather than rejected as malformed; and the pairing
+survives a restart with no PIN, which is what catches a client that regenerates its
+identity per boot.
+
+`nix run .#gs-probe -- <host> --pin 1234` is the same binary pointed at a real host by
+hand — the fastest way to find out why a panel will not pair.
+
 ## Verified working end-to-end (tier-2 VM test, no human in the loop)
 `nix build .#checks.x86_64-linux.integration-vm` boots the receiver from the real NixOS
 module in one VM and drives it from a *second* VM over a real LAN with scripted senders —
@@ -225,6 +249,11 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
   fullscreen window; cast a video via DLNA to see it decode+display).
 
 ## Biggest open items (see OPEN-QUESTIONS.md)
+0. **Q44 — there is no chooser.** The panel cannot offer a list of anything and take a
+   touch on it, which is why GameStream is operator-configured rather than walk-up. Not
+   GameStream-specific: it is the wall any protocol hits that needs the panel to *offer*
+   rather than *accept*. **Q43** is its sibling — the GameStream media plane has never run
+   against a host with a real encoder, and only hardware settles that.
 1. ~~**Q15** — Cast TLS actor + AirPlay RTSP actor.~~ **Done**: both listen, both are
    driven end-to-end by the VM test. What's left behind them is the media plane, below.
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).

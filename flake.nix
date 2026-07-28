@@ -332,6 +332,23 @@
           # cached independently — and so a bump can be checked before anything that
           # links it is rebuilt.
           moonlight-common-c = moonlightCommonCFor system;
+
+          # The GameStream prober: discover, pair, list apps, launch. Its real job is
+          # the `gamestream-vm` check, which points it at a real Sunshine — but it is
+          # also the fastest way to find out why a panel will not pair with a host.
+          # `nix run .#gs-probe -- <host> --pin 1234`.
+          gs-probe = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "gs-probe";
+            cargoExtraArgs = "-p proto-gamestream --example gs-probe";
+            doCheck = false;
+            # The example is not installed by crane's default install phase.
+            postInstall = ''
+              install -Dm755 \
+                "$(find target -name gs-probe -type f -perm -u+x | head -1)" \
+                "$out/bin/gs-probe"
+            '';
+          });
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
             # On Linux the default is the real receiver: every optional feature except
@@ -440,6 +457,14 @@
           # the line of C++ that says so" into an executed result — including which of
           # the sender's many checks we already pass, so a provisioned credential has
           # exactly one case left to flip.
+          # The GameStream client against a real Sunshine — the only test here that
+          # runs the *reference implementation* as the peer rather than a script of
+          # ours (D37). Pairing is hands-free because `sunshine -0` takes the PIN on
+          # stdin instead of its web UI.
+          gamestream-vm = import ./nix/gamestream-vm-test.nix {
+            inherit pkgs self;
+          };
+
           openscreen-device-auth = import ./nix/openscreen-device-auth.nix {
             inherit pkgs;
             openscreenSrc = openscreen-src;

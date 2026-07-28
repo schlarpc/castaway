@@ -862,3 +862,39 @@ the reasons are what a future reversal has to argue against.
   Also worth noting for whoever wires (1): the sink is *removed* and later *re-added* as a
   new node, so "reconnect to the same device" is not a thing — the audio path has to be
   re-established against whatever the default is when it comes back.
+
+## GameStream client (D37)
+
+- **Q43 — no session has been run against a real host, and the streaming half is where
+  that matters.** The `gamestream-vm` check pairs with a real Sunshine and lists its apps,
+  so everything up to and including `/launch` is proven against the reference
+  implementation. Past that point nothing is: the linked core is proven to link and answer
+  its own queries, and that is all. What is unverified is the whole media plane — RTSP
+  setup against a host that actually has an encoder, the ENet control stream, FEC recovery,
+  A/V pacing, and whether our `EncodedFrame` handoff feeds the pipeline something it
+  decodes. **What would settle it:** a Sunshine host with a real GPU on the LAN and
+  `nix run .#gs-probe -- <host> --launch Desktop`, then a `--features gamestream` receiver
+  pointed at it. This needs hardware; a headless VM answers `/launch` with 503 because it
+  has no encoder, which is honest and tells us nothing about the rest.
+
+- **Q44 — there is no chooser, so GameStream is operator-configured rather than walk-up.**
+  A person cannot pick a host or an app from the panel. Nothing in this codebase can yet
+  put a list on screen and take a touch on it: the attract scene is a bitmap rendered once
+  at startup with no `RenderCommand` to update it, and the transport strip is scoped to the
+  active session's `ControlCapabilities`. So sessions start from `castaway.toml` and
+  nothing else. **This is the gap that most contradicts the project's premise** ("throw
+  anything at the wall from any device, no app install") and it is not GameStream-specific:
+  any future protocol that needs the panel to *offer* something rather than *accept* it
+  will hit the same wall. The adapter is built with a command channel precisely so a
+  chooser can become its second caller without touching it. Wants a decision about what
+  that surface is — a native interactive layer behind `input_touch::InputSink` (the trait's
+  own docs already anticipate this), or a page served from the shared axum host and shown
+  in the browser layer.
+
+- **Q45 — the pairing PIN has nowhere good to live.** Pairing needs a PIN typed into the
+  *host's* UI while we hold a request open. `[gamestream] pair_pin` is how that is
+  configured today, which means a short-lived secret sits in a config file until someone
+  removes it. It is low-value (it authenticates one pairing attempt, not the session) but
+  it is still a credential in plaintext, and leaving it set means every restart re-attempts
+  a pairing that has already succeeded. Related to Q44: with a chooser, the PIN would be
+  entered on the panel and never written down.

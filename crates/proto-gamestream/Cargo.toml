@@ -34,6 +34,7 @@ base64.workspace = true
 [dev-dependencies]
 hex-literal.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing-subscriber.workspace = true
 
 [features]
 # The streaming session itself — links moonlight-common-c via moonlight-sys, so it
