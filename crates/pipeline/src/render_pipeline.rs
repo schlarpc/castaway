@@ -34,14 +34,37 @@ const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 /// A navigation being animated.
 #[derive(Debug, Clone, Copy)]
 struct Transition {
-    /// 1.0 = the outgoing screen is fully showing, 0.0 = gone.
+    /// 1.0 = the outgoing screen fills the panel, 0.0 = it is gone.
     progress: f32,
+    /// Progress per second, carried from the finger so a flick keeps going.
+    velocity: f32,
+    /// Where it is heading once nobody is holding it.
+    target: f32,
+    /// Which way the card leaves: `1.0` out to the right (going back), `-1.0` receding
+    /// left (going deeper).
+    direction: f32,
     /// While a finger is on the glass the progress is *its*, not the clock's.
     driven: bool,
 }
 
-/// How long an unattended transition takes.
-const TRANSITION: std::time::Duration = std::time::Duration::from_millis(180);
+/// What to do to the stack if a navigation springs back.
+#[derive(Debug, Clone)]
+enum Undo {
+    /// It pushed; pop it again.
+    Pop,
+    /// It popped or went home; put these back.
+    Restore(Vec<crate::shell::Screen>),
+}
+
+/// How small the card gets on its way out. Not to nothing: it shrinks *into a preview*,
+/// so what you flicked away is still legible as it goes.
+const CARD_MIN_SCALE: f32 = 0.82;
+
+/// How hard an unattended transition is pulled toward its target, per second.
+const SETTLE_RATE: f32 = 14.0;
+
+/// How fast the finger has to be moving for a flick to win over where it let go.
+const FLICK: f32 = 1.6;
 
 pub enum RenderCommand {
     /// Upload a decoded frame as the video layer.
@@ -950,12 +973,14 @@ pub struct RenderLoop {
     /// A navigation in progress: how much of the outgoing screen is still showing, and
     /// whether a finger is driving it.
     ///
-    /// A crossfade rather than a slide, for one reason that decided it: a slide needs
-    /// both screens rasterised *and* placed off-surface, and the compositor has no
-    /// clipping — an incoming screen parked to the right would be drawn across whatever
-    /// is beside it. A crossfade needs only opacity, which is a 32-byte uniform write per
-    /// frame rather than a 33 MB re-raster (D38).
+    /// The screen being left is a *card*: it moves and shrinks, and the destination is
+    /// underneath it the whole time. Placing it off-surface costs nothing — the GPU
+    /// clips geometry outside the viewport, so a card three-quarters of the way out is
+    /// three-quarters drawn. Both are transform-only, which is a 32-byte uniform write
+    /// per frame rather than a 33 MB re-raster (D38).
     transition: Option<Transition>,
+    /// How to put the stack back if a driven navigation is abandoned half-way.
+    transition_undo: Option<Undo>,
     /// Whether the shell is in front: someone is navigating, so a playing video is
     /// demoted to a corner rather than covering the screens they are using (D38, #28).
     shell_front: bool,
@@ -1030,6 +1055,7 @@ impl RenderLoop {
             rx,
             osd: None,
             transition: None,
+            transition_undo: None,
             shell_front: false,
             last_touch: None,
             shell: None,
@@ -1873,7 +1899,9 @@ impl RenderLoop {
         if self.shell.is_none() {
             return;
         }
-        self.begin_transition(false);
+        // Going deeper: the card recedes to the left.
+        self.begin_transition(false, -1.0);
+        self.transition_undo = Some(Undo::Pop);
         if let Some(stack) = &mut self.shell {
             stack.push(screen);
         }
@@ -1890,8 +1918,12 @@ impl RenderLoop {
             return false;
         }
         // Before the stack changes, so the screen being left is still the current one
-        // and can be drawn into its own layer to fade out.
-        self.begin_transition(false);
+        // and can be drawn into its own layer to travel away.
+        self.begin_transition(false, 1.0);
+        self.transition_undo = self
+            .shell
+            .as_ref()
+            .map(|s| Undo::Restore(s.above_screens()));
         let moved = self
             .shell
             .as_mut()
@@ -1909,7 +1941,11 @@ impl RenderLoop {
             .as_ref()
             .is_some_and(crate::shell::ScreenStack::can_pop)
         {
-            self.begin_transition(false);
+            self.begin_transition(false, 1.0);
+            self.transition_undo = self
+                .shell
+                .as_ref()
+                .map(|s| Undo::Restore(s.above_screens()));
         }
         let moved = self
             .shell
@@ -1951,7 +1987,7 @@ impl RenderLoop {
     ///
     /// Called *before* the stack changes, so the outgoing screen is still the current one
     /// and can be rasterised into its own layer.
-    fn begin_transition(&mut self, driven: bool) {
+    fn begin_transition(&mut self, driven: bool, direction: f32) {
         // Re-rasterise rather than copy: the compositor has no texture-to-texture copy,
         // and this happens once per navigation — a human action, not a frame.
         let Some(screen) = self.shell.as_ref().map(crate::shell::ScreenStack::current) else {
@@ -1980,8 +2016,12 @@ impl RenderLoop {
         });
         self.transition = Some(Transition {
             progress: 1.0,
+            velocity: 0.0,
+            target: 0.0,
+            direction,
             driven,
         });
+        self.apply_transition(1.0);
     }
 
     /// Advance an unattended transition. Returns whether anything is still animating.
@@ -1992,14 +2032,26 @@ impl RenderLoop {
         if t.driven {
             return true;
         }
-        let step = dt.as_secs_f32() / TRANSITION.as_secs_f32();
-        t.progress -= step;
-        let p = t.progress;
-        if p <= 0.0 {
-            self.end_transition();
+        let dt = dt.as_secs_f32().min(0.05);
+        // Carry the finger's speed, then let the pull toward the target take over. The
+        // velocity is what makes a flick keep going after the hand has stopped; the pull
+        // is what stops it overshooting into somewhere nobody asked for.
+        t.progress += t.velocity * dt;
+        t.velocity *= (1.0 - dt * 6.0).max(0.0);
+        let pull = (t.target - t.progress) * (dt * SETTLE_RATE).min(1.0);
+        t.progress += pull;
+        let (p, target) = (t.progress, t.target);
+        let settled = (p - target).abs() < 0.004 && t.velocity.abs() < 0.05;
+        if settled {
+            if target >= 0.5 {
+                // Sprung back: the navigation is undone, and the card is whole again.
+                self.undo_transition();
+            } else {
+                self.end_transition();
+            }
             return false;
         }
-        self.apply_transition(p);
+        self.apply_transition(p.clamp(0.0, 1.2));
         true
     }
 
@@ -2009,19 +2061,31 @@ impl RenderLoop {
     /// that is half-way leaves the panel half-way — and letting go without finishing
     /// puts it back, which is what makes the gesture feel like it is attached to the
     /// hand rather than a switch that fires.
-    pub fn drive_transition(&mut self, shown: f32) {
+    pub fn drive_transition(&mut self, shown: f32, velocity: f32) {
         let shown = shown.clamp(0.0, 1.0);
         if let Some(t) = self.transition.as_mut() {
             t.progress = shown;
+            t.velocity = velocity;
             t.driven = true;
         }
         self.apply_transition(shown);
     }
 
-    /// Let go of a driven transition: it finishes on the clock from wherever it is.
+    /// Let go: where it ends up is decided here, from where it was released and how fast
+    /// it was moving.
+    ///
+    /// A flick wins over position — someone who threw the card away meant it, even if
+    /// they let go early — and otherwise it goes wherever it was more than half way to.
     pub fn release_transition(&mut self) {
         if let Some(t) = self.transition.as_mut() {
             t.driven = false;
+            t.target = if t.velocity <= -FLICK {
+                0.0
+            } else if t.velocity >= FLICK {
+                1.0
+            } else {
+                f32::from(t.progress > 0.5)
+            };
         }
     }
 
@@ -2031,17 +2095,46 @@ impl RenderLoop {
         self.transition.is_some()
     }
 
-    fn apply_transition(&mut self, opacity: f32) {
+    /// Place the outgoing card for `p`: full-screen at 1.0, shrunk and travelled at 0.0.
+    fn apply_transition(&mut self, p: f32) {
+        let direction = self.transition.map_or(1.0, |t| t.direction);
+        let scale = CARD_MIN_SCALE + (1.0 - CARD_MIN_SCALE) * p;
+        // Centred as it shrinks, then carried a whole panel-width on its way out.
+        let centre = (1.0 - scale) / 2.0;
+        let travel = (1.0 - p) * direction;
         self.compositor.upsert_layer(Layer {
             id: LayerId::ShellPrev,
-            opacity: opacity.clamp(0.0, 1.0),
-            transform: Transform::default(),
+            // Only fading at the very end, so the card stays a card rather than a ghost.
+            opacity: (p * 4.0).clamp(0.0, 1.0),
+            transform: Transform {
+                scale_x: scale,
+                scale_y: scale,
+                offset_x: centre + travel,
+                offset_y: centre,
+            },
         });
+    }
+
+    /// A navigation that sprang back: put the stack where it was and drop the card.
+    fn undo_transition(&mut self) {
+        if let Some(undo) = self.transition_undo.take() {
+            if let Some(stack) = &mut self.shell {
+                match undo {
+                    Undo::Pop => {
+                        stack.pop();
+                    }
+                    Undo::Restore(screens) => stack.restore(screens),
+                }
+            }
+            self.repaint_shell();
+        }
+        self.end_transition();
     }
 
     fn end_transition(&mut self) {
         self.compositor.remove_layer(LayerId::ShellPrev);
         self.transition = None;
+        self.transition_undo = None;
     }
 
     /// Rasterise a screen, whichever kind it is.

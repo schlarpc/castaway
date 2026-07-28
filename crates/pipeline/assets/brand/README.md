@@ -35,14 +35,16 @@ The site uses **Inter** (body and headings) and **Spline Sans Mono** (monospace)
 crate embeds **DejaVu Sans / Sans-Bold** and every rendered surface is measured against
 it, including golden-image tests.
 
-**Attempted and blocked.** Both Inter and Spline Sans Mono are packaged only as *variable*
-fonts (`InterVariable.ttf`, `Inter[opsz,wght].ttf`), and `ab_glyph` — the rasterizer this
-crate uses — renders a variable font's default instance with no way to select a weight
-axis. Loading Inter for both `regular` and `bold` would draw both at Regular, and the
-screens lean on that contrast: every title, tile label and row heading is bold against
-dim body text.
+**Deliberately not matched, and not worth chasing.** DejaVu stays.
 
-Getting there needs one of: a static-instance build of Inter vendored here (the upstream
-release ships them, nixpkgs does not), or a rasterizer with variable-font axis support.
-Neither is hard; both are a different piece of work from a palette. The palette landed
-(`pipeline::theme`); the typeface is still DejaVu.
+The mechanical reason it was not a drop-in: both Inter and Spline Sans Mono are packaged
+only as *variable* fonts, and `ab_glyph` renders a variable font's default instance with
+no weight-axis selection — so Inter for both `regular` and `bold` would draw both at
+Regular, and every title, tile label and row heading on these screens is bold against dim
+body text.
+
+The reason it stays that way is simpler: nobody reading a wall from across a room is
+identifying the body face, and matching it would mean vendoring static instances and
+re-checking every surface's metrics for a difference that is invisible at that distance.
+The brand is carried by the palette, the mascot and the wordmark, which is where it is
+actually legible.

@@ -183,6 +183,18 @@ impl ScreenStack {
         }
     }
 
+    /// Everything stacked above Home, for a navigation that may need putting back.
+    #[must_use]
+    pub fn above_screens(&self) -> Vec<Screen> {
+        self.above.clone()
+    }
+
+    /// Put the stack back to `screens` above Home. The other half of
+    /// [`Self::above_screens`], for a gesture abandoned half-way.
+    pub fn restore(&mut self, screens: Vec<Screen>) {
+        self.above = screens;
+    }
+
     /// Replace what Home shows, wherever we currently are.
     ///
     /// Home is rebuilt when the receiver's state changes — a protocol going down, a host

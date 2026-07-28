@@ -63,6 +63,8 @@ struct KioskApp {
     last_frame: Option<std::time::Instant>,
     /// Whether the current edge contact is dragging a navigation along with it.
     started_drag: bool,
+    /// The last position and time of that drag, for the velocity a flick carries.
+    drag_sample: Option<(std::time::Instant, f32)>,
     /// Where each contact was last seen, for turning a drag into a scroll.
     drag_last: std::collections::HashMap<u32, f32>,
     /// Live touch contacts, for the edge swipe. Nothing else in the tree tracked these:
@@ -193,7 +195,9 @@ impl KioskApp {
                 let from_edge = contact.from_edge;
                 let complete = contact.is_home_swipe(event.x, event.y);
                 let travel = event.x - contact.start.0;
-                if complete {
+                if complete && !self.started_drag {
+                    // Only when nothing is being dragged: with a card in hand the swipe
+                    // *is* the navigation, and finishing it is the release's job.
                     contact.fired = true;
                     self.go_home();
                     return true;
@@ -209,9 +213,25 @@ impl KioskApp {
                     }
                 }
                 if from_edge && self.started_drag {
-                    let shown = 1.0 - (travel / crate::overlay::SWIPE_TRAVEL).clamp(0.0, 1.0);
+                    // The card follows the hand: how far across the panel the finger has
+                    // come *is* how far through the navigation it is. Not the gesture
+                    // threshold — that decides whether a flick counts, not where the card
+                    // sits.
+                    let shown = 1.0 - travel.clamp(0.0, 1.0);
+                    let now = std::time::Instant::now();
+                    let velocity =
+                        self.drag_sample
+                            .map_or(0.0, |(t, x): (std::time::Instant, f32)| {
+                                let dt = (now - t).as_secs_f32();
+                                if dt > 0.001 {
+                                    -(event.x - x) / dt
+                                } else {
+                                    0.0
+                                }
+                            });
+                    self.drag_sample = Some((now, event.x));
                     if let Some(render) = self.render.as_mut() {
-                        render.drive_transition(shown);
+                        render.drive_transition(shown, velocity);
                     }
                 }
                 from_edge
@@ -587,6 +607,7 @@ pub fn run(
         drag_last: std::collections::HashMap::new(),
         last_frame: None,
         started_drag: false,
+        drag_sample: None,
         pill_since: None,
         pill_drawn: false,
         exit,
@@ -626,6 +647,7 @@ pub fn run_with_browser(
         drag_last: std::collections::HashMap::new(),
         last_frame: None,
         started_drag: false,
+        drag_sample: None,
         pill_since: None,
         pill_drawn: false,
         exit,

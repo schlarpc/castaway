@@ -257,12 +257,11 @@ Landed, in this order, each independently useful:
     beside it. A crossfade needs only opacity, which is a uniform write rather than a
     33 MB re-raster per frame.
 
-**Still open**: the typeface. dma.space uses Inter, packaged everywhere as a *variable*
-font, and `ab_glyph` renders a variable font's default instance with no weight-axis
-selection — so Inter for both regular and bold would draw both at Regular, and every title
-and heading on these screens is bold against dim body text. It needs a static-instance
-build vendored here or a rasterizer with axis support. Recorded in
-`assets/brand/README.md`.
+The typeface stays DejaVu, deliberately: nobody reading a wall from across a room is
+identifying the body face, and matching dma.space's Inter would mean vendoring static
+instances (it is packaged only as a variable font, which `ab_glyph` cannot take a weight
+axis from) and re-checking every surface's metrics for a difference invisible at that
+distance. The brand is carried by the palette, the mascot and the wordmark.
 
 ## 7. How this gets tested
 
