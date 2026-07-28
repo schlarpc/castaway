@@ -525,7 +525,6 @@ impl WgpuCompositor {
         let meta = self.layers.get(&id).map_or(
             Layer {
                 id,
-                z: default_z(id),
                 opacity: 1.0,
                 transform: Transform::default(),
             },
@@ -661,7 +660,6 @@ impl WgpuCompositor {
         let meta = self.layers.get(&id).map_or(
             Layer {
                 id,
-                z: default_z(id),
                 opacity: 1.0,
                 transform: Transform::default(),
             },
@@ -757,7 +755,6 @@ impl WgpuCompositor {
         let meta = self.layers.get(&id).map_or(
             Layer {
                 id,
-                z: default_z(id),
                 opacity: 1.0,
                 transform: Transform::default(),
             },
@@ -993,7 +990,9 @@ impl WgpuCompositor {
 
     fn render_into(&self, view: &wgpu::TextureView) {
         let mut ordered: Vec<&LayerState> = self.layers.values().collect();
-        ordered.sort_by_key(|s| s.meta.z);
+        // Paint order is layer identity, and identity is unique per layer, so this is a
+        // total order with no ties to break (D38).
+        ordered.sort_by_key(|s| s.meta.id);
 
         let mut encoder = self
             .device
@@ -1282,21 +1281,6 @@ fn build_programs(device: &wgpu::Device, format: wgpu::TextureFormat) -> Program
     }
 }
 
-fn default_z(id: LayerId) -> i32 {
-    match id {
-        LayerId::Attract => -10,
-        // Above the idle scene, below video: a sender with pixels of its own outranks a
-        // card describing a sender without them.
-        LayerId::NowPlaying => -5,
-        // Between the card and video: it belongs to the card, and a video sender covers
-        // both.
-        LayerId::Transport => -4,
-        LayerId::Video => 0,
-        LayerId::Browser => 5,
-        LayerId::Osd => 10,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1336,7 +1320,6 @@ mod tests {
         .unwrap();
         c.upsert_layer(Layer {
             id: LayerId::Video,
-            z: 0,
             opacity: 1.0,
             transform: Transform::default(),
         });
@@ -1361,7 +1344,6 @@ mod tests {
         .unwrap();
         c.upsert_layer(Layer {
             id: LayerId::Video,
-            z: 0,
             opacity: 1.0,
             transform: Transform::default(),
         });
@@ -1404,14 +1386,13 @@ mod tests {
         .unwrap();
         c.upsert_layer(Layer {
             id: LayerId::Video,
-            z: 0,
             opacity: 1.0,
             transform: Transform::default(),
         });
         // Green PiP in the bottom-right corner (corner 3) — BGRA path: green survives
         // the swizzle-free upload because G is channel-order invariant.
         c.upload_texture(
-            LayerId::Browser,
+            LayerId::BrowserFullscreen,
             2,
             2,
             TexelFormat::Bgra8,
@@ -1419,8 +1400,7 @@ mod tests {
         )
         .unwrap();
         c.upsert_layer(Layer {
-            id: LayerId::Browser,
-            z: 5,
+            id: LayerId::BrowserFullscreen,
             opacity: 1.0,
             transform: Transform::pip(3),
         });

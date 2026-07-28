@@ -827,7 +827,7 @@ impl ElectronHost {
             paint.modifier,
             local,
             view.transform,
-            view.z,
+            view.layer,
         ) {
             Ok(()) => self.inflight.push_back(borrow),
             Err(e) => warn!(target: "castaway::browser", error = %e, "browser frame import failed"),

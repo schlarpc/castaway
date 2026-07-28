@@ -204,7 +204,6 @@ mod integration {
             .unwrap();
         compositor.upsert_layer(Layer {
             id: LayerId::Attract,
-            z: -10,
             opacity: 1.0,
             transform: Transform::default(),
         });

@@ -100,11 +100,29 @@ impl DirtyRect {
     }
 }
 
-/// Identifies a compositor layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Identifies a compositor layer, **and its depth**.
+///
+/// Declaration order is paint order, back to front: the compositor draws layers sorted by
+/// this enum and nothing else. That is the whole ordering model, and it is deliberate.
+///
+/// It replaced a `z: i32` that callers passed in per upload. Two layers ended up at the
+/// same depth (the idle screen's web widget and the now-playing card, both at `-5`) and
+/// the tie fell to `HashMap` iteration order — nondeterministic, and harmless only
+/// because those two never appear together in practice. Deriving order from identity
+/// makes that unrepresentable: there is no depth to pass, so there is no depth to
+/// collide, and the paint order of the whole system is this list (ground rule 1).
+///
+/// The cost is that a layer wanting two different depths needs two variants — which is
+/// why the browser has two. That is honest: they are different surfaces with different
+/// sizes and different meanings, and they were already the pair that collided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LayerId {
     /// The idle/attract background (shown when nothing is casting; video covers it).
     Attract,
+    /// The idle screen's embedded web widget — the clock in the reserved card. Above the
+    /// idle background it sits in, below a session's card, because a session that is
+    /// actually playing outranks an ornament.
+    BrowserWidget,
     /// The now-playing card for an audio-only session, which has no pixels of its own.
     /// Above the attract scene, below video — a sender with pixels outranks a card about
     /// a sender without them.
@@ -115,19 +133,44 @@ pub enum LayerId {
     Transport,
     /// The main cast video/mirroring surface.
     Video,
-    /// The CEF browser surface (PiP / YouTube TV surface).
-    Browser,
+    /// A cast surface filling the panel (YouTube leanback, Cast app receivers). Above
+    /// video: it *is* the picture when it is up.
+    BrowserFullscreen,
     /// The OSD text/overlay layer.
     Osd,
+    /// The shell's navigation affordance — the home pill. Above everything, including a
+    /// fullscreen cast surface, because the way out of a screen must never be behind the
+    /// thing it is a way out of (D38).
+    ShellOverlay,
 }
 
-/// A composited layer: a texture placed with a transform, z-order, and opacity.
+impl LayerId {
+    /// Every layer, in paint order. The ordering test asserts against this rather than
+    /// against a hand-written list, so a new variant cannot be added without placing it.
+    pub const PAINT_ORDER: [Self; 8] = [
+        Self::Attract,
+        Self::BrowserWidget,
+        Self::NowPlaying,
+        Self::Transport,
+        Self::Video,
+        Self::BrowserFullscreen,
+        Self::Osd,
+        Self::ShellOverlay,
+    ];
+
+    /// Whether this layer is one of the browser's two surfaces.
+    #[must_use]
+    pub const fn is_browser(self) -> bool {
+        matches!(self, Self::BrowserWidget | Self::BrowserFullscreen)
+    }
+}
+
+/// A composited layer: a texture placed with a transform and opacity. Depth comes from
+/// [`LayerId`] and is not a property of the placement.
 #[derive(Debug, Clone)]
 pub struct Layer {
-    /// Which layer this is.
+    /// Which layer this is — and, by its ordering, how deep.
     pub id: LayerId,
-    /// Draw order — higher is on top.
-    pub z: i32,
     /// 0.0 (transparent) .. 1.0 (opaque).
     pub opacity: f32,
     /// Placement transform.
@@ -166,8 +209,9 @@ impl Compositor for NullCompositor {
     }
 
     fn present(&mut self) {
-        // A real backend sorts by z and draws; here we just account.
-        self.layers.sort_by_key(|l| l.z);
+        // A real backend sorts and draws; here we just account. Same key as the wgpu
+        // backend so the null one cannot disagree about order.
+        self.layers.sort_by_key(|l| l.id);
     }
 }
 
@@ -176,6 +220,15 @@ impl NullCompositor {
     #[must_use]
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    /// The layers in the order the last [`Compositor::present`] would have drawn them.
+    ///
+    /// Exists so the ordering guarantee is testable at all: it is otherwise invisible
+    /// until someone looks at a 65-inch screen and sees the wrong thing on top.
+    #[must_use]
+    pub fn order(&self) -> Vec<LayerId> {
+        self.layers.iter().map(|l| l.id).collect()
     }
 }
 
@@ -188,20 +241,17 @@ mod tests {
         let mut c = NullCompositor::default();
         c.upsert_layer(Layer {
             id: LayerId::Video,
-            z: 0,
             opacity: 1.0,
             transform: Transform::default(),
         });
         c.upsert_layer(Layer {
             id: LayerId::Video,
-            z: 1,
             opacity: 1.0,
             transform: Transform::default(),
         });
         assert_eq!(c.layer_count(), 1);
         c.upsert_layer(Layer {
             id: LayerId::Osd,
-            z: 10,
             opacity: 1.0,
             transform: Transform::default(),
         });
@@ -214,5 +264,60 @@ mod tests {
     fn pip_transform_is_scaled_down() {
         let t = Transform::pip(3);
         assert!(t.scale_x < 0.5 && t.offset_x > 0.5);
+    }
+
+    #[test]
+    fn paint_order_is_total_and_matches_the_declared_order() {
+        // The whole ordering model in one assertion. Before D38 depth was an `i32` each
+        // caller passed in, two layers shared `-5`, and the tie fell to `HashMap`
+        // iteration order — so what was on top depended on nothing you could read.
+        let mut sorted = LayerId::PAINT_ORDER;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            LayerId::PAINT_ORDER,
+            "PAINT_ORDER must be in ascending paint order — declaration order *is* depth"
+        );
+        // And no two layers can compare equal, which is what makes it a total order.
+        for (i, a) in LayerId::PAINT_ORDER.iter().enumerate() {
+            for b in &LayerId::PAINT_ORDER[i + 1..] {
+                assert_ne!(a, b, "duplicate layer in PAINT_ORDER");
+            }
+        }
+    }
+
+    #[test]
+    fn the_navigation_affordance_is_above_every_cast_surface() {
+        // D38's rule: the way out of a screen must never be behind the thing it is a way
+        // out of. A fullscreen cast surface is the one that would otherwise swallow it.
+        assert!(LayerId::ShellOverlay > LayerId::BrowserFullscreen);
+        assert!(LayerId::ShellOverlay > LayerId::Video);
+        assert!(LayerId::ShellOverlay > LayerId::Osd);
+    }
+
+    #[test]
+    fn a_playing_session_outranks_the_idle_widget() {
+        // The pair that used to collide at z = -5. A now-playing card is a live session;
+        // the widget is an ornament on the idle screen.
+        assert!(LayerId::NowPlaying > LayerId::BrowserWidget);
+        assert!(LayerId::BrowserWidget > LayerId::Attract);
+        // ...and video still covers both, per the doc comments on those variants.
+        assert!(LayerId::Video > LayerId::Transport);
+        assert!(LayerId::Transport > LayerId::NowPlaying);
+    }
+
+    #[test]
+    fn null_compositor_presents_in_paint_order_regardless_of_insertion_order() {
+        let mut c = NullCompositor::default();
+        // Inserted front-to-back, deliberately the wrong way round.
+        for id in LayerId::PAINT_ORDER.iter().rev() {
+            c.upsert_layer(Layer {
+                id: *id,
+                opacity: 1.0,
+                transform: Transform::default(),
+            });
+        }
+        c.present();
+        assert_eq!(c.order(), LayerId::PAINT_ORDER.to_vec());
     }
 }

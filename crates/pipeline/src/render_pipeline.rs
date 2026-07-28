@@ -1001,7 +1001,6 @@ impl RenderLoop {
                     // bottom-center of the surface.
                     self.compositor.upsert_layer(Layer {
                         id: LayerId::Osd,
-                        z: 10,
                         opacity: 1.0,
                         transform: banner.transform,
                     });
@@ -1116,7 +1115,6 @@ impl RenderLoop {
         self.compositor.upsert_layer(Layer {
             id: LayerId::Transport,
             // Above the card, below video.
-            z: -4,
             opacity: 1.0,
             transform: Transform {
                 scale_x: w / sw.max(1) as f32,
@@ -1221,7 +1219,6 @@ impl RenderLoop {
         )?;
         self.compositor.upsert_layer(Layer {
             id: LayerId::NowPlaying,
-            z: -5,
             opacity: 1.0,
             transform: Transform::default(),
         });
@@ -1244,7 +1241,6 @@ impl RenderLoop {
         )?;
         self.compositor.upsert_layer(Layer {
             id: LayerId::Attract,
-            z: -10,
             opacity: 1.0,
             transform: Transform::default(),
         });
@@ -1267,10 +1263,10 @@ impl RenderLoop {
         bgra: &[u8],
         dirty: &[DirtyRect],
         transform: Transform,
-        z: i32,
+        layer: LayerId,
     ) -> Result<(), PipelineError> {
         self.compositor.upload_texture_regions(
-            LayerId::Browser,
+            layer,
             width,
             height,
             TexelFormat::Bgra8,
@@ -1278,8 +1274,7 @@ impl RenderLoop {
             dirty,
         )?;
         self.compositor.upsert_layer(Layer {
-            id: LayerId::Browser,
-            z,
+            id: layer,
             opacity: 1.0,
             transform,
         });
@@ -1307,16 +1302,14 @@ impl RenderLoop {
         modifier: u64,
         handle: crate::hwaccel::remote_handle::LocalHandle,
         transform: Transform,
-        z: i32,
+        layer: LayerId,
     ) -> Result<(), PipelineError> {
         let texture = self
             .compositor
             .import_browser_frame(geometry, modifier, handle)?;
-        self.compositor
-            .adopt_rgba_texture(LayerId::Browser, texture);
+        self.compositor.adopt_rgba_texture(layer, texture);
         self.compositor.upsert_layer(Layer {
-            id: LayerId::Browser,
-            z,
+            id: layer,
             opacity: 1.0,
             transform,
         });
@@ -1330,12 +1323,18 @@ impl RenderLoop {
     /// from outside without this.
     #[must_use]
     pub fn browser_layer_present(&self) -> bool {
-        self.compositor.has_layer(LayerId::Browser)
+        self.compositor.has_layer(LayerId::BrowserWidget)
+            || self.compositor.has_layer(LayerId::BrowserFullscreen)
     }
 
-    /// Remove the browser layer (browser hidden).
+    /// Remove the browser's layers (browser hidden).
+    ///
+    /// Both, not the current one: the role can change between a frame arriving and this
+    /// being called, and a stale surface left composited is a clock card sitting over a
+    /// cast — or worse, a dead page over the idle screen.
     pub fn clear_browser(&mut self) {
-        self.compositor.remove_layer(LayerId::Browser);
+        self.compositor.remove_layer(LayerId::BrowserWidget);
+        self.compositor.remove_layer(LayerId::BrowserFullscreen);
     }
 
     /// Drain all pending commands (non-blocking) and present once. Returns the number of
@@ -1459,7 +1458,6 @@ impl RenderLoop {
                     if !self.has_video {
                         self.compositor.upsert_layer(Layer {
                             id: LayerId::Video,
-                            z: 0,
                             opacity: 1.0,
                             transform: Transform::default(),
                         });

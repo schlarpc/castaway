@@ -99,8 +99,8 @@ pub struct BrowserView {
     pub rect: InsetRect,
     /// Layer placement: `rect` normalized onto the surface, one texel per device pixel.
     pub transform: Transform,
-    /// Layer depth in the compositor stack.
-    pub z: i32,
+    /// Which compositor layer the viewport maps onto — and therefore how deep it sits.
+    pub layer: crate::compositor::LayerId,
 }
 
 #[cfg(feature = "render")]
@@ -125,11 +125,13 @@ impl BrowserRole {
         BrowserView {
             rect,
             transform: rect.transform(w, h),
-            // Attract is -10 and video is 0, so the idle widget sits between them: no
-            // explicit "hide the clock" step, a cast just covers it.
-            z: match self {
-                Self::AttractWidget => -5,
-                Self::Fullscreen => 5,
+            // The two roles are two *layers*, not one layer at two depths — which is what
+            // they used to be, colliding with the now-playing card (D38). The widget sits
+            // between the idle background and video, so a cast simply covers it with no
+            // explicit "hide the clock" step.
+            layer: match self {
+                Self::AttractWidget => crate::compositor::LayerId::BrowserWidget,
+                Self::Fullscreen => crate::compositor::LayerId::BrowserFullscreen,
             },
         }
     }

@@ -238,7 +238,6 @@ fn vaapi_decode_imports_zero_copy_and_composites_the_right_colour() {
         .expect("importing the decoder's surface");
     compositor.upsert_layer(Layer {
         id: LayerId::Video,
-        z: 0,
         opacity: 1.0,
         transform: Transform::default(),
     });
