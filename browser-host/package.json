@@ -1,0 +1,6 @@
+{
+  "name": "castaway-browser-host",
+  "private": true,
+  "description": "The Electron side of castaway's browser layer (D36). No npm dependencies, by policy.",
+  "main": "main.js"
+}

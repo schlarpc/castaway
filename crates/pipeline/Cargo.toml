@@ -92,6 +92,18 @@ d3d12 = { version = "22", optional = true }
 base64.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+
+# The Q40 spike example only: `pidfd_getfd` to pull dmabuf fds out of the Electron child.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+# The D36 gate (OPEN-QUESTIONS Q40): drives browser-host/ under Electron and imports its
+# shared-texture frames into a wgpu device. Linux-only by nature (pidfd + dmabuf).
+[[example]]
+name = "electron_osr"
+required-features = ["hwaccel"]
 
 [features]
 default = []

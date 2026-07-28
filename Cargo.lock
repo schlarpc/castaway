@@ -3500,6 +3500,7 @@ dependencies = [
  "ffmpeg-sys-next",
  "image",
  "input-touch",
+ "libc",
  "png 0.17.16",
  "pollster",
  "raw-window-handle",

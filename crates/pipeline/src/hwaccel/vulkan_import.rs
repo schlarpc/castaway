@@ -238,6 +238,139 @@ impl VulkanImporter {
         })
     }
 
+    /// Import a single-plane RGBA-family DMA-BUF as a `wgpu::Texture`.
+    ///
+    /// This is the shape an offscreen browser delivers (D36/Q40): Electron's
+    /// shared-texture OSR hands over one `NativePixmapHandle` plane of BGRA, where the
+    /// decoder path above hands two planes of NV12. Same extensions, same explicit
+    /// modifier layout, no disjoint case and no `MUTABLE_FORMAT` — an RGBA image is
+    /// sampled as itself, so no per-plane views and no format list.
+    ///
+    /// `owner` is dropped only when wgpu has retired every submission referencing the
+    /// texture. For a browser frame that is what gates the `release()` ack back to the
+    /// producer — Chromium recycles the buffer exactly the way libavcodec recycles VA
+    /// surfaces, so releasing early is the same tearing bug `DmaBufSurface` documents.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if the format is not BGRA/RGBA8 or Vulkan refuses
+    /// the image, allocation, or bind.
+    pub fn import_single_plane(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        modifier: u64,
+        plane: super::dmabuf::PlaneLayout,
+        format: wgpu::TextureFormat,
+        owner: std::sync::Arc<dyn GpuSurface>,
+    ) -> Result<wgpu::Texture, PipelineError> {
+        let vk_format = match format {
+            wgpu::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+            wgpu::TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+            other => {
+                return Err(PipelineError::GpuImport(format!(
+                    "single-plane import supports BGRA8/RGBA8, not {other:?}"
+                )))
+            }
+        };
+
+        let fd = dup_fd(plane.fd)?;
+
+        let plane_layouts = [vk::SubresourceLayout {
+            offset: plane.offset,
+            size: 0,
+            row_pitch: plane.pitch,
+            array_pitch: 0,
+            depth_pitch: 0,
+        }];
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+        let mut external_info = vk::ExternalMemoryImageCreateInfo::default().handle_types(DMA_BUF);
+
+        let create_info = vk::ImageCreateInfo::default()
+            .push_next(&mut external_info)
+            .push_next(&mut modifier_info)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            // See the NV12 path: `UNDEFINED` is the only legal initial layout for an
+            // imported DRM-modifier image, and the driver preserves the pixels across
+            // the first transition.
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        // SAFETY: `create_info` and every chained structure live until after this call.
+        let image = unsafe { self.device.create_image(&create_info, None) }
+            .map_err(|e| PipelineError::GpuImport(format!("vkCreateImage: {e}")))?;
+
+        let mut guard = ImageGuard {
+            device: self.device.clone(),
+            image,
+            memory: Vec::new(),
+            _surface: owner,
+        };
+
+        // SAFETY: `image` is live and `fd` is a duplicate this call may consume.
+        let memory = unsafe { self.import_memory(image, fd, None) }?;
+        guard.memory.push(memory);
+        let infos = [vk::BindImageMemoryInfo::default()
+            .image(image)
+            .memory(memory)
+            .memory_offset(0)];
+        // SAFETY: image and memory are live and owned by the guard.
+        unsafe { self.device.bind_image_memory2(&infos) }
+            .map_err(|e| PipelineError::GpuImport(format!("vkBindImageMemory2: {e}")))?;
+
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let hal_desc = wgpu::hal::TextureDescriptor {
+            label: Some("imported-browser-frame"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::hal::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+        // SAFETY: `image` was created respecting `hal_desc`, and the guard destroys it —
+        // the contract `texture_from_raw` states for a `Some(drop_guard)`.
+        let hal_texture = unsafe {
+            wgpu::hal::vulkan::Device::texture_from_raw(image, &hal_desc, Some(Box::new(guard)))
+        };
+        // SAFETY: the hal texture was built from this device's own image and matches the
+        // descriptor below.
+        Ok(unsafe {
+            device.create_texture_from_hal::<Vulkan>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("imported-browser-frame"),
+                    size: extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            )
+        })
+    }
+
     /// Create the `VkImage`, import the DMA-BUFs behind it, and bind them.
     ///
     /// # Safety

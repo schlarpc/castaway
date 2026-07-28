@@ -377,7 +377,46 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 The decision is made (D36); these are the things it is *gated on* or that must be proven
 during the port, in the order they can kill or reshape it.
 
-- **Q40 — The spike: shared-texture OSR into the wgpu compositor. THE GATE.** Electron's
+- **Q40 — The spike: shared-texture OSR into the wgpu compositor. THE GATE — PASSED on
+  Linux 2026-07-28.** `cargo run -p pipeline --features hwaccel --example electron_osr`
+  drives `browser-host/` under Electron 41.9.1 and reports:
+
+  ```
+  spike: 876 frames in 14.6s = 60.2 fps    (3840x2160 bgra, drops=0)
+  spike: 30 pixel checks, red channel over time: [8, 248, 232, 216, 200, …]
+  SPIKE PASS
+  ```
+
+  True 4K, the full requested frame rate, nothing dropped, and the imported picture is
+  *sampled and read back* rather than merely accepted — the walking red channel is what
+  proves the frames are live and not one image repeated. The import reuses the decode
+  path's Vulkan machinery (`VulkanImporter::import_single_plane`, added beside the NV12
+  one): same extensions, same explicit DRM-modifier layout, single plane, no
+  `MUTABLE_FORMAT`.
+
+  **The assertion is proven to bite.** Building with the format deliberately set to RGBA
+  makes it fail — `green is right but blue is not … R/B exchanged` — so "PASS" is a
+  claim about pixels, not about the absence of errors.
+
+  Four things learned that the port inherits:
+  1. The handle is at `textureInfo.handle.nativePixmap`, not `textureInfo.planes`. The
+     host logs the whole `textureInfo` once per run so a future rename is a diff rather
+     than a mystery.
+  2. **`BrowserWindow`'s constructor size is clamped to the display work area even
+     offscreen** — asking for 3840×2160 silently produced 3200×1800, which would have
+     made the 4K claim false. `setContentSize` after construction is not clamped.
+  3. The buffer arrives **linear** (`modifier: "0"`, stride = width×4), so the tiled
+     modifier path is *not* exercised by this result. Fine for a browser surface; do not
+     read this as proof for tiled imports.
+  4. `supportsZeroCopyWebGpuImport: false` is about Electron's *own* WebGPU import and
+     did not stop ours — we import into Vulkan directly. Worth not misreading later.
+
+  **Still unproven, and the reason this Q stays open**: the Windows leg (NT handle →
+  D3D12 `OpenSharedHandle` + keyed mutex) on the real box, and production fd transport —
+  the spike uses `pidfd_getfd` because the browser is our direct child, which is a
+  harness shortcut, not the design. Original statement of the gate:
+
+  Electron's
   `useSharedTexture` paint events deliver `NativePixmapHandle` plane fds on Linux — the
   dmabuf shape the VA-API import already consumes — and an NT HANDLE on Windows. To prove
   on Linux: import via Vulkan external memory + `VK_EXT_image_drm_format_modifier` next to
