@@ -21,4 +21,8 @@ pub enum MdnsError {
     /// Registering the service failed.
     #[error("mDNS register error: {0}")]
     Register(String),
+
+    /// Starting a browse for a service type failed.
+    #[error("mDNS browse error: {0}")]
+    Browse(String),
 }

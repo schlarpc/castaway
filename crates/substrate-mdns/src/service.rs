@@ -6,6 +6,27 @@ use mdns_sd::ServiceInfo;
 
 use crate::error::MdnsError;
 
+/// Fully qualify and validate a service type (`_x._tcp` → `_x._tcp.local.`).
+/// Shared by advertising and browsing so both reject the same malformed types.
+///
+/// # Errors
+/// [`MdnsError::InvalidServiceType`] if it isn't a `_name._tcp`/`_udp` type.
+pub fn qualify_type(service_type: &str) -> Result<String, MdnsError> {
+    let ty = service_type.trim_end_matches('.');
+    let looks_valid = ty.starts_with('_') && (ty.contains("._tcp") || ty.contains("._udp"));
+    if !looks_valid {
+        return Err(MdnsError::InvalidServiceType(service_type.to_string()));
+    }
+    Ok(if ty.ends_with(".local") {
+        format!("{ty}.")
+    } else if ty.ends_with("._tcp") || ty.ends_with("._udp") {
+        format!("{ty}.local.")
+    } else {
+        // e.g. already has a subdomain; normalize to end with a dot.
+        format!("{ty}.")
+    })
+}
+
 /// A service instance to advertise, e.g. `_googlecast._tcp` named "castaway" on 8009.
 #[derive(Debug, Clone)]
 pub struct MdnsService {
@@ -53,19 +74,7 @@ impl MdnsService {
     /// # Errors
     /// [`MdnsError::InvalidServiceType`] if it isn't a `_name._tcp`/`_udp` type.
     pub fn qualified_type(&self) -> Result<String, MdnsError> {
-        let ty = self.service_type.trim_end_matches('.');
-        let looks_valid = ty.starts_with('_') && (ty.contains("._tcp") || ty.contains("._udp"));
-        if !looks_valid {
-            return Err(MdnsError::InvalidServiceType(self.service_type.clone()));
-        }
-        Ok(if ty.ends_with(".local") {
-            format!("{ty}.")
-        } else if ty.ends_with("._tcp") || ty.ends_with("._udp") {
-            format!("{ty}.local.")
-        } else {
-            // e.g. already has a subdomain; normalize to end with a dot.
-            format!("{ty}.")
-        })
+        qualify_type(&self.service_type)
     }
 
     /// Convert to an `mdns_sd::ServiceInfo` with address auto-detection enabled.

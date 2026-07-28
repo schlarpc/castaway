@@ -9,9 +9,11 @@
 //! daemon itself is I/O.
 #![forbid(unsafe_code)]
 
+pub mod browse;
 pub mod error;
 pub mod service;
 
+pub use browse::{BrowseEvent, Browser, DiscoveredService};
 pub use error::MdnsError;
 pub use service::MdnsService;
 
@@ -52,6 +54,17 @@ impl MdnsResponder {
         info!(service = %service.service_type, instance = %service.instance, "mDNS advertised");
         self.registered.push(fullname);
         Ok(())
+    }
+
+    /// Browse the LAN for instances of a service type (`_nvstream._tcp`). The returned
+    /// [`Browser`] yields resolutions and removals until dropped; multiple concurrent
+    /// browses on the one daemon are fine.
+    ///
+    /// # Errors
+    /// [`MdnsError::InvalidServiceType`] for a malformed type,
+    /// [`MdnsError::Browse`] if the daemon refuses the query.
+    pub fn browse(&self, service_type: &str) -> Result<Browser, MdnsError> {
+        Browser::start(&self.daemon, service_type)
     }
 
     /// Stop advertising everything (also happens on drop). Best-effort.
