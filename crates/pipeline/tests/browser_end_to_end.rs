@@ -42,6 +42,19 @@ const PAGE: &str =
     "data:text/html,<style>html,body{margin:0;height:100%;background:rgb(0,128,255)}</style>\
      <body ontouchstart=\"document.title='touched'\"></body>";
 
+fn spec(
+    adblock: Arc<AdBlocker>,
+    audio_out: Option<pipeline::audio_out::AudioOutputFactory>,
+) -> pipeline::electron_browser::RespawnSpec {
+    pipeline::electron_browser::RespawnSpec {
+        program: electron_path(),
+        app_dir: app_dir(),
+        adblock,
+        audio_out,
+        user_agent: pipeline::TV_USER_AGENT.to_string(),
+    }
+}
+
 fn electron_path() -> std::path::PathBuf {
     std::env::var_os("CASTAWAY_ELECTRON")
         .map(std::path::PathBuf::from)
@@ -78,15 +91,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
     .expect("browser should start");
 
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
-    let mut host = ElectronHost::new(
-        electron,
-        electron_path(),
-        app_dir(),
-        blocker,
-        None,
-        pipeline::TV_USER_AGENT.to_string(),
-        rx,
-    );
+    let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
     host.resize(1280, 720);
     tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
 
@@ -166,15 +171,7 @@ fn a_touch_reaches_the_page() {
     .expect("browser should start");
 
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
-    let mut host = ElectronHost::new(
-        electron,
-        electron_path(),
-        app_dir(),
-        blocker,
-        None,
-        pipeline::TV_USER_AGENT.to_string(),
-        rx,
-    );
+    let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
     host.resize(640, 480);
     tx.send(BrowserCommand::Navigate(TOUCH_PAGE.into()))
         .unwrap();
@@ -214,6 +211,110 @@ fn a_touch_reaches_the_page() {
     );
 
     host.shutdown();
+}
+
+/// The page's audio has to reach *our* mixer, not the sound card.
+///
+/// The claim being tested is specific: `MediaElementAudioSourceNode` removes an element
+/// from the normal output path, so if the tap is working the browser process is silent
+/// and every sample arrives here instead. A count of zero means the audio went somewhere
+/// we cannot mix, control the volume of, or measure sync against — which is
+/// indistinguishable, from the room, from a page that is simply quiet.
+#[test]
+#[ignore = "needs a GPU and an Electron"]
+fn page_audio_arrives_as_pcm_with_a_media_clock() {
+    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(640, 480, cmd_rx) else {
+        eprintln!("skipping: no usable GPU");
+        return;
+    };
+
+    // A counting sink stands in for the real device: what matters is that blocks reach
+    // an `AudioOut` at all, not that anything was audible in the room.
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let factory: pipeline::audio_out::AudioOutputFactory = {
+        let counter = Arc::clone(&counter);
+        Arc::new(move || Box::new(CountingOut(Arc::clone(&counter))))
+    };
+
+    let blocker = Arc::new(AdBlocker::with_defaults());
+    let electron = Electron::spawn(
+        &electron_path(),
+        &app_dir(),
+        Arc::clone(&blocker),
+        Some(&factory),
+        pipeline::TV_USER_AGENT,
+    )
+    .expect("browser should start");
+
+    let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
+    let mut host = ElectronHost::new(electron, spec(blocker, Some(factory)), rx);
+    host.resize(640, 480);
+    let page = format!("file://{}", audio_page().display());
+    tx.send(BrowserCommand::Navigate(page)).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && counter.load(std::sync::atomic::Ordering::Relaxed) < 5 {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let blocks = counter.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        blocks >= 5,
+        "only {blocks} audio blocks reached the mixer: the tap is not capturing"
+    );
+
+    host.shutdown();
+}
+
+/// An `AudioOut` that only counts. The seam a test uses to see that samples left the page.
+#[derive(Debug)]
+struct CountingOut(Arc<std::sync::atomic::AtomicU64>);
+
+impl pipeline::audio_out::AudioOut for CountingOut {
+    fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), pipeline::error::PipelineError> {
+        Ok(())
+    }
+    fn write(
+        &mut self,
+        block: &pipeline::audio_decode::PcmBlock,
+    ) -> Result<(), pipeline::error::PipelineError> {
+        if !block.samples.is_empty() {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn stop(&mut self) {}
+}
+
+/// A page with a real `<audio src=...>`, written to a file rather than inlined.
+///
+/// Two earlier versions were wrong in instructive ways. The first used `srcObject` with a
+/// `MediaStream`, which `createMediaElementSource` cannot take, so the tap attached to
+/// nothing. The second inlined the same script in a `data:` URL with `<` HTML-escaped —
+/// which is a syntax error, because inside a data URL the script is parsed as
+/// JavaScript, not as HTML. Both failed the test correctly; a file is simply the shape
+/// with no escaping question in it.
+fn audio_page() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("castaway-audio-tap-test.html");
+    std::fs::write(
+        &path,
+        r"<body><script>
+const R=48000,N=R*2,b=new ArrayBuffer(44+N*2),v=new DataView(b);
+const W=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};
+W(0,'RIFF');v.setUint32(4,36+N*2,true);W(8,'WAVEfmt ');v.setUint32(16,16,true);
+v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,R,true);
+v.setUint32(28,R*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+W(36,'data');v.setUint32(40,N*2,true);
+for(let i=0;i<N;i++)v.setInt16(44+i*2,Math.sin(i*2*Math.PI*440/R)*20000,true);
+const a=document.createElement('audio');
+a.src=URL.createObjectURL(new Blob([b],{type:'audio/wav'}));
+a.loop=true;a.autoplay=true;document.body.appendChild(a);a.play();
+</script></body>",
+    )
+    .expect("write the audio test page");
+    path
 }
 
 /// Counts touches the page itself observed.

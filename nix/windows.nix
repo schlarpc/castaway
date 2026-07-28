@@ -291,6 +291,9 @@ let
     mkdir -p "$out/bin/browser-host"
     cp -r --no-preserve=mode,ownership ${../browser-host}/* "$out/bin/browser-host/"
     install -Dm644 ${./castaway.exe.manifest} "$out/bin/castaway.exe.manifest"
+    # The signing step travels with the artifact rather than living only in the repo: it
+    # runs on whoever deploys this, after Authenticode, and needs the tree beside it.
+    install -Dm755 ${../browser-host/vmp-sign.sh} "$out/bin/vmp-sign.sh"
   '' + lib.optionalString (widevine != null) ''
     # Staged for the receiver to copy into the browser profile on first run, not loaded
     # from here: ECS finds its CDM under `<userDataDir>/WidevineCdm/<version>/`, which is

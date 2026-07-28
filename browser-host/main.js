@@ -140,6 +140,21 @@ function installAdblock(ses) {
 // renderer sandbox for it. CDP's addScriptToEvaluateOnNewDocument is main-world and
 // document-start, which is exactly the pair required.
 // ---------------------------------------------------------------------------
+/// Every CDP command gets a deadline.
+///
+/// Not defensive decoration: a command sent to a webContents with no target never
+/// answers, and one unresolved await in the navigate chain is a page that never loads.
+/// That failure has no error and no log line — the panel is simply black.
+function withDeadline(promise, what, ms = 3000) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} did not answer in ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 // The debugger is attached once per window and kept, because *three* things need it:
 // scriptlet injection, the audio tap's binding, and touch. An earlier version attached it
 // lazily inside the scriptlet path, which meant a page with no matching uBO rule got no
@@ -154,9 +169,18 @@ async function ensureDebugger(contents) {
     return false;
   }
   try {
-    await contents.debugger.sendCommand('Runtime.enable');
-    await contents.debugger.sendCommand('Runtime.addBinding', { name: '__castawayAudio' });
-    await contents.debugger.sendCommand('Runtime.addBinding', { name: '__castawayAudioError' });
+    // `Page` is what addScriptToEvaluateOnNewDocument lives on; without enabling it the
+    // call answers "No target available" even when a target exists.
+    await withDeadline(contents.debugger.sendCommand('Page.enable'), 'Page.enable');
+    await withDeadline(contents.debugger.sendCommand('Runtime.enable'), 'Runtime.enable');
+    await withDeadline(
+      contents.debugger.sendCommand('Runtime.addBinding', { name: '__castawayAudio' }),
+      'addBinding audio'
+    );
+    await withDeadline(
+      contents.debugger.sendCommand('Runtime.addBinding', { name: '__castawayAudioError' }),
+      'addBinding audio-error'
+    );
     contents.debugger.on('message', (_e, method, params) => {
       if (method !== 'Runtime.bindingCalled') return;
       if (params.name === '__castawayAudioError') {
@@ -198,14 +222,20 @@ async function applyScriptlets(contents, source) {
   if (!(await ensureDebugger(contents))) return;
   try {
     if (scriptletHandle) {
-      await contents.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', {
-        identifier: scriptletHandle,
-      });
+      await withDeadline(
+        contents.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', {
+          identifier: scriptletHandle,
+        }),
+        'removeScriptToEvaluateOnNewDocument'
+      ).catch(() => {});
     }
-    const res = await contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
-      source: `${AUDIO_TAP}\n${source || ''}`,
-      runImmediately: true,
-    });
+    const res = await withDeadline(
+      contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+        source: `${AUDIO_TAP}\n${source || ''}`,
+        runImmediately: true,
+      }),
+      'addScriptToEvaluateOnNewDocument'
+    );
     scriptletHandle = res.identifier;
     log('info', `page armed (audio tap + ${(source || '').length} bytes of scriptlets)`);
   } catch (e) {
@@ -299,8 +329,11 @@ function createWindow(width, height) {
   // Electron exposes no PCM tap the way CEF's audio handler did, so this is the honest
   // arrangement rather than a chosen one; see GAPS for what it costs.
   w.webContents.setAudioMuted(false);
-  // The debugger is attached on navigate, not here: attaching before the window has a
-  // page stops it painting at all (measured — both end-to-end tests went dark).
+  // A window with nothing loaded has no CDP *target*, and commands sent to it never
+  // answer — they do not fail, they hang, which took the whole navigate chain down with
+  // them and left the panel black with no error. about:blank is the cheapest way to give
+  // the debugger something to attach to.
+  w.loadURL('about:blank').catch(() => {});
 
   w.webContents.on('paint', (event) => {
     if (!event.texture) {

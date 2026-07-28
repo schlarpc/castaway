@@ -63,8 +63,18 @@ pub enum PixelOrder {
 }
 
 /// What the browser sends us.
+/// `rename_all` on the enum renames *variants*; `rename_all_fields` is what makes
+/// multi-word fields match the JavaScript that produces them. Without it `sampleRate`
+/// simply never deserializes into `sample_rate` — and the failure is not loud: a message
+/// with a defaulted field silently carries a zero (which is how the A/V clock read 0),
+/// and one without a default is dropped as a protocol error, which for audio meant
+/// perfect silence with the tap working correctly on the far side.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum FromBrowser {
     /// The host app is up. Carries the pid so handles can be pulled from it.
     Ready {
@@ -186,7 +196,11 @@ pub enum FromBrowser {
 
 /// What we send the browser.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ToBrowser {
     /// Return a painted frame's buffer to the browser's pool.
     Release {
@@ -496,6 +510,49 @@ mod tests {
         );
         assert_eq!(planes[0].fd, 108);
         assert_eq!(planes[0].stride, 15360);
+    }
+
+    #[test]
+    fn messages_decode_from_the_field_names_the_browser_actually_sends() {
+        // Byte-for-byte what browser-host/main.js writes. The previous round-trip test
+        // only proved Rust agreed with itself, which is why a `sampleRate`/`sample_rate`
+        // mismatch survived it: audio was dropped as undecodable and the A/V clock read
+        // zero, both silently.
+        let lines: &[&[u8]] = &[
+            br#"{"type":"audio","pcm":"AAAAAA==","channels":2,"sampleRate":48000,"mediaTime":12.5,"paused":false}"#,
+            br#"{"type":"paint","id":1,"format":"bgra","width":8,"height":4,"mediaTime":3.25,"modifier":"0","planes":[{"fd":9,"stride":32,"offset":0}]}"#,
+            br#"{"type":"probe-result","id":2,"value":"3"}"#,
+            br#"{"type":"adblock-query","id":3,"url":"https://x/","source":"https://y/","kind":"script"}"#,
+        ];
+        let mut framer = LineFramer::default();
+        let mut got = Vec::new();
+        for line in lines {
+            got.extend(framer.push(line));
+            got.extend(framer.push(b"\n"));
+        }
+        assert_eq!(got.len(), 4, "every line must decode");
+        for (i, r) in got.iter().enumerate() {
+            assert!(r.is_ok(), "line {i} failed: {:?}", r.as_ref().err());
+        }
+        let FromBrowser::Audio {
+            sample_rate,
+            media_time,
+            channels,
+            ..
+        } = got[0].as_ref().unwrap().clone()
+        else {
+            panic!("expected audio")
+        };
+        assert_eq!(sample_rate, 48_000);
+        assert_eq!(channels, 2);
+        assert!((media_time - 12.5).abs() < f64::EPSILON);
+        let FromBrowser::Paint { media_time, .. } = got[1].as_ref().unwrap().clone() else {
+            panic!("expected paint")
+        };
+        assert!(
+            (media_time - 3.25).abs() < f64::EPSILON,
+            "the paint's media clock must survive: it is half of av_skew_ms"
+        );
     }
 
     #[test]

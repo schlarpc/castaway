@@ -134,6 +134,25 @@ impl Health {
     }
 }
 
+/// Seconds on the media clock → milliseconds, saturating.
+///
+/// A media time is never large enough to overflow, but `as` on a `f64` that somehow is
+/// (a NaN from a corrupt message, say) is undefined-ish rather than merely wrong, and a
+/// wrapped timestamp would read as a wild sync error rather than a bad input.
+fn ms(seconds: f64) -> i64 {
+    if !seconds.is_finite() {
+        return 0;
+    }
+    let millis = seconds * 1000.0;
+    // `as` on an out-of-range float saturates in Rust, but saying so explicitly documents
+    // that a wild value becomes a clamp rather than a wrapped timestamp — which would
+    // read as an enormous sync error instead of a bad input.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        millis as i64
+    }
+}
+
 /// Base64 → interleaved `f32`.
 ///
 /// The page sends native-endian `f32` bytes; a length that is not a multiple of four
@@ -245,8 +264,17 @@ impl Electron {
                 let probes = Arc::clone(&probes);
                 move || {
                     reader_loop(
-                        stdout, &pending, &health, &stdin, &adblock, &audio, &probes, &ready_tx,
-                    )
+                        stdout,
+                        &Wiring {
+                            pending: &pending,
+                            health: &health,
+                            stdin: &stdin,
+                            adblock: &adblock,
+                            audio: &audio,
+                            probes: &probes,
+                            ready_tx: &ready_tx,
+                        },
+                    );
                 }
             })
             .map_err(|e| PipelineError::GpuInit(format!("browser reader thread: {e}")))?;
@@ -410,21 +438,27 @@ impl Drop for Electron {
     }
 }
 
+/// Everything the reader thread dispatches into.
+///
+/// One struct rather than seven parameters threaded through two functions: they are all
+/// the same thing — the state a message can touch — and passing them individually made
+/// both signatures unreadable and neither more correct.
+struct Wiring<'a> {
+    pending: &'a Arc<Mutex<Option<PendingPaint>>>,
+    health: &'a Arc<Health>,
+    stdin: &'a Arc<Mutex<Option<ChildStdin>>>,
+    adblock: &'a Arc<AdBlocker>,
+    audio: &'a Arc<Mutex<Option<BrowserAudio>>>,
+    probes: &'a Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
+    ready_tx: &'a std::sync::mpsc::Sender<u32>,
+}
+
 /// Read the browser's stdout until it closes, dispatching each message.
 ///
 /// On its own thread rather than the render loop because blocking decisions must not wait
 /// for the next frame: a page stalls on a pending request, so answering at 60 Hz would
 /// make every blocked resource cost up to 16 ms.
-fn reader_loop(
-    stdout: std::process::ChildStdout,
-    pending: &Arc<Mutex<Option<PendingPaint>>>,
-    health: &Arc<Health>,
-    stdin: &Arc<Mutex<Option<ChildStdin>>>,
-    adblock: &Arc<AdBlocker>,
-    audio: &Arc<Mutex<Option<BrowserAudio>>>,
-    probes: &Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
-    ready_tx: &std::sync::mpsc::Sender<u32>,
-) {
+fn reader_loop(stdout: std::process::ChildStdout, w: &Wiring<'_>) {
     let mut framer = LineFramer::default();
     let mut reader = BufReader::new(stdout);
     loop {
@@ -436,9 +470,7 @@ fn reader_loop(
             for msg in framer.push(buf) {
                 match msg {
                     Ok(msg) => {
-                        handle(
-                            msg, pending, health, stdin, adblock, audio, probes, ready_tx,
-                        );
+                        handle(msg, w);
                     }
                     Err(e) => {
                         warn!(target: "castaway::browser", error = %e, "browser protocol");
@@ -450,19 +482,19 @@ fn reader_loop(
         reader.consume(consumed);
     }
     debug!(target: "castaway::browser", "browser stdout closed");
-    health.set_fault("browser stdout closed".into());
+    w.health.set_fault("browser stdout closed".into());
 }
 
-fn handle(
-    msg: FromBrowser,
-    pending: &Arc<Mutex<Option<PendingPaint>>>,
-    health: &Arc<Health>,
-    stdin: &Arc<Mutex<Option<ChildStdin>>>,
-    adblock: &Arc<AdBlocker>,
-    audio: &Arc<Mutex<Option<BrowserAudio>>>,
-    probes: &Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
-    ready_tx: &std::sync::mpsc::Sender<u32>,
-) {
+fn handle(msg: FromBrowser, w: &Wiring<'_>) {
+    let Wiring {
+        pending,
+        health,
+        stdin,
+        adblock,
+        audio,
+        probes,
+        ready_tx,
+    } = *w;
     match msg {
         FromBrowser::Ready { pid } => {
             let _ = ready_tx.send(pid);
@@ -480,7 +512,7 @@ fn handle(
             // own `media_time` is the lip-sync error. Recorded on every frame because a
             // skew that only appears under load is the one that matters.
             if media_time > 0.0 {
-                let video_ms = (media_time * 1000.0) as i64;
+                let video_ms = ms(media_time);
                 let audio_ms = health.audio_ms.load(Ordering::Relaxed);
                 if audio_ms != 0 {
                     health
@@ -573,9 +605,7 @@ fn handle(
                 warn!(target: "castaway::browser", "audio block did not decode");
                 return;
             };
-            health
-                .audio_ms
-                .store((media_time * 1000.0) as i64, Ordering::Relaxed);
+            health.audio_ms.store(ms(media_time), Ordering::Relaxed);
             health.audio_blocks.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut guard) = audio.lock() {
                 if let Some(sink) = guard.as_mut() {
@@ -667,12 +697,21 @@ pub struct ElectronHost {
 }
 
 /// What [`ElectronHost`] needs to bring a browser back.
-struct RespawnSpec {
-    program: std::path::PathBuf,
-    app_dir: std::path::PathBuf,
-    adblock: Arc<AdBlocker>,
-    audio_out: Option<AudioOutputFactory>,
-    user_agent: String,
+///
+/// Public because it is also what `new` takes: the same five things describe how to start
+/// a browser and how to start it *again*, and threading them separately made the
+/// constructor an eight-argument seam nobody could read.
+pub struct RespawnSpec {
+    /// The Electron binary.
+    pub program: std::path::PathBuf,
+    /// The host app directory.
+    pub app_dir: std::path::PathBuf,
+    /// The engine that answers blocking and scriptlet queries.
+    pub adblock: Arc<AdBlocker>,
+    /// Where the page's audio goes. `None` leaves the browser silent.
+    pub audio_out: Option<AudioOutputFactory>,
+    /// The user agent leanback keys off.
+    pub user_agent: String,
 }
 
 impl ElectronHost {
@@ -680,22 +719,12 @@ impl ElectronHost {
     #[must_use]
     pub fn new(
         electron: Electron,
-        program: std::path::PathBuf,
-        app_dir: std::path::PathBuf,
-        adblock: Arc<AdBlocker>,
-        audio_out: Option<AudioOutputFactory>,
-        user_agent: String,
+        respawn: RespawnSpec,
         commands: std::sync::mpsc::Receiver<BrowserCommand>,
     ) -> Self {
         Self {
             electron: Some(electron),
-            respawn: RespawnSpec {
-                program,
-                app_dir,
-                adblock,
-                audio_out,
-                user_agent,
-            },
+            respawn,
             commands,
             size: (1920, 1080),
             role: BrowserRole::Fullscreen,

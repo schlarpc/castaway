@@ -219,11 +219,13 @@ fn main() -> anyhow::Result<()> {
 
             let host = pipeline::ElectronHost::new(
                 electron,
-                program,
-                app_dir,
-                blocker,
-                Some(StdArc::clone(&audio_factory)),
-                pipeline::TV_USER_AGENT.to_string(),
+                pipeline::electron_browser::RespawnSpec {
+                    program,
+                    app_dir,
+                    adblock: blocker,
+                    audio_out: Some(StdArc::clone(&audio_factory)),
+                    user_agent: pipeline::TV_USER_AGENT.to_string(),
+                },
                 nav_rx,
             );
             // If the page dies and will not come back, stop telling senders it is there.
