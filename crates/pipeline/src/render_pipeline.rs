@@ -1286,6 +1286,43 @@ impl RenderLoop {
         Ok(())
     }
 
+    /// Import a browser frame's GPU buffer and make it the browser layer.
+    ///
+    /// The zero-copy counterpart of [`Self::upload_browser`], which took a CPU copy of
+    /// every frame because CEF's accelerated offscreen path is unusable upstream (Q6). At
+    /// 4K that copy was 33 MB per frame; this is a handful of driver objects.
+    ///
+    /// `handle` is the browser's buffer, already pulled into this process. It is consumed
+    /// here — the returned layer holds the imported texture, and the *caller* holds the
+    /// borrow that must outlive it (see `electron_browser::InFlight`), because only the
+    /// caller knows when the browser may recycle the pixels.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if this device cannot import external memory or the
+    /// geometry is one the single-plane path does not describe.
+    #[cfg(feature = "hwaccel")]
+    pub fn import_browser_frame(
+        &mut self,
+        geometry: crate::hwaccel::FrameGeometry,
+        modifier: u64,
+        handle: crate::hwaccel::remote_handle::LocalHandle,
+        transform: Transform,
+        z: i32,
+    ) -> Result<(), PipelineError> {
+        let texture = self
+            .compositor
+            .import_browser_frame(geometry, modifier, handle)?;
+        self.compositor
+            .adopt_rgba_texture(LayerId::Browser, texture);
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::Browser,
+            z,
+            opacity: 1.0,
+            transform,
+        });
+        Ok(())
+    }
+
     /// Remove the browser layer (browser hidden).
     pub fn clear_browser(&mut self) {
         self.compositor.remove_layer(LayerId::Browser);

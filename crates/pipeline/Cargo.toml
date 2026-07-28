@@ -15,8 +15,13 @@ input-touch.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "process", "io-util"] }
 bytes.workspace = true
+# Unconditional: `browser_proto` is the browser subprocess wire format (D36) and is
+# compiled in every build, so its round-trip tests run everywhere rather than only where
+# a browser backend exists.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # --- real render backends (optional; default off, DECISION-LOG D4) ---
 wgpu = { version = "22", optional = true }
@@ -38,18 +43,11 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
 ], optional = true }
-# CEF (offscreen browser). Pinned to the CEF 147.0.10 build so it matches the nixpkgs
-# `cef-binary` the flake points CEF_PATH at (flake.nix cefDist). If nixpkgs bumps
-# cef-binary, bump these together.
-cef = { version = "=147.1.0", optional = true }
-cef-dll-sys = { version = "=147.1.0", optional = true }
 # Brave's adblock engine — request-level ad/tracker blocking in the CEF host (Q6 answer).
 # Drop the default `single-thread` feature so the Engine is Arc-based (Send+Sync) — CEF
 # calls the resource handler across threads. Keep `embedded-domain-resolver` (needed for
 # URL parsing) and `full-regex-handling`.
 base64 = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 # A JS engine, to evaluate uBlock Origin's scriptlet modules and read their own registry
 # rather than parsing them. Cross-builds for the Windows MSVC target (checked).
 rquickjs = { version = "0.9", features = ["loader"], optional = true }
@@ -149,8 +147,10 @@ hwaccel = [
     "dep:winapi",
     "dep:d3d12",
 ]
-# `cef` needs `render` for the compositor it paints into; adblock is baked in.
-cef = ["render", "dep:cef", "dep:cef-dll-sys", "dep:adblock", "dep:ureq", "dep:base64", "dep:serde_json", "dep:serde", "dep:rquickjs"]
+# The browser subprocess (D36). Needs `render` for the compositor it paints into and
+# `hwaccel` for the zero-copy frame import; adblock and scriptlets are baked in because a
+# browser on a wall with no ad blocking is not a thing we would ship.
+electron = ["render", "hwaccel", "dep:adblock", "dep:ureq", "dep:base64", "dep:rquickjs"]
 
 [lints]
 workspace = true
@@ -168,14 +168,6 @@ required-features = ["render"]
 [[example]]
 name = "screen_preview"
 required-features = ["render"]
-
-[[example]]
-name = "cef_shot"
-required-features = ["cef"]
-
-[[example]]
-name = "idle_preview"
-required-features = ["cef"]
 
 [[test]]
 name = "hwaccel_zero_copy"

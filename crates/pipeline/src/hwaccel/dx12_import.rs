@@ -185,6 +185,28 @@ pub struct ImportedFrame {
     _owner: std::sync::Arc<dyn GpuSurface>,
 }
 
+impl ImportedFrame {
+    /// Yield the texture, leaking the resource reference into it.
+    ///
+    /// The compositor stores textures, not frames, so the resource has to outlive this
+    /// type without the caller holding it separately. `std::mem::forget` on the resource
+    /// is deliberate and is *not* a leak in the usual sense: D3D12 resources are
+    /// refcounted, and the reference is released when the texture wgpu owns is dropped
+    /// along with the layer. The alternative — a drop guard — is exactly what wgpu's DX12
+    /// `texture_from_raw` does not accept.
+    #[must_use]
+    pub fn into_texture(self) -> wgpu::Texture {
+        let Self {
+            texture,
+            _resource,
+            _owner,
+        } = self;
+        std::mem::forget(_resource);
+        std::mem::forget(_owner);
+        texture
+    }
+}
+
 impl std::fmt::Debug for ImportedFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImportedFrame")

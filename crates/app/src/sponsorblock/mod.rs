@@ -15,16 +15,16 @@
 // Nothing in a browser-less build calls these — there is no page to watch — but they are
 // still compiled and still tested, because misreading a payload is not something to find
 // out on a wall display.
-#![cfg_attr(not(feature = "cef"), allow(dead_code))]
+#![cfg_attr(not(feature = "electron"), allow(dead_code))]
 
 use std::time::{Duration, Instant};
 
 use proto_dial::LoungeCommand;
 use sponsorblock::VideoId;
 
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 mod actor;
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 pub use actor::run;
 
 /// What an ad event tells us. Field names and their string-typed booleans are taken from

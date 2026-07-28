@@ -7,7 +7,7 @@
 //!
 //! - `ffmpeg` — libav decode (d3d11va/vaapi) → frames.
 //! - `wgpu` — the [`compositor::Compositor`] impl (DX12/Vulkan), layers + PiP.
-//! - `cef` — the [`browser::BrowserSurface`] impl (offscreen YouTube TV surface / PiP).
+//! - `electron` — the browser subprocess (offscreen YouTube TV surface / PiP), D36.
 //!
 //! This crate is where `unsafe` FFI *would* live, so unlike the pure crates it does not
 //! `forbid(unsafe_code)`; the null backend uses none, and any real backend's `unsafe`
@@ -20,22 +20,25 @@ pub mod audio_out;
 #[cfg(feature = "audio")]
 pub mod audio_session;
 pub mod browser;
+// The browser subprocess protocol (D36). Pure and always compiled, so the wire types
+// are fixture-tested in every build rather than only where a browser exists.
+pub mod browser_proto;
 pub mod color;
 pub mod compositor;
 pub mod error;
 pub mod hwaccel;
 pub mod null;
 
+#[cfg(feature = "electron")]
+pub mod adblock_engine;
 #[cfg(feature = "render")]
 pub mod attract;
-#[cfg(feature = "cef")]
-pub mod cef_adblock;
-#[cfg(feature = "cef")]
-pub mod cef_browser;
 pub mod clock;
+#[cfg(feature = "electron")]
+pub mod electron_browser;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 pub mod filterlists;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
@@ -51,14 +54,12 @@ pub mod tap;
 #[cfg(feature = "render")]
 pub mod text;
 pub mod transport;
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 pub mod ubo_scriptlets;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
-#[cfg(feature = "cef")]
-pub mod widevine;
-
-pub use browser::{BrowserSurface, NullBrowser};
+#[cfg(feature = "electron")]
+pub use browser::{BrowserCommand, BrowserRole, BrowserSurface, BrowserView, NullBrowser};
 pub use color::YuvMatrix;
 pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
 pub use error::PipelineError;
@@ -67,8 +68,8 @@ pub use null::NullPipeline;
 
 #[cfg(feature = "render")]
 pub use attract::{AttractRow, AttractScene, InsetRect, WidgetSlot};
-#[cfg(feature = "cef")]
-pub use cef_browser::{BrowserCommand, BrowserHost, BrowserRole, Cef, TV_USER_AGENT};
+#[cfg(feature = "electron")]
+pub use electron_browser::{Electron, ElectronHost, TV_USER_AGENT};
 #[cfg(feature = "render")]
 pub use osd::{Banner, OsdController, OsdUpdate};
 #[cfg(feature = "render")]

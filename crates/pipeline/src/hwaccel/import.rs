@@ -136,6 +136,28 @@ impl GpuImporter {
     /// [`PipelineError::GpuImport`] if the surface is not one this platform understands,
     /// or the driver refused the import.
     #[allow(unused_variables)]
+    /// Import a single-plane browser frame (D36).
+    ///
+    /// Separate from [`Self::import`] because the producer is different in kind: a
+    /// decoder hands over NV12 surfaces from a pool it owns, a browser hands over one
+    /// RGBA buffer per paint that it will recycle the moment we release it.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if this build has no importer or the frame's layout
+    /// is one the single-plane path cannot describe.
+    #[cfg(all(feature = "hwaccel", unix))]
+    pub fn import_single_plane(
+        &mut self,
+        device: &wgpu::Device,
+        geometry: super::FrameGeometry,
+        modifier: u64,
+        plane: super::dmabuf::PlaneLayout,
+        owner: std::sync::Arc<dyn GpuSurface>,
+    ) -> Result<wgpu::Texture, PipelineError> {
+        self.inner
+            .import_single_plane(device, geometry, modifier, plane, owner)
+    }
+
     pub fn import(
         &mut self,
         device: &wgpu::Device,

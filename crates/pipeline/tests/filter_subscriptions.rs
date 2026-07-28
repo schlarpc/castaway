@@ -8,7 +8,7 @@
 //! already happened once — uBO moved to ES modules and `adblock`'s assembler reads zero
 //! resources from the current tree, which is why the bundle is pinned. This test is what
 //! notices if the pin ever stops yielding scriptlets, or if the lists move again.
-#![cfg(feature = "cef")]
+#![cfg(feature = "electron")]
 
 use pipeline::filterlists::{load_or_fetch_all, CachePaths};
 

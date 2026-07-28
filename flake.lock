@@ -1,17 +1,5 @@
 {
   "nodes": {
-    "cef-windows-src": {
-      "flake": false,
-      "locked": {
-        "narHash": "sha256-kdn2/IAj/YJjNKd0gsee0Ss2bo5SmYKOhg7gb1kI/V4=",
-        "type": "file",
-        "url": "https://cef-builds.spotifycdn.com/cef_binary_147.0.10%2Bgd58e84d%2Bchromium-147.0.7727.118_windows64_minimal.tar.bz2"
-      },
-      "original": {
-        "type": "file",
-        "url": "https://cef-builds.spotifycdn.com/cef_binary_147.0.10%2Bgd58e84d%2Bchromium-147.0.7727.118_windows64_minimal.tar.bz2"
-      }
-    },
     "crane": {
       "locked": {
         "lastModified": 1781825982,
@@ -141,7 +129,6 @@
     },
     "root": {
       "inputs": {
-        "cef-windows-src": "cef-windows-src",
         "crane": "crane",
         "electron-linux-src": "electron-linux-src",
         "electron-windows-src": "electron-windows-src",

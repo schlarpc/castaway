@@ -67,10 +67,10 @@ audio-out = ["audio", "pipeline/audio-out"]
 # LDAC decode. Off by default: advertising a codec we cannot decode makes the session
 # silence rather than a clean fallback to one we can (OPEN-QUESTIONS Q22).
 ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
-# CEF offscreen browser in the kiosk (YouTube leanback via DIAL launch). Implies `render`;
-# needs CEF_PATH from the flake devshell. CEF re-execs this binary for subprocesses, so
-# main() bootstraps it before anything else.
-cef = ["render", "hwaccel", "pipeline/cef", "dep:ureq"]
+# The browser subprocess in the kiosk (YouTube leanback via DIAL launch). Implies
+# `render` and `hwaccel` for the zero-copy frame import. Unlike the CEF build it replaced,
+# this binary is *not* also the browser's subprocess entry point, so main() is ordinary.
+electron = ["render", "hwaccel", "pipeline/electron", "dep:ureq"]
 
 [lints]
 workspace = true

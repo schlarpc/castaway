@@ -1,7 +1,7 @@
 # The full Linux kiosk build — renderer, browser, sound, Bluetooth. This is
 # `packages.default` on Linux, so it is what `nix run .` gives you.
 #
-# Every optional feature is on here except one. `cef` implies `render` and `hwaccel`;
+# Every optional feature is on here except one. `electron` implies `render` and `hwaccel`;
 # `audio-out` adds the A2DP decoders and a real PCM device; `bluetooth-socket` adds the
 # `socket:N` transport beside the USB default. The exception is `ldac`, which is *not* a
 # capability but an advertisement: the slot exists and the decoder does not (Q22), so a
@@ -13,35 +13,26 @@
 # but it is not a receiver you can cast YouTube to, because DIAL only *launches* an app
 # and the app is a web page (D27).
 #
-# Two things have to agree between build and run, and both are set here rather than left
-# to the environment:
-#   - CEF_PATH, because `initialize()` reads it at *runtime* to find the .pak/ICU/locales
-#     resources, not just at build time to link libcef.
-#   - LD_LIBRARY_PATH, so the loader finds libcef.so and the Vulkan/Wayland/X11 libraries
-#     that winit and wgpu dlopen. libGL is in there because cefDist's bundled libGLESv2.so
-#     links libGL.so.1; without it CEF's GPU process dies and wgpu's GL probe segfaults.
+# What has to agree between build and run is now just *where the browser is*: the wrapper
+# pins CASTAWAY_ELECTRON and CASTAWAY_BROWSER_APP so the receiver finds its subprocess
+# without a devshell, and CASTAWAY_WIDEVINE_CDM so it can pre-stage a CDM into the
+# browser profile on first run (G46's offline property, under D36's mechanism).
 #
-# The Widevine CDM is *not* configured here. It ships inside `cefDist` (flake.nix), beside
-# libcef.so, because that is the only directory Chromium looks in — see
-# crates/pipeline/src/widevine.rs. This file used to set a `CASTAWAY_WIDEVINE_PATH` that
-# fed a `--widevine-cdm-path` switch CEF does not have.
-{ pkgs, craneLib, commonArgs, cefDist }:
+# LD_LIBRARY_PATH is still set, but only for *our* binary now — the Vulkan/Wayland/X11
+# libraries winit and wgpu dlopen. The browser brings its own, because it is a separate
+# process with its own wrapper.
+{ pkgs, craneLib, commonArgs, electron, widevineCdm }:
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
   # audio decoders), ALSA for the PCM device, and CEF's own build tooling.
   kioskArgs = {
     pname = "castaway";
-    cargoExtraArgs = "--package castaway --features cef,audio-out,bluetooth-socket";
+    cargoExtraArgs = "--package castaway --features electron,audio-out,bluetooth-socket";
 
     nativeBuildInputs = [
       pkgs.pkg-config
       pkgs.makeWrapper
-      # cef-dll-sys constructs a `cmake::Config` even where it builds no C++, so the
-      # binaries have to exist. Its setup hook must not take over the build, though —
-      # crane drives cargo, not cmake.
-      pkgs.cmake
-      pkgs.ninja
     ];
 
     buildInputs = [
@@ -54,9 +45,7 @@ let
     # the libc headers pointed out explicitly in a Nix env.
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
-    CEF_PATH = "${cefDist}";
 
-    dontUseCmakeConfigure = true;
   };
 
   # dlopened at runtime, so they are wrapper-time rather than link-time inputs.
@@ -87,8 +76,15 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
   # runs — a subprocess started from an unwrapped path would come up without CEF_PATH.
   postInstall = ''
     wrapProgram $out/bin/castaway \
-      --set-default CEF_PATH ${cefDist} \
-      --prefix LD_LIBRARY_PATH : "${runtimeLibs}:${cefDist}"
+      --set-default CASTAWAY_ELECTRON ${electron}/bin/electron \
+      --set-default CASTAWAY_BROWSER_APP $out/share/castaway/browser-host \
+      --set-default CASTAWAY_WIDEVINE_CDM ${widevineCdm} \
+      --prefix LD_LIBRARY_PATH : "${runtimeLibs}"
+
+    # The browser host app travels with the binary. It is ours and dependency-free, so
+    # this is a copy rather than a node_modules tree.
+    mkdir -p $out/share/castaway
+    cp -r ${../browser-host} $out/share/castaway/browser-host
   '';
 
   meta = commonArgs.meta or { } // {

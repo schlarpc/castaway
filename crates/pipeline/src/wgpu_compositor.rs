@@ -285,6 +285,34 @@ struct Programs {
     sampler: wgpu::Sampler,
 }
 
+/// A browser frame's buffer handle, held for as long as the texture that aliases it.
+///
+/// A [`GpuSurface`] only so it can ride the importers' existing owner slot; nothing reads
+/// through it. Dropping it closes the handle, which is *not* the same as releasing the
+/// frame back to the browser — that is the protocol `Release`, and it is the caller's,
+/// deliberately, because only the caller knows when the GPU is finished.
+#[cfg(feature = "hwaccel")]
+#[derive(Debug)]
+struct BorrowedFrame(
+    /// Never read. Held so the handle outlives the texture that aliases it — closing it
+    /// early would pull the memory out from under a frame still being sampled.
+    #[allow(dead_code)]
+    crate::hwaccel::remote_handle::LocalHandle,
+);
+
+#[cfg(feature = "hwaccel")]
+impl GpuSurface for BorrowedFrame {
+    fn color(&self) -> castaway_core::ColorInfo {
+        // Browser output is full-range sRGB; the packed shader path does not consult
+        // this, but answering honestly costs nothing and a future path might.
+        castaway_core::ColorInfo::default()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// The wgpu compositor.
 pub struct WgpuCompositor {
     device: wgpu::Device,
@@ -553,6 +581,128 @@ impl WgpuCompositor {
     ///
     /// A fresh `wgpu::Texture` (and therefore a fresh bind group) is built per frame:
     /// the decoder cycles a pool of surfaces and gives no stable identity to cache on.
+    /// Import a browser frame's buffer into a sampleable texture.
+    ///
+    /// The one place the two platforms' browser imports meet. Everything above this —
+    /// `electron_browser`, the render loop, the compositor layer — is written once; only
+    /// the description of where the pixels live differs, and it differs here.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if the device cannot import external memory, or the
+    /// geometry is one the single-plane path cannot describe.
+    #[cfg(feature = "hwaccel")]
+    pub fn import_browser_frame(
+        &mut self,
+        geometry: crate::hwaccel::FrameGeometry,
+        modifier: u64,
+        handle: crate::hwaccel::remote_handle::LocalHandle,
+    ) -> Result<wgpu::Texture, PipelineError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let importer = self.importer.as_mut().ok_or_else(|| {
+                PipelineError::GpuImport("device cannot import GPU surfaces".into())
+            })?;
+            let plane = crate::hwaccel::dmabuf::PlaneLayout {
+                fd: handle.as_raw_fd(),
+                offset: 0,
+                // Linear browser output has no per-plane offset table; the stride is the
+                // row pitch and the importer needs it explicitly.
+                pitch: u64::from(geometry.width) * 4,
+            };
+            // The handle must outlive the texture, so it becomes the surface the import
+            // hangs its drop guard on.
+            let owner: std::sync::Arc<dyn GpuSurface> = std::sync::Arc::new(BorrowedFrame(handle));
+            importer.import_single_plane(&self.device, geometry, modifier, plane, owner)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            let _ = modifier; // an NT handle describes its own layout
+            let raw = handle.as_raw_handle().cast();
+            let owner: std::sync::Arc<dyn GpuSurface> = std::sync::Arc::new(BorrowedFrame(handle));
+            let frame = crate::hwaccel::dx12_import::Dx12Importer::import_single_plane(
+                &self.device,
+                geometry,
+                raw,
+                owner,
+            )?;
+            Ok(frame.into_texture())
+        }
+    }
+
+    /// Adopt an already-imported RGBA texture as a layer.
+    ///
+    /// The browser path's counterpart to [`Self::import_surface`]. It is separate rather
+    /// than a branch inside it because the two differ in every interesting way: a decoded
+    /// frame is NV12 sampled through per-plane views and owned by the decoder's pool,
+    /// while a browser frame is single-plane BGRA that the *caller* keeps borrowed from
+    /// the browser until the GPU is done with it. Sharing one entry point would mean one
+    /// of those two lifetimes being wrong.
+    pub fn adopt_rgba_texture(&mut self, id: LayerId, texture: wgpu::Texture) {
+        let format = match texture.format() {
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
+                TexelFormat::Rgba8
+            }
+            // Everything else was rejected by `FrameGeometry::validate` before the
+            // import; BGRA is what Chromium actually produces on both platforms.
+            _ => TexelFormat::Bgra8,
+        };
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("browser-frame"),
+            ..Default::default()
+        });
+        let meta = self.layers.get(&id).map_or(
+            Layer {
+                id,
+                z: default_z(id),
+                opacity: 1.0,
+                transform: Transform::default(),
+            },
+            |s| s.meta.clone(),
+        );
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("layer-uniform-browser"),
+                contents: bytemuck::bytes_of(&Uniform::from_layer(meta.transform, meta.opacity)),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("layer-bg-browser"),
+            layout: &self.programs.packed_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.programs.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        self.layers.insert(
+            id,
+            LayerState {
+                meta,
+                gpu: Some(LayerGpu {
+                    // `Packed` rather than a new variant: from the draw's point of view an
+                    // imported browser frame *is* a packed RGBA texture. The difference is
+                    // entirely in who owns the memory, and that is the caller's borrow,
+                    // held above this layer — see `electron_browser::InFlight`.
+                    texture: LayerTexture::Packed { texture, format },
+                    uniform,
+                    bind_group,
+                }),
+            },
+        );
+    }
+
     /// The import is a handful of driver objects, not a copy, so it costs microseconds.
     ///
     /// # Errors

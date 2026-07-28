@@ -37,6 +37,10 @@ pub struct Config {
     pub cast: Cast,
     /// Miracast / Wi-Fi Display settings.
     pub miracast: Miracast,
+    /// Where the browser subprocess lives (D36). Defaults work for a Nix-built artifact
+    /// and for running from the repo, so most deployments never set these.
+    #[serde(default)]
+    pub browser: Browser,
 }
 
 /// Miracast settings.
@@ -248,6 +252,29 @@ impl Default for SponsorBlock {
 }
 
 impl Config {
+    /// The Electron binary to run the browser host with.
+    ///
+    /// `$CASTAWAY_ELECTRON` first so a developer can point at a build under test without
+    /// editing config, then the configured path, then `electron` on `PATH`. The packaged
+    /// artifacts set the environment variable, which is why there is no clever search
+    /// here: on a panel the answer is known at build time.
+    #[must_use]
+    pub fn browser_program(&self) -> std::path::PathBuf {
+        std::env::var_os("CASTAWAY_ELECTRON")
+            .map(std::path::PathBuf::from)
+            .or_else(|| self.browser.electron_path.clone().map(Into::into))
+            .unwrap_or_else(|| std::path::PathBuf::from("electron"))
+    }
+
+    /// The directory holding the browser host app (`browser-host/`).
+    #[must_use]
+    pub fn browser_app_dir(&self) -> std::path::PathBuf {
+        std::env::var_os("CASTAWAY_BROWSER_APP")
+            .map(std::path::PathBuf::from)
+            .or_else(|| self.browser.app_dir.clone().map(Into::into))
+            .unwrap_or_else(|| std::path::PathBuf::from("browser-host"))
+    }
+
     /// The name one protocol advertises itself under: `<friendly_name>#<protocol>`.
     ///
     /// One box shows up in several pickers at once — AirPlay, Cast, DLNA, Bluetooth — and
@@ -406,6 +433,7 @@ impl Default for Enable {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            browser: Browser::default(),
             friendly_name: "dma.space/screen".to_string(),
             uuid: "0f8c2e10-castaway-0001-000000000001".to_string(),
             http_port: 8080,
@@ -670,4 +698,15 @@ mod advertised_name_tests {
         assert!(name.len() <= 63, "{} octets", name.len());
         assert!(name.ends_with("#cast"));
     }
+}
+
+/// Browser subprocess locations (D36). Both are normally supplied by the packaging, so a
+/// hand-written `castaway.toml` never needs this section.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Browser {
+    /// Path to the Electron binary. `$CASTAWAY_ELECTRON` overrides it.
+    pub electron_path: Option<String>,
+    /// Path to the host app directory. `$CASTAWAY_BROWSER_APP` overrides it.
+    pub app_dir: Option<String>,
 }

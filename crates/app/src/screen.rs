@@ -10,31 +10,31 @@
 //! protocol crate holds and renders the id, and the network call to find it lives here,
 //! in the crate that is allowed to do wiring and `anyhow`.
 
-#[cfg(any(feature = "cef", test))]
+#[cfg(any(feature = "electron", test))]
 use proto_dial::ScreenId;
 use proto_dial::ScreenSlot;
 
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 use std::time::Duration;
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 use tracing::{debug, info, warn};
 
 /// YouTube's screen lookup — the same endpoint a phone uses to turn a pairing code into
 /// a screen.
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 const GET_SCREEN: &str = "https://www.youtube.com/api/lounge/pairing/get_screen";
 
 /// How long to keep asking. The page has to load `youtube.com/tv` and register before
 /// there is anything to find, which on a cold start is seconds, not milliseconds — and
 /// on a slow link, more. Until then the lookup answers 404, which is not an error.
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 const ATTEMPTS: u32 = 20;
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// A single lookup's ceiling, chosen so a stalled one costs one attempt rather than all
 /// of them.
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolve the launched page's screen id and publish it into `slot`.
@@ -42,7 +42,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Best-effort by design: failing to find it costs a sender the attach-without-launch
 /// path, not the cast. Anything that launches normally still works, so this logs and
 /// gives up rather than failing a launch that already succeeded.
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 pub async fn publish_screen_id(pairing_code: String, slot: ScreenSlot) {
     for attempt in 1..=ATTEMPTS {
         match fetch(pairing_code.clone()).await {
@@ -67,7 +67,7 @@ pub async fn publish_screen_id(pairing_code: String, slot: ScreenSlot) {
 
 /// One lookup. `Ok(None)` means "not registered yet" — the 404 this answers with until
 /// the page has claimed the code.
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 async fn fetch(pairing_code: String) -> anyhow::Result<Option<ScreenId>> {
     // ureq is blocking, so it does not belong on the runtime (ground rule 4).
     let body = tokio::task::spawn_blocking(move || {
@@ -103,7 +103,7 @@ async fn fetch(pairing_code: String) -> anyhow::Result<Option<ScreenId>> {
 
 /// Without a browser there is no page, so there is no screen to find — and DIAL is not
 /// mounted at all in that build. Present so the call site needs no `cfg`.
-#[cfg(not(feature = "cef"))]
+#[cfg(not(feature = "electron"))]
 pub async fn publish_screen_id(_pairing_code: String, _slot: ScreenSlot) {}
 
 #[cfg(test)]

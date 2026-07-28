@@ -50,19 +50,19 @@ struct KioskApp {
     /// drive — the strip is then never drawn either, since nothing publishes capabilities.
     controls: Option<ControlSink>,
     /// The main-thread CEF host (this loop is CEF's message pump — architecture §6).
-    #[cfg(feature = "cef")]
-    browser: Option<crate::cef_browser::BrowserHost>,
+    #[cfg(feature = "electron")]
+    browser: Option<crate::electron_browser::ElectronHost>,
 }
 
 impl KioskApp {
-    /// The surface that currently receives input: the CEF browser layer when present.
+    /// The surface that currently receives input: the browser layer when present.
     /// Future interactive layers (video controls, adapter UIs) slot in here.
     fn input_sink(&mut self) -> Option<&mut dyn InputSink> {
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         {
             self.browser.as_mut().map(|b| b as &mut dyn InputSink)
         }
-        #[cfg(not(feature = "cef"))]
+        #[cfg(not(feature = "electron"))]
         {
             None
         }
@@ -245,7 +245,7 @@ impl ApplicationHandler for KioskApp {
             }
             self.render = Some(render);
         }
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         if let Some(host) = &mut self.browser {
             host.resize(size.width, size.height);
         }
@@ -264,7 +264,7 @@ impl ApplicationHandler for KioskApp {
                 if let Some(r) = &mut self.render {
                     r.resize(size.width, size.height);
                 }
-                #[cfg(feature = "cef")]
+                #[cfg(feature = "electron")]
                 if let Some(host) = &mut self.browser {
                     host.resize(size.width, size.height);
                 }
@@ -272,7 +272,7 @@ impl ApplicationHandler for KioskApp {
             WindowEvent::RedrawRequested => {
                 // CEF first: its message-loop iteration may paint a fresh frame, which
                 // then lands in this same redraw's present.
-                #[cfg(feature = "cef")]
+                #[cfg(feature = "electron")]
                 if let (Some(host), Some(r)) = (&mut self.browser, &mut self.render) {
                     host.pump(r);
                 }
@@ -326,26 +326,26 @@ pub fn run(
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         browser: None,
     };
     run_app(&mut app)
 }
 
-/// [`run`], plus a main-thread CEF [`BrowserHost`](crate::cef_browser::BrowserHost)
+/// [`run`], plus a main-thread CEF [`BrowserHost`](crate::electron_browser::ElectronHost)
 /// pumped every frame (the kiosk loop is CEF's external message pump). Shuts CEF down
 /// after the event loop exits.
 ///
 /// # Errors
 /// [`PipelineError`] if the event loop can't be created or run.
-#[cfg(feature = "cef")]
+#[cfg(feature = "electron")]
 pub fn run_with_browser(
     rx: Receiver<RenderCommand>,
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,
     controls: Option<ControlSink>,
-    browser: crate::cef_browser::BrowserHost,
+    browser: crate::electron_browser::ElectronHost,
 ) -> Result<(), PipelineError> {
     let mut app = KioskApp {
         rx: Some(rx),
@@ -360,7 +360,8 @@ pub fn run_with_browser(
         browser: Some(browser),
     };
     let result = run_app(&mut app);
-    // CEF must be shut down on this (main) thread, after the loop stops pumping it.
+    // The browser is stopped on this (main) thread after the loop stops driving it,
+    // so every borrowed frame is released before the subprocess goes away.
     if let Some(host) = app.browser.take() {
         host.shutdown();
     }

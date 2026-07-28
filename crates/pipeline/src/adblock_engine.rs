@@ -1,6 +1,7 @@
-//! Request-level ad/tracker blocking for the CEF browser, using Brave's `adblock`
+//! Request-level ad/tracker blocking for the browser, using Brave's `adblock`
 //! engine. This is the answer to "can we run uBlock Origin?" — CEF's extension APIs
-//! can't host uBO, but blocking at the request layer (CEF hands us every resource load)
+//! can't host uBO, but blocking at the request layer (the browser asks about every
+//! resource load)
 //! is cleaner for a kiosk and just as effective for the general web. Every block is
 //! **logged** on the `castaway::adblock` target so it's visible.
 
@@ -15,6 +16,12 @@ use tracing::info;
 
 /// A compact default block list; a full EasyList can be loaded via [`AdBlocker::from_list_text`].
 const DEFAULT_RULES: &str = include_str!("adblock_default.txt");
+
+/// The engine behind a lock, so the daily refresh can swap it under a running browser.
+///
+/// Two layers on purpose: the `RwLock` is held only long enough to clone the `Arc`, so a
+/// refresh never stalls a page load waiting for a decision to finish.
+pub type SharedBlocker = std::sync::Arc<std::sync::RwLock<std::sync::Arc<AdBlocker>>>;
 
 /// Wraps an adblock [`Engine`] and counts/logs blocks.
 pub struct AdBlocker {

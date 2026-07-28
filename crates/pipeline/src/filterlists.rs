@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 use adblock::resources::Resource;
 use tracing::{info, warn};
 
-use crate::cef_adblock::AdBlocker;
+use crate::adblock_engine::AdBlocker;
 
 /// The canonical EasyList URL — network-level rules.
 pub const EASYLIST_URL: &str = "https://easylist.to/easylist/easylist.txt";
@@ -96,7 +96,7 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// runtime of its own to borrow.
 ///
 /// Respects [`OFFLINE_ENV`] — a receiver pinned to its cache stays pinned.
-pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::cef_browser::SharedBlocker) {
+pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::adblock_engine::SharedBlocker) {
     if std::env::var_os(OFFLINE_ENV).is_some() {
         info!(target: "castaway::adblock", "offline: no periodic refresh");
         return;
@@ -105,7 +105,7 @@ pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::cef_browser::Share
         .name("adblock-refresh".into())
         .spawn(move || {
             // First pass immediately, then daily. The fetch used to happen on the main
-            // thread *before* `cef.initialize()` — 2.7 MB, a 34-module fetch and a QuickJS
+            // thread *before* the browser started — 2.7 MB, a 34-module fetch and a QuickJS
             // evaluation, up to ~110 s of it — while `serve()` was already answering DIAL
             // with `201 Created` and `<state>running</state>`. A phone could connect, see
             // `running`, and never be able to queue anything, because the screen-id budget
@@ -128,7 +128,7 @@ pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::cef_browser::Share
 }
 
 /// Fetch the lists and swap them in behind the shared cell.
-fn refresh_once(paths: &CachePaths, blocker: &crate::cef_browser::SharedBlocker) {
+fn refresh_once(paths: &CachePaths, blocker: &crate::adblock_engine::SharedBlocker) {
     {
         // The counters live on the blocker being replaced, so say where they got to
         // before they go — otherwise a long-running kiosk silently resets them daily.
@@ -552,9 +552,10 @@ mod tests {
         // The failure this guards: the live client holds its own handle, so swapping a
         // plain `Arc` would update nothing that is actually blocking. Everything reads
         // through the cell, so a refresh has to be visible to a holder taken beforehand.
-        let cell: crate::cef_browser::SharedBlocker = std::sync::Arc::new(std::sync::RwLock::new(
-            std::sync::Arc::new(AdBlocker::from_list_text("||before.example^\n")),
-        ));
+        let cell: crate::adblock_engine::SharedBlocker =
+            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                AdBlocker::from_list_text("||before.example^\n"),
+            )));
         let holder = std::sync::Arc::clone(&cell);
         let page = "https://site.test/";
         assert!(holder

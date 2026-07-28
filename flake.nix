@@ -33,12 +33,6 @@
       flake = false;
     };
 
-    cef-windows-src = {
-      # `+` has to stay percent-encoded or the CDN reads it as a space.
-      url = "file+https://cef-builds.spotifycdn.com/cef_binary_147.0.10%2Bgd58e84d%2Bchromium-147.0.7727.118_windows64_minimal.tar.bz2";
-      flake = false;
-    };
-
     # The Widevine CDM for the Windows artifact — the CRX3 Chrome's own component updater
     # installs, pinned to the version nixpkgs pins for Linux. See nix/widevine-windows.nix
     # for the query that regenerates this URL, and why we ship a CDM at all rather than
@@ -98,7 +92,6 @@
     , crane
     , nix-direnv
     , ffmpeg-windows-src
-    , cef-windows-src
     , widevine-windows-src
     , electron-linux-src
     , electron-windows-src
@@ -128,7 +121,7 @@
           #   anyway. Without one every EME-gated stream fails, and fails *quietly*: the
           #   page logs to its own console and the panel simply does not play, which looks
           #   like a network problem. Only the `cef` packages touch them, and both
-          #   `cefDistFor` and `windows.nix` degrade to no-DRM rather than failing if a
+          #   the browser packaging degrades to no-DRM rather than failing if a
           #   downstream nixpkgs refuses them.
           allowUnfreePredicate = pkg:
             builtins.elem (nixpkgs.lib.getName pkg) [
@@ -226,22 +219,13 @@
         let craneLib = cranelibFor system;
         in craneLib.buildDepsOnly (commonArgsFor system);
 
-      # The `cef`/`cef-dll-sys` crates expect a *flattened* CEF distribution (libcef.so +
-      # .pak resources at the root, not the Release/Resources split nixpkgs ships) plus an
-      # `archive.json` to pass their version check. We match the `cef` crate 147.1.0 to
-      # nixpkgs `cef-binary` (147.0.10) so the crates use the already-NixOS-linked
-      # libcef.so instead of downloading their own. Shared by the devShell and the
-      # Linux kiosk package, which must agree on it.
-      # The Widevine CDM belongs *here*, beside libcef, and not next to our own binary:
-      # Chromium scans `DIR_COMPONENT_PREINSTALLED` for `WidevineCdm/`, which resolves to
-      # `base::DIR_ASSETS` → `DIR_MODULE` → the directory of the module holding Chromium's
-      # code. On Linux that is libcef.so's directory, i.e. this distribution — on Windows
-      # it is the folder holding both, which is why `windows.nix` stages it beside the .exe.
+      # The Widevine CDM, staged into the browser's profile so a panel that has never
+      # been online can still play protected video (G46, re-proven under D36/Q42).
       #
-      # `tryEval` because the CDM is unfree: a nixpkgs without `allowUnfree` still builds a
-      # working receiver, it just cannot play protected streams. A hard dependency would
-      # make the package unbuildable for anyone who has not accepted Google's terms, over a
-      # feature most casts never touch.
+      # `tryEval` because the CDM is unfree: a nixpkgs without `allowUnfree` still builds
+      # a working receiver, it just cannot play protected streams. A hard dependency would
+      # make the package unbuildable for anyone who has not accepted Google's terms, over
+      # a feature most casts never touch.
       widevineLinuxFor = system:
         let
           pkgs = pkgsFor system;
@@ -250,20 +234,7 @@
         if attempt.success && attempt.value != null then
           "${attempt.value}/share/google/chrome/WidevineCdm"
         else
-          null;
-
-      cefDistFor = system:
-        let
-          pkgs = pkgsFor system;
-          widevine = widevineLinuxFor system;
-        in
-        pkgs.runCommand "cef-dist-${pkgs.cef-binary.version}" { } ''
-          mkdir -p $out
-          ln -s ${pkgs.cef-binary}/Release/* $out/
-          ln -s ${pkgs.cef-binary}/Resources/* $out/
-          ${pkgs.lib.optionalString (widevine != null) "ln -s ${widevine} $out/WidevineCdm"}
-          printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
-        '';
+          "";
 
       # The browser runtime (D36). Same pinned ECS archive as the Windows artifact stages,
       # patchelf'd for NixOS.
@@ -278,7 +249,8 @@
         pkgs = pkgsFor system;
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
-        cefDist = cefDistFor system;
+        electron = electronLinuxFor system;
+        widevineCdm = widevineLinuxFor system;
       };
 
       # Linux → Windows cross-build (x86_64-pc-windows-msvc). Only meaningful from
@@ -289,7 +261,7 @@
         commonArgs = commonArgsFor system;
         rustToolchain = rustToolchainFor system;
         ffmpegSrc = ffmpeg-windows-src;
-        cefSrc = cef-windows-src;
+        electronSrc = electron-windows-src;
         widevineSrc = widevine-windows-src;
       };
 
@@ -339,13 +311,13 @@
             # is trusted.
             electron = electronLinuxFor system;
 
-            # The Windows deploy artifacts, cross-compiled from Linux. `-cef` is the one
+            # The Windows deploy artifacts, cross-compiled from Linux. `-electron` is the one
             # that ships; `-render` drops the browser, and the bare build is the toolchain
             # canary — if it stops linking, the toolchain broke, not the media stack.
             castaway-windows = windows.castaway;
             castaway-windows-render = windows.castaway-render;
             castaway-windows-hwaccel = windows.castaway-hwaccel;
-            castaway-windows-cef = windows.castaway-cef;
+            castaway-windows-electron = windows.castaway-electron;
 
             # The MSVC CRT + Windows SDK sysroot they build against. Exposed on its own so
             # it can be built and cached independently of the Rust build.
@@ -497,7 +469,7 @@
           rustToolchain = rustToolchainFor system;
           # The same flattened CEF distribution the Linux kiosk package builds against;
           # a devShell that disagreed with the package would be a trap.
-          cefDist = cefDistFor system;
+          electron = electronLinuxFor system;
         in
         {
           default = pkgs.mkShell {
@@ -572,9 +544,10 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
             # Point the `cef` crates at the flattened, NixOS-linked CEF distribution.
-            CEF_PATH = "${cefDist}";
+            CASTAWAY_ELECTRON = "${electron}/bin/electron";
+            CASTAWAY_BROWSER_APP = toString ./browser-host;
             # Let winit/wgpu dlopen Vulkan/Wayland/X11, and the loader find libcef.so.
-            # libGL is needed because cefDist's bundled libGLESv2.so links libGL.so.1;
+            # libGL is needed because the browser's bundled libGLESv2.so links libGL.so.1;
             # without it CEF's GPU process dies and wgpu's GL-backend probe SIGSEGVs.
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.vulkan-loader
@@ -585,7 +558,7 @@
               pkgs.libxcursor
               pkgs.libxi
               pkgs.libxrandr
-            ] + ":${cefDist}";
+            ];
           };
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # `nix develop .#windows` — cross shell where plain `cargo build` targets

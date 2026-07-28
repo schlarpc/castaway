@@ -47,26 +47,11 @@ use crate::config::Config;
 const MDNS_HOST: &str = "castaway";
 
 fn main() -> anyhow::Result<()> {
-    // Tracing first, and *before* CEF bootstrap on purpose. A CEF subprocess re-execs this
-    // binary and then spends its entire life inside `execute_process` — so a subscriber
-    // installed after bootstrap is installed only in the browser process, and everything
-    // the render process logs (scriptlet injection, list reloads) goes nowhere. That is
-    // not a small gap: injection *only* happens over there.
-    //
-    // The ordering rule this bends is real but narrower than it looked: CEF wants
-    // `execute_process` early so a subprocess does no needless work and sees the original
-    // argv. Installing a subscriber touches neither — no argv, no env, no threads — and it
-    // is the whole reason the renderer is observable at all.
+    // Ordinary again. Under CEF this had to come before a bootstrap call that re-execed
+    // this same binary as Chromium's subprocess, and getting the order wrong silently
+    // un-instrumented the renderer. The browser is its own process now, and it reports
+    // through the protocol, so there is nothing to sequence against (D36).
     init_tracing();
-
-    // CEF is multi-process: subprocesses re-exec this same binary, so bootstrap comes
-    // before config and the tokio runtime. `None` means this invocation *was* a subprocess
-    // and has already run to completion.
-    #[cfg(feature = "cef")]
-    let cef = match pipeline::Cef::bootstrap().map_err(|e| anyhow::anyhow!("cef bootstrap: {e}"))? {
-        Some(cef) => cef,
-        None => return Ok(()),
-    };
 
     let config = Config::from_env().context("loading config")?;
     // A category name that is not one of SponsorBlock's parses to "unknown" rather than
@@ -102,9 +87,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     // The browser lives on the main thread and DIAL lives on the runtime, so a page that
-    // has given up tells DIAL over a channel rather than holding it. Only the `cef` build
+    // has given up tells DIAL over a channel rather than holding it. Only the browser build
     // has a browser to give up.
-    #[cfg_attr(not(feature = "cef"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "electron"), allow(unused_variables))]
     let (abandoned_tx, abandoned_rx) = mpsc::unbounded_channel::<()>();
 
     #[cfg(feature = "render")]
@@ -121,27 +106,14 @@ fn main() -> anyhow::Result<()> {
         // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
         // hide it. Without CEF there is no launch target, and DIAL goes unadvertised.
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
-
-        // Said once, at startup, because the alternative is discovering it from a
-        // leanback console line while standing in front of the panel. Both deploy
-        // artifacts stage a CDM beside libcef, so reaching this means the staging was
-        // dropped or the profile is on read-only storage — not that the build is Windows.
-        #[cfg(feature = "cef")]
-        if !pipeline::cef_browser::has_widevine() {
-            warn!(
-                "no Widevine CDM staged: DRM-protected video (rentals, some higher-tier \
-                 streams) will not play until Chromium's component updater fetches one, \
-                 which needs the network. Everything else is unaffected."
-            );
-        }
 
         // Whoever casts next gets the panel. Nothing but DIAL `DELETE` used to dismiss
         // the leanback page, and nothing sends `DELETE` (D28) — so the first YouTube cast
         // owned the screen for the rest of the process, with later DLNA/Cast video
         // decoding underneath it and Spotify playing under YouTube's own audio.
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         {
             let release_tx = nav_tx.clone();
             render_pipeline.set_screen_release(Arc::new(move || {
@@ -163,7 +135,7 @@ fn main() -> anyhow::Result<()> {
         let remote = manager.remote_handle();
         runtime.spawn(manager.run(event_rx));
 
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         let on_dial = move |event: proto_dial::DialEvent| match event {
             proto_dial::DialEvent::Launched(params) => {
                 let url = params.leanback_url();
@@ -175,11 +147,11 @@ fn main() -> anyhow::Result<()> {
                 let _ = nav_tx.send(pipeline::BrowserCommand::Hide);
             }
         };
-        #[cfg(feature = "cef")]
+        #[cfg(feature = "electron")]
         let on_dial = Some(on_dial);
         // Rendering but browser-less: there is a screen, and still nothing to put YouTube
         // on it with.
-        #[cfg(not(feature = "cef"))]
+        #[cfg(not(feature = "electron"))]
         let on_dial: Option<NoLauncher> = None;
 
         let serve_cfg = config.clone();
@@ -206,45 +178,56 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        // CEF setup happens on the main thread (which will also pump it): TV user agent
-        // so youtube.com/tv serves the leanback UI, EasyList (fetch → cache → built-in
-        // fallback) for the ad blocker, then cef_initialize.
-        #[cfg(feature = "cef")]
+        // The browser is a subprocess now, spawned here on the main thread because the
+        // kiosk loop that pumps it lives here too. Everything policy-shaped stays on this
+        // side: the TV user agent (leanback keys off it), the block lists, and the
+        // scriptlet bundle. The browser is handed those and asks us about the rest.
+        #[cfg(feature = "electron")]
         let browser_host = {
-            let mut cef = cef;
-            cef.set_user_agent(pipeline::TV_USER_AGENT);
-            // EasyList *and* uBlock Origin's list, plus the scriptlet bundle uBO's
-            // `##+js(...)` rules need bodies from. Written to a cache the render
-            // processes read, which is how injection reaches the page.
+            use std::sync::Arc as StdArc;
+
+            // Whatever is already on disk, or the built-in list — instantly. Fetching on
+            // the startup path used to block for up to ~110 s while `serve()` was already
+            // telling senders the app was `running`; the refresh thread does it off that
+            // path and swaps the engine in behind the shared cell when it lands.
             let list_cache = pipeline::filterlists::CachePaths::default();
-            // Whatever is already on disk, or the built-in list — instantly. Fetching
-            // here used to block the main thread for up to ~110 s before CEF even
-            // initialised, while `serve()` was already telling senders the app was
-            // `running`; the refresh thread does it off the startup path and swaps the
-            // engine in behind the shared cell when it lands.
-            cef.set_adblock(
+            let blocker = StdArc::new(
                 pipeline::filterlists::load_cached_only(&list_cache)
-                    .unwrap_or_else(pipeline::cef_adblock::AdBlocker::with_defaults),
+                    .unwrap_or_else(pipeline::adblock_engine::AdBlocker::with_defaults),
             );
-            // The lists change on the order of days and this box stays up for weeks, so
-            // re-fetch daily rather than running whatever it booted with until someone
-            // restarts it. The renderers notice by the cache changing under them.
-            pipeline::filterlists::spawn_daily_refresh(list_cache, cef.adblock_handle());
-            cef.initialize()
-                .map_err(|e| anyhow::anyhow!("cef initialize: {e}"))?;
-            let host = pipeline::BrowserHost::new(cef, nav_rx);
+            let shared: pipeline::adblock_engine::SharedBlocker =
+                StdArc::new(std::sync::RwLock::new(StdArc::clone(&blocker)));
+            // Lists change on the order of days and this box stays up for weeks, so
+            // re-fetch daily rather than running whatever it booted with forever.
+            pipeline::filterlists::spawn_daily_refresh(list_cache.clone(), StdArc::clone(&shared));
+
+            let program = config.browser_program();
+            let app_dir = config.browser_app_dir();
+            let electron = pipeline::Electron::spawn(
+                &program,
+                &app_dir,
+                StdArc::clone(&blocker),
+                pipeline::TV_USER_AGENT,
+            )
+            .map_err(|e| anyhow::anyhow!("browser: {e}"))?;
+
+            let host = pipeline::ElectronHost::new(
+                electron,
+                program,
+                app_dir,
+                blocker,
+                pipeline::TV_USER_AGENT.to_string(),
+                nav_rx,
+            );
             // If the page dies and will not come back, stop telling senders it is there.
-            // A crashed renderer we could not recover leaves nothing on screen, and DIAL
-            // answering `running` with a published screen id invites a phone to attach to
-            // it — which is the half of a browser crash a sender can actually see.
+            // DIAL answering `running` with a published screen id invites a phone to
+            // attach to nothing, which is the half of a browser crash a sender can see.
             let host = {
                 let tx = abandoned_tx.clone();
                 host.on_recovery_failed(Arc::new(move || {
                     let _ = tx.send(());
                 }))
             };
-            // The same browser does double duty: a live widget in the idle screen's card
-            // until a cast takes it fullscreen, then back to the widget on DIAL stop.
             match &config.attract_widget_url {
                 Some(url) => host.with_attract_widget(url),
                 None => host,
@@ -275,8 +258,9 @@ fn main() -> anyhow::Result<()> {
             }))
         };
 
-        // Registered after `cef.initialize()` on purpose: Chromium installs its own
-        // SIGINT handler during init, which would silently replace an earlier one.
+        // Chromium's SIGINT handler used to be installed into *this* process during
+        // `cef_initialize`, silently replacing ours, so this had to come after it. The
+        // browser owns its own signals now.
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
@@ -284,9 +268,10 @@ fn main() -> anyhow::Result<()> {
         // No size here on purpose: the controller rasterizes each banner for whatever the
         // surface measures at the time, so it follows the panel and any resize.
         let osd_controller = OsdController::new(osd_rx);
-        // The winit event loop MUST own the main thread; with CEF it doubles as the
-        // browser's message pump and shuts CEF down when the loop exits.
-        #[cfg(feature = "cef")]
+        // The winit event loop MUST own the main thread. It no longer doubles as a
+        // message pump — the browser has its own — but it still drives the per-frame
+        // import and stops the subprocess when the loop exits.
+        #[cfg(feature = "electron")]
         pipeline::kiosk::run_with_browser(
             rx,
             attract,
@@ -296,7 +281,7 @@ fn main() -> anyhow::Result<()> {
             browser_host,
         )
         .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
-        #[cfg(not(feature = "cef"))]
+        #[cfg(not(feature = "electron"))]
         pipeline::kiosk::run(
             rx,
             attract,
@@ -407,7 +392,7 @@ fn drain_osd_to_log(rx: &castaway_core::OsdReceiver) {
 
 /// The `on_dial` a build with no kiosk browser has: none. Spelled out as a type so the
 /// `None` at the call site has something to be `None` of.
-#[cfg(not(feature = "cef"))]
+#[cfg(not(feature = "electron"))]
 type NoLauncher = fn(proto_dial::DialEvent);
 
 /// What the service layer can ask of the pipeline, if there is one.
@@ -514,7 +499,7 @@ async fn serve(
     match (config.enable.dial, on_dial) {
         (true, None) => warn!(
             "DIAL disabled: this build has no kiosk browser to launch YouTube in \
-             (build with `--features cef`)"
+             (build with `--features electron`)"
         ),
         (false, _) => {}
         (true, Some(on_dial)) => {
@@ -534,8 +519,8 @@ async fn serve(
             let screen = dial.screen_slot();
             // The same screen id, put to a second use: SponsorBlock attaches to our own
             // page as a remote control and seeks past sponsors. Only where there is a
-            // page to attach to — this arm is the `cef` build by construction (D27).
-            #[cfg(feature = "cef")]
+            // page to attach to — this arm is the browser build by construction (D27).
+            #[cfg(feature = "electron")]
             if config.sponsorblock.enabled {
                 tokio::spawn(sponsorblock::run(
                     config.sponsorblock.clone(),
@@ -1057,7 +1042,7 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
     // Reserve the widget card only if something will actually paint into it: with no CEF
     // build (or no URL configured) the text should use the full width rather than frame a
     // permanently empty panel.
-    let widget = match (cfg!(feature = "cef"), &config.attract_widget_url) {
+    let widget = match (cfg!(feature = "electron"), &config.attract_widget_url) {
         (true, Some(_)) => WidgetSlot::RightCard,
         _ => WidgetSlot::None,
     };

@@ -1,0 +1,515 @@
+//! The wire protocol between castaway and its browser subprocess (D36).
+//!
+//! Pure, per ground rule 3: types and a line framer, no sockets and no process handling.
+//! The actor in [`crate::electron_browser`] owns the pipes and feeds bytes to this.
+//!
+//! ## Why this exists at all
+//!
+//! Under CEF the browser boundary was a version-locked C++ ABI: correctness meant three
+//! pins agreeing (the `cef` crate, nixpkgs `cef-binary`, and a hand-forged
+//! `archive.json`), and the whole path was `doCheck = false` because exercising it needed
+//! a GPU and a display. Moving the browser out of process replaces that with a boundary
+//! we define, which means it can be fixture-tested like every other wire protocol here.
+//!
+//! ## Shape
+//!
+//! Newline-delimited JSON, because the payloads are small and structural — the *pixels*
+//! never travel through it. A paint message carries a handle number and a geometry; the
+//! frame itself is a GPU buffer the consumer pulls over with
+//! [`crate::hwaccel::remote_handle`]. That split is the whole design: the control plane is
+//! chatty and cheap, the data plane never leaves the GPU.
+//!
+//! ## The one ordering rule
+//!
+//! A painted frame is borrowed, not given. The browser may not recycle the buffer until
+//! [`ToBrowser::Release`] names it, and the consumer may not send that until the GPU has
+//! finished sampling. Releasing early is a tear that only shows under load; never
+//! releasing is a stalled browser. [`FromBrowser::Paint`] and `Release` are therefore
+//! matched by `id`, and the actor is what keeps them paired.
+
+use serde::{Deserialize, Serialize};
+
+/// Frames the browser has painted and the consumer has not yet released.
+///
+/// Small on purpose. The browser drops rather than queues when this many are outstanding
+/// (ground rule 4: for live output, latency beats freshness), so a slow consumer costs
+/// dropped frames rather than growing lag.
+pub const MAX_INFLIGHT_FRAMES: usize = 3;
+
+/// One plane of a painted frame, as the producer's platform describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaneInfo {
+    /// The buffer handle **in the browser's own numbering** — an fd on Linux, an NT
+    /// handle on Windows. Meaningless in this process until pulled across.
+    pub fd: i64,
+    /// Bytes per row.
+    pub stride: u64,
+    /// Byte offset of the plane within its buffer.
+    pub offset: u64,
+}
+
+/// Pixel channel order, as the browser reported it.
+///
+/// An enum rather than a string because getting this wrong is survivable-looking: the
+/// picture renders with red and blue exchanged, which reads as a colour-management bug
+/// rather than a decoding one (ground rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PixelOrder {
+    /// `B,G,R,A` — what Chromium reports on both platforms in practice.
+    Bgra,
+    /// `R,G,B,A`.
+    Rgba,
+}
+
+/// What the browser sends us.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum FromBrowser {
+    /// The host app is up. Carries the pid so handles can be pulled from it.
+    Ready {
+        /// The browser's process id.
+        pid: u32,
+    },
+    /// A frame is ready and borrowed until released.
+    Paint {
+        /// Matches the [`ToBrowser::Release`] that returns it.
+        id: u64,
+        /// Channel order.
+        format: PixelOrder,
+        /// Coded width in pixels.
+        width: u32,
+        /// Coded height in pixels.
+        height: u32,
+        /// DRM format modifier as a decimal string (Linux). `u64` does not survive JSON
+        /// numbers, and `0` is linear. Absent on Windows, where the handle carries it.
+        #[serde(default)]
+        modifier: Option<String>,
+        /// One entry for BGRA. More than one means a layout this build does not handle.
+        planes: Vec<PlaneInfo>,
+    },
+    /// A frame was produced and thrown away because the consumer was behind.
+    Dropped {
+        /// How many have been dropped in total this session.
+        total: u64,
+    },
+    /// The browser could not give a GPU handle and fell back to software readback.
+    ///
+    /// Its own variant rather than an error because it is *the* recorded worst case for
+    /// D36: the port is only worthwhile if frames stay on the GPU.
+    NoTexture {
+        /// Whatever the browser could say about why.
+        detail: String,
+    },
+    /// What should be injected into this page? Answered with
+    /// [`ToBrowser::ScriptletSource`].
+    ///
+    /// Per-URL rather than once at startup, because uBO's `##+js(...)` rules are
+    /// **domain-scoped**: the script for youtube.com is not the script for anything else,
+    /// and a single blob would either inject the wrong page's patches everywhere or
+    /// nothing anywhere. The engine computes it per navigation, exactly as the CEF render
+    /// process used to.
+    ScriptletQuery {
+        /// Correlates the answer.
+        id: u64,
+        /// The document about to load.
+        url: String,
+    },
+    /// May this resource load? Answered with [`ToBrowser::AdblockVerdict`].
+    AdblockQuery {
+        /// Correlates the answer.
+        id: u64,
+        /// Absolute request URL.
+        url: String,
+        /// The document the request came from, for domain-scoped rules.
+        source: String,
+        /// Chromium's resource type string (`script`, `image`, `xhr`, …).
+        kind: String,
+    },
+    /// A page finished loading.
+    LoadEnd {
+        /// The URL that finished.
+        url: String,
+        /// HTTP status, where there was one.
+        status: Option<u32>,
+    },
+    /// A page failed to load.
+    LoadError {
+        /// The URL that failed.
+        url: String,
+        /// Chromium's description.
+        error: String,
+    },
+    /// A renderer process died. The host decides whether to recover.
+    RenderGone {
+        /// Chromium's reason string (`crashed`, `killed`, `oom`, …).
+        reason: String,
+    },
+    /// Something the browser wants logged, without inventing a message type for it.
+    Log {
+        /// Severity as a bare word.
+        level: String,
+        /// Message body.
+        message: String,
+    },
+}
+
+/// What we send the browser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ToBrowser {
+    /// Return a painted frame's buffer to the browser's pool.
+    Release {
+        /// The `id` from the [`FromBrowser::Paint`] being returned.
+        id: u64,
+    },
+    /// Show `url` at the given viewport size.
+    Navigate {
+        /// Where to go.
+        url: String,
+        /// Viewport width in pixels.
+        width: u32,
+        /// Viewport height in pixels.
+        height: u32,
+    },
+    /// Stop painting and drop the page.
+    Blank,
+    /// The viewport changed size.
+    Resize {
+        /// New width in pixels.
+        width: u32,
+        /// New height in pixels.
+        height: u32,
+    },
+    /// A touch point, in browser view pixels.
+    Touch {
+        /// Which contact.
+        id: u32,
+        /// What the contact did.
+        phase: TouchPhase,
+        /// X in view pixels.
+        x: f32,
+        /// Y in view pixels.
+        y: f32,
+    },
+    /// A mouse-shaped event, in browser view pixels.
+    Pointer {
+        /// What happened.
+        kind: PointerKind,
+        /// X in view pixels.
+        x: f32,
+        /// Y in view pixels.
+        y: f32,
+    },
+    /// A scroll, at a position and with a delta.
+    ///
+    /// Its own variant rather than a `PointerKind`, because a wheel is the one input that
+    /// needs *both* a position and a displacement: Chromium scrolls whatever is under the
+    /// cursor, so sending the delta alone would scroll the wrong element on any page with
+    /// more than one scrollable region.
+    Wheel {
+        /// X in view pixels.
+        x: f32,
+        /// Y in view pixels.
+        y: f32,
+        /// Horizontal delta in pixels.
+        dx: f32,
+        /// Vertical delta in pixels.
+        dy: f32,
+    },
+    /// The answer to an [`FromBrowser::AdblockQuery`].
+    AdblockVerdict {
+        /// The query being answered.
+        id: u64,
+        /// Whether to cancel the request.
+        block: bool,
+    },
+    /// The scriptlets for a page, answering [`FromBrowser::ScriptletQuery`].
+    ScriptletSource {
+        /// The query being answered.
+        id: u64,
+        /// JavaScript to evaluate in the main world before any page script. Empty when
+        /// no rule matches, which is the common case.
+        source: String,
+    },
+    /// Shut down cleanly.
+    Quit,
+}
+
+/// A touch contact's state, mapped from [`input_touch::TouchPhase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TouchPhase {
+    /// Contact began.
+    Start,
+    /// Contact moved.
+    Move,
+    /// Contact lifted.
+    End,
+    /// Contact cancelled by the system.
+    Cancel,
+}
+
+/// The mouse-shaped events the panel can produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerKind {
+    /// Cursor moved.
+    Move,
+    /// Primary button pressed.
+    Down,
+    /// Primary button released.
+    Up,
+}
+
+/// Accumulates bytes from the browser's stdout and yields whole messages.
+///
+/// A framer rather than a `BufRead::lines()` loop because the actor reads from an async
+/// pipe in arbitrary chunks: a message can arrive split across two reads, and two
+/// messages can arrive in one. Getting that wrong shows up as rare, load-dependent
+/// corruption, which is the worst kind to debug — so it is a type with tests.
+#[derive(Debug, Default)]
+pub struct LineFramer {
+    buffer: Vec<u8>,
+}
+
+/// How much unframed input to tolerate before concluding the peer is not speaking this
+/// protocol. Generous next to any real message; small next to memory exhaustion.
+const MAX_LINE: usize = 1 << 20;
+
+impl LineFramer {
+    /// Feed a chunk; returns each complete message it completed.
+    ///
+    /// Undecodable lines are reported as errors and *skipped* rather than ending the
+    /// stream: one malformed message from a browser we did not write should cost that
+    /// message, not the session.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<Result<FromBrowser, ProtocolError>> {
+        let mut out = Vec::new();
+        self.buffer.extend_from_slice(chunk);
+        while let Some(newline) = self.buffer.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=newline).collect();
+            let line = &line[..line.len() - 1];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            out.push(serde_json::from_slice::<FromBrowser>(line).map_err(|e| {
+                ProtocolError::Decode {
+                    detail: e.to_string(),
+                    line: String::from_utf8_lossy(&line[..line.len().min(200)]).into_owned(),
+                }
+            }));
+        }
+        if self.buffer.len() > MAX_LINE {
+            let overflowed = self.buffer.len();
+            self.buffer.clear();
+            out.push(Err(ProtocolError::LineTooLong { bytes: overflowed }));
+        }
+        out
+    }
+}
+
+/// Encode a message for the browser's stdin, newline-terminated.
+///
+/// # Errors
+/// [`ProtocolError::Encode`] if the message cannot be serialized, which for these types
+/// means a string containing something JSON cannot hold.
+pub fn encode(msg: &ToBrowser) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = serde_json::to_vec(msg).map_err(|e| ProtocolError::Encode {
+        detail: e.to_string(),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// What can go wrong translating the browser's side of the conversation.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProtocolError {
+    /// A line was not a message this build understands.
+    #[error("undecodable browser message ({detail}): {line}")]
+    Decode {
+        /// The decoder's complaint.
+        detail: String,
+        /// The offending line, truncated.
+        line: String,
+    },
+    /// The peer sent a great deal without a newline — not this protocol.
+    #[error("browser sent {bytes} bytes with no message boundary")]
+    LineTooLong {
+        /// How much was buffered before giving up.
+        bytes: usize,
+    },
+    /// A message could not be encoded.
+    #[error("could not encode a browser command: {detail}")]
+    Encode {
+        /// The encoder's complaint.
+        detail: String,
+    },
+}
+
+impl PixelOrder {
+    /// The `wgpu` format this order corresponds to.
+    #[cfg(feature = "render")]
+    #[must_use]
+    pub const fn texture_format(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+            Self::Rgba => wgpu::TextureFormat::Rgba8Unorm,
+        }
+    }
+}
+
+impl From<input_touch::TouchPhase> for TouchPhase {
+    fn from(phase: input_touch::TouchPhase) -> Self {
+        match phase {
+            input_touch::TouchPhase::Down => Self::Start,
+            input_touch::TouchPhase::Move => Self::Move,
+            input_touch::TouchPhase::Up => Self::End,
+            input_touch::TouchPhase::Cancel => Self::Cancel,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn framed(chunks: &[&[u8]]) -> Vec<Result<FromBrowser, ProtocolError>> {
+        let mut framer = LineFramer::default();
+        chunks.iter().flat_map(|c| framer.push(c)).collect()
+    }
+
+    #[test]
+    fn a_message_split_across_reads_is_reassembled() {
+        // The failure this prevents is rare and load-dependent: pipes split writes
+        // wherever they like, and a framer that assumed one read per message would work
+        // in every test and corrupt under a busy page.
+        let got = framed(&[br#"{"type":"ready","p"#, br#"id":42}"#, b"\n"]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(*got[0].as_ref().unwrap(), FromBrowser::Ready { pid: 42 });
+    }
+
+    #[test]
+    fn several_messages_in_one_read_all_arrive() {
+        let got = framed(&[b"{\"type\":\"ready\",\"pid\":1}\n{\"type\":\"blank-unknown\"}\n{\"type\":\"dropped\",\"total\":7}\n"]);
+        assert_eq!(got.len(), 3);
+        assert_eq!(*got[0].as_ref().unwrap(), FromBrowser::Ready { pid: 1 });
+        // The unknown one is an error…
+        assert!(got[1].is_err());
+        // …and crucially does not eat the message after it.
+        assert_eq!(*got[2].as_ref().unwrap(), FromBrowser::Dropped { total: 7 });
+    }
+
+    #[test]
+    fn crlf_and_blank_lines_are_tolerated() {
+        // Windows pipes, and a host app that prints an extra newline, should not be a
+        // protocol error.
+        let got = framed(&[b"\r\n{\"type\":\"ready\",\"pid\":3}\r\n\n"]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(*got[0].as_ref().unwrap(), FromBrowser::Ready { pid: 3 });
+    }
+
+    #[test]
+    fn a_peer_that_never_sends_a_newline_is_cut_off_rather_than_buffered_forever() {
+        let mut framer = LineFramer::default();
+        let mut errors = 0;
+        for _ in 0..40 {
+            for r in framer.push(&vec![b'x'; 64 * 1024]) {
+                if matches!(r, Err(ProtocolError::LineTooLong { .. })) {
+                    errors += 1;
+                }
+            }
+        }
+        assert!(errors > 0, "should have given up on an unframed peer");
+    }
+
+    #[test]
+    fn a_paint_message_round_trips_with_its_modifier_as_a_string() {
+        // The modifier is u64 and JSON numbers are f64: 0xffff_ffff_ffff_ff00 would come
+        // back changed if this were ever "simplified" to a number.
+        // One physical line: the framer splits on newlines, so a fixture wrapped for
+        // readability would be testing the framer's error path instead of this.
+        let line = br#"{"type":"paint","id":9,"format":"bgra","width":3840,"height":2160,"modifier":"18446744073709551360","planes":[{"fd":108,"stride":15360,"offset":0}]}"#;
+        let mut framer = LineFramer::default();
+        let mut got = framer.push(line);
+        got.extend(framer.push(b"\n"));
+        let FromBrowser::Paint {
+            id,
+            format,
+            width,
+            modifier,
+            planes,
+            ..
+        } = got.pop().unwrap().unwrap()
+        else {
+            panic!("expected a paint")
+        };
+        assert_eq!(id, 9);
+        assert_eq!(format, PixelOrder::Bgra);
+        assert_eq!(width, 3840);
+        assert_eq!(
+            modifier.unwrap().parse::<u64>().unwrap(),
+            0xffff_ffff_ffff_ff00
+        );
+        assert_eq!(planes[0].fd, 108);
+        assert_eq!(planes[0].stride, 15360);
+    }
+
+    #[test]
+    fn commands_encode_as_one_line_each() {
+        // The host app reads by newline, so an encoder that emitted pretty-printed JSON
+        // would deadlock it — silently, since the first fragment parses as nothing.
+        for msg in [
+            ToBrowser::Release { id: 1 },
+            ToBrowser::Blank,
+            ToBrowser::Quit,
+            ToBrowser::ScriptletSource {
+                id: 1,
+                source: "//\nmultiline\n".into(),
+            },
+        ] {
+            let bytes = encode(&msg).unwrap();
+            assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 1);
+            assert!(bytes.ends_with(b"\n"));
+        }
+    }
+
+    #[test]
+    fn a_scriptlet_blob_survives_the_round_trip_through_json() {
+        // uBO scriptlets are full of quotes, backslashes and newlines; if any of that
+        // broke framing the symptom would be "injection silently stopped working".
+        let source = "const s = \"a\\nb\";\n// ünïcode ✓\nfunction f(){return `x${1}`}\n";
+        let bytes = encode(&ToBrowser::ScriptletSource {
+            id: 4,
+            source: source.into(),
+        })
+        .unwrap();
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 1);
+        let back: ToBrowser = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(
+            back,
+            ToBrowser::ScriptletSource {
+                id: 4,
+                source: source.into()
+            }
+        );
+    }
+
+    #[test]
+    fn touch_phases_map_from_the_input_crate() {
+        assert_eq!(
+            TouchPhase::from(input_touch::TouchPhase::Down),
+            TouchPhase::Start
+        );
+        assert_eq!(
+            TouchPhase::from(input_touch::TouchPhase::Up),
+            TouchPhase::End
+        );
+        assert_eq!(
+            TouchPhase::from(input_touch::TouchPhase::Cancel),
+            TouchPhase::Cancel
+        );
+    }
+}

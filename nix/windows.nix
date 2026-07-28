@@ -11,9 +11,9 @@
 # The toolchain is all LLVM: clang-cl as the C/C++ driver, lld-link as the linker,
 # llvm-lib as the archiver, llvm-rc for resources.
 #
-# `ffmpegSrc`/`cefSrc` are the raw archives, pinned as flake inputs so they land in
+# `ffmpegSrc`/`electronSrc` are the raw archives, pinned as flake inputs so they land in
 # flake.lock; the derivations beside this file unpack and rearrange them.
-{ pkgs, craneLib, commonArgs, rustToolchain, ffmpegSrc, cefSrc, widevineSrc }:
+{ pkgs, craneLib, commonArgs, rustToolchain, ffmpegSrc, electronSrc, widevineSrc }:
 
 let
   inherit (pkgs) lib;
@@ -28,7 +28,12 @@ let
 
   sysroot = pkgs.callPackage ./msvc-sysroot.nix { };
   ffmpeg = pkgs.callPackage ./ffmpeg-windows.nix { src = ffmpegSrc; };
-  cef = pkgs.callPackage ./cef-windows.nix { src = cefSrc; };
+  # The ECS archive, unpacked. No layout fixups: unlike CEF's Release/Resources split,
+  # an Electron distribution is already flat, and it must stay byte-identical anyway
+  # because EVS signs these exact files (D36).
+  electron = pkgs.runCommand "electron-ecs-win32-x64" { nativeBuildInputs = [ pkgs.unzip ]; } ''
+    mkdir -p $out && cd $out && unzip -q ${electronSrc}
+  '';
 
   # The Widevine CDM, staged beside the .exe so DRM-gated video plays on a panel that has
   # never been online. `tryEval` for the same reason as the Linux side (flake.nix
@@ -235,10 +240,6 @@ let
     # `ffmpeg-sys-next` takes this branch instead of pkg-config, reading `include/` for
     # bindgen and `lib/` for the import libraries.
     FFMPEG_DIR = "${ffmpeg}";
-
-    # Without this, cef-dll-sys downloads a CEF distribution at build time — which the
-    # sandbox forbids, and which would defeat pinning anyway.
-    CEF_PATH = "${cef}";
     CMAKE_GENERATOR = "Ninja";
     CMAKE_SYSTEM_NAME = "Windows";
     "CMAKE_TOOLCHAIN_FILE_${envTarget}" = "${cmakeToolchain}";
@@ -278,33 +279,28 @@ let
     doCheck = false;
   };
 
-  # CEF's runtime layout is flat: everything beside the .exe. Upstream splits the
-  # distribution into Release/ (libraries) and Resources/ (.pak, ICU data, locales) for its
-  # own CMake build, but at runtime CEF resolves all of it relative to the module directory
-  # — which is exactly where an empty `Settings::resources_dir_path` points it. cef_browser.rs
-  # leaves those empty when CEF_PATH is unset, which is the case on the deploy box: there is
-  # no /nix/store there to point at.
-  #
-  # bootstrap.exe/bootstrapc.exe are deliberately not staged. They're the entry point for
-  # CEF's sandboxed "app is a DLL" mode; we initialize with `no_sandbox` and ship a real .exe.
-  stageCef = ''
-    install -Dm644 -t "$out/bin/" \
-      ${cef}/Release/*.dll ${cef}/Release/*.bin ${cef}/Release/*.json
-    install -Dm644 -t "$out/bin/" \
-      ${cef}/Resources/*.pak ${cef}/Resources/icudtl.dat
-    install -Dm644 -t "$out/bin/locales/" ${cef}/Resources/locales/*.pak
+  # The browser ships beside the .exe as its own tree: Electron is a separate process
+  # with its own DLLs, so unlike CEF it does not have to be flattened into ours. What we
+  # stage is the ECS distribution plus our host app, and the Widevine CDM for the profile
+  # pre-staging that makes first-boot DRM work offline (D36/Q42).
+  stageBrowser = ''
+    # The whole ECS distribution, unmodified: it is what EVS signs, and a modified tree
+    # invalidates the VMP signature. Our host app travels beside it.
+    mkdir -p "$out/bin/browser"
+    cp -r --no-preserve=mode,ownership ${electron}/* "$out/bin/browser/"
+    mkdir -p "$out/bin/browser-host"
+    cp -r --no-preserve=mode,ownership ${../browser-host}/* "$out/bin/browser-host/"
     install -Dm644 ${./castaway.exe.manifest} "$out/bin/castaway.exe.manifest"
   '' + lib.optionalString (widevine != null) ''
-    # Beside libcef.dll, because that is what `DIR_COMPONENT_PREINSTALLED` resolves to —
-    # Chromium's component updater finds `WidevineCdm/` there at startup and registers it
-    # with no network and no restart. Copied rather than symlinked: the deploy box has no
-    # /nix/store for a link to point into.
+    # Staged for the receiver to copy into the browser profile on first run, not loaded
+    # from here: ECS finds its CDM under `<userDataDir>/WidevineCdm/<version>/`, which is
+    # a runtime path. See browser-host/stage-widevine.sh, and Q42 for the measurement.
     cp -r --no-preserve=mode,ownership ${widevine}/WidevineCdm "$out/bin/"
   '';
 
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
-  mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withCef ? false }:
+  mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withBrowser ? false }:
     let
       cargoExtraArgs = "--package castaway"
         + lib.optionalString (features != [ ])
@@ -320,7 +316,7 @@ let
       # binary dies at startup on the deploy box with a missing-DLL dialog.
       postInstall = lib.optionalString withFfmpeg ''
         cp ${ffmpeg}/bin/*.dll "$out/bin/"
-      '' + lib.optionalString withCef stageCef;
+      '' + lib.optionalString withBrowser stageBrowser;
     });
 
   # DLLs Windows itself guarantees. Everything else has to travel with the binary.
@@ -429,11 +425,11 @@ rec {
   };
 
   # The full deploy artifact: render + the offscreen CEF browser (YouTube leanback via DIAL).
-  castaway-cef = mkCastaway {
-    pname = "castaway-windows-cef";
-    features = [ "cef" ];
+  castaway-electron = mkCastaway {
+    pname = "castaway-windows-electron";
+    features = [ "electron" ];
     withFfmpeg = true;
-    withCef = true;
+    withBrowser = true;
   };
 
   # One check per artifact — the staging differs between them, so each needs its own.
@@ -441,7 +437,7 @@ rec {
     castaway-windows-dll-closure = mkBundleCheck castaway;
     castaway-windows-render-dll-closure = mkBundleCheck castaway-render;
     castaway-windows-hwaccel-dll-closure = mkBundleCheck castaway-hwaccel;
-    castaway-windows-cef-dll-closure = mkBundleCheck castaway-cef;
+    castaway-windows-electron-dll-closure = mkBundleCheck castaway-electron;
   };
 
   # Cross dev shell: `nix develop .#windows` then plain `cargo build`, which picks the
