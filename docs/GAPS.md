@@ -1007,8 +1007,8 @@ display or the audio device, and two cannot take it back afterwards.
 
 - 🟡 **G67 — The DLNA media plane has never been exercised by any test. CONFIRMED.**
   The VM test casts `http://example.invalid/clip.mp4` at a build with no decoder in it
-  (`packages.default` is the null pipeline), so nothing has ever been fetched or decoded
-  through DLNA in CI. G61–G63 all lived in that blind spot.
+  (it pins `packages.castaway-portable`, the null pipeline), so nothing has ever been
+  fetched or decoded through DLNA in CI. G61–G63 all lived in that blind spot.
 
   Partly closed: `tests/media_url_av.rs` now decodes real files, and one case serves over
   real HTTP — which is what catches an ffmpeg built without the `http` protocol, a build

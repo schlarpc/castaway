@@ -28,7 +28,8 @@ $ nix develop
 ```shell
 $ cargo run                                      # debug build + run
 $ cargo build --release                          # optimized build
-$ nix run                                        # build and run via Nix
+$ nix run                                        # the full kiosk: renderer, browser, audio, Bluetooth
+$ nix run .#castaway-portable                    # no renderer, no browser — just the protocol stack
 $ ./result/bin/castaway   # the nix-built binary
 ```
 

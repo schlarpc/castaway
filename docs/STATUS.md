@@ -122,12 +122,17 @@ is out of scope on purpose. The step stays human, stays once, and the harness no
 the resulting refresh token into `.env.local` itself rather than asking for a paste.
 
 ## Which package to run
-- `packages.default` — portable, no renderer, no browser. Serves and discovers; **cannot**
-  play YouTube, and honestly declines to advertise DIAL (D27). What CI builds.
-- `packages.castaway-cef` — the Linux kiosk: render pipeline + CEF browser, wrapped with
+- `packages.default` — on Linux, the full kiosk, so `nix run .` is a receiver you can
+  actually cast to: render pipeline + CEF browser + audio out + Bluetooth, wrapped with
   `CEF_PATH`/`LD_LIBRARY_PATH` so it runs outside the devShell. **This is the one to deploy
-  on Linux** (`services.castaway.package`). Verified 2026-07-26: built from the flake, run
-  headless on Xvfb, and passed both `yt-selfplay` modes with real video composited at 4K.
+  on Linux** (`services.castaway.package`). Every optional feature is on except `ldac`,
+  which would advertise a codec we have no decoder for (Q22) and turn a session that would
+  have fallen back to SBC into silence. Verified 2026-07-26 in its `--features cef` form:
+  built from the flake, run headless on Xvfb, and passed both `yt-selfplay` modes with real
+  video composited at 4K. Still `castaway-cef` under its old name.
+- `packages.castaway-portable` — no renderer, no browser, nothing platform-specific.
+  Serves and discovers; **cannot** play YouTube, and honestly declines to advertise DIAL
+  (D27). What CI builds, and what `default` still is on Darwin.
 - `packages.castaway-windows-cef` — the Windows deploy artifact, cross-compiled.
 
 ## A YouTube cast, with no phone (`nix run .#yt-selfplay -- http://<receiver>:8080`)

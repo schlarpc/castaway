@@ -1,11 +1,17 @@
-# The Linux kiosk build with the browser in it — the one that can actually play YouTube.
+# The full Linux kiosk build — renderer, browser, sound, Bluetooth. This is
+# `packages.default` on Linux, so it is what `nix run .` gives you.
 #
-# `packages.default` is the portable build: no renderer, no browser. That is the right
-# default for CI and for proving the protocol stack, but it is not a receiver you can cast
-# YouTube to, because DIAL only *launches* an app and the app is a web page (D27). Without
-# this package the only way to get a browser on Linux was `cargo build --features cef`
-# inside the devShell, which is not a thing you can deploy — while the Windows side has
-# shipped `castaway-windows-cef` all along.
+# Every optional feature is on here except one. `cef` implies `render` and `hwaccel`;
+# `audio-out` adds the A2DP decoders and a real PCM device; `bluetooth-socket` adds the
+# `socket:N` transport beside the USB default. The exception is `ldac`, which is *not* a
+# capability but an advertisement: the slot exists and the decoder does not (Q22), so a
+# build with it on offers senders a codec it will then fail to decode, turning a session
+# that would have fallen back to SBC into silence. It stays off until libldacdec lands.
+#
+# `packages.castaway-portable` is the old default: no renderer, no browser, nothing
+# platform-specific. That is the right build for CI and for proving the protocol stack,
+# but it is not a receiver you can cast YouTube to, because DIAL only *launches* an app
+# and the app is a web page (D27).
 #
 # Two things have to agree between build and run, and both are set here rather than left
 # to the environment:
@@ -22,11 +28,11 @@
 { pkgs, craneLib, commonArgs, cefDist }:
 
 let
-  # Everything the `cef` feature drags in: it implies `render` and `hwaccel`, so this is
-  # the ffmpeg/bindgen set plus CEF's own build tooling.
-  cefArgs = {
-    pname = "castaway-cef";
-    cargoExtraArgs = "--package castaway --features cef";
+  # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
+  # audio decoders), ALSA for the PCM device, and CEF's own build tooling.
+  kioskArgs = {
+    pname = "castaway";
+    cargoExtraArgs = "--package castaway --features cef,audio-out,bluetooth-socket";
 
     nativeBuildInputs = [
       pkgs.pkg-config
@@ -67,11 +73,11 @@ let
     pkgs.alsa-lib
   ];
 in
-craneLib.buildPackage (commonArgs // cefArgs // {
-  # Its own dependency build: the feature set differs from the default package's, so it
+craneLib.buildPackage (commonArgs // kioskArgs // {
+  # Its own dependency build: the feature set differs from the portable package's, so it
   # cannot share those artifacts.
-  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // cefArgs // {
-    pname = "castaway-cef-deps";
+  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // kioskArgs // {
+    pname = "castaway-kiosk-deps";
   });
 
   # The render/browser tests want a GPU and a display; the sandbox has neither.
@@ -86,7 +92,7 @@ craneLib.buildPackage (commonArgs // cefArgs // {
   '';
 
   meta = commonArgs.meta or { } // {
-    description = "castaway with the CEF kiosk browser (the build that plays YouTube)";
+    description = "castaway: the full Linux kiosk — renderer, CEF browser, audio out, Bluetooth";
     mainProgram = "castaway";
   };
 })

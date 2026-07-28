@@ -205,7 +205,7 @@
       # `archive.json` to pass their version check. We match the `cef` crate 147.1.0 to
       # nixpkgs `cef-binary` (147.0.10) so the crates use the already-NixOS-linked
       # libcef.so instead of downloading their own. Shared by the devShell and the
-      # `castaway-cef` package, which must agree on it.
+      # Linux kiosk package, which must agree on it.
       # The Widevine CDM belongs *here*, beside libcef, and not next to our own binary:
       # Chromium scans `DIR_COMPONENT_PREINSTALLED` for `WidevineCdm/`, which resolves to
       # `base::DIR_ASSETS` → `DIR_MODULE` → the directory of the module holding Chromium's
@@ -239,8 +239,9 @@
           printf '%s' '{"type":"minimal","name":"cef_binary_${pkgs.cef-binary.version}+chromium_linux64","sha1":"0000000000000000000000000000000000000000"}' > $out/archive.json
         '';
 
-      # The kiosk build with the browser in it — what actually plays YouTube.
-      linuxCefFor = system: import ./nix/linux-cef.nix {
+      # The full kiosk build — renderer, browser, audio, Bluetooth. `packages.default` on
+      # Linux, so it is what `nix run .` gives you.
+      linuxKioskFor = system: import ./nix/linux-kiosk.nix {
         pkgs = pkgsFor system;
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
@@ -270,11 +271,16 @@
           cargoArtifacts = cargoArtifactsFor system;
         in
         {
-          default = craneLib.buildPackage (commonArgs // {
+          # No renderer, no browser, nothing platform-specific: the build that proves the
+          # protocol stack. It is `default` everywhere the full kiosk cannot be built (i.e.
+          # Darwin), and what `checks.build` compiles so `nix flake check` stays cheap.
+          castaway-portable = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             # Only run tests during the check phase, not during build
             doCheck = false;
           });
+
+          default = self.packages.${system}.castaway-portable;
 
           castaway = self.packages.${system}.default;
 
@@ -284,10 +290,15 @@
           yt-selfplay = import ./nix/yt-selfplay.nix { inherit pkgs; };
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let windows = windowsFor system; in {
-            # The Linux kiosk build with the browser in it. `default` above has neither a
-            # renderer nor a browser, so it cannot play YouTube at all — it does not even
-            # advertise DIAL (D27). This is the one to deploy on Linux.
-            castaway-cef = linuxCefFor system;
+            # On Linux the default is the real receiver: every optional feature except
+            # `ldac` (see nix/linux-kiosk.nix for why that one stays off). `nix run .`
+            # should hand you something that can actually display a cast, not a build that
+            # discovers, accepts, and then has nowhere to put the picture.
+            default = linuxKioskFor system;
+
+            # The name this build shipped under before it became the default. Kept so
+            # existing `packages.${system}.castaway-cef` references keep resolving.
+            castaway-cef = self.packages.${system}.default;
 
             # The Windows deploy artifacts, cross-compiled from Linux. `-cef` is the one
             # that ships; `-render` drops the browser, and the bare build is the toolchain
@@ -335,8 +346,12 @@
           };
         in
         {
-          # Build the crate as part of checks
-          build = self.packages.${system}.default;
+          # Build the crate as part of checks. Deliberately the *portable* build and not
+          # `default`: on Linux `default` is now the kiosk, and pulling CEF, ffmpeg and a
+          # second dependency tree into `nix flake check` would cost far more than it
+          # proves. The feature sets that build adds are covered by `audio`/`hwaccel`
+          # below; what is left uncovered is the CEF link, and that is a deploy-time build.
+          build = self.packages.${system}.castaway-portable;
 
           # Run clippy
           clippy = craneLib.cargoClippy (commonArgs // {
@@ -441,7 +456,7 @@
         let
           pkgs = pkgsFor system;
           rustToolchain = rustToolchainFor system;
-          # The same flattened CEF distribution the `castaway-cef` package builds against;
+          # The same flattened CEF distribution the Linux kiosk package builds against;
           # a devShell that disagreed with the package would be a trap.
           cefDist = cefDistFor system;
         in
@@ -566,14 +581,16 @@
                 description = ''
                   The castaway package to run.
 
-                  The default has no renderer and no browser: it serves and discovers, but
-                  it cannot display anything, and it does not advertise DIAL at all —
-                  YouTube casting is a web page, so a build with nowhere to put one
-                  declines to offer it rather than accepting casts it can never play.
+                  The default on Linux is the full kiosk: render pipeline, CEF browser,
+                  audio output and Bluetooth. Every optional feature is on except `ldac`,
+                  which advertises a codec the build cannot decode.
 
-                  For a kiosk on a real display, use
-                  `castaway.packages.''${system}.castaway-cef`, which carries the CEF
-                  browser and the render pipeline.
+                  For a headless box — one proving the protocol stack, or serving DLNA
+                  with no display attached — use
+                  `castaway.packages.''${system}.castaway-portable`, which has neither a
+                  renderer nor a browser. It does not advertise DIAL at all: YouTube
+                  casting is a web page, so a build with nowhere to put one declines to
+                  offer it rather than accepting casts it can never play.
                 '';
               };
 

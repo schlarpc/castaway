@@ -478,6 +478,12 @@ pkgs.testers.runNixOSTest {
       services.castaway = {
         enable = true;
         inherit httpPort;
+        # Pinned, not defaulted. The module's default is the full kiosk, which drags CEF
+        # and ffmpeg into a test that wants neither — and worse, replaces the null
+        # pipeline whose log lines every media assertion below greps for. What this test
+        # proves is the protocol stack; the picture is G67's problem, and closing it needs
+        # a `render` build with Xvfb rather than a package swap here.
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.castaway-portable;
         # Debug for castaway so the assertions can read the session manager's decisions
         # out of the journal.
         logLevel = "info,castaway=debug";
