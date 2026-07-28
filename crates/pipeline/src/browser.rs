@@ -7,7 +7,12 @@
 //! Here we define the trait + a [`NullBrowser`] stub used when `cef` is off (the Lounge
 //! path then falls back to a headless player — see OPEN-QUESTIONS Q6).
 
+// The browser's *geometry* is expressed in the attract scene's types, so it exists
+// only where that scene does. `BrowserCommand` above does not, and must not: `app`
+// drives navigation in builds with no renderer at all.
+#[cfg(feature = "render")]
 use crate::attract::{InsetRect, WidgetSlot};
+#[cfg(feature = "render")]
 use crate::compositor::Transform;
 
 use tracing::info;
@@ -51,20 +56,6 @@ impl BrowserSurface for NullBrowser {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn null_browser_records_url_and_is_not_real() {
-        let mut b = NullBrowser::default();
-        b.resize(1920, 1080);
-        b.load_url("https://www.youtube.com/tv");
-        assert_eq!(b.last_url(), Some("https://www.youtube.com/tv"));
-        assert!(!b.is_real());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Browser geometry and commands.
 //
@@ -85,6 +76,7 @@ pub enum BrowserCommand {
     Hide,
 }
 
+#[cfg(feature = "render")]
 /// What the one offscreen browser is currently for. There is exactly one browser, so its two
 /// uses are mutually exclusive by construction: a cast takes the panel over, and
 /// dismissing it hands the screen back to the idle widget.
@@ -97,6 +89,7 @@ pub enum BrowserRole {
     Fullscreen,
 }
 
+#[cfg(feature = "render")]
 /// Where a role's browser lives on a `surface`-sized panel: the offscreen viewport CEF
 /// rasterizes into (device pixels — the page lays itself out at the size it will actually
 /// be shown, instead of a small render upscaled) and the layer that viewport maps onto.
@@ -110,6 +103,7 @@ pub struct BrowserView {
     pub z: i32,
 }
 
+#[cfg(feature = "render")]
 impl BrowserRole {
     /// Viewport + layer placement for this role on a `surface`-sized panel.
     #[must_use]
@@ -141,6 +135,7 @@ impl BrowserRole {
     }
 }
 
+#[cfg(feature = "render")]
 /// Map window-normalized coordinates into a browser view-space pixel position. Free
 /// function (not a method) so the inset mapping is testable without a live CEF instance.
 pub fn to_view_px(rect: InsetRect, surface: (u32, u32), x: f32, y: f32) -> (f32, f32) {
@@ -149,4 +144,18 @@ pub fn to_view_px(rect: InsetRect, surface: (u32, u32), x: f32, y: f32) -> (f32,
     let vx = (x * surface.0.max(1) as f32 - rect.x as f32).clamp(0.0, rect.width as f32);
     let vy = (y * surface.1.max(1) as f32 - rect.y as f32).clamp(0.0, rect.height as f32);
     (vx, vy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_browser_records_url_and_is_not_real() {
+        let mut b = NullBrowser::default();
+        b.resize(1920, 1080);
+        b.load_url("https://www.youtube.com/tv");
+        assert_eq!(b.last_url(), Some("https://www.youtube.com/tv"));
+        assert!(!b.is_real());
+    }
 }
