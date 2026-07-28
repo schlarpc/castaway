@@ -6,6 +6,10 @@ decides what is on the glass.
 
 Companion to DECISION-LOG **D38**, which records the calls and what they cost.
 
+**Status: built.** §6 lists what landed and what did not. The rest of this document is
+written as the design it was, because the reasoning is still why the code looks like this
+— where the shipped thing differs, §6 says so.
+
 ---
 
 ## 1. The problem, stated properly
@@ -44,9 +48,10 @@ compositor layers currently exist, and the closest thing to a mode in the tree i
 > The attract screen tells you what to do **from your phone**. The home screen adds what
 > you can do **from the glass**.
 
-Cast, AirPlay, DLNA and Spotify stay instructions — there is nothing to tap, because the
-tap happens on your device. GameStream, local media, the intercom and the visualizer
-become tiles, because the panel is the thing that has to act.
+*As built, this got simpler:* everything is a tile. What differs is what a tile does. A
+receiver protocol's tile opens a screen telling you what to tap on your own device; a
+client protocol's tile sends the panel off to do something. The distinction is one
+`Option` on the tile, and the shell answers the first kind without a round trip.
 
 ---
 
@@ -70,8 +75,12 @@ Three rules it exists to enforce:
 
 ### Screens, concretely
 
-- **Home** — identity, the instruction rows that exist today, and a row of tiles for
-  things the panel can start. Replaces the baked attract bitmap.
+- **Home** — identity and a tile per service. *Changed during the build:* the plan kept
+  the per-service instruction rows and added tiles beside them. Seeing it rendered settled
+  it — six protocols' worth of instructions was the first thing anyone saw and none of it
+  was about what they were doing. The rows are gone and every service is a tile.
+- **Service** — one service's instructions, opened by its tile. Did not exist in the plan;
+  it is where the rows went.
 - **Picker** — a list with a title and a back affordance. Generic over what it lists:
   GameStream hosts, then that host's apps, then later media files and output devices. This
   is the screen that closes Q44.
@@ -145,8 +154,12 @@ so the page believes a finger is still down — permanently, for the life of the
 
 Every id the shell steals must therefore be followed by a synthesised
 `ToBrowser::Touch { phase: Cancel }`. The plumbing exists end to end and maps to
-Chromium's `touchCancel`, but **nothing has ever sent it**, so it is untested. This is the
-first thing to write a test for, not the last.
+Chromium's `touchCancel`, but nothing had ever sent it.
+
+*As built:* the reserved edge means the shell never steals a contact mid-drag — one that
+starts there is never forwarded in the first place. But the case remains for fingers
+already down when the panel is taken away, so `InputSink::cancel_all` exists and going
+home calls it. `tests/home_gesture.rs` covers it.
 
 ### Where it hooks in
 
@@ -210,25 +223,33 @@ Dell panel, whose touch arrives over USB HID.
 
 ---
 
-## 6. Order of work
+## 6. What was built
 
-Each step is meant to be independently landable and independently useful.
+Landed, in this order, each independently useful:
 
-1. **Layer identity + z-ordering rework.** No visible change. Deterministic ordering, room
-   for shell surfaces above a fullscreen browser.
-2. **The screen model, and Home as a live screen.** Replaces the baked bitmap; fixes the
-   resize bug. Still no navigation — Home is simply what the idle screen becomes.
-3. **Tiles and the picker.** Home gets tappable tiles; the picker screen exists and can
-   list things.
-4. **The GameStream picker.** First real consumer: hosts → apps → stream. Closes Q44 and
-   makes #33 walk-up.
-5. **The home gesture.** Swipe, pill, contact table, and the cancel-synthesis test.
-6. **Transitions.** The animator, and slide/fade between screens.
-7. **PiP** (#28), which unlocks the intercom (#29).
-8. **Idle policy** (#27): nothing playing and nobody connected returns to Home.
+1. **Layer identity + z-ordering.** Paint order *is* `LayerId`'s declaration order; there
+   is no depth to pass and so no collision to have. `ShellOverlay` sits above a fullscreen
+   cast, which is what makes a way out of one possible.
+2. **The screen model, and Home as a live screen.** `ScreenStack` with Home as a field
+   rather than element zero, so "never empty" is structural. Fixed the resize bug on the
+   way past.
+3. **The shape kit**, promoted out of `transport.rs` so the shell could use it.
+4. **Home as a launcher, and the screens behind it.** Per-service instructions moved off
+   the idle screen and behind their tiles — six protocols' worth of them was the first
+   thing anyone saw and none of it was about what they were doing.
+5. **Input routing.** Transport, then shell, then browser; the middle only where nothing
+   covers it.
+6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes Q44.
+7. **The home gesture.** Left-edge swipe and a fading pill, with `cancel_all` so nothing
+   is left holding a finger.
+8. **PiP and the idle return** (#28, #27). Bringing the shell forward demotes a playing
+   video to a corner instead of stopping it; an ending session returns Home unless someone
+   is using the panel.
 
-Theming (#24) threads through 2–6 rather than being a phase. Brand assets are already
-vendored at `crates/pipeline/assets/brand/` with their provenance recorded.
+**Still open**: transitions between screens (the animator exists only as the pill's fade),
+scrolling a picker longer than the panel, and theming (#24) — the palette and assets are
+vendored at `crates/pipeline/assets/brand/`, but nothing uses them yet and the font is
+still DejaVu.
 
 ## 7. How this gets tested
 

@@ -879,7 +879,13 @@ the reasons are what a future reversal has to argue against.
   pointed at it. This needs hardware; a headless VM answers `/launch` with 503 because it
   has no encoder, which is honest and tells us nothing about the rest.
 
-- **Q44 — there is no chooser, so GameStream is operator-configured rather than walk-up.**
+- **Q44 — ~~there is no chooser~~. RESOLVED (D38).** The shell landed: Home is a launcher,
+  Moonlight's tile opens a host picker, and a session can be started entirely from the
+  glass. What follows is kept because it is still the reasoning behind the design, and
+  because the two pieces named at the end — a scrollable picker and screen transitions —
+  are not done.
+
+  Original:
   A person cannot pick a host or an app from the panel. Nothing in this codebase can yet
   put a list on screen and take a touch on it: the attract scene is a bitmap rendered once
   at startup with no `RenderCommand` to update it, and the transport strip is scoped to the
@@ -893,7 +899,9 @@ the reasons are what a future reversal has to argue against.
   own docs already anticipate this), or a page served from the shared axum host and shown
   in the browser layer.
 
-- **Q45 — the pairing PIN has nowhere good to live.** Pairing needs a PIN typed into the
+- **Q45 — the pairing PIN has nowhere good to live.** *(Still open. The shell can now
+  show a list, but pairing still needs a PIN typed into the host and read from config —
+  entering it on the panel needs a keypad screen, which does not exist.)* Pairing needs a PIN typed into the
   *host's* UI while we hold a request open. `[gamestream] pair_pin` is how that is
   configured today, which means a short-lived secret sits in a config file until someone
   removes it. It is low-value (it authenticates one pairing attempt, not the session) but

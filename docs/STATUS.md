@@ -257,12 +257,30 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
 - Run it: `nix develop --command cargo run -p castaway --features render` (opens a
   fullscreen window; cast a video via DLNA to see it decode+display).
 
+## The panel's shell (D38, `docs/app-shell.md`)
+The idle screen became a launcher. A tile per enabled service; tapping one opens that
+service's own screen with its instructions and the exact name to look for, and tapping
+Moonlight opens a list of hosts, then that host's apps, then streams one. Every screen
+has a way back, and the way home is a left-edge swipe or a pill that appears on any touch
+and fades — the pill for someone who has never used the panel, the swipe for when it is in
+the way.
+
+Bringing the shell forward demotes whatever is playing to a corner rather than stopping
+it, and tapping that corner hands the panel back. A session ending returns Home, unless
+the panel was touched in the last twenty seconds.
+
+`cargo run -p pipeline --features render --example shell_preview -- <dir>` dumps every
+screen to PNG, which is how the layout was reviewed — hit-testing is unit-tested, but
+whether a screen reads from across a room is not something a test can answer.
+
+**Not done:** transitions between screens (the only animation is the pill's fade), a
+picker longer than the panel cannot scroll, and #24's theming is unstarted — the brand
+assets and palette are vendored, nothing uses them, and the font is still DejaVu.
+
 ## Biggest open items (see OPEN-QUESTIONS.md)
-0. **Q44 — there is no chooser.** The panel cannot offer a list of anything and take a
-   touch on it, which is why GameStream is operator-configured rather than walk-up. Not
-   GameStream-specific: it is the wall any protocol hits that needs the panel to *offer*
-   rather than *accept*. **Q43** is its sibling — the GameStream media plane has never run
-   against a host with a real encoder, and only hardware settles that.
+0. ~~**Q44 — there is no chooser.**~~ **Done** — see the shell above. **Q43** remains: the
+   GameStream media plane has never run against a host with a real encoder, and only
+   hardware settles that.
 1. ~~**Q15** — Cast TLS actor + AirPlay RTSP actor.~~ **Done**: both listen, both are
    driven end-to-end by the VM test. What's left behind them is the media plane, below.
 2. **Q1** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
