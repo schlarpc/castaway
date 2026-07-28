@@ -40,6 +40,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::adblock_engine::AdBlocker;
+use crate::audio_decode::PcmBlock;
+use crate::audio_out::{AudioOut, AudioOutputFactory};
 use crate::browser::{BrowserCommand, BrowserRole};
 use crate::browser_proto::{
     encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, ToBrowser, MAX_INFLIGHT_FRAMES,
@@ -103,6 +105,21 @@ struct Health {
     software_fallback: std::sync::atomic::AtomicBool,
     /// Frames the browser dropped because we were behind.
     drops: AtomicU64,
+    /// The media clock of the most recent audio block, in milliseconds.
+    ///
+    /// Milliseconds-as-integer because it is read from the render thread while the reader
+    /// thread writes it, and an `f64` cannot be atomic. Precision beyond a millisecond is
+    /// not meaningful for lip-sync anyway — the threshold where a viewer notices is tens
+    /// of milliseconds.
+    audio_ms: std::sync::atomic::AtomicI64,
+    /// How many audio blocks have been handed to the sink.
+    audio_blocks: AtomicU64,
+    /// Video media time minus audio media time, in milliseconds — the lip-sync error.
+    ///
+    /// Positive means the picture is ahead of the sound. Named the same as AirPlay's
+    /// `av_skew_ms` on purpose: it is the same quantity, and a panel with two protocols
+    /// reporting sync differently is a panel nobody can compare.
+    av_skew_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Health {
@@ -115,6 +132,31 @@ impl Health {
     fn take_fault(&self) -> Option<String> {
         self.fault.lock().ok().and_then(|mut f| f.take())
     }
+}
+
+/// Base64 → interleaved `f32`.
+///
+/// The page sends native-endian `f32` bytes; a length that is not a multiple of four
+/// means a truncated block, and playing three quarters of a sample as if it were a whole
+/// one is a click. Refusing is the quieter failure.
+fn decode_pcm(b64: &str) -> Option<Vec<f32>> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// The browser's audio output, opened on the first block that arrives.
+struct BrowserAudio {
+    out: Box<dyn AudioOut>,
+    started: bool,
 }
 
 /// A painted frame waiting to be imported on the render thread.
@@ -138,6 +180,8 @@ pub struct Electron {
     health: Arc<Health>,
     process: ProcessRef,
     reader: Option<std::thread::JoinHandle<()>>,
+    probes: Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
+    next_probe: AtomicU64,
 }
 
 impl Electron {
@@ -154,6 +198,7 @@ impl Electron {
         program: &std::path::Path,
         app_dir: &std::path::Path,
         adblock: Arc<AdBlocker>,
+        audio_out: Option<&AudioOutputFactory>,
         user_agent: &str,
     ) -> Result<Self, PipelineError> {
         let mut child = Command::new(program)
@@ -177,7 +222,17 @@ impl Electron {
             .ok_or_else(|| PipelineError::GpuInit("browser has no stdout".into()))?;
 
         let pending: Arc<Mutex<Option<PendingPaint>>> = Arc::new(Mutex::new(None));
+        // A factory rather than a device: a respawned browser takes a *fresh* output, the
+        // same way each session does, because two writers on one device fight rather
+        // than mix.
+        let audio: Arc<Mutex<Option<BrowserAudio>>> =
+            Arc::new(Mutex::new(audio_out.map(|make| BrowserAudio {
+                out: make(),
+                started: false,
+            })));
         let health = Arc::new(Health::default());
+        let probes: Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<u32>();
 
         let reader = std::thread::Builder::new()
@@ -186,7 +241,13 @@ impl Electron {
                 let pending = Arc::clone(&pending);
                 let health = Arc::clone(&health);
                 let stdin = Arc::clone(&stdin);
-                move || reader_loop(stdout, &pending, &health, &stdin, &adblock, &ready_tx)
+                let audio = Arc::clone(&audio);
+                let probes = Arc::clone(&probes);
+                move || {
+                    reader_loop(
+                        stdout, &pending, &health, &stdin, &adblock, &audio, &probes, &ready_tx,
+                    )
+                }
             })
             .map_err(|e| PipelineError::GpuInit(format!("browser reader thread: {e}")))?;
 
@@ -207,6 +268,8 @@ impl Electron {
             health,
             process,
             reader: Some(reader),
+            probes,
+            next_probe: AtomicU64::new(0),
         };
         info!(target: "castaway::browser", pid, "browser up");
         Ok(electron)
@@ -248,6 +311,49 @@ impl Electron {
     #[must_use]
     pub fn drops(&self) -> u64 {
         self.health.drops.load(Ordering::Relaxed)
+    }
+
+    /// Evaluate an expression in the page and wait for its value.
+    ///
+    /// For tests: it is how "the page saw the touch" gets asserted instead of "we sent
+    /// one". Not on the kiosk path — nothing in normal operation needs to interrogate
+    /// the page.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuInit`] if the browser does not answer within `timeout`.
+    pub fn probe(
+        &self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, PipelineError> {
+        let id = self.next_probe.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Ok(mut probes) = self.probes.lock() {
+            probes.insert(id, tx);
+        }
+        self.send(&ToBrowser::Probe {
+            id,
+            expression: expression.to_string(),
+        });
+        rx.recv_timeout(timeout)
+            .map_err(|_| PipelineError::GpuInit(format!("probe {id} went unanswered")))
+    }
+
+    /// Lip-sync error in milliseconds: video media time minus audio media time.
+    ///
+    /// `None` until both a frame and an audio block have carried a media clock, which for
+    /// a page with no media element is never — a clock page is not out of sync, it simply
+    /// has no sound to be out of sync with.
+    #[must_use]
+    pub fn av_skew_ms(&self) -> Option<i64> {
+        (self.health.audio_blocks.load(Ordering::Relaxed) > 0)
+            .then(|| self.health.av_skew_ms.load(Ordering::Relaxed))
+    }
+
+    /// Audio blocks handed to the mixer.
+    #[must_use]
+    pub fn audio_blocks(&self) -> u64 {
+        self.health.audio_blocks.load(Ordering::Relaxed)
     }
 
     /// Ask the browser to quit, then make sure it did.
@@ -315,6 +421,8 @@ fn reader_loop(
     health: &Arc<Health>,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     adblock: &Arc<AdBlocker>,
+    audio: &Arc<Mutex<Option<BrowserAudio>>>,
+    probes: &Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
     ready_tx: &std::sync::mpsc::Sender<u32>,
 ) {
     let mut framer = LineFramer::default();
@@ -328,7 +436,9 @@ fn reader_loop(
             for msg in framer.push(buf) {
                 match msg {
                     Ok(msg) => {
-                        handle(msg, pending, health, stdin, adblock, ready_tx);
+                        handle(
+                            msg, pending, health, stdin, adblock, audio, probes, ready_tx,
+                        );
                     }
                     Err(e) => {
                         warn!(target: "castaway::browser", error = %e, "browser protocol");
@@ -349,6 +459,8 @@ fn handle(
     health: &Arc<Health>,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     adblock: &Arc<AdBlocker>,
+    audio: &Arc<Mutex<Option<BrowserAudio>>>,
+    probes: &Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
     ready_tx: &std::sync::mpsc::Sender<u32>,
 ) {
     match msg {
@@ -360,9 +472,22 @@ fn handle(
             format,
             width,
             height,
+            media_time,
             modifier,
             planes,
         } => {
+            // The picture's place on the media clock, against which the audio block's
+            // own `media_time` is the lip-sync error. Recorded on every frame because a
+            // skew that only appears under load is the one that matters.
+            if media_time > 0.0 {
+                let video_ms = (media_time * 1000.0) as i64;
+                let audio_ms = health.audio_ms.load(Ordering::Relaxed);
+                if audio_ms != 0 {
+                    health
+                        .av_skew_ms
+                        .store(video_ms - audio_ms, Ordering::Relaxed);
+                }
+            }
             let Some(&plane) = planes.first() else {
                 warn!(target: "castaway::browser", id, "paint with no planes");
                 return;
@@ -434,6 +559,63 @@ fn handle(
             warn!(target: "castaway::browser", %reason, "render process gone");
             health.set_fault(format!("render process {reason}"));
         }
+        FromBrowser::Audio {
+            pcm,
+            channels,
+            sample_rate,
+            media_time,
+            paused,
+        } => {
+            if paused {
+                return;
+            }
+            let Some(samples) = decode_pcm(&pcm) else {
+                warn!(target: "castaway::browser", "audio block did not decode");
+                return;
+            };
+            health
+                .audio_ms
+                .store((media_time * 1000.0) as i64, Ordering::Relaxed);
+            health.audio_blocks.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut guard) = audio.lock() {
+                if let Some(sink) = guard.as_mut() {
+                    // Started lazily on the first block: the format is the page's to
+                    // choose, and a device opened before anything plays is a device held
+                    // open for a page that may never play.
+                    if !sink.started {
+                        if let Err(e) = sink.out.start(sample_rate, channels) {
+                            warn!(target: "castaway::browser", error = %e, "browser audio device");
+                            return;
+                        }
+                        sink.started = true;
+                        info!(
+                            target: "castaway::browser",
+                            sample_rate, channels, "browser audio into the mixer"
+                        );
+                    }
+                    let block = PcmBlock {
+                        samples,
+                        channels,
+                        sample_rate,
+                        // The page's media clock, carried straight through. This is the
+                        // same clock a paint's `media_time` is on, which is what makes
+                        // the skew in `av_skew_ms` a real measurement rather than a
+                        // comparison of two unrelated timelines.
+                        pts: std::time::Duration::from_secs_f64(media_time.max(0.0)),
+                    };
+                    if let Err(e) = sink.out.write(&block) {
+                        warn!(target: "castaway::browser", error = %e, "browser audio write");
+                    }
+                }
+            }
+        }
+        FromBrowser::ProbeResult { id, value } => {
+            if let Ok(mut probes) = probes.lock() {
+                if let Some(tx) = probes.remove(&id) {
+                    let _ = tx.send(value);
+                }
+            }
+        }
         FromBrowser::Log { level, message } => match level.as_str() {
             "error" => error!(target: "castaway::browser", "{message}"),
             "warn" => warn!(target: "castaway::browser", "{message}"),
@@ -480,6 +662,8 @@ pub struct ElectronHost {
     /// expressible without stalling on the GPU.
     inflight: VecDeque<InFlight>,
     left_down: bool,
+    /// When the next session line is due.
+    next_report: std::time::Instant,
 }
 
 /// What [`ElectronHost`] needs to bring a browser back.
@@ -487,6 +671,7 @@ struct RespawnSpec {
     program: std::path::PathBuf,
     app_dir: std::path::PathBuf,
     adblock: Arc<AdBlocker>,
+    audio_out: Option<AudioOutputFactory>,
     user_agent: String,
 }
 
@@ -498,6 +683,7 @@ impl ElectronHost {
         program: std::path::PathBuf,
         app_dir: std::path::PathBuf,
         adblock: Arc<AdBlocker>,
+        audio_out: Option<AudioOutputFactory>,
         user_agent: String,
         commands: std::sync::mpsc::Receiver<BrowserCommand>,
     ) -> Self {
@@ -507,6 +693,7 @@ impl ElectronHost {
                 program,
                 app_dir,
                 adblock,
+                audio_out,
                 user_agent,
             },
             commands,
@@ -520,6 +707,7 @@ impl ElectronHost {
             gave_up: None,
             inflight: VecDeque::new(),
             left_down: false,
+            next_report: std::time::Instant::now(),
         }
     }
 
@@ -570,6 +758,7 @@ impl ElectronHost {
         }
         self.recover(render);
         self.import_frame(render);
+        self.report();
     }
 
     /// Pull the newest painted frame across and hand it to the compositor.
@@ -679,6 +868,7 @@ impl ElectronHost {
                 &self.respawn.program,
                 &self.respawn.app_dir,
                 Arc::clone(&self.respawn.adblock),
+                self.respawn.audio_out.as_ref(),
                 &self.respawn.user_agent,
             ) {
                 Ok(e) => {
@@ -753,6 +943,44 @@ impl ElectronHost {
     /// Map a normalized panel coordinate into browser view pixels.
     fn to_view(&self, x: f32, y: f32) -> (f32, f32) {
         crate::browser::to_view_px(self.role.view(self.size).rect, self.size, x, y)
+    }
+
+    /// One structured line every 5 s while the browser has audio, mirroring the mirroring
+    /// path's own session log — because "is it in sync" must be answerable from the
+    /// journal rather than from someone standing in front of the panel.
+    fn report(&mut self) {
+        let Some(electron) = &self.electron else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now < self.next_report {
+            return;
+        }
+        self.next_report = now + std::time::Duration::from_secs(5);
+        if let Some(skew) = electron.av_skew_ms() {
+            info!(
+                target: "castaway::browser",
+                av_skew_ms = skew,
+                audio_blocks = electron.audio_blocks(),
+                drops = electron.drops(),
+                "browser session"
+            );
+        }
+    }
+
+    /// Ask the page a question. Test-only; see [`Electron::probe`].
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuInit`] if there is no browser or it does not answer.
+    pub fn probe(
+        &self,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, PipelineError> {
+        self.electron
+            .as_ref()
+            .ok_or_else(|| PipelineError::GpuInit("no browser to probe".into()))?
+            .probe(expression, timeout)
     }
 
     /// Whether the browser is delivering GPU frames.

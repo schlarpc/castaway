@@ -201,12 +201,18 @@ fn main() -> anyhow::Result<()> {
             // re-fetch daily rather than running whatever it booted with forever.
             pipeline::filterlists::spawn_daily_refresh(list_cache.clone(), StdArc::clone(&shared));
 
+            let audio_factory: pipeline::audio_out::AudioOutputFactory =
+                StdArc::new(pipeline::audio_session::default_output);
             let program = config.browser_program();
             let app_dir = config.browser_app_dir();
             let electron = pipeline::Electron::spawn(
                 &program,
                 &app_dir,
                 StdArc::clone(&blocker),
+                // The browser's audio is captured out of the page and mixed here rather
+                // than played by the browser process, so it takes an output of its own —
+                // one per session, like every other source.
+                Some(&audio_factory),
                 pipeline::TV_USER_AGENT,
             )
             .map_err(|e| anyhow::anyhow!("browser: {e}"))?;
@@ -216,6 +222,7 @@ fn main() -> anyhow::Result<()> {
                 program,
                 app_dir,
                 blocker,
+                Some(StdArc::clone(&audio_factory)),
                 pipeline::TV_USER_AGENT.to_string(),
                 nav_rx,
             );

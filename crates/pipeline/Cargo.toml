@@ -150,7 +150,10 @@ hwaccel = [
 # The browser subprocess (D36). Needs `render` for the compositor it paints into and
 # `hwaccel` for the zero-copy frame import; adblock and scriptlets are baked in because a
 # browser on a wall with no ad blocking is not a thing we would ship.
-electron = ["render", "hwaccel", "dep:adblock", "dep:ureq", "dep:base64", "dep:rquickjs"]
+# `audio` is not optional here: the browser's audio is captured out of the page and mixed
+# by us (D36), so a browser build without the audio path would be a YouTube that plays
+# silently — which is exactly the class of failure G61 was.
+electron = ["render", "hwaccel", "audio", "dep:adblock", "dep:ureq", "dep:base64", "dep:rquickjs"]
 
 [lints]
 workspace = true

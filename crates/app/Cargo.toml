@@ -70,7 +70,7 @@ ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
 # The browser subprocess in the kiosk (YouTube leanback via DIAL launch). Implies
 # `render` and `hwaccel` for the zero-copy frame import. Unlike the CEF build it replaced,
 # this binary is *not* also the browser's subprocess entry point, so main() is ordinary.
-electron = ["render", "hwaccel", "pipeline/electron", "dep:ureq"]
+electron = ["render", "hwaccel", "audio", "pipeline/electron", "dep:ureq"]
 
 [lints]
 workspace = true

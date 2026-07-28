@@ -1323,6 +1323,16 @@ impl RenderLoop {
         Ok(())
     }
 
+    /// Whether a browser frame is currently composited.
+    ///
+    /// Exists for the end-to-end test: "did a frame become a layer" is the question that
+    /// separates a working import from a working *product*, and it cannot be answered
+    /// from outside without this.
+    #[must_use]
+    pub fn browser_layer_present(&self) -> bool {
+        self.compositor.has_layer(LayerId::Browser)
+    }
+
     /// Remove the browser layer (browser hidden).
     pub fn clear_browser(&mut self) {
         self.compositor.remove_layer(LayerId::Browser);

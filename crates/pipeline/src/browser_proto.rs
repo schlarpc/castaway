@@ -81,6 +81,11 @@ pub enum FromBrowser {
         width: u32,
         /// Coded height in pixels.
         height: u32,
+        /// Chromium's paint timestamp in seconds, on the same media clock
+        /// [`FromBrowser::Audio::media_time`] uses. `0.0` when the compositor did not
+        /// supply one, which is the case for pages with no media element.
+        #[serde(default)]
+        media_time: f64,
         /// DRM format modifier as a decimal string (Linux). `u64` does not survive JSON
         /// numbers, and `0` is linear. Absent on Windows, where the handle carries it.
         #[serde(default)]
@@ -144,6 +149,31 @@ pub enum FromBrowser {
     RenderGone {
         /// Chromium's reason string (`crashed`, `killed`, `oom`, …).
         reason: String,
+    },
+    /// A block of the page's audio, taken before it reached any sound card.
+    ///
+    /// Carries `media_time` because that is what makes A/V sync *measurable*: the frames
+    /// castaway composites carry Chromium's paint timestamp, and both come from the same
+    /// media clock. Without the pair there is a picture and a sound with no stated
+    /// relationship, which is precisely the bug nobody can diagnose from the room.
+    Audio {
+        /// Base64 interleaved `f32` samples. CDP bindings carry strings only.
+        pcm: String,
+        /// Channel count in the interleave.
+        channels: u16,
+        /// Samples per second.
+        sample_rate: u32,
+        /// The media element's `currentTime` when this block was captured, in seconds.
+        media_time: f64,
+        /// Whether the element is paused (a tail block after a pause is not a gap).
+        paused: bool,
+    },
+    /// The page's answer to [`ToBrowser::Probe`], for tests that need to see inside it.
+    ProbeResult {
+        /// The query being answered.
+        id: u64,
+        /// The expression's value, JSON-encoded, or an error string.
+        value: String,
     },
     /// Something the browser wants logged, without inventing a message type for it.
     Log {
@@ -231,6 +261,17 @@ pub enum ToBrowser {
         /// JavaScript to evaluate in the main world before any page script. Empty when
         /// no rule matches, which is the common case.
         source: String,
+    },
+    /// Evaluate an expression in the page and report the result.
+    ///
+    /// Exists so an integration test can ask the *page* whether it received an input,
+    /// rather than asserting that we sent one. "Touch was dispatched" and "the page saw a
+    /// touch" are different claims, and only the second is worth anything.
+    Probe {
+        /// Correlates the answer.
+        id: u64,
+        /// A JavaScript expression.
+        expression: String,
     },
     /// Shut down cleanly.
     Quit,

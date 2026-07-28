@@ -21,6 +21,12 @@
 'use strict';
 
 const { app, BrowserWindow, components, dialog, session } = require('electron');
+const fs = require('fs');
+const path = require('path');
+
+// Injected into every page's main world: routes the page's audio to castaway instead of
+// to the sound card. See audio-tap.js for why this cannot be done from the host side.
+const AUDIO_TAP = fs.readFileSync(path.join(__dirname, 'audio-tap.js'), 'utf8');
 
 // ---------------------------------------------------------------------------
 // Fail loudly on stderr, never in a dialog. A modal on a wall-mounted panel is a
@@ -134,14 +140,62 @@ function installAdblock(ses) {
 // renderer sandbox for it. CDP's addScriptToEvaluateOnNewDocument is main-world and
 // document-start, which is exactly the pair required.
 // ---------------------------------------------------------------------------
-async function applyScriptlets(contents, source) {
-  if (!source) return;
+// The debugger is attached once per window and kept, because *three* things need it:
+// scriptlet injection, the audio tap's binding, and touch. An earlier version attached it
+// lazily inside the scriptlet path, which meant a page with no matching uBO rule got no
+// debugger — and therefore no touch and no audio. That failed silently, on exactly the
+// pages least likely to be noticed, which is why `a_touch_reaches_the_page` exists.
+async function ensureDebugger(contents) {
+  if (contents.debugger.isAttached()) return true;
   try {
-    if (!contents.debugger.isAttached()) contents.debugger.attach('1.3');
+    contents.debugger.attach('1.3');
   } catch (e) {
-    log('warn', `could not attach the debugger; scriptlets will not inject: ${e}`);
-    return;
+    log('warn', `debugger attach failed; touch, audio and scriptlets are all unavailable: ${e}`);
+    return false;
   }
+  try {
+    await contents.debugger.sendCommand('Runtime.enable');
+    await contents.debugger.sendCommand('Runtime.addBinding', { name: '__castawayAudio' });
+    await contents.debugger.sendCommand('Runtime.addBinding', { name: '__castawayAudioError' });
+    contents.debugger.on('message', (_e, method, params) => {
+      if (method !== 'Runtime.bindingCalled') return;
+      if (params.name === '__castawayAudioError') {
+        log('warn', `audio tap: ${params.payload}`);
+        return;
+      }
+      if (params.name !== '__castawayAudio') return;
+      try {
+        const b = JSON.parse(params.payload);
+        send({
+          type: 'audio',
+          pcm: b.pcm,
+          channels: b.channels,
+          sampleRate: b.sampleRate,
+          mediaTime: b.mediaTime,
+          paused: b.paused,
+        });
+      } catch (e) {
+        log('warn', `audio block: ${e}`);
+      }
+    });
+  } catch (e) {
+    log('warn', `debugger setup incomplete: ${e}`);
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Scriptlets. uBlock Origin's `##+js(...)` bodies must run in the page's **main world**
+// and before any page script, because they patch globals the page then uses. A preload
+// script cannot do it: under contextIsolation it runs in an isolated world, where the
+// patches are invisible to the page, and turning contextIsolation off would trade the
+// renderer sandbox for it. CDP's addScriptToEvaluateOnNewDocument is main-world and
+// document-start, which is exactly the pair required.
+//
+// The audio tap rides along because it needs the same two properties.
+// ---------------------------------------------------------------------------
+async function applyScriptlets(contents, source) {
+  if (!(await ensureDebugger(contents))) return;
   try {
     if (scriptletHandle) {
       await contents.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', {
@@ -149,16 +203,20 @@ async function applyScriptlets(contents, source) {
       });
     }
     const res = await contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
-      source,
+      source: `${AUDIO_TAP}\n${source || ''}`,
       runImmediately: true,
     });
     scriptletHandle = res.identifier;
-    log('info', `scriptlets armed (${source.length} bytes)`);
+    log('info', `page armed (audio tap + ${(source || '').length} bytes of scriptlets)`);
   } catch (e) {
     log('warn', `scriptlet injection failed: ${e}`);
   }
 }
 
+/// Ask castaway what to inject for `url`, with a deadline.
+///
+/// Per-navigation because uBO rules are domain-scoped. A late answer must not hold the
+/// page: an un-patched page is a far better outcome than one that never loads.
 function requestScriptlets(url) {
   const id = ++scriptletSeq;
   return new Promise((resolve) => {
@@ -170,8 +228,6 @@ function requestScriptlets(url) {
       resolve(source || '');
     };
     pendingScriptlets.set(id, finish);
-    // A late answer must not hold the navigation: an unblocked page is a much better
-    // outcome than a panel that never loads one.
     setTimeout(() => finish(''), 2000);
     send({ type: 'scriptlet-query', id, url });
   });
@@ -243,6 +299,8 @@ function createWindow(width, height) {
   // Electron exposes no PCM tap the way CEF's audio handler did, so this is the honest
   // arrangement rather than a chosen one; see GAPS for what it costs.
   w.webContents.setAudioMuted(false);
+  // The debugger is attached on navigate, not here: attaching before the window has a
+  // page stops it painting at all (measured — both end-to-end tests went dark).
 
   w.webContents.on('paint', (event) => {
     if (!event.texture) {
@@ -271,6 +329,7 @@ function createWindow(width, height) {
       format: info.pixelFormat === 'rgba' ? 'rgba' : 'bgra',
       width: info.codedSize.width,
       height: info.codedSize.height,
+      mediaTime: info.timestamp ? info.timestamp / 1e6 : 0,
       // Linux: per-plane fds plus a DRM modifier. Windows: one NT handle and no
       // modifier, because the handle describes its own layout.
       modifier: pixmap ? String(pixmap.modifier) : null,
@@ -361,6 +420,19 @@ function handle(msg) {
       if (finish) finish(msg.source);
       return;
     }
+    case 'probe': {
+      // Test-only: let castaway ask the page a question. Kept deliberately thin — it
+      // evaluates and reports, and owns no behaviour of its own.
+      if (!win || win.isDestroyed()) {
+        send({ type: 'probe-result', id: msg.id, value: '"no window"' });
+        return;
+      }
+      win.webContents
+        .executeJavaScript(`JSON.stringify(${msg.expression})`, true)
+        .then((value) => send({ type: 'probe-result', id: msg.id, value: value ?? 'null' }))
+        .catch((e) => send({ type: 'probe-result', id: msg.id, value: JSON.stringify(String(e)) }));
+      return;
+    }
     case 'quit':
       shutdown();
       return;
@@ -384,6 +456,8 @@ function shutdown() {
   app.quit();
 }
 
+let appReady = false;
+const queued = [];
 let buffered = '';
 process.stdin.on('data', (chunk) => {
   buffered += chunk;
@@ -392,10 +466,24 @@ process.stdin.on('data', (chunk) => {
     const line = buffered.slice(0, newline).trim();
     buffered = buffered.slice(newline + 1);
     if (!line) continue;
+    let msg;
     try {
-      handle(JSON.parse(line));
+      msg = JSON.parse(line);
     } catch (e) {
       log('warn', `unparseable command: ${e}`);
+      continue;
+    }
+    // Before `app.whenReady()` there is no window to act on, and `BrowserWindow` throws
+    // rather than waiting. Dropping the command there would lose the very first
+    // `navigate` to a startup race — a black panel with nothing in the log to explain it.
+    if (!appReady) {
+      queued.push(msg);
+      continue;
+    }
+    try {
+      handle(msg);
+    } catch (e) {
+      log('warn', `command failed: ${e}`);
     }
   }
 });
@@ -406,7 +494,15 @@ process.stdin.on('end', shutdown);
 app.whenReady().then(async () => {
   await readyComponents();
   installAdblock(session.defaultSession);
+  appReady = true;
   send({ type: 'ready', pid: process.pid });
+  for (const msg of queued.splice(0)) {
+    try {
+      handle(msg);
+    } catch (e) {
+      log('warn', `queued command failed: ${e}`);
+    }
+  }
 });
 
 app.on('window-all-closed', () => {

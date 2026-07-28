@@ -631,6 +631,12 @@ impl WgpuCompositor {
         }
     }
 
+    /// Whether `id` currently has a layer with a texture behind it.
+    #[must_use]
+    pub fn has_layer(&self, id: LayerId) -> bool {
+        self.layers.get(&id).is_some_and(|s| s.gpu.is_some())
+    }
+
     /// Adopt an already-imported RGBA texture as a layer.
     ///
     /// The browser path's counterpart to [`Self::import_surface`]. It is separate rather
