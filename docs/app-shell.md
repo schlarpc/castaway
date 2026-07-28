@@ -246,10 +246,23 @@ Landed, in this order, each independently useful:
    video to a corner instead of stopping it; an ending session returns Home unless someone
    is using the panel.
 
-**Still open**: transitions between screens (the animator exists only as the pill's fade),
-scrolling a picker longer than the panel, and theming (#24) — the palette and assets are
-vendored at `crates/pipeline/assets/brand/`, but nothing uses them yet and the font is
-still DejaVu.
+9. **Picker scrolling.** Scroll lives on the model in rows; a drag moves it; chevron hints
+   say there is more. Only whole rows fully on screen are laid out.
+10. **Theming (#24, partial).** `pipeline::theme` is one palette for every surface, with
+    dma.space's accents. The typeface did not land — see below.
+11. **Transitions.** A crossfade, and the home gesture drags it: part-way through a swipe
+    the panel is part-way through the navigation, so letting go without finishing puts it
+    back. A slide was the obvious choice and the compositor cannot do it — there is no
+    clipping, so an incoming screen parked off-surface would be drawn across whatever is
+    beside it. A crossfade needs only opacity, which is a uniform write rather than a
+    33 MB re-raster per frame.
+
+**Still open**: the typeface. dma.space uses Inter, packaged everywhere as a *variable*
+font, and `ab_glyph` renders a variable font's default instance with no weight-axis
+selection — so Inter for both regular and bold would draw both at Regular, and every title
+and heading on these screens is bold against dim body text. It needs a static-instance
+build vendored here or a rasterizer with axis support. Recorded in
+`assets/brand/README.md`.
 
 ## 7. How this gets tested
 

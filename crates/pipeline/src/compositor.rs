@@ -132,6 +132,10 @@ impl DirtyRect {
 pub enum LayerId {
     /// The idle/attract background (shown when nothing is casting; video covers it).
     Attract,
+    /// The screen being navigated *away* from, fading out over its replacement (D38).
+    /// Directly above the shell's own surface and below everything else, so a transition
+    /// never covers a cast or the controls for one.
+    ShellPrev,
     /// The idle screen's embedded web widget — the clock in the reserved card. Above the
     /// idle background it sits in, below a session's card, because a session that is
     /// actually playing outranks an ornament.
@@ -160,8 +164,9 @@ pub enum LayerId {
 impl LayerId {
     /// Every layer, in paint order. The ordering test asserts against this rather than
     /// against a hand-written list, so a new variant cannot be added without placing it.
-    pub const PAINT_ORDER: [Self; 8] = [
+    pub const PAINT_ORDER: [Self; 9] = [
         Self::Attract,
+        Self::ShellPrev,
         Self::BrowserWidget,
         Self::NowPlaying,
         Self::Transport,

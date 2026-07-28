@@ -31,6 +31,18 @@ const PIP_CORNER: u8 = 3;
 /// How long after a touch the panel counts as in use, for the idle return (#27).
 const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// A navigation being animated.
+#[derive(Debug, Clone, Copy)]
+struct Transition {
+    /// 1.0 = the outgoing screen is fully showing, 0.0 = gone.
+    progress: f32,
+    /// While a finger is on the glass the progress is *its*, not the clock's.
+    driven: bool,
+}
+
+/// How long an unattended transition takes.
+const TRANSITION: std::time::Duration = std::time::Duration::from_millis(180);
+
 pub enum RenderCommand {
     /// Upload a decoded frame as the video layer.
     Video(DecodedFrame),
@@ -935,6 +947,15 @@ pub struct RenderLoop {
     compositor: WgpuCompositor,
     rx: Receiver<RenderCommand>,
     osd: Option<crate::osd::OsdController>,
+    /// A navigation in progress: how much of the outgoing screen is still showing, and
+    /// whether a finger is driving it.
+    ///
+    /// A crossfade rather than a slide, for one reason that decided it: a slide needs
+    /// both screens rasterised *and* placed off-surface, and the compositor has no
+    /// clipping — an incoming screen parked to the right would be drawn across whatever
+    /// is beside it. A crossfade needs only opacity, which is a 32-byte uniform write per
+    /// frame rather than a 33 MB re-raster (D38).
+    transition: Option<Transition>,
     /// Whether the shell is in front: someone is navigating, so a playing video is
     /// demoted to a corner rather than covering the screens they are using (D38, #28).
     shell_front: bool,
@@ -1008,6 +1029,7 @@ impl RenderLoop {
             compositor,
             rx,
             osd: None,
+            transition: None,
             shell_front: false,
             last_touch: None,
             shell: None,
@@ -1848,14 +1870,28 @@ impl RenderLoop {
 
     /// Push a screen on top of the current one.
     pub fn shell_push(&mut self, screen: crate::shell::Screen) {
+        if self.shell.is_none() {
+            return;
+        }
+        self.begin_transition(false);
         if let Some(stack) = &mut self.shell {
             stack.push(screen);
-            self.repaint_shell();
         }
+        self.repaint_shell();
     }
 
     /// Go back one screen. Returns whether anything moved.
     pub fn shell_back(&mut self) -> bool {
+        if !self
+            .shell
+            .as_ref()
+            .is_some_and(crate::shell::ScreenStack::can_pop)
+        {
+            return false;
+        }
+        // Before the stack changes, so the screen being left is still the current one
+        // and can be drawn into its own layer to fade out.
+        self.begin_transition(false);
         let moved = self
             .shell
             .as_mut()
@@ -1868,6 +1904,13 @@ impl RenderLoop {
 
     /// Return to Home. Returns whether anything moved.
     pub fn shell_home(&mut self) -> bool {
+        if self
+            .shell
+            .as_ref()
+            .is_some_and(crate::shell::ScreenStack::can_pop)
+        {
+            self.begin_transition(false);
+        }
         let moved = self
             .shell
             .as_mut()
@@ -1904,6 +1947,117 @@ impl RenderLoop {
         stack.current().hit(w.max(1), h.max(1), x, y)
     }
 
+    /// Begin a crossfade away from whatever is currently drawn.
+    ///
+    /// Called *before* the stack changes, so the outgoing screen is still the current one
+    /// and can be rasterised into its own layer.
+    fn begin_transition(&mut self, driven: bool) {
+        // Re-rasterise rather than copy: the compositor has no texture-to-texture copy,
+        // and this happens once per navigation — a human action, not a frame.
+        let Some(screen) = self.shell.as_ref().map(crate::shell::ScreenStack::current) else {
+            return;
+        };
+        let (w, h) = self.compositor.target_size();
+        let (w, h) = (w.max(1), h.max(1));
+        let rgba = match self.render_screen(screen, w, h) {
+            Ok(rgba) => rgba,
+            Err(e) => {
+                warn!(error = %e, "could not draw the outgoing screen; navigating without a fade");
+                return;
+            }
+        };
+        if self
+            .compositor
+            .upload_texture(LayerId::ShellPrev, w, h, TexelFormat::Rgba8Srgb, &rgba)
+            .is_err()
+        {
+            return;
+        }
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::ShellPrev,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        self.transition = Some(Transition {
+            progress: 1.0,
+            driven,
+        });
+    }
+
+    /// Advance an unattended transition. Returns whether anything is still animating.
+    pub fn tick_transition(&mut self, dt: std::time::Duration) -> bool {
+        let Some(t) = self.transition.as_mut() else {
+            return false;
+        };
+        if t.driven {
+            return true;
+        }
+        let step = dt.as_secs_f32() / TRANSITION.as_secs_f32();
+        t.progress -= step;
+        let p = t.progress;
+        if p <= 0.0 {
+            self.end_transition();
+            return false;
+        }
+        self.apply_transition(p);
+        true
+    }
+
+    /// Set a driven transition's progress directly, from a finger's travel.
+    ///
+    /// `shown` is how much of the *outgoing* screen should still be visible, so a drag
+    /// that is half-way leaves the panel half-way — and letting go without finishing
+    /// puts it back, which is what makes the gesture feel like it is attached to the
+    /// hand rather than a switch that fires.
+    pub fn drive_transition(&mut self, shown: f32) {
+        let shown = shown.clamp(0.0, 1.0);
+        if let Some(t) = self.transition.as_mut() {
+            t.progress = shown;
+            t.driven = true;
+        }
+        self.apply_transition(shown);
+    }
+
+    /// Let go of a driven transition: it finishes on the clock from wherever it is.
+    pub fn release_transition(&mut self) {
+        if let Some(t) = self.transition.as_mut() {
+            t.driven = false;
+        }
+    }
+
+    /// Whether a navigation is animating.
+    #[must_use]
+    pub const fn transitioning(&self) -> bool {
+        self.transition.is_some()
+    }
+
+    fn apply_transition(&mut self, opacity: f32) {
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::ShellPrev,
+            opacity: opacity.clamp(0.0, 1.0),
+            transform: Transform::default(),
+        });
+    }
+
+    fn end_transition(&mut self) {
+        self.compositor.remove_layer(LayerId::ShellPrev);
+        self.transition = None;
+    }
+
+    /// Rasterise a screen, whichever kind it is.
+    fn render_screen(
+        &self,
+        screen: &crate::shell::Screen,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, PipelineError> {
+        match screen {
+            crate::shell::Screen::Home(scene) => crate::attract::render(scene, w, h),
+            crate::shell::Screen::Service(sc) => crate::service::render(sc, w, h),
+            crate::shell::Screen::Picker(p) => crate::picker::render(p, w, h),
+        }
+    }
+
     fn repaint_shell(&mut self) {
         if let Err(e) = self.paint_screen() {
             error!(error = %e, "failed to draw the shell screen");
@@ -1920,11 +2074,7 @@ impl RenderLoop {
         };
         let (w, h) = self.compositor.target_size();
         let (w, h) = (w.max(1), h.max(1));
-        let rgba = match screen {
-            crate::shell::Screen::Home(scene) => crate::attract::render(scene, w, h)?,
-            crate::shell::Screen::Service(sc) => crate::service::render(sc, w, h)?,
-            crate::shell::Screen::Picker(p) => crate::picker::render(p, w, h)?,
-        };
+        let rgba = self.render_screen(screen, w, h)?;
         self.set_attract(w, h, &rgba)
     }
 }

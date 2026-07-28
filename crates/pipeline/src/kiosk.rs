@@ -58,6 +58,11 @@ struct KioskApp {
     /// drive — the strip is then never drawn either, since nothing publishes capabilities.
     controls: Option<ControlSink>,
     shell_sink: Option<ShellSink>,
+    /// When the last frame was, so animations advance on wall time rather than on
+    /// however fast this box happens to redraw.
+    last_frame: Option<std::time::Instant>,
+    /// Whether the current edge contact is dragging a navigation along with it.
+    started_drag: bool,
     /// Where each contact was last seen, for turning a drag into a scroll.
     drag_last: std::collections::HashMap<u32, f32>,
     /// Live touch contacts, for the edge swipe. Nothing else in the tree tracked these:
@@ -185,12 +190,31 @@ impl KioskApp {
                 let Some(contact) = self.contacts.get_mut(&event.id) else {
                     return false;
                 };
-                if contact.is_home_swipe(event.x, event.y) {
+                let from_edge = contact.from_edge;
+                let complete = contact.is_home_swipe(event.x, event.y);
+                let travel = event.x - contact.start.0;
+                if complete {
                     contact.fired = true;
                     self.go_home();
                     return true;
                 }
-                contact.from_edge
+                // Part-way: the panel follows the finger, so letting go without
+                // finishing puts it back. A gesture that only fires at a threshold feels
+                // like a switch; one that moves with the hand feels attached to it.
+                if from_edge && !self.started_drag {
+                    if let Some(render) = self.render.as_mut() {
+                        if render.shell_depth() > 1 || render.shell_foreground() {
+                            self.started_drag = true;
+                        }
+                    }
+                }
+                if from_edge && self.started_drag {
+                    let shown = 1.0 - (travel / crate::overlay::SWIPE_TRAVEL).clamp(0.0, 1.0);
+                    if let Some(render) = self.render.as_mut() {
+                        render.drive_transition(shown);
+                    }
+                }
+                from_edge
             }
             TouchPhase::Up | TouchPhase::Cancel => {
                 self.contacts.remove(&event.id).is_some_and(|c| c.from_edge)
@@ -502,6 +526,14 @@ impl ApplicationHandler for KioskApp {
                     host.pump(r);
                 }
                 self.tick_pill();
+                if let Some(render) = self.render.as_mut() {
+                    let now = std::time::Instant::now();
+                    let dt = self
+                        .last_frame
+                        .map_or(std::time::Duration::ZERO, |t: std::time::Instant| now - t);
+                    self.last_frame = Some(now);
+                    render.tick_transition(dt);
+                }
                 if let Some(r) = &mut self.render {
                     r.pump();
                 }
@@ -553,6 +585,8 @@ pub fn run(
         shell_sink,
         contacts: std::collections::HashMap::new(),
         drag_last: std::collections::HashMap::new(),
+        last_frame: None,
+        started_drag: false,
         pill_since: None,
         pill_drawn: false,
         exit,
@@ -590,6 +624,8 @@ pub fn run_with_browser(
         shell_sink,
         contacts: std::collections::HashMap::new(),
         drag_last: std::collections::HashMap::new(),
+        last_frame: None,
+        started_drag: false,
         pill_since: None,
         pill_drawn: false,
         exit,
