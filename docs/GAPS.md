@@ -691,10 +691,35 @@ display or the audio device, and two cannot take it back afterwards.
   see G61, which this entry's original wording got wrong. This is a browser-only gap — but see G56, which is the feature that turns it
   from a YouTube-live annoyance into a prerequisite.
 
-  **Route 2 is now decided policy — D36.** The browser layer moves to an Electron
-  subprocess (stock on Linux, castLabs ECS for the Windows/DRM artifact), gated on the
-  shared-texture spike (Q40). The routes are kept below because the reasoning is what
-  justified the decision:
+  **Route 2 is now decided policy — D36 — and the codec claim is measured, not
+  inherited.** `browser-host/codec-probe.js` runs the same `MediaSource.isTypeSupported`
+  / `canPlayType` probe that produced this entry's CEF numbers, against any candidate
+  Electron, and exits non-zero if H.264 or AAC is missing. Two of the three variables are
+  settled empirically (2026-07-28):
+
+  | build | H.264 base/high | AAC-LC | how |
+  |---|---|---|---|
+  | CEF 147 (what we ship today) | `false` / `""` | `false` / `""` | measured, this entry |
+  | Electron 41.9.1, upstream via nixpkgs | `true` / `probably` | `true` / `probably` | **measured** |
+  | castLabs ECS 43.0.0 (Chrome 150) | `true` / `probably` | `true` / `probably` | **measured** |
+  | castLabs ECS 43.0.0 **win32-x64** | — | — | **static only, see below** |
+
+  The fork was worth measuring separately from upstream: "official builds set
+  `ffmpeg_branding=Chrome`" says nothing about what a fork does to them, and ECS is what
+  ships on Windows. It keeps them.
+
+  The Windows leg cannot be executed on a Linux builder, so it rests on a comparison
+  against the two binaries just measured: `ffmpeg.dll` carries the same
+  `H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10` and `AAC (Advanced Audio Coding)` decoder
+  long-names as the Linux `libffmpeg.so` that probes clean. Strong, and still inference —
+  the probe wants running on the box, where it is one command.
+
+  (Method note, since it nearly produced a false negative: a first pass grepped
+  line-anchored decoder short-names and scored AAC at zero *in a binary measured as
+  working*. The anchor was wrong, not the build. A static probe that disagrees with a
+  live measurement is a bug in the probe until proven otherwise.)
+
+  The routes are kept below because the reasoning is what justified the decision:
 
   Three routes, and none of them is "buy a build" — nobody sells a codec-enabled CEF:
   1. **Build CEF ourselves** with those GN args. Keeps the architecture exactly as it is;

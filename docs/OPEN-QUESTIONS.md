@@ -435,14 +435,35 @@ during the port, in the order they can kill or reshape it.
   recognizer CEF's `send_touch_event` feeds, in principle. Wants hands-on-glass
   verification on the panel: multi-touch, fling momentum, and the inset-widget coordinate
   mapping that `input_maps_into_the_inset_view_space` pins today.
-- **Q42 — Widevine under ECS.** G46's property — offline first-launch DRM from a staged
-  CDM — must be re-proven under ECS's component handling, which is castLabs' own, not the
-  `DIR_COMPONENT_PREINSTALLED` scan we reverse-engineered for CEF. And the Linux dev story
-  needs a decision: stock nixpkgs `electron` has no CDM loading at all, so Linux dev DRM
-  parity means ECS Linux builds (they exist; nothing to sign, Linux has no VMP) and a Nix
-  packaging job, or accepting that DRM is Windows-verified only. The EVS signing flow
-  itself is answered — free, signup, PyPI `castlabs-evs`, deploy-time step outside
-  `nix build` per ground rule 6.
+- **Q42 — Widevine under ECS. Mostly answered by measurement 2026-07-28; one claim left.**
+  The Linux-parity half is gone: D36 now pins ECS on *both* platforms, so there is one
+  CDM mechanism rather than two. What ECS does was measured rather than read — a cold
+  profile under `components.whenReady()` fetches the CDM to
+
+  ```
+  <userDataDir>/WidevineCdm/4.10.3050.0/_platform_specific/linux_x64/libwidevinecdm.so
+  ```
+
+  and that file is **byte-identical** to `pkgs.widevine-cdm` 4.10.3050.0, which the flake
+  already pins (`cefDist` stages it today), with `widevine-windows-src` as its Windows
+  counterpart. Uniform layout, only the `_platform_specific` leaf differs.
+
+  **Still to prove, and it is exactly G46's test:** that a *pre-staged* CDM at that path
+  satisfies a cold launch with **no network** — i.e. copy the pinned CDM in, run offline,
+  and assert `requestMediaKeySystemAccess('com.widevine.alpha')` resolves on the first
+  launch. `browser-host/widevine-probe.js` is written to be that test; it has been run
+  online (CDM fetched, path confirmed) but not yet in a network namespace against a
+  pre-staged profile. Until that passes, "the panel plays DRM with no internet" is an
+  expectation, not a result — and G46 exists because that exact expectation was false
+  once already.
+
+  Note also that `components.whenReady()` **blocks** on a cold profile while it fetches.
+  On a panel with no route to Google that is a hang on a path the receiver awaits, so the
+  host app needs a deadline around it regardless of pre-staging.
+
+  The EVS signing flow itself is answered — free, signup, PyPI `castlabs-evs`,
+  `sign-pkg` over the directory containing the executable, **after** Authenticode on
+  Windows, deploy-time step outside `nix build` per ground rule 6.
 
 ## Bluetooth audio sink
 

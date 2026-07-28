@@ -621,9 +621,30 @@ on Windows the third requires inverting castaway into a DLL loaded by CEF's
 `bootstrap.exe` (cross-build.md). Self-built CEF buys only the codecs, at the price of a
 Chromium build per security bump and a Linux→MSVC Chromium cross under Nix, forever.
 
-So: the browser layer moves to an **Electron subprocess** — stock nixpkgs `electron` on
-Linux and in CI, castLabs ECS (`castlabs/electron-releases`, MIT) for the Windows deploy
-artifact. What each recorded problem gets:
+So: the browser layer moves to an **Electron subprocess** — castLabs ECS
+(`castlabs/electron-releases`, MIT) on *both* platforms, pinned by us as a flake input
+beside `cef-windows-src`, and patchelf'd on Linux the way nixpkgs' own `electron-bin`
+patchelfs the upstream prebuilt.
+
+**One runtime everywhere, and it is not a detail.** The first draft of this decision had
+stock nixpkgs `electron` for Linux dev/CI and ECS only for the Windows artifact. That
+would have put Chrome 146 under development and Chrome 150 on the panel — different
+Chromium majors, so every codec, DRM and OSR behaviour verified in CI would have been
+verified against a browser we do not ship. Pinning ECS on both deletes that class of bug,
+and takes the "nixpkgs bumps Electron under us" drift with it.
+
+It also collapses Widevine to a single mechanism, which is the larger win. Measured
+2026-07-28: ECS's `components` API fetches the CDM to
+`<userDataDir>/WidevineCdm/<version>/_platform_specific/<linux_x64|win_x64>/`, and the
+file it fetched is **byte-identical** (same md5) to `pkgs.widevine-cdm` 4.10.3050.0,
+which this flake already pins for CEF and already pins a Windows counterpart of. So the
+CDM is *pre-stageable from a derivation we already have*, into a documented path, the
+same way on both platforms — no network at first launch, which is G46's property. That
+replaces the reverse-engineered CEF arrangement wholesale: the
+`DIR_COMPONENT_PREINSTALLED` → `DIR_ASSETS` → `DIR_MODULE` scan, the Linux-only hint
+file, and the platform split in `crates/pipeline/src/widevine.rs` all go away.
+
+What each recorded problem gets:
 
 - **G55**: official Electron builds set `proprietary_codecs=true ffmpeg_branding="Chrome"`
   (`build/args/all.gn`). Someone else maintains the codec-enabled Chromium, permanently.
