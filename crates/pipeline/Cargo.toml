@@ -172,6 +172,13 @@ required-features = ["render"]
 name = "screen_preview"
 required-features = ["render"]
 
+# Every shell screen — Home, a service's instructions, a picker with rows and one with
+# none — dumped to PNGs. Layout and hit-testing are unit-tested; whether a screen reads
+# from across a room is not something a test can answer (D38).
+[[example]]
+name = "shell_preview"
+required-features = ["render"]
+
 [[test]]
 name = "hwaccel_zero_copy"
 required-features = ["hwaccel"]

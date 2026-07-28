@@ -47,9 +47,12 @@ pub mod nowplaying_card;
 #[cfg(feature = "render")]
 pub mod osd;
 #[cfg(feature = "render")]
+pub mod picker;
+#[cfg(feature = "render")]
 pub mod render_pipeline;
 pub mod seek;
 #[cfg(feature = "render")]
+pub mod service;
 pub mod shape;
 #[cfg(feature = "render")]
 pub mod shell;
@@ -71,7 +74,7 @@ pub use hwaccel::{DecodePath, FallbackPolicy, HwBackendKind, HwGiveUp, HwPrefere
 pub use null::NullPipeline;
 
 #[cfg(feature = "render")]
-pub use attract::{AttractRow, AttractScene, InsetRect, WidgetSlot};
+pub use attract::{AttractScene, InsetRect, ServiceDetail, Tile, TileGlyph, WidgetSlot};
 #[cfg(feature = "electron")]
 pub use electron_browser::{Electron, ElectronHost, TV_USER_AGENT};
 #[cfg(feature = "render")]

@@ -1347,6 +1347,16 @@ impl RenderLoop {
         Ok(())
     }
 
+    /// The pixel size of the shell screen's texture, if one is composited.
+    ///
+    /// For the test that the screen is drawn at the surface size rather than stretched
+    /// to it — the failure is invisible on the 4K panel this ships on and wrong
+    /// everywhere else.
+    #[must_use]
+    pub fn shell_layer_size(&self) -> Option<(u32, u32)> {
+        self.compositor.layer_size(LayerId::Attract)
+    }
+
     /// Whether a browser frame is currently composited.
     ///
     /// Exists for the end-to-end test: "did a frame become a layer" is the question that
@@ -1616,6 +1626,8 @@ impl RenderLoop {
         let (w, h) = (w.max(1), h.max(1));
         let rgba = match screen {
             crate::shell::Screen::Home(scene) => crate::attract::render(scene, w, h)?,
+            crate::shell::Screen::Service(sc) => crate::service::render(sc, w, h)?,
+            crate::shell::Screen::Picker(p) => crate::picker::render(p, w, h)?,
         };
         self.set_attract(w, h, &rgba)
     }

@@ -658,6 +658,19 @@ impl WgpuCompositor {
 
     /// Whether `id` currently has a layer with a texture behind it.
     #[must_use]
+    /// The pixel size of a layer's texture, if it has one.
+    ///
+    /// Exists so "was this drawn at the surface size, or drawn small and stretched" is a
+    /// question a test can ask directly. Measuring it from the composited image is
+    /// possible but fragile — it depends on what the screen happens to contain.
+    pub fn layer_size(&self, id: LayerId) -> Option<(u32, u32)> {
+        self.layers
+            .get(&id)
+            .and_then(|s| s.gpu.as_ref())
+            .and_then(LayerGpu::packed)
+            .map(|(t, _)| (t.width(), t.height()))
+    }
+
     pub fn has_layer(&self, id: LayerId) -> bool {
         self.layers.get(&id).is_some_and(|s| s.gpu.is_some())
     }

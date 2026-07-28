@@ -89,29 +89,6 @@ impl WidgetSlot {
     }
 }
 
-/// One "how to cast" row: a colored bullet, a device/app label, and the instruction.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AttractRow {
-    /// Bullet accent color.
-    pub accent: Rgba,
-    /// The sender (e.g. "Chrome / Edge").
-    pub label: String,
-    /// What to do (e.g. "Cast → dma.space/screen").
-    pub detail: String,
-}
-
-impl AttractRow {
-    /// Convenience constructor.
-    #[must_use]
-    pub fn new(accent: Rgba, label: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            accent,
-            label: label.into(),
-            detail: detail.into(),
-        }
-    }
-}
-
 /// The full idle scene.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttractScene {
@@ -119,12 +96,85 @@ pub struct AttractScene {
     pub title: String,
     /// One-line tagline under the title.
     pub tagline: String,
-    /// The "how to cast" rows.
-    pub rows: Vec<AttractRow>,
     /// Dim footer (network info).
     pub footer: String,
     /// Room reserved for the live web widget (the CEF clock layer).
     pub widget: WidgetSlot,
+    /// Things the panel can start *itself*, as tappable tiles (D38).
+    ///
+    /// The rows above and these are two different kinds of thing, and the screen is
+    /// clearer for keeping them apart: a row is an instruction aimed at your phone
+    /// ("Cast → this name"), and the tap happens over there. A tile is something the
+    /// panel goes and does, and the tap happens here. Empty by default, which is exactly
+    /// what a receiver with no such sources should show.
+    pub tiles: Vec<Tile>,
+}
+
+/// A tappable tile on the Home screen — one per thing the panel can be, or do.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tile {
+    /// Opaque identity, echoed back when the tile is pressed. The shell does not know
+    /// what a tile *means* — `app` does — so this is whatever string it finds useful.
+    pub id: String,
+    /// Short label under the glyph.
+    pub label: String,
+    /// Which glyph to draw.
+    pub glyph: TileGlyph,
+    /// Accent colour for the glyph and the tile's edge.
+    pub accent: Rgba,
+    /// What to show when it is pressed, for a service the panel simply *receives*.
+    ///
+    /// `Some` means the press is answered locally: the shell pushes a screen with this
+    /// service's instructions and no round trip. That is most of them — Cast, AirPlay,
+    /// DLNA, Spotify — where there is nothing to do but tell someone what to tap on
+    /// their own device.
+    ///
+    /// `None` means the panel has to go and do something, so the press becomes an event
+    /// `app` handles: GameStream opens a host picker, media opens a library.
+    pub detail: Option<ServiceDetail>,
+}
+
+/// What a service's own screen says.
+///
+/// The instructions used to be rows on the idle screen, one per enabled protocol, which
+/// made the first thing anyone saw a wall of text about six things they were not doing.
+/// Now the idle screen shows what the panel *is*, and the details live one tap in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceDetail {
+    /// One line saying what this is: "Cast a tab, or your whole screen."
+    pub headline: String,
+    /// What to do, in order. Short enough to read from across a room.
+    pub steps: Vec<String>,
+    /// The exact name to look for in a picker, shown prominently — it is the one string
+    /// that has to be got right, and the one nobody can guess.
+    pub advertised: Option<String>,
+}
+
+/// The glyph a tile draws. Distance fields rather than an icon font, for the same reason
+/// the transport strip's are (see [`crate::shape`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TileGlyph {
+    /// A screen with signal arcs — Google Cast.
+    Cast,
+    /// A screen with an upward triangle — AirPlay.
+    AirPlay,
+    /// A plain screen — DLNA, and anything else that just wants a display.
+    Screen,
+    /// A waveform — audio: Spotify, Bluetooth, the visualizer.
+    Waveform,
+    /// A rounded frame with a play triangle — YouTube.
+    Video,
+    /// The Bluetooth rune.
+    Bluetooth,
+    /// A gamepad — GameStream / Moonlight.
+    Gamepad,
+    /// A folder — local media.
+    Folder,
+    /// A camera — the intercom view.
+    Camera,
+    /// A gear — settings.
+    Gear,
 }
 
 impl AttractScene {
@@ -134,47 +184,154 @@ impl AttractScene {
         use castaway_core::ProtocolKind;
 
         let name = "dma.space/screen";
-        // Each row names the *advertised* instance, `<name>#<protocol>`, because that is
+        // Each tile names the *advertised* instance, `<name>#<protocol>`, because that is
         // the string the picker shows — one box appears in four pickers at once and a
-        // bare name makes them indistinguishable. Built from `ProtocolKind::slug()` rather
-        // than written out, so this preview cannot drift from what `app` really
-        // advertises: it did exactly that, and the screenshot told people to look for a
-        // name no picker was showing.
+        // bare name makes them indistinguishable. Built from `ProtocolKind::slug()`
+        // rather than written out, so this preview cannot drift from what `app` really
+        // advertises: it did exactly that once, and the screenshot told people to look
+        // for a name no picker was showing.
         let advertised = |kind: ProtocolKind| format!("{name}#{}", kind.slug());
         Self {
             title: name.into(),
             tagline: "Throw anything at the wall — no app to install.".into(),
-            rows: vec![
-                AttractRow::new(
-                    [0x42, 0x85, 0xf4, 0xff],
-                    "Chrome / Edge",
-                    format!("Cast \u{2192} {}", advertised(ProtocolKind::Cast)),
-                ),
-                AttractRow::new(
-                    [0xff, 0xff, 0xff, 0xff],
-                    "iPhone / Mac",
-                    format!("AirPlay \u{2192} {}", advertised(ProtocolKind::AirPlay)),
-                ),
-                AttractRow::new(
-                    [0x3d, 0xdc, 0x84, 0xff],
-                    "Android / VLC",
-                    format!("Cast or DLNA \u{2192} {}", advertised(ProtocolKind::Dlna)),
-                ),
-                AttractRow::new(
-                    [0x1d, 0xb9, 0x54, 0xff],
-                    "Spotify",
-                    format!("Devices \u{2192} {}", advertised(ProtocolKind::Spotify)),
-                ),
-                AttractRow::new(
-                    [0xff, 0x00, 0x00, 0xff],
-                    "YouTube",
-                    "Cast button".to_string(),
-                ),
-            ],
             footer: "castaway  •  DLNA / mDNS on 10.0.0.5:8080".into(),
             widget: WidgetSlot::RightCard,
+            tiles: vec![
+                Tile {
+                    id: "cast".into(),
+                    label: "Cast".into(),
+                    glyph: TileGlyph::Cast,
+                    accent: [0x42, 0x85, 0xf4, 0xff],
+                    detail: Some(ServiceDetail {
+                        headline: "Cast a tab, or your whole screen.".into(),
+                        steps: vec![
+                            "Open Chrome or Edge".into(),
+                            "Menu → Cast, or the cast button in a video".into(),
+                        ],
+                        advertised: Some(advertised(ProtocolKind::Cast)),
+                    }),
+                },
+                Tile {
+                    id: "airplay".into(),
+                    label: "AirPlay".into(),
+                    glyph: TileGlyph::AirPlay,
+                    accent: [0xff, 0xff, 0xff, 0xff],
+                    detail: Some(ServiceDetail {
+                        headline: "Mirror an iPhone, iPad or Mac.".into(),
+                        steps: vec![
+                            "Control Centre → Screen Mirroring".into(),
+                            "Or the AirPlay button in a video or track".into(),
+                        ],
+                        advertised: Some(advertised(ProtocolKind::AirPlay)),
+                    }),
+                },
+                Tile {
+                    id: "dlna".into(),
+                    label: "DLNA".into(),
+                    glyph: TileGlyph::Screen,
+                    accent: [0x56, 0xba, 0x5b, 0xff],
+                    detail: Some(ServiceDetail {
+                        headline: "Send a video from Android or VLC.".into(),
+                        steps: vec![
+                            "VLC → the cast button".into(),
+                            "Or any app with \"Play on\" / \"Cast to device\"".into(),
+                        ],
+                        advertised: Some(advertised(ProtocolKind::Dlna)),
+                    }),
+                },
+                Tile {
+                    id: "spotify".into(),
+                    label: "Spotify".into(),
+                    glyph: TileGlyph::Waveform,
+                    accent: [0x1d, 0xb9, 0x54, 0xff],
+                    detail: Some(ServiceDetail {
+                        headline: "Play to the room, and keep the phone as the remote.".into(),
+                        steps: vec!["Play something".into(), "Tap Devices, bottom-left".into()],
+                        advertised: Some(advertised(ProtocolKind::Spotify)),
+                    }),
+                },
+                Tile {
+                    id: "youtube".into(),
+                    label: "YouTube".into(),
+                    glyph: TileGlyph::Video,
+                    accent: [0xff, 0x00, 0x00, 0xff],
+                    detail: Some(ServiceDetail {
+                        headline: "The cast button in the YouTube app.".into(),
+                        steps: vec!["Tap it, and pick this screen".into()],
+                        advertised: Some(advertised(ProtocolKind::YouTubeLounge)),
+                    }),
+                },
+                Tile {
+                    id: "gamestream".into(),
+                    label: "Gaming PC".into(),
+                    glyph: TileGlyph::Gamepad,
+                    accent: [0x02, 0xab, 0xfc, 0xff],
+                    // No detail: this one the panel goes and does, so the press becomes
+                    // an event and `app` opens a host picker.
+                    detail: None,
+                },
+            ],
         }
     }
+}
+
+/// Where the Home screen's tiles land, in device pixels.
+///
+/// One layout serves drawing and hit-testing (D33): a tile cannot be drawn where it
+/// cannot be pressed, or pressed where nothing is drawn. Returned as `(id, rect)` pairs
+/// in the order they are drawn.
+#[must_use]
+pub fn tile_layout(
+    scene: &AttractScene,
+    width: u32,
+    height: u32,
+) -> Vec<(String, crate::shape::Rect)> {
+    if scene.tiles.is_empty() {
+        return Vec::new();
+    }
+    let s = height as f32 / DESIGN_HEIGHT;
+    let margin = 90.0 * s;
+    let gap = 26.0 * s;
+
+    // The tiles *are* the screen now — the instructions that used to fill the left column
+    // moved behind them. So they get the whole width left of the widget card, laid out as
+    // a grid that wraps, rather than a row tucked into a corner.
+    let card = scene.widget.rect(width, height);
+    let avail = card.map_or(width as f32 - margin * 2.0, |c| {
+        c.x as f32 - margin - 40.0 * s
+    });
+    let top = 300.0 * s;
+
+    // Sized for a finger on a 65-inch panel: the tile *is* the touch target.
+    let side = 150.0 * s;
+    let per_row = (((avail + gap) / (side + gap)).floor() as usize).max(1);
+    scene
+        .tiles
+        .iter()
+        .enumerate()
+        .map(|(i, tile)| {
+            let (row, col) = (i / per_row, i % per_row);
+            (
+                tile.id.clone(),
+                crate::shape::Rect {
+                    x: margin + (side + gap) * col as f32,
+                    y: top + (side + gap) * row as f32,
+                    w: side,
+                    h: side,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Which tile a panel-normalized point is on, if any.
+#[must_use]
+pub fn tile_hit(scene: &AttractScene, width: u32, height: u32, x: f32, y: f32) -> Option<String> {
+    let (px, py) = (x * width as f32, y * height as f32);
+    tile_layout(scene, width, height)
+        .into_iter()
+        .find(|(_, rect)| rect.contains(px, py))
+        .map(|(id, _)| id)
 }
 
 struct Palette {
@@ -187,6 +344,7 @@ struct Palette {
     footer: Rgba,
     card_edge: Rgba,
     card_bg: Rgba,
+    tile_bg: Rgba,
 }
 
 impl Default for Palette {
@@ -201,6 +359,7 @@ impl Default for Palette {
             footer: [0x55, 0x5e, 0x72, 0xff],
             card_edge: [0x22, 0x2d, 0x44, 0xff],
             card_bg: [0x02, 0x03, 0x07, 0xff],
+            tile_bg: [0x15, 0x1e, 0x35, 0xff],
         }
     }
 }
@@ -290,49 +449,28 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
         &f.regular,
     );
 
-    // Rows.
-    let row_px = 34.0 * s;
-    let row_gap = 62.0 * s;
-    y += 90.0 * s;
-    let label_x = margin + 42.0 * s;
-    let detail_x = margin + 340.0 * s;
-    for row in &scene.rows {
-        let baseline = y + text::ascent(&f.regular, row_px) * 0.8;
-        let sq = 22.0 * s;
-        text::fill_rect(
-            &mut buf,
-            width,
-            height,
-            margin,
-            baseline - sq,
-            sq,
-            sq,
-            row.accent,
-        );
-        // Shrink each half to the room it actually has, the way the title and tagline
-        // already do. The rasterizer clips at the surface edge, not at the widget card,
-        // and these rows sit beside the card at smaller sizes — so an unshrunk detail
-        // runs straight underneath it. That is not hypothetical: the row text is
-        // `<name>#<protocol>`, which is exactly the long form.
-        let label_avail = (detail_x - label_x - 12.0 * s).max(1.0);
-        let detail_avail = (column - detail_x).max(1.0);
-        let label_px = fit_px(&f.bold, &row.label, row_px, label_avail);
-        let detail_px = fit_px(&f.regular, &row.detail, row_px, detail_avail);
-        text::draw_text(
-            &mut buf, width, height, label_x, baseline, &row.label, label_px, pal.label, &f.bold,
-        );
+    // Tiles: what the panel can start itself. Drawn from the same layout the hit test
+    // uses, so the two cannot disagree about where a tile is (D33).
+    let tiles = tile_layout(scene, width, height);
+    if let Some((_, first)) = tiles.first() {
+        // A heading, because the two halves of this screen mean opposite things and
+        // nothing else says so: the rows are what to do on your phone, these are what
+        // this panel will go and do.
+        let head_px = 22.0 * s;
         text::draw_text(
             &mut buf,
             width,
             height,
-            detail_x,
-            baseline,
-            &row.detail,
-            detail_px,
-            pal.detail,
-            &f.regular,
+            first.x,
+            first.y - 18.0 * s,
+            "TAP FOR HOW, OR JUST CAST",
+            head_px,
+            pal.footer,
+            &f.bold,
         );
-        y += row_gap;
+    }
+    for (tile, (_, rect)) in scene.tiles.iter().zip(tiles) {
+        draw_tile(&mut buf, width, height, tile, rect, s, &f, &pal);
     }
 
     // Footer.
@@ -351,6 +489,324 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     );
 
     Ok(buf)
+}
+
+/// Draw one tile: a rounded plate, its glyph, and a label under it.
+#[allow(clippy::too_many_arguments)]
+fn draw_tile(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    tile: &Tile,
+    rect: crate::shape::Rect,
+    s: f32,
+    f: &text::Fonts,
+    pal: &Palette,
+) {
+    use crate::shape;
+
+    let radius = 22.0 * s;
+    // A plate a shade lighter than the background, with the accent as a thin edge. The
+    // accent is not the fill: five saturated squares on a dark wall is a toy, and the
+    // label has to stay readable across a room.
+    shape::rounded_rect(buf, width, height, rect, radius, pal.tile_bg);
+    shape::rounded_outline(
+        buf,
+        width,
+        height,
+        rect,
+        radius,
+        (2.0 * s).max(1.0),
+        tile.accent,
+    );
+
+    let (cx, cy) = rect.center();
+    // Glyph sits above centre; the label takes the bottom third.
+    let gy = cy - rect.h * 0.10;
+    let g = rect.h * 0.26;
+    draw_tile_glyph(buf, width, height, tile.glyph, cx, gy, g, tile.accent);
+
+    let label_px = 22.0 * s;
+    let avail = rect.w - 12.0 * s;
+    let px = fit_px(&f.regular, &tile.label, label_px, avail);
+    let lw = text::measure(&f.regular, &tile.label, px);
+    text::draw_text(
+        buf,
+        width,
+        height,
+        cx - lw / 2.0,
+        rect.y + rect.h - 20.0 * s,
+        &tile.label,
+        px,
+        pal.label,
+        &f.regular,
+    );
+}
+
+/// The tile glyphs, as distance fields. `g` is the glyph's half-extent.
+///
+/// `pub(crate)` because the service screen draws the same glyph large — the screen a tile
+/// opens should look like the tile that opened it.
+pub(crate) fn draw_tile_glyph(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    glyph: TileGlyph,
+    cx: f32,
+    cy: f32,
+    g: f32,
+    color: Rgba,
+) {
+    use crate::shape::{self, Rect};
+
+    // A "screen" is the base of three of these; drawn once and reused so Cast, AirPlay
+    // and DLNA read as a family rather than three unrelated pictures.
+    let screen = |buf: &mut [u8], inset: f32| {
+        let body = Rect {
+            x: cx - g * (1.0 - inset),
+            y: cy - g * (0.72 - inset * 0.5),
+            w: g * 2.0 * (1.0 - inset),
+            h: g * 1.44 * (1.0 - inset * 0.7),
+        };
+        shape::rounded_outline(buf, width, height, body, g * 0.16, g * 0.16, color);
+    };
+    let hole = [0x0d, 0x14, 0x28, 0xff];
+
+    match glyph {
+        TileGlyph::Cast => {
+            screen(buf, 0.0);
+            // Three arcs from the bottom-left corner, the near-universal cast mark.
+            let (ox, oy) = (cx - g * 0.66, cy + g * 0.44);
+            for i in 1..=3 {
+                let r = g * 0.26 * i as f32;
+                shape::fill_sdf(
+                    buf,
+                    width,
+                    height,
+                    Rect::around(ox, oy, r + g * 0.2),
+                    color,
+                    |px, py| {
+                        // Quarter arc: distance to the circle, clipped to up-and-right.
+                        if px < ox - 0.5 || py > oy + 0.5 {
+                            return 1e3;
+                        }
+                        shape::sd_circle(px, py, ox, oy, r).abs() - g * 0.07
+                    },
+                );
+            }
+        }
+        TileGlyph::AirPlay => {
+            screen(buf, 0.0);
+            // The triangle sits below the screen, overlapping its lower edge.
+            shape::fill_sdf(
+                buf,
+                width,
+                height,
+                Rect::around(cx, cy + g * 0.7, g),
+                color,
+                |px, py| {
+                    shape::sd_triangle(
+                        px,
+                        py,
+                        [
+                            (cx, cy + g * 0.36),
+                            (cx + g * 0.46, cy + g * 0.98),
+                            (cx - g * 0.46, cy + g * 0.98),
+                        ],
+                    )
+                },
+            );
+        }
+        TileGlyph::Screen => {
+            screen(buf, 0.0);
+            // A stand, so it is a display rather than an empty rectangle.
+            shape::rounded_rect(
+                buf,
+                width,
+                height,
+                Rect {
+                    x: cx - g * 0.3,
+                    y: cy + g * 0.72,
+                    w: g * 0.6,
+                    h: g * 0.2,
+                },
+                g * 0.08,
+                color,
+            );
+        }
+        TileGlyph::Video => {
+            screen(buf, 0.0);
+            shape::fill_sdf(
+                buf,
+                width,
+                height,
+                Rect::around(cx, cy, g),
+                color,
+                |px, py| {
+                    shape::sd_triangle(
+                        px,
+                        py,
+                        [
+                            (cx - g * 0.24, cy - g * 0.34),
+                            (cx + g * 0.42, cy),
+                            (cx - g * 0.24, cy + g * 0.34),
+                        ],
+                    )
+                },
+            );
+        }
+        TileGlyph::Bluetooth => {
+            // The rune: a vertical spine with two crossed pairs of diagonals.
+            let (tx, ty) = (cx + g * 0.42, cy - g * 0.5);
+            let (bx2, by2) = (cx + g * 0.42, cy + g * 0.5);
+            let thick = g * 0.13;
+            let seg = |buf: &mut [u8], ax: f32, ay: f32, bx: f32, by: f32| {
+                shape::fill_sdf(
+                    buf,
+                    width,
+                    height,
+                    Rect::around((ax + bx) / 2.0, (ay + by) / 2.0, g * 1.2),
+                    color,
+                    |px, py| shape::sd_segment(px, py, ax, ay, bx, by) - thick / 2.0,
+                );
+            };
+            seg(buf, cx, cy - g, cx, cy + g);
+            seg(buf, cx, cy - g, tx, ty);
+            seg(buf, tx, ty, cx - g * 0.42, cy);
+            seg(buf, cx, cy + g, bx2, by2);
+            seg(buf, bx2, by2, cx - g * 0.42, cy);
+        }
+        TileGlyph::Gamepad => {
+            let body = Rect {
+                x: cx - g,
+                y: cy - g * 0.55,
+                w: g * 2.0,
+                h: g * 1.1,
+            };
+            shape::rounded_rect(buf, width, height, body, g * 0.45, color);
+            let arm = g * 0.34;
+            let thick = g * 0.12;
+            shape::rounded_rect(
+                buf,
+                width,
+                height,
+                Rect {
+                    x: cx - g * 0.62 - arm / 2.0,
+                    y: cy - thick / 2.0,
+                    w: arm,
+                    h: thick,
+                },
+                thick / 2.0,
+                hole,
+            );
+            shape::rounded_rect(
+                buf,
+                width,
+                height,
+                Rect {
+                    x: cx - g * 0.62 - thick / 2.0,
+                    y: cy - arm / 2.0,
+                    w: thick,
+                    h: arm,
+                },
+                thick / 2.0,
+                hole,
+            );
+            shape::disc(
+                buf,
+                width,
+                height,
+                cx + g * 0.48,
+                cy - g * 0.14,
+                g * 0.22,
+                hole,
+            );
+            shape::disc(
+                buf,
+                width,
+                height,
+                cx + g * 0.74,
+                cy + g * 0.14,
+                g * 0.22,
+                hole,
+            );
+        }
+        TileGlyph::Folder => {
+            let tab = Rect {
+                x: cx - g,
+                y: cy - g * 0.72,
+                w: g * 0.9,
+                h: g * 0.3,
+            };
+            shape::rounded_rect(buf, width, height, tab, g * 0.12, color);
+            let body = Rect {
+                x: cx - g,
+                y: cy - g * 0.48,
+                w: g * 2.0,
+                h: g * 1.2,
+            };
+            shape::rounded_rect(buf, width, height, body, g * 0.18, color);
+        }
+        TileGlyph::Camera => {
+            let body = Rect {
+                x: cx - g,
+                y: cy - g * 0.5,
+                w: g * 1.75,
+                h: g * 1.1,
+            };
+            shape::rounded_rect(buf, width, height, body, g * 0.22, color);
+            shape::fill_sdf(
+                buf,
+                width,
+                height,
+                Rect::around(cx + g * 0.6, cy, g),
+                color,
+                |px, py| {
+                    shape::sd_triangle(
+                        px,
+                        py,
+                        [
+                            (cx + g * 0.78, cy - g * 0.42),
+                            (cx + g * 1.18, cy),
+                            (cx + g * 0.78, cy + g * 0.42),
+                        ],
+                    )
+                },
+            );
+            shape::disc(buf, width, height, cx - g * 0.15, cy, g * 0.5, hole);
+        }
+        TileGlyph::Waveform => {
+            let heights = [0.35_f32, 0.75, 1.0, 0.6, 0.45];
+            let bar = g * 0.24;
+            let step = g * 0.46;
+            for (i, hfrac) in heights.iter().enumerate() {
+                let x = cx - step * 2.0 + step * i as f32;
+                let bh = g * hfrac;
+                shape::rounded_rect(
+                    buf,
+                    width,
+                    height,
+                    Rect {
+                        x: x - bar / 2.0,
+                        y: cy - bh,
+                        w: bar,
+                        h: bh * 2.0,
+                    },
+                    bar / 2.0,
+                    color,
+                );
+            }
+        }
+        TileGlyph::Gear => {
+            shape::disc(buf, width, height, cx, cy, g * 1.6, color);
+            for i in 0..6 {
+                let a = std::f32::consts::TAU * i as f32 / 6.0;
+                let (sx, sy) = (cx + a.cos() * g * 1.05, cy + a.sin() * g * 1.05);
+                shape::disc(buf, width, height, sx, sy, g * 0.5, color);
+            }
+            shape::disc(buf, width, height, cx, cy, g * 0.7, hole);
+        }
+    }
 }
 
 /// Encode an RGBA image as PNG bytes (for previews / captures).

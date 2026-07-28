@@ -1086,85 +1086,131 @@ fn no_renderer() -> axum::response::Response {
 /// Returns the *scene*, not pixels: the render thread draws it at the true surface size,
 /// so the panel is no longer handed a 3840x2160 bitmap to stretch (D38).
 fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
-    use pipeline::attract::{AttractRow, AttractScene, WidgetSlot};
+    use pipeline::attract::{AttractScene, ServiceDetail, Tile, TileGlyph, WidgetSlot};
 
     let name = &config.friendly_name;
-    // Each row names the entry that surface actually publishes, not the bare friendly
-    // name: the whole job of this screen is to tell someone what to look for in their
-    // picker, and since every surface now advertises `name#protocol` the bare name is
-    // a string they will not find.
-    let detail = |verb: &str, kind: ProtocolKind| {
-        format!("{verb} \u{2192} {}", config.advertised_name(kind))
-    };
-    let mut rows = Vec::new();
+    // Every tile names the entry that surface actually publishes, not the bare friendly
+    // name: one box appears in several pickers at once, and since each advertises
+    // `name#protocol` the bare name is a string nobody will find.
+    let advertised = |kind: ProtocolKind| config.advertised_name(kind).to_string();
+
+    // A tile per enabled service. The instructions live *behind* the tile rather than on
+    // the idle screen, because six protocols' worth of them was the first thing anyone
+    // saw and none of it was about what they were doing.
+    let service =
+        |id: &str, label: &str, glyph, accent, headline: &str, steps: Vec<String>, kind| Tile {
+            id: id.to_string(),
+            label: label.to_string(),
+            glyph,
+            accent,
+            detail: Some(ServiceDetail {
+                headline: headline.to_string(),
+                steps,
+                advertised: Some(advertised(kind)),
+            }),
+        };
+
+    let mut tiles = Vec::new();
     if config.enable.cast {
-        rows.push(AttractRow::new(
+        tiles.push(service(
+            "cast",
+            "Cast",
+            TileGlyph::Cast,
             [0x42, 0x85, 0xf4, 0xff],
-            "Chrome / Edge",
-            detail("Cast", ProtocolKind::Cast),
+            "Cast a tab, or your whole screen.",
+            vec![
+                "Open Chrome or Edge".into(),
+                "Menu \u{2192} Cast, or the cast button in a video".into(),
+            ],
+            ProtocolKind::Cast,
         ));
     }
     if config.enable.airplay {
-        rows.push(AttractRow::new(
+        tiles.push(service(
+            "airplay",
+            "AirPlay",
+            TileGlyph::AirPlay,
             [0xff, 0xff, 0xff, 0xff],
-            "iPhone / Mac",
-            detail("AirPlay", ProtocolKind::AirPlay),
+            "Mirror an iPhone, iPad or Mac.",
+            vec![
+                "Control Centre \u{2192} Screen Mirroring".into(),
+                "Or the AirPlay button in a video or track".into(),
+            ],
+            ProtocolKind::AirPlay,
         ));
     }
     if config.enable.dlna {
-        rows.push(AttractRow::new(
+        tiles.push(service(
+            "dlna",
+            "DLNA",
+            TileGlyph::Screen,
             [0x3d, 0xdc, 0x84, 0xff],
-            "Android / VLC",
-            detail("Cast or DLNA", ProtocolKind::Dlna),
+            "Send a video from Android or VLC.",
+            vec![
+                "VLC \u{2192} the cast button".into(),
+                "Or any app offering \"Play on\" or \"Cast to device\"".into(),
+            ],
+            ProtocolKind::Dlna,
         ));
     }
     if config.enable.spotify {
-        rows.push(AttractRow::new(
-            [0x1d, 0xb9, 0x54, 0xff],
+        tiles.push(service(
+            "spotify",
             "Spotify",
-            detail("Devices", ProtocolKind::Spotify),
-        ));
-    }
-    if config.enable.miracast {
-        rows.push(AttractRow::new(
-            [0x00, 0xa4, 0xef, 0xff],
-            "Windows",
-            detail("Win+K", ProtocolKind::Miracast),
-        ));
-    }
-    if config.enable.gamestream {
-        // The one row that is not an instruction to a phone: GameStream runs the other
-        // way round, so what a person needs to know is the host's name, not ours. The
-        // configured host is the honest answer; without one there is nothing to tell
-        // them yet, so the row says so rather than naming a picker entry that does not
-        // exist.
-        let host = config
-            .gamestream
-            .autostart_host
-            .as_deref()
-            .or(config.gamestream.pair_host.as_deref());
-        rows.push(AttractRow::new(
-            [0x76, 0xb9, 0x00, 0xff],
-            "Gaming PC",
-            match host {
-                Some(host) => format!("Moonlight \u{2192} {host}"),
-                None => "Moonlight \u{2192} pair a host first".to_string(),
-            },
-        ));
-    }
-    if config.enable.bluetooth {
-        rows.push(AttractRow::new(
-            [0x00, 0x82, 0xfc, 0xff],
-            "Any phone",
-            detail("Bluetooth", ProtocolKind::Bluetooth),
+            TileGlyph::Waveform,
+            [0x1d, 0xb9, 0x54, 0xff],
+            "Play to the room, and keep your phone as the remote.",
+            vec!["Play something".into(), "Tap Devices, bottom-left".into()],
+            ProtocolKind::Spotify,
         ));
     }
     if config.enable.dial {
-        rows.push(AttractRow::new(
-            [0xff, 0x00, 0x00, 0xff],
+        tiles.push(service(
+            "youtube",
             "YouTube",
-            detail("Cast button", ProtocolKind::YouTubeLounge),
+            TileGlyph::Video,
+            [0xff, 0x00, 0x00, 0xff],
+            "The cast button in the YouTube app.",
+            vec!["Tap it, and pick this screen".into()],
+            ProtocolKind::YouTubeLounge,
         ));
+    }
+    if config.enable.bluetooth {
+        tiles.push(service(
+            "bluetooth",
+            "Bluetooth",
+            TileGlyph::Bluetooth,
+            [0x00, 0x82, 0xfc, 0xff],
+            "Pair a phone and play straight to the room.",
+            vec![
+                "Settings \u{2192} Bluetooth".into(),
+                "Pick this screen".into(),
+            ],
+            ProtocolKind::Bluetooth,
+        ));
+    }
+    if config.enable.miracast {
+        tiles.push(service(
+            "miracast",
+            "Windows",
+            TileGlyph::Screen,
+            [0x00, 0xa4, 0xef, 0xff],
+            "Project a Windows desktop with no cable.",
+            vec!["Press Win+K".into(), "Pick this screen".into()],
+            ProtocolKind::Miracast,
+        ));
+    }
+    if config.enable.gamestream {
+        // The one tile with no instructions, because it is the one where the panel goes
+        // and does something rather than waiting to be sent something. Pressing it opens
+        // a host picker (D38), so there is nothing to tell anyone here.
+        tiles.push(Tile {
+            id: "gamestream".to_string(),
+            label: "Gaming PC".to_string(),
+            glyph: TileGlyph::Gamepad,
+            accent: [0x02, 0xab, 0xfc, 0xff],
+            detail: None,
+        });
     }
 
     // Reserve the widget card only if something will actually paint into it: with no CEF
@@ -1177,7 +1223,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
     let scene = AttractScene {
         title: name.clone(),
         tagline: "Throw anything at the wall — no app to install.".to_string(),
-        rows,
+        tiles,
         footer: format!(
             "castaway  •  {}",
             config.http_base_url().replace("http://", "")

@@ -23,9 +23,12 @@ use crate::attract::AttractScene;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Screen {
-    /// The idle screen: who this panel is, how to cast to it from a phone, and — once
-    /// tiles land — what it can be asked to do from the glass.
+    /// The idle screen: who this panel is, and a tile per thing it can be or do.
     Home(AttractScene),
+    /// One service's instructions, opened by pressing its tile.
+    Service(Box<crate::service::ServiceScreen>),
+    /// A list to choose from — GameStream hosts, then that host's apps.
+    Picker(Box<crate::picker::Picker>),
 }
 
 impl Screen {
@@ -34,8 +37,67 @@ impl Screen {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Home(_) => "home",
+            Self::Service(_) => "service",
+            Self::Picker(_) => "picker",
         }
     }
+}
+
+/// What a press on a shell screen means.
+///
+/// The shell answers what it can locally — pressing a service tile opens that service's
+/// screen, pressing back goes back — and hands `app` the rest. Same division as the
+/// transport strip's: the renderer knows *where* things are, the app knows what they
+/// mean (D33).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellEvent {
+    /// A tile with no local screen behind it. `app` decides: GameStream opens a host
+    /// picker, media opens a library.
+    Tile(String),
+    /// A row in a picker.
+    Item(String),
+}
+
+impl Screen {
+    /// What a panel-normalized touch hits on this screen, if anything.
+    #[must_use]
+    pub fn hit(&self, width: u32, height: u32, x: f32, y: f32) -> Option<ScreenHit> {
+        match self {
+            Self::Home(scene) => crate::attract::tile_hit(scene, width, height, x, y).map(|id| {
+                // A tile carrying its own instructions is answered here; one without
+                // is the app's to interpret.
+                scene
+                    .tiles
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.detail.clone().map(|d| (t.clone(), d)))
+                    .map_or(ScreenHit::Event(ShellEvent::Tile(id)), |(tile, detail)| {
+                        ScreenHit::Push(Screen::Service(Box::new(crate::service::ServiceScreen {
+                            tile,
+                            detail,
+                        })))
+                    })
+            }),
+            Self::Service(_) => {
+                crate::service::hit_back(width, height, x, y).then_some(ScreenHit::Back)
+            }
+            Self::Picker(p) => crate::picker::hit(p, width, height, x, y).map(|h| match h {
+                crate::picker::PickerHit::Back => ScreenHit::Back,
+                crate::picker::PickerHit::Item(id) => ScreenHit::Event(ShellEvent::Item(id)),
+            }),
+        }
+    }
+}
+
+/// What the shell should do about a press.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScreenHit {
+    /// Go one screen deeper, with this.
+    Push(Screen),
+    /// Go back one.
+    Back,
+    /// Not the shell's to decide — tell `app`.
+    Event(ShellEvent),
 }
 
 /// The screen stack. Home is the floor and cannot be popped.
