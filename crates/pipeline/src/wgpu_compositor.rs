@@ -454,10 +454,36 @@ impl WgpuCompositor {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if let Target::Surface { surface, config } = &mut self.target {
-            config.width = width.max(1);
-            config.height = height.max(1);
-            surface.configure(&self.device, config);
+        let (width, height) = (width.max(1), height.max(1));
+        match &mut self.target {
+            Target::Surface { surface, config } => {
+                config.width = width;
+                config.height = height;
+                surface.configure(&self.device, config);
+            }
+            // The offscreen target used to ignore this, which meant anything that only
+            // happens on a resize could not be tested without a window — including the
+            // shell redrawing itself at the new size (D38).
+            Target::Offscreen { texture, size } => {
+                if *size == (width, height) {
+                    return;
+                }
+                *texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("offscreen-target"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: texture.format(),
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                *size = (width, height);
+            }
         }
     }
 

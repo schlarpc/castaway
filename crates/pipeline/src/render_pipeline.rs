@@ -34,6 +34,14 @@ pub enum RenderCommand {
     NowPlaying(Box<crate::nowplaying_card::NowPlayingCard>),
     /// Drop the card (the session ended).
     ClearNowPlaying,
+    /// Show a shell screen — the idle Home screen, and later the pickers.
+    ///
+    /// Carries the *model*, like `NowPlaying` and for the same reasons: a 4K RGBA buffer
+    /// is 33 MB down a bounded channel, and only the render thread knows the true surface
+    /// size. The idle screen used to be rasterised once at startup at a hardcoded
+    /// 3840x2160 and GPU-upscaled to whatever the panel actually was; now it is drawn at
+    /// the size it will be shown, and can change while the receiver is running (D38).
+    Screen(Box<crate::shell::Screen>),
     /// Attach a consumer of composited frames (Q30). Sent as a command rather than set
     /// on the loop directly because the loop lives on the main thread and everything
     /// that wants to tap it does not.
@@ -897,6 +905,9 @@ pub struct RenderLoop {
     compositor: WgpuCompositor,
     rx: Receiver<RenderCommand>,
     osd: Option<crate::osd::OsdController>,
+    /// The shell screen currently underneath everything, kept so it can be redrawn at a
+    /// new size (D38). `None` for a renderer nothing has given a screen to.
+    screen: Option<crate::shell::Screen>,
     has_video: bool,
     /// Consumers of the composited output — screenshots, and later a stream tee. Empty
     /// on the default path, which is the point: a readback is a full-surface copy.
@@ -960,6 +971,7 @@ impl RenderLoop {
             compositor,
             rx,
             osd: None,
+            screen: None,
             has_video: false,
             taps: Vec::new(),
             failed_imports: 0,
@@ -1502,6 +1514,13 @@ impl RenderLoop {
                 self.set_transport(&card.transport(), w, h);
                 false
             }
+            RenderCommand::Screen(screen) => {
+                self.screen = Some(*screen);
+                if let Err(e) = self.paint_screen() {
+                    error!(error = %e, "failed to draw the shell screen");
+                }
+                false
+            }
             RenderCommand::AddTap(tap) => {
                 self.taps.push(tap);
                 false
@@ -1566,6 +1585,39 @@ impl RenderLoop {
     /// Resize the underlying surface (kiosk window resize).
     pub fn resize(&mut self, width: u32, height: u32) {
         self.compositor.resize(width, height);
+        // Redraw the shell at the new size rather than letting the GPU stretch what was
+        // drawn for the old one. The idle screen is a dithered gradient and fine text;
+        // upscaling smears both, which is exactly the banding the dither exists to avoid.
+        if let Err(e) = self.paint_screen() {
+            warn!(error = %e, "failed to redraw the shell screen after a resize");
+        }
+    }
+
+    /// Show a shell screen, drawing it at the current surface size.
+    ///
+    /// The in-process equivalent of [`RenderCommand::Screen`], for the kiosk, which owns
+    /// the loop directly and has no reason to go through a channel to reach itself.
+    pub fn set_screen(&mut self, screen: crate::shell::Screen) {
+        self.screen = Some(screen);
+        if let Err(e) = self.paint_screen() {
+            error!(error = %e, "failed to draw the shell screen");
+        }
+    }
+
+    /// Rasterise the current shell screen at the true surface size and install it.
+    ///
+    /// No-op when no screen has been set — a renderer driven only by casts (the offscreen
+    /// test harness, a headless tap) never has one, and should not get a background.
+    fn paint_screen(&mut self) -> Result<(), PipelineError> {
+        let Some(screen) = self.screen.as_ref() else {
+            return Ok(());
+        };
+        let (w, h) = self.compositor.target_size();
+        let (w, h) = (w.max(1), h.max(1));
+        let rgba = match screen {
+            crate::shell::Screen::Home(scene) => crate::attract::render(scene, w, h)?,
+        };
+        self.set_attract(w, h, &rgba)
     }
 }
 

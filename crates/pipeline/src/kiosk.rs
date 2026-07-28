@@ -24,7 +24,7 @@ use crate::render_pipeline::{RenderCommand, RenderLoop};
 use crate::wgpu_compositor::WgpuCompositor;
 
 /// An idle-scene image to show before/between casts: `(width, height, rgba8)`.
-pub type AttractImage = (u32, u32, Vec<u8>);
+pub type AttractImage = crate::attract::AttractScene;
 
 /// Where a press on the transport strip goes.
 ///
@@ -235,10 +235,11 @@ impl ApplicationHandler for KioskApp {
 
         if let Some(rx) = self.rx.take() {
             let mut render = RenderLoop::new(compositor, rx);
-            if let Some((w, h, rgba)) = self.attract.take() {
-                if let Err(e) = render.set_attract(w, h, &rgba) {
-                    error!(error = %e, "failed to install attract scene");
-                }
+            if let Some(scene) = self.attract.take() {
+                // Sent as a command rather than installed directly, so the surface is
+                // drawn at the size the compositor actually has and follows every later
+                // resize — the old path baked it once at a hardcoded 4K (D38).
+                render.set_screen(crate::shell::Screen::Home(scene));
             }
             if let Some(osd) = self.osd.take() {
                 render = render.with_osd(osd);

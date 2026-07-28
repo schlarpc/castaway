@@ -90,7 +90,7 @@ impl WidgetSlot {
 }
 
 /// One "how to cast" row: a colored bullet, a device/app label, and the instruction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttractRow {
     /// Bullet accent color.
     pub accent: Rgba,
@@ -113,7 +113,7 @@ impl AttractRow {
 }
 
 /// The full idle scene.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttractScene {
     /// Big title — the receiver's friendly name.
     pub title: String,

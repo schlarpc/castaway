@@ -50,6 +50,8 @@ pub mod osd;
 pub mod render_pipeline;
 pub mod seek;
 #[cfg(feature = "render")]
+pub mod shell;
+#[cfg(feature = "render")]
 pub mod tap;
 #[cfg(feature = "render")]
 pub mod text;

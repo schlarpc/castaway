@@ -1081,8 +1081,12 @@ fn no_renderer() -> axum::response::Response {
 /// Build the idle/attract image from the enabled protocols. Rendered at 1920×1080 and
 /// scaled to fill the panel.
 #[cfg(feature = "render")]
-fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
-    use pipeline::attract::{render, AttractRow, AttractScene, WidgetSlot};
+/// The Home screen's model — what the panel shows when nothing is casting.
+///
+/// Returns the *scene*, not pixels: the render thread draws it at the true surface size,
+/// so the panel is no longer handed a 3840x2160 bitmap to stretch (D38).
+fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
+    use pipeline::attract::{AttractRow, AttractScene, WidgetSlot};
 
     let name = &config.friendly_name;
     // Each row names the entry that surface actually publishes, not the bare friendly
@@ -1180,16 +1184,7 @@ fn build_attract(config: &Config) -> Option<(u32, u32, Vec<u8>)> {
         ),
         widget,
     };
-    // Native panel resolution (Dell C6522QT is 4K): a 1:1 background keeps the dither
-    // pattern intact — GPU upscaling would smear it and re-introduce banding.
-    let (w, h) = (3840, 2160);
-    match render(&scene, w, h) {
-        Ok(rgba) => Some((w, h, rgba)),
-        Err(e) => {
-            warn!(error = %e, "failed to render attract scene");
-            None
-        }
-    }
+    Some(scene)
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).
