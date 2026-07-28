@@ -607,3 +607,75 @@ What is deferred with eyes open: Miracast-over-Infrastructure (MS-MICE) is docum
 unbuilt — it removes the P2P *data* path but not the beacon, so it does not rescue us from
 the driver question, and it is only worth building once a group forms. See OPEN-QUESTIONS
 Q7 and Q26 for what has to be true before either can be promised on the deploy target.
+
+### D36 — The browser runtime: Electron over CEF, gated on one spike
+The browser stopped being an implementation detail the moment G56 became intent. Hosting
+other vendors' CAF receiver pages makes it a general commercial web-media runtime, and that
+runtime needs three things at once: H.264+AAC (G55 — measured absent, compiled out of every
+prebuilt CEF that exists), a VMP-verified Widevine host on Windows (G46/G56 — the Windows
+CDM is compiled with host verification; an unsigned host is refused licences by exactly the
+services G56 exists to host), and a renderer sandbox we can defend while executing other
+people's pages and their ad networks. Precompiled CEF can never have the first, castLabs
+will not sign it for the second (their free EVS is scoped to their own Electron fork), and
+on Windows the third requires inverting castaway into a DLL loaded by CEF's
+`bootstrap.exe` (cross-build.md). Self-built CEF buys only the codecs, at the price of a
+Chromium build per security bump and a Linux→MSVC Chromium cross under Nix, forever.
+
+So: the browser layer moves to an **Electron subprocess** — stock nixpkgs `electron` on
+Linux and in CI, castLabs ECS (`castlabs/electron-releases`, MIT) for the Windows deploy
+artifact. What each recorded problem gets:
+
+- **G55**: official Electron builds set `proprietary_codecs=true ffmpeg_branding="Chrome"`
+  (`build/args/all.gn`). Someone else maintains the codec-enabled Chromium, permanently.
+- **VMP**: ECS ships Widevine with VMP-signed development builds; production signing is EVS
+  — verified 2026-07-27: *"It is a free service, but requires signup to use"*, a PyPI CLI
+  (`castlabs-evs`), signing Windows/macOS packages built from ECS releases. Linux needs no
+  signing at all — the Linux CDM has no VMP, which G46 already established. EVS is a
+  network step over exact bytes, a hole in ground rule 6 the same shape as the unfree CDM,
+  handled the same way: a deploy-time step outside `nix build`, never inside it.
+- **The sandbox**: Electron owns its own process bootstrap and ships with the renderer
+  sandbox on by default on both platforms. castaway never links libcef, stays a real
+  `.exe`, and the Windows inversion dissolves rather than being solved.
+- **The process model**: castaway stops being re-exec'd as Chromium's subprocess binary;
+  the bootstrap-must-be-first `main()` ordering and the Nix wrapper-identity constraint go
+  with it, and the CEF pump thread domain — one of architecture-substrate §6's three —
+  is deleted. The browser becomes an out-of-process actor castaway supervises: a wedged
+  browser is killed and relaunched without dropping live AirPlay/DLNA sessions, which
+  in-process CEF could never offer an unattended panel.
+- **The frame path**: Electron's shared-texture OSR (`useSharedTexture`) delivers GPU
+  handles on all three platforms — NT HANDLE, IOSurface, `NativePixmapHandle` plane fds;
+  the last is the dmabuf shape the VA-API import already consumes — replacing the
+  33 MB/frame CPU `on_paint` copy that CEF's buggy accelerated OSR (Q6) forced us onto,
+  and letting the browser keep GPU compositing and decode.
+- **Q19's triple pin**: the version-locked FFI ABI (cef crate ↔ cef-binary ↔ forged
+  `archive.json`) is replaced by an IPC protocol we define — sans-I/O parser, golden
+  transcripts, a fake browser in CI. The browser boundary becomes testable per rules 3/6,
+  where today the whole path is `doCheck = false`.
+
+Priced rather than waved at: a Node runtime and a JS host app join a Rust appliance. The
+conditions that keep that honest are this decision's own (D30's carve-out logic fits — the
+peer is cloud infrastructure that changes unilaterally — but its "idiomatic Rust crate"
+condition does not transfer): the host app is **ours**, small, and dependency-free
+(Electron APIs only, no npm tree); the adblock engine stays in castaway and answers over
+IPC rather than being re-adopted as `adblock-rs` npm; the IPC protocol is fixture-tested
+like any wire protocol here. Remaining costs: castLabs is a third party under the Windows
+DRM artifact; ECS is not in nixpkgs (packaging + unfree handling); `cef_browser.rs` and
+`cef_adblock.rs` are rewritten against different mechanisms (`session.webRequest` for the
+request veto — async, so the engine round-trip fits; main-world injection for uBO
+scriptlets, which preloads alone do not give); touch goes through CDP
+`Input.dispatchTouchEvent` (`sendInputEvent` has no touch type); and G46's offline CDM
+staging is re-proven under ECS's component handling.
+
+Considered and rejected: **self-built CEF** (above — the smallest slice of the problem at
+the largest recurring cost); **WebView2/wry** (no offscreen texture access — composition
+hosting yields DComp visuals wgpu cannot sample — and no Linux story); **a full Chromium
+under CDP** (screencast is JPEG-grade, useless as a 4K playback surface); **Servo** (not a
+YouTube/EME runtime).
+
+**The gate.** CEF stays behind its feature flag until the spike (Q40) proves
+shared-texture handles importing into the wgpu compositor at 4K with sane pacing on
+Linux; the Windows import (NT handle → D3D12 `OpenSharedHandle` + keyed mutex) is
+deploy-critical and is proven separately on the box. The honest worst case, recorded so
+it is recognized if met: shared-texture import turns out flaky on a platform we ship, the
+fallback is software OSR frames crossing a process boundary — worse than today's
+in-process copy — and this decision reopens.

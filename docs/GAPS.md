@@ -691,6 +691,11 @@ display or the audio device, and two cannot take it back afterwards.
   see G61, which this entry's original wording got wrong. This is a browser-only gap — but see G56, which is the feature that turns it
   from a YouTube-live annoyance into a prerequisite.
 
+  **Route 2 is now decided policy — D36.** The browser layer moves to an Electron
+  subprocess (stock on Linux, castLabs ECS for the Windows/DRM artifact), gated on the
+  shared-texture spike (Q40). The routes are kept below because the reasoning is what
+  justified the decision:
+
   Three routes, and none of them is "buy a build" — nobody sells a codec-enabled CEF:
   1. **Build CEF ourselves** with those GN args. Keeps the architecture exactly as it is;
      costs chromium-scale compute per bump, and for the deploy artifact either a Windows
@@ -845,6 +850,32 @@ display or the audio device, and two cannot take it back afterwards.
   because booting on a dev key after someone supplied a real one would look exactly like
   success until a sender refused the panel. The acceptance test is already written: drop
   the credential in and `dev-chain-google-roots` is the one vector that changes verdict.
+
+- 🟡 **G86 — The CEF kiosk on a live desktop opens real Chrome windows, unsandboxed, and a
+  second launch hijacks the first. CONFIRMED (observed 2026-07-27), moot when D36 lands,
+  shipping until it does.** Found by running the new default package on the dev desktop —
+  the configuration Xvfb verification (STATUS) never exercises. Three defects, one root:
+  CEF 147 is the Chrome runtime, the whole `chrome/browser` layer, not a headless shell.
+
+  1. **`no_sandbox: 1` is unconditional** (`cef_browser.rs:775`). The only recorded
+     rationale is Windows-shaped — CEF's Windows sandbox demands the `bootstrap.exe`
+     "app is a DLL" inversion (cross-build.md) — but the flag is not `cfg`'d, so Linux
+     pays it too, where both sandbox mechanisms are available (userns confirmed working on
+     the dev box, and `chrome-sandbox` ships in cefDist, though a store symlink cannot
+     carry setuid). The component rendering untrusted remote content runs unconfined.
+  2. **The Chrome runtime joins the user's session.** Despite windowless OSR it opens
+     visible browser windows (with the `--no-sandbox` infobar) under the profile at
+     `~/.cache/castaway/cef`, which carries a Chromium **process singleton**: a second
+     instance hands its command line to the first ("Opening in existing browser
+     session."), makes the *first* open a desktop window, and then fails its own
+     `cef_initialize` as `gpu init failed` — which misdiagnoses beautifully as a Wayland
+     problem. It is not one: three isolated runs came up clean, kiosk at 3840×2160.
+  3. **castaway itself has no single-instance guard**, so on the panel a doubled service
+     start is a visible mess with nobody there to close it.
+
+  All three dissolve with D36 (browser out of process, sandboxed by default, singleton
+  policy ours to set), which is why the fix is the port rather than patches to a layer
+  that is leaving.
 
 - **G57 — ✅ The Cast media plane answered several questions with the same lie. CONFIRMED,
   fixed.** Three of them, found by reading `handle_media` next to what a sender does with

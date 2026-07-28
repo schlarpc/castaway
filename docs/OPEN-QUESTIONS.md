@@ -369,6 +369,41 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 - **Q19 — cef/cef-binary version coupling.** `cef` crate 147.1.0 is pinned to nixpkgs cef-binary
   147.0.10. If nixpkgs bumps cef-binary, bump the crate pin (and archive.json is auto-derived from
   `pkgs.cef-binary.version`). A `nix flake update` could break the pair until re-matched.
+  **Dissolves with D36** — the Electron port replaces the version-locked FFI ABI with an IPC
+  protocol we own; until the port lands this pin still binds.
+
+## Electron port (D36)
+
+The decision is made (D36); these are the things it is *gated on* or that must be proven
+during the port, in the order they can kill or reshape it.
+
+- **Q40 — The spike: shared-texture OSR into the wgpu compositor. THE GATE.** Electron's
+  `useSharedTexture` paint events deliver `NativePixmapHandle` plane fds on Linux — the
+  dmabuf shape the VA-API import already consumes — and an NT HANDLE on Windows. To prove
+  on Linux: import via Vulkan external memory + `VK_EXT_image_drm_format_modifier` next to
+  the existing hwaccel path; correct pixels (hash a known page against a reference); 4K
+  pacing with the `release()` lifetime honoured — a frame is valid only until released, so
+  the drop-late-frames rule (ground rule 4) has to map onto ack-then-release without
+  stalling Electron's frame queue. fd transport for the spike is `pidfd_getfd` (the
+  Electron main process is our direct child, so Yama scope 1 permits it); production uses
+  SCM_RIGHTS over the control socket, which needs the one small native piece in the host
+  app. The Windows import (D3D12 `OpenSharedHandle` + keyed mutex) is deploy-critical and
+  is a separate leg on the real box — machinery adjacent to the planned D3D11VA hwaccel
+  import. **Worst case, recorded in D36: software OSR frames crossing a process boundary
+  is worse than today's in-process copy, and the decision reopens.**
+- **Q41 — Touch through CDP.** `webContents.sendInputEvent` has no touch type, so touch
+  rides `Input.dispatchTouchEvent` via `webContents.debugger` — the same Chromium gesture
+  recognizer CEF's `send_touch_event` feeds, in principle. Wants hands-on-glass
+  verification on the panel: multi-touch, fling momentum, and the inset-widget coordinate
+  mapping that `input_maps_into_the_inset_view_space` pins today.
+- **Q42 — Widevine under ECS.** G46's property — offline first-launch DRM from a staged
+  CDM — must be re-proven under ECS's component handling, which is castLabs' own, not the
+  `DIR_COMPONENT_PREINSTALLED` scan we reverse-engineered for CEF. And the Linux dev story
+  needs a decision: stock nixpkgs `electron` has no CDM loading at all, so Linux dev DRM
+  parity means ECS Linux builds (they exist; nothing to sign, Linux has no VMP) and a Nix
+  packaging job, or accepting that DRM is Windows-verified only. The EVS signing flow
+  itself is answered — free, signup, PyPI `castlabs-evs`, deploy-time step outside
+  `nix build` per ground rule 6.
 
 ## Bluetooth audio sink
 
