@@ -75,6 +75,13 @@ pub struct Picker {
     pub items: Vec<PickerItem>,
     /// What the list is doing.
     pub status: PickerStatus,
+    /// How far the list is scrolled, in rows. Fractional so a drag moves smoothly rather
+    /// than snapping a row at a time.
+    ///
+    /// Kept in rows rather than pixels because the model does not know the panel's size —
+    /// the same reason every other screen carries a model and lets the render thread
+    /// decide what it measures.
+    pub scroll: f32,
 }
 
 impl Picker {
@@ -86,6 +93,7 @@ impl Picker {
             subtitle: None,
             items: Vec::new(),
             status: PickerStatus::Busy(message.into()),
+            scroll: 0.0,
         }
     }
 
@@ -105,8 +113,26 @@ impl Picker {
         } else {
             PickerStatus::Ready
         };
+        // A new list starts at the top: keeping a scroll offset across a refresh would
+        // leave someone looking at blank space where their row used to be.
+        self.scroll = 0.0;
         self.items = items;
         self
+    }
+
+    /// Scroll by `rows`, clamped to what there is to see.
+    ///
+    /// `visible` is how many rows the panel can show, which only the layout knows.
+    pub fn scroll_by(&mut self, rows: f32, visible: usize) {
+        let max = (self.items.len().saturating_sub(visible)) as f32;
+        self.scroll = (self.scroll + rows).clamp(0.0, max);
+    }
+
+    /// Whether there is anything above or below what is showing.
+    #[must_use]
+    pub fn overflow(&self, visible: usize) -> (bool, bool) {
+        let max = (self.items.len().saturating_sub(visible)) as f32;
+        (self.scroll > 0.01, self.scroll < max - 0.01)
     }
 
     /// Mark it failed.
@@ -137,6 +163,10 @@ pub struct Layout {
     pub title_baseline: f32,
     /// Scale factor from the design height.
     pub scale: f32,
+    /// How many rows the panel can show at once — what `scroll_by` needs to clamp.
+    pub visible: usize,
+    /// Pixels from one row's top to the next, for turning a drag into rows.
+    pub row_step: f32,
 }
 
 impl Layout {
@@ -182,22 +212,29 @@ pub fn layout(picker: &Picker, width: u32, height: u32) -> Layout {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let capacity = ((room + row_gap) / (row_h + row_gap)).floor().max(0.0) as usize;
 
+    // Whole rows only, and only ones fully on screen: a half-drawn row at the bottom is
+    // one a finger can reach and a person cannot read.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let first = picker.scroll.max(0.0).floor() as usize;
     let rows = picker
         .items
         .iter()
-        .take(capacity)
         .enumerate()
+        .skip(first)
+        .take(capacity)
         .map(|(i, item)| {
+            let slot = i as f32 - picker.scroll;
             (
                 item.id.clone(),
                 Rect {
                     x: margin,
-                    y: list_top + (row_h + row_gap) * i as f32,
+                    y: list_top + (row_h + row_gap) * slot,
                     w: list_w,
                     h: row_h,
                 },
             )
         })
+        .filter(|(_, r)| r.y >= list_top - row_h * 0.5 && r.y + r.h <= height as f32)
         .collect();
 
     Layout {
@@ -205,6 +242,8 @@ pub fn layout(picker: &Picker, width: u32, height: u32) -> Layout {
         rows,
         title_baseline: 232.0 * s,
         scale: s,
+        visible: capacity,
+        row_step: row_h + row_gap,
     }
 }
 
@@ -359,6 +398,37 @@ pub fn render(picker: &Picker, width: u32, height: u32) -> Result<Vec<u8>, Pipel
         );
     }
 
+    // A hint that there is more, top and bottom. A list that simply stops looks like a
+    // list that ended, and someone who cannot see that it scrolls will not try.
+    let (more_above, more_below) = picker.overflow(l.visible);
+    for (show, cy, facing) in [
+        (more_above, 300.0 * s, shape::Facing::Left),
+        (more_below, height as f32 - 46.0 * s, shape::Facing::Right),
+    ] {
+        if !show {
+            continue;
+        }
+        // A chevron rotated by drawing it on its side: the same mark as everywhere else,
+        // pointing the way there is more to go.
+        let cx = 90.0 * s + 1100.0 * s / 2.0;
+        let a = 10.0 * s;
+        let (dy0, dy1) = if facing == shape::Facing::Left {
+            (a, -a)
+        } else {
+            (-a, a)
+        };
+        for dx in [-a, a] {
+            shape::fill_sdf(
+                &mut buf,
+                width,
+                height,
+                Rect::around(cx, cy, a * 2.5),
+                pal.row_detail,
+                |px, py| shape::sd_segment(px, py, cx, cy + dy1, cx + dx, cy + dy0) - 2.4 * s,
+            );
+        }
+    }
+
     // Status, where the list would be. Never *instead of* rows that exist: a picker that
     // found three hosts and then failed refreshing still shows the three.
     let status_line = match &picker.status {
@@ -455,6 +525,84 @@ mod tests {
         let p = picker();
         let l = layout(&p, 1920, 1080);
         assert_eq!(l.hit(1900.0, 1060.0), None);
+    }
+
+    #[test]
+    fn scrolling_brings_later_rows_into_reach_and_stops_at_the_end() {
+        let many: Vec<_> = (0..40)
+            .map(|i| PickerItem::new(format!("id{i}"), format!("host {i}")))
+            .collect();
+        let mut p = Picker::loading("Many", "…").with_items(many, "none");
+        let l = layout(&p, 1920, 1080);
+        let visible = l.visible;
+        assert!(visible < 40, "the point of the test");
+        // The first row is on screen and the last is not.
+        assert!(l
+            .hit(l.rows[0].1.center().0, l.rows[0].1.center().1)
+            .is_some());
+        assert!(!l.rows.iter().any(|(id, _)| id == "id39"));
+
+        p.scroll_by(1000.0, visible);
+        let l = layout(&p, 1920, 1080);
+        assert!(
+            l.rows.iter().any(|(id, _)| id == "id39"),
+            "scrolled to the end, the last row should be reachable"
+        );
+        // ...and it cannot go further, so there is no blank space past the end.
+        let at_end = p.scroll;
+        p.scroll_by(50.0, visible);
+        assert!(
+            (p.scroll - at_end).abs() < f32::EPSILON,
+            "clamped at the end"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_row_is_still_pressable_where_it_is_drawn() {
+        // The rule that holds everywhere: drawn and pressable come from one layout.
+        let many: Vec<_> = (0..40)
+            .map(|i| PickerItem::new(format!("id{i}"), format!("host {i}")))
+            .collect();
+        let mut p = Picker::loading("Many", "…").with_items(many, "none");
+        p.scroll_by(5.0, layout(&p, 1920, 1080).visible);
+        let l = layout(&p, 1920, 1080);
+        for (id, rect) in &l.rows {
+            let (cx, cy) = rect.center();
+            assert_eq!(l.hit(cx, cy), Some(PickerHit::Item(id.clone())));
+            assert!(rect.y + rect.h <= 1080.0, "a row runs off the panel");
+        }
+    }
+
+    #[test]
+    fn a_refreshed_list_goes_back_to_the_top() {
+        // Keeping the offset would leave someone looking at blank space where their row
+        // used to be.
+        let mut p = Picker::loading("Many", "…").with_items(
+            (0..40)
+                .map(|i| PickerItem::new(format!("id{i}"), format!("h{i}")))
+                .collect(),
+            "none",
+        );
+        p.scroll_by(10.0, 5);
+        assert!(p.scroll > 0.0);
+        let p = p.with_items(vec![PickerItem::new("a", "only one")], "none");
+        assert_eq!(p.scroll, 0.0);
+    }
+
+    #[test]
+    fn overflow_says_which_way_there_is_more() {
+        let mut p = Picker::loading("Many", "…").with_items(
+            (0..40)
+                .map(|i| PickerItem::new(format!("id{i}"), format!("h{i}")))
+                .collect(),
+            "none",
+        );
+        let visible = layout(&p, 1920, 1080).visible;
+        assert_eq!(p.overflow(visible), (false, true), "at the top");
+        p.scroll_by(3.0, visible);
+        assert_eq!(p.overflow(visible), (true, true), "in the middle");
+        p.scroll_by(1000.0, visible);
+        assert_eq!(p.overflow(visible), (true, false), "at the end");
     }
 
     #[test]

@@ -58,6 +58,8 @@ struct KioskApp {
     /// drive — the strip is then never drawn either, since nothing publishes capabilities.
     controls: Option<ControlSink>,
     shell_sink: Option<ShellSink>,
+    /// Where each contact was last seen, for turning a drag into a scroll.
+    drag_last: std::collections::HashMap<u32, f32>,
     /// Live touch contacts, for the edge swipe. Nothing else in the tree tracked these:
     /// ids were carried faithfully to the browser and then forgotten (D38).
     contacts: std::collections::HashMap<u32, crate::overlay::Contact>,
@@ -331,9 +333,40 @@ impl KioskApp {
                         return;
                     }
                 }
-                if matches!(event.phase, TouchPhase::Down) && self.offer_to_shell(event.x, event.y)
-                {
-                    return;
+                // A drag over a shell screen scrolls it, rather than falling through to
+                // a browser that is not even visible there.
+                match event.phase {
+                    TouchPhase::Down => {
+                        if self
+                            .render
+                            .as_ref()
+                            .is_some_and(|r| r.shell_hit(event.x, event.y).is_some())
+                            || self
+                                .render
+                                .as_ref()
+                                .is_some_and(|r| r.shell_scrollable(event.x, event.y))
+                        {
+                            self.drag_last.insert(event.id, event.y);
+                        }
+                        if self.offer_to_shell(event.x, event.y) {
+                            self.drag_last.remove(&event.id);
+                            return;
+                        }
+                    }
+                    TouchPhase::Move => {
+                        if let Some(last) = self.drag_last.get_mut(&event.id) {
+                            let dy = event.y - *last;
+                            *last = event.y;
+                            if let Some(render) = self.render.as_mut() {
+                                if render.shell_scroll(dy) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    TouchPhase::Up | TouchPhase::Cancel => {
+                        self.drag_last.remove(&event.id);
+                    }
                 }
                 if let Some(sink) = self.input_sink() {
                     sink.touch(event);
@@ -519,6 +552,7 @@ pub fn run(
         controls,
         shell_sink,
         contacts: std::collections::HashMap::new(),
+        drag_last: std::collections::HashMap::new(),
         pill_since: None,
         pill_drawn: false,
         exit,
@@ -555,6 +589,7 @@ pub fn run_with_browser(
         controls,
         shell_sink,
         contacts: std::collections::HashMap::new(),
+        drag_last: std::collections::HashMap::new(),
         pill_since: None,
         pill_drawn: false,
         exit,

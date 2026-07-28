@@ -131,6 +131,12 @@ impl ScreenStack {
         self.above.last().unwrap_or(&self.home)
     }
 
+    /// What is on screen now, mutably — for a screen that carries interaction state of
+    /// its own, like a picker's scroll position.
+    pub fn current_mut(&mut self) -> &mut Screen {
+        self.above.last_mut().unwrap_or(&mut self.home)
+    }
+
     /// How deep we are. `1` is Home.
     #[must_use]
     pub fn depth(&self) -> usize {

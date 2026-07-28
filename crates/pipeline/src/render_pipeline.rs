@@ -1396,6 +1396,49 @@ impl RenderLoop {
         self.compositor.layer_size(LayerId::Attract)
     }
 
+    /// Scroll the current screen, if it is something that scrolls.
+    ///
+    /// `dy` is a panel-normalized drag: positive is a finger moving down, which reveals
+    /// what is *above*, the way a sheet of paper moves under a hand.
+    pub fn shell_scroll(&mut self, dy: f32) -> bool {
+        let (_, h) = self.compositor.target_size();
+        let h = h.max(1);
+        let Some(stack) = self.shell.as_mut() else {
+            return false;
+        };
+        let crate::shell::Screen::Picker(picker) = stack.current_mut() else {
+            return false;
+        };
+        let l = crate::picker::layout(picker, 1, h);
+        if picker.items.len() <= l.visible {
+            return false;
+        }
+        let rows = -dy * h as f32 / l.row_step;
+        picker.scroll_by(rows, l.visible);
+        self.repaint_shell();
+        true
+    }
+
+    /// Whether the shell screen at this point is one that scrolls, and has somewhere to
+    /// scroll to.
+    #[must_use]
+    pub fn shell_scrollable(&self, x: f32, y: f32) -> bool {
+        if self
+            .compositor
+            .covered_above(crate::compositor::LayerId::Attract, x, y)
+        {
+            return false;
+        }
+        let Some(stack) = self.shell.as_ref() else {
+            return false;
+        };
+        let crate::shell::Screen::Picker(picker) = stack.current() else {
+            return false;
+        };
+        let (_, h) = self.compositor.target_size();
+        picker.items.len() > crate::picker::layout(picker, 1, h.max(1)).visible
+    }
+
     /// Note that a finger touched the panel.
     ///
     /// Used by the idle policy: an ending session returns the panel Home, but not out
