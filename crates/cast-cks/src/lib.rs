@@ -52,6 +52,27 @@
 //!    [`NonceEcho::Empty`], and the caller that fills the protobuf matches on that
 //!    field rather than reaching for the challenge.
 //!
+//! ## Scope: inbound only
+//!
+//! This crate answers an `AuthChallenge` from a sender on the LAN. It has nothing
+//! to do with the *other* thing a Cast device identity is used for — attaching
+//! device identity to a receiver app's **outbound** requests to its own backend.
+//! That is a separate mechanism with a separate credential, and `castaway` does
+//! not implement it. D42 records why, and it is a deliberate gap rather than an
+//! unfinished one.
+//!
+//! The short version, because it is the kind of thing that looks like a missing
+//! feature: Google's `cast_shell` embeds a per-app whitelist deciding which
+//! receiver apps get device identity attached and in what form. It is ten app
+//! families, byte-identical across four firmware images. Seven of the ten need
+//! only *headers*, no signed assertion, so they require no device key at all.
+//! Three sign a JWT, and of those, two are Google's own surfaces carrying a
+//! dogfood group claim; exactly one is a third party (BSkyB NowTV). No current
+//! large streaming service appears anywhere in the table. So the capability this
+//! crate does not provide buys one UK streaming app.
+//!
+//! The RE record is `re-shell/artifacts/airreceiver-cast-signatures/APP-IDENTIFICATION.md`.
+//!
 //! ## Layering
 //!
 //! [`api`], [`table`], [`template`] and [`window`] are sans-I/O and synchronous

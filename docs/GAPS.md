@@ -116,6 +116,14 @@ Still open, roughly in the order they are worth taking:
    difference between a receiver Chrome ignores and one it will talk to. The seam is
    built; what is missing is the key.
 
+   One thing that is *not* on this branch's critical path, now that it has been measured:
+   **outbound app identification**. Google's per-app whitelist in `cast_shell` is ten app
+   families, seven of which need only headers rather than a signed assertion, and of the
+   three that sign a JWT two are Google's own dogfood surfaces — leaving one third party
+   (BSkyB NowTV). No current large streaming service is in the table at all. So hosting
+   third-party receiver apps is not gated on it, and D42 records the decision not to
+   implement it.
+
 The AVRCP surface is now finished apart from browsing, which we deliberately do not claim.
 What was grounded in BlueZ 5.86 rather than in memory, since a phone is the Target and its
 behaviour is the one we have to match: the packet-type field's position and values, the

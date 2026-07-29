@@ -986,3 +986,63 @@ This is ground rule 9 working as intended, not a carve-out from it: the RE lande
 fixtures and notes, the wire behaviour is reimplemented, and nothing links or ships
 AirReceiver. It is also the third protocol whose hard part turned out to be a default in
 someone else's verifier rather than a cryptographic barrier.
+
+### D42 — Outbound Cast app identification: not implemented, and the reach measured first
+D41 gave the receiver an identity for answering an `AuthChallenge`. A Cast device
+identity has a second use that D41 did not touch: attaching device identity to a
+receiver app's *outbound* requests to its own backend. AirServer's credential database
+carries the material for it — 4380 pre-signed RS256 JWTs beside the 2190 receiver-auth
+signatures — so "we already replay inbound, why not outbound" is the obvious next step.
+
+**The two credentials are not one thing, which is the first correction.** The four token
+families in that database split evenly. Templates 1 and 2 name no audience and no scope
+and are issued by the bare `${CAST-APP-DEVICE-ID}` — device attestation that a receiver
+app's *own* backend verifies. Templates 3 and 4 are Google service-account bearer grants
+minting an OAuth token for `…@cast-devices.gserviceaccount.com` under
+`scope=accounts/OAuthLogin`. An earlier reading of the RE notes described all four as the
+latter; that was wrong and is corrected in the notes.
+
+**What it would actually buy was measured rather than assumed.** `cast_shell` embeds
+Google's per-app device-identification whitelist as one 3000-byte JSON literal,
+byte-identical across the TCL RT51, an NVIDIA SHIELD, a Google first-party image and a
+standalone `tv/ams` copy, at four different offsets. Ten app families. **Seven need only
+headers** — device identity injected on requests to whitelisted servers, no signed
+assertion, no device key required. Three sign a JWT: HomeView (Google's own Home panel
+surface) and IMAX (all-zeros dummy app id) both use the service-account template and both
+carry `"groups.claims.jwt.cast.google.com": "1234:dogfood"`, which reads as internal;
+**BSkyB NowTV is the only third party in the table.** Netflix, HBO/Max, Disney+, Prime,
+Hulu, Spotify and YouTube appear nowhere in it. The premise that these JWTs are what gate
+the large DRM services — the whole reason to want them — is not supported by Google's own
+configuration.
+
+**The decision is not to implement it**, on two grounds that are worth keeping separate.
+
+The first is that the reach is one UK streaming app, so the feature does not pay for
+itself under any reading. That alone settles it.
+
+The second is a line about kind, and it is drawn deliberately because D41 does not
+generalise to cover this. D41's replayed signature convinces a sender on the operator's
+own LAN — their phone, their Chrome, their panel — and no third party with a stake in the
+answer is told anything false. An attestation JWT convinces a streaming service's backend
+of a *robustness class* that is not true, and that backend uses it to decide what content
+protection is safe to release under. Attestation is not an entitlement check, so
+misrepresenting the class is the function of presenting the token rather than a side
+effect. That is a deceived third party with a real interest, which the LAN case does not
+have, and it is also what D32 already decided in the small: decline what we cannot host
+in the sender's own vocabulary rather than fake it.
+
+Four costs were priced before deciding, and they hold even for the attestation half taken
+alone: the identity is a *second* vendor's (AirServer's, where D41 borrows AirReceiver's),
+so a burn costs two products' users; the tokens stop 2027-03-21, ahead of the CKS table's
+2027-12-06; unlike an inert receiver-auth signature a pre-signed JWT *is* the credential,
+so it could never live in this repository; and the two identities are different devices —
+`CN=2001805200936810051` under `Widevine Cast Subroot` versus `CN=RYW0O FA8FCA6AC5A0`
+under `Eureka Gen1 ICA` — so any backend correlating the attested device against the Cast
+device that authenticated sees two unrelated machines. The design would not have worked
+as described even if it had been built.
+
+The G56 consequence is the useful part: app identification is **not** a blocker for
+hosting third-party receiver apps, and a D32-style "declines because it needs attestation"
+path was scoped and dropped as near-dead code. The RE record is
+`re-shell/artifacts/airreceiver-cast-signatures/APP-IDENTIFICATION.md`, with
+`extract_app_whitelist.py` reproducing the table from any `cast_shell` build.
