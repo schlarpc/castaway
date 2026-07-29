@@ -1,6 +1,6 @@
 //! A second offline receiver-auth identity, from AirServer's bundled database.
 //!
-//! [`crate::table`] holds SoftMedia's (AirReceiver's) identity. This holds App
+//! [`crate::cks`] holds SoftMedia's (AirReceiver's) identity. This holds App
 //! Dynamic's (AirServer's), and the reason to carry both is **not** horizon — the
 //! CKS table runs to 2027-12-06 and this one stops on 2027-03-21, so on expiry
 //! alone this is strictly the worse of the two. The reason is *revocation*.
@@ -13,7 +13,7 @@
 //! and this identity is genuinely independent, not a second leaf off the same
 //! branch:
 //!
-//! | | CKS ([`crate::table`]) | AirServer (here) |
+//! | | CKS ([`crate::cks`]) | AirServer (here) |
 //! |---|---|---|
 //! | device CN | `RYW0O FA8FCA6AC5A0` | `2001805200936810051` |
 //! | issuer | `Eureka Gen1 ICA` | `NVidia mdarcy … Cast ICA` |
@@ -26,7 +26,7 @@
 //!
 //! ## Why the certificates are stored rather than re-issued
 //!
-//! [`crate::table`] ships one peer-certificate *template* and re-issues it per
+//! [`crate::cks`] ships one peer-certificate *template* and re-issues it per
 //! window, because CKS's certificates differ only in their validity dates. That
 //! trick does not work here. AirServer's per-window certificates differ in three
 //! places, and the third is fatal to it:
@@ -56,8 +56,9 @@ use rsa::pkcs1::DecodeRsaPrivateKey as _;
 use rsa::pkcs8::EncodePrivateKey as _;
 use rsa::RsaPrivateKey;
 
+use crate::provider::OfflineIdentity;
 use crate::window::Window;
-use crate::{CastCredential, CksError, CredentialOrigin};
+use crate::{CastCredential, CredentialOrigin, ReplayError};
 
 /// Start of window 0: 2024-03-20T00:00:00Z.
 const EPOCH_UNIX: i64 = 1_710_892_800;
@@ -99,22 +100,22 @@ impl AirServerTable {
     /// Parse the embedded fixtures.
     ///
     /// # Errors
-    /// [`CksError::Table`] if a fixture is not the length the layout requires, or
-    /// [`CksError::InvalidKey`] if the peer key does not parse. Every input is a
+    /// [`ReplayError::Table`] if a fixture is not the length the layout requires, or
+    /// [`ReplayError::InvalidKey`] if the peer key does not parse. Every input is a
     /// compile-time constant, so this either always succeeds or always fails — the
     /// tests are what turn that into a checked property.
-    pub fn load() -> Result<Self, CksError> {
+    pub fn load() -> Result<Self, ReplayError> {
         let expect_certs = WINDOW_COUNT as usize * PEER_CERT_STRIDE;
         let expect_sigs = WINDOW_COUNT as usize * SIGNATURE_LEN;
         if PEER_CERTS.len() != expect_certs {
-            return Err(CksError::Table(format!(
+            return Err(ReplayError::Table(format!(
                 "AirServer peer certificates are {} bytes; {WINDOW_COUNT} windows at \
                  stride {PEER_CERT_STRIDE} needs {expect_certs}",
                 PEER_CERTS.len()
             )));
         }
         if SIGNATURES_SHA1.len() != expect_sigs || SIGNATURES_SHA256.len() != expect_sigs {
-            return Err(CksError::Table(format!(
+            return Err(ReplayError::Table(format!(
                 "AirServer signature tables are {} and {} bytes; {WINDOW_COUNT} windows needs {expect_sigs}",
                 SIGNATURES_SHA1.len(),
                 SIGNATURES_SHA256.len()
@@ -122,10 +123,12 @@ impl AirServerTable {
         }
 
         let peer_key = RsaPrivateKey::from_pkcs1_der(PEER_KEY_DER)
-            .map_err(|e| CksError::InvalidKey(format!("embedded AirServer peer key: {e}")))?;
+            .map_err(|e| ReplayError::InvalidKey(format!("embedded AirServer peer key: {e}")))?;
         let peer_key_pkcs8_der = peer_key
             .to_pkcs8_der()
-            .map_err(|e| CksError::InvalidKey(format!("re-encoding the AirServer peer key: {e}")))?
+            .map_err(|e| {
+                ReplayError::InvalidKey(format!("re-encoding the AirServer peer key: {e}"))
+            })?
             .as_bytes()
             .to_vec();
 
@@ -179,13 +182,15 @@ impl AirServerTable {
     /// Build the credential for the window covering `unix`.
     ///
     /// # Errors
-    /// [`CksError::OutOfRange`] if this table does not reach `unix`.
-    pub fn credential_at(&self, unix: i64) -> Result<CastCredential, CksError> {
-        let index = self.index_at(unix).ok_or(CksError::OutOfRange {
+    /// [`ReplayError::OutOfRange`] if this table does not reach `unix`.
+    pub fn credential_at(&self, unix: i64) -> Result<CastCredential, ReplayError> {
+        let index = self.index_at(unix).ok_or(ReplayError::OutOfRange {
+            identity: OfflineIdentity::AirServer,
             unix,
             covers_until: self.covers_until(),
         })?;
-        let window = self.window(index).ok_or(CksError::OutOfRange {
+        let window = self.window(index).ok_or(ReplayError::OutOfRange {
+            identity: OfflineIdentity::AirServer,
             unix,
             covers_until: self.covers_until(),
         })?;
@@ -285,7 +290,7 @@ mod tests {
         assert_eq!(t.index_at(t.covers_until()), None);
         assert!(matches!(
             t.credential_at(t.covers_until()),
-            Err(CksError::OutOfRange { .. })
+            Err(ReplayError::OutOfRange { .. })
         ));
     }
 

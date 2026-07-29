@@ -14,9 +14,10 @@ use rsa::pkcs8::EncodePrivateKey as _;
 use rsa::RsaPrivateKey;
 
 use crate::pem;
+use crate::provider::OfflineIdentity;
 use crate::template::PeerTemplate;
 use crate::window::{Window, WINDOW_SECS};
-use crate::{CastCredential, CksError, CredentialOrigin};
+use crate::{CastCredential, CredentialOrigin, ReplayError};
 
 /// Start of window 0: 2023-01-01T00:00:00Z.
 const EPOCH_UNIX: i64 = 1_672_531_200;
@@ -36,7 +37,7 @@ const SIGNATURES_SHA256: &[u8] = include_bytes!("../fixtures/signatures_sha256.b
 
 /// The embedded table, parsed.
 #[derive(Debug, Clone)]
-pub struct StaticTable {
+pub struct CksTable {
     template: PeerTemplate,
     peer_key: RsaPrivateKey,
     peer_key_pkcs8_der: Vec<u8>,
@@ -44,19 +45,19 @@ pub struct StaticTable {
     ica_der: Vec<u8>,
 }
 
-impl StaticTable {
+impl CksTable {
     /// Parse the embedded fixtures.
     ///
     /// # Errors
-    /// [`CksError::Pem`], [`CksError::InvalidKey`] or [`CksError::Template`] if a
+    /// [`ReplayError::Pem`], [`ReplayError::InvalidKey`] or [`ReplayError::Template`] if a
     /// fixture does not have the shape it is supposed to. All inputs are compile-
     /// time constants, so this either always succeeds or always fails — the tests
     /// below are what make that a checked property rather than a hope.
-    pub fn load() -> Result<Self, CksError> {
+    pub fn load() -> Result<Self, ReplayError> {
         if SIGNATURES_SHA1.len() != WINDOW_COUNT as usize * SIGNATURE_LEN
             || SIGNATURES_SHA256.len() != WINDOW_COUNT as usize * SIGNATURE_LEN
         {
-            return Err(CksError::Table(format!(
+            return Err(ReplayError::Table(format!(
                 "signature tables are {} and {} bytes; {WINDOW_COUNT} windows needs {}",
                 SIGNATURES_SHA1.len(),
                 SIGNATURES_SHA256.len(),
@@ -65,10 +66,10 @@ impl StaticTable {
         }
 
         let peer_key = RsaPrivateKey::from_pkcs1_der(PEER_KEY_DER)
-            .map_err(|e| CksError::InvalidKey(format!("embedded peer key: {e}")))?;
+            .map_err(|e| ReplayError::InvalidKey(format!("embedded peer key: {e}")))?;
         let peer_key_pkcs8_der = peer_key
             .to_pkcs8_der()
-            .map_err(|e| CksError::InvalidKey(format!("re-encoding the peer key: {e}")))?
+            .map_err(|e| ReplayError::InvalidKey(format!("re-encoding the peer key: {e}")))?
             .as_bytes()
             .to_vec();
 
@@ -111,14 +112,16 @@ impl StaticTable {
     /// Build the credential for the window covering `unix`.
     ///
     /// # Errors
-    /// [`CksError::OutOfRange`] if the table does not cover `unix` — which, past
-    /// 2027-12-06, it never will. [`CksError::Sign`] if re-issuing fails.
-    pub fn credential_at(&self, unix: i64) -> Result<CastCredential, CksError> {
-        let index = self.index_at(unix).ok_or(CksError::OutOfRange {
+    /// [`ReplayError::OutOfRange`] if the table does not cover `unix` — which, past
+    /// 2027-12-06, it never will. [`ReplayError::Sign`] if re-issuing fails.
+    pub fn credential_at(&self, unix: i64) -> Result<CastCredential, ReplayError> {
+        let index = self.index_at(unix).ok_or(ReplayError::OutOfRange {
+            identity: OfflineIdentity::Cks,
             unix,
             covers_until: self.covers_until(),
         })?;
-        let window = self.window(index).ok_or(CksError::OutOfRange {
+        let window = self.window(index).ok_or(ReplayError::OutOfRange {
+            identity: OfflineIdentity::Cks,
             unix,
             covers_until: self.covers_until(),
         })?;
@@ -131,7 +134,7 @@ impl StaticTable {
             SIGNATURES_SHA1[at..at + SIGNATURE_LEN].to_vec(),
             SIGNATURES_SHA256[at..at + SIGNATURE_LEN].to_vec(),
             window,
-            CredentialOrigin::StaticTable { index },
+            CredentialOrigin::CksTable { index },
         )
     }
 
@@ -152,9 +155,9 @@ mod tests {
     use sha1::Sha1;
     use sha2::{Digest as _, Sha256};
 
-    fn table() -> &'static StaticTable {
-        static T: std::sync::OnceLock<StaticTable> = std::sync::OnceLock::new();
-        T.get_or_init(|| StaticTable::load().unwrap())
+    fn table() -> &'static CksTable {
+        static T: std::sync::OnceLock<CksTable> = std::sync::OnceLock::new();
+        T.get_or_init(|| CksTable::load().unwrap())
     }
 
     fn device_key() -> RsaPublicKey {
@@ -268,7 +271,7 @@ mod tests {
     fn past_the_end_of_the_table_is_a_typed_error_not_a_wrong_credential() {
         let t = table();
         match t.credential_at(t.covers_until()) {
-            Err(CksError::OutOfRange { covers_until, .. }) => {
+            Err(ReplayError::OutOfRange { covers_until, .. }) => {
                 assert_eq!(covers_until, 1_828_051_200);
             }
             other => panic!("expected OutOfRange, got {other:?}"),

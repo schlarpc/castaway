@@ -210,7 +210,7 @@
           # Keep Cargo sources plus non-Rust assets that crates `include_str!`/`include_bytes!`
           # (SCPD/description XML in proto-dlna; fonts, blue-noise dither and the default
           # adblock filter list in pipeline; the AirPort private key in crypto-raop; the Cast
-          # signature table, peer certificate template and key in cast-cks). A missing suffix
+          # signature table, peer certificate template and key in cast-replay). A missing suffix
           # here only shows up as an `include_str!` failure inside the sandbox, since a plain
           # `cargo build` reads the real tree — so add the extension when you add the asset.
           src = pkgs.lib.cleanSourceWith {

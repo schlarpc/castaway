@@ -14,7 +14,6 @@
 
 pub mod actor;
 pub mod auth;
-pub mod cks;
 pub mod control;
 pub mod error;
 pub mod framing;
@@ -22,6 +21,7 @@ pub mod messages;
 pub mod mirror;
 pub mod proto;
 pub mod receiver;
+pub mod replay;
 pub mod rtcp;
 pub mod rtp;
 pub mod rtp_actor;
@@ -29,13 +29,13 @@ pub mod session;
 
 pub use actor::{CastIdentity, CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;
-pub use cks::{CksAuthResponder, CksIdentity};
 pub use control::CastRemote;
 pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
 pub use mirror::{Codec, MediaKind, MirrorConfig, StreamConfig};
 pub use proto::CastMessage;
 pub use receiver::{CastRtpReceiver, Consume, Delivered, Received};
+pub use replay::{ReplayAuthResponder, ReplayIdentity};
 pub use rtcp::{BuildReport, Feedback};
 pub use rtp::{
     CastRtpPacket, CastRtpStream, EncryptedFrame, FrameCollector, FrameId, NackTarget, PacketId,

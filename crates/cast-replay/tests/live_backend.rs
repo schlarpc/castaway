@@ -6,7 +6,7 @@
 //! unit tests in `src/table.rs`.
 //!
 //! ```text
-//! cargo nextest run -p cast-cks --run-ignored all live_backend
+//! cargo nextest run -p cast-replay --run-ignored all live_backend
 //! ```
 //!
 //! What it establishes, when it passes: the `ts`/`sig` derivation is accepted, the
@@ -14,17 +14,17 @@
 //! decoding is right, and the returned material forms a credential whose window
 //! covers now.
 
-use cast_cks::{CksConfig, CksProvider, CredentialOrigin, HashAlgo};
+use cast_replay::{CredentialOrigin, HashAlgo, ReplayConfig, ReplayProvider};
 
 #[tokio::test]
 #[ignore = "requires network access to a third-party endpoint"]
 async fn the_backend_serves_a_usable_credential() {
-    let provider = CksProvider::resolve(CksConfig {
+    let provider = ReplayProvider::resolve(ReplayConfig {
         network: true,
         // No cache: a cached credential would satisfy the resolve without ever
         // touching the network, which is the opposite of what this is checking.
         cache_path: None,
-        ..CksConfig::default()
+        ..ReplayConfig::default()
     })
     .await
     .expect("resolving a credential");
@@ -53,7 +53,7 @@ async fn the_backend_serves_a_usable_credential() {
         assert_eq!(credential.signature(hash).len(), 256);
         assert_eq!(
             credential.signed_auth(hash).nonce_echo,
-            cast_cks::NonceEcho::Empty
+            cast_replay::NonceEcho::Empty
         );
     }
 

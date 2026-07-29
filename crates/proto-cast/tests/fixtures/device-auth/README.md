@@ -25,7 +25,7 @@ private key Google issued — must never appear here, in this repository, or any
 world-readable.
 
 The `cks-*` vectors are the exception worth naming: they are generated from the peer key
-in `crates/cast-cks/fixtures/`, which is real material extracted from a shipped binary.
+in `crates/cast-replay/fixtures/`, which is real material extracted from a shipped binary.
 It is not a device key — no software receiver holds one, which is the reason the replay
 exists at all — and its provenance and caveats are recorded in that directory's README.
 
@@ -41,7 +41,7 @@ exists at all — and its provenance and caveats are recorded in that directory'
   does not work with a self-generated credential, stated as an executed result rather than
   a belief.
 - `cks-chain-google-roots` — **ok**. The case above, flipped. Same receiver, same response
-  shape, a `cast-cks` credential instead of a generated one — and against the roots senders
+  shape, a `cast-replay` credential instead of a generated one — and against the roots senders
   actually ship, a real sender accepts it. This is the executed form of "Cast works now",
   and it is generated offline from the checked-in table at a fixed clock, so it needs
   neither the network nor the day it runs on.

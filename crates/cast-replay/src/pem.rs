@@ -7,13 +7,13 @@
 
 use base64::Engine as _;
 
-use crate::CksError;
+use crate::ReplayError;
 
 /// Decode every block carrying `label` from a PEM document, in order.
 ///
 /// # Errors
-/// [`CksError::Pem`] if a block is unterminated or its body is not base64.
-pub fn decode_all(pem: &str, label: &str) -> Result<Vec<Vec<u8>>, CksError> {
+/// [`ReplayError::Pem`] if a block is unterminated or its body is not base64.
+pub fn decode_all(pem: &str, label: &str) -> Result<Vec<Vec<u8>>, ReplayError> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
     let mut out = Vec::new();
@@ -22,7 +22,7 @@ pub fn decode_all(pem: &str, label: &str) -> Result<Vec<Vec<u8>>, CksError> {
         let body_start = start + begin.len();
         let body_end = rest[body_start..]
             .find(&end)
-            .ok_or_else(|| CksError::Pem(format!("unterminated {label} block")))?
+            .ok_or_else(|| ReplayError::Pem(format!("unterminated {label} block")))?
             + body_start;
         let body: String = rest[body_start..body_end]
             .chars()
@@ -31,7 +31,7 @@ pub fn decode_all(pem: &str, label: &str) -> Result<Vec<Vec<u8>>, CksError> {
         out.push(
             base64::engine::general_purpose::STANDARD
                 .decode(body.as_bytes())
-                .map_err(|e| CksError::Pem(format!("{label} block is not base64: {e}")))?,
+                .map_err(|e| ReplayError::Pem(format!("{label} block is not base64: {e}")))?,
         );
         rest = &rest[body_end + end.len()..];
     }
@@ -41,12 +41,12 @@ pub fn decode_all(pem: &str, label: &str) -> Result<Vec<Vec<u8>>, CksError> {
 /// Decode a PEM document expected to hold exactly one block of `label`.
 ///
 /// # Errors
-/// [`CksError::Pem`] if the count is not one, or a block fails to decode.
-pub fn decode_one(pem: &str, label: &str) -> Result<Vec<u8>, CksError> {
+/// [`ReplayError::Pem`] if the count is not one, or a block fails to decode.
+pub fn decode_one(pem: &str, label: &str) -> Result<Vec<u8>, ReplayError> {
     let mut blocks = decode_all(pem, label)?;
     match blocks.len() {
         1 => Ok(blocks.remove(0)),
-        n => Err(CksError::Pem(format!(
+        n => Err(ReplayError::Pem(format!(
             "expected exactly one {label} block, found {n}"
         ))),
     }

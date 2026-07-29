@@ -36,7 +36,7 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   it.
 - **Q2 — Cast device-auth cert material. Answered, with a caveat that replaces it.**
   `proto-cast` needs a credential a real sender will accept. It now has one:
-  `cast-cks` supplies a Google-issued chain (`Eureka Gen1 ICA` → `Eureka Root CA`) with a
+  `cast-replay` supplies a Google-issued chain (`Eureka Gen1 ICA` → `Eureka Root CA`) with a
   precomputed signature, from the CKS backend or from a 900-window table checked in
   beside it, and `checks.openscreen-device-auth` records the flip —
   `cks-chain-google-roots` is **ok** against the roots senders actually ship, where
@@ -48,7 +48,7 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   `enforce_nonce_checking` is off, so a signature over the peer certificate alone stays
   valid for that certificate's life. Generate the certificate on a fixed 2-day schedule
   from a fixed key and one signature covers each window. D41 has the reasoning;
-  `crates/cast-cks/fixtures/README.md` has the provenance.
+  `crates/cast-replay/fixtures/README.md` has the provenance.
 
   **What this does not answer.** The identity is not ours. It is AirReceiver's, shared
   with every install of that app, and Google can revoke it — at which point Cast stops

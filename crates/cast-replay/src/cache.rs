@@ -16,12 +16,12 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::window::Window;
-use crate::{CastCredential, CksError, CredentialOrigin};
+use crate::{CastCredential, CredentialOrigin, ReplayError};
 
 /// Filename under the state directory.
-pub const CACHE_FILE: &str = "cast-cks-credential.json";
+pub const CACHE_FILE: &str = "cast-replay-credential.json";
 
-/// The default cache path: `<state>/cast-cks-credential.json`.
+/// The default cache path: `<state>/cast-replay-credential.json`.
 #[must_use]
 pub fn default_path() -> PathBuf {
     castaway_paths::host().state().join(CACHE_FILE)
@@ -48,10 +48,10 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn unb64(value: &str, what: &str) -> Result<Vec<u8>, CksError> {
+fn unb64(value: &str, what: &str) -> Result<Vec<u8>, ReplayError> {
     base64::engine::general_purpose::STANDARD
         .decode(value.as_bytes())
-        .map_err(|e| CksError::Cache(format!("{what} is not base64: {e}")))
+        .map_err(|e| ReplayError::Cache(format!("{what} is not base64: {e}")))
 }
 
 /// Read a cached credential.
@@ -61,18 +61,23 @@ fn unb64(value: &str, what: &str) -> Result<Vec<u8>, CksError> {
 /// a cache that never loads is a bug worth seeing, not a slow path to live with.
 ///
 /// # Errors
-/// [`CksError::Cache`] if the file exists but is unreadable, malformed, or written
+/// [`ReplayError::Cache`] if the file exists but is unreadable, malformed, or written
 /// by a different version.
-pub fn load(path: &Path) -> Result<Option<CastCredential>, CksError> {
+pub fn load(path: &Path) -> Result<Option<CastCredential>, ReplayError> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(CksError::Cache(format!("reading {}: {e}", path.display()))),
+        Err(e) => {
+            return Err(ReplayError::Cache(format!(
+                "reading {}: {e}",
+                path.display()
+            )))
+        }
     };
     let cached: Cached = serde_json::from_slice(&raw)
-        .map_err(|e| CksError::Cache(format!("parsing {}: {e}", path.display())))?;
+        .map_err(|e| ReplayError::Cache(format!("parsing {}: {e}", path.display())))?;
     if cached.version != VERSION {
-        return Err(CksError::Cache(format!(
+        return Err(ReplayError::Cache(format!(
             "{} is version {}; this build writes {VERSION}",
             path.display(),
             cached.version
@@ -98,8 +103,8 @@ pub fn load(path: &Path) -> Result<Option<CastCredential>, CksError> {
 /// Write a credential to the cache, atomically.
 ///
 /// # Errors
-/// [`CksError::Cache`] if the directory cannot be created or the file written.
-pub fn store(path: &Path, credential: &CastCredential) -> Result<(), CksError> {
+/// [`ReplayError::Cache`] if the directory cannot be created or the file written.
+pub fn store(path: &Path, credential: &CastCredential) -> Result<(), ReplayError> {
     let (peer_cert, peer_key) = credential.tls_identity();
     let cached = Cached {
         version: VERSION,
@@ -117,21 +122,21 @@ pub fn store(path: &Path, credential: &CastCredential) -> Result<(), CksError> {
         window_end: credential.window().end_unix(),
     };
     let body = serde_json::to_vec_pretty(&cached)
-        .map_err(|e| CksError::Cache(format!("serialising the credential: {e}")))?;
+        .map_err(|e| ReplayError::Cache(format!("serialising the credential: {e}")))?;
 
     if let Some(parent) = path.parent() {
-        castaway_paths::ensure(parent).map_err(|e| CksError::Cache(e.to_string()))?;
+        castaway_paths::ensure(parent).map_err(|e| ReplayError::Cache(e.to_string()))?;
     }
     // Temp-then-rename, so a crash mid-write leaves the previous credential intact
     // rather than a truncated file the next start has to reject.
     let temp = path.with_extension("json.tmp");
     write_private(&temp, &body)?;
     std::fs::rename(&temp, path)
-        .map_err(|e| CksError::Cache(format!("installing {}: {e}", path.display())))
+        .map_err(|e| ReplayError::Cache(format!("installing {}: {e}", path.display())))
 }
 
 /// Write `body` to `path`, owner-readable only.
-fn write_private(path: &Path, body: &[u8]) -> Result<(), CksError> {
+fn write_private(path: &Path, body: &[u8]) -> Result<(), ReplayError> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
@@ -143,22 +148,25 @@ fn write_private(path: &Path, body: &[u8]) -> Result<(), CksError> {
     }
     let mut file = options
         .open(path)
-        .map_err(|e| CksError::Cache(format!("creating {}: {e}", path.display())))?;
+        .map_err(|e| ReplayError::Cache(format!("creating {}: {e}", path.display())))?;
     file.write_all(body)
-        .map_err(|e| CksError::Cache(format!("writing {}: {e}", path.display())))?;
+        .map_err(|e| ReplayError::Cache(format!("writing {}: {e}", path.display())))?;
     file.sync_all()
-        .map_err(|e| CksError::Cache(format!("flushing {}: {e}", path.display())))
+        .map_err(|e| ReplayError::Cache(format!("flushing {}: {e}", path.display())))
 }
 
 /// Remove a cached credential, if one is there.
 ///
 /// # Errors
-/// [`CksError::Cache`] if the file exists and cannot be removed.
-pub fn clear(path: &Path) -> Result<(), CksError> {
+/// [`ReplayError::Cache`] if the file exists and cannot be removed.
+pub fn clear(path: &Path) -> Result<(), ReplayError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(CksError::Cache(format!("removing {}: {e}", path.display()))),
+        Err(e) => Err(ReplayError::Cache(format!(
+            "removing {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -183,7 +191,7 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "cast-cks-test-{}-{:?}",
+            "cast-replay-test-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -221,7 +229,7 @@ mod tests {
     fn a_corrupt_cache_is_reported_rather_than_ignored() {
         let path = temp_dir().join("corrupt.json");
         std::fs::write(&path, b"{not json").unwrap();
-        assert!(matches!(load(&path), Err(CksError::Cache(_))));
+        assert!(matches!(load(&path), Err(ReplayError::Cache(_))));
         std::fs::remove_file(&path).ok();
     }
 
@@ -235,7 +243,7 @@ mod tests {
             "window_start":1,"window_end":2}"#,
         )
         .unwrap();
-        assert!(matches!(load(&path), Err(CksError::Cache(_))));
+        assert!(matches!(load(&path), Err(ReplayError::Cache(_))));
         std::fs::remove_file(&path).ok();
     }
 

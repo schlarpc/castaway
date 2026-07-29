@@ -21,7 +21,7 @@ use crypto_cast_auth::{CastDeviceSigner, DevCredential, HashAlgo};
 use prost::Message as _;
 use proto_cast::proto::{AuthChallenge, AuthResponse, DeviceAuthMessage, HashAlgorithm};
 use proto_cast::session::DeviceAuthResponder as _;
-use proto_cast::{CastAuthResponder, CksAuthResponder, TlsIdentity};
+use proto_cast::{CastAuthResponder, ReplayAuthResponder, TlsIdentity};
 use rsa::pkcs8::DecodePrivateKey as _;
 
 /// The clock every vector is generated and verified at. Fixed so the certificate windows
@@ -269,18 +269,18 @@ fn vectors() -> Vec<Vector> {
 /// This is the pair `dev-chain-google-roots` was waiting for. Everything about the
 /// dev response is right except whose root it chains to; these two are the same
 /// response shape with a chain that reaches `Eureka Root CA`, and the verdict on
-/// the first one is the whole point of `cast-cks` existing.
+/// the first one is the whole point of `cast-replay` existing.
 ///
 /// Generated from the checked-in table at [`AT`], so this needs no network and is
 /// byte-identical every run: the window is fixed, the peer key is fixed, and
 /// PKCS#1 v1.5 signing is deterministic.
 fn cks_vectors() -> Vec<Vector> {
-    let table = cast_cks::StaticTable::load().unwrap();
+    let table = cast_replay::CksTable::load().unwrap();
     let credential = std::sync::Arc::new(table.credential_at(i64::try_from(AT).unwrap()).unwrap());
     let (peer_cert, _key) = credential.tls_identity();
     let peer_cert = peer_cert.to_vec();
 
-    let responder = CksAuthResponder::new(std::sync::Arc::clone(&credential));
+    let responder = ReplayAuthResponder::new(std::sync::Arc::clone(&credential));
     let response = responder
         .respond(&challenge(Some(NONCE.to_vec()), HashAlgorithm::Sha256))
         .unwrap();

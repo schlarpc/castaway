@@ -26,9 +26,9 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::auth::CastAuthResponder;
-use crate::cks::CksIdentity;
 use crate::control::{CastRemote, FromReceiver};
 use crate::error::CastError;
+use crate::replay::ReplayIdentity;
 use crate::rtp_actor::MirrorSocket;
 use crate::session::{CastSession, DeviceAuthResponder};
 use crate::{framing, CAST_PORT, CAST_SERVICE_TYPE};
@@ -240,7 +240,7 @@ pub enum CastIdentity {
     ///
     /// The TLS certificate comes from the credential, so it is not named here
     /// separately — there is nothing to keep in sync.
-    Cks(Arc<CksIdentity>),
+    Replay(Arc<ReplayIdentity>),
 }
 
 impl CastIdentity {
@@ -252,8 +252,8 @@ impl CastIdentity {
 
     /// A CKS-provisioned credential.
     #[must_use]
-    pub fn cks(provider: Arc<cast_cks::CksProvider>) -> Self {
-        Self::Cks(Arc::new(CksIdentity::new(provider)))
+    pub fn replay(provider: Arc<cast_replay::ReplayProvider>) -> Self {
+        Self::Replay(Arc::new(ReplayIdentity::new(provider)))
     }
 
     /// The acceptor to serve a connection arriving at `now` with, and the responder
@@ -280,7 +280,7 @@ impl CastIdentity {
                     ),
                 ))
             }
-            Self::Cks(cks) => {
+            Self::Replay(cks) => {
                 let (acceptor, responder) = cks.for_connection()?;
                 Ok((acceptor, Some(responder)))
             }
@@ -296,7 +296,7 @@ impl CastIdentity {
                 "a self-generated device key; senders that verify the Google chain will reject it"
                     .into()
             }
-            Self::Cks(cks) => {
+            Self::Replay(cks) => {
                 let credential = cks.credential();
                 format!(
                     "a CKS credential from the {}, valid until {}",

@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-pub use cast_cks::OfflineIdentity;
+pub use cast_replay::OfflineIdentity;
 use castaway_core::ProtocolKind;
 use serde::Deserialize;
 
@@ -380,24 +380,25 @@ impl Default for AirPlay {
 #[serde(default)]
 pub struct Cast {
     /// The device credential CASTv2 authenticates with. Takes precedence over
-    /// [`Cast::cks`] when set — an operator who provisioned their own hardware
+    /// [`Cast::replay`] when set — an operator who provisioned their own hardware
     /// credential meant to use it.
     pub credential: CastCredential,
     /// The CKS-provisioned credential, used when `credential` is unset.
-    pub cks: Cks,
+    #[serde(alias = "cks")]
+    pub replay: Replay,
 }
 
 /// The CKS credential: a real Google-issued device chain with precomputed
-/// signatures, from a backend or from the table checked into `cast-cks`.
+/// signatures, from a backend or from the table checked into `cast-replay`.
 ///
 /// On by default, because without it device auth fails against every official
-/// sender and Cast is decorative. Read `crates/cast-cks/fixtures/README.md`
+/// sender and Cast is decorative. Read `crates/cast-replay/fixtures/README.md`
 /// before deciding to leave it on: the identity is shared with every install of
 /// the app it came from, Google can revoke it, and the offline table stops on
 /// 2027-12-06.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Cks {
+pub struct Replay {
     /// Whether to use a CKS credential at all. With this off and no
     /// `cast.credential`, the receiver falls back to a self-generated key that
     /// official senders reject.
@@ -428,7 +429,7 @@ pub struct Cks {
     pub offline_order: Vec<OfflineIdentity>,
 }
 
-impl Default for Cks {
+impl Default for Replay {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -939,18 +940,21 @@ mod tests {
     #[test]
     fn cks_is_enabled_unless_it_is_turned_off() {
         let c: Config = toml::from_str("").unwrap();
-        assert!(c.cast.cks.enabled);
-        assert!(c.cast.cks.network);
+        assert!(c.cast.replay.enabled);
+        assert!(c.cast.replay.network);
 
-        let c: Config = toml::from_str("[cast.cks]\nnetwork = false\n").unwrap();
-        assert!(c.cast.cks.enabled, "one key set must not clear the other");
+        let c: Config = toml::from_str("[cast.replay]\nnetwork = false\n").unwrap();
         assert!(
-            !c.cast.cks.network,
+            c.cast.replay.enabled,
+            "one key set must not clear the other"
+        );
+        assert!(
+            !c.cast.replay.network,
             "with the backend off the receiver is pinned to the table's 2027 end"
         );
 
-        let c: Config = toml::from_str("[cast.cks]\nenabled = false\n").unwrap();
-        assert!(!c.cast.cks.enabled);
+        let c: Config = toml::from_str("[cast.replay]\nenabled = false\n").unwrap();
+        assert!(!c.cast.replay.enabled);
     }
 
     /// The two credential sources are independent in the file; precedence between
@@ -964,7 +968,7 @@ mod tests {
         "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert!(c.cast.credential.key_file.is_some());
-        assert!(c.cast.cks.enabled);
+        assert!(c.cast.replay.enabled);
     }
 
     #[test]

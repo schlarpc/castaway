@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::Router;
-use cast_cks::{CksConfig, CksProvider};
+use cast_replay::{ReplayConfig, ReplayProvider};
 use castaway_core::{
     osd_channel, Advertisement, DisplayControl, ProtocolKind, SessionConfig, SessionManager,
     SessionSink, SourceAdapter, SourceId, SourceMessage,
@@ -910,17 +910,17 @@ async fn spawn_cast(
                 None,
             )
         }
-        None if config.cast.cks.enabled => {
+        None if config.cast.replay.enabled => {
             let provider = Arc::new(
-                CksProvider::resolve(CksConfig {
-                    network: config.cast.cks.network,
-                    offline_order: config.cast.cks.offline_order.clone(),
-                    ..CksConfig::default()
+                ReplayProvider::resolve(ReplayConfig {
+                    network: config.cast.replay.network,
+                    offline_order: config.cast.replay.offline_order.clone(),
+                    ..ReplayConfig::default()
                 })
                 .await
                 .context("resolving a CKS Cast credential")?,
             );
-            let identity = CastIdentity::cks(Arc::clone(&provider));
+            let identity = CastIdentity::replay(Arc::clone(&provider));
             info!("Cast device auth uses {}", identity.describe());
             (identity, Some(provider))
         }

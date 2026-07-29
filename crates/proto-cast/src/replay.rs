@@ -1,4 +1,4 @@
-//! Serving a connection from a [`cast_cks`] credential.
+//! Serving a connection from a [`cast_replay`] credential.
 //!
 //! The difference from [`crate::auth::CastAuthResponder`] is not the signing — it
 //! is that nothing is signed at all. The signature is precomputed, over a peer
@@ -6,12 +6,12 @@
 //! choose: presenting anything else means the sender verifies the signature
 //! against the wrong message and rejects a receiver that handshook cleanly.
 //!
-//! [`CksIdentity`] is therefore the thing that hands out both, from the same
+//! [`ReplayIdentity`] is therefore the thing that hands out both, from the same
 //! credential, in one call.
 
 use std::sync::{Arc, Mutex};
 
-use cast_cks::{CastCredential, CksProvider, Window};
+use cast_replay::{CastCredential, ReplayProvider, Window};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tracing::debug;
@@ -22,8 +22,8 @@ use crate::proto::{AuthChallenge, AuthResponse};
 use crate::session::DeviceAuthResponder;
 
 /// A TLS identity and device-auth responder driven by a CKS credential.
-pub struct CksIdentity {
-    provider: Arc<CksProvider>,
+pub struct ReplayIdentity {
+    provider: Arc<ReplayProvider>,
     /// The rustls config for the credential in force.
     ///
     /// Memoised per window rather than rebuilt per connection: the credential only
@@ -37,10 +37,10 @@ struct Cached {
     config: Arc<rustls::ServerConfig>,
 }
 
-impl CksIdentity {
+impl ReplayIdentity {
     /// Serve connections from `provider`.
     #[must_use]
-    pub fn new(provider: Arc<CksProvider>) -> Self {
+    pub fn new(provider: Arc<ReplayProvider>) -> Self {
         Self {
             provider,
             cached: Mutex::new(None),
@@ -64,7 +64,7 @@ impl CksIdentity {
         let config = self.config_for(&credential)?;
         Ok((
             TlsAcceptor::from(config),
-            Box::new(CksAuthResponder::new(Arc::clone(&credential))),
+            Box::new(ReplayAuthResponder::new(Arc::clone(&credential))),
         ))
     }
 
@@ -119,22 +119,22 @@ impl CksIdentity {
 /// sign. Public so a credential can be exercised without standing up a provider —
 /// the device-auth vectors do exactly that, at a fixed clock, from the static
 /// table.
-pub struct CksAuthResponder {
+pub struct ReplayAuthResponder {
     credential: Arc<CastCredential>,
 }
 
-impl CksAuthResponder {
+impl ReplayAuthResponder {
     /// Answer challenges from `credential`.
     ///
     /// The caller is responsible for presenting `credential`'s peer certificate in
-    /// TLS; [`CksIdentity`] is the thing that guarantees it.
+    /// TLS; [`ReplayIdentity`] is the thing that guarantees it.
     #[must_use]
     pub fn new(credential: Arc<CastCredential>) -> Self {
         Self { credential }
     }
 }
 
-impl DeviceAuthResponder for CksAuthResponder {
+impl DeviceAuthResponder for ReplayAuthResponder {
     fn respond(&self, challenge: &AuthChallenge) -> Result<AuthResponse, CastError> {
         // No signing, and deliberately no use of `challenge.sender_nonce`: the
         // signature was computed over the peer certificate alone. `signed_auth`
@@ -152,15 +152,15 @@ mod tests {
     use super::*;
     use crate::proto::HashAlgorithm;
 
-    async fn identity() -> CksIdentity {
-        let provider = CksProvider::resolve(cast_cks::CksConfig {
+    async fn identity() -> ReplayIdentity {
+        let provider = ReplayProvider::resolve(cast_replay::ReplayConfig {
             network: false,
             cache_path: None,
-            ..cast_cks::CksConfig::default()
+            ..cast_replay::ReplayConfig::default()
         })
         .await
         .unwrap();
-        CksIdentity::new(Arc::new(provider))
+        ReplayIdentity::new(Arc::new(provider))
     }
 
     fn challenge(hash: Option<HashAlgorithm>) -> AuthChallenge {
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn the_response_does_not_echo_the_senders_nonce() {
         let identity = identity().await;
-        let responder = CksAuthResponder::new(identity.credential());
+        let responder = ReplayAuthResponder::new(identity.credential());
         let response = responder
             .respond(&challenge(Some(HashAlgorithm::Sha256)))
             .unwrap();
@@ -192,7 +192,7 @@ mod tests {
     async fn the_signature_matches_the_certificate_the_acceptor_presents() {
         let identity = identity().await;
         let credential = identity.credential();
-        let responder = CksAuthResponder::new(Arc::clone(&credential));
+        let responder = ReplayAuthResponder::new(Arc::clone(&credential));
         let response = responder
             .respond(&challenge(Some(HashAlgorithm::Sha256)))
             .unwrap();
@@ -200,7 +200,7 @@ mod tests {
         let (tls_cert, _) = credential.tls_identity();
         assert_eq!(
             response.signature,
-            credential.signature(cast_cks::HashAlgo::Sha256)
+            credential.signature(cast_replay::HashAlgo::Sha256)
         );
         assert_eq!(tls_cert, credential.peer_cert_der());
         assert_eq!(
@@ -215,12 +215,12 @@ mod tests {
     #[tokio::test]
     async fn an_unspecified_hash_is_answered_with_sha1() {
         let identity = identity().await;
-        let responder = CksAuthResponder::new(identity.credential());
+        let responder = ReplayAuthResponder::new(identity.credential());
         let response = responder.respond(&challenge(None)).unwrap();
         assert_eq!(response.hash_algorithm, Some(HashAlgorithm::Sha1 as i32));
         assert_eq!(
             response.signature,
-            identity.credential().signature(cast_cks::HashAlgo::Sha1)
+            identity.credential().signature(cast_replay::HashAlgo::Sha1)
         );
     }
 

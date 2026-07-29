@@ -1,6 +1,6 @@
 # CKS fixtures
 
-The offline half of `cast-cks`: one Cast receiver identity and a table of
+The offline half of `cast-replay`: one Cast receiver identity and a table of
 precomputed receiver-auth signatures covering it.
 
 ## Provenance
@@ -41,8 +41,8 @@ connect.
 ## Caveats — read before relying on this
 
 * **It expires.** The table stops on **2027-12-06**. After that only the network
-  path can produce a credential, and `StaticTable::credential_at` returns
-  `CksError::OutOfRange` rather than something that looks like it works.
+  path can produce a credential, and `CksTable::credential_at` returns
+  `ReplayError::OutOfRange` rather than something that looks like it works.
 * **It is not our identity.** This is AirReceiver's Cast identity, shared with
   every install of that app and with `com.softmedia.receiver.castapp`. We are one
   more holder of it, not the holder.

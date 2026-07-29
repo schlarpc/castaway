@@ -40,7 +40,7 @@ use rsa::RsaPrivateKey;
 use serde::Deserialize;
 
 use crate::window::Window;
-use crate::CksError;
+use crate::ReplayError;
 
 /// The endpoint, as a format string over `ts` and `sig`.
 const URL: &str = "https://cast.remotetogo.com/api/v1/cks";
@@ -138,11 +138,11 @@ pub struct CksResponse {
 /// Decode a response body.
 ///
 /// # Errors
-/// [`CksError::Response`] if the body is not JSON, a required key is absent, a
+/// [`ReplayError::Response`] if the body is not JSON, a required key is absent, a
 /// value is not base64, or a signature is not 256 bytes.
-pub fn decode_response(body: &[u8]) -> Result<CksResponse, CksError> {
+pub fn decode_response(body: &[u8]) -> Result<CksResponse, ReplayError> {
     let raw: RawResponse = serde_json::from_slice(body)
-        .map_err(|e| CksError::Response(format!("body is not the expected JSON object: {e}")))?;
+        .map_err(|e| ReplayError::Response(format!("body is not the expected JSON object: {e}")))?;
 
     let peer_key = unwrap_field(&raw.pri, "pri")?;
     let response = CksResponse {
@@ -150,14 +150,14 @@ pub fn decode_response(body: &[u8]) -> Result<CksResponse, CksError> {
         device_cert: unwrap_field(&raw.cpu, "cpu")?,
         peer_cert: unwrap_field(&raw.r#pub, "pub")?,
         peer_key_pem: String::from_utf8(peer_key)
-            .map_err(|e| CksError::Response(format!("pri is not text: {e}")))?,
+            .map_err(|e| ReplayError::Response(format!("pri is not text: {e}")))?,
         sha1: unwrap_field(&raw.sha1, "sha1")?,
         sha256: unwrap_field(&raw.sha256, "sha256")?,
         now: raw.now,
     };
     for (what, sig) in [("sha1", &response.sha1), ("sha256", &response.sha256)] {
         if sig.len() != 256 {
-            return Err(CksError::Response(format!(
+            return Err(ReplayError::Response(format!(
                 "{what} is {} bytes; an RSA-2048 signature is 256",
                 sig.len()
             )));
@@ -175,23 +175,23 @@ impl CksResponse {
     /// `nb`/`na` too, and the client ignores them.)
     ///
     /// # Errors
-    /// [`CksError::InvalidKey`] if `pri` is not a usable RSA key,
-    /// [`CksError::Response`] if the peer certificate cannot be parsed or its
+    /// [`ReplayError::InvalidKey`] if `pri` is not a usable RSA key,
+    /// [`ReplayError::Response`] if the peer certificate cannot be parsed or its
     /// validity is not ordered.
-    pub fn into_credential(self) -> Result<crate::CastCredential, CksError> {
+    pub fn into_credential(self) -> Result<crate::CastCredential, ReplayError> {
         // The backend sends PKCS#8 in practice; the reference client feeds `pri`
         // to `PEM_read_bio_RSAPrivateKey`, which takes either, so accept both.
         let key = RsaPrivateKey::from_pkcs8_pem(&self.peer_key_pem)
             .or_else(|_| RsaPrivateKey::from_pkcs1_pem(&self.peer_key_pem))
-            .map_err(|e| CksError::InvalidKey(format!("CKS peer key: {e}")))?;
+            .map_err(|e| ReplayError::InvalidKey(format!("CKS peer key: {e}")))?;
         let key_pkcs8 = key
             .to_pkcs8_der()
-            .map_err(|e| CksError::InvalidKey(format!("re-encoding the CKS peer key: {e}")))?
+            .map_err(|e| ReplayError::InvalidKey(format!("re-encoding the CKS peer key: {e}")))?
             .as_bytes()
             .to_vec();
 
         let (_, cert) = x509_parser::parse_x509_certificate(&self.peer_cert)
-            .map_err(|e| CksError::Response(format!("peer certificate is not X.509: {e}")))?;
+            .map_err(|e| ReplayError::Response(format!("peer certificate is not X.509: {e}")))?;
         let window = Window::new(
             cert.validity().not_before.timestamp(),
             cert.validity().not_after.timestamp(),
@@ -211,10 +211,10 @@ impl CksResponse {
 }
 
 /// base64, then AES-128-CTR.
-fn unwrap_field(value: &str, name: &str) -> Result<Vec<u8>, CksError> {
+fn unwrap_field(value: &str, name: &str) -> Result<Vec<u8>, ReplayError> {
     let mut bytes = base64::engine::general_purpose::STANDARD
         .decode(value.as_bytes())
-        .map_err(|e| CksError::Response(format!("{name} is not base64: {e}")))?;
+        .map_err(|e| ReplayError::Response(format!("{name} is not base64: {e}")))?;
     FieldCipher::new(&FIELD_KEY.into(), &FIELD_IV.into()).apply_keystream(&mut bytes);
     Ok(bytes)
 }
@@ -290,21 +290,24 @@ mod tests {
     fn a_truncated_signature_is_rejected() {
         assert!(matches!(
             decode_response(&body(128)),
-            Err(CksError::Response(_))
+            Err(ReplayError::Response(_))
         ));
     }
 
     #[test]
     fn a_missing_key_is_rejected() {
         let body = br#"{"ica":"","cpu":"","pub":"","pri":"","sha1":""}"#;
-        assert!(matches!(decode_response(body), Err(CksError::Response(_))));
+        assert!(matches!(
+            decode_response(body),
+            Err(ReplayError::Response(_))
+        ));
     }
 
     #[test]
     fn a_non_json_body_is_rejected() {
         assert!(matches!(
             decode_response(b"<html>502 Bad Gateway</html>"),
-            Err(CksError::Response(_))
+            Err(ReplayError::Response(_))
         ));
     }
 }

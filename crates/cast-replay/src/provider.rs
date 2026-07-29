@@ -2,7 +2,7 @@
 //!
 //! This is the only module here that touches a socket or the filesystem
 //! (ground rule 3). Everything it decides is decided from [`crate::api`],
-//! [`crate::table`] and [`crate::cache`], which are pure.
+//! [`crate::cks`] and [`crate::cache`], which are pure.
 //!
 //! ## Resolution order
 //!
@@ -11,11 +11,11 @@
 //!    it just avoids spending a request per restart on material we already have.
 //! 2. **The backend.** Preferred over any table because it keeps working
 //!    indefinitely, where every table has a fixed end date.
-//! 3. **The checked-in tables**, in the order [`CksConfig::offline_order`] names,
+//! 3. **The checked-in tables**, in the order [`ReplayConfig::offline_order`] names,
 //!    taking the first that covers the instant wanted.
 //!
 //! A failed fetch is not fatal at any point — it falls through to the tables and
-//! is retried after [`CksConfig::failure_backoff`], matching the reference
+//! is retried after [`ReplayConfig::failure_backoff`], matching the reference
 //! client's 360-second hold-down. An unattended panel that loses its uplink keeps
 //! authenticating.
 //!
@@ -50,8 +50,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::airserver::AirServerTable;
-use crate::table::StaticTable;
-use crate::{api, cache, CastCredential, CksError};
+use crate::cks::CksTable;
+use crate::{api, cache, CastCredential, ReplayError};
 
 /// The two roots the reference client pins in place of the system trust store.
 /// `cast.remotetogo.com` is CloudFront-fronted, so this is the Starfield /
@@ -83,7 +83,7 @@ const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 #[non_exhaustive]
 pub enum OfflineIdentity {
     /// SoftMedia / AirReceiver, `CN=RYW0O FA8FCA6AC5A0` under `Eureka Gen1 ICA`.
-    /// Covers 2023-01-01 → 2027-12-06. See [`crate::table`].
+    /// Covers 2023-01-01 → 2027-12-06. See [`crate::cks`].
     Cks,
     /// App Dynamic / AirServer, `CN=2001805200936810051` under
     /// `Widevine Cast Subroot`. Covers 2024-03-20 → 2027-03-21. See
@@ -102,7 +102,7 @@ impl core::fmt::Display for OfflineIdentity {
 
 /// How the provider is allowed to obtain credentials.
 #[derive(Debug, Clone)]
-pub struct CksConfig {
+pub struct ReplayConfig {
     /// Whether the backend may be contacted at all. With this off the provider is
     /// entirely offline and bounded by whichever table `offline_order` selects.
     pub network: bool,
@@ -121,7 +121,7 @@ pub struct CksConfig {
     pub offline_order: Vec<OfflineIdentity>,
 }
 
-impl Default for CksConfig {
+impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
             network: true,
@@ -138,7 +138,7 @@ impl Default for CksConfig {
 
 /// Everything needed to run the fallback chain, minus the credential it produces.
 ///
-/// Split out so [`CksProvider`] can be built with a real credential already in
+/// Split out so [`ReplayProvider`] can be built with a real credential already in
 /// hand. The alternative — construct the provider around a placeholder and
 /// overwrite it — makes "no credential yet" a representable state on the
 /// connection path, which is exactly the state that must not exist.
@@ -146,9 +146,9 @@ struct Resolver {
     /// The offline tables, each `None` if its fixtures failed to load. A broken
     /// fixture set degrades that one identity rather than failing startup, which
     /// is half the point of carrying two.
-    cks_table: Option<StaticTable>,
+    cks_table: Option<CksTable>,
     airserver_table: Option<AirServerTable>,
-    config: CksConfig,
+    config: ReplayConfig,
     /// `backend_now - local_now`, learned from a successful fetch.
     ///
     /// A panel whose clock is wrong picks the wrong window and every sender
@@ -164,12 +164,12 @@ struct Resolver {
 /// Reads are cheap and synchronous ([`Self::current_at`]) because they sit on the
 /// per-connection path; refreshing happens in [`Self::run`]. There is always a
 /// credential: one is resolved before the provider exists.
-pub struct CksProvider {
+pub struct ReplayProvider {
     resolver: Resolver,
     current: RwLock<Arc<CastCredential>>,
 }
 
-impl CksProvider {
+impl ReplayProvider {
     /// Resolve a credential and build the provider.
     ///
     /// Fails only if *no* path yields a credential — which, inside the table's
@@ -178,11 +178,11 @@ impl CksProvider {
     /// and rejects every sender.
     ///
     /// # Errors
-    /// [`CksError`] if neither the cache, the backend nor the table produces a
+    /// [`ReplayError`] if neither the cache, the backend nor the table produces a
     /// credential.
-    pub async fn resolve(config: CksConfig) -> Result<Self, CksError> {
+    pub async fn resolve(config: ReplayConfig) -> Result<Self, ReplayError> {
         let resolver = Resolver {
-            cks_table: log_load("cks", StaticTable::load()),
+            cks_table: log_load("cks", CksTable::load()),
             airserver_table: log_load("airserver", AirServerTable::load()),
             config,
             clock_offset: AtomicI64::new(0),
@@ -303,7 +303,7 @@ impl CksProvider {
 
 impl Resolver {
     /// Run the fallback chain once.
-    async fn resolve_once(&self, now_local: i64) -> Result<CastCredential, CksError> {
+    async fn resolve_once(&self, now_local: i64) -> Result<CastCredential, ReplayError> {
         let now = now_local + self.clock_offset.load(Ordering::Relaxed);
 
         if let Some(path) = &self.config.cache_path {
@@ -346,13 +346,13 @@ impl Resolver {
         self.offline_credential(now)
     }
 
-    /// Walk [`CksConfig::offline_order`] and take the first identity that covers
+    /// Walk [`ReplayConfig::offline_order`] and take the first identity that covers
     /// `now`.
     ///
     /// Returns the *last* failure rather than the first, because the last one is
     /// from the least-preferred identity and so describes the widest gap — for a
     /// panel past every table's end date, that is the message an operator needs.
-    fn offline_credential(&self, now: i64) -> Result<CastCredential, CksError> {
+    fn offline_credential(&self, now: i64) -> Result<CastCredential, ReplayError> {
         let mut last = None;
         for identity in &self.config.offline_order {
             let attempt = match identity {
@@ -361,14 +361,14 @@ impl Resolver {
                     .as_ref()
                     .map(|t| t.credential_at(now))
                     .unwrap_or_else(|| {
-                        Err(CksError::Table("the CKS fixtures did not load".into()))
+                        Err(ReplayError::Table("the CKS fixtures did not load".into()))
                     }),
                 OfflineIdentity::AirServer => self
                     .airserver_table
                     .as_ref()
                     .map(|t| t.credential_at(now))
                     .unwrap_or_else(|| {
-                        Err(CksError::Table(
+                        Err(ReplayError::Table(
                             "the AirServer fixtures did not load".into(),
                         ))
                     }),
@@ -382,19 +382,19 @@ impl Resolver {
             }
         }
         Err(last.unwrap_or_else(|| {
-            CksError::Table(
+            ReplayError::Table(
                 "no offline identity is configured and the backend did not answer".into(),
             )
         }))
     }
 
     /// One request to the backend.
-    async fn fetch(&self, ts: i64) -> Result<CastCredential, CksError> {
+    async fn fetch(&self, ts: i64) -> Result<CastCredential, ReplayError> {
         let timeout = self.config.timeout;
         // ureq is blocking, so it does not belong on the runtime (ground rule 4).
         let body = tokio::task::spawn_blocking(move || fetch_blocking(ts, timeout))
             .await
-            .map_err(|e| CksError::Http(format!("joining the CKS request: {e}")))??;
+            .map_err(|e| ReplayError::Http(format!("joining the CKS request: {e}")))??;
 
         let response = api::decode_response(&body)?;
         // Learn the clock correction before the window check below depends on it.
@@ -410,7 +410,7 @@ impl Resolver {
         let credential = response.into_credential()?;
         let now = ts + offset;
         if !credential.valid_at(now) {
-            return Err(CksError::Response(format!(
+            return Err(ReplayError::Response(format!(
                 "the backend returned a credential valid {}..{}, which does not cover {now}",
                 credential.window().start_unix(),
                 credential.window().end_unix()
@@ -426,7 +426,7 @@ impl Resolver {
 /// the receiver down when another identity would have worked — so it is logged at
 /// `error` (loud, because it means the panel is running on fewer identities than it
 /// was built with) and the slot is left empty.
-fn log_load<T>(identity: &str, loaded: Result<T, CksError>) -> Option<T> {
+fn log_load<T>(identity: &str, loaded: Result<T, ReplayError>) -> Option<T> {
     match loaded {
         Ok(table) => Some(table),
         Err(e) => {
@@ -441,7 +441,7 @@ fn log_load<T>(identity: &str, loaded: Result<T, CksError>) -> Option<T> {
 }
 
 /// Perform the request. Blocking; called only from `spawn_blocking`.
-fn fetch_blocking(ts: i64, timeout: Duration) -> Result<Vec<u8>, CksError> {
+fn fetch_blocking(ts: i64, timeout: Duration) -> Result<Vec<u8>, ReplayError> {
     use std::io::Read as _;
 
     let request = api::request(ts);
@@ -456,14 +456,14 @@ fn fetch_blocking(ts: i64, timeout: Duration) -> Result<Vec<u8>, CksError> {
         .set(request.api_key.0, request.api_key.1)
         .call()
         // `ureq::Error` is large; flatten it here rather than carry it outward.
-        .map_err(|e| CksError::Http(e.to_string()))?;
+        .map_err(|e| ReplayError::Http(e.to_string()))?;
 
     // Bounded: the body is a handful of certificates, and this is a third party's
     // endpoint — an unbounded read would let a bad day upstream exhaust the panel.
     let mut body = Vec::new();
     let mut reader = response.into_reader().take(MAX_RESPONSE_BYTES);
     std::io::Read::read_to_end(&mut reader, &mut body)
-        .map_err(|e| CksError::Http(format!("reading the CKS response: {e}")))?;
+        .map_err(|e| ReplayError::Http(format!("reading the CKS response: {e}")))?;
     Ok(body)
 }
 
@@ -473,26 +473,26 @@ fn fetch_blocking(ts: i64, timeout: Duration) -> Result<Vec<u8>, CksError> {
 /// (`CURLOPT_CAINFO`/`CAPATH` both `NULL`, anchors injected through
 /// `CURLOPT_SSL_CTX_FUNCTION`). It also means this path does not depend on the
 /// Windows deploy target having a usable root store.
-fn pinned_tls_config() -> Result<rustls::ClientConfig, CksError> {
+fn pinned_tls_config() -> Result<rustls::ClientConfig, ReplayError> {
     let mut roots = rustls::RootCertStore::empty();
     for der in crate::pem::decode_all(PINNED_ROOTS_PEM, "CERTIFICATE")? {
         roots
             .add(rustls::pki_types::CertificateDer::from(der))
-            .map_err(|e| CksError::Http(format!("pinned root is not usable: {e}")))?;
+            .map_err(|e| ReplayError::Http(format!("pinned root is not usable: {e}")))?;
     }
     if roots.is_empty() {
-        return Err(CksError::Http("no pinned roots were loaded".into()));
+        return Err(ReplayError::Http("no pinned roots were loaded".into()));
     }
     rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
-        .map_err(|e| CksError::Http(format!("building the CKS TLS config: {e}")))
+        .map_err(|e| ReplayError::Http(format!("building the CKS TLS config: {e}")))
         .map(|b| b.with_root_certificates(roots).with_no_client_auth())
 }
 
 /// The local clock as Unix seconds.
 ///
 /// A clock set before 1970 reads as 0, which is before the table's epoch and so
-/// produces [`CksError::OutOfRange`] — a typed failure rather than a confidently
+/// produces [`ReplayError::OutOfRange`] — a typed failure rather than a confidently
 /// wrong window.
 fn local_now() -> i64 {
     SystemTime::now()
@@ -509,10 +509,10 @@ mod tests {
     /// Inside the table's range, an offline provider always resolves.
     #[tokio::test]
     async fn resolves_offline_from_the_table() {
-        let provider = CksProvider::resolve(CksConfig {
+        let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         })
         .await
         .unwrap();
@@ -522,7 +522,7 @@ mod tests {
         assert!(credential.valid_at(at));
         assert_eq!(
             credential.origin(),
-            &CredentialOrigin::StaticTable { index: 652 }
+            &CredentialOrigin::CksTable { index: 652 }
         );
     }
 
@@ -539,11 +539,11 @@ mod tests {
             ),
             (vec![OfflineIdentity::AirServer, OfflineIdentity::Cks], true),
         ] {
-            let provider = CksProvider::resolve(CksConfig {
+            let provider = ReplayProvider::resolve(ReplayConfig {
                 network: false,
                 cache_path: None,
                 offline_order: order.clone(),
-                ..CksConfig::default()
+                ..ReplayConfig::default()
             })
             .await
             .unwrap();
@@ -568,11 +568,11 @@ mod tests {
     #[tokio::test]
     async fn an_exhausted_preferred_identity_falls_through() {
         let at = 1_814_400_000; // 2027-07-01: past AirServer, inside CKS
-        let provider = CksProvider::resolve(CksConfig {
+        let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
             offline_order: vec![OfflineIdentity::AirServer, OfflineIdentity::Cks],
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         })
         .await
         .unwrap();
@@ -580,7 +580,7 @@ mod tests {
         let credential = provider.current_at(at);
         assert!(credential.valid_at(at));
         assert!(
-            matches!(credential.origin(), CredentialOrigin::StaticTable { .. }),
+            matches!(credential.origin(), CredentialOrigin::CksTable { .. }),
             "expected the CKS table to cover this instant, got {}",
             credential.origin()
         );
@@ -590,15 +590,15 @@ mod tests {
     /// a sender will reject with no explanation.
     #[tokio::test]
     async fn past_every_table_startup_fails() {
-        let far_future_config = CksConfig {
+        let far_future_config = ReplayConfig {
             network: false,
             cache_path: None,
             offline_order: vec![OfflineIdentity::AirServer],
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         };
         // AirServer stops 2027-03-21; ask for 2027-07-01.
         let resolver = Resolver {
-            cks_table: StaticTable::load().ok(),
+            cks_table: CksTable::load().ok(),
             airserver_table: AirServerTable::load().ok(),
             config: far_future_config,
             clock_offset: AtomicI64::new(0),
@@ -606,7 +606,7 @@ mod tests {
         };
         assert!(matches!(
             resolver.offline_credential(1_814_400_000),
-            Err(CksError::OutOfRange { .. })
+            Err(ReplayError::OutOfRange { .. })
         ));
     }
 
@@ -615,30 +615,30 @@ mod tests {
     #[tokio::test]
     async fn no_offline_identity_is_a_named_error() {
         let resolver = Resolver {
-            cks_table: StaticTable::load().ok(),
+            cks_table: CksTable::load().ok(),
             airserver_table: AirServerTable::load().ok(),
-            config: CksConfig {
+            config: ReplayConfig {
                 network: false,
                 cache_path: None,
                 offline_order: vec![],
-                ..CksConfig::default()
+                ..ReplayConfig::default()
             },
             clock_offset: AtomicI64::new(0),
             retry_after: AtomicI64::new(0),
         };
         assert!(matches!(
             resolver.offline_credential(1_785_196_800),
-            Err(CksError::Table(_))
+            Err(ReplayError::Table(_))
         ));
     }
 
     /// A window roll must produce a different credential, not a stale one.
     #[tokio::test]
     async fn a_window_roll_re_issues_inline() {
-        let provider = CksProvider::resolve(CksConfig {
+        let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         })
         .await
         .unwrap();
@@ -653,10 +653,10 @@ mod tests {
     /// Reads on the connection path must not hit the network or the disk.
     #[tokio::test]
     async fn repeated_reads_in_one_window_return_the_same_credential() {
-        let provider = CksProvider::resolve(CksConfig {
+        let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         })
         .await
         .unwrap();
@@ -674,10 +674,10 @@ mod tests {
     /// With the network off, the backoff must never gate the table.
     #[tokio::test]
     async fn an_offline_provider_never_waits_on_a_backoff() {
-        let provider = CksProvider::resolve(CksConfig {
+        let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         })
         .await
         .unwrap();
@@ -693,16 +693,16 @@ mod tests {
     /// credential from the wrong window.
     #[tokio::test]
     async fn a_time_outside_the_table_is_an_error() {
-        let provider = CksProvider::resolve(CksConfig {
+        let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
-            ..CksConfig::default()
+            ..ReplayConfig::default()
         })
         .await
         .unwrap();
         assert!(matches!(
             provider.resolver.resolve_once(0).await,
-            Err(CksError::OutOfRange { .. })
+            Err(ReplayError::OutOfRange { .. })
         ));
     }
 }

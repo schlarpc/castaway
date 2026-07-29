@@ -17,7 +17,7 @@ use rsa::RsaPrivateKey;
 use sha2::Sha256;
 
 use crate::window::{UtcTime, Window};
-use crate::CksError;
+use crate::ReplayError;
 
 /// The DER of the `AlgorithmIdentifier` + `BIT STRING` header that sits between
 /// the `tbsCertificate` and the signature.
@@ -57,20 +57,20 @@ impl PeerTemplate {
     /// to the actual bytes rather than to a constant that could drift.
     ///
     /// # Errors
-    /// [`CksError::Template`] if the DER does not have the shape every shipped
+    /// [`ReplayError::Template`] if the DER does not have the shape every shipped
     /// template has: a two-byte-length outer `SEQUENCE`, a two-byte-length
     /// `tbsCertificate`, exactly one occurrence of each `UTCTime`, and a
     /// `sha256WithRSAEncryption` tail followed by 256 signature bytes.
-    pub fn parse(der: Vec<u8>, window0: Window) -> Result<Self, CksError> {
+    pub fn parse(der: Vec<u8>, window0: Window) -> Result<Self, ReplayError> {
         // Outer SEQUENCE, long-form length on two bytes.
         if der.len() < 8 || der[0] != 0x30 || der[1] != 0x82 {
-            return Err(CksError::Template(
+            return Err(ReplayError::Template(
                 "peer template is not a DER SEQUENCE with a two-byte length".into(),
             ));
         }
         let declared = 4 + usize::from(u16::from_be_bytes([der[2], der[3]]));
         if declared != der.len() {
-            return Err(CksError::Template(format!(
+            return Err(ReplayError::Template(format!(
                 "peer template length {declared} disagrees with its {} bytes",
                 der.len()
             )));
@@ -78,7 +78,7 @@ impl PeerTemplate {
 
         // tbsCertificate, likewise a two-byte-length SEQUENCE, starting immediately.
         if der[4] != 0x30 || der[5] != 0x82 {
-            return Err(CksError::Template(
+            return Err(ReplayError::Template(
                 "peer template's tbsCertificate is not a DER SEQUENCE with a two-byte length"
                     .into(),
             ));
@@ -86,7 +86,7 @@ impl PeerTemplate {
         let tbs_len = 4 + usize::from(u16::from_be_bytes([der[6], der[7]]));
         let tbs = 4..(4 + tbs_len);
         if tbs.end + SIGNATURE_ALGORITHM_TAIL.len() + SIGNATURE_LEN != der.len() {
-            return Err(CksError::Template(format!(
+            return Err(ReplayError::Template(format!(
                 "peer template's tbsCertificate ends at {}, leaving {} bytes for a {}-byte \
                  algorithm identifier and a {SIGNATURE_LEN}-byte signature",
                 tbs.end,
@@ -95,7 +95,7 @@ impl PeerTemplate {
             )));
         }
         if &der[tbs.end..tbs.end + SIGNATURE_ALGORITHM_TAIL.len()] != SIGNATURE_ALGORITHM_TAIL {
-            return Err(CksError::Template(
+            return Err(ReplayError::Template(
                 "peer template is not signed with sha256WithRSAEncryption".into(),
             ));
         }
@@ -104,7 +104,7 @@ impl PeerTemplate {
         let not_before = find_unique(&der[tbs.clone()], nb.as_bytes(), "notBefore")? + tbs.start;
         let not_after = find_unique(&der[tbs.clone()], na.as_bytes(), "notAfter")? + tbs.start;
         if not_after <= not_before {
-            return Err(CksError::Template(
+            return Err(ReplayError::Template(
                 "peer template's notAfter precedes its notBefore".into(),
             ));
         }
@@ -120,9 +120,13 @@ impl PeerTemplate {
     /// Re-issue the certificate for `window`, signing with `peer_key`.
     ///
     /// # Errors
-    /// [`CksError::Window`] if the window cannot be rendered as `UTCTime`,
-    /// [`CksError::Sign`] if signing fails.
-    pub fn reissue(&self, window: Window, peer_key: &RsaPrivateKey) -> Result<Vec<u8>, CksError> {
+    /// [`ReplayError::Window`] if the window cannot be rendered as `UTCTime`,
+    /// [`ReplayError::Sign`] if signing fails.
+    pub fn reissue(
+        &self,
+        window: Window,
+        peer_key: &RsaPrivateKey,
+    ) -> Result<Vec<u8>, ReplayError> {
         let (nb, na) = window.utc_times()?;
         let mut der = self.der.clone();
         der[self.not_before..self.not_before + UtcTime::LEN].copy_from_slice(nb.as_bytes());
@@ -133,10 +137,10 @@ impl PeerTemplate {
         // difference between one window verifying and all 900 failing.
         let signature = SigningKey::<Sha256>::new(peer_key.clone())
             .try_sign(&der[self.tbs.clone()])
-            .map_err(|e| CksError::Sign(e.to_string()))?
+            .map_err(|e| ReplayError::Sign(e.to_string()))?
             .to_vec();
         if signature.len() != SIGNATURE_LEN {
-            return Err(CksError::Sign(format!(
+            return Err(ReplayError::Sign(format!(
                 "peer key produced a {}-byte signature; the certificate has room for \
                  {SIGNATURE_LEN}",
                 signature.len()
@@ -152,12 +156,12 @@ impl PeerTemplate {
 ///
 /// Uniqueness is the point: a `UTCTime` that appeared twice would mean the offset
 /// picked is ambiguous, and the wrong copy would be rewritten.
-fn find_unique(haystack: &[u8], needle: &[u8], what: &str) -> Result<usize, CksError> {
+fn find_unique(haystack: &[u8], needle: &[u8], what: &str) -> Result<usize, ReplayError> {
     let mut found = None;
     for (i, chunk) in haystack.windows(needle.len()).enumerate() {
         if chunk == needle {
             if found.is_some() {
-                return Err(CksError::Template(format!(
+                return Err(ReplayError::Template(format!(
                     "peer template contains more than one copy of its {what}"
                 )));
             }
@@ -165,7 +169,7 @@ fn find_unique(haystack: &[u8], needle: &[u8], what: &str) -> Result<usize, CksE
         }
     }
     found.ok_or_else(|| {
-        CksError::Template(format!(
+        ReplayError::Template(format!(
             "peer template does not contain the {what} its window declares"
         ))
     })
@@ -175,11 +179,11 @@ fn find_unique(haystack: &[u8], needle: &[u8], what: &str) -> Result<usize, CksE
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::table::StaticTable;
+    use crate::cks::CksTable;
 
     #[test]
     fn template_layout_matches_the_shipped_certificate() {
-        let table = StaticTable::load().unwrap();
+        let table = CksTable::load().unwrap();
         let t = table.template();
         // Verified against the reference extractor: 734 bytes, tbs at 4..458,
         // the two UTCTime fields at 87 and 102.
@@ -191,7 +195,7 @@ mod tests {
 
     #[test]
     fn a_truncated_template_is_rejected_rather_than_reissued() {
-        let table = StaticTable::load().unwrap();
+        let table = CksTable::load().unwrap();
         let mut der = table.template().der.clone();
         der.truncate(der.len() - 1);
         let w = table.window(0).unwrap();
@@ -200,7 +204,7 @@ mod tests {
 
     #[test]
     fn a_template_signed_with_the_wrong_algorithm_is_rejected() {
-        let table = StaticTable::load().unwrap();
+        let table = CksTable::load().unwrap();
         let mut der = table.template().der.clone();
         // Flip the digest OID's last byte: 0x0b (sha256) -> 0x05 (sha1).
         let at = table.template().tbs.end + 12;

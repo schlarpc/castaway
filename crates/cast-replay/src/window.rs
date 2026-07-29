@@ -1,6 +1,6 @@
 //! The 2-day validity window a CKS credential is scoped to.
 
-use crate::CksError;
+use crate::ReplayError;
 
 /// Seconds in one CKS window. The whole scheme is built on a fixed 2-day
 /// schedule: the peer certificate is re-issued on it, and one precomputed
@@ -23,10 +23,10 @@ impl Window {
     /// Build a window from explicit bounds.
     ///
     /// # Errors
-    /// [`CksError::Window`] if the bounds are not ordered.
-    pub fn new(start_unix: i64, end_unix: i64) -> Result<Self, CksError> {
+    /// [`ReplayError::Window`] if the bounds are not ordered.
+    pub fn new(start_unix: i64, end_unix: i64) -> Result<Self, ReplayError> {
         if end_unix <= start_unix {
-            return Err(CksError::Window(format!(
+            return Err(ReplayError::Window(format!(
                 "window bounds are not ordered: {start_unix} .. {end_unix}"
             )));
         }
@@ -62,9 +62,9 @@ impl Window {
     /// peer certificate: `YYMMDDhhmmssZ`.
     ///
     /// # Errors
-    /// [`CksError::Window`] if a bound falls outside the years `UTCTime` can
+    /// [`ReplayError::Window`] if a bound falls outside the years `UTCTime` can
     /// represent (1950–2049), which no window in any shipped table does.
-    pub fn utc_times(self) -> Result<(UtcTime, UtcTime), CksError> {
+    pub fn utc_times(self) -> Result<(UtcTime, UtcTime), ReplayError> {
         Ok((
             UtcTime::from_unix(self.start_unix)?,
             UtcTime::from_unix(self.end_unix)?,
@@ -87,14 +87,15 @@ impl UtcTime {
     /// Render a Unix timestamp as `UTCTime`.
     ///
     /// # Errors
-    /// [`CksError::Window`] if the timestamp is outside 1950–2049, which
+    /// [`ReplayError::Window`] if the timestamp is outside 1950–2049, which
     /// `UTCTime`'s two-digit year cannot represent unambiguously.
-    pub fn from_unix(unix: i64) -> Result<Self, CksError> {
-        let dt = time::OffsetDateTime::from_unix_timestamp(unix)
-            .map_err(|e| CksError::Window(format!("timestamp {unix} is not a valid time: {e}")))?;
+    pub fn from_unix(unix: i64) -> Result<Self, ReplayError> {
+        let dt = time::OffsetDateTime::from_unix_timestamp(unix).map_err(|e| {
+            ReplayError::Window(format!("timestamp {unix} is not a valid time: {e}"))
+        })?;
         let year = dt.year();
         if !(1950..=2049).contains(&year) {
-            return Err(CksError::Window(format!(
+            return Err(ReplayError::Window(format!(
                 "year {year} cannot be encoded as UTCTime"
             )));
         }

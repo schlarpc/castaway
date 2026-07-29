@@ -1,6 +1,15 @@
-//! # cast-cks
+//! # cast-replay
 //!
-//! Cast receiver-auth credentials, from the CKS backend or from a checked-in table.
+//! Cast receiver-auth credentials by replay: from the CKS backend, or from either
+//! of two checked-in identities.
+//!
+//! The crate is named for the *mechanism*, not for a vendor, because it carries
+//! more than one vendor's identity. It is
+//! `re-shell/artifacts/airreceiver-cast-signatures/PROVISIONING.md`'s **class (b)**
+//! — do not hold a Cast device key, replay signatures made by somebody who does.
+//! Class (a), an operator's own provisioned hardware credential, is not this
+//! crate's concern; `app` reads that from `cast.credential` and it takes
+//! precedence over everything here.
 //!
 //! ## What problem this solves
 //!
@@ -27,12 +36,27 @@
 //! one signature stays valid for that certificate's entire life, and a signature
 //! computed once, elsewhere, works forever after.
 //!
-//! Receivers exploit that by generating their peer certificate on a fixed 2-day
+//! Receivers exploit that by generating their peer certificate on a fixed
 //! schedule from a fixed key, and shipping a table of one precomputed signature
-//! per window. This crate is that mechanism: [`table::StaticTable`] holds 900
-//! windows (2023-01-01 → 2027-12-06, 1800 signatures, all verified — see
-//! `fixtures/README.md`), and [`api`] speaks to the backend that serves the
-//! current window on demand.
+//! per window. This crate is that mechanism, with two independent identities in it:
+//!
+//! | | [`cks`] | [`airserver`] |
+//! |---|---|---|
+//! | from | SoftMedia / AirReceiver | App Dynamic / AirServer |
+//! | device CN | `RYW0O FA8FCA6AC5A0` | `2001805200936810051` |
+//! | root path | `Eureka Root CA` | `Widevine Cast Subroot` |
+//! | covers | 2023-01-01 → 2027-12-06 | 2024-03-20 → 2027-03-21 |
+//! | windows | 900, 2-day step, tiled | 1095, 1-day step, overlapping |
+//! | certificates | re-issued from a template | stored verbatim |
+//!
+//! [`api`] additionally speaks to the CKS backend, which serves the current window
+//! on demand and is the only path that outlives every table. [`provider`] runs the
+//! order. Fixture provenance is in `fixtures/README.md` and
+//! `fixtures/airserver/README.md`.
+//!
+//! Carrying two is about **revocation**, not horizon — see [`provider`], which
+//! explains why the order is operator policy and why nothing here tries to detect
+//! which identity has been burned.
 //!
 //! ## The two invariants
 //!
@@ -75,9 +99,9 @@
 //!
 //! ## Layering
 //!
-//! [`api`], [`table`], [`template`] and [`window`] are sans-I/O and synchronous
-//! (ground rule 3). [`provider`] is the thin actor that owns the socket, the disk
-//! cache and the fallback order.
+//! [`api`], [`cks`], [`airserver`], [`template`] and [`window`] are sans-I/O and
+//! synchronous (ground rule 3). [`provider`] is the thin actor that owns the
+//! socket, the disk cache and the fallback order.
 #![forbid(unsafe_code)]
 
 use thiserror::Error;
@@ -85,22 +109,22 @@ use thiserror::Error;
 pub mod airserver;
 pub mod api;
 pub mod cache;
+pub mod cks;
 mod pem;
 pub mod provider;
-pub mod table;
 pub mod template;
 pub mod window;
 
 pub use airserver::AirServerTable;
+pub use cks::CksTable;
 pub use crypto_cast_auth::{HashAlgo, NonceEcho, SigAlgo, SignedAuth};
-pub use provider::{CksConfig, CksProvider, OfflineIdentity};
-pub use table::StaticTable;
+pub use provider::{OfflineIdentity, ReplayConfig, ReplayProvider};
 pub use window::Window;
 
 /// Errors from credential acquisition.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum CksError {
+pub enum ReplayError {
     /// A PEM document could not be read.
     #[error("PEM: {0}")]
     Pem(String),
@@ -125,16 +149,20 @@ pub enum CksError {
     #[error("validity window: {0}")]
     Window(String),
 
-    /// The static table does not reach the requested time. Past `covers_until`
-    /// only the network path can produce a credential.
+    /// A checked-in table does not reach the requested time.
+    ///
+    /// Names the identity, because there are two with different end dates and
+    /// "which one ran out" is the first thing an operator needs to know.
     #[error(
-        "the checked-in signature table stops at {covers_until} and cannot cover {unix}; \
-         only the CKS backend can supply a credential past that point"
+        "the checked-in {identity} signature table stops at {covers_until} and cannot \
+         cover {unix}; only the CKS backend can supply a credential past that point"
     )]
     OutOfRange {
+        /// Which offline identity was asked.
+        identity: OfflineIdentity,
         /// The instant a credential was wanted for.
         unix: i64,
-        /// The first instant the table does not cover.
+        /// The first instant that identity's table does not cover.
         covers_until: i64,
     },
 
@@ -165,7 +193,7 @@ pub enum CredentialOrigin {
     Cache,
     /// Re-issued from the checked-in CKS table at `index` — SoftMedia's
     /// (AirReceiver's) identity. Works offline; stops working 2027-12-06.
-    StaticTable {
+    CksTable {
         /// The window's index in the table.
         index: u32,
     },
@@ -187,7 +215,7 @@ impl CredentialOrigin {
     #[must_use]
     pub const fn is_offline_table(&self) -> bool {
         match self {
-            Self::StaticTable { .. } | Self::AirServerTable { .. } => true,
+            Self::CksTable { .. } | Self::AirServerTable { .. } => true,
             Self::Network | Self::Cache => false,
         }
     }
@@ -198,7 +226,7 @@ impl core::fmt::Display for CredentialOrigin {
         match self {
             Self::Network => f.write_str("CKS backend"),
             Self::Cache => f.write_str("cached CKS response"),
-            Self::StaticTable { index } => write!(f, "checked-in CKS table, window {index}"),
+            Self::CksTable { index } => write!(f, "checked-in CKS table, window {index}"),
             Self::AirServerTable { index } => {
                 write!(f, "checked-in AirServer table, window {index}")
             }
@@ -227,7 +255,7 @@ impl CastCredential {
     /// Assemble a credential, checking the parts agree.
     ///
     /// # Errors
-    /// [`CksError::Response`] if a signature is not the 256 bytes an RSA-2048
+    /// [`ReplayError::Response`] if a signature is not the 256 bytes an RSA-2048
     /// device key produces, or the certificate chain is empty.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -239,17 +267,17 @@ impl CastCredential {
         sha256_signature: Vec<u8>,
         window: Window,
         origin: CredentialOrigin,
-    ) -> Result<Self, CksError> {
+    ) -> Result<Self, ReplayError> {
         for (what, sig) in [("SHA-1", &sha1_signature), ("SHA-256", &sha256_signature)] {
             if sig.len() != 256 {
-                return Err(CksError::Response(format!(
+                return Err(ReplayError::Response(format!(
                     "{what} signature is {} bytes; an RSA-2048 device signature is 256",
                     sig.len()
                 )));
             }
         }
         if device_cert_der.is_empty() || peer_cert_der.is_empty() {
-            return Err(CksError::Response(
+            return Err(ReplayError::Response(
                 "credential is missing a certificate".into(),
             ));
         }
@@ -344,7 +372,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    fn credential(origin: CredentialOrigin) -> Result<CastCredential, CksError> {
+    fn credential(origin: CredentialOrigin) -> Result<CastCredential, ReplayError> {
         CastCredential::new(
             vec![1],
             vec![vec![2]],
@@ -369,7 +397,7 @@ mod tests {
             Window::new(100, 200).unwrap(),
             CredentialOrigin::Network,
         );
-        assert!(matches!(bad, Err(CksError::Response(_))));
+        assert!(matches!(bad, Err(ReplayError::Response(_))));
     }
 
     /// The replay only verifies when nothing is echoed. If this ever became
@@ -395,7 +423,7 @@ mod tests {
         // "which identity is this panel presenting" is the question a revocation
         // makes urgent and there is nothing else to answer it from.
         assert_eq!(
-            CredentialOrigin::StaticTable { index: 652 }.to_string(),
+            CredentialOrigin::CksTable { index: 652 }.to_string(),
             "checked-in CKS table, window 652"
         );
         assert_eq!(
@@ -407,7 +435,7 @@ mod tests {
 
     #[test]
     fn only_the_table_origins_are_offline() {
-        assert!(CredentialOrigin::StaticTable { index: 0 }.is_offline_table());
+        assert!(CredentialOrigin::CksTable { index: 0 }.is_offline_table());
         assert!(CredentialOrigin::AirServerTable { index: 0 }.is_offline_table());
         assert!(!CredentialOrigin::Network.is_offline_table());
         assert!(!CredentialOrigin::Cache.is_offline_table());

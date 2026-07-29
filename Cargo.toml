@@ -17,7 +17,7 @@ members = [
     "crates/proto-cast",
     "crates/proto-spotify",
     "crates/crypto-cast-auth",
-    "crates/cast-cks",
+    "crates/cast-replay",
     "crates/substrate-rtp",
     "crates/substrate-rtsp",
     "crates/crypto-fairplay",
@@ -61,7 +61,7 @@ proto-bluetooth-audio = { path = "crates/proto-bluetooth-audio" }
 hci-transport = { path = "crates/hci-transport" }
 substrate-rtp = { path = "crates/substrate-rtp" }
 crypto-cast-auth = { path = "crates/crypto-cast-auth" }
-cast-cks = { path = "crates/cast-cks" }
+cast-replay = { path = "crates/cast-replay" }
 crypto-fairplay = { path = "crates/crypto-fairplay" }
 crypto-raop = { path = "crates/crypto-raop" }
 crypto-playfair = { path = "crates/crypto-playfair" }
@@ -164,7 +164,7 @@ hex-literal = "0.4"
 tokio-test = "0.4"
 # Reads back the certificates we issue, so the tests assert on the DER a sender parses
 # rather than on the parameters we handed rcgen. Also a runtime dependency of
-# `cast-cks`, which takes a credential's validity window from the certificate itself.
+# `cast-replay`, which takes a credential's validity window from the certificate itself.
 x509-parser = "0.18"
 
 [workspace.lints.rust]

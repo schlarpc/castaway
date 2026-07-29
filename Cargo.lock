@@ -523,7 +523,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cast-cks"
+name = "cast-replay"
 version = "0.1.0"
 dependencies = [
  "aes",
@@ -552,7 +552,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "cast-cks",
+ "cast-replay",
  "castaway-core",
  "castaway-paths",
  "control-display",
@@ -3743,7 +3743,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
- "cast-cks",
+ "cast-replay",
  "castaway-core",
  "crypto-cast-auth",
  "ctr",

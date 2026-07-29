@@ -23,7 +23,7 @@ tree links, ships or shells out to AirServer.
 Regenerate with:
 
 ```sh
-airserver_castdb.py <cast.db> --export crates/cast-cks/fixtures/airserver
+airserver_castdb.py <cast.db> --export crates/cast-replay/fixtures/airserver
 ```
 
 ## What is *not* here

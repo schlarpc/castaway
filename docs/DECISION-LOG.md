@@ -956,7 +956,7 @@ precomputed signature per window. No device key anywhere in the design. The omit
 is itself the evidence — a party holding a device key could sign the nonce and would have
 no reason to ship a 900-entry table.
 
-**The decision** is to do that too, in `cast-cks`: a reimplementation of the CKS request
+**The decision** is to do that too, in `cast-replay`: a reimplementation of the CKS request
 and its response cipher, plus the 900-window table (2023-01-01 → 2027-12-06, 1800
 signatures) checked in as fixtures. Backend first — it keeps working as the calendar moves
 — with the table behind it so an unattended panel that loses its uplink keeps
