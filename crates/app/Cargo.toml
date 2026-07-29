@@ -20,6 +20,7 @@ substrate-mdns.workspace = true
 proto-dlna.workspace = true
 proto-cast.workspace = true
 crypto-cast-auth.workspace = true
+cast-cks.workspace = true
 proto-spotify.workspace = true
 proto-bluetooth-audio.workspace = true
 hci-transport.workspace = true

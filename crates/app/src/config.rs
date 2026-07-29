@@ -370,8 +370,44 @@ impl Default for AirPlay {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Cast {
-    /// The device credential CASTv2 authenticates with.
+    /// The device credential CASTv2 authenticates with. Takes precedence over
+    /// [`Cast::cks`] when set — an operator who provisioned their own hardware
+    /// credential meant to use it.
     pub credential: CastCredential,
+    /// The CKS-provisioned credential, used when `credential` is unset.
+    pub cks: Cks,
+}
+
+/// The CKS credential: a real Google-issued device chain with precomputed
+/// signatures, from a backend or from the table checked into `cast-cks`.
+///
+/// On by default, because without it device auth fails against every official
+/// sender and Cast is decorative. Read `crates/cast-cks/fixtures/README.md`
+/// before deciding to leave it on: the identity is shared with every install of
+/// the app it came from, Google can revoke it, and the offline table stops on
+/// 2027-12-06.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Cks {
+    /// Whether to use a CKS credential at all. With this off and no
+    /// `cast.credential`, the receiver falls back to a self-generated key that
+    /// official senders reject.
+    pub enabled: bool,
+    /// Whether the backend may be contacted.
+    ///
+    /// Turning this off pins the receiver to the checked-in table — which works,
+    /// offline, until 2027-12-06 and not one window past it. The backend is the
+    /// only thing that extends past that date.
+    pub network: bool,
+}
+
+impl Default for Cks {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            network: true,
+        }
+    }
 }
 
 /// Where the Cast device credential comes from.
@@ -866,6 +902,39 @@ mod tests {
         assert!(c.enable.cast);
         // Unspecified flags fall back to their defaults.
         assert!(c.enable.dlna);
+    }
+
+    /// On by default: without a CKS credential, device auth fails against every
+    /// official sender and Cast is decorative.
+    #[test]
+    fn cks_is_enabled_unless_it_is_turned_off() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.cast.cks.enabled);
+        assert!(c.cast.cks.network);
+
+        let c: Config = toml::from_str("[cast.cks]\nnetwork = false\n").unwrap();
+        assert!(c.cast.cks.enabled, "one key set must not clear the other");
+        assert!(
+            !c.cast.cks.network,
+            "with the backend off the receiver is pinned to the table's 2027 end"
+        );
+
+        let c: Config = toml::from_str("[cast.cks]\nenabled = false\n").unwrap();
+        assert!(!c.cast.cks.enabled);
+    }
+
+    /// The two credential sources are independent in the file; precedence between
+    /// them is `spawn_cast`'s, and a provisioned credential wins.
+    #[test]
+    fn a_provisioned_credential_parses_alongside_cks() {
+        let toml = r#"
+            [cast.credential]
+            key_file = "/run/secrets/cast-key.pem"
+            certificate_file = "/run/secrets/cast-cert.der"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.cast.credential.key_file.is_some());
+        assert!(c.cast.cks.enabled);
     }
 
     #[test]

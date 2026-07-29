@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::Router;
+use cast_cks::{CksConfig, CksProvider};
 use castaway_core::{
     osd_channel, Advertisement, DisplayControl, ProtocolKind, SessionConfig, SessionManager,
     SessionSink, SourceAdapter, SourceId, SourceMessage,
@@ -41,7 +42,7 @@ use castaway_core::{
 use control_display::NullDisplay;
 use crypto_cast_auth::CastDeviceSigner;
 use proto_airplay::AirPlayReceiver;
-use proto_cast::{CastReceiver, TlsIdentity};
+use proto_cast::{CastIdentity, CastReceiver, TlsIdentity};
 use proto_dial::DialService;
 use proto_dlna::DlnaService;
 use proto_miracast::MiracastAdapter;
@@ -886,7 +887,11 @@ async fn spawn_cast(
     shutdown: Arc<Notify>,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let signer = match config
+    // Three ways to be a Cast device, in descending order of how much they are ours.
+    // A provisioned credential is the operator's own hardware identity and wins; a CKS
+    // credential is real but shared and revocable; a generated key is correct and
+    // rejected by every official sender.
+    let (identity, cks_refresh) = match config
         .cast
         .credential
         .load()
@@ -894,12 +899,29 @@ async fn spawn_cast(
     {
         Some(credential) => {
             info!("Cast device auth uses the provisioned device credential");
-            CastDeviceSigner::from_pkcs8_pem(
+            let signer = CastDeviceSigner::from_pkcs8_pem(
                 &credential.key_pem,
                 credential.certificate_der,
                 credential.intermediates_der,
             )
-            .context("parsing the provisioned Cast device key")?
+            .context("parsing the provisioned Cast device key")?;
+            (
+                CastIdentity::device_key(self_signed_tls()?, Arc::new(signer)),
+                None,
+            )
+        }
+        None if config.cast.cks.enabled => {
+            let provider = Arc::new(
+                CksProvider::resolve(CksConfig {
+                    network: config.cast.cks.network,
+                    ..CksConfig::default()
+                })
+                .await
+                .context("resolving a CKS Cast credential")?,
+            );
+            let identity = CastIdentity::cks(Arc::clone(&provider));
+            info!("Cast device auth uses {}", identity.describe());
+            (identity, Some(provider))
         }
         None => {
             // RSA-2048 keygen takes seconds; it belongs on a blocking thread, not stalling
@@ -911,22 +933,23 @@ async fn spawn_cast(
             warn!(
                 "Cast device auth uses a self-generated dev credential; senders that verify \
                  the Google chain — which is every official one — will reject it. Set \
-                 cast.credential in castaway.toml to provision a real one (Q2/Q11)"
+                 cast.credential in castaway.toml to provision a real one, or re-enable \
+                 cast.cks (Q2/Q11)"
             );
-            dev.signer
+            (
+                CastIdentity::device_key(self_signed_tls()?, Arc::new(dev.signer)),
+                None,
+            )
         }
     };
 
-    let identity = TlsIdentity::self_signed(&["castaway.local".to_string()])
-        .context("generating the Cast TLS identity")?;
     let receiver = CastReceiver::new(
         proto_cast::actor::default_listen_addr(),
         config.advertised_name(ProtocolKind::Cast).as_str(),
         config.uuid.replace('-', ""),
         identity,
     )
-    .context("building the CASTv2 receiver")?
-    .with_signer(Arc::new(signer));
+    .context("building the CASTv2 receiver")?;
     // Cast is the other protocol in which the receiver is the player, so a sender's
     // scrubber can only be answered from our own clock — the same seam DLNA reads.
     let receiver = match playback {
@@ -941,15 +964,34 @@ async fn spawn_cast(
     let sink = SessionSink::new(SourceId::new(ProtocolKind::Cast, "listener"), event_tx);
     let adapter = Arc::new(receiver);
     Ok(tokio::spawn(async move {
+        // A CKS credential expires every two days, so something has to replace it while
+        // the panel runs. Without one there is nothing to refresh, and this arm simply
+        // never resolves.
+        let refresh = async move {
+            match cks_refresh {
+                Some(provider) => provider.run().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             res = adapter.run(sink) => {
                 if let Err(e) = res {
                     warn!(error = %e, "Cast adapter exited");
                 }
             }
+            () = refresh => {}
             () = shutdown.notified() => info!("Cast listener stopping"),
         }
     }))
+}
+
+/// The self-signed TLS identity the non-CKS paths present.
+///
+/// A CKS credential brings its own certificate — the one its signature covers —
+/// so this is only reached when the receiver signs for itself.
+fn self_signed_tls() -> anyhow::Result<TlsIdentity> {
+    TlsIdentity::self_signed(&["castaway.local".to_string()])
+        .context("generating the Cast TLS identity")
 }
 
 /// Register whatever an adapter says it needs discoverable. The app supplies only
