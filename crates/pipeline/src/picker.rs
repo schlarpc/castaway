@@ -438,10 +438,13 @@ pub fn render(picker: &Picker, width: u32, height: u32) -> Result<Vec<u8>, Pipel
         PickerStatus::Failed(m) => Some((m.as_str(), pal.failed)),
     };
     if let Some((msg, colour)) = status_line {
+        // With no rows the message sits where the first row would (the list's own top,
+        // plus a baseline's worth), not at 280·s — that number landed exactly on the
+        // subtitle's descenders, and "Searching…" printed through the tagline.
         let y = l
             .rows
             .last()
-            .map_or(280.0 * s, |(_, r)| r.y + r.h + 60.0 * s);
+            .map_or(365.0 * s, |(_, r)| r.y + r.h + 60.0 * s);
         text::draw_text(
             &mut buf,
             width,
