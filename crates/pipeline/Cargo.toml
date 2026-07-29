@@ -48,6 +48,12 @@ image = { version = "0.25", default-features = false, features = [
 # calls the resource handler across threads. Keep `embedded-domain-resolver` (needed for
 # URL parsing) and `full-regex-handling`.
 base64 = { workspace = true, optional = true }
+# SVG rasterisation for the tile glyphs. They used to be hand-rolled distance fields, and
+# every one that looked wrong was a geometry bug in this repo rather than in the artwork
+# (see `assets/glyphs/README.md`). `text` is off because the marks are pure paths — it
+# would pull in fontdb and a font database lookup for nothing. Pure Rust, so the Windows
+# cross-build is unaffected.
+resvg = { version = "0.45", default-features = false, optional = true }
 # A JS engine, to evaluate uBlock Origin's scriptlet modules and read their own registry
 # rather than parsing them. Cross-builds for the Windows MSVC target (checked).
 rquickjs = { version = "0.9", features = ["loader"], optional = true }
@@ -122,6 +128,7 @@ render = [
     "dep:ab_glyph",
     "dep:png",
     "dep:image",
+    "dep:resvg",
 ]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]

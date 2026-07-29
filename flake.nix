@@ -222,6 +222,7 @@
               || (pkgs.lib.hasSuffix ".bin" path)
               || (pkgs.lib.hasSuffix ".pem" path)
               || (pkgs.lib.hasSuffix ".png" path)
+              || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path);
             name = "source";
           };

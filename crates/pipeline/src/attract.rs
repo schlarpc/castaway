@@ -170,26 +170,47 @@ pub struct ServiceDetail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TileGlyph {
-    /// A screen with signal arcs — Google Cast.
+    /// Google Cast.
     Cast,
-    /// A screen with an upward triangle — AirPlay.
+    /// AirPlay.
     AirPlay,
-    /// A plain screen — DLNA, and anything else that just wants a display.
-    Screen,
-    /// A waveform — audio: Spotify, Bluetooth, the visualizer.
-    Waveform,
-    /// A rounded frame with a play triangle — YouTube.
-    Video,
-    /// The Bluetooth rune.
+    /// DLNA.
+    Dlna,
+    /// Spotify.
+    Spotify,
+    /// YouTube.
+    YouTube,
+    /// Bluetooth.
     Bluetooth,
-    /// A gamepad — GameStream / Moonlight.
+    /// A game controller — Moonlight.
     Gamepad,
-    /// A folder — local media.
+    /// A folder — a local media library.
     Folder,
-    /// A camera — the intercom view.
-    Camera,
-    /// A gear — settings.
+    /// Miracast.
+    Miracast,
+    /// A cog — settings.
     Gear,
+}
+
+impl TileGlyph {
+    /// The vendored artwork for this mark.
+    ///
+    /// One file per variant, matched here and nowhere else, so adding a variant is a
+    /// compile error until it has a mark to draw.
+    const fn svg(self) -> &'static str {
+        match self {
+            Self::Cast => include_str!("../assets/glyphs/cast.svg"),
+            Self::AirPlay => include_str!("../assets/glyphs/airplay.svg"),
+            Self::Dlna => include_str!("../assets/glyphs/dlna.svg"),
+            Self::Spotify => include_str!("../assets/glyphs/spotify.svg"),
+            Self::YouTube => include_str!("../assets/glyphs/youtube.svg"),
+            Self::Bluetooth => include_str!("../assets/glyphs/bluetooth.svg"),
+            Self::Gamepad => include_str!("../assets/glyphs/gamepad.svg"),
+            Self::Folder => include_str!("../assets/glyphs/folder.svg"),
+            Self::Miracast => include_str!("../assets/glyphs/miracast.svg"),
+            Self::Gear => include_str!("../assets/glyphs/gear.svg"),
+        }
+    }
 }
 
 impl AttractScene {
@@ -244,7 +265,7 @@ impl AttractScene {
                 Tile {
                     id: "dlna".into(),
                     label: "DLNA".into(),
-                    glyph: TileGlyph::Screen,
+                    glyph: TileGlyph::Dlna,
                     accent: [0x56, 0xba, 0x5b, 0xff],
                     detail: Some(ServiceDetail {
                         headline: "Send a video from Android or VLC.".into(),
@@ -258,7 +279,7 @@ impl AttractScene {
                 Tile {
                     id: "spotify".into(),
                     label: "Spotify".into(),
-                    glyph: TileGlyph::Waveform,
+                    glyph: TileGlyph::Spotify,
                     accent: [0x1d, 0xb9, 0x54, 0xff],
                     detail: Some(ServiceDetail {
                         headline: "Play to the room, and keep the phone as the remote.".into(),
@@ -269,7 +290,7 @@ impl AttractScene {
                 Tile {
                     id: "youtube".into(),
                     label: "YouTube".into(),
-                    glyph: TileGlyph::Video,
+                    glyph: TileGlyph::YouTube,
                     accent: [0xff, 0x00, 0x00, 0xff],
                     detail: Some(ServiceDetail {
                         headline: "The cast button in the YouTube app.".into(),
@@ -718,7 +739,6 @@ fn draw_tile(
         (cx, gy),
         rect.h * 0.26,
         accent,
-        plate,
     );
 
     let px = fit_px(&f.regular, &tile.label, rect.h * 0.147, rect.w * 0.92);
@@ -736,11 +756,22 @@ fn draw_tile(
     );
 }
 
-/// The tile glyphs, as distance fields. `g` is the glyph's half-extent.
+/// Draw a tile's mark, tinted, into a `2g`-square box centred on `at`.
 ///
-/// `pub(crate)` because the service screen draws the same glyph large — the screen a tile
+/// The marks are vendored SVGs rasterised here (see `assets/glyphs/README.md`). They used
+/// to be hand-rolled distance fields, and every one that looked wrong was a geometry bug
+/// in this file rather than in any artwork: the Bluetooth rune's diagonals met on the
+/// spine instead of crossing it, the gear's teeth were sized with a radius where the
+/// primitive wanted a diameter, and DLNA and Spotify were approximations of marks that
+/// exist. Real artwork also means the brand marks are the brands' own.
+///
+/// Only the alpha survives rasterisation: every mark is monochrome and the tile picks the
+/// colour, so the SVG is a stencil rather than a picture. Rasterised per draw, which is
+/// per navigation and resize rather than per frame — the same bargain the mascot's PNG
+/// decode already makes.
+///
+/// `pub(crate)` because the service screen draws the same mark large — the screen a tile
 /// opens should look like the tile that opened it.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_tile_glyph(
     buf: &mut [u8],
     surface: (u32, u32),
@@ -748,322 +779,53 @@ pub(crate) fn draw_tile_glyph(
     at: (f32, f32),
     g: f32,
     color: Rgba,
-    plate: Rgba,
 ) {
     let (width, height) = surface;
     let (cx, cy) = at;
-    use crate::shape::{self, Rect};
-
-    // A "screen" is the base of three of these; drawn once and reused so Cast, AirPlay
-    // and DLNA read as a family rather than three unrelated pictures.
-    let screen = |buf: &mut [u8], inset: f32| {
-        let body = Rect {
-            x: cx - g * (1.0 - inset),
-            y: cy - g * (0.72 - inset * 0.5),
-            w: g * 2.0 * (1.0 - inset),
-            h: g * 1.44 * (1.0 - inset * 0.7),
-        };
-        shape::rounded_outline(buf, width, height, body, g * 0.16, g * 0.16, color);
+    let side = (g * 2.0).round().max(1.0) as u32;
+    let Some(mask) = glyph_mask(glyph, side) else {
+        return;
     };
-    // What a punched-out detail — the gear's bore, the d-pad, a camera lens — is filled
-    // with. It has to be the plate the glyph is drawn on: the tiles are tinted toward
-    // their accent now, and a fixed near-black left a dark blob in the middle of each.
-    let hole = plate;
-
-    match glyph {
-        TileGlyph::Cast => {
-            screen(buf, 0.0);
-            // `rounded_outline` straddles the rect boundary, so the frame's inner corner
-            // is half a stroke inside it. The mark radiates from that corner.
-            //
-            // An earlier version cut the frame open at this corner, the way Material's
-            // does. At tile size the cuts read as damage rather than as a deliberate gap:
-            // two square stubs and a bitten-off corner. A closed frame with the mark
-            // sitting inside it is the other common way to draw this, and it survives
-            // being small.
-            let t = g * 0.16;
-            let (ox, oy) = (cx - g + t / 2.0, cy + g * 0.72 - t / 2.0);
-            let quarter = |px: f32, py: f32| px >= ox - 0.5 && py <= oy + 0.5;
-            shape::fill_sdf(
-                buf,
-                width,
-                height,
-                Rect::around(ox, oy, g * 0.4),
-                color,
-                |px, py| {
-                    if quarter(px, py) {
-                        shape::sd_circle(px, py, ox, oy, g * 0.27)
-                    } else {
-                        1e3
-                    }
-                },
-            );
-            for r in [g * 0.56, g * 0.84] {
-                shape::fill_sdf(
-                    buf,
-                    width,
-                    height,
-                    Rect::around(ox, oy, r + g * 0.16),
-                    color,
-                    |px, py| {
-                        if quarter(px, py) {
-                            shape::sd_circle(px, py, ox, oy, r).abs() - g * 0.075
-                        } else {
-                            1e3
-                        }
-                    },
-                );
+    let (ox, oy) = (cx - g, cy - g);
+    for y in 0..side {
+        for x in 0..side {
+            let a = mask[(y * side + x) as usize];
+            if a == 0 {
+                continue;
             }
-        }
-        TileGlyph::AirPlay => {
-            screen(buf, 0.0);
-            // The triangle sits below the screen, overlapping its lower edge.
-            shape::fill_sdf(
+            text::blend_over(
                 buf,
                 width,
                 height,
-                Rect::around(cx, cy + g * 1.0, g * 0.8),
+                (ox + x as f32) as i32,
+                (oy + y as f32) as i32,
                 color,
-                |px, py| {
-                    shape::sd_triangle(
-                        px,
-                        py,
-                        // Apex just clear of the frame's bottom edge. It used to start
-                        // *inside* the frame, so the bottom bar cut across the triangle
-                        // and left it looking truncated.
-                        [
-                            (cx, cy + g * 0.76),
-                            (cx + g * 0.56, cy + g * 1.26),
-                            (cx - g * 0.56, cy + g * 1.26),
-                        ],
-                    )
-                },
+                f32::from(a) / 255.0,
             );
-        }
-        TileGlyph::Screen => {
-            screen(buf, 0.0);
-            // A stand, so it is a display rather than an empty rectangle.
-            shape::rounded_rect(
-                buf,
-                width,
-                height,
-                Rect {
-                    x: cx - g * 0.3,
-                    y: cy + g * 0.72,
-                    w: g * 0.6,
-                    h: g * 0.2,
-                },
-                g * 0.08,
-                color,
-            );
-        }
-        TileGlyph::Video => {
-            screen(buf, 0.0);
-            shape::fill_sdf(
-                buf,
-                width,
-                height,
-                Rect::around(cx, cy, g),
-                color,
-                |px, py| {
-                    shape::sd_triangle(
-                        px,
-                        py,
-                        [
-                            (cx - g * 0.24, cy - g * 0.34),
-                            (cx + g * 0.42, cy),
-                            (cx - g * 0.24, cy + g * 0.34),
-                        ],
-                    )
-                },
-            );
-        }
-        TileGlyph::Bluetooth => {
-            // The bind rune: a vertical spine, a vertex above and below it on the right,
-            // and two diagonals that *cross* the spine and come out on the left.
-            //
-            // Both diagonals used to stop at the same point on the middle-left, which
-            // draws a spine with one spike off it — a flag, not the rune.
-            let thick = g * 0.13;
-            let (rx, lx) = (cx + g * 0.44, cx - g * 0.44);
-            let (uy, ly) = (cy - g * 0.5, cy + g * 0.5);
-            let seg = |buf: &mut [u8], ax: f32, ay: f32, bx: f32, by: f32| {
-                shape::fill_sdf(
-                    buf,
-                    width,
-                    height,
-                    Rect::around((ax + bx) / 2.0, (ay + by) / 2.0, g * 1.2),
-                    color,
-                    |px, py| shape::sd_segment(px, py, ax, ay, bx, by) - thick / 2.0,
-                );
-            };
-            seg(buf, cx, cy - g, cx, cy + g);
-            seg(buf, cx, cy - g, rx, uy);
-            seg(buf, rx, uy, lx, ly);
-            seg(buf, cx, cy + g, rx, ly);
-            seg(buf, rx, ly, lx, uy);
-        }
-        TileGlyph::Gamepad => {
-            let body = Rect {
-                x: cx - g,
-                y: cy - g * 0.55,
-                w: g * 2.0,
-                h: g * 1.1,
-            };
-            shape::rounded_rect(buf, width, height, body, g * 0.45, color);
-            let arm = g * 0.34;
-            let thick = g * 0.12;
-            shape::rounded_rect(
-                buf,
-                width,
-                height,
-                Rect {
-                    x: cx - g * 0.62 - arm / 2.0,
-                    y: cy - thick / 2.0,
-                    w: arm,
-                    h: thick,
-                },
-                thick / 2.0,
-                hole,
-            );
-            shape::rounded_rect(
-                buf,
-                width,
-                height,
-                Rect {
-                    x: cx - g * 0.62 - thick / 2.0,
-                    y: cy - arm / 2.0,
-                    w: thick,
-                    h: arm,
-                },
-                thick / 2.0,
-                hole,
-            );
-            shape::disc(
-                buf,
-                width,
-                height,
-                cx + g * 0.48,
-                cy - g * 0.14,
-                g * 0.22,
-                hole,
-            );
-            shape::disc(
-                buf,
-                width,
-                height,
-                cx + g * 0.74,
-                cy + g * 0.14,
-                g * 0.22,
-                hole,
-            );
-        }
-        TileGlyph::Folder => {
-            // Wider than tall, with the tab standing clear above the body. The old one
-            // was very nearly square and its tab barely rose over the top edge, so it
-            // read as a rectangle with a chip out of it rather than as a folder.
-            let tab = Rect {
-                x: cx - g,
-                y: cy - g * 0.62,
-                w: g * 0.92,
-                h: g * 0.36,
-            };
-            shape::rounded_rect(buf, width, height, tab, g * 0.12, color);
-            let body = Rect {
-                x: cx - g,
-                y: cy - g * 0.34,
-                w: g * 2.0,
-                h: g * 1.02,
-            };
-            shape::rounded_rect(buf, width, height, body, g * 0.14, color);
-        }
-        TileGlyph::Camera => {
-            let body = Rect {
-                x: cx - g,
-                y: cy - g * 0.5,
-                w: g * 1.75,
-                h: g * 1.1,
-            };
-            shape::rounded_rect(buf, width, height, body, g * 0.22, color);
-            shape::fill_sdf(
-                buf,
-                width,
-                height,
-                Rect::around(cx + g * 0.6, cy, g),
-                color,
-                |px, py| {
-                    shape::sd_triangle(
-                        px,
-                        py,
-                        [
-                            (cx + g * 0.78, cy - g * 0.42),
-                            (cx + g * 1.18, cy),
-                            (cx + g * 0.78, cy + g * 0.42),
-                        ],
-                    )
-                },
-            );
-            shape::disc(buf, width, height, cx - g * 0.15, cy, g * 0.5, hole);
-        }
-        TileGlyph::Waveform => {
-            let heights = [0.35_f32, 0.75, 1.0, 0.6, 0.45];
-            let bar = g * 0.24;
-            let step = g * 0.46;
-            for (i, hfrac) in heights.iter().enumerate() {
-                let x = cx - step * 2.0 + step * i as f32;
-                let bh = g * hfrac;
-                shape::rounded_rect(
-                    buf,
-                    width,
-                    height,
-                    Rect {
-                        x: x - bar / 2.0,
-                        y: cy - bh,
-                        w: bar,
-                        h: bh * 2.0,
-                    },
-                    bar / 2.0,
-                    color,
-                );
-            }
-        }
-        TileGlyph::Gear => {
-            // Teeth are radial boxes, not bumps. Discs around the rim — even overlapping
-            // ones — draw a daisy: what makes a cog read as a cog is that its teeth have
-            // flat flanks and square ends. There is no rotated primitive in `shape`, so
-            // the sample point is rotated into each tooth's own frame instead, and the
-            // whole silhouette comes out of one distance field so body and teeth merge
-            // without a seam.
-            let (body_r, ring, tooth_l, tooth_w) = (g * 0.72, g * 0.86, g * 0.34, g * 0.24);
-            shape::fill_sdf(
-                buf,
-                width,
-                height,
-                Rect::around(cx, cy, ring + tooth_l + 2.0),
-                color,
-                |px, py| {
-                    let (dx, dy) = (px - cx, py - cy);
-                    let mut d = shape::sd_circle(px, py, cx, cy, body_r);
-                    for i in 0..8 {
-                        let (sin, cos) = (std::f32::consts::TAU * i as f32 / 8.0).sin_cos();
-                        let rx = dx.mul_add(cos, dy * sin);
-                        let ry = dy.mul_add(cos, -(dx * sin));
-                        d = d.min(shape::sd_round_box(
-                            rx,
-                            ry,
-                            ring,
-                            0.0,
-                            tooth_l,
-                            tooth_w,
-                            g * 0.06,
-                        ));
-                    }
-                    d
-                },
-            );
-            shape::disc(buf, width, height, cx, cy, g * 0.62, hole);
         }
     }
+}
+
+/// Rasterise a mark into a `side`×`side` coverage mask.
+///
+/// `None` if the artwork will not parse or the size is degenerate, which the caller takes
+/// as "draw nothing": a tile with no glyph is legible, and a panic here would take down a
+/// screen over a decoration.
+fn glyph_mask(glyph: TileGlyph, side: u32) -> Option<Vec<u8>> {
+    use resvg::tiny_skia;
+    let tree = resvg::usvg::Tree::from_str(glyph.svg(), &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(side, side)?;
+    let size = tree.size();
+    // Fit rather than stretch: the marks are square-ish on a 24-unit grid, but nothing
+    // guarantees the next one will be, and a stretched logo is worse than a small one.
+    let scale = (side as f32 / size.width()).min(side as f32 / size.height());
+    let transform = tiny_skia::Transform::from_translate(
+        (side as f32 - size.width() * scale) / 2.0,
+        (side as f32 - size.height() * scale) / 2.0,
+    )
+    .pre_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Some(pixmap.data().chunks_exact(4).map(|px| px[3]).collect())
 }
 
 /// Encode an RGBA image as PNG bytes (for previews / captures).

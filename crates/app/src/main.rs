@@ -1252,7 +1252,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         tiles.push(service(
             "dlna",
             "DLNA",
-            TileGlyph::Screen,
+            TileGlyph::Dlna,
             [0x3d, 0xdc, 0x84, 0xff],
             "Send a video from Android or VLC.",
             vec![
@@ -1266,7 +1266,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         tiles.push(service(
             "spotify",
             "Spotify",
-            TileGlyph::Waveform,
+            TileGlyph::Spotify,
             [0x1d, 0xb9, 0x54, 0xff],
             "Play to the room, and keep your phone as the remote.",
             vec!["Play something".into(), "Tap Devices, bottom-left".into()],
@@ -1277,7 +1277,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         tiles.push(service(
             "youtube",
             "YouTube",
-            TileGlyph::Video,
+            TileGlyph::YouTube,
             [0xff, 0x00, 0x00, 0xff],
             "The cast button in the YouTube app.",
             vec!["Tap it, and pick this screen".into()],
@@ -1302,7 +1302,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         tiles.push(service(
             "miracast",
             "Windows",
-            TileGlyph::Screen,
+            TileGlyph::Dlna,
             [0x00, 0xa4, 0xef, 0xff],
             "Project a Windows desktop with no cable.",
             vec!["Press Win+K".into(), "Pick this screen".into()],

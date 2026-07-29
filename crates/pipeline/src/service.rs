@@ -147,7 +147,6 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
         (gx, gy),
         plate.h * 0.30,
         accent,
-        plate_fill,
     );
 
     let text_x = plate.x + plate.w + 56.0 * s;
