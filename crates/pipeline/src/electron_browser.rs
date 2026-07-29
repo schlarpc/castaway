@@ -779,6 +779,20 @@ impl ElectronHost {
         self
     }
 
+    /// Leave a fullscreen page, if that is what the browser is showing.
+    ///
+    /// The home gesture's missing half. Bringing the shell forward *demotes* video to a
+    /// corner, but a fullscreen page has no demoted form — it is opaque, above the
+    /// shell, and stays there, so the gesture fired and nothing visibly happened.
+    /// Leaving a page means leaving it: same endpoint a DIAL stop reaches, returning
+    /// the idle widget (or nothing). The widget role is left alone — it *is* the home
+    /// screen's own content.
+    pub fn dismiss_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        if self.role == BrowserRole::Fullscreen {
+            self.hide(render);
+        }
+    }
+
     /// Track the kiosk surface size so the browser viewport matches.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
@@ -833,6 +847,25 @@ impl ElectronHost {
             id: paint.id,
             stdin: Arc::clone(&electron.stdin),
         };
+        // Nothing is meant to be showing. A blanked page still paints — about:blank is
+        // a white frame, importing it would put a fullscreen white layer where "hidden"
+        // should be — and after a dismiss the old page's last paints are still arriving.
+        if self.current_url.is_none() {
+            return; // `borrow` drops here, releasing the frame.
+        }
+        let view = self.role.view(self.size);
+        // A frame sized for a viewport we are no longer showing: the paint raced a role
+        // change or a resize. Stretching one frame of the old thing across the new rect
+        // is worse than one frame of nothing.
+        if (paint.width, paint.height) != (view.rect.width, view.rect.height) {
+            debug!(
+                target: "castaway::browser",
+                got = format_args!("{}x{}", paint.width, paint.height),
+                want = format_args!("{}x{}", view.rect.width, view.rect.height),
+                "dropping a stale-sized paint"
+            );
+            return; // `borrow` drops here, releasing the frame.
+        }
         let local = match electron.process.pull(RemoteHandle(paint.plane.fd)) {
             Ok(handle) => handle,
             Err(e) => {
@@ -841,7 +874,6 @@ impl ElectronHost {
             }
         };
 
-        let view = self.role.view(self.size);
         match render.import_browser_frame(
             crate::hwaccel::FrameGeometry {
                 width: paint.width,

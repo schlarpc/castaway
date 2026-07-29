@@ -352,3 +352,62 @@ fn center_pixel(pixels: &[u8], w: usize, h: usize) -> [u8; 4] {
 fn browser_layer_present(render: &pipeline::render_pipeline::RenderLoop) -> bool {
     render.browser_layer_present()
 }
+
+/// The home gesture's other half: leaving a fullscreen page actually leaves it.
+///
+/// Bringing the shell forward demotes *video*; a fullscreen page has no demoted form —
+/// it is opaque and above the shell, so unless going home dismisses it, the gesture
+/// completes and the panel looks exactly the same. That was the YouTube exit swipe
+/// "not working": it worked, invisibly.
+#[test]
+#[ignore = "needs a GPU and an Electron"]
+fn dismissing_a_fullscreen_page_takes_its_layer_down() {
+    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
+        eprintln!("skipping: no usable GPU");
+        return;
+    };
+
+    let blocker = Arc::new(AdBlocker::with_defaults());
+    let electron = Electron::spawn(
+        &electron_path(),
+        &app_dir(),
+        Arc::clone(&blocker),
+        None,
+        pipeline::TV_USER_AGENT,
+    )
+    .expect("browser should start");
+
+    let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
+    let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
+    host.resize(1280, 720);
+    tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !browser_layer_present(&render) {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(browser_layer_present(&render), "page never painted");
+
+    host.dismiss_fullscreen(&mut render);
+    // With no widget configured, dismissing leaves nothing behind; the layer must be
+    // gone at once, not whenever the page happens to stop painting.
+    assert!(
+        !browser_layer_present(&render),
+        "the fullscreen layer should be down after a dismiss"
+    );
+    // And it stays down: a stale paint from the dismissed page must not resurrect it.
+    for _ in 0..30 {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        !browser_layer_present(&render),
+        "the dismissed page came back on its own"
+    );
+
+    host.shutdown();
+}

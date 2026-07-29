@@ -110,6 +110,13 @@ impl KioskApp {
             sink.cancel_all();
         }
         if let Some(render) = self.render.as_mut() {
+            // A fullscreen page (YouTube leanback) is asked to leave; video is only
+            // demoted below. The page is opaque and above the shell, so without this
+            // the gesture completed and the panel looked exactly the same.
+            #[cfg(feature = "electron")]
+            if let Some(browser) = self.browser.as_mut() {
+                browser.dismiss_fullscreen(render);
+            }
             render.shell_home();
             // Bring the shell in front. If something is playing it is demoted to a
             // corner rather than stopped — someone pressing Home in the middle of a film
