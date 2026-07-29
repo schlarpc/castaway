@@ -33,14 +33,26 @@ use pipeline::adblock_engine::AdBlocker;
 use pipeline::browser::BrowserCommand;
 use pipeline::{Electron, ElectronHost};
 
-/// A page that is one flat, unmistakable colour, plus a touch reporter.
+/// A page that is one flat, unmistakable colour — and then repaints, slowly, several
+/// times, ending on a different one.
 ///
 /// `rgb(0, 128, 255)` because it is nothing like a clear colour, nothing like black, and
 /// its channels are all different — so a red/blue swap or a stuck channel fails rather
-/// than passing by luck.
+/// than passing by luck. The staged walk to `rgb(255, 64, 32)` is what makes staleness
+/// *visible*: a static page cannot distinguish "frames keep flowing" from "the layer
+/// froze on an early frame", which is exactly how the borrow/release deadlock shipped.
+/// The repaints must be *spaced*, not burst: paints faster than the consumer's tick are
+/// superseded in its pending slot, and a supersede releases a frame — which kept the
+/// browser just under `MAX_INFLIGHT` and hid the deadlock from a single-flip version of
+/// this page. One repaint per interval, each imported before the next, is the cadence
+/// that pins the outstanding count at the cap and wedges an unfixed consumer.
 const PAGE: &str =
     "data:text/html,<style>html,body{margin:0;height:100%;background:rgb(0,128,255)}</style>\
-     <body ontouchstart=\"document.title='touched'\"></body>";
+     <body ontouchstart=\"document.title='touched'\">\
+     <script>const steps=['rgb(0,160,224)','rgb(0,192,192)','rgb(64,224,128)',\
+     'rgb(160,255,64)','rgb(255,64,32)'];\
+     steps.forEach((c,i)=>setTimeout(()=>{document.body.style.background=c;\
+     document.documentElement.style.background=c},600*(i+1)))</script></body>";
 
 fn spec(
     adblock: Arc<AdBlocker>,
@@ -120,27 +132,31 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
         "composited centre is {px:?}, expected ~[0,128,255] — the layer is not the page"
     );
 
-    // Keep going well past MAX_INFLIGHT_FRAMES. If the borrow/release loop deadlocks the
-    // browser stops painting, so the picture goes stale rather than erroring — which is
-    // why this checks that the layer is *still* the page after a few hundred pumps
-    // rather than merely that nothing returned an error.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Keep going well past MAX_INFLIGHT_FRAMES, until the page's 2-second colour flip
+    // arrives on the composited output. If the borrow/release loop deadlocks the browser
+    // stops painting and the layer stays the *old* colour forever — a stale picture,
+    // not an error — so the assertion is that the picture *changed*, which a frozen
+    // layer cannot fake.
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut later = 0_u32;
-    while Instant::now() < deadline && later < 300 {
+    let mut flipped = false;
+    while Instant::now() < deadline && !flipped {
         host.pump(&mut render);
         render.pump();
         later += 1;
-        std::thread::sleep(Duration::from_millis(8));
+        let shot = render.read_rgba().expect("offscreen readback");
+        let px = center_pixel(&shot, 1280, 720);
+        flipped = near(px[0], 255) && near(px[1], 64) && near(px[2], 32);
+        std::thread::sleep(Duration::from_millis(16));
     }
     assert!(
         browser_layer_present(&render),
         "the browser layer vanished after {later} further pumps"
     );
-    let shot = render.read_rgba().expect("offscreen readback");
-    let px = center_pixel(&shot, 1280, 720);
     assert!(
-        near(px[1], 128) && near(px[2], 255),
-        "after {later} pumps the centre is {px:?}: painting stopped or the layer went stale"
+        flipped,
+        "after {later} pumps the page's colour flip never reached the screen: \
+         painting stopped or the layer went stale (the borrow/release deadlock)"
     );
 
     host.shutdown();

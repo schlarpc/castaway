@@ -42,7 +42,9 @@ process.on('unhandledRejection', (err) => log('error', `unhandled rejection: ${e
 // ---------------------------------------------------------------------------
 // Protocol
 // ---------------------------------------------------------------------------
-const MAX_INFLIGHT = 3;
+// Mirrors MAX_INFLIGHT_FRAMES in crates/pipeline/src/browser_proto.rs — its docs say
+// why four is the number.
+const MAX_INFLIGHT = 4;
 
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');

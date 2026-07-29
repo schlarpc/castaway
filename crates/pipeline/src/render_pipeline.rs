@@ -1405,9 +1405,10 @@ impl RenderLoop {
     /// 4K that copy was 33 MB per frame; this is a handful of driver objects.
     ///
     /// `handle` is the browser's buffer, already pulled into this process. It is consumed
-    /// here — the returned layer holds the imported texture, and the *caller* holds the
-    /// borrow that must outlive it (see `electron_browser::InFlight`), because only the
-    /// caller knows when the browser may recycle the pixels.
+    /// here, and `borrow` travels with it into the texture's owner: wgpu drops the pair
+    /// when the last submission sampling the texture retires, which is what tells the
+    /// caller's release logic (see `electron_browser::InFlight`) the browser may recycle
+    /// the pixels.
     ///
     /// # Errors
     /// [`PipelineError::GpuImport`] if this device cannot import external memory or the
@@ -1419,12 +1420,13 @@ impl RenderLoop {
         modifier: u64,
         span: crate::hwaccel::PlaneSpan,
         handle: crate::hwaccel::remote_handle::LocalHandle,
+        borrow: Box<dyn std::any::Any + Send + Sync>,
         transform: Transform,
         layer: LayerId,
     ) -> Result<(), PipelineError> {
         let texture = self
             .compositor
-            .import_browser_frame(geometry, modifier, span, handle)?;
+            .import_browser_frame(geometry, modifier, span, handle, borrow)?;
         self.compositor.adopt_rgba_texture(layer, texture);
         self.compositor.upsert_layer(Layer {
             id: layer,

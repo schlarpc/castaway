@@ -34,7 +34,13 @@ use serde::{Deserialize, Serialize};
 /// Small on purpose. The browser drops rather than queues when this many are outstanding
 /// (ground rule 4: for live output, latency beats freshness), so a slow consumer costs
 /// dropped frames rather than growing lag.
-pub const MAX_INFLIGHT_FRAMES: usize = 3;
+///
+/// Sized to the consumer's steady state, which legitimately holds three at 60 fps — the
+/// frame being retired by the GPU, the frame on the layer, and the newest paint waiting
+/// in the pending slot — plus one so a paint arriving in that state is not dropped.
+/// Mirrored by `MAX_INFLIGHT` in `browser-host/main.js`, which is the side that
+/// enforces it.
+pub const MAX_INFLIGHT_FRAMES: usize = 4;
 
 /// One plane of a painted frame, as the producer's platform describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

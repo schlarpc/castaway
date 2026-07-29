@@ -28,24 +28,29 @@
 //! A painted frame is *borrowed*. `Release` may only be sent once the GPU has finished
 //! sampling, because the import aliases Chromium's own buffer — releasing early is the
 //! tearing bug `hwaccel::dmabuf` documents for VA-API surfaces, in a different costume.
-//! [`InFlight`] is what holds the borrow, and it is dropped only after the compositor has
-//! adopted the texture and the previous frame's submission has retired.
+//! [`InFlight`] is what holds the borrow. It rides into the compositor as part of the
+//! imported texture's owner, so wgpu's own resource tracking drops it — and sends the
+//! release — exactly when the last submission sampling the texture has retired.
+//!
+//! It must not be held any longer than that. The browser stops *sending* paints once
+//! [`crate::browser_proto::MAX_INFLIGHT_FRAMES`] are unreleased, so a consumer that
+//! sits on borrows until "the
+//! next paint arrives" deadlocks the pipeline: the producer is waiting for a release the
+//! consumer will only send on a paint that is never coming. That consumer was this file,
+//! once — the freeze arrived with the third frame and read as "the page went black".
 
-use std::collections::VecDeque;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::adblock_engine::AdBlocker;
 use crate::audio_decode::PcmBlock;
 use crate::audio_out::{AudioOut, AudioOutputFactory};
 use crate::browser::{BrowserCommand, BrowserRole};
-use crate::browser_proto::{
-    encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, ToBrowser, MAX_INFLIGHT_FRAMES,
-};
+use crate::browser_proto::{encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, ToBrowser};
 use crate::error::PipelineError;
 use crate::hwaccel::remote_handle::{ProcessRef, RemoteHandle};
 
@@ -75,7 +80,10 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 ///
 /// Dropping this sends the release. That is the whole lifetime rule expressed as
 /// ownership, so "forgot to release" is not reachable and "released too early" is a
-/// visible `drop`.
+/// visible `drop`. On a successful import it is boxed into the texture's owner, which
+/// wgpu drops when the last submission sampling the texture retires — the earliest
+/// moment the release is true.
+#[derive(Debug)]
 struct InFlight {
     id: u64,
     /// The channel back to the browser. `Weak`-ish by hand: if the browser is gone the
@@ -520,6 +528,14 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                         .store(video_ms - audio_ms, Ordering::Relaxed);
                 }
             }
+            trace!(
+                target: "castaway::browser",
+                id,
+                width,
+                height,
+                planes = planes.len(),
+                "paint received"
+            );
             let Some(&plane) = planes.first() else {
                 warn!(target: "castaway::browser", id, "paint with no planes");
                 return;
@@ -685,12 +701,6 @@ pub struct ElectronHost {
     recovery_attempts: u32,
     retry_at: Option<std::time::Instant>,
     gave_up: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Frames handed to the compositor and not yet retired, oldest first.
-    ///
-    /// More than one because the compositor may still be sampling the previous frame
-    /// when the next arrives; holding a short queue is what makes release-after-retire
-    /// expressible without stalling on the GPU.
-    inflight: VecDeque<InFlight>,
     /// Whether the left button is held, and therefore whether the browser owns the
     /// pointer even where it strays outside its viewport.
     left_down: bool,
@@ -740,7 +750,6 @@ impl ElectronHost {
             recovery_attempts: 0,
             retry_at: None,
             gave_up: None,
-            inflight: VecDeque::new(),
             left_down: false,
             contacts: std::collections::HashSet::new(),
             next_report: std::time::Instant::now(),
@@ -806,12 +815,6 @@ impl ElectronHost {
             return;
         };
 
-        // Retire borrows the compositor is provably done with before taking another, so
-        // the browser's pool cannot be starved by our queue growing without bound.
-        while self.inflight.len() >= MAX_INFLIGHT_FRAMES {
-            self.inflight.pop_front();
-        }
-
         let borrow = InFlight {
             id: paint.id,
             stdin: Arc::clone(&electron.stdin),
@@ -837,10 +840,21 @@ impl ElectronHost {
                 pitch: paint.plane.stride,
             },
             local,
+            // The borrow travels with the texture: wgpu drops it — sending the release —
+            // when the last submission sampling this frame retires. Holding it here
+            // until "the next paint" instead is the deadlock the module docs describe.
+            Box::new(borrow),
             view.transform,
             view.layer,
         ) {
-            Ok(()) => self.inflight.push_back(borrow),
+            Ok(()) => trace!(
+                target: "castaway::browser",
+                id = paint.id,
+                width = paint.width,
+                height = paint.height,
+                layer = ?view.layer,
+                "frame imported"
+            ),
             Err(e) => warn!(
                 target: "castaway::browser",
                 error = %e,
@@ -908,7 +922,6 @@ impl ElectronHost {
             .as_mut()
             .is_none_or(|e| matches!(e.child.try_wait(), Ok(Some(_)) | Err(_)));
         if dead {
-            self.inflight.clear();
             self.clear(render);
             if let Some(old) = self.electron.take() {
                 old.shutdown();
@@ -953,9 +966,11 @@ impl ElectronHost {
     }
 
     /// Drop the browser layer and every borrow behind it.
+    ///
+    /// The borrows live inside the layer textures, so dropping the layers is what
+    /// releases the frames — once wgpu has retired the submissions still sampling them.
     fn clear(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
         self.current_url = None;
-        self.inflight.clear();
         render.clear_browser();
     }
 
@@ -971,7 +986,6 @@ impl ElectronHost {
             // The layer transform changes with the role but the texture is still the old
             // viewport's size; drop it rather than stretching one frame of the wrong
             // thing across the new rect.
-            self.inflight.clear();
             render.clear_browser();
         }
         self.role = role;
@@ -1047,11 +1061,11 @@ impl ElectronHost {
             .is_some_and(Electron::is_software_fallback)
     }
 
-    /// Stop the browser and release every borrowed frame. Call on the main thread after
-    /// the kiosk event loop exits.
+    /// Stop the browser. Call on the main thread after the kiosk event loop exits.
+    ///
+    /// Any borrows still riding compositor textures release into a closing pipe;
+    /// [`InFlight`] ignores that failure, and the child is exiting anyway.
     pub fn shutdown(mut self) {
-        // Borrows first: releasing after the child is gone writes into a closed pipe.
-        self.inflight.clear();
         if let Some(e) = self.electron.take() {
             e.shutdown();
         }

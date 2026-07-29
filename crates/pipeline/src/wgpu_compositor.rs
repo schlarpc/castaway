@@ -288,17 +288,28 @@ struct Programs {
 /// A browser frame's buffer handle, held for as long as the texture that aliases it.
 ///
 /// A [`GpuSurface`] only so it can ride the importers' existing owner slot; nothing reads
-/// through it. Dropping it closes the handle, which is *not* the same as releasing the
-/// frame back to the browser — that is the protocol `Release`, and it is the caller's,
-/// deliberately, because only the caller knows when the GPU is finished.
+/// through it. Both fields exist to be dropped at the right moment — when wgpu retires
+/// the last submission sampling the texture: the handle so the memory is not pulled out
+/// from under a frame still being sampled, and the caller's borrow so the protocol
+/// `Release` (its `Drop`) fires exactly then and the browser knows it may recycle the
+/// buffer.
 #[cfg(feature = "hwaccel")]
-#[derive(Debug)]
 struct BorrowedFrame(
-    /// Never read. Held so the handle outlives the texture that aliases it — closing it
-    /// early would pull the memory out from under a frame still being sampled.
+    /// Never read. Held so the handle outlives the texture that aliases it.
     #[allow(dead_code)]
     crate::hwaccel::remote_handle::LocalHandle,
+    /// The caller's release-on-drop borrow. Opaque here on purpose: the compositor's
+    /// only obligation is *when* it drops, not what it is.
+    #[allow(dead_code)]
+    Box<dyn std::any::Any + Send + Sync>,
 );
+
+#[cfg(feature = "hwaccel")]
+impl std::fmt::Debug for BorrowedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BorrowedFrame").field(&self.0).finish()
+    }
+}
 
 #[cfg(feature = "hwaccel")]
 impl GpuSurface for BorrowedFrame {
@@ -622,6 +633,7 @@ impl WgpuCompositor {
         modifier: u64,
         span: crate::hwaccel::PlaneSpan,
         handle: crate::hwaccel::remote_handle::LocalHandle,
+        borrow: Box<dyn std::any::Any + Send + Sync>,
     ) -> Result<wgpu::Texture, PipelineError> {
         #[cfg(unix)]
         {
@@ -637,9 +649,10 @@ impl WgpuCompositor {
                 // pitch disagrees with the buffer it allocated.
                 pitch: span.pitch,
             };
-            // The handle must outlive the texture, so it becomes the surface the import
-            // hangs its drop guard on.
-            let owner: std::sync::Arc<dyn GpuSurface> = std::sync::Arc::new(BorrowedFrame(handle));
+            // The handle and the caller's borrow must outlive the texture, so they
+            // become the surface the import hangs its drop guard on.
+            let owner: std::sync::Arc<dyn GpuSurface> =
+                std::sync::Arc::new(BorrowedFrame(handle, borrow));
             importer.import_single_plane(&self.device, geometry, modifier, plane, owner)
         }
         #[cfg(windows)]
@@ -647,7 +660,8 @@ impl WgpuCompositor {
             use std::os::windows::io::AsRawHandle as _;
             let _ = (modifier, span); // an NT handle describes its own layout
             let raw = handle.as_raw_handle().cast();
-            let owner: std::sync::Arc<dyn GpuSurface> = std::sync::Arc::new(BorrowedFrame(handle));
+            let owner: std::sync::Arc<dyn GpuSurface> =
+                std::sync::Arc::new(BorrowedFrame(handle, borrow));
             let frame = crate::hwaccel::dx12_import::Dx12Importer::import_single_plane(
                 &self.device,
                 geometry,
