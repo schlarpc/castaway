@@ -93,9 +93,20 @@ impl OutputBackendKind {
 }
 
 /// Which backend `audio_out::selected_output` opens in this build.
+///
+/// PipeWire outranks cpal where both are compiled: the kiosk feature list carries both
+/// so one list cross-builds, and on Linux the native backend is the one that can
+/// actually name sinks.
 #[must_use]
 pub const fn active_backend() -> OutputBackendKind {
-    #[cfg(feature = "audio-out")]
+    #[cfg(all(feature = "audio-pipewire", target_os = "linux"))]
+    {
+        OutputBackendKind::PipeWire
+    }
+    #[cfg(all(
+        feature = "audio-out",
+        not(all(feature = "audio-pipewire", target_os = "linux"))
+    ))]
     {
         #[cfg(target_os = "windows")]
         {
@@ -106,7 +117,10 @@ pub const fn active_backend() -> OutputBackendKind {
             OutputBackendKind::Alsa
         }
     }
-    #[cfg(not(feature = "audio-out"))]
+    #[cfg(not(any(
+        feature = "audio-out",
+        all(feature = "audio-pipewire", target_os = "linux")
+    )))]
     {
         OutputBackendKind::Null
     }
@@ -122,11 +136,21 @@ pub const fn active_backend() -> OutputBackendKind {
 /// [`PipelineError::Audio`] if the backend cannot be asked — no PipeWire daemon, no
 /// audio host. An empty list is not an error; a build with no backend returns one.
 pub fn list_output_devices() -> Result<Vec<OutputDeviceInfo>, PipelineError> {
-    #[cfg(feature = "audio-out")]
+    #[cfg(all(feature = "audio-pipewire", target_os = "linux"))]
+    {
+        crate::audio_pw::list_sinks()
+    }
+    #[cfg(all(
+        feature = "audio-out",
+        not(all(feature = "audio-pipewire", target_os = "linux"))
+    ))]
     {
         crate::audio_out::cpal_devices()
     }
-    #[cfg(not(feature = "audio-out"))]
+    #[cfg(not(any(
+        feature = "audio-out",
+        all(feature = "audio-pipewire", target_os = "linux")
+    )))]
     {
         Ok(Vec::new())
     }

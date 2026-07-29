@@ -17,6 +17,8 @@
 pub mod audio_decode;
 #[cfg(feature = "audio")]
 pub mod audio_out;
+#[cfg(all(feature = "audio-pipewire", target_os = "linux"))]
+pub mod audio_pw;
 // Not gated behind `audio`, for the same reason `theme` is not behind `render`: the
 // output-device selection is config-file surface, and config parses in every build.
 pub mod audio_select;

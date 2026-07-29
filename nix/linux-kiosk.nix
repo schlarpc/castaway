@@ -31,7 +31,7 @@ let
   # audio decoders) and ALSA for the PCM device.
   kioskArgs = {
     pname = "castaway";
-    cargoExtraArgs = "--package castaway --features electron,audio-out,bluetooth-socket,gamestream";
+    cargoExtraArgs = "--package castaway --features electron,audio-out,audio-pipewire,bluetooth-socket,gamestream";
 
     nativeBuildInputs = [
       pkgs.pkg-config
@@ -42,6 +42,9 @@ let
       # 7.x to match `ffmpeg-next`/`ffmpeg-sys-next` 7.1 (nixpkgs defaults to 8.x).
       pkgs.ffmpeg_7
       pkgs.alsa-lib
+      # libpipewire for the native output backend (`audio-pipewire`), which is what
+      # makes the settings screen's device list real sinks rather than ALSA shims.
+      pkgs.pipewire
     ];
 
     # `ffmpeg-sys-next` generates bindings with bindgen, which dlopens libclang and needs
@@ -67,6 +70,7 @@ let
     pkgs.libxrandr
     pkgs.ffmpeg_7
     pkgs.alsa-lib
+    pkgs.pipewire
     # moonlight-common-c's libcrypto. The linker's rpath already covers it; this keeps
     # the wrapper's view of the world complete if the store path moves under a copy.
     pkgs.openssl

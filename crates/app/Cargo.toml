@@ -73,6 +73,10 @@ audio = ["pipeline/audio"]
 bluetooth-socket = ["hci-transport/socket"]
 # …and the real PCM device (ALSA / WASAPI). What the kiosk ships with.
 audio-out = ["audio", "pipeline/audio-out"]
+# …or PipeWire natively (Linux), which is what makes output-device *selection* real
+# there: the ALSA shim shows one "pipewire" device, the native backend shows the sinks.
+# Takes precedence over audio-out's ALSA host at compile time; inert on Windows.
+audio-pipewire = ["audio", "pipeline/audio-pipewire"]
 # LDAC decode. Off by default: advertising a codec we cannot decode makes the session
 # silence rather than a clean fallback to one we can (OPEN-QUESTIONS Q22).
 ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]

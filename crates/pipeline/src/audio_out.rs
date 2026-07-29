@@ -51,11 +51,23 @@ pub use crate::audio_select::{
 /// offer devices it then couldn't open.
 #[must_use]
 pub fn selected_output(selection: &OutputSelection) -> Box<dyn AudioOut> {
-    #[cfg(feature = "audio-out")]
+    #[cfg(all(feature = "audio-pipewire", target_os = "linux"))]
+    {
+        Box::new(crate::audio_pw::PipeWireAudioOut::with_selection(
+            selection.clone(),
+        ))
+    }
+    #[cfg(all(
+        feature = "audio-out",
+        not(all(feature = "audio-pipewire", target_os = "linux"))
+    ))]
     {
         Box::new(CpalAudioOut::with_selection(selection.clone()))
     }
-    #[cfg(not(feature = "audio-out"))]
+    #[cfg(not(any(
+        feature = "audio-out",
+        all(feature = "audio-pipewire", target_os = "linux")
+    )))]
     {
         let _ = selection;
         Box::new(NullAudioOut::new())
@@ -138,7 +150,12 @@ impl AudioOut for NullAudioOut {
 pub use cpal_backend::CpalAudioOut;
 
 /// The cpal host's output devices — `audio_select::list_output_devices`'s real half.
-#[cfg(feature = "audio-out")]
+/// Compiled only where cpal is the *selected* backend: with the native PipeWire
+/// backend outranking it, this would be a list nobody asks for.
+#[cfg(all(
+    feature = "audio-out",
+    not(all(feature = "audio-pipewire", target_os = "linux"))
+))]
 pub(crate) fn cpal_devices() -> Result<Vec<OutputDeviceInfo>, PipelineError> {
     cpal_backend::list_output_devices()
 }
@@ -152,7 +169,9 @@ mod cpal_backend {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use tracing::{info, warn};
 
-    use super::{AudioOut, OutputDeviceInfo, OutputSelection, PcmBlock, PipelineError};
+    #[cfg(not(all(feature = "audio-pipewire", target_os = "linux")))]
+    use super::OutputDeviceInfo;
+    use super::{AudioOut, OutputSelection, PcmBlock, PipelineError};
 
     /// How many blocks may queue before the decoder is told to slow down.
     ///
@@ -288,7 +307,9 @@ mod cpal_backend {
         }
     }
 
-    /// The output devices cpal's host can list, by name.
+    /// The output devices cpal's host can list, by name. Same gate as `cpal_devices`,
+    /// its only caller.
+    #[cfg(not(all(feature = "audio-pipewire", target_os = "linux")))]
     pub(super) fn list_output_devices() -> Result<Vec<OutputDeviceInfo>, PipelineError> {
         let host = cpal::default_host();
         let devices = host

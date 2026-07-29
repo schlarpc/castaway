@@ -71,6 +71,13 @@ ureq = { version = "2", optional = true }
 # Cross-platform audio output: ALSA on Linux, WASAPI on Windows.
 cpal = { version = "0.15", optional = true }
 
+# The native PipeWire output backend (`audio-pipewire`): real sink names for the
+# settings screen and per-stream routing via `target.object`, neither of which the ALSA
+# compatibility shim can express. Linux-only by nature — the Windows panel reaches
+# WASAPI through cpal — hence the target table below.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { version = "0.8", optional = true }
+
 # --- hwaccel interop (optional; per-platform) ---
 # Version-locked to what `wgpu-hal` 22 itself links, because these types cross the
 # `wgpu::hal` boundary: a different `ash` or `d3d12` would be a different `vk::Image` /
@@ -139,6 +146,10 @@ ffmpeg = ["dep:ffmpeg-next"]
 # and a headless CI box has no sound card.
 audio = ["ffmpeg", "dep:ffmpeg-sys-next"]
 audio-out = ["audio", "dep:cpal"]
+# The native PipeWire backend. On Linux it takes precedence over `audio-out`'s
+# ALSA host (see `audio_select::active_backend`); on Windows it is inert, so a shared
+# feature list cross-builds cleanly.
+audio-pipewire = ["audio", "dep:pipewire"]
 # LDAC has no libav decoder and AOSP's libldac is encoder-only, so this needs the
 # reverse-engineered libldacdec (Q22). Without it the LDAC endpoint must not be
 # advertised at all.
