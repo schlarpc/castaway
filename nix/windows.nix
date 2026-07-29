@@ -301,6 +301,24 @@ let
     cp -r --no-preserve=mode,ownership ${widevine}/WidevineCdm "$out/bin/"
   '';
 
+  # The deploy tree as one zip, for getting onto the Windows box, which has no Nix store
+  # to copy `result` into: `nix build .#castaway-windows-electron.archive` →
+  # `result/castaway-windows-electron.zip`, unzipping to a single folder. zip rather than
+  # tar because Explorer opens it.
+  mkArchive = pkg: pkgs.runCommand "${pkg.pname}-archive"
+    {
+      nativeBuildInputs = [ pkgs.zip ];
+      meta.description = "The ${pkg.pname} deploy tree as a single zip";
+    } ''
+    cp -rL --no-preserve=mode,ownership ${pkg}/bin ${pkg.pname}
+    # The store's 1970 mtimes predate the zip format's 1980 DOS epoch; pin them at the
+    # epoch rather than letting zip clamp them with a warning per file. `-X` and the
+    # sorted name list keep the rebuild byte-identical.
+    find ${pkg.pname} -exec touch -d '1980-01-01 00:00:00 UTC' {} +
+    mkdir -p "$out"
+    find ${pkg.pname} | sort | zip -qX "$out/${pkg.pname}.zip" -@
+  '';
+
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
   mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withBrowser ? false }:
@@ -309,17 +327,23 @@ let
         + lib.optionalString (features != [ ])
         " --features ${lib.concatStringsSep "," features}";
       args = crossArgs // { inherit cargoExtraArgs; };
-    in
-    craneLib.buildPackage (args // {
-      inherit pname;
-      cargoArtifacts = craneLib.buildDepsOnly args;
+      pkg = craneLib.buildPackage (args // {
+        inherit pname;
+        cargoArtifacts = craneLib.buildDepsOnly args;
 
-      # Windows has no rpath and no /nix/store to resolve against: the loader looks for
-      # DLLs next to the .exe. Anything dynamically linked has to be copied in, or the
-      # binary dies at startup on the deploy box with a missing-DLL dialog.
-      postInstall = lib.optionalString withFfmpeg ''
-        cp ${ffmpeg}/bin/*.dll "$out/bin/"
-      '' + lib.optionalString withBrowser stageBrowser;
+        # Windows has no rpath and no /nix/store to resolve against: the loader looks for
+        # DLLs next to the .exe. Anything dynamically linked has to be copied in, or the
+        # binary dies at startup on the deploy box with a missing-DLL dialog.
+        postInstall = lib.optionalString withFfmpeg ''
+          cp ${ffmpeg}/bin/*.dll "$out/bin/"
+        '' + lib.optionalString withBrowser stageBrowser;
+      });
+    in
+    # `.archive` rides along on every artifact (`nix build .#<name>.archive`) instead of
+    # doubling the package set in flake.nix. passthru only, so it costs nothing unless
+    # asked for and doesn't change the package's own hash.
+    pkg.overrideAttrs (prev: {
+      passthru = (prev.passthru or { }) // { archive = mkArchive pkg; };
     });
 
   # DLLs Windows itself guarantees. Everything else has to travel with the binary.

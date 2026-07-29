@@ -2,19 +2,26 @@
 
 **Setup:** dev box is Linux (NixOS), deploy target is a Windows box wired to the Dell C6522QT.
 The design is ~90% portable Rust; the cross-build pain is contained to the same Windows-specific
-~10% (WinRT Miracast, DX12/D3D11 interop, CEF).
+~10% (WinRT Miracast, DX12/D3D11 interop).
 
-**Status:** the cross-build is real and lands from Nix — including CEF. `nix build
-.#castaway-windows-cef` produces a directory that can be copied to the Windows box and run.
-Nothing here needs a Windows machine or Windows CI to *build*; the physical box is still the only
-place to *test* the hardware paths.
+**Status:** the cross-build is real and lands from Nix. `nix build .#castaway-windows-electron`
+produces a directory that can be copied to the Windows box and run; append `.archive` to any
+Windows artifact for the same tree as a single zip. Nothing here needs a Windows machine or
+Windows CI to *build*; the physical box is still the only place to *test* the hardware paths.
+
+> Historical note: this document used to describe a CEF-based deploy artifact
+> (`.#castaway-windows-cef`, CEF's C++ wrapper cross-compiled with clang-cl and its runtime
+> flattened beside our exe). D36 replaced the browser layer with a prebuilt Electron (castLabs
+> ECS) subprocess on both platforms; the CEF-specific staging and CMake machinery is gone, and
+> what it taught us is folded into "the things that bite" below.
 
 ## Golden rule: don't gate daily dev on the cross-build
 
 The portable crates **build and run natively on the Linux dev box** — AirPlay, Cast (incl.
-desktop-mirroring), DLNA, Spotify, Lounge, the wgpu compositor (Vulkan), ffmpeg decode (VAAPI).
-Do daily dev/test here. Cross-build enters only for the Windows slice, and running it also
-continuously exercises your *future* Linux target.
+desktop-mirroring), DLNA, Spotify, Lounge, the wgpu compositor (Vulkan), ffmpeg decode (VAAPI),
+and the browser subprocess, because D36 pins the *same* ECS build on both platforms. Do daily
+dev/test here. Cross-build enters only for the Windows slice, and running it also continuously
+exercises your *future* Linux target.
 
 | Component | Build on Linux? | Test on Linux? | Notes |
 |---|---|---|---|
@@ -22,17 +29,23 @@ continuously exercises your *future* Linux target.
 | wgpu compositor | ✅ native (Vulkan) | ✅ native | DX12 path + D3D11 interop → Windows only |
 | ffmpeg decode | ✅ native (VAAPI) | ✅ native | Windows target links vendored libav import libs |
 | `windows` crate / Miracast `backend-windows` | ✅ cross (pure Rust bindings) | ❌ | deploy to Windows box; Wine won't do WinRT/Miracast |
-| CEF (cef-rs) | ✅ cross | ❌ | wrapper built with clang-cl; see the gotchas below |
+| Electron browser (castLabs ECS) | ✅ prebuilt, staged as-is | ✅ native, same ECS version | separate process — nothing to cross-compile (D36) |
 
 ## Artifacts
 
 | Output | Features | What it's for |
 |---|---|---|
 | `.#castaway-windows` | none | toolchain canary — if it stops linking, the toolchain broke, not the media stack |
-| `.#castaway-windows-render` | `render` | DX12 compositor + kiosk, no browser; bisect render problems without CEF's ~200 MB in the way |
+| `.#castaway-windows-render` | `render` | DX12 compositor + kiosk, no browser; bisect render problems without the browser runtime in the way |
 | `.#castaway-windows-hwaccel` | `hwaccel` | the D3D11VA → shared-NV12 → D3D12 decode bridge. Exists as its own artifact because it is the one part of Q20 Linux cannot exercise: the VA-API half has an offscreen readback test, this half has only the compiler until it reaches the Dell |
-| `.#castaway-windows-cef` | `cef` | the deploy artifact: render + offscreen browser + hwaccel, with the full CEF runtime staged |
+| `.#castaway-windows-electron` | `electron` | the deploy artifact: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
+
+Every Windows artifact also carries an `archive` passthru:
+`nix build .#castaway-windows-electron.archive` yields
+`result/castaway-windows-electron.zip` — the `bin/` tree as one zip, unzipping to a single
+folder on the box. Same content as the directory artifact, in the shape a USB stick or a
+remote-desktop clipboard wants.
 
 For an incremental loop, `nix develop .#windows` exports the whole cross environment (including
 `CARGO_BUILD_TARGET`), so plain `cargo build` cross-compiles. It's a **separate shell from
@@ -41,10 +54,9 @@ hijack the native dev loop.
 
 ## Target + toolchain: `x86_64-pc-windows-msvc`
 
-Use the **MSVC** target, not MinGW/`windows-gnu`: CEF's Windows import libs are MSVC-format and
-won't cleanly link against GNU, and windows-rs/WinRT is happiest on MSVC. The toolchain is all
-LLVM — `clang-cl` as the C/C++ driver, `lld-link` as the linker, `llvm-lib` as the archiver,
-`llvm-rc` for resources.
+Use the **MSVC** target, not MinGW/`windows-gnu`: windows-rs/WinRT is happiest on MSVC, and the
+vendored import libraries are MSVC-format. The toolchain is all LLVM — `clang-cl` as the C/C++
+driver, `lld-link` as the linker, `llvm-lib` as the archiver, `llvm-rc` for resources.
 
 `cargo-xwin` is the usual turnkey answer and it's what `nix/windows.nix` is modelled on, but it
 is **not** what runs the build: it wants a writable cache it can download the SDK into, which the
@@ -59,14 +71,13 @@ There is no `.cargo/config.toml` for this. Everything comes from the environment
 
 ## Vendored Windows dependencies
 
-Both archives are **flake inputs** (`ffmpeg-windows-src`, `cef-windows-src`, both `flake = false`),
-so their URLs and hashes live in `flake.lock` alongside nixpkgs and crane — one place to audit
-every external blob, one update story. They use the `file+https://` scheme, which yields the raw
-archive rather than an unpacked tree, because each needs layout fixups afterwards that a tarball
-input can't express. A `file+` input lands in the store named bare `source`, with no extension for
-stdenv to dispatch on, so both derivations unpack explicitly and assert on the expected top-level
-directory name — that assert is what catches a URL bump in `flake.nix` that forgot the matching
-`.nix` file.
+The prebuilt archives are **flake inputs** (`ffmpeg-windows-src`, `electron-windows-src`,
+`electron-linux-src`, `widevine-windows-src`, all `flake = false`), so their URLs and hashes
+live in `flake.lock` alongside nixpkgs and crane — one place to audit every external blob, one
+update story. They use the `file+https://` scheme, which yields the raw archive rather than an
+unpacked tree, so unpacking and layout policy live in the `.nix` files instead of being fixed
+by the fetcher. A `file+` input lands in the store named bare `source`, with no extension for
+stdenv to dispatch on, so each derivation unpacks explicitly.
 
 The MSVC sysroot is deliberately *not* an input: it isn't fetched, it's *generated* by running
 `xwin`, so it stays a fixed-output derivation (`nix/msvc-sysroot.nix`) pinned by `outputHash`. Note
@@ -76,66 +87,62 @@ splat behaviour can break the hash even though `crtVersion`/`sdkVersion` haven't
 - **ffmpeg** (`nix/ffmpeg-windows.nix`) — a prebuilt LGPL BtbN build, pinned to an immutable
   `autobuild-*` release tag rather than `latest`, whose assets are replaced daily. The archive
   already ships the exact `FFMPEG_DIR` layout (`include/`, `lib/*.lib`, `bin/*.dll`), so the
-  install is a straight copy.
+  install is a straight copy, plus an assert on the expected top-level directory name — which
+  is what catches a URL bump in `flake.nix` that forgot the matching `.nix` file.
 
   Prebuilt rather than source-built because nixpkgs marks `pkgsCross.mingwW64.ffmpeg` broken on
   64-bit MinGW, and it is: trimming it to a decode-only build just walks into the next transitive
   dependency with no mingw platform support. MSVC import libraries are ABI-neutral across a DLL
   boundary (plain C ABI), which is why gcc-built ffmpeg DLLs link fine under `lld-link`.
 
-- **CEF** (`nix/cef-windows.nix`) — the Windows binary distribution, keeping the **full** upstream
-  layout, unlike the flattened Linux `cefDist` in `flake.nix`. On Linux `cef-dll-sys` only emits
-  `-l cef`; on Windows it additionally runs CMake over the distribution to build
-  `libcef_dll_wrapper`, so `CMakeLists.txt`, `cmake/`, `include/` and `libcef_dll/` all have to
-  survive. Two additions on top: an `archive.json` (cef-dll-sys refuses a `CEF_PATH` without one)
-  and a root `libcef.lib` symlink (the build script emits `link-search=native={CEF_PATH}` at the
-  root but upstream puts the import lib under `Release/`).
+- **Electron** — castLabs "Electron for Content Security" (ECS), the browser runtime (D36).
+  Two inputs, `electron-windows-src` for the deploy artifact and `electron-linux-src` for
+  dev/CI, and they must be **bumped together**: one Chromium major everywhere is the point,
+  or every codec, DRM, and offscreen behaviour verified in CI was verified against a browser
+  we do not ship. The win32 zip is unpacked verbatim in `nix/windows.nix` with no layout
+  fixups — deliberately, see the runtime-layout section: EVS signs these exact files.
 
-### One CEF version, three pins
+- **Widevine CDM** (`nix/widevine-windows.nix`) — the CRX3 that Chrome's own component updater
+  installs, pre-staged so DRM-gated video plays on a panel that has never been online (Q42).
+  Pinned by hand to the same version nixpkgs' `widevine-cdm` pins for Linux; there is **no
+  eval-time assert** tying the two, so a `nix flake update` that moves the nixpkgs side is a
+  drift to catch by hand at review time. The CDM is unfree: unpacking is gated by
+  `allowUnfreePredicate`, and the build `tryEval`s it — a build that cannot have the CDM is a
+  receiver without DRM rather than no receiver at all.
 
-The CEF version is fixed in three unrelated places and all three must agree:
+## Cross-compiling C/C++: the things that bite
 
-| Pin | Where | Moves when |
-|---|---|---|
-| nixpkgs `cef-binary` | `cefDist` in `flake.nix` — what the **Linux** dev shell runs | `nix flake update` |
-| `cef-windows-src` | `flake.nix` input — what ships on **Windows** | never, by hand |
-| `cef`/`cef-dll-sys` crates | `crates/pipeline/Cargo.toml` | never, by hand |
+All handled in `nix/windows.nix`. Most were learned cross-building CEF's C++ wrapper — no
+third-party CMake build remains in the tree since D36 — but the machinery stays, because it is
+also how every build-script (`cc`-crate) compile works, and each lesson comes back with the
+next native dependency.
 
-Only the first moves on its own, which is the whole hazard: nixpkgs drifting ahead silently turns
-every browser bug into "does it reproduce on the box?". `cef-dll-sys` already enforces the third
-against the second by parsing `archive.json`, so `nix/cef-windows.nix` closes the loop with an
-eval-time assert against `cef-binary.version`. A mismatch fails `nix flake check` with a message
-naming both versions rather than producing two subtly different builds.
+1. **Third-party build systems lose flags you hand them.** CEF's cmake *overwrote*
+   `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` rather than appending, discarding everything a toolchain
+   file set before the first object compiled. So the cross flags live in a `clang-cl`
+   **wrapper script**, where no build system can lose them — same idea as the nixpkgs
+   cc-wrapper. The wrapper injects flags on *both* sides of the caller's arguments: leading
+   ones a caller may override, trailing ones must win. Trailing flags land **before** any `--`
+   separator — everything after that is an input filename.
 
-## Cross-building CEF: the four things that bite
+2. **`/WX` third-party code is calibrated against MSVC's `/W4`, and clang-cl's `/W4` is a
+   different warning set** — warnings MSVC never emits become hard errors in code we don't own.
+   The wrapper's trailing `-Wno-error` demotes them back rather than playing whack-a-mole with
+   per-divergence `-Wno-` flags.
 
-All fixed in `nix/windows.nix`; recorded here because each is non-obvious and each will come back
-on a CEF version bump.
+3. **Case-sensitivity.** Windows sources are written against a case-insensitive filesystem, so
+   an `#include` may spell a header differently from the file on disk. xwin symlinks every SDK
+   header under its all-lowercase name, which covers most of it but not mixed-case misspellings
+   (the worked example, still in the shim list: `<Softpub.h>` vs the SDK's `SoftPub.h`).
+   `nix/windows.nix` shims the requested spelling into an overlay include dir rather than
+   patching third-party sources. To find more: list every `#include` name in the sources being
+   cross-compiled that has no exact match in the sysroot but does have a case-insensitive one.
 
-1. **CEF's cmake overwrites `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS`** rather than appending, so
-   everything a toolchain file sets is discarded before the first object compiles. The fix is to
-   move the cross flags into a `clang-cl` **wrapper script**, where no third-party build system
-   can lose them. Same idea as the nixpkgs cc-wrapper.
-
-2. **`/WX` is calibrated against MSVC's `/W4`, and clang-cl's `/W4` is a different warning set.**
-   `/MP` (unimplemented in clang-cl) and `-Wmissing-field-initializers` (firing on CEF's own
-   `cef_types_wrappers.h`) both became hard errors. The wrapper injects flags on *both* sides of
-   the caller's arguments: leading ones a caller may override, trailing ones must win. Trailing
-   flags have to land **before** any `--` separator — everything after that is an input filename.
-
-3. **Case-sensitivity.** `cef_certificate_util_win.cc` includes `<Softpub.h>`; the SDK ships
-   `SoftPub.h`. xwin symlinks every SDK header under its all-lowercase name, which covers most
-   of it but not mixed-case misspellings. `nix/windows.nix` shims the requested spelling into an
-   overlay include dir rather than patching CEF. To find more after a bump: list every `#include`
-   name in the sources being cross-compiled that has no exact match in the sysroot but does have
-   a case-insensitive one.
-
-4. **CRT linkage must agree across the whole image.** CEF builds its wrapper `/MT` while Rust's
-   windows-msvc target defaults to the dynamic CRT. Two CRTs in one image means two heaps and two
-   errno/locale states, and memory allocated on one side and freed on the other corrupts —
-   `lld-link` resolves the mismatch *without a diagnostic* and lets it fail at runtime. It's one
-   knob (`crtStatic`) driving both `CMAKE_MSVC_RUNTIME_LIBRARY`/`CEF_RUNTIME_LIBRARY_FLAG` and
-   rustc's `target-feature=+crt-static`.
+4. **CRT linkage must agree across the whole image.** Rust's std and every build-script-compiled
+   C object end up in one binary, and two CRTs there means two heaps and two errno/locale states
+   — memory allocated on one side and freed on the other corrupts. `lld-link` resolves a
+   mismatch *without a diagnostic* and lets it fail at runtime, so it's one knob (`crtStatic`)
+   driving rustc's `target-feature=+crt-static` and the flags handed to any C compile.
 
    We pick **static**, so the deploy box needs no Visual C++ redistributable. That costs one
    host-side workaround: cc-rs turns `crt-static` into a bare `-static` for *any* GNU-family
@@ -148,15 +155,21 @@ on a CEF version bump.
 ## Runtime layout
 
 Windows has no rpath and no `/nix/store` to resolve against: the loader looks for DLLs next to
-the `.exe`. So everything dynamically linked is staged into `bin/` beside `castaway.exe` — the
-libav DLLs, and for the CEF build the whole flat CEF runtime.
+the `.exe`. So everything our binary links dynamically is staged into `bin/` beside
+`castaway.exe` — the libav DLLs — and the electron artifact stages the browser beside it as its
+own subtree, since Electron is a separate process with its own DLLs and nothing browser-side
+needs flattening into ours:
 
-CEF splits its distribution into `Release/` and `Resources/` for its own CMake build, but at
-runtime it resolves everything relative to the module directory, which is where an empty
-`Settings::resources_dir_path` points it. `cef_browser.rs` deliberately leaves those empty when
-`CEF_PATH` is unset — which is the case on the deploy box, since there's no `/nix/store` there to
-point at. `bootstrap.exe` is **not** staged: it's the entry point for CEF's sandboxed
-"app is a DLL" mode, and we initialize with `no_sandbox` and ship a real `.exe`.
+- `bin/browser/` — the ECS win32 distribution, **byte-for-byte as castLabs shipped it**. EVS
+  signs these exact files; a modified tree invalidates the VMP signature, and an unsigned
+  Widevine host is refused licences by exactly the services it exists to host.
+- `bin/browser-host/` — our Electron host app, launched from the receiver.
+- `bin/WidevineCdm/` — staged for the receiver to copy into the browser profile on first run,
+  not loaded from here: ECS resolves its CDM under `<userDataDir>/WidevineCdm/<version>/`, a
+  runtime path (see `browser-host/stage-widevine.sh` and Q42). Present only when the unfree
+  gate allows it.
+- `bin/vmp-sign.sh` — the VMP signing step travels with the artifact rather than living only
+  in the repo: it runs on whoever deploys, after Authenticode, and needs the tree beside it.
 
 ### The DLL closure is checked, not eyeballed
 
@@ -166,6 +179,9 @@ as a modal dialog on a wall-mounted panel with nobody standing there to dismiss 
 audited allowlist of DLLs Windows itself guarantees (`systemDlls` in `nix/windows.nix`). Windows
 binaries can't be executed on the builder, so a static check of what the loader will go looking
 for is the closest thing to a smoke test available without the hardware.
+
+The check reads `castaway.exe`'s import table (including delay-loads). The ECS tree is out of
+scope by design: it's a separate process shipping its own complete DLL set, verified upstream.
 
 If a legitimate new system DLL shows up, add it to `systemDlls` *with a note on where it comes
 from* — the list is an allowlist, not a suppression list.
@@ -183,16 +199,18 @@ compiled in — it isn't selected.
 
 ## Testing matrix — Wine won't save you
 
-- **Native Linux:** portable protocols, wgpu/Vulkan, ffmpeg/VAAPI, all unit tests. This is 90% of dev.
+- **Native Linux:** portable protocols, wgpu/Vulkan, ffmpeg/VAAPI, the ECS browser (same build
+  that ships), all unit tests. This is 90% of dev.
 - **Cross-build checks (`nix flake check`):** the Windows artifacts link, and their DLL closures
   are satisfied. No execution.
 - **Physical Windows box (C6522QT-attached):** the *only* place Miracast/WinRT/DX12-interop/
-  CEF-render integration is real. Deploy the artifact here for hardware tests. Wine has no
-  Miracast receiver API, no real Wi-Fi Direct, dicey DX12/CEF — not a test path.
+  browser-frame-import integration is real. Deploy the artifact here for hardware tests. Wine
+  has no Miracast receiver API, no real Wi-Fi Direct, dicey DX12 — not a test path.
 
 ## Bottom line
 
-Daily dev = native Linux. Windows slice = `nix build .#castaway-windows-cef`, fully from the Linux
-box, CEF included — the Windows-CI escape hatch this document used to recommend turned out not to
-be needed. Integration testing = the physical C6522QT Windows box. The whole cross-build concern
-stays quarantined in the same ~10% that's already non-portable.
+Daily dev = native Linux. Windows slice = `nix build .#castaway-windows-electron` (append
+`.archive` for the zip), fully from the Linux box, browser included — the Windows-CI escape
+hatch this document used to recommend turned out not to be needed. Integration testing = the
+physical C6522QT Windows box. The whole cross-build concern stays quarantined in the same ~10%
+that's already non-portable.
