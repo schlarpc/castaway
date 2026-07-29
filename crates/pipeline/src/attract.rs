@@ -557,6 +557,13 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     // fill is what an un-painted card shows — an empty panel rather than a hole.
     if let Some(card) = l.card {
         let (cx, cy) = (card.x as f32, card.y as f32);
+        // Her lower torso goes down first, so the card frame drawn next covers it where
+        // they overlap: she is *behind* the panel she leans on, edge and all. Her
+        // foreground half is not here at all — it is the MascotOverlay layer, composited
+        // above the live page (see `render_mascot_overlay`).
+        if scene.mascot {
+            draw_mascot_inner(&mut buf, width, height, s, l.card);
+        }
         let (cw, ch) = (card.width as f32, card.height as f32);
         // The largest object on the screen had the thinnest, flattest edge on it, so the
         // tiles outranked the thing that shows a live dashboard. A heavier frame with a
@@ -603,10 +610,10 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
         );
     }
 
-    // DMA-chan, hanging by her elbows over the top edge of the widget card. Drawn after
-    // the card so she overlaps it, and before the tiles because she is never near them.
-    if scene.mascot {
-        draw_mascot(&mut buf, width, height, s, l.card);
+    // With no card there is no panel to lean on and no page to layer against: she
+    // stands whole in the corner, drawn straight into the scene.
+    if scene.mascot && l.card.is_none() {
+        draw_mascot(&mut buf, width, height, s, None);
     }
 
     // Tiles, from the same layout the hit test reads, so the two cannot disagree about
@@ -618,29 +625,27 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
-/// The mascot, decoded from the vendored PNG and drawn at a height proportional to the
-/// panel. Decoding per render is fine: Home is drawn on navigation and resize, not per
-/// frame.
-fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<InsetRect>) {
-    // Two layers, as the site stacks them: `inner` is her lower torso alone and `outer`
-    // is head, arms and sash. Drawing only the outer one left her without a lower half,
-    // which read as a cropping bug rather than a missing layer.
-    const MASCOT_OUTER: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
-    const MASCOT_INNER: &[u8] = include_bytes!("../assets/brand/mascot-inner.png");
-    let (Ok(outer), Ok(inner)) = (
-        image::load_from_memory(MASCOT_OUTER),
-        image::load_from_memory(MASCOT_INNER),
-    ) else {
-        return;
-    };
-    let outer = outer.to_rgba8();
-    let inner = inner.to_rgba8();
-    let img = &outer;
-    // She hangs over the panel's top edge with her elbows dangling across it. Only the
-    // very bottom of her crosses that line — everything below it lands inside the card's
-    // rect, which the browser layer covers exactly, so the overhang is hidden behind the
-    // panel she is leaning on without anything having to clip it.
-    const OVERHANG: f32 = 0.10;
+// Two layers, as the site stacks them: `inner` is her lower torso alone and `outer` is
+// head, arms and sash. The split is load-bearing (and why the art ships as two files):
+// the torso goes *behind* the widget card — frame and all — while the arms leaning on
+// its top edge land *in front of* the live page inside it, which only a compositor
+// layer above the page can do.
+const MASCOT_OUTER: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
+const MASCOT_INNER: &[u8] = include_bytes!("../assets/brand/mascot-inner.png");
+
+/// She hangs over the panel's top edge with her elbows dangling across it; this is how
+/// much of her height crosses the line.
+const OVERHANG: f32 = 0.10;
+
+/// Where the mascot sits: pixel origin and target size, shared by the scene's inner
+/// half and the overlay's outer half so the two cannot land misaligned.
+fn mascot_placement(
+    width: u32,
+    height: u32,
+    s: f32,
+    card: Option<InsetRect>,
+    (iw, ih): (u32, u32),
+) -> Option<(f32, f32, u32, u32)> {
     // Sized from the room above the panel rather than from a number, so the overhang is
     // 10% at any resolution and she never has to be clamped against the top of the
     // screen — a clamp would silently push her further over the edge, which is exactly
@@ -653,9 +658,8 @@ fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<Ins
         None => (190.0 * s) as u32,
     };
     if target_h == 0 {
-        return;
+        return None;
     }
-    let (iw, ih) = (img.width().max(1), img.height().max(1));
     let target_w = (target_h as f32 * iw as f32 / ih as f32) as u32;
     let (ox, oy) = match card {
         Some(card) => (
@@ -671,31 +675,125 @@ fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<Ins
             height as f32 - target_h as f32 - 60.0 * s,
         ),
     };
-    // Inner (the lower torso) first, then outer over it: her arms and hands are on the
-    // outer layer and have to occlude the body, not be painted under it.
-    for layer in [&inner, &outer] {
-        for py in 0..target_h {
-            for px in 0..target_w {
-                // Nearest-neighbour, like the album-art path: the source is far larger
-                // than the target, so the artefacts a filter would fix are not visible.
-                let sx = px * iw / target_w.max(1);
-                let sy = py * ih / target_h.max(1);
-                let p = layer.get_pixel(sx.min(iw - 1), sy.min(ih - 1)).0;
-                if p[3] == 0 {
-                    continue;
-                }
-                text::blend_over(
-                    buf,
-                    width,
-                    height,
-                    (ox + px as f32) as i32,
-                    (oy + py as f32) as i32,
-                    [p[0], p[1], p[2], 0xff],
-                    f32::from(p[3]) / 255.0,
-                );
+    Some((ox, oy, target_w, target_h))
+}
+
+/// Draw one mascot layer into `buf` at the placement, scaled nearest-neighbour — like
+/// the album-art path: the source is far larger than the target, so the artefacts a
+/// filter would fix are not visible.
+fn blit_mascot_layer(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    layer: &image::RgbaImage,
+    (ox, oy, target_w, target_h): (f32, f32, u32, u32),
+) {
+    let (iw, ih) = (layer.width().max(1), layer.height().max(1));
+    for py in 0..target_h {
+        for px in 0..target_w {
+            let sx = px * iw / target_w.max(1);
+            let sy = py * ih / target_h.max(1);
+            let p = layer.get_pixel(sx.min(iw - 1), sy.min(ih - 1)).0;
+            if p[3] == 0 {
+                continue;
             }
+            text::blend_over(
+                buf,
+                width,
+                height,
+                (ox + px as f32) as i32,
+                (oy + py as f32) as i32,
+                [p[0], p[1], p[2], 0xff],
+                f32::from(p[3]) / 255.0,
+            );
         }
     }
+}
+
+/// Both mascot layers straight into the scene — the card-less arrangement, where there
+/// is nothing for her to be behind or in front of. Inner first, then outer over it: her
+/// arms and hands have to occlude the body, not be painted under it.
+fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<InsetRect>) {
+    let (Ok(outer), Ok(inner)) = (
+        image::load_from_memory(MASCOT_OUTER),
+        image::load_from_memory(MASCOT_INNER),
+    ) else {
+        return;
+    };
+    let outer = outer.to_rgba8();
+    let inner = inner.to_rgba8();
+    let Some(placement) = mascot_placement(width, height, s, card, (outer.width(), outer.height()))
+    else {
+        return;
+    };
+    blit_mascot_layer(buf, width, height, &inner, placement);
+    blit_mascot_layer(buf, width, height, &outer, placement);
+}
+
+/// The torso alone, into the scene, to be covered by the card frame drawn after it.
+fn draw_mascot_inner(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<InsetRect>) {
+    let (Ok(outer), Ok(inner)) = (
+        image::load_from_memory(MASCOT_OUTER),
+        image::load_from_memory(MASCOT_INNER),
+    ) else {
+        return;
+    };
+    let outer = outer.to_rgba8();
+    let inner = inner.to_rgba8();
+    // Placement from the *outer* image's dimensions for both halves: the two files are
+    // the same canvas, and sizing each from itself would let them drift.
+    let Some(placement) = mascot_placement(width, height, s, card, (outer.width(), outer.height()))
+    else {
+        return;
+    };
+    blit_mascot_layer(buf, width, height, &inner, placement);
+}
+
+/// The mascot's foreground half, rasterised alone on transparency for the
+/// `MascotOverlay` compositor layer, with the rect it belongs at.
+///
+/// `None` when the scene has no mascot, no widget card to lean on (the corner
+/// arrangement draws her whole into the scene instead), or no room for her.
+#[must_use]
+pub fn render_mascot_overlay(
+    scene: &AttractScene,
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u8>, InsetRect)> {
+    if !scene.mascot {
+        return None;
+    }
+    let card = scene.widget.rect(width, height)?;
+    let s = height.max(1) as f32 / DESIGN_HEIGHT;
+    let outer = image::load_from_memory(MASCOT_OUTER).ok()?.to_rgba8();
+    let (ox, oy, target_w, target_h) = mascot_placement(
+        width,
+        height,
+        s,
+        Some(card),
+        (outer.width(), outer.height()),
+    )?;
+    if target_w == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; (target_w * target_h * 4) as usize];
+    // Into a buffer exactly her size, at the origin; the layer's transform places it.
+    blit_mascot_layer(
+        &mut buf,
+        target_w,
+        target_h,
+        &outer,
+        (0.0, 0.0, target_w, target_h),
+    );
+    Some((
+        buf,
+        InsetRect {
+            x: ox.max(0.0) as u32,
+            y: oy.max(0.0) as u32,
+            width: target_w,
+            height: target_h,
+        },
+    ))
 }
 
 /// Draw one tile: a rounded plate, its glyph, and a label under it.

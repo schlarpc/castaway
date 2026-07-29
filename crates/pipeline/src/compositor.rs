@@ -140,6 +140,13 @@ pub enum LayerId {
     /// idle background it sits in, below a session's card, because a session that is
     /// actually playing outranks an ornament.
     BrowserWidget,
+    /// The mascot's foreground half — head, arms, sash — leaning over the widget card's
+    /// top edge. A layer of its own because the split is the point: her torso is drawn
+    /// *into* the idle scene behind the card frame, and her arms have to land in front
+    /// of the live page the card holds, which no amount of drawing into the scene below
+    /// that page can do. Never occludes: it is line art over transparency, and a layer
+    /// this test cannot see through would swallow touches meant for the card.
+    MascotOverlay,
     /// The now-playing card for an audio-only session, which has no pixels of its own.
     /// Above the attract scene, below video — a sender with pixels outranks a card about
     /// a sender without them.
@@ -172,15 +179,16 @@ impl LayerId {
     /// had just been opened.
     #[must_use]
     pub const fn occludes(self) -> bool {
-        !matches!(self, Self::ShellPrev)
+        !matches!(self, Self::ShellPrev | Self::MascotOverlay)
     }
 
     /// Every layer, in paint order. The ordering test asserts against this rather than
     /// against a hand-written list, so a new variant cannot be added without placing it.
-    pub const PAINT_ORDER: [Self; 9] = [
+    pub const PAINT_ORDER: [Self; 10] = [
         Self::Attract,
         Self::ShellPrev,
         Self::BrowserWidget,
+        Self::MascotOverlay,
         Self::NowPlaying,
         Self::Transport,
         Self::Video,
@@ -212,7 +220,11 @@ impl LayerId {
     #[must_use]
     pub const fn yields_to(self) -> &'static [Self] {
         match self {
-            Self::BrowserWidget => &[Self::NowPlaying, Self::Transport, Self::Video],
+            // The widget and the mascot leaning on it are one ornament in two layers;
+            // they leave the stage together.
+            Self::BrowserWidget | Self::MascotOverlay => {
+                &[Self::NowPlaying, Self::Transport, Self::Video]
+            }
             Self::Attract
             | Self::ShellPrev
             | Self::NowPlaying
@@ -408,10 +420,15 @@ mod tests {
                 );
             }
         }
-        // The widget is the only ornament with this behavior today; a new entry here
+        // The mascot overlay is the widget's other half and leaves with it.
+        assert_eq!(
+            LayerId::MascotOverlay.yields_to(),
+            LayerId::BrowserWidget.yields_to()
+        );
+        // These two are the only ornaments with this behavior today; a new entry here
         // should come with the same kind of reasoning, not by accident.
         for id in LayerId::PAINT_ORDER {
-            if id != LayerId::BrowserWidget {
+            if !matches!(id, LayerId::BrowserWidget | LayerId::MascotOverlay) {
                 assert!(id.yields_to().is_empty(), "{id:?} unexpectedly yields");
             }
         }

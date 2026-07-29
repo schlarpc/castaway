@@ -1706,9 +1706,13 @@ impl RenderLoop {
         // The shell half of the idle widget's visibility (see `attract_widget_covered`):
         // recomputed and handed down every frame, so it is a standing fact rather than a
         // transition to be caught. The session half the compositor derives itself from
-        // `LayerId::yields_to`.
+        // `LayerId::yields_to`. The mascot overlay is the widget's other half and
+        // follows the same verdict.
+        let off_home = self.shell_depth() > 1;
         self.compositor
-            .set_suppressed(LayerId::BrowserWidget, self.shell_depth() > 1);
+            .set_suppressed(LayerId::BrowserWidget, off_home);
+        self.compositor
+            .set_suppressed(LayerId::MascotOverlay, off_home);
         if self.taps.is_empty() {
             self.compositor.present();
             return;
@@ -2194,6 +2198,30 @@ impl RenderLoop {
         let (w, h) = self.compositor.target_size();
         let (w, h) = (w.max(1), h.max(1));
         let rgba = self.render_screen(screen, w, h)?;
+        // The mascot's foreground half rides its own layer above the widget's page (see
+        // `LayerId::MascotOverlay`). Rasterised alongside Home and carried while other
+        // screens are up — suppression keeps it off them — so coming back to Home does
+        // not redraw her.
+        if let crate::shell::Screen::Home(scene) = screen {
+            match crate::attract::render_mascot_overlay(scene, w, h) {
+                Some((pixels, rect)) => {
+                    self.compositor.upload_texture(
+                        LayerId::MascotOverlay,
+                        rect.width,
+                        rect.height,
+                        // Authored art: sRGB in, sRGB out.
+                        TexelFormat::Rgba8Srgb,
+                        &pixels,
+                    )?;
+                    self.compositor.upsert_layer(Layer {
+                        id: LayerId::MascotOverlay,
+                        opacity: 1.0,
+                        transform: rect.transform(w, h),
+                    });
+                }
+                None => self.compositor.remove_layer(LayerId::MascotOverlay),
+            }
+        }
         self.set_attract(w, h, &rgba)
     }
 }
