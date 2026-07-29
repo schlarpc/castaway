@@ -83,7 +83,10 @@ impl WidgetSlot {
                 // from across the room, not merely present.
                 let card_w = (w * 42 / 100).clamp(1, w);
                 let card_h = (card_w * 9 / 16).clamp(1, h);
-                let top = margin.min(h.saturating_sub(card_h));
+                // Sits a little below the top margin, because the mascot leans on its
+                // top edge and her size is derived from the room above it — at the bare
+                // margin she comes out too small to read from across the room.
+                let top = (margin * 8 / 5).min(h.saturating_sub(card_h));
                 Some(InsetRect {
                     x: w.saturating_sub(margin.saturating_add(card_w)),
                     y: top,
@@ -522,27 +525,32 @@ fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<Ins
     let Ok(img) = image::load_from_memory(MASCOT) else {
         return;
     };
-    let target_h = (276.0 * s) as u32;
+    let img = img.to_rgba8();
+    // She hangs over the panel's top edge with her elbows dangling across it. Only the
+    // very bottom of her crosses that line — everything below it lands inside the card's
+    // rect, which the browser layer covers exactly, so the overhang is hidden behind the
+    // panel she is leaning on without anything having to clip it.
+    const OVERHANG: f32 = 0.10;
+    // Sized from the room above the panel rather than from a number, so the overhang is
+    // 10% at any resolution and she never has to be clamped against the top of the
+    // screen — a clamp would silently push her further over the edge, which is exactly
+    // what a fixed size did.
+    let target_h = match card {
+        Some(card) => {
+            let room = (card.y as f32 - 12.0 * s).max(0.0);
+            (room / (1.0 - OVERHANG)) as u32
+        }
+        None => (190.0 * s) as u32,
+    };
     if target_h == 0 {
         return;
     }
-    let img = img.to_rgba8();
     let (iw, ih) = (img.width().max(1), img.height().max(1));
     let target_w = (target_h as f32 * iw as f32 / ih as f32) as u32;
-
-    // She leans on the panel: elbows on its top edge, legs dangling behind it. Everything
-    // below that edge lands inside the card's rect, which the browser layer covers
-    // exactly — so the part that would be "behind" the panel is hidden by it, for free.
-    //
-    // ARM_LINE is how far down her drawing her arms sit; putting that line on the card's
-    // top edge is what makes her rest on it rather than float above or sink into it.
-    const ARM_LINE: f32 = 0.62;
     let (ox, oy) = match card {
         Some(card) => (
-            card.x as f32 + card.width as f32 * 0.62,
-            // Never above the top of the panel: her antennae are the tallest thing she
-            // has and clipping them looks like a broken sprite rather than a lean.
-            (card.y as f32 - target_h as f32 * ARM_LINE).max(6.0 * s),
+            card.x as f32 + card.width as f32 * 0.64,
+            card.y as f32 - target_h as f32 * (1.0 - OVERHANG),
         ),
         // No panel to lean on: stand her in the corner instead.
         None => (
