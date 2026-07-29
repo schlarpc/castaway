@@ -371,10 +371,14 @@ rec {
     withFfmpeg = true;
   };
 
-  # The full deploy artifact: render + the offscreen Electron browser (YouTube leanback via DIAL).
+  # The full deploy artifact: render + the offscreen Electron browser (YouTube leanback
+  # via DIAL), and a real PCM device. `audio-out` is WASAPI here (cpal reaches it
+  # through the OS, no extra DLLs), which is also what makes the settings screen's
+  # output-device selection mean something on the panel. `audio-pipewire` is deliberately
+  # absent: its dependency table is Linux-only and the feature would be inert weight.
   castaway-electron = mkCastaway {
     pname = "castaway-windows-electron";
-    features = [ "electron" ];
+    features = [ "electron" "audio-out" ];
     withFfmpeg = true;
     withBrowser = true;
   };
