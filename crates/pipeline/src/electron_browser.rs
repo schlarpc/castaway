@@ -779,7 +779,8 @@ impl ElectronHost {
         self
     }
 
-    /// Leave a fullscreen page, if that is what the browser is showing.
+    /// Leave a fullscreen page, if that is what the browser is showing. Returns whether
+    /// there was one to leave, so a back control knows the press is spent.
     ///
     /// The home gesture's missing half. Bringing the shell forward *demotes* video to a
     /// corner, but a fullscreen page has no demoted form — it is opaque, above the
@@ -787,10 +788,12 @@ impl ElectronHost {
     /// Leaving a page means leaving it: same endpoint a DIAL stop reaches, returning
     /// the idle widget (or nothing). The widget role is left alone — it *is* the home
     /// screen's own content.
-    pub fn dismiss_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+    pub fn dismiss_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
         if self.role == BrowserRole::Fullscreen {
             self.hide(render);
+            return true;
         }
+        false
     }
 
     /// Track the kiosk surface size so the browser viewport matches.

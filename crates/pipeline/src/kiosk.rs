@@ -115,7 +115,7 @@ impl KioskApp {
             // the gesture completed and the panel looked exactly the same.
             #[cfg(feature = "electron")]
             if let Some(browser) = self.browser.as_mut() {
-                browser.dismiss_fullscreen(render);
+                let _ = browser.dismiss_fullscreen(render);
             }
             render.shell_home();
             // Bring the shell in front. If something is playing it is demoted to a
@@ -124,6 +124,31 @@ impl KioskApp {
             render.set_shell_foreground(true);
             info!("shell: home");
         }
+    }
+
+    /// One step out, from wherever the panel is: a fullscreen cast surface is left
+    /// first, then a pushed shell screen, and finally the shell comes forward over
+    /// whatever is playing. The keyboard twin of the back gesture — each press spends
+    /// itself on the topmost thing that can be left.
+    fn back_one_level(&mut self) {
+        if let Some(sink) = self.input_sink() {
+            sink.cancel_all();
+        }
+        let Some(render) = self.render.as_mut() else {
+            return;
+        };
+        #[cfg(feature = "electron")]
+        if let Some(browser) = self.browser.as_mut() {
+            if browser.dismiss_fullscreen(render) {
+                info!("shell: escape left the cast surface");
+                return;
+            }
+        }
+        if render.shell_back() {
+            info!("shell: escape went back");
+            return;
+        }
+        render.set_shell_foreground(true);
     }
 
     /// Update the pill layer for this frame. Cheap: while it is up and unchanging this
@@ -534,6 +559,21 @@ impl ApplicationHandler for KioskApp {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         self.route_input(&event);
         match event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Escape backs out one level, and is handled *here*, never delegated to
+                // a page: the browser receives input only through the touch/pointer
+                // protocol, so a key the kiosk consumes cannot leak into a page that
+                // might be listening for it. One level means what the back gesture
+                // means: a fullscreen cast surface is left first, then a pushed shell
+                // screen, and Home absorbs the rest.
+                if event.state == winit::event::ElementState::Pressed
+                    && !event.repeat
+                    && event.logical_key
+                        == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                {
+                    self.back_one_level();
+                }
+            }
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.size = (size.width, size.height);
