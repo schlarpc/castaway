@@ -1,8 +1,8 @@
 //! The credential provider: fallback order, disk cache, and background refresh.
 //!
 //! This is the only module here that touches a socket or the filesystem
-//! (ground rule 3). Everything it decides is decided from [`api`](crate::api),
-//! [`table`](crate::table) and [`cache`](crate::cache), which are pure.
+//! (ground rule 3). Everything it decides is decided from [`crate::api`],
+//! [`crate::table`] and [`crate::cache`], which are pure.
 //!
 //! ## Resolution order
 //!
