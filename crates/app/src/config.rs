@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+pub use cast_cks::OfflineIdentity;
 use castaway_core::ProtocolKind;
 use serde::Deserialize;
 
@@ -403,10 +404,28 @@ pub struct Cks {
     pub enabled: bool,
     /// Whether the backend may be contacted.
     ///
-    /// Turning this off pins the receiver to the checked-in table — which works,
+    /// Turning this off pins the receiver to the checked-in tables — which works,
     /// offline, until 2027-12-06 and not one window past it. The backend is the
     /// only thing that extends past that date.
     pub network: bool,
+    /// Which checked-in identities to fall back to, in order.
+    ///
+    /// Two are shipped, and they are *different devices on different branches of
+    /// the Cast PKI* — `cks` is AirReceiver's (`Eureka Gen1 ICA`, through
+    /// 2027-12-06), `airserver` is AirServer's (`Widevine Cast Subroot`, through
+    /// 2027-03-21). The default order prefers `cks` because it lasts eight months
+    /// longer.
+    ///
+    /// The reason to change it is **revocation**. Both identities are borrowed and
+    /// shared with every install of the product they came from, and Google can
+    /// revoke either one; the symptom is a clean TLS handshake followed by every
+    /// sender refusing to talk, with nothing in our logs saying why. If that
+    /// happens, reversing this list is the fix. Nothing in the receiver can detect
+    /// it, which is why this is a knob and not an inference.
+    ///
+    /// An empty list means no offline fallback at all: Cast then depends on the
+    /// backend being reachable, and fails loudly when it is not.
+    pub offline_order: Vec<OfflineIdentity>,
 }
 
 impl Default for Cks {
@@ -414,6 +433,7 @@ impl Default for Cks {
         Self {
             enabled: true,
             network: true,
+            offline_order: vec![OfflineIdentity::Cks, OfflineIdentity::AirServer],
         }
     }
 }

@@ -914,6 +914,7 @@ async fn spawn_cast(
             let provider = Arc::new(
                 CksProvider::resolve(CksConfig {
                     network: config.cast.cks.network,
+                    offline_order: config.cast.cks.offline_order.clone(),
                     ..CksConfig::default()
                 })
                 .await

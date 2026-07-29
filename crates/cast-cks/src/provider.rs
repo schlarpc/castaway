@@ -9,15 +9,38 @@
 //! 1. **The cache**, if it holds a credential still inside its window. A cached
 //!    credential *is* a previously fetched one, so using it is not a downgrade —
 //!    it just avoids spending a request per restart on material we already have.
-//! 2. **The backend.** Preferred over the table because it keeps working
-//!    indefinitely, where the table stops on 2027-12-06.
-//! 3. **The checked-in table.** Always available, needs no network, and covers
-//!    every window through 2027-12-06.
+//! 2. **The backend.** Preferred over any table because it keeps working
+//!    indefinitely, where every table has a fixed end date.
+//! 3. **The checked-in tables**, in the order [`CksConfig::offline_order`] names,
+//!    taking the first that covers the instant wanted.
 //!
-//! A failed fetch is not fatal at any point — it falls through to the table and
+//! A failed fetch is not fatal at any point — it falls through to the tables and
 //! is retried after [`CksConfig::failure_backoff`], matching the reference
 //! client's 360-second hold-down. An unattended panel that loses its uplink keeps
 //! authenticating.
+//!
+//! ## Why two offline identities, and what the order is really for
+//!
+//! The default order is [`OfflineIdentity::Cks`] then
+//! [`OfflineIdentity::AirServer`], and on *expiry* grounds that second entry is
+//! nearly vacuous: CKS covers through 2027-12-06 and AirServer stops 2027-03-21,
+//! so any instant AirServer can serve, CKS can serve too. It earns its place in
+//! two situations that expiry does not describe:
+//!
+//! * **Revocation.** D41's unmitigated risk is Google revoking the AirReceiver
+//!   identity, which would leave the panel completing TLS and failing auth with
+//!   nothing in the logs to explain it. The AirServer identity is a different
+//!   device under a different intermediate on a different branch of the Cast PKI
+//!   (see [`crate::airserver`]), so reversing the order is a config change instead
+//!   of a dead receiver. Nothing here can *detect* a revocation — that signal is
+//!   the sender refusing us — which is exactly why the order is operator-set
+//!   policy rather than something this module tries to infer.
+//! * **A broken fixture set.** If one table fails to load, the other still
+//!   resolves, and startup does not fail.
+//!
+//! The order is a declarative list rather than a chain of fallback flags so that
+//! "which identity is this panel presenting" has one answer, readable from config,
+//! instead of being reconstructed from which branches happened to be taken.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -26,8 +49,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
+use crate::airserver::AirServerTable;
 use crate::table::StaticTable;
-use crate::{api, cache, CastCredential, CksError, CredentialOrigin};
+use crate::{api, cache, CastCredential, CksError};
 
 /// The two roots the reference client pins in place of the system trust store.
 /// `cast.remotetogo.com` is CloudFront-fronted, so this is the Starfield /
@@ -49,11 +73,38 @@ const REFRESH_LEAD: Duration = Duration::from_secs(3600);
 /// Cap on the response body. A live response is a few kilobytes.
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 
+/// A checked-in offline receiver-auth identity.
+///
+/// Named rather than numbered so a config file and a log line say the same word,
+/// and so adding a third identity is a variant the compiler makes you handle
+/// everywhere it matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum OfflineIdentity {
+    /// SoftMedia / AirReceiver, `CN=RYW0O FA8FCA6AC5A0` under `Eureka Gen1 ICA`.
+    /// Covers 2023-01-01 → 2027-12-06. See [`crate::table`].
+    Cks,
+    /// App Dynamic / AirServer, `CN=2001805200936810051` under
+    /// `Widevine Cast Subroot`. Covers 2024-03-20 → 2027-03-21. See
+    /// [`crate::airserver`].
+    AirServer,
+}
+
+impl core::fmt::Display for OfflineIdentity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Cks => f.write_str("cks"),
+            Self::AirServer => f.write_str("airserver"),
+        }
+    }
+}
+
 /// How the provider is allowed to obtain credentials.
 #[derive(Debug, Clone)]
 pub struct CksConfig {
     /// Whether the backend may be contacted at all. With this off the provider is
-    /// entirely offline and bounded by the table's 2027-12-06 end.
+    /// entirely offline and bounded by whichever table `offline_order` selects.
     pub network: bool,
     /// Where to cache a fetched credential. `None` disables caching.
     pub cache_path: Option<PathBuf>,
@@ -61,6 +112,13 @@ pub struct CksConfig {
     pub timeout: Duration,
     /// Hold-down after a failed fetch.
     pub failure_backoff: Duration,
+    /// Which offline identities to try, in order, when the network path does not
+    /// produce a credential.
+    ///
+    /// Empty means "no offline fallback", which is a legitimate choice for an
+    /// operator who would rather Cast fail loudly than present a borrowed
+    /// identity — but it makes startup depend on reaching the backend.
+    pub offline_order: Vec<OfflineIdentity>,
 }
 
 impl Default for CksConfig {
@@ -70,6 +128,10 @@ impl Default for CksConfig {
             cache_path: Some(cache::default_path()),
             timeout: DEFAULT_TIMEOUT,
             failure_backoff: DEFAULT_FAILURE_BACKOFF,
+            // CKS first: it outlasts AirServer by eight months, so on expiry alone
+            // it is the better default. See the module docs for why AirServer is
+            // carried at all.
+            offline_order: vec![OfflineIdentity::Cks, OfflineIdentity::AirServer],
         }
     }
 }
@@ -81,7 +143,11 @@ impl Default for CksConfig {
 /// overwrite it — makes "no credential yet" a representable state on the
 /// connection path, which is exactly the state that must not exist.
 struct Resolver {
-    table: StaticTable,
+    /// The offline tables, each `None` if its fixtures failed to load. A broken
+    /// fixture set degrades that one identity rather than failing startup, which
+    /// is half the point of carrying two.
+    cks_table: Option<StaticTable>,
+    airserver_table: Option<AirServerTable>,
     config: CksConfig,
     /// `backend_now - local_now`, learned from a successful fetch.
     ///
@@ -116,7 +182,8 @@ impl CksProvider {
     /// credential.
     pub async fn resolve(config: CksConfig) -> Result<Self, CksError> {
         let resolver = Resolver {
-            table: StaticTable::load()?,
+            cks_table: log_load("cks", StaticTable::load()),
+            airserver_table: log_load("airserver", AirServerTable::load()),
             config,
             clock_offset: AtomicI64::new(0),
             retry_after: AtomicI64::new(0),
@@ -148,12 +215,12 @@ impl CksProvider {
                 return Arc::clone(&current);
             }
         }
-        match self.resolver.table.credential_at(now) {
+        match self.resolver.offline_credential(now) {
             Ok(fresh) => {
                 let fresh = Arc::new(fresh);
                 warn!(
                     origin = %fresh.origin(),
-                    "the Cast credential aged out; re-issued from the checked-in table"
+                    "the Cast credential aged out; re-issued from a checked-in table"
                 );
                 if let Ok(mut slot) = self.current.write() {
                     *slot = Arc::clone(&fresh);
@@ -217,7 +284,7 @@ impl CksProvider {
         let window_end = current.as_ref().map_or(now, |c| c.window().end_unix());
         let on_table = current
             .as_ref()
-            .is_some_and(|c| matches!(c.origin(), CredentialOrigin::StaticTable { .. }));
+            .is_some_and(|c| c.origin().is_offline_table());
 
         // Running on the table with a reachable backend is a state worth leaving:
         // the table expires, the backend does not.
@@ -270,13 +337,55 @@ impl Resolver {
                     warn!(
                         error = %e,
                         backoff_secs = self.config.failure_backoff.as_secs(),
-                        "the CKS backend is unreachable; falling back to the checked-in table"
+                        "the CKS backend is unreachable; falling back to a checked-in table"
                     );
                 }
             }
         }
 
-        self.table.credential_at(now)
+        self.offline_credential(now)
+    }
+
+    /// Walk [`CksConfig::offline_order`] and take the first identity that covers
+    /// `now`.
+    ///
+    /// Returns the *last* failure rather than the first, because the last one is
+    /// from the least-preferred identity and so describes the widest gap — for a
+    /// panel past every table's end date, that is the message an operator needs.
+    fn offline_credential(&self, now: i64) -> Result<CastCredential, CksError> {
+        let mut last = None;
+        for identity in &self.config.offline_order {
+            let attempt = match identity {
+                OfflineIdentity::Cks => self
+                    .cks_table
+                    .as_ref()
+                    .map(|t| t.credential_at(now))
+                    .unwrap_or_else(|| {
+                        Err(CksError::Table("the CKS fixtures did not load".into()))
+                    }),
+                OfflineIdentity::AirServer => self
+                    .airserver_table
+                    .as_ref()
+                    .map(|t| t.credential_at(now))
+                    .unwrap_or_else(|| {
+                        Err(CksError::Table(
+                            "the AirServer fixtures did not load".into(),
+                        ))
+                    }),
+            };
+            match attempt {
+                Ok(credential) => return Ok(credential),
+                Err(e) => {
+                    debug!(%identity, error = %e, "offline identity cannot cover this instant");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            CksError::Table(
+                "no offline identity is configured and the backend did not answer".into(),
+            )
+        }))
     }
 
     /// One request to the backend.
@@ -308,6 +417,26 @@ impl Resolver {
             )));
         }
         Ok(credential)
+    }
+}
+
+/// Load one offline table, reporting rather than propagating a failure.
+///
+/// A table whose fixtures are broken is a build-time defect, but it must not take
+/// the receiver down when another identity would have worked — so it is logged at
+/// `error` (loud, because it means the panel is running on fewer identities than it
+/// was built with) and the slot is left empty.
+fn log_load<T>(identity: &str, loaded: Result<T, CksError>) -> Option<T> {
+    match loaded {
+        Ok(table) => Some(table),
+        Err(e) => {
+            tracing::error!(
+                identity,
+                error = %e,
+                "an offline Cast identity failed to load; continuing without it"
+            );
+            None
+        }
     }
 }
 
@@ -375,6 +504,7 @@ fn local_now() -> i64 {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::CredentialOrigin;
 
     /// Inside the table's range, an offline provider always resolves.
     #[tokio::test]
@@ -394,6 +524,112 @@ mod tests {
             credential.origin(),
             &CredentialOrigin::StaticTable { index: 652 }
         );
+    }
+
+    /// Reversing the order is the whole mitigation for a revoked identity, so it
+    /// has to actually change which identity is presented.
+    #[tokio::test]
+    async fn the_offline_order_selects_the_identity() {
+        let at = 1_785_196_800; // 2026-07-28: inside both tables
+
+        for (order, expect_airserver) in [
+            (
+                vec![OfflineIdentity::Cks, OfflineIdentity::AirServer],
+                false,
+            ),
+            (vec![OfflineIdentity::AirServer, OfflineIdentity::Cks], true),
+        ] {
+            let provider = CksProvider::resolve(CksConfig {
+                network: false,
+                cache_path: None,
+                offline_order: order.clone(),
+                ..CksConfig::default()
+            })
+            .await
+            .unwrap();
+
+            let credential = provider.current_at(at);
+            assert!(
+                credential.valid_at(at),
+                "order {order:?} produced a stale window"
+            );
+            assert_eq!(
+                matches!(credential.origin(), CredentialOrigin::AirServerTable { .. }),
+                expect_airserver,
+                "order {order:?} picked {}",
+                credential.origin()
+            );
+        }
+    }
+
+    /// Between AirServer's end (2027-03-21) and CKS's (2027-12-06) only one table
+    /// can answer, so the preferred-but-exhausted identity must fall through rather
+    /// than fail. This is the one case where the fallback is driven by expiry.
+    #[tokio::test]
+    async fn an_exhausted_preferred_identity_falls_through() {
+        let at = 1_814_400_000; // 2027-07-01: past AirServer, inside CKS
+        let provider = CksProvider::resolve(CksConfig {
+            network: false,
+            cache_path: None,
+            offline_order: vec![OfflineIdentity::AirServer, OfflineIdentity::Cks],
+            ..CksConfig::default()
+        })
+        .await
+        .unwrap();
+
+        let credential = provider.current_at(at);
+        assert!(credential.valid_at(at));
+        assert!(
+            matches!(credential.origin(), CredentialOrigin::StaticTable { .. }),
+            "expected the CKS table to cover this instant, got {}",
+            credential.origin()
+        );
+    }
+
+    /// Past every table, resolution fails loudly instead of handing back something
+    /// a sender will reject with no explanation.
+    #[tokio::test]
+    async fn past_every_table_startup_fails() {
+        let far_future_config = CksConfig {
+            network: false,
+            cache_path: None,
+            offline_order: vec![OfflineIdentity::AirServer],
+            ..CksConfig::default()
+        };
+        // AirServer stops 2027-03-21; ask for 2027-07-01.
+        let resolver = Resolver {
+            cks_table: StaticTable::load().ok(),
+            airserver_table: AirServerTable::load().ok(),
+            config: far_future_config,
+            clock_offset: AtomicI64::new(0),
+            retry_after: AtomicI64::new(0),
+        };
+        assert!(matches!(
+            resolver.offline_credential(1_814_400_000),
+            Err(CksError::OutOfRange { .. })
+        ));
+    }
+
+    /// An operator who would rather Cast fail than present a borrowed identity gets
+    /// a clear error, not a panic and not a silent success.
+    #[tokio::test]
+    async fn no_offline_identity_is_a_named_error() {
+        let resolver = Resolver {
+            cks_table: StaticTable::load().ok(),
+            airserver_table: AirServerTable::load().ok(),
+            config: CksConfig {
+                network: false,
+                cache_path: None,
+                offline_order: vec![],
+                ..CksConfig::default()
+            },
+            clock_offset: AtomicI64::new(0),
+            retry_after: AtomicI64::new(0),
+        };
+        assert!(matches!(
+            resolver.offline_credential(1_785_196_800),
+            Err(CksError::Table(_))
+        ));
     }
 
     /// A window roll must produce a different credential, not a stale one.

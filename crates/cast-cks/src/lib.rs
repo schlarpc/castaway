@@ -82,6 +82,7 @@
 
 use thiserror::Error;
 
+pub mod airserver;
 pub mod api;
 pub mod cache;
 mod pem;
@@ -90,8 +91,9 @@ pub mod table;
 pub mod template;
 pub mod window;
 
+pub use airserver::AirServerTable;
 pub use crypto_cast_auth::{HashAlgo, NonceEcho, SigAlgo, SignedAuth};
-pub use provider::{CksConfig, CksProvider};
+pub use provider::{CksConfig, CksProvider, OfflineIdentity};
 pub use table::StaticTable;
 pub use window::Window;
 
@@ -161,12 +163,34 @@ pub enum CredentialOrigin {
     /// Read back from the on-disk cache — a previously fetched [`Self::Network`]
     /// credential, still inside its window.
     Cache,
-    /// Re-issued from the checked-in table at `index`. Works offline; stops
-    /// working when the table runs out.
+    /// Re-issued from the checked-in CKS table at `index` — SoftMedia's
+    /// (AirReceiver's) identity. Works offline; stops working 2027-12-06.
     StaticTable {
         /// The window's index in the table.
         index: u32,
     },
+    /// Taken from the checked-in AirServer table at `index` — App Dynamic's
+    /// identity, a different device on a different branch of the Cast PKI. Works
+    /// offline; stops working 2027-03-21. See [`airserver`].
+    AirServerTable {
+        /// The window's index in the table.
+        index: u32,
+    },
+}
+
+impl CredentialOrigin {
+    /// Whether this credential came from a checked-in table rather than the
+    /// network, and so has a fixed end date.
+    ///
+    /// A `match` rather than a stored flag, so a new offline identity has to answer
+    /// this question at the point it is added (ground rule 1).
+    #[must_use]
+    pub const fn is_offline_table(&self) -> bool {
+        match self {
+            Self::StaticTable { .. } | Self::AirServerTable { .. } => true,
+            Self::Network | Self::Cache => false,
+        }
+    }
 }
 
 impl core::fmt::Display for CredentialOrigin {
@@ -174,7 +198,10 @@ impl core::fmt::Display for CredentialOrigin {
         match self {
             Self::Network => f.write_str("CKS backend"),
             Self::Cache => f.write_str("cached CKS response"),
-            Self::StaticTable { index } => write!(f, "checked-in table, window {index}"),
+            Self::StaticTable { index } => write!(f, "checked-in CKS table, window {index}"),
+            Self::AirServerTable { index } => {
+                write!(f, "checked-in AirServer table, window {index}")
+            }
         }
     }
 }
@@ -364,10 +391,25 @@ mod tests {
 
     #[test]
     fn origin_renders_for_an_operator() {
+        // The two offline identities must be distinguishable in a log line, because
+        // "which identity is this panel presenting" is the question a revocation
+        // makes urgent and there is nothing else to answer it from.
         assert_eq!(
             CredentialOrigin::StaticTable { index: 652 }.to_string(),
-            "checked-in table, window 652"
+            "checked-in CKS table, window 652"
+        );
+        assert_eq!(
+            CredentialOrigin::AirServerTable { index: 861 }.to_string(),
+            "checked-in AirServer table, window 861"
         );
         assert_eq!(CredentialOrigin::Network.to_string(), "CKS backend");
+    }
+
+    #[test]
+    fn only_the_table_origins_are_offline() {
+        assert!(CredentialOrigin::StaticTable { index: 0 }.is_offline_table());
+        assert!(CredentialOrigin::AirServerTable { index: 0 }.is_offline_table());
+        assert!(!CredentialOrigin::Network.is_offline_table());
+        assert!(!CredentialOrigin::Cache.is_offline_table());
     }
 }
