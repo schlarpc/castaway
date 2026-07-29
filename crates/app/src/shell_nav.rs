@@ -19,13 +19,22 @@ use proto_gamestream::{GameStreamAdapter, GameStreamCommand};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::settings::{self, Applied};
+
 /// The id of the Moonlight tile on the Home screen. Matches what `build_attract` emits.
 const MOONLIGHT_TILE: &str = "gamestream";
+/// The id of the Settings tile. Matches what `build_attract` emits.
+const SETTINGS_TILE: &str = "settings";
 
 /// Picker item ids are namespaced, because one handler serves every picker and a bare id
 /// would not say which list it came from — an app called `10.0.0.7` is not impossible.
 const HOST_PREFIX: &str = "host:";
 const APP_PREFIX: &str = "app:";
+/// A row on the settings menu: `setting:<setting id>`.
+const SETTING_PREFIX: &str = "setting:";
+/// A row on one setting's choice list: `choose:<setting id>:<choice id>`. The setting
+/// id is a slug with no `:` in it; the choice id is opaque and may contain anything.
+const CHOICE_PREFIX: &str = "choose:";
 
 /// Drives shell navigation until the event channel closes.
 ///
@@ -37,6 +46,7 @@ pub async fn run(
     render: std::sync::mpsc::SyncSender<RenderCommand>,
     gamestream: Option<Arc<GameStreamAdapter>>,
     gamestream_commands: mpsc::Sender<GameStreamCommand>,
+    settings: settings::Catalog,
 ) {
     // Which host the app picker is for. Set when a host row is pressed.
     let mut chosen_host: Option<String> = None;
@@ -46,6 +56,9 @@ pub async fn run(
             ShellEvent::Tile(id) if id == MOONLIGHT_TILE => {
                 chosen_host = None;
                 show_hosts(&render, gamestream.as_deref()).await;
+            }
+            ShellEvent::Tile(id) if id == SETTINGS_TILE => {
+                show_settings_menu(&render, &settings);
             }
             ShellEvent::Tile(id) => {
                 // A tile with no local screen and nothing wired to it. Say so.
@@ -68,10 +81,145 @@ pub async fn run(
                         continue;
                     };
                     launch(&render, &gamestream_commands, &host, app).await;
+                } else if let Some(setting_id) = id.strip_prefix(SETTING_PREFIX) {
+                    show_setting(&render, &settings, setting_id).await;
+                } else if let Some(rest) = id.strip_prefix(CHOICE_PREFIX) {
+                    let Some((setting_id, choice_id)) = rest.split_once(':') else {
+                        warn!(%id, "shell: a choice row with no setting in its id");
+                        continue;
+                    };
+                    apply_choice(&render, &settings, setting_id, choice_id).await;
                 } else {
                     debug!(%id, "shell: an item from a list nothing owns");
                 }
             }
+        }
+    }
+}
+
+/// The settings menu: one row per setting, its current value underneath.
+///
+/// Synchronous, because it is all local: titles and summaries come from state already
+/// in hand, and a menu that flashed "loading…" for that would be theatre.
+fn show_settings_menu(
+    render: &std::sync::mpsc::SyncSender<RenderCommand>,
+    catalog: &settings::Catalog,
+) {
+    let items: Vec<PickerItem> = catalog
+        .all()
+        .iter()
+        .map(|s| {
+            PickerItem::new(format!("{SETTING_PREFIX}{}", s.id()), s.title())
+                .with_detail(s.summary())
+        })
+        .collect();
+    push(
+        render,
+        Picker::loading("Settings", "")
+            .with_items(items, "This build has nothing to configure yet".to_string()),
+    );
+}
+
+/// One setting's choice list, freshly enumerated. Blocking work (device enumeration
+/// asks a sound server), so it runs off the async loop.
+fn choice_picker(setting: &dyn settings::Setting) -> Picker {
+    match setting.choices() {
+        Ok(list) => {
+            let items: Vec<PickerItem> = list
+                .choices
+                .into_iter()
+                .map(|c| {
+                    let mut item = PickerItem::new(
+                        format!("{CHOICE_PREFIX}{}:{}", setting.id(), c.id),
+                        c.label,
+                    )
+                    .with_marked(c.current);
+                    if let Some(detail) = c.detail {
+                        item = item.with_detail(detail);
+                    }
+                    item
+                })
+                .collect();
+            let picker = match list.subtitle {
+                Some(sub) => Picker::loading(setting.title(), "").with_subtitle(sub),
+                None => Picker::loading(setting.title(), ""),
+            };
+            picker.with_items(items, list.empty_message)
+        }
+        Err(why) => Picker::loading(setting.title(), "").failed(why),
+    }
+}
+
+/// Drill into one setting: answer the press, then fill the list in.
+async fn show_setting(
+    render: &std::sync::mpsc::SyncSender<RenderCommand>,
+    catalog: &settings::Catalog,
+    setting_id: &str,
+) {
+    let Some(setting) = catalog.get(setting_id) else {
+        warn!(%setting_id, "shell: a settings row for a setting this build lacks");
+        return;
+    };
+    push(render, Picker::loading(setting.title(), "Looking…"));
+    let worker = Arc::clone(&setting);
+    match tokio::task::spawn_blocking(move || choice_picker(worker.as_ref())).await {
+        Ok(picker) => replace(render, picker),
+        Err(e) => {
+            warn!(%setting_id, error = %e, "shell: enumerating a setting's choices died");
+            replace(
+                render,
+                Picker::loading(setting.title(), "").failed("Something went wrong listing these"),
+            );
+        }
+    }
+}
+
+/// Apply a picked choice, then show the list again with the mark moved.
+///
+/// The refreshed list *replaces* the one on screen: the person is exactly where they
+/// were, with the check on the row they pressed — or the row they had, plus a line
+/// saying what refused, in the one state that is bad news.
+async fn apply_choice(
+    render: &std::sync::mpsc::SyncSender<RenderCommand>,
+    catalog: &settings::Catalog,
+    setting_id: &str,
+    choice_id: &str,
+) {
+    let Some(setting) = catalog.get(setting_id) else {
+        warn!(%setting_id, "shell: a choice for a setting this build lacks");
+        return;
+    };
+    let worker = Arc::clone(&setting);
+    let chosen = choice_id.to_owned();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let applied = worker.apply(&chosen);
+        // Re-enumerate under the same blocking hop: the list shown after a pick must
+        // be the list as it is now, not as it was before the device moved.
+        (applied, choice_picker(worker.as_ref()))
+    })
+    .await;
+    match outcome {
+        Ok((Ok(Applied::Saved), picker)) => {
+            info!(%setting_id, %choice_id, "settings: applied and saved");
+            replace(render, picker);
+        }
+        Ok((Ok(Applied::NotSaved(why)), picker)) => {
+            // Applied but not persisted — the panel works and the file disagrees, and
+            // saying so is the only thing standing between that and a mystery on the
+            // next restart.
+            warn!(%setting_id, %why, "settings: applied but not saved");
+            replace(render, picker.failed(why));
+        }
+        Ok((Err(why), picker)) => {
+            warn!(%setting_id, %choice_id, %why, "settings: refused");
+            replace(render, picker.failed(why));
+        }
+        Err(e) => {
+            warn!(%setting_id, error = %e, "shell: applying a setting died");
+            replace(
+                render,
+                Picker::loading(setting.title(), "").failed("Something went wrong applying that"),
+            );
         }
     }
 }
@@ -109,7 +257,9 @@ async fn show_hosts(
         })
         .collect();
     info!(count = items.len(), "shell: showing Moonlight hosts");
-    push(
+    // Replace, not push: the "looking…" screen and this are one step, and `back` must
+    // mean one step too (`ScreenStack::replace_top`'s whole reason to exist).
+    replace(
         render,
         Picker::loading("Moonlight", "")
             .with_subtitle("Gaming PCs running Sunshine on this network")
@@ -139,7 +289,7 @@ async fn show_apps(
                 .iter()
                 .map(|a| PickerItem::new(format!("{APP_PREFIX}{}", a.title), a.title.clone()))
                 .collect();
-            push(
+            replace(
                 render,
                 Picker::loading(host.to_string(), "")
                     .with_items(items, "This host lists nothing to launch".to_string()),
@@ -149,7 +299,7 @@ async fn show_apps(
             // The host's own words where there are any — "is a display connected and
             // turned on?" is a better thing to read than "error".
             warn!(%host, error = %e, "shell: could not list apps");
-            push(
+            replace(
                 render,
                 Picker::loading(host.to_string(), "").failed(friendly(&e)),
             );
@@ -202,6 +352,19 @@ fn push(render: &std::sync::mpsc::SyncSender<RenderCommand>, picker: Picker) {
     // through is one frame of staleness, not a reason to block.
     if render
         .try_send(RenderCommand::PushScreen(Box::new(Screen::Picker(
+            Box::new(picker),
+        ))))
+        .is_err()
+    {
+        debug!("shell: the render channel is full or closed");
+    }
+}
+
+/// Swap the screen on top for `picker` without going deeper — what every "answered the
+/// press, now filling it in" update uses, so `back` stays one step.
+fn replace(render: &std::sync::mpsc::SyncSender<RenderCommand>, picker: Picker) {
+    if render
+        .try_send(RenderCommand::ReplaceScreen(Box::new(Screen::Picker(
             Box::new(picker),
         ))))
         .is_err()

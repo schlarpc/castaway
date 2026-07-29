@@ -50,6 +50,114 @@ pub struct Config {
     /// and for running from the repo, so most deployments never set these.
     #[serde(default)]
     pub browser: Browser,
+    /// Audio output settings. This section is also written *by* the receiver — the
+    /// settings screen persists the picked output device here.
+    #[serde(default)]
+    pub audio: Audio,
+}
+
+/// Audio output settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Audio {
+    /// Which output device to play through.
+    pub output: AudioOutput,
+}
+
+/// Which output device each backend should use.
+///
+/// Keyed per backend rather than one shared value, because the ids share no vocabulary:
+/// a PipeWire `node.name` means nothing to WASAPI and vice versa, and one config file
+/// travels between the Linux box and the Windows panel. Each build reads only its own
+/// key and leaves the others alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct AudioOutput {
+    /// The PipeWire sink (`node.name`) — Linux builds with the native backend.
+    pub pipewire: OutputChoice,
+    /// The WASAPI device name — the Windows panel.
+    pub windows: OutputChoice,
+    /// The ALSA PCM name — Linux builds without the PipeWire backend.
+    pub alsa: OutputChoice,
+}
+
+impl AudioOutput {
+    /// The config key `backend` reads and the settings screen writes, or `None` where
+    /// there is nothing to select (the null backend).
+    #[must_use]
+    pub const fn key_for(
+        backend: pipeline::audio_select::OutputBackendKind,
+    ) -> Option<&'static str> {
+        use pipeline::audio_select::OutputBackendKind as B;
+        match backend {
+            B::PipeWire => Some("pipewire"),
+            B::Windows => Some("windows"),
+            B::Alsa => Some("alsa"),
+            B::Null => None,
+        }
+    }
+
+    /// This build's choice — the one behind [`Self::key_for`] of the active backend.
+    ///
+    /// Read where the selector is seeded (the render build) and in tests; the headless
+    /// build parses the section without acting on it, like `theme`.
+    #[cfg_attr(not(feature = "render"), allow(dead_code))]
+    #[must_use]
+    pub fn choice_for(&self, backend: pipeline::audio_select::OutputBackendKind) -> &OutputChoice {
+        use pipeline::audio_select::OutputBackendKind as B;
+        match backend {
+            B::PipeWire => &self.pipewire,
+            B::Windows => &self.windows,
+            // Null reads as "default", which is also what it ignores.
+            B::Alsa | B::Null => &self.alsa,
+        }
+    }
+}
+
+/// `"default"`, or a device id in the backend's own vocabulary.
+///
+/// The literal string `"default"` is the policy, not a device that happens to carry the
+/// name — which is unambiguous for the two backends that persist selections: PipeWire
+/// node names are `alsa_output.…`-shaped and WASAPI names are human labels. (ALSA does
+/// have a PCM literally called `default`; for it the two readings coincide anyway.)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OutputChoice {
+    /// Follow the system default.
+    #[default]
+    Default,
+    /// A specific device, by backend-specific id.
+    Device(String),
+}
+
+impl OutputChoice {
+    /// What this choice means to the pipeline.
+    #[must_use]
+    pub fn selection(&self) -> pipeline::audio_select::OutputSelection {
+        match self {
+            Self::Default => pipeline::audio_select::OutputSelection::SystemDefault,
+            Self::Device(id) => pipeline::audio_select::OutputSelection::Device(id.clone()),
+        }
+    }
+
+    /// The string form the config file carries.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Default => "default",
+            Self::Device(id) => id,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OutputChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(if s == "default" {
+            Self::Default
+        } else {
+            Self::Device(s)
+        })
+    }
 }
 
 /// Console and on-disk logging.
@@ -611,6 +719,7 @@ impl Default for Config {
             cast: Cast::default(),
             miracast: Miracast::default(),
             gamestream: GameStream::default(),
+            audio: Audio::default(),
         }
     }
 }
@@ -793,6 +902,53 @@ mod tests {
         "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert_eq!(c.unknown_sponsorblock_categories(), 1);
+    }
+
+    #[test]
+    fn output_devices_are_keyed_per_backend_and_default_to_default() {
+        use pipeline::audio_select::{OutputBackendKind, OutputSelection};
+
+        let c = Config::default();
+        assert_eq!(c.audio.output.pipewire, OutputChoice::Default);
+
+        let toml = r#"
+            [audio.output]
+            pipewire = "alsa_output.usb-DAC.analog-stereo"
+            windows = "default"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            c.audio
+                .output
+                .choice_for(OutputBackendKind::PipeWire)
+                .selection(),
+            OutputSelection::Device("alsa_output.usb-DAC.analog-stereo".into())
+        );
+        // The literal "default" is the policy, not a device named that.
+        assert_eq!(
+            c.audio
+                .output
+                .choice_for(OutputBackendKind::Windows)
+                .selection(),
+            OutputSelection::SystemDefault
+        );
+        // An unmentioned backend follows the system default.
+        assert_eq!(
+            c.audio
+                .output
+                .choice_for(OutputBackendKind::Alsa)
+                .selection(),
+            OutputSelection::SystemDefault
+        );
+    }
+
+    #[test]
+    fn every_selectable_backend_has_a_config_key() {
+        use pipeline::audio_select::OutputBackendKind as B;
+        for backend in [B::PipeWire, B::Windows, B::Alsa] {
+            assert!(AudioOutput::key_for(backend).is_some());
+        }
+        assert_eq!(AudioOutput::key_for(B::Null), None);
     }
 
     #[test]

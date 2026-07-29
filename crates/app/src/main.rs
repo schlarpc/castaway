@@ -13,6 +13,12 @@ mod bluetooth;
 mod config;
 mod logging;
 mod screen;
+// What the panel can change about itself, and how it persists. The types are always
+// compiled — the store's tests are the config-file contract, and they must run in the
+// build CI tests — but only the render build has screens to press them from, so the
+// headless build is excused its "never used" (the same standing theme/browser have).
+#[cfg_attr(not(feature = "render"), allow(unused))]
+mod settings;
 // The panel's own navigation: what happens when someone presses something the shell
 // could not answer itself. Only meaningful where there is a panel.
 #[cfg(feature = "render")]
@@ -104,6 +110,22 @@ fn main() -> anyhow::Result<()> {
     {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
+        // Which device sound leaves through. Config decides where it starts, the
+        // settings screen moves it live, and every session factory reads it at
+        // stream-open — so a pick reaches the *next* session of every source with no
+        // restart, while sessions already playing keep the device they opened.
+        let audio_selector = pipeline::audio_select::OutputSelector::new(
+            config
+                .audio
+                .output
+                .choice_for(pipeline::audio_select::active_backend())
+                .selection(),
+        );
+        #[cfg(feature = "audio")]
+        let audio_factory: pipeline::audio_out::AudioOutputFactory =
+            pipeline::audio_out::output_factory(audio_selector.clone());
+        #[cfg(feature = "audio")]
+        let render_pipeline = render_pipeline.with_audio_output(Arc::clone(&audio_factory));
         // A second handle on the render channel, for the shell: it pushes screens in
         // answer to panel presses, and the pipeline itself is about to be moved into the
         // session manager.
@@ -173,12 +195,20 @@ fn main() -> anyhow::Result<()> {
         let serve_tx = event_tx.clone();
         let serve_shutdown = shutdown.clone();
         let serve_osd = osd.clone();
+        // What the Settings tile opens. The store points at the same file the config
+        // came from, so what the screen saves is what the next boot reads.
+        let settings_catalog =
+            settings::Catalog::new(vec![Arc::new(settings::OutputDeviceSetting::new(
+                audio_selector.clone(),
+                settings::ConfigStore::from_env(),
+            ))]);
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
             playback: Some(playback),
             shell: Some(ShellChannels {
                 events: shell_event_rx,
                 render: render_tx.clone(),
+                settings: settings_catalog,
             }),
         };
         runtime.spawn(async move {
@@ -220,8 +250,6 @@ fn main() -> anyhow::Result<()> {
             // re-fetch daily rather than running whatever it booted with forever.
             pipeline::filterlists::spawn_daily_refresh(list_cache.clone(), StdArc::clone(&shared));
 
-            let audio_factory: pipeline::audio_out::AudioOutputFactory =
-                StdArc::new(pipeline::audio_session::default_output);
             let program = config.browser_program();
             let app_dir = config.browser_app_dir();
             let electron = pipeline::Electron::spawn(
@@ -484,6 +512,8 @@ struct ShellChannels {
     /// command — a shell update that cannot get through is one frame of staleness, not a
     /// reason to block the runtime.
     render: std::sync::mpsc::SyncSender<pipeline::render_pipeline::RenderCommand>,
+    /// What the Settings tile opens: this build's settings, ready to list and apply.
+    settings: settings::Catalog,
 }
 
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
@@ -759,7 +789,12 @@ async fn serve(
     // The panel's shell: presses it could not answer itself, and the screens that answer
     // them. Only started where there is a panel — a headless build has nothing to press.
     #[cfg(feature = "render")]
-    if let Some(ShellChannels { events, render }) = shell {
+    if let Some(ShellChannels {
+        events,
+        render,
+        settings,
+    }) = shell
+    {
         let (adapter, commands) = match &gamestream {
             Some((a, c)) => (Some(Arc::clone(a)), c.clone()),
             // A closed sender, so a press on a tile for an adapter that never started
@@ -770,7 +805,7 @@ async fn serve(
             }
         };
         adapter_handles.push(tokio::spawn(shell_nav::run(
-            events, render, adapter, commands,
+            events, render, adapter, commands, settings,
         )));
     }
 
@@ -1354,6 +1389,18 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
             detail: None,
         });
     }
+
+    // Settings, last and always: the receiver configures itself from its own glass, and
+    // a build with nothing to configure says so on the settings screen rather than by
+    // not having one. Like Moonlight's, a press is the app's to answer — it opens the
+    // settings menu (shell_nav), not an instructions card.
+    tiles.push(Tile {
+        id: "settings".to_string(),
+        label: "Settings".to_string(),
+        glyph: TileGlyph::Gear,
+        accent: [0x9a, 0xa3, 0xb2, 0xff],
+        detail: None,
+    });
 
     // Reserve the widget card only if something will actually paint into it: with no
     // browser build (or no URL configured) the text should use the full width rather than
