@@ -142,14 +142,19 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
 
 ## Deferred (per docs, not blockers)
 
-- **Q7 — Miracast: the protocol is done; the radio is the question.** `proto-miracast`
-  now implements the whole wire protocol — IE, `wfd-kv`, M1–M16, TS demux, UIBC — and a
-  Linux `MiracastBackend` that talks to wpa_supplicant. What has never happened is a
-  Wi-Fi Direct group forming. The protocol layers are fixture-tested and the control
-  interface is parsed from captured strings, so the untested surface is small and
-  well-bounded; it is also the part that needs hardware, root, and a cooperative driver.
-  `docs/miracast-protocol-notes.md` §7.6 has the commands. Three sub-questions, each of
-  which changes what to build next rather than merely how confident to be:
+- **Q7 — Miracast: the protocol is done; the radio now forms in CI; the *driver* is the
+  question.** `proto-miracast` implements the whole wire protocol — IE, `wfd-kv`,
+  M1–M16, TS demux, UIBC — and the Linux `MiracastBackend` now forms a real autonomous
+  P2P group under mac80211_hwsim (`checks.miracast-vm`): an independent wpa_supplicant
+  on a second radio, in its own network namespace, discovers the sink's WFD IE over the
+  air, joins by WPS push-button, DHCPs from the module's server, and a scripted WFD
+  source drives the sink's dial-out through M1→M7 to a running mirror and a clean
+  triggered teardown. Getting there surfaced and fixed four things a loopback test could
+  never see: P2P events are delivered on the `p2p-dev-*` management socket, WPS runs on
+  the *group* interface's registrar, `/tmp` reply sockets do not cross `PrivateTmp=`'s
+  mount namespace (now abstract), and the peer's neighbour-table entry must be provoked
+  by sweeping the group subnet, because in WFD the sink dials the source and the peer
+  never speaks first. Q7c and Q7d below are resolved; what remains needs hardware:
 
   - **Q7a — does this box's radio support `P2P-GO` alongside the station interface?**
     Partly answered, and the answer is encouraging for the *dev* box: iwlwifi advertises
@@ -170,17 +175,14 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
     `LinuxMiracastBackend` unconstructible without it. Not built: it needs a netlink
     dependency this workspace does not yet have.
 
-  - **Q7d — NetworkManager cannot host this, and that is structural.** Its Wi-Fi P2P
-    support is source-only by design; the sink-capability merge request was closed
-    unmerged, and it welds `go_intent` and never calls `GroupAdd`. castaway is a
-    *receiver*, so the deployment has to set the phy unmanaged and drive
-    `fi.w1.wpa_supplicant1` (or its control socket, which is what `backend_linux` does)
-    directly. That is a NixOS module decision, not a code one, and nothing in this repo
-    makes it yet.
-
-    The good news alongside it: nothing needs patching or vendoring. hostap 2.11 ships
-    `CONFIG_P2P`, `CONFIG_AP` and `CONFIG_WIFI_DISPLAY` enabled in its `defconfig`, and
-    NixOS's binary demonstrably has the WFD code compiled in.
+  - **Q7d — resolved: the module owns the supplicant.** NetworkManager structurally
+    cannot host a sink (source-only P2P, welded `go_intent`, no `GroupAdd`; §7.6), so
+    when `enable.miracast` is set the NixOS module runs a dedicated wpa_supplicant on
+    the configured interface, exposes its control sockets to the unprivileged service
+    through a `castaway-p2p` group, and marks the parent radio and its `p2p-*` children
+    unmanaged for NM. Nothing needed patching or vendoring: hostap 2.11 ships
+    `CONFIG_P2P`, `CONFIG_AP` and `CONFIG_WIFI_DISPLAY` in its `defconfig`, and the
+    hwsim test demonstrates NixOS's binary doing all three.
   - **Q7b — 5 GHz is blocked on this kernel.** `CONFIG_CFG80211_REG_RELAX_NO_IR` is not
     set on the NixOS kernel here (verified in `/proc/config.gz`, 6.18.33), and
     `cfg80211_ir_permissive_chan()` needs both it and the driver's own relax flag. So a
@@ -188,11 +190,17 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
     and `[miracast] freq_mhz` can only usefully name a 2.4 GHz channel until that is a
     kernel override in the flake. Decide whether 5 GHz matters enough to carry a custom
     kernel.
-  - **Q7c — who serves DHCP on the group interface?** As group owner we are expected to,
-    and the peer's IP is not something wpa_supplicant reports — the backend reads it from
-    the neighbour table, which is empty until the peer has an address. Nothing in this
-    repo starts a DHCP server. The NixOS module needs to, or the backend needs to hand
-    out one address itself.
+  - **Q7c — resolved: networkd serves DHCP, and the backend makes the kernel ask.** The
+    module matches the group interface by pattern (`p2p-<iface>-*` — it does not exist
+    until the group forms), addresses it and serves DHCP on it via systemd-networkd,
+    pool and gateway derived from the same `[miracast] group_cidr` the binary reads.
+    `EmitRouter=no`, deliberately: a casting phone must not route its life through a
+    mirroring link. The second half of the question turned out to be the sharper one:
+    the peer's lease alone never reaches our neighbour table, because in WFD the sink
+    dials the source and the peer has no reason to send us unicast traffic first — so
+    `peer_address` now sweeps the group subnet with empty datagrams to make the kernel
+    resolve every candidate, and the hwsim test asserts this works with a deliberately
+    silent peer.
 
 - **Q26 — Can a third-party app be a Miracast sink on Windows at all?** The deploy target
   is Windows, and the answer is not obviously yes. `WFDStartDisplaySink` — the Win32 API

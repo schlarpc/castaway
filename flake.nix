@@ -482,6 +482,12 @@
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           integration-vm = import ./nix/vm-test.nix { inherit pkgs self; };
 
+          # The Miracast radio path end to end on mac80211_hwsim: real mac80211 radios,
+          # real P2P group formation and WPS, DHCP across the group, and the sink
+          # dialling out over it — the whole surface Q7 said only hardware could touch,
+          # minus the driver's own quirks (§7.6), which remain the hardware's to prove.
+          miracast-vm = import ./nix/miracast-vm-test.nix { inherit pkgs self; };
+
           # A complete A2DP session with no radio: btvirt's linked virtual controllers,
           # BlueZ as an independent A2DP source on one, our receiver on the other. The
           # sender side is then an implementation that has never seen our code, which is
@@ -844,6 +850,14 @@
               networking.networkmanager.unmanaged = lib.optionals miracastEnabled [
                 "interface-name:${miracastInterface}"
                 "interface-name:p2p-${miracastInterface}-*"
+              ];
+
+              # Scripted networking's dhcpcd grabs every new interface by default, and
+              # a DHCP *client* soliciting on the interface we serve DHCP on gets it an
+              # IPv4LL address and a route it has no business having (observed in the
+              # hwsim test). networkd owns this interface; nobody else touches it.
+              networking.dhcpcd.denyInterfaces = lib.optionals miracastEnabled [
+                "p2p-${miracastInterface}-*"
               ];
 
               systemd.services.castaway = {
