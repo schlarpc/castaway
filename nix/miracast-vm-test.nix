@@ -39,13 +39,16 @@ let
     esac
   '';
 
-  # A scripted WFD *source*: accepts the sink's connection and walks M1→M7, then
-  # triggers TEARDOWN so the clean-shutdown path is what gets exercised. A second,
-  # independent reading of the wire exchange — the assertions mirror what real sources
-  # check, not what our sink implementation happens to emit.
+  # A scripted WFD *source*: accepts the sink's connection, walks M1→M7, streams a few
+  # real MPEG2-TS-over-RTP datagrams at the negotiated port, then triggers TEARDOWN so
+  # the clean-shutdown path is what gets exercised. A second, independent reading of the
+  # wire formats — TS packetisation included — so the assertions mirror what real
+  # sources send, not what our sink implementation happens to accept.
   # W503: as in vm-test.nix — operators lead their continuation lines here.
   wfdSource = pkgs.writers.writePython3Bin "wfd-source" { flakeIgnore = [ "E501" "W503" ]; } ''
     import socket
+    import struct
+    import time
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -116,6 +119,77 @@ let
     # M7.
     phase("PLAY")
     send("RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 4242\r\n\r\n")
+
+    # --- The media plane: hand-rolled MPEG2-TS over RTP, sent to the port the sink
+    # promised in M3, across the group interface. PAT, PMT (H.264 on PID 0x1011), and
+    # three access units as unbounded PES packets — the first carries SPS/PPS/IDR so
+    # the very first completed frame is a keyframe and the sink never needs M13. An
+    # unbounded PES only completes at the next payload-unit start, so three sent means
+    # two delivered; the third is still pending when TEARDOWN lands, and that is fine.
+
+
+    def ts_packet(pid, cc, payload):
+        """One 188-byte packet, payload-only (no adaptation field), stuffed with 0xff.
+
+        The stuffing is safe in both uses: PSI readers stop at section_length, and in
+        an unbounded PES the tail bytes ride inside the last NAL unit, where anything
+        without a start code is legal.
+        """
+        assert len(payload) <= 184
+        header = bytes([0x47, 0x40 | (pid >> 8), pid & 0xFF, 0x10 | (cc & 0x0F)])
+        return header + payload + b"\xff" * (184 - len(payload))
+
+
+    def psi(table_id, body):
+        """pointer_field + section header + body + a CRC the demux ignores."""
+        length = len(body) + 4
+        return (b"\x00" + bytes([table_id, 0xB0 | (length >> 8), length & 0xFF])
+                + body + b"\x00\x00\x00\x00")
+
+
+    def pes(pts, payload):
+        """An unbounded video PES (length 0) with a PTS, stream id 0xE0."""
+        pts_bytes = bytes([
+            0x21 | ((pts >> 29) & 0x0E),
+            (pts >> 22) & 0xFF,
+            0x01 | ((pts >> 14) & 0xFE),
+            (pts >> 7) & 0xFF,
+            0x01 | ((pts << 1) & 0xFE),
+        ])
+        return b"\x00\x00\x01\xe0\x00\x00" + bytes([0x80, 0x80, 5]) + pts_bytes + payload
+
+
+    def annex_b(*nals):
+        return b"".join(b"\x00\x00\x00\x01" + nal for nal in nals)
+
+
+    VIDEO_PID = 0x1011
+    PMT_PID = 0x1000
+    # program 1 -> PMT; then program 1, PCR on the video PID, H.264 (0x1B) on it.
+    pat = psi(0x00, bytes([0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE0 | (PMT_PID >> 8), PMT_PID & 0xFF]))
+    pmt = psi(0x02, bytes([0x00, 0x01, 0xC1, 0x00, 0x00, 0xE0 | (VIDEO_PID >> 8), VIDEO_PID & 0xFF, 0xF0, 0x00,
+                           0x1B, 0xE0 | (VIDEO_PID >> 8), VIDEO_PID & 0xFF, 0xF0, 0x00]))
+    keyframe = annex_b(b"\x67\x42\x00\x1f\xe9\x02\x80", b"\x68\xce\x06\xe2", b"\x65\x88\x80\x40" + b"\x10" * 24)
+    delta = annex_b(b"\x41\x9a\x24\x6c" + b"\x10" * 24)
+
+    rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sink = conn.getpeername()[0]
+
+
+    def rtp_send(seq, pts, packets):
+        header = struct.pack(">BBHII", 0x80, 33, seq, pts & 0xFFFFFFFF, 0x1234)
+        rtp.sendto(header + b"".join(packets), (sink, 1028))
+
+
+    # The sink wires its media plane while handling our PLAY response; a datagram that
+    # outruns that TCP segment is silently pre-session.
+    time.sleep(0.5)
+    rtp_send(0, 90000, [ts_packet(0, 0, pat), ts_packet(PMT_PID, 0, pmt),
+                        ts_packet(VIDEO_PID, 0, pes(90000, keyframe))])
+    rtp_send(1, 91500, [ts_packet(VIDEO_PID, 1, pes(91500, delta))])
+    rtp_send(2, 93000, [ts_packet(VIDEO_PID, 2, pes(93000, delta))])
+    print("rtp media sent", flush=True)
+    time.sleep(1)
 
     # Source-triggered teardown: the sink must come back with its own TEARDOWN rather
     # than just dropping the socket.
@@ -257,6 +331,17 @@ pkgs.testers.runNixOSTest {
         )
         machine.wait_until_succeeds(
             "grep -q 'wfd source session completed' /tmp/wfd-source.log", timeout=60
+        )
+
+    with subtest("real TS-over-RTP frames crossed the radio into the pipeline"):
+        # The source hand-rolled PAT/PMT/PES and sent them over the group interface;
+        # the count is logged when teardown closes the plane. Zero here is exactly the
+        # §7.2 failure — a sink that advertised a port it was not really reachable on —
+        # so the assertion is a nonzero count, keyframe first.
+        machine.wait_until_succeeds(
+            "journalctl -u castaway --no-pager "
+            "| grep -E -q 'encoded video source ended frames=[1-9]'",
+            timeout=30,
         )
 
     with subtest("the triggered teardown ended the session cleanly"):
