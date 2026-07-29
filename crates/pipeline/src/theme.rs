@@ -138,6 +138,16 @@ pub enum Season {
     Pride,
     /// Trans Day of Visibility, 31 March.
     Trans,
+    /// International Asexuality Day, 6 April.
+    Ace,
+    /// Lesbian Visibility Week, 22–28 April.
+    Lesbian,
+    /// Pansexual Pride Day, 24 May.
+    Pan,
+    /// Non-Binary Awareness Week, the week to 14 July.
+    NonBinary,
+    /// Bisexual Awareness Week, 16–23 September.
+    Bi,
     /// Christmas — the twelve days, not the run-up.
     Christmas,
     /// Halloween, the last week of October.
@@ -150,7 +160,17 @@ const SEASON_STRENGTH: f32 = 0.22;
 
 impl Season {
     /// Every season, so a test can prove each one is reachable and legible.
-    pub const ALL: [Self; 4] = [Self::Pride, Self::Trans, Self::Christmas, Self::Halloween];
+    pub const ALL: [Self; 9] = [
+        Self::Pride,
+        Self::Trans,
+        Self::Ace,
+        Self::Lesbian,
+        Self::Pan,
+        Self::NonBinary,
+        Self::Bi,
+        Self::Christmas,
+        Self::Halloween,
+    ];
 
     /// What to call it, for a log line and for anyone wondering why the screen changed.
     #[must_use]
@@ -158,6 +178,11 @@ impl Season {
         match self {
             Self::Pride => "pride",
             Self::Trans => "trans",
+            Self::Ace => "ace",
+            Self::Lesbian => "lesbian",
+            Self::Pan => "pan",
+            Self::NonBinary => "non-binary",
+            Self::Bi => "bi",
             Self::Christmas => "christmas",
             Self::Halloween => "halloween",
         }
@@ -173,6 +198,11 @@ impl Season {
         match self {
             Self::Pride => &PRIDE,
             Self::Trans => &TRANS,
+            Self::Ace => &ACE,
+            Self::Lesbian => &LESBIAN,
+            Self::Pan => &PAN,
+            Self::NonBinary => &NONBINARY,
+            Self::Bi => &BI,
             Self::Christmas => &YULE,
             Self::Halloween => &HALLOWEEN,
         }
@@ -226,6 +256,16 @@ pub enum ThemeChoice {
     Pride,
     /// Trans, all year.
     Trans,
+    /// Asexual, all year.
+    Ace,
+    /// Lesbian, all year.
+    Lesbian,
+    /// Pansexual, all year.
+    Pan,
+    /// Non-binary, all year.
+    NonBinary,
+    /// Bisexual, all year.
+    Bi,
     /// Christmas, all year.
     Christmas,
     /// Halloween, all year.
@@ -234,11 +274,16 @@ pub enum ThemeChoice {
 
 impl ThemeChoice {
     /// Every choice, so a test can prove each season can be asked for by name.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 11] = [
         Self::Auto,
         Self::Plain,
         Self::Pride,
         Self::Trans,
+        Self::Ace,
+        Self::Lesbian,
+        Self::Pan,
+        Self::NonBinary,
+        Self::Bi,
         Self::Christmas,
         Self::Halloween,
     ];
@@ -250,6 +295,11 @@ impl ThemeChoice {
             Self::Auto | Self::Plain => None,
             Self::Pride => Some(Season::Pride),
             Self::Trans => Some(Season::Trans),
+            Self::Ace => Some(Season::Ace),
+            Self::Lesbian => Some(Season::Lesbian),
+            Self::Pan => Some(Season::Pan),
+            Self::NonBinary => Some(Season::NonBinary),
+            Self::Bi => Some(Season::Bi),
             Self::Christmas => Some(Season::Christmas),
             Self::Halloween => Some(Season::Halloween),
         }
@@ -290,6 +340,48 @@ const TRANS: [Rgba; 5] = [
     [0x5b, 0xce, 0xfa, 0xff],
 ];
 
+/// The asexual flag: black, grey, white, purple.
+///
+/// The one in this set that leans on the mix rather than fighting it — three of its four
+/// stripes are achromatic, so what survives is a dark-to-light fall ending in purple.
+const ACE: [Rgba; 4] = [
+    [0x00, 0x00, 0x00, 0xff],
+    [0xa3, 0xa3, 0xa3, 0xff],
+    [0xff, 0xff, 0xff, 0xff],
+    [0x80, 0x00, 0x80, 0xff],
+];
+
+/// The lesbian flag, five-stripe community version: orange-red through white to magenta.
+const LESBIAN: [Rgba; 5] = [
+    [0xd5, 0x2d, 0x00, 0xff],
+    [0xff, 0x9a, 0x56, 0xff],
+    [0xff, 0xff, 0xff, 0xff],
+    [0xd3, 0x62, 0xa4, 0xff],
+    [0xa3, 0x02, 0x62, 0xff],
+];
+
+/// The pansexual flag: magenta, yellow, cyan.
+const PAN: [Rgba; 3] = [
+    [0xff, 0x21, 0x8c, 0xff],
+    [0xff, 0xd8, 0x00, 0xff],
+    [0x21, 0xb1, 0xff, 0xff],
+];
+
+/// The non-binary flag: yellow, white, purple, black.
+const NONBINARY: [Rgba; 4] = [
+    [0xfc, 0xf4, 0x34, 0xff],
+    [0xff, 0xff, 0xff, 0xff],
+    [0x9c, 0x59, 0xd1, 0xff],
+    [0x2c, 0x2c, 0x2c, 0xff],
+];
+
+/// The bisexual flag: magenta, lavender, blue.
+const BI: [Rgba; 3] = [
+    [0xd6, 0x02, 0x70, 0xff],
+    [0x9b, 0x4f, 0x96, 0xff],
+    [0x00, 0x38, 0xa8, 0xff],
+];
+
 /// Christmas.
 const YULE: [Rgba; 3] = [
     [0xd6, 0x1f, 0x26, 0xff],
@@ -312,6 +404,14 @@ pub const fn season(month: u32, day: u32) -> Option<Season> {
         (6, _) => Some(Season::Pride),
         // Trans Day of Visibility. One day, so it has to actually land on it.
         (3, 31) => Some(Season::Trans),
+        // International Asexuality Day.
+        (4, 6) => Some(Season::Ace),
+        (4, 22..=28) => Some(Season::Lesbian),
+        (5, 24) => Some(Season::Pan),
+        // Non-Binary Awareness Week, ending on International Non-Binary People's Day.
+        (7, 8..=14) => Some(Season::NonBinary),
+        // Bisexual Awareness Week, ending on Bi Visibility Day.
+        (9, 16..=23) => Some(Season::Bi),
         // The twelve days: Christmas is a season and it starts *on* the 25th. An earlier
         // version ran 1–26 December on the theory that a decoration appearing on the day
         // has missed it, which had it gone by the time anyone was off work.
@@ -367,6 +467,39 @@ mod tests {
     }
 
     #[test]
+    fn every_season_actually_happens_at_some_point_in_the_year() {
+        // `season` is a match, so an arm can silently shadow a later one — a season
+        // nobody can reach is a palette that exists only in the config file.
+        let days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for season in Season::ALL {
+            let found = (1..=12u32)
+                .any(|m| (1..=days[(m - 1) as usize]).any(|d| super::season(m, d) == Some(season)));
+            assert!(found, "{} never comes round", season.name());
+        }
+    }
+
+    #[test]
+    fn every_season_keeps_enough_colour_to_be_worth_the_trouble() {
+        // The other side of the legibility limit: mixed only 22% into a dark ramp, a flag
+        // that is mostly white, grey and black barely registers. Ace, non-binary and
+        // lesbian are the ones this is really about — they are all near the floor, and
+        // the floor is Halloween, which has shipped and reads fine.
+        for season in Season::ALL {
+            let chroma = season
+                .gradient()
+                .iter()
+                .map(|c| u32::from(c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                chroma >= 25,
+                "{} washes out to nothing (max chroma {chroma})",
+                season.name()
+            );
+        }
+    }
+
+    #[test]
     fn every_season_can_be_asked_for_by_name() {
         // The one thing the type system does not catch on its own: a season added without
         // a matching config value would be unreachable except on its own date.
@@ -395,6 +528,7 @@ mod tests {
             ("\"auto\"", ThemeChoice::Auto),
             ("\"plain\"", ThemeChoice::Plain),
             ("\"trans\"", ThemeChoice::Trans),
+            ("\"non-binary\"", ThemeChoice::NonBinary),
             ("\"christmas\"", ThemeChoice::Christmas),
         ] {
             let parsed: ThemeChoice = serde_json::from_str(text).expect(text);

@@ -100,10 +100,20 @@ Three rules it exists to enforce:
   YouTube are the marks that exist rather than our impression of them.
 
   *The background palette* is `theme::ThemeChoice`, a config option defaulting to `auto`:
-  the calendar picks (Pride in June, Trans Day of Visibility on 31 March, the twelve days
-  of Christmas, the last week of October), `plain` never decorates, and naming a season
-  wears it all year. A season's hues are mixed only 22% into the panel's own dark ramp —
-  a flag at full strength is a lightbox and every screen here is white text.
+  the calendar picks, `plain` never decorates, and naming a season wears it all year. The
+  calendar is Pride (June), Trans Day of Visibility (31 March), International Asexuality
+  Day (6 April), Lesbian Visibility Week (22–28 April), Pansexual Pride Day (24 May),
+  Non-Binary Awareness Week (8–14 July), Bisexual Awareness Week (16–23 September),
+  Halloween (24–31 October) and the twelve days of Christmas (25 December – 5 January).
+
+  A season's hues are mixed only **22%** into the panel's own dark ramp, because a flag at
+  full strength is a lightbox and every screen here is white text. That constraint is what
+  decides which flags work: the ones carrying white, grey or black stripes — ace,
+  non-binary, lesbian — give up most of their identity in the mix and land near the floor.
+  Two tests hold both ends of it, one that no season is bright enough to lose white text
+  on and one that none washes out below the chroma Halloween already ships at. A third
+  walks the year to prove no `season()` arm shadows a later one, because a palette nobody
+  can reach is a palette that exists only in the config file.
 
 - **Service** — one service's instructions, opened by its tile. Did not exist in the plan;
   it is where the rows went.
