@@ -46,17 +46,50 @@ pub enum RtspError {
 /// # Errors
 /// [`RtspError::Malformed`] if the bytes are a genuinely invalid message.
 pub fn parse(buf: &[u8]) -> Result<Option<(RtspMessage, usize)>, RtspError> {
-    // A bare-path request is rewritten before parsing, and the inserted bytes are
-    // subtracted back out so `consumed` still indexes the caller's original buffer.
-    let (bytes, inserted) = match absolutize_request_uri(buf) {
-        Some((rewritten, inserted)) => (Cow::Owned(rewritten), inserted),
+    // Two rewrites, both undone in the returned `consumed` so it still indexes the
+    // caller's original buffer: a bare-path request-URI gets an authority, and an
+    // HTTP/1.1 version token becomes RTSP/1.0 (see `httpize`).
+    let (bytes, inserted) = match httpize(buf) {
+        Some(rewritten) => (Cow::Owned(rewritten), 0),
         None => (Cow::Borrowed(buf), 0),
+    };
+    let (bytes, inserted) = match absolutize_request_uri(bytes.as_ref()) {
+        Some((rewritten, added)) => (Cow::Owned(rewritten), inserted + added),
+        None => (bytes, inserted),
     };
     match Message::parse(bytes.as_ref()) {
         Ok((msg, consumed)) => Ok(Some((msg, consumed.saturating_sub(inserted)))),
         Err(rtsp_types::ParseError::Incomplete(_)) => Ok(None),
         Err(e) => Err(RtspError::Malformed(format!("{e:?}"))),
     }
+}
+
+/// Rewrite an `HTTP/1.1` request line as `RTSP/1.0`, or `None` if it is not one.
+///
+/// AirPlay's control port is not purely RTSP. Legacy pairing is spoken over HTTP/1.1 on
+/// the *same* connection — pyatv's client posts `POST /pair-setup HTTP/1.1`, and iOS
+/// does the same — and `rtsp_types` refuses the version token, so every such request
+/// died as "malformed RTSP message" and took the connection with it. The two grammars
+/// are otherwise identical here (request line, headers, `Content-Length` body), so the
+/// token is the whole difference.
+///
+/// Same length in both directions (`HTTP/1.1` and `RTSP/1.0` are eight bytes), which is
+/// why this inserts nothing and `consumed` needs no adjustment.
+fn httpize(buf: &[u8]) -> Option<Vec<u8>> {
+    if buf.first() == Some(&b'$') {
+        return None;
+    }
+    let line_end = buf.windows(2).position(|w| w == b"\r\n")?;
+    let line = &buf[..line_end];
+    // The version is the last token of the request line, and only there: a header value
+    // or a body may say "HTTP/1.1" for its own reasons.
+    let version_start = line.iter().rposition(|b| *b == b' ')? + 1;
+    if &line[version_start..] != b"HTTP/1.1" {
+        return None;
+    }
+    let mut out = buf.to_vec();
+    out[version_start..line_end].copy_from_slice(b"RTSP/1.0");
+    Some(out)
 }
 
 /// The synthetic authority spliced in front of a bare-path request-URI.
