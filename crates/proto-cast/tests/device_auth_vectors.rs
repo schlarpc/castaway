@@ -261,6 +261,7 @@ fn vectors() -> Vec<Vector> {
     ]
     .into_iter()
     .chain(cks_vectors())
+    .chain(airserver_vectors())
     .collect()
 }
 
@@ -314,6 +315,69 @@ fn cks_vectors() -> Vec<Vector> {
         // establish that the empty echo is what carries it.
         Vector {
             name: "cks-nonce-echoed",
+            peer_cert,
+            nonce: NONCE.to_vec(),
+            auth: DeviceAuthMessage {
+                challenge: None,
+                response: Some(echoed),
+                error: None,
+            },
+            anchor: None,
+            at: AT,
+            expect: "error kCastV2SignedBlobsMismatch",
+        },
+    ]
+}
+
+/// The same two cases for the *other* borrowed identity (D43).
+///
+/// The point is that "openscreen accepts us" is established for both identities
+/// rather than inferred from one. These chain through `Widevine Cast Subroot` via an
+/// NVIDIA SHIELD ICA, where CKS reaches `Eureka Root CA` — a different branch of the
+/// Cast PKI, so acceptance of one says nothing about the other, and a revocation
+/// mitigation that has never been verified against a real sender is not a mitigation.
+///
+/// Generated from the checked-in AirServer table at [`AT`], which its 1095 windows
+/// cover (2024-03-20 → 2027-03-21). Unlike the CKS vectors nothing is re-issued here:
+/// the peer certificate is stored verbatim, because AirServer's carry a random UUID
+/// subject per window.
+fn airserver_vectors() -> Vec<Vector> {
+    let table = cast_replay::AirServerTable::load().unwrap();
+    let credential = std::sync::Arc::new(table.credential_at(i64::try_from(AT).unwrap()).unwrap());
+    let (peer_cert, _key) = credential.tls_identity();
+    let peer_cert = peer_cert.to_vec();
+
+    let responder = ReplayAuthResponder::new(std::sync::Arc::clone(&credential));
+    let response = responder
+        .respond(&challenge(Some(NONCE.to_vec()), HashAlgorithm::Sha256))
+        .unwrap();
+
+    let echoed = AuthResponse {
+        sender_nonce: Some(NONCE.to_vec()),
+        ..response.clone()
+    };
+
+    vec![
+        // The claim D43 rests on: this identity is independently acceptable to a real
+        // sender, so reversing `identity_order` after a revocation actually works.
+        Vector {
+            name: "airserver-chain-google-roots",
+            peer_cert: peer_cert.clone(),
+            nonce: NONCE.to_vec(),
+            auth: DeviceAuthMessage {
+                challenge: None,
+                response: Some(response),
+                error: None,
+            },
+            anchor: None,
+            at: AT,
+            expect: "ok",
+        },
+        // The same negative control as for CKS. The empty nonce echo is what carries
+        // a replayed signature, and that is a property of the mechanism rather than of
+        // one vendor's table, so it is asserted for both.
+        Vector {
+            name: "airserver-nonce-echoed",
             peer_cert,
             nonce: NONCE.to_vec(),
             auth: DeviceAuthMessage {
