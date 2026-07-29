@@ -914,7 +914,14 @@ async fn spawn_cast(
             let provider = Arc::new(
                 ReplayProvider::resolve(ReplayConfig {
                     network: config.cast.replay.network,
-                    offline_order: config.cast.replay.offline_order.clone(),
+                    identity_order: config.cast.replay.identity_order.clone(),
+                    // `None` is what disables the endpoint: the provider treats a
+                    // missing path as "this identity is table-only".
+                    airserver_db_path: config
+                        .cast
+                        .replay
+                        .airserver_live
+                        .then(cast_replay::airserver_api::default_db_path),
                     ..ReplayConfig::default()
                 })
                 .await

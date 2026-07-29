@@ -11,7 +11,7 @@
 //!    it just avoids spending a request per restart on material we already have.
 //! 2. **The backend.** Preferred over any table because it keeps working
 //!    indefinitely, where every table has a fixed end date.
-//! 3. **The checked-in tables**, in the order [`ReplayConfig::offline_order`] names,
+//! 3. **The checked-in tables**, in the order [`ReplayConfig::identity_order`] names,
 //!    taking the first that covers the instant wanted.
 //!
 //! A failed fetch is not fatal at any point — it falls through to the tables and
@@ -21,8 +21,8 @@
 //!
 //! ## Why two offline identities, and what the order is really for
 //!
-//! The default order is [`OfflineIdentity::Cks`] then
-//! [`OfflineIdentity::AirServer`], and on *expiry* grounds that second entry is
+//! The default order is [`Identity::Cks`] then
+//! [`Identity::AirServer`], and on *expiry* grounds that second entry is
 //! nearly vacuous: CKS covers through 2027-12-06 and AirServer stops 2027-03-21,
 //! so any instant AirServer can serve, CKS can serve too. It earns its place in
 //! two situations that expiry does not describe:
@@ -50,8 +50,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::airserver::AirServerTable;
+use crate::airserver_db::AirServerDb;
 use crate::cks::CksTable;
-use crate::{api, cache, CastCredential, ReplayError};
+use crate::{airserver_api, api, cache, CastCredential, ReplayError};
 
 /// The two roots the reference client pins in place of the system trust store.
 /// `cast.remotetogo.com` is CloudFront-fronted, so this is the Starfield /
@@ -70,8 +71,19 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// roll does not land mid-session.
 const REFRESH_LEAD: Duration = Duration::from_secs(3600);
 
-/// Cap on the response body. A live response is a few kilobytes.
+/// Cap on the CKS response body. A live response is a few kilobytes. (AirServer's
+/// response is ~14 MB and has its own, much larger cap — see
+/// [`crate::airserver_db::MAX_DB_BYTES`].)
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
+
+/// How close to a fetched database's end to start trying to replace it.
+///
+/// AirServer's live set spans about a month of 2-day windows, so three days of
+/// headroom means several refresh attempts — each separated by
+/// [`ReplayConfig::failure_backoff`] — before the old set stops working. The point is
+/// that a panel offline for a fortnight still rolls over the moment its uplink
+/// returns, rather than discovering the problem when the last window lapses.
+const REFRESH_HORIZON: i64 = 3 * 24 * 3600;
 
 /// A checked-in offline receiver-auth identity.
 ///
@@ -81,7 +93,7 @@ const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
-pub enum OfflineIdentity {
+pub enum Identity {
     /// SoftMedia / AirReceiver, `CN=RYW0O FA8FCA6AC5A0` under `Eureka Gen1 ICA`.
     /// Covers 2023-01-01 → 2027-12-06. See [`crate::cks`].
     Cks,
@@ -91,7 +103,7 @@ pub enum OfflineIdentity {
     AirServer,
 }
 
-impl core::fmt::Display for OfflineIdentity {
+impl core::fmt::Display for Identity {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Cks => f.write_str("cks"),
@@ -104,7 +116,7 @@ impl core::fmt::Display for OfflineIdentity {
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
     /// Whether the backend may be contacted at all. With this off the provider is
-    /// entirely offline and bounded by whichever table `offline_order` selects.
+    /// entirely offline and bounded by whichever table `identity_order` selects.
     pub network: bool,
     /// Where to cache a fetched credential. `None` disables caching.
     pub cache_path: Option<PathBuf>,
@@ -112,13 +124,15 @@ pub struct ReplayConfig {
     pub timeout: Duration,
     /// Hold-down after a failed fetch.
     pub failure_backoff: Duration,
-    /// Which offline identities to try, in order, when the network path does not
-    /// produce a credential.
+    /// Which identities to try, in order. Each is tried cache → live → table before
+    /// the next is considered.
     ///
-    /// Empty means "no offline fallback", which is a legitimate choice for an
-    /// operator who would rather Cast fail loudly than present a borrowed
-    /// identity — but it makes startup depend on reaching the backend.
-    pub offline_order: Vec<OfflineIdentity>,
+    /// Empty means no Cast credential at all, which is a legitimate choice for an
+    /// operator who would rather Cast fail loudly than present a borrowed identity.
+    pub identity_order: Vec<Identity>,
+    /// Where to keep AirServer's fetched credential database. `None` disables that
+    /// identity's live path, leaving it on its bundled table.
+    pub airserver_db_path: Option<PathBuf>,
 }
 
 impl Default for ReplayConfig {
@@ -128,10 +142,11 @@ impl Default for ReplayConfig {
             cache_path: Some(cache::default_path()),
             timeout: DEFAULT_TIMEOUT,
             failure_backoff: DEFAULT_FAILURE_BACKOFF,
-            // CKS first: it outlasts AirServer by eight months, so on expiry alone
-            // it is the better default. See the module docs for why AirServer is
-            // carried at all.
-            offline_order: vec![OfflineIdentity::Cks, OfflineIdentity::AirServer],
+            // CKS first: its *table* outlasts AirServer's by eight months, so on
+            // expiry alone it is the better default. See the module docs for why
+            // AirServer is carried at all.
+            identity_order: vec![Identity::Cks, Identity::AirServer],
+            airserver_db_path: Some(airserver_api::default_db_path()),
         }
     }
 }
@@ -148,6 +163,9 @@ struct Resolver {
     /// is half the point of carrying two.
     cks_table: Option<CksTable>,
     airserver_table: Option<AirServerTable>,
+    /// The last fetched AirServer database, memoised: opening one decrypts every
+    /// window, and nothing about it changes between fetches.
+    airserver_cache: RwLock<Option<Arc<AirServerDb>>>,
     config: ReplayConfig,
     /// `backend_now - local_now`, learned from a successful fetch.
     ///
@@ -155,8 +173,11 @@ struct Resolver {
     /// rejects it. The reference client keeps the same correction for the same
     /// reason; it is why the schedule does not follow the device clock.
     clock_offset: AtomicI64,
-    /// When the backend may next be tried, as a local Unix second.
-    retry_after: AtomicI64,
+    /// When each live source may next be tried, as a local Unix second. Separate
+    /// per source: one endpoint being down says nothing about the other, and sharing
+    /// a hold-down would let a dead CKS backend suppress AirServer refreshes.
+    cks_retry_after: AtomicI64,
+    airserver_retry_after: AtomicI64,
 }
 
 /// Supplies the current Cast receiver-auth credential.
@@ -184,9 +205,11 @@ impl ReplayProvider {
         let resolver = Resolver {
             cks_table: log_load("cks", CksTable::load()),
             airserver_table: log_load("airserver", AirServerTable::load()),
+            airserver_cache: RwLock::new(None),
             config,
             clock_offset: AtomicI64::new(0),
-            retry_after: AtomicI64::new(0),
+            cks_retry_after: AtomicI64::new(0),
+            airserver_retry_after: AtomicI64::new(0),
         };
         let credential = resolver.resolve_once(local_now()).await?;
         info!(
@@ -302,88 +325,242 @@ impl ReplayProvider {
 }
 
 impl Resolver {
-    /// Run the fallback chain once.
+    /// Run the chain once: each identity in order, and within an identity
+    /// cache → live → checked-in table.
+    ///
+    /// Returns the *last* failure rather than the first, because the last one comes
+    /// from the least-preferred identity and so describes the widest gap — for a
+    /// panel past every horizon, that is the message an operator needs.
     async fn resolve_once(&self, now_local: i64) -> Result<CastCredential, ReplayError> {
         let now = now_local + self.clock_offset.load(Ordering::Relaxed);
+        let mut last = None;
+        for identity in &self.config.identity_order {
+            let attempt = match identity {
+                Identity::Cks => self.resolve_cks(now_local, now).await,
+                Identity::AirServer => self.resolve_airserver(now_local, now).await,
+            };
+            match attempt {
+                Ok(credential) => return Ok(credential),
+                Err(e) => {
+                    debug!(%identity, error = %e, "identity cannot supply a credential");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| ReplayError::Table("no Cast identity is configured".into())))
+    }
 
+    /// CKS: the JSON credential cache, then the backend, then the table.
+    async fn resolve_cks(&self, now_local: i64, now: i64) -> Result<CastCredential, ReplayError> {
         if let Some(path) = &self.config.cache_path {
             match cache::load(path) {
                 Ok(Some(cached)) if cached.valid_at(now) => {
-                    debug!("using the cached Cast credential");
+                    debug!("using the cached CKS credential");
                     return Ok(cached);
                 }
-                Ok(Some(_)) => debug!("the cached Cast credential is outside its window"),
+                Ok(Some(_)) => debug!("the cached CKS credential is outside its window"),
                 Ok(None) => {}
                 // A cache that will not load is a real fault, but not one worth
                 // failing over — the remaining paths do not depend on it.
-                Err(e) => warn!(error = %e, "ignoring the Cast credential cache"),
+                Err(e) => warn!(error = %e, "ignoring the CKS credential cache"),
             }
         }
 
-        if self.config.network && now_local >= self.retry_after.load(Ordering::Relaxed) {
+        if self.may_try(&self.cks_retry_after, now_local) {
             match self.fetch(now_local).await {
                 Ok(credential) => {
                     if let Some(path) = &self.config.cache_path {
                         if let Err(e) = cache::store(path, &credential) {
-                            warn!(error = %e, "could not cache the Cast credential");
+                            warn!(error = %e, "could not cache the CKS credential");
                         }
                     }
                     return Ok(credential);
                 }
+                Err(e) => self.back_off(&self.cks_retry_after, now_local, "CKS backend", &e),
+            }
+        }
+
+        self.table_credential(Identity::Cks, now)
+    }
+
+    /// AirServer: the cached database, then a fetch, then the bundled table.
+    ///
+    /// The cache and the live source are the *same artifact* here — one database
+    /// covering ~30 rolling windows — which is what makes rollover cheap: a fetch
+    /// buys a month of windows rather than one, and between fetches the cached file
+    /// answers with no network at all.
+    ///
+    /// The ordering that matters: a cached database still inside
+    /// [`REFRESH_HORIZON`] of its end triggers a fetch *before* being used, so the
+    /// set is replaced while the old one still works rather than after it stops. If
+    /// that fetch fails, the old database is still used — an expiring credential
+    /// beats none.
+    async fn resolve_airserver(
+        &self,
+        now_local: i64,
+        now: i64,
+    ) -> Result<CastCredential, ReplayError> {
+        let cached = self.airserver_db(now);
+        let horizon_near = cached
+            .as_ref()
+            .is_some_and(|db| db.covers_until() - now < REFRESH_HORIZON);
+        let usable = cached
+            .as_ref()
+            .is_some_and(|db| db.credential_at(now).is_ok());
+
+        if (!usable || horizon_near) && self.may_try(&self.airserver_retry_after, now_local) {
+            match self.fetch_airserver_db().await {
+                Ok(db) => {
+                    if let Ok(credential) = db.credential_at(now) {
+                        info!(
+                            windows = db.window_count(),
+                            covers_until = db.covers_until(),
+                            generated = db.generated_unix(),
+                            "fetched a fresh AirServer credential database"
+                        );
+                        if let Ok(mut slot) = self.airserver_cache.write() {
+                            *slot = Some(Arc::new(db));
+                        }
+                        return Ok(credential);
+                    }
+                    warn!("the fetched AirServer database does not cover the current window");
+                }
                 Err(e) => {
-                    let until = now_local
-                        + i64::try_from(self.config.failure_backoff.as_secs()).unwrap_or(360);
-                    self.retry_after.store(until, Ordering::Relaxed);
-                    warn!(
-                        error = %e,
-                        backoff_secs = self.config.failure_backoff.as_secs(),
-                        "the CKS backend is unreachable; falling back to a checked-in table"
+                    self.back_off(
+                        &self.airserver_retry_after,
+                        now_local,
+                        "AirServer endpoint",
+                        &e,
                     );
                 }
             }
         }
 
-        self.offline_credential(now)
+        if let Some(db) = cached {
+            if let Ok(credential) = db.credential_at(now) {
+                if horizon_near {
+                    warn!(
+                        covers_until = db.covers_until(),
+                        "the cached AirServer database is close to its end and could not be \
+                         refreshed"
+                    );
+                }
+                return Ok(credential);
+            }
+        }
+
+        self.table_credential(Identity::AirServer, now)
     }
 
-    /// Walk [`ReplayConfig::offline_order`] and take the first identity that covers
-    /// `now`.
+    /// The cached AirServer database: the one held in memory, else the file on disk.
     ///
-    /// Returns the *last* failure rather than the first, because the last one is
-    /// from the least-preferred identity and so describes the widest gap — for a
-    /// panel past every table's end date, that is the message an operator needs.
+    /// Opening decrypts every window, so the result is memoised — `resolve_once` runs
+    /// on a timer, but there is no reason to pay for it on every wakeup.
+    fn airserver_db(&self, _now: i64) -> Option<Arc<AirServerDb>> {
+        if let Ok(slot) = self.airserver_cache.read() {
+            if let Some(db) = slot.as_ref() {
+                return Some(Arc::clone(db));
+            }
+        }
+        let path = self.config.airserver_db_path.as_ref()?;
+        if !path.exists() {
+            return None;
+        }
+        match AirServerDb::open(path) {
+            Ok(db) => {
+                let db = Arc::new(db);
+                if let Ok(mut slot) = self.airserver_cache.write() {
+                    *slot = Some(Arc::clone(&db));
+                }
+                Some(db)
+            }
+            // A database that will not open is worth saying loudly — it means this
+            // identity is running on its bundled table instead — but not worth
+            // failing over.
+            Err(e) => {
+                warn!(error = %e, path = %path.display(), "ignoring the cached AirServer database");
+                None
+            }
+        }
+    }
+
+    /// One POST to AirServer's endpoint, written to the cache path and reopened.
+    async fn fetch_airserver_db(&self) -> Result<AirServerDb, ReplayError> {
+        let path = self
+            .config
+            .airserver_db_path
+            .clone()
+            .ok_or_else(|| ReplayError::Cache("no AirServer database path is set".into()))?;
+        let timeout = self.config.timeout;
+        // ureq is blocking and the body is ~14 MB, so this belongs off the runtime
+        // (ground rule 4).
+        let target = path.clone();
+        let bytes = tokio::task::spawn_blocking(move || airserver_api::fetch_to(&target, timeout))
+            .await
+            .map_err(|e| ReplayError::Http(format!("joining the AirServer request: {e}")))??;
+        debug!(bytes, path = %path.display(), "wrote an AirServer credential database");
+
+        let opened = path.clone();
+        tokio::task::spawn_blocking(move || AirServerDb::open(&opened))
+            .await
+            .map_err(|e| ReplayError::Database(format!("joining the database open: {e}")))?
+    }
+
+    /// Whether a live source may be tried, given its hold-down.
+    fn may_try(&self, retry_after: &AtomicI64, now_local: i64) -> bool {
+        self.config.network && now_local >= retry_after.load(Ordering::Relaxed)
+    }
+
+    /// Record a failure and hold the source down for the configured backoff.
+    fn back_off(&self, retry_after: &AtomicI64, now_local: i64, what: &str, e: &ReplayError) {
+        let until = now_local + i64::try_from(self.config.failure_backoff.as_secs()).unwrap_or(360);
+        retry_after.store(until, Ordering::Relaxed);
+        warn!(
+            error = %e,
+            backoff_secs = self.config.failure_backoff.as_secs(),
+            "the {what} is unreachable; falling back",
+        );
+    }
+
+    /// One identity's checked-in table. Cheap: no network, no database, no decryption.
+    ///
+    /// This is what the per-connection path falls back to, so it must stay cheap.
+    fn table_credential(
+        &self,
+        identity: Identity,
+        now: i64,
+    ) -> Result<CastCredential, ReplayError> {
+        match identity {
+            Identity::Cks => self.cks_table.as_ref().map_or_else(
+                || Err(ReplayError::Table("the CKS fixtures did not load".into())),
+                |t| t.credential_at(now),
+            ),
+            Identity::AirServer => self.airserver_table.as_ref().map_or_else(
+                || {
+                    Err(ReplayError::Table(
+                        "the AirServer fixtures did not load".into(),
+                    ))
+                },
+                |t| t.credential_at(now),
+            ),
+        }
+    }
+
+    /// The first checked-in table, in configured order, that covers `now`.
     fn offline_credential(&self, now: i64) -> Result<CastCredential, ReplayError> {
         let mut last = None;
-        for identity in &self.config.offline_order {
-            let attempt = match identity {
-                OfflineIdentity::Cks => self
-                    .cks_table
-                    .as_ref()
-                    .map(|t| t.credential_at(now))
-                    .unwrap_or_else(|| {
-                        Err(ReplayError::Table("the CKS fixtures did not load".into()))
-                    }),
-                OfflineIdentity::AirServer => self
-                    .airserver_table
-                    .as_ref()
-                    .map(|t| t.credential_at(now))
-                    .unwrap_or_else(|| {
-                        Err(ReplayError::Table(
-                            "the AirServer fixtures did not load".into(),
-                        ))
-                    }),
-            };
-            match attempt {
+        for identity in &self.config.identity_order {
+            match self.table_credential(*identity, now) {
                 Ok(credential) => return Ok(credential),
                 Err(e) => {
-                    debug!(%identity, error = %e, "offline identity cannot cover this instant");
+                    debug!(%identity, error = %e, "table cannot cover this instant");
                     last = Some(e);
                 }
             }
         }
         Err(last.unwrap_or_else(|| {
             ReplayError::Table(
-                "no offline identity is configured and the backend did not answer".into(),
+                "no offline identity is configured and no live source answered".into(),
             )
         }))
     }
@@ -529,20 +706,17 @@ mod tests {
     /// Reversing the order is the whole mitigation for a revoked identity, so it
     /// has to actually change which identity is presented.
     #[tokio::test]
-    async fn the_offline_order_selects_the_identity() {
+    async fn the_identity_order_selects_the_identity() {
         let at = 1_785_196_800; // 2026-07-28: inside both tables
 
         for (order, expect_airserver) in [
-            (
-                vec![OfflineIdentity::Cks, OfflineIdentity::AirServer],
-                false,
-            ),
-            (vec![OfflineIdentity::AirServer, OfflineIdentity::Cks], true),
+            (vec![Identity::Cks, Identity::AirServer], false),
+            (vec![Identity::AirServer, Identity::Cks], true),
         ] {
             let provider = ReplayProvider::resolve(ReplayConfig {
                 network: false,
                 cache_path: None,
-                offline_order: order.clone(),
+                identity_order: order.clone(),
                 ..ReplayConfig::default()
             })
             .await
@@ -571,7 +745,7 @@ mod tests {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
             cache_path: None,
-            offline_order: vec![OfflineIdentity::AirServer, OfflineIdentity::Cks],
+            identity_order: vec![Identity::AirServer, Identity::Cks],
             ..ReplayConfig::default()
         })
         .await
@@ -593,7 +767,7 @@ mod tests {
         let far_future_config = ReplayConfig {
             network: false,
             cache_path: None,
-            offline_order: vec![OfflineIdentity::AirServer],
+            identity_order: vec![Identity::AirServer],
             ..ReplayConfig::default()
         };
         // AirServer stops 2027-03-21; ask for 2027-07-01.
@@ -601,8 +775,10 @@ mod tests {
             cks_table: CksTable::load().ok(),
             airserver_table: AirServerTable::load().ok(),
             config: far_future_config,
+            airserver_cache: RwLock::new(None),
             clock_offset: AtomicI64::new(0),
-            retry_after: AtomicI64::new(0),
+            cks_retry_after: AtomicI64::new(0),
+            airserver_retry_after: AtomicI64::new(0),
         };
         assert!(matches!(
             resolver.offline_credential(1_814_400_000),
@@ -620,16 +796,131 @@ mod tests {
             config: ReplayConfig {
                 network: false,
                 cache_path: None,
-                offline_order: vec![],
+                identity_order: vec![],
                 ..ReplayConfig::default()
             },
+            airserver_cache: RwLock::new(None),
             clock_offset: AtomicI64::new(0),
-            retry_after: AtomicI64::new(0),
+            cks_retry_after: AtomicI64::new(0),
+            airserver_retry_after: AtomicI64::new(0),
         };
         assert!(matches!(
             resolver.offline_credential(1_785_196_800),
             Err(ReplayError::Table(_))
         ));
+    }
+
+    /// The trimmed AirServer database, three windows from 2024-03-20.
+    const AIRSERVER_DB: &[u8] = include_bytes!("../fixtures/airserver/db_trimmed.sqlite");
+
+    /// Inside the first window of the trimmed database.
+    const IN_DB: i64 = 1_710_892_800 + 3600;
+
+    fn with_database() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airserver.sqlite");
+        std::fs::write(&path, AIRSERVER_DB).unwrap();
+        (dir, path)
+    }
+
+    /// A cached database answers with no network at all. This is the state a panel
+    /// spends almost all its time in: one fetch bought ~30 windows.
+    #[tokio::test]
+    async fn a_cached_database_is_used_without_network() {
+        let (_dir, path) = with_database();
+        let provider = ReplayProvider::resolve(ReplayConfig {
+            network: false,
+            cache_path: None,
+            identity_order: vec![Identity::AirServer],
+            airserver_db_path: Some(path),
+            ..ReplayConfig::default()
+        })
+        .await
+        .unwrap();
+
+        let credential = provider.resolver.resolve_once(IN_DB).await.unwrap();
+        assert_eq!(credential.origin(), &CredentialOrigin::AirServerLive);
+        assert!(credential.valid_at(IN_DB));
+    }
+
+    /// A database inside REFRESH_HORIZON of its end wants replacing, but if the fetch
+    /// cannot run it must still be used. An expiring credential beats none, and this
+    /// is the path a panel with no uplink takes.
+    #[tokio::test]
+    async fn an_expiring_database_is_still_used_when_no_fetch_is_possible() {
+        let (_dir, path) = with_database();
+        let provider = ReplayProvider::resolve(ReplayConfig {
+            network: false,
+            cache_path: None,
+            identity_order: vec![Identity::AirServer],
+            airserver_db_path: Some(path),
+            ..ReplayConfig::default()
+        })
+        .await
+        .unwrap();
+
+        // The last window of the trimmed set ends 2024-03-25; an hour before that is
+        // well inside the three-day horizon.
+        let near_end = 1_711_065_600 + 2 * 86_400 - 3600;
+        let credential = provider.resolver.resolve_once(near_end).await.unwrap();
+        assert_eq!(credential.origin(), &CredentialOrigin::AirServerLive);
+        assert!(credential.valid_at(near_end));
+    }
+
+    /// With no database path the identity is table-only, which is what an operator who
+    /// does not want the endpoint contacted gets.
+    #[tokio::test]
+    async fn without_a_database_path_airserver_uses_its_table() {
+        let provider = ReplayProvider::resolve(ReplayConfig {
+            network: false,
+            cache_path: None,
+            identity_order: vec![Identity::AirServer],
+            airserver_db_path: None,
+            ..ReplayConfig::default()
+        })
+        .await
+        .unwrap();
+
+        let at = 1_785_196_800;
+        let credential = provider.resolver.resolve_once(at).await.unwrap();
+        assert!(matches!(
+            credential.origin(),
+            CredentialOrigin::AirServerTable { .. }
+        ));
+    }
+
+    /// The two live sources hold down independently. Sharing one timer would let a
+    /// dead CKS backend suppress AirServer refreshes for the whole backoff, which is
+    /// exactly the coupling a second identity exists to avoid.
+    #[tokio::test]
+    async fn the_live_sources_back_off_independently() {
+        let (_dir, path) = with_database();
+        let provider = ReplayProvider::resolve(ReplayConfig {
+            network: false,
+            cache_path: None,
+            identity_order: vec![Identity::Cks, Identity::AirServer],
+            airserver_db_path: Some(path),
+            ..ReplayConfig::default()
+        })
+        .await
+        .unwrap();
+
+        provider
+            .resolver
+            .cks_retry_after
+            .store(i64::MAX, Ordering::Relaxed);
+        assert_eq!(
+            provider
+                .resolver
+                .airserver_retry_after
+                .load(Ordering::Relaxed),
+            0,
+            "holding CKS down must not touch AirServer"
+        );
+
+        // CKS is first in order and still answers from its table, so this asserts the
+        // isolation of the timers rather than the ordering.
+        assert!(provider.resolver.resolve_once(IN_DB).await.is_ok());
     }
 
     /// A window roll must produce a different credential, not a stale one.
@@ -683,7 +974,7 @@ mod tests {
         .unwrap();
         provider
             .resolver
-            .retry_after
+            .cks_retry_after
             .store(i64::MAX, Ordering::Relaxed);
         let credential = provider.resolver.resolve_once(1_785_196_800).await.unwrap();
         assert!(credential.valid_at(1_785_196_800));

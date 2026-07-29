@@ -39,7 +39,7 @@ use rsa::pkcs1::DecodeRsaPrivateKey as _;
 use rsa::pkcs8::EncodePrivateKey as _;
 use rsa::RsaPrivateKey;
 
-use crate::provider::OfflineIdentity;
+use crate::provider::Identity;
 use crate::window::Window;
 use crate::{CastCredential, CredentialOrigin, ReplayError};
 
@@ -243,7 +243,7 @@ impl AirServerDb {
             .filter(|w| w.window.contains(unix))
             .max_by_key(|w| w.window.end_unix())
             .ok_or(ReplayError::OutOfRange {
-                identity: OfflineIdentity::AirServer,
+                identity: Identity::AirServer,
                 unix,
                 covers_until: self.covers_until(),
             })?;

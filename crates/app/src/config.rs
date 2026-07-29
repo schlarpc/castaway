@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-pub use cast_replay::OfflineIdentity;
+pub use cast_replay::Identity;
 use castaway_core::ProtocolKind;
 use serde::Deserialize;
 
@@ -403,13 +403,26 @@ pub struct Replay {
     /// `cast.credential`, the receiver falls back to a self-generated key that
     /// official senders reject.
     pub enabled: bool,
-    /// Whether the backend may be contacted.
+    /// Whether either live endpoint may be contacted.
     ///
     /// Turning this off pins the receiver to the checked-in tables — which works,
-    /// offline, until 2027-12-06 and not one window past it. The backend is the
-    /// only thing that extends past that date.
+    /// offline, until 2027-12-06 and not one window past it. The live endpoints are
+    /// the only thing that extends past that date, and the only thing that stops the
+    /// checked-in databases from being the receiver's expiry date.
     pub network: bool,
-    /// Which checked-in identities to fall back to, in order.
+    /// Whether AirServer's live endpoint may be contacted, on top of `network`.
+    ///
+    /// On by default. The fetched database covers ~30 rolling windows, so one request
+    /// buys about a month and the receiver spends almost all its time answering from
+    /// the cached file with no network at all. It is refreshed three days before the
+    /// set runs out, so a panel that is offline for a fortnight still rolls over when
+    /// its uplink returns.
+    ///
+    /// Turning it off leaves that identity on its bundled table and its hard
+    /// 2027-03-21 end. The response is ~14 MB, which is the only reason an operator
+    /// on a metered link might want it off.
+    pub airserver_live: bool,
+    /// Which identities to try, in order.
     ///
     /// Two are shipped, and they are *different devices on different branches of
     /// the Cast PKI* — `cks` is AirReceiver's (`Eureka Gen1 ICA`, through
@@ -424,9 +437,13 @@ pub struct Replay {
     /// happens, reversing this list is the fix. Nothing in the receiver can detect
     /// it, which is why this is a knob and not an inference.
     ///
-    /// An empty list means no offline fallback at all: Cast then depends on the
-    /// backend being reachable, and fails loudly when it is not.
-    pub offline_order: Vec<OfflineIdentity>,
+    /// Each identity is tried cache → live endpoint → checked-in table before the
+    /// next is considered, so reordering changes which identity the panel presents
+    /// rather than merely which table it falls back to.
+    ///
+    /// An empty list means no Cast credential at all: the receiver then presents a
+    /// self-generated key that official senders reject.
+    pub identity_order: Vec<Identity>,
 }
 
 impl Default for Replay {
@@ -434,7 +451,8 @@ impl Default for Replay {
         Self {
             enabled: true,
             network: true,
-            offline_order: vec![OfflineIdentity::Cks, OfflineIdentity::AirServer],
+            airserver_live: true,
+            identity_order: vec![Identity::Cks, Identity::AirServer],
         }
     }
 }

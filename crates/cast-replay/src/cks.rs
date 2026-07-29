@@ -14,7 +14,7 @@ use rsa::pkcs8::EncodePrivateKey as _;
 use rsa::RsaPrivateKey;
 
 use crate::pem;
-use crate::provider::OfflineIdentity;
+use crate::provider::Identity;
 use crate::template::PeerTemplate;
 use crate::window::{Window, WINDOW_SECS};
 use crate::{CastCredential, CredentialOrigin, ReplayError};
@@ -116,12 +116,12 @@ impl CksTable {
     /// 2027-12-06, it never will. [`ReplayError::Sign`] if re-issuing fails.
     pub fn credential_at(&self, unix: i64) -> Result<CastCredential, ReplayError> {
         let index = self.index_at(unix).ok_or(ReplayError::OutOfRange {
-            identity: OfflineIdentity::Cks,
+            identity: Identity::Cks,
             unix,
             covers_until: self.covers_until(),
         })?;
         let window = self.window(index).ok_or(ReplayError::OutOfRange {
-            identity: OfflineIdentity::Cks,
+            identity: Identity::Cks,
             unix,
             covers_until: self.covers_until(),
         })?;

@@ -107,6 +107,7 @@
 use thiserror::Error;
 
 pub mod airserver;
+pub mod airserver_api;
 pub mod airserver_db;
 pub mod api;
 pub mod cache;
@@ -119,7 +120,7 @@ pub mod window;
 pub use airserver::AirServerTable;
 pub use cks::CksTable;
 pub use crypto_cast_auth::{HashAlgo, NonceEcho, SigAlgo, SignedAuth};
-pub use provider::{OfflineIdentity, ReplayConfig, ReplayProvider};
+pub use provider::{Identity, ReplayConfig, ReplayProvider};
 pub use window::Window;
 
 /// Errors from credential acquisition.
@@ -160,7 +161,7 @@ pub enum ReplayError {
     )]
     OutOfRange {
         /// Which offline identity was asked.
-        identity: OfflineIdentity,
+        identity: Identity,
         /// The instant a credential was wanted for.
         unix: i64,
         /// The first instant that identity's table does not cover.

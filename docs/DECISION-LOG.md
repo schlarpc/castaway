@@ -1056,7 +1056,7 @@ official sender quietly refusing to talk, with nothing in our logs to say why.
 
 **This does not reduce that likelihood. It changes the response from "reflash the panel"
 to "edit one line".** `cast-replay` now carries AirServer's identity beside AirReceiver's,
-and `[cast.replay] offline_order` picks between them.
+and `[cast.replay] identity_order` picks between them.
 
 **The identities are genuinely independent**, which is the property that makes a second
 one worth 960 KiB:
@@ -1102,7 +1102,7 @@ An unattended panel refreshing on a schedule is precisely the "do not run this i
 case the RE handoff warns about, and it would add a network path with its own failure modes
 for no window either existing path lacks.
 
-**Fallback is a declarative ordered list, not a chain of flags** — `offline_order` — so
+**Fallback is a declarative ordered list, not a chain of flags** — `identity_order` — so
 "which identity is this panel presenting" has one answer readable from config instead of
 being reconstructed from which branches happened to be taken. Nothing in the receiver can
 *detect* a revocation, since the signal is a sender refusing us, which is exactly why the

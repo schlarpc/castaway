@@ -56,7 +56,7 @@ use rsa::pkcs1::DecodeRsaPrivateKey as _;
 use rsa::pkcs8::EncodePrivateKey as _;
 use rsa::RsaPrivateKey;
 
-use crate::provider::OfflineIdentity;
+use crate::provider::Identity;
 use crate::window::Window;
 use crate::{CastCredential, CredentialOrigin, ReplayError};
 
@@ -185,12 +185,12 @@ impl AirServerTable {
     /// [`ReplayError::OutOfRange`] if this table does not reach `unix`.
     pub fn credential_at(&self, unix: i64) -> Result<CastCredential, ReplayError> {
         let index = self.index_at(unix).ok_or(ReplayError::OutOfRange {
-            identity: OfflineIdentity::AirServer,
+            identity: Identity::AirServer,
             unix,
             covers_until: self.covers_until(),
         })?;
         let window = self.window(index).ok_or(ReplayError::OutOfRange {
-            identity: OfflineIdentity::AirServer,
+            identity: Identity::AirServer,
             unix,
             covers_until: self.covers_until(),
         })?;
