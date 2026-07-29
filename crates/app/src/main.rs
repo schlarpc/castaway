@@ -805,7 +805,12 @@ async fn serve(
             }
         };
         adapter_handles.push(tokio::spawn(shell_nav::run(
-            events, render, adapter, commands, settings,
+            events,
+            render,
+            adapter,
+            commands,
+            settings,
+            osd.clone(),
         )));
     }
 

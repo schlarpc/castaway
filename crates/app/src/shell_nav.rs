@@ -47,6 +47,7 @@ pub async fn run(
     gamestream: Option<Arc<GameStreamAdapter>>,
     gamestream_commands: mpsc::Sender<GameStreamCommand>,
     settings: settings::Catalog,
+    osd: castaway_core::OsdSink,
 ) {
     // Which host the app picker is for. Set when a host row is pressed.
     let mut chosen_host: Option<String> = None;
@@ -88,7 +89,7 @@ pub async fn run(
                         warn!(%id, "shell: a choice row with no setting in its id");
                         continue;
                     };
-                    apply_choice(&render, &settings, setting_id, choice_id).await;
+                    apply_choice(&render, &osd, &settings, setting_id, choice_id).await;
                 } else {
                     debug!(%id, "shell: an item from a list nothing owns");
                 }
@@ -177,10 +178,13 @@ async fn show_setting(
 /// Apply a picked choice, then show the list again with the mark moved.
 ///
 /// The refreshed list *replaces* the one on screen: the person is exactly where they
-/// were, with the check on the row they pressed — or the row they had, plus a line
-/// saying what refused, in the one state that is bad news.
+/// were, with the check on the row they pressed. A choice that applied but could not be
+/// *saved* still shows the moved check — the running receiver honours it — and the save
+/// failure goes to the OSD as a toast, because it is news about a file, not about the
+/// list, and the screen should carry on working either way.
 async fn apply_choice(
     render: &std::sync::mpsc::SyncSender<RenderCommand>,
+    osd: &castaway_core::OsdSink,
     catalog: &settings::Catalog,
     setting_id: &str,
     choice_id: &str,
@@ -205,12 +209,14 @@ async fn apply_choice(
         }
         Ok((Ok(Applied::NotSaved(why)), picker)) => {
             // Applied but not persisted — the panel works and the file disagrees, and
-            // saying so is the only thing standing between that and a mystery on the
+            // the toast is the only thing standing between that and a mystery on the
             // next restart.
             warn!(%setting_id, %why, "settings: applied but not saved");
-            replace(render, picker.failed(why));
+            osd.banner(why, std::time::Duration::from_secs(8));
+            replace(render, picker);
         }
         Ok((Err(why), picker)) => {
+            // Nothing changed; this one belongs to the list it came from.
             warn!(%setting_id, %choice_id, %why, "settings: refused");
             replace(render, picker.failed(why));
         }
