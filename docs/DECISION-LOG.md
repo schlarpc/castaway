@@ -939,3 +939,50 @@ session with no restart, and sessions already playing keep the device they opene
 same rule as their sample rate. The Windows deploy artifact gains `audio-out` (WASAPI),
 which it had never actually carried; until now the full Windows build had no PCM device
 at all.
+
+### D41 — Cast device auth by replay: someone else's identity, deliberately, with the exit named
+Q2 — "we need a real Cast device credential" — has been the last thing standing between
+this receiver and an official sender, and it was posed as a hardware problem: device keys
+are fused into licensed silicon, so get one off a panel you own. That framing was right
+about where keys live and wrong about what the protocol requires.
+
+**What the protocol actually requires.** Openscreen builds the blob it verifies from the
+nonce the *receiver echoes*, not the one the sender issued, and `enforce_nonce_checking`
+defaults to false. Echo nothing and the signed message is the peer certificate alone — so
+a signature is bound to a certificate, not to a session, and stays valid for that
+certificate's whole life. Every shipping software receiver exploits this the same way:
+generate the peer certificate on a fixed 2-day schedule from a fixed key, and hold one
+precomputed signature per window. No device key anywhere in the design. The omitted nonce
+is itself the evidence — a party holding a device key could sign the nonce and would have
+no reason to ship a 900-entry table.
+
+**The decision** is to do that too, in `cast-cks`: a reimplementation of the CKS request
+and its response cipher, plus the 900-window table (2023-01-01 → 2027-12-06, 1800
+signatures) checked in as fixtures. Backend first — it keeps working as the calendar moves
+— with the table behind it so an unattended panel that loses its uplink keeps
+authenticating. `checks.openscreen-device-auth` records the result against Chrome's own
+verifier: `cks-chain-google-roots` is **ok**, where `dev-chain-google-roots` is still
+`kCastV2CertNotSignedByTrustedCa`.
+
+**What it costs, stated plainly.** The identity is AirReceiver's, not ours. It is shared
+with every install of that app, `AuthResponse` carries a `crl` field and Chrome fetches the
+Cast device CRL, so Google can revoke it and Cast stops working with no warning and no way
+for us to see it coming. The table expires 2027-12-06; the chain's own ceiling is
+2032-12-12, set by `Eureka Root CA`. This is a borrowed credential with a known end date,
+not a solved problem — which is why the exit stays first in precedence: `cast.credential`,
+an operator's own provisioned key, wins over CKS whenever it is set, and Q2 is rewritten
+rather than deleted.
+
+**Two invariants went into the type system rather than into comments**, because both fail
+after a *clean* TLS handshake and are therefore invisible from either end. The signature
+covers the certificate, so `CastCredential` hands out the TLS identity and the signature
+together and `CastIdentity` enumerates the three ways to be a Cast device — there is no way
+to pair a certificate with a signature from another window. And a replayed signature can
+only be answered with `NonceEcho::Empty`, which now travels on `SignedAuth` instead of
+being decided at the call site. The `cks-nonce-echoed` vector is the negative control that
+gives that second one teeth.
+
+This is ground rule 9 working as intended, not a carve-out from it: the RE landed as
+fixtures and notes, the wire behaviour is reimplemented, and nothing links or ships
+AirReceiver. It is also the third protocol whose hard part turned out to be a default in
+someone else's verifier rather than a cryptographic barrier.

@@ -34,27 +34,36 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   Note this was only ever a gate on **mirroring**. AirPlay 1 audio never touches
   FairPlay; its key arrives RSA-wrapped in the `ANNOUNCE` SDP and `crypto-raop` unwraps
   it.
-- **Q2 — Cast device-auth cert material. Still open, and now the *only* thing open.**
-  `crypto-cast-auth` needs a real device cert + key to sign the CASTv2 `AuthChallenge`.
-  At n=1 this is "a fixed local input" (per hackerspace notes).
+- **Q2 — Cast device-auth cert material. Answered, with a caveat that replaces it.**
+  `proto-cast` needs a credential a real sender will accept. It now has one:
+  `cast-cks` supplies a Google-issued chain (`Eureka Gen1 ICA` → `Eureka Root CA`) with a
+  precomputed signature, from the CKS backend or from a 900-window table checked in
+  beside it, and `checks.openscreen-device-auth` records the flip —
+  `cks-chain-google-roots` is **ok** against the roots senders actually ship, where
+  `dev-chain-google-roots` remains `kCastV2CertNotSignedByTrustedCa`. Chrome can cast to
+  this panel.
 
-  What changed: this is no longer a guess about what a sender wants. `checks.openscreen-
-  device-auth` runs openscreen's sender-side verifier — Chrome's own logic — over auth
-  responses we really produce, and the verdicts are unambiguous. Told to trust our dev
-  root, a real sender **accepts** the response; against the roots senders ship it fails
-  as `kCastV2CertNotSignedByTrustedCa` and nothing else. Chain order, key usage, digest,
-  the signed-blob layout: all already right.
+  How, given that no software receiver holds a device key: the signature is a *replay*.
+  Openscreen rebuilds the blob it verifies from the nonce the receiver echoes, and
+  `enforce_nonce_checking` is off, so a signature over the peer certificate alone stays
+  valid for that certificate's life. Generate the certificate on a fixed 2-day schedule
+  from a fixed key and one signature covers each window. D41 has the reasoning;
+  `crates/cast-cks/fixtures/README.md` has the provenance.
 
-  So the answer to "what do we need for Chrome to cast to this" is one file, not a
-  project. `[cast.credential]` in `castaway.toml` reads a PKCS#8 key, a device
-  certificate and any intermediates; drop a real one in and the single failing vector
-  flips. Nothing in the code has to change.
+  **What this does not answer.** The identity is not ours. It is AirReceiver's, shared
+  with every install of that app, and Google can revoke it — at which point Cast stops
+  working with no warning and nothing here can detect it in advance. The offline table
+  also stops on 2027-12-06. So the open question is no longer "how do we authenticate"
+  but "do we want to depend on someone else's revocable identity", and the durable answer
+  is still a credential of our own.
 
-  It stays out of the repository. A device credential identifies one specific piece of
-  hardware and is the one secret here that would be genuinely bad to publish — on the box
-  beside the other runtime secrets, never in the Nix store, never as a fixture. How you
-  get one off hardware you own is out of scope for these docs (GAPS.md G56 records why no
-  amount of automation against a device substitutes for holding its key).
+  That path is unchanged and now takes precedence in code: `[cast.credential]` in
+  `castaway.toml` reads a PKCS#8 key, a device certificate and any intermediates, and
+  wins over CKS when set. It stays out of the repository — a device credential identifies
+  one specific piece of hardware and is the one secret here that would be genuinely bad
+  to publish. How you get one off hardware you own is out of scope for these docs
+  (GAPS.md G56 records why no amount of automation against a device substitutes for
+  holding its key).
 - **Q3 — YouTube Lounge bind-channel transcript.** Need a real `yt-cast-receiver`
   session capture (the BrowserChannel framing: `RID`/`AID`/`SID`/`gsessionid`, chunked
   length-prefixed JSON). I've implemented the documented framing + command parser;
