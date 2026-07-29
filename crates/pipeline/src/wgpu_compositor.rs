@@ -1090,6 +1090,9 @@ impl Compositor for WgpuCompositor {
     fn covered_above(&self, id: LayerId, x: f32, y: f32) -> bool {
         self.layers.values().any(|s| {
             s.meta.id > id
+                // The outgoing half of a shell transition is the shell, not something on
+                // top of it.
+                && s.meta.id.occludes()
                 // A layer with no texture yet is registered but not drawn, so it hides
                 // nothing.
                 && s.gpu.is_some()

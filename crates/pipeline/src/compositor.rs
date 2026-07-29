@@ -162,6 +162,19 @@ pub enum LayerId {
 }
 
 impl LayerId {
+    /// Whether this layer covering a point means a touch there stops being the business
+    /// of whatever is underneath.
+    ///
+    /// True for every layer that is a surface of its own. False for [`Self::ShellPrev`],
+    /// which is a copy of the shell taken mid-navigation: it is *drawn* above the shell,
+    /// but it **is** the shell, and counting it as an occluder made every screen deaf for
+    /// the length of its own transition — including the back control on the screen that
+    /// had just been opened.
+    #[must_use]
+    pub const fn occludes(self) -> bool {
+        !matches!(self, Self::ShellPrev)
+    }
+
     /// Every layer, in paint order. The ordering test asserts against this rather than
     /// against a hand-written list, so a new variant cannot be added without placing it.
     pub const PAINT_ORDER: [Self; 9] = [
@@ -215,6 +228,7 @@ pub trait Compositor: Send {
     /// Only near-opaque layers count as covering; a translucent one still shows what is
     /// under it, and a partly-placed one (a letterboxed video, a PiP) covers only where
     /// it actually is.
+    /// A layer that is not [`LayerId::occludes`] never counts, however opaque it is.
     fn covered_above(&self, id: LayerId, x: f32, y: f32) -> bool;
 }
 
@@ -242,9 +256,9 @@ impl Compositor for NullCompositor {
     }
 
     fn covered_above(&self, id: LayerId, x: f32, y: f32) -> bool {
-        self.layers
-            .iter()
-            .any(|l| l.id > id && l.opacity >= OPAQUE_ENOUGH && l.transform.covers(x, y))
+        self.layers.iter().any(|l| {
+            l.id > id && l.id.occludes() && l.opacity >= OPAQUE_ENOUGH && l.transform.covers(x, y)
+        })
     }
 
     fn present(&mut self) {
@@ -375,6 +389,28 @@ mod tests {
             !c.covered_above(LayerId::Transport, 0.5, 0.9),
             "below its bottom edge"
         );
+    }
+
+    #[test]
+    fn a_screen_being_navigated_away_from_does_not_deafen_the_one_replacing_it() {
+        // The regression: `ShellPrev` is opaque and full-screen for the first frames of
+        // every navigation, so treating it as an occluder meant a press anywhere on the
+        // shell was swallowed until the animation finished — the back control on a screen
+        // did not answer for the length of the transition that had just opened it.
+        let mut c = NullCompositor::default();
+        c.upsert_layer(Layer {
+            id: LayerId::ShellPrev,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        assert!(!c.covered_above(LayerId::Attract, 0.5, 0.5));
+        // A real occluder in the same place still counts, so this is not a hole.
+        c.upsert_layer(Layer {
+            id: LayerId::Video,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        assert!(c.covered_above(LayerId::Attract, 0.5, 0.5));
     }
 
     #[test]
