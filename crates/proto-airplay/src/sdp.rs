@@ -226,6 +226,19 @@ pub enum StreamCrypto {
     },
 }
 
+impl AnnounceParams {
+    /// Re-key the media with a verified legacy-pairing secret (feature bit 27).
+    ///
+    /// `SHA512(aeskey ‖ shared)[0..16]`, per research §4.3. A no-op for an unencrypted
+    /// stream: there is no key to hash, and inventing one would be worse than the
+    /// plaintext the sender actually sent.
+    pub fn rekey_with(&mut self, shared: &[u8; 32]) {
+        if let StreamCrypto::Aes { key, .. } = &mut self.crypto {
+            *key = SessionKey(crate::pairing::rekey_media(&key.0, shared));
+        }
+    }
+}
+
 impl StreamCrypto {
     /// Whether the payload needs decrypting before it can be decoded.
     #[must_use]

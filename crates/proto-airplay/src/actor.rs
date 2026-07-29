@@ -488,9 +488,25 @@ mod tests {
     }
 
     #[test]
-    fn pairing_is_refused_rather_than_faked() {
+    fn legacy_pair_setup_answers_with_our_identity() {
+        // The advertisement promises bit 27, so this endpoint must answer — a 501 here
+        // is the receiver refusing the regime it just asked for.
         let mut session = AirPlaySession::new(identity());
         let raw = b"POST /pair-setup RTSP/1.0\r\nCSeq: 3\r\n\r\n";
+        let (msg, _) = substrate_rtsp::parse(raw).unwrap().unwrap();
+        let peer = SocketAddr::from(([10, 0, 0, 9], 5000));
+        let reply = dispatch(&mut session, &msg, peer).unwrap().unwrap();
+        let bytes = substrate_rtsp::write(&reply.message).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("RTSP/1.0 200"), "{text}");
+    }
+
+    #[test]
+    fn homekit_pairing_is_still_refused_rather_than_faked() {
+        // `X-Apple-HKP` marks a HomeKit flow, whose bits we do not advertise and whose
+        // SRP/ChaCha channel does not exist here. 501 is the honest answer.
+        let mut session = AirPlaySession::new(identity());
+        let raw = b"POST /pair-setup RTSP/1.0\r\nCSeq: 3\r\nX-Apple-HKP: 4\r\n\r\n";
         let (msg, _) = substrate_rtsp::parse(raw).unwrap().unwrap();
         let peer = SocketAddr::from(([10, 0, 0, 9], 5000));
         let reply = dispatch(&mut session, &msg, peer).unwrap().unwrap();

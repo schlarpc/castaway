@@ -26,6 +26,14 @@ pub enum AirPlayError {
     #[error("announce: {0}")]
     Sdp(#[from] SdpError),
 
+    /// A legacy pairing exchange (`/pair-verify`) could not be completed.
+    ///
+    /// Every variant is a sender that failed to prove itself, so the endpoint answers
+    /// `400` and the session goes no further — the alternative is deriving a media key
+    /// from a secret only one side believes in, which plays as noise.
+    #[error("pairing: {0}")]
+    Pairing(&'static str),
+
     /// The connection is over: a socket error, a byte stream that won't frame, or a
     /// peer claiming a message larger than we will buffer. The cause is rendered rather
     /// than wrapped — nothing downstream can recover differently per variant.

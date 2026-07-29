@@ -99,13 +99,13 @@ impl Features {
 /// Positions are evidence; names are folklore. Naming them in a Rust type would bake a
 /// guess into the code, so each is documented with what setting it *obliges us to do*.
 ///
-/// **The mask is UxPlay's pairing-less variant, `0x527FFEE6` — the Path B worked
-/// example** (`docs/airplay-research.md` §4.4), adopted whole once the obligations it
-/// carries were all real here: mirroring end to end, `/fp-setup` answering both round
-/// trips, resend requests actually sent, AAC decoded. A hand-curated conservative mask
-/// preceded it and was invisible to real senders — a picker's listing rules are
-/// folklore, so the mask a listed implementation ships *is* the specification.
-/// The regression test pins the exact value.
+/// **The mask is UxPlay's own default, `0x5A7FFEE6`** (`docs/airplay-research.md`
+/// §4.4/§9), adopted whole once the obligations it carries were all real here:
+/// mirroring end to end, `/fp-setup` answering both round trips, resend requests
+/// actually sent, AAC decoded, and — the last one — legacy pairing served. Two
+/// hand-curated masks preceded it and were invisible to real senders; a picker's
+/// listing rules are folklore, so the mask a listed implementation ships *is* the
+/// specification. The regression test pins the exact value.
 ///
 /// What the groups oblige us to do, and what backs each:
 ///
@@ -132,17 +132,18 @@ impl Features {
 ///   [`FEATURE_SCREEN_MULTI_CODEC`].
 /// - **26** (MFi) — would promise `/auth-setup` against a coprocessor we do not have.
 ///   shairport-sync *removed* this bit in 4.3 for exactly this reason.
-/// - **27** (legacy pairing) — beyond gating a 5-second pairing round trip, this bit
-///   changes the media key derivation: set, the AES key must be hashed with the
-///   pair-verify ECDH secret; clear, it must not. Mismatched, a session completes
-///   cleanly and then renders noise. UxPlay documents the bit-27-off variant as the
-///   pairing bypass; if iOS ever stops accepting it, this is the next lever.
+/// - ~~**27** (legacy pairing)~~ — **now set**, and the reason this list moved. The
+///   pairing-less variant (UxPlay's documented bypass) left the receiver absent from
+///   iOS Screen Mirroring, which is the failure UxPlay's own default guards against:
+///   it ships bit 27 *on*. `crate::pairing` implements the exchange, and the media
+///   re-key the bit also selects — set, the AES key is hashed with the pair-verify
+///   ECDH secret; clear, it is not, and a mismatch renders noise rather than failing.
 /// - **40/41/47** (buffered audio, PTP) — no buffered stream type, no IEEE-1588 clock.
 /// - **38/43/46/48** (HomeKit) — `/pair-setup` answers 501.
 /// - **51** (unified pair-setup + MFi) — nobody open-source has made it work; the
 ///   observed failure is iOS giving up at Pair-Setup [2/5].
 const FEATURE_BITS: &[u8] = &[
-    1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 28, 30,
+    1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 27, 28, 30,
 ];
 
 /// Feature bit 42: the sender may encode HEVC as well as H.264.
@@ -345,7 +346,7 @@ mod tests {
         // Which bits make a picker list a device is folklore, so the mask a listed
         // implementation ships is the specification — a hand-curated "conservative"
         // subset of it is how this receiver spent a while invisible to every iPhone.
-        assert_eq!(ident().features().txt(), "0x527FFEE6");
+        assert_eq!(ident().features().txt(), "0x5A7FFEE6");
     }
 
     #[test]
@@ -357,10 +358,6 @@ mod tests {
         for (bit, why) in [
             (42u8, "HEVC mirroring, which was not asked for"),
             (26, "MFi auth"),
-            (
-                27,
-                "legacy pairing, which also changes the media key derivation",
-            ),
             (40, "buffered audio"),
             (41, "PTP"),
             (46, "HomeKit pairing"),
@@ -381,6 +378,9 @@ mod tests {
             "bit 7 (screen) is required to be offered a mirror"
         );
         assert!(f.has(11) && f.has(12) && f.has(14));
+        // 27 is set now: `crate::pairing` serves /pair-setup and /pair-verify, and the
+        // media re-key it also selects is applied from the verified secret.
+        assert!(f.has(27), "bit 27 (legacy pairing) is implemented");
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod info;
 pub mod mirror;
+pub mod pairing;
 pub mod sdp;
 pub mod session;
 pub mod transport;

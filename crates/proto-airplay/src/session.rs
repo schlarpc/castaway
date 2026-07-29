@@ -96,6 +96,15 @@ impl<'a> AirPlayRequest<'a> {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// The `X-Apple-HKP` header, the cleanest discriminator between the pairing
+    /// regimes: legacy pairing sends none, HomeKit's flows always do (research §2).
+    /// Returned as the raw string rather than an enum — the values beyond 3 and 4 could
+    /// not be confirmed from any source, and inventing names for them would be folklore.
+    #[must_use]
+    pub fn apple_hkp(&self) -> Option<&'a str> {
+        self.header("X-Apple-HKP")
+    }
 }
 
 /// A response the actor serializes into an RTSP reply.
@@ -230,14 +239,30 @@ pub struct AirPlaySession {
     pending_eiv: Option<[u8; 16]>,
     /// A `FLUSH` the actor has not yet passed to the audio task.
     pending_flush: Option<crate::audio::FlushPoint>,
+    /// This receiver's long-term pairing identity (feature bit 27).
+    pairing: crate::pairing::PairingIdentity,
+    /// A `/pair-verify` exchange between its two stages. `Some` only in that window:
+    /// the type cannot be constructed any other way, so a stage-2 body arriving first
+    /// has nothing to verify against and is refused.
+    pair_verify: Option<crate::pairing::PairVerify>,
+    /// The verified ECDH secret, once a sender has proved itself.
+    ///
+    /// With bit 27 advertised this is not optional decoration: the audio key becomes
+    /// `SHA512(aeskey ‖ shared)[0..16]`, so a session that skipped pairing and one that
+    /// completed it derive *different* media keys from the same `rsaaeskey`.
+    paired_secret: Option<[u8; 32]>,
 }
 
 impl AirPlaySession {
     /// Create a session for the given receiver identity.
     #[must_use]
     pub fn new(identity: AirPlayIdentity) -> Self {
+        let pairing = crate::pairing::PairingIdentity::from_seed(&identity.pairing_id);
         Self {
             identity,
+            pairing,
+            pair_verify: None,
+            paired_secret: None,
             fairplay: FairPlaySession::new(),
             raop: RaopState::default(),
             local_ports: None,
@@ -337,9 +362,16 @@ impl AirPlaySession {
                 AirPlayResponse::ok_body(APPLE_PLIST_MIME, info::info_plist(&self.identity)?)
             }
             ("POST", "/fp-setup") => self.fp_setup(body),
+            // Legacy pairing (bit 27). HomeKit's flows arrive at the same paths but
+            // carry `X-Apple-HKP`, and we advertise none of their bits — a sender that
+            // sends one anyway is asking for a regime this receiver does not serve, and
+            // 501 is the honest answer.
+            ("POST", "/pair-setup") if req.apple_hkp().is_none() => {
+                AirPlayResponse::ok_body(OCTET_STREAM_MIME, self.pairing.pair_setup_response())
+            }
+            ("POST", "/pair-verify") if req.apple_hkp().is_none() => self.pair_verify(body),
             ("POST", "/pair-setup" | "/pair-verify") => {
-                // HomeKit transient pairing (SRP/Curve25519/Ed25519) not implemented yet.
-                warn!(%path, "AirPlay pairing not implemented (Q1)");
+                warn!(%path, hkp = ?req.apple_hkp(), "HomeKit pairing is not implemented");
                 AirPlayResponse::status(501)
             }
             ("POST" | "GET", "/feedback") => AirPlayResponse::ok(),
@@ -428,7 +460,16 @@ impl AirPlaySession {
     /// [`SdpError::rtsp_status`]: crate::error::SdpError::rtsp_status
     fn announce(&mut self, body: &[u8]) -> AirPlayResponse {
         match AnnounceParams::parse(body) {
-            Ok(params) => {
+            Ok(mut params) => {
+                // Bit 27's other half. We advertise legacy pairing, so a sender that
+                // paired derives its media key as `SHA512(aeskey ‖ shared)` and expects
+                // us to do the same; one that skipped pairing (nothing forces it —
+                // `/pair-verify` is the sender's move) uses the unwrapped key as-is.
+                // Which of the two happened is exactly `paired_secret`, so the rekey is
+                // conditioned on it rather than on the advertisement.
+                if let Some(shared) = &self.paired_secret {
+                    params.rekey_with(shared);
+                }
                 let link = params.describe();
                 log_info!(%link, "AirPlay audio announced");
                 self.raop = RaopState::Announced(Box::new(params));
@@ -725,6 +766,48 @@ impl AirPlaySession {
     /// and not here.
     ///
     /// Note the content type: fp-setup bodies are raw bytes, not plists.
+    /// `/pair-verify`, both stages, dispatched on the leading marker byte.
+    ///
+    /// A refusal is `400`, not `501`: 501 says "this receiver does not do this", which
+    /// would be a lie told to a sender we advertised bit 27 to, and some senders retry
+    /// a 501 forever.
+    fn pair_verify(&mut self, body: &[u8]) -> AirPlayResponse {
+        match body.first() {
+            Some(0x01) => match crate::pairing::PairVerify::begin(&self.pairing, body) {
+                Ok((state, reply)) => {
+                    self.pair_verify = Some(state);
+                    debug!("pair-verify: stage 1 answered");
+                    AirPlayResponse::ok_body(OCTET_STREAM_MIME, reply)
+                }
+                Err(e) => {
+                    warn!(error = %e, "pair-verify: stage 1 refused");
+                    AirPlayResponse::status(400)
+                }
+            },
+            Some(0x00) => match self.pair_verify.take() {
+                Some(state) => match state.finish(body) {
+                    Ok(shared) => {
+                        self.paired_secret = Some(shared);
+                        tracing::info!("airplay: sender paired");
+                        AirPlayResponse::ok()
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "pair-verify: sender failed to prove itself");
+                        AirPlayResponse::status(400)
+                    }
+                },
+                None => {
+                    warn!("pair-verify: stage 2 with no stage 1 before it");
+                    AirPlayResponse::status(400)
+                }
+            },
+            _ => {
+                warn!("pair-verify: body with no recognisable stage marker");
+                AirPlayResponse::status(400)
+            }
+        }
+    }
+
     fn fp_setup(&mut self, body: &[u8]) -> AirPlayResponse {
         match self.fairplay.handle(body) {
             Ok(reply) => AirPlayResponse::ok_body(OCTET_STREAM_MIME, reply),
@@ -1266,13 +1349,37 @@ mod tests {
     }
 
     #[test]
-    fn pairing_is_501_for_now() {
+    fn legacy_pairing_is_served_and_homekit_is_not() {
+        // Two regimes at the same paths, told apart by `X-Apple-HKP` (research §2).
+        // We advertise bit 27 and no HomeKit bits, so exactly one of these may work.
         let mut s = session();
+        let setup = s
+            .handle(&AirPlayRequest::new("POST", "/pair-setup", &[]))
+            .unwrap();
+        assert_eq!(setup.status, 200);
+        assert_eq!(setup.body.len(), 32, "our Ed25519 public key, raw");
+
+        let hkp = [("X-Apple-HKP".to_string(), "4".to_string())];
+        let req = AirPlayRequest {
+            method: "POST",
+            path: "/pair-setup",
+            headers: &hkp,
+            body: &[],
+        };
+        assert_eq!(s.handle(&req).unwrap().status, 501);
+    }
+
+    #[test]
+    fn a_pair_verify_stage_two_without_a_stage_one_is_refused() {
+        // The endpoint is LAN-facing and the body is attacker-chosen; there must be no
+        // path from "send me 68 bytes" to a session that believes it paired.
+        let mut s = session();
+        let body = [0u8; 68];
         assert_eq!(
-            s.handle(&AirPlayRequest::new("POST", "/pair-setup", &[]))
+            s.handle(&AirPlayRequest::new("POST", "/pair-verify", &body))
                 .unwrap()
                 .status,
-            501
+            400
         );
     }
 }
