@@ -194,6 +194,35 @@ impl LayerId {
     pub const fn is_browser(self) -> bool {
         matches!(self, Self::BrowserWidget | Self::BrowserFullscreen)
     }
+
+    /// Layers whose mere presence hides this one entirely, wherever they are.
+    ///
+    /// Depth ([`Self::PAINT_ORDER`]) settles who wins where two layers *overlap*; this
+    /// answers the different question of an ornament that must leave the stage when
+    /// something outranking it is on at all. Only the idle screen's web widget behaves
+    /// that way today: a now-playing card, the transport strip, or video each mean a
+    /// session is playing, and a clock that yields only where the card happens to
+    /// overlap it is the clock outranking the session everywhere else.
+    ///
+    /// A total function over the enum, like `PAINT_ORDER`, so a new layer cannot be
+    /// added without saying whether the widget yields to it. Enforced by the compositor
+    /// at present time — pure presence, no transition to get wrong. (The widget's other
+    /// reason to leave, the shell being off its Home screen, is not a layer and is fed
+    /// to the compositor by the render loop as an explicit suppression.)
+    #[must_use]
+    pub const fn yields_to(self) -> &'static [Self] {
+        match self {
+            Self::BrowserWidget => &[Self::NowPlaying, Self::Transport, Self::Video],
+            Self::Attract
+            | Self::ShellPrev
+            | Self::NowPlaying
+            | Self::Transport
+            | Self::Video
+            | Self::BrowserFullscreen
+            | Self::Osd
+            | Self::ShellOverlay => &[],
+        }
+    }
 }
 
 /// A composited layer: a texture placed with a transform and opacity. Depth comes from
@@ -357,6 +386,35 @@ mod tests {
         // ...and video still covers both, per the doc comments on those variants.
         assert!(LayerId::Video > LayerId::Transport);
         assert!(LayerId::Transport > LayerId::NowPlaying);
+    }
+
+    #[test]
+    fn the_idle_widget_yields_to_every_session_surface_entirely() {
+        // Depth alone was not enough: a bluetooth session's card sits *above* the
+        // widget but only covers it where they overlap, and a clock floating beside a
+        // playing session is the ornament outranking the session everywhere the card
+        // is not. `yields_to` is the whole-surface answer, and this pins its contents.
+        assert_eq!(
+            LayerId::BrowserWidget.yields_to(),
+            &[LayerId::NowPlaying, LayerId::Transport, LayerId::Video]
+        );
+        // Yielding only makes sense to a layer that would also win where they overlap;
+        // anything else would draw one way and occlude another.
+        for id in LayerId::PAINT_ORDER {
+            for &above in id.yields_to() {
+                assert!(
+                    above > id,
+                    "{id:?} yields to {above:?}, which paints below it"
+                );
+            }
+        }
+        // The widget is the only ornament with this behavior today; a new entry here
+        // should come with the same kind of reasoning, not by accident.
+        for id in LayerId::PAINT_ORDER {
+            if id != LayerId::BrowserWidget {
+                assert!(id.yields_to().is_empty(), "{id:?} unexpectedly yields");
+            }
+        }
     }
 
     #[test]

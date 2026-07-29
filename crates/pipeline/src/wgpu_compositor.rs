@@ -331,6 +331,11 @@ pub struct WgpuCompositor {
     programs: Programs,
     target: Target,
     layers: HashMap<LayerId, LayerState>,
+    /// Layers hidden for reasons the layer set cannot express — today only the idle
+    /// widget while the shell is off its Home screen. The layer-expressible half of
+    /// hiding ([`LayerId::yields_to`]) is derived, not stored. Both halves are applied
+    /// in [`Self::hidden`], which drawing and occlusion consult.
+    suppressed: std::collections::BTreeSet<LayerId>,
     /// Set when the device was opened with the external-memory extensions a hardware
     /// decoder's surfaces need. `None` once we have concluded it cannot import.
     importer: Option<GpuImporter>,
@@ -378,6 +383,7 @@ impl WgpuCompositor {
                 size: (width, height),
             },
             layers: HashMap::new(),
+            suppressed: std::collections::BTreeSet::new(),
             importer,
         })
     }
@@ -438,6 +444,7 @@ impl WgpuCompositor {
             programs,
             target: Target::Surface { surface, config },
             layers: HashMap::new(),
+            suppressed: std::collections::BTreeSet::new(),
             importer,
         })
     }
@@ -689,6 +696,27 @@ impl WgpuCompositor {
 
     pub fn has_layer(&self, id: LayerId) -> bool {
         self.layers.get(&id).is_some_and(|s| s.gpu.is_some())
+    }
+
+    /// Hide or restore a layer for a reason the layer set cannot express.
+    ///
+    /// The render loop calls this every pump with the shell's verdict on the idle
+    /// widget, so suppression is a recomputed fact, not a transition anyone can miss.
+    /// The layer keeps its texture and keeps receiving imports; it is only not drawn.
+    pub fn set_suppressed(&mut self, id: LayerId, on: bool) {
+        if on {
+            self.suppressed.insert(id);
+        } else {
+            self.suppressed.remove(&id);
+        }
+    }
+
+    /// Whether `id` is hidden this frame: suppressed from outside, or yielding to a
+    /// present layer per [`LayerId::yields_to`]. The single visibility gate — drawing
+    /// and occlusion both consult it, so what the glass shows and what input believes
+    /// cannot disagree.
+    fn hidden(&self, id: LayerId) -> bool {
+        self.suppressed.contains(&id) || id.yields_to().iter().any(|&above| self.has_layer(above))
     }
 
     /// Adopt an already-imported RGBA texture as a layer.
@@ -1046,7 +1074,9 @@ impl WgpuCompositor {
     fn render_into(&self, view: &wgpu::TextureView) {
         let mut ordered: Vec<&LayerState> = self.layers.values().collect();
         // Paint order is layer identity, and identity is unique per layer, so this is a
-        // total order with no ties to break (D38).
+        // total order with no ties to break (D38). A hidden layer stays in the map with
+        // its texture warm — it is simply not drawn this frame.
+        ordered.retain(|s| !self.hidden(s.meta.id));
         ordered.sort_by_key(|s| s.meta.id);
 
         let mut encoder = self
@@ -1109,6 +1139,8 @@ impl Compositor for WgpuCompositor {
                 // The outgoing half of a shell transition is the shell, not something on
                 // top of it.
                 && s.meta.id.occludes()
+                // A layer hidden this frame shows nothing, so it hides nothing.
+                && !self.hidden(s.meta.id)
                 // A layer with no texture yet is registered but not drawn, so it hides
                 // nothing.
                 && s.gpu.is_some()

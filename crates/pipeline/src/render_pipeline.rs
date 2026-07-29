@@ -1635,6 +1635,24 @@ impl RenderLoop {
         self.compositor.remove_layer(LayerId::BrowserFullscreen);
     }
 
+    /// Whether the idle screen's web widget belongs on the panel right now.
+    ///
+    /// The widget is part of the Home *scene*, so it yields whenever the shell has
+    /// navigated somewhere else, and whenever a session has put its own surface up.
+    /// The session half is declared on the layer (`LayerId::yields_to`) and enforced by
+    /// the compositor on its own; the shell half is not a layer, so the render loop
+    /// feeds it to the compositor each pump. This method is the two halves combined —
+    /// what input routing consults so touch ownership agrees with the glass.
+    #[must_use]
+    pub fn attract_widget_covered(&self) -> bool {
+        // Depth 1 is Home itself — the screen the widget belongs to.
+        self.shell_depth() > 1
+            || LayerId::BrowserWidget
+                .yields_to()
+                .iter()
+                .any(|&l| self.compositor.has_layer(l))
+    }
+
     /// Drain all pending commands (non-blocking) and present once. Returns the number of
     /// video frames applied this pump.
     pub fn pump(&mut self) -> usize {
@@ -1685,6 +1703,12 @@ impl RenderLoop {
     /// surface — 33 MB at 4K — and doing it speculatively would cost more than the rest
     /// of the frame. One readback serves everyone who said yes.
     fn present_and_serve_taps(&mut self) {
+        // The shell half of the idle widget's visibility (see `attract_widget_covered`):
+        // recomputed and handed down every frame, so it is a standing fact rather than a
+        // transition to be caught. The session half the compositor derives itself from
+        // `LayerId::yields_to`.
+        self.compositor
+            .set_suppressed(LayerId::BrowserWidget, self.shell_depth() > 1);
         if self.taps.is_empty() {
             self.compositor.present();
             return;

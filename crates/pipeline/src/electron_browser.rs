@@ -701,6 +701,13 @@ pub struct ElectronHost {
     recovery_attempts: u32,
     retry_at: Option<std::time::Instant>,
     gave_up: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Whether the idle widget is currently yielded to something that outranks it — a
+    /// shell screen other than Home, or a session surface. A per-pump mirror of
+    /// [`crate::render_pipeline::RenderLoop::attract_widget_covered`], held only so
+    /// input routing agrees with the compositor (which skips drawing the covered layer
+    /// on its own — see `LayerId::yields_to`). Always false in
+    /// [`BrowserRole::Fullscreen`]; a cast surface is never covered.
+    widget_covered: bool,
     /// Whether the left button is held, and therefore whether the browser owns the
     /// pointer even where it strays outside its viewport.
     left_down: bool,
@@ -750,6 +757,7 @@ impl ElectronHost {
             recovery_attempts: 0,
             retry_at: None,
             gave_up: None,
+            widget_covered: false,
             left_down: false,
             contacts: std::collections::HashSet::new(),
             next_report: std::time::Instant::now(),
@@ -801,6 +809,12 @@ impl ElectronHost {
                 BrowserCommand::Hide => self.hide(render),
             }
         }
+        // Mirror the render loop's per-frame verdict, for input's sake alone: the
+        // *drawing* of a covered widget is the compositor's business (it skips the
+        // layer — see `LayerId::yields_to`), but "does a touch on that rect belong to
+        // the page" is answered here, and it must agree with what is on the glass.
+        self.widget_covered =
+            self.role == BrowserRole::AttractWidget && render.attract_widget_covered();
         self.recover(render);
         self.import_frame(render);
         self.report();
@@ -1011,7 +1025,13 @@ impl ElectronHost {
 
     /// Map a normalized panel coordinate, or `None` if it is outside the viewport. For
     /// deciding whether an input belongs to the browser at all.
+    ///
+    /// A covered widget owns nothing: its rect is still where it always was, but what
+    /// the finger is touching is whatever covered it.
     fn hit_view(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        if self.widget_covered {
+            return None;
+        }
         crate::browser::hit_view_px(self.role.view(self.size).rect, self.size, x, y)
     }
 
