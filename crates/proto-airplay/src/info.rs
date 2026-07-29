@@ -45,6 +45,9 @@ pub fn info_plist(ident: &AirPlayIdentity) -> Result<Vec<u8>, AirPlayError> {
     // `pi` is a stable UUID, not the device id. These were the same string here once,
     // which is the Roku/Samsung behaviour rather than the Apple one.
     dict.insert("pi".into(), Value::String(ident.pairing_id.clone()));
+    // The same `pk` the TXT records carry; the three encodings of this identity must
+    // not disagree, so all come from `public_key_hex`.
+    dict.insert("pk".into(), Value::String(ident.public_key_hex()));
     dict.insert("vv".into(), Value::Integer(2i64.into()));
 
     // The mirroring surface. A sender reads *height* to choose an encode format and

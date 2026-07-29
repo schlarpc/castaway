@@ -30,11 +30,13 @@ pub const RAOP_SERVICE: &str = "_raop._tcp";
 /// reason to use it. Raising it silently changes which media plane a sender chooses.
 pub const SOURCE_VERSION: &str = "220.68";
 
-/// The model string. A bespoke name is fine for an audio receiver — real ones ship
-/// `AVR-X3500H`, `ShairportSync` — but it must not look like `^Mac\d+,\d+$`, which
-/// pyatv keeps on an explicit blocklist. Claiming an Apple TV is a *mirroring*
-/// requirement, so that changes when mirroring does.
-pub const MODEL: &str = "castaway1,1";
+/// The model string. Claiming an Apple TV is a *mirroring* requirement — a bespoke name
+/// was fine while this was an audio receiver, and the comment here used to say the model
+/// would change "when mirroring does". Mirroring is done (STATUS: end to end, from a
+/// real FairPlay vector over real sockets), so this is that change: `AppleTV3,2` is what
+/// UxPlay claims, the Path B worked example (`docs/airplay-research.md` §4.4). Not a
+/// `Mac\d+,\d+` string, which pyatv keeps on an explicit blocklist.
+pub const MODEL: &str = "AppleTV3,2";
 
 /// A 64-bit AirPlay feature bitmask.
 ///
@@ -97,37 +99,51 @@ impl Features {
 /// Positions are evidence; names are folklore. Naming them in a Rust type would bake a
 /// guess into the code, so each is documented with what setting it *obliges us to do*.
 ///
-/// - **7** — screen mirroring. Without it no sender ever offers a screen, however much
-///   of the mirroring stack exists behind it.
+/// **The mask is UxPlay's pairing-less variant, `0x527FFEE6` — the Path B worked
+/// example** (`docs/airplay-research.md` §4.4), adopted whole once the obligations it
+/// carries were all real here: mirroring end to end, `/fp-setup` answering both round
+/// trips, resend requests actually sent, AAC decoded. A hand-curated conservative mask
+/// preceded it and was invisible to real senders — a picker's listing rules are
+/// folklore, so the mask a listed implementation ships *is* the specification.
+/// The regression test pins the exact value.
+///
+/// What the groups oblige us to do, and what backs each:
+///
+/// - **7** — screen mirroring; the mirroring session is implemented end to end.
 /// - **9** — audio. Load-bearing for visibility: with it clear, owntone-class senders
 ///   drop the device from the picker entirely rather than showing it as broken.
-/// - **18** — PCM audio format. Matches `cn=0`.
-/// - **19** — ALAC audio format. Matches `cn=1`.
+/// - **18/19** — PCM and ALAC audio formats; matches `cn=0,1` on the RAOP record.
+/// - **20/21** — AAC. The ffmpeg pipeline decodes AAC, and mirror audio (AAC-ELD)
+///   rides the FairPlay session. `cn` still steers the plain audio flow to `0,1`.
 /// - **22** — accept an unencrypted audio stream. Matches `et=0`.
+/// - **11** — retransmit. The resend request on the control port is sent and served.
+/// - **2/12/14** — the FairPlay family: the sender runs `/fp-setup`, and both round
+///   trips answer correctly (`crypto-fairplay`); the `ekey` unwrap behind mirroring is
+///   `crypto-playfair`, vector-verified.
+/// - **1/5/6/10/13/15/16/17/25/28** — the rest of UxPlay's mask (video, photo, HLS,
+///   metadata and audio bookkeeping). UxPlay serves these minimally and is listed;
+///   diverging from a proven mask to shave bits is how the previous mask happened.
 /// - **30** — publish the modern `_airplay._tcp` key set (`pi`, `protovers`, `acl`),
 ///   which we do. Set by every real device observed, including AirPlay-1-only ones.
 ///
 /// Deliberately **not** set, and why:
 ///
-/// - **11** (retransmit) — the resend request on the control port is not implemented;
-///   we drop instead. Every real device sets this, and we still should not until we do.
-/// - **42** (multi-codec screen) — HEVC is not decoded here. With it clear a sender
-///   sends H.264; with it set and no HEVC path, the sender emits an empty codec-config
-///   packet and stalls, which is why `MirrorError::CodecRefused` exists to name it.
-/// - **20** (AAC-LC) — not offered in `cn`.
+/// - **42** (multi-codec screen) — HEVC is policy, not constant: see
+///   [`FEATURE_SCREEN_MULTI_CODEC`].
 /// - **26** (MFi) — would promise `/auth-setup` against a coprocessor we do not have.
 ///   shairport-sync *removed* this bit in 4.3 for exactly this reason.
 /// - **27** (legacy pairing) — beyond gating a 5-second pairing round trip, this bit
 ///   changes the media key derivation: set, the AES key must be hashed with the
 ///   pair-verify ECDH secret; clear, it must not. Mismatched, a session completes
-///   cleanly and then renders noise.
+///   cleanly and then renders noise. UxPlay documents the bit-27-off variant as the
+///   pairing bypass; if iOS ever stops accepting it, this is the next lever.
 /// - **40/41/47** (buffered audio, PTP) — no buffered stream type, no IEEE-1588 clock.
 /// - **38/43/46/48** (HomeKit) — `/pair-setup` answers 501.
 /// - **51** (unified pair-setup + MFi) — nobody open-source has made it work; the
 ///   observed failure is iOS giving up at Pair-Setup [2/5].
-/// - **12/14/2** (FairPlay-in-`et`) — the *audio* path still advertises `et=0,1`, and
-///   mirroring's FairPlay is negotiated through `/fp-setup` rather than through these.
-const FEATURE_BITS: &[u8] = &[7, 9, 18, 19, 22, 30];
+const FEATURE_BITS: &[u8] = &[
+    1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 28, 30,
+];
 
 /// Feature bit 42: the sender may encode HEVC as well as H.264.
 ///
@@ -175,6 +191,22 @@ impl AirPlayIdentity {
         Features::from_bits(&bits)
     }
 
+    /// The advertised `pk`: 32 bytes of stable hex, derived from the pairing id.
+    ///
+    /// Nothing verifies it — bit 27 is off, so no sender ever runs pair-verify against
+    /// this key — but every *listed* receiver ships one, including UxPlay, which
+    /// hardcodes a value in `dnssdint.h`. The earlier position ("real pairing-less
+    /// devices omit it: Marantz, Libratone") described audio-era hardware; the worked
+    /// example for a mirroring receiver carries a `pk`, so this does too. Derived
+    /// rather than random so it is the same key tomorrow: a sender that caches device
+    /// identities should find the same one.
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(self.pairing_id.as_bytes());
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// The `_airplay._tcp` advertisement.
     #[must_use]
     pub fn airplay_service(&self) -> MdnsService {
@@ -194,11 +226,7 @@ impl AirPlayIdentity {
             .with_txt("acl", "0")
             .with_txt("vv", "2")
             .with_txt("pw", "false")
-        // No `pk`. It is the receiver's Ed25519 long-term public key, and we have no
-        // pairing to use one with. Advertising it empty — which this used to do —
-        // publishes a key a sender may adopt as our identity and then cannot verify
-        // against. Real pairing-less devices (Marantz NR1607, Libratone Loop) omit it
-        // entirely, and are listed and usable.
+            .with_txt("pk", self.public_key_hex())
     }
 
     /// The `_raop._tcp` (audio) advertisement, in the AirPlay 1 "classic" dialect.
@@ -245,6 +273,8 @@ impl AirPlayIdentity {
             // implementation derives both from one variable, so they must not drift.
             .with_txt("sf", "0x4")
             .with_txt("pw", "false")
+            // Same key as the AirPlay record's; senders group the two services by it.
+            .with_txt("pk", self.public_key_hex())
     }
 }
 
@@ -310,17 +340,22 @@ mod tests {
     }
 
     #[test]
+    fn the_mask_is_the_path_b_worked_example_exactly() {
+        // UxPlay's pairing-less mask, byte for byte (`docs/airplay-research.md` §4.4).
+        // Which bits make a picker list a device is folklore, so the mask a listed
+        // implementation ships is the specification — a hand-curated "conservative"
+        // subset of it is how this receiver spent a while invisible to every iPhone.
+        assert_eq!(ident().features().txt(), "0x527FFEE6");
+    }
+
+    #[test]
     fn we_do_not_promise_what_we_cannot_serve() {
         // Each of these bits sends a sender down a flow that ends in a 501 or in
         // silence. They are the difference between "not implemented yet" and "lies to
         // every iPhone in the room", so they get a test rather than a comment.
         let f = ident().features();
         for (bit, why) in [
-            (11u8, "retransmit"),
-            (12, "FairPlay SAP v2.5"),
-            (14, "FairPlay"),
-            (20, "AAC-LC, which `cn` does not offer"),
-            (42, "HEVC mirroring, which has no decoder here"),
+            (42u8, "HEVC mirroring, which was not asked for"),
             (26, "MFi auth"),
             (
                 27,
@@ -338,12 +373,14 @@ mod tests {
             );
         }
         // And the ones that must be set: 9 or senders drop us from the picker
-        // entirely, 7 or none of them ever offers a screen.
+        // entirely, 7 or none of them ever offers a screen, 11/12/14 because the
+        // resend and FairPlay paths behind them are implemented and load-bearing.
         assert!(f.has(9), "bit 9 (audio) is required to appear at all");
         assert!(
             f.has(7),
             "bit 7 (screen) is required to be offered a mirror"
         );
+        assert!(f.has(11) && f.has(12) && f.has(14));
     }
 
     #[test]
@@ -384,10 +421,18 @@ mod tests {
     }
 
     #[test]
-    fn no_public_key_is_advertised_while_there_is_no_pairing() {
-        // Not an empty `pk` — no `pk` at all. An empty one publishes an identity a
-        // sender cannot verify against.
-        assert!(txt_of(&ident().airplay_service(), "pk").is_none());
+    fn the_public_key_is_present_stable_and_shared_by_both_records() {
+        // Nothing verifies it (bit 27 is off), but every listed mirroring receiver
+        // ships one — UxPlay hardcodes theirs — and senders group the two services by
+        // it. 64 hex chars: the shape of an Ed25519 public key, never empty (an empty
+        // `pk` publishes an identity a sender cannot verify against).
+        let id = ident();
+        let pk = txt_of(&id.airplay_service(), "pk").unwrap();
+        assert_eq!(pk.len(), 64);
+        assert!(pk.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(txt_of(&id.raop_service(), "pk").as_deref(), Some(&*pk));
+        // Stable: the same identity advertises the same key tomorrow.
+        assert_eq!(pk, id.public_key_hex());
     }
 
     #[test]

@@ -41,6 +41,27 @@ impl MdnsResponder {
         })
     }
 
+    /// Restrict the responder to the interface holding `addr` — the LAN the receiver
+    /// actually serves.
+    ///
+    /// Without this the daemon advertises and answers on *every* interface, and each
+    /// A record carries every address. On the dev box that meant the Tailscale CGNAT
+    /// address rode along in every advertisement: senders resolved two addresses,
+    /// pickers browsing multiple interfaces listed the device twice, and whichever
+    /// client connected over the tunnel found services that bind and verify against
+    /// the LAN. A receiver is a LAN appliance; it should advertise like one.
+    ///
+    /// # Errors
+    /// [`MdnsError::Daemon`] if the daemon refuses the interface selection.
+    pub fn restrict_to(&mut self, addr: std::net::IpAddr) -> Result<(), MdnsError> {
+        self.daemon
+            .disable_interface(mdns_sd::IfKind::All)
+            .map_err(|e| MdnsError::Daemon(e.to_string()))?;
+        self.daemon
+            .enable_interface(mdns_sd::IfKind::Addr(addr))
+            .map_err(|e| MdnsError::Daemon(e.to_string()))
+    }
+
     /// Advertise a service instance. Addresses are auto-detected across interfaces.
     ///
     /// # Errors

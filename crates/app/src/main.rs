@@ -518,6 +518,12 @@ async fn serve(
     let mut http = Router::new();
     let mut ssdp_devices: Vec<(SsdpDevice, String)> = Vec::new();
     let mut mdns = MdnsResponder::new().context("creating mDNS responder")?;
+    // Advertise on the serving LAN only. Left to auto-detection the daemon spoke on
+    // every interface, so each record also carried the Tailscale address — pickers
+    // browsing both interfaces listed the receiver twice, and clients that connected
+    // over the tunnel reached services that answer for the LAN.
+    mdns.restrict_to(std::net::IpAddr::V4(iface))
+        .context("restricting mDNS to the serving interface")?;
 
     if config.enable.dlna {
         let sink = SessionSink::new(SourceId::new(ProtocolKind::Dlna, "http"), event_tx.clone());
@@ -1105,13 +1111,10 @@ fn spawn_airplay(
     });
 
     advertise_adapter(&receiver, mdns);
-    info!("enabled: AirPlay (RTSP control on 7000)");
-    // Say this once, plainly: the control plane answers, the media plane can't start.
-    // A sender will find us, connect, and get an honest refusal rather than silence.
-    warn!(
-        "AirPlay control is live, but no media plane is implemented yet — a sender will \
-           connect and no audio will play"
-    );
+    // The warning that used to follow this line — "no media plane is implemented yet" —
+    // outlived the media plane by several milestones and had people debugging the
+    // advertisement for a limitation that no longer existed.
+    info!("enabled: AirPlay (audio + mirroring, RTSP control on 7000)");
 
     let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "listener"), event_tx);
     let adapter = Arc::new(receiver);
