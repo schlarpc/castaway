@@ -113,6 +113,12 @@ axum = "0.8"
 hyper = "1"
 rtsp-types = "0.1"
 plist = "1"
+# AirServer's live credential endpoint answers with a whole SQLite database, so one
+# has to be read. `bundled` compiles the amalgamation rather than hunting for an
+# MSVC import library — the workspace already ships C into the Windows artifact
+# (moonlight-common-c, enet, libcrypto), so this is not a new kind of dependency.
+# Read-only, and only ever pointed at a file we just wrote ourselves.
+rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
@@ -142,6 +148,17 @@ sha1 = "0.10"
 # Only for the CKS `sig` query parameter, whose shape is the backend's choice
 # (MD5 of a constant and a timestamp). Nothing here relies on it for security.
 md-5 = "0.10"
+# Opening AirServer's credential database, whose every BLOB is a libsodium
+# `crypto_secretbox` (XSalsa20-Poly1305) under a BLAKE2b-derived key.
+#
+# `blake2b_simd` rather than RustCrypto's `blake2` because libsodium's
+# `crypto_generichash_blake2b_salt_personal` sets the BLAKE2b parameter block's
+# *salt* and *personal* fields, and the `blake2` API does not expose them.
+blake2b_simd = "1"
+# XSalsa20-Poly1305, i.e. NaCl `crypto_secretbox`. A pre-release is the only
+# published version, but it is RustCrypto's own implementation of a frozen
+# construction, which beats composing salsa20 + poly1305 by hand here.
+crypto_secretbox = "0.2.0-pre.0"
 hmac = "0.12"
 hkdf = "0.12"
 rand = "0.8"
@@ -162,6 +179,7 @@ librespot-protocol = "0.8"
 # --- dev / test ---
 hex-literal = "0.4"
 tokio-test = "0.4"
+tempfile = "3"
 # Reads back the certificates we issue, so the tests assert on the DER a sender parses
 # rather than on the parameters we handed rcgen. Also a runtime dependency of
 # `cast-replay`, which takes a credential's validity window from the certificate itself.

@@ -107,6 +107,7 @@
 use thiserror::Error;
 
 pub mod airserver;
+pub mod airserver_db;
 pub mod api;
 pub mod cache;
 pub mod cks;
@@ -174,6 +175,10 @@ pub enum ReplayError {
     #[error("CKS response: {0}")]
     Response(String),
 
+    /// An AirServer credential database could not be opened or decrypted.
+    #[error("AirServer database: {0}")]
+    Database(String),
+
     /// The on-disk cache could not be read or written.
     #[error("credential cache: {0}")]
     Cache(String),
@@ -197,6 +202,9 @@ pub enum CredentialOrigin {
         /// The window's index in the table.
         index: u32,
     },
+    /// Read from an AirServer credential database fetched from the live endpoint
+    /// and cached on disk. Rolls forward as long as the endpoint answers.
+    AirServerLive,
     /// Taken from the checked-in AirServer table at `index` — App Dynamic's
     /// identity, a different device on a different branch of the Cast PKI. Works
     /// offline; stops working 2027-03-21. See [`airserver`].
@@ -216,7 +224,9 @@ impl CredentialOrigin {
     pub const fn is_offline_table(&self) -> bool {
         match self {
             Self::CksTable { .. } | Self::AirServerTable { .. } => true,
-            Self::Network | Self::Cache => false,
+            // A fetched database has its own horizon and wants refreshing on the
+            // same terms as a backend credential, so it is not a "table" here.
+            Self::Network | Self::Cache | Self::AirServerLive => false,
         }
     }
 }
@@ -230,6 +240,7 @@ impl core::fmt::Display for CredentialOrigin {
             Self::AirServerTable { index } => {
                 write!(f, "checked-in AirServer table, window {index}")
             }
+            Self::AirServerLive => f.write_str("fetched AirServer database"),
         }
     }
 }
