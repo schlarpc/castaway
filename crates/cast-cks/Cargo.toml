@@ -1,0 +1,48 @@
+[package]
+name = "cast-cks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Cast receiver-auth credentials: the CKS backend client and the checked-in signature table, with the peer-certificate re-issue both depend on."
+
+[dependencies]
+castaway-paths.workspace = true
+crypto-cast-auth.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+# Re-issuing the peer certificate (PKCS#1 v1.5 over SHA-256) and reading the
+# peer key in each of the three encodings the two paths use.
+rsa.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+# The CKS response field cipher: AES-128-CTR under one fixed key and IV.
+aes.workspace = true
+ctr.workspace = true
+# The `sig` query parameter is MD5(secret || ts). Not used for anything security
+# bearing — it is the backend's request format, not a choice made here.
+md-5.workspace = true
+
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Reads the peer certificate's validity, which is what bounds the credential.
+x509-parser.workspace = true
+
+# Rendering window bounds as the X.509 UTCTime the signature covers.
+time.workspace = true
+
+# The backend fetch: blocking, driven from spawn_blocking, pinned to the two
+# roots the reference client pins rather than the system store.
+ureq.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "macros"] }
+
+[lints]
+workspace = true

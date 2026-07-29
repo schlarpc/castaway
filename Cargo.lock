@@ -523,6 +523,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cast-cks"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "base64",
+ "castaway-paths",
+ "crypto-cast-auth",
+ "ctr",
+ "md-5",
+ "rsa",
+ "rustls 0.23.42",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.19",
+ "time",
+ "tokio",
+ "tracing",
+ "ureq",
+ "x509-parser",
+]
+
+[[package]]
 name = "castaway"
 version = "0.1.0"
 dependencies = [
@@ -2641,6 +2665,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
 
 [[package]]
 name = "mdns-sd"

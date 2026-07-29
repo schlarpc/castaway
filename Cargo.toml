@@ -17,6 +17,7 @@ members = [
     "crates/proto-cast",
     "crates/proto-spotify",
     "crates/crypto-cast-auth",
+    "crates/cast-cks",
     "crates/substrate-rtp",
     "crates/substrate-rtsp",
     "crates/crypto-fairplay",
@@ -60,6 +61,7 @@ proto-bluetooth-audio = { path = "crates/proto-bluetooth-audio" }
 hci-transport = { path = "crates/hci-transport" }
 substrate-rtp = { path = "crates/substrate-rtp" }
 crypto-cast-auth = { path = "crates/crypto-cast-auth" }
+cast-cks = { path = "crates/cast-cks" }
 crypto-fairplay = { path = "crates/crypto-fairplay" }
 crypto-raop = { path = "crates/crypto-raop" }
 crypto-playfair = { path = "crates/crypto-playfair" }
@@ -104,7 +106,8 @@ prost-build = "0.13"
 mdns-sd = "0.13"
 # Blocking HTTP, used off-runtime via spawn_blocking (EasyList; the Lounge screen lookup).
 ureq = "2"
-# Only for building scriptlet resources in tests; the real bundle arrives base64 already.
+# Scriptlet resources in tests, and the CKS response fields, which arrive base64
+# over a fixed keystream.
 base64 = "0.22"
 axum = "0.8"
 hyper = "1"
@@ -136,6 +139,9 @@ cbc = "0.1"
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 sha2 = "0.10"
 sha1 = "0.10"
+# Only for the CKS `sig` query parameter, whose shape is the backend's choice
+# (MD5 of a constant and a timestamp). Nothing here relies on it for security.
+md-5 = "0.10"
 hmac = "0.12"
 hkdf = "0.12"
 rand = "0.8"
@@ -157,7 +163,8 @@ librespot-protocol = "0.8"
 hex-literal = "0.4"
 tokio-test = "0.4"
 # Reads back the certificates we issue, so the tests assert on the DER a sender parses
-# rather than on the parameters we handed rcgen.
+# rather than on the parameters we handed rcgen. Also a runtime dependency of
+# `cast-cks`, which takes a credential's validity window from the certificate itself.
 x509-parser = "0.18"
 
 [workspace.lints.rust]
