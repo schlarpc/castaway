@@ -620,6 +620,7 @@ impl WgpuCompositor {
         &mut self,
         geometry: crate::hwaccel::FrameGeometry,
         modifier: u64,
+        span: crate::hwaccel::PlaneSpan,
         handle: crate::hwaccel::remote_handle::LocalHandle,
     ) -> Result<wgpu::Texture, PipelineError> {
         #[cfg(unix)]
@@ -630,10 +631,11 @@ impl WgpuCompositor {
             })?;
             let plane = crate::hwaccel::dmabuf::PlaneLayout {
                 fd: handle.as_raw_fd(),
-                offset: 0,
-                // Linear browser output has no per-plane offset table; the stride is the
-                // row pitch and the importer needs it explicitly.
-                pitch: u64::from(geometry.width) * 4,
+                offset: span.offset,
+                // The producer's own row pitch, not `width * 4`: Chromium pads rows to
+                // the GPU's alignment, and the driver rejects an explicit layout whose
+                // pitch disagrees with the buffer it allocated.
+                pitch: span.pitch,
             };
             // The handle must outlive the texture, so it becomes the surface the import
             // hangs its drop guard on.
@@ -643,7 +645,7 @@ impl WgpuCompositor {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle as _;
-            let _ = modifier; // an NT handle describes its own layout
+            let _ = (modifier, span); // an NT handle describes its own layout
             let raw = handle.as_raw_handle().cast();
             let owner: std::sync::Arc<dyn GpuSurface> = std::sync::Arc::new(BorrowedFrame(handle));
             let frame = crate::hwaccel::dx12_import::Dx12Importer::import_single_plane(

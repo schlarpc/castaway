@@ -100,6 +100,23 @@ impl FrameGeometry {
     }
 }
 
+/// Where a frame's single plane sits inside its buffer, as the producer reported it.
+///
+/// Carried alongside [`FrameGeometry`] rather than folded into it because it describes
+/// the *allocation*, not the picture: Chromium aligns its row pitch to the GPU's
+/// requirement (64 pixels on AMD), so at most widths `pitch != width * bpp`. Fabricating
+/// the pitch from the width is exactly the bug that made the browser layer black — the
+/// driver cross-checks the explicit layout against its own and rejects the import with
+/// `ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`.
+#[cfg(feature = "render")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaneSpan {
+    /// Byte offset of the plane within its buffer.
+    pub offset: u64,
+    /// Bytes per row, including any alignment padding after the visible pixels.
+    pub pitch: u64,
+}
+
 #[cfg(all(feature = "hwaccel", unix))]
 pub mod dmabuf;
 #[cfg(all(feature = "hwaccel", unix))]

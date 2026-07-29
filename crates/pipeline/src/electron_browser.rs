@@ -832,12 +832,25 @@ impl ElectronHost {
                 format: paint.format.texture_format(),
             },
             paint.modifier,
+            crate::hwaccel::PlaneSpan {
+                offset: paint.plane.offset,
+                pitch: paint.plane.stride,
+            },
             local,
             view.transform,
             view.layer,
         ) {
             Ok(()) => self.inflight.push_back(borrow),
-            Err(e) => warn!(target: "castaway::browser", error = %e, "browser frame import failed"),
+            Err(e) => warn!(
+                target: "castaway::browser",
+                error = %e,
+                width = paint.width,
+                height = paint.height,
+                modifier = format_args!("{:#x}", paint.modifier),
+                stride = paint.plane.stride,
+                offset = paint.plane.offset,
+                "browser frame import failed"
+            ),
         }
     }
 

@@ -1417,13 +1417,14 @@ impl RenderLoop {
         &mut self,
         geometry: crate::hwaccel::FrameGeometry,
         modifier: u64,
+        span: crate::hwaccel::PlaneSpan,
         handle: crate::hwaccel::remote_handle::LocalHandle,
         transform: Transform,
         layer: LayerId,
     ) -> Result<(), PipelineError> {
         let texture = self
             .compositor
-            .import_browser_frame(geometry, modifier, handle)?;
+            .import_browser_frame(geometry, modifier, span, handle)?;
         self.compositor.adopt_rgba_texture(layer, texture);
         self.compositor.upsert_layer(Layer {
             id: layer,
