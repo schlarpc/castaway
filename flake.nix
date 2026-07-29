@@ -660,6 +660,31 @@
             cfg = config.services.castaway;
             settingsFormat = pkgs.formats.toml { };
             configFile = settingsFormat.generate "castaway.toml" cfg.settings;
+
+            # Miracast is the one protocol that needs a radio rather than a socket, and
+            # the radio side is a *deployment*, not code (OPEN-QUESTIONS Q7c/Q7d): a
+            # wpa_supplicant castaway can command, and a DHCP server on the group
+            # interface. Both are derived from the same settings the binary reads, so
+            # the daemon castaway talks to and the daemon the module runs cannot drift.
+            miracastEnabled = cfg.settings.enable.miracast or false;
+            miracastInterface = cfg.settings.miracast.interface or "wlan0";
+            # Our side of the group subnet, in the `address/prefix` form both networkd's
+            # Address= and the binary's `[miracast] group_cidr` take — the same value
+            # feeds both, so the DHCP pool the module serves and the range the backend
+            # sweeps for peers cannot drift apart.
+            miracastGroupCidr = cfg.settings.miracast.group_cidr or "192.168.77.1/24";
+
+            miracastWpaConf = pkgs.writeText "castaway-wpa_supplicant.conf" ''
+              # castaway owns this wpa_supplicant instance (miracast-protocol-notes §7.6:
+              # NetworkManager structurally cannot host a Miracast sink). The control
+              # socket is the API: castaway sets the WFD IE, brings up the autonomous
+              # group and authorises WPS over it.
+              ctrl_interface=DIR=/run/wpa_supplicant GROUP=castaway-p2p
+              update_config=0
+              # Placeholders; castaway SETs the advertised name and type at bring-up.
+              device_name=castaway
+              device_type=7-0050F204-1
+            '';
           in
           {
             options.services.castaway = {
@@ -755,13 +780,81 @@
                 receiver so Cast/AirPlay/Spotify advertisements are answered by castaway.
               '';
 
+              # castaway itself runs unprivileged; membership in this group is what lets
+              # it reach the wpa_supplicant control sockets.
+              users.groups.castaway-p2p = lib.mkIf miracastEnabled { };
+
+              # The dedicated supplicant for the Miracast radio. Not networking.wireless
+              # and not NetworkManager: a sink must create an autonomous P2P group, which
+              # NM cannot do at all and the stock wireless module has no reason to allow.
+              systemd.services.castaway-wpa = lib.mkIf miracastEnabled {
+                description = "wpa_supplicant for castaway's Miracast radio";
+                wantedBy = [ "multi-user.target" ];
+                # The radio may appear after multi-user starts (USB, module load order),
+                # so the unit follows the device when systemd knows it and otherwise
+                # retries forever — an appliance's radio coming up late must not strand
+                # the sink until a reboot.
+                after = [ "sys-subsystem-net-devices-${miracastInterface}.device" ];
+                wants = [ "sys-subsystem-net-devices-${miracastInterface}.device" ];
+                unitConfig.StartLimitIntervalSec = 0;
+                serviceConfig = {
+                  ExecStart =
+                    "${lib.getExe' pkgs.wpa_supplicant "wpa_supplicant"} "
+                    + "-i ${miracastInterface} -D nl80211 -c ${miracastWpaConf}";
+                  Restart = "on-failure";
+                  RestartSec = 2;
+                };
+              };
+
+              # As group owner we are expected to run the DHCP server (Q7c) — the peer's
+              # address is how the backend finds who to dial, via the neighbour table.
+              # networkd carries this whole obligation declaratively: the group interface
+              # (`p2p-<parent>-N`) does not exist until the group forms and is named
+              # unpredictably, and a match pattern handles exactly that.
+              systemd.network = lib.mkIf miracastEnabled {
+                enable = true;
+                networks."40-castaway-p2p-group" = {
+                  matchConfig.Name = "p2p-${miracastInterface}-*";
+                  address = [ miracastGroupCidr ];
+                  networkConfig = {
+                    DHCPServer = true;
+                    # Address the interface the moment it appears: the peer's DHCP
+                    # DISCOVER can arrive within a second of association.
+                    ConfigureWithoutCarrier = true;
+                  };
+                  dhcpServerConfig = {
+                    PoolOffset = 100;
+                    PoolSize = 50;
+                    # A P2P group is a mirroring link, not a way to the internet. The
+                    # default EmitRouter=yes makes the phone route everything at us and
+                    # lose its own connectivity for the duration of the cast.
+                    EmitRouter = false;
+                    EmitDNS = false;
+                    EmitNTP = false;
+                  };
+                  # A sometimes-existing interface must not hold network-online.target.
+                  linkConfig.RequiredForOnline = false;
+                };
+              };
+
+              # If NetworkManager is present it must keep its hands off both the parent
+              # radio and the group interfaces wpa_supplicant creates on it; NM's P2P
+              # support is source-only by design (protocol notes §7.6) and its touch here
+              # is a torn-down group. Harmless to set when NM is disabled.
+              networking.networkmanager.unmanaged = lib.optionals miracastEnabled [
+                "interface-name:${miracastInterface}"
+                "interface-name:p2p-${miracastInterface}-*"
+              ];
+
               systemd.services.castaway = {
                 description = "castaway universal cast receiver";
                 wantedBy = [ "multi-user.target" ];
                 # Discovery joins multicast groups on a specific interface, so the
                 # address has to be up before we bind.
-                after = [ "network-online.target" ];
-                wants = [ "network-online.target" ];
+                after = [ "network-online.target" ]
+                  ++ lib.optional miracastEnabled "castaway-wpa.service";
+                wants = [ "network-online.target" ]
+                  ++ lib.optional miracastEnabled "castaway-wpa.service";
 
                 environment = {
                   CASTAWAY_CONFIG = "${configFile}";
@@ -792,6 +885,9 @@
                   # Everything it binds is above 1024 (HTTP, 1900, 5353), so it never
                   # needs root or CAP_NET_BIND_SERVICE.
                   DynamicUser = true;
+                  # The wpa_supplicant control sockets are the one privileged thing the
+                  # Miracast backend touches, and group membership is the whole grant.
+                  SupplementaryGroups = lib.optional miracastEnabled "castaway-p2p";
                   StateDirectory = "castaway";
                   # Backs XDG_CACHE_HOME above: filter lists, uBO scriptlet bodies, and
                   # the CEF profile. Losing it costs a refetch, not correctness, so it is
@@ -834,8 +930,11 @@
                 # 7236 here. The rule is per-interface-less on purpose — the P2P group
                 # interface does not exist until the group starts and is named
                 # unpredictably (`p2p-wlan0-N`).
-                ++ lib.optional (cfg.settings.enable.miracast or false)
-                  (cfg.settings.miracast.rtp_port or 1028);
+                ++ lib.optional miracastEnabled (cfg.settings.miracast.rtp_port or 1028)
+                # The DHCP server on the group interface (Q7c). Global for the same
+                # reason as the RTP port: the group interface's name is not known until
+                # the group forms.
+                ++ lib.optional miracastEnabled 67;
               };
             };
           };
