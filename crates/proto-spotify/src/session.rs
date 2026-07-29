@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::Engine as _;
 use castaway_core::{FrameSource, OsdSink};
 use castaway_core::{
     NowPlaying, PcmFrame, PlaybackState, RepeatMode, SessionEvent, SessionSink, SourceDescription,
@@ -438,31 +437,45 @@ async fn run(
     }
 }
 
+/// Turn a decrypted pairing into librespot credentials.
+///
+/// The decrypted zeroconf plaintext is not the credential bytes — it is the *base64
+/// text* of a second, AES-ECB-encrypted layer keyed on the device id and username, and
+/// [`Credentials::with_blob`] wants exactly that text. This function used to re-encode
+/// it, adding a third layer: `with_blob` stripped one, "decrypted" ASCII base64 as if
+/// it were ciphertext, and parsed the noise — surfacing on the panel as
+/// `unknown authentication type 52`, a number sampled from garbage. Every pairing
+/// failed that way; the phone showed the device and nothing ever logged in.
+fn credentials_from_pairing(
+    user: &PairedUser,
+    device_id: &str,
+) -> Result<Credentials, SpotifyError> {
+    // Guard the length before handing the blob over. `with_blob` runs `0..len - 0x10`
+    // over the *decoded* bytes, which underflows and panics below one AES block — and
+    // the length is attacker-chosen: our own HMAC check only proves the sender
+    // completed the Diffie-Hellman, not that the plaintext is well-formed. A hostile or
+    // buggy sender on the LAN should get an error, not a panicking task. 24 characters
+    // is the shortest padded base64 of 16 bytes; anything shorter cannot decode to a
+    // full block, and anything malformed fails inside `with_blob` cleanly.
+    const MIN_BLOB_B64: usize = 24;
+    if user.blob.len() < MIN_BLOB_B64 {
+        return Err(SpotifyError::Login(format!(
+            "credential blob is {} bytes of base64, need at least {MIN_BLOB_B64}",
+            user.blob.len()
+        )));
+    }
+
+    Credentials::with_blob(&user.user_name, &user.blob, device_id)
+        .map_err(|e| SpotifyError::Login(format!("credentials rejected: {e}")))
+}
+
 /// Bring up one session: log in, register as a Connect device, publish the audio path.
 async fn start(
     settings: &ConnectSettings,
     user: PairedUser,
     sink: &SessionSink,
 ) -> Result<LiveSession, SpotifyError> {
-    // Guard the length before handing the blob over. `Credentials::with_blob` ends with
-    // `for i in 0..len - 0x10`, which underflows and panics on anything shorter than one
-    // AES block — and the length is attacker-chosen: our own HMAC check only proves the
-    // sender completed the Diffie-Hellman, not that the plaintext is well-formed. A
-    // hostile or buggy sender on the LAN should get an error, not a panicking task.
-    const MIN_BLOB: usize = 16;
-    if user.blob.len() < MIN_BLOB {
-        return Err(SpotifyError::Login(format!(
-            "credential blob is {} bytes, need at least {MIN_BLOB}",
-            user.blob.len()
-        )));
-    }
-
-    let credentials = Credentials::with_blob(
-        &user.user_name,
-        base64::engine::general_purpose::STANDARD.encode(&user.blob),
-        &settings.device_id,
-    )
-    .map_err(|e| SpotifyError::Login(format!("credentials rejected: {e}")))?;
+    let credentials = credentials_from_pairing(&user, &settings.device_id)?;
 
     let session = Session::new(
         SessionConfig {
@@ -1166,6 +1179,83 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use castaway_core::{ProtocolKind, SourceId};
+
+    /// Build the inner credential blob exactly as the phone does: the librespot
+    /// `Credentials::with_blob` decode, run in reverse. Payload framing, then the
+    /// rolling XOR, then AES-192-ECB under the pbkdf2(sha1(device_id), username) key,
+    /// then base64 — whose *text bytes* are what the zeroconf plaintext carries.
+    fn phone_inner_blob(username: &str, device_id: &str, auth_data: &[u8]) -> Vec<u8> {
+        use aes::cipher::generic_array::GenericArray;
+        use aes::cipher::{BlockEncrypt as _, BlockSizeUser as _, KeyInit as _};
+        use base64::Engine as _;
+        use sha1::{Digest as _, Sha1};
+
+        assert!(auth_data.len() < 0x80, "test framing writes 1-byte varints");
+        // read_u8; read_bytes (ignored); read_u8; auth_type varint; read_u8; auth_data.
+        let mut payload = vec![0x00, 0x00, 0x00];
+        payload.push(0x01); // AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS
+        payload.push(0x00);
+        payload.push(auth_data.len() as u8);
+        payload.extend_from_slice(auth_data);
+        // Pad to whole AES blocks; the parser stops after auth_data and never looks.
+        while payload.len() % 16 != 0 {
+            payload.push(0x00);
+        }
+
+        // The decode XORs data[j] ^= data[j - 0x10] walking backwards, reading the
+        // still-encrypted lower block; encode is therefore the forward walk over the
+        // ciphertext being built.
+        for j in 0x10..payload.len() {
+            let prev = payload[j - 0x10];
+            payload[j] ^= prev;
+        }
+
+        let secret = Sha1::digest(device_id.as_bytes());
+        let mut key = [0u8; 24];
+        pbkdf2::pbkdf2_hmac::<Sha1>(&secret, username.as_bytes(), 0x100, &mut key[0..20]);
+        let hash = Sha1::digest(&key[..20]);
+        key[..20].copy_from_slice(&hash);
+        key[20..].copy_from_slice(&20u32.to_be_bytes());
+
+        let cipher = aes::Aes192::new(GenericArray::from_slice(&key));
+        for chunk in payload.chunks_exact_mut(aes::Aes192::block_size()) {
+            cipher.encrypt_block(GenericArray::from_mut_slice(chunk));
+        }
+
+        base64::engine::general_purpose::STANDARD
+            .encode(&payload)
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_phone_shaped_pairing_becomes_credentials_without_extra_encoding() {
+        // The regression that broke every pairing: the zeroconf plaintext already *is*
+        // the base64 text `with_blob` wants, and re-encoding it made librespot decrypt
+        // ASCII as ciphertext — parsed as a nonsense auth type ("unknown authentication
+        // type 52" on the panel, the number sampled from noise).
+        let auth_data = b"stored-credential-bytes";
+        let user = PairedUser {
+            user_name: "alice".into(),
+            blob: phone_inner_blob("alice", "deadbeef", auth_data),
+        };
+        let creds = credentials_from_pairing(&user, "deadbeef").expect("pairing should decode");
+        assert_eq!(creds.username.as_deref(), Some("alice"));
+        assert_eq!(creds.auth_data, auth_data);
+    }
+
+    #[test]
+    fn a_runt_blob_is_an_error_not_a_panic() {
+        // `with_blob` underflows on anything decoding below one AES block, and the
+        // length is attacker-chosen — the HMAC only proves the sender finished the DH.
+        let user = PairedUser {
+            user_name: "alice".into(),
+            blob: b"AAAA".to_vec(),
+        };
+        assert!(matches!(
+            credentials_from_pairing(&user, "deadbeef"),
+            Err(SpotifyError::Login(_))
+        ));
+    }
 
     fn settings() -> ConnectSettings {
         ConnectSettings {
