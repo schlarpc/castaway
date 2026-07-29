@@ -140,7 +140,7 @@ impl PairVerify {
 
         // Ephemeral by type: `EphemeralSecret` cannot be cloned or serialized, so this
         // key cannot outlive the exchange or be reused across sessions by accident.
-        let secret = EphemeralSecret::random_from_rng(&mut rand_core::OsRng);
+        let secret = EphemeralSecret::random_from_rng(rand_core::OsRng);
         let our_public = X25519Public::from(&secret).to_bytes();
         let shared = secret
             .diffie_hellman(&X25519Public::from(their_public))
@@ -258,7 +258,7 @@ mod tests {
     impl Sender {
         fn new() -> Self {
             let signing = SigningKey::from_bytes(&[7u8; KEY_LEN]);
-            let secret = EphemeralSecret::random_from_rng(&mut rand_core::OsRng);
+            let secret = EphemeralSecret::random_from_rng(rand_core::OsRng);
             let public = X25519Public::from(&secret).to_bytes();
             Self {
                 signing,
@@ -387,7 +387,7 @@ mod tests {
         // Right length, wrong marker: this is a stage-2 body arriving first.
         assert!(PairVerify::begin(&identity, &[0x00; VERIFY1_LEN]).is_err());
 
-        let mut sender = Sender::new();
+        let sender = Sender::new();
         let (verify, _) = PairVerify::begin(&identity, &sender.verify1()).unwrap();
         assert!(verify.finish(&[0x00; 4]).is_err());
     }

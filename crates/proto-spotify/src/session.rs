@@ -1195,7 +1195,7 @@ mod tests {
         let mut payload = vec![0x00, 0x00, 0x00];
         payload.push(0x01); // AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS
         payload.push(0x00);
-        payload.push(auth_data.len() as u8);
+        payload.push(u8::try_from(auth_data.len()).expect("test credential fits a byte"));
         payload.extend_from_slice(auth_data);
         // Pad to whole AES blocks; the parser stops after auth_data and never looks.
         while payload.len() % 16 != 0 {

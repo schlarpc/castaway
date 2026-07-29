@@ -9,8 +9,16 @@ use castaway_core::ProtocolKind;
 use serde::Deserialize;
 
 /// Top-level configuration.
+///
+/// Some sections are read only by builds that have the subsystem they configure —
+/// `theme` and `browser` need `electron`, `audio` needs an output backend. They stay
+/// in the struct unconditionally because this type is the *file schema*: a key that
+/// vanishes with a feature flag turns an operator's working config into a parse error
+/// on a build that merely cannot act on it. So the fields are deliberately unread in
+/// some builds rather than absent from them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[cfg_attr(not(feature = "electron"), allow(dead_code))]
 pub struct Config {
     /// The name senders see (mDNS instance / UPnP friendlyName).
     pub friendly_name: String,
@@ -549,6 +557,7 @@ impl Config {
     /// artifacts set the environment variable, which is why there is no clever search
     /// here: on a panel the answer is known at build time.
     #[must_use]
+    #[cfg_attr(not(feature = "electron"), allow(dead_code))]
     pub fn browser_program(&self) -> std::path::PathBuf {
         std::env::var_os("CASTAWAY_ELECTRON")
             .map(std::path::PathBuf::from)
@@ -558,6 +567,7 @@ impl Config {
 
     /// The directory holding the browser host app (`browser-host/`).
     #[must_use]
+    #[cfg_attr(not(feature = "electron"), allow(dead_code))]
     pub fn browser_app_dir(&self) -> std::path::PathBuf {
         std::env::var_os("CASTAWAY_BROWSER_APP")
             .map(std::path::PathBuf::from)

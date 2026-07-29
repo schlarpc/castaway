@@ -9,8 +9,6 @@
 //! `--beep [device id]` additionally opens a stream there (the default if no id) and
 //! plays one second of A440 — the whole session path, minus a protocol.
 
-use std::time::Duration;
-
 fn main() {
     let backend = pipeline::audio_select::active_backend();
     println!("backend: {backend:?}");
