@@ -79,8 +79,11 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
     );
 
     // Session over: the widget returns from the texture it kept all along — no new
-    // upload happened between these two pumps.
+    // upload happened between these pumps. The clear is deferred by the seek-shaped
+    // grace (see `CLEAR_GRACE`), so the card lingers briefly before yielding back.
     tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
+    render.pump();
+    std::thread::sleep(std::time::Duration::from_millis(1300));
     render.pump();
     assert!(
         widget_visible(&render),

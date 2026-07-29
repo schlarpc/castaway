@@ -31,6 +31,13 @@ const PIP_CORNER: u8 = 3;
 /// How long after a touch the panel counts as in use, for the idle return (#27).
 const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a requested video/card clear is held before it takes effect, so a control
+/// point that "seeks" by stopping and re-loading the item (VLC's live streams do this
+/// on every scrub) replaces the picture instead of flashing the idle screen between the
+/// STOP and the new item's first frame. Long enough for a network re-open; short enough
+/// that a genuine stop still reads as prompt.
+const CLEAR_GRACE: std::time::Duration = std::time::Duration::from_millis(1200);
+
 /// A navigation being animated.
 #[derive(Debug, Clone, Copy)]
 struct Transition {
@@ -991,6 +998,12 @@ pub struct RenderLoop {
     /// has given a Home to — the offscreen test harness, a headless tap.
     shell: Option<crate::shell::ScreenStack>,
     has_video: bool,
+    /// When a requested video-layer clear takes effect, unless a frame cancels it. The
+    /// deferral exists for control points that "seek" by stopping and re-loading the
+    /// item: an immediate clear bared the idle screen for the gap between the two.
+    video_clear_due: Option<std::time::Instant>,
+    /// The now-playing card's counterpart of [`Self::video_clear_due`].
+    card_clear_due: Option<std::time::Instant>,
     /// Consumers of the composited output — screenshots, and later a stream tee. Empty
     /// on the default path, which is the point: a readback is a full-surface copy.
     taps: Vec<Box<dyn crate::tap::OutputTap>>,
@@ -1059,6 +1072,8 @@ impl RenderLoop {
             last_touch: None,
             shell: None,
             has_video: false,
+            video_clear_due: None,
+            card_clear_due: None,
             taps: Vec::new(),
             failed_imports: 0,
             transport: None,
@@ -1702,7 +1717,26 @@ impl RenderLoop {
     /// The question is put to every tap *before* the copy, because the copy is a full
     /// surface — 33 MB at 4K — and doing it speculatively would cost more than the rest
     /// of the frame. One readback serves everyone who said yes.
+    /// Execute a scheduled layer clear whose grace has run out (see `ClearVideo`).
+    fn run_due_clears(&mut self) {
+        let now = std::time::Instant::now();
+        if self.video_clear_due.is_some_and(|due| now >= due) {
+            self.video_clear_due = None;
+            self.compositor.remove_layer(LayerId::Video);
+            self.has_video = false;
+        }
+        if self.card_clear_due.is_some_and(|due| now >= due) {
+            self.card_clear_due = None;
+            self.compositor.remove_layer(LayerId::NowPlaying);
+            // The strip belongs to the card. Leaving it would offer controls for a
+            // session that has ended, wired to a remote that has been dropped.
+            self.compositor.remove_layer(LayerId::Transport);
+            self.transport = None;
+        }
+    }
+
     fn present_and_serve_taps(&mut self) {
+        self.run_due_clears();
         // The shell half of the idle widget's visibility (see `attract_widget_covered`):
         // recomputed and handed down every frame, so it is a standing fact rather than a
         // transition to be caught. The session half the compositor derives itself from
@@ -1745,6 +1779,9 @@ impl RenderLoop {
     fn apply(&mut self, cmd: RenderCommand) -> bool {
         match cmd {
             RenderCommand::Video(frame) => {
+                // A frame arriving is the session speaking; whatever clear was pending
+                // belonged to the item this one replaces.
+                self.video_clear_due = None;
                 // Two ways pixels reach the video layer: uploaded from system memory
                 // (software decode) or imported in place from a surface the decoder
                 // produced on the GPU (hwaccel). Only the second one avoids the copy.
@@ -1793,6 +1830,8 @@ impl RenderLoop {
                 false
             }
             RenderCommand::NowPlaying(card) => {
+                // A live card cancels a pending clear, exactly as a video frame does.
+                self.card_clear_due = None;
                 // Rendered here rather than upstream: the metadata is a few hundred bytes
                 // and the pixels are tens of megabytes, so the channel carries the small
                 // one and this thread — which owns the surface size — makes the big one.
@@ -1870,16 +1909,19 @@ impl RenderLoop {
                 false
             }
             RenderCommand::ClearNowPlaying => {
-                self.compositor.remove_layer(LayerId::NowPlaying);
-                // The strip belongs to the card. Leaving it would offer controls for a
-                // session that has ended, wired to a remote that has been dropped.
-                self.compositor.remove_layer(LayerId::Transport);
-                self.transport = None;
+                // Deferred, like `ClearVideo` and for the same seek-shaped reason; the
+                // strip goes with the card when the grace runs out.
+                self.card_clear_due = Some(std::time::Instant::now() + CLEAR_GRACE);
                 false
             }
             RenderCommand::ClearVideo => {
-                self.compositor.remove_layer(LayerId::Video);
-                self.has_video = false;
+                // Not yet. A control point that cannot seek in-band restarts the item —
+                // VLC's live stream sends STOP then a fresh LOAD for every scrub — and
+                // clearing here bared the idle screen for the half-second between them.
+                // The clear is scheduled instead, and the next frame cancels it; a stop
+                // that really is the end of the session clears when the grace runs out,
+                // which is too brief to read as the frozen-frame bug this used to be.
+                self.video_clear_due = Some(std::time::Instant::now() + CLEAR_GRACE);
                 false
             }
         }
