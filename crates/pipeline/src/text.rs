@@ -206,6 +206,15 @@ pub fn ascent(font: &FontRef, px: f32) -> f32 {
     font.as_scaled(PxScale::from(px)).ascent()
 }
 
+/// The descent at `px`. Negative, as `ab_glyph` reports it: the bottom of the line box
+/// sits at `baseline - descent`. Exposed so a caller centring a line in a box can do it
+/// from the font's own metrics — `(box.h + ascent + descent) / 2` below the box top —
+/// instead of a guessed fraction of the size.
+#[must_use]
+pub fn descent(font: &FontRef, px: f32) -> f32 {
+    font.as_scaled(PxScale::from(px)).descent()
+}
+
 /// Source-over composite one pixel: works on opaque and transparent canvases alike.
 pub fn blend_over(
     buf: &mut [u8],

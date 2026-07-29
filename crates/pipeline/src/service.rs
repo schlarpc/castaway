@@ -232,12 +232,17 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
             h: name_px + pad,
         };
         shape::rounded_rect(&mut buf, width, height, plate, 12.0 * s, pal.plate);
+        // Centre the line in the plate from the font's own metrics. The previous
+        // `0.78 × size` baseline was a guess, and it sat the name visibly high.
+        let ascent = text::ascent(&f.bold, name_px);
+        let descent = text::descent(&f.bold, name_px);
+        let baseline = plate.y + (plate.h + ascent + descent) / 2.0;
         text::draw_text(
             &mut buf,
             width,
             height,
             margin,
-            y + name_px * 0.78,
+            baseline,
             advertised,
             name_px,
             pal.look_for,
