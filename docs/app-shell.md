@@ -125,8 +125,8 @@ Three rules it exists to enforce:
 - **Service** — one service's instructions, opened by its tile. Did not exist in the plan;
   it is where the rows went.
 - **Picker** — a list with a title and a back affordance. Generic over what it lists:
-  GameStream hosts, then that host's apps, then later media files and output devices. This
-  is the screen that closes Q44.
+  GameStream hosts, then that host's apps, then settings and output devices (see §6
+  item 12), later media files. This is the screen that closes Q44.
 - **Session** — something is playing. Video, or the now-playing card plus transport strip.
   Roughly what exists today.
 - **Browser** — a cast surface (YouTube leanback, Cast app surfaces) filling the panel.
@@ -299,6 +299,15 @@ Landed, in this order, each independently useful:
     clipping, so an incoming screen parked off-surface would be drawn across whatever is
     beside it. A crossfade needs only opacity, which is a uniform write rather than a
     33 MB re-raster per frame.
+12. **Settings (D40, first slice of #12).** A gear tile, always last on Home; behind it a
+    menu of settings, each drilling into a choice list — all pickers, so back, scrolling
+    and transitions came for free. `PickerItem::marked` is the one primitive it added: a
+    choice row is a selection, not a doorway, so the row in effect wears a check where the
+    others wear the go-somewhere chevron. The catalog (`app::settings::Setting`) is the
+    seam: `shell_nav` renders whatever the catalog describes and knows no setting by name,
+    the way the picker knows nothing about GameStream. One setting exists — output
+    device — and applying it writes `castaway.toml` back through `toml_edit` without
+    disturbing a byte the operator wrote (D40 records why not serde).
 
 The typeface stays DejaVu, deliberately: nobody reading a wall from across a room is
 identifying the body face, and matching dma.space's Inter would mean vendoring static

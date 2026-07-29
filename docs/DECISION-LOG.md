@@ -887,3 +887,55 @@ The deployment half is one line — `XDG_STATE_HOME = "%S"` in the unit, the sta
 of the `XDG_CACHE_HOME = "%C"` that closed G31. It resolves to `/var/lib/castaway`, which
 is where the GameStream pairing store was hardcoded to anyway, so that credential keeps its
 existing path rather than moving under an operator.
+
+### D40 — Settings on the glass, and the config file written back without being rewritten
+The first slice of #12 ("GUI configurable"): a Settings tile, a menu behind it, one
+setting in the menu — which device sound comes out of — and the piece that made the
+feature worth a decision entry: the receiver now *writes* `castaway.toml`.
+
+**The write is `toml_edit`, not serde, and that is the decision.** The config file is the
+operator's document: comments explaining why Miracast is off, hand-grouped sections, keys
+in the order they think in. Serializing `Config` back out would parse all of that into
+structs and print a stranger's file — every save flattening every comment — which teaches
+operators the config is not really theirs. So `app::settings::ConfigStore` parses the file
+into `toml_edit`'s lossless document, changes exactly one key, and writes atomically
+(sibling temp file + rename; the moment a panel loses power is mid-write to the only file
+it boots from). The store's tests pin the property byte-for-byte, and pin the refusals:
+a file that does not parse is reported, never clobbered — broken is the operator's to
+mend, and a receiver that "fixes" it by rewriting it has destroyed the evidence.
+
+**An unwritable config demotes the save, never the setting.** Apply order is runtime
+first: the shared `OutputSelector` moves, the choice list shows its check moved, and the
+receiver honours the choice until restart. Persistence failing (the NixOS module points
+`$CASTAWAY_CONFIG` into the read-only store; a panel's disk can be full) comes back as
+`Applied::NotSaved(why)` — not an error — and surfaces as an OSD toast naming the file
+and the reason, while the screen carries on. The failure being designed against is the
+same one as D39's: not "the save failed", but "nobody found out"; the one a settings
+screen must not have is a pick that visibly did nothing because a file elsewhere refused.
+
+**Settings are a catalog, not screens.** `app::settings::Setting` is the seam — id,
+title, current-value summary, choices, apply — and `shell_nav` renders whatever the
+catalog describes, knowing no setting by name. All three levels are pickers (D38's one
+list screen), which bought back, scrolling and transitions for free; the sole primitive
+added is `PickerItem::marked`, because a choice row is a selection rather than a doorway
+and drawing the go-somewhere chevron on it would promise a screen that never comes.
+Adding the next setting is one trait impl and one line in `main`.
+
+**Output-device selection is keyed per backend, and Linux got a native PipeWire backend
+to make it real.** `[audio.output]` carries `pipewire` / `windows` / `alsa` keys because
+device ids share no vocabulary across backends, and one file travels between the dev box
+and the panel — each build reads its own key and leaves the rest alone ("default" is the
+stated policy, not a device name). Through the ALSA shim, PipeWire is one device called
+"pipewire", which reduces the setting to a joke; so `pipeline::audio_pw` (feature
+`audio-pipewire`, Linux-only, via the idiomatic `pipewire` crate — the D30 dependency
+conditions, though this is a system API like cpal, not a protocol) enumerates real sinks
+from the registry and routes per-stream with `target.object`. Its internals deliberately
+mirror `CpalAudioOut` — bounded channel, never-blocking callback, stream owned by its own
+thread — and both backends share the fallback policy: a chosen device that has left the
+building plays through the default *with a warning*, because the wrong speakers saying so
+beat a panel gone silent over an unplugged DAC. Selection reaches sessions through one
+shared `OutputSelector` read at stream-open, so a pick applies to every source's next
+session with no restart, and sessions already playing keep the device they opened — the
+same rule as their sample rate. The Windows deploy artifact gains `audio-out` (WASAPI),
+which it had never actually carried; until now the full Windows build had no PCM device
+at all.
