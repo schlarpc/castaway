@@ -9,7 +9,7 @@
 //! receiver what to tell the sender and put it on the wire.
 //!
 //! One socket carries both streams. Cast's ANSWER names a single `udpPort` and the
-//! audio and video SSRCs, so demultiplexing is ours to do — hence [`peek_ssrc`].
+//! audio and video SSRCs, so demultiplexing is ours to do — hence `peek_ssrc`.
 //!
 //! The socket is bound *before* the OFFER is answered. A port in an ANSWER that nobody
 //! is listening on is a sender streaming into a black hole, and it would only show up

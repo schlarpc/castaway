@@ -68,7 +68,7 @@ const TLS_CERT_RENEW_WITH: Duration = Duration::from_secs(24 * 60 * 60);
 /// Self-signed is correct here, not a shortcut — every Cast receiver ships one, and
 /// senders don't build a chain to a trust root. What matters is that the same DER bytes
 /// the sender sees are the bytes the device-auth signature covers, and that the window
-/// in those bytes satisfies [`TLS_CERT_VALID_FOR`].
+/// in those bytes satisfies `TLS_CERT_VALID_FOR`.
 ///
 /// The key is kept across reissues rather than regenerated, which is what makes rotation
 /// cheap enough to do on the accept path: issuing a certificate is microseconds, and only
@@ -337,7 +337,7 @@ impl CastReceiver {
     ///
     /// The identity is owned rather than borrowed because it is not a fixed value: a
     /// self-signed certificate is short-lived by protocol requirement (see
-    /// [`TLS_CERT_VALID_FOR`]) and is reissued as connections arrive, and a CKS
+    /// `TLS_CERT_VALID_FOR`) and is reissued as connections arrive, and a replayed
     /// credential rolls with its window.
     ///
     /// # Errors

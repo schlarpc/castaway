@@ -231,7 +231,7 @@ impl RtpTimestamp {
 
 /// A packet's index within its frame.
 ///
-/// Cannot hold [`ALL_PACKETS_LOST`]: that value means "the whole frame is missing" in
+/// Cannot hold `ALL_PACKETS_LOST`: that value means "the whole frame is missing" in
 /// RTCP feedback, so letting it into a packet id would make [`NackTarget`] ambiguous.
 /// The sentinel is expressed by [`NackTarget::AllPackets`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
