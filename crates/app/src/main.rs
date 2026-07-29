@@ -1038,6 +1038,8 @@ fn spawn_miracast(
     {
         let caps = proto_miracast::SinkCapabilities::sink_default(config.miracast.rtp_port)
             .context("building the Miracast sink capabilities")?;
+        let group = proto_miracast::GroupSubnet::parse(&config.miracast.group_cidr)
+            .context("parsing [miracast] group_cidr")?;
         let backend = Arc::new(proto_miracast::LinuxMiracastBackend::new(
             proto_miracast::P2pConfig {
                 control_dir: config.miracast.control_dir.clone().into(),
@@ -1045,6 +1047,7 @@ fn spawn_miracast(
                 device_name: config.advertised_name(ProtocolKind::Miracast),
                 freq_mhz: config.miracast.freq_mhz,
                 max_throughput_mbps: config.miracast.max_throughput_mbps,
+                group,
             },
             caps,
         ));

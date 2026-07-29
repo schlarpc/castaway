@@ -34,7 +34,7 @@ use castaway_core::ProtocolKind;
 
 pub use actor::{bind_rtp, connect_control, run_session, MiracastAdapter};
 #[cfg(unix)]
-pub use backend_linux::{LinuxMiracastBackend, P2pConfig, WpaControl};
+pub use backend_linux::{GroupSubnet, LinuxMiracastBackend, P2pConfig, WpaControl};
 pub use error::{IeError, MiracastError, ParamError};
 pub use ie::{
     DeviceInformation, DeviceType, ExtendedCapability, SessionAvailability, Subelement,

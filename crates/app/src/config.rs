@@ -133,6 +133,13 @@ pub struct Miracast {
     pub rtp_port: u16,
     /// Maximum throughput to advertise, in Mbps.
     pub max_throughput_mbps: u16,
+    /// The group interface's subnet, as `address/prefix` — our own address first.
+    ///
+    /// Must agree with whatever addresses the group interface and serves DHCP on it
+    /// (the NixOS module derives both from this value). The backend sweeps this range
+    /// to resolve a freshly-associated peer: in WFD the sink dials the source, so the
+    /// peer has no reason to send us the packet that would fill the neighbour table.
+    pub group_cidr: String,
 }
 
 impl Default for Miracast {
@@ -144,6 +151,7 @@ impl Default for Miracast {
             // What lazycast uses and what every capture shows; nothing requires it.
             rtp_port: 1028,
             max_throughput_mbps: 200,
+            group_cidr: "192.168.77.1/24".to_owned(),
         }
     }
 }

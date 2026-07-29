@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use castaway_core::{CoreError, SessionSink};
-use tokio::net::UnixDatagram;
+use tokio::net::{UdpSocket, UnixDatagram};
 use tracing::{debug, info, warn};
 
 use crate::actor::{bind_rtp, connect_control, run_session};
@@ -212,6 +212,77 @@ impl Drop for WpaControl {
 /// Where wpa_supplicant's control sockets live on a systemd/NixOS box.
 pub const DEFAULT_CONTROL_DIR: &str = "/run/wpa_supplicant";
 
+/// The IPv4 subnet of the group interface: our own address plus the peers' pool.
+///
+/// The backend needs this for exactly one thing — *finding* a peer. In WFD the sink
+/// dials the source, so the peer never has a reason to send us unicast traffic first,
+/// and a client that quietly takes its DHCP lease (Windows does exactly this, since we
+/// advertise ourselves as neither its router nor its DNS) never puts itself in our
+/// neighbour table. Knowing the subnet lets [`nudge_neighbours`] make the kernel ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSubnet {
+    address: std::net::Ipv4Addr,
+    prefix: u8,
+}
+
+impl GroupSubnet {
+    /// A subnet from our own address and a prefix length.
+    ///
+    /// # Errors
+    /// [`MiracastError::Backend`] unless `20 <= prefix <= 30`: below /20 the sweep in
+    /// [`nudge_neighbours`] stops being a nudge and becomes four thousand datagrams, and
+    /// above /30 there is no room for a peer at all.
+    pub fn new(address: std::net::Ipv4Addr, prefix: u8) -> Result<Self, MiracastError> {
+        if !(20..=30).contains(&prefix) {
+            return Err(MiracastError::Backend(format!(
+                "group subnet /{prefix} is outside /20..=/30"
+            )));
+        }
+        Ok(Self { address, prefix })
+    }
+
+    /// Parse the `a.b.c.d/nn` form the config file uses.
+    ///
+    /// # Errors
+    /// [`MiracastError::Backend`] if it is not an IPv4 CIDR in the accepted range.
+    pub fn parse(s: &str) -> Result<Self, MiracastError> {
+        let bad =
+            || MiracastError::Backend(format!("`{s}` is not an IPv4 CIDR like 192.168.77.1/24"));
+        let (address, prefix) = s.split_once('/').ok_or_else(bad)?;
+        Self::new(
+            address.trim().parse().map_err(|_| bad())?,
+            prefix.trim().parse().map_err(|_| bad())?,
+        )
+    }
+
+    /// Every address a peer could hold: the subnet minus network, broadcast, and us.
+    fn peers(self) -> impl Iterator<Item = std::net::Ipv4Addr> {
+        let ours = u32::from(self.address);
+        let mask = u32::MAX << (32 - self.prefix);
+        let network = ours & mask;
+        let broadcast = network | !mask;
+        ((network + 1)..broadcast)
+            .filter(move |&host| host != ours)
+            .map(std::net::Ipv4Addr::from)
+    }
+}
+
+/// Make the kernel resolve every possible peer address on the group subnet.
+///
+/// One empty datagram to each host's discard port: the payload never matters and mostly
+/// never arrives — the side effect is the ARP request the kernel must send to deliver
+/// it, and the peer's reply is the neighbour-table entry [`peer_address`] is polling
+/// for. Needs no privileges and touches nothing outside the connected route.
+async fn nudge_neighbours(subnet: GroupSubnet) {
+    let Ok(socket) = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await else {
+        return;
+    };
+    for host in subnet.peers() {
+        // An unroutable host is not an error worth stopping a sweep over.
+        let _ = socket.send_to(&[], (host, 9)).await;
+    }
+}
+
 /// How to bring up the group.
 #[derive(Debug, Clone)]
 pub struct P2pConfig {
@@ -230,6 +301,19 @@ pub struct P2pConfig {
     pub freq_mhz: Option<u16>,
     /// Maximum throughput to advertise, in Mbps.
     pub max_throughput_mbps: u16,
+    /// The group interface's subnet — must match whatever assigns the interface its
+    /// address and serves DHCP on it (the NixOS module does both from the same value).
+    pub group: GroupSubnet,
+}
+
+/// The subnet the NixOS module configures, as a compile-checked default.
+fn default_group_subnet() -> GroupSubnet {
+    // A /24 is always in range, so this cannot actually fail; unwrap is still banned
+    // here (ground rule 7), and the fallback is the same value field by field.
+    GroupSubnet::new(std::net::Ipv4Addr::new(192, 168, 77, 1), 24).unwrap_or(GroupSubnet {
+        address: std::net::Ipv4Addr::new(192, 168, 77, 1),
+        prefix: 24,
+    })
 }
 
 impl Default for P2pConfig {
@@ -241,6 +325,7 @@ impl Default for P2pConfig {
             freq_mhz: None,
             // What MiracleCast and lazycast advertise, and what shipping senders accept.
             max_throughput_mbps: 200,
+            group: default_group_subnet(),
         }
     }
 }
@@ -344,12 +429,24 @@ const STATION_DEDUPE: Duration = Duration::from_secs(2);
 #[async_trait::async_trait]
 impl castaway_core::MiracastBackend for LinuxMiracastBackend {
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), CoreError> {
-        let control = WpaControl::connect(&self.config.control_dir, &self.config.interface)
-            .await
-            .map_err(|e| CoreError::Adapter(e.to_string()))?;
-        self.bring_up(&control)
-            .await
-            .map_err(|e| CoreError::Adapter(e.to_string()))?;
+        // The daemon and the radio are allowed to be late: castaway, wpa_supplicant and
+        // a USB adapter come up in whatever order the box feels like, and a backend
+        // that tried once and gave up would strand Miracast until a restart. Retry with
+        // a capped backoff instead — each failure says what is missing.
+        let mut backoff = Duration::from_secs(1);
+        let control = loop {
+            match WpaControl::connect(&self.config.control_dir, &self.config.interface).await {
+                Ok(control) => match self.bring_up(&control).await {
+                    Ok(()) => break control,
+                    Err(e) => warn!(error = %e, "Miracast bring-up failed; retrying"),
+                },
+                Err(e) => {
+                    warn!(error = %e, "no wpa_supplicant control socket yet; retrying");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        };
 
         let mut group: Option<GroupControl> = None;
         let mut last_station: Option<(MacAddr, tokio::time::Instant)> = None;
@@ -474,7 +571,7 @@ impl LinuxMiracastBackend {
         peer: MacAddr,
         sink: &SessionSink,
     ) -> Result<(), MiracastError> {
-        let address = peer_address(iface, peer, ADDRESS_TIMEOUT).await?;
+        let address = peer_address(iface, peer, Some(self.config.group), ADDRESS_TIMEOUT).await?;
         let rtp = bind_rtp(self.caps.client_rtp_ports.port()).await?;
         let control = connect_control((address, DEFAULT_CONTROL_PORT).into()).await?;
         run_session(
@@ -487,12 +584,17 @@ impl LinuxMiracastBackend {
     }
 }
 
+/// How often to re-sweep the subnet while waiting for a peer's address to resolve.
+const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Find a peer's IPv4 address by its MAC, from the kernel's neighbour table.
 ///
 /// wpa_supplicant does not know it: as group owner we hand out addresses over DHCP, and
 /// the association event carries only the MAC. Polling `/proc/net/arp` is the dependency-
-/// free way to close that gap — the entry appears as soon as the peer completes DHCP and
-/// speaks to us.
+/// free way to close that gap — but the entry does not appear on its own. In WFD *we*
+/// dial *them*, so the peer may never send us the unicast packet that would create one;
+/// given `subnet`, every poll round is preceded by a [`nudge_neighbours`] sweep so the
+/// kernel resolves the peer the moment DHCP has given it an address.
 ///
 /// # Errors
 /// [`MiracastError::Backend`] if no entry appears within `timeout`, which in practice
@@ -500,11 +602,19 @@ impl LinuxMiracastBackend {
 pub async fn peer_address(
     iface: &str,
     peer: MacAddr,
+    subnet: Option<GroupSubnet>,
     timeout: Duration,
 ) -> Result<std::net::Ipv4Addr, MiracastError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let wanted = peer.to_string();
+    let mut next_nudge = tokio::time::Instant::now();
     loop {
+        if let Some(subnet) = subnet {
+            if tokio::time::Instant::now() >= next_nudge {
+                nudge_neighbours(subnet).await;
+                next_nudge = tokio::time::Instant::now() + NUDGE_INTERVAL;
+            }
+        }
         if let Ok(table) = tokio::fs::read_to_string("/proc/net/arp").await {
             if let Some(address) = find_in_arp(&table, iface, &wanted) {
                 return Ok(address);
@@ -579,9 +689,39 @@ mod tests {
         // The failure mode this replaces is a silent hang, and the cause is almost always
         // the same one.
         let peer = MacAddr::parse("02:00:00:00:00:01").unwrap();
-        let err = peer_address("p2p-nonexistent-0", peer, Duration::from_millis(10))
+        let err = peer_address("p2p-nonexistent-0", peer, None, Duration::from_millis(10))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("DHCP"), "{err}");
+    }
+
+    #[test]
+    fn a_subnet_parses_and_yields_every_possible_peer() {
+        let subnet = GroupSubnet::parse("192.168.77.1/30").unwrap();
+        // A /30 holds .0 network, .1 us, .2 the one possible peer, .3 broadcast.
+        assert_eq!(
+            subnet.peers().collect::<Vec<_>>(),
+            vec![std::net::Ipv4Addr::new(192, 168, 77, 2)]
+        );
+    }
+
+    #[test]
+    fn a_24_subnet_sweeps_the_pool_but_not_network_broadcast_or_us() {
+        let subnet = GroupSubnet::parse("192.168.77.1/24").unwrap();
+        let peers: Vec<_> = subnet.peers().collect();
+        assert_eq!(peers.len(), 253);
+        assert!(!peers.contains(&std::net::Ipv4Addr::new(192, 168, 77, 0)));
+        assert!(!peers.contains(&std::net::Ipv4Addr::new(192, 168, 77, 1)));
+        assert!(!peers.contains(&std::net::Ipv4Addr::new(192, 168, 77, 255)));
+    }
+
+    #[test]
+    fn a_subnet_wide_enough_to_be_a_flood_is_refused() {
+        // /16 would be sixty-five thousand datagrams per association; the failure names
+        // the accepted range rather than sweeping anyway.
+        assert!(GroupSubnet::parse("10.0.0.1/16").is_err());
+        assert!(GroupSubnet::parse("10.0.0.1/31").is_err());
+        assert!(GroupSubnet::parse("not-a-cidr").is_err());
+        assert!(GroupSubnet::parse("10.0.0.1").is_err());
     }
 }
