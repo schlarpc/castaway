@@ -6,11 +6,12 @@ Snapshot for our next sync. Companion to DECISION-LOG.md (why) and OPEN-QUESTION
 running binary, and `nix build .#checks.x86_64-linux.integration-vm` passes the two-VM
 integration test.
 
-## What exists (18 crates, workspace per architecture-substrate.md §2)
+## What exists (19 crates, workspace per architecture-substrate.md §2)
 
 | Crate | State |
 |---|---|
 | `core` | Done. Traits (`SourceAdapter`, `Pipeline`, `DisplayControl`, `MiracastBackend`), `SessionEvent`/`FrameSource`, newtypes, last-writer-wins `SessionManager`. |
+| `paths` | **Done.** The one answer to "which directory?" on both platforms (D39). `Layout::{Xdg, LocalAppData}` is a value, not a `cfg`, so Linux CI exercises the Windows layout — absoluteness rule included. Resolution is pure (an `Environment` trait, no process env, no disk); finding nothing is reported as `Origin::Fallback` rather than guessed at. |
 | `substrate-ssdp` | Done. Pure M-SEARCH/NOTIFY layer + UDP 1900 `Responder`. |
 | `substrate-mdns` | Done. `mdns-sd` wrapper, validated `MdnsService`. |
 | `substrate-rtsp` | Done. `rtsp-types` framing + CSeq + `ByteTransform` slot + AirPlay's bare-path request-URIs. |
@@ -343,7 +344,9 @@ paired with, which is a deliberate act.
 gamestream = true
 
 [gamestream]
-state_dir = "/var/lib/castaway/gamestream"   # the credential — persistent, mode 0600
+# the credential — persistent, mode 0600. Omit it: the default is the platform state
+# directory + /gamestream, which under the NixOS unit is this same path.
+state_dir = "/var/lib/castaway/gamestream"
 pair_host = "10.0.0.7"                        # remove after pairing succeeds once
 pair_pin  = "1234"                            # typed into *Sunshine's* web UI, not ours
 autostart_host = "10.0.0.7"                   # optional; unset means nothing starts
@@ -363,6 +366,42 @@ removed afterwards rather than left in place.
 on the panel and take a touch on it, so the only way to start a session is the config above
 — operator-configured, not walk-up. That is the next work, and it is what would make this
 protocol feel like the rest of the receiver.
+
+## Logs (`[log]` in castaway.toml, D39)
+Two sinks, two filters. The console follows `RUST_LOG` (or `[log] level`) and belongs to
+whoever is watching the box; the file follows `[log] file_level` and belongs to a panel
+running unattended, so turning the console up to `debug` does **not** turn the file up with
+it — the mirroring paths log per frame.
+
+```toml
+[log]
+level      = "info"    # console; RUST_LOG wins over this
+to_file    = true      # rotated files on disk
+file_level = "info"    # deliberately not inherited from `level`
+rotation   = "daily"   # minutely | hourly | daily | never
+max_files  = 14        # pruned oldest-first at each rotation; ignored when `never`
+# directory = "..."    # default: the platform log directory (below)
+```
+
+Files land as `castaway.2026-07-28.log`, dated so a restart appends to today's rather than
+truncating it. Writes are synchronous: the release profile is `panic = "abort"`, and an
+aborting process never flushes a background writer's buffer — which is exactly the tail
+worth having.
+
+## Where files live (`castaway-paths`, D39)
+| | Linux (XDG) | Windows |
+|---|---|---|
+| state | `$XDG_STATE_HOME/castaway` | `%LOCALAPPDATA%\castaway\state` |
+| cache | `$XDG_CACHE_HOME/castaway` | `%LOCALAPPDATA%\castaway\cache` |
+| logs | `$XDG_STATE_HOME/castaway/logs` | `%LOCALAPPDATA%\castaway\logs` |
+| config | `$XDG_CONFIG_HOME/castaway` | `%LOCALAPPDATA%\castaway\config` |
+
+Under the NixOS module the unit sets `XDG_STATE_HOME=%S` and `XDG_CACHE_HOME=%C`, so those
+resolve to `/var/lib/castaway` and `/var/cache/castaway`. Both exist because a dynamic
+user's home is `/`: without them the paths become `/.local/state/castaway` and
+`/.cache/castaway` under `ProtectSystem=strict`, unwritable, and every failure there is
+swallowed by design (G31). If the environment names no home at all, the receiver logs a
+warning naming the fallback rather than writing state somewhere it will not be found again.
 
 ## Design decisions worth your review
 D7 (router composition vs SourceAdapter), D9 (hand-written prost, no protoc), D16 (socket

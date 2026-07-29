@@ -759,7 +759,13 @@
                 type = lib.types.str;
                 default = "info";
                 example = "info,castaway=debug";
-                description = "`RUST_LOG` filter for the service.";
+                description = ''
+                  `RUST_LOG` filter for the service — the *console* (journald) stream only.
+                  The rotated files under /var/lib/castaway/logs keep their own filter, so
+                  turning this up to `debug` to chase something does not also fill the
+                  panel's disk. Set `settings.log.file_level` to move that one, and
+                  `settings.log.to_file = false` to keep journald as the only sink.
+                '';
               };
 
               openFirewall = lib.mkOption {
@@ -889,6 +895,17 @@
                   # %C is systemd's CacheDirectory root, so this also gives the CEF
                   # profile (cookies, "watch as guest") somewhere to persist.
                   XDG_CACHE_HOME = "%C";
+                  # The same trap, on the state side, and it had the same shape: a
+                  # dynamic user's home is `/`, so `$XDG_STATE_HOME` unset resolved to
+                  # `/.local/state/castaway` under ProtectSystem=strict. Bluetooth link
+                  # keys silently failed to persist there (every phone re-pairs after a
+                  # restart) and it is now also where the rotated log files go.
+                  #
+                  # %S is the StateDirectory root, so with `StateDirectory=castaway`
+                  # below this resolves to /var/lib/castaway — which is where the
+                  # GameStream pairing store was hardcoded to anyway, so that credential
+                  # keeps its existing path rather than moving under the deployment.
+                  XDG_STATE_HOME = "%S";
                 };
 
                 serviceConfig = {

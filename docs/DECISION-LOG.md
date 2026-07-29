@@ -835,3 +835,55 @@ turns into a widget toolkit. Screens are hand-composed the way the now-playing c
 if that becomes painful the answer is more primitives, not a framework — if we find
 ourselves writing a layout engine, this decision reopens and the web shell deserves
 another look with the one-browser problem solved some other way.
+
+### D39 — One crate owns "which directory?", and the panel keeps its own logs
+Two small things that turned out to be the same thing.
+
+**The directory question was being answered three times, differently, and only for
+Linux.** `filterlists.rs` resolved `XDG_CACHE_HOME` itself and fell back to the temp
+directory; `Config::state_dir()` resolved `XDG_STATE_HOME` itself and fell back to the
+working directory; `[gamestream] state_dir` was the literal `/var/lib/castaway/gamestream`.
+On the Windows deploy target all three are wrong, and wrong in the way this project keeps
+finding: silently. G31 is exactly that failure already collected once — an unwritable
+cache directory under `DynamicUser`, every write swallowed by design, the receiver looking
+healthy while injecting no scriptlets at all. The same trap was sitting on the state side
+untriggered, where the cost is link keys that never persist and every phone re-pairing
+after a restart.
+
+So `castaway-paths`, and two properties it is built for. **The platform seam is a value,
+not a `cfg`.** `Layout::{Xdg, LocalAppData}` is a parameter of the resolution function and
+`Layout::HOST` is the crate's only `cfg`, so Linux CI runs the branch that will run on the
+deploy box — including its absoluteness rule, because `Path::is_absolute` answers for the
+*host* and calls `C:\Users\kiosk` relative on Linux. Borrowing the build host's answer for
+a deploy-target question is how the Windows branch becomes untestable from the machine it
+is written on. **Resolution is pure**: it reads an `Environment` trait rather than the
+process environment, so tests hand it a map instead of mutating global state — which under
+a parallel runner is racy and, since Rust 2024, `unsafe`.
+
+And it does not quietly pick somewhere when it finds nothing. `Origin::Fallback` is
+returned rather than concealed, and the app says so at startup. That log line is the whole
+point: the failure mode being designed against is not "the path was wrong", it is "nobody
+found out".
+
+**Logs on disk, because the deploy target has no journald.** A panel on a wall with nobody
+attached to a terminal has no answer to "what happened last Tuesday" — on Linux journald
+provides one, on Windows nothing does. `tracing-appender`, daily rotation, fourteen files
+kept.
+
+Two choices inside that. **The file sink has its own filter, and it is not inherited from
+the console's.** `RUST_LOG=debug` is a debugging act with an audience; the file belongs to
+a machine running unattended for a month, and the mirroring paths log per frame. Wiring
+them together would mean every diagnostic session silently commits the panel to filling its
+own disk. So `[log] file_level` defaults to `info` and stays there while the console goes
+to `debug`.
+
+**Writes are synchronous** — no `tracing_appender::non_blocking` worker. The interesting
+lines are the last ones before something died, the release profile is `panic = "abort"`,
+and an aborting process runs no destructors: a background writer's buffered tail is
+precisely the part that would be lost. Local-file writes at `info` are cheap enough to pay
+for that.
+
+The deployment half is one line — `XDG_STATE_HOME = "%S"` in the unit, the state-side twin
+of the `XDG_CACHE_HOME = "%C"` that closed G31. It resolves to `/var/lib/castaway`, which
+is where the GameStream pairing store was hardcoded to anyway, so that credential keeps its
+existing path rather than moving under an operator.

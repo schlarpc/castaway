@@ -22,6 +22,9 @@ pub struct Config {
     pub interface: Option<Ipv4Addr>,
     /// Which protocols to enable.
     pub enable: Enable,
+    /// Console and on-disk logging.
+    #[serde(default)]
+    pub log: Log,
     /// Which palette the idle screen wears. `auto` follows the calendar; `plain` is the
     /// panel's own dark ramp; naming a season wears it all year.
     #[serde(default)]
@@ -47,6 +50,69 @@ pub struct Config {
     /// and for running from the repo, so most deployments never set these.
     #[serde(default)]
     pub browser: Browser,
+}
+
+/// Console and on-disk logging.
+///
+/// The two sinks have separate filters because they have separate audiences: `level` (or
+/// `RUST_LOG`, which wins) is for whoever is watching the box now, `file_level` is what a
+/// panel running unattended for a month writes to its own disk. Turning the console up to
+/// `debug` deliberately does *not* turn the file up with it — see `logging.rs`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Log {
+    /// Console filter, in `RUST_LOG` syntax, used when `RUST_LOG` is unset.
+    pub level: String,
+    /// Also write a rotated log file. On by default: the deploy box is a panel on a wall
+    /// that nobody is attached to a terminal of, and "what happened last Tuesday" has no
+    /// other answer there. Turn it off where something else already persists the
+    /// console — journald does, though it is not what the Windows target has.
+    pub to_file: bool,
+    /// Where those files go. `None` uses the platform's log directory:
+    /// `$XDG_STATE_HOME/castaway/logs`, or `%LOCALAPPDATA%\castaway\logs`.
+    pub directory: Option<PathBuf>,
+    /// File filter, in `RUST_LOG` syntax. Deliberately not inherited from `level`.
+    pub file_level: String,
+    /// How often to start a new file.
+    pub rotation: Rotation,
+    /// How many rotated files to keep, oldest deleted first. Ignored when `rotation` is
+    /// `never`, since nothing rotates for the pruning to happen at.
+    pub max_files: u16,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            level: "info".to_owned(),
+            to_file: true,
+            directory: None,
+            // Not `debug`, and not `level`: at debug the mirroring paths log per frame,
+            // which on a panel left running is megabytes an hour of disk for a detail
+            // nobody asked to keep.
+            file_level: "info".to_owned(),
+            rotation: Rotation::Daily,
+            // Two weeks. Long enough to cover "it broke while we were away", short
+            // enough that a `warn`-heavy fortnight is still tens of megabytes.
+            max_files: 14,
+        }
+    }
+}
+
+/// How often the log file rolls over.
+///
+/// An enum rather than a string so an unrecognised value is a config parse error at
+/// startup, not a silent fallback to some default rotation nobody chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rotation {
+    /// A new file every minute. For chasing something short-lived, not for running.
+    Minutely,
+    /// A new file every hour.
+    Hourly,
+    /// A new file per day, which is the unit people ask questions in.
+    Daily,
+    /// One file, forever. `max_files` cannot bound it — only the disk does.
+    Never,
 }
 
 /// GameStream / Sunshine client settings.
@@ -95,7 +161,11 @@ pub struct GameStream {
 impl Default for GameStream {
     fn default() -> Self {
         Self {
-            state_dir: PathBuf::from("/var/lib/castaway/gamestream"),
+            // A subdirectory of the platform's state directory rather than a hardcoded
+            // `/var/lib/castaway/gamestream`: under the NixOS unit that is still where it
+            // lands (XDG_STATE_HOME=%S), and on the Windows deploy target the old literal
+            // was simply an unwritable path that lost the pairing on every restart.
+            state_dir: castaway_paths::host().state().join("gamestream"),
             pair_host: None,
             pair_pin: None,
             autostart_host: None,
@@ -408,8 +478,8 @@ pub struct Bluetooth {
     /// exercise a specific codec on real hardware — narrow it to `["sbc"]` and every
     /// phone falls back to the mandatory codec.
     pub codecs: Option<Vec<String>>,
-    /// Where link keys and other persistent state live. `None` uses
-    /// `$XDG_STATE_HOME/castaway`, falling back to the working directory.
+    /// Where link keys and other persistent state live. `None` uses the platform's state
+    /// directory: `$XDG_STATE_HOME/castaway`, or `%LOCALAPPDATA%\castaway\state`.
     pub state_dir: Option<String>,
 }
 
@@ -521,6 +591,7 @@ impl Default for Config {
             http_port: 8080,
             interface: None,
             enable: Enable::default(),
+            log: Log::default(),
             attract_widget_url: Some("https://digitalclock.live/".to_string()),
             bluetooth: Bluetooth::default(),
             airplay: AirPlay::default(),
@@ -569,20 +640,15 @@ impl Config {
     /// fails to parse.
     /// Where persistent state lives.
     ///
-    /// Config says where if it wants to; otherwise `$XDG_STATE_HOME/castaway`, falling
-    /// back to the working directory. Deliberately *not* the config directory: link keys
-    /// are state a running receiver writes, not something an operator edits.
+    /// Config says where if it wants to; otherwise the platform's state directory
+    /// (`castaway-paths`). Deliberately *not* the config directory: link keys are state a
+    /// running receiver writes, not something an operator edits.
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
         if let Some(dir) = &self.bluetooth.state_dir {
             return PathBuf::from(dir);
         }
-        std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-            })
-            .map_or_else(|| PathBuf::from("."), |base| base.join("castaway"))
+        castaway_paths::host().state().to_path_buf()
     }
 
     pub fn from_env() -> anyhow::Result<Self> {

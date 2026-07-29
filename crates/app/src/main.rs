@@ -11,6 +11,7 @@
 
 mod bluetooth;
 mod config;
+mod logging;
 mod screen;
 // The panel's own navigation: what happens when someone presses something the shell
 // could not answer itself. Only meaningful where there is a panel.
@@ -51,13 +52,16 @@ use crate::config::Config;
 const MDNS_HOST: &str = "castaway";
 
 fn main() -> anyhow::Result<()> {
-    // Ordinary again. Under CEF this had to come before a bootstrap call that re-execed
-    // this same binary as Chromium's subprocess, and getting the order wrong silently
-    // un-instrumented the renderer. The browser is its own process now, and it reports
-    // through the protocol, so there is nothing to sequence against (D36).
-    init_tracing();
-
+    // Config first, because the file sink is configurable and a subscriber can only be
+    // installed once. Nothing here logs — a config that fails to load returns an error
+    // main prints itself, which is the same thing a `tracing` line would have said.
+    //
+    // (Ordinary otherwise. Under CEF this had to come before a bootstrap call that
+    // re-execed this same binary as Chromium's subprocess, and getting the order wrong
+    // silently un-instrumented the renderer. The browser is its own process now, and it
+    // reports through the protocol, so there is nothing to sequence against — D36.)
     let config = Config::from_env().context("loading config")?;
+    logging::init(&config.log, castaway_paths::host());
     // A category name that is not one of SponsorBlock's parses to "unknown" rather than
     // failing, which for a *response* is the point and for *config* is a silent typo.
     if config.unknown_sponsorblock_categories() > 0 {
@@ -1410,15 +1414,6 @@ fn derive_mac(uuid: &str) -> String {
         *first = format!("{byte:02x}");
     }
     octets.join(":").to_uppercase()
-}
-
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
 }
 
 #[cfg(test)]
