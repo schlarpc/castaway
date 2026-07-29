@@ -93,8 +93,12 @@ impl fmt::Display for WpaCommand {
                 None => f.write_str("P2P_GROUP_ADD"),
             },
             Self::P2pGroupRemove { iface } => write!(f, "P2P_GROUP_REMOVE {iface}"),
+            // `p2p_dev_addr=`, not a bare MAC: on the group interface — an AP-mode
+            // registrar, which is where this command has to be sent — a bare argument is
+            // parsed as a *BSSID* and silently ignored, so the button would be open to
+            // any enrollee instead of the peer that asked.
             Self::WpsPbc { peer } => match peer {
-                Some(mac) => write!(f, "WPS_PBC {mac}"),
+                Some(mac) => write!(f, "WPS_PBC p2p_dev_addr={mac}"),
                 None => f.write_str("WPS_PBC any"),
             },
             Self::P2pProvDisc { peer, method } => write!(f, "P2P_PROV_DISC {peer} {method}"),
@@ -478,6 +482,13 @@ mod tests {
             "P2P_GROUP_ADD freq=5180"
         );
         assert_eq!(WpaCommand::WpsPbc { peer: None }.to_string(), "WPS_PBC any");
+        assert_eq!(
+            WpaCommand::WpsPbc {
+                peer: MacAddr::parse("02:11:22:33:44:55")
+            }
+            .to_string(),
+            "WPS_PBC p2p_dev_addr=02:11:22:33:44:55"
+        );
     }
 
     #[test]

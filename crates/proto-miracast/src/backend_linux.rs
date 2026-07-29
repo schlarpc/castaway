@@ -58,12 +58,64 @@ pub const WPS_DEVICE_TYPE_DISPLAY: &str = "7-0050F204-1";
 
 /// A connected wpa_supplicant control socket.
 ///
-/// The control interface is a Unix *datagram* socket, so the client binds a path of its
-/// own for replies. After `ATTACH`, unsolicited events arrive on the same socket
+/// The control interface is a Unix *datagram* socket, so the client binds an address of
+/// its own for replies. After `ATTACH`, unsolicited events arrive on the same socket
 /// interleaved with command replies, told apart only by the `<priority>` prefix.
 pub struct WpaControl {
     socket: UnixDatagram,
-    client_path: PathBuf,
+    /// The reply socket's filesystem path, when it has one. On Linux the socket lives in
+    /// the *abstract* namespace instead and this is `None` — see [`bind_client`].
+    client_path: Option<PathBuf>,
+}
+
+/// Bind the reply socket, in the abstract namespace.
+///
+/// Abstract rather than a path in `/tmp`, and the reason is mount namespaces: the
+/// deployment runs castaway with `PrivateTmp=`, so a path this process binds resolves to
+/// nothing in wpa_supplicant's namespace, and every reply is sent to a file that does not
+/// exist — the daemon works, the commands arrive, and the backend times out on all of
+/// them. Abstract addresses are kernel-wide, which is why Android's own `wpa_ctrl` client
+/// has used them forever.
+#[cfg(target_os = "linux")]
+fn bind_client() -> Result<(UnixDatagram, Option<PathBuf>), MiracastError> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Unique per *socket*, not per process: the parent and the group interface each get
+    // their own reply socket, and a name collision is a bind failure.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "castaway-wpa-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+        .map_err(|e| MiracastError::Backend(format!("abstract address {name}: {e}")))?;
+    let socket = std::os::unix::net::UnixDatagram::bind_addr(&address)
+        .map_err(|e| MiracastError::Backend(format!("binding @{name}: {e}")))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| MiracastError::Backend(format!("nonblocking @{name}: {e}")))?;
+    let socket = UnixDatagram::from_std(socket)
+        .map_err(|e| MiracastError::Backend(format!("registering @{name}: {e}")))?;
+    Ok((socket, None))
+}
+
+/// Bind the reply socket, as a temp-dir path — the non-Linux Unix fallback, where the
+/// abstract namespace does not exist.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bind_client() -> Result<(UnixDatagram, Option<PathBuf>), MiracastError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let client_path = std::env::temp_dir().join(format!(
+        "castaway-wpa-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    // A stale socket from a previous run is a bind failure with a confusing message.
+    let _ = std::fs::remove_file(&client_path);
+    let socket = UnixDatagram::bind(&client_path)
+        .map_err(|e| MiracastError::Backend(format!("binding {}: {e}", client_path.display())))?;
+    Ok((socket, Some(client_path)))
 }
 
 impl WpaControl {
@@ -72,16 +124,11 @@ impl WpaControl {
     /// # Errors
     /// [`MiracastError::Backend`] if the socket cannot be bound or connected — which on a
     /// normal box means either that wpa_supplicant is not running with a control
-    /// interface, or that this process is not root.
+    /// interface, or that this process cannot reach its socket (root, or the control
+    /// interface's `GROUP=`).
     pub async fn connect(control_dir: &Path, interface: &str) -> Result<Self, MiracastError> {
         let server = control_dir.join(interface);
-        // The client path must be unique per process; a stale one from a previous run is
-        // a bind failure with a confusing message, so it is removed first.
-        let client_path = std::env::temp_dir().join(format!("castaway-wpa-{}", std::process::id()));
-        let _ = std::fs::remove_file(&client_path);
-        let socket = UnixDatagram::bind(&client_path).map_err(|e| {
-            MiracastError::Backend(format!("binding {}: {e}", client_path.display()))
-        })?;
+        let (socket, client_path) = bind_client()?;
         socket
             .connect(&server)
             .map_err(|e| MiracastError::Backend(format!("connecting {}: {e}", server.display())))?;
@@ -153,9 +200,12 @@ impl WpaControl {
 
 impl Drop for WpaControl {
     fn drop(&mut self) {
-        // The client socket is a real file; leaving one per run behind would eventually
-        // make the next bind fail for a reason that has nothing to do with Wi-Fi.
-        let _ = std::fs::remove_file(&self.client_path);
+        // On the path-based fallback the client socket is a real file; leaving one per
+        // run behind would eventually make the next bind fail for a reason that has
+        // nothing to do with Wi-Fi. Abstract sockets vanish with the descriptor.
+        if let Some(path) = &self.client_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -268,6 +318,29 @@ impl LinuxMiracastBackend {
     }
 }
 
+/// The control socket of a running group's own interface.
+///
+/// A separate P2P group interface is a separate wpa_supplicant interface with a control
+/// socket of its own, and two things live only there: `WPS_PBC` (the group interface is
+/// the AP-mode registrar; the parent is a P2P management interface that would run the
+/// wrong WPS), and — depending on the hostap build — the `AP-STA-CONNECTED` events that
+/// start sessions. A backend attached only to the parent authorises nobody and may hear
+/// nothing associate; this is the piece a loopback test cannot catch.
+struct GroupControl {
+    iface: String,
+    /// `None` when the group socket could not be opened — the backend then limps along
+    /// on the parent socket alone, which loses whatever only the group socket carries
+    /// but keeps the group up for the next attempt.
+    control: Option<WpaControl>,
+}
+
+/// How long two `AP-STA-CONNECTED` events for the same peer are treated as one.
+///
+/// Both the parent and the group socket can emit the association, and serving the same
+/// peer twice means dialling an RTSP port whose source has already moved on. Two seconds
+/// is far below any real re-association (WPS plus DHCP alone take longer).
+const STATION_DEDUPE: Duration = Duration::from_secs(2);
+
 #[async_trait::async_trait]
 impl castaway_core::MiracastBackend for LinuxMiracastBackend {
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), CoreError> {
@@ -278,19 +351,26 @@ impl castaway_core::MiracastBackend for LinuxMiracastBackend {
             .await
             .map_err(|e| CoreError::Adapter(e.to_string()))?;
 
-        let mut group_iface: Option<String> = None;
+        let mut group: Option<GroupControl> = None;
+        let mut last_station: Option<(MacAddr, tokio::time::Instant)> = None;
         loop {
-            let event = control
-                .next_event()
-                .await
-                .map_err(|e| CoreError::Adapter(e.to_string()))?;
+            // One event from either socket. `next_event` is a single `recv().await`, so
+            // losing the race in `select!` cancels nothing mid-read.
+            let event = match group.as_ref().and_then(|g| g.control.as_ref()) {
+                Some(group_control) => tokio::select! {
+                    event = control.next_event() => event,
+                    event = group_control.next_event() => event,
+                },
+                None => control.next_event().await,
+            }
+            .map_err(|e| CoreError::Adapter(e.to_string()))?;
             match event {
                 WpaEvent::GroupStarted {
                     iface,
                     group_owner: true,
                 } => {
                     info!(iface, "P2P group up; we are the group owner");
-                    group_iface = Some(iface);
+                    group = Some(self.attach_group(iface).await);
                 }
                 WpaEvent::GroupStarted {
                     iface,
@@ -304,14 +384,21 @@ impl castaway_core::MiracastBackend for LinuxMiracastBackend {
                 }
                 WpaEvent::GroupRemoved { iface } => {
                     warn!(iface, "P2P group removed");
-                    group_iface = None;
+                    group = None;
                 }
                 WpaEvent::ProvDiscPbcRequest { peer } | WpaEvent::GoNegRequest { peer } => {
                     // Push-button is the only method a sink with no keypad can offer, and
                     // it is what both platforms use. Authorising immediately is the
                     // "walk up and cast" behaviour this panel wants.
                     info!(%peer, "authorising push-button enrolment");
-                    if let Err(e) = control
+                    // On the group socket when there is one: WPS for a GO runs on the
+                    // group interface's registrar, and the parent would `OK` a PBC that
+                    // enrols nobody.
+                    let registrar = group
+                        .as_ref()
+                        .and_then(|g| g.control.as_ref())
+                        .unwrap_or(&control);
+                    if let Err(e) = registrar
                         .require(WpaCommand::WpsPbc { peer: Some(peer) })
                         .await
                     {
@@ -319,10 +406,20 @@ impl castaway_core::MiracastBackend for LinuxMiracastBackend {
                     }
                 }
                 WpaEvent::StationConnected { peer } => {
-                    let Some(iface) = group_iface.clone() else {
+                    let Some(g) = &group else {
                         warn!(%peer, "a station associated before the group started");
                         continue;
                     };
+                    // The association can arrive on both sockets; the second copy is not
+                    // a second phone.
+                    if last_station
+                        .is_some_and(|(last, at)| last == peer && at.elapsed() < STATION_DEDUPE)
+                    {
+                        debug!(%peer, "duplicate association event, ignored");
+                        continue;
+                    }
+                    last_station = Some((peer, tokio::time::Instant::now()));
+                    let iface = g.iface.clone();
                     if let Err(e) = self.serve_peer(&iface, peer, &sink).await {
                         // One failed session is not a reason to tear the group down; the
                         // next person who walks up should still get a picture.
@@ -339,6 +436,37 @@ impl castaway_core::MiracastBackend for LinuxMiracastBackend {
 }
 
 impl LinuxMiracastBackend {
+    /// Open and subscribe the just-started group interface's own control socket.
+    ///
+    /// Infallible by design: the group is already up, and a backend that tore it down
+    /// because a *second* socket to the same daemon failed would turn a permissions
+    /// mistake into a dead radio. What is lost without it is logged, not guessed at.
+    async fn attach_group(&self, iface: String) -> GroupControl {
+        match WpaControl::connect(&self.config.control_dir, &iface).await {
+            Ok(group_control) => {
+                if let Err(e) = group_control.require(WpaCommand::Attach).await {
+                    // Commands (WPS_PBC) still work unattached; only events are lost.
+                    warn!(iface, error = %e, "could not subscribe to group-interface events");
+                }
+                GroupControl {
+                    iface,
+                    control: Some(group_control),
+                }
+            }
+            Err(e) => {
+                warn!(
+                    iface, error = %e,
+                    "no control socket for the group interface; WPS authorisation and \
+                     association events may not work"
+                );
+                GroupControl {
+                    iface,
+                    control: None,
+                }
+            }
+        }
+    }
+
     /// Run one session against a peer that has just associated.
     async fn serve_peer(
         &self,
