@@ -1,6 +1,6 @@
 //! The idle "attract" / lobby scene: what the panel shows when nothing is casting. It's
-//! the first thing anyone sees, so it names the receiver and tells them how to throw
-//! media at it. Rendered on the CPU (the shared [`crate::text`] rasterizer over a
+//! the first thing anyone sees, so it names the receiver and shows what it can do —
+//! and, deliberately, nothing else. Rendered on the CPU (the shared [`crate::text`] rasterizer over a
 //! gradient) into an RGBA image the compositor shows as a background layer (video covers
 //! it when a cast starts).
 //!
@@ -53,7 +53,7 @@ impl InsetRect {
 /// rect threaded through every call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WidgetSlot {
-    /// No widget: title and tagline are centered across the whole surface.
+    /// No widget: the screen uses its full width.
     #[default]
     None,
     /// Reserve a card in the top-right corner; the browser layer paints into it and the
@@ -103,24 +103,25 @@ impl WidgetSlot {
 pub struct AttractScene {
     /// Big title — the receiver's friendly name.
     pub title: String,
-    /// One-line tagline under the title.
-    pub tagline: String,
-    /// Dim footer (network info).
+    /// Dim footer: what this is, which build, and where to reach it.
+    ///
+    /// The only text on this screen that is not the receiver's name or a tile label. The
+    /// idle screen used to carry a tagline and a line telling you to tap something; both
+    /// were read once by whoever wrote them and by nobody since.
     pub footer: String,
     /// Room reserved for the live web widget (the CEF clock layer).
     pub widget: WidgetSlot,
-    /// A seasonal stripe under the title, if today is one (#24). `None` most of the
+    /// The season colouring the background, if today is in one (#24). `None` most of the
     /// year; the app decides, so the renderer stays pure and testable on any date.
     pub season: Option<crate::theme::Season>,
     /// Whether to draw DMA-chan in the corner.
     pub mascot: bool,
-    /// Things the panel can start *itself*, as tappable tiles (D38).
+    /// Every service, as a tappable tile (D38).
     ///
-    /// The rows above and these are two different kinds of thing, and the screen is
-    /// clearer for keeping them apart: a row is an instruction aimed at your phone
-    /// ("Cast → this name"), and the tap happens over there. A tile is something the
-    /// panel goes and does, and the tap happens here. Empty by default, which is exactly
-    /// what a receiver with no such sources should show.
+    /// Two kinds behind one shape, told apart by [`Tile::detail`]: a tile whose service
+    /// you drive from your own phone opens a screen saying what to tap over there, and a
+    /// tile the panel acts on itself becomes an event for `app`. Empty by default, which
+    /// is exactly what a receiver with nothing enabled should show.
     pub tiles: Vec<Tile>,
 }
 
@@ -207,8 +208,7 @@ impl AttractScene {
         let advertised = |kind: ProtocolKind| format!("{name}#{}", kind.slug());
         Self {
             title: name.into(),
-            tagline: "Throw anything at the wall — no app to install.".into(),
-            footer: "castaway  •  DLNA / mDNS on 10.0.0.5:8080".into(),
+            footer: "castaway  •  0a1b2c3  •  10.0.0.5:8080".into(),
             widget: WidgetSlot::RightCard,
             season: crate::theme::season(6, 15),
             mascot: true,
@@ -329,9 +329,6 @@ struct Layout {
     s: f32,
     card: Option<InsetRect>,
     title: Line,
-    tagline: Line,
-    /// Absent when there are no tiles for it to be a heading over.
-    heading: Option<Line>,
     tiles: Vec<(String, crate::shape::Rect)>,
     footer: Line,
 }
@@ -345,12 +342,12 @@ fn layout(scene: &AttractScene, width: u32, height: u32, f: &text::Fonts) -> Lay
     let margin = 90.0 * s;
     let card = scene.widget.rect(width, height);
 
-    // One left edge, shared by the title, the tagline, the heading and the tiles.
+    // One left edge, shared by the title and the tiles.
     //
-    // The title and tagline used to be *centred in the column* while everything below
-    // them was left-aligned at the margin. They lined up only because the demo title
-    // happened to be nearly as wide as the column allowed: any other receiver name and
-    // the header slid off the grid the rest of the screen is built on.
+    // The title used to be *centred in the column* while everything below it was
+    // left-aligned at the margin. They lined up only because the demo title happened to
+    // be nearly as wide as the column allowed: any other receiver name and the header
+    // slid off the grid the rest of the screen is built on.
     let left = margin;
     let right = card.map_or(w - margin, |c| c.x as f32 - GUTTER * s);
     let avail = (right - left).max(1.0);
@@ -361,24 +358,6 @@ fn layout(scene: &AttractScene, width: u32, height: u32, f: &text::Fonts) -> Lay
         baseline: 118.0f32.mul_add(s, text::ascent(&f.bold, title_px)),
         px: title_px,
     };
-
-    let tag_px = fit_px(&f.regular, &scene.tagline, 30.0 * s, avail);
-    let tagline = Line {
-        x: left,
-        baseline: 44.0f32.mul_add(s, title.baseline) + text::ascent(&f.regular, tag_px),
-        px: tag_px,
-    };
-
-    // Measured *down from the tagline* rather than placed at an absolute height. With a
-    // fixed top, a title that shrank to fit the column moved every baseline above the
-    // tiles while the tiles stayed put, so the gap over them silently opened and closed
-    // with the length of the receiver's name.
-    let head_px = 22.0 * s;
-    let heading = (!scene.tiles.is_empty()).then(|| Line {
-        x: left,
-        baseline: 40.0f32.mul_add(s, tagline.baseline) + text::ascent(&f.bold, head_px),
-        px: head_px,
-    });
 
     let foot_px = 24.0 * s;
     let footer = Line {
@@ -391,19 +370,15 @@ fn layout(scene: &AttractScene, width: u32, height: u32, f: &text::Fonts) -> Lay
         px: foot_px,
     };
 
-    // The box the tiles have to fit inside: from under the heading down to clear air
-    // above the footer.
-    let grid_top = heading.map_or(40.0f32.mul_add(s, tagline.baseline), |l| {
-        22.0f32.mul_add(s, l.baseline)
-    });
+    // The box the tiles have to fit inside: from under the title down to clear air above
+    // the footer.
+    let grid_top = 58.0f32.mul_add(s, title.baseline);
     let grid_bottom = footer.baseline - text::ascent(&f.regular, foot_px) - 36.0 * s;
 
     Layout {
         s,
         card,
         title,
-        tagline,
-        heading,
         tiles: solve_grid(
             &scene.tiles,
             left,
@@ -462,6 +437,12 @@ fn solve_grid(
     }
     let side = side_for(cols).max(1.0);
 
+    // Centred in the box vertically. With the tagline and the heading gone the box is
+    // taller than the grid usually needs, and a block pinned to its top left a hole
+    // between the tiles and the footer while the right-hand column sat centred.
+    let rows = n.div_ceil(cols) as f32;
+    let top = (avail_h - side.mul_add(rows, gap * (rows - 1.0))).max(0.0) / 2.0 + top;
+
     tiles
         .iter()
         .enumerate()
@@ -494,9 +475,7 @@ struct Palette {
     bg_top: Rgba,
     bg_bottom: Rgba,
     title: Rgba,
-    tagline: Rgba,
     label: Rgba,
-    heading: Rgba,
     footer: Rgba,
     card_edge: Rgba,
     card_bg: Rgba,
@@ -509,12 +488,7 @@ impl Default for Palette {
             bg_top: theme::BG_TOP,
             bg_bottom: theme::BG_BOTTOM,
             title: theme::TEXT,
-            // The tagline had the loudest colour on the screen for the line that says
-            // the least, while the one line explaining the interaction was set in the
-            // footer's grey. Swapped: the accent goes on the heading over the tiles.
-            tagline: theme::TEXT_DIM,
             label: theme::TEXT_BODY,
-            heading: theme::ACCENT,
             footer: theme::TEXT_FAINT,
             card_edge: theme::EDGE,
             card_bg: theme::WELL,
@@ -590,7 +564,6 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
 
     for (line, font, colour, body) in [
         (l.title, &f.bold, pal.title, scene.title.as_str()),
-        (l.tagline, &f.regular, pal.tagline, scene.tagline.as_str()),
         (l.footer, &f.regular, pal.footer, scene.footer.as_str()),
     ] {
         text::draw_text(
@@ -610,23 +583,6 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
     // the card so she overlaps it, and before the tiles because she is never near them.
     if scene.mascot {
         draw_mascot(&mut buf, width, height, s, l.card);
-    }
-
-    // A heading, because the two halves of this screen mean opposite things and nothing
-    // else says so: the card is what the panel is showing, these are what it will go and
-    // do if you press one.
-    if let Some(head) = l.heading {
-        text::draw_text(
-            &mut buf,
-            width,
-            height,
-            head.x,
-            head.baseline,
-            "TAP FOR HOW, OR JUST CAST",
-            head.px,
-            pal.heading,
-            &f.bold,
-        );
     }
 
     // Tiles, from the same layout the hit test reads, so the two cannot disagree about
@@ -735,19 +691,13 @@ fn draw_tile(
     use crate::shape;
 
     let accent = theme::regulated(tile.accent);
+    let plate = theme::tinted(pal.tile_bg, accent, 0.12);
     let radius = rect.h * 0.147;
     // A plate tinted toward the accent, with the accent itself as the edge. The accent is
     // not the whole fill: six saturated squares on a dark wall is a toy, and the label has
     // to stay readable across a room. But an untinted plate left a three-pixel border
     // doing all the work of telling six services apart from across that room.
-    shape::rounded_rect(
-        buf,
-        width,
-        height,
-        rect,
-        radius,
-        theme::tinted(pal.tile_bg, accent, 0.12),
-    );
+    shape::rounded_rect(buf, width, height, rect, radius, plate);
     shape::rounded_outline(
         buf,
         width,
@@ -768,6 +718,7 @@ fn draw_tile(
         (cx, gy),
         rect.h * 0.26,
         accent,
+        plate,
     );
 
     let px = fit_px(&f.regular, &tile.label, rect.h * 0.147, rect.w * 0.92);
@@ -789,6 +740,7 @@ fn draw_tile(
 ///
 /// `pub(crate)` because the service screen draws the same glyph large — the screen a tile
 /// opens should look like the tile that opened it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_tile_glyph(
     buf: &mut [u8],
     surface: (u32, u32),
@@ -796,6 +748,7 @@ pub(crate) fn draw_tile_glyph(
     at: (f32, f32),
     g: f32,
     color: Rgba,
+    plate: Rgba,
 ) {
     let (width, height) = surface;
     let (cx, cy) = at;
@@ -812,27 +765,52 @@ pub(crate) fn draw_tile_glyph(
         };
         shape::rounded_outline(buf, width, height, body, g * 0.16, g * 0.16, color);
     };
-    let hole = theme::BG_TOP;
+    // What a punched-out detail — the gear's bore, the d-pad, a camera lens — is filled
+    // with. It has to be the plate the glyph is drawn on: the tiles are tinted toward
+    // their accent now, and a fixed near-black left a dark blob in the middle of each.
+    let hole = plate;
 
     match glyph {
         TileGlyph::Cast => {
             screen(buf, 0.0);
-            // Three arcs from the bottom-left corner, the near-universal cast mark.
-            let (ox, oy) = (cx - g * 0.66, cy + g * 0.44);
-            for i in 1..=3 {
-                let r = g * 0.26 * i as f32;
+            // `rounded_outline` straddles the rect boundary, so the frame's inner corner
+            // is half a stroke inside it. The mark radiates from that corner.
+            //
+            // An earlier version cut the frame open at this corner, the way Material's
+            // does. At tile size the cuts read as damage rather than as a deliberate gap:
+            // two square stubs and a bitten-off corner. A closed frame with the mark
+            // sitting inside it is the other common way to draw this, and it survives
+            // being small.
+            let t = g * 0.16;
+            let (ox, oy) = (cx - g + t / 2.0, cy + g * 0.72 - t / 2.0);
+            let quarter = |px: f32, py: f32| px >= ox - 0.5 && py <= oy + 0.5;
+            shape::fill_sdf(
+                buf,
+                width,
+                height,
+                Rect::around(ox, oy, g * 0.4),
+                color,
+                |px, py| {
+                    if quarter(px, py) {
+                        shape::sd_circle(px, py, ox, oy, g * 0.27)
+                    } else {
+                        1e3
+                    }
+                },
+            );
+            for r in [g * 0.56, g * 0.84] {
                 shape::fill_sdf(
                     buf,
                     width,
                     height,
-                    Rect::around(ox, oy, r + g * 0.2),
+                    Rect::around(ox, oy, r + g * 0.16),
                     color,
                     |px, py| {
-                        // Quarter arc: distance to the circle, clipped to up-and-right.
-                        if px < ox - 0.5 || py > oy + 0.5 {
-                            return 1e3;
+                        if quarter(px, py) {
+                            shape::sd_circle(px, py, ox, oy, r).abs() - g * 0.075
+                        } else {
+                            1e3
                         }
-                        shape::sd_circle(px, py, ox, oy, r).abs() - g * 0.07
                     },
                 );
             }
@@ -844,16 +822,19 @@ pub(crate) fn draw_tile_glyph(
                 buf,
                 width,
                 height,
-                Rect::around(cx, cy + g * 0.7, g),
+                Rect::around(cx, cy + g * 1.0, g * 0.8),
                 color,
                 |px, py| {
                     shape::sd_triangle(
                         px,
                         py,
+                        // Apex just clear of the frame's bottom edge. It used to start
+                        // *inside* the frame, so the bottom bar cut across the triangle
+                        // and left it looking truncated.
                         [
-                            (cx, cy + g * 0.36),
-                            (cx + g * 0.46, cy + g * 0.98),
-                            (cx - g * 0.46, cy + g * 0.98),
+                            (cx, cy + g * 0.76),
+                            (cx + g * 0.56, cy + g * 1.26),
+                            (cx - g * 0.56, cy + g * 1.26),
                         ],
                     )
                 },
@@ -898,10 +879,14 @@ pub(crate) fn draw_tile_glyph(
             );
         }
         TileGlyph::Bluetooth => {
-            // The rune: a vertical spine with two crossed pairs of diagonals.
-            let (tx, ty) = (cx + g * 0.42, cy - g * 0.5);
-            let (bx2, by2) = (cx + g * 0.42, cy + g * 0.5);
+            // The bind rune: a vertical spine, a vertex above and below it on the right,
+            // and two diagonals that *cross* the spine and come out on the left.
+            //
+            // Both diagonals used to stop at the same point on the middle-left, which
+            // draws a spine with one spike off it — a flag, not the rune.
             let thick = g * 0.13;
+            let (rx, lx) = (cx + g * 0.44, cx - g * 0.44);
+            let (uy, ly) = (cy - g * 0.5, cy + g * 0.5);
             let seg = |buf: &mut [u8], ax: f32, ay: f32, bx: f32, by: f32| {
                 shape::fill_sdf(
                     buf,
@@ -913,10 +898,10 @@ pub(crate) fn draw_tile_glyph(
                 );
             };
             seg(buf, cx, cy - g, cx, cy + g);
-            seg(buf, cx, cy - g, tx, ty);
-            seg(buf, tx, ty, cx - g * 0.42, cy);
-            seg(buf, cx, cy + g, bx2, by2);
-            seg(buf, bx2, by2, cx - g * 0.42, cy);
+            seg(buf, cx, cy - g, rx, uy);
+            seg(buf, rx, uy, lx, ly);
+            seg(buf, cx, cy + g, rx, ly);
+            seg(buf, rx, ly, lx, uy);
         }
         TileGlyph::Gamepad => {
             let body = Rect {
@@ -974,20 +959,23 @@ pub(crate) fn draw_tile_glyph(
             );
         }
         TileGlyph::Folder => {
+            // Wider than tall, with the tab standing clear above the body. The old one
+            // was very nearly square and its tab barely rose over the top edge, so it
+            // read as a rectangle with a chip out of it rather than as a folder.
             let tab = Rect {
                 x: cx - g,
-                y: cy - g * 0.72,
-                w: g * 0.9,
-                h: g * 0.3,
+                y: cy - g * 0.62,
+                w: g * 0.92,
+                h: g * 0.36,
             };
             shape::rounded_rect(buf, width, height, tab, g * 0.12, color);
             let body = Rect {
                 x: cx - g,
-                y: cy - g * 0.48,
+                y: cy - g * 0.34,
                 w: g * 2.0,
-                h: g * 1.2,
+                h: g * 1.02,
             };
-            shape::rounded_rect(buf, width, height, body, g * 0.18, color);
+            shape::rounded_rect(buf, width, height, body, g * 0.14, color);
         }
         TileGlyph::Camera => {
             let body = Rect {
@@ -1040,13 +1028,40 @@ pub(crate) fn draw_tile_glyph(
             }
         }
         TileGlyph::Gear => {
-            shape::disc(buf, width, height, cx, cy, g * 1.6, color);
-            for i in 0..6 {
-                let a = std::f32::consts::TAU * i as f32 / 6.0;
-                let (sx, sy) = (cx + a.cos() * g * 1.05, cy + a.sin() * g * 1.05);
-                shape::disc(buf, width, height, sx, sy, g * 0.5, color);
-            }
-            shape::disc(buf, width, height, cx, cy, g * 0.7, hole);
+            // Teeth are radial boxes, not bumps. Discs around the rim — even overlapping
+            // ones — draw a daisy: what makes a cog read as a cog is that its teeth have
+            // flat flanks and square ends. There is no rotated primitive in `shape`, so
+            // the sample point is rotated into each tooth's own frame instead, and the
+            // whole silhouette comes out of one distance field so body and teeth merge
+            // without a seam.
+            let (body_r, ring, tooth_l, tooth_w) = (g * 0.72, g * 0.86, g * 0.34, g * 0.24);
+            shape::fill_sdf(
+                buf,
+                width,
+                height,
+                Rect::around(cx, cy, ring + tooth_l + 2.0),
+                color,
+                |px, py| {
+                    let (dx, dy) = (px - cx, py - cy);
+                    let mut d = shape::sd_circle(px, py, cx, cy, body_r);
+                    for i in 0..8 {
+                        let (sin, cos) = (std::f32::consts::TAU * i as f32 / 8.0).sin_cos();
+                        let rx = dx.mul_add(cos, dy * sin);
+                        let ry = dy.mul_add(cos, -(dx * sin));
+                        d = d.min(shape::sd_round_box(
+                            rx,
+                            ry,
+                            ring,
+                            0.0,
+                            tooth_l,
+                            tooth_w,
+                            g * 0.06,
+                        ));
+                    }
+                    d
+                },
+            );
+            shape::disc(buf, width, height, cx, cy, g * 0.62, hole);
         }
     }
 }
@@ -1184,10 +1199,10 @@ mod tests {
 
     #[test]
     fn the_header_and_the_tiles_share_one_left_edge() {
-        // What "slapdash" actually was: the title and tagline were centred in the column
-        // while everything under them was left-aligned, and the two agreed only because
-        // the demo title happened to be as wide as the column. Any other receiver name
-        // and the header slid off the grid.
+        // What "slapdash" actually was: the title was centred in the column while
+        // everything under it was left-aligned, and the two agreed only because the demo
+        // title happened to be as wide as the column. Any other receiver name and the
+        // header slid off the grid.
         let f = text::fonts().unwrap();
         for title in [
             "dma.space/screen",
@@ -1203,29 +1218,47 @@ mod tests {
                 (l.title.x - left).abs() < 0.01,
                 "title of {title:?} is off-grid"
             );
-            assert!((l.tagline.x - left).abs() < 0.01, "tagline under {title:?}");
-            let head = l.heading.expect("the demo has tiles");
-            assert!((head.x - left).abs() < 0.01, "heading under {title:?}");
         }
     }
 
     #[test]
-    fn the_gap_over_the_tiles_does_not_depend_on_the_title() {
-        // The vertical half of the same bug: the tile grid sat at an absolute height
-        // while the text above it moved, so the space over the tiles opened and closed
-        // with the length of the title. Here the whole column moves together.
+    fn the_tiles_stay_centred_between_the_title_and_the_footer() {
+        // The vertical half of the alignment bug: the grid used to sit at an absolute
+        // height while the text above it moved, so the room over the tiles opened and
+        // closed with the length of the receiver's name — tens of pixels, and in the
+        // worst case a tagline almost touching the heading under it.
+        //
+        // The grid is centred in whatever room is left now, so what has to hold is that
+        // the *balance* is title-independent: the two clearances differ by the same fixed
+        // amount whatever is written above them. (The block itself still shifts a little
+        // between titles, because a title too wide for the column is shrunk to fit and a
+        // shorter one is not — but it shifts as a centred block, not as a gap opening.)
         let f = text::fonts().unwrap();
-        let gap = |title: &str| {
+        let balance = |title: &str| {
             let mut scene = AttractScene::demo();
             scene.title = title.into();
             let l = layout(&scene, 1920, 1080, &f);
-            l.tiles[0].1.y - l.heading.expect("tiles").baseline
+            let top = l.tiles.iter().map(|(_, r)| r.y).fold(f32::MAX, f32::min);
+            let bottom = l.tiles.iter().map(|(_, r)| r.y + r.h).fold(0.0, f32::max);
+            let above = top - l.title.baseline;
+            let below = (l.footer.baseline - text::ascent(&f.regular, l.footer.px)) - bottom;
+            assert!(
+                above > 0.0 && below > 0.0,
+                "{title:?} collides: {above} {below}"
+            );
+            above - below
         };
-        let long = gap("dma.space/screen");
-        assert!(
-            (gap("castaway") - long).abs() < 0.01,
-            "a short title changed the gap over the tiles"
-        );
+        let reference = balance("dma.space/screen");
+        for title in [
+            "castaway",
+            "a",
+            "the hackerspace wall panel in the front room",
+        ] {
+            assert!(
+                (balance(title) - reference).abs() < 1.0,
+                "{title:?} threw the grid off centre"
+            );
+        }
     }
 
     #[test]

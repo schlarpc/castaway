@@ -128,14 +128,8 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
     // The same regulation the tile got, so the screen a tile opens is the colour of the
     // tile that opened it rather than the raw brand colour.
     let accent = crate::theme::regulated(screen.tile.accent);
-    shape::rounded_rect(
-        &mut buf,
-        width,
-        height,
-        plate,
-        26.0 * s,
-        crate::theme::tinted(pal.plate, accent, 0.12),
-    );
+    let plate_fill = crate::theme::tinted(pal.plate, accent, 0.12);
+    shape::rounded_rect(&mut buf, width, height, plate, 26.0 * s, plate_fill);
     shape::rounded_outline(
         &mut buf,
         width,
@@ -153,6 +147,7 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
         (gx, gy),
         plate.h * 0.30,
         accent,
+        plate_fill,
     );
 
     let text_x = plate.x + plate.w + 56.0 * s;

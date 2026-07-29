@@ -1331,10 +1331,13 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
     };
     let scene = AttractScene {
         title: name.clone(),
-        tagline: "Throw anything at the wall — no app to install.".to_string(),
         tiles,
+        // What it is, which build, and where to reach it. Nothing else: the idle screen
+        // used to carry a tagline and a line of instructions, and neither was information
+        // anyone standing in front of the panel needed.
         footer: format!(
-            "castaway  •  {}",
+            "castaway  •  {}  •  {}",
+            env!("CASTAWAY_GIT_REV"),
             config.http_base_url().replace("http://", "")
         ),
         widget,
