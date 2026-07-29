@@ -1046,3 +1046,75 @@ hosting third-party receiver apps, and a D32-style "declines because it needs at
 path was scoped and dropped as near-dead code. The RE record is
 `re-shell/artifacts/airreceiver-cast-signatures/APP-IDENTIFICATION.md`, with
 `extract_app_whitelist.py` reproducing the table from any `cast_shell` build.
+
+### D43 — A second borrowed identity, because revocation is the risk we could not price
+D41 shipped one borrowed Cast identity and named the thing it could not fix: the
+AirReceiver credential is shared with every install of that app, `AuthResponse` carries a
+`crl` field, Chrome fetches the Cast device CRL, and Google can revoke it whenever it
+likes. The failure mode is the worst shape available — a clean TLS handshake, then every
+official sender quietly refusing to talk, with nothing in our logs to say why.
+
+**This does not reduce that likelihood. It changes the response from "reflash the panel"
+to "edit one line".** `cast-replay` now carries AirServer's identity beside AirReceiver's,
+and `[cast.replay] offline_order` picks between them.
+
+**The identities are genuinely independent**, which is the property that makes a second
+one worth 960 KiB:
+
+| | `cks` | `airserver` |
+|---|---|---|
+| device CN | `RYW0O FA8FCA6AC5A0` | `2001805200936810051` |
+| issuer | `Eureka Gen1 ICA` | `NVidia mdarcy … Cast ICA` |
+| root path | `Eureka Root CA` | `Widevine Cast Subroot` |
+| covers | 2023-01-01 → 2027-12-06 | 2024-03-20 → 2027-03-21 |
+
+Different device, different intermediate, different *branch* of the Cast PKI — the
+AirServer leaf comes through the Widevine-backed provisioning path this project probed in
+D42, not from a Eureka ICA. A revocation or a root-level problem that kills one has no
+particular reason to touch the other.
+
+**What this is not is a horizon improvement, and the docs say so rather than implying
+otherwise.** AirServer stops eight months *before* the CKS table, so on expiry grounds
+alone the second entry is nearly vacuous: any instant it can serve, CKS can serve too.
+The single exception is a preferred-but-exhausted identity falling through, which is
+tested. The CKS backend remains the only path that outlives every table.
+
+**Two structural surprises in the data**, both of which shaped the implementation rather
+than being absorbed silently:
+
+* **Windows overlap.** AirServer steps 1 day with 2-day validity, where CKS steps 2 days
+  and tiles. So two windows are valid at any instant, and `index_at` returns the later
+  one — more remaining life, less chance of a roll landing mid-session.
+* **The certificates cannot be re-issued from a template.** `cks` ships one template and
+  rebuilds each window's certificate from it, because CKS's differ only in validity.
+  AirServer's also differ in serial (linear in the index, so derivable) and in **subject
+  CN, which is a fresh random UUID per window**. Not derivable from anything, and the
+  device signature covers exact DER, so a rebuilt certificate would be rejected. Hence
+  790 KiB of certificates checked in verbatim. Paying disk to remove a silent-failure
+  class is the trade ground rule 1 asks for, and a test asserts the UUIDs really are
+  distinct so that a future database without them makes the cheaper representation
+  discoverable.
+
+**Deliberately not done: the live AirServer endpoint.**
+`api.airserver.com/cast_certificates/get` vends a rolling 30-window database under a
+*different* SHIELD identity, so there is a pool or a rotation behind it. It is not called.
+An unattended panel refreshing on a schedule is precisely the "do not run this in a loop"
+case the RE handoff warns about, and it would add a network path with its own failure modes
+for no window either existing path lacks.
+
+**Fallback is a declarative ordered list, not a chain of flags** — `offline_order` — so
+"which identity is this panel presenting" has one answer readable from config instead of
+being reconstructed from which branches happened to be taken. Nothing in the receiver can
+*detect* a revocation, since the signal is a sender refusing us, which is exactly why the
+order is operator policy rather than an inference. A table whose fixtures fail to load
+degrades that one identity and logs at `error`; startup still succeeds on the other, which
+is half the point of carrying two.
+
+The crate was renamed `cast-cks` → `cast-replay` in the same breath: "CKS" is one of the
+two vendors, and the crate is the mechanism both share. Provenance is in
+`crates/cast-replay/fixtures/airserver/README.md`; no JWTs came across (D42).
+
+**Still unverified here:** the AirServer chain is accepted by Openscreen's own sender path
+1095/1095 according to the extraction tool, but castaway's `checks.openscreen-device-auth`
+has no AirServer vector yet — it still exercises the CKS chain only. Adding one is the
+obvious next step and would make this identity as well-evidenced in CI as D41's.

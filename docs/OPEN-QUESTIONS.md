@@ -57,6 +57,13 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   but "do we want to depend on someone else's revocable identity", and the durable answer
   is still a credential of our own.
 
+  **There are now two borrowed identities rather than one (D43)** — AirServer's, on a
+  different branch of the Cast PKI (`Widevine Cast Subroot`), sits beside AirReceiver's
+  and `[cast.replay] offline_order` chooses. That does not answer the question either: it
+  makes a revocation survivable with a config edit instead of a reflash, and it doubles
+  the number of other people's identities this panel depends on. Two borrowed
+  credentials are not one owned credential.
+
   That path is unchanged and now takes precedence in code: `[cast.credential]` in
   `castaway.toml` reads a PKCS#8 key, a device certificate and any intermediates, and
   wins over CKS when set. It stays out of the repository — a device credential identifies
