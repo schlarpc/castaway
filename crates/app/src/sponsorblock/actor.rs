@@ -36,7 +36,20 @@ const TOAST: Duration = Duration::from_secs(3);
 
 /// Run the actor until the process ends. Never returns an error to its caller: a receiver
 /// that cannot reach SponsorBlock is a receiver that plays sponsors, not a broken one.
-pub async fn run(config: SponsorBlockConfig, screen: ScreenSlot, osd: OsdSink) {
+/// How long the screen may sit with no video before the panel takes itself back.
+///
+/// "Ready to cast" with an empty queue is nobody watching anything; three minutes
+/// covers someone browsing the leanback UI by remote (every press is channel traffic
+/// that resets this) without leaving the splash up all evening. A *paused* video never
+/// counts as idle — the screen still has a video, and someone means to come back.
+const IDLE_EXIT: Duration = Duration::from_secs(180);
+
+pub async fn run(
+    config: SponsorBlockConfig,
+    screen: ScreenSlot,
+    osd: OsdSink,
+    on_idle: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) {
     info!(
         categories = ?config.categories,
         "SponsorBlock: {}",
@@ -58,8 +71,22 @@ pub async fn run(config: SponsorBlockConfig, screen: ScreenSlot, osd: OsdSink) {
     // forgot which had already been skipped, so a reattach mid-video could skip a
     // sponsor the viewer had already sat through.
     let mut planner = Planner::new();
+    // When the screen last became video-less, carried *across* channel re-attaches: the
+    // long-poll EOFs and rebinds every couple of minutes as a matter of course, and an
+    // idle clock that restarted with the channel would never reach its deadline.
+    let mut idle_since: Option<tokio::time::Instant> = None;
     loop {
-        match session(&config, &screen, &osd, &identity, &mut planner).await {
+        match session(
+            &config,
+            &screen,
+            &osd,
+            &identity,
+            &mut planner,
+            on_idle.as_deref(),
+            &mut idle_since,
+        )
+        .await
+        {
             Ok(()) => debug!("SponsorBlock session ended; will re-attach"),
             Err(e) => warn!(error = %e, "SponsorBlock session failed; will re-attach"),
         }
@@ -76,6 +103,8 @@ async fn session(
     osd: &OsdSink,
     identity: &SenderIdentity,
     planner: &mut Planner,
+    on_idle: Option<&(dyn Fn() + Send + Sync)>,
+    idle_since: &mut Option<tokio::time::Instant>,
 ) -> anyhow::Result<()> {
     let screen_id = wait_for_screen(screen).await;
     let token = lounge_token(&screen_id).await?;
@@ -98,11 +127,33 @@ async fn session(
     // `None` means "nothing scheduled"; a far-future sleep is simpler than juggling
     // Option<Sleep> in the select below.
     let mut due = Duration::from_secs(3600);
+    // A screen that just appeared with nothing on it starts its idle clock now — the
+    // launch splash counts. `get_or_insert` and not `=`: a re-attach mid-idle must not
+    // grant the splash another three minutes.
+    idle_since.get_or_insert_with(tokio::time::Instant::now);
 
     loop {
+        let idle_deadline = idle_since.map(|since| since + IDLE_EXIT);
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
+                // `nowPlaying` states whether the screen holds a video at all, every
+                // time it fires. With one, the screen is not idle — a *paused* video is
+                // someone coming back. Without one — the "Ready to cast" splash, or a
+                // queue that ran out — the idle clock starts, once: later video-less
+                // reports do not push the deadline back.
+                if command.name == "nowPlaying" {
+                    let has_video = command
+                        .payload
+                        .get("videoId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| !id.is_empty());
+                    if has_video {
+                        *idle_since = None;
+                    } else {
+                        idle_since.get_or_insert_with(tokio::time::Instant::now);
+                    }
+                }
                 sender.observe(&command);
                 if let Some(ad) = ad_update(&command) {
                     if ad.started {
@@ -136,6 +187,23 @@ async fn session(
                 }
             }
             () = tokio::time::sleep(due) => {}
+            () = async {
+                match idle_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if on_idle.is_some() => {
+                info!(
+                    idle = ?IDLE_EXIT,
+                    "YouTube screen has no video and nobody is driving it; \
+                     returning the panel to the home screen"
+                );
+                *idle_since = None;
+                if let Some(idle) = on_idle {
+                    idle();
+                }
+                return Ok(());
+            }
         }
 
         let Some(current) = clock.as_ref().map(PlaybackClock::position) else {

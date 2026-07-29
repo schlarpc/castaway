@@ -605,10 +605,26 @@ async fn serve(
             // page to attach to — this arm is the browser build by construction (D27).
             #[cfg(feature = "electron")]
             if config.sponsorblock.enabled {
+                // The Lounge watcher doubles as the idle watch: a screen sitting at
+                // "Ready to cast" with no video for a few minutes is nobody watching
+                // anything, and the panel takes itself back. Wired as a DIAL stop so
+                // the whole exit path is the one a phone's stop already takes — the
+                // page hides, the app state reads stopped, the screen slot clears.
+                let idle_dial = dial.clone();
+                let idle_tx = dial_tx.clone();
+                let on_idle: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let dial = idle_dial.clone();
+                    let tx = idle_tx.clone();
+                    tokio::spawn(async move {
+                        dial.abandoned().await;
+                        let _ = tx.send(proto_dial::DialEvent::Stopped).await;
+                    });
+                });
                 tokio::spawn(sponsorblock::run(
                     config.sponsorblock.clone(),
                     screen.clone(),
                     osd.clone(),
+                    Some(on_idle),
                 ));
             }
             // A page that crashed past recovery is not running, whatever DIAL last said.
