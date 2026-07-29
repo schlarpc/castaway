@@ -469,8 +469,8 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
         &f.regular,
     );
 
-    // DMA-chan, bottom-right, behind nothing and in the way of nothing: the corner the
-    // tiles and the widget card both leave empty.
+    // DMA-chan, hanging by her elbows over the top edge of the widget card. Drawn after
+    // the card so she overlaps it, and before the tiles because she is never near them.
     if scene.mascot {
         draw_mascot(&mut buf, width, height, s, slot);
     }
@@ -521,9 +521,9 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
 /// panel. Decoding per render is fine: Home is drawn on navigation and resize, not per
 /// frame.
 fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<InsetRect>) {
-    // Two layers, as the site stacks them: the outer is her silhouette and the inner is
-    // the body inside it. Drawing only one of them left her without a lower torso, which
-    // read as a cropping bug rather than a missing layer.
+    // Two layers, as the site stacks them: `inner` is her lower torso alone and `outer`
+    // is head, arms and sash. Drawing only the outer one left her without a lower half,
+    // which read as a cropping bug rather than a missing layer.
     const MASCOT_OUTER: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
     const MASCOT_INNER: &[u8] = include_bytes!("../assets/brand/mascot-inner.png");
     let (Ok(outer), Ok(inner)) = (
