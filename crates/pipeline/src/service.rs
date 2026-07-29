@@ -125,7 +125,17 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
         w: 180.0 * s,
         h: 180.0 * s,
     };
-    shape::rounded_rect(&mut buf, width, height, plate, 26.0 * s, pal.plate);
+    // The same regulation the tile got, so the screen a tile opens is the colour of the
+    // tile that opened it rather than the raw brand colour.
+    let accent = crate::theme::regulated(screen.tile.accent);
+    shape::rounded_rect(
+        &mut buf,
+        width,
+        height,
+        plate,
+        26.0 * s,
+        crate::theme::tinted(pal.plate, accent, 0.12),
+    );
     shape::rounded_outline(
         &mut buf,
         width,
@@ -133,7 +143,7 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
         plate,
         26.0 * s,
         (2.0 * s).max(1.0),
-        screen.tile.accent,
+        accent,
     );
     let (gx, gy) = plate.center();
     crate::attract::draw_tile_glyph(
@@ -142,7 +152,7 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
         screen.tile.glyph,
         (gx, gy),
         plate.h * 0.30,
-        screen.tile.accent,
+        accent,
     );
 
     let text_x = plate.x + plate.w + 56.0 * s;

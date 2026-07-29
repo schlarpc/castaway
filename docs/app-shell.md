@@ -79,6 +79,20 @@ Three rules it exists to enforce:
   the per-service instruction rows and added tiles beside them. Seeing it rendered settled
   it — six protocols' worth of instructions was the first thing anyone saw and none of it
   was about what they were doing. The rows are gone and every service is a tile.
+
+  *Laid out once, twice corrected.* One `layout()` places the title, tagline, heading,
+  tiles and footer together; the renderer and the hit test both read it. The first version
+  laid the screen out twice — the text from one set of constants and the tiles from
+  another — which lined up only for one particular title, and put the tile grid at an
+  absolute height so a longer name silently closed the gap above it. Everything now shares
+  one left edge and one rhythm measured down from the title.
+
+  The grid gets a **fixed box** (under the heading, above the footer, left of the widget
+  card) and solves columns and tile size to fit it, choosing the arrangement that makes
+  tiles largest and breaking ties toward the fewest empty cells. The version before it
+  used a constant tile size and grew downward: at seven tiles the third row started below
+  the footer and ran off the bottom of the panel. Nothing on this screen scrolls, so the
+  box is the constraint and the tiles are what gives.
 - **Service** — one service's instructions, opened by its tile. Did not exist in the plan;
   it is where the rows went.
 - **Picker** — a list with a title and a back affordance. Generic over what it lists:

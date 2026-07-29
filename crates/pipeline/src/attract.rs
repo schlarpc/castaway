@@ -302,36 +302,176 @@ pub fn tile_layout(
     width: u32,
     height: u32,
 ) -> Vec<(String, crate::shape::Rect)> {
-    if scene.tiles.is_empty() {
+    // No fonts means the renderer fails on the very same call and nothing is drawn, so
+    // nothing should answer to a touch either. Returning an empty layout is what keeps
+    // the two halves of D33 agreeing even in the failure case.
+    let Ok(f) = text::fonts() else {
+        return Vec::new();
+    };
+    layout(scene, width, height, &f).tiles
+}
+
+/// A line of text, placed: where its pen starts, its baseline, and its size.
+#[derive(Debug, Clone, Copy)]
+struct Line {
+    x: f32,
+    baseline: f32,
+    px: f32,
+}
+
+/// Everything on the Home screen, placed, in one pass.
+///
+/// It exists because the screen used to be laid out twice — the renderer positioned the
+/// text from one set of constants and [`tile_layout`] positioned the tiles from another —
+/// and the two only agreed for one particular title. Every block now comes out of here,
+/// so they share an edge and a rhythm by construction rather than by coincidence.
+struct Layout {
+    s: f32,
+    card: Option<InsetRect>,
+    title: Line,
+    tagline: Line,
+    /// Absent when there are no tiles for it to be a heading over.
+    heading: Option<Line>,
+    tiles: Vec<(String, crate::shape::Rect)>,
+    footer: Line,
+}
+
+/// The gap between the left column and the widget card, in design pixels.
+const GUTTER: f32 = 56.0;
+
+fn layout(scene: &AttractScene, width: u32, height: u32, f: &text::Fonts) -> Layout {
+    let (w, h) = (width.max(1) as f32, height.max(1) as f32);
+    let s = height.max(1) as f32 / DESIGN_HEIGHT;
+    let margin = 90.0 * s;
+    let card = scene.widget.rect(width, height);
+
+    // One left edge, shared by the title, the tagline, the heading and the tiles.
+    //
+    // The title and tagline used to be *centred in the column* while everything below
+    // them was left-aligned at the margin. They lined up only because the demo title
+    // happened to be nearly as wide as the column allowed: any other receiver name and
+    // the header slid off the grid the rest of the screen is built on.
+    let left = margin;
+    let right = card.map_or(w - margin, |c| c.x as f32 - GUTTER * s);
+    let avail = (right - left).max(1.0);
+
+    let title_px = fit_px(&f.bold, &scene.title, 76.0 * s, avail);
+    let title = Line {
+        x: left,
+        baseline: 118.0f32.mul_add(s, text::ascent(&f.bold, title_px)),
+        px: title_px,
+    };
+
+    let tag_px = fit_px(&f.regular, &scene.tagline, 30.0 * s, avail);
+    let tagline = Line {
+        x: left,
+        baseline: 44.0f32.mul_add(s, title.baseline) + text::ascent(&f.regular, tag_px),
+        px: tag_px,
+    };
+
+    // Measured *down from the tagline* rather than placed at an absolute height. With a
+    // fixed top, a title that shrank to fit the column moved every baseline above the
+    // tiles while the tiles stayed put, so the gap over them silently opened and closed
+    // with the length of the receiver's name.
+    let head_px = 22.0 * s;
+    let heading = (!scene.tiles.is_empty()).then(|| Line {
+        x: left,
+        baseline: 40.0f32.mul_add(s, tagline.baseline) + text::ascent(&f.bold, head_px),
+        px: head_px,
+    });
+
+    let foot_px = 24.0 * s;
+    let footer = Line {
+        // Right-aligned to the panel margin, which is also the card's right edge: the
+        // card is centred and the whole bottom-right quarter of the screen was empty,
+        // while the bottom-left already carried the tiles. This is the right column's
+        // second element, and it shares that column's edge.
+        x: (w - margin - text::measure(&f.regular, &scene.footer, foot_px)).max(left),
+        baseline: 50.0f32.mul_add(-s, h),
+        px: foot_px,
+    };
+
+    // The box the tiles have to fit inside: from under the heading down to clear air
+    // above the footer.
+    let grid_top = heading.map_or(40.0f32.mul_add(s, tagline.baseline), |l| {
+        22.0f32.mul_add(s, l.baseline)
+    });
+    let grid_bottom = footer.baseline - text::ascent(&f.regular, foot_px) - 36.0 * s;
+
+    Layout {
+        s,
+        card,
+        title,
+        tagline,
+        heading,
+        tiles: solve_grid(
+            &scene.tiles,
+            left,
+            grid_top,
+            avail,
+            (grid_bottom - grid_top).max(1.0),
+            s,
+        ),
+        footer,
+    }
+}
+
+/// Fit every tile inside a fixed box.
+///
+/// The grid used to be a constant tile size at a constant top, growing downward as tiles
+/// were added: the seventh one started below the footer text and ran off the bottom of
+/// the panel — half drawn, and the half below the edge unreachable. Here the *box* is
+/// fixed and the tiles are solved to fit it, so no number of them can overflow and
+/// nothing ever needs to scroll.
+///
+/// Columns are chosen to make the tiles as large as the box allows. Ties go to the
+/// arrangement with the fewest empty cells, so four tiles are a 2×2 block rather than a
+/// row of three with an orphan underneath.
+fn solve_grid(
+    tiles: &[Tile],
+    left: f32,
+    top: f32,
+    avail_w: f32,
+    avail_h: f32,
+    s: f32,
+) -> Vec<(String, crate::shape::Rect)> {
+    if tiles.is_empty() {
         return Vec::new();
     }
-    let s = height as f32 / DESIGN_HEIGHT;
-    let margin = 90.0 * s;
+    let n = tiles.len();
     let gap = 26.0 * s;
+    // Capped so a lone tile is a tile and not a billboard.
+    let max_side = 220.0 * s;
 
-    // The tiles *are* the screen now — the instructions that used to fill the left column
-    // moved behind them. So they get the whole width left of the widget card, laid out as
-    // a grid that wraps, rather than a row tucked into a corner.
-    let card = scene.widget.rect(width, height);
-    let avail = card.map_or(width as f32 - margin * 2.0, |c| {
-        c.x as f32 - margin - 40.0 * s
-    });
-    let top = 300.0 * s;
+    let side_for = |cols: usize| {
+        let rows = n.div_ceil(cols);
+        ((avail_w - gap * (cols - 1) as f32) / cols as f32)
+            .min((avail_h - gap * (rows - 1) as f32) / rows as f32)
+            .min(max_side)
+    };
+    let empty_for = |cols: usize| cols * n.div_ceil(cols) - n;
 
-    // Sized for a finger on a 65-inch panel: the tile *is* the touch target.
-    let side = 150.0 * s;
-    let per_row = (((avail + gap) / (side + gap)).floor() as usize).max(1);
-    scene
-        .tiles
+    let mut cols = 1;
+    for candidate in 2..=n {
+        let (a, b) = (side_for(candidate), side_for(cols));
+        // A hair of tolerance so two arrangements separated by a rounding error are
+        // decided by which wraps more evenly, not by float noise.
+        if a > b + 0.5 || (a > b - 0.5 && empty_for(candidate) < empty_for(cols)) {
+            cols = candidate;
+        }
+    }
+    let side = side_for(cols).max(1.0);
+
+    tiles
         .iter()
         .enumerate()
         .map(|(i, tile)| {
-            let (row, col) = (i / per_row, i % per_row);
+            let (row, col) = (i / cols, i % cols);
             (
                 tile.id.clone(),
                 crate::shape::Rect {
-                    x: margin + (side + gap) * col as f32,
-                    y: top + (side + gap) * row as f32,
+                    x: (side + gap).mul_add(col as f32, left),
+                    y: (side + gap).mul_add(row as f32, top),
                     w: side,
                     h: side,
                 },
@@ -356,6 +496,7 @@ struct Palette {
     title: Rgba,
     tagline: Rgba,
     label: Rgba,
+    heading: Rgba,
     footer: Rgba,
     card_edge: Rgba,
     card_bg: Rgba,
@@ -368,8 +509,12 @@ impl Default for Palette {
             bg_top: theme::BG_TOP,
             bg_bottom: theme::BG_BOTTOM,
             title: theme::TEXT,
-            tagline: theme::ACCENT,
+            // The tagline had the loudest colour on the screen for the line that says
+            // the least, while the one line explaining the interaction was set in the
+            // footer's grey. Swapped: the accent goes on the heading over the tiles.
+            tagline: theme::TEXT_DIM,
             label: theme::TEXT_BODY,
+            heading: theme::ACCENT,
             footer: theme::TEXT_FAINT,
             card_edge: theme::EDGE,
             card_bg: theme::WELL,
@@ -406,19 +551,20 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
         None => text::fill_gradient(&mut buf, width, height, pal.bg_top, pal.bg_bottom),
     }
 
-    let w = width as f32;
-    // Scale everything relative to a 720p design so it looks right at any resolution.
-    let s = height as f32 / DESIGN_HEIGHT;
-    let margin = 90.0 * s;
+    let l = layout(scene, width, height, &f);
+    let s = l.s;
 
     // The widget card, framed *around* the reserved rect: the browser layer covers that
     // rect exactly, so a frame drawn inside it would vanish on the first paint. The inner
     // fill is what an un-painted card shows — an empty panel rather than a hole.
-    let slot = scene.widget.rect(width, height);
-    if let Some(card) = slot {
-        let edge = (3.0 * s).max(1.0);
+    if let Some(card) = l.card {
         let (cx, cy) = (card.x as f32, card.y as f32);
         let (cw, ch) = (card.width as f32, card.height as f32);
+        // The largest object on the screen had the thinnest, flattest edge on it, so the
+        // tiles outranked the thing that shows a live dashboard. A heavier frame with a
+        // lit inner lip reads as a recessed window rather than a grey band.
+        let edge = (4.0 * s).max(1.0);
+        let lip = (1.5 * s).max(1.0);
         text::fill_rect(
             &mut buf,
             width,
@@ -429,90 +575,65 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
             ch + edge * 2.0,
             pal.card_edge,
         );
+        text::fill_rect(
+            &mut buf,
+            width,
+            height,
+            cx - lip,
+            cy - lip,
+            lip.mul_add(2.0, cw),
+            lip.mul_add(2.0, ch),
+            theme::tinted(pal.card_edge, theme::TEXT, 0.22),
+        );
         text::fill_rect(&mut buf, width, height, cx, cy, cw, ch, pal.card_bg);
     }
 
-    // The text column: the whole surface, or everything left of the widget card. The rows
-    // below stay left-aligned either way — the card sits above them.
-    let column = slot.map_or(w, |card| card.x as f32 - 40.0 * s);
-    let avail = (column - margin * 2.0).max(1.0);
-
-    // Title (bold, centered in the column).
-    let title_px = fit_px(&f.bold, &scene.title, 76.0 * s, avail);
-    let title_w = text::measure(&f.bold, &scene.title, title_px);
-    let mut y = 120.0 * s + text::ascent(&f.bold, title_px);
-    text::draw_text(
-        &mut buf,
-        width,
-        height,
-        (column - title_w) / 2.0,
-        y,
-        &scene.title,
-        title_px,
-        pal.title,
-        &f.bold,
-    );
-
-    // Tagline (centered in the column).
-    let tag_px = fit_px(&f.regular, &scene.tagline, 30.0 * s, avail);
-    let tag_w = text::measure(&f.regular, &scene.tagline, tag_px);
-    y += 46.0 * s + text::ascent(&f.regular, tag_px);
-    text::draw_text(
-        &mut buf,
-        width,
-        height,
-        (column - tag_w) / 2.0,
-        y,
-        &scene.tagline,
-        tag_px,
-        pal.tagline,
-        &f.regular,
-    );
-
-    // DMA-chan, hanging by her elbows over the top edge of the widget card. Drawn after
-    // the card so she overlaps it, and before the tiles because she is never near them.
-    if scene.mascot {
-        draw_mascot(&mut buf, width, height, s, slot);
-    }
-
-    // Tiles: what the panel can start itself. Drawn from the same layout the hit test
-    // uses, so the two cannot disagree about where a tile is (D33).
-    let tiles = tile_layout(scene, width, height);
-    if let Some((_, first)) = tiles.first() {
-        // A heading, because the two halves of this screen mean opposite things and
-        // nothing else says so: the rows are what to do on your phone, these are what
-        // this panel will go and do.
-        let head_px = 22.0 * s;
+    for (line, font, colour, body) in [
+        (l.title, &f.bold, pal.title, scene.title.as_str()),
+        (l.tagline, &f.regular, pal.tagline, scene.tagline.as_str()),
+        (l.footer, &f.regular, pal.footer, scene.footer.as_str()),
+    ] {
         text::draw_text(
             &mut buf,
             width,
             height,
-            first.x,
-            first.y - 18.0 * s,
+            line.x,
+            line.baseline,
+            body,
+            line.px,
+            colour,
+            font,
+        );
+    }
+
+    // DMA-chan, hanging by her elbows over the top edge of the widget card. Drawn after
+    // the card so she overlaps it, and before the tiles because she is never near them.
+    if scene.mascot {
+        draw_mascot(&mut buf, width, height, s, l.card);
+    }
+
+    // A heading, because the two halves of this screen mean opposite things and nothing
+    // else says so: the card is what the panel is showing, these are what it will go and
+    // do if you press one.
+    if let Some(head) = l.heading {
+        text::draw_text(
+            &mut buf,
+            width,
+            height,
+            head.x,
+            head.baseline,
             "TAP FOR HOW, OR JUST CAST",
-            head_px,
-            pal.footer,
+            head.px,
+            pal.heading,
             &f.bold,
         );
     }
-    for (tile, (_, rect)) in scene.tiles.iter().zip(tiles) {
-        draw_tile(&mut buf, width, height, tile, rect, s, &f, &pal);
-    }
 
-    // Footer.
-    let foot_px = 24.0 * s;
-    let foot_baseline = height as f32 - 50.0 * s;
-    text::draw_text(
-        &mut buf,
-        width,
-        height,
-        margin,
-        foot_baseline,
-        &scene.footer,
-        foot_px,
-        pal.footer,
-        &f.regular,
-    );
+    // Tiles, from the same layout the hit test reads, so the two cannot disagree about
+    // where a tile is (D33).
+    for (tile, (_, rect)) in scene.tiles.iter().zip(l.tiles) {
+        draw_tile(&mut buf, width, height, tile, rect, &f, &pal);
+    }
 
     Ok(buf)
 }
@@ -558,7 +679,10 @@ fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<Ins
     let target_w = (target_h as f32 * iw as f32 / ih as f32) as u32;
     let (ox, oy) = match card {
         Some(card) => (
-            card.x as f32 + card.width as f32 * 0.64,
+            // Anchored to the card's right edge rather than to a fraction of its width,
+            // so a different card aspect moves her with the edge she is leaning on
+            // instead of sliding her sideways for no reason.
+            (card.x + card.width) as f32 - target_w as f32 - 44.0 * s,
             card.y as f32 - target_h as f32 * (1.0 - OVERHANG),
         ),
         // No panel to lean on: stand her in the corner instead.
@@ -595,50 +719,65 @@ fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<Ins
 }
 
 /// Draw one tile: a rounded plate, its glyph, and a label under it.
-#[allow(clippy::too_many_arguments)]
+///
+/// Every dimension is a fraction of the tile rather than of the panel, because the grid
+/// now sizes tiles to fit its box: a corner radius or a label in absolute pixels would
+/// look right at six tiles and wrong at ten.
 fn draw_tile(
     buf: &mut [u8],
     width: u32,
     height: u32,
     tile: &Tile,
     rect: crate::shape::Rect,
-    s: f32,
     f: &text::Fonts,
     pal: &Palette,
 ) {
     use crate::shape;
 
-    let radius = 22.0 * s;
-    // A plate a shade lighter than the background, with the accent as a thin edge. The
-    // accent is not the fill: five saturated squares on a dark wall is a toy, and the
-    // label has to stay readable across a room.
-    shape::rounded_rect(buf, width, height, rect, radius, pal.tile_bg);
+    let accent = theme::regulated(tile.accent);
+    let radius = rect.h * 0.147;
+    // A plate tinted toward the accent, with the accent itself as the edge. The accent is
+    // not the whole fill: six saturated squares on a dark wall is a toy, and the label has
+    // to stay readable across a room. But an untinted plate left a three-pixel border
+    // doing all the work of telling six services apart from across that room.
+    shape::rounded_rect(
+        buf,
+        width,
+        height,
+        rect,
+        radius,
+        theme::tinted(pal.tile_bg, accent, 0.12),
+    );
     shape::rounded_outline(
         buf,
         width,
         height,
         rect,
         radius,
-        (2.0 * s).max(1.0),
-        tile.accent,
+        (rect.h * 0.015).max(1.0),
+        accent,
     );
 
     let (cx, cy) = rect.center();
     // Glyph sits above centre; the label takes the bottom third.
     let gy = cy - rect.h * 0.10;
-    let g = rect.h * 0.26;
-    draw_tile_glyph(buf, (width, height), tile.glyph, (cx, gy), g, tile.accent);
+    draw_tile_glyph(
+        buf,
+        (width, height),
+        tile.glyph,
+        (cx, gy),
+        rect.h * 0.26,
+        accent,
+    );
 
-    let label_px = 22.0 * s;
-    let avail = rect.w - 12.0 * s;
-    let px = fit_px(&f.regular, &tile.label, label_px, avail);
+    let px = fit_px(&f.regular, &tile.label, rect.h * 0.147, rect.w * 0.92);
     let lw = text::measure(&f.regular, &tile.label, px);
     text::draw_text(
         buf,
         width,
         height,
         cx - lw / 2.0,
-        rect.y + rect.h - 20.0 * s,
+        rect.h.mul_add(0.88, rect.y),
         &tile.label,
         px,
         pal.label,
@@ -962,6 +1101,131 @@ mod tests {
     fn scales_to_4k_without_panicking() {
         let img = render(&AttractScene::demo(), 3840, 2160).unwrap();
         assert_eq!(img.len(), 3840 * 2160 * 4);
+    }
+
+    /// A scene with `n` tiles, for the layout tests.
+    fn scene_with(n: usize) -> AttractScene {
+        let mut scene = AttractScene::demo();
+        scene.tiles = (0..n)
+            .map(|i| Tile {
+                id: format!("t{i}"),
+                label: "Service".into(),
+                glyph: TileGlyph::Cast,
+                accent: theme::BLUE,
+                detail: None,
+            })
+            .collect();
+        scene
+    }
+
+    #[test]
+    fn every_tile_fits_the_panel_at_any_count() {
+        // The regression this exists for: the grid was a constant tile size at a constant
+        // top, so it grew downward as tiles were added. At seven the third row started
+        // below the footer and ran off the bottom edge — drawn half on the panel, with
+        // the rest of it nowhere. Nothing here may scroll, so the grid has to fit.
+        for (w, h) in [(1920, 1080), (3840, 2160), (1280, 720)] {
+            for n in 1..=16 {
+                let scene = scene_with(n);
+                let tiles = tile_layout(&scene, w, h);
+                assert_eq!(tiles.len(), n, "{n} tiles at {w}x{h}");
+                let card = scene.widget.rect(w, h).expect("the demo reserves a card");
+                for (id, r) in &tiles {
+                    assert!(
+                        r.x >= 0.0 && r.y >= 0.0 && r.w > 0.0 && r.h > 0.0,
+                        "{id} of {n} at {w}x{h} is {r:?}"
+                    );
+                    assert!(
+                        r.x + r.w <= w as f32 && r.y + r.h <= h as f32,
+                        "{id} of {n} at {w}x{h} runs off the panel: {r:?}"
+                    );
+                    assert!(
+                        r.x + r.w <= card.x as f32,
+                        "{id} of {n} at {w}x{h} runs under the widget card: {r:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiles_never_overlap_each_other() {
+        // Two tiles sharing pixels would make the hit test's first match arbitrary.
+        for n in 1..=16 {
+            let tiles = tile_layout(&scene_with(n), 1920, 1080);
+            for (i, (_, a)) in tiles.iter().enumerate() {
+                for (_, b) in &tiles[i + 1..] {
+                    let apart = a.x + a.w <= b.x + 0.01
+                        || b.x + b.w <= a.x + 0.01
+                        || a.y + a.h <= b.y + 0.01
+                        || b.y + b.h <= a.y + 0.01;
+                    assert!(apart, "{n} tiles: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bigger_grid_never_makes_a_tile_bigger() {
+        // The property that makes "no overflow" hold without a clamp: adding tiles can
+        // only shrink them. A count that made them grow would mean the solver found room
+        // that was not there.
+        let side = |n| tile_layout(&scene_with(n), 1920, 1080)[0].1.w;
+        for n in 1..16 {
+            assert!(
+                side(n + 1) <= side(n) + 0.01,
+                "{n} → {} tiles grew from {} to {}",
+                n + 1,
+                side(n),
+                side(n + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_and_the_tiles_share_one_left_edge() {
+        // What "slapdash" actually was: the title and tagline were centred in the column
+        // while everything under them was left-aligned, and the two agreed only because
+        // the demo title happened to be as wide as the column. Any other receiver name
+        // and the header slid off the grid.
+        let f = text::fonts().unwrap();
+        for title in [
+            "dma.space/screen",
+            "castaway",
+            "a",
+            "the hackerspace wall panel",
+        ] {
+            let mut scene = AttractScene::demo();
+            scene.title = title.into();
+            let l = layout(&scene, 1920, 1080, &f);
+            let left = l.tiles[0].1.x;
+            assert!(
+                (l.title.x - left).abs() < 0.01,
+                "title of {title:?} is off-grid"
+            );
+            assert!((l.tagline.x - left).abs() < 0.01, "tagline under {title:?}");
+            let head = l.heading.expect("the demo has tiles");
+            assert!((head.x - left).abs() < 0.01, "heading under {title:?}");
+        }
+    }
+
+    #[test]
+    fn the_gap_over_the_tiles_does_not_depend_on_the_title() {
+        // The vertical half of the same bug: the tile grid sat at an absolute height
+        // while the text above it moved, so the space over the tiles opened and closed
+        // with the length of the title. Here the whole column moves together.
+        let f = text::fonts().unwrap();
+        let gap = |title: &str| {
+            let mut scene = AttractScene::demo();
+            scene.title = title.into();
+            let l = layout(&scene, 1920, 1080, &f);
+            l.tiles[0].1.y - l.heading.expect("tiles").baseline
+        };
+        let long = gap("dma.space/screen");
+        assert!(
+            (gap("castaway") - long).abs() < 0.01,
+            "a short title changed the gap over the tiles"
+        );
     }
 
     #[test]

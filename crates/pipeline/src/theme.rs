@@ -57,6 +57,70 @@ pub const TEXT_FAINT: Rgba = [0x55, 0x5e, 0x72, 0xff];
 /// service accents, all of which are brand colours belonging to somebody else.
 pub const ACCENT: Rgba = [0x4f, 0xd1, 0xc5, 0xff];
 
+/// The luminance band every service accent is pulled into.
+///
+/// Wide enough that a brand colour still looks like itself, narrow enough that a row of
+/// them reads as one set.
+const ACCENT_MIN_LUMA: f32 = 0.45;
+/// Top of that band. See [`ACCENT_MIN_LUMA`].
+const ACCENT_MAX_LUMA: f32 = 0.75;
+
+/// Relative luminance of a colour, on the gamma-encoded values.
+///
+/// Not physically correct — the proper form linearises first. It is used here to compare
+/// colours against each other rather than to measure any of them, and the cheap version
+/// orders them the same way.
+fn luma(c: Rgba) -> f32 {
+    0.2126f32.mul_add(
+        f32::from(c[0]),
+        0.7152f32.mul_add(f32::from(c[1]), 0.0722 * f32::from(c[2])),
+    ) / 255.0
+}
+
+/// An accent brought into the panel's luminance band, keeping its hue.
+///
+/// The service accents are other people's brand colours and they agree about nothing:
+/// YouTube's `#ff0000` and AirPlay's pure white sit next to Cast blue with no shared
+/// discipline, so the row reads as a sticker sheet — and the white outline was the
+/// brightest object on the screen after the title. Colours below the band are lifted
+/// toward white and ones above it pulled toward black, which is the smallest change that
+/// puts them all on one footing. Anything already inside comes back untouched, so most
+/// of them are unaffected.
+#[must_use]
+pub fn regulated(c: Rgba) -> Rgba {
+    let l = luma(c);
+    if l < ACCENT_MIN_LUMA {
+        // Mixing toward white raises luminance linearly, so the amount is closed-form.
+        let t = (ACCENT_MIN_LUMA - l) / (1.0 - l).max(f32::EPSILON);
+        [
+            mix(c[0], 0xff, t),
+            mix(c[1], 0xff, t),
+            mix(c[2], 0xff, t),
+            c[3],
+        ]
+    } else if l > ACCENT_MAX_LUMA {
+        let t = 1.0 - ACCENT_MAX_LUMA / l;
+        [mix(c[0], 0, t), mix(c[1], 0, t), mix(c[2], 0, t), c[3]]
+    } else {
+        c
+    }
+}
+
+/// A surface pulled `t` of the way toward an accent.
+///
+/// So a tile can carry its identity in its fill and not only in its outline: a plate that
+/// is the same near-black for every service leaves a 3-pixel border doing all the work of
+/// telling six of them apart across a room.
+#[must_use]
+pub fn tinted(base: Rgba, accent: Rgba, t: f32) -> Rgba {
+    [
+        mix(base[0], accent[0], t),
+        mix(base[1], accent[1], t),
+        mix(base[2], accent[2], t),
+        base[3],
+    ]
+}
+
 /// A seasonal accent, replacing the usual one for part of the year (#24).
 ///
 /// Pure and date-driven so it is testable without waiting for June: the panel asks what
@@ -159,6 +223,28 @@ pub const fn season(month: u32, day: u32) -> Option<Season> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_accent_outside_the_band_is_pulled_into_it_and_one_inside_is_left_alone() {
+        // The two that were the problem: pure red is too dark to sit next to Cast blue,
+        // and pure white was the brightest thing on the screen after the title.
+        for c in [[0xff, 0x00, 0x00, 0xff], [0xff, 0xff, 0xff, 0xff]] {
+            let r = regulated(c);
+            let l = luma(r);
+            assert!(
+                (ACCENT_MIN_LUMA - 0.02..=ACCENT_MAX_LUMA + 0.02).contains(&l),
+                "{c:?} regulated to {r:?}, luma {l}"
+            );
+        }
+        // Hue survives: a regulated red is still overwhelmingly red.
+        let red = regulated([0xff, 0x00, 0x00, 0xff]);
+        assert!(red[0] > red[1] && red[1] == red[2]);
+        // The brand colours are already in the band, so they come back untouched — the
+        // regulation is a correction for outliers, not a filter over the whole palette.
+        for c in [BLUE, GREEN, GOLD, ACCENT] {
+            assert_eq!(regulated(c), c, "{c:?} should not have been touched");
+        }
+    }
 
     #[test]
     fn seasons_land_where_they_should_and_nowhere_else() {
