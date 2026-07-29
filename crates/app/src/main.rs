@@ -1315,8 +1315,8 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
     if config.enable.miracast {
         tiles.push(service(
             "miracast",
-            "Windows",
-            TileGlyph::Dlna,
+            "Miracast",
+            TileGlyph::Miracast,
             [0x00, 0xa4, 0xef, 0xff],
             "Project a Windows desktop with no cable.",
             vec!["Press Win+K".into(), "Pick this screen".into()],
