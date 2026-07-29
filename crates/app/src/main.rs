@@ -338,6 +338,13 @@ fn main() -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
+        // Dropping the runtime waits for every blocking task that has already started —
+        // and the SponsorBlock Lounge stream is a blocking read that can sit inside its
+        // 90-second timeout with nothing to interrupt it. The window is gone; nobody is
+        // served by waiting. One second lets short blocking work (a screenshot encode, a
+        // DNS lookup) finish, then the process leaves and the OS reclaims the rest.
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        return Ok(());
     }
 
     #[cfg(not(feature = "render"))]
