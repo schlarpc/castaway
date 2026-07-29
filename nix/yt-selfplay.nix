@@ -78,7 +78,7 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
       if status != 200:
           raise SystemExit("no DIAL device description at " + base + "/dial/dd.xml (HTTP {}).\n"
                            "A receiver with no kiosk browser does not advertise DIAL at all — "
-                           "check the log for 'DIAL disabled', and build with --features cef.".format(status))
+                           "check the log for 'DIAL disabled', and build with --features electron.".format(status))
       print("dd.xml: ok")
 
       status, body = http(base + "/dial/apps/YouTube")

@@ -25,7 +25,7 @@
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
-  # audio decoders), ALSA for the PCM device, and CEF's own build tooling.
+  # audio decoders) and ALSA for the PCM device.
   kioskArgs = {
     pname = "castaway";
     cargoExtraArgs = "--package castaway --features electron,audio-out,bluetooth-socket";
@@ -72,8 +72,8 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
   # The render/browser tests want a GPU and a display; the sandbox has neither.
   doCheck = false;
 
-  # CEF re-execs this same binary for its subprocesses, so the wrapper has to be what
-  # runs — a subprocess started from an unwrapped path would come up without CEF_PATH.
+  # The receiver locates Electron, the host app, and the CDM through these env vars, so
+  # the wrapper has to be what runs — an unwrapped start would come up browser-less.
   postInstall = ''
     wrapProgram $out/bin/castaway \
       --set-default CASTAWAY_ELECTRON ${electron}/bin/electron \
@@ -92,7 +92,7 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
   '';
 
   meta = commonArgs.meta or { } // {
-    description = "castaway: the full Linux kiosk — renderer, CEF browser, audio out, Bluetooth";
+    description = "castaway: the full Linux kiosk — renderer, Electron browser, audio out, Bluetooth";
     mainProgram = "castaway";
   };
 })

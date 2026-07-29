@@ -239,7 +239,7 @@ impl std::fmt::Display for AudioFormat {
 pub enum PixelFormat {
     /// Planar YUV 4:2:0, 8-bit (typical ffmpeg decode output).
     Yuv420p,
-    /// Packed BGRA, 8-bit (CEF OnPaint output).
+    /// Packed BGRA, 8-bit (browser paint output).
     Bgra8,
     /// Packed RGBA, 8-bit.
     Rgba8,

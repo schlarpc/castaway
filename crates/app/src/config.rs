@@ -30,7 +30,7 @@ pub struct Config {
     #[serde(default)]
     pub theme: pipeline::theme::ThemeChoice,
     /// A page to render live in the idle screen's widget card (a clock, a dashboard).
-    /// `None` leaves the attract scene text-only, full width. Needs the `cef` build.
+    /// `None` leaves the attract scene text-only, full width. Needs the `electron` build.
     pub attract_widget_url: Option<String>,
     /// Bluetooth A2DP sink settings.
     pub bluetooth: Bluetooth,
@@ -359,7 +359,7 @@ impl CastCredential {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SponsorBlock {
-    /// Skip segments during YouTube playback. Needs the `cef` build — there is no
+    /// Skip segments during YouTube playback. Needs the `electron` build — there is no
     /// playback to skip without one.
     pub enabled: bool,
     /// Which categories to skip.

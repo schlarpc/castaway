@@ -1,7 +1,7 @@
 //! The touchable transport strip along the bottom of the now-playing card.
 //!
 //! The C6522QT is a touch panel, and until now the only thing anyone could do with a
-//! finger was drive the CEF browser. An audio session — Spotify or a Bluetooth phone —
+//! finger was drive the browser. An audio session — Spotify or a Bluetooth phone —
 //! put a card on the wall that you could look at and not touch, while the controls lived
 //! on whichever phone had started it. This is the other half of [`RemoteControl`]: the
 //! reverse channel existed, and nothing on the panel was wired to it.

@@ -19,15 +19,14 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    # Prebuilt third-party blobs for the Windows cross-build. Inputs rather than in-tree
-    # `fetchurl` hashes so `flake.lock` records every external artifact this repo pulls in
-    # — one place to audit, one update story. `file+` keeps them as the raw archives:
-    # nix/{ffmpeg,cef}-windows.nix do the unpacking, because both need layout fixups
-    # afterwards that a bare tarball input can't express.
+    # Prebuilt third-party blobs. Inputs rather than in-tree `fetchurl` hashes so
+    # `flake.lock` records every external artifact this repo pulls in — one place to
+    # audit, one update story. `file+` keeps them as the raw archives: the nix/
+    # derivations do the unpacking, so layout policy lives beside the build that uses it.
     #
-    # Both URLs are immutable by construction. BtbN replaces the assets under its `latest`
-    # tag daily, so this pins the dated `autobuild-*` release instead; the CEF CDN keys on
-    # the full version+commit+chromium triple.
+    # Every URL is immutable by construction. BtbN replaces the assets under its `latest`
+    # tag daily, so this pins the dated `autobuild-*` release instead; the rest are
+    # version-stamped release and CDN paths.
     ffmpeg-windows-src = {
       url = "file+https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-24-13-32/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip";
       flake = false;
@@ -144,9 +143,9 @@
           #   locally rather than shipped onward — which is what a receiver on a wall does
           #   anyway. Without one every EME-gated stream fails, and fails *quietly*: the
           #   page logs to its own console and the panel simply does not play, which looks
-          #   like a network problem. Only the `cef` packages touch them, and both
-          #   the browser packaging degrades to no-DRM rather than failing if a
-          #   downstream nixpkgs refuses them.
+          #   like a network problem. Only the browser packaging touches them, and it
+          #   degrades to no-DRM rather than failing if a downstream nixpkgs refuses
+          #   them.
           allowUnfreePredicate = pkg:
             builtins.elem (nixpkgs.lib.getName pkg) [
               "msvc-sysroot"
@@ -364,10 +363,6 @@
             # discovers, accepts, and then has nowhere to put the picture.
             default = linuxKioskFor system;
 
-            # The name this build shipped under before it became the default. Kept so
-            # existing `packages.${system}.castaway-cef` references keep resolving.
-            castaway-cef = self.packages.${system}.default;
-
             # The browser runtime the port targets (D36). Exposed on its own so it can be
             # run against the probes in `browser-host/` — `nix run .#electron -- \
             # browser-host/codec-probe.js` is how a version bump gets checked before it
@@ -421,10 +416,11 @@
         in
         {
           # Build the crate as part of checks. Deliberately the *portable* build and not
-          # `default`: on Linux `default` is now the kiosk, and pulling CEF, ffmpeg and a
-          # second dependency tree into `nix flake check` would cost far more than it
+          # `default`: on Linux `default` is now the kiosk, and pulling Electron, ffmpeg
+          # and a second dependency tree into `nix flake check` would cost far more than it
           # proves. The feature sets that build adds are covered by `audio`/`hwaccel`
-          # below; what is left uncovered is the CEF link, and that is a deploy-time build.
+          # below; what is left uncovered is the `electron` build, and that is a
+          # deploy-time concern.
           build = self.packages.${system}.castaway-portable;
 
           # Run clippy
@@ -544,8 +540,8 @@
         let
           pkgs = pkgsFor system;
           rustToolchain = rustToolchainFor system;
-          # The same flattened CEF distribution the Linux kiosk package builds against;
-          # a devShell that disagreed with the package would be a trap.
+          # The same ECS distribution the Linux kiosk package stages; a devShell that
+          # disagreed with the package would be a trap.
           electron = electronLinuxFor system;
         in
         {
@@ -579,13 +575,8 @@
               # against Vulkan/Wayland/X11 at runtime.
               pkgs.pkg-config
 
-              # For the `cef` feature (cef-dll-sys constructs a cmake::Config; the C++
-              # wrapper is only *built* on Windows/macOS, but keep the tools available).
-              pkgs.cmake
-              pkgs.ninja
-
               # The scripted phone, on PATH: `yt-selfplay http://<receiver>:8080` while a
-              # `--features cef` build runs, to check a YouTube cast really plays.
+              # `--features electron` build runs, to check a YouTube cast really plays.
               self.packages.${system}.yt-selfplay
 
               # nix-direnv for this flake's shell
@@ -628,12 +619,12 @@
             # and needs the libc headers pointed out explicitly in a Nix env.
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
-            # Point the `cef` crates at the flattened, NixOS-linked CEF distribution.
+            # Point the receiver at the ECS runtime and our Electron host app.
             CASTAWAY_ELECTRON = "${electron}/bin/electron";
             CASTAWAY_BROWSER_APP = toString ./browser-host;
-            # Let winit/wgpu dlopen Vulkan/Wayland/X11, and the loader find libcef.so.
-            # libGL is needed because the browser's bundled libGLESv2.so links libGL.so.1;
-            # without it CEF's GPU process dies and wgpu's GL-backend probe SIGSEGVs.
+            # Let winit/wgpu dlopen Vulkan/Wayland/X11.
+            # libGL is needed because Electron's bundled libGLESv2.so links libGL.so.1;
+            # without it the browser's GPU process dies and wgpu's GL-backend probe SIGSEGVs.
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
               pkgs.vulkan-loader
               pkgs.libGL
@@ -703,7 +694,7 @@
                 description = ''
                   The castaway package to run.
 
-                  The default on Linux is the full kiosk: render pipeline, CEF browser,
+                  The default on Linux is the full kiosk: render pipeline, Electron browser,
                   audio output and Bluetooth. Every optional feature is on except `ldac`,
                   which advertises a codec the build cannot decode.
 
@@ -892,7 +883,7 @@
                   # requests from its in-memory engine. Exactly the silent failure Q17 and
                   # Q36 were written to prevent, reintroduced by the deployment.
                   #
-                  # %C is systemd's CacheDirectory root, so this also gives the CEF
+                  # %C is systemd's CacheDirectory root, so this also gives the browser
                   # profile (cookies, "watch as guest") somewhere to persist.
                   XDG_CACHE_HOME = "%C";
                   # The same trap, on the state side, and it had the same shape: a
@@ -921,7 +912,7 @@
                   SupplementaryGroups = lib.optional miracastEnabled "castaway-p2p";
                   StateDirectory = "castaway";
                   # Backs XDG_CACHE_HOME above: filter lists, uBO scriptlet bodies, and
-                  # the CEF profile. Losing it costs a refetch, not correctness, so it is
+                  # the browser profile. Losing it costs a refetch, not correctness, so it is
                   # a cache directory rather than state.
                   CacheDirectory = "castaway";
                   WorkingDirectory = "/var/lib/castaway";

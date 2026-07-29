@@ -22,8 +22,8 @@ use crate::hwaccel::{GpuImporter, SurfaceImport};
 /// Build the wgpu instance restricted to the backend this platform is meant to run on.
 ///
 /// Windows gets **DX12 only**, not `Backends::all()`. The deploy target's whole render
-/// path is D3D12 — and the interop that lands on top of it (CEF's shared textures, the
-/// Miracast encode path) is DXGI-specific — so a silent fallback to Vulkan or GL would
+/// path is D3D12 — and the interop that lands on top of it (the browser's shared
+/// textures, the Miracast encode path) is DXGI-specific — so a silent fallback to Vulkan or GL would
 /// paper over a broken driver install and then fail much later, somewhere less obvious.
 /// Failing at adapter selection is the diagnosable outcome.
 ///
@@ -170,8 +170,8 @@ impl Nv12Uniform {
     }
 }
 
-/// Pixel layout accepted by [`WgpuCompositor::upload_texture`]. BGRA sources (CEF
-/// `on_paint`, some decoders) upload as native `Bgra8Unorm` — no CPU swizzle pass.
+/// Pixel layout accepted by [`WgpuCompositor::upload_texture`]. BGRA sources (browser
+/// paints, some decoders) upload as native `Bgra8Unorm` — no CPU swizzle pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexelFormat {
     /// Packed RGBA8, sample values taken as-is.
@@ -855,7 +855,7 @@ impl WgpuCompositor {
     }
 
     /// Write only `rects` regions of the full `width`×`height` frame in `pixels` into
-    /// the layer's existing texture — the partial-update path for CEF dirty rects.
+    /// the layer's existing texture — the partial-update path for browser dirty rects.
     /// Falls back to a full [`Self::upload_texture`] when the layer has no texture yet
     /// or its size/format changed (the caller always passes the complete frame, so the
     /// fallback needs nothing extra).

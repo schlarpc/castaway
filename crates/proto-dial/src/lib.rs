@@ -8,7 +8,7 @@
 //! Flow: sender hits the cast button → DIAL `POST /apps/YouTube` launches → the app
 //! layer registers a Lounge screen and long-polls the bind channel → [`lounge::to_event`]
 //! maps `setPlaylist`/`play`/`pause`/`seekTo` into session events driving the player.
-//! The playback backend is CEF (YouTube's TV surface) or yt-dlp → pipeline.
+//! The playback backend is the Electron browser (YouTube's TV surface) or yt-dlp → pipeline.
 #![forbid(unsafe_code)]
 
 pub mod dial;

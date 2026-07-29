@@ -1,11 +1,11 @@
-//! The browser surface. A real backend is CEF in offscreen-rendering mode (behind the
-//! `cef` feature): it renders a page to a pixel buffer (`OnPaint`) fed into the
-//! compositor as one of the two browser layers, doubling as PiP and
-//! the YouTube Lounge playback surface (architecture §5). MVP is the CPU `OnPaint` path;
-//! GPU shared-texture OSR is aspirational (cef#4057/#3730).
+//! The browser surface. The real backend is the Electron subprocess in offscreen
+//! rendering mode (behind the `electron` feature — see `electron_browser` and D36): it
+//! renders a page into shared GPU textures fed into the compositor as one of the two
+//! browser layers, doubling as PiP and the YouTube Lounge playback surface
+//! (architecture §5).
 //!
-//! Here we define the trait + a [`NullBrowser`] stub used when `cef` is off (the Lounge
-//! path then falls back to a headless player — see OPEN-QUESTIONS Q6).
+//! Here we define the trait + a [`NullBrowser`] stub used when `electron` is off (the
+//! Lounge path then falls back to a headless player — see OPEN-QUESTIONS Q6).
 
 // The browser's *geometry* is expressed in the attract scene's types, so it exists
 // only where that scene does. `BrowserCommand` above does not, and must not: `app`
@@ -27,7 +27,7 @@ pub trait BrowserSurface: Send {
     fn is_real(&self) -> bool;
 }
 
-/// A stub browser used when the `cef` feature is off. It records the last URL so the
+/// A stub browser used when the `electron` feature is off. It records the last URL so the
 /// app can fall back to a headless player for that content.
 #[derive(Default)]
 pub struct NullBrowser {
@@ -90,8 +90,8 @@ pub enum BrowserRole {
 }
 
 #[cfg(feature = "render")]
-/// Where a role's browser lives on a `surface`-sized panel: the offscreen viewport CEF
-/// rasterizes into (device pixels — the page lays itself out at the size it will actually
+/// Where a role's browser lives on a `surface`-sized panel: the offscreen viewport the
+/// browser rasterizes into (device pixels — the page lays itself out at the size it will actually
 /// be shown, instead of a small render upscaled) and the layer that viewport maps onto.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrowserView {

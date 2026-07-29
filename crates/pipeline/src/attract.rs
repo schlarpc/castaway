@@ -47,7 +47,7 @@ impl InsetRect {
     }
 }
 
-/// Whether the idle scene reserves room for the live web widget (the CEF clock). Without
+/// Whether the idle scene reserves room for the live web widget (the browser clock). Without
 /// a browser there is nothing to put there, so the text uses the full width instead of
 /// leaving a hole — hence an enum the renderer must match on rather than a maybe-empty
 /// rect threaded through every call.
@@ -109,7 +109,7 @@ pub struct AttractScene {
     /// idle screen used to carry a tagline and a line telling you to tap something; both
     /// were read once by whoever wrote them and by nobody since.
     pub footer: String,
-    /// Room reserved for the live web widget (the CEF clock layer).
+    /// Room reserved for the live web widget (the browser clock layer).
     pub widget: WidgetSlot,
     /// The season colouring the background, if today is in one (#24). `None` most of the
     /// year; the app decides, so the renderer stays pure and testable on any date.

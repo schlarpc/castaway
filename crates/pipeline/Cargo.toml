@@ -5,14 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Media pipeline: the null (log) backend used for daily dev, plus the Compositor/Decoder/Browser trait surfaces the ffmpeg + wgpu + CEF backends slot behind feature flags."
+description = "Media pipeline: the null (log) backend used for daily dev, plus the Compositor/Decoder/Browser trait surfaces the ffmpeg + wgpu + Electron backends slot behind feature flags."
 
 [dependencies]
 castaway-core.workspace = true
 # One answer to "which directory?", shared with the app (the filter-list cache).
 castaway-paths.workspace = true
 # The InputSink/TouchEvent/PointerEvent interface: the kiosk routes window input to the
-# focused surface (the CEF browser today) through it.
+# focused surface (the Electron browser today) through it.
 input-touch.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
@@ -45,10 +45,10 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
 ], optional = true }
-# Brave's adblock engine — request-level ad/tracker blocking in the CEF host (Q6 answer).
-# Drop the default `single-thread` feature so the Engine is Arc-based (Send+Sync) — CEF
-# calls the resource handler across threads. Keep `embedded-domain-resolver` (needed for
-# URL parsing) and `full-regex-handling`.
+# Brave's adblock engine — request-level ad/tracker blocking in the browser host (Q6
+# answer). Drop the default `single-thread` feature so the Engine is Arc-based
+# (Send+Sync) — resource queries arrive across threads. Keep `embedded-domain-resolver`
+# (needed for URL parsing) and `full-regex-handling`.
 base64 = { workspace = true, optional = true }
 # SVG rasterisation for the tile glyphs. They used to be hand-rolled distance fields, and
 # every one that looked wrong was a geometry bug in this repo rather than in the artwork
@@ -122,7 +122,7 @@ required-features = ["hwaccel"]
 default = []
 # `render` = the wgpu Compositor backend (feature can't be named `wgpu` — that's a dep).
 # `kiosk`  = winit fullscreen output driving the compositor.
-# `ffmpeg` = libav decode. `cef` = offscreen browser (still a marker; Q6).
+# `ffmpeg` = libav decode. `electron` (below) = the offscreen browser.
 render = [
     "dep:wgpu",
     "dep:pollster",

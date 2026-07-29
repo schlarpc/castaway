@@ -113,9 +113,10 @@ splat behaviour can break the hash even though `crtVersion`/`sdkVersion` haven't
 ## Cross-compiling C/C++: the things that bite
 
 All handled in `nix/windows.nix`. Most were learned cross-building CEF's C++ wrapper — no
-third-party CMake build remains in the tree since D36 — but the machinery stays, because it is
-also how every build-script (`cc`-crate) compile works, and each lesson comes back with the
-next native dependency.
+third-party CMake build remains in the tree since D36, and the CMake toolchain file and
+case-shim machinery went with it (both live in git history) — but the wrapper and the CRT
+knob stay, because they are also how every build-script (`cc`-crate) compile works, and each
+lesson comes back with the next native dependency.
 
 1. **Third-party build systems lose flags you hand them.** CEF's cmake *overwrote*
    `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS` rather than appending, discarding everything a toolchain
@@ -133,10 +134,12 @@ next native dependency.
 3. **Case-sensitivity.** Windows sources are written against a case-insensitive filesystem, so
    an `#include` may spell a header differently from the file on disk. xwin symlinks every SDK
    header under its all-lowercase name, which covers most of it but not mixed-case misspellings
-   (the worked example, still in the shim list: `<Softpub.h>` vs the SDK's `SoftPub.h`).
-   `nix/windows.nix` shims the requested spelling into an overlay include dir rather than
-   patching third-party sources. To find more: list every `#include` name in the sources being
-   cross-compiled that has no exact match in the sysroot but does have a case-insensitive one.
+   (the CEF-era worked example: `<Softpub.h>` vs the SDK's `SoftPub.h`). The fix is to shim
+   the requested spelling into an overlay include dir rather than patching third-party sources
+   — the `msvc-include-case-shims` derivation in `nix/windows.nix`'s git history does exactly
+   that; resurrect it when the next mixed-case include appears. To find them: list every
+   `#include` name in the sources being cross-compiled that has no exact match in the sysroot
+   but does have a case-insensitive one.
 
 4. **CRT linkage must agree across the whole image.** Rust's std and every build-script-compiled
    C object end up in one binary, and two CRTs there means two heaps and two errno/locale states

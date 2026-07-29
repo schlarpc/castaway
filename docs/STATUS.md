@@ -25,13 +25,13 @@ integration test.
 | `crypto-playfair` | **Done, and vector-verified.** The FairPlay v3 `ekey`→AES unwrap that gates mirroring. Tables generated and `garble` transpiled from the published source rather than retyped; correctness settled by the twenty published vectors, all four modes. Own crate because the material is GPL where this workspace is MIT. |
 | `proto-airplay` | **AirPlay 1 audio *and* mirroring, both end to end.** `FLUSH` discards what a seek left behind. `ANNOUNCE` → `SETUP` → `RECORD` as a state machine that carries what each step settled, three UDP sockets bound *before* `SETUP` answers, AES-CBC payload decrypt, and frames into the pipeline — driven over real sockets by an integration test. `et=0,1`: the RSA session-key unwrap works (`crypto-raop`), and `Apple-Challenge` is signed. `SET_PARAMETER` volume/progress/DMAP metadata reach the now-playing card, which also shows the negotiated generation and codec. Timing probes and resend requests are sent, not just parsed. Mirroring: the two-phase `SETUP` plist, FairPlay unwrap, SHA-512 stream keys, the 128-byte-framed data channel with its continuous AES-CTR keystream, AVCC→Annex-B with in-band SPS/PPS — driven from a real FairPlay vector over real sockets in an integration test. **Instrumented for a device session**: every live session logs one structured line every 5 s — frames and drops per plane, resends, stale/unanchored discards, the clock offset and delay, the latency the sender declares, and `av_skew_ms`, the video-minus-audio presentation difference that *is* the lip-sync error. Mirror audio (AAC-ELD) rides the same session, keyed by the same FairPlay key with the `eiv` verbatim, through the same depacketiser. **Not done:** `FLUSH` ignores `RTP-Info`, there is no clock discipline beyond the pipeline's own pacing, and no presentation clock aligning the mirror's two planes — both now stamp against one origin, so the offset is *measurable*, but nothing corrects it yet. HEVC is implemented behind `[airplay] offer_hevc`, off by default. No event channel (UxPlay returns `eventPort: 0` and mirrors fine, so neither do we). AirPlay 2 is untouched — see `docs/airplay-research.md` §2.2. |
 | `sponsorblock` | **Live.** Hash-prefix lookup, category/overlap filtering, and the when-to-skip planner — pure, fixture-tested. Driven by an actor in `app` that binds to our own screen as a Lounge remote. |
-| `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a non-CEF fallback; no native Lounge client. |
+| `proto-dial` | **Live launch, and a phone really plays through it** (`yt-selfplay`), including the attach-to-a-running-app path via a published `<screenId>`. Gated on a launch target: a build with no browser does not advertise DIAL. Pure Lounge bind-channel parser/mapping kept for a browser-less fallback; no native Lounge client. |
 | `proto-miracast` | **The whole protocol, none of the radio.** The WFD information element (byte-identical to what MiracleCast and lazycast put on the air), the `wfd-kv` parameter language as one type per parameter, the M1–M16 exchange with its two independent CSeq counters, MPEG2-TS-over-RTP demuxed to `EncodedFrame`, UIBC touch/HIDC encoding with a coordinate type that cannot carry panel pixels, and a tokio actor driven end-to-end by a scripted source over real sockets. AOSP's format chooser is reimplemented as an oracle, so what an Android phone *would* pick is asserted in tests rather than guessed. Off by default in `app`. **And now the radio, minus the driver.** The Linux backend forms a real autonomous P2P group in CI (`checks.miracast-vm`, mac80211_hwsim): a second radio in its own network namespace discovers the sink's WFD IE over the air, joins by WPS push-button, takes a DHCP lease from the group the NixOS module serves, and the sink resolves the peer with its own neighbour-table sweep (in WFD the peer never speaks first), dials its 7236, negotiates M1→M7 to a running mirror, receives hand-rolled MPEG2-TS-over-RTP across the group — PAT, PMT, and an IDR-first PES the pipeline counts as decoded-plane frames, proving the advertised RTP port is really reachable (the §7.2 two-minute-watchdog failure) — and ends with a clean triggered teardown. The backend speaks to all three of wpa_supplicant's control surfaces — the `p2p-dev-*` management socket that actually delivers P2P events, the group interface's socket where the WPS registrar lives, and an abstract-namespace reply path that survives `PrivateTmp=`. **Not done:** any *real* driver — hwsim is the best-behaved mac80211 there is, and the §7.6 driver check (Q7a) plus 5 GHz (Q7b) remain the hardware's to pass; Miracast-over-Infrastructure (MS-MICE) is documented and unimplemented; HDCP is deliberately `none`. |
 | `moonlight-sys` | **Bindings, pinned and checked in.** FFI to moonlight-common-c, the linked GameStream core (D37). Regenerated from the same revision Nix builds; struct layouts guarded by bindgen's compile-time size/offset asserts. |
 | `proto-gamestream` | **Paired against real Sunshine; never yet streamed.** The one *inverted* protocol — the panel is the Moonlight client, so it browses and dials rather than advertising and waiting. Ours: mDNS host discovery, the NVHTTP API as request builders + rich response types, the gen-7 pairing handshake as a typestate machine, the client identity, per-host pairing persistence, and the adapter. Verified three ways: against Sunshine's own checked-in vectors (its `clientchallenge` ciphertext, its phase-4 hash, its `clientpairingsecret` signature), through all four phases over real sockets against a scripted host, and — the one that counts — against the **real `sunshine` binary in a VM**, which pairs, trusts us over mutual TLS, and serves its app list (`checks.gamestream-vm`). Linked, behind the off-by-default `stream` feature: RTSP, ENet control, FEC'd RTP video, encrypted Opus audio, input. **Not done:** no session has ever run against a real Sunshine host — everything between "the host said 200 to /launch" and pixels is unverified. There is **no chooser**, so a session can only be started from config, which makes this operator-configured rather than walk-up (D37 records that as deferred, not designed). The linked half is GPL-3.0 against this MIT tree, so `castaway-portable` does not link it. |
-| `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. cef still a stub (Q6). |
+| `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. Browser: the Electron subprocess host behind `electron` (D36). |
 | `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, Q14). |
-| `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to CEF *or* to the panel's transport strip, whichever owns the point touched (D33). |
+| `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to the browser *or* to the panel's transport strip, whichever owns the point touched (D33). |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. |
 
 ## The panel's own controls (`cargo run -p pipeline --features render --example card_preview <out.png> [cover.png]`)
@@ -159,25 +159,26 @@ the resulting refresh token into `.env.local` itself rather than asking for a pa
 
 ## Which package to run
 - `packages.default` — on Linux, the full kiosk, so `nix run .` is a receiver you can
-  actually cast to: render pipeline + CEF browser + audio out + Bluetooth, wrapped with
-  `CEF_PATH`/`LD_LIBRARY_PATH` so it runs outside the devShell. **This is the one to deploy
-  on Linux** (`services.castaway.package`). Every optional feature is on except `ldac`,
-  which would advertise a codec we have no decoder for (Q22) and turn a session that would
-  have fallen back to SBC into silence. Verified 2026-07-26 in its `--features cef` form:
-  built from the flake, run headless on Xvfb, and passed both `yt-selfplay` modes with real
-  video composited at 4K. Still `castaway-cef` under its old name.
+  actually cast to: render pipeline + Electron browser + audio out + Bluetooth, wrapped
+  with `CASTAWAY_ELECTRON`/`CASTAWAY_BROWSER_APP`/`LD_LIBRARY_PATH` so it runs outside the
+  devShell. **This is the one to deploy on Linux** (`services.castaway.package`). Every
+  optional feature is on except `ldac`, which would advertise a codec we have no decoder
+  for (Q22) and turn a session that would have fallen back to SBC into silence. Verified
+  2026-07-26 in its pre-D36 `--features cef` form: built from the flake, run headless on
+  Xvfb, and passed both `yt-selfplay` modes with real video composited at 4K.
 - `packages.castaway-portable` — no renderer, no browser, nothing platform-specific.
   Serves and discovers; **cannot** play YouTube, and honestly declines to advertise DIAL
   (D27). What CI builds, and what `default` still is on Darwin.
-- `packages.castaway-windows-cef` — the Windows deploy artifact, cross-compiled.
+- `packages.castaway-windows-electron` — the Windows deploy artifact, cross-compiled
+  (append `.archive` for the same tree as a single zip).
 
 ## A YouTube cast, with no phone (`nix run .#yt-selfplay -- http://<receiver>:8080`)
 The one path a VM test cannot cover: YouTube's Lounge servers are a third party to the
-session, so this needs the real internet and a running `--features cef` receiver. It is a
+session, so this needs the real internet and a running `--features electron` receiver. It is a
 scripted phone — DIAL launch with a `pairingCode` it invented, wait for the receiver's
 page to register that code with YouTube, bind to the Lounge session as a remote control,
 queue videos, and assert the screen actually plays them. **Verified 2026-07-26** against
-the CEF kiosk on Xvfb: three taps, each confirmed playing, plus 4K screenshots of real
+the (then-CEF) kiosk on Xvfb: three taps, each confirmed playing, plus 4K screenshots of real
 decoded video on the composited surface.
 
 `--reconnect` covers the cast that is *not* the first one: a sender that arrives after the
@@ -204,7 +205,7 @@ distinguish from success.
 `--expect-skip` proves SponsorBlock end to end, asserting a *discontinuity* — playback
 advancing further than wall time did, which only a seek can do.
 
-## SponsorBlock (`[sponsorblock]` in castaway.toml, needs the `cef` build)
+## SponsorBlock (`[sponsorblock]` in castaway.toml, needs the `electron` build)
 **Live, verified 2026-07-26** — segments loaded, segment skipped, toast on screen over
 real video. The receiver attaches to its own page as a second Lounge remote and sends
 `seekTo`; there is no hook into the player and no injected JavaScript (D29).
@@ -300,7 +301,14 @@ assets and palette are vendored, nothing uses them, and the font is still DejaVu
    receive path is differential-tested against openscreen's `RtpPacketizer` +
    `FrameCrypto`, compiled from a pinned checkout by the `openscreen-rtp-fixtures` check.
 
-## CEF browser + adblock + YouTube (behind the `cef` feature)
+## Browser + adblock + YouTube (proven on CEF; the runtime is now Electron — D36)
+
+> **Superseded by D36:** the in-process CEF host this section describes was replaced by the
+> Electron (castLabs ECS) subprocess — `electron` feature, `pipeline::electron_browser` —
+> and the CEF crates, packages, and `cef` feature are gone from the tree. The section is
+> kept as the record of what was verified and how; the adblock/scriptlet/YouTube machinery
+> it describes carried over to the Electron host.
+
 The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly against nixpkgs
 `cef-binary` (flake `cefDist` + `CEF_PATH`; no download/patchelf). Proven with screenshots:
 - `pipeline::cef_browser` — offscreen Chromium via cef-rs; renders real pages headlessly

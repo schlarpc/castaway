@@ -19,7 +19,7 @@ The design docs are the spec — read them before touching a subsystem:
   what the citations are worth. Read before changing `proto-dlna`.
 - **docs/miracast-protocol-notes.md** — the WFD/Miracast protocol record `proto-miracast` is built from: the information element, the `wfd-kv` grammar, the M1–M16 exchange, MPEG2-TS-over-RTP, UIBC, and what real Windows and Android senders actually do. Read before changing `proto-miracast`; §7 is the platform reality and is where the project's remaining risk lives.
 - **docs/gamestream-protocol-notes.md** — the GameStream/Moonlight record. The one *inverted* protocol (we are the client) and the one that is half-linked rather than reimplemented: NVHTTP + pairing are ours, the streaming core is moonlight-common-c (D37). Read before changing `proto-gamestream`; §6 is where its remaining risk lives.
-- **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`, MSVC), the CEF/ffmpeg escape hatches, and the testing matrix.
+- **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`-modelled MSVC toolchain), the vendored Electron/ffmpeg/Widevine blobs, and the testing matrix.
 
 Reference implementations named in the docs (UxPlay, openscreen, librespot, yt-cast-receiver, …)
 are **RE sources / wire-behavior specs, not runtime dependencies** — we reimplement.
@@ -51,7 +51,7 @@ These are binding engineering constraints for this project. They override genera
 4. **Async everything.** Media playback must run fluidly, so I/O is `tokio`-based and non-blocking
    end to end. Adapters are async actors emitting `SessionEvent`s; blocking/CPU work (decode,
    crypto) goes on dedicated threads or `spawn_blocking`, never on the runtime. Respect the
-   three-thread-domain model (winit/wgpu main, CEF pump, tokio pool) in architecture-substrate.md §6;
+   three-thread-domain model (winit/wgpu main + browser pump, decode threads, tokio pool) in architecture-substrate.md §6;
    for live mirroring, **drop late frames** (latency beats freshness).
 
 5. **Cross-platform is a ground rule; Linux-first is the tactic.** Build the portable core
@@ -68,7 +68,7 @@ These are binding engineering constraints for this project. They override genera
    - *Integration tests* drive whole adapters against scripted senders inside **Nix-built VMs**
      (`nixosTest`/`pkgs.testers`) so end-to-end discovery+session flows run in CI with no hardware.
    Prefer building a harness over manual verification. Hardware-only paths (Miracast Wi-Fi Direct,
-   DX12/CEF render, the physical panel) are the *only* things allowed to require the real box; isolate them.
+   DX12/browser render, the physical panel) are the *only* things allowed to require the real box; isolate them.
 
 7. **Errors: typed in libraries, `anyhow` in the app.** Every `substrate-*`/`proto-*`/`crypto-*`/
    `core` crate exposes a `thiserror` enum whose variants enumerate its real failure modes (so
@@ -78,7 +78,7 @@ These are binding engineering constraints for this project. They override genera
 
 8. **`unsafe` is quarantined to FFI.** Pure crates (`core`, `substrate-*`, `proto-*`, `crypto-*`)
    set `unsafe_code = "forbid"`. The FFI/interop crates (`pipeline` for ffmpeg/wgpu, `control-display`,
-   `input-touch`, the `windows`/CEF glue) may use `unsafe`, but every `unsafe` block carries a
+   `input-touch`, the `windows` glue) may use `unsafe`, but every `unsafe` block carries a
    `// SAFETY:` comment stating the invariant it upholds. Keep FFI surface thin and wrapped in safe
    types at the crate boundary.
 

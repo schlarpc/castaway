@@ -1,7 +1,7 @@
 //! Request-level ad/tracker blocking for the browser, using Brave's `adblock`
-//! engine. This is the answer to "can we run uBlock Origin?" — CEF's extension APIs
-//! can't host uBO, but blocking at the request layer (the browser asks about every
-//! resource load)
+//! engine. This is the answer to "can we run uBlock Origin?" — an offscreen kiosk
+//! browser can't host uBO, but blocking at the request layer (the browser asks about
+//! every resource load)
 //! is cleaner for a kiosk and just as effective for the general web. Every block is
 //! **logged** on the `castaway::adblock` target so it's visible.
 

@@ -51,11 +51,12 @@ stdenvNoCC.mkDerivation {
   # a panel that will not play rentals.
   #
   # `widevinecdm.dll.sig` travels with the library because it is the CDM's own signature
-  # file, which `CdmHostFiles::OpenCdmFile` looks for beside it. (Our *host* binaries have
-  # no `.sig` — CEF is not a Google-signed build — so verification fails and, per
-  # `cdm_module.cc`, is recorded to UMA and otherwise ignored. The practical consequence
-  # is VMP: services that demand a verified media path will refuse licences. YouTube's
-  # software-secure path does not.)
+  # file, which `CdmHostFiles::OpenCdmFile` looks for beside it. (Host binaries without a
+  # valid VMP signature fail that verification; per `cdm_module.cc` the failure is
+  # recorded to UMA and otherwise ignored, and the practical consequence is that services
+  # demanding a verified media path refuse licences — which is why the ECS tree gets
+  # EVS-signed at deploy time, see vmp-sign.sh and D36. YouTube's software-secure path
+  # does not demand it.)
   installPhase = ''
     runHook preInstall
 
@@ -92,7 +93,7 @@ stdenvNoCC.mkDerivation {
     homepage = "https://www.widevine.com/";
     license = lib.licenses.unfree;
     # The *payload* is for Windows; the derivation is a Linux-side unzip, so this is
-    # `all` like cef-windows.nix. Naming the target platform here would make `checkMeta`
+    # `all`. Naming the target platform here would make `checkMeta`
     # refuse it on the cross-builder — and because the caller wraps this in `tryEval`,
     # the refusal would land as a silently DRM-less artifact rather than an error.
     platforms = lib.platforms.all;

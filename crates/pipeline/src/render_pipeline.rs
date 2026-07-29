@@ -266,7 +266,7 @@ pub struct RenderPipeline {
     /// panel gives it back.
     ///
     /// A callback rather than a `BrowserCommand` sender because the browser lives behind
-    /// the `cef` feature and the pipeline should not: the pipeline's concern is "somebody
+    /// the `electron` feature and the pipeline should not: the pipeline's concern is "somebody
     /// else is casting now", and what that means for a browser is the app's business.
     release_screen: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Output gain, shared with whichever audio session is live.
@@ -644,8 +644,7 @@ impl Pipeline for RenderPipeline {
         #[cfg(feature = "audio")]
         {
             // A source that is only audio still takes the session, and a YouTube page
-            // left on screen would keep playing its own sound over it — CEF's audio goes
-            // straight to the system device, not through our mixer.
+            // left on screen would keep playing its own sound over it.
             self.release_screen();
             // Preempt first: the flag slot holds whichever session is live, video or
             // audio, because only one source may own the output at a time.
@@ -1365,7 +1364,7 @@ impl RenderLoop {
         Ok(())
     }
 
-    /// Upload a CEF browser frame (BGRA8, as `on_paint` delivers) as the `Browser`
+    /// Upload a browser frame (BGRA8, as a CPU paint delivers it) as the `Browser`
     /// compositor layer. `bgra` is always the complete frame; only the `dirty` regions are
     /// written to the GPU (native BGRA, no CPU swizzle), falling back to a full upload on
     /// first paint or resize. `transform` and `z` come from the browser's role — fullscreen
@@ -1402,7 +1401,7 @@ impl RenderLoop {
     /// Import a browser frame's GPU buffer and make it the browser layer.
     ///
     /// The zero-copy counterpart of [`Self::upload_browser`], which took a CPU copy of
-    /// every frame because CEF's accelerated offscreen path is unusable upstream (Q6). At
+    /// every frame because CEF's accelerated offscreen path was unusable upstream (Q6). At
     /// 4K that copy was 33 MB per frame; this is a handful of driver objects.
     ///
     /// `handle` is the browser's buffer, already pulled into this process. It is consumed
@@ -1716,7 +1715,7 @@ impl RenderLoop {
         match cmd {
             RenderCommand::Video(frame) => {
                 // Two ways pixels reach the video layer: uploaded from system memory
-                // (software decode, CEF) or imported in place from a surface the decoder
+                // (software decode) or imported in place from a surface the decoder
                 // produced on the GPU (hwaccel). Only the second one avoids the copy.
                 let landed = match &frame.image {
                     FrameImage::Cpu { format, data } => {

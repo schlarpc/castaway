@@ -1,6 +1,6 @@
 # Substrate & Pipeline Architecture (Rust, cross-platform)
 
-Design for the unified receiver. Targets Linux + Windows. Decode via libav (ffmpeg), composite via wgpu, browser surfaces via CEF OSR, display control via DDC/CEC/serial.
+Design for the unified receiver. Targets Linux + Windows. Decode via libav (ffmpeg), composite via wgpu, browser surfaces via an offscreen Electron subprocess (D36), display control via DDC/CEC/serial.
 
 ---
 
@@ -85,12 +85,12 @@ receiver/
 │  ├─ proto-dlna/             # MediaRenderer (uses ssdp)
 │  ├─ proto-dial/             # DIAL + YouTube Lounge bind channel (uses ssdp, http)
 │  ├─ proto-spotify/          # Spotify Connect (uses mdns)
-│  ├─ pipeline/               # ffmpeg decode + wgpu compositor + winit + CEF
+│  ├─ pipeline/               # ffmpeg decode + wgpu compositor + winit + Electron host
 │  ├─ control-display/        # DDC (ddc-hi) / CEC (cec-rs) / serial (serialport)
 │  └─ app/                    # the binary: config, wiring, kiosk output
 ```
 
-Key third-party crates: `tokio`, `rtsp-types`, `mdns-sd`, `webrtc`(rtp/rtcp), `prost`, `ffmpeg-next`, `wgpu`, `winit`, `axum`, `quick-xml`, `ddc-hi`, `cec-rs`, `serialport`, plus a CEF binding (see §5, immaturity risk).
+Key third-party crates: `tokio`, `rtsp-types`, `mdns-sd`, `webrtc`(rtp/rtcp), `prost`, `ffmpeg-next`, `wgpu`, `winit`, `axum`, `quick-xml`, `ddc-hi`, `cec-rs`, `serialport`, plus the Electron browser subprocess (see §5, D36).
 
 ---
 
@@ -159,7 +159,7 @@ Everything else is OS-agnostic. Target today is **Windows** (§7.5) — write `b
  EncodedFrame / Url ─▶ ffmpeg decode (hwaccel) ─▶ AVFrame
                                                     │  (GPU surface or CPU)
                                                     ▼
-      CEF OSR OnPaint ─▶ browser texture ─▶  ┌─ wgpu Compositor ─┐
+      Browser OSR paint ─▶ browser texture ─▶ ┌─ wgpu Compositor ─┐
       OSD text ────────▶ overlay texture ─▶  │ layers: quads +   │ ─▶ winit surface (fullscreen)
       cast video ──────▶ video texture ───▶  │ transforms + z    │
                                              └───────────────────┘
@@ -173,21 +173,34 @@ Everything else is OS-agnostic. Target today is **Windows** (§7.5) — write `b
   - MVP first: decode → CPU `AVFrame` → upload to wgpu texture. Wire zero-copy once it works.
 - **Kiosk output:** `winit` fullscreen borderless on the HDMI output. Linux kiosk options: run under a minimal Wayland/X, or go direct **DRM/KMS** (via `drm`/`smithay`) for no-compositor fullscreen. Windows: borderless fullscreen window.
 
-## 5. CEF integration (PiP browser + doubles as the YouTube Lounge renderer)
+## 5. Browser integration (PiP browser + doubles as the YouTube Lounge renderer)
 
-- Run CEF in **offscreen rendering (OSR)** mode: it renders pages to a pixel buffer (`OnPaint` with dirty rects) or, with `shared_texture_enabled`, to a **D3D11 shared texture** (Windows) for zero-copy into the compositor.
+*(This section originally specified an in-process CEF embedding via cef-rs; D36 replaced it
+with an Electron subprocess. The compositor-facing shape — an offscreen browser fed in as a
+layer — is unchanged.)*
+
+- The browser is an **Electron subprocess** — castLabs ECS, the same pinned build on both
+  platforms — in offscreen rendering mode. `browser-host/` is the Electron-side app;
+  `pipeline::electron_browser` is the Rust host that drives it (wire types in
+  `pipeline::browser_proto`). Frames stay on the GPU: shared textures imported zero-copy
+  into the compositor (dmabuf on Linux, D3D shared handles on Windows).
 - Feed that surface in as a compositor **layer** → free PiP, overlays, transparent HUDs.
-- **Double duty:** the YouTube "app" you host for the Lounge protocol can *be* a CEF instance loading YouTube's TV surface — the Lounge command channel drives the page, CEF renders it, the compositor shows it. One browser solves both PiP *and* the Lounge playback backend.
-- **Risk, corrected (verified 2026-07):** the binding itself is *fine* — use **`tauri-apps/cef-rs`** (the canonical one; several stale forks exist — space-07, hamaluik, dylanede, Julusian/rust-cef — ignore them). It tracks upstream tightly: release `cef-v150.2.1` (Chromium 150) dated 2026-07-21, all three platforms incl. ARM64, ~8 open issues. The *real* risks are narrower:
-  - **Accelerated / shared-texture OSR is buggy in upstream CEF itself**, not the Rust layer — e.g. `OnAcceleratedPaint` handle comes back null on CEF 143/Windows ([cef#4057](https://github.com/chromiumembedded/cef/issues/4057)), and accelerated OSR doesn't emit damage rects ([cef#3730](https://github.com/chromiumembedded/cef/issues/3730)). **So: MVP on the plain CPU `OnPaint` buffer path (mature); treat GPU zero-copy OSR as aspirational and keep it off the critical path.**
-  - **CEF integration tax** (language-independent): multi-process model needs a subprocess entry point (`cef_execute_process` early in `main`, or a helper exe), and you ship the ~hundreds-of-MB CEF distribution + ICU + resources.
-  - `wry`/WebView2 is still *not* a substitute — it renders to its own window, not into your compositor, so no PiP.
+- **Double duty:** the YouTube "app" you host for the Lounge protocol *is* the browser
+  loading YouTube's TV surface — the Lounge command channel drives the page, the browser
+  renders it, the compositor shows it. One browser solves both PiP *and* the Lounge
+  playback backend.
+- What the subprocess split buys (see D36 for the full trade): someone else maintains the
+  codec-enabled Chromium (H.264/AAC — G55), the Widevine host is VMP-signable (G46/G56),
+  a renderer crash is a subprocess restart rather than our process dying, and `main()` is
+  ordinary — no re-exec entry point, no version-locked C++ ABI.
+- `wry`/WebView2 is still *not* a substitute — it renders to its own window, not into your
+  compositor, so no PiP.
 
 ## 6. Threading model (a real constraint — get it right early)
 
 Three thread domains, because each subsystem has non-negotiable affinity:
 - **Main thread:** `winit` event loop + `wgpu` present. (winit strongly prefers main thread.)
-- **CEF thread(s):** CEF's own message pump (`do_message_loop_work` or multi-threaded loop). Must not block on your async runtime.
+- **Browser:** its own OS *process* (the Electron subprocess), not threads of ours — the Rust host side is pumped from the kiosk loop on the main thread each frame, and must stay non-blocking there.
 - **Tokio runtime (worker pool):** all protocol adapters, network I/O, decode orchestration.
 
 Cross-domain comms via channels. Decoded frames flow decode-thread → render-thread via an mpsc of GPU-uploadable frames; **for live mirroring, drop late frames** (latency > freshness). Textures are only touched on the render thread.
@@ -235,7 +248,7 @@ Control, in priority order for this panel:
 Design `control-display` behind a trait with RS-232 + DDC backends; the session manager fires `DisplayControl::PowerOn` / `SelectInput(self)` on session start.
 
 **Bonus interfaces this panel unlocks (a TV wouldn't):**
-- **Touch input** — it's an interactive panel; touch arrives over **USB HID**. This is an *input* vector, not just display control: read the HID touch device and route events into the compositor / CEF, so the 65" surface actually drives the UI. New workspace crate: **`input-touch`** (`evdev` on Linux, Raw Input / WM_POINTER on Windows). Big flex: a 4K touch wall driven by your compositor + CEF.
+- **Touch input** — it's an interactive panel; touch arrives over **USB HID**. This is an *input* vector, not just display control: read the HID touch device and route events into the compositor / browser, so the 65" surface actually drives the UI. New workspace crate: **`input-touch`** (`evdev` on Linux, Raw Input / WM_POINTER on Windows). Big flex: a 4K touch wall driven by your compositor + browser.
 - **USB-C single-cable** — the panel's USB-C does DP-alt (DP 1.4, **4K60**) + USB data + up to 90W PD. One cable from the PC can carry **video-out + touch-in** (and, if the PC is USB-C-powered, power too — moot here since you already have a full PC). Output target: **3840×2160 @ 60**.
 
 ## 9. Suggested build order
@@ -248,14 +261,14 @@ Priorities are set by the **actual crowd** (NixOS/Rust/Windows programmers + som
 4. `substrate-mdns` + `proto-spotify` (Tier-0 flex) + `proto-cast` media-URL mode.
 5. **`crypto-cast-auth` + `proto-cast` mirroring** — the *workhorse* for this crowd (Chrome/Edge "Cast desktop" from Linux **and** Windows, LAN-based, no Wi-Fi Direct). Carve one gen-1 cert.
 6. `substrate-rtsp`/`substrate-rtp` + `proto-airplay` audio → mirroring (+ `crypto-fairplay`). Mac contingent.
-7. `proto-dial` + YouTube Lounge (+ CEF — the risky/cross-build-heavy bit; CPU-OnPaint MVP).
+7. `proto-dial` + YouTube Lounge (+ the browser — now the Electron subprocess, D36).
 8. **`proto-miracast` `backend-windows`** — promoted to core (Win+K + Linux GNOME Network Displays senders). *Cheap on Windows* (thin `MiracastReceiver` OS-call), so it's not the yak it is on Linux. Needs Ethernet-upstream (§7.5).
-9. `control-display` (RS-232 primary / DDC) + `input-touch` (USB HID touch → CEF/compositor).
+9. `control-display` (RS-232 primary / DDC) + `input-touch` (USB HID touch → browser/compositor).
 10. *Later:* `proto-miracast` `backend-linux` when/if the box migrates (the one crate the move touches).
 
 ## 10. Cross-build (dev Linux → target Windows)
 
-See **`cross-build.md`**. TL;DR: portable ~90% runs native on the Linux dev box; the Windows slice targets **`x86_64-pc-windows-msvc` via `cargo-xwin`** (MSVC needed for CEF's import libs + windows-rs). CEF is the cross-link boss fight — fall back to a **`windows-latest` CI build** for the CEF-heavy binary if cross-linking fights back. Wine can't test Miracast/WinRT/DX12/CEF — the physical C6522QT-connected Windows box is the integration rig.
+See **`cross-build.md`**. TL;DR: portable ~90% runs native on the Linux dev box; the Windows slice targets **`x86_64-pc-windows-msvc`** with a cargo-xwin-modelled LLVM toolchain (MSVC for windows-rs and the vendored import libs), fully from Nix on the Linux box. The browser ships as a prebuilt Electron tree beside the exe, so there is no cross-link boss fight left. Wine can't test Miracast/WinRT/DX12 — the physical C6522QT-connected Windows box is the integration rig.
 
 ---
 

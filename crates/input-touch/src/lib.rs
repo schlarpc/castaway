@@ -2,7 +2,7 @@
 //!
 //! The C6522QT is an interactive panel: touch arrives over USB HID. This crate models
 //! touch as an *input* vector (not just display control), so the 65" surface drives the
-//! compositor / CEF UI (architecture §8). A [`TouchSource`] emits normalized
+//! compositor / browser UI (architecture §8). A [`TouchSource`] emits normalized
 //! [`TouchEvent`]s; backends are evdev (Linux, `evdev` feature) and Raw Input / WM_POINTER
 //! (Windows, `winuser` feature). The default [`NullTouch`] emits nothing.
 //!
@@ -100,7 +100,7 @@ pub enum PointerEvent {
 /// A consumer of routed panel/window input: the surface that currently "owns" the
 /// screen. The kiosk (or any input router) decodes raw events — winit window events
 /// today, HID/evdev on the physical panel — into normalized [`TouchEvent`]s /
-/// [`PointerEvent`]s and delivers them to exactly one focused sink. The CEF browser
+/// [`PointerEvent`]s and delivers them to exactly one focused sink. The browser
 /// layer is the first implementor; protocol adapters or native UI layers that want
 /// direct interaction implement this same trait and take focus.
 pub trait InputSink {
@@ -118,7 +118,7 @@ pub trait InputSink {
 }
 
 /// A source of touch events. The backend spawns a reader and forwards events on the
-/// channel; the compositor/CEF layer consumes them.
+/// channel; the compositor/browser layer consumes them.
 pub trait TouchSource: Send {
     /// Take the receiving end of the touch event stream. Returns `None` if already taken.
     fn events(&mut self) -> Option<mpsc::Receiver<TouchEvent>>;

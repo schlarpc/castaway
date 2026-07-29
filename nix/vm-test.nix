@@ -478,8 +478,8 @@ pkgs.testers.runNixOSTest {
       services.castaway = {
         enable = true;
         inherit httpPort;
-        # Pinned, not defaulted. The module's default is the full kiosk, which drags CEF
-        # and ffmpeg into a test that wants neither — and worse, replaces the null
+        # Pinned, not defaulted. The module's default is the full kiosk, which drags
+        # Electron and ffmpeg into a test that wants neither — and worse, replaces the null
         # pipeline whose log lines every media assertion below greps for. What this test
         # proves is the protocol stack; the picture is G67's problem, and closing it needs
         # a `render` build with Xvfb rather than a package swap here.
@@ -547,7 +547,7 @@ pkgs.testers.runNixOSTest {
             sender.succeed(f"curl -sSf -o /dev/null {location}")
 
     with subtest("a browser-less build does not offer YouTube at all"):
-        # This build has no `cef` feature, so there is no page to launch — and DIAL is
+        # This build has no `electron` feature, so there is no page to launch — and DIAL is
         # launch-only, so every part of a YouTube cast after the launch happens between
         # the phone, YouTube's servers, and a page that would never exist. Advertising it
         # anyway is what D16 forbids: the sender gets a cast target that accepts the

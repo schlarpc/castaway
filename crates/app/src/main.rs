@@ -118,9 +118,9 @@ fn main() -> anyhow::Result<()> {
         let playback: Arc<dyn castaway_core::PlaybackReport> =
             Arc::new(render_pipeline.playback_handle());
 
-        // DIAL launch → navigate the main-thread CEF browser to YouTube leanback with
+        // DIAL launch → navigate the main-thread browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
-        // hide it. Without CEF there is no launch target, and DIAL goes unadvertised.
+        // hide it. Without the browser there is no launch target, and DIAL goes unadvertised.
         #[cfg(feature = "electron")]
         let (nav_tx, nav_rx) = std::sync::mpsc::channel::<pipeline::BrowserCommand>();
 
@@ -1329,9 +1329,9 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         });
     }
 
-    // Reserve the widget card only if something will actually paint into it: with no CEF
-    // build (or no URL configured) the text should use the full width rather than frame a
-    // permanently empty panel.
+    // Reserve the widget card only if something will actually paint into it: with no
+    // browser build (or no URL configured) the text should use the full width rather than
+    // frame a permanently empty panel.
     let widget = match (cfg!(feature = "electron"), &config.attract_widget_url) {
         (true, Some(_)) => WidgetSlot::RightCard,
         _ => WidgetSlot::None,

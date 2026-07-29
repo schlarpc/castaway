@@ -10,7 +10,7 @@
 channel = "1.96.1"
 profile = "default"
 components = ["rust-src", "rust-analyzer", "llvm-tools-preview"]
-# The Windows deploy target (docs/cross-build.md). MSVC rather than MinGW: CEF's import
-# libs are MSVC-format and windows-rs expects MSVC. The matching CRT/SDK sysroot comes
-# from nix/msvc-sysroot.nix; nix/windows.nix wires clang-cl + lld-link around it.
+# The Windows deploy target (docs/cross-build.md). MSVC rather than MinGW: windows-rs
+# expects MSVC and the vendored import libs are MSVC-format. The matching CRT/SDK sysroot
+# comes from nix/msvc-sysroot.nix; nix/windows.nix wires clang-cl + lld-link around it.
 targets = ["x86_64-pc-windows-msvc"]

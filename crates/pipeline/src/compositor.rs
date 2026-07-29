@@ -66,7 +66,7 @@ impl Transform {
 }
 
 /// An axis-aligned pixel region of a layer's texture — the granularity of partial
-/// uploads (CEF `on_paint` dirty rects).
+/// uploads (browser paint dirty rects).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirtyRect {
     /// Left edge in pixels.

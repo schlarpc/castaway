@@ -1,5 +1,5 @@
 //! The [`Pipeline`] trait: what the session manager drives for *media*. The real impl
-//! (ffmpeg + wgpu + CEF) lives in the `pipeline` crate; a null logging impl lives there
+//! (ffmpeg + wgpu + Electron) lives in the `pipeline` crate; a null logging impl lives there
 //! too and is what the daily Linux dev loop and tests use.
 //!
 //! OSD is deliberately NOT here — it's a separate overlay concern that many sources feed

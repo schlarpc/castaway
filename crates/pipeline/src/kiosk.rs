@@ -74,7 +74,7 @@ struct KioskApp {
     pill_since: Option<std::time::Instant>,
     /// Whether the pill's texture is currently a layer, so the fade only uploads once.
     pill_drawn: bool,
-    /// The main-thread CEF host (this loop is CEF's message pump — architecture §6).
+    /// The main-thread browser host (this loop is its message pump — architecture §6).
     #[cfg(feature = "electron")]
     browser: Option<crate::electron_browser::ElectronHost>,
 }
@@ -539,7 +539,7 @@ impl ApplicationHandler for KioskApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // CEF first: its message-loop iteration may paint a fresh frame, which
+                // Browser first: its pump may deliver a fresh frame, which
                 // then lands in this same redraw's present.
                 #[cfg(feature = "electron")]
                 if let (Some(host), Some(r)) = (&mut self.browser, &mut self.render) {
@@ -619,9 +619,9 @@ pub fn run(
     run_app(&mut app)
 }
 
-/// [`run`], plus a main-thread CEF [`BrowserHost`](crate::electron_browser::ElectronHost)
-/// pumped every frame (the kiosk loop is CEF's external message pump). Shuts CEF down
-/// after the event loop exits.
+/// [`run`], plus a main-thread [`ElectronHost`](crate::electron_browser::ElectronHost)
+/// pumped every frame (the kiosk loop is the browser's external message pump). Shuts the
+/// browser down after the event loop exits.
 ///
 /// # Errors
 /// [`PipelineError`] if the event loop can't be created or run.
