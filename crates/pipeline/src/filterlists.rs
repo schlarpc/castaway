@@ -74,13 +74,13 @@ impl Default for CachePaths {
 
 /// A cache directory that survives a reboot, so a kiosk that comes up without network
 /// still has last week's lists rather than none.
+///
+/// Resolved by `castaway-paths` rather than here: this used to read `XDG_CACHE_HOME`
+/// itself and fall back to the temp directory, which on the deploy box is neither
+/// persistent nor the same place the rest of the receiver keeps its files (G31).
 #[must_use]
 pub fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("castaway")
+    castaway_paths::host().cache().to_path_buf()
 }
 
 /// How often the lists are re-fetched while the receiver runs.

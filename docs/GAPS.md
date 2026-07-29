@@ -467,6 +467,12 @@ display or the audio device, and two cannot take it back afterwards.
   deployment environment. The same base path feeds `stable_cache_dir()`, so the CEF profile
   — cookies, "watch as guest" — is also non-persistent. Fix is `XDG_CACHE_HOME=%C` or
   `CacheDirectory=castaway` in the unit; worth confirming `HOME` on the box first.
+  **Closed twice over (D39):** the unit sets `XDG_CACHE_HOME=%C`, and the per-call-site
+  env lookup this gap is really about is gone — `castaway-paths` now owns every directory
+  question, for both platforms, and reports `Origin::Fallback` instead of silently writing
+  somewhere unwritable. The state side had the identical untriggered bug (link keys under
+  `/.local/state/castaway`, so every phone re-pairs after a restart); `XDG_STATE_HOME=%S`
+  closes it.
 
 - ✅ **G32 — A daily refresh that fetches a >1 KB non-list body destroys the good cache.
   CONFIRMED, silent.** `filterlists.rs:368`: `text_for` accepts any response over 1024

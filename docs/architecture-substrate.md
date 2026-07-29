@@ -72,6 +72,7 @@ receiver/
 ├─ Cargo.toml                 # [workspace]
 ├─ crates/
 │  ├─ core/                   # session mgr, internal API, event bus, traits
+│  ├─ paths/                  # per-user dirs, XDG + %LOCALAPPDATA%, layout as a value (D39)
 │  ├─ substrate-mdns/         # mdns-sd wrapper: advertise N services
 │  ├─ substrate-ssdp/         # SSDP responder + UPnP description host (axum)
 │  ├─ substrate-rtsp/         # rtsp-types + RtspConn actor + transform slot

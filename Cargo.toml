@@ -5,6 +5,7 @@ resolver = "2"
 # as it lands.
 members = [
     "crates/core",
+    "crates/paths",
     "crates/substrate-hci",
     "crates/substrate-l2cap",
     "crates/substrate-sdp",
@@ -48,6 +49,7 @@ repository = "https://github.com/schlarpc/castaway"
 [workspace.dependencies]
 # --- internal crates ---
 castaway-core = { path = "crates/core" }
+castaway-paths = { path = "crates/paths" }
 substrate-mdns = { path = "crates/substrate-mdns" }
 substrate-ssdp = { path = "crates/substrate-ssdp" }
 substrate-rtsp = { path = "crates/substrate-rtsp" }
@@ -86,6 +88,9 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Rotated on-disk logs for the unattended panel. Used synchronously (no `non_blocking`
+# worker) so an aborting process does not take its own last lines with it.
+tracing-appender = "0.2"
 
 # --- serialization / wire ---
 bytes = "1"

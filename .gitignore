@@ -42,3 +42,7 @@ htmlcov/
 .env.*
 !.env.example
 .envrc.local
+
+# The relative directory `castaway-paths` falls back to when the environment names no
+# home at all (a bare `cargo run` under a scrubbed env).
+.castaway/
