@@ -385,6 +385,35 @@ mod tests {
         assert_eq!(from_db.window(), from_table.window());
     }
 
+    /// The same content at a 512-byte page size, where the 778-byte encrypted
+    /// certificates span several pages instead of sitting inline. Reading both to the
+    /// same credential is what says the reader is not quietly dependent on blobs
+    /// fitting in one page — which a real 14 MB response's larger rows do not.
+    #[test]
+    fn page_size_does_not_change_what_is_read() {
+        const TRIMMED_512: &[u8] = include_bytes!("../fixtures/airserver/db_trimmed_512.sqlite");
+
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.db");
+        let b_path = dir.path().join("b.db");
+        std::fs::write(&a_path, TRIMMED).unwrap();
+        std::fs::write(&b_path, TRIMMED_512).unwrap();
+
+        let a = AirServerDb::open(&a_path).unwrap();
+        let b = AirServerDb::open(&b_path).unwrap();
+        assert_eq!(a.window_count(), b.window_count());
+        assert_eq!(a.covers_until(), b.covers_until());
+
+        let ca = a.credential_at(1_710_892_800).unwrap();
+        let cb = b.credential_at(1_710_892_800).unwrap();
+        assert_eq!(ca.peer_cert_der(), cb.peer_cert_der());
+        assert_eq!(ca.device_cert_der(), cb.device_cert_der());
+        assert_eq!(ca.intermediates_der(), cb.intermediates_der());
+        for hash in [crate::HashAlgo::Sha1, crate::HashAlgo::Sha256] {
+            assert_eq!(ca.signature(hash), cb.signature(hash));
+        }
+    }
+
     /// A live set is distinguishable from the bundled table in the logs, which is the
     /// point of a separate origin.
     #[test]

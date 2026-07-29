@@ -1095,12 +1095,12 @@ than being absorbed silently:
   distinct so that a future database without them makes the cheaper representation
   discoverable.
 
-**Deliberately not done: the live AirServer endpoint.**
-`api.airserver.com/cast_certificates/get` vends a rolling 30-window database under a
-*different* SHIELD identity, so there is a pool or a rotation behind it. It is not called.
-An unattended panel refreshing on a schedule is precisely the "do not run this in a loop"
-case the RE handoff warns about, and it would add a network path with its own failure modes
-for no window either existing path lacks.
+**The live AirServer endpoint is wired (see D44).** An earlier revision of this entry
+declined it on the grounds that an unattended panel refreshing on a schedule is the "do
+not run this in a loop" case the RE handoff warns about. That was the wrong call, and the
+reason is in the sentence above about horizons: without it, the checked-in database *is*
+the receiver's expiry date, and a CKS revocation leaves nothing rolling at all, because
+the CKS endpoint keeps vending the same revoked identity.
 
 **Fallback is a declarative ordered list, not a chain of flags** — `identity_order` — so
 "which identity is this panel presenting" has one answer readable from config instead of
@@ -1114,7 +1114,67 @@ The crate was renamed `cast-cks` → `cast-replay` in the same breath: "CKS" is 
 two vendors, and the crate is the mechanism both share. Provenance is in
 `crates/cast-replay/fixtures/airserver/README.md`; no JWTs came across (D42).
 
-**Still unverified here:** the AirServer chain is accepted by Openscreen's own sender path
-1095/1095 according to the extraction tool, but castaway's `checks.openscreen-device-auth`
-has no AirServer vector yet — it still exercises the CKS chain only. Adding one is the
-obvious next step and would make this identity as well-evidenced in CI as D41's.
+**Verified in CI as of D44.** `checks.openscreen-device-auth` now judges both chains with
+openscreen's own sender-side verifier: `airserver-chain-google-roots` is **ok** and
+`airserver-nonce-echoed` is `kCastV2SignedBlobsMismatch`. So this identity is as
+well-evidenced as D41's, and the claim that reversing `identity_order` after a revocation
+actually works no longer rests on the extraction tool's word.
+
+### D44 — Both identities get a live endpoint, so the checked-in databases stop being an expiry date
+D43 carried two borrowed identities but only one live path: CKS had a backend, AirServer
+had a 1095-window table and a hard 2027-03-21 wall. That asymmetry undid most of the point.
+A checked-in table is a *floor*, not a plan, and two floors with fixed end dates are still
+two fixed end dates — worse, the case D43 exists for is a CKS revocation, and the CKS
+backend keeps vending the same revoked identity, so after one there was nothing rolling.
+
+**Both identities are now `cache → live → checked-in table`**, tried in
+`cast.replay.identity_order` before the next identity is considered. Reordering therefore
+changes which identity the panel *presents*, not merely which table it falls back to.
+`offline_order` became `identity_order` and `OfflineIdentity` became `Identity`, neither
+being offline-only any more.
+
+**AirServer's cache and live source are one artifact**, which is what makes rollover cheap:
+the endpoint answers with a whole ~14 MB SQLite database covering about 30 rolling windows,
+so one request buys a month and the panel spends nearly all its time answering from the
+cached file with no network at all. A database within three days of its end triggers a fetch
+*before* being used — the set is replaced while the old one still works rather than after it
+stops — and if that fetch fails the old database is still used, because an expiring
+credential beats none.
+
+**The two live sources hold down independently.** Sharing one backoff timer would let a dead
+CKS backend suppress AirServer refreshes for the whole hold-down, which is exactly the
+coupling a second identity exists to remove.
+
+**Reading the response meant reading SQLite, and the first attempt at that was wrong.** The
+initial approach was ~400 lines of hand-written b-tree, varint and overflow-page parsing,
+justified by keeping a `forbid(unsafe_code)` crate free of C for the MSVC cross-build. That
+premise was false — `moonlight-sys` already links moonlight-common-c, enet and libcrypto
+into the Windows artifact — and applying new hand-written parsing to a 13 MB blob off the
+network was the wrong trade regardless. It was deleted in favour of `rusqlite` with
+`bundled`. The same instinct had started hand-composing XSalsa20 + Poly1305 to avoid a
+pre-release `crypto_secretbox`; that was also reversed. Rolling your own to dodge a version
+tag is the worse half of that trade.
+
+**Three properties of the container were established by experiment, not assumption**, each
+of which fails confusingly rather than loudly: `crypto_secretbox`'s AEAD impl keeps
+libsodium's tag-*first* layout rather than RustCrypto's usual appended tag; `metadata.json`
+is the one column that is not a secretbox, stored as plaintext `{"generated": <unix>}`; and
+the BLAKE2b KDF is pinned to a vector taken from the reference implementation so its
+salt/personal parameterisation cannot drift unnoticed. The strongest test is
+cross-implementation: a credential built through the database path must be byte-identical to
+one built from the checked-in fixtures, which were exported from the same source by the
+Python tool.
+
+**`jwt_token` is never read.** A live response carries 20 520 of them — bearer credentials
+for the outbound identification D42 declined — and skipping the table is both the policy and
+the reason a 14 MB response is cheap to ingest.
+
+**What is still not faithful.** The POST body is `[]`. The real body is a JSON array
+assembled at `0x14012e100` over a `QList` whose element shape was never recovered; an empty
+array is accepted and returns a complete set, so it is sufficient but not faithful, and a
+future `AD-Db-Schema-Version` could start requiring an element. Nothing in CI exercises
+either live endpoint — both are third-party services, so the tests cover the reader, the
+resolution order and the rollover decisions, not the network.
+
+`cast.replay.airserver_live` turns the endpoint off for an operator on a metered link,
+leaving that identity on its bundled table.

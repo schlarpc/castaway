@@ -91,10 +91,23 @@ Two structural differences from the CKS table, both load-bearing:
 * **It expires eight months before the CKS table.** It is not a horizon
   improvement and is not the default. See `src/provider.rs` on why the order is
   operator policy.
-* **The live endpoint is not used.** `api.airserver.com/cast_certificates/get`
-  vends a rolling 30-window database under a *different* SHIELD identity, so
-  there is a pool or rotation behind it. The crate deliberately does not call it:
-  an unattended panel refreshing on a schedule is precisely the "do not run this
-  in a loop" case that `AIRSERVER_HANDOFF.md` warns about, and the offline table
-  plus the CKS backend already cover every window either can. Adding it would be
-  a new network path with its own failure modes for no coverage we lack.
+* **The live endpoint *is* used now (D44).** `api.airserver.com/cast_certificates/get`
+  vends a rolling ~30-window database under a *different* SHIELD identity, so
+  there is a pool or rotation behind it. `src/airserver_api.rs` fetches it and
+  `src/airserver_db.rs` reads it, which is what stops the table above from being
+  the receiver's expiry date. These fixtures remain the floor for a panel that has
+  never had an uplink.
+
+## The two test databases
+
+`db_trimmed.sqlite` and `db_trimmed_512.sqlite` are not credentials the receiver
+uses — they are the corpus `src/airserver_db.rs` is tested against offline. Both
+hold the full schema, the six tables the reader reads, three windows, and an
+*empty* `jwt_token`. Regenerate them with the snippet in that module's tests if the
+schema ever moves.
+
+The second exists because its page size is 512 bytes, so the 778-byte encrypted
+certificates span several pages where the default 4096 keeps each one inline.
+Decoding both to the same bytes is the assertion; a reader that only ever saw the
+default page size would not have been tested on the layout a real database uses for
+its larger blobs.
