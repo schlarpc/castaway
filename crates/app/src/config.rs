@@ -22,6 +22,10 @@ pub struct Config {
     pub interface: Option<Ipv4Addr>,
     /// Which protocols to enable.
     pub enable: Enable,
+    /// Which palette the idle screen wears. `auto` follows the calendar; `plain` is the
+    /// panel's own dark ramp; naming a season wears it all year.
+    #[serde(default)]
+    pub theme: pipeline::theme::ThemeChoice,
     /// A page to render live in the idle screen's widget card (a clock, a dashboard).
     /// `None` leaves the attract scene text-only, full width. Needs the `cef` build.
     pub attract_widget_url: Option<String>,
@@ -502,6 +506,7 @@ impl Default for Enable {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            theme: pipeline::theme::ThemeChoice::default(),
             browser: Browser::default(),
             friendly_name: "dma.space/screen".to_string(),
             uuid: "0f8c2e10-castaway-0001-000000000001".to_string(),

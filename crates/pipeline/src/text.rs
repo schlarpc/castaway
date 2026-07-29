@@ -19,7 +19,7 @@ const FONT_REGULAR: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 
 /// An RGBA color.
-pub type Rgba = [u8; 4];
+pub use crate::theme::Rgba;
 
 /// The two embedded weights.
 pub struct Fonts {

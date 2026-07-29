@@ -182,8 +182,10 @@ pub enum TileGlyph {
     YouTube,
     /// Bluetooth.
     Bluetooth,
-    /// A game controller — Moonlight.
-    Gamepad,
+    /// Moonlight.
+    Moonlight,
+    /// Matter Cast.
+    MatterCast,
     /// A folder — a local media library.
     Folder,
     /// Miracast.
@@ -205,7 +207,8 @@ impl TileGlyph {
             Self::Spotify => include_str!("../assets/glyphs/spotify.svg"),
             Self::YouTube => include_str!("../assets/glyphs/youtube.svg"),
             Self::Bluetooth => include_str!("../assets/glyphs/bluetooth.svg"),
-            Self::Gamepad => include_str!("../assets/glyphs/gamepad.svg"),
+            Self::Moonlight => include_str!("../assets/glyphs/moonlight.svg"),
+            Self::MatterCast => include_str!("../assets/glyphs/matter.svg"),
             Self::Folder => include_str!("../assets/glyphs/folder.svg"),
             Self::Miracast => include_str!("../assets/glyphs/miracast.svg"),
             Self::Gear => include_str!("../assets/glyphs/gear.svg"),
@@ -301,7 +304,7 @@ impl AttractScene {
                 Tile {
                     id: "gamestream".into(),
                     label: "Moonlight".into(),
-                    glyph: TileGlyph::Gamepad,
+                    glyph: TileGlyph::Moonlight,
                     accent: theme::BLUE,
                     // No detail: this one the panel goes and does, so the press becomes
                     // an event and `app` opens a host picker.

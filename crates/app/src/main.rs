@@ -1316,7 +1316,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         tiles.push(Tile {
             id: "gamestream".to_string(),
             label: "Moonlight".to_string(),
-            glyph: TileGlyph::Gamepad,
+            glyph: TileGlyph::Moonlight,
             accent: [0x02, 0xab, 0xfc, 0xff],
             detail: None,
         });
@@ -1344,7 +1344,7 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
         // What today is, asked once at build time rather than baked: the panel is up for
         // weeks, so the screen has to be able to change season without a restart — which
         // it does, because Home is rebuilt whenever the receiver's state changes.
-        season: seasonal_accent(),
+        season: seasonal_accent(config.theme),
         mascot: true,
     };
     Some(scene)
@@ -1357,8 +1357,13 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
 /// June and off in July, and a decoration that needs an edit is a decoration that never
 /// appears.
 #[cfg(feature = "render")]
-fn seasonal_accent() -> Option<pipeline::theme::Season> {
+fn seasonal_accent(choice: pipeline::theme::ThemeChoice) -> Option<pipeline::theme::Season> {
     use std::time::{SystemTime, UNIX_EPOCH};
+    // A forced choice needs no calendar, which also means a clock this box cannot read
+    // does not stop someone asking for a palette outright.
+    if let Some(forced) = choice.forced() {
+        return Some(forced);
+    }
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     // Civil date from a Unix timestamp, Howard Hinnant's algorithm. A date crate for
     // three lines of arithmetic that never has to handle a timezone is not worth the
@@ -1373,7 +1378,7 @@ fn seasonal_accent() -> Option<pipeline::theme::Season> {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let _ = era;
-    pipeline::theme::season(month, day)
+    choice.resolve(month, day)
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).

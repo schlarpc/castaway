@@ -93,6 +93,18 @@ Three rules it exists to enforce:
   used a constant tile size and grew downward: at seven tiles the third row started below
   the footer and ran off the bottom of the panel. Nothing on this screen scrolls, so the
   box is the constraint and the tiles are what gives.
+  *The marks are vendored SVGs* (`crates/pipeline/assets/glyphs/`), rasterised into a
+  coverage mask and tinted with the tile's accent. They began as hand-rolled distance
+  fields, and every glyph that looked wrong was a geometry bug here rather than in any
+  artwork — because there was no artwork. That is also the only way DLNA, Spotify and
+  YouTube are the marks that exist rather than our impression of them.
+
+  *The background palette* is `theme::ThemeChoice`, a config option defaulting to `auto`:
+  the calendar picks (Pride in June, Trans Day of Visibility on 31 March, the twelve days
+  of Christmas, the last week of October), `plain` never decorates, and naming a season
+  wears it all year. A season's hues are mixed only 22% into the panel's own dark ramp —
+  a flag at full strength is a lightbox and every screen here is white text.
+
 - **Service** — one service's instructions, opened by its tile. Did not exist in the plan;
   it is where the rows went.
 - **Picker** — a list with a title and a back affordance. Generic over what it lists:

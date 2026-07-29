@@ -13,7 +13,12 @@
 //! emissive panel on a wall in a dim room. A background lifted from the page would be a
 //! lamp. These are the dark ramp the panel already used, kept.
 
-use crate::text::Rgba;
+/// A straight RGBA8 colour, the one every surface in this crate passes around.
+///
+/// Defined here rather than in [`crate::text`] because this module is the one that is
+/// always compiled: colour is not a rendering concern, and the config file names a
+/// palette whether or not this build can draw one.
+pub type Rgba = [u8; 4];
 
 /// dma.space blue — the site's default brand colour and its link colour.
 pub const BLUE: Rgba = [0x02, 0xab, 0xfc, 0xff];
@@ -121,20 +126,22 @@ pub fn tinted(base: Rgba, accent: Rgba, t: f32) -> Rgba {
     ]
 }
 
-/// A seasonal accent, replacing the usual one for part of the year (#24).
+/// A seasonal palette for the background (#24).
 ///
 /// Pure and date-driven so it is testable without waiting for June: the panel asks what
 /// today is, and everything else follows from that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Season {
-    /// What to call it, for a log line and for anyone wondering why the screen changed.
-    pub name: &'static str,
-    /// The hues the season is made of, top to bottom.
-    ///
-    /// Not drawn as-is: [`Self::gradient`] mixes them most of the way into the panel's
-    /// own dark ramp first. A flag at full strength is a lightbox, and everything on
-    /// these screens is white text.
-    pub hues: &'static [Rgba],
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum Season {
+    /// Pride, in the six-colour flag. All of June.
+    Pride,
+    /// Trans Day of Visibility, 31 March.
+    Trans,
+    /// Christmas — the twelve days, not the run-up.
+    Christmas,
+    /// Halloween, the last week of October.
+    Halloween,
 }
 
 /// How much of a season's hue survives the mix into the background. Low on purpose: the
@@ -142,13 +149,42 @@ pub struct Season {
 const SEASON_STRENGTH: f32 = 0.22;
 
 impl Season {
+    /// Every season, so a test can prove each one is reachable and legible.
+    pub const ALL: [Self; 4] = [Self::Pride, Self::Trans, Self::Christmas, Self::Halloween];
+
+    /// What to call it, for a log line and for anyone wondering why the screen changed.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pride => "pride",
+            Self::Trans => "trans",
+            Self::Christmas => "christmas",
+            Self::Halloween => "halloween",
+        }
+    }
+
+    /// The hues this season is made of, top to bottom.
+    ///
+    /// Not drawn as-is: [`Self::gradient`] mixes them most of the way into the panel's own
+    /// dark ramp first. A flag at full strength is a lightbox, and everything on these
+    /// screens is white text.
+    #[must_use]
+    pub const fn hues(self) -> &'static [Rgba] {
+        match self {
+            Self::Pride => &PRIDE,
+            Self::Trans => &TRANS,
+            Self::Christmas => &YULE,
+            Self::Halloween => &HALLOWEEN,
+        }
+    }
+
     /// The background ramp for this season: its hues, each pulled most of the way toward
     /// the panel's own dark gradient at the height it sits.
     #[must_use]
     pub fn gradient(self) -> Vec<Rgba> {
-        let n = self.hues.len().max(1);
-        self.hues
-            .iter()
+        let hues = self.hues();
+        let n = hues.len().max(1);
+        hues.iter()
             .enumerate()
             .map(|(i, hue)| {
                 // Keep the vertical fall of the normal background, so a seasonal screen
@@ -170,6 +206,66 @@ impl Season {
     }
 }
 
+/// Which palette the idle screen wears (#24).
+///
+/// A config option rather than only the calendar, because the calendar cannot know that
+/// the space is throwing a party in April or that someone wants the screen plain for a
+/// photograph. `Auto` is the default and is what the panel does unattended.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ThemeChoice {
+    /// Follow the calendar.
+    #[default]
+    Auto,
+    /// The panel's own dark ramp, whatever today is.
+    Plain,
+    /// Pride, all year.
+    Pride,
+    /// Trans, all year.
+    Trans,
+    /// Christmas, all year.
+    Christmas,
+    /// Halloween, all year.
+    Halloween,
+}
+
+impl ThemeChoice {
+    /// Every choice, so a test can prove each season can be asked for by name.
+    pub const ALL: [Self; 6] = [
+        Self::Auto,
+        Self::Plain,
+        Self::Pride,
+        Self::Trans,
+        Self::Christmas,
+        Self::Halloween,
+    ];
+
+    /// The season this asks for outright, if it names one.
+    #[must_use]
+    pub const fn forced(self) -> Option<Season> {
+        match self {
+            Self::Auto | Self::Plain => None,
+            Self::Pride => Some(Season::Pride),
+            Self::Trans => Some(Season::Trans),
+            Self::Christmas => Some(Season::Christmas),
+            Self::Halloween => Some(Season::Halloween),
+        }
+    }
+
+    /// What to wear on `(month, day)`.
+    #[must_use]
+    pub const fn resolve(self, month: u32, day: u32) -> Option<Season> {
+        match self {
+            Self::Auto => season(month, day),
+            Self::Plain => None,
+            other => other.forced(),
+        }
+    }
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn mix(a: u8, b: u8, t: f32) -> u8 {
     (f32::from(a) + (f32::from(b) - f32::from(a)) * t.clamp(0.0, 1.0)).clamp(0.0, 255.0) as u8
@@ -185,6 +281,15 @@ const PRIDE: [Rgba; 6] = [
     [0x75, 0x07, 0x87, 0xff],
 ];
 
+/// The trans flag: light blue, pink, white, pink, light blue.
+const TRANS: [Rgba; 5] = [
+    [0x5b, 0xce, 0xfa, 0xff],
+    [0xf5, 0xa9, 0xb8, 0xff],
+    [0xff, 0xff, 0xff, 0xff],
+    [0xf5, 0xa9, 0xb8, 0xff],
+    [0x5b, 0xce, 0xfa, 0xff],
+];
+
 /// Christmas.
 const YULE: [Rgba; 3] = [
     [0xd6, 0x1f, 0x26, 0xff],
@@ -197,25 +302,21 @@ const HALLOWEEN: [Rgba; 2] = [[0xff, 0x77, 0x18, 0xff], [0x6a, 0x2d, 0x8f, 0xff]
 
 /// What season `(month, day)` falls in, if any.
 ///
-/// Deliberately a *stripe* rather than a repaint. The screens have to stay legible and
-/// the service tiles already carry other people's brand colours; a seasonal palette
-/// fighting those would make the panel harder to read for a joke that lands once a year.
+/// Deliberately the *background* rather than a stripe across it. The screens have to stay
+/// legible and the tile marks already carry other people's brand colours; a seasonal
+/// palette fighting those would make the panel harder to read for a joke that lands once
+/// a year, so the hue is mixed in at [`SEASON_STRENGTH`] and no further.
 #[must_use]
 pub const fn season(month: u32, day: u32) -> Option<Season> {
     match (month, day) {
-        (6, _) => Some(Season {
-            name: "pride",
-            hues: &PRIDE,
-        }),
-        // The run-up, not the day: a decoration that appears on the 25th has missed it.
-        (12, 1..=26) => Some(Season {
-            name: "christmas",
-            hues: &YULE,
-        }),
-        (10, 24..=31) => Some(Season {
-            name: "halloween",
-            hues: &HALLOWEEN,
-        }),
+        (6, _) => Some(Season::Pride),
+        // Trans Day of Visibility. One day, so it has to actually land on it.
+        (3, 31) => Some(Season::Trans),
+        // The twelve days: Christmas is a season and it starts *on* the 25th. An earlier
+        // version ran 1–26 December on the theory that a decoration appearing on the day
+        // has missed it, which had it gone by the time anyone was off work.
+        (12, 25..=31) | (1, 1..=5) => Some(Season::Christmas),
+        (10, 24..=31) => Some(Season::Halloween),
         _ => None,
     }
 }
@@ -248,24 +349,67 @@ mod tests {
 
     #[test]
     fn seasons_land_where_they_should_and_nowhere_else() {
-        assert_eq!(season(6, 1).map(|s| s.name), Some("pride"));
-        assert_eq!(season(6, 30).map(|s| s.name), Some("pride"));
-        assert_eq!(season(12, 20).map(|s| s.name), Some("christmas"));
-        assert_eq!(season(10, 31).map(|s| s.name), Some("halloween"));
+        assert_eq!(season(6, 1), Some(Season::Pride));
+        assert_eq!(season(6, 30), Some(Season::Pride));
+        assert_eq!(season(3, 31), Some(Season::Trans));
+        assert_eq!(season(10, 31), Some(Season::Halloween));
+        // Christmas is the twelve days, so it starts on the 25th and crosses the year.
+        assert_eq!(season(12, 25), Some(Season::Christmas));
+        assert_eq!(season(12, 31), Some(Season::Christmas));
+        assert_eq!(season(1, 1), Some(Season::Christmas));
+        assert_eq!(season(1, 5), Some(Season::Christmas));
+        assert_eq!(season(12, 24), None, "the run-up is not the season");
+        assert_eq!(season(1, 6), None, "twelfth night is the end of it");
         // An ordinary Tuesday gets an ordinary screen.
         assert_eq!(season(3, 14), None);
+        assert_eq!(season(3, 30), None, "the day before is not the day");
         assert_eq!(season(10, 1), None);
-        assert_eq!(season(12, 31), None);
+    }
+
+    #[test]
+    fn every_season_can_be_asked_for_by_name() {
+        // The one thing the type system does not catch on its own: a season added without
+        // a matching config value would be unreachable except on its own date.
+        for season in Season::ALL {
+            assert!(
+                ThemeChoice::ALL.iter().any(|c| c.forced() == Some(season)),
+                "{} cannot be chosen in the config",
+                season.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_forced_choice_ignores_the_calendar_and_auto_follows_it() {
+        // 14 March is nothing in particular, which is the point.
+        assert_eq!(ThemeChoice::Auto.resolve(3, 14), None);
+        assert_eq!(ThemeChoice::Plain.resolve(6, 15), None, "plain means plain");
+        assert_eq!(ThemeChoice::Pride.resolve(3, 14), Some(Season::Pride));
+        assert_eq!(ThemeChoice::Auto.resolve(6, 15), Some(Season::Pride));
+    }
+
+    #[test]
+    fn the_theme_choice_round_trips_through_a_config_file() {
+        // It is written by hand into a TOML file, so the spelling is part of the contract.
+        for (text, expect) in [
+            ("\"auto\"", ThemeChoice::Auto),
+            ("\"plain\"", ThemeChoice::Plain),
+            ("\"trans\"", ThemeChoice::Trans),
+            ("\"christmas\"", ThemeChoice::Christmas),
+        ] {
+            let parsed: ThemeChoice = serde_json::from_str(text).expect(text);
+            assert_eq!(parsed, expect);
+            assert_eq!(serde_json::to_string(&expect).expect("write"), text);
+        }
     }
 
     #[test]
     fn a_seasonal_background_stays_dark_enough_to_read_white_text_on() {
         // The whole risk of tinting the background: a flag at full strength is a
         // lightbox, and every screen here is white text on this ramp.
-        for (m, d) in [(6, 15), (12, 10), (10, 28)] {
-            let s = season(m, d).expect("a season");
+        for s in Season::ALL {
             let g = s.gradient();
-            assert!(!g.is_empty(), "{} has no colours", s.name);
+            assert!(!g.is_empty(), "{} has no colours", s.name());
             for stop in g {
                 let luma = 0.2126f32.mul_add(
                     f32::from(stop[0]),
@@ -274,7 +418,7 @@ mod tests {
                 assert!(
                     luma < 90.0,
                     "{} stop {stop:?} is too bright to read on (luma {luma})",
-                    s.name
+                    s.name()
                 );
             }
         }
@@ -284,7 +428,7 @@ mod tests {
     fn a_season_still_falls_darker_toward_the_bottom() {
         // Otherwise it reads as a flat wash rather than the panel's own background
         // wearing a colour.
-        let g = season(6, 15).expect("pride").gradient();
+        let g = Season::Pride.gradient();
         let luma = |c: Rgba| f32::from(c[0]) + f32::from(c[1]) + f32::from(c[2]);
         assert!(luma(g[0]) > luma(g[g.len() - 1]));
     }

@@ -62,7 +62,9 @@ pub mod shell;
 pub mod tap;
 #[cfg(feature = "render")]
 pub mod text;
-#[cfg(feature = "render")]
+// Not gated behind `render`, unlike every other drawing module: `ThemeChoice` is a field
+// in the app's config file, which has to parse on a build with no renderer in it at all.
+// Nothing here draws — it is colour constants and the calendar.
 pub mod theme;
 pub mod transport;
 #[cfg(feature = "electron")]

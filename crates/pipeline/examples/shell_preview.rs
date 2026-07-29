@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write("picker-empty", pipeline::picker::render(&empty, w, h)?)?;
 
     // Silence the unused-import warning when the glyph list changes.
-    let _ = TileGlyph::Gamepad;
+    let _ = TileGlyph::Moonlight;
     let _ = ServiceDetail {
         headline: String::new(),
         steps: vec![],
