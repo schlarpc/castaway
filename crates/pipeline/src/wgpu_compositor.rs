@@ -115,6 +115,11 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// The matrix yields gamma-encoded R'G'B'; the render target is sRGB and re-encodes on
+// store, so writing R'G'B' raw double-encodes — video reached the panel washed out.
+// Decode to linear here and let the target's own encode undo it. BT.709's transfer is
+// treated as sRGB, which is what every desktop compositor ships and is indistinguishable
+// on this panel; honest BT.1886 handling is a colorimetry project, not a bug fix.
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Plane 0 is full-resolution luma (R8); plane 1 is half-resolution interleaved
@@ -124,7 +129,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cbcr = textureSample(chroma, smp, in.uv).rg;
     let s = vec3<f32>(y, cbcr.r, cbcr.g) - u.offset.xyz;
     let rgb = vec3<f32>(dot(u.m0.xyz, s), dot(u.m1.xyz, s), dot(u.m2.xyz, s));
-    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), u.offset.w);
+    let encoded = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let linear = select(
+        pow((encoded + 0.055) / 1.055, vec3<f32>(2.4)),
+        encoded / 12.92,
+        encoded <= vec3<f32>(0.04045),
+    );
+    return vec4<f32>(linear, u.offset.w);
 }
 "#;
 
@@ -357,7 +368,11 @@ impl WgpuCompositor {
         .ok_or_else(|| PipelineError::GpuInit("no GPU adapter".into()))?;
         let (device, queue, importer) = open_device(&adapter)?;
 
-        let format = wgpu::TextureFormat::Rgba8Unorm;
+        // sRGB, matching what the kiosk swapchain negotiates: the compositor samples and
+        // blends in linear and the target re-encodes on store, so `read_rgba` hands back
+        // display-referred bytes — the same values a screenshot of the panel would show.
+        // A linear offscreen target made the tests see different pixels than the glass.
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let programs = build_programs(&device, format);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen-target"),

@@ -73,10 +73,13 @@ impl FrameGeometry {
     pub fn validate(self) -> Result<Self, crate::error::PipelineError> {
         if !matches!(
             self.format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+            wgpu::TextureFormat::Bgra8Unorm
+                | wgpu::TextureFormat::Rgba8Unorm
+                | wgpu::TextureFormat::Bgra8UnormSrgb
+                | wgpu::TextureFormat::Rgba8UnormSrgb
         ) {
             return Err(crate::error::PipelineError::GpuImport(format!(
-                "single-plane import supports BGRA8/RGBA8, not {:?}",
+                "single-plane import supports the BGRA8/RGBA8 family, not {:?}",
                 self.format
             )));
         }

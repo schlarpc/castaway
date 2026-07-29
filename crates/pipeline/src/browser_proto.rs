@@ -411,12 +411,18 @@ pub enum ProtocolError {
 
 impl PixelOrder {
     /// The `wgpu` format this order corresponds to.
+    ///
+    /// The `Srgb` variants, and deliberately: a browser paints sRGB-encoded pixels, so
+    /// the sampler has to decode them and the sRGB swapchain re-encode on the way out.
+    /// Importing the same bytes as plain `Unorm` skips the decode and keeps the encode,
+    /// which is the double-encode `TexelFormat::Rgba8`'s docs warn about — on the panel
+    /// it read as the whole page washed out.
     #[cfg(feature = "render")]
     #[must_use]
     pub const fn texture_format(self) -> wgpu::TextureFormat {
         match self {
-            Self::Bgra => wgpu::TextureFormat::Bgra8Unorm,
-            Self::Rgba => wgpu::TextureFormat::Rgba8Unorm,
+            Self::Bgra => wgpu::TextureFormat::Bgra8UnormSrgb,
+            Self::Rgba => wgpu::TextureFormat::Rgba8UnormSrgb,
         }
     }
 }

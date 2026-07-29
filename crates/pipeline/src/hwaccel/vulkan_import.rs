@@ -263,8 +263,13 @@ impl VulkanImporter {
         owner: std::sync::Arc<dyn GpuSurface>,
     ) -> Result<wgpu::Texture, PipelineError> {
         let geometry = geometry.validate()?;
+        // The `SRGB` formats describe the same bytes and the same DRM layout as their
+        // `UNORM` siblings — the difference is only that sampling decodes. RADV lists
+        // the same modifiers for both.
         let vk_format = match geometry.format {
             wgpu::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+            wgpu::TextureFormat::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
+            wgpu::TextureFormat::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
             // Validated above, so this arm is the RGBA one and nothing else can reach it.
             _ => vk::Format::R8G8B8A8_UNORM,
         };
