@@ -277,8 +277,7 @@ impl CastSession {
         match env.r#type.as_str() {
             "GET_STATUS" => Ok(self.reply_receiver_status(&sender, env.request_id.unwrap_or(0))),
             "GET_APP_AVAILABILITY" => {
-                let req: AppAvailabilityRequest =
-                    serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                let req: AppAvailabilityRequest = messages::parse_message(payload)?;
                 let answers: Vec<(String, bool)> = req
                     .app_ids
                     .into_iter()
@@ -296,8 +295,7 @@ impl CastSession {
                 )]))
             }
             "LAUNCH" => {
-                let req: LaunchRequest =
-                    serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                let req: LaunchRequest = messages::parse_message(payload)?;
                 let app = App::classify(&req.app_id);
                 if let Some(refusal) = self.refusal_for(app) {
                     // Saying "running" to a launch we cannot serve is the worst answer
@@ -320,8 +318,7 @@ impl CastSession {
                 Ok(self.reply_receiver_status(&sender, req.request_id))
             }
             "SET_VOLUME" => {
-                let req: SetVolumeRequest =
-                    serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                let req: SetVolumeRequest = messages::parse_message(payload)?;
                 // Apply before replying: the `RECEIVER_STATUS` a sender reads back is how
                 // its slider learns where it ended up, so echoing the old value makes the
                 // control snap home and look broken on top of doing nothing.
@@ -365,8 +362,7 @@ impl CastSession {
         let request_id = env.request_id.unwrap_or(0);
         match env.r#type.as_str() {
             "LOAD" => {
-                let req: LoadRequest =
-                    serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+                let req: LoadRequest = messages::parse_message(payload)?;
                 let uri = MediaUri::parse(&req.media.content_id)
                     .map_err(|_| CastError::InvalidMedia(req.media.content_id.clone()))?;
                 let start = req

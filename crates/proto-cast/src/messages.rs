@@ -112,8 +112,21 @@ impl Envelope {
     /// # Errors
     /// [`CastError::Json`] if the payload isn't an object with a string `type`.
     pub fn parse(payload: &str) -> Result<Self, CastError> {
-        serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))
+        parse_message(payload)
     }
+}
+
+/// Parse a message payload, carrying the payload itself into the error.
+///
+/// A serde error names a line and column of a message nobody logged, which is a riddle,
+/// not a diagnostic. Real senders diverge from the reference JSON constantly — that is
+/// the DLNA lesson replayed on Cast — and the payload is the evidence the divergence is
+/// diagnosed from.
+///
+/// # Errors
+/// [`CastError::Json`] naming both the serde error and the payload.
+pub fn parse_message<T: serde::de::DeserializeOwned>(payload: &str) -> Result<T, CastError> {
+    serde_json::from_str(payload).map_err(|e| CastError::Json(format!("{e} in payload {payload}")))
 }
 
 /// A `LAUNCH` request on the receiver namespace.
@@ -164,7 +177,33 @@ pub struct VolumeChange {
     /// New output level, `0.0..=1.0`.
     pub level: Option<f32>,
     /// New mute state.
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub muted: Option<bool>,
+}
+
+/// A boolean that also accepts its stringly form.
+///
+/// VLC's chromecast module sends `"autoplay":"false"` — the string — in its `LOAD`, and
+/// a strict parse killed the whole connection, which read from the couch as "VLC sees
+/// the device and nothing plays". The receiver's job at this boundary is the DLNA
+/// conformance posture: parse what real senders actually send, exactly and tolerantly,
+/// and reject only what is genuinely ambiguous.
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrText {
+        Bool(bool),
+        Text(String),
+    }
+    match Option::<BoolOrText>::deserialize(de)? {
+        None => Ok(None),
+        Some(BoolOrText::Bool(b)) => Ok(Some(b)),
+        Some(BoolOrText::Text(t)) if t.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(BoolOrText::Text(t)) if t.eq_ignore_ascii_case("false") => Ok(Some(false)),
+        Some(BoolOrText::Text(t)) => Err(serde::de::Error::custom(format!(
+            "neither a boolean nor \"true\"/\"false\": {t:?}"
+        ))),
+    }
 }
 
 /// A `LOAD` request on the media namespace.
@@ -178,7 +217,8 @@ pub struct LoadRequest {
     /// Start position, seconds.
     #[serde(rename = "currentTime")]
     pub current_time: Option<f64>,
-    /// Whether to start immediately.
+    /// Whether to start immediately. Lenient: VLC sends the *string* `"false"`.
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub autoplay: Option<bool>,
 }
 
@@ -453,5 +493,39 @@ mod tests {
     #[test]
     fn pong_is_minimal() {
         assert_eq!(pong(), "{\"type\":\"PONG\"}");
+    }
+
+    #[test]
+    fn vlcs_load_with_its_stringly_autoplay_parses() {
+        // Captured verbatim from VLC 3.x's chromecast module (2026-07-29): `autoplay`
+        // is the *string* "false". The strict parse rejected it and tore down the whole
+        // connection — VLC listed the device and nothing ever played.
+        let payload = r#"{"type":"LOAD","media":{"metadata":{ "metadataType":0,"title":"cast-test.mp4"},"contentId":"http://10.42.0.50:8010/chromecast/4357016178264/650812800/stream","streamType":"LIVE","contentType":"video/x-matroska"},"autoplay":"false","requestId":1}"#;
+        let req: LoadRequest = parse_message(payload).expect("VLC's LOAD should parse");
+        assert_eq!(req.autoplay, Some(false));
+        assert_eq!(req.request_id, 1);
+        assert!(req.media.content_id.starts_with("http://10.42.0.50:8010/"));
+    }
+
+    #[test]
+    fn lenient_bools_accept_both_forms_and_refuse_nonsense() {
+        let b: LoadRequest = parse_message(
+            r#"{"requestId":1,"media":{"contentId":"u","contentType":"t"},"autoplay":true}"#,
+        )
+        .unwrap();
+        assert_eq!(b.autoplay, Some(true));
+        let t: LoadRequest = parse_message(
+            r#"{"requestId":1,"media":{"contentId":"u","contentType":"t"},"autoplay":"TRUE"}"#,
+        )
+        .unwrap();
+        assert_eq!(t.autoplay, Some(true));
+        assert!(parse_message::<LoadRequest>(
+            r#"{"requestId":1,"media":{"contentId":"u","contentType":"t"},"autoplay":"maybe"}"#,
+        )
+        .is_err());
+        // And a parse failure names the payload, because a line/column of a message
+        // nobody logged is a riddle.
+        let err = parse_message::<LoadRequest>(r#"{"requestId":"x"}"#).unwrap_err();
+        assert!(err.to_string().contains(r#"{"requestId":"x"}"#));
     }
 }
