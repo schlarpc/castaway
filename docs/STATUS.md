@@ -391,6 +391,14 @@ max_files  = 14        # pruned oldest-first at each rotation; ignored when `nev
 # directory = "..."    # default: the platform log directory (below)
 ```
 
+Under both sinks sits a **noise floor**: libraries that log per frame, per packet or per
+poll are held down to a level where they still report trouble. It is not cosmetic —
+`wgpu_core` logs `Device::maintain` at *`INFO`* once per presented frame, so without it the
+on-disk log fills at the default settings; and `mdns_sd` at `debug` was 2168 of 2179
+console lines in the first five seconds with only DLNA enabled. The floor is composed
+*under* whatever you ask for, so `RUST_LOG=debug` means castaway at debug; naming a target
+explicitly gets it back (`RUST_LOG=info,wgpu_core=debug`).
+
 Files land as `castaway.2026-07-28.log`, dated so a restart appends to today's rather than
 truncating it. Writes are synchronous: the release profile is `panic = "abort"`, and an
 aborting process never flushes a background writer's buffer — which is exactly the tail
