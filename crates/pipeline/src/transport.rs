@@ -344,7 +344,7 @@ pub fn layout(model: &TransportModel, width: u32, height: u32) -> Layout {
     let glyph = h * 0.26;
     // The touch target, not the glyph. Fitts' law on a wall: fingers are wide, the panel
     // is far away, and the cost of a generous target is whitespace nobody notices.
-    let target = (glyph * 1.9).min(w / (controls.len().max(1) as f32));
+    let target = (glyph * 2.6).min(w / (controls.len().max(1) as f32));
     let row_y = h * 0.60;
 
     let total = target * controls.len() as f32;
@@ -562,7 +562,9 @@ mod paint {
             let (cx, cy) = rect.center();
             match control {
                 TransportControl::PlayPause => {
-                    let r = l.glyph * 0.78;
+                    // The primary control is the big one — a play disc smaller than the
+                    // skip marks beside it reads as a minor action.
+                    let r = l.glyph * 0.95;
                     crate::shape::disc(&mut buf, width, height, cx, cy, r * 2.0, pal.disc);
                     // Play nudged right of centre: its triangle's visual mass sits left
                     // of the glyph box's middle, and every player nudges it.
