@@ -539,30 +539,41 @@ impl Default for Spotify {
 }
 
 /// Per-protocol enable flags.
+///
+/// Everything is on by default: the receiver's job is to catch whatever the LAN throws
+/// at it, and each adapter that needs hardware the box lacks logs a warning and skips
+/// itself rather than failing the process — so "all on" degrades to "all that this box
+/// can do". These flags exist to *withhold* a capability deliberately (e.g. Miracast on
+/// a box whose only upstream is the same Wi-Fi radio it would take into group-owner
+/// mode, or Bluetooth when the one controller is needed elsewhere).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Enable {
-    /// DLNA MediaRenderer (SSDP + HTTP). Live.
+    /// DLNA MediaRenderer (SSDP + HTTP).
     pub dlna: bool,
-    /// Spotify Connect (mDNS + HTTP onboarding, then playback). Live.
+    /// Spotify Connect (mDNS + HTTP onboarding, then playback).
     pub spotify: bool,
-    /// DIAL → YouTube Lounge (SSDP + HTTP). Live launch; Lounge client is follow-up.
+    /// DIAL → YouTube Lounge (SSDP + HTTP). Only advertised when there is a browser to
+    /// launch into (`electron` builds); otherwise gated off at startup regardless.
     pub dial: bool,
-    /// Advertise Google Cast over mDNS. Off by default until the TLS actor lands.
+    /// Google Cast: mDNS advertisement, TLS actor on 8009, media LOAD and mirroring.
     pub cast: bool,
-    /// Advertise AirPlay/RAOP over mDNS. Off by default until the RTSP actor lands.
+    /// AirPlay/RAOP: mDNS advertisement, RTSP control on 7000, audio and mirroring.
     pub airplay: bool,
-    /// Bluetooth A2DP sink. Off by default: it claims a USB controller exclusively, so
-    /// turning it on without a dedicated one takes the box's Bluetooth away.
+    /// Bluetooth A2DP sink. Claims a Bluetooth controller *exclusively* (USB by
+    /// default, `socket:N` on Linux) — turn this off if the box's one controller is
+    /// needed for anything else. No controller present just logs and skips.
     pub bluetooth: bool,
-    /// GameStream / Sunshine client. Off by default because it is the one protocol
-    /// where the panel dials *out*: it needs a host to have been paired with, which is
-    /// a deliberate act, and it is useless until then.
+    /// GameStream / Sunshine client. The one protocol where the panel dials *out*:
+    /// until a host is paired (a PIN exchange someone must drive from the host side)
+    /// the adapter only browses mDNS for hosts, which costs nothing — so it stays on
+    /// and pairing remains the only gate.
     pub gamestream: bool,
-    /// Miracast sink. Off by default, and for a heavier reason than the others: it takes
-    /// the Wi-Fi radio into group-owner mode. On a box whose upstream is that same radio
-    /// the two roles time-share, and mirroring — the one workload with no slack — is what
-    /// pays for it (architecture §7.5). Turn it on with Ethernet upstream.
+    /// Miracast sink. The expensive one: it takes the Wi-Fi radio into group-owner
+    /// mode. On a box whose upstream is that same radio the two roles time-share, and
+    /// mirroring — the one workload with no slack — is what pays for it (architecture
+    /// §7.5). Fine with Ethernet upstream; turn it off if the radio is the uplink.
+    /// A radio that can't do P2P group-owner logs and skips.
     pub miracast: bool,
 }
 
@@ -572,11 +583,11 @@ impl Default for Enable {
             dlna: true,
             spotify: true,
             dial: true,
-            cast: false,
-            airplay: false,
-            bluetooth: false,
-            gamestream: false,
-            miracast: false,
+            cast: true,
+            airplay: true,
+            bluetooth: true,
+            gamestream: true,
+            miracast: true,
         }
     }
 }
@@ -728,7 +739,8 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.http_port, 8080);
         assert!(c.enable.dlna && c.enable.spotify && c.enable.dial);
-        assert!(!c.enable.cast && !c.enable.airplay);
+        assert!(c.enable.cast && c.enable.airplay);
+        assert!(c.enable.bluetooth && c.enable.gamestream && c.enable.miracast);
     }
 
     #[test]

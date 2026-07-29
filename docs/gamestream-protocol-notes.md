@@ -189,8 +189,9 @@ operator-configured rather than walk-up, the opposite of this project's premise.
 this as deferred, not designed.
 
 **The GPL boundary.** moonlight-common-c is GPL-3.0 and this workspace is MIT. The `stream`
-feature that links it is off by default and off in `castaway-portable`. Turning it on is a
-deliberate act with a licence consequence; see D37.
+feature that links it is off by default at the cargo level and off in `castaway-portable`.
+The Linux kiosk package turns it on, which makes that *artifact* GPL-3.0-bound — a deliberate
+act with a licence consequence, taken for the panel build only; see D37.
 
 **Things that will look like our bug and are not** (from the appendices, worth knowing):
 - Sunshine's `not_found` handler writes its body twice, so a 404 body is unparseable. That is

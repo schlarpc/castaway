@@ -33,10 +33,16 @@ let
     uuid = "0f8c2e10-castaway-0001-00000000vmbt"
     http_port = 8080
 
+    # Everything defaults on; this test is about the A2DP sink alone, so the rest is
+    # named off rather than left to drift with the defaults.
     [enable]
     dlna = false
     spotify = false
     dial = false
+    cast = false
+    airplay = false
+    gamestream = false
+    miracast = false
     bluetooth = true
 
     [bluetooth]

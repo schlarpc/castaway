@@ -291,6 +291,7 @@
         commonArgs = commonArgsFor system;
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
+        moonlightCommonC = moonlightCommonCFor system;
       };
 
       # Linux → Windows cross-build (x86_64-pc-windows-msvc). Only meaningful from

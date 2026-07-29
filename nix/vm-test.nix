@@ -493,9 +493,9 @@ pkgs.testers.runNixOSTest {
           # The VM's default route is the NAT interface, so the auto-detect would pick
           # the wrong address; pin discovery to the test LAN.
           interface = config.networking.primaryIPAddress;
-          # Both off in the shipped defaults — Cast's device auth is still a dev key
-          # (Q2/Q11) and AirPlay can't pair (Q1) — and both on here, because their
-          # socket actors are exactly what this test exists to exercise.
+          # On in the shipped defaults too, but pinned here because their socket
+          # actors are exactly what this test exists to exercise — a defaults change
+          # should not be able to hollow this test out silently.
           enable.cast = true;
           enable.airplay = true;
         };

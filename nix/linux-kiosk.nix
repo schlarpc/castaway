@@ -1,9 +1,12 @@
-# The full Linux kiosk build — renderer, browser, sound, Bluetooth. This is
+# The full Linux kiosk build — renderer, browser, sound, Bluetooth, GameStream. This is
 # `packages.default` on Linux, so it is what `nix run .` gives you.
 #
 # Every optional feature is on here except one. `electron` implies `render` and `hwaccel`;
 # `audio-out` adds the A2DP decoders and a real PCM device; `bluetooth-socket` adds the
-# `socket:N` transport beside the USB default. The exception is `ldac`, which is *not* a
+# `socket:N` transport beside the USB default; `gamestream` links moonlight-common-c so
+# the GameStream client can actually stream — which makes *this artifact* GPL-3.0-bound
+# (D37): fine for the panel it runs on, but it is why `castaway-portable` and the MIT
+# source tree stay clean of it. The exception is `ldac`, which is *not* a
 # capability but an advertisement: the slot exists and the decoder does not (Q22), so a
 # build with it on offers senders a codec it will then fail to decode, turning a session
 # that would have fallen back to SBC into silence. It stays off until libldacdec lands.
@@ -21,14 +24,14 @@
 # LD_LIBRARY_PATH is still set, but only for *our* binary now — the Vulkan/Wayland/X11
 # libraries winit and wgpu dlopen. The browser brings its own, because it is a separate
 # process with its own wrapper.
-{ pkgs, craneLib, commonArgs, electron, widevineCdm }:
+{ pkgs, craneLib, commonArgs, electron, widevineCdm, moonlightCommonC }:
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
   # audio decoders) and ALSA for the PCM device.
   kioskArgs = {
     pname = "castaway";
-    cargoExtraArgs = "--package castaway --features electron,audio-out,bluetooth-socket";
+    cargoExtraArgs = "--package castaway --features electron,audio-out,bluetooth-socket,gamestream";
 
     nativeBuildInputs = [
       pkgs.pkg-config
@@ -46,6 +49,10 @@ let
     LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
     BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
 
+    # Where `moonlight-sys`'s build.rs finds the linked GameStream core (D37): the
+    # library's own archives, and OpenSSL, whose libcrypto PlatformCrypto.c needs.
+    MOONLIGHT_COMMON_C_LIB_DIR =
+      "${moonlightCommonC}/lib:${pkgs.openssl.out}/lib";
   };
 
   # dlopened at runtime, so they are wrapper-time rather than link-time inputs.
@@ -60,6 +67,9 @@ let
     pkgs.libxrandr
     pkgs.ffmpeg_7
     pkgs.alsa-lib
+    # moonlight-common-c's libcrypto. The linker's rpath already covers it; this keeps
+    # the wrapper's view of the world complete if the store path moves under a copy.
+    pkgs.openssl
   ];
 in
 craneLib.buildPackage (commonArgs // kioskArgs // {
