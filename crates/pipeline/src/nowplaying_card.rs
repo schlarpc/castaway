@@ -295,18 +295,10 @@ fn build_lines(
                 gap: 8.0 * s,
             });
         }
-        // Say how many were not shown rather than truncating in silence — "and 12 more"
-        // is the difference between a short queue and a hidden one.
-        let hidden = card.up_next.len().saturating_sub(MAX_UP_NEXT);
-        if hidden > 0 {
-            lines.push(Line {
-                text: format!("and {hidden} more"),
-                px: 22.0 * s,
-                color: pal.source,
-                bold: false,
-                gap: 0.0,
-            });
-        }
+        // No "and N more" footer. It said how many were hidden, which nobody standing
+        // at the panel can do anything with — the phone that owns the queue already
+        // shows the whole thing. The rows shown are the queue as far as this card is
+        // concerned.
     }
 
     lines
@@ -531,15 +523,20 @@ mod tests {
     }
 
     #[test]
-    fn a_long_queue_says_how_much_it_is_hiding() {
-        // Silent truncation would read as a three-song queue, which is a different and
-        // much more annoying claim than "there are more".
+    fn a_long_queue_shows_its_head_and_no_counting_footer() {
+        // "and N more" told someone at the panel a number they could do nothing with;
+        // the phone that owns the queue already shows the whole thing. The card shows
+        // the next few and stops.
         let mut c = card();
         c.up_next = (0..7)
             .map(|i| QueueItem::new(format!("Track {i}")))
             .collect();
         let texts = line_texts(&c);
-        assert!(texts.contains(&"and 4 more".to_string()), "{texts:?}");
+        assert!(texts.contains(&"Track 0".to_string()), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("more")),
+            "no counting footer: {texts:?}"
+        );
     }
 
     #[test]

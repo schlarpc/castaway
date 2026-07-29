@@ -703,7 +703,23 @@ impl Pipeline for RenderPipeline {
     }
 
     async fn now_playing(&self, snapshot: castaway_core::NowPlaying) -> Result<(), CoreError> {
-        self.publish_card(|card| card.track = snapshot);
+        self.publish_card(|card| {
+            // The track that just started was, a moment ago, the head of the queue.
+            // Sources are not obliged to re-send the queue on a natural advance —
+            // Spotify's cluster updates announce edits, not progress — so the card
+            // advances its own copy: showing a track both as "playing" and as "up next"
+            // reads as the queue having stalled. Matched on title+artist because that
+            // is all a `QueueItem` carries; a queue with genuine duplicates loses one
+            // occurrence, which is the truthful outcome anyway.
+            let now_head = card.up_next.first().is_some_and(|next| {
+                Some(next.title.as_str()) == snapshot.title.as_deref()
+                    && next.artist == snapshot.artist
+            });
+            if now_head {
+                card.up_next.remove(0);
+            }
+            card.track = snapshot;
+        });
         Ok(())
     }
 
@@ -2272,6 +2288,38 @@ impl RenderLoop {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[tokio::test]
+    async fn a_track_starting_advances_the_cards_own_queue() {
+        // Sources are not obliged to re-send the queue on a natural advance — Spotify's
+        // cluster updates announce edits, not progress — so when the playing track is
+        // the head of the card's queue, the card shifts its own copy rather than
+        // showing one song as both "playing" and "up next".
+        let (pipe, _rx) = RenderPipeline::new(4);
+        pipe.up_next(vec![
+            castaway_core::QueueItem::new("Aerodynamic"),
+            castaway_core::QueueItem::new("Voyager"),
+        ])
+        .await
+        .unwrap();
+
+        let mut started = castaway_core::NowPlaying::default();
+        started.title = Some("Aerodynamic".into());
+        pipe.now_playing(started).await.unwrap();
+        let card = pipe.card();
+        assert_eq!(card.up_next.len(), 1);
+        assert_eq!(card.up_next[0].title, "Voyager");
+
+        // A track that is *not* the head says nothing about the queue.
+        let mut unrelated = castaway_core::NowPlaying::default();
+        unrelated.title = Some("Contact".into());
+        pipe.now_playing(unrelated).await.unwrap();
+        assert_eq!(
+            pipe.card().up_next.len(),
+            1,
+            "unrelated track ate the queue"
+        );
+    }
 
     fn make_test_clip() -> Option<std::path::PathBuf> {
         let dir = std::env::temp_dir().join("castaway-render-test");
