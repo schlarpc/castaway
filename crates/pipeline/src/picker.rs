@@ -26,6 +26,12 @@ pub struct PickerItem {
     pub title: String,
     /// A dimmer second line — an address, a codec, a path.
     pub detail: Option<String>,
+    /// Whether this row is the one currently in effect — a choice list's checkmark.
+    ///
+    /// Marked rows draw a check where unmarked ones draw the go-somewhere chevron,
+    /// because in a choice list a row is a selection, not a doorway, and drawing the
+    /// chevron anyway would promise a screen that never comes.
+    pub marked: bool,
 }
 
 impl PickerItem {
@@ -36,6 +42,7 @@ impl PickerItem {
             id: id.into(),
             title: title.into(),
             detail: None,
+            marked: false,
         }
     }
 
@@ -43,6 +50,13 @@ impl PickerItem {
     #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    /// Builder-style current-choice marker.
+    #[must_use]
+    pub const fn with_marked(mut self, marked: bool) -> Self {
+        self.marked = marked;
         self
     }
 }
@@ -262,6 +276,8 @@ struct Palette {
     row_bg: Rgba,
     row_title: Rgba,
     row_detail: Rgba,
+    /// The current-choice check.
+    current: Rgba,
     back: Rgba,
     status: Rgba,
     failed: Rgba,
@@ -278,6 +294,7 @@ impl Default for Palette {
             row_bg: theme::PLATE,
             row_title: theme::TEXT_BODY,
             row_detail: theme::TEXT_DIM,
+            current: theme::ACCENT,
             back: theme::TEXT_DIM,
             status: theme::TEXT_DIM,
             // dma.space coral, for the one state that is bad news.
@@ -384,19 +401,37 @@ pub fn render(picker: &Picker, width: u32, height: u32) -> Result<Vec<u8>, Pipel
                 &f.regular,
             );
         }
-        // A chevron on the right: this row goes somewhere.
         let (cx, cy) = (rect.x + rect.w - 40.0 * s, rect.y + rect.h / 2.0);
-        shape::chevron(
-            &mut buf,
-            width,
-            height,
-            cx,
-            cy,
-            11.0 * s,
-            3.2 * s,
-            pal.row_detail,
-            shape::Facing::Right,
-        );
+        if item.marked {
+            // A check: this row is the one in effect right now.
+            let thickness = 3.2 * s;
+            let (ax, ay) = (cx - 11.0 * s, cy + 0.5 * s);
+            let (bx, by) = (cx - 3.5 * s, cy + 8.0 * s);
+            let (ex, ey) = (cx + 11.0 * s, cy - 8.0 * s);
+            for (x0, y0, x1, y1) in [(ax, ay, bx, by), (bx, by, ex, ey)] {
+                shape::fill_sdf(
+                    &mut buf,
+                    width,
+                    height,
+                    Rect::around(cx, cy, 16.0 * s),
+                    pal.current,
+                    |px, py| shape::sd_segment(px, py, x0, y0, x1, y1) - thickness / 2.0,
+                );
+            }
+        } else {
+            // A chevron on the right: this row goes somewhere.
+            shape::chevron(
+                &mut buf,
+                width,
+                height,
+                cx,
+                cy,
+                11.0 * s,
+                3.2 * s,
+                pal.row_detail,
+                shape::Facing::Right,
+            );
+        }
     }
 
     // A hint that there is more, top and bottom. A list that simply stops looks like a
@@ -647,6 +682,22 @@ mod tests {
         assert!(matches!(empty.status, PickerStatus::Empty(_)));
         let failed = Picker::loading("x", "Looking…").failed("the host refused");
         assert!(matches!(failed.status, PickerStatus::Failed(_)));
+    }
+
+    #[test]
+    fn a_marked_row_draws_its_check_not_a_doorway() {
+        // Same list twice, differing only in which row claims to be current: the pixels
+        // must differ, or "this one is in effect" is a field nobody can see.
+        let plain = Picker::loading("Output", "…")
+            .with_items(vec![PickerItem::new("a", "Speakers")], "none");
+        let marked = Picker::loading("Output", "…").with_items(
+            vec![PickerItem::new("a", "Speakers").with_marked(true)],
+            "none",
+        );
+        assert!(!plain.items[0].marked, "unmarked is the default");
+        let a = render(&plain, 1280, 720).unwrap();
+        let b = render(&marked, 1280, 720).unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
