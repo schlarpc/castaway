@@ -14,21 +14,35 @@
 //! both associate as clients sidesteps the whole state machine — which is also what
 //! Microsoft's own Surface Hub does. See `docs/miracast-protocol-notes.md` §1.8.
 //!
-//! ## What this cannot do without hardware
+//! ## Three sockets, not one
 //!
-//! A great deal, and it is worth being precise about which parts:
+//! wpa_supplicant looks like one daemon and is three control surfaces, and getting this
+//! wrong is silent:
 //!
-//! - **The driver has to support `P2P-GO` concurrently with the station interface.** Many
-//!   do not, several claim to and fail at group formation, and the answer for four driver
-//!   families depends on firmware rather than on the driver. §7.6 of the notes has the
-//!   table and the commands to check a given box.
-//! - **The peer's IP address is not something wpa_supplicant knows.** As group owner we
-//!   are expected to run a DHCP server on the group interface; the address then appears in
-//!   the kernel's neighbour table, which is where [`peer_address`] looks for it. A
-//!   deployment with no DHCP server on that interface will get [`MiracastError::Backend`]
-//!   naming exactly that, rather than a silent hang.
+//! - **The P2P management socket** (`p2p-dev-<iface>` on drivers with P2P-Device
+//!   support, the plain interface otherwise) — where P2P commands belong and, crucially,
+//!   where P2P events are *delivered*. Attached to the wrong one, every command answers
+//!   `OK` and no event ever arrives.
+//! - **The group interface's socket** (`p2p-<iface>-N`), which exists only while a group
+//!   does — the AP-mode WPS registrar lives there, so `WPS_PBC` must be sent there, and
+//!   `AP-STA-CONNECTED` may be emitted only there.
+//! - **The reply path back to us**, which binds in the abstract namespace because a
+//!   `/tmp` path does not resolve across the mount namespace `PrivateTmp=` builds.
 //!
-//! Both are recorded in `docs/OPEN-QUESTIONS.md`; neither is resolvable from CI.
+//! ## What this still cannot prove without hardware
+//!
+//! The whole sequence — group formation, WPS enrolment, DHCP across the group, the
+//! neighbour-table sweep, and the RTSP dial — runs in CI against mac80211_hwsim radios
+//! (`nix/miracast-vm-test.nix`). What that cannot vouch for is a *driver*: hwsim is the
+//! best-behaved mac80211 implementation there is, and §7.6 of the protocol notes is a
+//! table of real chipsets that advertise `P2P-GO` and then fail at group formation. The
+//! driver check (OPEN-QUESTIONS Q7a) remains the hardware's to pass.
+//!
+//! The peer's IP address is not something wpa_supplicant knows: as group owner we are
+//! expected to run a DHCP server on the group interface (the NixOS module does, via
+//! networkd, from the same `group_cidr` this backend sweeps), and the address appears in
+//! the kernel's neighbour table, which is where [`peer_address`] looks — after making
+//! the kernel ask, since in WFD the peer has no reason to speak to us first.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -419,6 +433,30 @@ struct GroupControl {
     control: Option<WpaControl>,
 }
 
+/// Connect to the interface's *P2P management* socket.
+///
+/// On drivers with P2P-Device support (iwlwifi, mac80211_hwsim, mt76, ath10k — most of
+/// the viable table in protocol notes §7.6), wpa_supplicant runs P2P on a dedicated
+/// `p2p-dev-<iface>` interface with a control socket of its own, and that socket is
+/// where every P2P event is delivered and where the P2P configuration lives. A backend
+/// attached to the netdev's socket issues commands that all answer `OK` — they are
+/// routed to the management interface internally — and then never hears
+/// `P2P-GROUP-STARTED` come back. Prefer the management socket; fall back to the plain
+/// interface for drivers without a P2P Device.
+async fn connect_p2p_management(
+    control_dir: &Path,
+    interface: &str,
+) -> Result<WpaControl, MiracastError> {
+    let management = format!("p2p-dev-{interface}");
+    match WpaControl::connect(control_dir, &management).await {
+        Ok(control) => {
+            debug!(socket = %management, "using the P2P Device management socket");
+            Ok(control)
+        }
+        Err(_) => WpaControl::connect(control_dir, interface).await,
+    }
+}
+
 /// How long two `AP-STA-CONNECTED` events for the same peer are treated as one.
 ///
 /// Both the parent and the group socket can emit the association, and serving the same
@@ -435,7 +473,7 @@ impl castaway_core::MiracastBackend for LinuxMiracastBackend {
         // a capped backoff instead — each failure says what is missing.
         let mut backoff = Duration::from_secs(1);
         let control = loop {
-            match WpaControl::connect(&self.config.control_dir, &self.config.interface).await {
+            match connect_p2p_management(&self.config.control_dir, &self.config.interface).await {
                 Ok(control) => match self.bring_up(&control).await {
                     Ok(()) => break control,
                     Err(e) => warn!(error = %e, "Miracast bring-up failed; retrying"),
