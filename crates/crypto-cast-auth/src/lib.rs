@@ -59,6 +59,43 @@ pub enum SigAlgo {
     RsaPkcs1v15,
 }
 
+/// What the receiver must put in `AuthResponse.sender_nonce`.
+///
+/// Not a free choice, and not simply "whatever the sender sent". Openscreen
+/// builds the blob it verifies from the nonce the receiver *echoes*, not the one
+/// it issued:
+///
+/// ```text
+/// size_t nonce_response_size = nonce_response.size();
+/// ErrorOr<std::vector<uint8_t>> nonce_plus_peer_cert_der =
+///     peer_cert.SerializeToDER(nonce_response_size);
+/// ```
+///
+/// So the echo has to describe what the signature actually covers. Getting it
+/// wrong costs nothing at the TLS layer and fails every session at the auth
+/// layer, which is why it travels with the signature instead of being decided at
+/// the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NonceEcho {
+    /// Echo nothing: the signature covers the peer certificate alone. Required by
+    /// replayed signatures, which cannot have covered a nonce chosen after they
+    /// were computed.
+    Empty,
+    /// Echo these bytes: the signature covers `nonce || peer_cert_der`.
+    Sender(Vec<u8>),
+}
+
+impl NonceEcho {
+    /// The bytes to echo, or `None` to leave the field unset.
+    #[must_use]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Empty => None,
+            Self::Sender(nonce) => Some(nonce),
+        }
+    }
+}
+
 /// The material `proto-cast` needs to build an `AuthResponse`.
 #[derive(Debug, Clone)]
 pub struct SignedAuth {
@@ -72,6 +109,9 @@ pub struct SignedAuth {
     pub hash: HashAlgo,
     /// The signature algorithm used.
     pub algorithm: SigAlgo,
+    /// What to echo in `sender_nonce`, determined by what [`Self::signature`]
+    /// covers. See [`NonceEcho`].
+    pub nonce_echo: NonceEcho,
 }
 
 /// Signs Cast device-auth challenges with a fixed device key + certificate chain.
@@ -218,6 +258,9 @@ impl CastDeviceSigner {
             intermediate_certificate: self.intermediates_der.clone(),
             hash,
             algorithm: SigAlgo::RsaPkcs1v15,
+            // We just signed whatever `sender_nonce` was prepended, so the echo is
+            // exactly that — echoing more or less than we signed is what breaks.
+            nonce_echo: sender_nonce.map_or(NonceEcho::Empty, |n| NonceEcho::Sender(n.to_vec())),
         })
     }
 }
@@ -268,6 +311,29 @@ mod tests {
         let vk = VerifyingKey::<Sha256>::new(signer.public_key());
         let sig = Signature::try_from(signed.signature.as_slice()).unwrap();
         assert!(vk.verify(b"cert-b", &sig).is_err());
+    }
+
+    /// The echo has to describe what was signed. A signer that prepends a nonce
+    /// must echo it; one that signs the certificate alone must echo nothing, or
+    /// the sender rebuilds a different message and verification fails.
+    #[test]
+    fn nonce_echo_describes_what_was_signed() {
+        let signer = &dev().signer;
+        let nonce = [0x5Au8; 16];
+        assert_eq!(
+            signer
+                .sign(b"cert", Some(&nonce), HashAlgo::Sha256)
+                .unwrap()
+                .nonce_echo,
+            NonceEcho::Sender(nonce.to_vec())
+        );
+        assert_eq!(
+            signer
+                .sign(b"cert", None, HashAlgo::Sha256)
+                .unwrap()
+                .nonce_echo,
+            NonceEcho::Empty
+        );
     }
 
     #[test]
