@@ -72,6 +72,64 @@ impl Rect {
 
 #[cfg(feature = "render")]
 mod draw {
+    /// Rasterise an SVG mark into a `side`x`side` alpha coverage mask, fitted and
+    /// centred. The mask carries only coverage; the caller supplies the colour, which
+    /// is what lets one piece of vendored artwork serve every palette state.
+    ///
+    /// `None` if the artwork will not parse or the size is degenerate, which callers
+    /// take as "draw nothing": a control with no glyph is legible, and a panic here
+    /// would take down a screen over a decoration.
+    #[must_use]
+    pub fn svg_mask(svg: &str, side: u32) -> Option<Vec<u8>> {
+        use resvg::tiny_skia;
+        let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).ok()?;
+        let mut pixmap = tiny_skia::Pixmap::new(side, side)?;
+        let size = tree.size();
+        // Fit rather than stretch: marks live on a square-ish grid, but nothing
+        // guarantees the next one will, and a stretched mark is worse than a small one.
+        let scale = (side as f32 / size.width()).min(side as f32 / size.height());
+        let transform = tiny_skia::Transform::from_translate(
+            (side as f32 - size.width() * scale) / 2.0,
+            (side as f32 - size.height() * scale) / 2.0,
+        )
+        .pre_scale(scale, scale);
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        Some(pixmap.data().chunks_exact(4).map(|px| px[3]).collect())
+    }
+
+    /// Blend a coverage mask centred on `(cx, cy)` in `color`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_mask(
+        buf: &mut [u8],
+        width: u32,
+        height: u32,
+        mask: &[u8],
+        side: u32,
+        cx: f32,
+        cy: f32,
+        color: crate::text::Rgba,
+    ) {
+        let ox = cx - side as f32 / 2.0;
+        let oy = cy - side as f32 / 2.0;
+        for y in 0..side {
+            for x in 0..side {
+                let a = mask[(y * side + x) as usize];
+                if a == 0 {
+                    continue;
+                }
+                crate::text::blend_over(
+                    buf,
+                    width,
+                    height,
+                    (ox + x as f32) as i32,
+                    (oy + y as f32) as i32,
+                    color,
+                    f32::from(a) / 255.0,
+                );
+            }
+        }
+    }
+
     use super::Rect;
     use crate::text::{self, Rgba};
 

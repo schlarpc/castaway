@@ -564,22 +564,69 @@ mod paint {
                 TransportControl::PlayPause => {
                     let r = l.glyph * 0.78;
                     crate::shape::disc(&mut buf, width, height, cx, cy, r * 2.0, pal.disc);
+                    // Play nudged right of centre: its triangle's visual mass sits left
+                    // of the glyph box's middle, and every player nudges it.
                     if model.state.is_active() {
-                        pause_glyph(&mut buf, width, height, cx, cy, l.glyph * 0.72, pal.on_disc);
+                        draw_icon(
+                            &mut buf,
+                            width,
+                            height,
+                            cx,
+                            cy,
+                            l.glyph * 1.55,
+                            pal.on_disc,
+                            ICON_PAUSE,
+                        );
                     } else {
-                        play_glyph(&mut buf, width, height, cx, cy, l.glyph * 0.78, pal.on_disc);
+                        draw_icon(
+                            &mut buf,
+                            width,
+                            height,
+                            cx + l.glyph * 0.07,
+                            cy,
+                            l.glyph * 1.8,
+                            pal.on_disc,
+                            ICON_PLAY,
+                        );
                     }
                 }
                 TransportControl::Previous => {
-                    skip_glyph(&mut buf, width, height, cx, cy, l.glyph, pal.idle, false);
+                    draw_icon(
+                        &mut buf,
+                        width,
+                        height,
+                        cx,
+                        cy,
+                        l.glyph * 2.4,
+                        pal.idle,
+                        ICON_SKIP_PREVIOUS,
+                    );
                 }
                 TransportControl::Next => {
-                    skip_glyph(&mut buf, width, height, cx, cy, l.glyph, pal.idle, true);
+                    draw_icon(
+                        &mut buf,
+                        width,
+                        height,
+                        cx,
+                        cy,
+                        l.glyph * 2.4,
+                        pal.idle,
+                        ICON_SKIP_NEXT,
+                    );
                 }
                 TransportControl::Shuffle => {
                     let on = model.shuffle.unwrap_or(false);
                     let color = if on { pal.active } else { pal.idle };
-                    shuffle_glyph(&mut buf, width, height, cx, cy, l.glyph, color);
+                    draw_icon(
+                        &mut buf,
+                        width,
+                        height,
+                        cx,
+                        cy,
+                        l.glyph * 2.2,
+                        color,
+                        ICON_SHUFFLE,
+                    );
                     if on {
                         active_dot(
                             &mut buf,
@@ -595,7 +642,16 @@ mod paint {
                 TransportControl::Repeat => {
                     let mode = model.repeat.unwrap_or_default();
                     let color = if mode.is_on() { pal.active } else { pal.idle };
-                    repeat_glyph(&mut buf, width, height, cx, cy, l.glyph, color);
+                    draw_icon(
+                        &mut buf,
+                        width,
+                        height,
+                        cx,
+                        cy,
+                        l.glyph * 2.2,
+                        color,
+                        ICON_REPEAT,
+                    );
                     if matches!(mode, RepeatMode::Track) {
                         // Repeat-one is the mode people cannot tell from repeat-all at a
                         // glance, so it gets the numeral every music player puts there.
@@ -655,190 +711,35 @@ mod paint {
         crate::shape::disc(buf, width, height, cx, cy, glyph * 0.16, color);
     }
 
-    fn play_glyph(
-        buf: &mut [u8],
-        width: u32,
-        height: u32,
-        cx: f32,
-        cy: f32,
-        size: f32,
-        color: Rgba,
-    ) {
-        let h = size * 0.5;
-        let w = size * 0.44;
-        // Nudged right: a triangle centred on its bounding box looks left-of-centre inside a
-        // disc, because its visual mass is toward the flat edge.
-        let x = cx - w * 0.35 + size * 0.06;
-        let pts = [(x, cy - h), (x, cy + h), (x + w * 2.0, cy)];
-        crate::shape::fill_sdf(
-            buf,
-            width,
-            height,
-            crate::shape::Rect::around(cx, cy, size + 2.0),
-            color,
-            |px, py| crate::shape::sd_triangle(px, py, pts),
-        );
-    }
+    // The marks themselves are vendored artwork — Material Symbols geometry, the set
+    // every phone's player uses, so the panel's controls read instantly. Rasterised to
+    // a coverage mask and tinted, exactly as the tile glyphs are: the SDF-sketched
+    // approximations these replaced were close for the triangles and visibly wrong for
+    // pause and shuffle.
+    const ICON_PLAY: &str = include_str!("../assets/glyphs/transport/play.svg");
+    const ICON_PAUSE: &str = include_str!("../assets/glyphs/transport/pause.svg");
+    const ICON_SKIP_NEXT: &str = include_str!("../assets/glyphs/transport/skip-next.svg");
+    const ICON_SKIP_PREVIOUS: &str = include_str!("../assets/glyphs/transport/skip-previous.svg");
+    const ICON_SHUFFLE: &str = include_str!("../assets/glyphs/transport/shuffle.svg");
+    const ICON_REPEAT: &str = include_str!("../assets/glyphs/transport/repeat.svg");
 
-    fn pause_glyph(
-        buf: &mut [u8],
-        width: u32,
-        height: u32,
-        cx: f32,
-        cy: f32,
-        size: f32,
-        color: Rgba,
-    ) {
-        let bar_w = size * 0.17;
-        let bar_h = size * 0.5;
-        let gap = size * 0.19;
-        for sign in [-1.0f32, 1.0] {
-            let bx = cx + sign * (gap + bar_w / 2.0);
-            crate::shape::fill_sdf(
-                buf,
-                width,
-                height,
-                crate::shape::Rect::around(cx, cy, size + 2.0),
-                color,
-                |px, py| {
-                    crate::shape::sd_round_box(px, py, bx, cy, bar_w / 2.0, bar_h, bar_w * 0.28)
-                },
-            );
-        }
-    }
-
-    /// Skip: a triangle against a bar. `forward` points right (next), otherwise left (prev).
+    /// Rasterise and blend one vendored mark, centred, `side` pixels square.
     #[allow(clippy::too_many_arguments)]
-    fn skip_glyph(
+    fn draw_icon(
         buf: &mut [u8],
         width: u32,
         height: u32,
         cx: f32,
         cy: f32,
-        size: f32,
+        side: f32,
         color: Rgba,
-        forward: bool,
+        svg: &str,
     ) {
-        let dir = if forward { 1.0 } else { -1.0 };
-        let h = size * 0.42;
-        let w = size * 0.42;
-        let bar_w = size * 0.11;
-        let tip = cx + dir * w * 0.62;
-        let back = cx - dir * w * 0.5;
-        let pts = [(back, cy - h), (back, cy + h), (tip, cy)];
-        let bar_x = cx + dir * (w * 0.62 + bar_w * 0.9);
-        crate::shape::fill_sdf(
-            buf,
-            width,
-            height,
-            crate::shape::Rect::around(cx, cy, size + 2.0),
-            color,
-            |px, py| {
-                crate::shape::sd_triangle(px, py, pts).min(crate::shape::sd_round_box(
-                    px,
-                    py,
-                    bar_x,
-                    cy,
-                    bar_w / 2.0,
-                    h,
-                    bar_w * 0.3,
-                ))
-            },
-        );
-    }
-
-    /// Shuffle: two crossing paths, each running horizontally before and after the
-    /// crossing, with arrowheads on the right.
-    ///
-    /// The horizontal runs are what make this read as *shuffle* rather than as a cross:
-    /// two bare diagonals are an X, and an X on a wall panel is "close" or "error" to
-    /// everyone who walks past it.
-    fn shuffle_glyph(
-        buf: &mut [u8],
-        width: u32,
-        height: u32,
-        cx: f32,
-        cy: f32,
-        size: f32,
-        color: Rgba,
-    ) {
-        let s = size * 0.46;
-        let t = size * 0.075;
-        let (l, r) = (cx - s, cx + s * 0.62);
-        let (top, bot) = (cy - s * 0.5, cy + s * 0.5);
-        let stub = s * 0.34;
-        let head = size * 0.15;
-        crate::shape::fill_sdf(
-            buf,
-            width,
-            height,
-            crate::shape::Rect::around(cx, cy, size + 2.0),
-            color,
-            |px, py| {
-                // Each path: a horizontal entry, the diagonal that crosses the other, and
-                // a horizontal run into its arrowhead.
-                let path = |ay: f32, by: f32| {
-                    crate::shape::sd_segment(px, py, l, ay, l + stub, ay)
-                        .min(crate::shape::sd_segment(px, py, l + stub, ay, r - stub, by))
-                        .min(crate::shape::sd_segment(px, py, r - stub, by, r, by))
-                        - t
-                };
-                let arrow = |y: f32| {
-                    crate::shape::sd_triangle(
-                        px,
-                        py,
-                        [(r, y - head), (r, y + head), (r + head * 1.5, y)],
-                    )
-                };
-                path(top, bot)
-                    .min(path(bot, top))
-                    .min(arrow(top))
-                    .min(arrow(bot))
-            },
-        );
-    }
-
-    /// Repeat: a rounded loop, open at the top right, with an arrowhead closing it.
-    fn repeat_glyph(
-        buf: &mut [u8],
-        width: u32,
-        height: u32,
-        cx: f32,
-        cy: f32,
-        size: f32,
-        color: Rgba,
-    ) {
-        let s = size * 0.44;
-        let t = size * 0.075;
-        let head = size * 0.15;
-        crate::shape::fill_sdf(
-            buf,
-            width,
-            height,
-            crate::shape::Rect::around(cx, cy, size + 2.0),
-            color,
-            |px, py| {
-                // The ring, minus a notch at the top right where the arrowhead goes.
-                let ring =
-                    (crate::shape::sd_round_box(px, py, cx, cy, s, s * 0.82, s * 0.45).abs()) - t;
-                let notch_x = cx + s * 0.25;
-                let notched = if px > notch_x && py < cy - s * 0.35 {
-                    f32::MAX
-                } else {
-                    ring
-                };
-                let arrow = crate::shape::sd_triangle(
-                    px,
-                    py,
-                    [
-                        (notch_x, cy - s * 0.82 - head),
-                        (notch_x, cy - s * 0.82 + head),
-                        (notch_x + head * 1.6, cy - s * 0.82),
-                    ],
-                );
-                notched.min(arrow)
-            },
-        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let side = side.round().max(1.0) as u32;
+        if let Some(mask) = crate::shape::svg_mask(svg, side) {
+            crate::shape::blit_mask(buf, width, height, &mask, side, cx, cy, color);
+        }
     }
 }
 
