@@ -41,6 +41,34 @@ pub trait AudioOut: Send {
 /// observe that samples actually left the box — see `null::tests`.
 pub type AudioOutputFactory = std::sync::Arc<dyn Fn() -> Box<dyn AudioOut> + Send + Sync>;
 
+pub use crate::audio_select::{
+    OutputBackendKind, OutputDeviceInfo, OutputSelection, OutputSelector,
+};
+
+/// An output honouring `selection`, from the active backend.
+///
+/// The dispatch mirrors [`active_backend`] exactly; a build where they disagreed would
+/// offer devices it then couldn't open.
+#[must_use]
+pub fn selected_output(selection: &OutputSelection) -> Box<dyn AudioOut> {
+    #[cfg(feature = "audio-out")]
+    {
+        Box::new(CpalAudioOut::with_selection(selection.clone()))
+    }
+    #[cfg(not(feature = "audio-out"))]
+    {
+        let _ = selection;
+        Box::new(NullAudioOut::new())
+    }
+}
+
+/// A factory whose streams follow `selector` — the one the app installs everywhere, so
+/// a device picked on the settings screen reaches every source's next session.
+#[must_use]
+pub fn output_factory(selector: OutputSelector) -> AudioOutputFactory {
+    std::sync::Arc::new(move || selected_output(&selector.get()))
+}
+
 /// Counts what it is given and plays nothing.
 #[derive(Debug, Default)]
 pub struct NullAudioOut {
@@ -109,6 +137,12 @@ impl AudioOut for NullAudioOut {
 #[cfg(feature = "audio-out")]
 pub use cpal_backend::CpalAudioOut;
 
+/// The cpal host's output devices — `audio_select::list_output_devices`'s real half.
+#[cfg(feature = "audio-out")]
+pub(crate) fn cpal_devices() -> Result<Vec<OutputDeviceInfo>, PipelineError> {
+    cpal_backend::list_output_devices()
+}
+
 #[cfg(feature = "audio-out")]
 mod cpal_backend {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,7 +152,7 @@ mod cpal_backend {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use tracing::{info, warn};
 
-    use super::{AudioOut, PcmBlock, PipelineError};
+    use super::{AudioOut, OutputDeviceInfo, OutputSelection, PcmBlock, PipelineError};
 
     /// How many blocks may queue before the decoder is told to slow down.
     ///
@@ -135,6 +169,7 @@ mod cpal_backend {
     /// own, which parks until told to stop. This type then holds nothing but channels and
     /// is `Send` because it genuinely is.
     pub struct CpalAudioOut {
+        selection: OutputSelection,
         samples: Option<SyncSender<Vec<f32>>>,
         shutdown: Option<SyncSender<()>>,
         underruns: Arc<AtomicU64>,
@@ -156,10 +191,17 @@ mod cpal_backend {
     }
 
     impl CpalAudioOut {
-        /// An output that has not opened a device yet.
+        /// An output that has not opened a device yet, on the system default.
         #[must_use]
         pub fn new() -> Self {
+            Self::with_selection(OutputSelection::SystemDefault)
+        }
+
+        /// An output that will open whatever `selection` names.
+        #[must_use]
+        pub fn with_selection(selection: OutputSelection) -> Self {
             Self {
+                selection,
                 samples: None,
                 shutdown: None,
                 underruns: Arc::new(AtomicU64::new(0)),
@@ -187,18 +229,20 @@ mod cpal_backend {
             // the failure this whole path exists to avoid.
             let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
             let underruns = Arc::clone(&self.underruns);
+            let selection = self.selection.clone();
 
             std::thread::spawn(move || {
-                let stream = match open_stream(sample_rate, channels, samples_rx, underruns) {
-                    Ok(s) => {
-                        let _ = ready_tx.send(Ok(()));
-                        s
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
+                let stream =
+                    match open_stream(&selection, sample_rate, channels, samples_rx, underruns) {
+                        Ok(s) => {
+                            let _ = ready_tx.send(Ok(()));
+                            s
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
                 // Park until stop() drops the sender or sends. The stream lives exactly
                 // as long as this scope, on this thread, and never crosses a boundary.
                 let _ = shutdown_rx.recv();
@@ -244,17 +288,52 @@ mod cpal_backend {
         }
     }
 
+    /// The output devices cpal's host can list, by name.
+    pub(super) fn list_output_devices() -> Result<Vec<OutputDeviceInfo>, PipelineError> {
+        let host = cpal::default_host();
+        let devices = host
+            .output_devices()
+            .map_err(|e| PipelineError::Audio(format!("listing output devices: {e}")))?;
+        Ok(devices
+            .filter_map(|d| d.name().ok())
+            .map(|name| OutputDeviceInfo {
+                id: name.clone(),
+                label: name,
+            })
+            .collect())
+    }
+
+    /// The device `selection` names, or the default.
+    ///
+    /// A named device that is not there falls back to the default *with a warning*
+    /// rather than failing the session: the case this happens in is a USB DAC that was
+    /// unplugged, and a panel that goes silent because its favourite device left is
+    /// worse than one that plays from the wrong speakers and says so.
+    fn pick_device(host: &cpal::Host, selection: &OutputSelection) -> Result<cpal::Device, String> {
+        if let OutputSelection::Device(name) = selection {
+            let found = host
+                .output_devices()
+                .map_err(|e| format!("listing output devices: {e}"))?
+                .find(|d| d.name().is_ok_and(|n| n == *name));
+            match found {
+                Some(device) => return Ok(device),
+                None => warn!(device = %name, "configured output device not found; using default"),
+            }
+        }
+        host.default_output_device()
+            .ok_or_else(|| "no default output device".to_owned())
+    }
+
     /// Build and start the output stream. Runs on the audio thread.
     fn open_stream(
+        selection: &OutputSelection,
         sample_rate: u32,
         channels: u16,
         rx: Receiver<Vec<f32>>,
         underruns: Arc<AtomicU64>,
     ) -> Result<cpal::Stream, String> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| "no default output device".to_owned())?;
+        let device = pick_device(&host, selection)?;
 
         // Ask for exactly what the stream is. A device that refuses gets the
         // conversation resolved here rather than by something downstream silently
@@ -350,6 +429,18 @@ mod tests {
         out.start(44_100, 2).unwrap();
         out.stop();
         assert_eq!(out.format(), None);
+    }
+
+    #[test]
+    fn the_factory_reads_the_selector_per_stream_not_at_creation() {
+        // A device picked on the settings screen must reach the *next* session without
+        // rebuilding the factory. All this can assert headlessly is that construction
+        // succeeds either way; the dispatch itself is compile-time.
+        let sel = OutputSelector::default();
+        let factory = output_factory(sel.clone());
+        let _first = factory();
+        sel.set(OutputSelection::Device("dac".into()));
+        let _second = factory();
     }
 
     #[test]
