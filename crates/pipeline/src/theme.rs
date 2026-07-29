@@ -138,8 +138,10 @@ pub enum Season {
     Pride,
     /// Trans Day of Visibility, 31 March.
     Trans,
-    /// International Asexuality Day, 6 April.
+    /// Asexuality: International Asexuality Day (6 April) and Ace Week (22–28 October).
     Ace,
+    /// Intersex Awareness Day, 26 October.
+    Intersex,
     /// Lesbian Visibility Week, 22–28 April.
     Lesbian,
     /// Pansexual Pride Day, 24 May.
@@ -160,10 +162,11 @@ const SEASON_STRENGTH: f32 = 0.22;
 
 impl Season {
     /// Every season, so a test can prove each one is reachable and legible.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Pride,
         Self::Trans,
         Self::Ace,
+        Self::Intersex,
         Self::Lesbian,
         Self::Pan,
         Self::NonBinary,
@@ -179,6 +182,7 @@ impl Season {
             Self::Pride => "pride",
             Self::Trans => "trans",
             Self::Ace => "ace",
+            Self::Intersex => "intersex",
             Self::Lesbian => "lesbian",
             Self::Pan => "pan",
             Self::NonBinary => "non-binary",
@@ -199,6 +203,7 @@ impl Season {
             Self::Pride => &PRIDE,
             Self::Trans => &TRANS,
             Self::Ace => &ACE,
+            Self::Intersex => &INTERSEX,
             Self::Lesbian => &LESBIAN,
             Self::Pan => &PAN,
             Self::NonBinary => &NONBINARY,
@@ -258,6 +263,8 @@ pub enum ThemeChoice {
     Trans,
     /// Asexual, all year.
     Ace,
+    /// Intersex, all year.
+    Intersex,
     /// Lesbian, all year.
     Lesbian,
     /// Pansexual, all year.
@@ -274,12 +281,13 @@ pub enum ThemeChoice {
 
 impl ThemeChoice {
     /// Every choice, so a test can prove each season can be asked for by name.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Auto,
         Self::Plain,
         Self::Pride,
         Self::Trans,
         Self::Ace,
+        Self::Intersex,
         Self::Lesbian,
         Self::Pan,
         Self::NonBinary,
@@ -296,6 +304,7 @@ impl ThemeChoice {
             Self::Pride => Some(Season::Pride),
             Self::Trans => Some(Season::Trans),
             Self::Ace => Some(Season::Ace),
+            Self::Intersex => Some(Season::Intersex),
             Self::Lesbian => Some(Season::Lesbian),
             Self::Pan => Some(Season::Pan),
             Self::NonBinary => Some(Season::NonBinary),
@@ -349,6 +358,13 @@ const ACE: [Rgba; 4] = [
     [0xa3, 0xa3, 0xa3, 0xff],
     [0xff, 0xff, 0xff, 0xff],
     [0x80, 0x00, 0x80, 0xff],
+];
+
+/// The intersex flag: a purple ring on yellow, read here as a band across it.
+const INTERSEX: [Rgba; 3] = [
+    [0xff, 0xd8, 0x00, 0xff],
+    [0x79, 0x02, 0xaa, 0xff],
+    [0xff, 0xd8, 0x00, 0xff],
 ];
 
 /// The lesbian flag, five-stripe community version: orange-red through white to magenta.
@@ -416,7 +432,14 @@ pub const fn season(month: u32, day: u32) -> Option<Season> {
         // version ran 1–26 December on the theory that a decoration appearing on the day
         // has missed it, which had it gone by the time anyone was off work.
         (12, 25..=31) | (1, 1..=5) => Some(Season::Christmas),
-        (10, 24..=31) => Some(Season::Halloween),
+        // October holds three, so it needs a rule: **a single-day observance outranks a
+        // week it falls inside**, because the week has six other days to be seen on and
+        // the day has none. Hence Intersex Awareness Day before Ace Week, which contains
+        // it. Halloween is only the two days it is actually about — a week of it crowded
+        // out everything else in the month for a night.
+        (10, 26) => Some(Season::Intersex),
+        (10, 22..=28) => Some(Season::Ace),
+        (10, 30..=31) => Some(Season::Halloween),
         _ => None,
     }
 }
@@ -453,6 +476,12 @@ mod tests {
         assert_eq!(season(6, 30), Some(Season::Pride));
         assert_eq!(season(3, 31), Some(Season::Trans));
         assert_eq!(season(10, 31), Some(Season::Halloween));
+        assert_eq!(season(10, 30), Some(Season::Halloween));
+        assert_eq!(
+            season(10, 29),
+            None,
+            "Halloween is the two days it is about"
+        );
         // Christmas is the twelve days, so it starts on the 25th and crosses the year.
         assert_eq!(season(12, 25), Some(Season::Christmas));
         assert_eq!(season(12, 31), Some(Season::Christmas));
@@ -464,6 +493,18 @@ mod tests {
         assert_eq!(season(3, 14), None);
         assert_eq!(season(3, 30), None, "the day before is not the day");
         assert_eq!(season(10, 1), None);
+    }
+
+    #[test]
+    fn a_day_outranks_the_week_it_sits_inside() {
+        // October is the crowded month and this is the rule that resolves it: Intersex
+        // Awareness Day falls in the middle of Ace Week, and the day wins because it has
+        // no other chance to land.
+        assert_eq!(season(10, 22), Some(Season::Ace));
+        assert_eq!(season(10, 26), Some(Season::Intersex));
+        assert_eq!(season(10, 28), Some(Season::Ace));
+        // ...and Halloween is clear of both.
+        assert_eq!(season(10, 31), Some(Season::Halloween));
     }
 
     #[test]

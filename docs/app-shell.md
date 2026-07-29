@@ -103,8 +103,15 @@ Three rules it exists to enforce:
   the calendar picks, `plain` never decorates, and naming a season wears it all year. The
   calendar is Pride (June), Trans Day of Visibility (31 March), International Asexuality
   Day (6 April), Lesbian Visibility Week (22–28 April), Pansexual Pride Day (24 May),
-  Non-Binary Awareness Week (8–14 July), Bisexual Awareness Week (16–23 September),
-  Halloween (24–31 October) and the twelve days of Christmas (25 December – 5 January).
+  Non-Binary Awareness Week (8–14 July), Bisexual Awareness Week (16–23 September), Ace
+  Week (22–28 October), Intersex Awareness Day (26 October), Halloween (30–31 October)
+  and the twelve days of Christmas (25 December – 5 January).
+
+  October holds three of those, so the calendar needs a precedence rule: **a single-day
+  observance outranks a week it falls inside**, because the week has six other days to be
+  seen on and the day has none. Intersex Awareness Day therefore wins the 26th from Ace
+  Week, which contains it. Halloween is only the two days it is actually about — a week of
+  it crowded out the rest of the month for one night.
 
   A season's hues are mixed only **22%** into the panel's own dark ramp, because a flag at
   full strength is a lightbox and every screen here is white text. That constraint is what
