@@ -64,9 +64,7 @@ impl CksIdentity {
         let config = self.config_for(&credential)?;
         Ok((
             TlsAcceptor::from(config),
-            Box::new(CksAuthResponder {
-                credential: Arc::clone(&credential),
-            }),
+            Box::new(CksAuthResponder::new(Arc::clone(&credential))),
         ))
     }
 
@@ -115,9 +113,25 @@ impl CksIdentity {
     }
 }
 
-/// Answers a challenge with the credential's precomputed signature.
-struct CksAuthResponder {
+/// Answers a challenge with a credential's precomputed signature.
+///
+/// The counterpart to [`crate::auth::CastAuthResponder`] for material we did not
+/// sign. Public so a credential can be exercised without standing up a provider —
+/// the device-auth vectors do exactly that, at a fixed clock, from the static
+/// table.
+pub struct CksAuthResponder {
     credential: Arc<CastCredential>,
+}
+
+impl CksAuthResponder {
+    /// Answer challenges from `credential`.
+    ///
+    /// The caller is responsible for presenting `credential`'s peer certificate in
+    /// TLS; [`CksIdentity`] is the thing that guarantees it.
+    #[must_use]
+    pub fn new(credential: Arc<CastCredential>) -> Self {
+        Self { credential }
+    }
 }
 
 impl DeviceAuthResponder for CksAuthResponder {
@@ -162,9 +176,7 @@ mod tests {
     #[tokio::test]
     async fn the_response_does_not_echo_the_senders_nonce() {
         let identity = identity().await;
-        let responder = CksAuthResponder {
-            credential: identity.credential(),
-        };
+        let responder = CksAuthResponder::new(identity.credential());
         let response = responder
             .respond(&challenge(Some(HashAlgorithm::Sha256)))
             .unwrap();
@@ -180,9 +192,7 @@ mod tests {
     async fn the_signature_matches_the_certificate_the_acceptor_presents() {
         let identity = identity().await;
         let credential = identity.credential();
-        let responder = CksAuthResponder {
-            credential: Arc::clone(&credential),
-        };
+        let responder = CksAuthResponder::new(Arc::clone(&credential));
         let response = responder
             .respond(&challenge(Some(HashAlgorithm::Sha256)))
             .unwrap();
@@ -205,9 +215,7 @@ mod tests {
     #[tokio::test]
     async fn an_unspecified_hash_is_answered_with_sha1() {
         let identity = identity().await;
-        let responder = CksAuthResponder {
-            credential: identity.credential(),
-        };
+        let responder = CksAuthResponder::new(identity.credential());
         let response = responder.respond(&challenge(None)).unwrap();
         assert_eq!(response.hash_algorithm, Some(HashAlgorithm::Sha1 as i32));
         assert_eq!(

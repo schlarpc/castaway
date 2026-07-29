@@ -29,7 +29,7 @@ pub mod session;
 
 pub use actor::{CastIdentity, CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;
-pub use cks::CksIdentity;
+pub use cks::{CksAuthResponder, CksIdentity};
 pub use control::CastRemote;
 pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};

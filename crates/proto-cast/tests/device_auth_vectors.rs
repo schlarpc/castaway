@@ -21,7 +21,7 @@ use crypto_cast_auth::{CastDeviceSigner, DevCredential, HashAlgo};
 use prost::Message as _;
 use proto_cast::proto::{AuthChallenge, AuthResponse, DeviceAuthMessage, HashAlgorithm};
 use proto_cast::session::DeviceAuthResponder as _;
-use proto_cast::{CastAuthResponder, TlsIdentity};
+use proto_cast::{CastAuthResponder, CksAuthResponder, TlsIdentity};
 use rsa::pkcs8::DecodePrivateKey as _;
 
 /// The clock every vector is generated and verified at. Fixed so the certificate windows
@@ -257,6 +257,73 @@ fn vectors() -> Vec<Vector> {
             anchor: Some(root),
             at: AT + 30 * 24 * 60 * 60,
             expect: "error kCastV2TlsCertExpired",
+        },
+    ]
+    .into_iter()
+    .chain(cks_vectors())
+    .collect()
+}
+
+/// The CKS credential, against the trust store senders actually ship.
+///
+/// This is the pair `dev-chain-google-roots` was waiting for. Everything about the
+/// dev response is right except whose root it chains to; these two are the same
+/// response shape with a chain that reaches `Eureka Root CA`, and the verdict on
+/// the first one is the whole point of `cast-cks` existing.
+///
+/// Generated from the checked-in table at [`AT`], so this needs no network and is
+/// byte-identical every run: the window is fixed, the peer key is fixed, and
+/// PKCS#1 v1.5 signing is deterministic.
+fn cks_vectors() -> Vec<Vector> {
+    let table = cast_cks::StaticTable::load().unwrap();
+    let credential = std::sync::Arc::new(table.credential_at(i64::try_from(AT).unwrap()).unwrap());
+    let (peer_cert, _key) = credential.tls_identity();
+    let peer_cert = peer_cert.to_vec();
+
+    let responder = CksAuthResponder::new(std::sync::Arc::clone(&credential));
+    let response = responder
+        .respond(&challenge(Some(NONCE.to_vec()), HashAlgorithm::Sha256))
+        .unwrap();
+
+    // The same response with the sender's nonce echoed back. The signature is
+    // untouched and still covers the certificate alone, so a sender rebuilds
+    // `nonce || cert` and refuses it.
+    let echoed = AuthResponse {
+        sender_nonce: Some(NONCE.to_vec()),
+        ..response.clone()
+    };
+
+    vec![
+        // The flip. A real sender, with the roots it ships, accepts this receiver.
+        Vector {
+            name: "cks-chain-google-roots",
+            peer_cert: peer_cert.clone(),
+            nonce: NONCE.to_vec(),
+            auth: DeviceAuthMessage {
+                challenge: None,
+                response: Some(response),
+                error: None,
+            },
+            anchor: None,
+            at: AT,
+            expect: "ok",
+        },
+        // The negative control for the rule the replay depends on, and the reason
+        // `NonceEcho` is a type rather than a comment: echo anything and the same
+        // signature stops verifying. Without this, the case above passing would not
+        // establish that the empty echo is what carries it.
+        Vector {
+            name: "cks-nonce-echoed",
+            peer_cert,
+            nonce: NONCE.to_vec(),
+            auth: DeviceAuthMessage {
+                challenge: None,
+                response: Some(echoed),
+                error: None,
+            },
+            anchor: None,
+            at: AT,
+            expect: "error kCastV2SignedBlobsMismatch",
         },
     ]
 }

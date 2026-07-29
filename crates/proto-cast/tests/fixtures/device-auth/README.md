@@ -19,10 +19,15 @@ Two things consume these, and the pair is the point:
 
 The keys are fixed and checked in for one reason: RSA PKCS#1 v1.5 signing is
 deterministic, and X.509 issuance here is too, so fixed keys plus a fixed clock make the
-whole vector byte-reproducible. **They are test keys and nothing else.** They authenticate
-no device, they are not the receiver's runtime identity — that one is generated at startup
-or provisioned via `cast.credential` — and a real device credential must never appear
-here, in this repository, or anywhere world-readable.
+whole vector byte-reproducible. **`dev-*-key.pem` and `tls-key.pem` are test keys and
+nothing else.** They authenticate no device, and a real *device* credential — one whose
+private key Google issued — must never appear here, in this repository, or anywhere
+world-readable.
+
+The `cks-*` vectors are the exception worth naming: they are generated from the peer key
+in `crates/cast-cks/fixtures/`, which is real material extracted from a shipped binary.
+It is not a device key — no software receiver holds one, which is the reason the replay
+exists at all — and its provenance and caveats are recorded in that directory's README.
 
 ## Reading the verdicts
 
@@ -33,8 +38,18 @@ here, in this repository, or anywhere world-readable.
   root it chains to: told to trust our dev root, a real sender accepts it.
 - `dev-chain-google-roots` — **kCastV2CertNotSignedByTrustedCa**. The same bytes against
   the trust store senders actually ship. This is the whole of why casting from Chrome
-  does not work, stated as an executed result rather than a belief, and it is the one case
-  a provisioned credential is supposed to flip.
+  does not work with a self-generated credential, stated as an executed result rather than
+  a belief.
+- `cks-chain-google-roots` — **ok**. The case above, flipped. Same receiver, same response
+  shape, a `cast-cks` credential instead of a generated one — and against the roots senders
+  actually ship, a real sender accepts it. This is the executed form of "Cast works now",
+  and it is generated offline from the checked-in table at a fixed clock, so it needs
+  neither the network nor the day it runs on.
+- `cks-nonce-echoed` — **kCastV2SignedBlobsMismatch**. The negative control for the rule
+  the whole replay rests on. The same credential and the same untouched signature, with the
+  sender's nonce echoed back: the sender rebuilds `nonce || cert` and refuses it. This is
+  why `NonceEcho` is a type rather than a comment — without this case, the one above
+  passing would not establish that the empty echo is what carries it.
 - `nonce-omitted`, `nonce-mismatched` — **ok**, both. The sender records a nonce mismatch
   and then ignores it: `VerifySenderNonce` defaults to not enforcing, and verification
   rebuilds the signed blob from the nonce the *response* echoed rather than the one it
