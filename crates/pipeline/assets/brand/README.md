@@ -8,8 +8,8 @@ these and keep the same file names.
 | File | Source | What it is |
 |---|---|---|
 | `brand-logo.svg` | `/assets/brand-logo.svg` | The `dma` wordmark + spark, 583×128. Authored as flat white paths with no fill colour of its own — the site tints it with `filter: invert(1)` on dark backgrounds. |
-| `mascot-inner.png` | `/assets/mascot-inner.png` | DMA-chan, inner layer, 808×1274. |
-| `mascot-outer.png` | `/assets/mascot-outer.png` | DMA-chan, outer layer, 808×1274. The site stacks the two, so either can be animated against the other. |
+| `mascot-inner.png` | `/assets/mascot-inner.png` | DMA-chan, inner layer, 808×1274. Her lower torso only — the rest of the frame is transparent, so on its own it looks like a stray shape. |
+| `mascot-outer.png` | `/assets/mascot-outer.png` | DMA-chan, outer layer, 808×1274. Head, arms and sash. The site stacks the two, so either can be animated against the other; **inner goes underneath**, because her arms have to occlude the body rather than the other way round. Drawing only this one leaves her without a lower half. |
 | `favicon.png` | `/favicon.png` | 96×96 mark. The only square-cropped form of the logo, so it is what a small tile or the home pill should use. |
 
 ## Palette

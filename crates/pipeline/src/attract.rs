@@ -83,10 +83,10 @@ impl WidgetSlot {
                 // from across the room, not merely present.
                 let card_w = (w * 42 / 100).clamp(1, w);
                 let card_h = (card_w * 9 / 16).clamp(1, h);
-                // Sits a little below the top margin, because the mascot leans on its
-                // top edge and her size is derived from the room above it — at the bare
-                // margin she comes out too small to read from across the room.
-                let top = (margin * 8 / 5).min(h.saturating_sub(card_h));
+                // Vertically centred. It is the minimised app, not a corner ornament,
+                // and centring also gives the mascot leaning on its top edge room to be
+                // a readable size — hers is derived from the gap above it.
+                let top = h.saturating_sub(card_h) / 2;
                 Some(InsetRect {
                     x: w.saturating_sub(margin.saturating_add(card_w)),
                     y: top,
@@ -521,11 +521,20 @@ pub fn render(scene: &AttractScene, width: u32, height: u32) -> Result<Vec<u8>, 
 /// panel. Decoding per render is fine: Home is drawn on navigation and resize, not per
 /// frame.
 fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<InsetRect>) {
-    const MASCOT: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
-    let Ok(img) = image::load_from_memory(MASCOT) else {
+    // Two layers, as the site stacks them: the outer is her silhouette and the inner is
+    // the body inside it. Drawing only one of them left her without a lower torso, which
+    // read as a cropping bug rather than a missing layer.
+    const MASCOT_OUTER: &[u8] = include_bytes!("../assets/brand/mascot-outer.png");
+    const MASCOT_INNER: &[u8] = include_bytes!("../assets/brand/mascot-inner.png");
+    let (Ok(outer), Ok(inner)) = (
+        image::load_from_memory(MASCOT_OUTER),
+        image::load_from_memory(MASCOT_INNER),
+    ) else {
         return;
     };
-    let img = img.to_rgba8();
+    let outer = outer.to_rgba8();
+    let inner = inner.to_rgba8();
+    let img = &outer;
     // She hangs over the panel's top edge with her elbows dangling across it. Only the
     // very bottom of her crosses that line — everything below it lands inside the card's
     // rect, which the browser layer covers exactly, so the overhang is hidden behind the
@@ -558,25 +567,29 @@ fn draw_mascot(buf: &mut [u8], width: u32, height: u32, s: f32, card: Option<Ins
             height as f32 - target_h as f32 - 60.0 * s,
         ),
     };
-    for py in 0..target_h {
-        for px in 0..target_w {
-            // Nearest-neighbour, like the album-art path: the source is far larger than
-            // the target, so the sampling artefacts a filter would fix are not visible.
-            let sx = px * iw / target_w.max(1);
-            let sy = py * ih / target_h.max(1);
-            let p = img.get_pixel(sx.min(iw - 1), sy.min(ih - 1)).0;
-            if p[3] == 0 {
-                continue;
+    // Inner (the lower torso) first, then outer over it: her arms and hands are on the
+    // outer layer and have to occlude the body, not be painted under it.
+    for layer in [&inner, &outer] {
+        for py in 0..target_h {
+            for px in 0..target_w {
+                // Nearest-neighbour, like the album-art path: the source is far larger
+                // than the target, so the artefacts a filter would fix are not visible.
+                let sx = px * iw / target_w.max(1);
+                let sy = py * ih / target_h.max(1);
+                let p = layer.get_pixel(sx.min(iw - 1), sy.min(ih - 1)).0;
+                if p[3] == 0 {
+                    continue;
+                }
+                text::blend_over(
+                    buf,
+                    width,
+                    height,
+                    (ox + px as f32) as i32,
+                    (oy + py as f32) as i32,
+                    [p[0], p[1], p[2], 0xff],
+                    f32::from(p[3]) / 255.0,
+                );
             }
-            text::blend_over(
-                buf,
-                width,
-                height,
-                (ox + px as f32) as i32,
-                (oy + py as f32) as i32,
-                [p[0], p[1], p[2], 0xff],
-                f32::from(p[3]) / 255.0,
-            );
         }
     }
 }
@@ -952,14 +965,18 @@ mod tests {
     }
 
     #[test]
-    fn widget_card_is_a_16_9_rect_in_the_top_right() {
+    fn widget_card_is_a_16_9_rect_on_the_right_and_vertically_centred() {
         let (w, h) = (3840, 2160);
         let card = WidgetSlot::RightCard.rect(w, h).unwrap();
         let aspect = f64::from(card.width) / f64::from(card.height);
         assert!((aspect - 16.0 / 9.0).abs() < 0.02, "aspect {aspect}");
         // Inside the surface, in the top-right quadrant.
         assert!(card.x + card.width < w && card.y + card.height < h);
-        assert!(card.x > w / 2 && card.y < h / 4);
+        assert!(card.x > w / 2, "the card belongs on the right");
+        // Centred within a row of slack, rather than pinned to the top: the mascot's
+        // size comes from the gap above it, so a card that crept upward would shrink her.
+        let centre_error = (card.y as i64 - ((h - card.height) / 2) as i64).abs();
+        assert!(centre_error < 4, "the card should be vertically centred");
         assert_eq!(WidgetSlot::None.rect(w, h), None);
     }
 
