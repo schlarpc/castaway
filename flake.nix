@@ -221,10 +221,16 @@
               || (pkgs.lib.hasSuffix ".ttf" path)
               || (pkgs.lib.hasSuffix ".bin" path)
               || (pkgs.lib.hasSuffix ".pem" path)
+              || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".txt" path);
             name = "source";
           };
           strictDeps = true;
+
+          # The revision the footer on the idle screen shows. Passed in rather than shelled
+          # out for, because the build sandbox has no `.git` and no `git` — see the app's
+          # `build.rs`, which falls back to asking git only for a plain `cargo build`.
+          CASTAWAY_GIT_REV = self.shortRev or self.dirtyShortRev or "unknown";
 
           buildInputs = [
             # Add additional build inputs here
