@@ -124,3 +124,42 @@ fn but_not_out_from_under_someone_using_it() {
 
     assert_eq!(render.shell_depth(), 2, "still where they left it");
 }
+
+#[test]
+fn an_audio_session_minimizes_into_the_widget_slot_and_restores() {
+    // The audio twin of the video PiP: a Spotify/Bluetooth session's card sits above
+    // the shell, so going home used to change nothing anyone could see. Now the card
+    // shrinks into the home screen's widget slot, and a tap there is how it comes back.
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
+        .unwrap();
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    render.pump();
+
+    let rect = pipeline::attract::WidgetSlot::RightCard.rect(W, H).unwrap();
+    let (cx, cy) = (
+        (rect.x as f32 + rect.width as f32 / 2.0) / W as f32,
+        (rect.y as f32 + rect.height as f32 / 2.0) / H as f32,
+    );
+    assert!(
+        !render.hit_minimized_card(cx, cy),
+        "fullscreen card is not a minimized one"
+    );
+
+    render.set_shell_foreground(true);
+    assert!(
+        render.hit_minimized_card(cx, cy),
+        "card should be in the slot"
+    );
+    assert!(
+        !render.hit_minimized_card(0.05, 0.05),
+        "the rest of the panel is not the card"
+    );
+
+    // Restoring is the slot tap's job (the kiosk routes it); from here it is just the
+    // shell going back.
+    render.set_shell_foreground(false);
+    assert!(!render.hit_minimized_card(cx, cy));
+}

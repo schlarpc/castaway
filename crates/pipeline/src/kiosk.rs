@@ -110,12 +110,13 @@ impl KioskApp {
             sink.cancel_all();
         }
         if let Some(render) = self.render.as_mut() {
-            // A fullscreen page (YouTube leanback) is asked to leave; video is only
-            // demoted below. The page is opaque and above the shell, so without this
-            // the gesture completed and the panel looked exactly the same.
+            // A fullscreen page (YouTube leanback) minimizes into the widget slot;
+            // video is demoted to a corner below. The page is opaque and above the
+            // shell, so without this the gesture completed and the panel looked
+            // exactly the same.
             #[cfg(feature = "electron")]
             if let Some(browser) = self.browser.as_mut() {
-                let _ = browser.dismiss_fullscreen(render);
+                let _ = browser.minimize_fullscreen(render);
             }
             render.shell_home();
             // Bring the shell in front. If something is playing it is demoted to a
@@ -139,8 +140,8 @@ impl KioskApp {
         };
         #[cfg(feature = "electron")]
         if let Some(browser) = self.browser.as_mut() {
-            if browser.dismiss_fullscreen(render) {
-                info!("shell: escape left the cast surface");
+            if browser.minimize_fullscreen(render) {
+                info!("shell: escape minimized the cast surface");
                 return;
             }
         }
@@ -149,6 +150,32 @@ impl KioskApp {
             return;
         }
         render.set_shell_foreground(true);
+    }
+
+    /// Restore whatever is minimized under a press, if anything. Returns whether the
+    /// press was spent doing so.
+    ///
+    /// A minimized surface is an app in the home screen's widget slot, and tapping a
+    /// minimized app means "bring it back" — never "forward my tap into it at 42%
+    /// scale". The audio card is checked first because it is the one drawn when both a
+    /// session and a minimized page exist (the session outranks the page's slot).
+    fn restore_minimized(&mut self, x: f32, y: f32) -> bool {
+        let Some(render) = self.render.as_mut() else {
+            return false;
+        };
+        if render.hit_minimized_card(x, y) {
+            render.set_shell_foreground(false);
+            info!("shell: restoring the playing session");
+            return true;
+        }
+        #[cfg(feature = "electron")]
+        if let Some(browser) = self.browser.as_mut() {
+            if browser.hit_minimized(x, y) && browser.restore_fullscreen(render) {
+                info!("shell: restoring the cast surface");
+                return true;
+            }
+        }
+        false
     }
 
     /// Update the pill layer for this frame. Cheap: while it is up and unchanging this
@@ -362,6 +389,10 @@ impl KioskApp {
                     if self.offer_to_transport(x, y, phase) {
                         return;
                     }
+                    // A minimized app restores on click, same as on tap.
+                    if down && self.restore_minimized(x, y) {
+                        return;
+                    }
                     // The shell sits under everything, so it only sees a press where
                     // nothing is covering it — `shell_hit` enforces that. Presses only:
                     // a release is the end of an interaction the press already claimed.
@@ -413,6 +444,11 @@ impl KioskApp {
                 // a browser that is not even visible there.
                 match event.phase {
                     TouchPhase::Down => {
+                        // A minimized app restores on tap, before the shell or the
+                        // page underneath can claim the press.
+                        if self.restore_minimized(event.x, event.y) {
+                            return;
+                        }
                         if self
                             .render
                             .as_ref()

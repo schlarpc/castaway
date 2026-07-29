@@ -1477,6 +1477,14 @@ impl RenderLoop {
         self.compositor.layer_size(LayerId::Attract)
     }
 
+    /// The pixel size of any layer's texture, if it has one. For the tests that ask
+    /// "which surface is this picture actually on" — minimize/restore moves the browser
+    /// between two layers, and presence alone cannot tell them apart.
+    #[must_use]
+    pub fn layer_size(&self, id: LayerId) -> Option<(u32, u32)> {
+        self.compositor.layer_size(id)
+    }
+
     /// Scroll the current screen, if it is something that scrolls.
     ///
     /// `dy` is a panel-normalized drag: positive is a finger moving down, which reveals
@@ -1541,6 +1549,7 @@ impl RenderLoop {
         }
         self.shell_front = front;
         self.place_video();
+        self.place_card();
     }
 
     /// Whether the shell is in front.
@@ -1581,6 +1590,58 @@ impl RenderLoop {
             opacity: 1.0,
             transform,
         });
+    }
+
+    /// Put the now-playing card where the current mode says it goes: the whole panel
+    /// normally, the home screen's widget slot when the shell is forward.
+    ///
+    /// The audio-session twin of [`Self::place_video`], and the reason the home gesture
+    /// visibly *works* from a Spotify or Bluetooth session: the card layers sit above
+    /// the shell, so bringing the shell forward changed nothing anyone could see. Now
+    /// the session minimizes into the card — the slot the idle clock occupies, which a
+    /// playing session already outranks (`LayerId::yields_to`) — exactly as every other
+    /// app surface does. Both rects are 16:9, so the scale is uniform.
+    fn place_card(&mut self) {
+        if !self.compositor.has_layer(LayerId::NowPlaying) {
+            return;
+        }
+        let (w, h) = self.compositor.target_size();
+        let (w, h) = (w.max(1), h.max(1));
+        let transform = if self.shell_front {
+            crate::attract::WidgetSlot::RightCard
+                .rect(w, h)
+                .map_or_else(Transform::default, |r| r.transform(w, h))
+        } else {
+            Transform::default()
+        };
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::NowPlaying,
+            opacity: 1.0,
+            transform,
+        });
+        // The strip's controls are unusably small at card scale; it returns with the
+        // full view. Suppressed, not removed — the texture and model stay warm.
+        self.compositor
+            .set_suppressed(LayerId::Transport, self.shell_front);
+    }
+
+    /// Whether a panel-normalized point is on the minimized now-playing card.
+    #[must_use]
+    pub fn hit_minimized_card(&self, x: f32, y: f32) -> bool {
+        if !(self.shell_front && self.compositor.has_layer(LayerId::NowPlaying)) {
+            return false;
+        }
+        let (w, h) = self.compositor.target_size();
+        let (w, h) = (w.max(1), h.max(1));
+        crate::attract::WidgetSlot::RightCard
+            .rect(w, h)
+            .is_some_and(|r| {
+                let t = r.transform(w, h);
+                x >= t.offset_x
+                    && y >= t.offset_y
+                    && x <= t.offset_x + t.scale_x
+                    && y <= t.offset_y + t.scale_y
+            })
     }
 
     /// Draw the home pill and place it as the shell's overlay layer.
@@ -1861,6 +1922,9 @@ impl RenderLoop {
                     Err(e) => error!(error = %e, "failed to render the now-playing card"),
                 }
                 self.set_transport(&card.transport(), w, h);
+                // A card published while someone is on the home screen arrives
+                // minimized rather than snatching the panel from under them.
+                self.place_card();
                 false
             }
             RenderCommand::Home(scene) => {

@@ -779,21 +779,63 @@ impl ElectronHost {
         self
     }
 
-    /// Leave a fullscreen page, if that is what the browser is showing. Returns whether
-    /// there was one to leave, so a back control knows the press is spent.
+    /// Minimize a fullscreen page into the home screen's widget slot. Returns whether
+    /// there was one to minimize, so a back control knows the press is spent.
     ///
-    /// The home gesture's missing half. Bringing the shell forward *demotes* video to a
-    /// corner, but a fullscreen page has no demoted form — it is opaque, above the
-    /// shell, and stays there, so the gesture fired and nothing visibly happened.
-    /// Leaving a page means leaving it: same endpoint a DIAL stop reaches, returning
-    /// the idle widget (or nothing). The widget role is left alone — it *is* the home
-    /// screen's own content.
-    pub fn dismiss_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
-        if self.role == BrowserRole::Fullscreen {
-            self.hide(render);
-            return true;
+    /// Going home *demotes* every playing surface rather than ending it: video shrinks
+    /// to a corner, an audio card into the widget slot, and a page — YouTube leanback —
+    /// does the same. The page is not navigated; it keeps playing at card size (its
+    /// audio keeps flowing through the tap), and a tap on the card restores it. Ending
+    /// the session stays what it always was: the sender's stop, or the page going idle.
+    pub fn minimize_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
+        if self.role != BrowserRole::Fullscreen {
+            return false;
         }
-        false
+        self.role = BrowserRole::AttractWidget;
+        // The fullscreen-size texture is the wrong shape for the card; drop it and let
+        // the first card-size paint bring the layer back (stale-size paints are
+        // released unimported in the meantime).
+        render.clear_browser();
+        let rect = self.role.view(self.size).rect;
+        if let Some(e) = &self.electron {
+            e.send(&ToBrowser::Resize {
+                width: rect.width,
+                height: rect.height,
+            });
+        }
+        true
+    }
+
+    /// Bring a minimized page back to fullscreen. Returns whether there was one.
+    pub fn restore_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
+        if !self.is_minimized() {
+            return false;
+        }
+        self.role = BrowserRole::Fullscreen;
+        render.clear_browser();
+        let rect = self.role.view(self.size).rect;
+        if let Some(e) = &self.electron {
+            e.send(&ToBrowser::Resize {
+                width: rect.width,
+                height: rect.height,
+            });
+        }
+        true
+    }
+
+    /// Whether the widget slot currently holds a minimized page rather than the idle
+    /// widget — i.e. tapping it means "restore", not "talk to the clock".
+    #[must_use]
+    pub fn is_minimized(&self) -> bool {
+        self.role == BrowserRole::AttractWidget
+            && self.current_url.is_some()
+            && self.current_url != self.widget
+    }
+
+    /// Whether a panel-normalized point lands on the minimized page's card.
+    #[must_use]
+    pub fn hit_minimized(&self, x: f32, y: f32) -> bool {
+        self.is_minimized() && !self.widget_covered && self.hit_view(x, y).is_some()
     }
 
     /// Track the kiosk surface size so the browser viewport matches.

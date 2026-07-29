@@ -353,15 +353,18 @@ fn browser_layer_present(render: &pipeline::render_pipeline::RenderLoop) -> bool
     render.browser_layer_present()
 }
 
-/// The home gesture's other half: leaving a fullscreen page actually leaves it.
+/// Going home minimizes a fullscreen page into the widget slot — it keeps playing
+/// small, and comes back on restore.
 ///
-/// Bringing the shell forward demotes *video*; a fullscreen page has no demoted form —
-/// it is opaque and above the shell, so unless going home dismisses it, the gesture
-/// completes and the panel looks exactly the same. That was the YouTube exit swipe
-/// "not working": it worked, invisibly.
+/// Bringing the shell forward demotes *video*; a page used to have no demoted form, so
+/// the exit swipe completed invisibly. Now the page is an app like the others: home
+/// shrinks it into the home screen's card, a tap brings it back, and its stale
+/// fullscreen-size paints must not resurrect the fullscreen layer in between.
 #[test]
 #[ignore = "needs a GPU and an Electron"]
-fn dismissing_a_fullscreen_page_takes_its_layer_down() {
+fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
+    use pipeline::compositor::LayerId;
+
     let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
         eprintln!("skipping: no usable GPU");
@@ -384,29 +387,55 @@ fn dismissing_a_fullscreen_page_takes_its_layer_down() {
     tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && !browser_layer_present(&render) {
+    while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_none() {
         host.pump(&mut render);
         render.pump();
         std::thread::sleep(Duration::from_millis(16));
     }
-    assert!(browser_layer_present(&render), "page never painted");
-
-    host.dismiss_fullscreen(&mut render);
-    // With no widget configured, dismissing leaves nothing behind; the layer must be
-    // gone at once, not whenever the page happens to stop painting.
     assert!(
-        !browser_layer_present(&render),
-        "the fullscreen layer should be down after a dismiss"
+        render.layer_size(LayerId::BrowserFullscreen).is_some(),
+        "page never painted fullscreen"
     );
-    // And it stays down: a stale paint from the dismissed page must not resurrect it.
-    for _ in 0..30 {
+
+    assert!(
+        host.minimize_fullscreen(&mut render),
+        "nothing to minimize?"
+    );
+    assert!(
+        render.layer_size(LayerId::BrowserFullscreen).is_none(),
+        "the fullscreen texture should be down at once"
+    );
+
+    // The page repaints at card size and lands in the widget slot; fullscreen-size
+    // paints still in flight are released unimported and must not resurrect the layer.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut widget = None;
+    while Instant::now() < deadline && widget.is_none() {
+        host.pump(&mut render);
+        render.pump();
+        assert!(
+            render.layer_size(LayerId::BrowserFullscreen).is_none(),
+            "a stale paint resurrected the fullscreen layer"
+        );
+        widget = render.layer_size(LayerId::BrowserWidget);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let (w, h) = widget.expect("the page never arrived in the widget slot");
+    assert!(
+        w < 1280 && h < 720,
+        "minimized paint should be card-sized, got {w}x{h}"
+    );
+
+    assert!(host.restore_fullscreen(&mut render), "nothing to restore?");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_none() {
         host.pump(&mut render);
         render.pump();
         std::thread::sleep(Duration::from_millis(16));
     }
     assert!(
-        !browser_layer_present(&render),
-        "the dismissed page came back on its own"
+        render.layer_size(LayerId::BrowserFullscreen).is_some(),
+        "the page never came back fullscreen"
     );
 
     host.shutdown();
