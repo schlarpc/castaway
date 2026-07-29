@@ -552,6 +552,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "cast-cks",
  "castaway-core",
  "castaway-paths",
  "control-display",
@@ -3742,6 +3743,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "cast-cks",
  "castaway-core",
  "crypto-cast-auth",
  "ctr",

@@ -14,6 +14,7 @@
 
 pub mod actor;
 pub mod auth;
+pub mod cks;
 pub mod control;
 pub mod error;
 pub mod framing;
@@ -26,8 +27,9 @@ pub mod rtp;
 pub mod rtp_actor;
 pub mod session;
 
-pub use actor::{CastReceiver, TlsIdentity};
+pub use actor::{CastIdentity, CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;
+pub use cks::CksIdentity;
 pub use control::CastRemote;
 pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};

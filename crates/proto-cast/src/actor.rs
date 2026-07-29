@@ -5,8 +5,9 @@
 //!
 //! Senders reach us over TLS with a certificate they never validate: CASTv2
 //! authenticates the *device*, not the transport. The binding between the two is the
-//! device-auth handshake, which signs over this connection's TLS certificate — so the
-//! actor keeps its certificate DER and hands it to [`CastAuthResponder`] per connection.
+//! device-auth handshake, whose signature covers this connection's TLS certificate — so
+//! the acceptor and the responder are drawn together, per connection, from one
+//! [`CastIdentity`], and never chosen separately.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -25,10 +26,11 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::auth::CastAuthResponder;
+use crate::cks::CksIdentity;
 use crate::control::{CastRemote, FromReceiver};
 use crate::error::CastError;
 use crate::rtp_actor::MirrorSocket;
-use crate::session::CastSession;
+use crate::session::{CastSession, DeviceAuthResponder};
 use crate::{framing, CAST_PORT, CAST_SERVICE_TYPE};
 
 /// Cap on a single CASTv2 frame. Real messages are a few KiB; the length prefix is
@@ -208,6 +210,104 @@ impl TlsIdentity {
     }
 }
 
+/// How this receiver proves it is a Cast device.
+///
+/// One enum rather than a TLS identity plus an optional signer, because the two
+/// are not independent: the device-auth signature covers the TLS certificate, and
+/// a pairing that disagrees produces a receiver that completes its handshake and
+/// then fails every challenge — with nothing on either side saying why. Making
+/// the combinations enumerable means the only way to pick a certificate is to
+/// pick the credential it belongs to.
+pub enum CastIdentity {
+    /// A self-signed certificate and no device credential. Device auth is refused,
+    /// which every official sender treats as fatal before it sends a `LOAD`.
+    /// Useful only against senders that do not challenge.
+    Unauthenticated(TlsIdentity),
+
+    /// A self-signed certificate signed over by a device key we hold.
+    ///
+    /// Correct by construction, and rejected by every official sender unless the
+    /// chain roots in Google's device CA — which, for a locally generated
+    /// credential, it does not (OPEN-QUESTIONS Q2).
+    DeviceKey {
+        /// The TLS identity whose certificate the signature covers.
+        tls: TlsIdentity,
+        /// The key that signs it.
+        signer: Arc<CastDeviceSigner>,
+    },
+
+    /// A CKS credential: a real Google-issued chain with a precomputed signature.
+    ///
+    /// The TLS certificate comes from the credential, so it is not named here
+    /// separately — there is nothing to keep in sync.
+    Cks(Arc<CksIdentity>),
+}
+
+impl CastIdentity {
+    /// Self-signed TLS with a device key of our own.
+    #[must_use]
+    pub fn device_key(tls: TlsIdentity, signer: Arc<CastDeviceSigner>) -> Self {
+        Self::DeviceKey { tls, signer }
+    }
+
+    /// A CKS-provisioned credential.
+    #[must_use]
+    pub fn cks(provider: Arc<cast_cks::CksProvider>) -> Self {
+        Self::Cks(Arc::new(CksIdentity::new(provider)))
+    }
+
+    /// The acceptor to serve a connection arriving at `now` with, and the responder
+    /// that answers its challenge.
+    ///
+    /// Returned together so a caller cannot take one from one credential and one
+    /// from another. `None` for the responder means device auth is refused.
+    fn for_connection(
+        &self,
+        now: SystemTime,
+    ) -> Result<(TlsAcceptor, Option<Box<dyn DeviceAuthResponder>>), CastError> {
+        match self {
+            Self::Unauthenticated(tls) => {
+                let (acceptor, _cert) = tls.current_at(now);
+                Ok((acceptor, None))
+            }
+            Self::DeviceKey { tls, signer } => {
+                let (acceptor, cert_der) = tls.current_at(now);
+                Ok((
+                    acceptor,
+                    Some(
+                        Box::new(CastAuthResponder::new(Arc::clone(signer), cert_der))
+                            as Box<dyn DeviceAuthResponder>,
+                    ),
+                ))
+            }
+            Self::Cks(cks) => {
+                let (acceptor, responder) = cks.for_connection()?;
+                Ok((acceptor, Some(responder)))
+            }
+        }
+    }
+
+    /// A one-line description for the startup log.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unauthenticated(_) => "no device credential; challenges will be refused".into(),
+            Self::DeviceKey { .. } => {
+                "a self-generated device key; senders that verify the Google chain will reject it"
+                    .into()
+            }
+            Self::Cks(cks) => {
+                let credential = cks.credential();
+                format!(
+                    "a CKS credential from the {}, valid until {}",
+                    credential.origin(),
+                    credential.window().end_unix()
+                )
+            }
+        }
+    }
+}
+
 /// `SystemTime` in the shape rcgen wants.
 fn offset_date_time(at: SystemTime) -> Result<OffsetDateTime, CastError> {
     let secs = at
@@ -223,8 +323,7 @@ pub struct CastReceiver {
     listen: SocketAddr,
     friendly_name: String,
     device_id: String,
-    identity: TlsIdentity,
-    signer: Option<Arc<CastDeviceSigner>>,
+    identity: CastIdentity,
     /// Where playback has reached, for the `currentTime` a sender draws its scrubber from.
     ///
     /// Absent in a build with no decoder, which then reports zero — the wire has no slot
@@ -234,11 +333,12 @@ pub struct CastReceiver {
 }
 
 impl CastReceiver {
-    /// Build a receiver listening on `listen` with the given TLS `identity`.
+    /// Build a receiver listening on `listen` with the given `identity`.
     ///
-    /// The identity is owned rather than borrowed because it is not a fixed value: its
-    /// certificate is short-lived by protocol requirement (see [`TLS_CERT_VALID_FOR`])
-    /// and is reissued as connections arrive.
+    /// The identity is owned rather than borrowed because it is not a fixed value: a
+    /// self-signed certificate is short-lived by protocol requirement (see
+    /// [`TLS_CERT_VALID_FOR`]) and is reissued as connections arrive, and a CKS
+    /// credential rolls with its window.
     ///
     /// # Errors
     /// Currently infallible; kept fallible because construction reaches TLS setup.
@@ -246,14 +346,13 @@ impl CastReceiver {
         listen: SocketAddr,
         friendly_name: impl Into<String>,
         device_id: impl Into<String>,
-        identity: TlsIdentity,
+        identity: CastIdentity,
     ) -> Result<Self, CastError> {
         Ok(Self {
             listen,
             friendly_name: friendly_name.into(),
             device_id: device_id.into(),
             identity,
-            signer: None,
             playback: None,
         })
     }
@@ -270,15 +369,6 @@ impl CastReceiver {
         self
     }
 
-    /// Answer device-auth challenges with `signer` instead of refusing them. Without a
-    /// signer the session returns an `AuthError`, which real senders reject before they
-    /// ever send a `LOAD` (OPEN-QUESTIONS Q2/Q11).
-    #[must_use]
-    pub fn with_signer(mut self, signer: Arc<CastDeviceSigner>) -> Self {
-        self.signer = Some(signer);
-        self
-    }
-
     /// The port senders should be pointed at (as advertised over mDNS).
     #[must_use]
     pub fn port(&self) -> u16 {
@@ -291,9 +381,18 @@ impl CastReceiver {
         if let Err(e) = stream.set_nodelay(true) {
             debug!(%peer, error = %e, "could not disable Nagle");
         }
-        // Taken per connection, not once at startup: the certificate rotates, and the
-        // device-auth signature has to cover the one this sender is actually looking at.
-        let (acceptor, tls_cert_der) = self.identity.current_at(SystemTime::now());
+        // Taken per connection, not once at startup: the credential rotates — a
+        // self-signed certificate is reissued as it ages, a CKS one rolls with its
+        // window — and the device-auth signature has to cover the certificate this
+        // sender is actually looking at. Both come back from one call so they cannot
+        // be drawn from different credentials.
+        let (acceptor, auth) = match self.identity.for_connection(SystemTime::now()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(%peer, error = %e, "no usable Cast identity for this connection");
+                return;
+            }
+        };
         let mut tls = match acceptor.accept(stream).await {
             Ok(tls) => tls,
             Err(e) => {
@@ -303,10 +402,6 @@ impl CastReceiver {
         };
         info!(%peer, "CASTv2 sender connected");
 
-        let auth = self.signer.clone().map(|signer| {
-            Box::new(CastAuthResponder::new(signer, tls_cert_der))
-                as Box<dyn crate::session::DeviceAuthResponder>
-        });
         let mut session = CastSession::new(auth);
 
         // Bind the RTP socket up front. The ANSWER has to name a port, and the only way
@@ -561,7 +656,7 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             "Lab TV",
             "0f8c2e10",
-            identity,
+            CastIdentity::Unauthenticated(identity),
         )
         .unwrap()
     }
@@ -629,7 +724,7 @@ mod tests {
             SocketAddr::from(([0, 0, 0, 0], 8009)),
             "Lab TV",
             "0f8c2e10",
-            identity(),
+            CastIdentity::Unauthenticated(identity()),
         )
         .unwrap();
         let ads = r.advertisements();

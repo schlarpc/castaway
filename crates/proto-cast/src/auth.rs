@@ -4,11 +4,49 @@
 
 use std::sync::Arc;
 
-use crypto_cast_auth::{CastDeviceSigner, HashAlgo};
+use crypto_cast_auth::{CastDeviceSigner, HashAlgo, SigAlgo, SignedAuth};
 
 use crate::error::CastError;
 use crate::proto::{AuthChallenge, AuthResponse, HashAlgorithm, SignatureAlgorithm};
 use crate::session::DeviceAuthResponder;
+
+/// The hash a challenge asks for. The proto2 default is SHA-1; an explicit
+/// SHA-256 request is honoured.
+pub(crate) fn requested_hash(challenge: &AuthChallenge) -> HashAlgo {
+    match challenge.hash_algorithm {
+        Some(h) if h == HashAlgorithm::Sha256 as i32 => HashAlgo::Sha256,
+        _ => HashAlgo::Sha1,
+    }
+}
+
+/// Fill the `AuthResponse` proto from signed material.
+///
+/// The one place the response is built, so the `sender_nonce` rule is applied
+/// once rather than at each responder. That field comes from
+/// [`SignedAuth::nonce_echo`] — what the signature actually covers — and never
+/// from the challenge: a replayed signature covers the peer certificate alone,
+/// and echoing the sender's nonce back would make the sender rebuild a different
+/// message and reject a response that is otherwise correct.
+pub(crate) fn auth_response(signed: SignedAuth) -> AuthResponse {
+    let hash_algorithm = match signed.hash {
+        HashAlgo::Sha1 => HashAlgorithm::Sha1,
+        HashAlgo::Sha256 => HashAlgorithm::Sha256,
+    };
+    let signature_algorithm = match signed.algorithm {
+        SigAlgo::RsaPkcs1v15 => SignatureAlgorithm::RsassaPkcs1v15,
+    };
+    AuthResponse {
+        signature: signed.signature,
+        client_auth_certificate: signed.client_auth_certificate,
+        intermediate_certificate: signed.intermediate_certificate,
+        signature_algorithm: Some(signature_algorithm as i32),
+        sender_nonce: signed.nonce_echo.as_bytes().map(<[u8]>::to_vec),
+        hash_algorithm: Some(hash_algorithm as i32),
+        // No CRL. Openscreen senders default to `kCrlOptional`, so a receiver that
+        // supplies none is still accepted; Chrome fetches the Cast CRL itself.
+        crl: None,
+    }
+}
 
 /// A per-connection auth responder: the shared device signer plus this connection's
 /// TLS server certificate (which the challenge is signed over).
@@ -30,30 +68,15 @@ impl CastAuthResponder {
 
 impl DeviceAuthResponder for CastAuthResponder {
     fn respond(&self, challenge: &AuthChallenge) -> Result<AuthResponse, CastError> {
-        // The proto2 default hash is SHA1; honor an explicit SHA256 request.
-        let hash = match challenge.hash_algorithm {
-            Some(h) if h == HashAlgorithm::Sha256 as i32 => HashAlgo::Sha256,
-            _ => HashAlgo::Sha1,
-        };
-        let nonce = challenge.sender_nonce.as_deref();
         let signed = self
             .signer
-            .sign(&self.tls_cert_der, nonce, hash)
+            .sign(
+                &self.tls_cert_der,
+                challenge.sender_nonce.as_deref(),
+                requested_hash(challenge),
+            )
             .map_err(|e| CastError::Auth(e.to_string()))?;
-
-        let hash_algorithm = match signed.hash {
-            HashAlgo::Sha1 => HashAlgorithm::Sha1,
-            HashAlgo::Sha256 => HashAlgorithm::Sha256,
-        };
-        Ok(AuthResponse {
-            signature: signed.signature,
-            client_auth_certificate: signed.client_auth_certificate,
-            intermediate_certificate: signed.intermediate_certificate,
-            signature_algorithm: Some(SignatureAlgorithm::RsassaPkcs1v15 as i32),
-            sender_nonce: challenge.sender_nonce.clone(),
-            hash_algorithm: Some(hash_algorithm as i32),
-            crl: None,
-        })
+        Ok(auth_response(signed))
     }
 }
 

@@ -10,6 +10,9 @@ description = "Google Cast (CASTv2) receiver: framing, device-auth handshake, an
 [dependencies]
 castaway-core.workspace = true
 crypto-cast-auth.workspace = true
+# The replay-based device credential. `CksIdentity` is where the TLS certificate and
+# the precomputed signature are drawn from one value rather than chosen separately.
+cast-cks.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
