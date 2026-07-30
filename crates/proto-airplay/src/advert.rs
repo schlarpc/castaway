@@ -192,20 +192,20 @@ impl AirPlayIdentity {
         Features::from_bits(&bits)
     }
 
-    /// The advertised `pk`: 32 bytes of stable hex, derived from the pairing id.
+    /// The advertised `pk`: the long-term Ed25519 public key, lowercase hex.
     ///
-    /// Nothing verifies it — bit 27 is off, so no sender ever runs pair-verify against
-    /// this key — but every *listed* receiver ships one, including UxPlay, which
-    /// hardcodes a value in `dnssdint.h`. The earlier position ("real pairing-less
-    /// devices omit it: Marantz, Libratone") described audio-era hardware; the worked
-    /// example for a mirroring receiver carries a `pk`, so this does too. Derived
-    /// rather than random so it is the same key tomorrow: a sender that caches device
-    /// identities should find the same one.
+    /// This is a promise like every other key here, and bit 27 is what calls it in:
+    /// senders run `/pair-setup` and `/pair-verify` against this receiver, and one
+    /// that pins the advertised key checks it against the identity the pairing layer
+    /// presents. So the value *must be* [`crate::pairing::PairingIdentity`]'s public
+    /// key, and it is obtained from that type rather than derived here — this method
+    /// used to hash its own (SHA-256 of the pairing id, where the real key is seeded
+    /// from SHA-512), which advertised an identity `/pair-setup` then contradicted.
+    /// Stable across restarts because the seed is: a sender that caches device
+    /// identities finds the same one tomorrow.
     #[must_use]
     pub fn public_key_hex(&self) -> String {
-        use sha2::{Digest as _, Sha256};
-        let digest = Sha256::digest(self.pairing_id.as_bytes());
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        crate::pairing::PairingIdentity::from_seed(&self.pairing_id).public_key_hex()
     }
 
     /// The `_airplay._tcp` advertisement.
@@ -422,10 +422,9 @@ mod tests {
 
     #[test]
     fn the_public_key_is_present_stable_and_shared_by_both_records() {
-        // Nothing verifies it (bit 27 is off), but every listed mirroring receiver
-        // ships one — UxPlay hardcodes theirs — and senders group the two services by
-        // it. 64 hex chars: the shape of an Ed25519 public key, never empty (an empty
-        // `pk` publishes an identity a sender cannot verify against).
+        // Bit 27 is set, so senders verify against this key — and they group the two
+        // services by it. 64 hex chars: the shape of an Ed25519 public key, never
+        // empty (an empty `pk` publishes an identity a sender cannot verify against).
         let id = ident();
         let pk = txt_of(&id.airplay_service(), "pk").unwrap();
         assert_eq!(pk.len(), 64);
@@ -433,6 +432,25 @@ mod tests {
         assert_eq!(txt_of(&id.raop_service(), "pk").as_deref(), Some(&*pk));
         // Stable: the same identity advertises the same key tomorrow.
         assert_eq!(pk, id.public_key_hex());
+    }
+
+    #[test]
+    fn the_advertised_pk_is_the_key_the_pairing_layer_presents() {
+        // The defect this pins down: `pk` used to be SHA-256(pairing_id) while
+        // `/pair-setup` handed over an Ed25519 key seeded from SHA-512(pairing_id).
+        // An iOS sender that pinned the advertisement saw the receiver contradict its
+        // own identity at pairing time — a mismatch with no error on our side at all.
+        let id = ident();
+        let pairing = crate::pairing::PairingIdentity::from_seed(&id.pairing_id);
+        let advertised = txt_of(&id.airplay_service(), "pk").unwrap();
+        let presented: String = pairing
+            .public_key()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(advertised, presented);
+        // And the raw 32 bytes `/pair-setup` returns are that same key.
+        assert_eq!(pairing.pair_setup_response(), pairing.public_key().to_vec());
     }
 
     #[test]
