@@ -3012,6 +3012,19 @@ impl RenderLoop {
         self.transition.is_some()
     }
 
+    /// The outgoing screen's late fade: opaque for most of the travel, then a smooth
+    /// ease out over the last stretch.
+    ///
+    /// This was `(p * 4.0).clamp(0.0, 1.0)` — a slope-4 linear ramp with hard corners
+    /// at both ends, which is a visible pop on a two-metre panel (the largest single
+    /// frame-to-frame opacity step at 60 fps was ~0.22). A smoothstep over a slightly
+    /// longer tail has zero slope at both ends, so the fade starts and finishes
+    /// without a corner, and its worst step is well under half the old one.
+    fn fade_late(p: f32) -> f32 {
+        let t = (p / 0.45).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
     /// Place the outgoing screen for `p`: whole at 1.0, gone at 0.0.
     fn apply_transition(&mut self, p: f32) {
         let leaving = self
@@ -3032,7 +3045,7 @@ impl RenderLoop {
                     },
                     // Only fading at the very end, so the card stays a card rather than a
                     // ghost.
-                    (p * 4.0).clamp(0.0, 1.0),
+                    Self::fade_late(p),
                 )
             }
             Leaving::Into(rect) => {
@@ -3051,15 +3064,19 @@ impl RenderLoop {
                         offset_y: lerp(0.0, rect.y),
                     },
                     // Late, so it is still legible as the screen right up to the tile.
-                    (p * 4.0).clamp(0.0, 1.0),
+                    Self::fade_late(p),
                 )
             }
             // Held still; the arriving screen is the one moving.
             Leaving::Yield => (
                 Transform::default(),
-                // Gone early, so what remains of the transition is the new screen growing over
-                // an empty panel rather than through a ghost of the old one.
-                ((p - (1.0 - OUTGOING_FADE)) / OUTGOING_FADE).clamp(0.0, 1.0),
+                // Gone early, so what remains of the transition is the new screen growing
+                // over an empty panel rather than through a ghost of the old one — but
+                // eased, not a linear ramp with corners at both ends.
+                {
+                    let t = ((p - (1.0 - OUTGOING_FADE)) / OUTGOING_FADE).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                },
             ),
         };
         self.compositor.upsert_layer(Layer {
@@ -3163,6 +3180,30 @@ impl RenderLoop {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// The outgoing screen's fade must be a curve, not a ramp with corners: at 60 fps
+    /// no frame-to-frame opacity step may pop. This is the regression test for the old
+    /// `(p * 4.0).clamp(0.0, 1.0)`, whose worst step at 60 fps of a 400 ms transition
+    /// was ~0.22 — a visible blink on a two-metre panel.
+    #[test]
+    #[cfg(feature = "kiosk")]
+    fn the_late_fade_is_continuous_and_reaches_both_ends() {
+        assert_eq!(RenderLoop::fade_late(0.0), 0.0);
+        assert!((RenderLoop::fade_late(1.0) - 1.0).abs() < f32::EPSILON);
+        let mut prev = RenderLoop::fade_late(0.0);
+        // p sweeps 0→1 as a ~400 ms spring would at 60 fps: about 24 frames.
+        for i in 1..=24 {
+            let p = i as f32 / 24.0;
+            let now = RenderLoop::fade_late(p);
+            assert!(now >= prev, "the fade never reverses");
+            assert!(
+                now - prev < 0.15,
+                "a {:.3} step between adjacent frames is a pop, not a fade",
+                now - prev
+            );
+            prev = now;
+        }
+    }
 
     #[tokio::test]
     async fn a_track_starting_advances_the_cards_own_queue() {

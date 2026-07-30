@@ -169,6 +169,13 @@ pub struct Step {
 /// that happen to trigger each move. The numbers are the design languages' own ranges —
 /// large-surface transitions in the 300–500 ms band, exits at roughly two thirds of their
 /// entrance — and the one deliberate exception is called out below.
+///
+/// Retuned once already, upward: the first set sat at the bottom of that band and read
+/// as violent on a two-metre panel — a display this size wants the top of the range,
+/// because the same normalized travel covers three times the arc of a phone held at
+/// arm's length. The demote/summon pair moved from ~0.4 s to ~0.5 s, the summon's
+/// overshoot softened (0.85 → 0.90 damping — still lively, no longer a bounce), and
+/// every off-glass entrance slowed in proportion.
 pub struct Choreography;
 
 impl Choreography {
@@ -181,30 +188,30 @@ impl Choreography {
             // stately; from nowhere it is a fade-through and should be brisk, because
             // nothing about it rewards being watched.
             (None, _) => match step.origin {
-                Origin::From(_) => Spring::new(0.40, 1.0),
-                Origin::Nowhere => Spring::new(0.28, 1.0),
+                Origin::From(_) => Spring::new(0.50, 1.0),
+                Origin::Nowhere => Spring::new(0.34, 1.0),
             },
             // Leaving altogether: the fastest thing the panel does. Nobody is waiting for
             // something to finish going away.
-            (_, None) => Spring::new(0.20, 1.0),
+            (_, None) => Spring::new(0.26, 1.0),
 
             // The shared-element pair — the panel's signature move, and the one the eye
             // follows all the way, so it gets the longest response.
-            (Some(Panel), Some(Widget)) => Spring::new(0.42, 1.0),
+            (Some(Panel), Some(Widget)) => Spring::new(0.52, 1.0),
             // The summon. The one place overshoot is right: this is the transition a person
             // directly asked for by putting a finger on the corner, and a touch of
             // liveliness is how the panel acknowledges *them* rather than looking as
             // uniformly smooth as everything that happens on its own. Apple's
             // open-from-icon does exactly this. Everything else on a display people see out
             // of the corner of their eye all day is critically damped.
-            (Some(Widget), Some(Panel)) => Spring::new(0.38, 0.85),
+            (Some(Widget), Some(Panel)) => Spring::new(0.48, 0.90),
 
             // The demoted form arriving and leaving — what a shell screen opening over Home
             // does to whatever was in the corner.
-            (Some(Hidden), Some(Widget)) => Spring::new(0.32, 0.90),
-            (Some(Widget), Some(Hidden)) => Spring::new(0.22, 1.0),
-            (Some(Hidden), Some(Panel)) => Spring::new(0.34, 0.90),
-            (Some(Panel), Some(Hidden)) => Spring::new(0.24, 1.0),
+            (Some(Hidden), Some(Widget)) => Spring::new(0.38, 0.92),
+            (Some(Widget), Some(Hidden)) => Spring::new(0.26, 1.0),
+            (Some(Hidden), Some(Panel)) => Spring::new(0.42, 0.92),
+            (Some(Panel), Some(Hidden)) => Spring::new(0.28, 1.0),
 
             // Same placement: asked for on the pump that notices nothing moved. Never
             // actually integrates anything, but a total match is worth more than an
@@ -248,20 +255,20 @@ impl Choreography {
     /// both and should never be the thing that finishes last.
     #[must_use]
     pub const fn floor() -> Spring {
-        Spring::new(0.30, 1.0)
+        Spring::new(0.38, 1.0)
     }
 
     /// A screen arriving out of the thing that was pressed. The panel's most deliberate
     /// motion — somebody asked for it and is watching the whole way — so it is the longest.
     #[must_use]
     pub const fn container() -> Spring {
-        Spring::new(0.40, 1.0)
+        Spring::new(0.50, 1.0)
     }
 
     /// A screen arriving with no origin, along the navigation axis.
     #[must_use]
     pub const fn shared_axis() -> Spring {
-        Spring::new(0.34, 1.0)
+        Spring::new(0.42, 1.0)
     }
 
     /// Where a screen with no origin comes from: one panel-width along the axis it is
