@@ -135,6 +135,7 @@ pub async fn run(
         chosen_host: None,
         pairing: None,
         pairing_outcomes,
+        close_page,
     };
     nav.run(events, outcomes_rx).await;
 }
@@ -155,6 +156,8 @@ struct Nav {
     /// The sender half the spawned pairing task reports through. Held here so the
     /// channel outlives any individual task.
     pairing_outcomes: mpsc::Sender<PairingOutcome>,
+    /// Where the close badge's press goes: the task holding the DIAL-launched page.
+    close_page: mpsc::UnboundedSender<()>,
 }
 
 impl Nav {
@@ -199,7 +202,7 @@ impl Nav {
                 // The badge on the demoted page. The launch is DIAL's, so the stop is
                 // too — this just forwards the press to the task holding the service.
                 info!("shell: close badge pressed; stopping the launched page");
-                let _ = close_page.send(());
+                let _ = self.close_page.send(());
             }
             ShellEvent::Item(id) => {
                 if let Some(host) = id.strip_prefix(HOST_PREFIX) {
@@ -610,7 +613,6 @@ async fn launch(
         .is_err()
     {
         warn!("shell: the GameStream adapter is gone");
-        return;
     }
     // The stream composites *above* the shell, so there is no need to navigate away —
     // and every reason not to: if the launch fails, whatever the picker last said is

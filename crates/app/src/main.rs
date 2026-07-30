@@ -407,7 +407,6 @@ fn main() -> anyhow::Result<()> {
         // served by waiting. One second lets short blocking work (a screenshot encode, a
         // DNS lookup) finish, then the process leaves and the OS reclaims the rest.
         runtime.shutdown_timeout(Duration::from_secs(1));
-        return Ok(());
     }
 
     #[cfg(not(feature = "render"))]
@@ -1651,16 +1650,14 @@ fn seasonal_accent(choice: pipeline::theme::ThemeChoice) -> Option<pipeline::the
     // Civil date from a Unix timestamp, Howard Hinnant's algorithm. A date crate for
     // three lines of arithmetic that never has to handle a timezone is not worth the
     // dependency — the panel's seasons are day-grained and it is on UTC.
-    let days = (secs / 86_400) as i64;
+    let days = i64::try_from(secs / 86_400).ok()?;
     let z = days + 719_468;
-    let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let _ = era;
+    let day = u32::try_from(doy - (153 * mp + 2) / 5 + 1).ok()?;
+    let month = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).ok()?;
     choice.resolve(month, day)
 }
 

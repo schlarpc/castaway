@@ -142,7 +142,7 @@ async fn a_cast_from_a_control_point_decodes_and_then_reports_that_it_finished()
     std::thread::spawn({
         let (video, cleared) = (Arc::clone(&video), Arc::clone(&cleared));
         move || {
-            while let Ok(cmd) = frames.recv() {
+            while let Some(cmd) = frames.recv_timeout(Duration::from_secs(60)) {
                 match cmd {
                     RenderCommand::Video(_) => {
                         video.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -244,7 +244,7 @@ async fn a_cast_at_a_url_that_is_not_there_comes_back_as_an_error() {
     let (ends_tx, ends_rx) = castaway_core::playback::end_channel();
     pipe.set_playback_ends(ends_tx);
     // Drained so a full render channel cannot be what ends the decode.
-    std::thread::spawn(move || while frames.recv().is_ok() {});
+    std::thread::spawn(move || while frames.recv_timeout(Duration::from_secs(60)).is_some() {});
 
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(32);
     let manager =
