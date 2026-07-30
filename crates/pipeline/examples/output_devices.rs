@@ -35,6 +35,9 @@ fn main() {
 
 #[cfg(feature = "audio")]
 fn beep(selection: &pipeline::audio_select::OutputSelection) {
+    // In the function because the function is the `cfg`: at top level this import
+    // would be an unused-import warning in every build without `audio`.
+    use std::time::Duration;
     println!("beeping to {selection:?}…");
     let mut out = pipeline::audio_out::selected_output(selection);
     if let Err(e) = out.start(48_000, 2) {
