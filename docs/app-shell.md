@@ -164,6 +164,15 @@ is promoting them into `text.rs`, not writing them.
 The cost is honest and worth stating: no CSS, no layout engine, no free animation curves,
 and #24's mascot-and-flourish ambitions are more work than they would be in a page.
 
+The animation curves are the part that has since been paid for, and the bill came to two
+pure modules rather than a framework (D46). `panel` is what the panel *is* — which screens
+are stacked, which surfaces exist, who has the glass — with everything else derived from it;
+`motion` is how it moves between those states, as springs against one choreography table.
+Writing them by hand bought two things a page would not have given: the transitions are
+unit-tested without a GPU, and the model that decides them is the same one that answers
+input, so what the glass shows and what a touch means cannot disagree. That equivalence was
+not available when the two were separate, and its absence was the bug.
+
 ---
 
 ## 4. Getting home from a fullscreen browser

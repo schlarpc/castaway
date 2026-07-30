@@ -1244,3 +1244,93 @@ Not done, and known: nothing yet asserts at runtime that the set of actually-bou
 equals the registry's resolved view (`ss` in the integration VM against
 `--network-surface=json` would close that loop), and the generated doc's hardening section
 describes the systemd unit but nothing diffs it against `flake.nix`.
+
+### D46 — The panel is one model, and its motion is derived from that model rather than authored per transition
+Two rounds of the same bug produced this. A now-playing card was drawn over a service
+screen's text, and Spotify came back from a reclaim as a nameless session with no controls
+and an "up next" list in an otherwise empty card. Both were the same shape of failure:
+"what is on the glass" was a *product of independent variables* — `RenderLoop::shell_front`,
+the screen stack's depth, `ElectronHost::role` plus a `widget_covered` flag it refreshed by
+hand — and the combinations nobody had decided about were the bugs. `shell_front` says
+whether the shell is above the media layers and nothing whatever about which screen it is
+on, so demoting into the *Home screen's* widget slot while two screens deep was
+representable, and therefore happened.
+
+**`pipeline::panel` is the one authority.** Which screens are stacked, which surfaces exist,
+and whether the shell has been asked forward; everything else is derived — placement,
+suppression, hit testing, the browser's viewport. Four things stop being representable:
+focus on a session that is not there (`Focus` is derived, never stored); a demoted surface
+on a screen with nowhere to put it (`Placement` is Panel/Widget/Hidden, total over focus ×
+depth × surface); the page as a second state machine (the browser host reads `page_view()`
+each pump instead of owning a `BrowserRole` it mutates); and the idle clock being the same
+thing as a minimised cast page (they shared a browser, a layer and a slot, and were told
+apart by comparing URLs — now `Surface::IdleWidget` vs `Surface::CastPage`, one of which can
+never be full-panel or restored).
+
+The kiosk's `back_one_level` if-chain — minimise a page, else pop a screen, else bring the
+shell forward, across two objects in whatever order they were written — became
+`Panel::back() -> Left`, matched exhaustively. The ordering falls out of focus: you cannot
+pop a screen you are not looking at. `pop_screen` stays separate, because a back affordance
+drawn *on* a screen must not demote a session as a side effect of a press that session is
+not even covering.
+
+**`pipeline::motion` is the continuous half, and it takes no new inputs.** The two things it
+needs — presence changed, placement changed — are exactly what the model already reports,
+which is why the motion was tractable after the model and not before. Three rules, which is
+where Apple's, Google's and Microsoft's languages agree, and each is physical honesty rather
+than taste: a surface that exists before and after **travels, never cross-fades** (`Motion`
+interpolates a rectangle; there is no cross-fade path for a surface that persists); a
+surface that appears comes **from where it was summoned** (`Origin`, with `Nowhere` a
+variant somebody has to choose, so a forgotten tile rect is visible in a diff rather than
+invisible on the glass); and **entrances decelerate while exits accelerate and are faster**,
+asserted pair by pair against the `Choreography` table.
+
+Springs rather than curves, because a spring accepts an initial velocity and that is exactly
+what a released drag hands over. Each of a rect's four components springs independently in
+normalized units — five scalars where a normalized progress needs one — and that buys the
+property making interruption free: **retargeting is just a different target**, so a reversal
+mid-flight carries real velocity through the turn with no rebasing. Damping is 1.0
+everywhere except the summon (0.85), because a display people see out of the corner of their
+eye all day should not wobble, and the one exception is the transition somebody asked for
+with a finger.
+
+**Input must never read the animation.** Coverage was answered from live layer transforms, so
+a press 100 ms into a 300 ms arrival meant something different from the same press once it
+landed. `Panel::covered_by_any` answers from placement, and the caller names *which* surfaces
+to ask about, because "covered" is relative to depth: the transport strip is drawn on the card
+it belongs to, and that card is no reason for its own controls to stop answering. The same
+audit found the two strip-coverage checks had drifted — they carried the rule independently,
+with a comment saying it had to be repeated rather than assumed, and when the rule changed
+only one changed, so a covered strip stopped owning presses while still acting on them.
+
+**Three things the renderer had to gain**, and one it did not. Corner radius, animatable, so a
+screen keeps its tile's corner and flattens as it grows: a square-cornered rectangle emerging
+from a rounded one reads as two objects. An independent source rect, because the tiles are
+exactly square and the panel is 1.778 — drawing a full-panel texture into a tile rect
+compressed it 44%, and `cover_source` crops instead, which is provably a no-op once the shapes
+agree and so can be applied unconditionally. Both live in the uniform, whose sizes are now
+asserted in a `const` block: a WGSL/Rust layout drift does not fail to compile, it draws every
+layer from the wrong bytes. What it did *not* gain is transient content layers, so a container
+transform still scales a finished screen rather than crossfading contents inside a morphing
+container — the growing screen is a small screenshot until that lands.
+
+**The slot and the PiP corner are deliberately still square**, because that is what the art
+does: the widget card frame is drawn with `fill_rect`. Rounding either is now one constant
+rather than a shader change, which is why the mechanism landed separately from any cosmetic
+call about it.
+
+Two consequences worth stating. The floor scales *up* 2% while receding rather than down,
+because it is the bottom layer and insetting it would open a black border where a phone shows
+a backdrop; the mascot's transform is *composed* with it, since she is a sub-rect and handing
+her the floor's transform stretches line art across the panel. And she leans on the **slot**,
+not on the clock: `MascotOverlay` moved above the card so what the slot holds is under her
+arms, and what removes her became `slot_veil` — how far the occupant has expanded between its
+demoted width and the whole panel. Degree rather than presence, so the change is a fade with
+no threshold, and a demoted *video* (which goes to the far corner, not the slot) correctly
+leaves her alone.
+
+Not done, and known: no transient content layers (above); no elevation shadow, so a demoted
+card reads as a flat inset rather than a lifted card; `CLEAR_GRACE` still debounces presence
+separately from the exit animation, which is right for VLC's stop-then-reload scrubbing and
+redundant for preemption; and the driven edge-drag still animates only the outgoing screen,
+so a half-completed swipe does not carry the incoming one with it.
