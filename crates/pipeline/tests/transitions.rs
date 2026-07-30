@@ -7,11 +7,10 @@ use pipeline::render_pipeline::{RenderCommand, RenderLoop};
 use pipeline::shell::Screen;
 use std::time::Duration;
 
-fn shell() -> (std::sync::mpsc::SyncSender<RenderCommand>, RenderLoop) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+fn shell() -> (pipeline::RenderTx, RenderLoop) {
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(640, 360, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     render.pump();
     (tx, render)
 }

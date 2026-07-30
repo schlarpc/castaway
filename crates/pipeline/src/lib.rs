@@ -104,8 +104,10 @@ pub use electron_browser::{Electron, ElectronHost, TV_USER_AGENT};
 #[cfg(feature = "render")]
 pub use osd::{Banner, OsdController, OsdUpdate};
 #[cfg(feature = "render")]
-pub use render_pipeline::{PlaybackHandle, ScreenshotHandle};
+pub use render_pipeline::{
+    render_channel, RenderCommand, RenderLoop, RenderPipeline, RenderRx, RenderTx,
+};
 #[cfg(feature = "render")]
-pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
+pub use render_pipeline::{PlaybackHandle, ScreenshotHandle};
 #[cfg(feature = "render")]
 pub use wgpu_compositor::WgpuCompositor;

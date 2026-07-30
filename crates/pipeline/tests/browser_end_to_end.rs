@@ -105,7 +105,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
     let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
     host.resize(1280, 720);
-    tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
+    tx.send(BrowserCommand::Navigate(PAGE.into()));
 
     // Pump the way the kiosk does, until the layer appears or we give up.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -189,8 +189,7 @@ fn a_touch_reaches_the_page() {
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
     let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
     host.resize(640, 480);
-    tx.send(BrowserCommand::Navigate(TOUCH_PAGE.into()))
-        .unwrap();
+    tx.send(BrowserCommand::Navigate(TOUCH_PAGE.into()));
 
     // Wait for the page to be painting, which is the only evidence available out here
     // that it has loaded and its handlers are attached.
@@ -267,7 +266,7 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
     let mut host = ElectronHost::new(electron, spec(blocker, Some(factory)), rx);
     host.resize(640, 480);
     let page = format!("file://{}", audio_page().display());
-    tx.send(BrowserCommand::Navigate(page)).unwrap();
+    tx.send(BrowserCommand::Navigate(page));
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && counter.load(std::sync::atomic::Ordering::Relaxed) < 5 {
@@ -384,7 +383,7 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
     let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
     host.resize(1280, 720);
-    tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
+    tx.send(BrowserCommand::Navigate(PAGE.into()));
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_none() {

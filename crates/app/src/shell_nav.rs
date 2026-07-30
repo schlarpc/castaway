@@ -43,7 +43,7 @@ const CHOICE_PREFIX: &str = "choose:";
 /// that silently ignores a press is indistinguishable from a broken touchscreen.
 pub async fn run(
     mut events: mpsc::Receiver<ShellEvent>,
-    render: std::sync::mpsc::SyncSender<RenderCommand>,
+    render: pipeline::RenderTx,
     gamestream: Option<Arc<GameStreamAdapter>>,
     gamestream_commands: mpsc::Sender<GameStreamCommand>,
     settings: settings::Catalog,
@@ -102,10 +102,7 @@ pub async fn run(
 ///
 /// Synchronous, because it is all local: titles and summaries come from state already
 /// in hand, and a menu that flashed "loading…" for that would be theatre.
-fn show_settings_menu(
-    render: &std::sync::mpsc::SyncSender<RenderCommand>,
-    catalog: &settings::Catalog,
-) {
+fn show_settings_menu(render: &pipeline::RenderTx, catalog: &settings::Catalog) {
     let items: Vec<PickerItem> = catalog
         .all()
         .iter()
@@ -152,11 +149,7 @@ fn choice_picker(setting: &dyn settings::Setting) -> Picker {
 }
 
 /// Drill into one setting: answer the press, then fill the list in.
-async fn show_setting(
-    render: &std::sync::mpsc::SyncSender<RenderCommand>,
-    catalog: &settings::Catalog,
-    setting_id: &str,
-) {
+async fn show_setting(render: &pipeline::RenderTx, catalog: &settings::Catalog, setting_id: &str) {
     let Some(setting) = catalog.get(setting_id) else {
         warn!(%setting_id, "shell: a settings row for a setting this build lacks");
         return;
@@ -183,7 +176,7 @@ async fn show_setting(
 /// failure goes to the OSD as a toast, because it is news about a file, not about the
 /// list, and the screen should carry on working either way.
 async fn apply_choice(
-    render: &std::sync::mpsc::SyncSender<RenderCommand>,
+    render: &pipeline::RenderTx,
     osd: &castaway_core::OsdSink,
     catalog: &settings::Catalog,
     setting_id: &str,
@@ -231,10 +224,7 @@ async fn apply_choice(
 }
 
 /// Show the hosts the GameStream adapter has discovered.
-async fn show_hosts(
-    render: &std::sync::mpsc::SyncSender<RenderCommand>,
-    adapter: Option<&GameStreamAdapter>,
-) {
+async fn show_hosts(render: &pipeline::RenderTx, adapter: Option<&GameStreamAdapter>) {
     let Some(adapter) = adapter else {
         push(
             render,
@@ -277,11 +267,7 @@ async fn show_hosts(
 }
 
 /// Show what a host offers.
-async fn show_apps(
-    render: &std::sync::mpsc::SyncSender<RenderCommand>,
-    adapter: Option<&GameStreamAdapter>,
-    host: &str,
-) {
+async fn show_apps(render: &pipeline::RenderTx, adapter: Option<&GameStreamAdapter>, host: &str) {
     push(
         render,
         Picker::loading(host.to_string(), "Asking the host…"),
@@ -315,7 +301,7 @@ async fn show_apps(
 
 /// Ask the adapter to start streaming, and hand the panel back to it.
 async fn launch(
-    render: &std::sync::mpsc::SyncSender<RenderCommand>,
+    render: &pipeline::RenderTx,
     commands: &mpsc::Sender<GameStreamCommand>,
     host: &str,
     app: &str,
@@ -353,28 +339,18 @@ fn friendly(e: &proto_gamestream::GameStreamError) -> String {
     }
 }
 
-fn push(render: &std::sync::mpsc::SyncSender<RenderCommand>, picker: Picker) {
-    // Drop-on-full, like every other render command: a shell update that cannot get
-    // through is one frame of staleness, not a reason to block.
-    if render
-        .try_send(RenderCommand::PushScreen(Box::new(Screen::Picker(
-            Box::new(picker),
-        ))))
-        .is_err()
-    {
-        debug!("shell: the render channel is full or closed");
-    }
+fn push(render: &pipeline::RenderTx, picker: Picker) {
+    // A screen push is a state transition, so it rides the lossless control lane —
+    // a tile press that silently went nowhere is exactly what the lane exists to end.
+    render.send(RenderCommand::PushScreen(Box::new(Screen::Picker(
+        Box::new(picker),
+    ))));
 }
 
 /// Swap the screen on top for `picker` without going deeper — what every "answered the
 /// press, now filling it in" update uses, so `back` stays one step.
-fn replace(render: &std::sync::mpsc::SyncSender<RenderCommand>, picker: Picker) {
-    if render
-        .try_send(RenderCommand::ReplaceScreen(Box::new(Screen::Picker(
-            Box::new(picker),
-        ))))
-        .is_err()
-    {
-        debug!("shell: the render channel is full or closed");
-    }
+fn replace(render: &pipeline::RenderTx, picker: Picker) {
+    render.send(RenderCommand::ReplaceScreen(Box::new(Screen::Picker(
+        Box::new(picker),
+    ))));
 }

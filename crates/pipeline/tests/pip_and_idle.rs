@@ -31,12 +31,11 @@ fn frame() -> DecodedFrame {
     }
 }
 
-fn playing() -> (std::sync::mpsc::SyncSender<RenderCommand>, RenderLoop) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+fn playing() -> (pipeline::RenderTx, RenderLoop) {
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
-    tx.try_send(RenderCommand::Video(frame())).unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    tx.send(RenderCommand::Video(frame()));
     render.pump();
     (tx, render)
 }
@@ -87,14 +86,13 @@ fn tapping_the_demoted_video_is_how_it_comes_back() {
 fn a_cast_starting_while_someone_navigates_arrives_in_the_corner() {
     // Not covering what they are reading. The alternative — always full-screen on the
     // first frame — is the behaviour that made the shell unusable during playback.
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     render.pump();
     render.set_shell_foreground(true);
 
-    tx.try_send(RenderCommand::Video(frame())).unwrap();
+    tx.send(RenderCommand::Video(frame()));
     render.pump();
 
     assert!(render.pip_rect().is_some(), "it should arrive demoted");
@@ -108,7 +106,7 @@ fn an_ending_session_returns_the_panel_home() {
     )));
     assert_eq!(render.shell_depth(), 2);
 
-    tx.try_send(RenderCommand::RestPanel).unwrap();
+    tx.send(RenderCommand::RestPanel);
     render.pump();
 
     assert_eq!(render.shell_depth(), 1, "back to a known state");
@@ -125,7 +123,7 @@ fn but_not_out_from_under_someone_using_it() {
     )));
     render.note_touch();
 
-    tx.try_send(RenderCommand::RestPanel).unwrap();
+    tx.send(RenderCommand::RestPanel);
     render.pump();
 
     assert_eq!(render.shell_depth(), 2, "still where they left it");
@@ -136,12 +134,10 @@ fn an_audio_session_minimizes_into_the_widget_slot_and_restores() {
     // The audio twin of the video PiP: a Spotify/Bluetooth session's card sits above
     // the shell, so going home used to change nothing anyone could see. Now the card
     // shrinks into the home screen's widget slot, and a tap there is how it comes back.
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
 
     let (cx, cy) = slot_center();
@@ -186,12 +182,10 @@ fn a_demoted_card_leaves_the_glass_when_the_shell_goes_deeper_than_home() {
     // and the render loop's own hit test. `Panel` pins the rule; this pins that navigating
     // actually re-places the layers, which is the half that used to be missing — nothing
     // re-placed anything except `set_shell_foreground`.
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
     render.set_shell_foreground(true);
 
@@ -249,7 +243,7 @@ fn a_session_that_restarts_gets_the_panel_back() {
     assert!(render.shell_foreground());
 
     // What `Pipeline::play`/`play_audio` send when a session starts.
-    tx.try_send(RenderCommand::RestPanel).unwrap();
+    tx.send(RenderCommand::RestPanel);
     render.pump();
 
     assert!(
@@ -268,7 +262,7 @@ fn but_a_session_starting_does_not_snatch_the_panel_from_a_hand_on_it() {
     render.set_shell_foreground(true);
     render.note_touch();
 
-    tx.try_send(RenderCommand::RestPanel).unwrap();
+    tx.send(RenderCommand::RestPanel);
     render.pump();
 
     assert!(render.shell_foreground(), "still theirs");
@@ -291,12 +285,10 @@ fn demoting_a_session_travels_rather_than_teleporting() {
     // The whole point of `motion`. Before it, `set_shell_foreground` wrote the corner's
     // transform and the card was simply *there* on the next frame; a person watching had no
     // idea the thing they had been looking at was now the thing in the corner.
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
 
     render.set_shell_foreground(true);
@@ -336,16 +328,14 @@ fn a_session_that_ends_leaves_rather_than_vanishing() {
     // The deferred clear used to drop the layer outright, so the card was composited one
     // frame and gone the next. Now the clear starts an exit and the layer is retired when the
     // motion has finished.
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
     render.tick_motion(std::time::Duration::from_millis(16));
 
-    tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
+    tx.send(RenderCommand::ClearNowPlaying);
     render.pump();
     // Past the grace, so the exit is allowed to begin.
     std::thread::sleep(std::time::Duration::from_millis(1300));
@@ -444,12 +434,10 @@ fn a_session_that_comes_back_mid_exit_reverses_instead_of_jumping() {
     // that is republished must carry on from where it is — restarting it from the fade-through
     // origin is a visible jump, and reversing for free is the whole reason each component
     // springs in real units rather than along a normalized progress.
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
     // Settle it, so "mid-exit" is measured from a known whole card.
     for _ in 0..180 {
@@ -461,7 +449,7 @@ fn a_session_that_comes_back_mid_exit_reverses_instead_of_jumping() {
     assert!((render.card_opacity() - 1.0).abs() < 0.01);
 
     // Start leaving, and get part-way.
-    tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
+    tx.send(RenderCommand::ClearNowPlaying);
     render.pump();
     std::thread::sleep(std::time::Duration::from_millis(1300));
     for _ in 0..3 {
@@ -475,8 +463,7 @@ fn a_session_that_comes_back_mid_exit_reverses_instead_of_jumping() {
     );
 
     // Back it comes. The next frame must continue from `mid`, not from a fresh fade-in at 0.
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
     let resumed = render.card_opacity();
     assert!(

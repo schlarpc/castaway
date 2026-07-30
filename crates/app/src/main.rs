@@ -546,7 +546,7 @@ struct ShellChannels {
     /// Screens to show in answer. Bounded and drop-on-full like every other render
     /// command — a shell update that cannot get through is one frame of staleness, not a
     /// reason to block the runtime.
-    render: std::sync::mpsc::SyncSender<pipeline::render_pipeline::RenderCommand>,
+    render: pipeline::RenderTx,
     /// What the Settings tile opens: this build's settings, ready to list and apply.
     settings: settings::Catalog,
 }

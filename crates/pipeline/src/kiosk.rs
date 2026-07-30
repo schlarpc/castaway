@@ -8,7 +8,6 @@
 //! always shows the freshest available frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use input_touch::{InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase};
@@ -20,7 +19,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::error::PipelineError;
 use crate::osd::OsdController;
-use crate::render_pipeline::{RenderCommand, RenderLoop};
+use crate::render_pipeline::RenderLoop;
 use crate::wgpu_compositor::WgpuCompositor;
 
 /// An idle-scene image to show before/between casts: `(width, height, rgba8)`.
@@ -42,7 +41,7 @@ pub type ControlSink = Arc<dyn Fn(castaway_core::ControlTxn) + Send + Sync>;
 pub type ShellSink = Arc<dyn Fn(crate::shell::ShellEvent) + Send + Sync>;
 
 struct KioskApp {
-    rx: Option<Receiver<RenderCommand>>,
+    rx: Option<crate::render_pipeline::RenderRx>,
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
     window: Option<Arc<Window>>,
@@ -670,7 +669,7 @@ impl ApplicationHandler for KioskApp {
 /// # Errors
 /// [`PipelineError`] if the event loop can't be created or run.
 pub fn run(
-    rx: Receiver<RenderCommand>,
+    rx: crate::render_pipeline::RenderRx,
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,
@@ -709,7 +708,7 @@ pub fn run(
 /// [`PipelineError`] if the event loop can't be created or run.
 #[cfg(feature = "electron")]
 pub fn run_with_browser(
-    rx: Receiver<RenderCommand>,
+    rx: crate::render_pipeline::RenderRx,
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
     exit: Option<Arc<AtomicBool>>,

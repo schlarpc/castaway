@@ -149,10 +149,105 @@ pub enum RenderCommand {
     UrlAudioOnly(Box<crate::ffmpeg_decode::MediaLayout>),
 }
 
+/// The sending half of the render channel: two lanes, chosen by the command itself.
+///
+/// Video frames ride a small bounded lane and are dropped when the loop is behind —
+/// for live media, latency beats completeness (architecture §6). Everything else is a
+/// *state transition*, and a dropped transition desynchronises the panel from its
+/// sessions: `RestPanel` used to ride the same depth-3 lane as the frames, so a cast
+/// that arrived while the lane happened to be full simply never took the screen, and a
+/// `PushScreen` could turn a tile press into nothing. Transitions therefore ride an
+/// unbounded lane that cannot refuse them. The routing lives *here, on the type*, so no
+/// call site can put a transition on the lossy lane or a frame on the unbounded one.
+#[derive(Clone)]
+pub struct RenderTx {
+    frames: SyncSender<RenderCommand>,
+    control: std::sync::mpsc::Sender<RenderCommand>,
+}
+
+impl RenderTx {
+    /// Send a command down its lane.
+    ///
+    /// A refused frame is dropped by design. A transition cannot be refused; the only
+    /// way it goes nowhere is a disconnected receiver, which means the render loop
+    /// itself is gone and there is no panel left to desynchronise.
+    pub fn send(&self, cmd: RenderCommand) {
+        match cmd {
+            RenderCommand::Video(_) => drop(self.frames.try_send(cmd)),
+            control => drop(self.control.send(control)),
+        }
+    }
+
+    /// Send a video frame, answering whether the render loop is still there.
+    ///
+    /// `false` only on disconnect — a full lane just drops the frame. The decode and
+    /// mirror loops use the answer to stop pushing at a loop that is gone.
+    pub fn send_frame(&self, frame: DecodedFrame) -> bool {
+        !matches!(
+            self.frames.try_send(RenderCommand::Video(frame)),
+            Err(TrySendError::Disconnected(_))
+        )
+    }
+}
+
+/// The receiving half: what [`RenderLoop`] drains every pump.
+pub struct RenderRx {
+    frames: Receiver<RenderCommand>,
+    control: Receiver<RenderCommand>,
+}
+
+impl RenderRx {
+    /// The next command, transitions first.
+    ///
+    /// Control-before-frames means a frame can be applied after a `ClearVideo` that was
+    /// sent later; that is absorbed by the clear being *scheduled* (`CLEAR_GRACE`), not
+    /// immediate, so a straggler frame is cleared with everything else. The opposite
+    /// order would be worse: frames delaying the transition that explains them.
+    pub fn try_recv(&self) -> Option<RenderCommand> {
+        match self.control.try_recv() {
+            Ok(cmd) => Some(cmd),
+            Err(_) => self.frames.try_recv().ok(),
+        }
+    }
+
+    /// Block up to `timeout` for the next command. Two receivers share the timeout by
+    /// polling in millisecond slices — only tests block here, so coarse is fine.
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<RenderCommand> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(cmd) = self.try_recv() {
+                return Some(cmd);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// A render channel: a bounded frame lane of `frame_depth` and an unbounded
+/// transition lane. See [`RenderTx`] for why there are two.
+#[must_use]
+pub fn render_channel(frame_depth: usize) -> (RenderTx, RenderRx) {
+    let (frames_tx, frames_rx) = sync_channel(frame_depth.max(1));
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    (
+        RenderTx {
+            frames: frames_tx,
+            control: control_tx,
+        },
+        RenderRx {
+            frames: frames_rx,
+            control: control_rx,
+        },
+    )
+}
+
 /// Asks the render thread to capture what it is showing.
 #[derive(Clone)]
 pub struct ScreenshotHandle {
-    tx: SyncSender<RenderCommand>,
+    tx: RenderTx,
 }
 
 impl std::fmt::Debug for ScreenshotHandle {
@@ -173,11 +268,7 @@ impl ScreenshotHandle {
     /// time, or whatever the capture itself failed with.
     pub fn capture(&self, timeout: Duration) -> Result<Vec<u8>, PipelineError> {
         let (tap, rx) = crate::tap::ScreenshotTap::new();
-        self.tx
-            .try_send(RenderCommand::AddTap(Box::new(tap)))
-            .map_err(|_| {
-                PipelineError::Surface("the render thread is not accepting work".into())
-            })?;
+        self.tx.send(RenderCommand::AddTap(Box::new(tap)));
         rx.recv_timeout(timeout).map_err(|_| {
             PipelineError::Surface("the render thread did not present in time".into())
         })?
@@ -278,7 +369,7 @@ impl PlaybackReport for PlaybackHandle {
 /// The tokio-side pipeline handle. Implements [`Pipeline`]; owns decode threads and the
 /// sender half of the render channel.
 pub struct RenderPipeline {
-    tx: SyncSender<RenderCommand>,
+    tx: RenderTx,
     /// Stop flag for the currently-running decode thread, so a new `Play`/`stop`
     /// preempts the old one.
     active: Mutex<Option<Arc<AtomicBool>>>,
@@ -335,12 +426,12 @@ impl RenderPipeline {
     /// For the parts of `app` that drive the *shell* rather than playback — they need to
     /// push screens without owning the pipeline, and the pipeline is moved into the
     /// session manager at startup.
-    pub fn commands(&self) -> std::sync::mpsc::SyncSender<RenderCommand> {
+    pub fn commands(&self) -> RenderTx {
         self.tx.clone()
     }
 
-    pub fn new(depth: usize) -> (Self, Receiver<RenderCommand>) {
-        let (tx, rx) = sync_channel(depth.max(1));
+    pub fn new(depth: usize) -> (Self, RenderRx) {
+        let (tx, rx) = render_channel(depth);
         (
             Self {
                 tx,
@@ -436,9 +527,8 @@ impl RenderPipeline {
             return;
         };
         edit(&mut guard);
-        let _ = self
-            .tx
-            .try_send(RenderCommand::NowPlaying(Box::new(guard.clone())));
+        self.tx
+            .send(RenderCommand::NowPlaying(Box::new(guard.clone())));
     }
 
     /// Pin the hardware-decode choice.
@@ -474,7 +564,7 @@ impl RenderPipeline {
     /// ended and restarted (a phone reclaiming Spotify, a preempted sender pressing play)
     /// came back minimised into a corner with no way to know it had.
     fn claim_panel(&self) {
-        let _ = self.tx.try_send(RenderCommand::RestPanel);
+        self.tx.send(RenderCommand::RestPanel);
     }
 
     /// Hand the panel back from whatever is covering it, if anything is.
@@ -609,8 +699,8 @@ impl Pipeline for RenderPipeline {
             // Either way the item is over, so the screen goes back to idle. Without this
             // the last decoded frame stayed frozen on a two-metre panel indefinitely, and
             // a failed fetch left the attract scene up with nothing saying why.
-            let _ = tx.try_send(RenderCommand::ClearVideo);
-            let _ = tx.try_send(RenderCommand::ClearNowPlaying);
+            tx.send(RenderCommand::ClearVideo);
+            tx.send(RenderCommand::ClearNowPlaying);
 
             // …and tell whoever pushed the URL. Clearing the screen is what the room sees;
             // this is what the phone sees, and without it a control point read PLAYING / OK
@@ -644,9 +734,7 @@ impl Pipeline for RenderPipeline {
                 tokio::spawn(async move {
                     while let Some(frame) = rx.recv().await {
                         // Drop on full — live mirroring favors latency over freshness.
-                        if let Err(TrySendError::Disconnected(_)) =
-                            tx.try_send(RenderCommand::Video(frame))
-                        {
+                        if !tx.send_frame(frame) {
                             break;
                         }
                     }
@@ -878,11 +966,11 @@ impl Pipeline for RenderPipeline {
                 if let Ok(mut held) = self.playback.lock() {
                     *held = None;
                 }
-                let _ = self.tx.try_send(RenderCommand::ClearVideo);
+                self.tx.send(RenderCommand::ClearVideo);
                 if let Ok(mut guard) = self.card.lock() {
                     *guard = crate::nowplaying_card::NowPlayingCard::default();
                 }
-                let _ = self.tx.try_send(RenderCommand::ClearNowPlaying);
+                self.tx.send(RenderCommand::ClearNowPlaying);
                 info!("render pipeline: STOP (transport)");
                 Ok(())
             }
@@ -904,16 +992,16 @@ impl Pipeline for RenderPipeline {
         if let Ok(mut held) = self.playback.lock() {
             *held = None;
         }
-        let _ = self.tx.try_send(RenderCommand::ClearVideo);
+        self.tx.send(RenderCommand::ClearVideo);
         if let Ok(mut guard) = self.card.lock() {
             *guard = crate::nowplaying_card::NowPlayingCard::default();
         }
-        let _ = self.tx.try_send(RenderCommand::ClearNowPlaying);
+        self.tx.send(RenderCommand::ClearNowPlaying);
         // Nothing is playing and nobody is connected, so put the panel back where a
         // person expects to find it (#27). The render loop declines if the panel was
         // touched recently — an ending session is no reason to close a screen someone is
         // reading.
-        let _ = self.tx.try_send(RenderCommand::RestPanel);
+        self.tx.send(RenderCommand::RestPanel);
         info!("render pipeline: STOP");
         Ok(())
     }
@@ -924,7 +1012,7 @@ impl Pipeline for RenderPipeline {
 fn decode_into(
     uri: &str,
     hw: HwPreference,
-    tx: &SyncSender<RenderCommand>,
+    tx: &RenderTx,
     stop: &Arc<AtomicBool>,
     clock: &crate::clock::MediaClock,
     seek: &crate::seek::SeekControl,
@@ -953,7 +1041,7 @@ fn decode_into(
                 // carry whatever the container's tags said, since a bare URL from Cast or
                 // AirPlay brings no metadata of its own.
                 if !layout.has_video {
-                    let _ = tx.try_send(RenderCommand::UrlAudioOnly(Box::new(layout.clone())));
+                    tx.send(RenderCommand::UrlAudioOnly(Box::new(layout.clone())));
                 }
             },
             |frame| {
@@ -961,10 +1049,7 @@ fn decode_into(
                     return false;
                 }
                 // Drop on full (bounded queue) but stop if the render loop is gone.
-                !matches!(
-                    tx.try_send(RenderCommand::Video(frame)),
-                    Err(TrySendError::Disconnected(_))
-                )
+                tx.send_frame(frame)
             },
         )
     }
@@ -990,7 +1075,7 @@ fn decode_into(
 fn decode_mirror(
     #[allow(unused_mut)] mut rx: tokio::sync::mpsc::Receiver<castaway_core::EncodedFrame>,
     hw: HwPreference,
-    tx: &SyncSender<RenderCommand>,
+    tx: &RenderTx,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), PipelineError> {
     #[cfg(feature = "ffmpeg")]
@@ -1021,10 +1106,7 @@ fn decode_mirror(
                     return false;
                 }
                 // Drop on full (bounded queue) but stop if the render loop is gone.
-                !matches!(
-                    tx.try_send(RenderCommand::Video(frame)),
-                    Err(TrySendError::Disconnected(_))
-                )
+                tx.send_frame(frame)
             },
         )
     }
@@ -1042,7 +1124,7 @@ fn decode_mirror(
 /// [`Self::pump_blocking`].
 pub struct RenderLoop {
     compositor: WgpuCompositor,
-    rx: Receiver<RenderCommand>,
+    rx: RenderRx,
     osd: Option<crate::osd::OsdController>,
     /// A navigation in progress: how much of the outgoing screen is still showing, and
     /// whether a finger is driving it.
@@ -1157,7 +1239,7 @@ impl TransportState {
 impl RenderLoop {
     /// Build a render loop over an existing compositor and the pipeline's receiver.
     #[must_use]
-    pub fn new(compositor: WgpuCompositor, rx: Receiver<RenderCommand>) -> Self {
+    pub fn new(compositor: WgpuCompositor, rx: RenderRx) -> Self {
         Self {
             compositor,
             rx,
@@ -1227,11 +1309,7 @@ impl RenderLoop {
     ///
     /// # Errors
     /// [`PipelineError`] if the GPU can't be acquired.
-    pub fn offscreen(
-        width: u32,
-        height: u32,
-        rx: Receiver<RenderCommand>,
-    ) -> Result<Self, PipelineError> {
+    pub fn offscreen(width: u32, height: u32, rx: RenderRx) -> Result<Self, PipelineError> {
         Ok(Self::new(WgpuCompositor::new_offscreen(width, height)?, rx))
     }
 
@@ -2208,7 +2286,7 @@ impl RenderLoop {
     /// video frames applied this pump.
     pub fn pump(&mut self) -> usize {
         let mut applied = 0;
-        while let Ok(cmd) = self.rx.try_recv() {
+        while let Some(cmd) = self.rx.try_recv() {
             if self.apply(cmd) {
                 applied += 1;
             }
@@ -2224,11 +2302,11 @@ impl RenderLoop {
     /// decode thread races the render loop.
     pub fn pump_blocking(&mut self, timeout: Duration) -> usize {
         let mut applied = 0;
-        if let Ok(cmd) = self.rx.recv_timeout(timeout) {
+        if let Some(cmd) = self.rx.recv_timeout(timeout) {
             if self.apply(cmd) {
                 applied += 1;
             }
-            while let Ok(cmd) = self.rx.try_recv() {
+            while let Some(cmd) = self.rx.try_recv() {
                 if self.apply(cmd) {
                     applied += 1;
                 }
@@ -2655,7 +2733,9 @@ impl RenderLoop {
     /// starting too, and has to claim the panel the same way.
     pub fn rest_panel_if_idle(&mut self) {
         if self.last_touch.is_some_and(|t| t.elapsed() < IDLE_GRACE) {
-            debug!("shell: staying put, the panel was touched recently");
+            // `info`, not `debug`: this is the whole explanation for "I cast something
+            // and the panel didn't change", and the on-disk log only keeps `info` up.
+            info!("shell: a session claimed the panel, but it was touched recently; staying put");
             return;
         }
         let deep = self.panel.depth() > 1;
@@ -3199,7 +3279,7 @@ mod card_tests {
             .unwrap();
 
         let mut last = None;
-        while let Ok(cmd) = rx.try_recv() {
+        while let Some(cmd) = rx.try_recv() {
             if let RenderCommand::NowPlaying(card) = cmd {
                 last = Some(card);
             }
@@ -3264,7 +3344,7 @@ mod card_tests {
         pipeline.stop().await.unwrap();
 
         let mut cleared = false;
-        while let Ok(cmd) = rx.try_recv() {
+        while let Some(cmd) = rx.try_recv() {
             if matches!(cmd, RenderCommand::ClearNowPlaying) {
                 cleared = true;
             }

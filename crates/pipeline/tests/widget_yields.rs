@@ -60,11 +60,10 @@ fn widget_visible(render: &RenderLoop) -> bool {
     shot[i] > 0xf0 && shot[i + 1] < 0x10 && shot[i + 2] > 0xf0
 }
 
-fn idle_with_widget() -> (std::sync::mpsc::SyncSender<RenderCommand>, RenderLoop) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+fn idle_with_widget() -> (pipeline::RenderTx, RenderLoop) {
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     render.pump();
 
     // Stand in for the browser host: it is the thing that tells the panel a page is up, and
@@ -95,8 +94,7 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
 
     // An audio-only session: a card, no video. Its rect need not overlap the widget's —
     // that is the point.
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     settle(&mut render);
     assert!(
         !widget_visible(&render),
@@ -107,7 +105,7 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
     // Session over: the widget returns from the texture it kept all along — no new
     // upload happened between these pumps. The clear is deferred by the seek-shaped
     // grace (see `CLEAR_GRACE`), so the card lingers briefly before yielding back.
-    tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
+    tx.send(RenderCommand::ClearNowPlaying);
     render.pump();
     std::thread::sleep(std::time::Duration::from_millis(1300));
     settle(&mut render);
@@ -163,8 +161,7 @@ fn the_mascot_leans_on_the_slot_and_leaves_only_for_a_full_panel_session() {
     );
 
     // A session takes the panel: she is nowhere near the slot now, so she goes.
-    tx.try_send(RenderCommand::NowPlaying(Box::default()))
-        .unwrap();
+    tx.send(RenderCommand::NowPlaying(Box::default()));
     settle(&mut render);
     assert!(
         render.mascot_opacity().is_some_and(|o| o < 0.05),
@@ -206,7 +203,7 @@ fn a_demoted_video_is_nowhere_near_her_and_leaves_her_alone() {
     // Video demotes to the PiP corner, not the slot. Driving her from "is a session present"
     // would have hidden her for a video in the opposite corner of the panel.
     let (tx, mut render) = idle_with_widget();
-    tx.try_send(RenderCommand::Video(castaway_core::DecodedFrame {
+    tx.send(RenderCommand::Video(castaway_core::DecodedFrame {
         width: W,
         height: H,
         pts: std::time::Duration::ZERO,
@@ -214,8 +211,7 @@ fn a_demoted_video_is_nowhere_near_her_and_leaves_her_alone() {
             format: castaway_core::PixelFormat::Rgba8,
             data: bytes::Bytes::from(vec![0x40; (W * H * 4) as usize]),
         },
-    }))
-    .unwrap();
+    }));
     settle(&mut render);
     render.set_shell_foreground(true);
     settle(&mut render);
