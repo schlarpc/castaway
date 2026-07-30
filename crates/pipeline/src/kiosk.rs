@@ -489,6 +489,23 @@ impl KioskApp {
     }
 }
 
+/// The window's stable identity: Wayland `app_id`, X11 `WM_CLASS`, and the name the
+/// desktop entry and hicolor icons are installed under. The three have to agree or
+/// the Wayland icon lookup finds nothing, so it is one constant.
+const APP_ID: &str = "castaway";
+
+/// The window icon, on the platforms that take one from the window (X11, Windows).
+///
+/// 64px: X11 taskbars and pagers scale down from `_NET_WM_ICON`, and 64 is the
+/// largest anything asks for at 1x without being wasteful to ship in every window.
+/// `None` — no icon rather than no window — if the artwork fails to rasterize; the
+/// checked-in artwork failing is caught by `icon`'s own tests, not here.
+fn window_icon() -> Option<winit::window::Icon> {
+    const SIDE: u32 = 64;
+    let rgba = crate::icon::rasterize(SIDE)?;
+    winit::window::Icon::from_rgba(rgba, SIDE, SIDE).ok()
+}
+
 /// Normalize window-pixel coordinates to `0.0..=1.0`.
 fn normalize(x: f64, y: f64, (w, h): (u32, u32)) -> (f32, f32) {
     #[allow(clippy::cast_possible_truncation)]
@@ -539,7 +556,24 @@ impl ApplicationHandler for KioskApp {
         }
         let attrs = Window::default_attributes()
             .with_title("castaway")
+            // X11 and Windows read the icon off the window itself. Wayland has no
+            // such property — there the compositor looks up a `.desktop` entry whose
+            // name matches the app_id set below, so the icon only appears if
+            // `castaway.desktop` (Icon=castaway) and the hicolor PNGs are installed,
+            // which nix/linux-kiosk.nix does.
+            .with_window_icon(window_icon())
             .with_fullscreen(Some(Fullscreen::Borderless(None)));
+        // A stable identity for the window: Wayland app_id and X11 WM_CLASS, both
+        // "castaway". This is the string desktops key everything on — the Wayland
+        // icon lookup above, taskbar grouping, window rules — and winit's default
+        // is the generic "winit" otherwise. Called fully qualified because both
+        // platform extension traits name their method `with_name`.
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::{wayland, x11};
+            let attrs = wayland::WindowAttributesExtWayland::with_name(attrs, APP_ID, APP_ID);
+            x11::WindowAttributesExtX11::with_name(attrs, APP_ID, APP_ID)
+        };
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

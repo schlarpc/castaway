@@ -57,6 +57,14 @@ url.workspace = true
 # Driving the DLNA media plane end to end: a real SOAP envelope into the real router.
 tower = { version = "0.5", features = ["util"] }
 
+[build-dependencies]
+# Embeds assets/castaway.rc (the .exe icon) when the *target* is Windows — which is
+# why this is an unconditional build-dependency rather than a `[target...]` one:
+# cargo matches those tables against the host, and the Windows build is a cross
+# build from Linux. Chosen over winresource because it drives `llvm-rc`, which is
+# the resource compiler nix/windows.nix actually ships.
+embed-resource = "3"
+
 [features]
 default = []
 # Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)

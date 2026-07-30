@@ -103,6 +103,32 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
     # them with a permission error that names a temp file rather than the cause.
     cp -r --no-preserve=mode,ownership ${../browser-host} $out/share/castaway/browser-host
     chmod -R u+w $out/share/castaway/browser-host
+
+    # The icon, the way Wayland actually delivers one: the kiosk window sets
+    # app_id "castaway" (pipeline::kiosk), the compositor looks for a desktop
+    # entry of that name, and the entry's Icon= resolves through the hicolor
+    # theme. X11 gets the icon off the window itself, but keeps WM_CLASS
+    # "castaway" so the same entry matches there too. The rasters are checked
+    # in, generated from castaway-icon.svg by the pipeline `icon_render`
+    # example — this only installs them.
+    for size in 16 24 32 48 64 128 256; do
+      install -Dm444 crates/pipeline/assets/brand/icon/castaway-$size.png \
+        $out/share/icons/hicolor/''${size}x''${size}/apps/castaway.png
+    done
+    install -Dm444 crates/pipeline/assets/brand/castaway-icon.svg \
+      $out/share/icons/hicolor/scalable/apps/castaway.svg
+
+    mkdir -p $out/share/applications
+    cat > $out/share/applications/castaway.desktop <<'EOF'
+    [Desktop Entry]
+    Type=Application
+    Name=castaway
+    Comment=Universal cast receiver
+    Exec=castaway
+    Icon=castaway
+    Categories=AudioVideo;Video;
+    StartupWMClass=castaway
+    EOF
   '';
 
   meta = commonArgs.meta or { } // {

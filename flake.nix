@@ -225,6 +225,9 @@
               || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path)
+              # The Windows resource script and the .exe icon it embeds (app/build.rs).
+              || (pkgs.lib.hasSuffix ".rc" path)
+              || (pkgs.lib.hasSuffix ".ico" path)
               # Everything under a fixtures/ directory, wholesale: ground rule 9 lands
               # reverse engineering as checked-in fixtures, and several are files no
               # suffix rule can name — proto-cast's extensionless `expect`/`time`

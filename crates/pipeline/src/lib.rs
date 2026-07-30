@@ -45,6 +45,8 @@ pub mod electron_browser;
 pub mod ffmpeg_decode;
 #[cfg(feature = "electron")]
 pub mod filterlists;
+#[cfg(feature = "render")]
+pub mod icon;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
 #[cfg(feature = "render")]
