@@ -37,7 +37,7 @@ pub use discovery::HostCandidate;
 pub use error::GameStreamError;
 pub use identity::ClientIdentity;
 pub use nvhttp::{App, LaunchParams, ServerInfo, UniqueId};
-pub use pairing::PairedServer;
+pub use pairing::{PairedServer, PairingPin};
 
 /// The mDNS service type GameStream hosts (Sunshine, GFE) advertise.
 pub const NVSTREAM_SERVICE_TYPE: &str = "_nvstream._tcp";
