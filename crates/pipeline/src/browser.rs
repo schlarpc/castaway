@@ -77,13 +77,18 @@ pub enum BrowserCommand {
 }
 
 #[cfg(feature = "render")]
-/// What the one offscreen browser is currently for. There is exactly one browser, so its two
-/// uses are mutually exclusive by construction: a cast takes the panel over, and
-/// dismissing it hands the screen back to the idle widget.
+/// A placement an offscreen browser window can occupy on the panel.
+///
+/// Formerly the mode flag of the *one* browser; since the two-window split
+/// (`browser_proto::Surface`) it names a viewport-and-layer, not a browser. The widget
+/// window always occupies [`Self::AttractWidget`]; the page window occupies
+/// [`Self::Fullscreen`] normally and [`Self::AttractWidget`] while minimized into the
+/// home screen's slot — where it outranks the widget, whose paints are dropped for the
+/// duration (one slot, one occupant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserRole {
-    /// The idle web widget (the clock) painting into the attract scene's reserved card,
-    /// *below* the video layer so a starting cast simply covers it.
+    /// The idle widget slot (the clock's card) in the attract scene, *below* the video
+    /// layer so a starting cast simply covers it.
     AttractWidget,
     /// A cast surface (YouTube leanback): fills the panel, above the video layer.
     Fullscreen,

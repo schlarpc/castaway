@@ -78,6 +78,7 @@ pub mod ubo_scriptlets;
 pub mod wgpu_compositor;
 #[cfg(feature = "electron")]
 pub use browser::{BrowserCommand, BrowserRole, BrowserSurface, BrowserView, NullBrowser};
+pub use browser_proto::Surface as BrowserWindowSurface;
 pub use color::YuvMatrix;
 pub use compositor::{Compositor, Layer, LayerId, NullCompositor, Transform};
 pub use error::PipelineError;

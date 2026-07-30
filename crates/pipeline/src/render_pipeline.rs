@@ -1719,12 +1719,24 @@ impl RenderLoop {
 
     /// Remove the browser's layers (browser hidden).
     ///
-    /// Both, not the current one: the role can change between a frame arriving and this
-    /// being called, and a stale surface left composited is a clock card sitting over a
-    /// cast — or worse, a dead page over the idle screen.
+    /// Both — the whole-browser cases: shutdown, respawn, unrecoverable process death.
+    /// With one window per surface, everything short of that is per-layer
+    /// ([`Self::clear_browser_layer`]): taking a dismissed cast down must not take the
+    /// live clock with it.
     pub fn clear_browser(&mut self) {
         self.compositor.remove_layer(LayerId::BrowserWidget);
         self.compositor.remove_layer(LayerId::BrowserFullscreen);
+    }
+
+    /// Remove one of the browser's two layers, leaving the other's picture alone.
+    ///
+    /// Anything that is not a browser layer is refused rather than removed: this method
+    /// exists for the browser host, and a typo'd `LayerId` silently deleting the video
+    /// layer would be a far stranger bug than a clear that visibly did not happen.
+    pub fn clear_browser_layer(&mut self, id: LayerId) {
+        if id.is_browser() {
+            self.compositor.remove_layer(id);
+        }
     }
 
     /// Whether the idle screen's web widget belongs on the panel right now.

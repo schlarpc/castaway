@@ -353,6 +353,111 @@ fn browser_layer_present(render: &pipeline::render_pipeline::RenderLoop) -> bool
     render.browser_layer_present()
 }
 
+/// A stand-in for the clock: paints the card, and counts how many times it has loaded.
+/// `performance.timeOrigin`-style state — anything that survives only as long as the
+/// document does — is what the two-window split exists to protect.
+const WIDGET_PAGE: &str =
+    "data:text/html,<style>html,body{margin:0;height:100%;background:rgb(32,192,32)}</style>\
+     <body><script>window.__widgetBorn=(window.__widgetBorn||0)+1;window.__ticks=0;\
+     setInterval(()=>{window.__ticks++},250)</script></body>";
+
+/// The widget survives a cast opening and closing, without reloading.
+///
+/// The one-window design could not have this: the clock and the page were the same
+/// webContents navigated back and forth, so opening YouTube flashed the clock's last
+/// frame through it and closing it reloaded the clock from scratch. Two windows make
+/// both non-events, and this pins each half: the widget layer never disappears while a
+/// page comes and goes, and the widget document is never re-created.
+#[test]
+#[ignore = "needs a GPU and an Electron"]
+fn a_cast_page_comes_and_goes_without_disturbing_the_widget() {
+    use pipeline::compositor::LayerId;
+    use pipeline::BrowserWindowSurface as Surface;
+
+    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
+        eprintln!("skipping: no usable GPU");
+        return;
+    };
+
+    let blocker = Arc::new(AdBlocker::with_defaults());
+    let electron = Electron::spawn(
+        &electron_path(),
+        &app_dir(),
+        Arc::clone(&blocker),
+        None,
+        pipeline::TV_USER_AGENT,
+    )
+    .expect("browser should start");
+
+    let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
+    let mut host =
+        ElectronHost::new(electron, spec(blocker, None), rx).with_attract_widget(WIDGET_PAGE);
+    host.resize(1280, 720);
+
+    // The widget arrives in the slot on its own — no command needed.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && render.layer_size(LayerId::BrowserWidget).is_none() {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        render.layer_size(LayerId::BrowserWidget).is_some(),
+        "the widget never painted into its slot"
+    );
+
+    // A cast opens fullscreen. The widget's layer must never so much as blink: the old
+    // single-window design dropped it here, which is the flash this test exists for.
+    tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_none() {
+        host.pump(&mut render);
+        render.pump();
+        assert!(
+            render.layer_size(LayerId::BrowserWidget).is_some(),
+            "opening a cast disturbed the widget layer"
+        );
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        render.layer_size(LayerId::BrowserFullscreen).is_some(),
+        "the cast page never painted"
+    );
+
+    // And closes. Still no blink, and no reload: the widget document is the same one.
+    tx.send(BrowserCommand::Hide).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_some() {
+        host.pump(&mut render);
+        render.pump();
+        assert!(
+            render.layer_size(LayerId::BrowserWidget).is_some(),
+            "closing the cast disturbed the widget layer"
+        );
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        render.layer_size(LayerId::BrowserFullscreen).is_none(),
+        "the cast layer never came down"
+    );
+
+    let born = host
+        .probe_on(
+            Surface::Widget,
+            "window.__widgetBorn",
+            Duration::from_secs(5),
+        )
+        .expect("the widget should answer");
+    assert_eq!(
+        born.trim(),
+        "1",
+        "the widget document was re-created {born} time(s): its state did not survive the cast"
+    );
+
+    host.shutdown();
+}
+
 /// Going home minimizes a fullscreen page into the widget slot — it keeps playing
 /// small, and comes back on restore.
 ///

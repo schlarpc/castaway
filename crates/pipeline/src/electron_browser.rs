@@ -38,6 +38,17 @@
 //! next paint arrives" deadlocks the pipeline: the producer is waiting for a release the
 //! consumer will only send on a paint that is never coming. That consumer was this file,
 //! once — the freeze arrived with the third frame and read as "the page went black".
+//!
+//! ## Two windows
+//!
+//! The subprocess owns one offscreen window per [`Surface`]: the idle widget (the
+//! clock), navigated once at startup and never again, and the cast page (YouTube
+//! leanback), navigated per cast. One window used to play both parts, which meant
+//! opening a cast flashed the clock through it and ending one reloaded the clock from
+//! scratch. Now each window's paints carry its surface and land on its own compositor
+//! layer, and the only coupling left is the *panel* rule: the widget slot shows one
+//! thing at a time, and a page demoted into it outranks the clock — so while a page is
+//! demoted, widget paints are released unimported rather than fought over the layer.
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -50,7 +61,9 @@ use crate::adblock_engine::AdBlocker;
 use crate::audio_decode::PcmBlock;
 use crate::audio_out::{AudioOut, AudioOutputFactory};
 use crate::browser::{BrowserCommand, BrowserRole};
-use crate::browser_proto::{encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, ToBrowser};
+use crate::browser_proto::{
+    encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, Surface, ToBrowser,
+};
 use crate::error::PipelineError;
 use crate::hwaccel::remote_handle::{ProcessRef, RemoteHandle};
 
@@ -104,11 +117,21 @@ impl Drop for InFlight {
     }
 }
 
+/// A fault the reader thread observed, and where.
+#[derive(Debug, Clone)]
+struct Fault {
+    /// The window it happened in, or `None` for the process itself (stdout closed).
+    /// Recovery is scoped by this: a crashing cast page reloads the page, not the clock.
+    surface: Option<Surface>,
+    /// What happened, for the log.
+    reason: String,
+}
+
 /// What the reader thread has observed, for the main thread to act on.
 #[derive(Debug, Default)]
 struct Health {
     /// A renderer died, or a load failed hard enough to warrant recovery.
-    fault: Mutex<Option<String>>,
+    fault: Mutex<Option<Fault>>,
     /// The browser told us it could not produce GPU frames.
     software_fallback: std::sync::atomic::AtomicBool,
     /// Frames the browser dropped because we were behind.
@@ -131,13 +154,13 @@ struct Health {
 }
 
 impl Health {
-    fn set_fault(&self, reason: String) {
+    fn set_fault(&self, surface: Option<Surface>, reason: String) {
         if let Ok(mut slot) = self.fault.lock() {
-            slot.get_or_insert(reason);
+            slot.get_or_insert(Fault { surface, reason });
         }
     }
 
-    fn take_fault(&self) -> Option<String> {
+    fn take_fault(&self) -> Option<Fault> {
         self.fault.lock().ok().and_then(|mut f| f.take())
     }
 }
@@ -196,14 +219,32 @@ struct PendingPaint {
     plane: PlaneInfo,
 }
 
+/// One pending slot per window. Each is deliberately a single slot: an older frame
+/// superseded before it was drawn is worthless, and holding it would only add lag
+/// (ground rule 4). Separate slots because the windows paint at unrelated rates — a
+/// 60 fps page must not be able to supersede the clock's once-a-second frame out of a
+/// shared slot.
+#[derive(Default)]
+struct PendingPaints {
+    widget: Option<PendingPaint>,
+    page: Option<PendingPaint>,
+}
+
+impl PendingPaints {
+    fn slot(&mut self, surface: Surface) -> &mut Option<PendingPaint> {
+        match surface {
+            Surface::Widget => &mut self.widget,
+            Surface::Page => &mut self.page,
+        }
+    }
+}
+
 /// The browser subprocess: spawn, protocol, supervision.
 pub struct Electron {
     child: Child,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
-    /// Newest painted frame not yet imported. Deliberately a single slot: an older frame
-    /// superseded before it was drawn is worthless, and holding it would only add lag
-    /// (ground rule 4).
-    pending: Arc<Mutex<Option<PendingPaint>>>,
+    /// Newest painted frame per window, not yet imported.
+    pending: Arc<Mutex<PendingPaints>>,
     health: Arc<Health>,
     process: ProcessRef,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -248,7 +289,7 @@ impl Electron {
             .take()
             .ok_or_else(|| PipelineError::GpuInit("browser has no stdout".into()))?;
 
-        let pending: Arc<Mutex<Option<PendingPaint>>> = Arc::new(Mutex::new(None));
+        let pending: Arc<Mutex<PendingPaints>> = Arc::new(Mutex::new(PendingPaints::default()));
         // A factory rather than a device: a respawned browser takes a *fresh* output, the
         // same way each session does, because two writers on one device fight rather
         // than mix.
@@ -332,9 +373,12 @@ impl Electron {
         }
     }
 
-    /// Take the newest painted frame, if one arrived since the last call.
-    fn take_paint(&self) -> Option<PendingPaint> {
-        self.pending.lock().ok().and_then(|mut p| p.take())
+    /// Take a window's newest painted frame, if one arrived since the last call.
+    fn take_paint(&self, surface: Surface) -> Option<PendingPaint> {
+        self.pending
+            .lock()
+            .ok()
+            .and_then(|mut p| p.slot(surface).take())
     }
 
     /// Whether the browser reported it cannot deliver GPU frames.
@@ -359,6 +403,7 @@ impl Electron {
     /// [`PipelineError::GpuInit`] if the browser does not answer within `timeout`.
     pub fn probe(
         &self,
+        surface: Surface,
         expression: &str,
         timeout: std::time::Duration,
     ) -> Result<String, PipelineError> {
@@ -368,6 +413,7 @@ impl Electron {
             probes.insert(id, tx);
         }
         self.send(&ToBrowser::Probe {
+            surface,
             id,
             expression: expression.to_string(),
         });
@@ -452,7 +498,7 @@ impl Drop for Electron {
 /// the same thing — the state a message can touch — and passing them individually made
 /// both signatures unreadable and neither more correct.
 struct Wiring<'a> {
-    pending: &'a Arc<Mutex<Option<PendingPaint>>>,
+    pending: &'a Arc<Mutex<PendingPaints>>,
     health: &'a Arc<Health>,
     stdin: &'a Arc<Mutex<Option<ChildStdin>>>,
     adblock: &'a Arc<AdBlocker>,
@@ -490,7 +536,8 @@ fn reader_loop(stdout: std::process::ChildStdout, w: &Wiring<'_>) {
         reader.consume(consumed);
     }
     debug!(target: "castaway::browser", "browser stdout closed");
-    w.health.set_fault("browser stdout closed".into());
+    // The process, not a window: both surfaces are gone with it.
+    w.health.set_fault(None, "browser stdout closed".into());
 }
 
 fn handle(msg: FromBrowser, w: &Wiring<'_>) {
@@ -508,6 +555,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             let _ = ready_tx.send(pid);
         }
         FromBrowser::Paint {
+            surface,
             id,
             format,
             width,
@@ -518,8 +566,10 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
         } => {
             // The picture's place on the media clock, against which the audio block's
             // own `media_time` is the lip-sync error. Recorded on every frame because a
-            // skew that only appears under load is the one that matters.
-            if media_time > 0.0 {
+            // skew that only appears under load is the one that matters. Page frames
+            // only: the widget has no media element, and letting a clock frame's zero
+            // into the pair would read as a wild sync excursion.
+            if surface == Surface::Page && media_time > 0.0 {
                 let video_ms = ms(media_time);
                 let audio_ms = health.audio_ms.load(Ordering::Relaxed);
                 if audio_ms != 0 {
@@ -530,6 +580,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             }
             trace!(
                 target: "castaway::browser",
+                ?surface,
                 id,
                 width,
                 height,
@@ -554,8 +605,8 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             let modifier = modifier
                 .as_deref()
                 .map_or(0, |m| m.parse::<u64>().unwrap_or(0));
-            let superseded = pending.lock().ok().and_then(|mut slot| {
-                slot.replace(PendingPaint {
+            let superseded = pending.lock().ok().and_then(|mut slots| {
+                slots.slot(surface).replace(PendingPaint {
                     id,
                     format,
                     width,
@@ -596,18 +647,27 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             let block = adblock.should_block(&url, &source, &kind);
             reply(stdin, &ToBrowser::AdblockVerdict { id, block });
         }
-        FromBrowser::LoadEnd { url, status } => {
-            debug!(target: "castaway::browser", %url, ?status, "load end");
+        FromBrowser::LoadEnd {
+            surface,
+            url,
+            status,
+        } => {
+            debug!(target: "castaway::browser", ?surface, %url, ?status, "load end");
         }
-        FromBrowser::LoadError { url, error } => {
-            warn!(target: "castaway::browser", %url, %error, "load error");
-            health.set_fault(format!("load failed: {error}"));
+        FromBrowser::LoadError {
+            surface,
+            url,
+            error,
+        } => {
+            warn!(target: "castaway::browser", ?surface, %url, %error, "load error");
+            health.set_fault(Some(surface), format!("load failed: {error}"));
         }
-        FromBrowser::RenderGone { reason } => {
-            warn!(target: "castaway::browser", %reason, "render process gone");
-            health.set_fault(format!("render process {reason}"));
+        FromBrowser::RenderGone { surface, reason } => {
+            warn!(target: "castaway::browser", ?surface, %reason, "render process gone");
+            health.set_fault(Some(surface), format!("render process {reason}"));
         }
         FromBrowser::Audio {
+            surface,
             pcm,
             channels,
             sample_rate,
@@ -621,7 +681,11 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                 warn!(target: "castaway::browser", "audio block did not decode");
                 return;
             };
-            health.audio_ms.store(ms(media_time), Ordering::Relaxed);
+            // The lip-sync pair is page audio against page frames; a widget that
+            // somehow made a sound still gets mixed, but must not pollute the clock.
+            if surface == Surface::Page {
+                health.audio_ms.store(ms(media_time), Ordering::Relaxed);
+            }
             health.audio_blocks.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut guard) = audio.lock() {
                 if let Some(sink) = guard.as_mut() {
@@ -694,29 +758,48 @@ pub struct ElectronHost {
     respawn: RespawnSpec,
     commands: std::sync::mpsc::Receiver<BrowserCommand>,
     size: (u32, u32),
-    role: BrowserRole,
+    /// The idle widget's URL. `None` when no widget is configured — or when the widget
+    /// itself proved unrecoverable and was given up on. The widget window, when this is
+    /// set, permanently owns [`Surface::Widget`] and the card viewport; it is never
+    /// navigated anywhere else.
     widget: Option<String>,
     widget_started: bool,
-    current_url: Option<String>,
+    /// What the page window is showing, `None` when no cast is up. Its own state,
+    /// disjoint from the widget's: navigating a cast in must not disturb the clock, and
+    /// dismissing one must not re-navigate it.
+    page_url: Option<String>,
+    /// Where the page window's picture belongs: [`BrowserRole::Fullscreen`] normally,
+    /// [`BrowserRole::AttractWidget`] while minimized into the home screen's slot —
+    /// where it outranks the widget, whose paints are dropped for the duration.
+    page_view: BrowserRole,
     recovery_attempts: u32,
-    retry_at: Option<std::time::Instant>,
+    /// A scheduled recovery: when it is due, and which window it is for (`None` = the
+    /// whole process, so both).
+    retry: Option<Retry>,
     gave_up: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Whether the idle widget is currently yielded to something that outranks it — a
+    /// Whether the widget *slot* is currently yielded to something that outranks it — a
     /// shell screen other than Home, or a session surface. A per-pump mirror of
     /// [`crate::render_pipeline::RenderLoop::attract_widget_covered`], held only so
     /// input routing agrees with the compositor (which skips drawing the covered layer
-    /// on its own — see `LayerId::yields_to`). Always false in
-    /// [`BrowserRole::Fullscreen`]; a cast surface is never covered.
-    widget_covered: bool,
-    /// Whether the left button is held, and therefore whether the browser owns the
-    /// pointer even where it strays outside its viewport.
-    left_down: bool,
-    /// Touch contacts the browser owns — the ones whose press landed inside its
-    /// viewport. Tracked per id because ownership is a property of the whole contact,
-    /// not of each event.
-    contacts: std::collections::HashSet<u32>,
+    /// on its own — see `LayerId::yields_to`). It covers whatever occupies the slot —
+    /// the clock, or a demoted page. A fullscreen page is never covered.
+    slot_covered: bool,
+    /// Which window holds the left button, and therefore owns the pointer even where it
+    /// strays outside its viewport. `None` when the button is up.
+    left_down: Option<Surface>,
+    /// Touch contacts a window owns — the ones whose press landed inside its viewport,
+    /// mapped to the window that took the press. Tracked per id because ownership is a
+    /// property of the whole contact, not of each event.
+    contacts: std::collections::HashMap<u32, Surface>,
     /// When the next session line is due.
     next_report: std::time::Instant,
+}
+
+/// A recovery due at a time, for a window (or for the process when `surface` is `None`).
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    at: std::time::Instant,
+    surface: Option<Surface>,
 }
 
 /// What [`ElectronHost`] needs to bring a browser back.
@@ -750,16 +833,16 @@ impl ElectronHost {
             respawn,
             commands,
             size: (1920, 1080),
-            role: BrowserRole::Fullscreen,
             widget: None,
             widget_started: false,
-            current_url: None,
+            page_url: None,
+            page_view: BrowserRole::Fullscreen,
             recovery_attempts: 0,
-            retry_at: None,
+            retry: None,
             gave_up: None,
-            widget_covered: false,
-            left_down: false,
-            contacts: std::collections::HashSet::new(),
+            slot_covered: false,
+            left_down: None,
+            contacts: std::collections::HashMap::new(),
             next_report: std::time::Instant::now(),
         }
     }
@@ -788,21 +871,22 @@ impl ElectronHost {
     /// audio keeps flowing through the tap), and a tap on the card restores it. Ending
     /// the session stays what it always was: the sender's stop, or the page going idle.
     pub fn minimize_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
-        if self.role != BrowserRole::Fullscreen {
+        if self.page_url.is_none() || self.page_view != BrowserRole::Fullscreen {
             return false;
         }
-        self.role = BrowserRole::AttractWidget;
+        self.page_view = BrowserRole::AttractWidget;
         // The fullscreen-size texture is the wrong shape for the card; drop it and let
-        // the first card-size paint bring the layer back (stale-size paints are
-        // released unimported in the meantime).
-        render.clear_browser();
-        let rect = self.role.view(self.size).rect;
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Resize {
-                width: rect.width,
-                height: rect.height,
-            });
-        }
+        // the first card-size paint land in the slot (stale-size paints are released
+        // unimported in the meantime). The widget layer is left alone: the clock is
+        // already card-shaped there, and staying visible until the page's card frame
+        // replaces it beats a hole.
+        render.clear_browser_layer(crate::compositor::LayerId::BrowserFullscreen);
+        let rect = self.page_browser_view().rect;
+        self.send(&ToBrowser::Resize {
+            surface: Surface::Page,
+            width: rect.width,
+            height: rect.height,
+        });
         true
     }
 
@@ -811,15 +895,18 @@ impl ElectronHost {
         if !self.is_minimized() {
             return false;
         }
-        self.role = BrowserRole::Fullscreen;
-        render.clear_browser();
-        let rect = self.role.view(self.size).rect;
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Resize {
-                width: rect.width,
-                height: rect.height,
-            });
-        }
+        self.page_view = BrowserRole::Fullscreen;
+        // The slot goes back to the widget: drop the page's card frame rather than
+        // leaving it to go stale there, and ask the clock for a frame *now* — its next
+        // natural repaint could be most of a second away.
+        render.clear_browser_layer(crate::compositor::LayerId::BrowserWidget);
+        self.invalidate_widget();
+        let rect = self.page_browser_view().rect;
+        self.send(&ToBrowser::Resize {
+            surface: Surface::Page,
+            width: rect.width,
+            height: rect.height,
+        });
         true
     }
 
@@ -827,26 +914,37 @@ impl ElectronHost {
     /// widget — i.e. tapping it means "restore", not "talk to the clock".
     #[must_use]
     pub fn is_minimized(&self) -> bool {
-        self.role == BrowserRole::AttractWidget
-            && self.current_url.is_some()
-            && self.current_url != self.widget
+        self.page_demoted()
     }
 
     /// Whether a panel-normalized point lands on the minimized page's card.
     #[must_use]
     pub fn hit_minimized(&self, x: f32, y: f32) -> bool {
-        self.is_minimized() && !self.widget_covered && self.hit_view(x, y).is_some()
+        self.is_minimized()
+            && self
+                .input_target()
+                .and_then(|(_, view)| self.hit(view, x, y))
+                .is_some()
     }
 
-    /// Track the kiosk surface size so the browser viewport matches.
+    /// Track the kiosk surface size so both browser viewports match.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
         self.size = (width, height);
-        let rect = self.role.view(self.size).rect;
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Resize {
+        if self.widget.is_some() {
+            let rect = self.widget_view().rect;
+            self.send(&ToBrowser::Resize {
+                surface: Surface::Widget,
+                width: rect.width,
+                height: rect.height,
+            });
+        }
+        if self.page_url.is_some() {
+            let rect = self.page_browser_view().rect;
+            self.send(&ToBrowser::Resize {
+                surface: Surface::Page,
                 width: rect.width,
                 height: rect.height,
             });
@@ -858,33 +956,69 @@ impl ElectronHost {
     pub fn pump(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
         if !self.widget_started {
             self.widget_started = true;
-            if let Some(url) = self.widget.clone() {
-                self.show(render, &url, BrowserRole::AttractWidget);
-            }
+            self.show_widget();
         }
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
-                BrowserCommand::Navigate(url) => self.show(render, &url, BrowserRole::Fullscreen),
-                BrowserCommand::Hide => self.hide(render),
+                BrowserCommand::Navigate(url) => self.show_page(render, &url),
+                BrowserCommand::Hide => self.hide_page(render),
             }
         }
         // Mirror the render loop's per-frame verdict, for input's sake alone: the
-        // *drawing* of a covered widget is the compositor's business (it skips the
+        // *drawing* of a covered slot is the compositor's business (it skips the
         // layer — see `LayerId::yields_to`), but "does a touch on that rect belong to
-        // the page" is answered here, and it must agree with what is on the glass.
-        self.widget_covered =
-            self.role == BrowserRole::AttractWidget && render.attract_widget_covered();
+        // what is in it" is answered here, and it must agree with what is on the glass.
+        self.slot_covered = render.attract_widget_covered();
         self.recover(render);
-        self.import_frame(render);
+        self.import_frames(render);
         self.report();
     }
 
-    /// Pull the newest painted frame across and hand it to the compositor.
-    fn import_frame(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+    /// The widget window's placement: always the attract card.
+    fn widget_view(&self) -> crate::browser::BrowserView {
+        BrowserRole::AttractWidget.view(self.size)
+    }
+
+    /// The page window's placement: fullscreen, or the card while minimized.
+    fn page_browser_view(&self) -> crate::browser::BrowserView {
+        self.page_view.view(self.size)
+    }
+
+    /// Whether the page window currently occupies the widget slot — which is when, and
+    /// only when, widget paints are dropped instead of composited.
+    fn page_demoted(&self) -> bool {
+        self.page_url.is_some() && self.page_view == BrowserRole::AttractWidget
+    }
+
+    /// Ask the widget window for a frame now rather than at its next natural repaint.
+    fn invalidate_widget(&self) {
+        if self.widget.is_some() {
+            self.send(&ToBrowser::Invalidate {
+                surface: Surface::Widget,
+            });
+        }
+    }
+
+    /// Queue a command on the browser, if there is one.
+    fn send(&self, msg: &ToBrowser) {
+        if let Some(e) = &self.electron {
+            e.send(msg);
+        }
+    }
+
+    /// Pull each window's newest painted frame across and hand it to the compositor.
+    fn import_frames(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        for surface in [Surface::Widget, Surface::Page] {
+            self.import_frame(render, surface);
+        }
+    }
+
+    /// Import one window's pending frame, routing it to that window's layer.
+    fn import_frame(&mut self, render: &mut crate::render_pipeline::RenderLoop, surface: Surface) {
         let Some(electron) = &self.electron else {
             return;
         };
-        let Some(paint) = electron.take_paint() else {
+        let Some(paint) = electron.take_paint(surface) else {
             return;
         };
 
@@ -892,14 +1026,27 @@ impl ElectronHost {
             id: paint.id,
             stdin: Arc::clone(&electron.stdin),
         };
-        // Nothing is meant to be showing. A blanked page still paints — about:blank is
-        // a white frame, importing it would put a fullscreen white layer where "hidden"
-        // should be — and after a dismiss the old page's last paints are still arriving.
-        if self.current_url.is_none() {
-            return; // `borrow` drops here, releasing the frame.
-        }
-        let view = self.role.view(self.size);
-        // A frame sized for a viewport we are no longer showing: the paint raced a role
+        // Frames from a window with nothing to show are released unimported. A blanked
+        // page still paints — about:blank is a white frame, importing it would put a
+        // fullscreen white layer where "hidden" should be — and after a dismiss the old
+        // page's last paints are still arriving. The widget's extra case is the panel
+        // rule: while a page is demoted into the slot, the page owns it, and a clock
+        // frame imported there would fight the cast for the same layer.
+        let view = match surface {
+            Surface::Widget => {
+                if self.widget.is_none() || self.page_demoted() {
+                    return; // `borrow` drops here, releasing the frame.
+                }
+                self.widget_view()
+            }
+            Surface::Page => {
+                if self.page_url.is_none() {
+                    return; // `borrow` drops here, releasing the frame.
+                }
+                self.page_browser_view()
+            }
+        };
+        // A frame sized for a viewport we are no longer showing: the paint raced a view
         // change or a resize. Stretching one frame of the old thing across the new rect
         // is worse than one frame of nothing.
         if (paint.width, paint.height) != (view.rect.width, view.rect.height) {
@@ -959,7 +1106,9 @@ impl ElectronHost {
         }
     }
 
-    /// Put the page back if it died, or give up loudly.
+    /// Put a failed window back if something died, or give up loudly — on that window,
+    /// not on both. The clock surviving a crashing cast page (and vice versa) is half of
+    /// what the two-window split buys.
     fn recover(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
         let fault = self.electron.as_ref().and_then(|e| e.health.take_fault());
         if let Some(fault) = fault {
@@ -967,44 +1116,69 @@ impl ElectronHost {
             if self.recovery_attempts > RECOVERY_ATTEMPTS {
                 error!(
                     target: "castaway::browser",
-                    %fault,
+                    fault = %fault.reason,
+                    surface = ?fault.surface,
                     attempts = self.recovery_attempts - 1,
-                    url = %self.current_url.clone().unwrap_or_default(),
-                    "giving up on the page; returning the panel to the idle screen"
+                    "giving up on the failing browser surface"
                 );
-                self.retry_at = None;
+                self.retry = None;
                 self.recovery_attempts = 0;
-                // Falling back to the idle widget is wrong when the idle widget is what
-                // failed: the panel would cycle through the same crash forever.
-                if self.current_url.as_deref() == self.widget.as_deref() {
-                    error!(
-                        target: "castaway::browser",
-                        "the idle widget is what failed; leaving the browser layer empty"
-                    );
-                    self.clear(render);
-                } else {
-                    self.hide(render);
-                }
-                if let Some(gave_up) = self.gave_up.clone() {
-                    gave_up();
+                match fault.surface {
+                    // Reloading the widget forever is wrong when the widget is what
+                    // fails: the panel would cycle through the same crash for good.
+                    // Dropping it also must not end a cast that is perfectly healthy.
+                    Some(Surface::Widget) => {
+                        error!(
+                            target: "castaway::browser",
+                            "the idle widget is what failed; leaving its slot empty"
+                        );
+                        self.widget = None;
+                        self.send(&ToBrowser::Blank {
+                            surface: Surface::Widget,
+                        });
+                        if !self.page_demoted() {
+                            render.clear_browser_layer(crate::compositor::LayerId::BrowserWidget);
+                        }
+                    }
+                    // The page is what DIAL senders are attached to; only its loss is
+                    // theirs to hear about. The clock stays up either way.
+                    Some(Surface::Page) => {
+                        self.hide_page(render);
+                        if let Some(gave_up) = self.gave_up.clone() {
+                            gave_up();
+                        }
+                    }
+                    // The process: everything is gone, and unrecoverable.
+                    None => {
+                        self.hide_page(render);
+                        render.clear_browser();
+                        if let Some(gave_up) = self.gave_up.clone() {
+                            gave_up();
+                        }
+                    }
                 }
                 return;
             }
             warn!(
                 target: "castaway::browser",
-                %fault,
+                fault = %fault.reason,
+                surface = ?fault.surface,
                 attempt = self.recovery_attempts,
                 retry_in = ?RECOVERY_DELAY,
                 "recovering the browser"
             );
-            self.retry_at = Some(std::time::Instant::now() + RECOVERY_DELAY);
+            self.retry = Some(Retry {
+                at: std::time::Instant::now() + RECOVERY_DELAY,
+                surface: fault.surface,
+            });
         }
 
-        let Some(due) = self.retry_at else { return };
-        if std::time::Instant::now() < due {
+        let Some(retry) = self.retry else { return };
+        if std::time::Instant::now() < retry.at {
             return;
         }
-        self.retry_at = None;
+        self.retry = None;
+        let mut surface = retry.surface;
 
         // A dead *process* needs respawning, not just re-navigating — the distinction the
         // embedded path never had to make, because there the process was ours.
@@ -1013,7 +1187,7 @@ impl ElectronHost {
             .as_mut()
             .is_none_or(|e| matches!(e.child.try_wait(), Ok(Some(_)) | Err(_)));
         if dead {
-            self.clear(render);
+            render.clear_browser();
             if let Some(old) = self.electron.take() {
                 old.shutdown();
             }
@@ -1033,83 +1207,132 @@ impl ElectronHost {
                     return;
                 }
             }
+            // A fresh process has neither window; both must come back whatever the
+            // fault named.
+            surface = None;
         }
 
-        let Some(url) = self.current_url.clone() else {
-            return;
-        };
-        let role = self.role;
-        info!(target: "castaway::browser", %url, "reloading after a fault");
-        self.show(render, &url, role);
-    }
-
-    /// Give the panel back: the idle widget if there is one, otherwise nothing.
-    fn hide(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
-        match self.widget.clone() {
-            Some(url) => self.show(render, &url, BrowserRole::AttractWidget),
+        match surface {
+            Some(Surface::Widget) => self.show_widget(),
+            Some(Surface::Page) => self.reload_page(),
             None => {
-                if let Some(e) = &self.electron {
-                    e.send(&ToBrowser::Blank);
-                }
-                self.clear(render);
+                self.show_widget();
+                self.reload_page();
             }
         }
     }
 
-    /// Drop the browser layer and every borrow behind it.
-    ///
-    /// The borrows live inside the layer textures, so dropping the layers is what
-    /// releases the frames — once wgpu has retired the submissions still sampling them.
-    fn clear(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
-        self.current_url = None;
-        render.clear_browser();
+    /// Navigate the widget window to the configured attract URL, if there is one.
+    fn show_widget(&self) {
+        let Some(url) = self.widget.clone() else {
+            return;
+        };
+        let rect = self.widget_view().rect;
+        self.send(&ToBrowser::Navigate {
+            surface: Surface::Widget,
+            url,
+            width: rect.width,
+            height: rect.height,
+        });
     }
 
-    /// Point the browser at `url` in `role`.
-    fn show(
-        &mut self,
-        render: &mut crate::render_pipeline::RenderLoop,
-        url: &str,
-        role: BrowserRole,
-    ) {
-        let rect = role.view(self.size).rect;
-        if self.role != role {
-            // The layer transform changes with the role but the texture is still the old
-            // viewport's size; drop it rather than stretching one frame of the wrong
-            // thing across the new rect.
-            render.clear_browser();
-        }
-        self.role = role;
-        if self.current_url.as_deref() != Some(url) {
-            self.recovery_attempts = 0;
-            self.retry_at = None;
-        }
-        self.current_url = Some(url.to_string());
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Navigate {
-                url: url.to_string(),
-                width: rect.width,
-                height: rect.height,
+    /// Re-navigate the page window to what it was showing, after a fault.
+    fn reload_page(&self) {
+        let Some(url) = self.page_url.clone() else {
+            return;
+        };
+        let rect = self.page_browser_view().rect;
+        info!(target: "castaway::browser", %url, "reloading the page after a fault");
+        self.send(&ToBrowser::Navigate {
+            surface: Surface::Page,
+            url,
+            width: rect.width,
+            height: rect.height,
+        });
+    }
+
+    /// Dismiss the cast page. The widget window is untouched: its clock has been live
+    /// underneath the whole time, so "give the panel back" is now nothing more than
+    /// taking the page's layer down.
+    fn hide_page(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        let was_demoted = self.page_demoted();
+        if self.page_url.take().is_some() {
+            self.send(&ToBrowser::Blank {
+                surface: Surface::Page,
             });
         }
+        self.page_view = BrowserRole::Fullscreen;
+        render.clear_browser_layer(crate::compositor::LayerId::BrowserFullscreen);
+        if was_demoted {
+            // The page's card frame is squatting on the widget's layer; hand the slot
+            // back and get a clock frame at once rather than at its next repaint.
+            render.clear_browser_layer(crate::compositor::LayerId::BrowserWidget);
+            self.invalidate_widget();
+        }
     }
 
-    /// Map a normalized panel coordinate into browser view pixels, clamped. For a
-    /// contact the browser already owns.
-    fn to_view(&self, x: f32, y: f32) -> (f32, f32) {
-        crate::browser::to_view_px(self.role.view(self.size).rect, self.size, x, y)
+    /// Show a cast page fullscreen — the widget window is not involved, which is why
+    /// opening a cast no longer flashes the clock through it.
+    fn show_page(&mut self, render: &mut crate::render_pipeline::RenderLoop, url: &str) {
+        if self.page_view != BrowserRole::Fullscreen {
+            // A new cast arriving while the old page sat minimized: it opens
+            // fullscreen, and the slot returns to the widget.
+            self.page_view = BrowserRole::Fullscreen;
+            render.clear_browser_layer(crate::compositor::LayerId::BrowserWidget);
+            self.invalidate_widget();
+        }
+        if self.page_url.as_deref() != Some(url) {
+            self.recovery_attempts = 0;
+            self.retry = None;
+        }
+        self.page_url = Some(url.to_string());
+        let rect = self.page_browser_view().rect;
+        self.send(&ToBrowser::Navigate {
+            surface: Surface::Page,
+            url: url.to_string(),
+            width: rect.width,
+            height: rect.height,
+        });
     }
 
-    /// Map a normalized panel coordinate, or `None` if it is outside the viewport. For
-    /// deciding whether an input belongs to the browser at all.
+    /// The window a fresh input belongs to, with its current placement: the page while a
+    /// cast is up (wherever its view is), else the widget. Never both — the demoted
+    /// page *replaces* the clock in the slot, so there is always at most one owner for
+    /// a point on the glass.
+    fn input_target(&self) -> Option<(Surface, crate::browser::BrowserView)> {
+        if self.page_url.is_some() {
+            Some((Surface::Page, self.page_browser_view()))
+        } else if self.widget.is_some() && self.widget_started {
+            Some((Surface::Widget, self.widget_view()))
+        } else {
+            None
+        }
+    }
+
+    /// A window's current placement, for mapping events of a contact it already owns.
+    fn view_of(&self, surface: Surface) -> crate::browser::BrowserView {
+        match surface {
+            Surface::Widget => self.widget_view(),
+            Surface::Page => self.page_browser_view(),
+        }
+    }
+
+    /// Map a normalized panel coordinate into a window's view pixels, clamped. For a
+    /// contact that window already owns.
+    fn to_view(&self, surface: Surface, x: f32, y: f32) -> (f32, f32) {
+        crate::browser::to_view_px(self.view_of(surface).rect, self.size, x, y)
+    }
+
+    /// Map a normalized panel coordinate into a view, or `None` if it is outside it.
+    /// For deciding whether an input belongs to that window at all.
     ///
-    /// A covered widget owns nothing: its rect is still where it always was, but what
-    /// the finger is touching is whatever covered it.
-    fn hit_view(&self, x: f32, y: f32) -> Option<(f32, f32)> {
-        if self.widget_covered {
+    /// A covered slot owns nothing: its rect is still where it always was, but what the
+    /// finger is touching is whatever covered it.
+    fn hit(&self, view: crate::browser::BrowserView, x: f32, y: f32) -> Option<(f32, f32)> {
+        if view.layer == crate::compositor::LayerId::BrowserWidget && self.slot_covered {
             return None;
         }
-        crate::browser::hit_view_px(self.role.view(self.size).rect, self.size, x, y)
+        crate::browser::hit_view_px(view.rect, self.size, x, y)
     }
 
     /// One structured line every 5 s while the browser has audio, mirroring the mirroring
@@ -1135,7 +1358,7 @@ impl ElectronHost {
         }
     }
 
-    /// Ask the page a question. Test-only; see [`Electron::probe`].
+    /// Ask the cast page a question. Test-only; see [`Electron::probe`].
     ///
     /// # Errors
     /// [`PipelineError::GpuInit`] if there is no browser or it does not answer.
@@ -1144,10 +1367,24 @@ impl ElectronHost {
         expression: &str,
         timeout: std::time::Duration,
     ) -> Result<String, PipelineError> {
+        self.probe_on(Surface::Page, expression, timeout)
+    }
+
+    /// Ask a named window's page a question. Test-only, like [`Self::probe`] — it is
+    /// how a test sees that the clock kept its state while a cast came and went.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuInit`] if there is no browser or it does not answer.
+    pub fn probe_on(
+        &self,
+        surface: Surface,
+        expression: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, PipelineError> {
         self.electron
             .as_ref()
             .ok_or_else(|| PipelineError::GpuInit("no browser to probe".into()))?
-            .probe(expression, timeout)
+            .probe(surface, expression, timeout)
     }
 
     /// Whether the browser is delivering GPU frames.
@@ -1177,73 +1414,83 @@ impl ElectronHost {
 impl input_touch::InputSink for ElectronHost {
     fn touch(&mut self, event: input_touch::TouchEvent) {
         use input_touch::TouchPhase;
-        // A contact belongs to the browser only if it *started* inside the viewport, and
-        // then it belongs to it until it ends. Two failures this prevents, and the second
-        // is the nastier one:
+        // A contact belongs to a window only if it *started* inside that window's
+        // viewport, and then it belongs to it until it ends. Two failures this prevents,
+        // and the second is the nastier one:
         //
-        //  - When the browser is the idle screen's clock card, a touch anywhere on the
+        //  - When the target is the idle screen's clock card, a touch anywhere on the
         //    65-inch panel used to be clamped into that corner and delivered to the page.
         //  - Deciding per-event instead of per-contact would drop the *end* of a drag
         //    that wandered off the card, and the page would believe a finger was down for
         //    the rest of the session.
-        let owned = match event.phase {
+        //
+        // Ownership is recorded as *which window*, not merely "ours": the page can be
+        // dismissed mid-drag, and the end of that drag must still go to the page rather
+        // than being re-aimed at whatever owns the glass by then.
+        let owned: Option<Surface> = match event.phase {
             TouchPhase::Down => {
-                let inside = self.hit_view(event.x, event.y).is_some();
-                if inside {
-                    self.contacts.insert(event.id);
+                let target = self
+                    .input_target()
+                    .and_then(|(s, view)| self.hit(view, event.x, event.y).map(|_| s));
+                if let Some(surface) = target {
+                    self.contacts.insert(event.id, surface);
                 }
-                inside
+                target
             }
-            TouchPhase::Move => self.contacts.contains(&event.id),
+            TouchPhase::Move => self.contacts.get(&event.id).copied(),
             TouchPhase::Up | TouchPhase::Cancel => self.contacts.remove(&event.id),
         };
-        if !owned {
-            return;
-        }
-        let (x, y) = self.to_view(event.x, event.y);
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Touch {
-                id: event.id,
-                phase: event.phase.into(),
-                x,
-                y,
-            });
-        }
+        let Some(surface) = owned else { return };
+        let (x, y) = self.to_view(surface, event.x, event.y);
+        self.send(&ToBrowser::Touch {
+            surface,
+            id: event.id,
+            phase: event.phase.into(),
+            x,
+            y,
+        });
     }
 
     fn cancel_all(&mut self) {
-        // Every contact the browser thinks is down, told to stop. Without this a page
-        // keeps a phantom finger for the life of the session: the browser host holds a
-        // contact map keyed by id and only an end or a cancel removes an entry.
-        let ids: Vec<u32> = self.contacts.drain().collect();
-        if ids.is_empty() {
-            return;
-        }
-        let Some(e) = &self.electron else { return };
-        for id in ids {
-            e.send(&ToBrowser::Touch {
+        // Every contact a window thinks is down, told to stop — each in the window that
+        // owns it. Without this a page keeps a phantom finger for the life of the
+        // session: the browser host holds a contact map keyed by id and only an end or a
+        // cancel removes an entry.
+        let contacts: Vec<(u32, Surface)> = self.contacts.drain().collect();
+        for (id, surface) in contacts {
+            self.send(&ToBrowser::Touch {
+                surface,
                 id,
                 phase: crate::browser_proto::TouchPhase::Cancel,
                 x: 0.0,
                 y: 0.0,
             });
         }
-        self.left_down = false;
+        self.left_down = None;
     }
 
     fn pointer(&mut self, event: input_touch::PointerEvent) {
         use crate::browser_proto::PointerKind;
         use input_touch::PointerEvent;
-        let Some(e) = &self.electron else { return };
         match event {
             PointerEvent::Move { x, y } => {
-                // While a button is held the browser owns the pointer wherever it goes;
-                // otherwise a hover only counts inside the viewport.
-                if !self.left_down && self.hit_view(x, y).is_none() {
-                    return;
-                }
-                let (x, y) = self.to_view(x, y);
-                e.send(&ToBrowser::Pointer {
+                // While a button is held its window owns the pointer wherever it goes;
+                // otherwise a hover only counts inside the target's viewport.
+                let surface = match self.left_down {
+                    Some(surface) => surface,
+                    None => {
+                        let Some(surface) = self
+                            .input_target()
+                            .and_then(|(s, view)| self.hit(view, x, y).map(|_| s))
+                        else {
+                            return;
+                        };
+                        surface
+                    }
+                };
+                let (x, y) = self.to_view(surface, x, y);
+                self.send(&ToBrowser::Pointer {
+                    surface,
                     kind: PointerKind::Move,
                     x,
                     y,
@@ -1255,18 +1502,26 @@ impl input_touch::InputSink for ElectronHost {
                 if button != input_touch::PointerButton::Left {
                     return;
                 }
-                // Press must land inside; release is delivered iff the press was ours,
-                // for the same reason a touch's end is.
-                if down && self.hit_view(x, y).is_none() {
-                    return;
-                }
-                if !down && !self.left_down {
-                    return;
-                }
-                self.left_down = down;
-                let (x, y) = self.to_view(x, y);
-                let Some(e) = &self.electron else { return };
-                e.send(&ToBrowser::Pointer {
+                // Press must land inside; release is delivered iff the press was some
+                // window's, and to that window, for the same reason a touch's end is.
+                let surface = if down {
+                    let Some(surface) = self
+                        .input_target()
+                        .and_then(|(s, view)| self.hit(view, x, y).map(|_| s))
+                    else {
+                        return;
+                    };
+                    self.left_down = Some(surface);
+                    surface
+                } else {
+                    let Some(surface) = self.left_down.take() else {
+                        return;
+                    };
+                    surface
+                };
+                let (x, y) = self.to_view(surface, x, y);
+                self.send(&ToBrowser::Pointer {
+                    surface,
                     kind: if down {
                         PointerKind::Down
                     } else {
@@ -1277,13 +1532,22 @@ impl input_touch::InputSink for ElectronHost {
                 });
             }
             PointerEvent::Wheel { x, y, dx, dy } => {
-                // A scroll goes to whatever is under the cursor, so it has to be over us.
-                if self.hit_view(x, y).is_none() {
+                // A scroll goes to whatever is under the cursor, so it has to be over
+                // the target window.
+                let Some(surface) = self
+                    .input_target()
+                    .and_then(|(s, view)| self.hit(view, x, y).map(|_| s))
+                else {
                     return;
-                }
-                let (x, y) = self.to_view(x, y);
-                let Some(e) = &self.electron else { return };
-                e.send(&ToBrowser::Wheel { x, y, dx, dy });
+                };
+                let (x, y) = self.to_view(surface, x, y);
+                self.send(&ToBrowser::Wheel {
+                    surface,
+                    x,
+                    y,
+                    dx,
+                    dy,
+                });
             }
         }
     }

@@ -43,7 +43,8 @@ process.on('unhandledRejection', (err) => log('error', `unhandled rejection: ${e
 // Protocol
 // ---------------------------------------------------------------------------
 // Mirrors MAX_INFLIGHT_FRAMES in crates/pipeline/src/browser_proto.rs — its docs say
-// why four is the number.
+// why four is the number. Enforced per *window*: each surface has its own pending slot
+// on castaway's side, so a 60 fps page must not be able to spend the clock's budget.
 const MAX_INFLIGHT = 4;
 
 function send(msg) {
@@ -53,7 +54,9 @@ function log(level, message) {
   send({ type: 'log', level, message });
 }
 
-/** Frames lent to castaway, id → texture. */
+/** Frames lent to castaway, id → { texture, win }. Ids are unique across windows, so a
+ * release does not need to say which window it returns to — but the entry remembers,
+ * because the per-window lent count has to come back down on the right window. */
 const inflight = new Map();
 let paintSeq = 0;
 let drops = 0;
@@ -62,12 +65,27 @@ let drops = 0;
 const pendingBlock = new Map();
 let blockSeq = 0;
 
-let win = null;
+/**
+ * surface → BrowserWindow, per crates/pipeline/src/browser_proto.rs `Surface`: 'widget'
+ * is the idle clock, created when castaway first navigates it; 'page' is the cast
+ * surface, created on its first navigate. Two windows so the two have separate
+ * webContents — separate navigation state, separate renderers — and opening a cast never
+ * flashes the clock through it. If a second window cannot be created, both surfaces
+ * share the survivor (logged): degraded single-window behaviour, not a crash.
+ *
+ * Per-window state lives on the window itself (`__surface`, `__touchPoints`, `__lent`,
+ * `__scriptletHandle`) so shared-fallback mode cannot cross wires between two maps.
+ */
+const wins = new Map();
+
+function getWindow(surface) {
+  const w = wins.get(surface);
+  return w && !w.isDestroyed() ? w : null;
+}
+
 /** Pending scriptlet questions, id → resolve. */
 const pendingScriptlets = new Map();
 let scriptletSeq = 0;
-/** The CDP script registration, so a new blob replaces rather than stacks. */
-let scriptletHandle = null;
 
 const USER_AGENT = process.env.CASTAWAY_USER_AGENT || undefined;
 
@@ -128,10 +146,25 @@ function installAdblock(ses) {
       type: 'adblock-query',
       id,
       url: details.url,
-      source: (win && !win.isDestroyed() && win.webContents.getURL()) || '',
+      source: sourceUrlFor(details),
       kind: details.resourceType || 'other',
     });
   });
+}
+
+/** The document URL a request came from, for domain-scoped rules. With two windows the
+ * requester matters: a rule scoped to youtube.com must not fire on the clock's requests,
+ * so the window is found by the request's own webContents rather than assumed. */
+function sourceUrlFor(details) {
+  for (const w of new Set(wins.values())) {
+    if (w && !w.isDestroyed() && w.webContents.id === details.webContentsId) {
+      return w.webContents.getURL();
+    }
+  }
+  // A request with no window of ours (a service worker, say): the page window's
+  // document is the best available answer, as it was when there was only one window.
+  const page = getWindow('page') || getWindow('widget');
+  return (page && page.webContents.getURL()) || '';
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +195,8 @@ function withDeadline(promise, what, ms = 3000) {
 // lazily inside the scriptlet path, which meant a page with no matching uBO rule got no
 // debugger — and therefore no touch and no audio. That failed silently, on exactly the
 // pages least likely to be noticed, which is why `a_touch_reaches_the_page` exists.
-async function ensureDebugger(contents) {
+async function ensureDebugger(w) {
+  const contents = w.webContents;
   if (contents.debugger.isAttached()) return true;
   try {
     contents.debugger.attach('1.3');
@@ -194,6 +228,9 @@ async function ensureDebugger(contents) {
         const b = JSON.parse(params.payload);
         send({
           type: 'audio',
+          // Read at delivery time, not attach time: in shared-window fallback the
+          // window's surface changes with each navigate.
+          surface: w.__surface,
           pcm: b.pcm,
           channels: b.channels,
           sampleRate: b.sampleRate,
@@ -220,13 +257,16 @@ async function ensureDebugger(contents) {
 //
 // The audio tap rides along because it needs the same two properties.
 // ---------------------------------------------------------------------------
-async function applyScriptlets(contents, source) {
-  if (!(await ensureDebugger(contents))) return;
+async function applyScriptlets(w, source) {
+  const contents = w.webContents;
+  if (!(await ensureDebugger(w))) return;
   try {
-    if (scriptletHandle) {
+    // The registration handle is per-window: each webContents keeps its own injected
+    // blob, and replacing the page's must not strip the clock's.
+    if (w.__scriptletHandle) {
       await withDeadline(
         contents.debugger.sendCommand('Page.removeScriptToEvaluateOnNewDocument', {
-          identifier: scriptletHandle,
+          identifier: w.__scriptletHandle,
         }),
         'removeScriptToEvaluateOnNewDocument'
       ).catch(() => {});
@@ -238,8 +278,8 @@ async function applyScriptlets(contents, source) {
       }),
       'addScriptToEvaluateOnNewDocument'
     );
-    scriptletHandle = res.identifier;
-    log('info', `page armed (audio tap + ${(source || '').length} bytes of scriptlets)`);
+    w.__scriptletHandle = res.identifier;
+    log('info', `${w.__surface} armed (audio tap + ${(source || '').length} bytes of scriptlets)`);
   } catch (e) {
     log('warn', `scriptlet injection failed: ${e}`);
   }
@@ -270,10 +310,9 @@ function requestScriptlets(url) {
 // CDP too. Chromium's own gesture recognizer is on the far side of both, so scroll,
 // fling and tap behave as they did embedded.
 // ---------------------------------------------------------------------------
-const touchPoints = new Map();
-
 async function dispatchTouch(msg) {
-  if (!win || win.isDestroyed()) return;
+  const win = getWindow(msg.surface);
+  if (!win) return;
   const contents = win.webContents;
   if (!contents.debugger.isAttached()) return;
 
@@ -283,6 +322,9 @@ async function dispatchTouch(msg) {
     : msg.phase === 'cancel' ? 'touchCancel'
     : 'touchEnd';
 
+  // Contacts are per-window: a finger down on the page must not appear in the
+  // widget's touch list, or lifting it there would leave the page a phantom finger.
+  const touchPoints = win.__touchPoints;
   if (msg.phase === 'end' || msg.phase === 'cancel') touchPoints.delete(msg.id);
   else touchPoints.set(msg.id, { x: msg.x, y: msg.y, id: msg.id });
 
@@ -300,16 +342,44 @@ async function dispatchTouch(msg) {
 }
 
 function dispatchPointer(msg) {
-  if (!win || win.isDestroyed()) return;
+  const win = getWindow(msg.surface);
+  if (!win) return;
   const contents = win.webContents;
   const type = msg.kind === 'down' ? 'mouseDown' : msg.kind === 'up' ? 'mouseUp' : 'mouseMove';
   contents.sendInputEvent({ type, x: Math.round(msg.x), y: Math.round(msg.y), button: 'left', clickCount: 1 });
 }
 
 // ---------------------------------------------------------------------------
-// The window
+// The windows: one per surface, created lazily on that surface's first navigate.
 // ---------------------------------------------------------------------------
-function createWindow(width, height) {
+/** The window a navigate should act on: the surface's own, created now if need be. If
+ * creation fails and another window exists, both surfaces share it — single-window
+ * behaviour as a logged fallback, because a receiver with a clock through its cast page
+ * is degraded and a receiver that crashed is gone. */
+function ensureWindow(surface, width, height) {
+  const existing = getWindow(surface);
+  if (existing) {
+    existing.setContentSize(width, height);
+    return existing;
+  }
+  try {
+    const w = createWindow(surface, width, height);
+    wins.set(surface, w);
+    return w;
+  } catch (e) {
+    const survivor = [...new Set(wins.values())].find((o) => o && !o.isDestroyed());
+    if (!survivor) throw e;
+    log(
+      'warn',
+      `creating the ${surface} window failed (${e}); sharing one window for both surfaces`
+    );
+    wins.set(surface, survivor);
+    survivor.setContentSize(width, height);
+    return survivor;
+  }
+}
+
+function createWindow(surface, width, height) {
   const w = new BrowserWindow({
     show: false,
     webPreferences: {
@@ -322,6 +392,14 @@ function createWindow(width, height) {
       backgroundThrottling: false,
     },
   });
+  // Per-window state, kept on the window so shared-fallback mode cannot mismatch a
+  // window with some other window's bookkeeping. `__surface` is the tag every outbound
+  // message about this window carries; navigate re-stamps it, which only matters when
+  // one window is serving both surfaces.
+  w.__surface = surface;
+  w.__touchPoints = new Map();
+  w.__lent = 0;
+  w.__scriptletHandle = null;
   // Constructor sizes are clamped to the display work area even offscreen — asking for
   // 4K silently yields the panel's size instead. setContentSize is not clamped.
   w.setContentSize(width, height);
@@ -350,16 +428,18 @@ function createWindow(width, height) {
       event.texture.release();
       return;
     }
-    if (inflight.size >= MAX_INFLIGHT) {
+    if (w.__lent >= MAX_INFLIGHT) {
       drops += 1;
       send({ type: 'dropped', total: drops });
       event.texture.release();
       return;
     }
     const id = ++paintSeq;
-    inflight.set(id, event.texture);
+    w.__lent += 1;
+    inflight.set(id, { texture: event.texture, win: w });
     send({
       type: 'paint',
+      surface: w.__surface,
       id,
       format: info.pixelFormat === 'rgba' ? 'rgba' : 'bgra',
       width: info.codedSize.width,
@@ -375,15 +455,15 @@ function createWindow(width, height) {
   });
 
   w.webContents.on('did-finish-load', () => {
-    send({ type: 'load-end', url: w.webContents.getURL(), status: null });
+    send({ type: 'load-end', surface: w.__surface, url: w.webContents.getURL(), status: null });
   });
   w.webContents.on('did-fail-load', (_e, code, desc, url) => {
     // -3 is ERR_ABORTED, which a navigation that superseded another produces routinely.
     if (code === -3) return;
-    send({ type: 'load-error', url: url || '', error: `${desc} (${code})` });
+    send({ type: 'load-error', surface: w.__surface, url: url || '', error: `${desc} (${code})` });
   });
   w.webContents.on('render-process-gone', (_e, details) => {
-    send({ type: 'render-gone', reason: (details && details.reason) || 'unknown' });
+    send({ type: 'render-gone', surface: w.__surface, reason: (details && details.reason) || 'unknown' });
   });
 
   return w;
@@ -395,35 +475,47 @@ function createWindow(width, height) {
 function handle(msg) {
   switch (msg.type) {
     case 'release': {
-      const texture = inflight.get(msg.id);
-      if (texture) {
+      const lent = inflight.get(msg.id);
+      if (lent) {
         inflight.delete(msg.id);
-        texture.release();
+        if (lent.win && !lent.win.isDestroyed()) lent.win.__lent -= 1;
+        lent.texture.release();
       }
       return;
     }
     case 'navigate': {
-      if (!win || win.isDestroyed()) win = createWindow(msg.width, msg.height);
-      else win.setContentSize(msg.width, msg.height);
+      const win = ensureWindow(msg.surface, msg.width, msg.height);
+      // Re-stamped on every navigate: a no-op with two windows, and the thing that
+      // keeps paints truthfully tagged when one window is serving both surfaces.
+      win.__surface = msg.surface;
       // Ask for this page's scriptlets and arm them *before* navigating: uBO rules are
       // domain-scoped, and arming after the load has already begun races the very page
       // scripts the patches exist to get in front of.
       requestScriptlets(msg.url)
-        .then((source) => applyScriptlets(win.webContents, source))
+        .then((source) => applyScriptlets(win, source))
         .catch((e) => log('warn', `scriptlets for ${msg.url}: ${e}`))
         .finally(() =>
           win.loadURL(msg.url).catch((e) =>
-            send({ type: 'load-error', url: msg.url, error: String(e) })
+            send({ type: 'load-error', surface: win.__surface, url: msg.url, error: String(e) })
           )
         );
       return;
     }
     case 'blank': {
-      if (win && !win.isDestroyed()) win.loadURL('about:blank').catch(() => {});
+      const win = getWindow(msg.surface);
+      if (win) win.loadURL('about:blank').catch(() => {});
       return;
     }
     case 'resize': {
-      if (win && !win.isDestroyed()) win.setContentSize(msg.width, msg.height);
+      const win = getWindow(msg.surface);
+      if (win) win.setContentSize(msg.width, msg.height);
+      return;
+    }
+    case 'invalidate': {
+      // A full repaint on demand: how the clock reappears at once when a demoted page
+      // leaves the widget slot, instead of after its next natural damage.
+      const win = getWindow(msg.surface);
+      if (win) win.webContents.invalidate();
       return;
     }
     case 'touch':
@@ -433,7 +525,8 @@ function handle(msg) {
       dispatchPointer(msg);
       return;
     case 'wheel': {
-      if (!win || win.isDestroyed()) return;
+      const win = getWindow(msg.surface);
+      if (!win) return;
       // Position *and* delta: Chromium scrolls what is under the cursor, so a delta with
       // no position scrolls whichever region happens to be focused.
       win.webContents.sendInputEvent({
@@ -456,9 +549,10 @@ function handle(msg) {
       return;
     }
     case 'probe': {
-      // Test-only: let castaway ask the page a question. Kept deliberately thin — it
+      // Test-only: let castaway ask a page a question. Kept deliberately thin — it
       // evaluates and reports, and owns no behaviour of its own.
-      if (!win || win.isDestroyed()) {
+      const win = getWindow(msg.surface);
+      if (!win) {
         send({ type: 'probe-result', id: msg.id, value: '"no window"' });
         return;
       }
@@ -479,9 +573,9 @@ function handle(msg) {
 function shutdown() {
   // Return every lent frame before going: Chromium asserts on a texture destroyed while
   // still lent out, and an assert here is a crash rather than a clean exit.
-  for (const [, texture] of inflight) {
+  for (const [, lent] of inflight) {
     try {
-      texture.release();
+      lent.texture.release();
     } catch {
       /* already gone */
     }

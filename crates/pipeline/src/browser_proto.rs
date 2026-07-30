@@ -26,10 +26,18 @@
 //! finished sampling. Releasing early is a tear that only shows under load; never
 //! releasing is a stalled browser. [`FromBrowser::Paint`] and `Release` are therefore
 //! matched by `id`, and the actor is what keeps them paired.
+//!
+//! ## Two windows, one pipe
+//!
+//! The host owns one offscreen window per [`Surface`] — the idle widget and the cast
+//! page — so the two have separate navigation state: opening a cast never flashes the
+//! clock through the page, and ending one never reloads the clock. The pipe stays
+//! single; every window-scoped message names its surface instead. Paint `id`s remain
+//! globally unique across both windows, so `Release` needs no tag.
 
 use serde::{Deserialize, Serialize};
 
-/// Frames the browser has painted and the consumer has not yet released.
+/// Frames one window has painted and the consumer has not yet released.
 ///
 /// Small on purpose. The browser drops rather than queues when this many are outstanding
 /// (ground rule 4: for live output, latency beats freshness), so a slow consumer costs
@@ -38,9 +46,29 @@ use serde::{Deserialize, Serialize};
 /// Sized to the consumer's steady state, which legitimately holds three at 60 fps — the
 /// frame being retired by the GPU, the frame on the layer, and the newest paint waiting
 /// in the pending slot — plus one so a paint arriving in that state is not dropped.
+/// **Per window**, not per process: each surface has its own pending slot on the
+/// consumer side, so a busy page must not be able to starve the clock of its budget.
 /// Mirrored by `MAX_INFLIGHT` in `browser-host/main.js`, which is the side that
 /// enforces it.
 pub const MAX_INFLIGHT_FRAMES: usize = 4;
+
+/// Which of the browser's two windows a message is about.
+///
+/// The browser host owns one offscreen `BrowserWindow` per variant, each with its own
+/// `webContents` and therefore its own navigation state: opening a cast page must not
+/// flash the clock through it, and closing the page must not force the clock to reload.
+/// Every message that acts on — or reports from — a window names its surface, so "which
+/// window" is never inferred from what happens to be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Surface {
+    /// The idle widget (the clock): created at startup when an attract URL is
+    /// configured, and never navigated anywhere else.
+    Widget,
+    /// The cast page (YouTube leanback, DIAL launches): created on first navigate,
+    /// blanked when the cast ends.
+    Page,
+}
 
 /// One plane of a painted frame, as the producer's platform describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +117,8 @@ pub enum FromBrowser {
     },
     /// A frame is ready and borrowed until released.
     Paint {
+        /// Which window painted it — and therefore which compositor layer it is for.
+        surface: Surface,
         /// Matches the [`ToBrowser::Release`] that returns it.
         id: u64,
         /// Channel order.
@@ -149,6 +179,8 @@ pub enum FromBrowser {
     },
     /// A page finished loading.
     LoadEnd {
+        /// The window it loaded in.
+        surface: Surface,
         /// The URL that finished.
         url: String,
         /// HTTP status, where there was one.
@@ -156,6 +188,8 @@ pub enum FromBrowser {
     },
     /// A page failed to load.
     LoadError {
+        /// The window it failed in — recovery reloads that window, not both.
+        surface: Surface,
         /// The URL that failed.
         url: String,
         /// Chromium's description.
@@ -163,6 +197,10 @@ pub enum FromBrowser {
     },
     /// A renderer process died. The host decides whether to recover.
     RenderGone {
+        /// The window whose renderer died. The other window's renderer is a separate
+        /// process and is still fine — a crashing cast page must not take the clock
+        /// down with it.
+        surface: Surface,
         /// Chromium's reason string (`crashed`, `killed`, `oom`, …).
         reason: String,
     },
@@ -173,6 +211,9 @@ pub enum FromBrowser {
     /// media clock. Without the pair there is a picture and a sound with no stated
     /// relationship, which is precisely the bug nobody can diagnose from the room.
     Audio {
+        /// The window whose page produced it. Only [`Surface::Page`] audio counts
+        /// toward the lip-sync measurement — the clock has no media clock to pair with.
+        surface: Surface,
         /// Base64 interleaved `f32` samples. CDP bindings carry strings only.
         pcm: String,
         /// Channel count in the interleave.
@@ -213,8 +254,12 @@ pub enum ToBrowser {
         /// The `id` from the [`FromBrowser::Paint`] being returned.
         id: u64,
     },
-    /// Show `url` at the given viewport size.
+    /// Show `url` in a window at the given viewport size. The window is created on its
+    /// first navigate; a failure to create it falls back to sharing the other window,
+    /// logged, rather than crashing (single-window behaviour as the degraded mode).
     Navigate {
+        /// The window to navigate.
+        surface: Surface,
         /// Where to go.
         url: String,
         /// Viewport width in pixels.
@@ -222,17 +267,35 @@ pub enum ToBrowser {
         /// Viewport height in pixels.
         height: u32,
     },
-    /// Stop painting and drop the page.
-    Blank,
-    /// The viewport changed size.
+    /// Stop painting and drop one window's page. The other window is untouched — this
+    /// is what lets a cast end without the clock so much as blinking.
+    Blank {
+        /// The window to blank.
+        surface: Surface,
+    },
+    /// A window's viewport changed size.
     Resize {
+        /// The window that changed.
+        surface: Surface,
         /// New width in pixels.
         width: u32,
         /// New height in pixels.
         height: u32,
     },
+    /// Repaint now, without waiting for the page to damage itself.
+    ///
+    /// Exists for the moment a demoted page leaves the widget slot: the clock underneath
+    /// is live but may not repaint for up to its own update interval, and "the slot shows
+    /// stale cast pixels for a second" reads as a hang from across the room. Chromium's
+    /// `webContents.invalidate()` answers with a full frame at once.
+    Invalidate {
+        /// The window to repaint.
+        surface: Surface,
+    },
     /// A touch point, in browser view pixels.
     Touch {
+        /// The window that owns the contact.
+        surface: Surface,
         /// Which contact.
         id: u32,
         /// What the contact did.
@@ -244,6 +307,8 @@ pub enum ToBrowser {
     },
     /// A mouse-shaped event, in browser view pixels.
     Pointer {
+        /// The window under the pointer.
+        surface: Surface,
         /// What happened.
         kind: PointerKind,
         /// X in view pixels.
@@ -258,6 +323,8 @@ pub enum ToBrowser {
     /// cursor, so sending the delta alone would scroll the wrong element on any page with
     /// more than one scrollable region.
     Wheel {
+        /// The window under the cursor.
+        surface: Surface,
         /// X in view pixels.
         x: f32,
         /// Y in view pixels.
@@ -288,6 +355,8 @@ pub enum ToBrowser {
     /// rather than asserting that we sent one. "Touch was dispatched" and "the page saw a
     /// touch" are different claims, and only the second is worth anything.
     Probe {
+        /// The window whose page is asked.
+        surface: Surface,
         /// Correlates the answer.
         id: u64,
         /// A JavaScript expression.
@@ -498,11 +567,12 @@ mod tests {
         // back changed if this were ever "simplified" to a number.
         // One physical line: the framer splits on newlines, so a fixture wrapped for
         // readability would be testing the framer's error path instead of this.
-        let line = br#"{"type":"paint","id":9,"format":"bgra","width":3840,"height":2160,"modifier":"18446744073709551360","planes":[{"fd":108,"stride":15360,"offset":0}]}"#;
+        let line = br#"{"type":"paint","surface":"page","id":9,"format":"bgra","width":3840,"height":2160,"modifier":"18446744073709551360","planes":[{"fd":108,"stride":15360,"offset":0}]}"#;
         let mut framer = LineFramer::default();
         let mut got = framer.push(line);
         got.extend(framer.push(b"\n"));
         let FromBrowser::Paint {
+            surface,
             id,
             format,
             width,
@@ -513,6 +583,7 @@ mod tests {
         else {
             panic!("expected a paint")
         };
+        assert_eq!(surface, Surface::Page);
         assert_eq!(id, 9);
         assert_eq!(format, PixelOrder::Bgra);
         assert_eq!(width, 3840);
@@ -531,10 +602,12 @@ mod tests {
         // mismatch survived it: audio was dropped as undecodable and the A/V clock read
         // zero, both silently.
         let lines: &[&[u8]] = &[
-            br#"{"type":"audio","pcm":"AAAAAA==","channels":2,"sampleRate":48000,"mediaTime":12.5,"paused":false}"#,
-            br#"{"type":"paint","id":1,"format":"bgra","width":8,"height":4,"mediaTime":3.25,"modifier":"0","planes":[{"fd":9,"stride":32,"offset":0}]}"#,
+            br#"{"type":"audio","surface":"page","pcm":"AAAAAA==","channels":2,"sampleRate":48000,"mediaTime":12.5,"paused":false}"#,
+            br#"{"type":"paint","surface":"widget","id":1,"format":"bgra","width":8,"height":4,"mediaTime":3.25,"modifier":"0","planes":[{"fd":9,"stride":32,"offset":0}]}"#,
             br#"{"type":"probe-result","id":2,"value":"3"}"#,
             br#"{"type":"adblock-query","id":3,"url":"https://x/","source":"https://y/","kind":"script"}"#,
+            br#"{"type":"render-gone","surface":"page","reason":"crashed"}"#,
+            br#"{"type":"load-error","surface":"widget","url":"https://clock/","error":"boom (-2)"}"#,
         ];
         let mut framer = LineFramer::default();
         let mut got = Vec::new();
@@ -542,11 +615,12 @@ mod tests {
             got.extend(framer.push(line));
             got.extend(framer.push(b"\n"));
         }
-        assert_eq!(got.len(), 4, "every line must decode");
+        assert_eq!(got.len(), 6, "every line must decode");
         for (i, r) in got.iter().enumerate() {
             assert!(r.is_ok(), "line {i} failed: {:?}", r.as_ref().err());
         }
         let FromBrowser::Audio {
+            surface,
             sample_rate,
             media_time,
             channels,
@@ -555,15 +629,42 @@ mod tests {
         else {
             panic!("expected audio")
         };
+        assert_eq!(surface, Surface::Page);
         assert_eq!(sample_rate, 48_000);
         assert_eq!(channels, 2);
         assert!((media_time - 12.5).abs() < f64::EPSILON);
-        let FromBrowser::Paint { media_time, .. } = got[1].as_ref().unwrap().clone() else {
+        let FromBrowser::Paint {
+            surface,
+            media_time,
+            ..
+        } = got[1].as_ref().unwrap().clone()
+        else {
             panic!("expected paint")
         };
+        assert_eq!(
+            surface,
+            Surface::Widget,
+            "a widget paint must not be routable to the page's layer"
+        );
         assert!(
             (media_time - 3.25).abs() < f64::EPSILON,
             "the paint's media clock must survive: it is half of av_skew_ms"
+        );
+        // The two faults carry the window they happened in — recovery is per-window.
+        assert_eq!(
+            *got[4].as_ref().unwrap(),
+            FromBrowser::RenderGone {
+                surface: Surface::Page,
+                reason: "crashed".into()
+            }
+        );
+        assert_eq!(
+            *got[5].as_ref().unwrap(),
+            FromBrowser::LoadError {
+                surface: Surface::Widget,
+                url: "https://clock/".into(),
+                error: "boom (-2)".into()
+            }
         );
     }
 
@@ -573,7 +674,12 @@ mod tests {
         // would deadlock it — silently, since the first fragment parses as nothing.
         for msg in [
             ToBrowser::Release { id: 1 },
-            ToBrowser::Blank,
+            ToBrowser::Blank {
+                surface: Surface::Page,
+            },
+            ToBrowser::Invalidate {
+                surface: Surface::Widget,
+            },
             ToBrowser::Quit,
             ToBrowser::ScriptletSource {
                 id: 1,
@@ -583,6 +689,53 @@ mod tests {
             let bytes = encode(&msg).unwrap();
             assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 1);
             assert!(bytes.ends_with(b"\n"));
+        }
+    }
+
+    #[test]
+    fn window_commands_name_their_surface_in_the_words_the_host_app_reads() {
+        // Byte-level, like the decode fixture above and for the same reason: the Rust
+        // side agreeing with itself proves nothing about the JavaScript that switches on
+        // `msg.surface`. A tag that serialized as "Widget" would route every command to
+        // the fallback path — silently, since main.js logs-and-continues on the unknown.
+        let cases: [(ToBrowser, &str); 4] = [
+            (
+                ToBrowser::Navigate {
+                    surface: Surface::Widget,
+                    url: "https://clock/".into(),
+                    width: 640,
+                    height: 360,
+                },
+                r#"{"type":"navigate","surface":"widget","url":"https://clock/","width":640,"height":360}"#,
+            ),
+            (
+                ToBrowser::Blank {
+                    surface: Surface::Page,
+                },
+                r#"{"type":"blank","surface":"page"}"#,
+            ),
+            (
+                ToBrowser::Resize {
+                    surface: Surface::Page,
+                    width: 1920,
+                    height: 1080,
+                },
+                r#"{"type":"resize","surface":"page","width":1920,"height":1080}"#,
+            ),
+            (
+                ToBrowser::Invalidate {
+                    surface: Surface::Widget,
+                },
+                r#"{"type":"invalidate","surface":"widget"}"#,
+            ),
+        ];
+        for (msg, want) in cases {
+            let bytes = encode(&msg).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&bytes[..bytes.len() - 1]).unwrap(),
+                want,
+                "encoding drifted from what browser-host/main.js reads"
+            );
         }
     }
 
