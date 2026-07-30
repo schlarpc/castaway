@@ -423,7 +423,15 @@ function handle(msg) {
       return;
     }
     case 'resize': {
-      if (win && !win.isDestroyed()) win.setContentSize(msg.width, msg.height);
+      if (win && !win.isDestroyed()) {
+        win.setContentSize(msg.width, msg.height);
+        // Demand a paint at the new size. An offscreen page that is mostly a <video>
+        // (leanback) may not repaint on its own after a resize, and castaway drops
+        // every stale-sized frame — so without this the demoted widget sat on its
+        // empty well ("YouTube minimizes to a black card") until the page next chose
+        // to animate.
+        win.webContents.invalidate();
+      }
       return;
     }
     case 'touch':

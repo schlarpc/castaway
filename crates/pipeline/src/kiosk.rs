@@ -157,6 +157,16 @@ impl KioskApp {
                 info!(?surface, "shell: restoring a demoted surface");
                 true
             }
+            crate::panel::PanelHit::Close(surface) => {
+                // The panel only *offers* the badge; ending the launch is the app's.
+                // Consumed either way — a press on a visible X must not fall through
+                // and restore the thing it meant to close.
+                info!(?surface, "shell: closing a demoted surface");
+                if let Some(sink) = self.shell_sink.as_ref() {
+                    sink(crate::shell::ShellEvent::ClosePage);
+                }
+                true
+            }
             crate::panel::PanelHit::Shell(_) | crate::panel::PanelHit::Miss => false,
         }
     }
@@ -326,6 +336,8 @@ impl KioskApp {
                         ShellEvent::Tile(id) | ShellEvent::Item(id) => {
                             info!(%id, "shell: handing a press to the app");
                         }
+                        // Emitted by restore_minimized, never by a screen.
+                        ShellEvent::ClosePage => {}
                     }
                     sink(event);
                 }

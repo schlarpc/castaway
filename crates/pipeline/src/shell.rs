@@ -57,6 +57,10 @@ pub enum ShellEvent {
     Tile(String),
     /// A row in a picker.
     Item(String),
+    /// The close badge on the demoted page: stop whatever launched it and give the
+    /// slot back to the clock. Handed to `app` because only it owns the launch —
+    /// today that is the DIAL stop path, the same exit a phone's stop button takes.
+    ClosePage,
 }
 
 impl Screen {

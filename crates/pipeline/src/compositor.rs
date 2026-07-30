@@ -220,6 +220,12 @@ pub enum LayerId {
     BrowserFullscreen,
     /// The OSD text/overlay layer.
     Osd,
+    /// The close badge on a demoted (pip'd) app — the "X" that stops it and gives the
+    /// slot back to the clock. Its own layer because it must sit above whatever the
+    /// slot holds *and* above the mascot's arms leaning on it, and because it appears
+    /// per-frame from the panel model (a closable surface is demoted) rather than from
+    /// any transition someone has to remember to run.
+    CloseAffordance,
     /// The shell's navigation affordance — the home pill. Above everything, including a
     /// fullscreen cast surface, because the way out of a screen must never be behind the
     /// thing it is a way out of (D38).
@@ -237,12 +243,15 @@ impl LayerId {
     /// had just been opened.
     #[must_use]
     pub const fn occludes(self) -> bool {
-        !matches!(self, Self::ShellPrev | Self::MascotOverlay)
+        !matches!(
+            self,
+            Self::ShellPrev | Self::MascotOverlay | Self::CloseAffordance
+        )
     }
 
     /// Every layer, in paint order. The ordering test asserts against this rather than
     /// against a hand-written list, so a new variant cannot be added without placing it.
-    pub const PAINT_ORDER: [Self; 10] = [
+    pub const PAINT_ORDER: [Self; 11] = [
         Self::Attract,
         Self::ShellPrev,
         Self::BrowserWidget,
@@ -252,6 +261,7 @@ impl LayerId {
         Self::Video,
         Self::BrowserFullscreen,
         Self::Osd,
+        Self::CloseAffordance,
         Self::ShellOverlay,
     ];
 
@@ -295,6 +305,7 @@ impl LayerId {
             | Self::Video
             | Self::BrowserFullscreen
             | Self::Osd
+            | Self::CloseAffordance
             | Self::ShellOverlay => &[],
         }
     }

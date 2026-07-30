@@ -48,6 +48,7 @@ pub async fn run(
     gamestream_commands: mpsc::Sender<GameStreamCommand>,
     settings: settings::Catalog,
     osd: castaway_core::OsdSink,
+    close_page: mpsc::UnboundedSender<()>,
 ) {
     // Which host the app picker is for. Set when a host row is pressed.
     let mut chosen_host: Option<String> = None;
@@ -71,6 +72,12 @@ pub async fn run(
                         format!("\"{id}\" is on the screen but not wired up yet"),
                     ),
                 );
+            }
+            ShellEvent::ClosePage => {
+                // The badge on the demoted page. The launch is DIAL's, so the stop is
+                // too — this just forwards the press to the task holding the service.
+                info!("shell: close badge pressed; stopping the launched page");
+                let _ = close_page.send(());
             }
             ShellEvent::Item(id) => {
                 if let Some(host) = id.strip_prefix(HOST_PREFIX) {

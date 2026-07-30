@@ -119,6 +119,53 @@ impl Default for Palette {
     }
 }
 
+/// Draw the close badge — a dark disc with an X — into a tight RGBA8 buffer of
+/// `side`×`side`. The pill's palette, because it is the pill's sibling: both are the
+/// shell's own chrome drawn over other people's pixels.
+#[must_use]
+pub fn render_close_badge(side: u32) -> Vec<u8> {
+    let side = side.max(8);
+    let pal = Palette::default();
+    let mut buf = vec![0u8; (side * side * 4) as usize];
+    let s = side as f32;
+    let c = s / 2.0;
+    // Inset so the antialiased rim survives its own bounds.
+    shape::disc(&mut buf, side, side, c, c, s - 4.0, pal.plate);
+    shape::rounded_outline(
+        &mut buf,
+        side,
+        side,
+        shape::Rect {
+            x: 2.0,
+            y: 2.0,
+            w: s - 4.0,
+            h: s - 4.0,
+        },
+        (s - 4.0) / 2.0,
+        (s * 0.03).max(1.0),
+        pal.edge,
+    );
+    // The X: two strokes, fat enough to read across a room.
+    let (a, b) = (s * 0.34, s * 0.66);
+    let stroke = (s * 0.055).max(2.0);
+    for (ax, ay, bx, by) in [(a, a, b, b), (a, b, b, a)] {
+        shape::fill_sdf(
+            &mut buf,
+            side,
+            side,
+            shape::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: s,
+                h: s,
+            },
+            pal.glyph,
+            |px, py| shape::sd_segment(px, py, ax, ay, bx, by) - stroke,
+        );
+    }
+    buf
+}
+
 /// Draw the pill into a tight RGBA8 buffer of its own size.
 ///
 /// Tight rather than full-surface, like the OSD banner: this is a small texture placed

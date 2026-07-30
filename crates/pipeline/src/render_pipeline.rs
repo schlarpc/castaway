@@ -1167,6 +1167,8 @@ pub struct RenderLoop {
     video_clear_due: Option<std::time::Instant>,
     /// The now-playing card's counterpart of [`Self::video_clear_due`].
     card_clear_due: Option<std::time::Instant>,
+    /// The side the close badge was last rasterized at; `0` when it is not up.
+    close_badge_side: u32,
     /// The card as last rasterized, with the surface size it was rasterized at.
     ///
     /// Position now republishes once a second (the transport strip's clock syncs on
@@ -1262,6 +1264,7 @@ impl RenderLoop {
             last_touch: None,
             video_clear_due: None,
             card_clear_due: None,
+            close_badge_side: 0,
             card_shown: None,
             taps: Vec::new(),
             failed_imports: 0,
@@ -1473,6 +1476,14 @@ impl RenderLoop {
     /// has no business knowing about scrub fractions, and the mapping needs the model
     /// this loop is holding anyway.
     #[must_use]
+    /// Whether the mascot overlay would actually be drawn this frame — present and
+    /// not suppressed or yielded away. For tests.
+    #[must_use]
+    pub fn mascot_on_glass(&self) -> bool {
+        self.compositor.has_layer(LayerId::MascotOverlay)
+            && !self.compositor.hidden(LayerId::MascotOverlay)
+    }
+
     /// The strip's live position estimate: the last published reading plus however
     /// long playback has run since. For tests and logs.
     #[must_use]
@@ -2399,6 +2410,49 @@ impl RenderLoop {
         }
     }
 
+    /// The close badge, derived fresh each frame like the placements themselves: on
+    /// the glass exactly while a closable surface sits demoted in a visible slot, at
+    /// that surface's corner. A standing fact, not a transition anyone has to run —
+    /// which is what keeps it from ever outliving the thing it would close.
+    fn place_close_badge(&mut self) {
+        let (w, h) = self.compositor.target_size();
+        let shown = crate::panel::Surface::ALL.into_iter().find(|s| {
+            s.closable() && self.panel.placement(*s).is_widget() && self.panel.widget_slot_visible()
+        });
+        let rect = shown.and_then(|s| crate::panel::close_rect(s, w, h));
+        let Some(rect) = rect else {
+            self.compositor.remove_layer(LayerId::CloseAffordance);
+            self.close_badge_side = 0;
+            return;
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let side = (rect.w * w.max(1) as f32).round().max(8.0) as u32;
+        if side != self.close_badge_side {
+            let rgba = crate::overlay::render_close_badge(side);
+            if let Err(e) = self.compositor.upload_texture(
+                LayerId::CloseAffordance,
+                side,
+                side,
+                TexelFormat::Rgba8Srgb,
+                &rgba,
+            ) {
+                error!(error = %e, "failed to draw the close badge");
+                return;
+            }
+            self.close_badge_side = side;
+        }
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::CloseAffordance,
+            opacity: 1.0,
+            transform: Transform {
+                scale_x: rect.w,
+                scale_y: rect.h,
+                offset_x: rect.x,
+                offset_y: rect.y,
+            },
+        });
+    }
+
     fn present_and_serve_taps(&mut self) {
         self.run_due_clears();
         // Every placement, recomputed and handed down each frame, so it is a standing fact
@@ -2407,9 +2461,11 @@ impl RenderLoop {
         // surfaces in the same slot is not decided here: the compositor derives that from
         // `LayerId::yields_to`.
         //
-        // The idle widget and the mascot leaning on it are the panel's answer for
-        // `Surface::IdleWidget`: an ornament of the Home screen, so they leave when the
-        // shell does.
+        // The idle widget page leaves with its surface; the mascot does not follow it.
+        // She leans on the slot's card *frame*, which is baked into the Home floor and
+        // visible whether or not a page occupies the hole — tying her to the page was
+        // the bug where coming Home with the one browser off being YouTube showed her
+        // torso (in the floor texture) and suppressed the rest of her.
         let widget_hidden = !self
             .panel
             .placement(crate::panel::Surface::IdleWidget)
@@ -2418,7 +2474,8 @@ impl RenderLoop {
         self.compositor
             .set_suppressed(LayerId::BrowserWidget, widget_hidden);
         self.compositor
-            .set_suppressed(LayerId::MascotOverlay, widget_hidden);
+            .set_suppressed(LayerId::MascotOverlay, !self.panel.widget_slot_visible());
+        self.place_close_badge();
         if self.placement_moved() {
             self.reflow_surfaces();
         }
@@ -2802,7 +2859,9 @@ impl RenderLoop {
     pub fn shell_hit(&self, x: f32, y: f32) -> Option<crate::shell::ScreenHit> {
         match self.panel_hit(x, y) {
             crate::panel::PanelHit::Shell(hit) => Some(hit),
-            crate::panel::PanelHit::Restore(_) | crate::panel::PanelHit::Miss => None,
+            crate::panel::PanelHit::Restore(_)
+            | crate::panel::PanelHit::Close(_)
+            | crate::panel::PanelHit::Miss => None,
         }
     }
 

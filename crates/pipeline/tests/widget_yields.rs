@@ -199,6 +199,37 @@ fn the_mascot_leans_on_the_slot_and_leaves_only_for_a_full_panel_session() {
 }
 
 #[test]
+fn she_stays_whole_when_the_browser_is_off_being_youtube() {
+    // The regression this pins (TODO 21): her lower half is baked into the Home floor
+    // texture and her upper half is its own layer. With the one browser showing a page
+    // (Surface::CastPage) there is no idle-widget *surface* — and the overlay was keyed
+    // on exactly that, so coming Home showed half of dma-chan. She leans on the slot's
+    // frame, and the frame is there whenever Home is.
+    let (_tx, mut render) = idle_with_widget();
+
+    // The browser leaves the clock and becomes a page; the widget surface goes away.
+    render.set_surface(Surface::IdleWidget, false);
+    render.set_surface(Surface::CastPage, true);
+
+    // Fullscreen page: she is out of the way, as ever.
+    render.set_shell_foreground(false);
+    settle(&mut render);
+    assert!(
+        !render.mascot_on_glass(),
+        "a full-panel page is no place for an ornament"
+    );
+
+    // Back to Home, the page demoted into the slot: the frame is visible, so is she —
+    // all of her, not the half that happens to live in the floor texture.
+    render.set_shell_foreground(true);
+    settle(&mut render);
+    assert!(
+        render.mascot_on_glass(),
+        "Home's floor shows her torso; suppressing the overlay leaves half a mascot"
+    );
+}
+
+#[test]
 fn a_demoted_video_is_nowhere_near_her_and_leaves_her_alone() {
     // Video demotes to the PiP corner, not the slot. Driving her from "is a session present"
     // would have hidden her for a video in the opposite corner of the panel.

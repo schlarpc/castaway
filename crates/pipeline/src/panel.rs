@@ -73,6 +73,18 @@ impl Surface {
     pub const fn is_session(self) -> bool {
         !matches!(self, Self::IdleWidget)
     }
+
+    /// Whether the panel can *end* this surface's session from a close badge.
+    ///
+    /// Only the page today: closing it is a launch-stop the app already knows how to
+    /// perform (the DIAL stop path), and "the widget goes back to the clock" is exactly
+    /// what that path does. Video and the card deliberately say no — their sessions
+    /// belong to a sender that expects to end them itself, and the transport strip's
+    /// stop button is the honest control for the ones that grant one.
+    #[must_use]
+    pub const fn closable(self) -> bool {
+        matches!(self, Self::CastPage)
+    }
 }
 
 /// Which surfaces exist right now.
@@ -190,6 +202,10 @@ pub enum PanelHit {
     /// A demoted session surface. The press means "give this the panel back" — never
     /// "forward my touch into it at 42% scale".
     Restore(Surface),
+    /// The close badge on a demoted surface: stop it and give the slot back to the
+    /// clock. Only offered for surfaces [`Surface::closable`] says the panel can
+    /// actually end.
+    Close(Surface),
     /// The shell's current screen answered it.
     Shell(ScreenHit),
     /// Nothing the panel owns is there. The press belongs to whatever is underneath — a
@@ -313,6 +329,19 @@ impl Panel {
     #[must_use]
     fn at_home(&self) -> bool {
         self.shell.as_ref().is_none_or(|s| s.depth() == 1)
+    }
+
+    /// Whether Home's widget slot — the card frame painted into the floor — is on the
+    /// glass, regardless of what (if anything) occupies its hole.
+    ///
+    /// This is what the mascot overlay keys on: she leans on the *frame*, and the frame
+    /// is there whenever Home is, whether the hole holds the clock, a demoted app, or
+    /// nothing but its well. Keying her on the idle-widget *surface* instead was the
+    /// bug where coming Home while the one browser was off being YouTube left her torso
+    /// (baked into the floor) with the overlay half suppressed.
+    #[must_use]
+    pub fn widget_slot_visible(&self) -> bool {
+        self.at_home() && matches!(self.focus(), Focus::Shell)
     }
 
     // -- navigation --------------------------------------------------------------
@@ -492,6 +521,13 @@ impl Panel {
             if self.placement(surface).is_widget()
                 && demoted_rect(surface, width, height).is_some_and(|r| r.contains(x, y))
             {
+                // The badge before the body: it is drawn on top, and a press cannot
+                // mean both "bring it back" and "make it go away".
+                if surface.closable()
+                    && close_rect(surface, width, height).is_some_and(|r| r.contains(x, y))
+                {
+                    return PanelHit::Close(surface);
+                }
                 return PanelHit::Restore(surface);
             }
         }
@@ -627,6 +663,30 @@ pub fn demoted_rect(surface: Surface, width: u32, height: u32) -> Option<NormRec
     }
 }
 
+/// Where a demoted surface's close badge sits: a square in its top-left corner,
+/// normalized to the panel.
+///
+/// Top-*left*, not top-right: the mascot leans over the slot's right edge, and a badge
+/// under her arms would be both hidden and, worse, still pressable. Sized as a fraction
+/// of the demoted rect's height, floored generously — this is a touch target on a wall
+/// panel, not a desktop close button.
+#[must_use]
+pub fn close_rect(surface: Surface, width: u32, height: u32) -> Option<NormRect> {
+    if !surface.closable() {
+        return None;
+    }
+    let rect = demoted_rect(surface, width, height)?;
+    let (w, h) = (width.max(1) as f32, height.max(1) as f32);
+    // A square in pixels: the badge's side is a fraction of the slot's pixel height.
+    let side_px = (rect.h * h * 0.22).max(48.0);
+    Some(NormRect {
+        x: rect.x,
+        y: rect.y,
+        w: side_px / w,
+        h: side_px / h,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -649,6 +709,34 @@ mod tests {
     /// Never covered — the compositor veto these tests are not about.
     fn clear(_x: f32, _y: f32) -> bool {
         false
+    }
+
+    #[test]
+    fn the_close_badge_closes_and_the_rest_of_the_slot_restores() {
+        // TODO 22: a press on the demoted page's X means "make it go away", and it must
+        // not double as "bring it back" — the two hits partition the slot.
+        let mut p = panel();
+        p.set_surface(Surface::CastPage, true);
+        // Demoted: the shell is forward, the page in the slot.
+        p.hand_to_shell();
+        assert!(p.placement(Surface::CastPage).is_widget());
+
+        let slot = demoted_rect(Surface::CastPage, W, H).unwrap();
+        let badge = close_rect(Surface::CastPage, W, H).unwrap();
+        // The badge's corner press closes…
+        let (bx, by) = (badge.x + badge.w / 2.0, badge.y + badge.h / 2.0);
+        assert!(matches!(
+            p.hit(W, H, bx, by, clear),
+            PanelHit::Close(Surface::CastPage)
+        ));
+        // …a press on the middle of the slot restores…
+        let (cx, cy) = (slot.x + slot.w / 2.0, slot.y + slot.h / 2.0);
+        assert!(matches!(
+            p.hit(W, H, cx, cy, clear),
+            PanelHit::Restore(Surface::CastPage)
+        ));
+        // …and a surface the panel cannot end offers no badge at all.
+        assert!(close_rect(Surface::Video, W, H).is_none());
     }
 
     #[test]

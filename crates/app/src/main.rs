@@ -653,6 +653,15 @@ async fn serve(
     // and then browses a session that will never play. D16's rule ("advertising a service
     // with no listener only frustrates senders") is the same rule here, and a missing
     // launch target is a missing listener.
+    // The panel's close badge on a demoted page. A channel rather than a callback
+    // because the two ends live in different arms of this function: the badge is
+    // pressed in the shell (below), and the thing it stops is the DIAL launch (here).
+    // With no DIAL to stop, the receiver is simply dropped and a press goes nowhere —
+    // which cannot happen on a panel, since without a browser there is no page to
+    // have demoted in the first place.
+    // (Unused in a build with no panel to press it on; honest rather than dead.)
+    #[cfg_attr(not(feature = "render"), allow(unused_variables))]
+    let (close_page_tx, mut close_page_rx) = mpsc::unbounded_channel::<()>();
     match (config.enable.dial, on_dial) {
         (true, None) => warn!(
             "DIAL disabled: this build has no kiosk browser to launch YouTube in \
@@ -709,6 +718,19 @@ async fn serve(
                 tokio::spawn(async move {
                     while abandoned.recv().await.is_some() {
                         dial.abandoned().await;
+                    }
+                });
+            }
+            // The close badge takes the same exit a phone's stop button does: the page
+            // hides, the app state reads stopped, the screen slot clears — and the
+            // widget goes back to being the clock.
+            {
+                let dial = dial.clone();
+                let tx = dial_tx.clone();
+                tokio::spawn(async move {
+                    while close_page_rx.recv().await.is_some() {
+                        dial.abandoned().await;
+                        let _ = tx.send(proto_dial::DialEvent::Stopped).await;
                     }
                 });
             }
@@ -857,6 +879,7 @@ async fn serve(
             commands,
             settings,
             osd.clone(),
+            close_page_tx.clone(),
         )));
     }
 

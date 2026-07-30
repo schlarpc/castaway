@@ -935,8 +935,8 @@ impl WgpuCompositor {
     /// Whether `id` is hidden this frame: suppressed from outside, or yielding to a
     /// present layer per [`LayerId::yields_to`]. The single visibility gate — drawing
     /// and occlusion both consult it, so what the glass shows and what input believes
-    /// cannot disagree.
-    fn hidden(&self, id: LayerId) -> bool {
+    /// cannot disagree. Public so tests can assert on what the glass would show.
+    pub fn hidden(&self, id: LayerId) -> bool {
         self.suppressed.contains(&id) || id.yields_to().iter().any(|&above| self.has_layer(above))
     }
 
