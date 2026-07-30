@@ -1167,6 +1167,13 @@ pub struct RenderLoop {
     video_clear_due: Option<std::time::Instant>,
     /// The now-playing card's counterpart of [`Self::video_clear_due`].
     card_clear_due: Option<std::time::Instant>,
+    /// The card as last rasterized, with the surface size it was rasterized at.
+    ///
+    /// Position now republishes once a second (the transport strip's clock syncs on
+    /// it), and the card draws no position — so this is what lets the per-second
+    /// update repaint the small strip without re-rasterizing a card of identical
+    /// pixels that is tens of megabytes at 4K.
+    card_shown: Option<(Box<crate::nowplaying_card::NowPlayingCard>, (u32, u32))>,
     /// Consumers of the composited output — screenshots, and later a stream tee. Empty
     /// on the default path, which is the point: a readback is a full-surface copy.
     taps: Vec<Box<dyn crate::tap::OutputTap>>,
@@ -1255,6 +1262,7 @@ impl RenderLoop {
             last_touch: None,
             video_clear_due: None,
             card_clear_due: None,
+            card_shown: None,
             taps: Vec::new(),
             failed_imports: 0,
             transport: None,
@@ -1351,12 +1359,17 @@ impl RenderLoop {
             placement.3.round().max(1.0) as u32,
         );
 
-        // Keep the existing timestamp when the source has repeated a position it already
-        // gave us. The card republishes for reasons that have nothing to do with playback
-        // — a queue update, the device naming itself — and restamping on those would rewind
-        // the scrubber by however long had passed since the real reading.
+        // Keep the existing timestamp only when the source has repeated the *exact
+        // reading* it already gave us. The card republishes for reasons that have
+        // nothing to do with playback — a queue update, the device naming itself — and
+        // restamping on those would rewind the scrubber by however long had passed
+        // since the real reading. But matching on position alone confused "the same
+        // reading again" with "a new track that also starts at 0:00": advancing a track
+        // from the phone kept the old track's anchor, and the scrubber read 1:20 over a
+        // song at 0:00. Any field of the reading changing — state, duration, shuffle —
+        // is a fresh reading, and a fresh reading re-anchors the clock.
         let taken_at = match self.transport.as_ref() {
-            Some(prev) if prev.model.position == model.position => prev.taken_at,
+            Some(prev) if prev.model == *model => prev.taken_at,
             _ => std::time::Instant::now(),
         };
 
@@ -1460,6 +1473,15 @@ impl RenderLoop {
     /// has no business knowing about scrub fractions, and the mapping needs the model
     /// this loop is holding anyway.
     #[must_use]
+    /// The strip's live position estimate: the last published reading plus however
+    /// long playback has run since. For tests and logs.
+    #[must_use]
+    pub fn transport_position(&self) -> Option<Duration> {
+        self.transport
+            .as_ref()
+            .and_then(TransportState::live_position)
+    }
+
     pub fn transport_action(
         &self,
         x: f32,
@@ -2370,6 +2392,7 @@ impl RenderLoop {
                     // session that has ended, wired to a remote that has been dropped.
                     self.compositor.remove_layer(LayerId::Transport);
                     self.transport = None;
+                    self.card_shown = None;
                 }
                 Surface::CastPage | Surface::IdleWidget => {}
             }
@@ -2488,15 +2511,25 @@ impl RenderLoop {
                 // and the pixels are tens of megabytes, so the channel carries the small
                 // one and this thread — which owns the surface size — makes the big one.
                 let (w, h) = self.card_size();
-                match crate::nowplaying_card::render(&card, w, h) {
-                    Ok(rgba) => {
-                        if let Err(e) = self.set_now_playing(w, h, &rgba) {
-                            error!(error = %e, "failed to draw the now-playing card");
+                // …and only when the pixels would differ. Position ticks once a second
+                // and the card does not draw it — that is the strip's job — so a card
+                // that changed in nothing but position skips the big raster entirely.
+                let same_pixels = self
+                    .card_shown
+                    .as_ref()
+                    .is_some_and(|(prev, size)| *size == (w, h) && prev.visual_eq(&card));
+                if !same_pixels {
+                    match crate::nowplaying_card::render(&card, w, h) {
+                        Ok(rgba) => {
+                            if let Err(e) = self.set_now_playing(w, h, &rgba) {
+                                error!(error = %e, "failed to draw the now-playing card");
+                            }
                         }
+                        Err(e) => error!(error = %e, "failed to render the now-playing card"),
                     }
-                    Err(e) => error!(error = %e, "failed to render the now-playing card"),
                 }
                 self.set_transport(&card.transport(), w, h);
+                self.card_shown = Some((card.clone(), (w, h)));
                 // A card published while someone is on the home screen arrives
                 // minimized rather than snatching the panel from under them.
                 self.set_surface(crate::panel::Surface::Card, true);

@@ -49,6 +49,22 @@ impl NowPlayingCard {
     pub fn has_transport(&self) -> bool {
         !self.transport().is_empty()
     }
+
+    /// Whether this card rasterizes to the same pixels as `other`.
+    ///
+    /// Position is excluded on both sides: the card draws no elapsed time — that is
+    /// the transport strip's job — so two cards differing only in position are the
+    /// same picture. This is what lets position republish once a second without
+    /// re-rasterizing a full-panel texture per tick.
+    #[must_use]
+    pub fn visual_eq(&self, other: &Self) -> bool {
+        let flatten = |c: &Self| {
+            let mut c = c.clone();
+            c.track.position = None;
+            c
+        };
+        flatten(self) == flatten(other)
+    }
 }
 
 /// One laid-out line of the card.
@@ -174,7 +190,16 @@ fn build_lines(
         .display_name
         .clone()
         .or_else(|| card.source.address.clone());
-    let state = state_label(card.track.state);
+    // The state line only earns its place when there is no transport strip: the strip's
+    // play/pause glyph already says exactly this, drawn over the same card, and the
+    // word underneath it read as clutter ("playing" under a pause button). A card with
+    // no strip — a source that advertises no controls — keeps the word, because then
+    // nothing else on the screen says whether sound should be coming out.
+    let state = if card.has_transport() {
+        None
+    } else {
+        state_label(card.track.state)
+    };
     let mut lines: Vec<Line> = Vec::with_capacity(5);
 
     let source_line = card.source.to_string();
