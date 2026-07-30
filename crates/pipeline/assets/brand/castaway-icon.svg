@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  castaway's own mark: a dark panel catching a signal thrown at a paper boat.
+
+  Ours, unlike the rest of this directory - authored in-repo, not taken from
+  dma.space. Every colour is a `pipeline::theme` constant: the tile is the
+  panel's background ramp (BG_TOP to BG_BOTTOM) inside an EDGE bezel, the sea
+  is ACCENT teal, the arcs are dma.space BLUE, the boat is TEXT white.
+
+  Source of truth for every raster: the window icon is rasterized from this
+  file at runtime (pipeline::icon), and the checked-in PNGs under icon/ are
+  regenerated from it by the pipeline crate's `icon_render` example (see
+  README.md here). Edit here, re-run that, never touch the PNGs by hand.
+
+  Drawn on a 256 grid with nothing thinner than 6 units, so it still reads
+  as "boat under a signal" at 16px.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0d1428"/>
+      <stop offset="1" stop-color="#030509"/>
+    </linearGradient>
+    <clipPath id="tile">
+      <rect x="8" y="8" width="240" height="240" rx="52"/>
+    </clipPath>
+  </defs>
+
+  <!-- The panel: the background ramp every castaway screen wears. -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+
+  <!-- The sea, clipped to the panel: ACCENT teal, the "this line is telling
+       you something" colour, doing exactly that. -->
+  <g clip-path="url(#tile)">
+    <path d="M0 210 C 48 194 88 170 128 178 C 170 186 210 206 256 192 L 256 256 L 0 256 Z"
+          fill="#4fd1c5"/>
+  </g>
+
+  <!-- The signal, arriving: two arcs of dma.space blue over the mast. -->
+  <g fill="none" stroke="#02abfc" stroke-linecap="round">
+    <path d="M93.4 80 A 40 40 0 0 1 162.6 80" stroke-width="15"/>
+    <path d="M69.1 66 A 68 68 0 0 1 186.9 66" stroke-width="15"/>
+  </g>
+
+  <!-- The castaway: a paper boat, sail then hull, riding the crest. The gap
+       between them is what makes it a boat rather than a gem; it is invisible
+       at 16px, where the silhouette does the work alone. -->
+  <path d="M128 98 L157 144 L99 144 Z M82 152 L174 152 L152 184 L104 184 Z"
+        fill="#ffffff"/>
+
+  <!-- The bezel: EDGE, the frame colour of every framed area on the panel. -->
+  <rect x="11" y="11" width="234" height="234" rx="49" fill="none" stroke="#222d44" stroke-width="6"/>
+</svg>
