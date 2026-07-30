@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use aes::cipher::{KeyIvInit as _, StreamCipher as _};
 use castaway_core::{
-    FrameSource, ProtocolKind, SessionEvent, SessionSink, SourceAdapter, SourceId,
+    FrameSource, MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceAdapter, SourceId,
 };
 use proto_airplay::{AirPlayIdentity, AirPlayReceiver, MirrorKeys, StreamConnectionId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -104,7 +104,9 @@ async fn a_raop_session_negotiates_and_audio_reaches_the_pipeline() {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let receiver = std::sync::Arc::new(AirPlayReceiver::new(identity()).with_addr(addr));
+    let receiver = std::sync::Arc::new(
+        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
+    );
 
     tokio::spawn({
         let receiver = std::sync::Arc::clone(&receiver);
@@ -232,7 +234,9 @@ async fn a_setup_before_announce_is_refused_over_a_real_socket() {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let receiver = std::sync::Arc::new(AirPlayReceiver::new(identity()).with_addr(addr));
+    let receiver = std::sync::Arc::new(
+        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
+    );
     tokio::spawn(async move {
         let _ = receiver.run(sink).await;
     });
@@ -310,7 +314,9 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
         .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let receiver = std::sync::Arc::new(AirPlayReceiver::new(identity()).with_addr(addr));
+    let receiver = std::sync::Arc::new(
+        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
+    );
     tokio::spawn(async move {
         let _ = receiver.run(sink).await;
     });
@@ -562,4 +568,67 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
         .expect("an audio frame arrived")
         .expect("the channel is open");
     assert_eq!(frame.data.as_ref(), plain.as_slice());
+}
+
+/// With a declared media range, the ports a `SETUP` advertises come from that range —
+/// the property the firewall depends on: every port a sender is told to hit is one the
+/// deployment could have opened ahead of time.
+#[tokio::test]
+async fn setup_advertises_ports_from_the_declared_media_range() {
+    let (tx, _events) = mpsc::channel(64);
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    // Eight ports: one connection takes four (mirror data TCP + audio/control/timing UDP).
+    let range = MediaPorts::Range(castaway_core::PortRange::new(42510, 42517).unwrap());
+    let receiver = std::sync::Arc::new(AirPlayReceiver::new(identity(), range).with_addr(addr));
+    tokio::spawn({
+        let receiver = std::sync::Arc::clone(&receiver);
+        async move {
+            let _ = receiver.run(sink).await;
+        }
+    });
+
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(addr).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut stream = stream.expect("the receiver started listening");
+
+    let announce = request(
+        &mut stream,
+        "ANNOUNCE rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/sdp")],
+        ANNOUNCE_SDP.as_bytes(),
+        1,
+    )
+    .await;
+    assert!(announce.starts_with("RTSP/1.0 200"), "{announce}");
+
+    let setup = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[(
+            "Transport",
+            "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=6001;timing_port=6002",
+        )],
+        &[],
+        2,
+    )
+    .await;
+    assert!(setup.starts_with("RTSP/1.0 200"), "{setup}");
+    let audio_port = server_port(&setup);
+    assert!(
+        (42510..=42517).contains(&audio_port),
+        "SETUP advertised {audio_port}, outside the declared range 42510-42517"
+    );
 }

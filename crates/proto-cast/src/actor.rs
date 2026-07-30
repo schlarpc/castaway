@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use castaway_core::{
-    Advertisement, CoreError, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
+    Advertisement, CoreError, MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
 };
 use crypto_cast_auth::CastDeviceSigner;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -324,6 +324,8 @@ pub struct CastReceiver {
     friendly_name: String,
     device_id: String,
     identity: CastIdentity,
+    /// Where each session's mirroring RTP socket binds (the port an ANSWER names).
+    media_ports: MediaPorts,
     /// Where playback has reached, for the `currentTime` a sender draws its scrubber from.
     ///
     /// Absent in a build with no decoder, which then reports zero — the wire has no slot
@@ -347,12 +349,14 @@ impl CastReceiver {
         friendly_name: impl Into<String>,
         device_id: impl Into<String>,
         identity: CastIdentity,
+        media_ports: MediaPorts,
     ) -> Result<Self, CastError> {
         Ok(Self {
             listen,
             friendly_name: friendly_name.into(),
             device_id: device_id.into(),
             identity,
+            media_ports,
             playback: None,
         })
     }
@@ -407,7 +411,7 @@ impl CastReceiver {
         // Bind the RTP socket up front. The ANSWER has to name a port, and the only way
         // to name one we are certain of is to already hold it. A failure here costs
         // mirroring, not the connection — the media-URL path does not need a socket.
-        let mut rtp = match MirrorSocket::bind(self.listen.ip()).await {
+        let mut rtp = match MirrorSocket::bind(self.listen.ip(), self.media_ports).await {
             Ok(socket) => {
                 session = session.with_mirror_port(socket.port());
                 Some(socket)
@@ -657,6 +661,7 @@ mod tests {
             "Lab TV",
             "0f8c2e10",
             CastIdentity::Unauthenticated(identity),
+            MediaPorts::Ephemeral,
         )
         .unwrap()
     }
@@ -725,6 +730,7 @@ mod tests {
             "Lab TV",
             "0f8c2e10",
             CastIdentity::Unauthenticated(identity()),
+            MediaPorts::Ephemeral,
         )
         .unwrap();
         let ads = r.advertisements();

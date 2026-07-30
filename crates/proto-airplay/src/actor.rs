@@ -19,8 +19,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use castaway_core::{
-    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, ProtocolKind, SessionEvent,
-    SessionSink, SourceAdapter,
+    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, MediaPorts, ProtocolKind,
+    SessionEvent, SessionSink, SourceAdapter,
 };
 use substrate_rtsp::rtsp_types::headers::{HeaderName, CONTENT_TYPE, CSEQ, SERVER};
 use substrate_rtsp::rtsp_types::{Message, Response, StatusCode, Version};
@@ -56,15 +56,22 @@ const SERVER_HEADER_PREFIX: &str = "AirTunes/";
 pub struct AirPlayReceiver {
     identity: AirPlayIdentity,
     addr: SocketAddr,
+    media_ports: MediaPorts,
 }
 
 impl AirPlayReceiver {
-    /// Build a receiver for `identity` on the default AirPlay port.
+    /// Build a receiver for `identity` on the default AirPlay port, binding each
+    /// session's media sockets (RAOP audio/control/timing UDP, the mirroring data
+    /// channel TCP) according to `media_ports`.
+    ///
+    /// A required argument rather than a defaulted builder: the ephemeral fallback is
+    /// invisible to a firewall, so choosing it has to be written down at the call site.
     #[must_use]
-    pub fn new(identity: AirPlayIdentity) -> Self {
+    pub fn new(identity: AirPlayIdentity, media_ports: MediaPorts) -> Self {
         Self {
             identity,
             addr: SocketAddr::from(([0, 0, 0, 0], AIRPLAY_PORT)),
+            media_ports,
         }
     }
 
@@ -93,7 +100,7 @@ impl AirPlayReceiver {
         // The mirroring data channel is a second TCP listener, bound now for the same
         // reason the UDP sockets are: a SETUP has to answer with a port that already
         // exists, not one we intend to create.
-        let mut mirror_listener = match TcpListener::bind(SocketAddr::new(local_ip, 0)).await {
+        let mut mirror_listener = match bind_tcp_media(local_ip, self.media_ports).await {
             Ok(listener) => match listener.local_addr() {
                 Ok(addr) => {
                     session.set_mirror_data_port(addr.port());
@@ -109,7 +116,7 @@ impl AirPlayReceiver {
                 None
             }
         };
-        match AudioSockets::bind(local_ip).await {
+        match AudioSockets::bind(local_ip, self.media_ports).await {
             Ok((sockets, ports)) => {
                 session.set_local_ports(ports);
                 audio_sockets = Some(sockets);
@@ -426,7 +433,8 @@ mod tests {
 
     #[test]
     fn advertises_both_services_on_the_one_port_it_binds() {
-        let r = AirPlayReceiver::new(identity()).with_addr(SocketAddr::from(([0, 0, 0, 0], 17000)));
+        let r = AirPlayReceiver::new(identity(), MediaPorts::Ephemeral)
+            .with_addr(SocketAddr::from(([0, 0, 0, 0], 17000)));
         let ads = r.advertisements();
         assert_eq!(ads.len(), 2);
         let ports: Vec<u16> = ads
@@ -443,7 +451,7 @@ mod tests {
 
     #[test]
     fn raop_keeps_its_deviceid_at_name_instance_convention() {
-        let r = AirPlayReceiver::new(identity());
+        let r = AirPlayReceiver::new(identity(), MediaPorts::Ephemeral);
         let ads = r.advertisements();
         match &ads[1] {
             Advertisement::MdnsService { ty, instance, .. } => {
@@ -457,7 +465,7 @@ mod tests {
     #[test]
     fn kind_is_airplay() {
         assert_eq!(
-            AirPlayReceiver::new(identity()).kind(),
+            AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).kind(),
             ProtocolKind::AirPlay
         );
     }
@@ -528,11 +536,11 @@ struct AudioSockets {
 }
 
 impl AudioSockets {
-    /// Bind all three on ephemeral ports of `host`.
-    async fn bind(host: IpAddr) -> std::io::Result<(Self, ReceiverPorts)> {
-        let audio = UdpSocket::bind(SocketAddr::new(host, 0)).await?;
-        let control = UdpSocket::bind(SocketAddr::new(host, 0)).await?;
-        let timing = UdpSocket::bind(SocketAddr::new(host, 0)).await?;
+    /// Bind all three on `host`, inside the receiver's media port policy.
+    async fn bind(host: IpAddr, media_ports: MediaPorts) -> std::io::Result<(Self, ReceiverPorts)> {
+        let audio = bind_udp_media(host, media_ports).await?;
+        let control = bind_udp_media(host, media_ports).await?;
+        let timing = bind_udp_media(host, media_ports).await?;
         let ports = ReceiverPorts {
             audio: audio.local_addr()?.port(),
             control: control.local_addr()?.port(),
@@ -547,6 +555,51 @@ impl AudioSockets {
             ports,
         ))
     }
+}
+
+/// Whether a failed bind means "this port is taken, try the next one".
+///
+/// `AddrInUse` is the ordinary collision — a sibling socket from the same range, or an
+/// unrelated process. `PermissionDenied` is Windows: WSAEACCES is what its excluded
+/// port ranges (`netsh interface … show excludedportrange`) answer with, and treating
+/// it as fatal would let one reserved port poison the whole range.
+fn is_port_taken(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// The error when every candidate port is taken.
+fn range_exhausted(media_ports: MediaPorts) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!("no free port in the media port range {media_ports}"),
+    )
+}
+
+/// Bind a UDP socket on the first free candidate port of `media_ports`.
+async fn bind_udp_media(host: IpAddr, media_ports: MediaPorts) -> std::io::Result<UdpSocket> {
+    for port in media_ports.candidates() {
+        match UdpSocket::bind(SocketAddr::new(host, port)).await {
+            Ok(socket) => return Ok(socket),
+            Err(e) if is_port_taken(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(range_exhausted(media_ports))
+}
+
+/// Bind a TCP listener on the first free candidate port of `media_ports`.
+async fn bind_tcp_media(host: IpAddr, media_ports: MediaPorts) -> std::io::Result<TcpListener> {
+    for port in media_ports.candidates() {
+        match TcpListener::bind(SocketAddr::new(host, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if is_port_taken(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(range_exhausted(media_ports))
 }
 
 /// Receive audio, control and timing datagrams until the session ends.

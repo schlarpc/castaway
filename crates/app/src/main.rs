@@ -546,6 +546,15 @@ async fn serve(
         "castaway services starting"
     );
 
+    // Validated once, up front, and failed loudly: a broken [media_ports] range means
+    // the operator asked to control where media sockets land, and booting on the
+    // ephemeral fallback would silently undo that (and reopen the firewall gap the
+    // range exists to close, docs/network-surface.md).
+    let media_ports = config
+        .media_ports
+        .policy()
+        .context("parsing [media_ports] in castaway.toml")?;
+
     let mut http = Router::new();
     let mut ssdp_devices: Vec<(SsdpDevice, String)> = Vec::new();
     let mut mdns = MdnsResponder::new().context("creating mDNS responder")?;
@@ -723,6 +732,7 @@ async fn serve(
         adapter_handles.push(
             spawn_cast(
                 &config,
+                media_ports,
                 &mut mdns,
                 event_tx.clone(),
                 shutdown.clone(),
@@ -734,6 +744,7 @@ async fn serve(
     if config.enable.airplay {
         adapter_handles.push(spawn_airplay(
             &config,
+            media_ports,
             &mut mdns,
             event_tx.clone(),
             shutdown.clone(),
@@ -882,6 +893,7 @@ async fn serve(
 /// `shutdown`. Returns the actor's join handle so shutdown can wait on it.
 async fn spawn_cast(
     config: &Config,
+    media_ports: castaway_core::MediaPorts,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
@@ -956,6 +968,7 @@ async fn spawn_cast(
         config.advertised_name(ProtocolKind::Cast).as_str(),
         config.uuid.replace('-', ""),
         identity,
+        media_ports,
     )
     .context("building the CASTv2 receiver")?;
     // Cast is the other protocol in which the receiver is the player, so a sender's
@@ -1201,20 +1214,24 @@ fn spawn_miracast(
 /// until `shutdown`. Returns the actor's join handle so shutdown can wait on it.
 fn spawn_airplay(
     config: &Config,
+    media_ports: castaway_core::MediaPorts,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    let receiver = AirPlayReceiver::new(proto_airplay::AirPlayIdentity {
-        name: config.advertised_name(ProtocolKind::AirPlay),
-        device_id: derive_mac(&config.uuid),
-        host: MDNS_HOST.to_string(),
-        // `pi` is a stable per-protocol UUID, which is what every real receiver
-        // advertises; reusing the device id here is the Roku/Samsung outlier behaviour.
-        pairing_id: device_uuid(&config.uuid, "airplay"),
-        offer_hevc: config.airplay.offer_hevc,
-        mirror_height: config.airplay.mirror_height,
-    });
+    let receiver = AirPlayReceiver::new(
+        proto_airplay::AirPlayIdentity {
+            name: config.advertised_name(ProtocolKind::AirPlay),
+            device_id: derive_mac(&config.uuid),
+            host: MDNS_HOST.to_string(),
+            // `pi` is a stable per-protocol UUID, which is what every real receiver
+            // advertises; reusing the device id here is the Roku/Samsung outlier behaviour.
+            pairing_id: device_uuid(&config.uuid, "airplay"),
+            offer_hevc: config.airplay.offer_hevc,
+            mirror_height: config.airplay.mirror_height,
+        },
+        media_ports,
+    );
 
     advertise_adapter(&receiver, mdns);
     // The warning that used to follow this line — "no media plane is implemented yet" —

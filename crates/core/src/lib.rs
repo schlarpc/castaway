@@ -17,6 +17,7 @@ pub mod nowplaying;
 pub mod osd;
 pub mod pipeline;
 pub mod playback;
+pub mod ports;
 pub mod session;
 pub mod source;
 pub mod types;
@@ -30,6 +31,7 @@ pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState, QueueItem,
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
 pub use pipeline::Pipeline;
 pub use playback::{PlaybackEnd, PlaybackProgress, PlaybackReport};
+pub use ports::{MediaPorts, PortRange, PortRangeError};
 pub use session::{RemoteHandle, SessionConfig, SessionManager};
 pub use source::SourceDescription;
 pub use types::{

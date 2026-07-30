@@ -64,14 +64,45 @@ pub struct MirrorSocket {
 }
 
 impl MirrorSocket {
-    /// Bind an ephemeral UDP port on `ip`, ready to be named in an ANSWER.
+    /// Bind a UDP port on `ip` from the receiver's media port policy, ready to be
+    /// named in an ANSWER.
+    ///
+    /// Range candidates are tried lowest-first; a port that is already taken —
+    /// `AddrInUse`, or `PermissionDenied` from a Windows excluded port range — moves
+    /// to the next, so a sibling session's socket does not fail this one.
     ///
     /// # Errors
-    /// [`CastError::Io`] if the socket cannot be bound or its port read back.
-    pub async fn bind(ip: std::net::IpAddr) -> Result<Self, CastError> {
-        let socket = UdpSocket::bind(SocketAddr::new(ip, 0))
-            .await
-            .map_err(|e| CastError::Io(format!("binding mirroring RTP socket: {e}")))?;
+    /// [`CastError::Io`] if no candidate port can be bound or the port can't be read
+    /// back.
+    pub async fn bind(
+        ip: std::net::IpAddr,
+        media_ports: castaway_core::MediaPorts,
+    ) -> Result<Self, CastError> {
+        let mut socket = None;
+        for candidate in media_ports.candidates() {
+            match UdpSocket::bind(SocketAddr::new(ip, candidate)).await {
+                Ok(bound) => {
+                    socket = Some(bound);
+                    break;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(CastError::Io(format!("binding mirroring RTP socket: {e}")));
+                }
+            }
+        }
+        let socket = socket.ok_or_else(|| {
+            CastError::Io(format!(
+                "no free port in the media port range {media_ports} for the mirroring RTP socket"
+            ))
+        })?;
         let port = socket
             .local_addr()
             .map_err(|e| CastError::Io(format!("reading mirroring RTP port: {e}")))?

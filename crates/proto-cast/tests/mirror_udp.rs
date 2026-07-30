@@ -32,7 +32,9 @@ struct Harness {
 }
 
 async fn start() -> Harness {
-    let socket = MirrorSocket::bind(LOCALHOST).await.unwrap();
+    let socket = MirrorSocket::bind(LOCALHOST, castaway_core::MediaPorts::Ephemeral)
+        .await
+        .unwrap();
     let receiver_addr = SocketAddr::new(LOCALHOST, socket.port());
 
     let (video, audio, rtp) = socket.start(&mirror_config(receiver_addr.port()));
@@ -184,7 +186,9 @@ async fn datagrams_for_another_ssrc_are_ignored_rather_than_misparsed() {
 
 #[tokio::test]
 async fn the_receive_loop_stops_when_the_pipeline_drops_its_end() {
-    let socket = MirrorSocket::bind(LOCALHOST).await.unwrap();
+    let socket = MirrorSocket::bind(LOCALHOST, castaway_core::MediaPorts::Ephemeral)
+        .await
+        .unwrap();
     let addr = SocketAddr::new(LOCALHOST, socket.port());
     let (video, _audio, rtp) = socket.start(&mirror_config(addr.port()));
     let task = tokio::spawn(rtp.run());
@@ -206,4 +210,37 @@ async fn the_receive_loop_stops_when_the_pipeline_drops_its_end() {
         .await
         .expect("the RTP loop outlived the pipeline that owned it")
         .unwrap();
+}
+
+/// The declared media port range is respected: the socket lands inside it, taken ports
+/// are skipped rather than fatal, and exhaustion is an error instead of a silent fall
+/// back to an ephemeral port — which no firewall rule could have named.
+#[tokio::test]
+async fn a_declared_range_is_honoured_skipping_taken_ports() {
+    use castaway_core::{MediaPorts, PortRange};
+
+    let range = MediaPorts::Range(PortRange::new(42500, 42502).unwrap());
+
+    // Occupy the first candidate so the bind has something to skip.
+    let blocker = UdpSocket::bind(SocketAddr::new(LOCALHOST, 42500))
+        .await
+        .unwrap();
+
+    let socket = MirrorSocket::bind(LOCALHOST, range).await.unwrap();
+    assert!(
+        (42501..=42502).contains(&socket.port()),
+        "expected the next free port in the range, got {}",
+        socket.port()
+    );
+
+    // Take whatever is left; the range is now full.
+    let second = MirrorSocket::bind(LOCALHOST, range).await.unwrap();
+    assert_ne!(second.port(), socket.port());
+
+    let exhausted = MirrorSocket::bind(LOCALHOST, range).await;
+    assert!(
+        exhausted.is_err(),
+        "an exhausted range must refuse, not fall back to an ephemeral port"
+    );
+    drop(blocker);
 }

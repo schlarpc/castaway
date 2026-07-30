@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 pub use cast_replay::Identity;
-use castaway_core::ProtocolKind;
+use castaway_core::{MediaPorts, PortRange, PortRangeError, ProtocolKind};
 use serde::Deserialize;
 
 /// Top-level configuration.
@@ -27,6 +27,9 @@ pub struct Config {
     pub uuid: String,
     /// HTTP host port for the shared UPnP/DIAL/Spotify server.
     pub http_port: u16,
+    /// The port range AirPlay and Cast bind their per-session media sockets from.
+    #[serde(default)]
+    pub media_ports: MediaPortsConfig,
     /// LAN IPv4 to advertise. `None` auto-detects the default-route interface.
     pub interface: Option<Ipv4Addr>,
     /// Which protocols to enable.
@@ -644,6 +647,51 @@ impl Config {
     }
 }
 
+/// The port range AirPlay and Cast bind their per-session media sockets from.
+///
+/// These are the sockets a `SETUP` or an ANSWER names — RAOP audio/control/timing and
+/// the mirroring data channel for AirPlay, the mirroring RTP socket for Cast. They used
+/// to bind ephemeral OS-assigned ports, which no firewall rule can cover: the control
+/// plane looked perfect and the media arrived at a closed port. A declared range is
+/// what lets the NixOS module (and a Windows firewall rule) open exactly what the
+/// process may listen on — the range here is the one `docs/network-surface.md`
+/// documents and `nix/network-surface.json` carries to the firewall.
+///
+/// The default width is 32 ports. One AirPlay session takes four (three UDP, one TCP)
+/// and one Cast mirroring session takes one, so the default sustains several times the
+/// concurrent-session count a single panel can display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MediaPortsConfig {
+    /// First port of the inclusive range.
+    pub first: u16,
+    /// Last port of the inclusive range.
+    pub last: u16,
+}
+
+impl Default for MediaPortsConfig {
+    fn default() -> Self {
+        Self {
+            // An unassigned-in-practice block well clear of every fixed port this
+            // receiver or its peers use.
+            first: 41000,
+            last: 41031,
+        }
+    }
+}
+
+impl MediaPortsConfig {
+    /// The validated policy the adapters bind with.
+    ///
+    /// # Errors
+    /// [`PortRangeError`] if the range starts at 0 or is backwards. Deliberately not
+    /// lenient: an operator who wrote a broken range meant to control these ports, and
+    /// quietly falling back to ephemeral would undo exactly what they asked for.
+    pub fn policy(self) -> Result<MediaPorts, PortRangeError> {
+        PortRange::new(self.first, self.last).map(MediaPorts::Range)
+    }
+}
+
 /// Bluetooth A2DP sink settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -793,6 +841,7 @@ impl Default for Config {
             friendly_name: "dma.space/screen".to_string(),
             uuid: "0f8c2e10-castaway-0001-000000000001".to_string(),
             http_port: 8080,
+            media_ports: MediaPortsConfig::default(),
             interface: None,
             enable: Enable::default(),
             log: Log::default(),
@@ -1070,6 +1119,25 @@ mod tests {
             assert!(AudioOutput::key_for(backend).is_some());
         }
         assert_eq!(AudioOutput::key_for(B::Null), None);
+    }
+
+    #[test]
+    fn media_ports_default_to_a_firewallable_range() {
+        // The default range is load-bearing: nix/network-surface.json carries it to the
+        // NixOS firewall, so a change here without regenerating that file must fail the
+        // surface freshness test, not just this one.
+        let c = Config::default();
+        assert_eq!(c.media_ports.policy().unwrap().to_string(), "41000-41031");
+    }
+
+    #[test]
+    fn a_broken_media_port_range_is_an_error_not_a_fallback() {
+        // Ephemeral fallback would silently reopen the un-firewallable behaviour the
+        // range exists to close; an operator who wrote a range meant to control it.
+        let c: Config = toml::from_str("[media_ports]\nfirst = 0\nlast = 10\n").unwrap();
+        assert!(c.media_ports.policy().is_err());
+        let c: Config = toml::from_str("[media_ports]\nfirst = 50\nlast = 40\n").unwrap();
+        assert!(c.media_ports.policy().is_err());
     }
 
     #[test]
