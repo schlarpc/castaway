@@ -9,18 +9,26 @@
 
 ## Listening sockets
 
-| Port | Transport | Owner | Carries | Security | Exists when |
-|---|---|---|---|---|---|
-| 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png | plaintext HTTP (LAN control plane) | always |
-| 5353 | udp | mdns | mDNS/DNS-SD responder (mdns-sd daemon) | plaintext multicast | always |
-| 1900 | udp | ssdp | SSDP M-SEARCH responder + NOTIFY alive/byebye | plaintext multicast | always |
-| 7000 | tcp | airplay | RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP | plaintext — pair-verify/FairPlay not implemented (Q1) | enable.airplay |
-| 41000–41031 (`[media_ports]`) | udp | airplay | RAOP audio + control + timing (three sockets per session) | RTP; AES-CBC when the sender negotiates it | enable.airplay |
-| 41000–41031 (`[media_ports]`) | tcp | airplay | mirroring data channel (one listener per session) | AES-CTR frames (MirrorKeys) | enable.airplay |
-| 8009 | tcp | cast | CASTv2: length-prefixed protobuf over TLS | TLS, self-signed or CKS-replayed certificate; the device-auth signature covers it (D41/D43) | enable.cast |
-| 41000–41031 (`[media_ports]`) | udp | cast | mirroring RTP + RTCP (one socket per session; audio and video SSRCs demuxed on it) | AES-CTR per Cast mirroring keys | enable.cast |
-| 1028 (`miracast.rtp_port`) | udp | miracast | MPEG2-TS over RTP from the source | plaintext RTP; WPA2 protects the P2P link at layer 2 | enable.miracast |
-| 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (Q7c) | plaintext | enable.miracast |
+| Port | Transport | Owner | Carries | Security | Exists when | Chosen by |
+|---|---|---|---|---|---|---|
+| 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png | plaintext HTTP (LAN control plane) | always | ours |
+| 5353 | udp | mdns | mDNS/DNS-SD responder (mdns-sd daemon) | plaintext multicast | always | spec |
+| 1900 | udp | ssdp | SSDP M-SEARCH responder + NOTIFY alive/byebye | plaintext multicast | always | spec |
+| 7000 | tcp | airplay | RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP | plaintext — pair-verify/FairPlay not implemented (Q1) | enable.airplay | convention |
+| 41000–41031 (`[media_ports]`) | udp | airplay | RAOP audio + control + timing (three sockets per session) | RTP; AES-CBC when the sender negotiates it | enable.airplay | ours |
+| 41000–41031 (`[media_ports]`) | tcp | airplay | mirroring data channel (one listener per session) | AES-CTR frames (MirrorKeys) | enable.airplay | ours |
+| 8009 | tcp | cast | CASTv2: length-prefixed protobuf over TLS | TLS, self-signed or CKS-replayed certificate; the device-auth signature covers it (D41/D43) | enable.cast | convention |
+| 41000–41031 (`[media_ports]`) | udp | cast | mirroring RTP + RTCP (one socket per session; audio and video SSRCs demuxed on it) | AES-CTR per Cast mirroring keys | enable.cast | ours |
+| 1028 (`miracast.rtp_port`) | udp | miracast | MPEG2-TS over RTP from the source | plaintext RTP; WPA2 protects the P2P link at layer 2 | enable.miracast | convention |
+| 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (Q7c) | plaintext | enable.miracast | spec |
+
+**Chosen by** answers "could we move this port?", in three tiers:
+
+- **spec** — fixed by the protocol itself (a well-known rendezvous port or an RFC); a sender's first packet goes there before it knows we exist. Nothing on either side can move it.
+- **convention** — signaled to senders (an mDNS SRV record, or in-band during session setup), so movable in principle; in practice every implementation in the wild uses this one number.
+- **ours** — entirely our choice; senders only ever learn it from what we advertise or answer.
+
+The tiers correlate with the config surface, and a test holds the line: every *spec* port is a fixed constant, every *ours* port has a config knob. *Convention* splits case by case — `miracast.rtp_port` has a knob because captures show senders tolerate variance; Cast's 8009 and AirPlay's 7000 stay constants because moving a port every sender expects buys nothing and exercises a path none of them is tested against. Outbound is the mirror image: every destination port in the table below is the peer's or the service's to pick, never ours.
 
 Notes, per listener that has one:
 

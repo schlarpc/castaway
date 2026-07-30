@@ -2,6 +2,7 @@
   "GENERATED": "by crates/app/src/surface.rs; CASTAWAY_REGEN_SURFACE=1 cargo test -p castaway surface — a test fails when this file drifts",
   "listeners": [
     {
+      "chosen_by": "ours",
       "gate": [],
       "owner": "http",
       "port": {
@@ -15,6 +16,7 @@
       "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png"
     },
     {
+      "chosen_by": "spec",
       "gate": [],
       "owner": "mdns",
       "port": {
@@ -25,6 +27,7 @@
       "wire": "mDNS/DNS-SD responder (mdns-sd daemon)"
     },
     {
+      "chosen_by": "spec",
       "gate": [],
       "owner": "ssdp",
       "port": {
@@ -35,6 +38,7 @@
       "wire": "SSDP M-SEARCH responder + NOTIFY alive/byebye"
     },
     {
+      "chosen_by": "convention",
       "gate": [
         "airplay"
       ],
@@ -47,6 +51,7 @@
       "wire": "RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP"
     },
     {
+      "chosen_by": "ours",
       "gate": [
         "airplay"
       ],
@@ -63,6 +68,7 @@
       "wire": "RAOP audio + control + timing (three sockets per session)"
     },
     {
+      "chosen_by": "ours",
       "gate": [
         "airplay"
       ],
@@ -79,6 +85,7 @@
       "wire": "mirroring data channel (one listener per session)"
     },
     {
+      "chosen_by": "convention",
       "gate": [
         "cast"
       ],
@@ -91,6 +98,7 @@
       "wire": "CASTv2: length-prefixed protobuf over TLS"
     },
     {
+      "chosen_by": "ours",
       "gate": [
         "cast"
       ],
@@ -107,6 +115,7 @@
       "wire": "mirroring RTP + RTCP (one socket per session; audio and video SSRCs demuxed on it)"
     },
     {
+      "chosen_by": "convention",
       "gate": [
         "miracast"
       ],
@@ -123,6 +132,7 @@
       "wire": "MPEG2-TS over RTP from the source"
     },
     {
+      "chosen_by": "spec",
       "gate": [
         "miracast"
       ],

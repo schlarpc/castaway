@@ -92,6 +92,37 @@ pub enum Provider {
     Deployment(&'static str),
 }
 
+/// Who actually picked the port number — the answer to "could we move this?".
+///
+/// The tiers correlate with the config surface, and a test holds the line: a
+/// spec-forced port is always a fixed constant, and a freely-chosen one always has a
+/// config knob. The convention tier splits case by case — `miracast.rtp_port` has a
+/// knob because captures show senders tolerate variance; Cast's 8009 and AirPlay's
+/// 7000 do not, because moving a port every sender on earth expects buys nothing and
+/// exercises a path none of them is tested against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Fixed by the protocol itself (a well-known rendezvous port, or an RFC): a
+    /// sender's first packet goes there before it knows we exist. Nothing on either
+    /// side can move it.
+    Spec,
+    /// Signaled to senders (an mDNS SRV record, or in-band during session setup), so
+    /// movable in principle — but every implementation in the wild uses this number.
+    Convention,
+    /// Entirely ours: senders only ever learn it from what we advertise or answer.
+    Ours,
+}
+
+impl Provenance {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spec => "spec",
+            Self::Convention => "convention",
+            Self::Ours => "ours",
+        }
+    }
+}
+
 /// When the listener exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
@@ -120,6 +151,8 @@ pub struct Listener {
     pub gate: Gate,
     /// Who binds it.
     pub provider: Provider,
+    /// Who picked the number.
+    pub chosen_by: Provenance,
     /// What an operator should know that the columns can't say.
     pub notes: &'static str,
 }
@@ -171,6 +204,7 @@ fn shared_listeners() -> Vec<Listener> {
             security: "plaintext HTTP (LAN control plane)",
             gate: Gate::Always,
             provider: Provider::Process,
+            chosen_by: Provenance::Ours,
             notes: "One host shared by three protocols (D7); a disabled protocol's \
                     routes are simply not mounted. /screenshot.png always answers.",
         },
@@ -183,6 +217,7 @@ fn shared_listeners() -> Vec<Listener> {
             security: "plaintext multicast",
             gate: Gate::Always,
             provider: Provider::Process,
+            chosen_by: Provenance::Spec,
             notes: "Advertises only enabled protocols, restricted to the serving \
                     interface. GameStream's host browser runs a second daemon — a \
                     second 5353 socket — when enabled. Contends with Avahi/Bonjour \
@@ -197,6 +232,7 @@ fn shared_listeners() -> Vec<Listener> {
             security: "plaintext multicast",
             gate: Gate::Always,
             provider: Provider::Process,
+            chosen_by: Provenance::Spec,
             notes: "Bound even with DLNA and DIAL both off; it then answers for no \
                     device type.",
         },
@@ -220,6 +256,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 security: "plaintext — pair-verify/FairPlay not implemented (Q1)",
                 gate: Gate::AnyOf(&[ProtocolKind::AirPlay]),
                 provider: Provider::Process,
+                chosen_by: Provenance::Convention,
                 notes: "Both _airplay._tcp and _raop._tcp advertise this one port. \
                         Nothing binds 7011: it is the AirPlay 1 UDP timing port, not \
                         a listener, and the listener once bound there was removed.",
@@ -233,6 +270,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 security: "RTP; AES-CBC when the sender negotiates it",
                 gate: Gate::AnyOf(&[ProtocolKind::AirPlay]),
                 provider: Provider::Process,
+                chosen_by: Provenance::Ours,
                 notes: "Bound per sender before SETUP answers, so the Transport \
                         header only ever names ports that are already listening.",
             },
@@ -245,6 +283,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 security: "AES-CTR frames (MirrorKeys)",
                 gate: Gate::AnyOf(&[ProtocolKind::AirPlay]),
                 provider: Provider::Process,
+                chosen_by: Provenance::Ours,
                 notes: "Answered as dataPort in the second SETUP reply.",
             },
         ],
@@ -259,6 +298,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                            device-auth signature covers it (D41/D43)",
                 gate: Gate::AnyOf(&[ProtocolKind::Cast]),
                 provider: Provider::Process,
+                chosen_by: Provenance::Convention,
                 notes: "",
             },
             Listener {
@@ -271,6 +311,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 security: "AES-CTR per Cast mirroring keys",
                 gate: Gate::AnyOf(&[ProtocolKind::Cast]),
                 provider: Provider::Process,
+                chosen_by: Provenance::Ours,
                 notes: "Bound before the OFFER is answered; named as udpPort in the \
                         ANSWER.",
             },
@@ -288,6 +329,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 security: "plaintext RTP; WPA2 protects the P2P link at layer 2",
                 gate: Gate::AnyOf(&[ProtocolKind::Miracast]),
                 provider: Provider::Process,
+                chosen_by: Provenance::Convention,
                 notes: "Advertised in M3 and echoed in SETUP; bound before M3 is \
                         sent. The RTSP control plane is outbound — the sink dials \
                         the source's 7236, so there is no TCP listener.",
@@ -301,6 +343,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 security: "plaintext",
                 gate: Gate::AnyOf(&[ProtocolKind::Miracast]),
                 provider: Provider::Deployment("systemd-networkd, via the NixOS module"),
+                chosen_by: Provenance::Spec,
                 notes: "As group owner we must address the peer. The rule is not \
                         interface-scoped because the group interface (p2p-*-N) does \
                         not exist until the group forms.",
@@ -510,8 +553,8 @@ pub fn spec_markdown() -> String {
          > are denied by `clippy.toml` outside registered sites. `castaway\n\
          > --network-surface` prints this table resolved against the loaded config.\n\n\
          ## Listening sockets\n\n\
-         | Port | Transport | Owner | Carries | Security | Exists when |\n\
-         |---|---|---|---|---|---|\n",
+         | Port | Transport | Owner | Carries | Security | Exists when | Chosen by |\n\
+         |---|---|---|---|---|---|---|\n",
     );
     for l in listeners() {
         let deployment = match l.provider {
@@ -520,7 +563,7 @@ pub fn spec_markdown() -> String {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {}{} | {} | {} | {} |",
+            "| {} | {} | {}{} | {} | {} | {} | {} |",
             port_label(l.port),
             l.transport.as_str(),
             l.owner.label(),
@@ -528,8 +571,28 @@ pub fn spec_markdown() -> String {
             l.wire,
             l.security,
             gate_label(l.gate),
+            l.chosen_by.as_str(),
         );
     }
+    out.push_str(
+        "\n**Chosen by** answers \"could we move this port?\", in three tiers:\n\n\
+         - **spec** — fixed by the protocol itself (a well-known rendezvous port or \
+         an RFC); a sender's first packet goes there before it knows we exist. \
+         Nothing on either side can move it.\n\
+         - **convention** — signaled to senders (an mDNS SRV record, or in-band \
+         during session setup), so movable in principle; in practice every \
+         implementation in the wild uses this one number.\n\
+         - **ours** — entirely our choice; senders only ever learn it from what we \
+         advertise or answer.\n\n\
+         The tiers correlate with the config surface, and a test holds the line: \
+         every *spec* port is a fixed constant, every *ours* port has a config knob. \
+         *Convention* splits case by case — `miracast.rtp_port` has a knob because \
+         captures show senders tolerate variance; Cast's 8009 and AirPlay's 7000 stay \
+         constants because moving a port every sender expects buys nothing and \
+         exercises a path none of them is tested against. Outbound is the mirror \
+         image: every destination port in the table below is the peer's or the \
+         service's to pick, never ours.\n",
+    );
     out.push_str("\nNotes, per listener that has one:\n\n");
     for l in listeners() {
         if !l.notes.is_empty() {
@@ -632,6 +695,7 @@ pub fn spec_json() -> String {
                 },
                 "port": port,
                 "gate": gate,
+                "chosen_by": l.chosen_by.as_str(),
                 "wire": l.wire,
             })
         })
@@ -931,6 +995,30 @@ mod tests {
         );
         assert_eq!(port_of("mdns", Transport::Udp), substrate_mdns::MDNS_PORT);
         assert_eq!(port_of("ssdp", Transport::Udp), substrate_ssdp::SSDP_PORT);
+    }
+
+    /// Provenance and configurability move together: a spec-forced port must be a
+    /// fixed constant (offering a knob for 5353 would be a lie), and a freely-chosen
+    /// port must have one (hardcoding a number nothing forces is a choice someone
+    /// should be able to unmake). Convention is deliberately unconstrained — that
+    /// tier is decided case by case, and the doc's legend explains each call.
+    #[test]
+    fn provenance_matches_the_config_surface() {
+        for l in listeners() {
+            match l.chosen_by {
+                Provenance::Spec => assert!(
+                    matches!(l.port, PortSpec::Fixed(_)),
+                    "{} is spec-forced but not a fixed constant",
+                    l.owner.label()
+                ),
+                Provenance::Ours => assert!(
+                    !matches!(l.port, PortSpec::Fixed(_)),
+                    "{} is ours to choose but offers no config knob",
+                    l.owner.label()
+                ),
+                Provenance::Convention => {}
+            }
+        }
     }
 
     #[test]
