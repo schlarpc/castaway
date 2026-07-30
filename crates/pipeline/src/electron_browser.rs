@@ -49,10 +49,24 @@ use tracing::{debug, error, info, trace, warn};
 use crate::adblock_engine::AdBlocker;
 use crate::audio_decode::PcmBlock;
 use crate::audio_out::{AudioOut, AudioOutputFactory};
-use crate::browser::{BrowserCommand, BrowserRole};
+use crate::browser::{BrowserCommand, BrowserRole, BrowserView};
 use crate::browser_proto::{encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, ToBrowser};
 use crate::error::PipelineError;
 use crate::hwaccel::remote_handle::{ProcessRef, RemoteHandle};
+use crate::panel::Surface;
+
+/// Which panel surface a loaded page is: a session's, or the idle screen's own furniture.
+///
+/// One function rather than a `bool` threaded to four call sites, because the distinction is
+/// the whole reason the panel can answer for both — a cast page can own the glass and be
+/// restored, the clock can do neither.
+const fn surface_of(cast: bool) -> Surface {
+    if cast {
+        Surface::CastPage
+    } else {
+        Surface::IdleWidget
+    }
+}
 
 /// A user agent that makes YouTube serve its TV interface.
 ///
@@ -694,20 +708,29 @@ pub struct ElectronHost {
     respawn: RespawnSpec,
     commands: std::sync::mpsc::Receiver<BrowserCommand>,
     size: (u32, u32),
-    role: BrowserRole,
+    /// Whether the page currently loaded is a *session's* — a cast surface — rather than
+    /// the idle screen's clock.
+    ///
+    /// The only thing about the page this host still decides, because it is the only part
+    /// it knows: which URL it was told to load. Where that page *goes* is the panel's
+    /// answer (`RenderLoop::page_view`), which is why there is no `BrowserRole` here any
+    /// more. It used to keep one and mutate it on minimize/restore — a second state machine
+    /// over the same slot as the now-playing card, kept in step with the first by
+    /// convention.
+    is_cast: bool,
+    /// The view last applied: the viewport the subprocess was told to rasterize at, and the
+    /// layer it maps onto. `None` when the page is not on the glass.
+    ///
+    /// Compared against the panel's answer once per pump; a difference is a resize round
+    /// trip, which is why this is remembered rather than recomputed into the subprocess
+    /// every frame.
+    view: Option<BrowserView>,
     widget: Option<String>,
     widget_started: bool,
     current_url: Option<String>,
     recovery_attempts: u32,
     retry_at: Option<std::time::Instant>,
     gave_up: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Whether the idle widget is currently yielded to something that outranks it — a
-    /// shell screen other than Home, or a session surface. A per-pump mirror of
-    /// [`crate::render_pipeline::RenderLoop::attract_widget_covered`], held only so
-    /// input routing agrees with the compositor (which skips drawing the covered layer
-    /// on its own — see `LayerId::yields_to`). Always false in
-    /// [`BrowserRole::Fullscreen`]; a cast surface is never covered.
-    widget_covered: bool,
     /// Whether the left button is held, and therefore whether the browser owns the
     /// pointer even where it strays outside its viewport.
     left_down: bool,
@@ -750,14 +773,14 @@ impl ElectronHost {
             respawn,
             commands,
             size: (1920, 1080),
-            role: BrowserRole::Fullscreen,
+            is_cast: false,
+            view: None,
             widget: None,
             widget_started: false,
             current_url: None,
             recovery_attempts: 0,
             retry_at: None,
             gave_up: None,
-            widget_covered: false,
             left_down: false,
             contacts: std::collections::HashSet::new(),
             next_report: std::time::Instant::now(),
@@ -779,63 +802,40 @@ impl ElectronHost {
         self
     }
 
-    /// Minimize a fullscreen page into the home screen's widget slot. Returns whether
-    /// there was one to minimize, so a back control knows the press is spent.
+    /// Follow the panel: put the page where the panel says it goes.
     ///
-    /// Going home *demotes* every playing surface rather than ending it: video shrinks
-    /// to a corner, an audio card into the widget slot, and a page — YouTube leanback —
-    /// does the same. The page is not navigated; it keeps playing at card size (its
-    /// audio keeps flowing through the tap), and a tap on the card restores it. Ending
-    /// the session stays what it always was: the sender's stop, or the page going idle.
-    pub fn minimize_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
-        if self.role != BrowserRole::Fullscreen {
-            return false;
+    /// The fold. Minimizing and restoring used to be methods here that mutated a role this
+    /// host owned, which meant the page's placement and every *other* surface's placement
+    /// were two machines that had to be kept in agreement — and were not. Now the panel
+    /// decides for all of them and this reacts, once per pump, to a difference it can see.
+    ///
+    /// A placement change is a *resize* round trip rather than a transform: the page lays
+    /// itself out at the size it will be shown, so the subprocess has to re-rasterize. The
+    /// old texture is dropped rather than stretched across the new rect, and the layer comes
+    /// back with the first paint at the right size (stale-sized paints are released
+    /// unimported in the meantime — see `import_frame`).
+    fn follow_panel(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        let want = self
+            .current_url
+            .is_some()
+            .then(|| render.page_view(self.is_cast))
+            .flatten();
+        if want == self.view {
+            return;
         }
-        self.role = BrowserRole::AttractWidget;
-        // The fullscreen-size texture is the wrong shape for the card; drop it and let
-        // the first card-size paint bring the layer back (stale-size paints are
-        // released unimported in the meantime).
+        let resized = want.map(|v| v.rect) != self.view.map(|v| v.rect);
+        self.view = want;
+        // Layer *or* size changed: either way what is composited is the old viewport's
+        // texture, which belongs to a placement that is over.
         render.clear_browser();
-        let rect = self.role.view(self.size).rect;
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Resize {
-                width: rect.width,
-                height: rect.height,
-            });
+        if let (Some(view), true) = (want, resized) {
+            if let Some(e) = &self.electron {
+                e.send(&ToBrowser::Resize {
+                    width: view.rect.width,
+                    height: view.rect.height,
+                });
+            }
         }
-        true
-    }
-
-    /// Bring a minimized page back to fullscreen. Returns whether there was one.
-    pub fn restore_fullscreen(&mut self, render: &mut crate::render_pipeline::RenderLoop) -> bool {
-        if !self.is_minimized() {
-            return false;
-        }
-        self.role = BrowserRole::Fullscreen;
-        render.clear_browser();
-        let rect = self.role.view(self.size).rect;
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Resize {
-                width: rect.width,
-                height: rect.height,
-            });
-        }
-        true
-    }
-
-    /// Whether the widget slot currently holds a minimized page rather than the idle
-    /// widget — i.e. tapping it means "restore", not "talk to the clock".
-    #[must_use]
-    pub fn is_minimized(&self) -> bool {
-        self.role == BrowserRole::AttractWidget
-            && self.current_url.is_some()
-            && self.current_url != self.widget
-    }
-
-    /// Whether a panel-normalized point lands on the minimized page's card.
-    #[must_use]
-    pub fn hit_minimized(&self, x: f32, y: f32) -> bool {
-        self.is_minimized() && !self.widget_covered && self.hit_view(x, y).is_some()
     }
 
     /// Track the kiosk surface size so the browser viewport matches.
@@ -844,13 +844,9 @@ impl ElectronHost {
             return;
         }
         self.size = (width, height);
-        let rect = self.role.view(self.size).rect;
-        if let Some(e) = &self.electron {
-            e.send(&ToBrowser::Resize {
-                width: rect.width,
-                height: rect.height,
-            });
-        }
+        // The viewport follows from the panel's placement on a surface this size, so the
+        // round trip is `follow_panel`'s on the next pump rather than a second one here.
+        self.view = None;
     }
 
     /// One per-frame tick on the main thread: apply commands, recover if needed, and
@@ -859,21 +855,18 @@ impl ElectronHost {
         if !self.widget_started {
             self.widget_started = true;
             if let Some(url) = self.widget.clone() {
-                self.show(render, &url, BrowserRole::AttractWidget);
+                self.show(render, &url, false);
             }
         }
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
-                BrowserCommand::Navigate(url) => self.show(render, &url, BrowserRole::Fullscreen),
+                BrowserCommand::Navigate(url) => self.show(render, &url, true),
                 BrowserCommand::Hide => self.hide(render),
             }
         }
-        // Mirror the render loop's per-frame verdict, for input's sake alone: the
-        // *drawing* of a covered widget is the compositor's business (it skips the
-        // layer — see `LayerId::yields_to`), but "does a touch on that rect belong to
-        // the page" is answered here, and it must agree with what is on the glass.
-        self.widget_covered =
-            self.role == BrowserRole::AttractWidget && render.attract_widget_covered();
+        // Where the page belongs is the panel's answer, recomputed every pump so a
+        // navigation, a session starting or a demote does not need this host to be told.
+        self.follow_panel(render);
         self.recover(render);
         self.import_frame(render);
         self.report();
@@ -898,7 +891,9 @@ impl ElectronHost {
         if self.current_url.is_none() {
             return; // `borrow` drops here, releasing the frame.
         }
-        let view = self.role.view(self.size);
+        let Some(view) = self.view else {
+            return; // `borrow` drops here: nothing is meant to be on the glass.
+        };
         // A frame sized for a viewport we are no longer showing: the paint raced a role
         // change or a resize. Stretching one frame of the old thing across the new rect
         // is worse than one frame of nothing.
@@ -1038,15 +1033,18 @@ impl ElectronHost {
         let Some(url) = self.current_url.clone() else {
             return;
         };
-        let role = self.role;
+        let cast = self.is_cast;
         info!(target: "castaway::browser", %url, "reloading after a fault");
-        self.show(render, &url, role);
+        self.show(render, &url, cast);
     }
 
     /// Give the panel back: the idle widget if there is one, otherwise nothing.
     fn hide(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
+        // Whatever was up is over: the cast page goes even when the idle widget replaces it
+        // in the same slot, because they are different surfaces to the panel.
+        render.set_surface(surface_of(self.is_cast), false);
         match self.widget.clone() {
-            Some(url) => self.show(render, &url, BrowserRole::AttractWidget),
+            Some(url) => self.show(render, &url, false),
             None => {
                 if let Some(e) = &self.electron {
                     e.send(&ToBrowser::Blank);
@@ -1062,29 +1060,44 @@ impl ElectronHost {
     /// releases the frames — once wgpu has retired the submissions still sampling them.
     fn clear(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
         self.current_url = None;
+        self.view = None;
+        render.set_surface(surface_of(self.is_cast), false);
         render.clear_browser();
     }
 
-    /// Point the browser at `url` in `role`.
-    fn show(
-        &mut self,
-        render: &mut crate::render_pipeline::RenderLoop,
-        url: &str,
-        role: BrowserRole,
-    ) {
-        let rect = role.view(self.size).rect;
-        if self.role != role {
-            // The layer transform changes with the role but the texture is still the old
-            // viewport's size; drop it rather than stretching one frame of the wrong
-            // thing across the new rect.
+    /// Point the browser at `url`.
+    ///
+    /// `cast` says which of the two pages this is — a session's surface, or the idle
+    /// screen's clock — which is what the panel needs in order to place it. It used to be
+    /// inferred by comparing the URL against the configured widget URL, in a method called
+    /// `is_minimized`, which is a lot of indirection for "which of these two things did we
+    /// just load".
+    fn show(&mut self, render: &mut crate::render_pipeline::RenderLoop, url: &str, cast: bool) {
+        if self.is_cast != cast {
+            // Two different surfaces as far as the panel is concerned, so the old one is
+            // gone; and its texture is the wrong viewport for the new one.
+            render.set_surface(surface_of(self.is_cast), false);
             render.clear_browser();
+            self.view = None;
         }
-        self.role = role;
+        self.is_cast = cast;
         if self.current_url.as_deref() != Some(url) {
             self.recovery_attempts = 0;
             self.retry_at = None;
         }
         self.current_url = Some(url.to_string());
+        render.set_surface(surface_of(cast), true);
+        // A cast page arriving *is* a session starting, so it claims the panel on the same
+        // terms as every other one — including being declined while somebody is mid-tap.
+        // Without this a DIAL launch would arrive demoted whenever the shell happened to
+        // have the glass, because nothing else in this path asks for it.
+        if cast {
+            render.rest_panel_if_idle();
+        }
+        self.view = render.page_view(cast);
+        let rect = self
+            .view
+            .map_or_else(|| BrowserRole::Fullscreen.view(self.size).rect, |v| v.rect);
         if let Some(e) = &self.electron {
             e.send(&ToBrowser::Navigate {
                 url: url.to_string(),
@@ -1097,19 +1110,20 @@ impl ElectronHost {
     /// Map a normalized panel coordinate into browser view pixels, clamped. For a
     /// contact the browser already owns.
     fn to_view(&self, x: f32, y: f32) -> (f32, f32) {
-        crate::browser::to_view_px(self.role.view(self.size).rect, self.size, x, y)
+        let rect = self
+            .view
+            .map_or_else(|| BrowserRole::Fullscreen.view(self.size).rect, |v| v.rect);
+        crate::browser::to_view_px(rect, self.size, x, y)
     }
 
     /// Map a normalized panel coordinate, or `None` if it is outside the viewport. For
     /// deciding whether an input belongs to the browser at all.
     ///
-    /// A covered widget owns nothing: its rect is still where it always was, but what
-    /// the finger is touching is whatever covered it.
+    /// A page that is not on the glass owns nothing: the panel answered `Hidden`, or a card
+    /// took the slot, so what the finger is touching is whatever is there instead.
     fn hit_view(&self, x: f32, y: f32) -> Option<(f32, f32)> {
-        if self.widget_covered {
-            return None;
-        }
-        crate::browser::hit_view_px(self.role.view(self.size).rect, self.size, x, y)
+        let rect = self.view?.rect;
+        crate::browser::hit_view_px(rect, self.size, x, y)
     }
 
     /// One structured line every 5 s while the browser has audio, mirroring the mirroring

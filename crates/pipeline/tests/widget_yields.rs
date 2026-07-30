@@ -5,14 +5,20 @@
 //! the middle of the panel left the clock floating beside it, and a pushed shell
 //! screen — drawn on the Attract layer, *below* the widget — sat underneath it. Both
 //! are the same wrong picture: an ornament outranking the thing the panel is actually
-//! doing. The rule under test is `LayerId::yields_to` plus the render loop's
-//! shell-depth suppression, applied by the compositor per frame.
+//! doing.
+//!
+//! Two rules together, and they are deliberately in different places: which of two surfaces
+//! in the same slot wins is declared on the layers (`LayerId::yields_to`) because it is a
+//! fact about depth, while whether the slot is on the panel at all is
+//! `Panel::placement(Surface::IdleWidget)` — the widget belongs to the Home *screen*, so it
+//! leaves when the shell does. The compositor applies both per frame.
 #![cfg(feature = "render")]
 #![allow(clippy::unwrap_used)]
 
 use pipeline::attract::{AttractScene, WidgetSlot};
 use pipeline::browser::BrowserRole;
-use pipeline::compositor::{DirtyRect, LayerId};
+use pipeline::compositor::DirtyRect;
+use pipeline::panel::Surface;
 use pipeline::render_pipeline::{RenderCommand, RenderLoop};
 
 const W: u32 = 1920;
@@ -44,6 +50,10 @@ fn idle_with_widget() -> (std::sync::mpsc::SyncSender<RenderCommand>, RenderLoop
     tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
         .unwrap();
     render.pump();
+
+    // Stand in for the browser host: it is the thing that tells the panel a page is up, and
+    // this test paints the layer itself rather than starting Electron.
+    render.set_surface(Surface::IdleWidget, true);
 
     let view = BrowserRole::AttractWidget.view((W, H));
     let (w, h) = (view.rect.width, view.rect.height);

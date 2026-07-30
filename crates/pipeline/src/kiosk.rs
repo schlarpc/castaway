@@ -110,27 +110,23 @@ impl KioskApp {
             sink.cancel_all();
         }
         if let Some(render) = self.render.as_mut() {
-            // A fullscreen page (YouTube leanback) minimizes into the widget slot;
-            // video is demoted to a corner below. The page is opaque and above the
-            // shell, so without this the gesture completed and the panel looked
-            // exactly the same.
-            #[cfg(feature = "electron")]
-            if let Some(browser) = self.browser.as_mut() {
-                let _ = browser.minimize_fullscreen(render);
-            }
+            // One call, and everything that is up follows it: a fullscreen page minimizes
+            // into the widget slot, video demotes to its corner, a card to the slot. There
+            // used to be a step here that reached into the browser to minimize it by hand,
+            // because the page was the one surface the shell's own focus did not move.
             render.shell_home();
-            // Bring the shell in front. If something is playing it is demoted to a
-            // corner rather than stopped — someone pressing Home in the middle of a film
-            // has not asked for it to end.
             render.set_shell_foreground(true);
             info!("shell: home");
         }
     }
 
-    /// One step out, from wherever the panel is: a fullscreen cast surface is left
-    /// first, then a pushed shell screen, and finally the shell comes forward over
-    /// whatever is playing. The keyboard twin of the back gesture — each press spends
-    /// itself on the topmost thing that can be left.
+    /// One step out, from wherever the panel is.
+    ///
+    /// The keyboard twin of the back gesture. The ordering — leave a fullscreen session
+    /// before the screen underneath it — is [`crate::panel::Panel::back`]'s, and this
+    /// matches on what it spent itself on rather than deciding it: three branches over two
+    /// objects, in whatever order they had been written, was how the page and the shell came
+    /// to disagree about who had the glass.
     fn back_one_level(&mut self) {
         if let Some(sink) = self.input_sink() {
             sink.cancel_all();
@@ -138,44 +134,32 @@ impl KioskApp {
         let Some(render) = self.render.as_mut() else {
             return;
         };
-        #[cfg(feature = "electron")]
-        if let Some(browser) = self.browser.as_mut() {
-            if browser.minimize_fullscreen(render) {
-                info!("shell: escape minimized the cast surface");
-                return;
-            }
+        match render.panel_back() {
+            crate::panel::Left::Demoted => info!("shell: escape demoted the cast surface"),
+            crate::panel::Left::Screen => info!("shell: escape went back"),
+            crate::panel::Left::Nothing => {}
         }
-        if render.shell_back() {
-            info!("shell: escape went back");
-            return;
-        }
-        render.set_shell_foreground(true);
     }
 
-    /// Restore whatever is minimized under a press, if anything. Returns whether the
-    /// press was spent doing so.
+    /// Restore whatever is demoted under a press, if anything. Returns whether the press
+    /// was spent doing so.
     ///
-    /// A minimized surface is an app in the home screen's widget slot, and tapping a
-    /// minimized app means "bring it back" — never "forward my tap into it at 42%
-    /// scale". The audio card is checked first because it is the one drawn when both a
-    /// session and a minimized page exist (the session outranks the page's slot).
+    /// A demoted surface is an app in the home screen's furniture, and tapping one means
+    /// "bring it back" — never "forward my tap into it at 42% scale". Which of them is
+    /// under the finger, and in what order they are offered, is the panel's answer: the
+    /// card is checked before the page because it is the one drawn when both exist.
     fn restore_minimized(&mut self, x: f32, y: f32) -> bool {
         let Some(render) = self.render.as_mut() else {
             return false;
         };
-        if render.hit_minimized_card(x, y) {
-            render.set_shell_foreground(false);
-            info!("shell: restoring the playing session");
-            return true;
-        }
-        #[cfg(feature = "electron")]
-        if let Some(browser) = self.browser.as_mut() {
-            if browser.hit_minimized(x, y) && browser.restore_fullscreen(render) {
-                info!("shell: restoring the cast surface");
-                return true;
+        match render.panel_hit(x, y) {
+            crate::panel::PanelHit::Restore(surface) => {
+                render.panel_restore();
+                info!(?surface, "shell: restoring a demoted surface");
+                true
             }
+            crate::panel::PanelHit::Shell(_) | crate::panel::PanelHit::Miss => false,
         }
-        false
     }
 
     /// Update the pill layer for this frame. Cheap: while it is up and unchanging this
@@ -217,17 +201,10 @@ impl KioskApp {
 
         match event.phase {
             TouchPhase::Down => {
-                // A tap on the demoted video puts it back. It is the only thing on
-                // screen that means "give this the panel again".
-                if self
-                    .render
-                    .as_ref()
-                    .is_some_and(|r| r.hit_pip(event.x, event.y))
-                {
-                    if let Some(render) = self.render.as_mut() {
-                        render.set_shell_foreground(false);
-                        info!("shell: handing the panel back to what is playing");
-                    }
+                // A tap on a demoted surface puts it back — the one thing on screen that
+                // means "give this the panel again". Answered here, above everything,
+                // because a demoted corner sits over whatever the shell is showing.
+                if self.restore_minimized(event.x, event.y) {
                     return true;
                 }
                 let contact = Contact::new(event.x, event.y);
@@ -266,7 +243,11 @@ impl KioskApp {
                 // like a switch; one that moves with the hand feels attached to it.
                 if from_edge && !self.started_drag {
                     if let Some(render) = self.render.as_mut() {
-                        if render.shell_depth() > 1 || render.shell_foreground() {
+                        // Somewhere to go: a screen to leave, or something playing to hand
+                        // the glass back to. Asking "is the shell in front" instead would
+                        // say yes at Home with nothing on, and animate a drag that uncovers
+                        // nothing.
+                        if render.shell_depth() > 1 || render.can_hand_back() {
                             self.started_drag = true;
                         }
                     }

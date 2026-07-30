@@ -24,10 +24,6 @@ use crate::wgpu_compositor::{TexelFormat, WgpuCompositor};
 
 /// A command sent from the tokio/decode side to the render thread. (OSD is a separate
 /// channel — see [`castaway_core::osd`] / [`crate::osd`] — so any source can post it.)
-/// Which corner a demoted video goes to. Bottom-right: the shell's own content runs down
-/// the left, and the home pill owns the bottom-left.
-const PIP_CORNER: u8 = 3;
-
 /// How long after a touch the panel counts as in use, for the idle return (#27).
 const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -1025,22 +1021,19 @@ pub struct RenderLoop {
     transition: Option<Transition>,
     /// How to put the stack back if a driven navigation is abandoned half-way.
     transition_undo: Option<Undo>,
-    /// Whether the shell is in front: someone is navigating, so a playing video is
-    /// demoted to a corner rather than covering the screens they are using (D38, #28).
-    shell_front: bool,
-    /// Where the session's own surfaces were last put. Kept so [`SurfacePlacement`] can
-    /// be recomputed every pump — it depends on which shell screen is current, and a
-    /// navigation is not a place anybody should have to remember to re-place layers from
-    /// — while the uniform writes still happen only when the answer changes.
-    placed: SurfacePlacement,
+    /// What the panel is presenting: which screens are stacked, which surfaces are up, and
+    /// who has the glass. The authority — this loop derives every placement, every
+    /// suppression and every hit test from it rather than keeping opinions of its own
+    /// (see [`crate::panel`]).
+    panel: crate::panel::Panel,
+    /// What [`crate::panel::Panel::placement`] last answered for each surface. A change
+    /// detector, not state: placement is recomputed every pump, because it depends on which
+    /// screen is current and no navigation should have to remember to re-place layers — but
+    /// the uniform writes only happen when the answer moves.
+    placed: [crate::panel::Placement; crate::panel::Surface::ALL.len()],
     /// When the panel was last touched, so an ending session does not yank someone out
     /// of a screen they are reading (#27).
     last_touch: Option<std::time::Instant>,
-    /// The shell's screen stack (D38), kept so the current screen can be redrawn at a
-    /// new size and so navigation has somewhere to live. `None` for a renderer nothing
-    /// has given a Home to — the offscreen test harness, a headless tap.
-    shell: Option<crate::shell::ScreenStack>,
-    has_video: bool,
     /// When a requested video-layer clear takes effect, unless a frame cancels it. The
     /// deferral exists for control points that "seek" by stopping and re-loading the
     /// item: an immediate clear bared the idle screen for the gap between the two.
@@ -1059,41 +1052,30 @@ pub struct RenderLoop {
     transport: Option<TransportState>,
 }
 
-/// Where a live session's own surfaces — video, and the now-playing card — belong.
+/// The transform a surface takes for a placement, on a `width`×`height` surface.
 ///
-/// The one answer to "what is on the glass", derived from the shell's focus *and* which
-/// screen it is on, and read by everything: layer placement, layer suppression, and hit
-/// testing. It exists because the alternative was each of those re-deriving it from
-/// [`RenderLoop::shell_front`] alone, and disagreeing.
-///
-/// The disagreement was a real bug, and it is the reason this is an enum and not a
-/// `bool`: the demoted slot is the *Home screen's* widget slot (`WidgetSlot::RightCard`),
-/// so on any screen pushed above Home there is no slot to be demoted into — but
-/// `shell_front` says nothing about which screen is current, so a session minimised while
-/// someone opened a service screen was drawn over the text they were reading. Three
-/// states make that unrepresentable rather than merely unlikely (ground rule 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SurfacePlacement {
-    /// The session owns the panel: full size, the shell behind it.
-    Panel,
-    /// Minimised into the Home screen's widget slot, tappable to restore.
-    Widget,
-    /// Not drawn at all. The shell is on a screen of its own above Home, which owns the
-    /// whole surface — a PiP is a Home-screen affordance, so it has nowhere to be.
-    Hidden,
-}
-
-impl SurfacePlacement {
-    /// Whether a surface placed like this is on the glass at all.
-    const fn visible(self) -> bool {
-        !matches!(self, Self::Hidden)
+/// [`crate::panel::Placement`] says *which of three states* a surface is in; the geometry
+/// is the surface's own, which is why this is a free function next to the layer code rather
+/// than something the pure model computes. `Hidden` keeps the demoted transform — the layer
+/// is suppressed, so where it would have been does not matter, and keeping it means
+/// unsuppressing needs no second decision.
+fn demoted_transform(
+    surface: crate::panel::Surface,
+    placement: crate::panel::Placement,
+    width: u32,
+    height: u32,
+) -> Transform {
+    if matches!(placement, crate::panel::Placement::Panel) {
+        return Transform::default();
     }
-
-    /// Whether this is the demoted, tappable corner — the only placement a press on a
-    /// session surface means "give it the panel back" rather than "forward the touch".
-    const fn is_widget(self) -> bool {
-        matches!(self, Self::Widget)
-    }
+    crate::panel::demoted_rect(surface, width, height).map_or_else(Transform::default, |r| {
+        Transform {
+            scale_x: r.w,
+            scale_y: r.h,
+            offset_x: r.x,
+            offset_y: r.y,
+        }
+    })
 }
 
 /// The transport strip's state on the render thread.
@@ -1148,11 +1130,9 @@ impl RenderLoop {
             osd: None,
             transition: None,
             transition_undo: None,
-            shell_front: false,
-            placed: SurfacePlacement::Panel,
+            panel: crate::panel::Panel::new(),
+            placed: [crate::panel::Placement::Hidden; crate::panel::Surface::ALL.len()],
             last_touch: None,
-            shell: None,
-            has_video: false,
             video_clear_due: None,
             card_clear_due: None,
             taps: Vec::new(),
@@ -1557,7 +1537,7 @@ impl RenderLoop {
     pub fn shell_scroll(&mut self, dy: f32) -> bool {
         let (_, h) = self.compositor.target_size();
         let h = h.max(1);
-        let Some(stack) = self.shell.as_mut() else {
+        let Some(stack) = self.panel.stack_mut() else {
             return false;
         };
         let crate::shell::Screen::Picker(picker) = stack.current_mut() else {
@@ -1583,10 +1563,7 @@ impl RenderLoop {
         {
             return false;
         }
-        let Some(stack) = self.shell.as_ref() else {
-            return false;
-        };
-        let crate::shell::Screen::Picker(picker) = stack.current() else {
+        let Some(crate::shell::Screen::Picker(picker)) = self.panel.current() else {
             return false;
         };
         let (_, h) = self.compositor.target_size();
@@ -1609,51 +1586,114 @@ impl RenderLoop {
     /// which is what the compositor's PiP transform has been there for since the
     /// beginning (architecture §4).
     pub fn set_shell_foreground(&mut self, front: bool) {
-        if self.shell_front == front {
-            return;
+        let moved = if front {
+            self.panel.hand_to_shell()
+        } else {
+            self.panel.hand_to_session()
+        };
+        if moved {
+            self.reflow_surfaces();
         }
-        self.shell_front = front;
-        self.reflow_surfaces();
     }
 
-    /// Whether the shell is in front.
+    /// Whether the shell has the glass.
     #[must_use]
-    pub const fn shell_foreground(&self) -> bool {
-        self.shell_front
+    pub fn shell_foreground(&self) -> bool {
+        self.panel.focus() == crate::panel::Focus::Shell
     }
 
-    /// Where a live session's surfaces belong right now. See [`SurfacePlacement`].
+    /// Whether there is a session surface to hand the glass back to.
     ///
-    /// Total over both inputs, so there is no combination of focus and screen depth that
-    /// nobody decided about. Depth `0` is a renderer with no shell at all — the offscreen
-    /// harness — and has no screens to protect, so the session keeps the panel.
-    fn placement(&self) -> SurfacePlacement {
-        match (self.shell_front, self.shell_depth()) {
-            (false, _) | (_, 0) => SurfacePlacement::Panel,
-            (true, 1) => SurfacePlacement::Widget,
-            (true, _) => SurfacePlacement::Hidden,
+    /// What the edge drag asks before it starts animating: with nothing playing, dragging
+    /// the shell aside at Home uncovers nothing and is not a gesture.
+    #[must_use]
+    pub const fn can_hand_back(&self) -> bool {
+        self.panel.can_hand_back()
+    }
+
+    /// What the panel is presenting, for the browser host and the kiosk's input routing.
+    #[must_use]
+    pub const fn panel(&self) -> &crate::panel::Panel {
+        &self.panel
+    }
+
+    /// Record that a surface is up, or gone, and re-place everything if that changed the
+    /// answer.
+    ///
+    /// The one way presence enters the model. Called where a surface really appears or
+    /// leaves: a first video frame, a published card, a page shown or hidden, a deferred
+    /// clear expiring.
+    pub fn set_surface(&mut self, surface: crate::panel::Surface, present: bool) {
+        if self.panel.set_surface(surface, present) {
+            self.reflow_surfaces();
         }
     }
 
-    /// Put every session surface where [`Self::placement`] currently says it goes.
+    /// Go one step out. See [`crate::panel::Left`].
+    pub fn panel_back(&mut self) -> crate::panel::Left {
+        let left = self.panel.back();
+        match left {
+            // A screen change is a navigation and gets the fade; the others only move
+            // layers, which `reflow_surfaces` does.
+            crate::panel::Left::Screen => self.repaint_shell(),
+            crate::panel::Left::Demoted | crate::panel::Left::Nothing => {}
+        }
+        self.reflow_surfaces();
+        left
+    }
+
+    /// Hand the glass back to what is playing. Returns whether anything moved.
+    pub fn panel_restore(&mut self) -> bool {
+        let moved = self.panel.hand_to_session();
+        if moved {
+            self.reflow_surfaces();
+        }
+        moved
+    }
+
+    /// Where every session surface goes right now, and the placement each of them was last
+    /// given.
     ///
-    /// Called whenever an input to that answer changes — focus, the screen stack, a
-    /// surface appearing — and once per pump as a standing fact, because navigation
-    /// happens in several places and none of them should have to remember this.
+    /// Called whenever an input to the answer changes — focus, the screen stack, a surface
+    /// appearing — and once per pump as a standing fact, because navigation happens in
+    /// several places and none of them should have to remember this.
     fn reflow_surfaces(&mut self) {
-        self.placed = self.placement();
-        self.place_video();
-        self.place_card();
+        use crate::panel::Surface;
+        for (i, surface) in Surface::ALL.into_iter().enumerate() {
+            let want = self.panel.placement(surface);
+            if let Some(slot) = self.placed.get_mut(i) {
+                *slot = want;
+            }
+            match surface {
+                Surface::Video => self.place_video(want),
+                Surface::Card => self.place_card(want),
+                // The browser's two surfaces are placed by the browser host, which owns
+                // the viewport the page rasterizes into: a placement change there is a
+                // *resize* round trip, not a transform. It reads its own answer from the
+                // panel each pump — see `ElectronHost::follow_panel`.
+                Surface::CastPage | Surface::IdleWidget => {}
+            }
+        }
+    }
+
+    /// Whether the placement of any surface has moved since it was last applied.
+    fn placement_moved(&self) -> bool {
+        crate::panel::Surface::ALL
+            .into_iter()
+            .enumerate()
+            .any(|(i, surface)| self.placed.get(i) != Some(&self.panel.placement(surface)))
     }
 
     /// Where the demoted video sits, in panel-normalized coordinates. `None` when it is
     /// not demoted, or when there is no video.
     #[must_use]
     pub fn pip_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        (self.placement().is_widget() && self.has_video).then(|| {
-            let t = Transform::pip(PIP_CORNER);
-            (t.offset_x, t.offset_y, t.scale_x, t.scale_y)
-        })
+        use crate::panel::Surface;
+        if !self.panel.placement(Surface::Video).is_widget() {
+            return None;
+        }
+        let (w, h) = self.compositor.target_size();
+        crate::panel::demoted_rect(Surface::Video, w, h).map(|r| (r.x, r.y, r.w, r.h))
     }
 
     /// Whether a panel-normalized point is on the demoted video.
@@ -1663,17 +1703,13 @@ impl RenderLoop {
             .is_some_and(|(ox, oy, sx, sy)| x >= ox && y >= oy && x <= ox + sx && y <= oy + sy)
     }
 
-    /// Put the video layer where the current mode says it goes.
-    fn place_video(&mut self) {
-        if !self.has_video {
+    /// Put the video layer where the panel says it goes.
+    fn place_video(&mut self, placement: crate::panel::Placement) {
+        if !self.compositor.has_layer(LayerId::Video) {
             return;
         }
-        let placement = self.placement();
-        let transform = if placement.is_widget() {
-            Transform::pip(PIP_CORNER)
-        } else {
-            Transform::default()
-        };
+        let (w, h) = self.compositor.target_size();
+        let transform = demoted_transform(crate::panel::Surface::Video, placement, w, h);
         self.compositor.upsert_layer(Layer {
             id: LayerId::Video,
             opacity: 1.0,
@@ -1686,8 +1722,7 @@ impl RenderLoop {
             .set_suppressed(LayerId::Video, !placement.visible());
     }
 
-    /// Put the now-playing card where the current mode says it goes: the whole panel
-    /// normally, the home screen's widget slot when the shell is forward.
+    /// Put the now-playing card where the panel says it goes.
     ///
     /// The audio-session twin of [`Self::place_video`], and the reason the home gesture
     /// visibly *works* from a Spotify or Bluetooth session: the card layers sit above
@@ -1695,20 +1730,12 @@ impl RenderLoop {
     /// the session minimizes into the card — the slot the idle clock occupies, which a
     /// playing session already outranks (`LayerId::yields_to`) — exactly as every other
     /// app surface does. Both rects are 16:9, so the scale is uniform.
-    fn place_card(&mut self) {
+    fn place_card(&mut self, placement: crate::panel::Placement) {
         if !self.compositor.has_layer(LayerId::NowPlaying) {
             return;
         }
         let (w, h) = self.compositor.target_size();
-        let (w, h) = (w.max(1), h.max(1));
-        let placement = self.placement();
-        let transform = if placement.is_widget() {
-            crate::attract::WidgetSlot::RightCard
-                .rect(w, h)
-                .map_or_else(Transform::default, |r| r.transform(w, h))
-        } else {
-            Transform::default()
-        };
+        let transform = demoted_transform(crate::panel::Surface::Card, placement, w, h);
         self.compositor.upsert_layer(Layer {
             id: LayerId::NowPlaying,
             opacity: 1.0,
@@ -1720,27 +1747,19 @@ impl RenderLoop {
         // full view. Suppressed, not removed — the texture and model stay warm.
         self.compositor.set_suppressed(
             LayerId::Transport,
-            !matches!(placement, SurfacePlacement::Panel),
+            !matches!(placement, crate::panel::Placement::Panel),
         );
     }
 
     /// Whether a panel-normalized point is on the minimized now-playing card.
     #[must_use]
     pub fn hit_minimized_card(&self, x: f32, y: f32) -> bool {
-        if !(self.placement().is_widget() && self.compositor.has_layer(LayerId::NowPlaying)) {
+        use crate::panel::Surface;
+        if !self.panel.placement(Surface::Card).is_widget() {
             return false;
         }
         let (w, h) = self.compositor.target_size();
-        let (w, h) = (w.max(1), h.max(1));
-        crate::attract::WidgetSlot::RightCard
-            .rect(w, h)
-            .is_some_and(|r| {
-                let t = r.transform(w, h);
-                x >= t.offset_x
-                    && y >= t.offset_y
-                    && x <= t.offset_x + t.scale_x
-                    && y <= t.offset_y + t.scale_y
-            })
+        crate::panel::demoted_rect(Surface::Card, w, h).is_some_and(|r| r.contains(x, y))
     }
 
     /// Draw the home pill and place it as the shell's overlay layer.
@@ -1826,22 +1845,43 @@ impl RenderLoop {
         self.compositor.remove_layer(LayerId::BrowserFullscreen);
     }
 
-    /// Whether the idle screen's web widget belongs on the panel right now.
+    /// Where the browser's page belongs right now: the viewport to rasterize into, the
+    /// layer it maps onto, and whether it is on the glass at all.
     ///
-    /// The widget is part of the Home *scene*, so it yields whenever the shell has
-    /// navigated somewhere else, and whenever a session has put its own surface up.
-    /// The session half is declared on the layer (`LayerId::yields_to`) and enforced by
-    /// the compositor on its own; the shell half is not a layer, so the render loop
-    /// feeds it to the compositor each pump. This method is the two halves combined —
-    /// what input routing consults so touch ownership agrees with the glass.
+    /// The whole of what the browser host used to decide for itself. It kept a
+    /// `BrowserRole` it mutated on minimize/restore, plus a per-pump copy of a
+    /// "widget covered" verdict it had to remember to refresh — a second state machine over
+    /// the same slot as the now-playing card, coordinated by convention. Now the panel
+    /// answers, the host follows, and the two cannot drift.
+    ///
+    /// `cast` distinguishes the two pages that share the one browser: a session's page
+    /// (leanback, a Cast receiver), which can own the panel and be restored, from the idle
+    /// screen's clock, which is Home's own furniture. That used to be a URL comparison.
     #[must_use]
-    pub fn attract_widget_covered(&self) -> bool {
-        // Depth 1 is Home itself — the screen the widget belongs to.
-        self.shell_depth() > 1
-            || LayerId::BrowserWidget
+    pub fn page_view(&self, cast: bool) -> Option<crate::browser::BrowserView> {
+        let surface = if cast {
+            crate::panel::Surface::CastPage
+        } else {
+            crate::panel::Surface::IdleWidget
+        };
+        let role = match self.panel.placement(surface) {
+            crate::panel::Placement::Panel => crate::browser::BrowserRole::Fullscreen,
+            crate::panel::Placement::Widget => crate::browser::BrowserRole::AttractWidget,
+            crate::panel::Placement::Hidden => return None,
+        };
+        // A card in the slot outranks a page in it. Declared on the layer rather than in
+        // the model, because it is a fact about depth (`LayerId::yields_to`) — but the host
+        // needs it as an answer too, so that a touch on the slot goes to whatever is
+        // actually drawn there.
+        if role == crate::browser::BrowserRole::AttractWidget
+            && LayerId::BrowserWidget
                 .yields_to()
                 .iter()
                 .any(|&l| self.compositor.has_layer(l))
+        {
+            return None;
+        }
+        Some(role.view(self.compositor.target_size()))
     }
 
     /// Drain all pending commands (non-blocking) and present once. Returns the number of
@@ -1899,11 +1939,12 @@ impl RenderLoop {
         if self.video_clear_due.is_some_and(|due| now >= due) {
             self.video_clear_due = None;
             self.compositor.remove_layer(LayerId::Video);
-            self.has_video = false;
+            self.panel.set_surface(crate::panel::Surface::Video, false);
         }
         if self.card_clear_due.is_some_and(|due| now >= due) {
             self.card_clear_due = None;
             self.compositor.remove_layer(LayerId::NowPlaying);
+            self.panel.set_surface(crate::panel::Surface::Card, false);
             // The strip belongs to the card. Leaving it would offer controls for a
             // session that has ended, wired to a remote that has been dropped.
             self.compositor.remove_layer(LayerId::Transport);
@@ -1913,21 +1954,25 @@ impl RenderLoop {
 
     fn present_and_serve_taps(&mut self) {
         self.run_due_clears();
-        // The shell half of the idle widget's visibility (see `attract_widget_covered`):
-        // recomputed and handed down every frame, so it is a standing fact rather than a
-        // transition to be caught. The session half the compositor derives itself from
-        // `LayerId::yields_to`. The mascot overlay is the widget's other half and
-        // follows the same verdict.
-        let off_home = self.shell_depth() > 1;
+        // Every placement, recomputed and handed down each frame, so it is a standing fact
+        // rather than a transition somebody has to catch — and applied only when the answer
+        // moved, so the uniform writes stay one-per-change. Precedence *between* two
+        // surfaces in the same slot is not decided here: the compositor derives that from
+        // `LayerId::yields_to`.
+        //
+        // The idle widget and the mascot leaning on it are the panel's answer for
+        // `Surface::IdleWidget`: an ornament of the Home screen, so they leave when the
+        // shell does.
+        let widget_hidden = !self
+            .panel
+            .placement(crate::panel::Surface::IdleWidget)
+            .visible()
+            || !self.panel.surfaces().has(crate::panel::Surface::IdleWidget);
         self.compositor
-            .set_suppressed(LayerId::BrowserWidget, off_home);
+            .set_suppressed(LayerId::BrowserWidget, widget_hidden);
         self.compositor
-            .set_suppressed(LayerId::MascotOverlay, off_home);
-        // A session's own surfaces, on the same terms: where they belong depends on which
-        // screen the shell is on, and every navigation is a place that would otherwise
-        // have to remember to re-place them. Recomputed here and applied only when the
-        // answer moved, so the uniform writes stay one-per-change rather than per frame.
-        if self.placement() != self.placed {
+            .set_suppressed(LayerId::MascotOverlay, widget_hidden);
+        if self.placement_moved() {
             self.reflow_surfaces();
         }
         if self.taps.is_empty() {
@@ -2001,13 +2046,10 @@ impl RenderLoop {
                     self.failed_imports = 0;
                 }
                 if landed.is_ok() {
-                    if !self.has_video {
-                        self.has_video = true;
-                        // Placed by the current mode, not unconditionally full-screen: a
-                        // cast that starts while someone is navigating should arrive in
-                        // the corner rather than covering what they are reading.
-                        self.place_video();
-                    }
+                    // Placed by the panel, not unconditionally full-screen: a cast that
+                    // starts while someone is navigating arrives demoted rather than
+                    // covering what they are reading.
+                    self.set_surface(crate::panel::Surface::Video, true);
                     return true;
                 }
                 false
@@ -2030,7 +2072,8 @@ impl RenderLoop {
                 self.set_transport(&card.transport(), w, h);
                 // A card published while someone is on the home screen arrives
                 // minimized rather than snatching the panel from under them.
-                self.place_card();
+                self.set_surface(crate::panel::Surface::Card, true);
+                self.place_card(self.panel.placement(crate::panel::Surface::Card));
                 false
             }
             RenderCommand::Home(scene) => {
@@ -2042,9 +2085,10 @@ impl RenderLoop {
                 false
             }
             RenderCommand::ReplaceScreen(screen) => {
-                if let Some(stack) = &mut self.shell {
-                    stack.replace_top(*screen);
+                if self.panel.stack().is_some() {
+                    self.panel.replace_top(*screen);
                     self.repaint_shell();
+                    self.reflow_surfaces();
                 }
                 false
             }
@@ -2053,16 +2097,7 @@ impl RenderLoop {
                 false
             }
             RenderCommand::RestPanel => {
-                // The idle return (#27), and a starting session's claim on the glass. Not
-                // while someone is using the panel: neither end of a session is a reason
-                // to close a picker out from under them.
-                let busy = self.last_touch.is_some_and(|t| t.elapsed() < IDLE_GRACE);
-                if busy {
-                    debug!("shell: staying put, the panel was touched recently");
-                } else {
-                    self.shell_home();
-                    self.set_shell_foreground(false);
-                }
+                self.rest_panel_if_idle();
                 false
             }
             RenderCommand::AddTap(tap) => {
@@ -2146,82 +2181,88 @@ impl RenderLoop {
     /// changes, and a host appearing on the LAN should not close a picker someone is
     /// reading.
     pub fn set_home(&mut self, scene: crate::attract::AttractScene) {
-        match &mut self.shell {
-            Some(stack) => stack.update_home(scene),
-            None => self.shell = Some(crate::shell::ScreenStack::new(scene)),
-        }
+        self.panel.set_home(scene);
         self.repaint_shell();
+        self.reflow_surfaces();
     }
 
     /// Push a screen on top of the current one.
     pub fn shell_push(&mut self, screen: crate::shell::Screen) {
-        if self.shell.is_none() {
+        if self.panel.stack().is_none() {
             return;
         }
         // Going deeper: the card recedes to the left.
         self.begin_transition(false, -1.0);
         self.transition_undo = Some(Undo::Pop);
-        if let Some(stack) = &mut self.shell {
-            stack.push(screen);
-        }
+        self.panel.push(screen);
         self.repaint_shell();
+        self.reflow_surfaces();
     }
 
     /// Go back one screen. Returns whether anything moved.
+    ///
+    /// Screens only: this is the shell's own step, not the panel's. One press "out" is
+    /// [`Self::panel_back`], which leaves a fullscreen session first.
     pub fn shell_back(&mut self) -> bool {
-        if !self
-            .shell
-            .as_ref()
-            .is_some_and(crate::shell::ScreenStack::can_pop)
-        {
+        if self.panel.depth() <= 1 {
             return false;
         }
         // Before the stack changes, so the screen being left is still the current one
         // and can be drawn into its own layer to travel away.
         self.begin_transition(false, 1.0);
-        self.transition_undo = self
-            .shell
-            .as_ref()
-            .map(|s| Undo::Restore(s.above_screens()));
-        let moved = self
-            .shell
-            .as_mut()
-            .is_some_and(crate::shell::ScreenStack::pop);
+        self.transition_undo = Some(Undo::Restore(self.panel.above_screens()));
+        let moved = self.panel.pop_screen();
         if moved {
             self.repaint_shell();
+            self.reflow_surfaces();
         }
         moved
     }
 
     /// Return to Home. Returns whether anything moved.
     pub fn shell_home(&mut self) -> bool {
-        if self
-            .shell
-            .as_ref()
-            .is_some_and(crate::shell::ScreenStack::can_pop)
-        {
+        let deep = self.panel.depth() > 1;
+        if deep {
             self.begin_transition(false, 1.0);
-            self.transition_undo = self
-                .shell
-                .as_ref()
-                .map(|s| Undo::Restore(s.above_screens()));
+            self.transition_undo = Some(Undo::Restore(self.panel.above_screens()));
         }
-        let moved = self
-            .shell
-            .as_mut()
-            .is_some_and(crate::shell::ScreenStack::go_home);
-        if moved {
+        self.panel.go_home();
+        if deep {
             self.repaint_shell();
         }
-        moved
+        self.reflow_surfaces();
+        deep
+    }
+
+    /// Put the panel back to its resting arrangement — Home, glass handed to whatever is
+    /// playing — unless somebody is using it.
+    ///
+    /// The idle return (#27) and a starting session's claim on the glass, which are the same
+    /// act and are declined on the same terms: neither end of a session is a reason to close
+    /// a picker out from under someone. Public because a page that arrives outside the
+    /// `Pipeline` trait — a DIAL launch, which comes in as a browser command — is a session
+    /// starting too, and has to claim the panel the same way.
+    pub fn rest_panel_if_idle(&mut self) {
+        if self.last_touch.is_some_and(|t| t.elapsed() < IDLE_GRACE) {
+            debug!("shell: staying put, the panel was touched recently");
+            return;
+        }
+        let deep = self.panel.depth() > 1;
+        if deep {
+            self.begin_transition(false, 1.0);
+            self.transition_undo = Some(Undo::Restore(self.panel.above_screens()));
+        }
+        self.panel.rest();
+        if deep {
+            self.repaint_shell();
+        }
+        self.reflow_surfaces();
     }
 
     /// How deep the shell is; `1` is Home. For tests and logs.
     #[must_use]
     pub fn shell_depth(&self) -> usize {
-        self.shell
-            .as_ref()
-            .map_or(0, crate::shell::ScreenStack::depth)
+        self.panel.depth()
     }
 
     /// What a panel-normalized touch would hit on the current shell screen.
@@ -2231,15 +2272,24 @@ impl RenderLoop {
     /// them and owns that part of the glass. Same rule the transport strip follows.
     #[must_use]
     pub fn shell_hit(&self, x: f32, y: f32) -> Option<crate::shell::ScreenHit> {
-        let stack = self.shell.as_ref()?;
-        if self
-            .compositor
-            .covered_above(crate::compositor::LayerId::Attract, x, y)
-        {
-            return None;
+        match self.panel_hit(x, y) {
+            crate::panel::PanelHit::Shell(hit) => Some(hit),
+            crate::panel::PanelHit::Restore(_) | crate::panel::PanelHit::Miss => None,
         }
+    }
+
+    /// What a panel-normalized press means. The one routing answer — see
+    /// [`crate::panel::Panel::hit`].
+    ///
+    /// The compositor's occlusion check is passed in as the veto for surfaces the model
+    /// does not describe: the transport strip, the OSD, the mascot's arms.
+    #[must_use]
+    pub fn panel_hit(&self, x: f32, y: f32) -> crate::panel::PanelHit {
         let (w, h) = self.compositor.target_size();
-        stack.current().hit(w.max(1), h.max(1), x, y)
+        self.panel.hit(w, h, x, y, |x, y| {
+            self.compositor
+                .covered_above(crate::compositor::LayerId::Attract, x, y)
+        })
     }
 
     /// Begin a crossfade away from whatever is currently drawn.
@@ -2249,7 +2299,7 @@ impl RenderLoop {
     fn begin_transition(&mut self, driven: bool, direction: f32) {
         // Re-rasterise rather than copy: the compositor has no texture-to-texture copy,
         // and this happens once per navigation — a human action, not a frame.
-        let Some(screen) = self.shell.as_ref().map(crate::shell::ScreenStack::current) else {
+        let Some(screen) = self.panel.current() else {
             return;
         };
         let (w, h) = self.compositor.target_size();
@@ -2377,15 +2427,14 @@ impl RenderLoop {
     /// A navigation that sprang back: put the stack where it was and drop the card.
     fn undo_transition(&mut self) {
         if let Some(undo) = self.transition_undo.take() {
-            if let Some(stack) = &mut self.shell {
-                match undo {
-                    Undo::Pop => {
-                        stack.pop();
-                    }
-                    Undo::Restore(screens) => stack.restore(screens),
+            match undo {
+                Undo::Pop => {
+                    self.panel.pop_screen();
                 }
+                Undo::Restore(screens) => self.panel.restore_screens(screens),
             }
             self.repaint_shell();
+            self.reflow_surfaces();
         }
         self.end_transition();
     }
@@ -2421,7 +2470,7 @@ impl RenderLoop {
     /// No-op when no screen has been set — a renderer driven only by casts (the offscreen
     /// test harness, a headless tap) never has one, and should not get a background.
     fn paint_screen(&mut self) -> Result<(), PipelineError> {
-        let Some(screen) = self.shell.as_ref().map(crate::shell::ScreenStack::current) else {
+        let Some(screen) = self.panel.current() else {
             return Ok(());
         };
         let (w, h) = self.compositor.target_size();

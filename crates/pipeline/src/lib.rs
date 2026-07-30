@@ -53,6 +53,10 @@ pub mod nowplaying_card;
 pub mod osd;
 #[cfg(feature = "render")]
 pub mod overlay;
+/// What the panel is presenting — the shell's screens, the session's surfaces, and who
+/// has the glass. Pure, and the single authority all three used to answer separately.
+#[cfg(feature = "render")]
+pub mod panel;
 #[cfg(feature = "render")]
 pub mod picker;
 #[cfg(feature = "render")]

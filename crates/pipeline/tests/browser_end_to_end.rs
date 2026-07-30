@@ -397,10 +397,12 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
         "page never painted fullscreen"
     );
 
-    assert!(
-        host.minimize_fullscreen(&mut render),
-        "nothing to minimize?"
-    );
+    // Demoting is the *panel's* verb now, not a method on the browser host: one press out
+    // moves every surface that is up, and the host follows on its next pump. That is the
+    // fold this test is really covering — it used to reach past the panel to minimize the
+    // page directly, which is exactly how the page and the shell came to disagree.
+    assert_eq!(render.panel_back(), pipeline::panel::Left::Demoted);
+    host.pump(&mut render);
     assert!(
         render.layer_size(LayerId::BrowserFullscreen).is_none(),
         "the fullscreen texture should be down at once"
@@ -426,7 +428,8 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
         "minimized paint should be card-sized, got {w}x{h}"
     );
 
-    assert!(host.restore_fullscreen(&mut render), "nothing to restore?");
+    assert!(render.panel_restore(), "nothing to restore?");
+    host.pump(&mut render);
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_none() {
         host.pump(&mut render);

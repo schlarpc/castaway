@@ -3,6 +3,12 @@
 //! Both come out of the same fact: the shell draws *below* video. Navigating while
 //! something plays would be invisible, so the video is demoted rather than stopped —
 //! someone pressing Home in the middle of a film has not asked for it to end.
+//!
+//! The *rules* live in `pipeline::panel`, as unit tests with no GPU in them. What is left
+//! here is the seam: that the render loop's public answers — `pip_rect`,
+//! `hit_minimized_card`, `RenderCommand::RestPanel` — still agree with the model they are
+//! derived from, on a real surface, with real commands flowing through the channel. That
+//! agreement is the thing that broke last time.
 #![cfg(feature = "render")]
 #![allow(clippy::unwrap_used)]
 
@@ -138,11 +144,7 @@ fn an_audio_session_minimizes_into_the_widget_slot_and_restores() {
         .unwrap();
     render.pump();
 
-    let rect = pipeline::attract::WidgetSlot::RightCard.rect(W, H).unwrap();
-    let (cx, cy) = (
-        (rect.x as f32 + rect.width as f32 / 2.0) / W as f32,
-        (rect.y as f32 + rect.height as f32 / 2.0) / H as f32,
-    );
+    let (cx, cy) = slot_center();
     assert!(
         !render.hit_minimized_card(cx, cy),
         "fullscreen card is not a minimized one"
@@ -164,13 +166,11 @@ fn an_audio_session_minimizes_into_the_widget_slot_and_restores() {
     assert!(!render.hit_minimized_card(cx, cy));
 }
 
-/// The middle of the Home screen's widget slot, panel-normalized.
+/// The middle of where a demoted card sits — taken from the model, so this asserts the
+/// render loop agrees with it rather than restating the arithmetic beside it.
 fn slot_center() -> (f32, f32) {
-    let rect = pipeline::attract::WidgetSlot::RightCard.rect(W, H).unwrap();
-    (
-        (rect.x as f32 + rect.width as f32 / 2.0) / W as f32,
-        (rect.y as f32 + rect.height as f32 / 2.0) / H as f32,
-    )
+    let r = pipeline::panel::demoted_rect(pipeline::panel::Surface::Card, W, H).unwrap();
+    (r.x + r.w / 2.0, r.y + r.h / 2.0)
 }
 
 fn a_screen() -> pipeline::shell::Screen {
@@ -182,10 +182,10 @@ fn a_screen() -> pipeline::shell::Screen {
 
 #[test]
 fn a_demoted_card_leaves_the_glass_when_the_shell_goes_deeper_than_home() {
-    // The reported bug: the minimized slot *is* the Home screen's widget slot, so a card
-    // demoted into it while someone opened a service screen was drawn over the text they
-    // were reading — a PiP on a screen that has no PiP. Nothing in `shell_front` said
-    // which screen was current, so nothing stopped it.
+    // The reported bug, through the real thing: commands over the channel, a real surface,
+    // and the render loop's own hit test. `Panel` pins the rule; this pins that navigating
+    // actually re-places the layers, which is the half that used to be missing — nothing
+    // re-placed anything except `set_shell_foreground`.
     let (tx, rx) = std::sync::mpsc::sync_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
     tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
@@ -218,8 +218,9 @@ fn a_demoted_card_leaves_the_glass_when_the_shell_goes_deeper_than_home() {
 
 #[test]
 fn a_demoted_video_leaves_the_glass_the_same_way() {
-    // Same rule, the other surface: `hit_pip` is what routes a tap to "give the panel
-    // back", so a PiP that is not drawn must not be hittable either.
+    // Same rule, the other surface and the other geometry: video demotes to the PiP corner
+    // rather than the widget slot, and `hit_pip` is what routes a tap there to "give the
+    // panel back" — so a corner that is not drawn must not be hittable either.
     let (_tx, mut render) = playing();
     render.set_shell_foreground(true);
     let (ox, oy, sx, sy) = render.pip_rect().expect("demoted at Home");
