@@ -45,6 +45,118 @@ use crate::sink::PcmSink;
 /// interval that still looks like it is moving.
 const POSITION_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Everything the panel needs in order to *present* this session, in one place.
+///
+/// A Connect session can end and come back without the login ending: the phone takes
+/// playback back (`device became inactive` → [`SessionEvent::End`]) and then hands it over
+/// again, and librespot asks for a fresh PCM channel rather than logging in afresh. That
+/// second start is a new session as far as [`castaway_core::SessionManager`] is concerned
+/// — `End` drops the source description, the control surface, the card and the queue,
+/// because a session that has gone must not leave buttons on screen wired to a peer that
+/// left with it.
+///
+/// So a restart has to say all of it again, and the bug this type exists to prevent is
+/// that the restart path only said *some* of it: it emitted `Audio` and nothing else, and
+/// the panel got a session with no name, no transport controls and no track — an empty
+/// card with a queue eventually pasted into it. Bundling the facts with the emit that
+/// republishes them is what makes "start a session and forget half of it" not a thing you
+/// can write here (ground rule 1).
+struct Presentation {
+    /// Who is connected and over what. A `Mutex` because it grows: the login knows the
+    /// account name, and the phone names *itself* only later, over a player event.
+    description: std::sync::Mutex<SourceDescription>,
+    /// The handle the panel drives the phone through. Fixed for the life of the login —
+    /// it wraps `Spirc`, which outlives any one session.
+    control: Arc<dyn castaway_core::RemoteControl>,
+    /// The track as last known, and the queue behind it. `None`/empty before the cloud has
+    /// said anything.
+    now_playing: std::sync::Mutex<Option<NowPlaying>>,
+    up_next: std::sync::Mutex<Vec<castaway_core::QueueItem>>,
+}
+
+impl Presentation {
+    fn new(description: SourceDescription, control: Arc<dyn castaway_core::RemoteControl>) -> Self {
+        Self {
+            description: std::sync::Mutex::new(description),
+            control,
+            now_playing: std::sync::Mutex::new(None),
+            up_next: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Read a field's current value, tolerating a poisoned lock: a session that cannot
+    /// report its own title is still worth having, and nothing here is unsafe when stale.
+    fn read<T: Clone>(lock: &std::sync::Mutex<T>) -> Option<T> {
+        lock.lock().ok().map(|held| held.clone())
+    }
+
+    /// Merge in what a player event just taught us about the sender, and return the whole
+    /// description so the caller can publish it.
+    fn merge_description(&self, info: SourceDescription) -> Option<SourceDescription> {
+        let mut held = self.description.lock().ok()?;
+        *held = std::mem::take(&mut *held).merged(info);
+        Some(held.clone())
+    }
+
+    /// Record the current track, so a restart can say what is playing without waiting for
+    /// the next player event — which, for a track that never stopped, never comes.
+    fn set_now_playing(&self, snapshot: &NowPlaying) {
+        if let Ok(mut held) = self.now_playing.lock() {
+            *held = Some(snapshot.clone());
+        }
+    }
+
+    /// Record the queue, for the same reason: cluster updates announce *edits*, so a
+    /// restart mid-playlist would otherwise show nothing coming up.
+    fn set_up_next(&self, items: &[castaway_core::QueueItem]) {
+        if let Ok(mut held) = self.up_next.lock() {
+            held.clear();
+            held.extend_from_slice(items);
+        }
+    }
+
+    /// Open a session on `sink`: the audio plane, then everything needed to present it.
+    ///
+    /// Order is load-bearing. `Audio` is what makes this source the active one, and the
+    /// session manager rejects metadata, controls and queues for a source that is not —
+    /// so everything else has to follow it, not precede it.
+    ///
+    /// # Errors
+    /// [`SpotifyError::SessionGone`] if the session manager has shut down.
+    async fn open(
+        &self,
+        sink: &SessionSink,
+        source: FrameSource,
+        format: castaway_core::AudioFormat,
+    ) -> Result<(), SpotifyError> {
+        let emit = |event| async move {
+            sink.emit(event)
+                .await
+                .map_err(|_| SpotifyError::SessionGone)
+        };
+        emit(SessionEvent::Audio {
+            source,
+            format,
+            // PCM from librespot: nothing to configure a decoder with, because there is
+            // no decoder.
+            config: None,
+        })
+        .await?;
+        if let Some(description) = Self::read(&self.description) {
+            emit(SessionEvent::SourceInfo(description)).await?;
+        }
+        emit(SessionEvent::ControlSurface(Arc::clone(&self.control))).await?;
+        if let Some(snapshot) = Self::read(&self.now_playing).flatten() {
+            emit(SessionEvent::NowPlaying(snapshot)).await?;
+        }
+        let queue = Self::read(&self.up_next).unwrap_or_default();
+        if !queue.is_empty() {
+            emit(SessionEvent::UpNext(queue)).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Who paired, and the credential blob they handed over.
 ///
 /// The blob is still the *outer*-decrypted form from [`crate::discovery::add_user`];
@@ -556,40 +668,32 @@ async fn start(
     let (sample_rate, channels) = PcmSink::format();
     let format = castaway_core::AudioFormat::from_hz(sample_rate, channels)
         .ok_or(SpotifyError::Crypto("librespot named an impossible format"))?;
-    sink.emit(SessionEvent::Audio {
-        source: FrameSource::Pcm(pcm_rx),
-        format,
-        // PCM from librespot: nothing to configure a decoder with, because there is no
-        // decoder.
-        config: None,
-    })
-    .await
-    .map_err(|_| SpotifyError::SessionGone)?;
 
-    sink.emit(SessionEvent::SourceInfo(
+    // One description of this session, published by whoever (re)opens it. Every task that
+    // learns something about it updates this rather than only emitting it, so a restart
+    // republishes what the room was already looking at.
+    let presentation = Arc::new(Presentation::new(
         SourceDescription::new()
             .with_display_name(user.user_name.clone())
             .with_link(format!("Spotify Connect · {sample_rate} Hz · stereo")),
-    ))
-    .await
-    .map_err(|_| SpotifyError::SessionGone)?;
+        Arc::new(SpotifyRemote::new(Arc::clone(&spirc))),
+    ));
 
-    sink.emit(SessionEvent::ControlSurface(Arc::new(SpotifyRemote::new(
-        Arc::clone(&spirc),
-    ))))
-    .await
-    .map_err(|_| SpotifyError::SessionGone)?;
+    presentation
+        .open(sink, FrameSource::Pcm(pcm_rx), format)
+        .await?;
 
     // Serve the sink's requests for a fresh channel. This is what makes preemption
     // survivable: the pipeline takes our audio away, and when someone presses play again
-    // librespot's `start()` asks here, we emit a new `Audio` event, and the session
-    // manager hands Spotify the panel back — the same path as starting playback, because
-    // from the room's point of view that is what just happened.
+    // librespot's `start()` asks here, we reopen the session, and the session manager hands
+    // Spotify the panel back — the same path as starting playback, because from the room's
+    // point of view that is what just happened.
     let reattach_task = tokio::spawn(serve_reattach(
         pcm_requests,
         Arc::clone(&pcm_link),
         sink.clone(),
         format,
+        Arc::clone(&presentation),
     ));
 
     let hung_up = Arc::new(AtomicBool::new(false));
@@ -598,8 +702,14 @@ async fn start(
         sink.clone(),
         session.clone(),
         Arc::clone(&hung_up),
+        Arc::clone(&presentation),
     ));
-    let queue_task = tokio::spawn(pump_queue(cluster_updates, sink.clone(), session.clone()));
+    let queue_task = tokio::spawn(pump_queue(
+        cluster_updates,
+        sink.clone(),
+        session.clone(),
+        Arc::clone(&presentation),
+    ));
     let spirc_task = tokio::spawn(spirc_task);
 
     Ok(LiveSession {
@@ -617,15 +727,18 @@ async fn start(
 /// One request per preemption, not per block: the sink coalesces, and the channel it gets
 /// back lasts until something takes the panel again.
 ///
-/// Emitting `SessionEvent::Audio` is deliberately the *same* event a session start uses.
-/// The session manager's arbitration is last-writer-wins, so this preempts whoever holds
-/// the panel — which is the correct reading of "the person whose phone this is just
-/// pressed play".
+/// Reopening is deliberately the *same* act a session start is — [`Presentation::open`],
+/// not a bare `Audio` event. The session manager's arbitration is last-writer-wins, so
+/// this preempts whoever holds the panel, which is the correct reading of "the person whose
+/// phone this is just pressed play"; and because `End` wiped the description, the controls
+/// and the card, saying only `Audio` here left the panel showing a nameless session with no
+/// buttons and no track.
 async fn serve_reattach(
     mut requests: mpsc::UnboundedReceiver<()>,
     link: Arc<crate::sink::PcmLink>,
     sink: SessionSink,
     format: castaway_core::AudioFormat,
+    presentation: Arc<Presentation>,
 ) {
     while requests.recv().await.is_some() {
         // Coalesce anything that piled up while we were not looking, so a burst of failed
@@ -633,15 +746,7 @@ async fn serve_reattach(
         while requests.try_recv().is_ok() {}
         info!("spotify: reattaching audio to the pipeline");
         let source = FrameSource::Pcm(link.attach());
-        if sink
-            .emit(SessionEvent::Audio {
-                source,
-                format,
-                config: None,
-            })
-            .await
-            .is_err()
-        {
+        if presentation.open(&sink, source, format).await.is_err() {
             debug!("spotify: session manager gone; stopping the reattach server");
             return;
         }
@@ -665,6 +770,7 @@ async fn pump_events(
     sink: SessionSink,
     session: Session,
     hung_up: Arc<AtomicBool>,
+    presentation: Arc<Presentation>,
 ) {
     let mut snapshot = NowPlaying::new(PlaybackState::Stopped);
     // Which track the current snapshot describes, so late artwork for a track that has
@@ -684,6 +790,7 @@ async fn pump_events(
                     continue;
                 }
                 snapshot.artwork = Some(artwork);
+                presentation.set_now_playing(&snapshot);
                 if sink
                     .emit(SessionEvent::NowPlaying(snapshot.clone()))
                     .await
@@ -778,14 +885,18 @@ async fn pump_events(
                     .find(|s| !s.is_empty());
                 if let Some(who) = who {
                     debug!(%who, "spotify: controlling client");
-                    if sink
-                        .emit(SessionEvent::SourceInfo(
-                            SourceDescription::new().with_display_name(who),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    // Merged into the session's own description as well as emitted, so a
+                    // reopen names the phone rather than falling back to the account id.
+                    let merged = presentation
+                        .merge_description(SourceDescription::new().with_display_name(who));
+                    if let Some(description) = merged {
+                        if sink
+                            .emit(SessionEvent::SourceInfo(description))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 false
@@ -811,6 +922,10 @@ async fn pump_events(
             _ => false,
         };
 
+        // Recorded even when it is not republished: `PositionChanged` deliberately does
+        // not go down the channel (a 33 MB re-raster for a number the card does not draw),
+        // but a session that reopens should still come back at the right position.
+        presentation.set_now_playing(&snapshot);
         if changed
             && sink
                 .emit(SessionEvent::NowPlaying(snapshot.clone()))
@@ -844,6 +959,7 @@ async fn pump_queue(
     mut updates: impl futures::Stream<Item = Result<ClusterUpdate, librespot_core::Error>> + Unpin,
     sink: SessionSink,
     session: Session,
+    presentation: Arc<Presentation>,
 ) {
     use futures::StreamExt as _;
 
@@ -867,6 +983,7 @@ async fn pump_queue(
         }
         debug!(queued = items.len(), "spotify: queue changed");
         last.clone_from(&items);
+        presentation.set_up_next(&items);
         if sink.emit(SessionEvent::UpNext(items)).await.is_err() {
             return;
         }
@@ -1179,6 +1296,129 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use castaway_core::{ProtocolKind, SourceId};
+
+    /// A control surface that does nothing. `SpotifyRemote` wraps librespot's `Spirc`,
+    /// which cannot be built without logging in; what these tests are about is *which
+    /// events a session opening emits*, and that is indifferent to who answers them.
+    #[derive(Debug)]
+    struct StubRemote;
+
+    #[async_trait::async_trait]
+    impl castaway_core::RemoteControl for StubRemote {
+        fn capabilities(&self) -> castaway_core::ControlCapabilities {
+            castaway_core::ControlCapabilities::NONE
+        }
+        async fn issue_unchecked(
+            &self,
+            _txn: castaway_core::ControlTxn,
+        ) -> Result<(), castaway_core::CoreError> {
+            Ok(())
+        }
+    }
+
+    fn presentation() -> Presentation {
+        Presentation::new(
+            SourceDescription::new().with_display_name("schlarpc"),
+            Arc::new(StubRemote),
+        )
+    }
+
+    fn pcm() -> FrameSource {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        FrameSource::Pcm(rx)
+    }
+
+    fn format() -> castaway_core::AudioFormat {
+        castaway_core::AudioFormat::from_hz(44100, 2).unwrap()
+    }
+
+    /// Which events, in order, an opening produced.
+    async fn opened(presentation: &Presentation) -> Vec<SessionEvent> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Spotify, "http"), tx);
+        presentation.open(&sink, pcm(), format()).await.unwrap();
+        drop(sink);
+        let mut events = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            events.push(msg.event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn a_session_opens_with_its_audio_first_and_its_identity_behind_it() {
+        // Order is load-bearing: `Audio` is what makes this source active, and the session
+        // manager rejects metadata and controls for a source that is not.
+        let events = opened(&presentation()).await;
+        assert!(
+            matches!(events.first(), Some(SessionEvent::Audio { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::SourceInfo(_))),
+            "a session should say who it is: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ControlSurface(_))),
+            "…and hand over its controls: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_republishes_the_track_and_the_queue_that_never_stopped() {
+        // The reported bug. The phone takes playback back (`End` — which drops the
+        // description, the controls, the card and the queue) and then hands it over again;
+        // librespot asks for a fresh PCM channel but reports no new track, because the
+        // track never changed. The reopening has to say all of it again, or the panel shows
+        // a nameless session with an "up next" list pasted into an otherwise empty card —
+        // which is exactly what it showed.
+        let presentation = presentation();
+        let mut track = NowPlaying::new(PlaybackState::Playing);
+        track.title = Some("DONMAI".to_owned());
+        presentation.set_now_playing(&track);
+        presentation.set_up_next(&[castaway_core::QueueItem {
+            title: "PSYCHO".to_owned(),
+            artist: Some("Hakos Baelz".to_owned()),
+        }]);
+
+        let events = opened(&presentation).await;
+
+        let titles: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::NowPlaying(n) => n.title.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["DONMAI".to_owned()], "{events:?}");
+        let queued: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::UpNext(items) => Some(items.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, vec![1], "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reopening_names_the_phone_rather_than_the_account_id() {
+        // `SessionClientChanged` is the only place the phone names itself, and it arrives
+        // once, mid-session. Merging it into the session's own description is what makes a
+        // reopen say "iPhone" instead of falling back to a 25-character Spotify id.
+        let presentation = presentation();
+        presentation.merge_description(SourceDescription::new().with_display_name("iPhone"));
+        let events = opened(&presentation).await;
+        let named = events.iter().any(|e| match e {
+            SessionEvent::SourceInfo(info) => info.to_string().contains("iPhone"),
+            _ => false,
+        });
+        assert!(named, "{events:?}");
+    }
 
     /// Build the inner credential blob exactly as the phone does: the librespot
     /// `Credentials::with_blob` decode, run in reverse. Payload framing, then the
