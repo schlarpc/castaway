@@ -799,6 +799,14 @@ pub fn render_mascot_overlay(
 /// Draw one tile: a rounded plate, its glyph, and a label under it.
 ///
 /// Every dimension is a fraction of the tile rather than of the panel, because the grid
+/// A tile's corner radius, as a fraction of its height.
+///
+/// Named because it is now used twice: the tile draws itself with it, and a screen opened out
+/// of that tile *starts* with it and flattens to the panel's own square corner as it grows —
+/// which is what makes the growth read as the tile expanding rather than as a screen scaling up
+/// (see `crate::motion`).
+pub const TILE_RADIUS: f32 = 0.147;
+
 /// now sizes tiles to fit its box: a corner radius or a label in absolute pixels would
 /// look right at six tiles and wrong at ten.
 fn draw_tile(
@@ -814,7 +822,7 @@ fn draw_tile(
 
     let accent = theme::regulated(tile.accent);
     let plate = theme::tinted(pal.tile_bg, accent, 0.12);
-    let radius = rect.h * 0.147;
+    let radius = rect.h * TILE_RADIUS;
     // A plate tinted toward the accent, with the accent itself as the edge. The accent is
     // not the whole fill: six saturated squares on a dark wall is a toy, and the label has
     // to stay readable across a room. But an untinted plate left a three-pixel border

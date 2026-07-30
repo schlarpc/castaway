@@ -1896,6 +1896,8 @@ impl RenderLoop {
             offset_y: rect.y,
         };
         if self.compositor.has_layer(LayerId::Attract) {
+            self.compositor
+                .set_radius(LayerId::Attract, self.floor.radius());
             self.compositor.upsert_layer(Layer {
                 id: LayerId::Attract,
                 opacity: dim,
@@ -2514,16 +2516,22 @@ impl RenderLoop {
         // Going deeper. With a place to come from, the *arriving* screen is what moves —
         // growing out of the tile — and the one being left holds still and fades early. With
         // no place, the pair travels along the axis instead.
-        let (leaving, from_rect, spring) = match from {
+        let (_, panel_h) = self.compositor.target_size();
+        let (leaving, from_rect, spring, radius) = match from {
             Some(rect) => (
                 Leaving::Yield,
                 rect,
                 crate::motion::Choreography::container(),
+                // The tile's own corner, in device pixels, flattening as the screen grows: a
+                // square-cornered rectangle emerging from a rounded one reads as two objects
+                // rather than one expanding.
+                rect.h * panel_h as f32 * crate::attract::TILE_RADIUS,
             ),
             None => (
                 Leaving::Slide { direction: -1.0 },
                 crate::motion::Choreography::off_panel(-1.0),
                 crate::motion::Choreography::shared_axis(),
+                0.0,
             ),
         };
         self.begin_transition(false, leaving);
@@ -2531,7 +2539,7 @@ impl RenderLoop {
         self.panel.push_from(screen, from);
         self.repaint_shell();
         // After the repaint, so the layer it launches is already the new screen's texture.
-        self.floor.launch(from_rect, spring);
+        self.floor.launch(from_rect, spring, radius);
         self.reflow_surfaces();
     }
 
@@ -2561,6 +2569,7 @@ impl RenderLoop {
                 self.floor.launch(
                     crate::motion::Choreography::off_panel(1.0),
                     crate::motion::Choreography::shared_axis(),
+                    0.0,
                 );
             }
             self.reflow_surfaces();
@@ -2790,6 +2799,10 @@ impl RenderLoop {
                 // Straight back into the thing it was opened out of. Linear in `p` because
                 // `p` is already the spring's own curve.
                 let lerp = |a: f32, b: f32| b + (a - b) * p;
+                // …and rounding as it goes, the mirror of the growth that opened it.
+                let (_, h) = self.compositor.target_size();
+                let radius = rect.h * h as f32 * crate::attract::TILE_RADIUS * (1.0 - p);
+                self.compositor.set_radius(LayerId::ShellPrev, radius);
                 (
                     Transform {
                         scale_x: lerp(1.0, rect.w),
@@ -2832,6 +2845,7 @@ impl RenderLoop {
     }
 
     fn end_transition(&mut self) {
+        self.compositor.set_radius(LayerId::ShellPrev, 0.0);
         self.compositor.remove_layer(LayerId::ShellPrev);
         self.transition = None;
         self.transition_undo = None;

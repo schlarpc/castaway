@@ -509,6 +509,10 @@ pub struct Floor {
     dim: f32,
     dim_vel: f32,
     spring: Option<Spring>,
+    /// The corner radius the arriving screen launched with, in device pixels, and the width it
+    /// launched at. Together they say how far through the growth it is, which is what the
+    /// radius decays over.
+    launch: Option<(f32, f32)>,
 }
 
 impl Floor {
@@ -538,7 +542,11 @@ impl Floor {
     /// out of the thing somebody is looking at rather than replacing the panel wholesale; or,
     /// for a screen opened by something with no place on the panel, an off-panel rect, which
     /// makes the same mechanism a shared-axis slide.
-    pub fn launch(&mut self, from: NormRect, spring: Spring) {
+    /// `radius` is the corner radius of the thing it is growing out of, in device pixels. It
+    /// decays to zero as the screen reaches full size, which is what makes the growth read as
+    /// *that tile expanding* rather than as a screen being scaled up — a square-cornered
+    /// rectangle emerging from a rounded one is the tell that they are two different objects.
+    pub fn launch(&mut self, from: NormRect, spring: Spring, radius: f32) {
         self.at = Some(from);
         self.vel = NormRect {
             x: 0.0,
@@ -547,6 +555,24 @@ impl Floor {
             h: 0.0,
         };
         self.spring = Some(spring);
+        self.launch = if radius > 0.0 {
+            Some((radius, from.w.clamp(0.0, 0.999)))
+        } else {
+            None
+        };
+    }
+
+    /// The arriving screen's corner radius right now, in device pixels.
+    ///
+    /// Zero once it has arrived, or if it never had one: the panel's own corners are square, so
+    /// a screen at full size is too.
+    #[must_use]
+    pub fn radius(&self) -> f32 {
+        let (Some((radius, from_w)), Some(at)) = (self.launch, self.at) else {
+            return 0.0;
+        };
+        let grown = ((at.w - from_w) / (1.0 - from_w)).clamp(0.0, 1.0);
+        radius * (1.0 - grown)
     }
 
     /// Advance toward the arrangement `recessed` asks for. Returns whether it is still
@@ -581,6 +607,7 @@ impl Floor {
             self.dim_vel = 0.0;
             // Back to the floor's own spring: whatever launched a screen has landed.
             self.spring = None;
+            self.launch = None;
             return false;
         }
         true
