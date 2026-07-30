@@ -225,9 +225,12 @@
               || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path)
-              # cast-replay's trimmed AirServer databases (D44) — include_bytes!'d by
-              # its tests, so their absence is a sandbox-only compile failure.
-              || (pkgs.lib.hasSuffix ".sqlite" path)
+              # Everything under a fixtures/ directory, wholesale: ground rule 9 lands
+              # reverse engineering as checked-in fixtures, and several are files no
+              # suffix rule can name — proto-cast's extensionless `expect`/`time`
+              # vector files, cast-replay's trimmed .sqlite databases (D44). Enumerating
+              # suffixes here made each new fixture kind a sandbox-only test failure.
+              || (pkgs.lib.hasInfix "/fixtures/" path)
               # The network-surface artifacts (D45): the app's freshness tests read
               # them at runtime and fail on drift, which is what keeps the firewall
               # JSON in lock-step with the registry — so the sandbox must see them.
