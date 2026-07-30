@@ -1885,34 +1885,57 @@ impl RenderLoop {
             if self.compositor.has_layer(LayerId::MascotOverlay) {
                 self.compositor.upsert_layer(Layer {
                     id: LayerId::MascotOverlay,
-                    opacity: dim * (1.0 - self.session_veil()),
+                    opacity: dim * (1.0 - self.slot_veil()),
                     transform: compose(floor, base),
                 });
             }
         }
     }
 
-    /// How much of a session is on the panel, `0.0`..=`1.0`.
+    /// How far a session has expanded past the slot, `0.0`..=`1.0`.
     ///
-    /// What the mascot's visibility follows. She leans on the clock card, so she leaves when a
-    /// session takes the slot — but *fading*, not yielding: a hard hide pops, and it pops back
-    /// at the moment a departing card's layer is finally dropped, which is now the moment that
-    /// card has already faded to nothing. Taking the session surface's own opacity means her
-    /// return is exactly as gradual as the departure that uncovers her, for free.
-    fn session_veil(&self) -> f32 {
+    /// What the mascot's visibility follows, and the arithmetic behind "she leans on the
+    /// *slot*". At `0.0` the occupant is at its demoted size — in the slot, which is the card
+    /// frame she is leaning over, so she stays and her arms land in front of it. At `1.0` it
+    /// fills the panel, which is not the slot at all and no place for an ornament to be drawn
+    /// over, so she is gone.
+    ///
+    /// A matter of degree rather than of presence, which is what makes it smooth for free:
+    /// she fades out exactly as fast as the occupant grows, and back exactly as fast as it
+    /// shrinks or leaves. Presence alone was a hard hide, and it popped.
+    ///
+    /// Video is included and rarely contributes: it demotes to the PiP corner rather than the
+    /// slot, so a demoted video leaves her alone — correctly, since it is nowhere near her —
+    /// while a full-screen one hides her like anything else that has taken the panel.
+    fn slot_veil(&self) -> f32 {
+        let (w, h) = self.compositor.target_size();
         crate::panel::Surface::ALL
             .into_iter()
             .filter(|s| s.is_session())
-            .map(|s| {
-                let m = self.motions.get(s);
-                if m.drawn() {
-                    m.opacity()
-                } else {
-                    0.0
+            .map(|surface| {
+                let motion = self.motions.get(surface);
+                if !motion.drawn() {
+                    return 0.0;
                 }
+                let demoted = crate::panel::demoted_rect(surface, w, h)
+                    .map_or(1.0, |r| r.w)
+                    .clamp(0.0, 0.999);
+                // How far between its demoted width and the whole panel it currently is.
+                let expansion = (motion.frame().w - demoted) / (1.0 - demoted);
+                expansion.clamp(0.0, 1.0) * motion.opacity()
             })
             .fold(0.0_f32, f32::max)
             .clamp(0.0, 1.0)
+    }
+
+    /// How visible the mascot is right now, for tests: the veil applied to the floor's dim.
+    #[must_use]
+    pub fn mascot_opacity(&self) -> Option<f32> {
+        if !self.compositor.has_layer(LayerId::MascotOverlay) {
+            return None;
+        }
+        let dim = self.floor.placement().map_or(1.0, |(_, dim)| dim);
+        Some(dim * (1.0 - self.slot_veil()))
     }
 
     /// Whether the placement of any surface has moved since it was last applied.

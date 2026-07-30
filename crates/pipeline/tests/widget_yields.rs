@@ -17,7 +17,7 @@
 
 use pipeline::attract::{AttractScene, WidgetSlot};
 use pipeline::browser::BrowserRole;
-use pipeline::compositor::DirtyRect;
+use pipeline::compositor::{DirtyRect, LayerId};
 use pipeline::panel::Surface;
 use pipeline::render_pipeline::{RenderCommand, RenderLoop};
 
@@ -146,5 +146,82 @@ fn a_pushed_shell_screen_takes_the_widget_with_it() {
     assert!(
         widget_visible(&render),
         "back on Home, the widget should be back"
+    );
+}
+
+#[test]
+fn the_mascot_leans_on_the_slot_and_leaves_only_for_a_full_panel_session() {
+    // She leans on the *slot*, not on the clock: the card frame is painted into the scene and
+    // persists, so a session demoted into that slot is something for her arms to land on
+    // rather than something that buries them. What gets her out of the way is an occupant
+    // that has taken the whole panel — a matter of degree, so the change is a fade.
+    let (tx, mut render) = idle_with_widget();
+    assert_eq!(
+        render.mascot_opacity(),
+        Some(1.0),
+        "on the idle screen she is fully there"
+    );
+
+    // A session takes the panel: she is nowhere near the slot now, so she goes.
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    settle(&mut render);
+    assert!(
+        render.mascot_opacity().is_some_and(|o| o < 0.05),
+        "a full-panel session is no place for an ornament: {:?}",
+        render.mascot_opacity()
+    );
+
+    // Demote it into the slot. Now she is leaning on it, so she comes back — and she is
+    // *above* it, which is what makes the lean read.
+    render.set_shell_foreground(true);
+    settle(&mut render);
+    assert!(
+        render.mascot_opacity().is_some_and(|o| o > 0.8),
+        "with the session in the slot she leans on it: {:?}",
+        render.mascot_opacity()
+    );
+    assert!(
+        LayerId::MascotOverlay > LayerId::NowPlaying,
+        "and her arms have to land in front of what the slot holds"
+    );
+
+    // Summoned back to full panel: she gets out of the way again, gradually.
+    let mut seen = Vec::new();
+    render.panel_restore();
+    for _ in 0..180 {
+        render.pump();
+        seen.push(render.mascot_opacity().unwrap_or_default());
+        if !render.tick_motion(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+    let partial = seen.iter().filter(|o| **o > 0.05 && **o < 0.95).count();
+    assert!(partial >= 2, "she blinked out instead of fading: {seen:?}");
+    assert!(seen.last().is_some_and(|o| *o < 0.05), "{seen:?}");
+}
+
+#[test]
+fn a_demoted_video_is_nowhere_near_her_and_leaves_her_alone() {
+    // Video demotes to the PiP corner, not the slot. Driving her from "is a session present"
+    // would have hidden her for a video in the opposite corner of the panel.
+    let (tx, mut render) = idle_with_widget();
+    tx.try_send(RenderCommand::Video(castaway_core::DecodedFrame {
+        width: W,
+        height: H,
+        pts: std::time::Duration::ZERO,
+        image: castaway_core::FrameImage::Cpu {
+            format: castaway_core::PixelFormat::Rgba8,
+            data: bytes::Bytes::from(vec![0x40; (W * H * 4) as usize]),
+        },
+    }))
+    .unwrap();
+    settle(&mut render);
+    render.set_shell_foreground(true);
+    settle(&mut render);
+    assert!(
+        render.mascot_opacity().is_some_and(|o| o > 0.8),
+        "a video in the far corner is no reason for her to go: {:?}",
+        render.mascot_opacity()
     );
 }

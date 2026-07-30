@@ -140,13 +140,6 @@ pub enum LayerId {
     /// idle background it sits in, below a session's card, because a session that is
     /// actually playing outranks an ornament.
     BrowserWidget,
-    /// The mascot's foreground half — head, arms, sash — leaning over the widget card's
-    /// top edge. A layer of its own because the split is the point: her torso is drawn
-    /// *into* the idle scene behind the card frame, and her arms have to land in front
-    /// of the live page the card holds, which no amount of drawing into the scene below
-    /// that page can do. Never occludes: it is line art over transparency, and a layer
-    /// this test cannot see through would swallow touches meant for the card.
-    MascotOverlay,
     /// The now-playing card for an audio-only session, which has no pixels of its own.
     /// Above the attract scene, below video — a sender with pixels outranks a card about
     /// a sender without them.
@@ -155,6 +148,23 @@ pub enum LayerId {
     /// below video, for the same reason the card is: a sender with pixels of its own
     /// outranks controls for a sender without them.
     Transport,
+    /// The mascot's foreground half — head, arms, sash — leaning over the widget card's
+    /// top edge. A layer of its own because the split is the point: her torso is drawn
+    /// *into* the idle scene behind the card frame, and her arms have to land in front of
+    /// whatever the card is holding, which no amount of drawing into the scene below it can
+    /// do.
+    ///
+    /// Above the now-playing card and its strip, which is what "she leans on the *slot*"
+    /// means: the card frame is part of the scene and persists, so a session demoted into
+    /// that slot is something she is leaning on rather than something that buries her arms.
+    /// Below video and a fullscreen cast surface, because a session that has taken the whole
+    /// panel is not in the slot and she has no business being drawn over it — the fade that
+    /// gets her out of the way is driven by how far the occupant has *expanded*
+    /// (`RenderLoop::slot_veil`), not by its mere existence.
+    ///
+    /// Never occludes: it is line art over transparency, and a layer this test cannot see
+    /// through would swallow touches meant for the card.
+    MascotOverlay,
     /// The main cast video/mirroring surface.
     Video,
     /// A cast surface filling the panel (YouTube leanback, Cast app receivers). Above
@@ -188,9 +198,9 @@ impl LayerId {
         Self::Attract,
         Self::ShellPrev,
         Self::BrowserWidget,
-        Self::MascotOverlay,
         Self::NowPlaying,
         Self::Transport,
+        Self::MascotOverlay,
         Self::Video,
         Self::BrowserFullscreen,
         Self::Osd,
@@ -223,12 +233,12 @@ impl LayerId {
             // The clock yields the moment a session has anything on the panel: an ornament
             // must not outrank the thing the panel is actually doing.
             Self::BrowserWidget => &[Self::NowPlaying, Self::Transport, Self::Video],
-            // The mascot leans on the clock and leaves with it — but *not* by yielding.
-            // A hard hide is a pop, and she pops back the instant a departing card's layer
-            // goes, which after `motion` is the moment that card has already faded to
-            // nothing. Her visibility is driven as an opacity instead
-            // (`RenderLoop::apply_floor`), from how much of a session surface is on the
-            // panel, so she fades out as one arrives and back as it leaves.
+            // The mascot yields to nothing, and deliberately not to the card: she leans on
+            // the *slot*, so a session demoted into it is what she is leaning on. What gets
+            // her out of the way is a full-panel occupant, and that is a matter of degree
+            // rather than presence — driven as an opacity from how far the occupant has
+            // expanded (`RenderLoop::slot_veil`). A hard hide would also pop, and it popped
+            // back at the moment a departing card had already faded to nothing.
             Self::MascotOverlay => &[],
             Self::Attract
             | Self::ShellPrev
