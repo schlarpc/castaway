@@ -42,6 +42,14 @@ pub const PILL_HOLD: std::time::Duration = std::time::Duration::from_millis(2200
 /// How long the fade itself takes.
 pub const PILL_FADE: std::time::Duration = std::time::Duration::from_millis(600);
 
+/// What the pill fades *to* while a session holds the whole panel — dim, but present.
+///
+/// On an app view (Spotify's card, YouTube, a cast) the pill is the one exit that is
+/// structurally in the same place everywhere, and an affordance faded to nothing reads
+/// as there being no way out. Dim enough not to fight the picture; the floor is 0 on
+/// the idle screen, where there is nothing to exit.
+pub const PILL_SESSION_FLOOR: f32 = 0.38;
+
 /// Where the pill sits, in device pixels.
 ///
 /// Bottom-left, near the edge the swipe comes from, so the two affordances teach each
@@ -117,6 +125,53 @@ impl Default for Palette {
             label: theme::TEXT_BODY,
         }
     }
+}
+
+/// Draw the close badge — a dark disc with an X — into a tight RGBA8 buffer of
+/// `side`×`side`. The pill's palette, because it is the pill's sibling: both are the
+/// shell's own chrome drawn over other people's pixels.
+#[must_use]
+pub fn render_close_badge(side: u32) -> Vec<u8> {
+    let side = side.max(8);
+    let pal = Palette::default();
+    let mut buf = vec![0u8; (side * side * 4) as usize];
+    let s = side as f32;
+    let c = s / 2.0;
+    // Inset so the antialiased rim survives its own bounds.
+    shape::disc(&mut buf, side, side, c, c, s - 4.0, pal.plate);
+    shape::rounded_outline(
+        &mut buf,
+        side,
+        side,
+        shape::Rect {
+            x: 2.0,
+            y: 2.0,
+            w: s - 4.0,
+            h: s - 4.0,
+        },
+        (s - 4.0) / 2.0,
+        (s * 0.03).max(1.0),
+        pal.edge,
+    );
+    // The X: two strokes, fat enough to read across a room.
+    let (a, b) = (s * 0.34, s * 0.66);
+    let stroke = (s * 0.055).max(2.0);
+    for (ax, ay, bx, by) in [(a, a, b, b), (a, b, b, a)] {
+        shape::fill_sdf(
+            &mut buf,
+            side,
+            side,
+            shape::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: s,
+                h: s,
+            },
+            pal.glyph,
+            |px, py| shape::sd_segment(px, py, ax, ay, bx, by) - stroke,
+        );
+    }
+    buf
 }
 
 /// Draw the pill into a tight RGBA8 buffer of its own size.
@@ -214,10 +269,147 @@ impl Contact {
     }
 }
 
+/// What the panel should do about a contact moving on the reserved edge.
+///
+/// The decision is here, and pure, because it lived in the kiosk as an if-chain over five
+/// variables and two of its cases were simply missing: a part-way drag began nothing, so
+/// nothing followed the finger, and the flag that said "a drag is in hand" was never cleared —
+/// which left the completed-swipe branch (`if complete && !dragging`) permanently unreachable.
+/// The home gesture stopped working after the first time anybody dragged from the edge and let
+/// go early, and there was no test that could have noticed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EdgeDrag {
+    /// Not ours, or nowhere to go.
+    Ignore,
+    /// Fire the home gesture now: the swipe completed with nothing in hand.
+    Home,
+    /// Begin a back-navigation and carry it with the finger.
+    Begin,
+    /// Carry the one already in hand. `shown` is how much of the outgoing screen still shows,
+    /// so letting go part-way can put it back.
+    Carry {
+        /// `1.0` = untouched, `0.0` = fully dragged away.
+        shown: f32,
+    },
+}
+
+/// Decide what a move to `(x, y)` means for `contact`.
+///
+/// `dragging` is whether a driven navigation is already in hand, `depth` the shell's screen
+/// depth, and `playing` whether there is a session to hand the glass back to.
+///
+/// The one ordering that matters: a *completed* swipe only fires when nothing is in hand,
+/// because with a navigation being carried the swipe **is** the navigation and finishing it is
+/// the release's job.
+#[must_use]
+pub fn edge_drag(
+    contact: &Contact,
+    x: f32,
+    y: f32,
+    dragging: bool,
+    depth: usize,
+    playing: bool,
+) -> EdgeDrag {
+    if !contact.from_edge {
+        return EdgeDrag::Ignore;
+    }
+    if dragging {
+        // `travel` is a fraction of the panel, so a drag all the way across is a whole
+        // navigation. Clamped, because a finger can leave the edge it started on.
+        let travel = (x - contact.start.0).clamp(0.0, 1.0);
+        return EdgeDrag::Carry {
+            shown: 1.0 - travel,
+        };
+    }
+    if contact.is_home_swipe(x, y) {
+        return EdgeDrag::Home;
+    }
+    // Only a screen-to-screen back is carried today: its whole animation *is* a position, so a
+    // finger can be halfway through one. Handing the glass back at Home is a change of focus
+    // rather than of place, so it stays a threshold gesture — which is why `playing` alone does
+    // not begin a drag.
+    if depth > 1 {
+        EdgeDrag::Begin
+    } else {
+        let _ = playing;
+        EdgeDrag::Ignore
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_completed_swipe_goes_home_but_only_with_nothing_in_hand() {
+        let c = Contact::new(0.01, 0.5);
+        assert_eq!(edge_drag(&c, 0.2, 0.5, false, 1, false), EdgeDrag::Home);
+        // With a navigation being carried the swipe *is* that navigation, and finishing it
+        // belongs to the release.
+        assert!(matches!(
+            edge_drag(&c, 0.2, 0.5, true, 1, false),
+            EdgeDrag::Carry { .. }
+        ));
+    }
+
+    #[test]
+    fn a_drag_from_the_edge_on_a_pushed_screen_begins_a_carry() {
+        let c = Contact::new(0.01, 0.5);
+        // Short of the swipe threshold, so this is the part-way case that used to begin nothing.
+        assert_eq!(edge_drag(&c, 0.05, 0.5, false, 2, false), EdgeDrag::Begin);
+        assert_eq!(
+            edge_drag(&c, 0.05, 0.5, true, 2, false),
+            EdgeDrag::Carry { shown: 0.96 }
+        );
+    }
+
+    #[test]
+    fn a_carry_tracks_the_finger_and_cannot_leave_its_range() {
+        let c = Contact::new(0.0, 0.5);
+        assert_eq!(
+            edge_drag(&c, 0.0, 0.5, true, 2, false),
+            EdgeDrag::Carry { shown: 1.0 }
+        );
+        assert_eq!(
+            edge_drag(&c, 0.5, 0.5, true, 2, false),
+            EdgeDrag::Carry { shown: 0.5 }
+        );
+        assert_eq!(
+            edge_drag(&c, 1.0, 0.5, true, 2, false),
+            EdgeDrag::Carry { shown: 0.0 }
+        );
+        // Back past where it started, and off the far side: both clamp rather than inverting
+        // the navigation or overshooting past its end.
+        assert_eq!(
+            edge_drag(&c, -0.5, 0.5, true, 2, false),
+            EdgeDrag::Carry { shown: 1.0 }
+        );
+        assert_eq!(
+            edge_drag(&c, 2.0, 0.5, true, 2, false),
+            EdgeDrag::Carry { shown: 0.0 }
+        );
+    }
+
+    #[test]
+    fn a_contact_from_the_middle_of_the_panel_is_never_ours() {
+        // The reserved edge is what keeps an ordinary drag across a page from navigating.
+        let c = Contact::new(0.5, 0.5);
+        for dragging in [false, true] {
+            assert_eq!(edge_drag(&c, 0.9, 0.5, dragging, 3, true), EdgeDrag::Ignore);
+        }
+    }
+
+    #[test]
+    fn at_home_a_part_way_drag_begins_nothing_and_leaves_the_swipe_working() {
+        // The bug this function exists for. At Home there is no screen to carry, so a part-way
+        // drag must begin nothing *and* leave the completed-swipe branch reachable — the old
+        // code set its "dragging" flag here and never cleared it, so the home gesture stopped
+        // working for the rest of the process's life.
+        let c = Contact::new(0.01, 0.5);
+        assert_eq!(edge_drag(&c, 0.05, 0.5, false, 1, true), EdgeDrag::Ignore);
+        assert_eq!(edge_drag(&c, 0.2, 0.5, false, 1, true), EdgeDrag::Home);
+    }
 
     #[test]
     fn a_swipe_from_the_edge_goes_home() {

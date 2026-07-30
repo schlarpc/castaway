@@ -102,6 +102,21 @@
       url = "github:sleepybishop/nanors/b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a";
       flake = false;
     };
+
+    # Sony's LDAC library, for the one A2DP codec ffmpeg has no decoder for (Q22).
+    #
+    # Its own input rather than `pkgs.ldacbt` because under the nixpkgs pinned above that
+    # attribute is EHfive/ldacBT 2.0.2.3, built `_ENCODE_ONLY` — a shared object with no
+    # `ldacBT_decode` in it and a header that does not declare one. A newer nixpkgs
+    # replaced it with this fork, but reaching that means bumping ffmpeg and Electron too.
+    # See nix/ldacbt.nix.
+    #
+    # Unlike moonlight-common-c, the licence composes: Apache-2.0, so linking it does not
+    # bind the artifact the way D37's GPL-3.0 does.
+    external-libldac-src = {
+      url = "github:open-vela/external_libldac/5b4bf66096ba0d69615efb2422ba3d023c34c2fd";
+      flake = false;
+    };
   };
 
   outputs =
@@ -119,6 +134,7 @@
     , moonlight-common-c-src
     , moonlight-enet-src
     , moonlight-nanors-src
+    , external-libldac-src
     , ...
     }:
     let
@@ -225,6 +241,9 @@
               || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path)
+              # The Windows resource script and the .exe icon it embeds (app/build.rs).
+              || (pkgs.lib.hasSuffix ".rc" path)
+              || (pkgs.lib.hasSuffix ".ico" path)
               # Everything under a fixtures/ directory, wholesale: ground rule 9 lands
               # reverse engineering as checked-in fixtures, and several are files no
               # suffix rule can name — proto-cast's extensionless `expect`/`time`
@@ -296,6 +315,13 @@
         nanorsSrc = moonlight-nanors-src;
       };
 
+      # Sony's LDAC library, with the decoder in it — which `pkgs.ldacbt` under this pin
+      # does not have. `ldac-sys/build.rs` finds it through `LDACBT_LIB_DIR` (Q22).
+      ldacbtFor = system: import ./nix/ldacbt.nix {
+        pkgs = pkgsFor system;
+        src = external-libldac-src;
+      };
+
       # The full kiosk build — renderer, browser, audio, Bluetooth. `packages.default` on
       # Linux, so it is what `nix run .` gives you.
       linuxKioskFor = system: import ./nix/linux-kiosk.nix {
@@ -305,6 +331,7 @@
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
         moonlightCommonC = moonlightCommonCFor system;
+        ldacbt = ldacbtFor system;
       };
 
       # Linux → Windows cross-build (x86_64-pc-windows-msvc). Only meaningful from
@@ -412,12 +439,18 @@
           # The audio path: libav decoders for the A2DP codecs plus a real PCM device.
           # Kept as its own check because it is the one feature whose absence is
           # *silent* — a receiver with no decoder pairs, streams, and plays nothing.
+          # `ldac` rides along here rather than getting a check of its own. It is part of
+          # the same silent-failure story — a codec we advertise and cannot decode is a
+          # session of silence (Q22) — and its tests are the only ones that decode LDAC at
+          # all, so leaving them out of `nix flake check` would mean the endpoint's
+          # correctness rested on somebody remembering to pass a feature flag.
           audioArgs = {
-            cargoExtraArgs = "--package castaway --features audio-out";
+            cargoExtraArgs = "--package castaway --features audio-out,ldac";
             nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = [ pkgs.ffmpeg_7 pkgs.alsa-lib ];
+            buildInputs = [ pkgs.ffmpeg_7 pkgs.alsa-lib (ldacbtFor system) ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+            LDACBT_LIB_DIR = "${ldacbtFor system}/lib";
           };
 
           hwaccelArgs = {
@@ -527,12 +560,21 @@
           audio = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
               pname = "castaway-audio-deps";
-              inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+              inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS LDACBT_LIB_DIR;
               cargoExtraArgs = audioArgs.cargoExtraArgs;
             });
-            inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-            cargoExtraArgs = "--package pipeline --features audio";
+            inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS LDACBT_LIB_DIR;
+            cargoExtraArgs = "--package pipeline --features audio,ldac";
           });
+
+          # The bindings for a library that ships no headers, regenerated and diffed.
+          # Nothing at build time can catch a wrong FFI signature here, so this is the only
+          # thing standing between a nixpkgs bump and a decoder that reads noise (Q22).
+          ldac-bindings = import ./nix/ldac-bindings.nix {
+            inherit pkgs;
+            rustToolchain = rustToolchainFor system;
+            ldacbt = ldacbtFor system;
+          };
 
           hwaccel-clippy = craneLib.cargoClippy (commonArgs // {
             cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
@@ -604,6 +646,10 @@
               # ALSA dev libs for `cpal`, the PCM output behind the `audio-out` feature.
               # Linux-only: the Windows build reaches WASAPI through the OS.
               pkgs.alsa-lib
+              # Sony's LDAC library, for the one A2DP codec ffmpeg cannot decode (Q22).
+              # Ours rather than `pkgs.ldacbt`, which under this nixpkgs pin is built
+              # encoder-only — see nix/ldacbt.nix.
+              (ldacbtFor system)
               # libcrypto, for the GameStream core's AES-GCM/CBC (D37).
               pkgs.openssl
               # Runtime libs for the `render`/`kiosk` pipeline features (wgpu + winit).
@@ -625,6 +671,12 @@
             # PlatformCrypto.c needs and which nothing else in the link line provides.
             MOONLIGHT_COMMON_C_LIB_DIR =
               "${moonlightCommonCFor system}/lib:${pkgs.openssl.out}/lib";
+
+            # Where `ldac-sys`'s build.rs finds `libldacBT` (Q22). Set even though the
+            # library is in `buildInputs` and the ld wrapper would find it anyway: the
+            # build script emits no link directive at all without this, so that a build
+            # without the `ldac` feature does not depend on the library being present.
+            LDACBT_LIB_DIR = "${ldacbtFor system}/lib";
 
             # Environment variables for development
             RUST_BACKTRACE = "1";

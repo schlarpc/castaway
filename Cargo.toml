@@ -27,6 +27,7 @@ members = [
     "crates/proto-dial",
     "crates/proto-miracast",
     "crates/moonlight-sys",
+    "crates/ldac-sys",
     "crates/proto-gamestream",
     "crates/sponsorblock",
     "crates/pipeline",
@@ -71,6 +72,7 @@ proto-airplay = { path = "crates/proto-airplay" }
 proto-dial = { path = "crates/proto-dial" }
 proto-miracast = { path = "crates/proto-miracast" }
 moonlight-sys = { path = "crates/moonlight-sys" }
+ldac-sys = { path = "crates/ldac-sys" }
 proto-gamestream = { path = "crates/proto-gamestream" }
 proto-spotify = { path = "crates/proto-spotify" }
 sponsorblock = { path = "crates/sponsorblock" }
@@ -84,6 +86,10 @@ tokio-util = "0.7"
 tokio-stream = "0.1"
 async-trait = "0.1"
 futures = "0.3"
+
+# --- cli ---
+# `env` so `--config` and `$CASTAWAY_CONFIG` are one code path with one precedence rule.
+clap = { version = "4", features = ["derive", "env"] }
 
 # --- error / logging ---
 thiserror = "2"

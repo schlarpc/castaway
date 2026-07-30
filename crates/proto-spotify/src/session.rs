@@ -45,6 +45,118 @@ use crate::sink::PcmSink;
 /// interval that still looks like it is moving.
 const POSITION_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Everything the panel needs in order to *present* this session, in one place.
+///
+/// A Connect session can end and come back without the login ending: the phone takes
+/// playback back (`device became inactive` → [`SessionEvent::End`]) and then hands it over
+/// again, and librespot asks for a fresh PCM channel rather than logging in afresh. That
+/// second start is a new session as far as [`castaway_core::SessionManager`] is concerned
+/// — `End` drops the source description, the control surface, the card and the queue,
+/// because a session that has gone must not leave buttons on screen wired to a peer that
+/// left with it.
+///
+/// So a restart has to say all of it again, and the bug this type exists to prevent is
+/// that the restart path only said *some* of it: it emitted `Audio` and nothing else, and
+/// the panel got a session with no name, no transport controls and no track — an empty
+/// card with a queue eventually pasted into it. Bundling the facts with the emit that
+/// republishes them is what makes "start a session and forget half of it" not a thing you
+/// can write here (ground rule 1).
+struct Presentation {
+    /// Who is connected and over what. A `Mutex` because it grows: the login knows the
+    /// account name, and the phone names *itself* only later, over a player event.
+    description: std::sync::Mutex<SourceDescription>,
+    /// The handle the panel drives the phone through. Fixed for the life of the login —
+    /// it wraps `Spirc`, which outlives any one session.
+    control: Arc<dyn castaway_core::RemoteControl>,
+    /// The track as last known, and the queue behind it. `None`/empty before the cloud has
+    /// said anything.
+    now_playing: std::sync::Mutex<Option<NowPlaying>>,
+    up_next: std::sync::Mutex<Vec<castaway_core::QueueItem>>,
+}
+
+impl Presentation {
+    fn new(description: SourceDescription, control: Arc<dyn castaway_core::RemoteControl>) -> Self {
+        Self {
+            description: std::sync::Mutex::new(description),
+            control,
+            now_playing: std::sync::Mutex::new(None),
+            up_next: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Read a field's current value, tolerating a poisoned lock: a session that cannot
+    /// report its own title is still worth having, and nothing here is unsafe when stale.
+    fn read<T: Clone>(lock: &std::sync::Mutex<T>) -> Option<T> {
+        lock.lock().ok().map(|held| held.clone())
+    }
+
+    /// Merge in what a player event just taught us about the sender, and return the whole
+    /// description so the caller can publish it.
+    fn merge_description(&self, info: SourceDescription) -> Option<SourceDescription> {
+        let mut held = self.description.lock().ok()?;
+        *held = std::mem::take(&mut *held).merged(info);
+        Some(held.clone())
+    }
+
+    /// Record the current track, so a restart can say what is playing without waiting for
+    /// the next player event — which, for a track that never stopped, never comes.
+    fn set_now_playing(&self, snapshot: &NowPlaying) {
+        if let Ok(mut held) = self.now_playing.lock() {
+            *held = Some(snapshot.clone());
+        }
+    }
+
+    /// Record the queue, for the same reason: cluster updates announce *edits*, so a
+    /// restart mid-playlist would otherwise show nothing coming up.
+    fn set_up_next(&self, items: &[castaway_core::QueueItem]) {
+        if let Ok(mut held) = self.up_next.lock() {
+            held.clear();
+            held.extend_from_slice(items);
+        }
+    }
+
+    /// Open a session on `sink`: the audio plane, then everything needed to present it.
+    ///
+    /// Order is load-bearing. `Audio` is what makes this source the active one, and the
+    /// session manager rejects metadata, controls and queues for a source that is not —
+    /// so everything else has to follow it, not precede it.
+    ///
+    /// # Errors
+    /// [`SpotifyError::SessionGone`] if the session manager has shut down.
+    async fn open(
+        &self,
+        sink: &SessionSink,
+        source: FrameSource,
+        format: castaway_core::AudioFormat,
+    ) -> Result<(), SpotifyError> {
+        let emit = |event| async move {
+            sink.emit(event)
+                .await
+                .map_err(|_| SpotifyError::SessionGone)
+        };
+        emit(SessionEvent::Audio {
+            source,
+            format,
+            // PCM from librespot: nothing to configure a decoder with, because there is
+            // no decoder.
+            config: None,
+        })
+        .await?;
+        if let Some(description) = Self::read(&self.description) {
+            emit(SessionEvent::SourceInfo(description)).await?;
+        }
+        emit(SessionEvent::ControlSurface(Arc::clone(&self.control))).await?;
+        if let Some(snapshot) = Self::read(&self.now_playing).flatten() {
+            emit(SessionEvent::NowPlaying(snapshot)).await?;
+        }
+        let queue = Self::read(&self.up_next).unwrap_or_default();
+        if !queue.is_empty() {
+            emit(SessionEvent::UpNext(queue)).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Who paired, and the credential blob they handed over.
 ///
 /// The blob is still the *outer*-decrypted form from [`crate::discovery::add_user`];
@@ -556,40 +668,32 @@ async fn start(
     let (sample_rate, channels) = PcmSink::format();
     let format = castaway_core::AudioFormat::from_hz(sample_rate, channels)
         .ok_or(SpotifyError::Crypto("librespot named an impossible format"))?;
-    sink.emit(SessionEvent::Audio {
-        source: FrameSource::Pcm(pcm_rx),
-        format,
-        // PCM from librespot: nothing to configure a decoder with, because there is no
-        // decoder.
-        config: None,
-    })
-    .await
-    .map_err(|_| SpotifyError::SessionGone)?;
 
-    sink.emit(SessionEvent::SourceInfo(
+    // One description of this session, published by whoever (re)opens it. Every task that
+    // learns something about it updates this rather than only emitting it, so a restart
+    // republishes what the room was already looking at.
+    let presentation = Arc::new(Presentation::new(
         SourceDescription::new()
             .with_display_name(user.user_name.clone())
             .with_link(format!("Spotify Connect · {sample_rate} Hz · stereo")),
-    ))
-    .await
-    .map_err(|_| SpotifyError::SessionGone)?;
+        Arc::new(SpotifyRemote::new(Arc::clone(&spirc))),
+    ));
 
-    sink.emit(SessionEvent::ControlSurface(Arc::new(SpotifyRemote::new(
-        Arc::clone(&spirc),
-    ))))
-    .await
-    .map_err(|_| SpotifyError::SessionGone)?;
+    presentation
+        .open(sink, FrameSource::Pcm(pcm_rx), format)
+        .await?;
 
     // Serve the sink's requests for a fresh channel. This is what makes preemption
     // survivable: the pipeline takes our audio away, and when someone presses play again
-    // librespot's `start()` asks here, we emit a new `Audio` event, and the session
-    // manager hands Spotify the panel back — the same path as starting playback, because
-    // from the room's point of view that is what just happened.
+    // librespot's `start()` asks here, we reopen the session, and the session manager hands
+    // Spotify the panel back — the same path as starting playback, because from the room's
+    // point of view that is what just happened.
     let reattach_task = tokio::spawn(serve_reattach(
         pcm_requests,
         Arc::clone(&pcm_link),
         sink.clone(),
         format,
+        Arc::clone(&presentation),
     ));
 
     let hung_up = Arc::new(AtomicBool::new(false));
@@ -598,8 +702,14 @@ async fn start(
         sink.clone(),
         session.clone(),
         Arc::clone(&hung_up),
+        Arc::clone(&presentation),
     ));
-    let queue_task = tokio::spawn(pump_queue(cluster_updates, sink.clone(), session.clone()));
+    let queue_task = tokio::spawn(pump_queue(
+        cluster_updates,
+        sink.clone(),
+        session.clone(),
+        Arc::clone(&presentation),
+    ));
     let spirc_task = tokio::spawn(spirc_task);
 
     Ok(LiveSession {
@@ -617,15 +727,18 @@ async fn start(
 /// One request per preemption, not per block: the sink coalesces, and the channel it gets
 /// back lasts until something takes the panel again.
 ///
-/// Emitting `SessionEvent::Audio` is deliberately the *same* event a session start uses.
-/// The session manager's arbitration is last-writer-wins, so this preempts whoever holds
-/// the panel — which is the correct reading of "the person whose phone this is just
-/// pressed play".
+/// Reopening is deliberately the *same* act a session start is — [`Presentation::open`],
+/// not a bare `Audio` event. The session manager's arbitration is last-writer-wins, so
+/// this preempts whoever holds the panel, which is the correct reading of "the person whose
+/// phone this is just pressed play"; and because `End` wiped the description, the controls
+/// and the card, saying only `Audio` here left the panel showing a nameless session with no
+/// buttons and no track.
 async fn serve_reattach(
     mut requests: mpsc::UnboundedReceiver<()>,
     link: Arc<crate::sink::PcmLink>,
     sink: SessionSink,
     format: castaway_core::AudioFormat,
+    presentation: Arc<Presentation>,
 ) {
     while requests.recv().await.is_some() {
         // Coalesce anything that piled up while we were not looking, so a burst of failed
@@ -633,15 +746,7 @@ async fn serve_reattach(
         while requests.try_recv().is_ok() {}
         info!("spotify: reattaching audio to the pipeline");
         let source = FrameSource::Pcm(link.attach());
-        if sink
-            .emit(SessionEvent::Audio {
-                source,
-                format,
-                config: None,
-            })
-            .await
-            .is_err()
-        {
+        if presentation.open(&sink, source, format).await.is_err() {
             debug!("spotify: session manager gone; stopping the reattach server");
             return;
         }
@@ -665,6 +770,7 @@ async fn pump_events(
     sink: SessionSink,
     session: Session,
     hung_up: Arc<AtomicBool>,
+    presentation: Arc<Presentation>,
 ) {
     let mut snapshot = NowPlaying::new(PlaybackState::Stopped);
     // Which track the current snapshot describes, so late artwork for a track that has
@@ -684,6 +790,7 @@ async fn pump_events(
                     continue;
                 }
                 snapshot.artwork = Some(artwork);
+                presentation.set_now_playing(&snapshot);
                 if sink
                     .emit(SessionEvent::NowPlaying(snapshot.clone()))
                     .await
@@ -728,17 +835,19 @@ async fn pump_events(
                 true
             }
             PlayerEvent::PositionChanged { position_ms, .. } => {
-                // Kept in the snapshot, deliberately *not* republished.
+                // Republished: the transport strip (D33) draws a scrubber whose UI-side
+                // clock re-anchors on every published position, so this once-a-second
+                // reading is what keeps the strip honest against the real player —
+                // without it the only position a track ever published was its opening 0,
+                // and the clock free-ran on the OS clock from there (and carried its
+                // anchor across a track change, since 0 equals 0).
                 //
-                // `NowPlaying` goes to `publish_card`, which rasterizes the card at the
-                // compositor's target size and uploads it — at 4K that is a 33 MB texture.
-                // Once a second, forever, for a number the card does not draw: there is no
-                // progress bar and no elapsed time in `nowplaying_card`. It was pure heat.
-                //
-                // When the card grows a scrubber this becomes a real change again, and the
-                // republish should come back with it — ideally repainting only the bar.
+                // The old objection — a 33 MB card raster per second for a number the
+                // card does not draw — is answered on the render side now: a card that
+                // changed in nothing but position skips the raster (`visual_eq`) and
+                // only the small strip repaints.
                 snapshot.position = Some(Duration::from_millis(u64::from(position_ms)));
-                false
+                true
             }
             PlayerEvent::Stopped { .. } => {
                 snapshot = NowPlaying::new(PlaybackState::Stopped);
@@ -778,14 +887,18 @@ async fn pump_events(
                     .find(|s| !s.is_empty());
                 if let Some(who) = who {
                     debug!(%who, "spotify: controlling client");
-                    if sink
-                        .emit(SessionEvent::SourceInfo(
-                            SourceDescription::new().with_display_name(who),
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    // Merged into the session's own description as well as emitted, so a
+                    // reopen names the phone rather than falling back to the account id.
+                    let merged = presentation
+                        .merge_description(SourceDescription::new().with_display_name(who));
+                    if let Some(description) = merged {
+                        if sink
+                            .emit(SessionEvent::SourceInfo(description))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 false
@@ -811,6 +924,10 @@ async fn pump_events(
             _ => false,
         };
 
+        // Recorded even when it is not republished: `PositionChanged` deliberately does
+        // not go down the channel (a 33 MB re-raster for a number the card does not draw),
+        // but a session that reopens should still come back at the right position.
+        presentation.set_now_playing(&snapshot);
         if changed
             && sink
                 .emit(SessionEvent::NowPlaying(snapshot.clone()))
@@ -844,6 +961,7 @@ async fn pump_queue(
     mut updates: impl futures::Stream<Item = Result<ClusterUpdate, librespot_core::Error>> + Unpin,
     sink: SessionSink,
     session: Session,
+    presentation: Arc<Presentation>,
 ) {
     use futures::StreamExt as _;
 
@@ -858,7 +976,7 @@ async fn pump_queue(
             debug!("spotify: cluster update with no player state, queue unchanged");
             continue;
         };
-        let items = names.resolve(&session, tracks).await;
+        let items = names.resolve(&session, &tracks).await;
         // Cluster updates arrive for volume changes, device lists and playback position
         // — most of them leave the queue untouched, and re-rendering the card for each
         // would be a needless repaint on a screen people are looking at.
@@ -867,6 +985,7 @@ async fn pump_queue(
         }
         debug!(queued = items.len(), "spotify: queue changed");
         last.clone_from(&items);
+        presentation.set_up_next(&items);
         if sink.emit(SessionEvent::UpNext(items)).await.is_err() {
             return;
         }
@@ -879,7 +998,7 @@ async fn pump_queue(
 /// because it was about volume, or the device list, or a session hand-off. That is
 /// emphatically not the same as an empty queue, and conflating the two blanks the panel.
 /// `Some(vec![])` is the real thing: a player state that genuinely has nothing queued.
-fn queue_tracks(update: &ClusterUpdate) -> Option<&[ProvidedTrack]> {
+fn queue_tracks(update: &ClusterUpdate) -> Option<Vec<&ProvidedTrack>> {
     let state = update.cluster.as_ref()?.player_state.as_ref()?;
 
     // One line, once per change, naming the keys the cloud actually sent. The metadata
@@ -893,8 +1012,28 @@ fn queue_tracks(update: &ClusterUpdate) -> Option<&[ProvidedTrack]> {
         );
     }
 
-    let end = state.next_tracks.len().min(UP_NEXT_LIMIT);
-    Some(&state.next_tracks[..end])
+    Some(
+        state
+            .next_tracks
+            .iter()
+            .filter(|t| !is_bookkeeping(t))
+            .take(UP_NEXT_LIMIT)
+            .collect(),
+    )
+}
+
+/// Whether a queue entry is librespot's bookkeeping rather than a track.
+///
+/// A repeating context gets a hidden `spotify:delimiter` entry inserted where the list
+/// wraps around (librespot `state/tracks.rs`). It is not a song, no lookup will ever
+/// name it, and rendering it printed `spotify:delimiter` on the wall as though it were
+/// one — reliably, after skipping around a playlist on repeat.
+fn is_bookkeeping(track: &ProvidedTrack) -> bool {
+    track.uri == "spotify:delimiter"
+        || track
+            .metadata
+            .get("hidden")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 /// How many queued tracks are worth a metadata lookup when the cloud did not name them.
@@ -910,12 +1049,30 @@ const RESOLVE_LIMIT: usize = 6;
 /// list that has not changed.
 #[derive(Default)]
 struct QueueNames {
-    /// What we know a URI is called. `None` records a lookup that *failed*, which is as
-    /// worth remembering as one that worked.
-    seen: std::collections::HashMap<String, Option<castaway_core::QueueItem>>,
+    /// What we know a URI is called, or how often asking has failed.
+    seen: std::collections::HashMap<String, Known>,
     /// Insertion order, so the oldest entry can be dropped when the map is full.
     order: std::collections::VecDeque<String>,
 }
+
+/// What a lookup taught us about a URI.
+#[derive(Debug, Clone)]
+enum Known {
+    /// It resolved; this is its name for the rest of the session.
+    Named(castaway_core::QueueItem),
+    /// It failed, this many times so far.
+    ///
+    /// A count rather than a verdict, because the two things a failure can be need
+    /// opposite treatment: a *transient* one — a 5xx or timeout during exactly the
+    /// skip-burst that makes the queue churn — must be retried, or a raw id sticks on
+    /// the wall for the rest of the evening; a *permanent* one (region-locked, a local
+    /// file) must eventually go quiet, or it spends the whole lookup budget on every
+    /// volume change forever. The count is the line between them.
+    Failed(u8),
+}
+
+/// Failures after which a URI stops being retried.
+const FAILED_TRIES: u8 = 3;
 
 /// How many resolved names to keep.
 ///
@@ -934,25 +1091,29 @@ impl QueueNames {
     async fn resolve(
         &mut self,
         session: &Session,
-        tracks: &[ProvidedTrack],
+        tracks: &[&ProvidedTrack],
     ) -> Vec<castaway_core::QueueItem> {
         let mut out = Vec::with_capacity(tracks.len());
         let mut fetched = 0usize;
 
-        for track in tracks {
-            // A remembered *failure* counts as remembered. Recording only successes meant
-            // a track whose lookup failed — region-locked, or a transient 5xx — was
-            // retried on every cluster update, and those arrive on volume changes, device
-            // list churn and hand-offs. Six awaited round trips per update, for a name
-            // that was never going to come, inline in the loop that feeds the card.
-            if let Some(hit) = self.seen.get(&track.uri) {
-                out.push(hit.clone().unwrap_or_else(|| fallback_item(track)));
-                continue;
+        for &track in tracks {
+            // A name is a name for the rest of the session; a failure is only final
+            // once it has used up its retries (see [`Known::Failed`]).
+            match self.seen.get(&track.uri) {
+                Some(Known::Named(item)) => {
+                    out.push(item.clone());
+                    continue;
+                }
+                Some(Known::Failed(n)) if *n >= FAILED_TRIES => {
+                    out.push(fallback_item(track));
+                    continue;
+                }
+                Some(Known::Failed(_)) | None => {}
             }
 
             // Free path: the cloud already told us.
             if let Some(item) = named_from_metadata(track) {
-                self.remember(&track.uri, Some(item.clone()));
+                self.remember(&track.uri, Known::Named(item.clone()));
                 out.push(item);
                 continue;
             }
@@ -964,11 +1125,11 @@ impl QueueNames {
                 fetched += 1;
                 match fetch_track_name(session, &track.uri).await {
                     Some(item) => {
-                        self.remember(&track.uri, Some(item.clone()));
+                        self.remember(&track.uri, Known::Named(item.clone()));
                         out.push(item);
                         continue;
                     }
-                    None => self.remember(&track.uri, None),
+                    None => self.note_failure(&track.uri),
                 }
             }
 
@@ -977,15 +1138,24 @@ impl QueueNames {
         out
     }
 
-    /// Record what a URI resolved to, evicting the oldest entry when full.
-    fn remember(&mut self, uri: &str, item: Option<castaway_core::QueueItem>) {
-        if self.seen.insert(uri.to_owned(), item).is_none() {
+    /// Record what a URI taught us, evicting the oldest entry when full.
+    fn remember(&mut self, uri: &str, known: Known) {
+        if self.seen.insert(uri.to_owned(), known).is_none() {
             self.order.push_back(uri.to_owned());
             while self.order.len() > RESOLVE_CACHE {
                 if let Some(oldest) = self.order.pop_front() {
                     self.seen.remove(&oldest);
                 }
             }
+        }
+    }
+
+    /// One more failed lookup for `uri`.
+    fn note_failure(&mut self, uri: &str) {
+        match self.seen.get_mut(uri) {
+            Some(Known::Failed(n)) => *n = n.saturating_add(1),
+            Some(Known::Named(_)) => {}
+            None => self.remember(uri, Known::Failed(1)),
         }
     }
 }
@@ -1180,6 +1350,129 @@ mod tests {
     use super::*;
     use castaway_core::{ProtocolKind, SourceId};
 
+    /// A control surface that does nothing. `SpotifyRemote` wraps librespot's `Spirc`,
+    /// which cannot be built without logging in; what these tests are about is *which
+    /// events a session opening emits*, and that is indifferent to who answers them.
+    #[derive(Debug)]
+    struct StubRemote;
+
+    #[async_trait::async_trait]
+    impl castaway_core::RemoteControl for StubRemote {
+        fn capabilities(&self) -> castaway_core::ControlCapabilities {
+            castaway_core::ControlCapabilities::NONE
+        }
+        async fn issue_unchecked(
+            &self,
+            _txn: castaway_core::ControlTxn,
+        ) -> Result<(), castaway_core::CoreError> {
+            Ok(())
+        }
+    }
+
+    fn presentation() -> Presentation {
+        Presentation::new(
+            SourceDescription::new().with_display_name("schlarpc"),
+            Arc::new(StubRemote),
+        )
+    }
+
+    fn pcm() -> FrameSource {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        FrameSource::Pcm(rx)
+    }
+
+    fn format() -> castaway_core::AudioFormat {
+        castaway_core::AudioFormat::from_hz(44100, 2).unwrap()
+    }
+
+    /// Which events, in order, an opening produced.
+    async fn opened(presentation: &Presentation) -> Vec<SessionEvent> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Spotify, "http"), tx);
+        presentation.open(&sink, pcm(), format()).await.unwrap();
+        drop(sink);
+        let mut events = Vec::new();
+        while let Some(msg) = rx.recv().await {
+            events.push(msg.event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn a_session_opens_with_its_audio_first_and_its_identity_behind_it() {
+        // Order is load-bearing: `Audio` is what makes this source active, and the session
+        // manager rejects metadata and controls for a source that is not.
+        let events = opened(&presentation()).await;
+        assert!(
+            matches!(events.first(), Some(SessionEvent::Audio { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::SourceInfo(_))),
+            "a session should say who it is: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ControlSurface(_))),
+            "…and hand over its controls: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_republishes_the_track_and_the_queue_that_never_stopped() {
+        // The reported bug. The phone takes playback back (`End` — which drops the
+        // description, the controls, the card and the queue) and then hands it over again;
+        // librespot asks for a fresh PCM channel but reports no new track, because the
+        // track never changed. The reopening has to say all of it again, or the panel shows
+        // a nameless session with an "up next" list pasted into an otherwise empty card —
+        // which is exactly what it showed.
+        let presentation = presentation();
+        let mut track = NowPlaying::new(PlaybackState::Playing);
+        track.title = Some("DONMAI".to_owned());
+        presentation.set_now_playing(&track);
+        presentation.set_up_next(&[castaway_core::QueueItem {
+            title: "PSYCHO".to_owned(),
+            artist: Some("Hakos Baelz".to_owned()),
+        }]);
+
+        let events = opened(&presentation).await;
+
+        let titles: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::NowPlaying(n) => n.title.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["DONMAI".to_owned()], "{events:?}");
+        let queued: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::UpNext(items) => Some(items.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued, vec![1], "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reopening_names_the_phone_rather_than_the_account_id() {
+        // `SessionClientChanged` is the only place the phone names itself, and it arrives
+        // once, mid-session. Merging it into the session's own description is what makes a
+        // reopen say "iPhone" instead of falling back to a 25-character Spotify id.
+        let presentation = presentation();
+        presentation.merge_description(SourceDescription::new().with_display_name("iPhone"));
+        let events = opened(&presentation).await;
+        let named = events.iter().any(|e| match e {
+            SessionEvent::SourceInfo(info) => info.to_string().contains("iPhone"),
+            _ => false,
+        });
+        assert!(named, "{events:?}");
+    }
+
     /// Build the inner credential blob exactly as the phone does: the librespot
     /// `Credentials::with_blob` decode, run in reverse. Payload framing, then the
     /// rolling XOR, then AES-192-ECB under the pbkdf2(sha1(device_id), username) key,
@@ -1363,16 +1656,16 @@ mod tests {
         // The other half: when the state *is* present and says nothing is queued, that is
         // authoritative and the card should clear.
         assert_eq!(
-            queue_tracks(&cluster_update(Some(Vec::new()))).map(<[_]>::len),
+            queue_tracks(&cluster_update(Some(Vec::new()))).map(|t| t.len()),
             Some(0)
         );
     }
 
     /// The free half of `QueueNames::resolve` — everything that needs no session.
-    fn named(tracks: &[ProvidedTrack]) -> Vec<castaway_core::QueueItem> {
+    fn named(tracks: &[&ProvidedTrack]) -> Vec<castaway_core::QueueItem> {
         tracks
             .iter()
-            .map(|t| named_from_metadata(t).unwrap_or_else(|| fallback_item(t)))
+            .map(|&t| named_from_metadata(t).unwrap_or_else(|| fallback_item(t)))
             .collect()
     }
 
@@ -1385,7 +1678,7 @@ mod tests {
             ),
             provided("spotify:track:bbb", &[("title", "Second")]),
         ]));
-        let items = named(queue_tracks(&update).unwrap());
+        let items = named(&queue_tracks(&update).unwrap());
         assert_eq!(items[0].title, "Alkatraz");
         assert_eq!(items[0].artist.as_deref(), Some("DEMONDICE"));
         assert_eq!(items[1].title, "Second");
@@ -1440,24 +1733,50 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_lookup_is_remembered_so_it_is_not_retried_every_update() {
-        // Recording only successes meant a track whose lookup failed — region-locked, or
-        // a transient 5xx — was retried on every cluster update, and those arrive on
-        // volume changes, device-list churn and hand-offs. Six awaited round trips per
-        // update, for a name that was never going to come.
+    fn a_failed_lookup_is_retried_a_few_times_then_goes_quiet() {
+        // Both halves matter. A failure remembered *forever* stuck a raw id on the wall
+        // for the rest of the evening when the failure was a 5xx during exactly the
+        // skip-burst that churns the queue. A failure never remembered spent six awaited
+        // round trips per cluster update — and those arrive on volume changes — for a
+        // name that was never going to come. The count is the line between them.
         let mut names = QueueNames::default();
-        names.remember("spotify:track:gone", None);
-        assert!(
-            names.seen.contains_key("spotify:track:gone"),
-            "a failure is as worth remembering as a success"
+        for tries in 1..=FAILED_TRIES {
+            names.note_failure("spotify:track:gone");
+            let Some(Known::Failed(n)) = names.seen.get("spotify:track:gone") else {
+                panic!("a failure must be recorded as a failure");
+            };
+            assert_eq!(*n, tries);
+        }
+        // Under the limit a failure reads as "worth another try"…
+        assert!(matches!(
+            names.seen.get("spotify:track:gone"),
+            Some(Known::Failed(n)) if *n >= FAILED_TRIES
+        ));
+        // …and a later success replaces nothing (a name, once known, is final).
+        names.remember(
+            "spotify:track:ok",
+            Known::Named(castaway_core::QueueItem::new("A Name".to_owned())),
         );
-        // …and it still renders as something, rather than as nothing.
-        let track = provided("spotify:track:gone", &[]);
-        let hit = names.seen.get(&track.uri).unwrap().clone();
-        assert_eq!(
-            hit.unwrap_or_else(|| fallback_item(&track)).title,
-            "spotify:gone"
-        );
+        names.note_failure("spotify:track:ok");
+        assert!(matches!(
+            names.seen.get("spotify:track:ok"),
+            Some(Known::Named(_))
+        ));
+    }
+
+    #[test]
+    fn bookkeeping_entries_never_reach_the_card() {
+        // librespot inserts a hidden `spotify:delimiter` where a repeating context wraps
+        // around. It is not a song, and it rendered as one — literally the string
+        // "spotify:delimiter" in Up next — after skipping around a playlist on repeat.
+        let update = cluster_update(Some(vec![
+            provided("spotify:delimiter", &[("hidden", "true")]),
+            provided("spotify:track:aaa", &[("title", "Alkatraz")]),
+            provided("spotify:track:hid", &[("title", "x"), ("hidden", "true")]),
+        ]));
+        let tracks = queue_tracks(&update).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].uri, "spotify:track:aaa");
     }
 
     #[test]
@@ -1466,7 +1785,7 @@ mod tests {
         // as long as the panel stayed up.
         let mut names = QueueNames::default();
         for i in 0..(RESOLVE_CACHE + 50) {
-            names.remember(&format!("spotify:track:{i}"), None);
+            names.remember(&format!("spotify:track:{i}"), Known::Failed(FAILED_TRIES));
         }
         assert_eq!(names.seen.len(), RESOLVE_CACHE);
         assert_eq!(names.order.len(), RESOLVE_CACHE);
@@ -1487,8 +1806,8 @@ mod tests {
         // A re-resolved URI must not push a second entry, or the queue outgrows the map
         // and eviction starts dropping live entries.
         let mut names = QueueNames::default();
-        names.remember("spotify:track:a", None);
-        names.remember("spotify:track:a", None);
+        names.remember("spotify:track:a", Known::Failed(FAILED_TRIES));
+        names.remember("spotify:track:a", Known::Failed(FAILED_TRIES));
         assert_eq!(names.order.len(), 1);
         assert_eq!(names.seen.len(), 1);
     }

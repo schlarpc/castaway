@@ -16,11 +16,10 @@ use pipeline::shell::{Screen, ScreenHit, ShellEvent};
 const W: u32 = 1920;
 const H: u32 = 1080;
 
-fn loop_with_home() -> (std::sync::mpsc::SyncSender<RenderCommand>, RenderLoop) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+fn loop_with_home() -> (pipeline::RenderTx, RenderLoop) {
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     render.pump();
     (tx, render)
 }
@@ -43,11 +42,21 @@ fn pressing_a_service_tile_opens_that_service_and_back_returns() {
 
     let (x, y) = tile_centre(&scene, "cast");
     let hit = render.shell_hit(x, y).expect("the tile should be hittable");
-    let ScreenHit::Push(screen) = hit else {
+    let ScreenHit::Push { screen, from } = hit else {
         panic!("a service tile should open its own screen, got {hit:?}");
     };
     assert_eq!(screen.name(), "service");
-    render.shell_push(screen);
+    // The tile's own rect travels with the press, so the screen it opens can grow out of it
+    // rather than materialising in the middle of the panel.
+    let from = from.expect("a tile press knows where it was");
+    let tile = pipeline::attract::tile_layout(&scene, W, H)
+        .into_iter()
+        .find(|(id, _)| id == "cast")
+        .expect("the demo scene has a cast tile")
+        .1;
+    assert!((from.x - tile.x / W as f32).abs() < 1e-5, "{from:?}");
+    assert!((from.w - tile.w / W as f32).abs() < 1e-5, "{from:?}");
+    render.shell_push_from(screen, Some(from));
     assert_eq!(render.shell_depth(), 2);
 
     // Back, from where the service screen draws it.
@@ -121,13 +130,12 @@ fn a_refreshing_picker_stays_one_step_from_home() {
     // refresh to escape, which on a busy network is unbounded.
     let (tx, mut render) = loop_with_home();
     for i in 0..12 {
-        tx.try_send(RenderCommand::ReplaceScreen(Box::new(Screen::Picker(
+        tx.send(RenderCommand::ReplaceScreen(Box::new(Screen::Picker(
             Box::new(pipeline::picker::Picker::loading(
                 "Moonlight",
                 format!("looking… {i}"),
             )),
-        ))))
-        .unwrap();
+        ))));
         render.pump();
     }
     assert_eq!(render.shell_depth(), 2);
@@ -148,7 +156,7 @@ fn the_shell_does_not_answer_where_a_cast_is_covering_it() {
         "hittable with nothing over it"
     );
 
-    tx.try_send(RenderCommand::Video(DecodedFrame {
+    tx.send(RenderCommand::Video(DecodedFrame {
         width: W,
         height: H,
         pts: std::time::Duration::ZERO,
@@ -156,8 +164,7 @@ fn the_shell_does_not_answer_where_a_cast_is_covering_it() {
             format: castaway_core::PixelFormat::Rgba8,
             data: bytes::Bytes::from(vec![0xff; (W * H * 4) as usize]),
         },
-    }))
-    .unwrap();
+    }));
     render.pump();
 
     assert_eq!(
@@ -176,13 +183,12 @@ fn the_now_playing_card_also_covers_the_shell() {
 
     let mut track = NowPlaying::default().with_title("something playing");
     track.state = PlaybackState::Playing;
-    tx.try_send(RenderCommand::NowPlaying(Box::new(NowPlayingCard {
+    tx.send(RenderCommand::NowPlaying(Box::new(NowPlayingCard {
         track,
         source: castaway_core::SourceDescription::default(),
         up_next: Vec::new(),
         controls: ControlCapabilities::PLAY | ControlCapabilities::PAUSE,
-    })))
-    .unwrap();
+    })));
     render.pump();
 
     assert_eq!(render.shell_hit(x, y), None);
@@ -199,8 +205,7 @@ fn refreshing_home_does_not_close_a_screen_someone_is_reading() {
     ))));
     assert_eq!(render.shell_depth(), 2);
 
-    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
-        .unwrap();
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     render.pump();
 
     assert_eq!(render.shell_depth(), 2, "still in the picker");

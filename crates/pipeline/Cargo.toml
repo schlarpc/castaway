@@ -70,6 +70,10 @@ adblock = { version = "0.13", optional = true, default-features = false, feature
 ureq = { version = "2", optional = true }
 # Cross-platform audio output: ALSA on Linux, WASAPI on Windows.
 cpal = { version = "0.15", optional = true }
+# The LDAC decoder. The only A2DP codec libav has no decoder for, so the only one that
+# needs a second decode backend beside ffmpeg (Q22). Sony's own library, via nixpkgs
+# `ldacbt`; the safe wrapper is `ldac_decode` and it is the only consumer.
+ldac-sys = { workspace = true, optional = true }
 
 # The native PipeWire output backend (`audio-pipewire`): real sink names for the
 # settings screen and per-stream routing via `target.object`, neither of which the ALSA
@@ -150,10 +154,16 @@ audio-out = ["audio", "dep:cpal"]
 # ALSA host (see `audio_select::active_backend`); on Windows it is inert, so a shared
 # feature list cross-builds cleanly.
 audio-pipewire = ["audio", "dep:pipewire"]
-# LDAC has no libav decoder and AOSP's libldac is encoder-only, so this needs the
-# reverse-engineered libldacdec (Q22). Without it the LDAC endpoint must not be
-# advertised at all.
-ldac = ["audio"]
+# The LDAC decoder, over FFI to Sony's own `libldacBT` (Q22). Off by default because it
+# is the one decoder that is not already in the ffmpeg the rest of `audio` links: a build
+# without `ldacbt` available would fail to link rather than fail to decode. Implies
+# `audio` because the PCM it produces goes through the same session and output path.
+#
+# The feature no longer merely reserves a slot. `can_decode` asks whether a decoder
+# exists rather than whether this flag is set, so with it off the LDAC endpoint is absent
+# from the advertised table and with it on the endpoint is backed by something real —
+# which is what the flag failing to mean anything cost us the first time (Q22).
+ldac = ["audio", "dep:ldac-sys"]
 # `hwaccel` gates whether the hardware decode backends are *compiled*, never whether they
 # are *used* — that is a runtime decision (`HwPreference`), so a build with this on still
 # plays on a box with no GPU decode. Needs both halves: `ffmpeg` produces the surfaces and
@@ -192,6 +202,13 @@ required-features = ["render"]
 name = "screen_preview"
 required-features = ["render"]
 
+# Regenerates the checked-in window/desktop icon rasters from
+# assets/brand/castaway-icon.svg — the artifacts are committed, so this only
+# needs re-running when the artwork changes.
+[[example]]
+name = "icon_render"
+required-features = ["render"]
+
 # Every shell screen — Home, a service's instructions, a picker with rows and one with
 # none — dumped to PNGs. Layout and hit-testing are unit-tested; whether a screen reads
 # from across a room is not something a test can answer (D38).
@@ -202,3 +219,14 @@ required-features = ["render"]
 [[test]]
 name = "hwaccel_zero_copy"
 required-features = ["hwaccel"]
+
+# Regenerates the checked-in LDAC test vectors with the library's own encoder. Not part of
+# any test run — the fixtures it writes are, and they are checked in so the decode tests do
+# not need an encoder (or this feature) to have bytes to chew on.
+[[example]]
+name = "ldac_fixtures"
+required-features = ["ldac"]
+
+[[test]]
+name = "ldac_decode"
+required-features = ["ldac"]

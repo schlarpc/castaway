@@ -12,14 +12,13 @@ use pipeline::render_pipeline::{RenderCommand, RenderLoop};
 
 #[test]
 fn a_screen_is_drawn_at_the_surface_size_not_stretched_to_it() {
-    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let (tx, rx) = pipeline::render_channel(4);
     let (w, h) = (960, 540);
     let mut render = RenderLoop::offscreen(w, h, rx).unwrap();
 
-    tx.try_send(RenderCommand::Home(Box::new(
+    tx.send(RenderCommand::Home(Box::new(
         pipeline::attract::AttractScene::demo(),
-    )))
-    .unwrap();
+    )));
     render.pump();
 
     let rgba = render.read_rgba().unwrap();
@@ -36,13 +35,12 @@ fn a_screen_is_drawn_at_the_surface_size_not_stretched_to_it() {
 
 #[test]
 fn resizing_redraws_the_screen_rather_than_stretching_it() {
-    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let (tx, rx) = pipeline::render_channel(4);
     // Start small, then grow — the case that used to leave an upscaled surface behind.
     let mut render = RenderLoop::offscreen(320, 180, rx).unwrap();
-    tx.try_send(RenderCommand::Home(Box::new(
+    tx.send(RenderCommand::Home(Box::new(
         pipeline::attract::AttractScene::demo(),
-    )))
-    .unwrap();
+    )));
     render.pump();
     assert_eq!(
         render.shell_layer_size(),

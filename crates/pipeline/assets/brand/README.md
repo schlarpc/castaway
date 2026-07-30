@@ -5,6 +5,22 @@ live site to unblock the app shell (D38) rather than handed over as a kit, so tr
 names and crops as ours and the artwork as theirs. If a canonical kit turns up, replace
 these and keep the same file names.
 
+**Except the app icon, which is ours.** `castaway-icon.svg` was authored in this repo
+(a paper boat catching a signal, in the panel's own `theme.rs` colours) and is the
+single source of truth for every raster of it:
+
+- `icon/castaway-{16,24,32,48,64,128,256}.png` — generated, checked in. Regenerate
+  with `cargo run -p pipeline --example icon_render --features render` after any edit
+  to the SVG; never edit the PNGs by hand. The same SVG is rasterized at runtime for
+  the winit window icon (`pipeline::icon`), so what the taskbar shows and what is
+  installed on disk cannot drift.
+- `crates/app/assets/castaway.ico` — the Windows `.exe` icon, assembled from these
+  PNGs (see the README there).
+
+nix/linux-kiosk.nix installs the PNGs as the hicolor theme icon and ships a
+`castaway.desktop`, which is how a Wayland compositor — where windows carry no icon
+property — finds it via the window's `app_id`.
+
 | File | Source | What it is |
 |---|---|---|
 | `brand-logo.svg` | `/assets/brand-logo.svg` | The `dma` wordmark + spark, 583×128. Authored as flat white paths with no fill colour of its own — the site tints it with `filter: invert(1)` on dark backgrounds. |

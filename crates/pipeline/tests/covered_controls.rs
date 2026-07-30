@@ -43,11 +43,10 @@ fn video_frame(width: u32, height: u32) -> DecodedFrame {
 
 #[test]
 fn a_strip_hidden_under_video_neither_owns_nor_acts() {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let (tx, rx) = pipeline::render_channel(8);
     let mut render = RenderLoop::offscreen(1280, 720, rx).unwrap();
 
-    tx.try_send(RenderCommand::NowPlaying(Box::new(card())))
-        .unwrap();
+    tx.send(RenderCommand::NowPlaying(Box::new(card())));
     render.pump();
     assert!(
         render.transport_owns(ON_STRIP.0, ON_STRIP.1),
@@ -55,8 +54,7 @@ fn a_strip_hidden_under_video_neither_owns_nor_acts() {
          proves nothing about coverage"
     );
 
-    tx.try_send(RenderCommand::Video(video_frame(1280, 720)))
-        .unwrap();
+    tx.send(RenderCommand::Video(video_frame(1280, 720)));
     render.pump();
 
     assert!(

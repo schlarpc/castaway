@@ -22,6 +22,30 @@ fn main() {
     if let Some(dir) = git_dir() {
         println!("cargo:rerun-if-changed={dir}/HEAD");
     }
+
+    embed_windows_icon();
+}
+
+/// Compile assets/castaway.rc — the `.exe` icon, and nothing else (see the comment
+/// in that file about the external manifest) — into the binary when the *target* is
+/// Windows. Keyed on `CARGO_CFG_TARGET_OS` rather than `cfg(windows)` because the
+/// Windows binary is cross-built from Linux (docs/cross-build.md), where build.rs
+/// itself runs as a Linux program; `embed-resource` finds `llvm-rc`, which
+/// nix/windows.nix puts on the PATH for exactly this.
+///
+/// A warning rather than a failure if no resource compiler turns up: an icon-less
+/// .exe is cosmetically wrong, an unbuildable one is broken.
+fn embed_windows_icon() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=assets/castaway.rc");
+    println!("cargo:rerun-if-changed=assets/castaway.ico");
+    if let Err(e) =
+        embed_resource::compile("assets/castaway.rc", embed_resource::NONE).manifest_optional()
+    {
+        println!("cargo:warning=castaway.exe ships without its icon: {e}");
+    }
 }
 
 fn git_rev() -> Option<String> {

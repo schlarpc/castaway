@@ -45,7 +45,19 @@ pub(crate) fn create_instance() -> wgpu::Instance {
 const SHADER: &str = r#"
 // {vec4, f32} lays out as 32 bytes (struct align 16), matching the Rust `Uniform`
 // which pads to 32. Do NOT add a vec3 pad here — that would round the size up to 48.
-struct Uniform { transform: vec4<f32>, opacity: f32 };
+// 48 bytes, matching the Rust `Uniform`: vec4 (0..16), f32 (16), f32 (20), vec2 (24..32),
+// vec4 (32..48). Scalars for radius and size *because* of alignment: a `vec4<f32>` has 16-byte
+// alignment, so putting them in one would have pushed them to offset 32 while the Rust side kept
+// them at 16 — which is how the first attempt at this silently drew every layer from the wrong
+// bytes. `source` is a vec4 and lands at 32, which is already aligned.
+struct Uniform {
+    transform: vec4<f32>,
+    opacity: f32,
+    radius: f32,
+    size: vec2<f32>,
+    // (offset x, offset y, scale x, scale y) in texture coordinates — see `cover_source`.
+    source: vec4<f32>,
+};
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 @group(0) @binding(2) var<uniform> u: Uniform;
@@ -70,10 +82,32 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+
+// A rounded-rect mask over the layer's own pixels.
+//
+// Corner radius has to be *animatable* for the panel's motion to read as physical: an app
+// travelling into a rounded card slot with square corners is the single most noticeable tell
+// that a transition is a scale rather than an object moving. `size` is the layer's device-pixel
+// size and `r` a radius in the same units, so the corner stays circular whatever the layer's
+// aspect — which a radius expressed in normalized space cannot do.
+//
+// The standard signed-distance rounded box, feathered over one pixel: without the feather a
+// 4K corner is visibly stair-stepped, and the whole point is that it not look cheap.
+fn rounded_alpha(uv: vec2<f32>, size: vec2<f32>, r: f32) -> f32 {
+    if (r <= 0.0) { return 1.0; }
+    let half = size * 0.5;
+    let q = abs(uv * size - half) - (half - vec2<f32>(r, r));
+    let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+    return 1.0 - clamp(d + 0.5, 0.0, 1.0);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, smp, in.uv);
-    return vec4<f32>(c.rgb, c.a * u.opacity);
+    // The container's own coordinates for the mask; the cropped ones for the content. That
+    // difference is the whole of "clip, do not stretch".
+    let c = textureSample(tex, smp, in.uv * u.source.zw + u.source.xy);
+    let mask = rounded_alpha(in.uv, u.size, u.radius);
+    return vec4<f32>(c.rgb, c.a * u.opacity * mask);
 }
 "#;
 
@@ -90,6 +124,10 @@ struct Uniform {
     m1: vec4<f32>,
     m2: vec4<f32>,
     offset: vec4<f32>,
+    // (radius in device pixels, layer width, layer height, unused) — see `rounded_alpha`.
+    shape: vec4<f32>,
+    // (offset x, offset y, scale x, scale y) in texture coordinates — see `cover_source`.
+    source: vec4<f32>,
 };
 @group(0) @binding(0) var luma: texture_2d<f32>;
 @group(0) @binding(1) var chroma: texture_2d<f32>;
@@ -120,13 +158,24 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 // Decode to linear here and let the target's own encode undo it. BT.709's transfer is
 // treated as sRGB, which is what every desktop compositor ships and is indistinguishable
 // on this panel; honest BT.1886 handling is a colorimetry project, not a bug fix.
+
+/// The same rounded-rect mask the packed path uses; see `SHADER`'s `rounded_alpha`.
+fn rounded_alpha(uv: vec2<f32>, size: vec2<f32>, r: f32) -> f32 {
+    if (r <= 0.0) { return 1.0; }
+    let half = size * 0.5;
+    let q = abs(uv * size - half) - (half - vec2<f32>(r, r));
+    let d = length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+    return 1.0 - clamp(d + 0.5, 0.0, 1.0);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Plane 0 is full-resolution luma (R8); plane 1 is half-resolution interleaved
     // chroma (RG8). Both are sampled with the same normalized uv — the hardware handles
     // the 2× chroma upsample as part of filtering.
-    let y = textureSample(luma, smp, in.uv).r;
-    let cbcr = textureSample(chroma, smp, in.uv).rg;
+    let uv = in.uv * u.source.zw + u.source.xy;
+    let y = textureSample(luma, smp, uv).r;
+    let cbcr = textureSample(chroma, smp, uv).rg;
     let s = vec3<f32>(y, cbcr.r, cbcr.g) - u.offset.xyz;
     let rgb = vec3<f32>(dot(u.m0.xyz, s), dot(u.m1.xyz, s), dot(u.m2.xyz, s));
     let encoded = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
@@ -135,7 +184,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         encoded / 12.92,
         encoded <= vec3<f32>(0.04045),
     );
-    return vec4<f32>(linear, u.offset.w);
+    let mask = rounded_alpha(in.uv, u.shape.yz, u.shape.x);
+    return vec4<f32>(linear, u.offset.w * mask);
 }
 "#;
 
@@ -144,16 +194,61 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 struct Uniform {
     transform: [f32; 4],
     opacity: f32,
-    _pad: [f32; 3],
+    /// Corner radius in device pixels, and the on-screen size it is a radius *of*. Three
+    /// floats, which is exactly the padding this struct already carried — so it stays 32 bytes
+    /// and the buffer layout is unchanged. A `[f32; 4]` here would *not* have worked: the WGSL
+    /// side would align a `vec4` to 16 and read from offset 32.
+    radius: f32,
+    size: [f32; 2],
+    source: [f32; 4],
 }
 
 impl Uniform {
-    fn from_layer(t: Transform, opacity: f32) -> Self {
+    fn from_layer(t: Transform, opacity: f32, shape: Shape) -> Self {
         Self {
             transform: [t.scale_x, t.scale_y, t.offset_x, t.offset_y],
             opacity,
-            _pad: [0.0; 3],
+            radius: shape.radius,
+            size: [shape.size.0, shape.size.1],
+            source: shape.source,
         }
+    }
+}
+
+/// A layer's rounded-rect mask: how round its corners are, on a surface this size.
+///
+/// Radius in *device pixels*, because that is the only unit in which a corner stays circular
+/// on a layer of any aspect — and a demoted card is 16:9 while the panel it came from may not
+/// be. Zero is a square corner and costs the shader one comparison.
+#[derive(Debug, Clone, Copy)]
+pub struct Shape {
+    /// Corner radius, device pixels.
+    pub radius: f32,
+    /// The layer's on-screen size, device pixels.
+    pub size: (f32, f32),
+    /// Which part of the texture to sample — see [`crate::compositor::cover_source`].
+    pub source: [f32; 4],
+}
+
+impl Default for Shape {
+    /// Square corners, and the whole texture.
+    ///
+    /// Hand-written, because the derived one would zero the source scale and every layer would
+    /// sample a single texel.
+    fn default() -> Self {
+        Self {
+            radius: 0.0,
+            size: (0.0, 0.0),
+            source: crate::compositor::FULL_SOURCE,
+        }
+    }
+}
+
+impl Shape {
+    /// The NV12 layout's form: a whole `vec4`, which is safe there because it lands at offset
+    /// 80 — already 16-aligned.
+    fn packed(self) -> [f32; 4] {
+        [self.radius, self.size.0, self.size.1, 0.0]
     }
 }
 
@@ -166,10 +261,14 @@ struct Nv12Uniform {
     m2: [f32; 4],
     /// `xyz` = YUV zero point, `w` = opacity.
     offset: [f32; 4],
+    /// `(radius px, width px, height px, unused)` — see [`Shape`]. A sixth vec4 rather than
+    /// stolen padding, because this layout had none going spare.
+    shape: [f32; 4],
+    source: [f32; 4],
 }
 
 impl Nv12Uniform {
-    fn from_layer(t: Transform, opacity: f32, yuv: YuvMatrix) -> Self {
+    fn from_layer(t: Transform, opacity: f32, yuv: YuvMatrix, shape: Shape) -> Self {
         let row = |r: [f32; 3]| [r[0], r[1], r[2], 0.0];
         Self {
             transform: [t.scale_x, t.scale_y, t.offset_x, t.offset_y],
@@ -177,6 +276,8 @@ impl Nv12Uniform {
             m1: row(yuv.matrix[1]),
             m2: row(yuv.matrix[2]),
             offset: [yuv.offset[0], yuv.offset[1], yuv.offset[2], opacity],
+            shape: shape.packed(),
+            source: shape.source,
         }
     }
 }
@@ -255,17 +356,17 @@ impl LayerGpu {
 
     /// Rewrite this layer's uniform for a new transform/opacity, in whichever layout its
     /// pipeline expects.
-    fn write_uniform(&self, queue: &wgpu::Queue, transform: Transform, opacity: f32) {
+    fn write_uniform(&self, queue: &wgpu::Queue, transform: Transform, opacity: f32, shape: Shape) {
         match &self.texture {
             LayerTexture::Packed { .. } => queue.write_buffer(
                 &self.uniform,
                 0,
-                bytemuck::bytes_of(&Uniform::from_layer(transform, opacity)),
+                bytemuck::bytes_of(&Uniform::from_layer(transform, opacity, shape)),
             ),
             LayerTexture::Nv12 { yuv, .. } => queue.write_buffer(
                 &self.uniform,
                 0,
-                bytemuck::bytes_of(&Nv12Uniform::from_layer(transform, opacity, *yuv)),
+                bytemuck::bytes_of(&Nv12Uniform::from_layer(transform, opacity, *yuv, shape)),
             ),
         }
     }
@@ -347,6 +448,14 @@ pub struct WgpuCompositor {
     /// hiding ([`LayerId::yields_to`]) is derived, not stored. Both halves are applied
     /// in [`Self::hidden`], which drawing and occlusion consult.
     suppressed: std::collections::BTreeSet<LayerId>,
+    /// Per-layer texture crop, absent where the whole texture is sampled.
+    sources: std::collections::BTreeMap<LayerId, [f32; 4]>,
+    /// Per-layer corner radius in device pixels, `0.0` where absent.
+    ///
+    /// Driven from outside every frame, exactly like [`Self::set_suppressed`] and for the same
+    /// reason: it is a *standing fact* the render loop recomputes from where a surface's motion
+    /// currently has it, not a property of the layer that anyone has to remember to update.
+    radii: std::collections::BTreeMap<LayerId, f32>,
     /// Set when the device was opened with the external-memory extensions a hardware
     /// decoder's surfaces need. `None` once we have concluded it cannot import.
     importer: Option<GpuImporter>,
@@ -399,6 +508,8 @@ impl WgpuCompositor {
             },
             layers: HashMap::new(),
             suppressed: std::collections::BTreeSet::new(),
+            radii: std::collections::BTreeMap::new(),
+            sources: std::collections::BTreeMap::new(),
             importer,
         })
     }
@@ -460,6 +571,8 @@ impl WgpuCompositor {
             target: Target::Surface { surface, config },
             layers: HashMap::new(),
             suppressed: std::collections::BTreeSet::new(),
+            radii: std::collections::BTreeMap::new(),
+            sources: std::collections::BTreeMap::new(),
             importer,
         })
     }
@@ -593,7 +706,11 @@ impl WgpuCompositor {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("layer-uniform"),
-                contents: bytemuck::bytes_of(&Uniform::from_layer(meta.transform, meta.opacity)),
+                contents: bytemuck::bytes_of(&Uniform::from_layer(
+                    meta.transform,
+                    meta.opacity,
+                    Shape::default(),
+                )),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -709,6 +826,20 @@ impl WgpuCompositor {
             .map(|(t, _)| (t.width(), t.height()))
     }
 
+    /// Where a layer is currently placed, if it is composited.
+    ///
+    /// The companion of [`Self::layer_size`], and there for the same reason: "did that screen
+    /// go back into the tile it came out of" is a question about the *placement* a test has to
+    /// be able to read, and measuring it out of the composited image depends on what the
+    /// screen happens to contain.
+    #[must_use]
+    pub fn layer_transform(&self, id: LayerId) -> Option<crate::compositor::Transform> {
+        self.layers
+            .get(&id)
+            .filter(|s| s.gpu.is_some())
+            .map(|s| s.meta.transform)
+    }
+
     pub fn has_layer(&self, id: LayerId) -> bool {
         self.layers.get(&id).is_some_and(|s| s.gpu.is_some())
     }
@@ -718,6 +849,81 @@ impl WgpuCompositor {
     /// The render loop calls this every pump with the shell's verdict on the idle
     /// widget, so suppression is a recomputed fact, not a transition anyone can miss.
     /// The layer keeps its texture and keeps receiving imports; it is only not drawn.
+    /// How a layer draws: its corner radius, the on-screen size that radius is in pixels *of*,
+    /// and which part of its texture to sample.
+    ///
+    /// The size comes from the transform rather than from the texture, because a demoted card
+    /// is a full-panel texture drawn small — the corner has to be round on the glass, not round
+    /// in the source.
+    fn shape_of(&self, layer: &Layer) -> Shape {
+        let (w, h) = self.target_size();
+        Shape {
+            radius: self.radii.get(&layer.id).copied().unwrap_or_default(),
+            size: (
+                layer.transform.scale_x * w as f32,
+                layer.transform.scale_y * h as f32,
+            ),
+            source: self
+                .sources
+                .get(&layer.id)
+                .copied()
+                .unwrap_or(crate::compositor::FULL_SOURCE),
+        }
+    }
+
+    /// Sample only part of a layer's texture, so a container of the wrong shape crops its
+    /// content rather than stretching it. See [`crate::compositor::cover_source`].
+    ///
+    /// Pushed every frame like [`Self::set_radius`], and for the same reason: it is derived from
+    /// where a motion currently has the layer, not a property anyone should have to remember.
+    pub fn set_source(&mut self, id: LayerId, source: [f32; 4]) {
+        let full = crate::compositor::FULL_SOURCE;
+        let changed = self.sources.get(&id).copied().unwrap_or(full) != source;
+        if source == full {
+            self.sources.remove(&id);
+        } else {
+            self.sources.insert(id, source);
+        }
+        if !changed {
+            return;
+        }
+        let Some(state) = self.layers.get(&id) else {
+            return;
+        };
+        let meta = state.meta.clone();
+        let shape = self.shape_of(&meta);
+        if let Some(gpu) = self.layers.get(&id).and_then(|s| s.gpu.as_ref()) {
+            gpu.write_uniform(&self.queue, meta.transform, meta.opacity, shape);
+        }
+    }
+
+    /// Round a layer's corners, in device pixels. `0.0` is square.
+    ///
+    /// The animation's, not the layer's: a surface travelling into the rounded card slot has to
+    /// *become* round on the way, or the corners pop at the end and the travel reads as a
+    /// scale rather than as an object moving. Recomputed and pushed every frame.
+    pub fn set_radius(&mut self, id: LayerId, radius: f32) {
+        let changed = self.radii.get(&id).copied().unwrap_or_default() != radius;
+        if radius > 0.0 {
+            self.radii.insert(id, radius);
+        } else {
+            self.radii.remove(&id);
+        }
+        // Push it straight through rather than waiting for the next `upsert_layer`, so a
+        // caller that sets a radius and does not also re-place the layer still gets it.
+        if !changed {
+            return;
+        }
+        let Some(state) = self.layers.get(&id) else {
+            return;
+        };
+        let meta = state.meta.clone();
+        let shape = self.shape_of(&meta);
+        if let Some(gpu) = self.layers.get(&id).and_then(|s| s.gpu.as_ref()) {
+            gpu.write_uniform(&self.queue, meta.transform, meta.opacity, shape);
+        }
+    }
+
     pub fn set_suppressed(&mut self, id: LayerId, on: bool) {
         if on {
             self.suppressed.insert(id);
@@ -729,8 +935,8 @@ impl WgpuCompositor {
     /// Whether `id` is hidden this frame: suppressed from outside, or yielding to a
     /// present layer per [`LayerId::yields_to`]. The single visibility gate — drawing
     /// and occlusion both consult it, so what the glass shows and what input believes
-    /// cannot disagree.
-    fn hidden(&self, id: LayerId) -> bool {
+    /// cannot disagree. Public so tests can assert on what the glass would show.
+    pub fn hidden(&self, id: LayerId) -> bool {
         self.suppressed.contains(&id) || id.yields_to().iter().any(|&above| self.has_layer(above))
     }
 
@@ -767,7 +973,11 @@ impl WgpuCompositor {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("layer-uniform-browser"),
-                contents: bytemuck::bytes_of(&Uniform::from_layer(meta.transform, meta.opacity)),
+                contents: bytemuck::bytes_of(&Uniform::from_layer(
+                    meta.transform,
+                    meta.opacity,
+                    Shape::default(),
+                )),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -869,6 +1079,7 @@ impl WgpuCompositor {
                     meta.transform,
                     meta.opacity,
                     yuv,
+                    Shape::default(),
                 )),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
@@ -1133,6 +1344,9 @@ impl WgpuCompositor {
 
 impl Compositor for WgpuCompositor {
     fn upsert_layer(&mut self, layer: Layer) {
+        // Taken before the entry is borrowed: the shape depends on the radius map and the
+        // surface size, neither of which the entry owns.
+        let shape = self.shape_of(&layer);
         let entry = self.layers.entry(layer.id).or_insert_with(|| LayerState {
             meta: layer.clone(),
             gpu: None,
@@ -1140,7 +1354,7 @@ impl Compositor for WgpuCompositor {
         entry.meta = layer.clone();
         // If the layer already has a texture, push the new transform/opacity to its uniform.
         if let Some(gpu) = &entry.gpu {
-            gpu.write_uniform(&self.queue, layer.transform, layer.opacity);
+            gpu.write_uniform(&self.queue, layer.transform, layer.opacity, shape);
         }
     }
 
@@ -1397,6 +1611,17 @@ fn build_programs(device: &wgpu::Device, format: wgpu::TextureFormat) -> Program
     }
 }
 
+/// The uniform layouts, asserted at compile time.
+///
+/// A WGSL `struct` aligns each member by its own alignment, so adding a field on one side and
+/// not matching it on the other does not fail to compile — it draws every layer from the wrong
+/// bytes, which looks like a rendering bug anywhere but here. These are the sizes the shaders'
+/// own comments claim.
+const _: () = {
+    assert!(std::mem::size_of::<Uniform>() == 48);
+    assert!(std::mem::size_of::<Nv12Uniform>() == 112);
+};
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1444,6 +1669,116 @@ mod tests {
         // Center pixel should be red.
         let idx = ((16 * 32) + 16) * 4;
         assert_eq!(&px[idx..idx + 4], &[255, 0, 0, 255], "center should be red");
+    }
+
+    #[test]
+    fn a_radius_rounds_the_corners_and_leaves_the_middle_alone() {
+        // The shader half of the motion work. Without it an app travels into a rounded card
+        // with square corners, which is the one artefact that makes a transition read as a
+        // scale rather than as an object moving — so it is worth a pixel test rather than a
+        // trust exercise.
+        let mut c = compositor_or_skip!(32, 32);
+        c.upload_texture(
+            LayerId::Video,
+            4,
+            4,
+            TexelFormat::Rgba8,
+            &solid(4, 4, [255, 0, 0, 255]),
+        )
+        .unwrap();
+        let at = |px: &[u8], x: usize, y: usize| {
+            let i = ((y * 32) + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+
+        // Square first, so the corner's *change* is what is being measured rather than
+        // whatever the clear colour happens to be.
+        c.set_radius(LayerId::Video, 0.0);
+        c.upsert_layer(Layer {
+            id: LayerId::Video,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        c.present();
+        let square = c.read_rgba().unwrap();
+        assert_eq!(at(&square, 0, 0), [255, 0, 0, 255], "square: corner is red");
+
+        // A radius of a third of the surface: the corner has to go, the middle must not.
+        c.set_radius(LayerId::Video, 10.0);
+        c.present();
+        let round = c.read_rgba().unwrap();
+        assert!(
+            at(&round, 0, 0)[0] < 40,
+            "the corner should be cut away, got {:?}",
+            at(&round, 0, 0)
+        );
+        assert_eq!(
+            at(&round, 16, 16),
+            [255, 0, 0, 255],
+            "the middle is not a corner"
+        );
+        // Edge midpoints are on the straight part of the rounded rect and must survive, or the
+        // radius is being applied as an inset rather than as a corner.
+        assert_eq!(at(&round, 16, 0), [255, 0, 0, 255], "top edge midpoint");
+        assert_eq!(at(&round, 0, 16), [255, 0, 0, 255], "left edge midpoint");
+
+        // And back to square, so the radius is genuinely per-frame state and not a one-way door.
+        c.set_radius(LayerId::Video, 0.0);
+        c.present();
+        assert_eq!(
+            at(&c.read_rgba().unwrap(), 0, 0),
+            [255, 0, 0, 255],
+            "square again"
+        );
+    }
+
+    #[test]
+    fn a_cropped_source_shows_the_middle_of_the_texture_rather_than_all_of_it_squashed() {
+        // The other half of the container transform, and the one geometry tests cannot see: does
+        // the crop actually reach the sampler.
+        //
+        // Eight texels in four *pairs*, drawn across four pixels. That pairing is what makes the
+        // readback exact under a linear sampler: every pixel centre lands either on a texel
+        // centre or exactly between two texels of the same colour, so there is nothing to blend.
+        // Sampling the middle half then maps the four pixels onto texels 2..5 — one colour each,
+        // no interpolation — which is the only way to assert a crop rather than infer one.
+        let mut c = compositor_or_skip!(4, 4);
+        let (a, b, d, e) = (
+            [255u8, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+        );
+        let strip: Vec<u8> = [a, a, b, b, d, d, e, e].concat();
+        c.upload_texture(LayerId::Video, 8, 1, TexelFormat::Rgba8, &strip)
+            .unwrap();
+        c.upsert_layer(Layer {
+            id: LayerId::Video,
+            opacity: 1.0,
+            transform: Transform::default(),
+        });
+        // Row 1 of 4, so the sample is clear of any edge behaviour at the top row.
+        let column = |px: &[u8], x: usize| {
+            let i = (4 + x) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        c.present();
+        let px = c.read_rgba().unwrap();
+        assert_eq!(column(&px, 0), [255, 0, 0], "uncropped: red leads");
+        assert_eq!(column(&px, 3), [255, 255, 0], "uncropped: yellow trails");
+
+        // The middle half: the two inner pairs, across the whole surface.
+        c.set_source(LayerId::Video, [0.25, 0.0, 0.5, 1.0]);
+        c.present();
+        let px = c.read_rgba().unwrap();
+        assert_eq!(column(&px, 0), [0, 255, 0], "cropped: green now leads");
+        assert_eq!(column(&px, 3), [0, 0, 255], "cropped: blue now trails");
+
+        // And back, so the crop is per-frame state rather than a one-way door.
+        c.set_source(LayerId::Video, crate::compositor::FULL_SOURCE);
+        c.present();
+        assert_eq!(column(&c.read_rgba().unwrap(), 0), [255, 0, 0]);
     }
 
     #[test]

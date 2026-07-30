@@ -53,7 +53,7 @@ use proto_spotify::SpotifyService;
 use substrate_mdns::MdnsResponder;
 use substrate_ssdp::{Responder, ResponderConfig, SsdpDevice};
 use tokio::sync::{mpsc, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 
@@ -61,12 +61,30 @@ use crate::config::Config;
 /// the box, however many services it publishes.
 const MDNS_HOST: &str = "castaway";
 
+/// The command line. Small on purpose: the config file is the interface, and the flags
+/// only answer "which file?" and the read-only surface query.
+#[derive(Debug, clap::Parser)]
+#[command(name = "castaway", version, about = "Universal cast receiver")]
+struct Cli {
+    /// Path to the config file. Without it (or $CASTAWAY_CONFIG), `castaway.toml` in
+    /// the working directory is used if present, else the platform config directory
+    /// ($XDG_CONFIG_HOME/castaway/castaway.toml, or %LOCALAPPDATA%\castaway\config).
+    #[arg(long, value_name = "PATH", env = config::CONFIG_ENV)]
+    config: Option<std::path::PathBuf>,
+    /// Print every socket this config binds, and exit.
+    #[arg(long, value_name = "FORMAT", num_args = 0..=1, default_missing_value = "table")]
+    network_surface: Option<surface::Format>,
+}
+
 fn main() -> anyhow::Result<()> {
+    let cli = <Cli as clap::Parser>::parse();
+    // Resolved once, and handed to both the loader and the settings store: the file the
+    // screen saves settings into is by construction the file the next boot reads.
+    let location = config::ConfigLocation::from_cli(cli.config);
     // A query, not a run: print what this config binds and exit before any socket is
     // bound or log file created.
-    if let Some(format) = surface::requested(std::env::args().skip(1)) {
-        let format = format.map_err(|e| anyhow::anyhow!(e))?;
-        let config = Config::from_env().context("loading config")?;
+    if let Some(format) = cli.network_surface {
+        let config = Config::load_at(&location).context("loading config")?;
         print!("{}", surface::render(format, &config));
         return Ok(());
     }
@@ -78,8 +96,13 @@ fn main() -> anyhow::Result<()> {
     // re-execed this same binary as Chromium's subprocess, and getting the order wrong
     // silently un-instrumented the renderer. The browser is its own process now, and it
     // reports through the protocol, so there is nothing to sequence against — D36.)
-    let config = Config::from_env().context("loading config")?;
+    let config = Config::load_at(&location).context("loading config")?;
     logging::init(&config.log, castaway_paths::host());
+    info!(
+        path = %location.path().display(),
+        origin = ?location.origin(),
+        "config"
+    );
     // A category name that is not one of SponsorBlock's parses to "unknown" rather than
     // failing, which for a *response* is the point and for *config* is a silent typo.
     if config.unknown_sponsorblock_categories() > 0 {
@@ -212,7 +235,7 @@ fn main() -> anyhow::Result<()> {
         let settings_catalog =
             settings::Catalog::new(vec![Arc::new(settings::OutputDeviceSetting::new(
                 audio_selector.clone(),
-                settings::ConfigStore::from_env(),
+                settings::ConfigStore::at(&location),
             ))]);
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
@@ -523,7 +546,7 @@ struct ShellChannels {
     /// Screens to show in answer. Bounded and drop-on-full like every other render
     /// command — a shell update that cannot get through is one frame of staleness, not a
     /// reason to block the runtime.
-    render: std::sync::mpsc::SyncSender<pipeline::render_pipeline::RenderCommand>,
+    render: pipeline::RenderTx,
     /// What the Settings tile opens: this build's settings, ready to list and apply.
     settings: settings::Catalog,
 }
@@ -549,13 +572,26 @@ async fn serve(
         #[cfg(feature = "render")]
         shell,
     } = handles;
-    let iface = config.resolved_interface();
+    let (iface, iface_source) = config.resolved_interface_with_source();
     info!(
         name = %config.friendly_name,
         interface = %iface,
+        source = ?iface_source,
         http_port = config.http_port,
         "castaway services starting"
     );
+    // The fallback is right — a box with no route should still boot and render — but
+    // it must not be *quiet*: every mDNS record, SSDP LOCATION and DIAL URL below
+    // will now name an address no other machine can dial, so from the LAN the
+    // receiver simply does not exist. Say so, once, where an operator reading the
+    // log after "nothing can see it" will find the fix.
+    if iface_source == config::InterfaceSource::LoopbackFallback {
+        error!(
+            "no LAN IPv4 address could be auto-detected; advertising on 127.0.0.1, so \
+             no device on the network can discover or reach this receiver. Set \
+             `interface = \"<this box's LAN IPv4>\"` in castaway.toml to fix this."
+        );
+    }
 
     // Validated once, up front, and failed loudly: a broken [media_ports] range means
     // the operator asked to control where media sockets land, and booting on the
@@ -630,6 +666,15 @@ async fn serve(
     // and then browses a session that will never play. D16's rule ("advertising a service
     // with no listener only frustrates senders") is the same rule here, and a missing
     // launch target is a missing listener.
+    // The panel's close badge on a demoted page. A channel rather than a callback
+    // because the two ends live in different arms of this function: the badge is
+    // pressed in the shell (below), and the thing it stops is the DIAL launch (here).
+    // With no DIAL to stop, the receiver is simply dropped and a press goes nowhere —
+    // which cannot happen on a panel, since without a browser there is no page to
+    // have demoted in the first place.
+    // (Unused in a build with no panel to press it on; honest rather than dead.)
+    #[cfg_attr(not(feature = "render"), allow(unused_variables))]
+    let (close_page_tx, mut close_page_rx) = mpsc::unbounded_channel::<()>();
     match (config.enable.dial, on_dial) {
         (true, None) => warn!(
             "DIAL disabled: this build has no kiosk browser to launch YouTube in \
@@ -686,6 +731,19 @@ async fn serve(
                 tokio::spawn(async move {
                     while abandoned.recv().await.is_some() {
                         dial.abandoned().await;
+                    }
+                });
+            }
+            // The close badge takes the same exit a phone's stop button does: the page
+            // hides, the app state reads stopped, the screen slot clears — and the
+            // widget goes back to being the clock.
+            {
+                let dial = dial.clone();
+                let tx = dial_tx.clone();
+                tokio::spawn(async move {
+                    while close_page_rx.recv().await.is_some() {
+                        dial.abandoned().await;
+                        let _ = tx.send(proto_dial::DialEvent::Stopped).await;
                     }
                 });
             }
@@ -834,6 +892,7 @@ async fn serve(
             commands,
             settings,
             osd.clone(),
+            close_page_tx.clone(),
         )));
     }
 
@@ -876,6 +935,18 @@ async fn serve(
         "/screenshot.png",
         axum::routing::get(screenshot_route).with_state(screenshot),
     );
+    // The root answered 404, and the root is exactly the URL a person types after
+    // reading the advertised host:port off the panel — so "working as intended" read
+    // as "the receiver is down". A landing page is the cheapest health signal there
+    // is; a real web control UI can replace this handler without moving the URL.
+    let landing = landing_page(&config);
+    let http = http.route(
+        "/",
+        axum::routing::get(move || {
+            let page = landing.clone();
+            async move { axum::response::Html(page) }
+        }),
+    );
 
     info!(%addr, "HTTP host listening");
     let http_shutdown = shutdown.clone();
@@ -902,6 +973,51 @@ async fn serve(
     .await;
     drop(mdns);
     Ok(())
+}
+
+/// The page at `/`: who this receiver is and which surfaces it is offering.
+///
+/// Rendered once at startup from the loaded config — it states what this boot
+/// *advertises*, which is a config fact, not live session state. Anything dynamic
+/// belongs to the future control UI, not here.
+fn landing_page(config: &Config) -> String {
+    // The friendly name is operator input headed into markup; everything else
+    // interpolated below is our own constants.
+    let name = config
+        .friendly_name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let mut services = String::new();
+    for (on, label) in [
+        (config.enable.cast, "Google Cast"),
+        (config.enable.airplay, "AirPlay"),
+        (config.enable.dlna, "DLNA MediaRenderer"),
+        (config.enable.dial, "YouTube (DIAL)"),
+        (config.enable.spotify, "Spotify Connect"),
+        (config.enable.bluetooth, "Bluetooth audio"),
+        (config.enable.miracast, "Miracast"),
+        (config.enable.gamestream, "GameStream (Moonlight client)"),
+    ] {
+        if on {
+            services.push_str(&format!("<li>{label}</li>\n"));
+        }
+    }
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{name} · castaway</title>\
+         <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:38rem;\
+         margin:3rem auto;padding:0 1rem;background:#111;color:#eee}}\
+         a{{color:#8cf}}h1{{font-size:1.4rem}}li{{margin:.2rem 0}}</style>\
+         </head><body>\
+         <h1>{name}</h1>\
+         <p>castaway {version} is up. This box accepts:</p>\
+         <ul>{services}</ul>\
+         <p><a href=\"/screenshot.png\">What the panel is showing right now</a></p>\
+         </body></html>",
+        version = env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// Stand up the CASTv2 TLS listener, advertise what it asks for, and run it until
@@ -1580,6 +1696,26 @@ fn derive_mac(uuid: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::device_uuid;
+
+    /// The page at `/` names the box, says what is on, and omits what is off —
+    /// with the operator's name HTML-escaped on its way into markup.
+    #[test]
+    fn the_landing_page_states_the_advertised_surface() {
+        let mut config = crate::config::Config {
+            friendly_name: "Lab <TV> & friends".to_owned(),
+            ..Default::default()
+        };
+        config.enable.miracast = false;
+        let page = super::landing_page(&config);
+        assert!(page.contains("Lab &lt;TV&gt; &amp; friends"));
+        assert!(!page.contains("Lab <TV>"), "raw markup must not survive");
+        assert!(page.contains("Google Cast"));
+        assert!(
+            !page.contains("Miracast"),
+            "a disabled surface is not listed"
+        );
+        assert!(page.contains("/screenshot.png"));
+    }
 
     #[test]
     fn each_protocol_gets_its_own_device_uuid_and_keeps_it() {

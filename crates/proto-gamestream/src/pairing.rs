@@ -48,6 +48,46 @@ pub struct PairingSeed {
     pub secret: [u8; 16],
 }
 
+/// A 4-digit pairing PIN — the human half of the handshake.
+///
+/// The PIN is ASCII text, not a number: the AES key is `SHA-256(salt ‖ digits)`, so
+/// `0007` and `7` derive different keys, and Sunshine's own entry field requires exactly
+/// four digit characters (docs/gamestream-protocol-notes.md §3). This type carries that
+/// invariant so a PIN cannot exist half-formatted — [`std::fmt::Display`] is the one
+/// rendering, always four digits, leading zeros kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingPin(u16);
+
+impl PairingPin {
+    /// A fresh PIN from the OS RNG.
+    ///
+    /// OS randomness, not a timestamp: the PIN is the only secret gating the handshake
+    /// against everyone else on the LAN, and it is about to be shown on a wall — the
+    /// window where guessability matters is exactly the window it is being typed in.
+    #[must_use]
+    pub fn generate() -> Self {
+        use rand::Rng;
+        Self(rand::rngs::OsRng.gen_range(0..=9999u16))
+    }
+
+    /// A PIN from a value someone already has. `None` above 9999 — a fifth digit is not
+    /// a PIN the host would accept.
+    #[must_use]
+    pub const fn from_value(value: u16) -> Option<Self> {
+        if value <= 9999 {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for PairingPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04}", self.0)
+    }
+}
+
 /// The `/pair` query values a phase asks the transport to send. Values only — the
 /// `nvhttp` module owns parameter names and ordering.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,6 +593,30 @@ mod tests {
     use hex_literal::hex;
 
     use super::*;
+
+    #[test]
+    fn a_pin_formats_as_exactly_four_digits_with_leading_zeros() {
+        // The failure this catches is silent and total: the AES key is a hash of the
+        // PIN's ASCII text, so a PIN shown as "7" while the handshake hashes "0007"
+        // fails every pairing whose PIN starts with a zero — about a third of them —
+        // with nothing anywhere saying why.
+        assert_eq!(PairingPin::from_value(7).unwrap().to_string(), "0007");
+        assert_eq!(PairingPin::from_value(0).unwrap().to_string(), "0000");
+        assert_eq!(PairingPin::from_value(9999).unwrap().to_string(), "9999");
+        assert!(PairingPin::from_value(10_000).is_none());
+    }
+
+    #[test]
+    fn generated_pins_are_always_four_ascii_digits() {
+        for _ in 0..256 {
+            let text = PairingPin::generate().to_string();
+            assert_eq!(text.len(), 4, "not four characters: {text}");
+            assert!(
+                text.bytes().all(|b| b.is_ascii_digit()),
+                "not digits: {text}"
+            );
+        }
+    }
 
     /// The host credentials Sunshine's own pairing unit test uses
     /// (`tests/unit/test_http_pairing.cpp`, GamesOnWhales/localhost). Its checked-in

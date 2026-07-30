@@ -164,6 +164,15 @@ is promoting them into `text.rs`, not writing them.
 The cost is honest and worth stating: no CSS, no layout engine, no free animation curves,
 and #24's mascot-and-flourish ambitions are more work than they would be in a page.
 
+The animation curves are the part that has since been paid for, and the bill came to two
+pure modules rather than a framework (D46). `panel` is what the panel *is* — which screens
+are stacked, which surfaces exist, who has the glass — with everything else derived from it;
+`motion` is how it moves between those states, as springs against one choreography table.
+Writing them by hand bought two things a page would not have given: the transitions are
+unit-tested without a GPU, and the model that decides them is the same one that answers
+input, so what the glass shows and what a touch means cannot disagree. That equivalence was
+not available when the two were separate, and its absence was the bug.
+
 ---
 
 ## 4. Getting home from a fullscreen browser
@@ -282,7 +291,11 @@ Landed, in this order, each independently useful:
    thing anyone saw and none of it was about what they were doing.
 5. **Input routing.** Transport, then shell, then browser; the middle only where nothing
    covers it.
-6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes Q44.
+6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes Q44. Pairing is
+   part of the walk-up now: pressing an unpaired host shows a panel-generated PIN and
+   waits for it to be typed into Sunshine's web UI — one pairing at a time, a
+   three-minute panel-side timeout (the protocol layer rightly has none), and a retry
+   row on failure. The config-driven startup pairing shares the same adapter call.
 7. **The home gesture.** Left-edge swipe and a fading pill, with `cancel_all` so nothing
    is left holding a finger.
 8. **PiP and the idle return** (#28, #27). Bringing the shell forward demotes a playing

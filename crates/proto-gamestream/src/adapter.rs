@@ -303,7 +303,24 @@ impl GameStreamAdapter {
         Ok(client)
     }
 
-    async fn handle_pair(&self, host: &str, pin: &str) -> Result<(), GameStreamError> {
+    /// Run the pairing handshake with a host and persist the result.
+    ///
+    /// Public for the same reason [`Self::apps_for`] is (D38): the panel's shell is a
+    /// second caller, and unlike the config-driven [`GameStreamCommand::Pair`] it needs
+    /// the *verdict* — a screen has to change on success and say why on failure, which
+    /// a fire-and-forget command cannot carry.
+    ///
+    /// Blocks for as long as the host's side takes: Sunshine parks the first response
+    /// until someone types the PIN into its web UI, so this returns when a human acts.
+    /// There is deliberately no timeout here (docs/gamestream-protocol-notes.md §3 —
+    /// "a wait to allow, not a timeout to tune"); a caller with a screen to keep honest
+    /// owns its own.
+    ///
+    /// # Errors
+    /// [`GameStreamError::WrongPin`] when the digits typed on the host were not these;
+    /// [`GameStreamError::Pairing`] when a trust check failed; transport errors as the
+    /// client reports them.
+    pub async fn pair(&self, host: &str, pin: &str) -> Result<(), GameStreamError> {
         let (address, port) = self
             .resolve(host)
             .await
@@ -565,7 +582,7 @@ impl SourceAdapter for GameStreamAdapter {
                 },
                 command = commands.recv() => match command {
                     Some(GameStreamCommand::Pair { host, pin }) => {
-                        if let Err(e) = self.handle_pair(&host, &pin).await {
+                        if let Err(e) = self.pair(&host, &pin).await {
                             warn!(%host, error = %e, "GameStream pairing failed");
                         }
                     }

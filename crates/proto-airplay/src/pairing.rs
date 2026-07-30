@@ -61,9 +61,15 @@ const VERIFY2_LEN: usize = 4 + SIG_LEN;
 
 /// The receiver's long-term Ed25519 identity.
 ///
-/// Derived from the same stable seed the advertisement's `pk` is, so the key a sender
-/// pins today is the key it verifies against tomorrow. A random key per boot would make
-/// every restart look like a different device to anything that remembers.
+/// Derived from a stable seed (the pairing UUID), so the key a sender pins today is the
+/// key it verifies against tomorrow. A random key per boot would make every restart
+/// look like a different device to anything that remembers.
+///
+/// The advertised `pk` — mDNS TXT and `/info` — is **this key**, via
+/// [`Self::public_key_hex`]: `advert.rs` calls into here rather than deriving its own.
+/// It used to derive one (SHA-256 of the seed, where this key's seed is SHA-512), and
+/// the two disagreed — a sender that pinned the advertisement then watched
+/// `/pair-setup` hand over a different identity.
 #[derive(Debug, Clone)]
 pub struct PairingIdentity {
     signing: SigningKey,
@@ -85,6 +91,17 @@ impl PairingIdentity {
     #[must_use]
     pub fn public_key(&self) -> [u8; KEY_LEN] {
         self.signing.verifying_key().to_bytes()
+    }
+
+    /// The public half as the 64 lowercase hex chars the `pk` TXT records and the
+    /// `/info` plist carry. Lives here so the advertisement and the pairing layer
+    /// share one derivation and cannot diverge again.
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        self.public_key()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// The `/pair-setup` response body: our public key, raw.

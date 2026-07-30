@@ -1,15 +1,25 @@
 # The full Linux kiosk build — renderer, browser, sound, Bluetooth, GameStream. This is
 # `packages.default` on Linux, so it is what `nix run .` gives you.
 #
-# Every optional feature is on here except one. `electron` implies `render` and `hwaccel`;
+# Every optional feature is on here. `electron` implies `render` and `hwaccel`;
 # `audio-out` adds the A2DP decoders and a real PCM device; `bluetooth-socket` adds the
 # `socket:N` transport beside the USB default; `gamestream` links moonlight-common-c so
 # the GameStream client can actually stream — which makes *this artifact* GPL-3.0-bound
 # (D37): fine for the panel it runs on, but it is why `castaway-portable` and the MIT
-# source tree stay clean of it. The exception is `ldac`, which is *not* a
-# capability but an advertisement: the slot exists and the decoder does not (Q22), so a
-# build with it on offers senders a codec it will then fail to decode, turning a session
-# that would have fallen back to SBC into silence. It stays off until libldacdec lands.
+# source tree stay clean of it. `ldac` links Sony's `libldacBT` for the one A2DP codec
+# ffmpeg cannot decode (Q22) — Apache-2.0, so unlike GameStream it binds nothing.
+#
+# `ldac` used to be the one exception here, and the reason is worth keeping: the feature
+# bound nothing, so a build with it on advertised a codec it would then fail to decode and
+# turned a session that should have fallen back to SBC into silence (Q22). That cannot
+# recur — `can_decode` asks the library for a handle rather than reading the flag.
+#
+# Note what having the feature on does *not* do: advertise the endpoint. LDAC is in
+# `bluetooth::OPT_IN`, so this artifact carries a working decoder and still offers senders
+# the same four codecs as before until `codecs = ["ldac", "sbc"]` is in the config. It sits
+# first in preference order, so switching it on by default would not add an option — it
+# would change what every capable sender negotiates, on a panel nobody is watching, before
+# one has ever streamed to it.
 #
 # `packages.castaway-portable` is the old default: no renderer, no browser, nothing
 # platform-specific. That is the right build for CI and for proving the protocol stack,
@@ -24,14 +34,14 @@
 # LD_LIBRARY_PATH is still set, but only for *our* binary now — the Vulkan/Wayland/X11
 # libraries winit and wgpu dlopen. The browser brings its own, because it is a separate
 # process with its own wrapper.
-{ pkgs, craneLib, commonArgs, electron, widevineCdm, moonlightCommonC }:
+{ pkgs, craneLib, commonArgs, electron, widevineCdm, moonlightCommonC, ldacbt }:
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
   # audio decoders) and ALSA for the PCM device.
   kioskArgs = {
     pname = "castaway";
-    cargoExtraArgs = "--package castaway --features electron,audio-out,audio-pipewire,bluetooth-socket,gamestream";
+    cargoExtraArgs = "--package castaway --features electron,audio-out,audio-pipewire,bluetooth-socket,gamestream,ldac";
 
     nativeBuildInputs = [
       pkgs.pkg-config
@@ -45,6 +55,9 @@ let
       # libpipewire for the native output backend (`audio-pipewire`), which is what
       # makes the settings screen's device list real sinks rather than ALSA shims.
       pkgs.pipewire
+      # Sony's LDAC library (`ldac`). Ours rather than `pkgs.ldacbt`, which under this
+      # nixpkgs pin is built encoder-only — see nix/ldacbt.nix.
+      ldacbt
     ];
 
     # `ffmpeg-sys-next` generates bindings with bindgen, which dlopens libclang and needs
@@ -56,6 +69,11 @@ let
     # library's own archives, and OpenSSL, whose libcrypto PlatformCrypto.c needs.
     MOONLIGHT_COMMON_C_LIB_DIR =
       "${moonlightCommonC}/lib:${pkgs.openssl.out}/lib";
+
+    # Where `ldac-sys`'s build.rs finds `libldacBT` (Q22). Without it the crate emits no
+    # link directive at all, so this artifact would build and then fail to resolve
+    # `ldacBT_decode` — which is the honest failure, but only if the variable is set here.
+    LDACBT_LIB_DIR = "${ldacbt}/lib";
   };
 
   # dlopened at runtime, so they are wrapper-time rather than link-time inputs.
@@ -74,6 +92,8 @@ let
     # moonlight-common-c's libcrypto. The linker's rpath already covers it; this keeps
     # the wrapper's view of the world complete if the store path moves under a copy.
     pkgs.openssl
+    # Same for libldacBT, which unlike moonlight-common-c is linked dynamically.
+    ldacbt
   ];
 in
 craneLib.buildPackage (commonArgs // kioskArgs // {
@@ -103,6 +123,32 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
     # them with a permission error that names a temp file rather than the cause.
     cp -r --no-preserve=mode,ownership ${../browser-host} $out/share/castaway/browser-host
     chmod -R u+w $out/share/castaway/browser-host
+
+    # The icon, the way Wayland actually delivers one: the kiosk window sets
+    # app_id "castaway" (pipeline::kiosk), the compositor looks for a desktop
+    # entry of that name, and the entry's Icon= resolves through the hicolor
+    # theme. X11 gets the icon off the window itself, but keeps WM_CLASS
+    # "castaway" so the same entry matches there too. The rasters are checked
+    # in, generated from castaway-icon.svg by the pipeline `icon_render`
+    # example — this only installs them.
+    for size in 16 24 32 48 64 128 256; do
+      install -Dm444 crates/pipeline/assets/brand/icon/castaway-$size.png \
+        $out/share/icons/hicolor/''${size}x''${size}/apps/castaway.png
+    done
+    install -Dm444 crates/pipeline/assets/brand/castaway-icon.svg \
+      $out/share/icons/hicolor/scalable/apps/castaway.svg
+
+    mkdir -p $out/share/applications
+    cat > $out/share/applications/castaway.desktop <<'EOF'
+    [Desktop Entry]
+    Type=Application
+    Name=castaway
+    Comment=Universal cast receiver
+    Exec=castaway
+    Icon=castaway
+    Categories=AudioVideo;Video;
+    StartupWMClass=castaway
+    EOF
   '';
 
   meta = commonArgs.meta or { } // {

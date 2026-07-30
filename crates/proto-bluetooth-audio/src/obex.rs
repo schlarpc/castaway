@@ -86,6 +86,13 @@ pub enum Header {
     ConnectionId(u32),
     /// Total object length.
     Length(u32),
+    /// GOEP 2.0 Single Response Mode. `0x01` enables it: the responder then streams
+    /// the whole object unprompted instead of waiting for a GET per chunk.
+    ///
+    /// Not optional dressing — over L2CAP (which AVRCP cover art always is, GOEP 2.0
+    /// §4.6) SRM support is mandatory, and a responder that grants it treats a
+    /// continuation GET arriving mid-stream as a protocol violation.
+    SingleResponseMode(u8),
     /// A header we don't model, kept so it round-trips.
     Other {
         /// Header identifier.
@@ -107,7 +114,12 @@ mod hi {
     pub const WHO: u8 = 0x4A;
     pub const CONNECTION_ID: u8 = 0xCB;
     pub const LENGTH: u8 = 0xC3;
+    /// GOEP 2.0's Single Response Mode, a one-byte header (top bits `0b10`).
+    pub const SRM: u8 = 0x97;
 }
+
+/// The value that enables SRM in [`Header::SingleResponseMode`].
+pub const SRM_ENABLE: u8 = 0x01;
 
 impl Header {
     /// Encode into `buf`.
@@ -136,6 +148,10 @@ impl Header {
             Self::Length(v) => {
                 buf.put_u8(hi::LENGTH);
                 buf.put_u32(*v);
+            }
+            Self::SingleResponseMode(v) => {
+                buf.put_u8(hi::SRM);
+                buf.put_u8(*v);
             }
             Self::Other { id, value } => match id >> 6 {
                 0b00 | 0b01 => put_bytes(buf, *id, value),
@@ -218,6 +234,7 @@ impl Header {
                 hi::WHO => Self::Who(value),
                 hi::CONNECTION_ID => Self::ConnectionId(quad(&value)),
                 hi::LENGTH => Self::Length(quad(&value)),
+                hi::SRM => Self::SingleResponseMode(value.first().copied().unwrap_or(0)),
                 other => Self::Other { id: other, value },
             });
             buf = &buf[used..];
@@ -305,6 +322,24 @@ pub enum FetchState {
     Failed,
 }
 
+/// Where Single Response Mode stands for the fetch in flight.
+///
+/// An enum rather than a bool because the dangerous state is the *unanswered* one: until
+/// the responder's first packet arrives we do not know which conversation we are in, and
+/// sending a continuation GET on a guess is exactly the protocol violation SRM exists to
+/// rule out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Srm {
+    /// Offered on the first GET; the responder has not answered yet.
+    Offered,
+    /// Granted: the responder streams every remaining chunk unprompted, and a GET from
+    /// us mid-stream is a violation (observed: an iPhone drops the whole image channel,
+    /// and sometimes the ACL link with it).
+    Active,
+    /// The responder did not echo the offer: classic request/response continuation.
+    Declined,
+}
+
 /// One OBEX session to a peer's image server, good for as many images as the link lasts.
 ///
 /// A sans-I/O state machine: the caller writes [`CoverArtSession::next_request`] to the
@@ -322,6 +357,10 @@ pub struct CoverArtSession {
     connection_id: Option<u32>,
     body: BytesMut,
     max_packet: u16,
+    /// SRM for the fetch in flight. `None` until the first GET of an object has been
+    /// produced — which is also what makes that GET recognisably the first, carrying
+    /// the type, the handle, and the SRM offer.
+    srm: Option<Srm>,
 }
 
 impl CoverArtSession {
@@ -336,6 +375,7 @@ impl CoverArtSession {
             // 0xFFFF would be legal but a responder may honour it literally and exceed
             // the L2CAP MTU we negotiated; the channel MTU is the real ceiling.
             max_packet: max_packet.clamp(0x00FF, 0x1000),
+            srm: None,
         }
     }
 
@@ -365,13 +405,18 @@ impl CoverArtSession {
         }
         self.handle = Some(handle.into());
         self.body.clear();
+        self.srm = None;
         self.state = FetchState::Fetching;
         true
     }
 
     /// The next packet to send, or `None` when there is nothing to say.
-    #[must_use]
-    pub fn next_request(&self) -> Option<Bytes> {
+    ///
+    /// `&mut self` because producing a request *is* a state transition: handing out the
+    /// first GET of an object is what marks SRM as offered, and under an active SRM
+    /// grant this deliberately answers `None` — the responder is streaming, and the one
+    /// thing a client must not do is ask again.
+    pub fn next_request(&mut self) -> Option<Bytes> {
         match self.state {
             FetchState::Connecting => {
                 let mut prefix = BytesMut::with_capacity(4);
@@ -387,31 +432,59 @@ impl CoverArtSession {
                     .encode(),
                 )
             }
-            FetchState::Fetching => {
-                let mut headers = Vec::with_capacity(3);
-                // The connection id must be echoed on every request after CONNECT, and
-                // must come first. Responders reject a GET without it.
-                if let Some(id) = self.connection_id {
-                    headers.push(Header::ConnectionId(id));
-                }
-                // Type and handle are only sent on the *first* GET of an object; the
-                // continuation GETs carry the connection id alone. Repeating them makes
-                // some responders restart the transfer, which never terminates.
-                if self.body.is_empty() {
+            FetchState::Fetching => match self.srm {
+                // The first GET of the object: type, handle, and the SRM offer.
+                // Repeating type/handle on later GETs makes some responders restart
+                // the transfer, which never terminates.
+                None => {
+                    let mut headers = Vec::with_capacity(4);
+                    // The connection id must be echoed on every request after CONNECT,
+                    // and must come first. Responders reject a GET without it.
+                    if let Some(id) = self.connection_id {
+                        headers.push(Header::ConnectionId(id));
+                    }
+                    // Offered on every fetch: AVRCP cover art is always GOEP 2.0 over
+                    // L2CAP, where SRM support is mandatory (§4.6), and reference
+                    // clients (bluez obexd) always ask. Before this offer existed we
+                    // answered an iPhone's streamed chunks with continuation GETs and
+                    // it dropped the channel — see `Srm`.
+                    headers.push(Header::SingleResponseMode(SRM_ENABLE));
                     headers.push(Header::Type(TYPE_THUMBNAIL.to_owned()));
                     if let Some(handle) = &self.handle {
                         headers.push(Header::ImageHandle(handle.clone()));
                     }
+                    self.srm = Some(Srm::Offered);
+                    Some(
+                        ObexPacket {
+                            code: op::GET_FINAL,
+                            prefix: Bytes::new(),
+                            headers,
+                        }
+                        .encode(),
+                    )
                 }
-                Some(
-                    ObexPacket {
-                        code: op::GET_FINAL,
-                        prefix: Bytes::new(),
-                        headers,
-                    }
-                    .encode(),
-                )
-            }
+                // Streaming: the responder sends the rest unprompted. Asking again is
+                // the protocol violation this enum exists to make unrepresentable.
+                Some(Srm::Active) => None,
+                // Waiting on the first response; the GET is already in flight.
+                Some(Srm::Offered) => None,
+                // Classic request/response: every further chunk is asked for, with the
+                // connection id alone.
+                Some(Srm::Declined) => {
+                    let headers = match self.connection_id {
+                        Some(id) => vec![Header::ConnectionId(id)],
+                        None => Vec::new(),
+                    };
+                    Some(
+                        ObexPacket {
+                            code: op::GET_FINAL,
+                            prefix: Bytes::new(),
+                            headers,
+                        }
+                        .encode(),
+                    )
+                }
+            },
             FetchState::Ready | FetchState::Failed => None,
         }
     }
@@ -445,6 +518,16 @@ impl CoverArtSession {
                 Ok(None)
             }
             FetchState::Fetching => {
+                // The first response settles which conversation this is: a responder
+                // that grants SRM echoes the enable back and then streams; one that
+                // ignores it expects a GET per chunk.
+                if self.srm == Some(Srm::Offered) {
+                    let granted = pkt
+                        .headers
+                        .iter()
+                        .any(|h| matches!(h, Header::SingleResponseMode(SRM_ENABLE)));
+                    self.srm = Some(if granted { Srm::Active } else { Srm::Declined });
+                }
                 for h in &pkt.headers {
                     match h {
                         Header::Body(b) | Header::EndOfBody(b) => self.body.extend_from_slice(b),
@@ -456,6 +539,7 @@ impl CoverArtSession {
                     rsp::SUCCESS => {
                         self.state = FetchState::Ready;
                         self.handle = None;
+                        self.srm = None;
                         let data = self.body.split().freeze();
                         if data.is_empty() {
                             return Err(AudioError::BadMediaPacket("cover art response was empty"));
@@ -475,6 +559,7 @@ impl CoverArtSession {
                         self.state = FetchState::Ready;
                         self.handle = None;
                         self.body.clear();
+                        self.srm = None;
                         Err(AudioError::BadMediaPacket("cover art fetch was refused"))
                     }
                 }
@@ -698,6 +783,101 @@ mod tests {
                 .iter()
                 .any(|h| matches!(h, Header::ImageHandle(_))),
             "continuation GETs must not repeat the handle"
+        );
+    }
+
+    #[test]
+    fn the_first_get_offers_single_response_mode() {
+        // AVRCP cover art is always GOEP 2.0 over L2CAP, where SRM support is
+        // mandatory (§4.6) and every reference client asks. Not offering it left us in
+        // a conversation the responder wasn't having — see the streaming test below.
+        let mut client = connected();
+        assert!(client.fetch("0000001"));
+        let first = ObexPacket::decode(&client.next_request().unwrap(), 0).unwrap();
+        assert!(
+            first
+                .headers
+                .contains(&Header::SingleResponseMode(SRM_ENABLE)),
+            "the SRM offer belongs on the first GET: {:?}",
+            first.headers
+        );
+    }
+
+    #[test]
+    fn a_responder_that_grants_srm_streams_without_further_gets() {
+        // The regression this pins: an iPhone that granted SRM streamed its chunks and
+        // got a continuation GET back for each one — a protocol violation mid-stream —
+        // and dropped the image channel (logs show it sometimes took the ACL link with
+        // it, reason 0x13). Under an SRM grant the client must go quiet and consume.
+        let image = jpeg(900);
+        let mut client = connected();
+        assert!(client.fetch("0000001"));
+        assert!(client.next_request().is_some(), "the one and only GET");
+
+        // First response grants SRM and starts the stream.
+        assert!(client
+            .feed(&reply(
+                0x90,
+                &[],
+                vec![
+                    Header::SingleResponseMode(SRM_ENABLE),
+                    Header::Body(Bytes::copy_from_slice(&image[..300])),
+                ],
+            ))
+            .unwrap()
+            .is_none());
+        assert!(
+            client.next_request().is_none(),
+            "a granted SRM means no continuation GETs, ever"
+        );
+
+        // The rest arrives unprompted.
+        assert!(client
+            .feed(&reply(
+                0x90,
+                &[],
+                vec![Header::Body(Bytes::copy_from_slice(&image[300..600]))],
+            ))
+            .unwrap()
+            .is_none());
+        assert!(client.next_request().is_none());
+        let art = client
+            .feed(&reply(
+                0xA0,
+                &[],
+                vec![Header::EndOfBody(Bytes::copy_from_slice(&image[600..]))],
+            ))
+            .unwrap()
+            .expect("artwork");
+        assert_eq!(&art.data[..], &image[..]);
+        assert!(
+            client.is_ready(),
+            "and the session is good for the next one"
+        );
+    }
+
+    #[test]
+    fn a_responder_that_ignores_srm_gets_classic_continuations() {
+        // Backward compatible by construction: no SRM echo in the first response means
+        // request/response, exactly as before the offer existed.
+        let mut client = connected();
+        assert!(client.fetch("0000001"));
+        assert!(client.next_request().is_some());
+        client
+            .feed(&reply(
+                0x90,
+                &[],
+                vec![Header::Body(Bytes::from_static(&[0xFF, 0xD8, 0xFF, 0x00]))],
+            ))
+            .unwrap();
+        let cont = ObexPacket::decode(&client.next_request().unwrap(), 0).unwrap();
+        assert_eq!(cont.code, op::GET_FINAL);
+        assert!(
+            !cont
+                .headers
+                .iter()
+                .any(|h| matches!(h, Header::SingleResponseMode(_))),
+            "the offer is not repeated once the responder has declined it"
         );
     }
 

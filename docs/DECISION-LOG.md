@@ -1244,3 +1244,209 @@ Not done, and known: nothing yet asserts at runtime that the set of actually-bou
 equals the registry's resolved view (`ss` in the integration VM against
 `--network-surface=json` would close that loop), and the generated doc's hardening section
 describes the systemd unit but nothing diffs it against `flake.nix`.
+
+### D46 — The panel is one model, and its motion is derived from that model rather than authored per transition
+Two rounds of the same bug produced this. A now-playing card was drawn over a service
+screen's text, and Spotify came back from a reclaim as a nameless session with no controls
+and an "up next" list in an otherwise empty card. Both were the same shape of failure:
+"what is on the glass" was a *product of independent variables* — `RenderLoop::shell_front`,
+the screen stack's depth, `ElectronHost::role` plus a `widget_covered` flag it refreshed by
+hand — and the combinations nobody had decided about were the bugs. `shell_front` says
+whether the shell is above the media layers and nothing whatever about which screen it is
+on, so demoting into the *Home screen's* widget slot while two screens deep was
+representable, and therefore happened.
+
+**`pipeline::panel` is the one authority.** Which screens are stacked, which surfaces exist,
+and whether the shell has been asked forward; everything else is derived — placement,
+suppression, hit testing, the browser's viewport. Four things stop being representable:
+focus on a session that is not there (`Focus` is derived, never stored); a demoted surface
+on a screen with nowhere to put it (`Placement` is Panel/Widget/Hidden, total over focus ×
+depth × surface); the page as a second state machine (the browser host reads `page_view()`
+each pump instead of owning a `BrowserRole` it mutates); and the idle clock being the same
+thing as a minimised cast page (they shared a browser, a layer and a slot, and were told
+apart by comparing URLs — now `Surface::IdleWidget` vs `Surface::CastPage`, one of which can
+never be full-panel or restored).
+
+The kiosk's `back_one_level` if-chain — minimise a page, else pop a screen, else bring the
+shell forward, across two objects in whatever order they were written — became
+`Panel::back() -> Left`, matched exhaustively. The ordering falls out of focus: you cannot
+pop a screen you are not looking at. `pop_screen` stays separate, because a back affordance
+drawn *on* a screen must not demote a session as a side effect of a press that session is
+not even covering.
+
+**`pipeline::motion` is the continuous half, and it takes no new inputs.** The two things it
+needs — presence changed, placement changed — are exactly what the model already reports,
+which is why the motion was tractable after the model and not before. Three rules, which is
+where Apple's, Google's and Microsoft's languages agree, and each is physical honesty rather
+than taste: a surface that exists before and after **travels, never cross-fades** (`Motion`
+interpolates a rectangle; there is no cross-fade path for a surface that persists); a
+surface that appears comes **from where it was summoned** (`Origin`, with `Nowhere` a
+variant somebody has to choose, so a forgotten tile rect is visible in a diff rather than
+invisible on the glass); and **entrances decelerate while exits accelerate and are faster**,
+asserted pair by pair against the `Choreography` table.
+
+Springs rather than curves, because a spring accepts an initial velocity and that is exactly
+what a released drag hands over. Each of a rect's four components springs independently in
+normalized units — five scalars where a normalized progress needs one — and that buys the
+property making interruption free: **retargeting is just a different target**, so a reversal
+mid-flight carries real velocity through the turn with no rebasing. Damping is 1.0
+everywhere except the summon (0.85), because a display people see out of the corner of their
+eye all day should not wobble, and the one exception is the transition somebody asked for
+with a finger.
+
+**Input must never read the animation.** Coverage was answered from live layer transforms, so
+a press 100 ms into a 300 ms arrival meant something different from the same press once it
+landed. `Panel::covered_by_any` answers from placement, and the caller names *which* surfaces
+to ask about, because "covered" is relative to depth: the transport strip is drawn on the card
+it belongs to, and that card is no reason for its own controls to stop answering. The same
+audit found the two strip-coverage checks had drifted — they carried the rule independently,
+with a comment saying it had to be repeated rather than assumed, and when the rule changed
+only one changed, so a covered strip stopped owning presses while still acting on them.
+
+**Three things the renderer had to gain**, and one it did not. Corner radius, animatable, so a
+screen keeps its tile's corner and flattens as it grows: a square-cornered rectangle emerging
+from a rounded one reads as two objects. An independent source rect, because the tiles are
+exactly square and the panel is 1.778 — drawing a full-panel texture into a tile rect
+compressed it 44%, and `cover_source` crops instead, which is provably a no-op once the shapes
+agree and so can be applied unconditionally. Both live in the uniform, whose sizes are now
+asserted in a `const` block: a WGSL/Rust layout drift does not fail to compile, it draws every
+layer from the wrong bytes. What it did *not* gain is transient content layers, so a container
+transform still scales a finished screen rather than crossfading contents inside a morphing
+container — the growing screen is a small screenshot until that lands.
+
+**The slot and the PiP corner are deliberately still square**, because that is what the art
+does: the widget card frame is drawn with `fill_rect`. Rounding either is now one constant
+rather than a shader change, which is why the mechanism landed separately from any cosmetic
+call about it.
+
+Two consequences worth stating. The floor scales *up* 2% while receding rather than down,
+because it is the bottom layer and insetting it would open a black border where a phone shows
+a backdrop; the mascot's transform is *composed* with it, since she is a sub-rect and handing
+her the floor's transform stretches line art across the panel. And she leans on the **slot**,
+not on the clock: `MascotOverlay` moved above the card so what the slot holds is under her
+arms, and what removes her became `slot_veil` — how far the occupant has expanded between its
+demoted width and the whole panel. Degree rather than presence, so the change is a fade with
+no threshold, and a demoted *video* (which goes to the far corner, not the slot) correctly
+leaves her alone.
+
+**The edge drag turned out never to have worked**, and finding it is the clearest argument for
+the model. The kiosk computed how far the finger had come and called `drive_transition` — but
+nothing *began* a transition, so it drove one that did not exist and nothing followed the hand.
+Worse, the flag meaning "a drag is in hand" was set and never cleared, which made the
+completed-swipe branch (`if complete && !dragging`) unreachable: **the swipe-to-home gesture
+stopped working permanently after the first time anyone dragged from the edge and let go
+early.** Two missing cases in an if-chain over five variables, in the one file with no test
+harness — the kiosk owns the winit event loop.
+
+So the decision is now `overlay::edge_drag`, pure and total: Ignore / Home / Begin / Carry, with
+the one ordering that matters stated (a completed swipe fires only with nothing in hand, because
+with a navigation being carried the swipe *is* that navigation). Only a screen-to-screen back is
+carried, because its whole animation is a position and a finger can be halfway through one;
+handing the glass back at Home is a change of focus rather than of place, so it stays a
+threshold gesture. And the incoming screen is carried too — `Floor::drive` sets a position with
+no spring while a contact is down, and the spring resumes from exactly there on release, which
+is what makes letting go part-way put it back.
+
+**One integrator, one feel.** The screen transition kept its own — a velocity decay plus a
+proportional pull, with its own settle thresholds — beside the springs everything else uses. Two
+mechanisms for one thing is the shape of problem this whole entry is about, so it now takes a
+`Spring` from the same choreography table. The hand-rolled `SETTLE_RATE` is gone, and a flick
+works because a spring accepts an initial velocity rather than because a decay term was tuned
+against a pull term.
+
+`Origin::From`'s live user is the arriving *screen* (`Floor::launch`), which is the one thing
+whose whole path from a press is local. A session surface always arrives `Nowhere`, because every
+route that starts one — a phone casting, a DIAL launch, a track beginning — crosses an async
+round trip that no touch survives. That is said in the code rather than left to be inferred: the
+`RenderLoop` briefly carried an `origin` field nothing ever set, which read as if it were wired.
+
+Not done, and known: no transient content layers (above), so a container transform still scales a
+finished screen; no elevation shadow, so a demoted card reads as a flat inset rather than as a
+lifted card; and `CLEAR_GRACE` still debounces presence separately from the exit animation —
+right for VLC's stop-then-reload scrubbing, redundant for preemption. `Floor::launch` and
+`Motion::enter` are still two implementations of "arrive from a place", one for the floor and one
+for surfaces, which is the next duplication to collapse. The kiosk's input routing has no test
+harness of its own; extracting `edge_drag` moved the part that had bugs in it out, but
+`route_input`'s ordering is next.
+
+### D47 — LDAC: link Sony's own codec, and advertise it only when asked
+LDAC is the one A2DP codec libav has no decoder for, and it was the last unimplemented thing in
+the Bluetooth sink. It is now implemented by **linking** `libldacBT` — Sony's own library, via
+open-vela's fork — behind `ldac-sys` and a safe wrapper in `pipeline::ldac_decode`, with the
+endpoint kept out of the advertised table until the config names it (OPEN-QUESTIONS Q22,
+architecture-substrate.md §11.4a).
+
+**This is not a third carve-out from ground rule 9,** and the distinction is worth stating so
+nobody reads it as one. D30 and D37 are exceptions about *protocol* stacks: rule 9 tells us to
+reimplement the wire, and in those two cases we did not. LDAC is a *codec*. This pipeline already
+links libavcodec for SBC, AAC, aptX and aptX HD, and nobody proposed reimplementing those — the
+rule was never about DSP. What would have been a rule-9 question is the A2DP framing around the
+codec, and that stays ours: the capability block, the payload header, the transport-frame walk,
+all reimplemented and fixture-tested. The line is the same one D37 draws, in a place where it
+happens not to be contentious.
+
+Three findings, each of which looked settled and was not:
+
+- **A reverse-engineered decoder was never needed.** Q22 had it that AOSP's `libldac` is
+  encoder-only, so decode meant the RE'd `libldacdec`. The premise is true and the conclusion is
+  false: open-vela's fork builds Sony's complete codec, decoder included.
+- **`pkgs.ldacbt` is not that library.** Under the nixpkgs this flake pins, it is EHfive/ldacBT
+  built `_ENCODE_ONLY`: `libldacBT_enc.so`, no `ldacBT_decode`, and a header that does not declare
+  one. A newer nixpkgs has the right one, but reaching it means bumping ffmpeg and Electron for a
+  codec. So `nix/ldacbt.nix` builds it from a pinned source and fails the build if the symbol ever
+  goes missing again — the check exists because the failure mode is a plausible-looking library.
+- **Apache-2.0, so nothing is bound.** Unlike D37's GPL-3.0 core, this composes with the MIT tree.
+  The feature is off by default for a build-dependency reason — it needs `LDACBT_LIB_DIR` at link
+  time — and not a licence one.
+
+**Advertising is now separated from decoding, in both directions.** Q22 was the failure in one
+direction: `can_decode` answered `cfg!(feature = "ldac")` while the feature bound nothing, so a
+build advertised LDAC, a phone picked it — LDAC is *first* in preference order — and every packet
+failed. A connected phone, a running session, and silence. That is fixed at the root: `can_decode`
+allocates a decoder handle and reports what happened, so the flag and the fact cannot disagree.
+
+The other direction is this decision's own reticence, and it is deliberate. A decoder existing is
+not a reason to let every sender use it tomorrow. Because LDAC sorts first, enabling it does not
+add an option — it changes what every capable phone negotiates, immediately, on a panel nobody is
+watching, from a decoder that has never seen a real Android encoder. So `bluetooth::OPT_IN` holds
+it back and `codecs = ["ldac", "sbc"]` turns it on, with SBC named alongside so a sender that
+cannot do LDAC still connects and the experiment does not present as a broken receiver. The
+condition for removing it is named rather than left to taste: one real sender streaming to it.
+
+**The test vectors are the substance of the work, more than the FFI is.** Four sharp edges in
+`ldacBT_decode` are invisible until you hear them, and all four survive a test that checks for
+`Ok`: the input buffer needs two bytes of slack past the frame because the bit reader fetches
+three bytes at a time; one A2DP payload holds a *sequence* of transport frames and each call
+consumes one, so a per-packet loop plays a sixth of the audio; a `-1` return carrying
+`LDACBT_ERR_DEC_CONFIG_UPDATED` is a success that reconfigured the handle and produced audio; and
+the *stream* states its sample rate, not the negotiation, so following our own AVDTP answer plays
+a 96 kHz stream at 44.1.
+
+So the fixtures are generated by Sony's encoder and checked against a pure Rust parser that shares
+no code with it. The encoder reports how many transport frames it packed into each MTU; the parser
+walks the same bytes and must reach the same number, at 44.1 kHz stereo and at 96 kHz dual channel
+— the second because it puts 256 samples in a frame instead of 128, and because a rate assumed
+rather than read is exactly the Q25 failure in the one codec where it can be caught. That check
+runs in every build, with no FFI. The decode assertions are on the audio: level, both channels,
+balance, and the exact PCM frame count the fixture implies.
+
+What that does not prove is interoperability — the bytes came from our own encoder, not a phone —
+and being honest about which half is proven is the whole reason the endpoint is opt-in rather than
+on. A capture from a real Android sender is the missing fixture, and the thing that retires it.
+
+Also landed here, because it is the same class of problem: `proto-bluetooth-audio` gained a pure
+LDAC frame-header parser. It decodes nothing. It exists because LDAC's A2DP payload needs a
+one-byte header stripped, and without a syncword to check against, failing to strip it decodes to
+noise rather than to an error — the same silent shape as treating classic aptX as RTP. It also
+surfaces the stream's own rate for comparison against the negotiated one, which is the only
+codec here where that comparison is possible at all.
+
+Not done, and known: no capture from a real sender, which is the one thing the fixtures cannot
+substitute for. `ldacBT_get_bitrate` is bound and unread, so nothing reports LDAC's actual rate
+the way `Depacketizer::bitpool` reports SBC's — the on-screen card says only the codec and rate.
+The ABR library (`libldacBT_abr`) is not built and would be meaningless in a sink anyway, since
+adaptive bitrate is the sender's decision. And the wrapper follows a mid-stream rate change by
+re-reporting the new rate on its blocks, which is correct as far as it goes; the output device is
+not reopened, so a sender that switches rate mid-session will play at the wrong pitch until the
+session restarts. That is a pre-existing property of `audio_session::run` rather than something
+LDAC introduced — but LDAC is the first codec that can actually trigger it.

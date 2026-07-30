@@ -38,6 +38,19 @@ impl ResponderConfig {
     }
 }
 
+/// How many times each `NOTIFY ssdp:alive` round is sent, [`NOTIFY_REPEAT_GAP`] apart.
+///
+/// SSDP rides bare UDP with no retry of its own, and UDA §1.2 tells advertisers to
+/// send each announcement more than once for exactly that reason — every real stack
+/// repeats the burst 2–3 times. One lost datagram per interval used to mean half a
+/// cache lifetime of invisibility.
+const NOTIFY_REPEATS: u32 = 3;
+
+/// The pause between repeats of an alive burst. Small and fixed: the spec asks only
+/// that repeats not be back-to-back, and the responder is single-tasked, so a long gap
+/// here would delay M-SEARCH answers.
+const NOTIFY_REPEAT_GAP: Duration = Duration::from_millis(120);
+
 /// One device advertised by the responder, with the path its description is served at.
 struct Advertised {
     device: SsdpDevice,
@@ -137,23 +150,46 @@ impl Responder {
         debug!(%from, "answered M-SEARCH");
     }
 
-    async fn send_alive(&self, sock: &UdpSocket, multicast: SocketAddr) {
+    /// Every `ssdp:alive` NOTIFY one announcement round carries: one per target per
+    /// device. Pure — the repeat/burst policy lives in [`Self::send_alive`].
+    fn alive_messages(&self) -> Vec<String> {
+        let mut msgs = Vec::new();
         for adv in &self.devices {
             let resp = self.response_for(adv);
             for target in adv.device.targets() {
-                let msg = resp.notify_alive(&target);
+                msgs.push(resp.notify_alive(&target));
+            }
+        }
+        msgs
+    }
+
+    /// Every `ssdp:byebye` NOTIFY a graceful shutdown announces.
+    fn byebye_messages(&self) -> Vec<String> {
+        let mut msgs = Vec::new();
+        for adv in &self.devices {
+            let resp = self.response_for(adv);
+            for target in adv.device.targets() {
+                msgs.push(resp.notify_byebye(&target));
+            }
+        }
+        msgs
+    }
+
+    async fn send_alive(&self, sock: &UdpSocket, multicast: SocketAddr) {
+        let msgs = self.alive_messages();
+        for round in 0..NOTIFY_REPEATS {
+            if round > 0 {
+                tokio::time::sleep(NOTIFY_REPEAT_GAP).await;
+            }
+            for msg in &msgs {
                 let _ = sock.send_to(msg.as_bytes(), multicast).await;
             }
         }
     }
 
     async fn send_byebye(&self, sock: &UdpSocket, multicast: SocketAddr) {
-        for adv in &self.devices {
-            let resp = self.response_for(adv);
-            for target in adv.device.targets() {
-                let msg = resp.notify_byebye(&target);
-                let _ = sock.send_to(msg.as_bytes(), multicast).await;
-            }
+        for msg in self.byebye_messages() {
+            let _ = sock.send_to(msg.as_bytes(), multicast).await;
         }
     }
 }
@@ -172,6 +208,14 @@ fn bind_multicast(interface: Ipv4Addr) -> Result<UdpSocket, SsdpError> {
     let bind: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT).into();
     socket.bind(&bind.into())?;
     socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &interface)?;
+    // The join says where we *listen*; where our NOTIFYs *leave* is a separate
+    // option, and left unset it is the default route — on a multi-homed box (this
+    // one has a Tailscale tunnel beside the LAN) that can be the wrong wire
+    // entirely, with every announcement disappearing into the tunnel.
+    socket.set_multicast_if_v4(&interface)?;
+    // UDA 1.0 specifies TTL 4 for SSDP; the kernel default is 1, which a router
+    // configured to forward multicast between segments would decrement to nothing.
+    socket.set_multicast_ttl_v4(4)?;
     socket.set_multicast_loop_v4(false)?;
     socket.set_nonblocking(true)?;
     let std_sock: std::net::UdpSocket = socket.into();
@@ -211,5 +255,48 @@ mod tests {
             r.location_for(&r.devices[0]),
             "http://127.0.0.1:8080/dlna/description.xml"
         );
+    }
+
+    #[test]
+    fn one_alive_round_covers_every_target_and_the_burst_repeats_it() {
+        let r = Responder::new(cfg()).advertise(
+            SsdpDevice {
+                uuid: "uuid:x".into(),
+                device_type: "urn:schemas-upnp-org:device:MediaRenderer:1".into(),
+                services: vec!["urn:schemas-upnp-org:service:AVTransport:1".into()],
+            },
+            "/dlna/description.xml",
+        );
+        // Root, uuid, device type, one service: four targets, four NOTIFYs a round.
+        let msgs = r.alive_messages();
+        assert_eq!(msgs.len(), r.devices[0].device.targets().len());
+        assert!(msgs.iter().all(|m| m.contains("ssdp:alive")), "{msgs:?}");
+        // And the byebye set mirrors it, target for target.
+        let byes = r.byebye_messages();
+        assert_eq!(byes.len(), msgs.len());
+        assert!(byes.iter().all(|m| m.contains("ssdp:byebye")), "{byes:?}");
+        // The burst policy: repeated because UDP drops, bounded because it is noise.
+        // 2–3 is what real stacks do; 1 is the defect this replaces.
+        assert!((2..=3).contains(&NOTIFY_REPEATS), "{NOTIFY_REPEATS}");
+        assert!(NOTIFY_REPEAT_GAP < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn the_multicast_socket_names_its_egress_interface_and_upnp_ttl() {
+        // Read the options back off the live socket: `set_multicast_if_v4` was simply
+        // never called (NOTIFYs left via the default route — the tunnel, on a box
+        // with one), and the TTL rode the kernel default of 1 where UPnP says 4.
+        let sock = match bind_multicast(Ipv4Addr::LOCALHOST) {
+            Ok(s) => s,
+            // A sandbox that refuses multicast joins can't run this; that absence
+            // is environmental, not a defect in the code under test.
+            Err(e) => {
+                eprintln!("skipping: multicast bind unavailable here ({e})");
+                return;
+            }
+        };
+        let raw = socket2::SockRef::from(&sock);
+        assert_eq!(raw.multicast_if_v4().unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(raw.multicast_ttl_v4().unwrap(), 4);
     }
 }

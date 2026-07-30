@@ -1,0 +1,5 @@
+// The .exe's icon, and deliberately nothing else. In particular NO manifest:
+// castaway.exe.manifest is staged as an *external* manifest by nix/windows.nix,
+// and Windows only honours an external manifest when the image embeds none —
+// adding one here would silently replace it (see nix/castaway.exe.manifest).
+1 ICON "castaway.ico"

@@ -200,6 +200,21 @@ mod tests {
     }
 
     #[test]
+    fn the_info_pk_is_the_pairing_identity() {
+        // `/info`, the TXT records, and `/pair-setup` are three encodings of one
+        // identity; a sender reads them all and can see a contradiction. All three
+        // must come from `PairingIdentity` — `/info` used to carry a SHA-256-derived
+        // stand-in the pairing layer never presented.
+        let id = ident();
+        let dict = parsed(&id);
+        let pairing = crate::pairing::PairingIdentity::from_seed(&id.pairing_id);
+        assert_eq!(
+            dict.get("pk").unwrap().as_string().unwrap(),
+            pairing.public_key_hex()
+        );
+    }
+
+    #[test]
     fn the_pairing_identifier_is_not_the_device_id() {
         let dict = parsed(&ident());
         assert_ne!(

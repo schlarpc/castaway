@@ -35,6 +35,7 @@ control-display.workspace = true
 input-touch.workspace = true
 
 anyhow.workspace = true
+clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -57,6 +58,14 @@ url.workspace = true
 # Driving the DLNA media plane end to end: a real SOAP envelope into the real router.
 tower = { version = "0.5", features = ["util"] }
 
+[build-dependencies]
+# Embeds assets/castaway.rc (the .exe icon) when the *target* is Windows — which is
+# why this is an unconditional build-dependency rather than a `[target...]` one:
+# cargo matches those tables against the host, and the Windows build is a cross
+# build from Linux. Chosen over winresource because it drives `llvm-rc`, which is
+# the resource compiler nix/windows.nix actually ships.
+embed-resource = "3"
+
 [features]
 default = []
 # Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)
@@ -78,8 +87,14 @@ audio-out = ["audio", "pipeline/audio-out"]
 # there: the ALSA shim shows one "pipewire" device, the native backend shows the sinks.
 # Takes precedence over audio-out's ALSA host at compile time; inert on Windows.
 audio-pipewire = ["audio", "pipeline/audio-pipewire"]
-# LDAC decode. Off by default: advertising a codec we cannot decode makes the session
-# silence rather than a clean fallback to one we can (OPEN-QUESTIONS Q22).
+# LDAC decode, over FFI to Sony's own library (OPEN-QUESTIONS Q22). Off by default
+# because it needs `LDACBT_LIB_DIR` at link time, not because the decoder is in doubt —
+# a build without it would fail to link rather than fail to decode.
+#
+# Note that this feature compiling in the decoder is *not* the same as advertising the
+# endpoint. Even with it on, LDAC is in `bluetooth::OPT_IN` and stays out of the
+# advertised table until the config names it, because it sits first in preference order
+# and would otherwise silently become what every capable sender negotiates.
 ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
 # The browser subprocess in the kiosk (YouTube leanback via DIAL launch). Implies
 # `render` and `hwaccel` for the zero-copy frame import. Unlike the CEF build it replaced,

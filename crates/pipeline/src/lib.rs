@@ -45,14 +45,29 @@ pub mod electron_browser;
 pub mod ffmpeg_decode;
 #[cfg(feature = "electron")]
 pub mod filterlists;
+#[cfg(feature = "render")]
+pub mod icon;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
+// The second decode backend: Sony's `libldacBT`, for the one A2DP codec libav has no
+// decoder for (Q22). Gated on the feature that links it, and `audio_decode::can_decode`
+// answers from whether this module is here rather than from the flag itself.
+#[cfg(feature = "ldac")]
+pub mod ldac_decode;
+/// How the panel *moves* between the states [`panel`] decides: springs, and the
+/// choreography table that says which one each transition gets. Pure.
+#[cfg(feature = "render")]
+pub mod motion;
 #[cfg(feature = "render")]
 pub mod nowplaying_card;
 #[cfg(feature = "render")]
 pub mod osd;
 #[cfg(feature = "render")]
 pub mod overlay;
+/// What the panel is presenting — the shell's screens, the session's surfaces, and who
+/// has the glass. Pure, and the single authority all three used to answer separately.
+#[cfg(feature = "render")]
+pub mod panel;
 #[cfg(feature = "render")]
 pub mod picker;
 #[cfg(feature = "render")]
@@ -92,8 +107,10 @@ pub use electron_browser::{Electron, ElectronHost, TV_USER_AGENT};
 #[cfg(feature = "render")]
 pub use osd::{Banner, OsdController, OsdUpdate};
 #[cfg(feature = "render")]
-pub use render_pipeline::{PlaybackHandle, ScreenshotHandle};
+pub use render_pipeline::{
+    render_channel, RenderCommand, RenderLoop, RenderPipeline, RenderRx, RenderTx,
+};
 #[cfg(feature = "render")]
-pub use render_pipeline::{RenderCommand, RenderLoop, RenderPipeline};
+pub use render_pipeline::{PlaybackHandle, ScreenshotHandle};
 #[cfg(feature = "render")]
 pub use wgpu_compositor::WgpuCompositor;

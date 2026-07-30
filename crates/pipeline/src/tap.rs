@@ -208,7 +208,7 @@ mod integration {
             transform: Transform::default(),
         });
 
-        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (_tx, rx) = crate::render_pipeline::render_channel(1);
         let mut rloop = RenderLoop::new(compositor, rx);
         let (tap, png_rx) = ScreenshotTap::new();
         rloop.add_tap(Box::new(tap));

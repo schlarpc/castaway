@@ -809,9 +809,18 @@ mod tests {
                 "{codec:?} is advertised but cannot be decoded"
             );
         }
-        assert!(
-            !decodable_codecs().contains(&AudioCodec::Ldac),
-            "no LDAC decoder is bound yet, so it must not be advertised"
+        // LDAC follows the backend, in both directions. This used to assert it was never
+        // present, which was right while the feature bound nothing and became a lie the
+        // moment it bound something — the point was always that the list reports what
+        // exists, not that one codec is permanently absent.
+        //
+        // Whether the *endpoint* is advertised is a separate question and is not settled
+        // here: the app keeps LDAC out of the default table until a config asks for it
+        // (`bluetooth::OPT_IN`). This is only about what can be decoded.
+        assert_eq!(
+            decodable_codecs().contains(&AudioCodec::Ldac),
+            cfg!(feature = "ldac"),
+            "LDAC must be decodable exactly when its backend is linked"
         );
     }
 }

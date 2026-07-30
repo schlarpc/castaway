@@ -273,7 +273,11 @@ pub enum ToBrowser {
         /// The window to blank.
         surface: Surface,
     },
-    /// A window's viewport changed size.
+    /// A window's viewport changed size — or came back onto the glass at the size it
+    /// already had. Either way the host app answers with `setContentSize` *and* a forced
+    /// repaint, because the consumer drops stale-sized frames and a page with no reason
+    /// to damage itself (a paused video, a clock between ticks) would otherwise leave
+    /// its layer empty until it next chose to animate.
     Resize {
         /// The window that changed.
         surface: Surface,
@@ -281,16 +285,6 @@ pub enum ToBrowser {
         width: u32,
         /// New height in pixels.
         height: u32,
-    },
-    /// Repaint now, without waiting for the page to damage itself.
-    ///
-    /// Exists for the moment a demoted page leaves the widget slot: the clock underneath
-    /// is live but may not repaint for up to its own update interval, and "the slot shows
-    /// stale cast pixels for a second" reads as a hang from across the room. Chromium's
-    /// `webContents.invalidate()` answers with a full frame at once.
-    Invalidate {
-        /// The window to repaint.
-        surface: Surface,
     },
     /// A touch point, in browser view pixels.
     Touch {
@@ -677,9 +671,6 @@ mod tests {
             ToBrowser::Blank {
                 surface: Surface::Page,
             },
-            ToBrowser::Invalidate {
-                surface: Surface::Widget,
-            },
             ToBrowser::Quit,
             ToBrowser::ScriptletSource {
                 id: 1,
@@ -723,10 +714,14 @@ mod tests {
                 r#"{"type":"resize","surface":"page","width":1920,"height":1080}"#,
             ),
             (
-                ToBrowser::Invalidate {
-                    surface: Surface::Widget,
+                ToBrowser::Touch {
+                    surface: Surface::Page,
+                    id: 2,
+                    phase: TouchPhase::Start,
+                    x: 12.0,
+                    y: 34.0,
                 },
-                r#"{"type":"invalidate","surface":"widget"}"#,
+                r#"{"type":"touch","surface":"page","id":2,"phase":"start","x":12.0,"y":34.0}"#,
             ),
         ];
         for (msg, want) in cases {

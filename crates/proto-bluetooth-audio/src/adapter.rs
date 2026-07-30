@@ -201,10 +201,23 @@ struct Link {
     /// client is connected, so a receiver that waits to see a handle before connecting
     /// waits forever (Q29).
     art: Option<(Cid, Box<CoverArtSession>)>,
+    /// Fetches this link's peer has answered by closing the image channel, ever.
+    ///
+    /// A count rather than a flag for the same reason `media_failures` is: the log can
+    /// then say whether this was one bad moment or a peer that punishes every fetch —
+    /// and at [`ART_STRIKES_LIMIT`] we stop asking for the rest of the link, because
+    /// artwork is decoration and the observed worst case for provoking the peer again
+    /// was it dropping the whole ACL link (reason 0x13).
+    art_strikes: u8,
     /// What we know about this phone: address from link-up, name from the remote-name
     /// request, codec from AVDTP configuration. Each arrives separately.
     description: SourceDescription,
 }
+
+/// Mid-fetch closures after which cover art is given up for the link. Two rather than
+/// one so a single coincidental teardown (a phone switching outputs mid-song) does not
+/// cost the whole link its artwork.
+const ART_STRIKES_LIMIT: u8 = 2;
 
 impl Link {
     fn new(peer: BdAddr, capabilities: Vec<crate::codec::CodecCapability>) -> Self {
@@ -245,6 +258,7 @@ impl Link {
             art_psm: None,
             art_sdp: None,
             art: None,
+            art_strikes: 0,
             description: SourceDescription::new().with_address(peer.to_string()),
         }
     }
@@ -675,7 +689,7 @@ impl BluetoothAdapter {
                             }
                         }
                     } else if link.art.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        if let Some((_, session)) = &link.art {
+                        if let Some((_, session)) = &mut link.art {
                             if let Some(request) = session.next_request() {
                                 out.replies.push((cid, request));
                             }
@@ -695,10 +709,24 @@ impl BluetoothAdapter {
                     } else if link.art_sdp.as_ref().is_some_and(|(c, _)| *c == cid) {
                         link.art_sdp = None;
                     } else if link.art.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        // The image server went away. The PSM is remembered, so the next
-                        // track change brings the session back up rather than giving up
-                        // on artwork for the rest of the link.
-                        debug!("cover art: the image session closed");
+                        // The image server went away. If it went away *mid-fetch*, that
+                        // is the peer reacting to our GET — the observed iPhone failure —
+                        // and each strike counts toward giving cover art up for this
+                        // link. An idle close is routine housekeeping; the PSM is
+                        // remembered and the next track brings the session back.
+                        let mid_fetch = link
+                            .art
+                            .as_ref()
+                            .is_some_and(|(_, s)| s.state() == FetchState::Fetching);
+                        if mid_fetch {
+                            link.art_strikes += 1;
+                            info!(
+                                strikes = link.art_strikes,
+                                "cover art: the peer closed the image session mid-fetch"
+                            );
+                        } else {
+                            debug!("cover art: the image session closed");
+                        }
                         link.art = None;
                     }
                     debug!(%cid, %psm, "l2cap channel closed");
@@ -1378,6 +1406,15 @@ impl BluetoothAdapter {
     /// the life of the link.
     fn open_cover_art(&self, link: &mut Link, out: &mut Outbox) {
         if link.art.is_some() || link.art_sdp.is_some() {
+            return;
+        }
+        // A peer that has repeatedly hung up on a fetch is telling us something about
+        // our requests it cannot say in OBEX. Stop asking for the rest of this link:
+        // artwork is decoration, and re-provoking a peer that answers protocol
+        // disagreements by dropping channels risks the audio session itself (the
+        // observed worst case took the whole ACL link down, reason 0x13).
+        if link.art_strikes >= ART_STRIKES_LIMIT {
+            debug!("cover art: given up for this link after repeated mid-fetch closures");
             return;
         }
         if let Some(psm) = link.art_psm {

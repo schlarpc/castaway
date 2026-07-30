@@ -426,16 +426,15 @@ impl CastReceiver {
         // handed over except by being told, and the only thing that knows is the pipeline —
         // which reaches this connection through here. Publishing it also gives the panel a
         // Cast session it can drive, on the same terms it drives a DLNA one.
+        //
+        // Built here, *published* only after a `Play` (see `with_control_surface`): the
+        // session manager only accepts a control surface from the source that holds the
+        // screen, so emitting it at connection time — before any LOAD — was a guaranteed
+        // drop. Every sender opens idle status connections long before it casts, and each
+        // one used to log `no active session` here while the panel never got a remote it
+        // could drive and `media_ended` never reached the sender (its queue simply stuck).
         let (to_actor, from_receiver) = tokio::sync::mpsc::channel(8);
-        if let Err(e) = sink
-            .emit(SessionEvent::ControlSurface(Arc::new(CastRemote::new(
-                to_actor,
-                sink.clone(),
-            ))))
-            .await
-        {
-            debug!(%peer, error = %e, "could not publish the Cast control surface");
-        }
+        let remote = Arc::new(CastRemote::new(to_actor, sink.clone()));
 
         let mut mirror_task: Option<JoinHandle<()>> = None;
         if let Err(e) = self
@@ -447,6 +446,7 @@ impl CastReceiver {
                 &mut rtp,
                 &mut mirror_task,
                 from_receiver,
+                &remote,
             )
             .await
         {
@@ -475,6 +475,7 @@ impl CastReceiver {
         rtp: &mut Option<MirrorSocket>,
         mirror_task: &mut Option<JoinHandle<()>>,
         mut from_receiver: tokio::sync::mpsc::Receiver<FromReceiver>,
+        remote: &Arc<CastRemote>,
     ) -> Result<(), CastError> {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -516,7 +517,7 @@ impl CastReceiver {
                 session.observe_progress(self.playback.as_ref().and_then(|p| p.progress()));
                 let reaction = session.handle(&msg)?;
                 Self::write_all(tls, &reaction.outgoing).await?;
-                for event in reaction.events {
+                for event in with_control_surface(reaction.events, remote) {
                     let ended = matches!(event, SessionEvent::End);
                     sink.emit(event)
                         .await
@@ -650,6 +651,29 @@ pub fn default_listen_addr() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], CAST_PORT))
 }
 
+/// Splice this connection's control surface into a reaction's event stream, immediately
+/// after the event that makes the connection the active source.
+///
+/// The session manager only accepts a `ControlSurface` from the source that currently
+/// holds the screen, so the surface must *follow* `Play` — published at connection time
+/// (as it used to be) it was dropped every single time, the panel got no remote to
+/// drive, and the pipeline's end-of-media report never reached the sender, whose queue
+/// simply stuck. Re-published after every `Play` rather than once per connection: VLC
+/// sends STOP + LOAD for every scrub, and each fresh hold on the screen needs the
+/// surface again. Mirroring deliberately gets none — there is no media session behind
+/// it to drive, so a transport strip would be all buttons and no effect.
+fn with_control_surface(events: Vec<SessionEvent>, remote: &Arc<CastRemote>) -> Vec<SessionEvent> {
+    let mut out = Vec::with_capacity(events.len() + 1);
+    for event in events {
+        let begins = matches!(event, SessionEvent::Play { .. });
+        out.push(event);
+        if begins {
+            out.push(SessionEvent::ControlSurface(remote.clone()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -767,5 +791,34 @@ mod tests {
     #[test]
     fn kind_is_cast() {
         assert_eq!(receiver(identity()).kind(), ProtocolKind::Cast);
+    }
+
+    /// The manager only accepts a control surface from the active source, so the
+    /// surface has to come after the `Play` that makes this connection active —
+    /// and must not be offered by connections that never play (every sender opens
+    /// idle status connections, which used to spam `no active session` drops).
+    #[test]
+    fn the_control_surface_follows_play_and_never_precedes_it() {
+        let (to_actor, _actor_rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let sink = SessionSink::new(castaway_core::SourceId::new(ProtocolKind::Cast, "test"), tx);
+        let remote = Arc::new(CastRemote::new(to_actor, sink));
+
+        // A status-only connection produces no session event → no surface.
+        assert!(with_control_surface(vec![], &remote).is_empty());
+
+        // A LOAD's Play is immediately followed by the surface, in that order.
+        let play = SessionEvent::Play {
+            source: castaway_core::MediaUri::parse("http://10.0.0.2/film.mkv").unwrap(),
+            start: None,
+        };
+        let out = with_control_surface(vec![play], &remote);
+        assert!(matches!(out[0], SessionEvent::Play { .. }));
+        assert!(matches!(out[1], SessionEvent::ControlSurface(_)));
+        assert_eq!(out.len(), 2);
+
+        // Events that do not take the screen get no surface attached.
+        let out = with_control_surface(vec![SessionEvent::End], &remote);
+        assert!(matches!(out[..], [SessionEvent::End]));
     }
 }

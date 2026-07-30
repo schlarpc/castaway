@@ -508,14 +508,17 @@ function handle(msg) {
     }
     case 'resize': {
       const win = getWindow(msg.surface);
-      if (win) win.setContentSize(msg.width, msg.height);
-      return;
-    }
-    case 'invalidate': {
-      // A full repaint on demand: how the clock reappears at once when a demoted page
-      // leaves the widget slot, instead of after its next natural damage.
-      const win = getWindow(msg.surface);
-      if (win) win.webContents.invalidate();
+      if (win) {
+        win.setContentSize(msg.width, msg.height);
+        // Demand a paint at the new size — even when the size did not change, because
+        // castaway also resizes a window it just put back on the glass. Two reasons a
+        // page would otherwise sit on an empty layer: an offscreen page that is mostly
+        // a <video> (leanback) may not repaint on its own after a resize, and the
+        // clock repaints only when its content changes — up to a second after its slot
+        // came back. Castaway drops every stale-sized frame, so both read as a black
+        // card until the page next chose to animate.
+        win.webContents.invalidate();
+      }
       return;
     }
     case 'touch':

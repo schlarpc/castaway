@@ -83,7 +83,7 @@ fn app_dir() -> std::path::PathBuf {
 #[test]
 #[ignore = "needs a GPU and an Electron"]
 fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
-    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
     let mut render = match pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) {
         Ok(r) => r,
         Err(e) => {
@@ -170,7 +170,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
 #[test]
 #[ignore = "needs a GPU and an Electron"]
 fn a_touch_reaches_the_page() {
-    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
     let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(640, 480, cmd_rx) else {
         eprintln!("skipping: no usable GPU");
         return;
@@ -239,7 +239,7 @@ fn a_touch_reaches_the_page() {
 #[test]
 #[ignore = "needs a GPU and an Electron"]
 fn page_audio_arrives_as_pcm_with_a_media_clock() {
-    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
     let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(640, 480, cmd_rx) else {
         eprintln!("skipping: no usable GPU");
         return;
@@ -374,7 +374,7 @@ fn a_cast_page_comes_and_goes_without_disturbing_the_widget() {
     use pipeline::compositor::LayerId;
     use pipeline::BrowserWindowSurface as Surface;
 
-    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
     let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
         eprintln!("skipping: no usable GPU");
         return;
@@ -470,7 +470,7 @@ fn a_cast_page_comes_and_goes_without_disturbing_the_widget() {
 fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
     use pipeline::compositor::LayerId;
 
-    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
     let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
         eprintln!("skipping: no usable GPU");
         return;
@@ -502,10 +502,12 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
         "page never painted fullscreen"
     );
 
-    assert!(
-        host.minimize_fullscreen(&mut render),
-        "nothing to minimize?"
-    );
+    // Demoting is the *panel's* verb now, not a method on the browser host: one press out
+    // moves every surface that is up, and the host follows on its next pump. That is the
+    // fold this test is really covering — it used to reach past the panel to minimize the
+    // page directly, which is exactly how the page and the shell came to disagree.
+    assert_eq!(render.panel_back(), pipeline::panel::Left::Demoted);
+    host.pump(&mut render);
     assert!(
         render.layer_size(LayerId::BrowserFullscreen).is_none(),
         "the fullscreen texture should be down at once"
@@ -531,7 +533,8 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
         "minimized paint should be card-sized, got {w}x{h}"
     );
 
-    assert!(host.restore_fullscreen(&mut render), "nothing to restore?");
+    assert!(render.panel_restore(), "nothing to restore?");
+    host.pump(&mut render);
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline && render.layer_size(LayerId::BrowserFullscreen).is_none() {
         host.pump(&mut render);

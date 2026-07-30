@@ -41,7 +41,15 @@ impl Status {
     pub const TERMINATED_LOCAL_HOST: Self = Self(0x16);
     /// A parameter value was invalid.
     pub const INVALID_PARAMETERS: Self = Self(0x12);
-    /// The remote user ended the connection — the ordinary "phone walked away" status.
+    /// The peer's *host* ended the connection.
+    ///
+    /// Named "Remote User Terminated Connection" in the spec, and that name has cost real
+    /// debugging time: it reads as "somebody pressed disconnect over there", but it is
+    /// what a peer sends for **any** host-side decision to drop the link — a phone
+    /// deciding an accessory is idle, or misbehaving, or that its own stack has had
+    /// enough. The one thing it does rule out is us: a local teardown is
+    /// [`Self::TERMINATED_LOCAL_HOST`], and a radio problem is
+    /// [`Self::CONNECTION_TIMEOUT`]. So it means "the phone hung up", not "the user did".
     pub const REMOTE_USER_TERMINATED: Self = Self(0x13);
     /// Pairing not allowed.
     pub const PAIRING_NOT_ALLOWED: Self = Self(0x18);
@@ -72,7 +80,10 @@ impl Status {
             Self::REJECTED_LIMITED_RESOURCES => "rejected: limited resources",
             Self::REJECTED_SECURITY => "rejected: security",
             Self::INVALID_PARAMETERS => "invalid parameters",
-            Self::REMOTE_USER_TERMINATED => "remote user terminated",
+            // Not the spec's wording, deliberately: see the constant. "Remote user
+            // terminated" sends whoever reads the log looking for a person who pressed a
+            // button, and there usually was not one.
+            Self::REMOTE_USER_TERMINATED => "the peer hung up",
             Self::TERMINATED_LOCAL_HOST => "terminated by local host",
             Self::PAIRING_NOT_ALLOWED => "pairing not allowed",
             Self::UNSUPPORTED_FEATURE => "unsupported feature",

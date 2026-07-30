@@ -543,8 +543,41 @@ the reasons are what a future reversal has to argue against.
   Plug into **USB 2.0** and use a short extension cable: USB 3.0 radiated noise desensitises
   2.4 GHz radios and is the single biggest real-world range factor. And when Miracast lands,
   force its P2P group to 5 GHz or a mirroring session will stomp on A2DP (§7.5).
-- **Q22 — LDAC decoder. REOPENED 2026-07-26: the premise was wrong, and the feature was a
-  lie.** The original answer said LDAC has no libav support and AOSP's `libldac` is
+- **Q22 — LDAC decoder. ANSWERED 2026-07-29: we link Sony's own library, and the endpoint
+  is opt-in until a phone has used it.** See D47 for the decision and
+  architecture-substrate.md §11.4a for the shape. `ldac-sys` binds `libldacBT`,
+  `pipeline::ldac_decode` wraps it, `nix/ldacbt.nix` builds it, and the `ldac-bindings`
+  flake check keeps the FFI signatures honest against the pinned header. `can_decode`
+  answers by allocating a decoder handle, so the flag and the fact cannot drift again.
+  The endpoint stays out of the advertised table until `codecs = ["ldac", "sbc"]` appears
+  in the config — the decoder is tested against checked-in bitstreams and has never met a
+  real sender, and LDAC is *first* in preference order, so shipping it on would change what
+  every capable phone negotiates rather than adding an option.
+
+  Three things this question got wrong along the way, kept because each one is the kind of
+  thing that reads as settled and is not:
+
+  1. **"Decode means a reverse-engineered library."** No: open-vela's fork of Sony's own
+     library builds the decoder. We link the reference implementation.
+  2. **"nixpkgs ships it."** True of *current* nixpkgs and false of the one this flake
+     pins, where `pkgs.ldacbt` is EHfive/ldacBT built `_ENCODE_ONLY` — a shared object with
+     no `ldacBT_decode` and a header that declares none. Found by building against it. Hence
+     `nix/ldacbt.nix`, which also fails loudly if a future source ever loses the symbol.
+  3. **"The package ships no headers, so the signatures must be hand-written carefully."**
+     The premise was about the *other* packaging; ours installs the header, so the bindings
+     are generated and diffed rather than trusted. Which is just as well, because the
+     header and the implementation disagree about the third parameter's *name*
+     (`var0` vs `nshift`) while agreeing on its arity.
+
+  What the FFI actually demanded, none of which is in the API summary below: the input
+  buffer needs two bytes of slack past the frame (the bit reader fetches three bytes at a
+  time, so reading the last byte overreads); one A2DP payload is a *sequence* of transport
+  frames and `ldacBT_decode` consumes one per call; and a `-1` return with
+  `LDACBT_ERR_DEC_CONFIG_UPDATED` is a success that reconfigured the handle and produced
+  audio, so treating it as a dropped frame loses the first frame of every rate change.
+
+  **The original reopening, for the record.** The premise was wrong, and the feature was a
+  lie. The original answer said LDAC has no libav support and AOSP's `libldac` is
   encoder-only, so decode means the reverse-engineered `libldacdec` over FFI. The first
   half holds; the second does not. nixpkgs ships **`ldacbt` 2.0.72**, an open-vela fork of
   Sony's own library, and it exports a complete decode API — not a reverse-engineered one:
@@ -572,11 +605,12 @@ the reasons are what a future reversal has to argue against.
   feature on. Fixed by giving `can_decode` one source of truth — whether a decoder
   actually exists — so LDAC is simply not advertised today.
 
-  **Parked, not blocked.** What it needs: `ldacbt` in the flake's build inputs and dev
+  **Parked, not blocked.** What it needed: `ldacbt` in the flake's build inputs and dev
   shell; an FFI module (the first non-ffmpeg decoder, so `unsafe` with `// SAFETY:` per
-  ground rule 8); `AudioDecoder` refactored to a backend enum, since it currently *is* an
+  ground rule 8); `AudioDecoder` refactored to a backend enum, since it was then an
   `ffmpeg::decoder::Audio`; and `codec_id`/`can_decode` taught that LDAC has a decoder.
-  Then the `ldac` feature means something and the endpoint can come back.
+  All four landed as written — the list was right, and only the first item turned out to
+  mean building the library rather than depending on it.
 - **Q23 — Pairing and takeover. ANSWERED: Just Works, keys persisted, last-writer-wins.**
   `NoInputNoOutput` so neither side prompts, link keys persisted to the config dir so a
   repeat guest reconnects silently, and a second phone preempts the first to match the

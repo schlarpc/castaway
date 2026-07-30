@@ -1,9 +1,11 @@
-//! libav decode for the A2DP codecs: encoded frames in, interleaved f32 PCM out.
+//! Decode for the A2DP codecs: encoded frames in, interleaved f32 PCM out.
 //!
 //! Four of the five ride on ffmpeg decoders that are already in the build. LDAC is the
-//! exception — libav has no decoder and AOSP's `libldac` is encoder-only — so it is
-//! gated behind the `ldac` feature and its absence must keep the endpoint out of the
-//! advertised table rather than fail at decode time (OPEN-QUESTIONS Q22).
+//! exception — libav has no decoder — so it has a **second backend**, Sony's own
+//! `libldacBT` behind the `ldac` feature (see [`crate::ldac_decode`]). Which backend a
+//! codec uses is settled once, in [`Backend::for_codec`], and the absence of one must keep
+//! the endpoint out of the advertised table rather than fail at decode time
+//! (OPEN-QUESTIONS Q22).
 //!
 //! AAC arrives here already unwrapped from its LATM multiplex — see
 //! `proto_bluetooth_audio::latm` for why that is a separate step and what happens if it is
@@ -48,6 +50,61 @@ fn map_err(e: ffmpeg::Error) -> PipelineError {
 /// [`FrameSource::Pcm`]: castaway_core::FrameSource::Pcm
 pub use castaway_core::PcmFrame as PcmBlock;
 
+/// Which decoder implementation a codec needs.
+///
+/// An enum rather than an `Option<ffmpeg::codec::Id>` because "no ffmpeg decoder" and "not
+/// decodable" stopped being the same thing when LDAC got a backend of its own, and the
+/// place that used to conflate them is where Q22's silence came from. Every question this
+/// module answers about a codec — can it be decoded, what opens it, what closes over the
+/// state — routes through here, so there is one decision and not three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// A libav decoder, named by id.
+    Ffmpeg(ffmpeg::codec::Id),
+    /// Sony's `libldacBT`. Only reachable with the `ldac` feature on: without it there is
+    /// no backend for LDAC at all, which is the answer `can_decode` needs.
+    #[cfg(feature = "ldac")]
+    Ldac,
+}
+
+impl Backend {
+    /// Which backend decodes `codec` in this build.
+    ///
+    /// # Errors
+    /// [`PipelineError::Decode`] naming the codec, when this build has nothing for it.
+    fn for_codec(codec: AudioCodec) -> Result<Self, PipelineError> {
+        match codec {
+            #[cfg(feature = "ldac")]
+            AudioCodec::Ldac => Ok(Self::Ldac),
+            // Without the feature there is no LDAC decoder in the process, and saying so
+            // here is what keeps the endpoint off the advertised table. The old wording
+            // said libav has none and left it at that, which was true and not the point:
+            // what matters is that *nothing* does (Q22).
+            #[cfg(not(feature = "ldac"))]
+            AudioCodec::Ldac => Err(PipelineError::Decode(
+                "no LDAC decoder in this build: libav has none, and the `ldac` feature \
+                 that binds Sony's own library is off (Q22)"
+                    .into(),
+            )),
+            other => codec_id(other).map(Self::Ffmpeg),
+        }
+    }
+
+    /// Whether the backend is actually present, as opposed to merely named.
+    fn is_available(self) -> bool {
+        match self {
+            // An ffmpeg build without the decoder compiled in is a real configuration:
+            // `aptx_hd` in particular is not universal, and advertising it on a build
+            // without it puts our best endpoint in front of a sender and then fails.
+            Self::Ffmpeg(id) => ffmpeg::decoder::find(id).is_some(),
+            // Asks the library for a handle rather than trusting the feature flag. See
+            // `ldac_decode::available`.
+            #[cfg(feature = "ldac")]
+            Self::Ldac => crate::ldac_decode::available(),
+        }
+    }
+}
+
 /// Which ffmpeg decoder an A2DP codec asks for.
 fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
     match codec {
@@ -63,15 +120,10 @@ fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
         AudioCodec::AptXHd => Ok(ffmpeg::codec::Id::APTX_HD),
         AudioCodec::Alac => Ok(ffmpeg::codec::Id::ALAC),
         AudioCodec::Opus => Ok(ffmpeg::codec::Id::OPUS),
-        // libav has no LDAC decoder and AOSP's libldac is encoder-only, so this needs the
-        // reverse-engineered `libldacdec` over FFI. The `ldac` feature reserves the slot;
-        // until something is bound behind it there is no decoder, and `can_decode` must
-        // say so rather than trusting the flag (Q22).
-        AudioCodec::Ldac => Err(PipelineError::Decode(
-            "no LDAC decoder is bound in this build; libav has none (Q22)".into(),
-        )),
+        // LDAC never reaches here: `Backend::for_codec` routes it to its own backend
+        // before asking libav, because libav has no LDAC decoder to name.
         other => Err(PipelineError::Decode(format!(
-            "no audio decoder mapped for {other:?}"
+            "no libav audio decoder mapped for {other:?}"
         ))),
     }
 }
@@ -85,15 +137,23 @@ fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
 pub fn can_decode(codec: AudioCodec) -> bool {
     // One source of truth, and it is whether a decoder actually exists. This used to
     // answer `cfg!(feature = "ldac")` for LDAC, which is a different question: the `ldac`
-    // feature reserves the slot but binds no decoder, so a build with it on advertised an
-    // LDAC endpoint and then failed every packet — the exact silence Q22 is about.
+    // feature reserved a slot and bound no decoder, so a build with it on advertised an
+    // LDAC endpoint and then failed every packet — the exact silence Q22 is about. The
+    // feature now binds a real backend, and this still does not ask about the feature.
     ensure_init();
-    codec_id(codec).is_ok_and(|id| ffmpeg::decoder::find(id).is_some())
+    Backend::for_codec(codec).is_ok_and(Backend::is_available)
+}
+
+/// The decoder state for whichever backend a stream landed on.
+enum Decoder {
+    Ffmpeg(ffmpeg::decoder::Audio),
+    #[cfg(feature = "ldac")]
+    Ldac(Box<crate::ldac_decode::Decoder>),
 }
 
 /// An open decoder for one A2DP stream.
 pub struct AudioDecoder {
-    decoder: ffmpeg::decoder::Audio,
+    decoder: Decoder,
     format: AudioFormat,
     codec: AudioCodec,
 }
@@ -129,7 +189,19 @@ impl AudioDecoder {
         config: Option<&[u8]>,
     ) -> Result<Self, PipelineError> {
         ensure_init();
-        let id = codec_id(codec)?;
+        let id = match Backend::for_codec(codec)? {
+            Backend::Ffmpeg(id) => id,
+            // LDAC takes none of what follows: no extradata (the configuration is in every
+            // frame header), no libav context, and no channel-layout struct to fill in.
+            #[cfg(feature = "ldac")]
+            Backend::Ldac => {
+                return Ok(Self {
+                    decoder: Decoder::Ldac(Box::new(crate::ldac_decode::Decoder::new(format)?)),
+                    format,
+                    codec,
+                })
+            }
+        };
         let found = ffmpeg::decoder::find(id).ok_or_else(|| {
             PipelineError::Decode(format!("this ffmpeg build has no {id:?} decoder"))
         })?;
@@ -193,7 +265,7 @@ impl AudioDecoder {
             .map_err(map_err)?;
 
         Ok(Self {
-            decoder,
+            decoder: Decoder::Ffmpeg(decoder),
             format,
             codec,
         })
@@ -217,27 +289,35 @@ impl AudioDecoder {
         frame: &EncodedFrame,
         mut on_pcm: impl FnMut(PcmBlock),
     ) -> Result<(), PipelineError> {
+        // A decoder that refuses everything is a configuration problem, and configuration
+        // problems are solved offline against real bytes rather than with a phone in hand.
+        // Set CASTAWAY_DUMP_AUDIO to a path to capture the raw frames as they arrive.
+        // Before the backend split, so a dump is of what arrived rather than of what one
+        // backend made of it — and so the LDAC path is dumpable too, which is how the
+        // fixtures in `tests/fixtures` are formatted.
+        self.dump(frame);
+
+        #[cfg(feature = "ldac")]
+        if let Decoder::Ldac(ldac) = &mut self.decoder {
+            // One payload is a *sequence* of transport frames, and the wrapper walks it;
+            // the timestamps of the frames after the first are derived from the audio the
+            // earlier ones produced.
+            ldac.decode(&frame.data, frame.pts, on_pcm)?;
+            ldac.check_against_negotiation();
+            return Ok(());
+        }
+        let Decoder::Ffmpeg(decoder) = &mut self.decoder else {
+            // Unreachable: the only other variant returned above. Written as a guard
+            // rather than a `match` so the ffmpeg body below stays unindented and the diff
+            // that introduced the second backend stays readable.
+            return Ok(());
+        };
+
         let mut packet = ffmpeg::Packet::copy(&frame.data);
         packet.set_pts(Some(
             i64::try_from(frame.pts.as_micros()).unwrap_or(i64::MAX),
         ));
-
-        // A decoder that refuses everything is a configuration problem, and configuration
-        // problems are solved offline against real bytes rather than with a phone in hand.
-        // Set CASTAWAY_DUMP_AUDIO to a path to capture the raw frames as they arrive.
-        if let Ok(path) = std::env::var("CASTAWAY_DUMP_AUDIO") {
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let len = u32::try_from(frame.data.len()).unwrap_or(u32::MAX);
-                let _ = f.write_all(&len.to_le_bytes());
-                let _ = f.write_all(&frame.data);
-            }
-        }
-        if let Err(e) = self.decoder.send_packet(&packet) {
+        if let Err(e) = decoder.send_packet(&packet) {
             // The leading bytes identify the framing when a decoder refuses everything:
             // `fff1`/`fff9` is ADTS, `56ex` is LOAS/LATM with a sync stream, and neither
             // is raw LATM. Guessing between them is how a stream decodes to nothing.
@@ -256,32 +336,57 @@ impl AudioDecoder {
             );
             return Ok(());
         }
-        self.drain(&mut on_pcm)
+        Self::drain(decoder, &mut on_pcm)
+    }
+
+    /// Write the frame to `CASTAWAY_DUMP_AUDIO`, if it is set.
+    fn dump(&self, frame: &EncodedFrame) {
+        if let Ok(path) = std::env::var("CASTAWAY_DUMP_AUDIO") {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let len = u32::try_from(frame.data.len()).unwrap_or(u32::MAX);
+                let _ = f.write_all(&len.to_le_bytes());
+                let _ = f.write_all(&frame.data);
+            }
+        }
     }
 
     /// Flush the decoder at end of stream.
     ///
+    /// Flushing is not optional on the ffmpeg path: libav decoders hold frames back, and a
+    /// session that never flushes loses whatever was still in the pipeline when the phone
+    /// stopped. `libldacBT` holds nothing — one frame in, one block out, synchronously — so
+    /// there is nothing to flush on the LDAC path and nothing to lose by saying so.
+    ///
     /// # Errors
     /// [`PipelineError::Decode`] if draining fails.
     pub fn flush(&mut self, mut on_pcm: impl FnMut(PcmBlock)) -> Result<(), PipelineError> {
-        let _ = self.decoder.send_eof();
-        self.drain(&mut on_pcm)
+        match &mut self.decoder {
+            Decoder::Ffmpeg(decoder) => {
+                let _ = decoder.send_eof();
+                Self::drain(decoder, &mut on_pcm)
+            }
+            #[cfg(feature = "ldac")]
+            Decoder::Ldac(_) => Ok(()),
+        }
     }
 
-    fn drain(&mut self, on_pcm: &mut impl FnMut(PcmBlock)) -> Result<(), PipelineError> {
+    fn drain(
+        decoder: &mut ffmpeg::decoder::Audio,
+        on_pcm: &mut impl FnMut(PcmBlock),
+    ) -> Result<(), PipelineError> {
         let mut decoded = ffmpeg::frame::Audio::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
-            let block = self.convert(&decoded)?;
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            let block = pcm_from_frame(&decoded)?;
             if !block.samples.is_empty() {
                 on_pcm(block);
             }
         }
         Ok(())
-    }
-
-    /// Convert whatever the decoder produced into interleaved f32.
-    fn convert(&mut self, decoded: &ffmpeg::frame::Audio) -> Result<PcmBlock, PipelineError> {
-        pcm_from_frame(decoded)
     }
 }
 
@@ -804,20 +909,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ldac_is_not_claimed_as_decodable_just_because_its_feature_is_on() {
+    #[cfg(not(feature = "ldac"))]
+    fn a_build_without_the_ldac_backend_does_not_claim_ldac() {
         // Q22, and the way it actually went wrong: `can_decode` answered the feature flag
-        // rather than "is there a decoder", so a build with `--features ldac` advertised
-        // an LDAC endpoint, a phone picked it, and every packet failed. The feature
-        // reserves the slot; it does not conjure a decoder.
+        // rather than "is there a decoder", so a build with `--features ldac` advertised an
+        // LDAC endpoint, a phone picked it, and every packet failed. The flag now binds a
+        // real backend — but this side of the invariant still has to hold, because
+        // `castaway-portable` and the Windows artifact are both built without it.
         assert!(
             !can_decode(AudioCodec::Ldac),
-            "no LDAC decoder is bound, whatever the feature says"
+            "there is no LDAC backend in this build"
         );
         let err = AudioDecoder::new(AudioCodec::Ldac, format(44_100, 2), None).unwrap_err();
         assert!(
             format!("{err}").to_lowercase().contains("ldac"),
-            "got: {err}"
+            "the error must name the codec; got: {err}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "ldac")]
+    fn a_build_with_the_ldac_backend_claims_it_and_can_open_it() {
+        // The other side, and the part that was a lie for a while: with the feature on
+        // there is a decoder, and `can_decode` says so because it *asked the library* — not
+        // because the flag is set. `tests/ldac_decode.rs` is where the audio itself is
+        // asserted; this is only about the claim.
+        assert!(can_decode(AudioCodec::Ldac));
+        assert!(AudioDecoder::new(AudioCodec::Ldac, format(44_100, 2), None).is_ok());
     }
 
     #[test]

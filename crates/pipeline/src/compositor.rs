@@ -65,6 +65,54 @@ impl Transform {
     }
 }
 
+/// Which part of a layer's texture to sample, so a container of the wrong shape *clips* its
+/// content instead of stretching it.
+///
+/// Returned as `(offset_x, offset_y, scale_x, scale_y)` in texture coordinates, centred.
+///
+/// The case it exists for: a service screen opens out of a tile, and the tiles are square while
+/// the panel is 16:9 — so drawing a full-panel texture into the tile's rect compresses it 44%
+/// horizontally, and for the first third of the animation the screen is visibly the wrong shape.
+/// What every design language does instead is scale the content by a *single* factor and let the
+/// container crop the excess, which is the only way a morph between two aspects can keep its
+/// content honest.
+///
+/// A no-op whenever the two aspects agree, which is what makes it safe to apply unconditionally:
+/// at rest a full-panel layer is exactly the panel's shape, so this returns the whole texture.
+#[must_use]
+pub fn cover_source(dest: (f32, f32), src: (f32, f32)) -> [f32; 4] {
+    let (dest_aspect, src_aspect) = (
+        dest.0 / dest.1.max(f32::EPSILON),
+        src.0 / src.1.max(f32::EPSILON),
+    );
+    if !dest_aspect.is_finite() || !src_aspect.is_finite() || dest_aspect <= 0.0 {
+        return FULL_SOURCE;
+    }
+    // Wider destination than content → the content's width is the binding constraint, so crop
+    // vertically. Narrower → crop horizontally. Either way one axis stays whole.
+    let (w, h) = if dest_aspect > src_aspect {
+        (1.0, (src_aspect / dest_aspect).clamp(0.0, 1.0))
+    } else {
+        ((dest_aspect / src_aspect).clamp(0.0, 1.0), 1.0)
+    };
+    // A crop of less than half a texel is not a crop. The widget slot is a hard-coded 16:9 on a
+    // 16:9 panel and misses by one part in ten thousand; without this, "a no-op when the shapes
+    // agree" would be *nearly* true, and every frame would rewrite a uniform to move the
+    // sampling by a fifth of a pixel.
+    let whole = |scale: f32, extent: f32| {
+        if (1.0 - scale) * extent < 0.5 {
+            1.0
+        } else {
+            scale
+        }
+    };
+    let (w, h) = (whole(w, src.0), whole(h, src.1));
+    [(1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h]
+}
+
+/// The whole texture: what a layer samples unless something says otherwise.
+pub const FULL_SOURCE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
 /// An axis-aligned pixel region of a layer's texture — the granularity of partial
 /// uploads (browser paint dirty rects).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,13 +188,6 @@ pub enum LayerId {
     /// idle background it sits in, below a session's card, because a session that is
     /// actually playing outranks an ornament.
     BrowserWidget,
-    /// The mascot's foreground half — head, arms, sash — leaning over the widget card's
-    /// top edge. A layer of its own because the split is the point: her torso is drawn
-    /// *into* the idle scene behind the card frame, and her arms have to land in front
-    /// of the live page the card holds, which no amount of drawing into the scene below
-    /// that page can do. Never occludes: it is line art over transparency, and a layer
-    /// this test cannot see through would swallow touches meant for the card.
-    MascotOverlay,
     /// The now-playing card for an audio-only session, which has no pixels of its own.
     /// Above the attract scene, below video — a sender with pixels outranks a card about
     /// a sender without them.
@@ -155,6 +196,23 @@ pub enum LayerId {
     /// below video, for the same reason the card is: a sender with pixels of its own
     /// outranks controls for a sender without them.
     Transport,
+    /// The mascot's foreground half — head, arms, sash — leaning over the widget card's
+    /// top edge. A layer of its own because the split is the point: her torso is drawn
+    /// *into* the idle scene behind the card frame, and her arms have to land in front of
+    /// whatever the card is holding, which no amount of drawing into the scene below it can
+    /// do.
+    ///
+    /// Above the now-playing card and its strip, which is what "she leans on the *slot*"
+    /// means: the card frame is part of the scene and persists, so a session demoted into
+    /// that slot is something she is leaning on rather than something that buries her arms.
+    /// Below video and a fullscreen cast surface, because a session that has taken the whole
+    /// panel is not in the slot and she has no business being drawn over it — the fade that
+    /// gets her out of the way is driven by how far the occupant has *expanded*
+    /// (`RenderLoop::slot_veil`), not by its mere existence.
+    ///
+    /// Never occludes: it is line art over transparency, and a layer this test cannot see
+    /// through would swallow touches meant for the card.
+    MascotOverlay,
     /// The main cast video/mirroring surface.
     Video,
     /// A cast surface filling the panel (YouTube leanback, Cast app receivers). Above
@@ -162,6 +220,12 @@ pub enum LayerId {
     BrowserFullscreen,
     /// The OSD text/overlay layer.
     Osd,
+    /// The close badge on a demoted (pip'd) app — the "X" that stops it and gives the
+    /// slot back to the clock. Its own layer because it must sit above whatever the
+    /// slot holds *and* above the mascot's arms leaning on it, and because it appears
+    /// per-frame from the panel model (a closable surface is demoted) rather than from
+    /// any transition someone has to remember to run.
+    CloseAffordance,
     /// The shell's navigation affordance — the home pill. Above everything, including a
     /// fullscreen cast surface, because the way out of a screen must never be behind the
     /// thing it is a way out of (D38).
@@ -179,21 +243,25 @@ impl LayerId {
     /// had just been opened.
     #[must_use]
     pub const fn occludes(self) -> bool {
-        !matches!(self, Self::ShellPrev | Self::MascotOverlay)
+        !matches!(
+            self,
+            Self::ShellPrev | Self::MascotOverlay | Self::CloseAffordance
+        )
     }
 
     /// Every layer, in paint order. The ordering test asserts against this rather than
     /// against a hand-written list, so a new variant cannot be added without placing it.
-    pub const PAINT_ORDER: [Self; 10] = [
+    pub const PAINT_ORDER: [Self; 11] = [
         Self::Attract,
         Self::ShellPrev,
         Self::BrowserWidget,
-        Self::MascotOverlay,
         Self::NowPlaying,
         Self::Transport,
+        Self::MascotOverlay,
         Self::Video,
         Self::BrowserFullscreen,
         Self::Osd,
+        Self::CloseAffordance,
         Self::ShellOverlay,
     ];
 
@@ -220,11 +288,16 @@ impl LayerId {
     #[must_use]
     pub const fn yields_to(self) -> &'static [Self] {
         match self {
-            // The widget and the mascot leaning on it are one ornament in two layers;
-            // they leave the stage together.
-            Self::BrowserWidget | Self::MascotOverlay => {
-                &[Self::NowPlaying, Self::Transport, Self::Video]
-            }
+            // The clock yields the moment a session has anything on the panel: an ornament
+            // must not outrank the thing the panel is actually doing.
+            Self::BrowserWidget => &[Self::NowPlaying, Self::Transport, Self::Video],
+            // The mascot yields to nothing, and deliberately not to the card: she leans on
+            // the *slot*, so a session demoted into it is what she is leaning on. What gets
+            // her out of the way is a full-panel occupant, and that is a matter of degree
+            // rather than presence — driven as an opacity from how far the occupant has
+            // expanded (`RenderLoop::slot_veil`). A hard hide would also pop, and it popped
+            // back at the moment a departing card had already faded to nothing.
+            Self::MascotOverlay => &[],
             Self::Attract
             | Self::ShellPrev
             | Self::NowPlaying
@@ -232,6 +305,7 @@ impl LayerId {
             | Self::Video
             | Self::BrowserFullscreen
             | Self::Osd
+            | Self::CloseAffordance
             | Self::ShellOverlay => &[],
         }
     }
@@ -361,6 +435,73 @@ mod tests {
     }
 
     #[test]
+    fn a_square_container_crops_a_wide_texture_rather_than_squashing_it() {
+        // The measured case: tiles are exactly square and the panel is 1.778, so a screen
+        // growing out of a tile is compressed 44% horizontally unless it is cropped instead.
+        let [ox, oy, sw, sh] = cover_source((227.0, 227.0), (1920.0, 1080.0));
+        assert!((sh - 1.0).abs() < 1e-6, "height stays whole, got {sh}");
+        assert!(
+            (sw - 1080.0 / 1920.0).abs() < 1e-4,
+            "width should crop to the container's aspect, got {sw}"
+        );
+        // Centred, so the middle of the screen is what shows.
+        assert!((ox - (1.0 - sw) / 2.0).abs() < 1e-6);
+        assert!(oy.abs() < 1e-6);
+    }
+
+    #[test]
+    fn matching_aspects_sample_the_whole_texture() {
+        // What makes it safe to apply unconditionally: at rest every layer is the panel's own
+        // shape, so this has to be exactly a no-op rather than nearly one.
+        assert_eq!(
+            cover_source((1920.0, 1080.0), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+        // The widget slot, and the floor's 2% overscan: same shape, different size.
+        assert_eq!(cover_source((806.0, 453.4), (1920.0, 1080.0)), FULL_SOURCE);
+        assert_eq!(
+            cover_source((1958.4, 1101.6), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+    }
+
+    #[test]
+    fn the_binding_axis_is_the_one_that_stays_whole() {
+        // Cover, not fit: the content is scaled until it *covers* the container, so whichever
+        // axis would leave a gap is the one that stays whole and the other crops.
+        //
+        // A tall narrow container onto a wide texture crops *horizontally* — it shows a narrow
+        // vertical slice — which is the opposite of what reads as intuitive and is why this is
+        // worth pinning rather than eyeballing.
+        let [ox, oy, sw, sh] = cover_source((100.0, 400.0), (1920.0, 1080.0));
+        assert!((sh - 1.0).abs() < 1e-6, "height stays whole, got {sh}");
+        assert!(sw < 0.2, "width should crop hard, got {sw}");
+        assert!(oy.abs() < 1e-6);
+        assert!((ox - (1.0 - sw) / 2.0).abs() < 1e-6);
+
+        // And the mirror, so both branches are covered: a wide container onto a tall texture
+        // crops vertically.
+        let [ox, oy, sw, sh] = cover_source((400.0, 100.0), (1080.0, 1920.0));
+        assert!((sw - 1.0).abs() < 1e-6, "width stays whole, got {sw}");
+        assert!(sh < 0.2, "height should crop hard, got {sh}");
+        assert!(ox.abs() < 1e-6);
+        assert!((oy - (1.0 - sh) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_degenerate_container_samples_the_whole_texture_rather_than_dividing_by_zero() {
+        // A layer can be placed at zero size for a frame — a motion caught at its first step, a
+        // surface resized to nothing — and a NaN in a uniform is a black panel, not a warning.
+        for dest in [(0.0, 0.0), (0.0, 100.0), (-5.0, 100.0)] {
+            assert_eq!(
+                cover_source(dest, (1920.0, 1080.0)),
+                FULL_SOURCE,
+                "{dest:?}"
+            );
+        }
+    }
+
+    #[test]
     fn paint_order_is_total_and_matches_the_declared_order() {
         // The whole ordering model in one assertion. Before D38 depth was an `i32` each
         // caller passed in, two layers shared `-5`, and the tie fell to `HashMap`
@@ -420,15 +561,15 @@ mod tests {
                 );
             }
         }
-        // The mascot overlay is the widget's other half and leaves with it.
-        assert_eq!(
-            LayerId::MascotOverlay.yields_to(),
-            LayerId::BrowserWidget.yields_to()
-        );
-        // These two are the only ornaments with this behavior today; a new entry here
-        // should come with the same kind of reasoning, not by accident.
+        // The mascot leaves with the clock too, but by fading rather than yielding — see
+        // `LayerId::yields_to`. A hard hide pops, and it pops back at the moment a departing
+        // card has already faded to nothing, so her visibility is an opacity the render loop
+        // drives from how much of a session is on the panel.
+        assert!(LayerId::MascotOverlay.yields_to().is_empty());
+        // The clock is the only layer that yields today; a new entry here should come with
+        // the same kind of reasoning, not by accident.
         for id in LayerId::PAINT_ORDER {
-            if !matches!(id, LayerId::BrowserWidget | LayerId::MascotOverlay) {
+            if id != LayerId::BrowserWidget {
                 assert!(id.yields_to().is_empty(), "{id:?} unexpectedly yields");
             }
         }

@@ -1,0 +1,14 @@
+[package]
+name = "ldac-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "FFI bindings to libldacBT, Sony's own LDAC codec library: the decode API the A2DP sink needs and libav does not have (Q22). Bindings are pregenerated and pinned; the ldac-bindings flake check regenerates and diffs them."
+links = "ldacBT"
+
+[dependencies]
+
+[lints]
+workspace = true
