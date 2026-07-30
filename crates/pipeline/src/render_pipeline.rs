@@ -62,6 +62,13 @@ enum Leaving {
 struct Transition {
     /// How the outgoing screen leaves.
     leaving: Leaving,
+    /// The spring that carries it there once nobody is holding it.
+    ///
+    /// The same kind of spring every other surface on the panel uses, from the same
+    /// [`crate::motion::Choreography`] table. It was a hand-rolled velocity decay plus a
+    /// proportional pull — a second integrator with its own feel and its own settle thresholds,
+    /// which is exactly the "two mechanisms for one thing" this work exists to remove.
+    spring: crate::motion::Spring,
     /// 1.0 = the outgoing screen fills the panel, 0.0 = it is gone.
     progress: f32,
     /// Progress per second, carried from the finger so a flick keeps going.
@@ -81,12 +88,17 @@ enum Undo {
     Restore(Vec<(crate::shell::Screen, Option<crate::panel::NormRect>)>),
 }
 
+/// How much of a container transform the outgoing screen has to be gone by.
+///
+/// Material's crossfade split, and it is asymmetric on purpose: the content being replaced goes
+/// in the first third or so while the arriving content takes the rest. Both fading over the
+/// whole duration is what produces the double-exposure look that reads as a dissolve rather than
+/// as one thing becoming another.
+const OUTGOING_FADE: f32 = 0.4;
+
 /// How small the card gets on its way out. Not to nothing: it shrinks *into a preview*,
 /// so what you flicked away is still legible as it goes.
 const CARD_MIN_SCALE: f32 = 0.82;
-
-/// How hard an unattended transition is pulled toward its target, per second.
-const SETTLE_RATE: f32 = 14.0;
 
 /// How fast the finger has to be moving for a flick to win over where it let go.
 const FLICK: f32 = 1.6;
@@ -1064,10 +1076,6 @@ pub struct RenderLoop {
     /// *composed* with it: she is a sub-rect of the scene, not a full-panel layer, so handing
     /// her the floor's transform directly would stretch line art across the whole panel.
     mascot_base: Option<Transform>,
-    /// What a surface arriving next should grow out of — the rect of the thing a person
-    /// touched to cause it. Consumed by the next entrance; `None` means there was no origin
-    /// and the arrival fades through instead (see [`crate::motion::Origin`]).
-    origin: Option<crate::panel::NormRect>,
     /// When the panel was last touched, so an ending session does not yank someone out
     /// of a screen they are reading (#27).
     last_touch: Option<std::time::Instant>,
@@ -1162,7 +1170,6 @@ impl RenderLoop {
             floor: crate::motion::Floor::default(),
             animating: false,
             mascot_base: None,
-            origin: None,
             last_touch: None,
             video_clear_due: None,
             card_clear_due: None,
@@ -1723,7 +1730,17 @@ impl RenderLoop {
             if let Some(slot) = self.placed.get_mut(i) {
                 *slot = now;
             }
-            let origin = self.origin();
+            // No session surface has a spatial origin today, and saying so plainly beats a
+            // field that reads as if one might: a surface being *summoned* out of the corner is
+            // a `Moving` step that carries its own velocity and wants no origin, and every
+            // genuine arrival — a phone casting, a DIAL launch, a track starting — reaches the
+            // panel across an async round trip that no touch survives. The screens are the ones
+            // with origins, and they carry theirs on the navigation (`ScreenStack`).
+            //
+            // What would change this: a launch whose *whole* path is local, like a GameStream
+            // app started from a picker row, if the row's rect were threaded through to the
+            // session it starts.
+            let origin = crate::motion::Origin::Nowhere;
             let step = Step {
                 from: had,
                 to: now,
@@ -1741,23 +1758,18 @@ impl RenderLoop {
                 match (had, now) {
                     // Arriving on the panel: placed at its origin before its first frame, so
                     // there is no flash of the destination first.
-                    (None, Some(_)) => motion.enter(target, origin, spring),
+                    //
+                    // Unless it is still *here* — a surface part-way through its exit that comes
+                    // back (a preemption, a stop immediately followed by a play) reverses from
+                    // wherever it has got to, keeping its velocity. Restarting it from an origin
+                    // it has already left is a jump, and it is the one interruption the whole
+                    // per-component spring arrangement exists to make free.
+                    (None, Some(_)) if !motion.drawn() => motion.enter(target, origin, spring),
                     (Some(_), None) => motion.leave(spring),
                     _ => motion.move_to(spring),
                 }
             }
         }
-    }
-
-    /// Where a surface arriving on the panel should come from.
-    ///
-    /// Only an *entrance* asks: a surface being summoned out of the corner is a `Moving`
-    /// step, so it starts wherever it already is and carries its velocity — no origin needed
-    /// or wanted. What is left is the genuinely new arrival, which either came from something
-    /// a person touched (recorded by the navigation that caused it) or from nothing at all.
-    fn origin(&self) -> crate::motion::Origin {
-        self.origin
-            .map_or(crate::motion::Origin::Nowhere, crate::motion::Origin::From)
     }
 
     /// Where `surface` is heading, and how visible it should be there.
@@ -2728,6 +2740,12 @@ impl RenderLoop {
         });
         self.transition = Some(Transition {
             leaving,
+            spring: match leaving {
+                // A screen going back where it came from is the deliberate one, watched all the
+                // way; the axis slide is the ordinary one.
+                Leaving::Into(_) | Leaving::Yield => crate::motion::Choreography::container(),
+                Leaving::Slide { .. } => crate::motion::Choreography::shared_axis(),
+            },
             progress: 1.0,
             velocity: 0.0,
             target: 0.0,
@@ -2745,16 +2763,14 @@ impl RenderLoop {
             return true;
         }
         let dt = dt.as_secs_f32().min(0.05);
-        // Carry the finger's speed, then let the pull toward the target take over. The
-        // velocity is what makes a flick keep going after the hand has stopped; the pull
-        // is what stops it overshooting into somewhere nobody asked for.
-        t.progress += t.velocity * dt;
-        t.velocity *= (1.0 - dt * 6.0).max(0.0);
-        let pull = (t.target - t.progress) * (dt * SETTLE_RATE).min(1.0);
-        t.progress += pull;
-        let (p, target) = (t.progress, t.target);
-        let settled = (p - target).abs() < 0.004 && t.velocity.abs() < 0.05;
-        if settled {
+        // One spring, taking the finger's speed as its initial velocity — which is what a
+        // spring is *for*, and what makes a flick keep going after the hand has stopped without
+        // a separate decay term to tune against a separate pull term.
+        let (p, v) = t.spring.step(t.progress, t.velocity, t.target, dt);
+        t.progress = p;
+        t.velocity = v;
+        let target = t.target;
+        if crate::motion::Spring::settled(p, v, target) {
             if target >= 0.5 {
                 // Sprung back: the navigation is undone, and the card is whole again.
                 self.undo_transition();
@@ -2861,9 +2877,9 @@ impl RenderLoop {
             // Held still; the arriving screen is the one moving.
             Leaving::Yield => (
                 Transform::default(),
-                // Early: gone by 40% of the way through, so what remains of the transition is
-                // the new screen growing over an empty panel rather than through a ghost.
-                ((p - 0.6) / 0.4).clamp(0.0, 1.0),
+                // Gone early, so what remains of the transition is the new screen growing over
+                // an empty panel rather than through a ghost of the old one.
+                ((p - (1.0 - OUTGOING_FADE)) / OUTGOING_FADE).clamp(0.0, 1.0),
             ),
         };
         self.compositor.upsert_layer(Layer {

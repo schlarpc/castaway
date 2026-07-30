@@ -103,6 +103,12 @@ impl Spring {
 ///
 /// See rule 2 in the module docs. This is the input that makes an app open *from its tile*
 /// rather than materialise in the middle of the screen.
+///
+/// The live user of [`Self::From`] today is [`Floor::launch`] — the arriving *screen*, which is
+/// the one thing whose whole path from a press is local. A session surface always arrives
+/// [`Self::Nowhere`], because every route that starts one (a phone casting, a DIAL launch, a
+/// track beginning) crosses an async round trip that no touch survives. The surface path is
+/// tested and ready for the case that changes it, which `RenderLoop::reflow_surfaces` names.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Origin {
     /// A rectangle on the panel: the tile that was pressed, or the corner it is being

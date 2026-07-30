@@ -1347,9 +1347,24 @@ threshold gesture. And the incoming screen is carried too — `Floor::drive` set
 no spring while a contact is down, and the spring resumes from exactly there on release, which
 is what makes letting go part-way put it back.
 
-Not done, and known: no transient content layers (above), so a container transform still scales
-a finished screen; no elevation shadow, so a demoted card reads as a flat inset rather than as a
+**One integrator, one feel.** The screen transition kept its own — a velocity decay plus a
+proportional pull, with its own settle thresholds — beside the springs everything else uses. Two
+mechanisms for one thing is the shape of problem this whole entry is about, so it now takes a
+`Spring` from the same choreography table. The hand-rolled `SETTLE_RATE` is gone, and a flick
+works because a spring accepts an initial velocity rather than because a decay term was tuned
+against a pull term.
+
+`Origin::From`'s live user is the arriving *screen* (`Floor::launch`), which is the one thing
+whose whole path from a press is local. A session surface always arrives `Nowhere`, because every
+route that starts one — a phone casting, a DIAL launch, a track beginning — crosses an async
+round trip that no touch survives. That is said in the code rather than left to be inferred: the
+`RenderLoop` briefly carried an `origin` field nothing ever set, which read as if it were wired.
+
+Not done, and known: no transient content layers (above), so a container transform still scales a
+finished screen; no elevation shadow, so a demoted card reads as a flat inset rather than as a
 lifted card; and `CLEAR_GRACE` still debounces presence separately from the exit animation —
-right for VLC's stop-then-reload scrubbing, redundant for preemption. The kiosk's input routing
-still has no test harness of its own; extracting `edge_drag` moved the part that had bugs in it
-out, but `route_input`'s ordering is next.
+right for VLC's stop-then-reload scrubbing, redundant for preemption. `Floor::launch` and
+`Motion::enter` are still two implementations of "arrive from a place", one for the floor and one
+for surfaces, which is the next duplication to collapse. The kiosk's input routing has no test
+harness of its own; extracting `edge_drag` moved the part that had bugs in it out, but
+`route_input`'s ordering is next.

@@ -437,3 +437,62 @@ fn a_screen_opened_from_a_tile_grows_out_of_that_tile_and_goes_back_into_it() {
         "it should shrink back toward the tile at {tile:?}, ended at {last:?}"
     );
 }
+
+#[test]
+fn a_session_that_comes_back_mid_exit_reverses_instead_of_jumping() {
+    // Preemption, and a stop immediately followed by a play. A surface part-way through its exit
+    // that is republished must carry on from where it is — restarting it from the fade-through
+    // origin is a visible jump, and reversing for free is the whole reason each component
+    // springs in real units rather than along a normalized progress.
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
+        .unwrap();
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    render.pump();
+    // Settle it, so "mid-exit" is measured from a known whole card.
+    for _ in 0..180 {
+        render.pump();
+        if !render.tick_motion(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+    assert!((render.card_opacity() - 1.0).abs() < 0.01);
+
+    // Start leaving, and get part-way.
+    tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
+    render.pump();
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    for _ in 0..3 {
+        render.pump();
+        render.tick_motion(std::time::Duration::from_millis(16));
+    }
+    let mid = render.card_opacity();
+    assert!(
+        mid > 0.05 && mid < 0.95,
+        "the test needs it genuinely part-way, got {mid}"
+    );
+
+    // Back it comes. The next frame must continue from `mid`, not from a fresh fade-in at 0.
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    render.pump();
+    let resumed = render.card_opacity();
+    assert!(
+        (resumed - mid).abs() < 0.2,
+        "it jumped on the way back: {mid} -> {resumed}"
+    );
+    // …and it finishes whole rather than half-faded.
+    for _ in 0..180 {
+        render.pump();
+        if !render.tick_motion(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+    assert!(
+        (render.card_opacity() - 1.0).abs() < 0.01,
+        "it should end fully back, got {}",
+        render.card_opacity()
+    );
+}
