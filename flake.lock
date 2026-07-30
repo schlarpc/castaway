@@ -39,6 +39,23 @@
         "url": "https://github.com/castlabs/electron-releases/releases/download/v43.0.0%2Bwvcus/electron-v43.0.0%2Bwvcus-win32-x64.zip"
       }
     },
+    "external-libldac-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1770030712,
+        "narHash": "sha256-5jeqTyhSBtYky15Xw1lIbUxeGZMQQQdM/EQUFicyi3Y=",
+        "owner": "open-vela",
+        "repo": "external_libldac",
+        "rev": "5b4bf66096ba0d69615efb2422ba3d023c34c2fd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "open-vela",
+        "repo": "external_libldac",
+        "rev": "5b4bf66096ba0d69615efb2422ba3d023c34c2fd",
+        "type": "github"
+      }
+    },
     "ffmpeg-windows-src": {
       "flake": false,
       "locked": {
@@ -183,6 +200,7 @@
         "crane": "crane",
         "electron-linux-src": "electron-linux-src",
         "electron-windows-src": "electron-windows-src",
+        "external-libldac-src": "external-libldac-src",
         "ffmpeg-windows-src": "ffmpeg-windows-src",
         "moonlight-common-c-src": "moonlight-common-c-src",
         "moonlight-enet-src": "moonlight-enet-src",
