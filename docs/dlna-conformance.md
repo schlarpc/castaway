@@ -75,6 +75,17 @@ still never been observed on a real Windows box.
 
 **Other places practice diverges from the text:**
 
+- **VLC's "Renderer" menu cannot find a DLNA MediaRenderer, by design — do not debug
+  our SSDP against it.** VLC discovers renderers over mDNS only (its
+  `microdns`/Bonjour services-discovery), and the only renderer module it ships is
+  Chromecast (`_googlecast._tcp`); there is no UPnP MediaRenderer *output* in VLC at
+  all. Its UPnP support (`Local Network → Universal Plug'n'Play`) is the other
+  direction entirely: browsing MediaServers as a control point. So "VLC doesn't list
+  the renderer" is the expected behaviour of a correct receiver, not a discovery
+  failure — it was chased as one once. Test SSDP/renderer discovery with something
+  that actually drives a MediaRenderer: BubbleUPnP, Kodi, Symfonium, or the scripted
+  control point in `nix/vm-test.nix`.
+
 - **MIME globs do not work.** gmrender-resurrect: *"BubbleUPnP does not seem to match
   generic `audio/*` types, but only matches mime-types _exactly_."* See G80.
 - **`x-` prefixes are a coin toss.** The same source documents controllers disagreeing

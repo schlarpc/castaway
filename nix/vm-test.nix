@@ -452,11 +452,19 @@ let
     print("info: " + repr(sorted(info)))
     assert info["name"] == sys.argv[3], info
 
-    # Refused, not faked: pairing isn't implemented, and the receiver must say so rather
-    # than 200 its way into a sender that then waits forever for a media plane.
+    # Answered, not refused: legacy pairing (feature bit 27) is implemented, and the
+    # response body is the receiver's long-term Ed25519 identity — the same 32 bytes
+    # the /info plist (and the mDNS TXT records) advertise as `pk`. A sender that pins
+    # the advertisement verifies against exactly this key, so the two agreeing is the
+    # whole point, not a formality: they disagreed once (pk was a SHA-256 stand-in the
+    # pairing layer never presented), and the symptom was iOS listing the receiver and
+    # then dropping the session with nothing in our logs.
     request("POST", "/pair-setup", 3)
-    status, _, _ = response()
-    assert status == 501, status
+    status, _, body = response()
+    assert status == 200, status
+    assert len(body) == 32, body
+    assert body.hex() == info["pk"], (body.hex(), info["pk"])
+    print("pair-setup pk: " + body.hex())
 
     request("TEARDOWN", "/stream", 4)
     status, _, _ = response()
@@ -643,16 +651,16 @@ pkgs.testers.runNixOSTest {
             "journalctl -u castaway --no-pager | grep -q 'null pipeline: CONTROL.*Volume'"
         )
 
-    with subtest("an AirPlay sender gets OPTIONS, /info, and an honest 501 for pairing"):
+    with subtest("an AirPlay sender gets OPTIONS, /info, and its pk from /pair-setup"):
         receiver.wait_for_open_port(7000)
         # `#airplay`, not the bare name: every advertised surface says which one it is,
         # and `/info` reports the same name the picker shows.
         session = sender.succeed(f"airplay-send {kiosk} 7000 ${friendlyName}#airplay")
         assert "airplay session completed" in session, session
-        # `wait_for_open_port` also produces a connect/disconnect pair, so this next line
-        # alone is weak. The pairing refusal is the one only a real request can log — it
-        # proves the sender's 501 came from the state machine, not from a closed socket.
-        receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay pairing not implemented (Q1) path=/pair-setup'")
+        # `wait_for_open_port` also produces a connect/disconnect pair, so the journal
+        # greps alone are weak. The load-bearing proof is the sender's own assertions
+        # above the "completed" line: /pair-setup answered 200 with the 32-byte
+        # Ed25519 key that /info advertised — only the state machine can do that.
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'AirPlay sender connected'")
         # The connection must be *closed*, not leaked: the actor emits End and logs this
         # on the way out. It can't be asserted as 'session: end' the way Cast is — the
@@ -684,8 +692,18 @@ pkgs.testers.runNixOSTest {
         assert "et=0,1" in raop and "et=0,3,5" not in raop, raop  # RSA yes, FairPlay no
         assert "cn=0,1" in raop and "cn=0,1,2,3" not in raop, raop  # no AAC we don't offer
         airplay = sender.succeed("avahi-browse -rpt _airplay._tcp")
-        # No `pk`: an empty one publishes an identity a sender cannot verify against.
-        assert "pk=" not in airplay, airplay
+        # `pk` is present (bit 27 promises pairing, so the identity must be published)
+        # and it is *the* identity: the same 64 hex chars the scripted sender read
+        # from /info and received raw from /pair-setup. The three encodings of this
+        # key have disagreed before, and a sender that pins one sees the lie.
+        pk = next(
+            line.split(": ", 1)[1]
+            for line in session.splitlines()
+            if line.startswith("pair-setup pk: ")
+        )
+        assert f"pk={pk}" in airplay, airplay
+        # The RAOP record carries the same key; senders group the two services by it.
+        assert f"pk={pk}" in raop, raop
         # `pi` is a UUID, not the device id echoed back.
         assert "pi=" in airplay, airplay
 
