@@ -46,3 +46,8 @@ htmlcov/
 # The relative directory `castaway-paths` falls back to when the environment names no
 # home at all (a bare `cargo run` under a scrubbed env).
 .castaway/
+
+# The working-directory config a `cargo run` picks up. Local by definition: deployments
+# name their config with `$CASTAWAY_CONFIG` (the NixOS module generates one), so anything
+# here is somebody's dev box and not the panel on the wall.
+/castaway.toml
