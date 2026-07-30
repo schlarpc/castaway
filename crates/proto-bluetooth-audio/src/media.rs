@@ -14,6 +14,7 @@ use castaway_core::{AudioCodec, EncodedFrame};
 use substrate_rtp::RtpPacket;
 
 use crate::latm::LatmParser;
+use crate::ldac;
 
 /// Every SBC frame starts with this.
 const SBC_SYNCWORD: u8 = 0x9C;
@@ -70,6 +71,14 @@ pub struct Depacketizer {
     /// read it; the parser is stateful because a sender may send the configuration once
     /// and reuse it (RFC 3016 §4.1).
     latm: Option<LatmParser>,
+    /// What the most recent LDAC payload said it was, read from its first frame header.
+    ///
+    /// The counterpart of `sbc_bitpool`, and for the same reason: it is the number the
+    /// stream states about itself, which is not necessarily the number the negotiation
+    /// settled on. LDAC is the only A2DP codec that carries its sample rate in-band, so it
+    /// is the only one where that comparison is possible at all — and the decoder follows
+    /// the stream, so without this nothing would ever say the two had diverged.
+    ldac_stream: Option<ldac::StreamConfig>,
 }
 
 impl Depacketizer {
@@ -84,6 +93,7 @@ impl Depacketizer {
             frames_seen: 0,
             sbc_bitpool: None,
             latm: (codec == AudioCodec::Aac).then(LatmParser::new),
+            ldac_stream: None,
         }
     }
 
@@ -102,6 +112,19 @@ impl Depacketizer {
     #[must_use]
     pub const fn bitpool(&self) -> Option<u8> {
         self.sbc_bitpool
+    }
+
+    /// What the most recent LDAC payload declared about itself, if this is an LDAC stream.
+    ///
+    /// Read from the frame headers rather than from the negotiation, because LDAC is the
+    /// one A2DP codec where they can differ without anything failing: Sony's decoder
+    /// reconfigures itself from these bytes and keeps playing. Comparing this against the
+    /// negotiated [`castaway_core::AudioFormat`] is the only way that divergence becomes
+    /// visible — the audio stays correct, but the endpoint we advertised does not describe
+    /// what is arriving.
+    #[must_use]
+    pub const fn ldac_stream(&self) -> Option<ldac::StreamConfig> {
+        self.ldac_stream
     }
 
     /// Whether packets for this codec carry an RTP header at all.
@@ -143,6 +166,15 @@ impl Depacketizer {
                     // flags into it). Neither decoder wants it, but leaving it in place
                     // shifts every frame by one byte and decodes to noise.
                     payload = payload.slice(1..);
+                    if self.codec == AudioCodec::Ldac {
+                        // The check that makes the byte above provably the right thing to
+                        // drop. An LDAC transport frame begins with the syncword 0xAA, so a
+                        // payload that does not is one we have mis-framed — and handing
+                        // that to a decoder is noise, not an error. It also gives us the
+                        // stream's own rate and channel configuration for free, which is
+                        // the only in-band answer any of these five codecs offers.
+                        self.ldac_stream = Some(ldac::StreamConfig::parse(&payload)?);
+                    }
                     if self.codec == AudioCodec::Sbc {
                         // Syncword 0x9C, then one byte of stream parameters, then the
                         // bitpool this frame was coded at.
@@ -245,15 +277,39 @@ mod tests {
     fn sbc_and_ldac_drop_their_one_byte_codec_header() {
         // Leaving the frame-count byte in shifts every frame by one and decodes to
         // noise, in the same silent way as the aptX case.
-        for codec in [AudioCodec::Sbc, AudioCodec::Ldac] {
-            let mut d = Depacketizer::new(codec, 44_100);
-            let frame = d.push(rtp(0, &[0x05, 0xAA, 0xBB, 0xCC])).unwrap();
-            assert_eq!(
-                &frame.data[..],
-                &[0xAA, 0xBB, 0xCC],
-                "{codec:?} must drop its codec header"
-            );
-        }
+        //
+        // The two codecs need different payloads because only one of them is checked: an
+        // SBC frame is taken on trust, while an LDAC payload has to start with its
+        // syncword or it is refused (see the test below).
+        let mut sbc = Depacketizer::new(AudioCodec::Sbc, 44_100);
+        let frame = sbc.push(rtp(0, &[0x05, 0xAA, 0xBB, 0xCC])).unwrap();
+        assert_eq!(&frame.data[..], &[0xAA, 0xBB, 0xCC]);
+
+        let mut ldac = Depacketizer::new(AudioCodec::Ldac, 44_100);
+        // One LDAC transport frame: syncword, 44.1 kHz stereo, three payload bytes.
+        let ldac_frame = [0xAAu8, 0b0001_0000, 0b0000_1000, 0x11, 0x22, 0x33];
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(&ldac_frame);
+        let frame = ldac.push(rtp(0, &payload)).unwrap();
+        assert_eq!(
+            &frame.data[..],
+            &ldac_frame,
+            "the frame count must come off"
+        );
+    }
+
+    #[test]
+    fn an_ldac_payload_must_start_with_a_frame_syncword() {
+        // The guard that makes dropping that byte provable rather than assumed. If the
+        // one-byte payload header stopped coming off, every frame would shift by a byte and
+        // Sony's decoder would be handed a frame count where it expects 0xAA — which is
+        // noise on the speakers, not an error in a log.
+        let mut d = Depacketizer::new(AudioCodec::Ldac, 44_100);
+        assert!(
+            d.push(rtp(0, &[0x05, 0x9C, 0x31, 0x35, 0x00])).is_err(),
+            "an SBC frame is not an LDAC frame"
+        );
+        assert_eq!(d.ldac_stream(), None, "and nothing was recorded from it");
     }
 
     /// One SBC frame header: syncword, stream parameters, bitpool, CRC.
@@ -317,6 +373,90 @@ mod tests {
         // This capture's header is nine bytes of StreamMuxConfig plus a one-byte length.
         assert_eq!(frame.data.len(), multiplex.len() - 10);
         assert_eq!(&frame.data[..], &multiplex[10..]);
+    }
+
+    /// Length-prefixed records: a little-endian `u32` length, then that many bytes.
+    ///
+    /// The framing `CASTAWAY_DUMP_AUDIO` writes, so a capture from a real phone can be
+    /// dropped in beside a generated fixture and replayed by the same code.
+    fn records(data: &[u8]) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while let Some(header) = data.get(at..at + 4) {
+            let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            at += 4;
+            let Some(record) = data.get(at..at + len) else {
+                break;
+            };
+            out.push(Bytes::copy_from_slice(record));
+            at += len;
+        }
+        out
+    }
+
+    #[test]
+    fn ldac_packets_walk_to_the_frame_count_their_encoder_reported() {
+        // The cross-implementation check. These fixtures were produced by Sony's own
+        // encoder (`pipeline/examples/ldac_fixtures.rs`), which *reports* how many
+        // `ldac_transport_frame`s it packed into each MTU — and `crate::ldac` walks the
+        // same bytes with a pure Rust parser that shares no code with the library. The
+        // counts agreeing is what makes the field widths in that module a finding rather
+        // than a guess, and it holds in every build because nothing here links the codec.
+        //
+        // The numbers below are what the encoder printed when the fixtures were generated:
+        // 44.1 kHz stereo, MQ, 679-byte MTU gives 14 packets of 6 frames each.
+        let packets = records(include_bytes!(
+            "../tests/fixtures/a2dp-ldac-44100-stereo.bin"
+        ));
+        assert_eq!(packets.len(), 14, "fixture has the wrong number of packets");
+
+        let mut d = Depacketizer::new(AudioCodec::Ldac, 44_100);
+        let mut frames = 0u32;
+        for packet in packets {
+            let frame = d.push(packet).unwrap();
+            // Every payload starts at a frame boundary, which is the property the
+            // one-byte header coming off is *for*.
+            assert_eq!(frame.data[0], 0xAA);
+            let stream = d.ldac_stream().expect("an LDAC payload declares itself");
+            assert_eq!(stream.sample_rate, ldac::SampleRate::Hz44100);
+            assert_eq!(stream.channels, ldac::ChannelConfig::Stereo);
+            frames += u32::from(stream.frames);
+        }
+        assert_eq!(
+            frames, 84,
+            "the walk must find every frame the encoder wrote"
+        );
+        // 84 frames x 128 samples per channel: a hair under the 0.25 s that went in, the
+        // difference being the partial frame the encoder never emitted.
+        assert_eq!(frames * 128, 10_752);
+    }
+
+    #[test]
+    fn the_rate_ldac_declares_is_read_from_the_stream_not_the_negotiation() {
+        // 96 kHz dual channel, and the depacketizer told 44.1 kHz stereo. It must report
+        // what the *frames* say, because that is what the decoder will follow: LDAC
+        // reconfigures itself from the frame header and keeps playing, so a receiver that
+        // trusted its own negotiation here would log 44.1 kHz for a 96 kHz stream and
+        // nothing would ever contradict it (the aptX shape of Q25, in the one codec that
+        // can actually be checked).
+        let packets = records(include_bytes!("../tests/fixtures/a2dp-ldac-96000-dual.bin"));
+        assert_eq!(packets.len(), 7);
+
+        let mut d = Depacketizer::new(AudioCodec::Ldac, 44_100);
+        let mut frames = 0u32;
+        for packet in packets {
+            d.push(packet).unwrap();
+            let stream = d.ldac_stream().unwrap();
+            assert_eq!(stream.sample_rate, ldac::SampleRate::Hz96000);
+            assert_eq!(stream.channels, ldac::ChannelConfig::DualChannel);
+            // Two channels, coded independently — the trap the capability field has too.
+            assert_eq!(stream.channels.channel_count(), 2);
+            frames += u32::from(stream.frames);
+        }
+        assert_eq!(frames, 42);
+        // 256 samples per frame at 96 kHz, not 128: the same PCM count from six times
+        // fewer seconds of audio.
+        assert_eq!(frames * 256, 10_752);
     }
 
     #[test]

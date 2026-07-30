@@ -21,6 +21,7 @@ pub mod control;
 pub mod error;
 pub mod host;
 pub mod latm;
+pub mod ldac;
 pub mod media;
 pub mod obex;
 pub mod sink;
