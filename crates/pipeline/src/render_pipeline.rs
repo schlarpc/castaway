@@ -98,8 +98,16 @@ pub enum RenderCommand {
     ReplaceScreen(Box<crate::shell::Screen>),
     /// Go back one shell screen.
     ShellBack,
-    /// Return the shell to Home. What the idle policy and a finished session use.
-    ShellHome,
+    /// Put the panel back to its resting arrangement: the shell at Home, and the glass
+    /// handed to whatever is playing.
+    ///
+    /// Both ends of a session send this, and they mean the same thing by it. A session
+    /// *ending* wants the idle screen back (#27); a session *starting* wants the panel it
+    /// is about to fill — and without that, a source that restarts while the shell happens
+    /// to be forward stays minimised for ever, because nothing else ever hands the glass
+    /// back. Both are declined the same way, by the same predicate: not while someone is
+    /// using the panel.
+    RestPanel,
     /// Attach a consumer of composited frames (Q30). Sent as a command rather than set
     /// on the loop directly because the loop lives on the main thread and everything
     /// that wants to tap it does not.
@@ -428,6 +436,17 @@ impl RenderPipeline {
         }
     }
 
+    /// Ask for the panel a starting session is about to fill.
+    ///
+    /// The counterpart of the idle return in [`Self::stop`], and declined on the same
+    /// terms — the render loop keeps someone who is using the panel where they are. What
+    /// it fixes: nothing else ever took the shell out of the foreground, so a source that
+    /// ended and restarted (a phone reclaiming Spotify, a preempted sender pressing play)
+    /// came back minimised into a corner with no way to know it had.
+    fn claim_panel(&self) {
+        let _ = self.tx.try_send(RenderCommand::RestPanel);
+    }
+
     /// Hand the panel back from whatever is covering it, if anything is.
     fn release_screen(&self) {
         let release = self
@@ -465,6 +484,7 @@ impl RenderPipeline {
 impl Pipeline for RenderPipeline {
     async fn play(&self, source: MediaUri, start: Option<Duration>) -> Result<(), CoreError> {
         self.release_screen();
+        self.claim_panel();
         self.preempt();
         let stop = Arc::new(AtomicBool::new(false));
         self.set_active(stop.clone());
@@ -578,6 +598,7 @@ impl Pipeline for RenderPipeline {
         audio: Option<castaway_core::MirrorAudio>,
     ) -> Result<(), CoreError> {
         self.release_screen();
+        self.claim_panel();
         self.preempt();
         match video {
             // A mirror session is pixels by definition. PCM reaching here means an
@@ -653,6 +674,7 @@ impl Pipeline for RenderPipeline {
             // A source that is only audio still takes the session, and a YouTube page
             // left on screen would keep playing its own sound over it.
             self.release_screen();
+            self.claim_panel();
             // Preempt first: the flag slot holds whichever session is live, video or
             // audio, because only one source may own the output at a time.
             self.preempt();
@@ -861,7 +883,7 @@ impl Pipeline for RenderPipeline {
         // person expects to find it (#27). The render loop declines if the panel was
         // touched recently — an ending session is no reason to close a screen someone is
         // reading.
-        let _ = self.tx.try_send(RenderCommand::ShellHome);
+        let _ = self.tx.try_send(RenderCommand::RestPanel);
         info!("render pipeline: STOP");
         Ok(())
     }
@@ -1006,6 +1028,11 @@ pub struct RenderLoop {
     /// Whether the shell is in front: someone is navigating, so a playing video is
     /// demoted to a corner rather than covering the screens they are using (D38, #28).
     shell_front: bool,
+    /// Where the session's own surfaces were last put. Kept so [`SurfacePlacement`] can
+    /// be recomputed every pump — it depends on which shell screen is current, and a
+    /// navigation is not a place anybody should have to remember to re-place layers from
+    /// — while the uniform writes still happen only when the answer changes.
+    placed: SurfacePlacement,
     /// When the panel was last touched, so an ending session does not yank someone out
     /// of a screen they are reading (#27).
     last_touch: Option<std::time::Instant>,
@@ -1030,6 +1057,43 @@ pub struct RenderLoop {
     failed_imports: u32,
     /// The transport strip currently on screen, if any.
     transport: Option<TransportState>,
+}
+
+/// Where a live session's own surfaces — video, and the now-playing card — belong.
+///
+/// The one answer to "what is on the glass", derived from the shell's focus *and* which
+/// screen it is on, and read by everything: layer placement, layer suppression, and hit
+/// testing. It exists because the alternative was each of those re-deriving it from
+/// [`RenderLoop::shell_front`] alone, and disagreeing.
+///
+/// The disagreement was a real bug, and it is the reason this is an enum and not a
+/// `bool`: the demoted slot is the *Home screen's* widget slot (`WidgetSlot::RightCard`),
+/// so on any screen pushed above Home there is no slot to be demoted into — but
+/// `shell_front` says nothing about which screen is current, so a session minimised while
+/// someone opened a service screen was drawn over the text they were reading. Three
+/// states make that unrepresentable rather than merely unlikely (ground rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfacePlacement {
+    /// The session owns the panel: full size, the shell behind it.
+    Panel,
+    /// Minimised into the Home screen's widget slot, tappable to restore.
+    Widget,
+    /// Not drawn at all. The shell is on a screen of its own above Home, which owns the
+    /// whole surface — a PiP is a Home-screen affordance, so it has nowhere to be.
+    Hidden,
+}
+
+impl SurfacePlacement {
+    /// Whether a surface placed like this is on the glass at all.
+    const fn visible(self) -> bool {
+        !matches!(self, Self::Hidden)
+    }
+
+    /// Whether this is the demoted, tappable corner — the only placement a press on a
+    /// session surface means "give it the panel back" rather than "forward the touch".
+    const fn is_widget(self) -> bool {
+        matches!(self, Self::Widget)
+    }
 }
 
 /// The transport strip's state on the render thread.
@@ -1085,6 +1149,7 @@ impl RenderLoop {
             transition: None,
             transition_undo: None,
             shell_front: false,
+            placed: SurfacePlacement::Panel,
             last_touch: None,
             shell: None,
             has_video: false,
@@ -1548,8 +1613,7 @@ impl RenderLoop {
             return;
         }
         self.shell_front = front;
-        self.place_video();
-        self.place_card();
+        self.reflow_surfaces();
     }
 
     /// Whether the shell is in front.
@@ -1558,11 +1622,35 @@ impl RenderLoop {
         self.shell_front
     }
 
+    /// Where a live session's surfaces belong right now. See [`SurfacePlacement`].
+    ///
+    /// Total over both inputs, so there is no combination of focus and screen depth that
+    /// nobody decided about. Depth `0` is a renderer with no shell at all — the offscreen
+    /// harness — and has no screens to protect, so the session keeps the panel.
+    fn placement(&self) -> SurfacePlacement {
+        match (self.shell_front, self.shell_depth()) {
+            (false, _) | (_, 0) => SurfacePlacement::Panel,
+            (true, 1) => SurfacePlacement::Widget,
+            (true, _) => SurfacePlacement::Hidden,
+        }
+    }
+
+    /// Put every session surface where [`Self::placement`] currently says it goes.
+    ///
+    /// Called whenever an input to that answer changes — focus, the screen stack, a
+    /// surface appearing — and once per pump as a standing fact, because navigation
+    /// happens in several places and none of them should have to remember this.
+    fn reflow_surfaces(&mut self) {
+        self.placed = self.placement();
+        self.place_video();
+        self.place_card();
+    }
+
     /// Where the demoted video sits, in panel-normalized coordinates. `None` when it is
     /// not demoted, or when there is no video.
     #[must_use]
     pub fn pip_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        (self.shell_front && self.has_video).then(|| {
+        (self.placement().is_widget() && self.has_video).then(|| {
             let t = Transform::pip(PIP_CORNER);
             (t.offset_x, t.offset_y, t.scale_x, t.scale_y)
         })
@@ -1580,7 +1668,8 @@ impl RenderLoop {
         if !self.has_video {
             return;
         }
-        let transform = if self.shell_front {
+        let placement = self.placement();
+        let transform = if placement.is_widget() {
             Transform::pip(PIP_CORNER)
         } else {
             Transform::default()
@@ -1590,6 +1679,11 @@ impl RenderLoop {
             opacity: 1.0,
             transform,
         });
+        // Suppressed rather than removed on a pushed screen: the decoder keeps handing
+        // over frames and the session keeps its clock, so this has to be a placement the
+        // next navigation can undo, not a teardown.
+        self.compositor
+            .set_suppressed(LayerId::Video, !placement.visible());
     }
 
     /// Put the now-playing card where the current mode says it goes: the whole panel
@@ -1607,7 +1701,8 @@ impl RenderLoop {
         }
         let (w, h) = self.compositor.target_size();
         let (w, h) = (w.max(1), h.max(1));
-        let transform = if self.shell_front {
+        let placement = self.placement();
+        let transform = if placement.is_widget() {
             crate::attract::WidgetSlot::RightCard
                 .rect(w, h)
                 .map_or_else(Transform::default, |r| r.transform(w, h))
@@ -1619,16 +1714,20 @@ impl RenderLoop {
             opacity: 1.0,
             transform,
         });
+        self.compositor
+            .set_suppressed(LayerId::NowPlaying, !placement.visible());
         // The strip's controls are unusably small at card scale; it returns with the
         // full view. Suppressed, not removed — the texture and model stay warm.
-        self.compositor
-            .set_suppressed(LayerId::Transport, self.shell_front);
+        self.compositor.set_suppressed(
+            LayerId::Transport,
+            !matches!(placement, SurfacePlacement::Panel),
+        );
     }
 
     /// Whether a panel-normalized point is on the minimized now-playing card.
     #[must_use]
     pub fn hit_minimized_card(&self, x: f32, y: f32) -> bool {
-        if !(self.shell_front && self.compositor.has_layer(LayerId::NowPlaying)) {
+        if !(self.placement().is_widget() && self.compositor.has_layer(LayerId::NowPlaying)) {
             return false;
         }
         let (w, h) = self.compositor.target_size();
@@ -1824,6 +1923,13 @@ impl RenderLoop {
             .set_suppressed(LayerId::BrowserWidget, off_home);
         self.compositor
             .set_suppressed(LayerId::MascotOverlay, off_home);
+        // A session's own surfaces, on the same terms: where they belong depends on which
+        // screen the shell is on, and every navigation is a place that would otherwise
+        // have to remember to re-place them. Recomputed here and applied only when the
+        // answer moved, so the uniform writes stay one-per-change rather than per frame.
+        if self.placement() != self.placed {
+            self.reflow_surfaces();
+        }
         if self.taps.is_empty() {
             self.compositor.present();
             return;
@@ -1946,9 +2052,10 @@ impl RenderLoop {
                 self.shell_back();
                 false
             }
-            RenderCommand::ShellHome => {
-                // The idle return (#27). Not while someone is using the panel: a session
-                // ending is no reason to close a picker out from under them.
+            RenderCommand::RestPanel => {
+                // The idle return (#27), and a starting session's claim on the glass. Not
+                // while someone is using the panel: neither end of a session is a reason
+                // to close a picker out from under them.
                 let busy = self.last_touch.is_some_and(|t| t.elapsed() < IDLE_GRACE);
                 if busy {
                     debug!("shell: staying put, the panel was touched recently");

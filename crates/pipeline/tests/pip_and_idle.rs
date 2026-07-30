@@ -102,7 +102,7 @@ fn an_ending_session_returns_the_panel_home() {
     )));
     assert_eq!(render.shell_depth(), 2);
 
-    tx.try_send(RenderCommand::ShellHome).unwrap();
+    tx.try_send(RenderCommand::RestPanel).unwrap();
     render.pump();
 
     assert_eq!(render.shell_depth(), 1, "back to a known state");
@@ -119,7 +119,7 @@ fn but_not_out_from_under_someone_using_it() {
     )));
     render.note_touch();
 
-    tx.try_send(RenderCommand::ShellHome).unwrap();
+    tx.try_send(RenderCommand::RestPanel).unwrap();
     render.pump();
 
     assert_eq!(render.shell_depth(), 2, "still where they left it");
@@ -162,4 +162,114 @@ fn an_audio_session_minimizes_into_the_widget_slot_and_restores() {
     // shell going back.
     render.set_shell_foreground(false);
     assert!(!render.hit_minimized_card(cx, cy));
+}
+
+/// The middle of the Home screen's widget slot, panel-normalized.
+fn slot_center() -> (f32, f32) {
+    let rect = pipeline::attract::WidgetSlot::RightCard.rect(W, H).unwrap();
+    (
+        (rect.x as f32 + rect.width as f32 / 2.0) / W as f32,
+        (rect.y as f32 + rect.height as f32 / 2.0) / H as f32,
+    )
+}
+
+fn a_screen() -> pipeline::shell::Screen {
+    pipeline::shell::Screen::Picker(Box::new(pipeline::picker::Picker::loading(
+        "Moonlight",
+        "…",
+    )))
+}
+
+#[test]
+fn a_demoted_card_leaves_the_glass_when_the_shell_goes_deeper_than_home() {
+    // The reported bug: the minimized slot *is* the Home screen's widget slot, so a card
+    // demoted into it while someone opened a service screen was drawn over the text they
+    // were reading — a PiP on a screen that has no PiP. Nothing in `shell_front` said
+    // which screen was current, so nothing stopped it.
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
+        .unwrap();
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    render.pump();
+    render.set_shell_foreground(true);
+
+    let (cx, cy) = slot_center();
+    assert!(
+        render.hit_minimized_card(cx, cy),
+        "at Home it is in the slot"
+    );
+
+    render.shell_push(a_screen());
+    render.pump();
+    assert!(
+        !render.hit_minimized_card(cx, cy),
+        "a screen above Home owns its whole surface; the card has nowhere to be"
+    );
+    // …and coming back restores it, without the session having been touched.
+    render.shell_back();
+    render.pump();
+    assert!(
+        render.hit_minimized_card(cx, cy),
+        "back at Home, the card is in the slot again"
+    );
+}
+
+#[test]
+fn a_demoted_video_leaves_the_glass_the_same_way() {
+    // Same rule, the other surface: `hit_pip` is what routes a tap to "give the panel
+    // back", so a PiP that is not drawn must not be hittable either.
+    let (_tx, mut render) = playing();
+    render.set_shell_foreground(true);
+    let (ox, oy, sx, sy) = render.pip_rect().expect("demoted at Home");
+    let (px, py) = (ox + sx / 2.0, oy + sy / 2.0);
+    assert!(render.hit_pip(px, py));
+
+    render.shell_push(a_screen());
+    render.pump();
+    assert!(render.pip_rect().is_none(), "no corner on a pushed screen");
+    assert!(!render.hit_pip(px, py), "and nothing to tap there");
+
+    render.shell_home();
+    render.pump();
+    assert!(render.pip_rect().is_some(), "home again, corner again");
+}
+
+#[test]
+fn a_session_that_restarts_gets_the_panel_back() {
+    // What left the panel stuck: nothing but a touch ever took the shell out of the
+    // foreground, so a source that ended and started again (a phone reclaiming Spotify)
+    // came back minimized into the corner with no way to know it had.
+    let (tx, mut render) = playing();
+    render.shell_push(a_screen());
+    render.set_shell_foreground(true);
+    render.pump();
+    assert!(render.shell_foreground());
+
+    // What `Pipeline::play`/`play_audio` send when a session starts.
+    tx.try_send(RenderCommand::RestPanel).unwrap();
+    render.pump();
+
+    assert!(
+        !render.shell_foreground(),
+        "the starting session owns the panel"
+    );
+    assert_eq!(render.shell_depth(), 1, "and the shell is back at Home");
+}
+
+#[test]
+fn but_a_session_starting_does_not_snatch_the_panel_from_a_hand_on_it() {
+    // The other half of the same predicate: someone reading a picker keeps it, exactly as
+    // they do when a session *ends* underneath them.
+    let (tx, mut render) = playing();
+    render.shell_push(a_screen());
+    render.set_shell_foreground(true);
+    render.note_touch();
+
+    tx.try_send(RenderCommand::RestPanel).unwrap();
+    render.pump();
+
+    assert!(render.shell_foreground(), "still theirs");
+    assert_eq!(render.shell_depth(), 2, "still where they left it");
 }
