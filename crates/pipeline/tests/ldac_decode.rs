@@ -201,6 +201,40 @@ fn the_stream_decodes_at_its_own_rate_and_not_the_one_we_negotiated() {
 }
 
 #[test]
+fn a_mono_stream_is_not_labelled_with_the_channel_count_we_negotiated() {
+    // The one configuration where a block's size differs from a stereo one, and therefore
+    // the only one that catches the shortcut this test exists to forbid: the library reports
+    // the sample rate and *not* the channel count, so reusing the negotiated count is the
+    // obvious move and is wrong. A mono block labelled stereo halves its own reported
+    // duration, which the output device then plays at roughly double speed while every
+    // layer reports success.
+    let blocks = decode_all(
+        include_bytes!("fixtures/ldac-44100-mono.bin"),
+        // Negotiated stereo, deliberately — the mismatch is the point.
+        format(44_100, 2),
+    );
+    assert!(!blocks.is_empty());
+    for block in &blocks {
+        assert_eq!(block.channels, 1, "a mono frame decodes to one channel");
+        assert_eq!(block.sample_rate, 44_100);
+        // 128 samples per channel at 44.1 kHz, and one channel.
+        assert_eq!(block.frame_count(), 128);
+    }
+    let total: usize = blocks.iter().map(PcmBlock::frame_count).sum();
+    assert_eq!(
+        total,
+        84 * 128,
+        "the same frame count as the stereo fixture"
+    );
+
+    let samples: Vec<f32> = blocks
+        .iter()
+        .flat_map(|b| b.samples.iter().copied())
+        .collect();
+    assert!(EXPECTED_RMS.contains(&rms(&samples)), "mono is silent");
+}
+
+#[test]
 fn a_payload_with_its_a2dp_header_still_attached_produces_nothing() {
     // The framing mistake, from the decoder's side. `proto-bluetooth-audio` refuses this
     // before it gets here — but that guard is one `if` away from being deleted, and this is

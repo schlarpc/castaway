@@ -333,10 +333,13 @@ impl Decoder {
             .chunks_exact(4)
             .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let format = self.stream_format().unwrap_or(self.negotiated);
+        let rate = self
+            .stream_format()
+            .unwrap_or(self.negotiated)
+            .sample_rate();
         PcmBlock {
-            sample_rate: format.sample_rate(),
-            channels: format.channels(),
+            sample_rate: rate,
+            channels: channels_written(rate, samples.len()),
             samples,
             pts,
         }
@@ -371,6 +374,27 @@ impl Drop for Decoder {
         // construction), and this is the only place it is released. `ldacBT_free_handle`
         // closes an initialised handle itself, so no separate `close` is needed.
         unsafe { sys::ldacBT_free_handle(self.handle) };
+    }
+}
+
+/// How many channels a decoded block holds, derived from its own size.
+///
+/// The library will tell us the sample rate and not the channel count — there is no
+/// `ldacBT_get_channel` in the public API — so the obvious thing is to reuse the negotiated
+/// count. That is wrong in exactly the case this whole module is careful about: LDAC's frame
+/// header carries the channel configuration and the decoder follows it, so a sender that
+/// negotiated stereo and codes mono produces half-size blocks. Labelling those as stereo
+/// halves the reported duration, doubles the apparent rate, and plays the audio at speed.
+///
+/// The size is enough to recover it. One call decodes exactly one frame — 128 samples per
+/// channel at 44.1/48 kHz, 256 at 88.2/96 — into interleaved `f32`, so the sample count is
+/// `frame_samples * channels` and the division is exact. Anything that does not divide is a
+/// short final write; two channels is the safer reading, being what every real sender uses.
+fn channels_written(rate: u32, samples: usize) -> u16 {
+    let frame_samples = if rate >= 88_200 { 256 } else { 128 };
+    match samples.checked_div(frame_samples) {
+        Some(1) => 1,
+        _ => 2,
     }
 }
 

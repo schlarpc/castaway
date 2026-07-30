@@ -93,6 +93,15 @@ fn main() {
             name: "96000-dual",
             frames: 12_000, // an eighth of a second, and the same frame count
         },
+        // Mono, because it is the one configuration whose block size differs — 128 samples
+        // rather than 256 for a stereo frame — and therefore the one that catches a decoder
+        // labelling its output with the negotiated channel count instead of the stream's.
+        Config {
+            rate: 44_100,
+            channel_mode: ldac::LDACBT_CHANNEL_MODE_MONO,
+            name: "44100-mono",
+            frames: 11_025,
+        },
     ];
 
     for config in &configs {

@@ -460,6 +460,29 @@ mod tests {
     }
 
     #[test]
+    fn a_mono_ldac_stream_says_so_in_its_frames() {
+        // Mono is the configuration where the frame's channel field actually changes the
+        // *size* of what a decoder produces, so it is the one that catches a reader taking
+        // the channel count from the negotiation instead. Same audio, same frame count as
+        // the stereo fixture, half the bitstream.
+        let packets = records(include_bytes!("../tests/fixtures/a2dp-ldac-44100-mono.bin"));
+        assert_eq!(packets.len(), 7);
+
+        let mut d = Depacketizer::new(AudioCodec::Ldac, 44_100);
+        let mut frames = 0u32;
+        for packet in packets {
+            d.push(packet).unwrap();
+            let stream = d.ldac_stream().unwrap();
+            assert_eq!(stream.channels, ldac::ChannelConfig::Mono);
+            assert_eq!(stream.channels.channel_count(), 1);
+            frames += u32::from(stream.frames);
+        }
+        // Twelve frames per packet rather than six: a mono frame is half the size, so twice
+        // as many fit in the same MTU.
+        assert_eq!(frames, 84);
+    }
+
+    #[test]
     fn an_aac_payload_that_is_not_a_valid_multiplex_is_refused() {
         // Three arbitrary bytes are not an AudioMuxElement. Accepting them would put
         // garbage in front of the decoder, which is exactly the failure this path exists
