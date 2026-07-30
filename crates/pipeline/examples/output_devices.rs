@@ -54,13 +54,13 @@ fn beep(selection: &pipeline::audio_select::OutputSelection) {
             sample_rate: 48_000,
             channels: 2,
             samples,
-            pts: Duration::from_millis(block * 10),
+            pts: std::time::Duration::from_millis(block * 10),
         };
         if let Err(e) = out.write(&pcm) {
             println!("write failed: {e}");
             return;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     out.stop();
     println!("beeped.");
