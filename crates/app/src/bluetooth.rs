@@ -142,13 +142,22 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
     // first. This used to check LDAC alone, which left aptX HD, aptX and AAC unguarded.
     let decodable = decodable();
     let codecs = match &config.bluetooth.codecs {
+        // Named explicitly: honour the list verbatim, including anything in `OPT_IN`.
+        // This is the switch that turns LDAC on for a test.
         Some(names) => Some(
             names
                 .iter()
                 .map(|n| parse_codec(n))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         ),
-        None => None,
+        // Nothing named: everything this build can decode *except* the opt-in set.
+        None => Some(
+            decodable
+                .iter()
+                .copied()
+                .filter(|c| !OPT_IN.contains(c))
+                .collect(),
+        ),
     };
     if let Some(codecs) = &codecs {
         info!(?codecs, "bluetooth: advertising a restricted codec table");
@@ -258,7 +267,35 @@ async fn open_transport(config: &Config) -> anyhow::Result<(Arc<dyn HciTransport
     Ok((Arc::new(transport), id))
 }
 
+/// Codecs a build can decode but does not advertise unless the config names them.
+///
+/// This is a *policy* list, and it is deliberately separate from `decodable()`, which is a
+/// statement of fact. Conflating the two is what Q22 was about in the other direction:
+/// `can_decode` answered a feature flag instead of "is there a decoder", and a build
+/// advertised LDAC with nothing behind it. So the fact stays honest and the reticence lives
+/// here, where it can be read and argued with.
+///
+/// **LDAC.** The decoder is real and tested (`pipeline/tests/ldac_decode.rs`), but it has
+/// never met a phone. It is also first in the preference order, which means turning it on
+/// by default does not add an option — it changes what *every* LDAC-capable sender
+/// negotiates, immediately, on a panel nobody is watching. The upside over aptX HD is
+/// marginal; the downside if the wrapper mishandles something a real Android encoder does
+/// and we have not seen is a silent room. So it goes in by hand first:
+///
+/// ```toml
+/// [bluetooth]
+/// codecs = ["ldac", "sbc"]
+/// ```
+///
+/// Naming SBC alongside it is not required but is what you want for a test: it leaves the
+/// mandatory fallback in place, so a sender that cannot do LDAC still connects and the
+/// experiment does not look like a broken receiver. Remove LDAC from here once a real
+/// sender has streamed to it — that is the whole condition.
+const OPT_IN: &[castaway_core::AudioCodec] = &[castaway_core::AudioCodec::Ldac];
+
 /// Which codecs the linked pipeline can decode.
+///
+/// A statement of fact, not of policy: see [`OPT_IN`] for the difference and why it exists.
 fn decodable() -> Vec<castaway_core::AudioCodec> {
     #[cfg(feature = "audio")]
     {
@@ -393,6 +430,37 @@ mod tests {
                 "advertising {codec:?}, which this build cannot decode"
             );
         }
+    }
+
+    #[cfg(all(feature = "audio", feature = "ldac"))]
+    #[test]
+    fn ldac_is_decodable_but_not_advertised_until_the_config_asks_for_it() {
+        use proto_bluetooth_audio::codec::CodecCapability;
+
+        // The two halves have to stay separable. `decodable` is a fact about the build and
+        // must say yes — if it said no, `codecs = ["ldac"]` would be filtered out later by
+        // the very check that keeps us from advertising what we cannot decode, and the
+        // opt-in would silently do nothing. The default table must say no, because LDAC is
+        // first in preference order and would otherwise become what every capable sender
+        // negotiates the moment this shipped.
+        assert!(
+            decodable().contains(&castaway_core::AudioCodec::Ldac),
+            "a build with the ldac feature can decode LDAC"
+        );
+        assert!(
+            OPT_IN.contains(&castaway_core::AudioCodec::Ldac),
+            "and does not advertise it without being asked"
+        );
+
+        // What the config switch produces, through the same narrowing the adapter applies.
+        let asked_for = [
+            castaway_core::AudioCodec::Ldac,
+            castaway_core::AudioCodec::Sbc,
+        ];
+        let mut table = proto_bluetooth_audio::codec::advertised(&decodable());
+        table.retain(|c| asked_for.contains(&c.audio_codec()));
+        assert_eq!(table.first().map(CodecCapability::name), Some("ldac"));
+        assert_eq!(table.last().map(CodecCapability::name), Some("sbc"));
     }
 
     #[cfg(feature = "audio")]

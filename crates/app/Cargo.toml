@@ -78,8 +78,14 @@ audio-out = ["audio", "pipeline/audio-out"]
 # there: the ALSA shim shows one "pipewire" device, the native backend shows the sinks.
 # Takes precedence over audio-out's ALSA host at compile time; inert on Windows.
 audio-pipewire = ["audio", "pipeline/audio-pipewire"]
-# LDAC decode. Off by default: advertising a codec we cannot decode makes the session
-# silence rather than a clean fallback to one we can (OPEN-QUESTIONS Q22).
+# LDAC decode, over FFI to Sony's own library (OPEN-QUESTIONS Q22). Off by default
+# because it needs `LDACBT_LIB_DIR` at link time, not because the decoder is in doubt —
+# a build without it would fail to link rather than fail to decode.
+#
+# Note that this feature compiling in the decoder is *not* the same as advertising the
+# endpoint. Even with it on, LDAC is in `bluetooth::OPT_IN` and stays out of the
+# advertised table until the config names it, because it sits first in preference order
+# and would otherwise silently become what every capable sender negotiates.
 ldac = ["audio", "pipeline/ldac", "proto-bluetooth-audio/ldac"]
 # The browser subprocess in the kiosk (YouTube leanback via DIAL launch). Implies
 # `render` and `hwaccel` for the zero-copy frame import. Unlike the CEF build it replaced,
