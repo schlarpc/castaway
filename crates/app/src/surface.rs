@@ -757,7 +757,7 @@ fn resolve(config: &Config) -> Vec<Resolved> {
 }
 
 /// Output shapes `--network-surface` can print.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
     /// A human table, resolved against the loaded config.
     Table,
@@ -769,31 +769,6 @@ pub enum Format {
     Doc,
     /// The spec view: `nix/network-surface.json`, exactly as checked in.
     Nix,
-}
-
-/// Did the command line ask for the network surface, and in which shape?
-///
-/// # Errors
-/// If `--network-surface=` names an unknown format.
-pub fn requested(args: impl Iterator<Item = String>) -> Option<Result<Format, String>> {
-    for arg in args {
-        match arg.as_str() {
-            "--network-surface" | "--network-surface=table" => return Some(Ok(Format::Table)),
-            "--network-surface=json" => return Some(Ok(Format::Json)),
-            "--network-surface=netsh" => return Some(Ok(Format::Netsh)),
-            "--network-surface=doc" => return Some(Ok(Format::Doc)),
-            "--network-surface=nix" => return Some(Ok(Format::Nix)),
-            other => {
-                if let Some(fmt) = other.strip_prefix("--network-surface=") {
-                    return Some(Err(format!(
-                        "unknown --network-surface format {fmt:?}; expected table, json, \
-                         netsh, doc or nix"
-                    )));
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Render the surface resolved against `config`, in `format`.
@@ -1023,24 +998,25 @@ mod tests {
 
     #[test]
     fn the_cli_flag_parses_and_rejects_unknown_formats() {
-        let args = |s: &str| Some(s.to_owned()).into_iter();
+        use clap::Parser as _;
+        let parse = |args: &[&str]| {
+            crate::Cli::try_parse_from(std::iter::once("castaway").chain(args.iter().copied()))
+        };
+        // Bare flag means the human table; `=` keeps the old spelling working.
         assert_eq!(
-            requested(args("--network-surface")),
-            Some(Ok(Format::Table))
+            parse(&["--network-surface"]).unwrap().network_surface,
+            Some(Format::Table)
         );
         assert_eq!(
-            requested(args("--network-surface=json")),
-            Some(Ok(Format::Json))
+            parse(&["--network-surface=json"]).unwrap().network_surface,
+            Some(Format::Json)
         );
         assert_eq!(
-            requested(args("--network-surface=netsh")),
-            Some(Ok(Format::Netsh))
+            parse(&["--network-surface=netsh"]).unwrap().network_surface,
+            Some(Format::Netsh)
         );
-        assert_eq!(requested(args("--something-else")), None);
-        assert!(matches!(
-            requested(args("--network-surface=yaml")),
-            Some(Err(_))
-        ));
+        assert!(parse(&["--something-else"]).is_err());
+        assert!(parse(&["--network-surface=yaml"]).is_err());
     }
 
     #[test]

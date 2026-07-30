@@ -872,7 +872,8 @@ impl Default for Bluetooth {
 
 /// Environment variable naming the config file, for run-as-a-service deployments where
 /// the working directory isn't ours to choose (the NixOS module points this at the
-/// generated `castaway.toml` in the Nix store).
+/// generated `castaway.toml` in the Nix store). `--config` reads it via clap, so the
+/// flag and the variable are one precedence rule: flag beats variable beats defaults.
 pub const CONFIG_ENV: &str = "CASTAWAY_CONFIG";
 
 /// mDNS instance labels cap at 63 octets, and UPnP friendly names are not much kinder.
@@ -881,17 +882,83 @@ const MAX_ADVERTISED_LEN: usize = 63;
 /// The config file looked for in the working directory when [`CONFIG_ENV`] is unset.
 pub const DEFAULT_CONFIG_FILE: &str = "castaway.toml";
 
+/// Where the config file lives — resolved once at startup, then shared by the loader
+/// and the settings screen's [`crate::settings::ConfigStore`], so what the screen saves
+/// is what the next boot reads. There is deliberately no second place that answers
+/// "which file?": the reader and the writer disagreeing is how a saved setting vanishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLocation {
+    path: PathBuf,
+    origin: ConfigOrigin,
+}
+
+/// How the config path was chosen. Decides how strict loading is: a file someone
+/// *named* must exist, a file we merely looked for may not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    /// `--config` or `$CASTAWAY_CONFIG`. Missing is a hard error: whoever set it meant
+    /// *that* file, and booting on defaults instead would look exactly like success.
+    Explicit,
+    /// `castaway.toml` in the working directory — the dev-checkout convention. Chosen
+    /// only when the file is actually there, so it can never shadow a fresh install.
+    WorkingDirectory,
+    /// The platform config directory (`$XDG_CONFIG_HOME/castaway/`, or
+    /// `%LOCALAPPDATA%\castaway\config`). The default; absent just means defaults.
+    Platform,
+}
+
+impl ConfigLocation {
+    /// Resolve the config path. Pure — the working-directory probe and the platform
+    /// directory both come in as arguments, so tests need no environment or disk.
+    #[must_use]
+    pub fn resolve(
+        explicit: Option<PathBuf>,
+        platform_config_dir: &Path,
+        working_file_exists: bool,
+    ) -> Self {
+        match explicit {
+            Some(path) => Self {
+                path,
+                origin: ConfigOrigin::Explicit,
+            },
+            None if working_file_exists => Self {
+                path: PathBuf::from(DEFAULT_CONFIG_FILE),
+                origin: ConfigOrigin::WorkingDirectory,
+            },
+            None => Self {
+                path: platform_config_dir.join(DEFAULT_CONFIG_FILE),
+                origin: ConfigOrigin::Platform,
+            },
+        }
+    }
+
+    /// [`Self::resolve`] against the real host: the platform directory from
+    /// `castaway-paths`, the probe against the working directory. `explicit` is
+    /// `--config`, which clap has already given `$CASTAWAY_CONFIG`'s value when only
+    /// the variable was set.
+    #[must_use]
+    pub fn from_cli(explicit: Option<PathBuf>) -> Self {
+        Self::resolve(
+            explicit,
+            castaway_paths::host().config(),
+            Path::new(DEFAULT_CONFIG_FILE).exists(),
+        )
+    }
+
+    /// The file itself — what the loader reads and the settings store rewrites.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// How the path was chosen, for the startup log line.
+    #[must_use]
+    pub const fn origin(&self) -> ConfigOrigin {
+        self.origin
+    }
+}
+
 impl Config {
-    /// Load the config the environment selects.
-    ///
-    /// The two sources differ in how strict they are, on purpose: an operator who set
-    /// `$CASTAWAY_CONFIG` meant *that* file, so a missing one is a hard error rather than
-    /// a silent boot with defaults, while the conventional working-directory file stays
-    /// optional (running `cargo run` in a bare checkout should just work).
-    ///
-    /// # Errors
-    /// If `$CASTAWAY_CONFIG` names a file that can't be read, or any config file present
-    /// fails to parse.
     /// Where persistent state lives.
     ///
     /// Config says where if it wants to; otherwise the platform's state directory
@@ -905,15 +972,27 @@ impl Config {
         castaway_paths::host().state().to_path_buf()
     }
 
-    pub fn from_env() -> anyhow::Result<Self> {
-        match std::env::var_os(CONFIG_ENV) {
-            Some(path) => {
-                let path = PathBuf::from(path);
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {CONFIG_ENV}={}", path.display()))?;
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    /// Load the config from a resolved [`ConfigLocation`].
+    ///
+    /// The origins differ in how strict they are, on purpose: an operator who passed
+    /// `--config` or set `$CASTAWAY_CONFIG` meant *that* file, so a missing one is a
+    /// hard error rather than a silent boot with defaults, while the conventional
+    /// locations stay optional (running `cargo run` in a bare checkout should just
+    /// work, and a fresh install has no platform file yet).
+    ///
+    /// # Errors
+    /// If an [`ConfigOrigin::Explicit`] file can't be read, or any config file present
+    /// fails to parse.
+    pub fn load_at(location: &ConfigLocation) -> anyhow::Result<Self> {
+        match location.origin {
+            ConfigOrigin::Explicit => {
+                let text = std::fs::read_to_string(&location.path).with_context(|| {
+                    format!("reading the named config {}", location.path.display())
+                })?;
+                toml::from_str(&text)
+                    .with_context(|| format!("parsing {}", location.path.display()))
             }
-            None => Self::load(DEFAULT_CONFIG_FILE),
+            ConfigOrigin::WorkingDirectory | ConfigOrigin::Platform => Self::load(&location.path),
         }
     }
 
@@ -1142,6 +1221,41 @@ mod tests {
         assert!(c.media_ports.policy().is_err());
         let c: Config = toml::from_str("[media_ports]\nfirst = 50\nlast = 40\n").unwrap();
         assert!(c.media_ports.policy().is_err());
+    }
+
+    #[test]
+    fn the_config_path_is_resolved_once_with_one_precedence_rule() {
+        let platform = Path::new("/home/kiosk/.config/castaway");
+        // Explicit (--config, or $CASTAWAY_CONFIG via clap) beats everything.
+        let loc = ConfigLocation::resolve(Some(PathBuf::from("/etc/c.toml")), platform, true);
+        assert_eq!(loc.path(), Path::new("/etc/c.toml"));
+        assert_eq!(loc.origin(), ConfigOrigin::Explicit);
+        // A working-directory file is the dev-checkout convention…
+        let loc = ConfigLocation::resolve(None, platform, true);
+        assert_eq!(loc.path(), Path::new(DEFAULT_CONFIG_FILE));
+        assert_eq!(loc.origin(), ConfigOrigin::WorkingDirectory);
+        // …and without one, the platform config directory is the default.
+        let loc = ConfigLocation::resolve(None, platform, false);
+        assert_eq!(
+            loc.path(),
+            Path::new("/home/kiosk/.config/castaway/castaway.toml")
+        );
+        assert_eq!(loc.origin(), ConfigOrigin::Platform);
+    }
+
+    #[test]
+    fn an_explicitly_named_config_that_is_missing_is_an_error_not_defaults() {
+        let absent = std::env::temp_dir().join("castaway-explicit-missing.toml");
+        let loc = ConfigLocation::resolve(Some(absent), Path::new("/nowhere"), false);
+        assert!(Config::load_at(&loc).is_err());
+    }
+
+    #[test]
+    fn a_missing_platform_config_boots_on_defaults() {
+        let dir = std::env::temp_dir().join("castaway-no-such-dir");
+        let loc = ConfigLocation::resolve(None, &dir, false);
+        let c = Config::load_at(&loc).unwrap();
+        assert_eq!(c.http_port, Config::default().http_port);
     }
 
     #[test]

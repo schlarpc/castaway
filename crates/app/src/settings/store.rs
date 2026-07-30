@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use crate::config::{CONFIG_ENV, DEFAULT_CONFIG_FILE};
+use crate::config::ConfigLocation;
 
 /// Edits the receiver's own config file in place, preserving everything it does not
 /// change.
@@ -62,15 +62,12 @@ impl ConfigStore {
         Self { path: path.into() }
     }
 
-    /// The store over the same file [`crate::config::Config::from_env`] loads — the
-    /// `$CASTAWAY_CONFIG` file, or `castaway.toml` in the working directory. The file
-    /// not existing yet is fine: the first saved setting creates it.
+    /// The store over the same file [`crate::config::Config::load_at`] loaded — the
+    /// one resolved [`ConfigLocation`] both share. The file not existing yet is fine:
+    /// the first saved setting creates it.
     #[must_use]
-    pub fn from_env() -> Self {
-        match std::env::var_os(CONFIG_ENV) {
-            Some(path) => Self::new(PathBuf::from(path)),
-            None => Self::new(DEFAULT_CONFIG_FILE),
-        }
+    pub fn at(location: &ConfigLocation) -> Self {
+        Self::new(location.path())
     }
 
     /// The file being edited. (Error messages already name it; only tests need to ask.)

@@ -61,12 +61,30 @@ use crate::config::Config;
 /// the box, however many services it publishes.
 const MDNS_HOST: &str = "castaway";
 
+/// The command line. Small on purpose: the config file is the interface, and the flags
+/// only answer "which file?" and the read-only surface query.
+#[derive(Debug, clap::Parser)]
+#[command(name = "castaway", version, about = "Universal cast receiver")]
+struct Cli {
+    /// Path to the config file. Without it (or $CASTAWAY_CONFIG), `castaway.toml` in
+    /// the working directory is used if present, else the platform config directory
+    /// ($XDG_CONFIG_HOME/castaway/castaway.toml, or %LOCALAPPDATA%\castaway\config).
+    #[arg(long, value_name = "PATH", env = config::CONFIG_ENV)]
+    config: Option<std::path::PathBuf>,
+    /// Print every socket this config binds, and exit.
+    #[arg(long, value_name = "FORMAT", num_args = 0..=1, default_missing_value = "table")]
+    network_surface: Option<surface::Format>,
+}
+
 fn main() -> anyhow::Result<()> {
+    let cli = <Cli as clap::Parser>::parse();
+    // Resolved once, and handed to both the loader and the settings store: the file the
+    // screen saves settings into is by construction the file the next boot reads.
+    let location = config::ConfigLocation::from_cli(cli.config);
     // A query, not a run: print what this config binds and exit before any socket is
     // bound or log file created.
-    if let Some(format) = surface::requested(std::env::args().skip(1)) {
-        let format = format.map_err(|e| anyhow::anyhow!(e))?;
-        let config = Config::from_env().context("loading config")?;
+    if let Some(format) = cli.network_surface {
+        let config = Config::load_at(&location).context("loading config")?;
         print!("{}", surface::render(format, &config));
         return Ok(());
     }
@@ -78,8 +96,13 @@ fn main() -> anyhow::Result<()> {
     // re-execed this same binary as Chromium's subprocess, and getting the order wrong
     // silently un-instrumented the renderer. The browser is its own process now, and it
     // reports through the protocol, so there is nothing to sequence against — D36.)
-    let config = Config::from_env().context("loading config")?;
+    let config = Config::load_at(&location).context("loading config")?;
     logging::init(&config.log, castaway_paths::host());
+    info!(
+        path = %location.path().display(),
+        origin = ?location.origin(),
+        "config"
+    );
     // A category name that is not one of SponsorBlock's parses to "unknown" rather than
     // failing, which for a *response* is the point and for *config* is a silent typo.
     if config.unknown_sponsorblock_categories() > 0 {
@@ -212,7 +235,7 @@ fn main() -> anyhow::Result<()> {
         let settings_catalog =
             settings::Catalog::new(vec![Arc::new(settings::OutputDeviceSetting::new(
                 audio_selector.clone(),
-                settings::ConfigStore::from_env(),
+                settings::ConfigStore::at(&location),
             ))]);
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),

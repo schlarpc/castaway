@@ -87,6 +87,10 @@ tokio-stream = "0.1"
 async-trait = "0.1"
 futures = "0.3"
 
+# --- cli ---
+# `env` so `--config` and `$CASTAWAY_CONFIG` are one code path with one precedence rule.
+clap = { version = "4", features = ["derive", "env"] }
+
 # --- error / logging ---
 thiserror = "2"
 anyhow = "1"
