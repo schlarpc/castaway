@@ -53,7 +53,7 @@ use proto_spotify::SpotifyService;
 use substrate_mdns::MdnsResponder;
 use substrate_ssdp::{Responder, ResponderConfig, SsdpDevice};
 use tokio::sync::{mpsc, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 
@@ -549,13 +549,26 @@ async fn serve(
         #[cfg(feature = "render")]
         shell,
     } = handles;
-    let iface = config.resolved_interface();
+    let (iface, iface_source) = config.resolved_interface_with_source();
     info!(
         name = %config.friendly_name,
         interface = %iface,
+        source = ?iface_source,
         http_port = config.http_port,
         "castaway services starting"
     );
+    // The fallback is right — a box with no route should still boot and render — but
+    // it must not be *quiet*: every mDNS record, SSDP LOCATION and DIAL URL below
+    // will now name an address no other machine can dial, so from the LAN the
+    // receiver simply does not exist. Say so, once, where an operator reading the
+    // log after "nothing can see it" will find the fix.
+    if iface_source == config::InterfaceSource::LoopbackFallback {
+        error!(
+            "no LAN IPv4 address could be auto-detected; advertising on 127.0.0.1, so \
+             no device on the network can discover or reach this receiver. Set \
+             `interface = \"<this box's LAN IPv4>\"` in castaway.toml to fix this."
+        );
+    }
 
     // Validated once, up front, and failed loudly: a broken [media_ports] range means
     // the operator asked to control where media sockets land, and booting on the

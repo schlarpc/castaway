@@ -949,15 +949,51 @@ impl Config {
     /// The advertised interface IPv4 — configured, or auto-detected, or loopback.
     #[must_use]
     pub fn resolved_interface(&self) -> Ipv4Addr {
-        self.interface
-            .or_else(detect_ipv4)
-            .unwrap_or(Ipv4Addr::LOCALHOST)
+        self.resolved_interface_with_source().0
+    }
+
+    /// [`Self::resolved_interface`], plus where the address came from — so startup
+    /// can *say* when the answer is the loopback fallback, which every advertisement
+    /// then names an address nothing on the LAN can reach. The fallback itself is
+    /// right (a box with no route should still boot and render its idle screen); the
+    /// defect was that it happened silently.
+    #[must_use]
+    pub fn resolved_interface_with_source(&self) -> (Ipv4Addr, InterfaceSource) {
+        resolve_interface(self.interface, detect_ipv4())
     }
 
     /// The base URL of the HTTP host (used for SSDP LOCATION / DIAL Application-URL).
     #[must_use]
     pub fn http_base_url(&self) -> String {
         format!("http://{}:{}", self.resolved_interface(), self.http_port)
+    }
+}
+
+/// Where the advertised interface address came from — and, in the last variant,
+/// whether it is one anything can actually discover the receiver at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceSource {
+    /// The operator set `interface` in the config; it is taken at its word.
+    Configured,
+    /// Auto-detected from the default route.
+    Detected,
+    /// Detection failed, so this is `127.0.0.1`: the process boots and renders, but
+    /// every advertisement carries an address no other machine can dial — discovery
+    /// is dead until `interface` is set or a route appears and the box restarts.
+    LoopbackFallback,
+}
+
+/// The resolution ladder as a pure function, so the fallback arm is testable without
+/// arranging for a machine with no routes: config wins, then detection, then loopback
+/// with its name on it.
+fn resolve_interface(
+    configured: Option<Ipv4Addr>,
+    detected: Option<Ipv4Addr>,
+) -> (Ipv4Addr, InterfaceSource) {
+    match (configured, detected) {
+        (Some(ip), _) => (ip, InterfaceSource::Configured),
+        (None, Some(ip)) => (ip, InterfaceSource::Detected),
+        (None, None) => (Ipv4Addr::LOCALHOST, InterfaceSource::LoopbackFallback),
     }
 }
 
@@ -1149,6 +1185,28 @@ mod tests {
         let absent = std::env::temp_dir().join("castaway-does-not-exist.toml");
         let c = Config::load(absent).unwrap();
         assert_eq!(c.http_port, Config::default().http_port);
+    }
+
+    #[test]
+    fn interface_resolution_prefers_config_then_detection_and_names_the_fallback() {
+        let configured = Ipv4Addr::new(10, 0, 0, 5);
+        let detected = Ipv4Addr::new(192, 168, 1, 7);
+        // An operator's word beats detection.
+        assert_eq!(
+            resolve_interface(Some(configured), Some(detected)),
+            (configured, InterfaceSource::Configured)
+        );
+        assert_eq!(
+            resolve_interface(None, Some(detected)),
+            (detected, InterfaceSource::Detected)
+        );
+        // The fallback still boots the box — but it must *say so*, because every
+        // advertisement then carries an address nothing on the LAN can dial. The
+        // source variant is what startup logs its error from.
+        assert_eq!(
+            resolve_interface(None, None),
+            (Ipv4Addr::LOCALHOST, InterfaceSource::LoopbackFallback)
+        );
     }
 
     #[test]
