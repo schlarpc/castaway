@@ -1189,3 +1189,58 @@ BLAKE2b constants' addresses in `.rdata`, the Qt request builder's addresses, an
 commands. The reason it is that detailed: the tooling lives in `re-shell/artifacts/`,
 which is **gitignored there**, so those scripts are not under version control and
 this repo holds the only durable copy of how any of it was obtained.
+
+### D45 — The network surface is a registry, and everything that names a port is generated from it
+Issues #22 and #30 asked for two things that sound like documentation — a central record of
+every bound port and a description of the exposed surface — and the hand-kept firewall list
+in the NixOS module showed why documentation alone would rot: it had already drifted three
+ways from the code it described. TCP 7011 was open with nothing behind it (the second
+AirPlay listener was removed long ago; 7011 is the AirPlay 1 UDP *timing* port, never a
+listener). Cast and AirPlay were gated on `cfg.settings.enable.* or false` while the binary
+defaults every enable flag to true, so a stock deploy ran Cast on 8009 with the firewall
+closed — masked in CI because the integration VM pins `enable.cast = true` explicitly. And
+the mirroring media planes bound OS-assigned ephemeral ports, which no rule could name in
+advance: on a firewalled box every control plane looked perfect and the media died in
+silence, masked in the VMs that disable their firewalls.
+
+**The registry is code, in `crates/app/src/surface.rs`**: every listener with its owner,
+transport, port spec (fixed / config-keyed / the `[media_ports]` range), security posture,
+enable-flag gate and provider (process or deployment); every advertisement (mDNS service
+types, SSDP STs, the WFD IE); every outbound destination; the non-IP surfaces. Entries are
+built from the constants the listeners bind (`proto_cast::CAST_PORT`,
+`proto_airplay::AIRPLAY_PORT`, `substrate_ssdp::SSDP_PORT`, `substrate_mdns::MDNS_PORT`),
+and the per-protocol table is an exhaustive match over `ProtocolKind` — a new protocol
+does not compile until its surface is declared, an empty declaration being a declaration.
+`ProtocolKind` lost `#[non_exhaustive]` for exactly this: the attribute contradicted the
+enum's own "closed enum" doc comment and would have handed every downstream match the `_`
+arm this forcing function exists to deny.
+
+**Everything else is generated and held to the registry by a test or a lint.**
+`docs/network-surface.md` (#30's answer) and `nix/network-surface.json` are emitted by the
+registry; freshness tests fail on any drift and `CASTAWAY_REGEN_SURFACE=1` rewrites them.
+The NixOS module derives `networking.firewall` from the JSON — gates resolve against
+`cfg.settings` with the binary's own defaults, and an unknown gate flag fails evaluation
+rather than staying closed. `nix flake check` runs the freshness tests, so a stale JSON
+cannot build. In the other direction, `clippy.toml` disallows the raw bind calls
+workspace-wide (CI runs `--deny warnings`); each registered site carries `#[expect]`
+naming its entry, so an unregistered bind is a lint error, not a doc gap. The receiver
+answers for itself with `castaway --network-surface[=json|netsh]` — the resolved view of
+the loaded config, and the netsh form is the Windows half of #22's firewall ask.
+
+**The media planes had to stop being ephemeral for any of this to be true**, so AirPlay's
+per-session sockets (audio/control/timing UDP, mirror-data TCP) and Cast's mirroring RTP
+socket now allocate lowest-free-first from `[media_ports]` (default 41000–41031, 32 ports;
+a session takes at most four). `MediaPorts::Ephemeral` still exists for tests, but it is a
+required constructor argument — choosing the unfirewallable behaviour has to be written at
+the call site. A broken configured range is a boot error, not a fallback: the operator who
+wrote it meant to control where media lands, and booting ephemeral would undo that quietly.
+
+**The miracast exception is stated rather than smoothed over**: its firewall gate follows
+the module's explicit opt-in (`enable.miracast or false`), not the binary's default-on,
+because the module's radio units grabbing `wlan0` on an unconfigured box is a worse
+failure than a closed port on a protocol that needs a radio anyway.
+
+Not done, and known: nothing yet asserts at runtime that the set of actually-bound sockets
+equals the registry's resolved view (`ss` in the integration VM against
+`--network-surface=json` would close that loop), and the generated doc's hardening section
+describes the systemd unit but nothing diffs it against `flake.nix`.
