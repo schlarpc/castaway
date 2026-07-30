@@ -319,6 +319,7 @@ hci-transport/        The backends: Linux HCI_CHANNEL_USER socket, USB/WinUSB vi
 substrate-l2cap/      BR/EDR L2CAP: signaling, basic + ERTM channels, PSM routing
 substrate-sdp/        SDP data elements, record server, minimal client
 proto-bluetooth-audio/  AVDTP/A2DP + AVCTP/AVRCP + OBEX-BIP cover art
+ldac-sys/             FFI to libldacBT, the one codec libav cannot decode (D47)
 ```
 
 **Why the transports are a separate crate from `substrate-hci`:** ground rule 8 has every
@@ -331,6 +332,14 @@ on both platforms.
 Dependencies flow toward `core` as always; `proto-bluetooth-audio` is the only one that
 knows what a track is. Codec *decode* stays in `pipeline` with the rest of libav — the proto
 crate depacketizes and hands up `EncodedFrame`s, exactly as `proto-cast` does for video.
+
+One exception to "no codec knowledge in the proto crate", and it is about framing rather
+than decoding: `proto-bluetooth-audio/src/ldac.rs` parses the three-byte LDAC transport-frame
+header. It is there because LDAC is the only one of the five that states its own sample rate
+and channel configuration, which makes it the only one where the negotiated configuration can
+be *checked* instead of trusted — and because its A2DP payload needs a one-byte header
+stripped, which without a syncword to verify against decodes to noise rather than failing.
+Pure, `unsafe`-free, and it decodes nothing.
 
 ### 11.3 The platform seam: `HciTransport`
 
@@ -651,6 +660,35 @@ need a real phone, or `mpris-proxy` with a player behind it.
 - **AVDTP** negotiates one stream endpoint: DISCOVER → GET_CAPABILITIES → SET_CONFIGURATION
   → OPEN → START. Our SEP table offers, in preference order: **LDAC, aptX HD, aptX, AAC, SBC**.
   The sender picks; we decode whatever it picks.
+
+  Two filters stand between that order and what a sender actually sees, and they answer
+  different questions. `codec::advertised(decodable)` drops anything this *build* cannot
+  decode — the invariant Q22 is about, because the table is best-first and an endpoint we
+  cannot decode is not a missed opportunity but the one the phone reaches for. On top of
+  that, `bluetooth::OPT_IN` drops anything we can decode and are not ready to *offer*; LDAC
+  is there today, so the shipped table is aptX HD → aptX → AAC → SBC until a config says
+  `codecs = ["ldac", "sbc"]` (§11.4a).
+
+### 11.4a Advertising is a policy, decoding is a fact
+
+Worth its own heading because conflating the two has now gone wrong in both directions.
+
+Q22 was the first: `can_decode` answered a feature flag instead of "is there a decoder", so
+a build advertised LDAC with nothing behind it and handed a connected phone silence. The fix
+was to make the fact honest — `can_decode` allocates a decoder handle and reports what
+happened.
+
+That leaves the opposite question, which the fact cannot answer: a decoder existing does not
+mean we want every sender using it tomorrow. LDAC sits first in preference order, so turning
+it on does not add an option — it *changes what every capable sender negotiates*, at once, on
+an unattended panel. Its decoder is tested against checked-in bitstreams (§11.7) and has
+never met a phone.
+
+So the two live apart. `pipeline::audio_session::decodable_codecs()` is a statement of fact
+and must stay complete, because the advertised table is filtered *through* it — a codec
+missing there cannot be re-enabled by config, only lost. `bluetooth::OPT_IN` is the policy
+and is where reticence goes, with a named condition for removal: LDAC comes out once a real
+sender has streamed to it.
 - **AVRCP** gives metadata (`GetElementAttributes`), playback status and position
   (`RegisterNotification`), and takes passthrough commands (play/pause/next/previous) plus
   absolute volume. Both directions matter — see §11.5.
@@ -710,9 +748,25 @@ read it — a text-only card beats a decoder failure three layers down.
 
 The pipeline is video-only today. A2DP needs decoded PCM to reach a speaker, so `pipeline`
 grows an audio sink (`cpal`, cross-platform) alongside the compositor, plus libav decoders
-for SBC/AAC/aptX/aptX HD. **LDAC is the one codec libav lacks** — AOSP's `libldac` is
-encoder-only, so decode uses the reverse-engineered `libldacdec` behind FFI, feature-gated
-so a build without it degrades to refusing the LDAC SEP rather than failing to build.
+for SBC/AAC/aptX/aptX HD. **LDAC is the one codec libav lacks**, so it is the one codec with
+a decode backend of its own: `ldac-sys` binds Sony's `libldacBT` and `pipeline::ldac_decode`
+wraps it, behind the `ldac` feature, so a build without the library refuses the LDAC SEP
+rather than failing to build.
+
+Two corrections to what this section used to say, both worth keeping because each one would
+have cost a day:
+
+- It said decode needs the *reverse-engineered* `libldacdec`, on the grounds that AOSP's
+  `libldac` is encoder-only. The first half is true and the conclusion is not:
+  open-vela's fork of Sony's library builds the full codec, decoder included, so what we
+  link is the reference implementation (D47).
+- The nixpkgs pinned by this flake exposes that library as `pkgs.ldacbt` — and it is built
+  `_ENCODE_ONLY`, with a header that declares no `ldacBT_decode` at all. `nix/ldacbt.nix`
+  builds it from source for that reason. "nixpkgs has it" was true and useless.
+
+Whether the endpoint is *advertised* is a separate decision from whether it can be decoded,
+and it is the app's: LDAC is in `bluetooth::OPT_IN`, so it stays out of the table until the
+config names it (§11.4a).
 
 ### 11.7 Testing without a radio
 
@@ -721,6 +775,32 @@ scripted controller: a fake transport replays HCI events, and the L2CAP/AVDTP/AV
 asserted on the bytes they emit. Tier-2 puts two of these back-to-back — our sink against a
 scripted *source* over an in-memory L2CAP — so a full pair → discover → configure → stream →
 metadata → cover-art flow runs in CI with no hardware at all.
+
+**The codec test vectors.** Decode is the one part of this that a scripted controller cannot
+help with, because the failures are in the audio rather than in the bytes: a decoder that
+walks a multi-frame payload once instead of per frame plays a sixth of it, a wrong sample
+format is silence of the right length, and a mishandled interleave is one channel of a stereo
+pair. All three pass a test that checks for `Ok`. So the codecs are asserted on their output —
+RMS in a window, both channels present and balanced, and the exact PCM frame count the input
+implies.
+
+LDAC gets two fixture sets rather than one, generated together by
+`pipeline/examples/ldac_fixtures.rs` from Sony's own encoder:
+
+- `proto-bluetooth-audio/tests/fixtures/a2dp-ldac-*.bin` — whole A2DP media packets. Replayed
+  through the depacketizer and the pure frame-header parser, in **every** build, with no FFI
+  involved. The encoder reports how many transport frames it packed into each packet; our
+  parser walks the same bytes and has to arrive at the same number. That is a
+  cross-implementation check on the field widths, not a round-trip through our own code.
+- `pipeline/tests/fixtures/ldac-*.bin` — the same packets stripped to their transport frames,
+  replayed through the library under `--features ldac` and asserted on as audio.
+
+Both cover 44.1 kHz stereo *and* 96 kHz dual channel, because 96 kHz puts 256 samples in a
+frame instead of 128 and dual channel codes its two channels independently — a fixture set
+that was all 44.1 kHz stereo would leave both untested. What they do not prove is
+interoperability: they came from our own encoder, not from a phone. That is the reason LDAC
+is opt-in (§11.4a), and a capture from a real Android sender is the thing that would retire
+it.
 
 **Driving ERTM from the kernel.** `proto-bluetooth-audio/examples/ertm_echo.rs` listens on
 a PSM in Enhanced Retransmission Mode and echoes what arrives, so BlueZ's `l2test` — the

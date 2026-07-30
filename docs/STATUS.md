@@ -162,10 +162,19 @@ the resulting refresh token into `.env.local` itself rather than asking for a pa
   actually cast to: render pipeline + Electron browser + audio out + Bluetooth, wrapped
   with `CASTAWAY_ELECTRON`/`CASTAWAY_BROWSER_APP`/`LD_LIBRARY_PATH` so it runs outside the
   devShell. **This is the one to deploy on Linux** (`services.castaway.package`). Every
-  optional feature is on except `ldac`, which would advertise a codec we have no decoder
-  for (Q22) and turn a session that would have fallen back to SBC into silence. Verified
-  2026-07-26 in its pre-D36 `--features cef` form: built from the flake, run headless on
-  Xvfb, and passed both `yt-selfplay` modes with real video composited at 4K.
+  optional feature is on, `ldac` included as of 2026-07-29 — it links Sony's own
+  `libldacBT` for the one A2DP codec ffmpeg cannot decode (Q22, D47). Note that having the
+  decoder compiled in is not the same as offering it: LDAC stays out of the advertised
+  codec table until the config asks for it, because it sorts *first* and switching it on
+  would change what every capable phone negotiates rather than adding an option. To try it:
+
+  ```toml
+  [bluetooth]
+  codecs = ["ldac", "sbc"]
+  ```
+
+  Verified 2026-07-26 in its pre-D36 `--features cef` form: built from the flake, run
+  headless on Xvfb, and passed both `yt-selfplay` modes with real video composited at 4K.
 - `packages.castaway-portable` — no renderer, no browser, nothing platform-specific.
   Serves and discovers; **cannot** play YouTube, and honestly declines to advertise DIAL
   (D27). What CI builds, and what `default` still is on Darwin.
