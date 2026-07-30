@@ -274,3 +274,94 @@ fn but_a_session_starting_does_not_snatch_the_panel_from_a_hand_on_it() {
     assert!(render.shell_foreground(), "still theirs");
     assert_eq!(render.shell_depth(), 2, "still where they left it");
 }
+
+/// Pump and advance motion one frame at a time, calling `each` with the card's live rect.
+fn frames(render: &mut RenderLoop, mut each: impl FnMut(&RenderLoop)) {
+    for _ in 0..180 {
+        render.pump();
+        each(render);
+        if !render.tick_motion(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+}
+
+#[test]
+fn demoting_a_session_travels_rather_than_teleporting() {
+    // The whole point of `motion`. Before it, `set_shell_foreground` wrote the corner's
+    // transform and the card was simply *there* on the next frame; a person watching had no
+    // idea the thing they had been looking at was now the thing in the corner.
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
+        .unwrap();
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    render.pump();
+
+    render.set_shell_foreground(true);
+    let mut widths = Vec::new();
+    frames(&mut render, |r| widths.push(r.card_frame().w));
+
+    let first = widths.first().copied().unwrap_or_default();
+    let last = widths.last().copied().unwrap_or_default();
+    assert!(first > 0.9, "it should start at full width, got {first}");
+    let slot = pipeline::panel::demoted_rect(pipeline::panel::Surface::Card, W, H).unwrap();
+    assert!(
+        (last - slot.w).abs() < 0.002,
+        "it should arrive in the slot: {last} vs {}",
+        slot.w
+    );
+    // The assertion that distinguishes a movement from a jump: it was observably part-way,
+    // for more than a frame or two.
+    let midway = widths
+        .iter()
+        .filter(|w| **w < first - 0.05 && **w > slot.w + 0.05)
+        .count();
+    assert!(
+        midway >= 4,
+        "only {midway} frames were part-way; that is a teleport, not a travel: {widths:?}"
+    );
+    // And monotone: a card that overshoots into the corner and comes back reads as a bounce,
+    // which is right for the summon and wrong for a demote.
+    for pair in widths.windows(2) {
+        if let [a, b] = pair {
+            assert!(b <= &(a + 0.0005), "the demote reversed: {a} -> {b}");
+        }
+    }
+}
+
+#[test]
+fn a_session_that_ends_leaves_rather_than_vanishing() {
+    // The deferred clear used to drop the layer outright, so the card was composited one
+    // frame and gone the next. Now the clear starts an exit and the layer is retired when the
+    // motion has finished.
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    tx.try_send(RenderCommand::Home(Box::new(AttractScene::demo())))
+        .unwrap();
+    tx.try_send(RenderCommand::NowPlaying(Box::default()))
+        .unwrap();
+    render.pump();
+    render.tick_motion(std::time::Duration::from_millis(16));
+
+    tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
+    render.pump();
+    // Past the grace, so the exit is allowed to begin.
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+
+    let mut opacities = Vec::new();
+    frames(&mut render, |r| opacities.push(r.card_opacity()));
+    let faded = opacities
+        .iter()
+        .filter(|o| **o > 0.05 && **o < 0.95)
+        .count();
+    assert!(
+        faded >= 2,
+        "the card blinked out instead of leaving: {opacities:?}"
+    );
+    assert!(
+        opacities.last().is_some_and(|o| *o < 0.05),
+        "it never finished leaving: {opacities:?}"
+    );
+}

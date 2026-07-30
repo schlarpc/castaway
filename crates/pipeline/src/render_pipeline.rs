@@ -1026,11 +1026,26 @@ pub struct RenderLoop {
     /// suppression and every hit test from it rather than keeping opinions of its own
     /// (see [`crate::panel`]).
     panel: crate::panel::Panel,
-    /// What [`crate::panel::Panel::placement`] last answered for each surface. A change
-    /// detector, not state: placement is recomputed every pump, because it depends on which
-    /// screen is current and no navigation should have to remember to re-place layers — but
-    /// the uniform writes only happen when the answer moves.
-    placed: [crate::panel::Placement; crate::panel::Surface::ALL.len()],
+    /// What the panel last answered for each surface: its placement, or `None` when it was
+    /// not on the panel at all. A change detector, not state — placement is recomputed every
+    /// pump, because it depends on which screen is current and no navigation should have to
+    /// remember to re-place layers. A difference here is what starts a motion.
+    placed: [Option<crate::panel::Placement>; crate::panel::Surface::ALL.len()],
+    /// Where each surface actually is on its way to where the panel says it goes, and the
+    /// floor's own recession. The continuous half of the model (see [`crate::motion`]).
+    motions: crate::motion::Motions,
+    /// The floor: the shell pushing back and dimming under a session that has the glass.
+    floor: crate::motion::Floor,
+    /// Whether anything is still moving, so the kiosk knows to ask for another frame.
+    animating: bool,
+    /// The mascot overlay's own placement, if she is up. Kept so the floor's recession can be
+    /// *composed* with it: she is a sub-rect of the scene, not a full-panel layer, so handing
+    /// her the floor's transform directly would stretch line art across the whole panel.
+    mascot_base: Option<Transform>,
+    /// What a surface arriving next should grow out of — the rect of the thing a person
+    /// touched to cause it. Consumed by the next entrance; `None` means there was no origin
+    /// and the arrival fades through instead (see [`crate::motion::Origin`]).
+    origin: Option<crate::panel::NormRect>,
     /// When the panel was last touched, so an ending session does not yank someone out
     /// of a screen they are reading (#27).
     last_touch: Option<std::time::Instant>,
@@ -1052,30 +1067,19 @@ pub struct RenderLoop {
     transport: Option<TransportState>,
 }
 
-/// The transform a surface takes for a placement, on a `width`×`height` surface.
+/// Place `inner` inside `outer`: the transform a sub-rect layer needs when the surface it
+/// belongs to has itself been moved.
 ///
-/// [`crate::panel::Placement`] says *which of three states* a surface is in; the geometry
-/// is the surface's own, which is why this is a free function next to the layer code rather
-/// than something the pure model computes. `Hidden` keeps the demoted transform — the layer
-/// is suppressed, so where it would have been does not matter, and keeping it means
-/// unsuppressing needs no second decision.
-fn demoted_transform(
-    surface: crate::panel::Surface,
-    placement: crate::panel::Placement,
-    width: u32,
-    height: u32,
-) -> Transform {
-    if matches!(placement, crate::panel::Placement::Panel) {
-        return Transform::default();
+/// Both are rect placements in the same normalized space, so this is the obvious composition
+/// — but it is worth a name, because doing it the other way round is the bug that stretches a
+/// mascot across a panel.
+fn compose(outer: Transform, inner: Transform) -> Transform {
+    Transform {
+        scale_x: outer.scale_x * inner.scale_x,
+        scale_y: outer.scale_y * inner.scale_y,
+        offset_x: outer.offset_x + outer.scale_x * inner.offset_x,
+        offset_y: outer.offset_y + outer.scale_y * inner.offset_y,
     }
-    crate::panel::demoted_rect(surface, width, height).map_or_else(Transform::default, |r| {
-        Transform {
-            scale_x: r.w,
-            scale_y: r.h,
-            offset_x: r.x,
-            offset_y: r.y,
-        }
-    })
 }
 
 /// The transport strip's state on the render thread.
@@ -1131,7 +1135,12 @@ impl RenderLoop {
             transition: None,
             transition_undo: None,
             panel: crate::panel::Panel::new(),
-            placed: [crate::panel::Placement::Hidden; crate::panel::Surface::ALL.len()],
+            placed: [None; crate::panel::Surface::ALL.len()],
+            motions: crate::motion::Motions::default(),
+            floor: crate::motion::Floor::default(),
+            animating: false,
+            mascot_base: None,
+            origin: None,
             last_touch: None,
             video_clear_due: None,
             card_clear_due: None,
@@ -1351,13 +1360,7 @@ impl RenderLoop {
         phase: crate::transport::TouchPhase,
     ) -> Option<castaway_core::ControlTxn> {
         let state = self.transport.as_ref()?;
-        // Same coverage rule as `transport_owns`, and it has to be repeated rather than
-        // assumed: the two are called independently by the router, and a covered strip
-        // that still *acted* would pause someone's video when they touched the video.
-        if self
-            .compositor
-            .covered_above(crate::compositor::LayerId::Transport, x, y)
-        {
+        if self.strip_covered(x, y) {
             return None;
         }
         let (sw, sh) = self.compositor.target_size();
@@ -1377,19 +1380,40 @@ impl RenderLoop {
         let Some(state) = self.transport.as_ref() else {
             return false;
         };
-        // A covered strip owns nothing. It sits below video, so a session that publishes
-        // metadata *and* pixels — a DLNA video with tags, say — used to leave an
-        // invisible strip swallowing the bottom of the glass and answering to presses
-        // aimed at whatever was actually on screen.
-        if self
-            .compositor
-            .covered_above(crate::compositor::LayerId::Transport, x, y)
-        {
+        if self.strip_covered(x, y) {
             return false;
         }
         let (sw, sh) = self.compositor.target_size();
         let (lx, ly) = crate::transport::to_strip_local(x, y, sw, sh);
         state.layout.hit(lx, ly).is_some()
+    }
+
+    /// Whether the transport strip is covered here, and so neither owns a press nor acts on
+    /// one.
+    ///
+    /// One answer, shared: the two used to carry the same check independently, with a comment
+    /// saying it had to be repeated rather than assumed — and the moment the rule changed,
+    /// only one of them changed with it, so a covered strip stopped *owning* presses and
+    /// carried on *acting* on them.
+    ///
+    /// The strip sits below video, so a session that publishes metadata *and* pixels — a DLNA
+    /// video with tags, say — used to leave an invisible strip swallowing the bottom of the
+    /// glass and answering presses aimed at whatever was actually on screen.
+    ///
+    /// Answered from the model, not from the live layers, for the reason
+    /// [`crate::panel::Panel::covered_by_any`] gives: a strip must not become answerable for
+    /// the 300 ms a video spends arriving over it. And only for what is *above* it —
+    /// `LayerId::Transport` is drawn directly on the card it belongs to, so that card
+    /// covering this point is no reason for its own controls to stop answering.
+    fn strip_covered(&self, x: f32, y: f32) -> bool {
+        const ABOVE_THE_STRIP: [crate::panel::Surface; 2] = [
+            crate::panel::Surface::Video,
+            crate::panel::Surface::CastPage,
+        ];
+        self.panel.covered_by_any(x, y, &ABOVE_THE_STRIP)
+            || self
+                .compositor
+                .covered_above(crate::compositor::LayerId::Transport, x, y)
     }
 
     /// Install the now-playing card as its own layer.
@@ -1651,29 +1675,244 @@ impl RenderLoop {
         moved
     }
 
-    /// Where every session surface goes right now, and the placement each of them was last
-    /// given.
+    /// Point every surface at where the panel says it goes.
+    ///
+    /// Sets *targets*, and nothing else: what a surface does about a new target — travel,
+    /// arrive from an origin, leave — is [`crate::motion`]'s, and the layers are written by
+    /// [`Self::tick_motion`] once per frame. Splitting it this way is what makes every
+    /// placement change an animation for free: a caller that changes the panel's state does
+    /// not have to know, or say, how the result should move.
     ///
     /// Called whenever an input to the answer changes — focus, the screen stack, a surface
     /// appearing — and once per pump as a standing fact, because navigation happens in
     /// several places and none of them should have to remember this.
     fn reflow_surfaces(&mut self) {
+        use crate::motion::{Choreography, Step};
         use crate::panel::Surface;
+        let no_shell = self.panel.depth() == 0;
         for (i, surface) in Surface::ALL.into_iter().enumerate() {
             let want = self.panel.placement(surface);
-            if let Some(slot) = self.placed.get_mut(i) {
-                *slot = want;
+            let present = self.panel.surfaces().has(surface);
+            let had = self.placed.get(i).copied().unwrap_or(None);
+            let now = present.then_some(want);
+            if had == now {
+                continue;
             }
-            match surface {
-                Surface::Video => self.place_video(want),
-                Surface::Card => self.place_card(want),
-                // The browser's two surfaces are placed by the browser host, which owns
-                // the viewport the page rasterizes into: a placement change there is a
-                // *resize* round trip, not a transform. It reads its own answer from the
-                // panel each pump — see `ElectronHost::follow_panel`.
-                Surface::CastPage | Surface::IdleWidget => {}
+            if let Some(slot) = self.placed.get_mut(i) {
+                *slot = now;
+            }
+            let origin = self.origin();
+            let step = Step {
+                from: had,
+                to: now,
+                origin,
+            };
+            let spring = Choreography::spring(step);
+            let target = self.target_for(surface, want, present);
+            let Some(motion) = self.motions.get_mut(surface) else {
+                continue;
+            };
+            if no_shell {
+                // Nobody is watching a renderer with no shell — see `Motion::snap`.
+                motion.snap(target);
+            } else {
+                match (had, now) {
+                    // Arriving on the panel: placed at its origin before its first frame, so
+                    // there is no flash of the destination first.
+                    (None, Some(_)) => motion.enter(target, origin, spring),
+                    (Some(_), None) => motion.leave(spring),
+                    _ => motion.move_to(spring),
+                }
             }
         }
+    }
+
+    /// Where a surface arriving on the panel should come from.
+    ///
+    /// Only an *entrance* asks: a surface being summoned out of the corner is a `Moving`
+    /// step, so it starts wherever it already is and carries its velocity — no origin needed
+    /// or wanted. What is left is the genuinely new arrival, which either came from something
+    /// a person touched (recorded by the navigation that caused it) or from nothing at all.
+    fn origin(&self) -> crate::motion::Origin {
+        self.origin
+            .map_or(crate::motion::Origin::Nowhere, crate::motion::Origin::From)
+    }
+
+    /// Where `surface` is heading, and how visible it should be there.
+    fn target_for(
+        &self,
+        surface: crate::panel::Surface,
+        want: crate::panel::Placement,
+        present: bool,
+    ) -> crate::motion::Target {
+        use crate::motion::{Choreography, Target};
+        use crate::panel::{demoted_rect, NormRect, Placement};
+        let (w, h) = self.compositor.target_size();
+        let resting = match want {
+            Placement::Panel => NormRect::FULL,
+            Placement::Widget | Placement::Hidden => {
+                demoted_rect(surface, w, h).unwrap_or(NormRect::FULL)
+            }
+        };
+        if !present || matches!(want, Placement::Hidden) {
+            // Leaving, or pushed off by a screen: inward and out, the mirror of arrival.
+            return Target {
+                rect: resting.scaled(Choreography::EXIT_SCALE),
+                opacity: 0.0,
+            };
+        }
+        Target {
+            rect: resting,
+            opacity: 1.0,
+        }
+    }
+
+    /// Advance every motion by `dt` and write the layers. Returns whether anything is still
+    /// moving, so the kiosk knows to ask for another frame.
+    ///
+    /// The one place a layer transform is written for a session surface. Everything else sets
+    /// targets.
+    pub fn tick_motion(&mut self, dt: std::time::Duration) -> bool {
+        use crate::motion::Phase;
+        use crate::panel::Surface;
+        let dt = dt.as_secs_f32();
+        let mut moving = false;
+        for surface in Surface::ALL {
+            let want = self.panel.placement(surface);
+            let present = self.panel.surfaces().has(surface);
+            let target = self.target_for(surface, want, present);
+            let Some(motion) = self.motions.get_mut(surface) else {
+                continue;
+            };
+            if motion.phase() == Phase::Absent {
+                continue;
+            }
+            moving |= motion.step(target, dt);
+        }
+        let recessed = self.panel.focus() == crate::panel::Focus::Session;
+        moving |= self.floor.step(recessed, dt);
+        self.apply_motions();
+        self.animating = moving;
+        moving
+    }
+
+    /// Write every layer from where its motion currently has it, without advancing time.
+    ///
+    /// Called after stepping *and* before presenting, so the frame on the glass always matches
+    /// the motion state. That matters most on the frame an entrance begins: the motion is
+    /// placed at its origin during a reflow, and presenting before applying would show one
+    /// frame at the destination first — a flash, and one flash is worse than no animation.
+    fn apply_motions(&mut self) {
+        use crate::panel::Surface;
+        for surface in Surface::ALL {
+            let Some(motion) = self.motions.get_mut(surface) else {
+                continue;
+            };
+            let (frame, opacity, drawn) = (motion.frame(), motion.opacity(), motion.drawn());
+            self.apply_motion(surface, frame, opacity, drawn);
+        }
+        self.apply_floor();
+    }
+
+    /// Put one surface's layer where its motion currently has it.
+    fn apply_motion(
+        &mut self,
+        surface: crate::panel::Surface,
+        frame: crate::panel::NormRect,
+        opacity: f32,
+        drawn: bool,
+    ) {
+        use crate::panel::Surface;
+        let layer = match surface {
+            Surface::Video => LayerId::Video,
+            Surface::Card => LayerId::NowPlaying,
+            // The browser's own layers are placed by the browser host, which owns the
+            // viewport the page rasterizes into — a placement change there is a *resize*
+            // round trip, not a transform (see `ElectronHost::follow_panel`). Animating the
+            // transform underneath it would stretch a page rasterized for the other rect,
+            // which is worse than not animating it at all until phase 2 gives the compositor
+            // a source rect of its own.
+            Surface::CastPage | Surface::IdleWidget => return,
+        };
+        if !self.compositor.has_layer(layer) {
+            return;
+        }
+        self.compositor.set_suppressed(layer, !drawn);
+        if !drawn {
+            return;
+        }
+        self.compositor.upsert_layer(Layer {
+            id: layer,
+            opacity,
+            transform: Transform {
+                scale_x: frame.w,
+                scale_y: frame.h,
+                offset_x: frame.x,
+                offset_y: frame.y,
+            },
+        });
+        // The strip belongs to the card and is unusably small at anything but full size.
+        if layer == LayerId::NowPlaying {
+            self.compositor
+                .set_suppressed(LayerId::Transport, frame.w < 0.999);
+        }
+    }
+
+    /// Place the shell where the floor's motion has it: pushed back and dimmed under a
+    /// session that has the glass, flat and bright when it has the panel.
+    ///
+    /// Also called at the end of a repaint, so a freshly rasterized screen lands in the
+    /// floor's current placement instead of at full size for one frame.
+    fn apply_floor(&mut self) {
+        let Some((rect, dim)) = self.floor.placement() else {
+            return;
+        };
+        let floor = Transform {
+            scale_x: rect.w,
+            scale_y: rect.h,
+            offset_x: rect.x,
+            offset_y: rect.y,
+        };
+        if self.compositor.has_layer(LayerId::Attract) {
+            self.compositor.upsert_layer(Layer {
+                id: LayerId::Attract,
+                opacity: dim,
+                transform: floor,
+            });
+        }
+        // Composed, not replaced: she is a sub-rect of the scene and moves *with* it.
+        if let Some(base) = self.mascot_base {
+            if self.compositor.has_layer(LayerId::MascotOverlay) {
+                self.compositor.upsert_layer(Layer {
+                    id: LayerId::MascotOverlay,
+                    opacity: dim * (1.0 - self.session_veil()),
+                    transform: compose(floor, base),
+                });
+            }
+        }
+    }
+
+    /// How much of a session is on the panel, `0.0`..=`1.0`.
+    ///
+    /// What the mascot's visibility follows. She leans on the clock card, so she leaves when a
+    /// session takes the slot — but *fading*, not yielding: a hard hide pops, and it pops back
+    /// at the moment a departing card's layer is finally dropped, which is now the moment that
+    /// card has already faded to nothing. Taking the session surface's own opacity means her
+    /// return is exactly as gradual as the departure that uncovers her, for free.
+    fn session_veil(&self) -> f32 {
+        crate::panel::Surface::ALL
+            .into_iter()
+            .filter(|s| s.is_session())
+            .map(|s| {
+                let m = self.motions.get(s);
+                if m.drawn() {
+                    m.opacity()
+                } else {
+                    0.0
+                }
+            })
+            .fold(0.0_f32, f32::max)
+            .clamp(0.0, 1.0)
     }
 
     /// Whether the placement of any surface has moved since it was last applied.
@@ -1681,7 +1920,11 @@ impl RenderLoop {
         crate::panel::Surface::ALL
             .into_iter()
             .enumerate()
-            .any(|(i, surface)| self.placed.get(i) != Some(&self.panel.placement(surface)))
+            .any(|(i, surface)| {
+                let present = self.panel.surfaces().has(surface);
+                let now = present.then(|| self.panel.placement(surface));
+                self.placed.get(i).copied().unwrap_or(None) != now
+            })
     }
 
     /// Where the demoted video sits, in panel-normalized coordinates. `None` when it is
@@ -1703,52 +1946,19 @@ impl RenderLoop {
             .is_some_and(|(ox, oy, sx, sy)| x >= ox && y >= oy && x <= ox + sx && y <= oy + sy)
     }
 
-    /// Put the video layer where the panel says it goes.
-    fn place_video(&mut self, placement: crate::panel::Placement) {
-        if !self.compositor.has_layer(LayerId::Video) {
-            return;
-        }
-        let (w, h) = self.compositor.target_size();
-        let transform = demoted_transform(crate::panel::Surface::Video, placement, w, h);
-        self.compositor.upsert_layer(Layer {
-            id: LayerId::Video,
-            opacity: 1.0,
-            transform,
-        });
-        // Suppressed rather than removed on a pushed screen: the decoder keeps handing
-        // over frames and the session keeps its clock, so this has to be a placement the
-        // next navigation can undo, not a teardown.
-        self.compositor
-            .set_suppressed(LayerId::Video, !placement.visible());
+    /// Where the now-playing card actually is right now, mid-animation included.
+    ///
+    /// For tests: "did it travel or did it teleport" cannot be asked from outside without
+    /// being able to watch it, and it is the difference this whole module exists for.
+    #[must_use]
+    pub fn card_frame(&self) -> crate::panel::NormRect {
+        self.motions.get(crate::panel::Surface::Card).frame()
     }
 
-    /// Put the now-playing card where the panel says it goes.
-    ///
-    /// The audio-session twin of [`Self::place_video`], and the reason the home gesture
-    /// visibly *works* from a Spotify or Bluetooth session: the card layers sit above
-    /// the shell, so bringing the shell forward changed nothing anyone could see. Now
-    /// the session minimizes into the card — the slot the idle clock occupies, which a
-    /// playing session already outranks (`LayerId::yields_to`) — exactly as every other
-    /// app surface does. Both rects are 16:9, so the scale is uniform.
-    fn place_card(&mut self, placement: crate::panel::Placement) {
-        if !self.compositor.has_layer(LayerId::NowPlaying) {
-            return;
-        }
-        let (w, h) = self.compositor.target_size();
-        let transform = demoted_transform(crate::panel::Surface::Card, placement, w, h);
-        self.compositor.upsert_layer(Layer {
-            id: LayerId::NowPlaying,
-            opacity: 1.0,
-            transform,
-        });
-        self.compositor
-            .set_suppressed(LayerId::NowPlaying, !placement.visible());
-        // The strip's controls are unusably small at card scale; it returns with the
-        // full view. Suppressed, not removed — the texture and model stay warm.
-        self.compositor.set_suppressed(
-            LayerId::Transport,
-            !matches!(placement, crate::panel::Placement::Panel),
-        );
+    /// How visible the now-playing card is right now. For tests, like [`Self::card_frame`].
+    #[must_use]
+    pub fn card_opacity(&self) -> f32 {
+        self.motions.get(crate::panel::Surface::Card).opacity()
     }
 
     /// Whether a panel-normalized point is on the minimized now-playing card.
@@ -1936,19 +2146,45 @@ impl RenderLoop {
     /// Execute a scheduled layer clear whose grace has run out (see `ClearVideo`).
     fn run_due_clears(&mut self) {
         let now = std::time::Instant::now();
+        // A due clear starts the *exit*; it does not drop the layer. Removing it here is
+        // what made a card vanish rather than leave, and it is why `Phase::Leaving` exists:
+        // the layer is retired by `retire_finished` once the motion has actually gone.
         if self.video_clear_due.is_some_and(|due| now >= due) {
             self.video_clear_due = None;
-            self.compositor.remove_layer(LayerId::Video);
-            self.panel.set_surface(crate::panel::Surface::Video, false);
+            self.set_surface(crate::panel::Surface::Video, false);
         }
         if self.card_clear_due.is_some_and(|due| now >= due) {
             self.card_clear_due = None;
-            self.compositor.remove_layer(LayerId::NowPlaying);
-            self.panel.set_surface(crate::panel::Surface::Card, false);
-            // The strip belongs to the card. Leaving it would offer controls for a
-            // session that has ended, wired to a remote that has been dropped.
-            self.compositor.remove_layer(LayerId::Transport);
-            self.transport = None;
+            self.set_surface(crate::panel::Surface::Card, false);
+        }
+        self.retire_finished();
+    }
+
+    /// Drop the layers of surfaces whose motion has finished leaving.
+    ///
+    /// The other half of a deferred clear. A surface is composited for as long as it is
+    /// visible — including the whole of its exit — and only then does its texture go.
+    fn retire_finished(&mut self) {
+        use crate::motion::Phase;
+        use crate::panel::Surface;
+        for surface in Surface::ALL {
+            if self.panel.surfaces().has(surface) {
+                continue;
+            }
+            if self.motions.get(surface).phase() != Phase::Absent {
+                continue;
+            }
+            match surface {
+                Surface::Video => self.compositor.remove_layer(LayerId::Video),
+                Surface::Card => {
+                    self.compositor.remove_layer(LayerId::NowPlaying);
+                    // The strip belongs to the card. Leaving it would offer controls for a
+                    // session that has ended, wired to a remote that has been dropped.
+                    self.compositor.remove_layer(LayerId::Transport);
+                    self.transport = None;
+                }
+                Surface::CastPage | Surface::IdleWidget => {}
+            }
         }
     }
 
@@ -1975,6 +2211,9 @@ impl RenderLoop {
         if self.placement_moved() {
             self.reflow_surfaces();
         }
+        // The layers, from wherever the motions have got to. Idempotent uniform writes, and
+        // the reason a presented frame can never disagree with the animation.
+        self.apply_motions();
         if self.taps.is_empty() {
             self.compositor.present();
             return;
@@ -2073,7 +2312,6 @@ impl RenderLoop {
                 // A card published while someone is on the home screen arrives
                 // minimized rather than snatching the panel from under them.
                 self.set_surface(crate::panel::Surface::Card, true);
-                self.place_card(self.panel.placement(crate::panel::Surface::Card));
                 false
             }
             RenderCommand::Home(scene) => {
@@ -2491,16 +2729,25 @@ impl RenderLoop {
                         TexelFormat::Rgba8Srgb,
                         &pixels,
                     )?;
+                    self.mascot_base = Some(rect.transform(w, h));
                     self.compositor.upsert_layer(Layer {
                         id: LayerId::MascotOverlay,
                         opacity: 1.0,
                         transform: rect.transform(w, h),
                     });
                 }
-                None => self.compositor.remove_layer(LayerId::MascotOverlay),
+                None => {
+                    self.mascot_base = None;
+                    self.compositor.remove_layer(LayerId::MascotOverlay);
+                }
             }
         }
-        self.set_attract(w, h, &rgba)
+        self.set_attract(w, h, &rgba)?;
+        // A freshly rasterized screen must land in the floor's *current* placement. Without
+        // this it appears at full size for one frame and then jumps, which is the snap this
+        // whole module removes everywhere else.
+        self.apply_floor();
+        Ok(())
     }
 }
 

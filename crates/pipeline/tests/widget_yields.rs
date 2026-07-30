@@ -36,6 +36,22 @@ fn widget_center() -> (usize, usize) {
     )
 }
 
+/// Pump and advance motion until nothing is moving.
+///
+/// Needed now that a surface *leaves* rather than vanishing: a card whose session ended is
+/// composited for the whole of its exit, so the layer — and therefore the clock's yielding —
+/// only goes once the motion has finished. On the panel the kiosk's redraw loop supplies this
+/// clock; in a test it has to be asked for.
+fn settle(render: &mut RenderLoop) {
+    for _ in 0..180 {
+        render.pump();
+        if !render.tick_motion(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+    render.pump();
+}
+
 fn widget_visible(render: &RenderLoop) -> bool {
     let shot = render.read_rgba().unwrap();
     let (cx, cy) = widget_center();
@@ -81,7 +97,7 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
     // that is the point.
     tx.try_send(RenderCommand::NowPlaying(Box::default()))
         .unwrap();
-    render.pump();
+    settle(&mut render);
     assert!(
         !widget_visible(&render),
         "a playing session is on the panel; the ornament must leave, \
@@ -94,7 +110,7 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
     tx.try_send(RenderCommand::ClearNowPlaying).unwrap();
     render.pump();
     std::thread::sleep(std::time::Duration::from_millis(1300));
-    render.pump();
+    settle(&mut render);
     assert!(
         widget_visible(&render),
         "with the session gone the widget should be back, from its warm texture"
@@ -119,14 +135,14 @@ fn a_pushed_shell_screen_takes_the_widget_with_it() {
     render.shell_push(pipeline::shell::Screen::Service(Box::new(
         pipeline::service::ServiceScreen { tile, detail },
     )));
-    render.pump();
+    settle(&mut render);
     assert!(
         !widget_visible(&render),
         "off Home, the Home scene's widget has no business on the panel"
     );
 
     render.shell_back();
-    render.pump();
+    settle(&mut render);
     assert!(
         widget_visible(&render),
         "back on Home, the widget should be back"

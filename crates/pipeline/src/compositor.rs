@@ -220,11 +220,16 @@ impl LayerId {
     #[must_use]
     pub const fn yields_to(self) -> &'static [Self] {
         match self {
-            // The widget and the mascot leaning on it are one ornament in two layers;
-            // they leave the stage together.
-            Self::BrowserWidget | Self::MascotOverlay => {
-                &[Self::NowPlaying, Self::Transport, Self::Video]
-            }
+            // The clock yields the moment a session has anything on the panel: an ornament
+            // must not outrank the thing the panel is actually doing.
+            Self::BrowserWidget => &[Self::NowPlaying, Self::Transport, Self::Video],
+            // The mascot leans on the clock and leaves with it — but *not* by yielding.
+            // A hard hide is a pop, and she pops back the instant a departing card's layer
+            // goes, which after `motion` is the moment that card has already faded to
+            // nothing. Her visibility is driven as an opacity instead
+            // (`RenderLoop::apply_floor`), from how much of a session surface is on the
+            // panel, so she fades out as one arrives and back as it leaves.
+            Self::MascotOverlay => &[],
             Self::Attract
             | Self::ShellPrev
             | Self::NowPlaying
@@ -420,15 +425,15 @@ mod tests {
                 );
             }
         }
-        // The mascot overlay is the widget's other half and leaves with it.
-        assert_eq!(
-            LayerId::MascotOverlay.yields_to(),
-            LayerId::BrowserWidget.yields_to()
-        );
-        // These two are the only ornaments with this behavior today; a new entry here
-        // should come with the same kind of reasoning, not by accident.
+        // The mascot leaves with the clock too, but by fading rather than yielding — see
+        // `LayerId::yields_to`. A hard hide pops, and it pops back at the moment a departing
+        // card has already faded to nothing, so her visibility is an opacity the render loop
+        // drives from how much of a session is on the panel.
+        assert!(LayerId::MascotOverlay.yields_to().is_empty());
+        // The clock is the only layer that yields today; a new entry here should come with
+        // the same kind of reasoning, not by accident.
         for id in LayerId::PAINT_ORDER {
-            if !matches!(id, LayerId::BrowserWidget | LayerId::MascotOverlay) {
+            if id != LayerId::BrowserWidget {
                 assert!(id.yields_to().is_empty(), "{id:?} unexpectedly yields");
             }
         }

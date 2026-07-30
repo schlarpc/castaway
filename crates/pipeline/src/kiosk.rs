@@ -617,6 +617,10 @@ impl ApplicationHandler for KioskApp {
                         .map_or(std::time::Duration::ZERO, |t: std::time::Instant| now - t);
                     self.last_frame = Some(now);
                     render.tick_transition(dt);
+                    // Every surface's own motion, on the same clock. Continuous redraw means
+                    // this is called whether or not anything is moving; a motion that has
+                    // settled costs one enum comparison per surface.
+                    render.tick_motion(dt);
                 }
                 if let Some(r) = &mut self.render {
                     r.pump();

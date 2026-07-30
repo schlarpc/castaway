@@ -460,9 +460,9 @@ impl Panel {
     /// from a different variable. Demoted surfaces are offered first and in a fixed order,
     /// because they are drawn over the shell and a press cannot belong to both.
     ///
-    /// `covered` is the compositor's veto for surfaces this model does not describe: the
-    /// transport strip, the OSD, the mascot's arms. It is consulted only for the shell,
-    /// which is the one thing that sits under all of them.
+    /// `covered` is the veto for surfaces this model does not describe: the transport strip,
+    /// the OSD, the home pill. It is consulted only for the shell, which is the one thing that
+    /// sits under all of them.
     pub fn hit(
         &self,
         width: u32,
@@ -483,7 +483,8 @@ impl Panel {
         let Some(stack) = self.shell.as_ref() else {
             return PanelHit::Miss;
         };
-        if covered(x, y) {
+        // The shell is the floor, so every session surface is above it.
+        if self.covered_by_any(x, y, &SESSION_SURFACES) || covered(x, y) {
             return PanelHit::Miss;
         }
         stack
@@ -492,6 +493,42 @@ impl Panel {
             .map_or(PanelHit::Miss, PanelHit::Shell)
     }
 }
+
+impl Panel {
+    /// Whether any of `surfaces` covers this point, *per the model*.
+    ///
+    /// Deliberately answered from where a surface is placed rather than from where its
+    /// animation has got to. Input must not be a moving target: a press 100 ms into a 400 ms
+    /// arrival has to mean what the same press means when it has landed, or the panel
+    /// answers differently depending on when you happened to touch it. So a surface placed
+    /// [`Placement::Panel`] covers the glass the instant it is placed there, and one placed
+    /// [`Placement::Widget`] covers its demoted rect — whatever either of them is currently
+    /// drawn at.
+    ///
+    /// The caller names which surfaces to ask about, because "covered" is relative to how
+    /// deep the asker is: the shell is under all of them, but the transport strip is drawn
+    /// *above* the now-playing card it belongs to, and a card is no reason for its own
+    /// controls to stop answering.
+    #[must_use]
+    pub fn covered_by_any(&self, x: f32, y: f32, surfaces: &[Surface]) -> bool {
+        surfaces
+            .iter()
+            .copied()
+            .any(|surface| match self.placement(surface) {
+                Placement::Panel => true,
+                Placement::Widget => {
+                    // Panel-normalized, so the surface size cancels: any size gives the same
+                    // fractional rect, and `hit` has already checked these for a restore.
+                    demoted_rect(surface, 1920, 1080).is_some_and(|r| r.contains(x, y))
+                }
+                Placement::Hidden => false,
+            })
+    }
+}
+
+/// Every surface a session can put up, in paint order. What the shell — which is under all
+/// of them — asks [`Panel::covered_by_any`] about.
+pub const SESSION_SURFACES: [Surface; 3] = [Surface::Card, Surface::Video, Surface::CastPage];
 
 /// A panel-normalized rectangle: where a demoted surface sits, as a fraction of the
 /// surface.
@@ -512,10 +549,34 @@ pub struct NormRect {
 }
 
 impl NormRect {
+    /// The whole panel.
+    pub const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+
     /// Whether a panel-normalized point is inside.
     #[must_use]
     pub fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x <= self.x + self.w && y <= self.y + self.h
+    }
+
+    /// The same rect scaled about its own centre.
+    ///
+    /// What an arrival and a departure are made of: a surface with nowhere to come from
+    /// grows outward from just inside itself, and one that is leaving shrinks inward. Both
+    /// have to keep the centre still, or the motion reads as a slide.
+    #[must_use]
+    pub fn scaled(self, factor: f32) -> Self {
+        let (w, h) = (self.w * factor, self.h * factor);
+        Self {
+            x: self.x + (self.w - w) / 2.0,
+            y: self.y + (self.h - h) / 2.0,
+            w,
+            h,
+        }
     }
 }
 

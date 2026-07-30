@@ -47,6 +47,10 @@ pub mod ffmpeg_decode;
 pub mod filterlists;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
+/// How the panel *moves* between the states [`panel`] decides: springs, and the
+/// choreography table that says which one each transition gets. Pure.
+#[cfg(feature = "render")]
+pub mod motion;
 #[cfg(feature = "render")]
 pub mod nowplaying_card;
 #[cfg(feature = "render")]
