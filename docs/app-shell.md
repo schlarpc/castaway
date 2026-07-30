@@ -282,7 +282,11 @@ Landed, in this order, each independently useful:
    thing anyone saw and none of it was about what they were doing.
 5. **Input routing.** Transport, then shell, then browser; the middle only where nothing
    covers it.
-6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes Q44.
+6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes Q44. Pairing is
+   part of the walk-up now: pressing an unpaired host shows a panel-generated PIN and
+   waits for it to be typed into Sunshine's web UI — one pairing at a time, a
+   three-minute panel-side timeout (the protocol layer rightly has none), and a retry
+   row on failure. The config-driven startup pairing shares the same adapter call.
 7. **The home gesture.** Left-edge swipe and a fading pill, with `cancel_all` so nothing
    is left holding a finger.
 8. **PiP and the idle return** (#28, #27). Bringing the shell forward demotes a playing

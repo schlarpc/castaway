@@ -251,6 +251,10 @@ pub struct GameStream {
     /// Pair with this host at startup, using `pair_pin`. Both must be set; the PIN is
     /// consumed once and pairing is persisted, so this is meant to be removed from the
     /// config afterwards rather than left in place.
+    ///
+    /// Optional twice over: the panel can also pair on its own — pressing an unpaired
+    /// host in the Moonlight picker puts a PIN on the glass. This stays for boxes
+    /// without a touch surface, and for provisioning a panel before it is hung.
     pub pair_host: Option<String>,
     /// The PIN to type into the host's own UI during that pairing.
     pub pair_pin: Option<String>,
