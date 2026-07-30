@@ -26,6 +26,15 @@ Regenerate with:
 airserver_castdb.py <cast.db> --export crates/cast-replay/fixtures/airserver
 ```
 
+**To get a `cast.db` in the first place, and to re-derive any of this from the
+shipped installers, see [`../../PROVENANCE.md`](../../PROVENANCE.md) §3** — source
+artifact hashes, which product versions carry the database as a loose file versus
+linked into the executable, how to carve it, where the two BLAKE2b constants sit in
+`.rdata`, and the one column that is not encrypted. §4 covers the live endpoint
+`src/airserver_api.rs` reimplements, including the one part of the request that was
+never recovered. The tooling is **not** under version control, so that file is the
+durable record.
+
 ## What is *not* here
 
 The database also carries **4380 pre-signed RS256 JWTs**. None of them are in

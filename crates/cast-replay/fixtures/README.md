@@ -15,6 +15,12 @@ Landed here as **fixtures, not a dependency** — ground rule 9. Nothing in this
 tree links, ships or shells out to AirReceiver; these are bytes plus a
 reimplementation of the derivation that makes them usable.
 
+**To re-derive these from scratch, see [`../PROVENANCE.md`](../PROVENANCE.md) §1**,
+which carries the source-artifact hashes, the APK and ABI they came from, the `dbio`
+container offsets, the KEK recovery, and the commands. §2 covers the backend request
+`src/api.rs` reimplements. The tooling referenced above is **not** under version
+control, so that file is the durable record rather than a pointer to one.
+
 | File | Contents |
 |---|---|
 | `device_cert.pem` | Google device certificate `CN=RYW0O FA8FCA6AC5A0`, valid 2014-03-07 → 2034-03-02. `AuthResponse.client_auth_certificate`. |

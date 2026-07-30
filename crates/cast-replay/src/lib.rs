@@ -49,10 +49,15 @@
 //! | windows | 900, 2-day step, tiled | 1095, 1-day step, overlapping |
 //! | certificates | re-issued from a template | stored verbatim |
 //!
-//! [`api`] additionally speaks to the CKS backend, which serves the current window
-//! on demand and is the only path that outlives every table. [`provider`] runs the
-//! order. Fixture provenance is in `fixtures/README.md` and
-//! `fixtures/airserver/README.md`.
+//! [`api`] and [`airserver_api`] speak to each vendor's live endpoint, which is what
+//! keeps either identity from expiring with its table; [`provider`] runs the order.
+//!
+//! **`PROVENANCE.md` is the record of how all four of those were derived** — both
+//! static tables and both remote protocols — with source-artifact hashes, product
+//! versions, binary addresses and the commands to do it again. It is deliberately
+//! detailed because the RE tooling lives outside version control, so this crate is
+//! the durable copy. `fixtures/README.md` and `fixtures/airserver/README.md` describe
+//! what each file *is*.
 //!
 //! Carrying two is about **revocation**, not horizon — see [`provider`], which
 //! explains why the order is operator policy and why nothing here tries to detect

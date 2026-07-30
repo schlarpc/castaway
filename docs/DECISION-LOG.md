@@ -1178,3 +1178,14 @@ resolution order and the rollover decisions, not the network.
 
 `cast.replay.airserver_live` turns the endpoint off for an operator on a metered link,
 leaving that identity on its bundled table.
+
+**All four derivations are now written down where the code is.**
+`crates/cast-replay/PROVENANCE.md` records both static tables and both remote
+protocols: source-artifact SHA-256s and the exact product versions (AirReceiver Lite
+5.1.7 arm64-v8a; AirServer 5.7.2 and 2025.7.23, which differ in whether the database
+is a loose file or linked into the executable), the `dbio` container offset and KEK
+recovery, the CKS provider vtable layout and its `MD5(secret || ts)` request, the
+BLAKE2b constants' addresses in `.rdata`, the Qt request builder's addresses, and the
+commands. The reason it is that detailed: the tooling lives in `re-shell/artifacts/`,
+which is **gitignored there**, so those scripts are not under version control and
+this repo holds the only durable copy of how any of it was obtained.
