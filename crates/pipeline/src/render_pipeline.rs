@@ -1863,6 +1863,21 @@ impl RenderLoop {
         if !drawn {
             return;
         }
+        // The card is authored at the surface's own shape, while the widget slot is a
+        // hard-coded 16:9 — so on a panel that is not 16:9 a demoted card is stretched today.
+        // A no-op on one that is. Video is *not* cropped this way: its texture's aspect is the
+        // decoded frame's, not the panel's, and how a mismatched frame is fitted belongs to the
+        // decode path rather than here.
+        if layer == LayerId::NowPlaying {
+            let (pw, ph) = self.compositor.target_size();
+            self.compositor.set_source(
+                layer,
+                crate::compositor::cover_source(
+                    (frame.w * pw as f32, frame.h * ph as f32),
+                    (pw as f32, ph as f32),
+                ),
+            );
+        }
         self.compositor.upsert_layer(Layer {
             id: layer,
             opacity,
@@ -1889,6 +1904,7 @@ impl RenderLoop {
         let Some((rect, dim)) = self.floor.placement() else {
             return;
         };
+        let panel = self.compositor.target_size();
         let floor = Transform {
             scale_x: rect.w,
             scale_y: rect.h,
@@ -1898,6 +1914,17 @@ impl RenderLoop {
         if self.compositor.has_layer(LayerId::Attract) {
             self.compositor
                 .set_radius(LayerId::Attract, self.floor.radius());
+            // Clip, do not stretch. The tiles are square and the panel is 16:9, so a screen
+            // growing out of a tile would be compressed 44% horizontally for the first third of
+            // its travel. A no-op once it has arrived, since a full-panel layer is exactly the
+            // panel's shape — which is why it can be applied unconditionally.
+            self.compositor.set_source(
+                LayerId::Attract,
+                crate::compositor::cover_source(
+                    (rect.w * panel.0 as f32, rect.h * panel.1 as f32),
+                    (panel.0 as f32, panel.1 as f32),
+                ),
+            );
             self.compositor.upsert_layer(Layer {
                 id: LayerId::Attract,
                 opacity: dim,

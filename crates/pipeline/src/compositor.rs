@@ -65,6 +65,54 @@ impl Transform {
     }
 }
 
+/// Which part of a layer's texture to sample, so a container of the wrong shape *clips* its
+/// content instead of stretching it.
+///
+/// Returned as `(offset_x, offset_y, scale_x, scale_y)` in texture coordinates, centred.
+///
+/// The case it exists for: a service screen opens out of a tile, and the tiles are square while
+/// the panel is 16:9 — so drawing a full-panel texture into the tile's rect compresses it 44%
+/// horizontally, and for the first third of the animation the screen is visibly the wrong shape.
+/// What every design language does instead is scale the content by a *single* factor and let the
+/// container crop the excess, which is the only way a morph between two aspects can keep its
+/// content honest.
+///
+/// A no-op whenever the two aspects agree, which is what makes it safe to apply unconditionally:
+/// at rest a full-panel layer is exactly the panel's shape, so this returns the whole texture.
+#[must_use]
+pub fn cover_source(dest: (f32, f32), src: (f32, f32)) -> [f32; 4] {
+    let (dest_aspect, src_aspect) = (
+        dest.0 / dest.1.max(f32::EPSILON),
+        src.0 / src.1.max(f32::EPSILON),
+    );
+    if !dest_aspect.is_finite() || !src_aspect.is_finite() || dest_aspect <= 0.0 {
+        return FULL_SOURCE;
+    }
+    // Wider destination than content → the content's width is the binding constraint, so crop
+    // vertically. Narrower → crop horizontally. Either way one axis stays whole.
+    let (w, h) = if dest_aspect > src_aspect {
+        (1.0, (src_aspect / dest_aspect).clamp(0.0, 1.0))
+    } else {
+        ((dest_aspect / src_aspect).clamp(0.0, 1.0), 1.0)
+    };
+    // A crop of less than half a texel is not a crop. The widget slot is a hard-coded 16:9 on a
+    // 16:9 panel and misses by one part in ten thousand; without this, "a no-op when the shapes
+    // agree" would be *nearly* true, and every frame would rewrite a uniform to move the
+    // sampling by a fifth of a pixel.
+    let whole = |scale: f32, extent: f32| {
+        if (1.0 - scale) * extent < 0.5 {
+            1.0
+        } else {
+            scale
+        }
+    };
+    let (w, h) = (whole(w, src.0), whole(h, src.1));
+    [(1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h]
+}
+
+/// The whole texture: what a layer samples unless something says otherwise.
+pub const FULL_SOURCE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
 /// An axis-aligned pixel region of a layer's texture — the granularity of partial
 /// uploads (browser paint dirty rects).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +421,73 @@ mod tests {
     fn pip_transform_is_scaled_down() {
         let t = Transform::pip(3);
         assert!(t.scale_x < 0.5 && t.offset_x > 0.5);
+    }
+
+    #[test]
+    fn a_square_container_crops_a_wide_texture_rather_than_squashing_it() {
+        // The measured case: tiles are exactly square and the panel is 1.778, so a screen
+        // growing out of a tile is compressed 44% horizontally unless it is cropped instead.
+        let [ox, oy, sw, sh] = cover_source((227.0, 227.0), (1920.0, 1080.0));
+        assert!((sh - 1.0).abs() < 1e-6, "height stays whole, got {sh}");
+        assert!(
+            (sw - 1080.0 / 1920.0).abs() < 1e-4,
+            "width should crop to the container's aspect, got {sw}"
+        );
+        // Centred, so the middle of the screen is what shows.
+        assert!((ox - (1.0 - sw) / 2.0).abs() < 1e-6);
+        assert!(oy.abs() < 1e-6);
+    }
+
+    #[test]
+    fn matching_aspects_sample_the_whole_texture() {
+        // What makes it safe to apply unconditionally: at rest every layer is the panel's own
+        // shape, so this has to be exactly a no-op rather than nearly one.
+        assert_eq!(
+            cover_source((1920.0, 1080.0), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+        // The widget slot, and the floor's 2% overscan: same shape, different size.
+        assert_eq!(cover_source((806.0, 453.4), (1920.0, 1080.0)), FULL_SOURCE);
+        assert_eq!(
+            cover_source((1958.4, 1101.6), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+    }
+
+    #[test]
+    fn the_binding_axis_is_the_one_that_stays_whole() {
+        // Cover, not fit: the content is scaled until it *covers* the container, so whichever
+        // axis would leave a gap is the one that stays whole and the other crops.
+        //
+        // A tall narrow container onto a wide texture crops *horizontally* — it shows a narrow
+        // vertical slice — which is the opposite of what reads as intuitive and is why this is
+        // worth pinning rather than eyeballing.
+        let [ox, oy, sw, sh] = cover_source((100.0, 400.0), (1920.0, 1080.0));
+        assert!((sh - 1.0).abs() < 1e-6, "height stays whole, got {sh}");
+        assert!(sw < 0.2, "width should crop hard, got {sw}");
+        assert!(oy.abs() < 1e-6);
+        assert!((ox - (1.0 - sw) / 2.0).abs() < 1e-6);
+
+        // And the mirror, so both branches are covered: a wide container onto a tall texture
+        // crops vertically.
+        let [ox, oy, sw, sh] = cover_source((400.0, 100.0), (1080.0, 1920.0));
+        assert!((sw - 1.0).abs() < 1e-6, "width stays whole, got {sw}");
+        assert!(sh < 0.2, "height should crop hard, got {sh}");
+        assert!(ox.abs() < 1e-6);
+        assert!((oy - (1.0 - sh) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_degenerate_container_samples_the_whole_texture_rather_than_dividing_by_zero() {
+        // A layer can be placed at zero size for a frame — a motion caught at its first step, a
+        // surface resized to nothing — and a NaN in a uniform is a black panel, not a warning.
+        for dest in [(0.0, 0.0), (0.0, 100.0), (-5.0, 100.0)] {
+            assert_eq!(
+                cover_source(dest, (1920.0, 1080.0)),
+                FULL_SOURCE,
+                "{dest:?}"
+            );
+        }
     }
 
     #[test]
