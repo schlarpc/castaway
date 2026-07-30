@@ -62,6 +62,8 @@ struct KioskApp {
     last_frame: Option<std::time::Instant>,
     /// Whether the current edge contact is dragging a navigation along with it.
     started_drag: bool,
+    /// Whether the primary mouse button is down — i.e. a synthesized contact is live.
+    pointer_contact: bool,
     /// The last position and time of that drag, for the velocity a flick carries.
     drag_sample: Option<(std::time::Instant, f32)>,
     /// Where each contact was last seen, for turning a drag into a scroll.
@@ -174,17 +176,30 @@ impl KioskApp {
     /// Update the pill layer for this frame. Cheap: while it is up and unchanging this
     /// writes one 32-byte uniform, and it only rasterizes when it first appears.
     fn tick_pill(&mut self) {
-        let Some(since) = self.pill_since else {
-            return;
-        };
-        let opacity = crate::overlay::pill_opacity(since.elapsed());
         let Some(render) = self.render.as_mut() else {
             return;
         };
+        // While a session holds the whole panel, the pill never fully leaves: it dims
+        // to a floor instead. It is the one exit affordance that is *structurally* in
+        // the same place on every app view — Spotify's card, YouTube, a cast — and an
+        // affordance that has faded to nothing is indistinguishable from there being
+        // no way out (TODO 16/19). The idle screen keeps the old behavior: nothing is
+        // covering the shell there, so the pill has nothing to offer a way out of.
+        let floor = if render.session_fullscreen() {
+            crate::overlay::PILL_SESSION_FLOOR
+        } else {
+            0.0
+        };
+        let interaction = self
+            .pill_since
+            .map_or(0.0, |since| crate::overlay::pill_opacity(since.elapsed()));
+        let opacity = interaction.max(floor);
         if opacity <= 0.0 {
-            render.clear_home_pill();
+            if self.pill_drawn {
+                render.clear_home_pill();
+                self.pill_drawn = false;
+            }
             self.pill_since = None;
-            self.pill_drawn = false;
             return;
         }
         if !self.pill_drawn {
@@ -196,6 +211,10 @@ impl KioskApp {
             self.pill_drawn = true;
         }
         render.set_home_pill_opacity(opacity);
+        // A finished interaction fade hands over to the floor (or to nothing).
+        if interaction <= 0.0 {
+            self.pill_since = None;
+        }
     }
 
     /// The navigation layer: the home pill, and the reserved left edge the swipe starts
@@ -374,6 +393,13 @@ impl KioskApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 let (x, y) = normalize(position.x, position.y, size);
+                // A held primary button is a contact mid-drag: it takes the same road a
+                // finger does, or the gesture half of the panel only exists for touch.
+                if self.pointer_contact
+                    && self.route_contact(TouchEvent::new(POINTER_CONTACT, TouchPhase::Move, x, y))
+                {
+                    return;
+                }
                 if let Some(sink) = self.input_sink() {
                     sink.pointer(PointerEvent::Move { x, y });
                 }
@@ -384,25 +410,19 @@ impl KioskApp {
                 };
                 let down = state.is_pressed();
                 let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
-                // The strip gets first refusal on the primary button — it is drawn over
-                // whatever else is on screen, so it has to receive over it too.
+                // The primary button is a finger. It used to get a hand-rolled subset of
+                // the touch routing — transport, restore, shell, but never the navigation
+                // layer — so on any box whose screen reports as a *pointer* (a dev
+                // mouse, and some HID touch stacks under Wayland) the edge swipe and the
+                // home pill simply did not exist, while Esc worked. One path now.
                 if button == PointerButton::Left {
                     let phase = if down {
-                        crate::transport::TouchPhase::Press
+                        TouchPhase::Down
                     } else {
-                        crate::transport::TouchPhase::Release
+                        TouchPhase::Up
                     };
-                    if self.offer_to_transport(x, y, phase) {
-                        return;
-                    }
-                    // A minimized app restores on click, same as on tap.
-                    if down && self.restore_minimized(x, y) {
-                        return;
-                    }
-                    // The shell sits under everything, so it only sees a press where
-                    // nothing is covering it — `shell_hit` enforces that. Presses only:
-                    // a release is the end of an interaction the press already claimed.
-                    if down && self.offer_to_shell(x, y) {
+                    self.pointer_contact = down;
+                    if self.route_contact(TouchEvent::new(POINTER_CONTACT, phase, x, y)) {
                         return;
                     }
                 }
@@ -419,72 +439,8 @@ impl KioskApp {
             }
             WindowEvent::Touch(touch) => {
                 let event = translate_touch(touch, size);
-                // Any touch raises the pill. Someone who does not know the gesture has to
-                // be shown the way out without knowing to ask for it.
-                self.wake_pill();
-                if let Some(render) = self.render.as_mut() {
-                    render.note_touch();
-                }
-
-                // The navigation layer sees every phase, and sees them first. It is the
-                // only thing above a fullscreen cast, so it is the only thing that can
-                // offer a way out of one.
-                if self.route_navigation(&event) {
+                if self.route_contact(event) {
                     return;
-                }
-
-                let phase = match event.phase {
-                    TouchPhase::Down => Some(crate::transport::TouchPhase::Press),
-                    TouchPhase::Up => Some(crate::transport::TouchPhase::Release),
-                    // A move is neither: the strip acts on the two ends of a contact, and
-                    // swallowing moves would break a drag that started on the browser and
-                    // happened to pass over the strip.
-                    TouchPhase::Move | TouchPhase::Cancel => None,
-                };
-                if let Some(phase) = phase {
-                    if self.offer_to_transport(event.x, event.y, phase) {
-                        return;
-                    }
-                }
-                // A drag over a shell screen scrolls it, rather than falling through to
-                // a browser that is not even visible there.
-                match event.phase {
-                    TouchPhase::Down => {
-                        // A minimized app restores on tap, before the shell or the
-                        // page underneath can claim the press.
-                        if self.restore_minimized(event.x, event.y) {
-                            return;
-                        }
-                        if self
-                            .render
-                            .as_ref()
-                            .is_some_and(|r| r.shell_hit(event.x, event.y).is_some())
-                            || self
-                                .render
-                                .as_ref()
-                                .is_some_and(|r| r.shell_scrollable(event.x, event.y))
-                        {
-                            self.drag_last.insert(event.id, event.y);
-                        }
-                        if self.offer_to_shell(event.x, event.y) {
-                            self.drag_last.remove(&event.id);
-                            return;
-                        }
-                    }
-                    TouchPhase::Move => {
-                        if let Some(last) = self.drag_last.get_mut(&event.id) {
-                            let dy = event.y - *last;
-                            *last = event.y;
-                            if let Some(render) = self.render.as_mut() {
-                                if render.shell_scroll(dy) {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    TouchPhase::Up | TouchPhase::Cancel => {
-                        self.drag_last.remove(&event.id);
-                    }
                 }
                 if let Some(sink) = self.input_sink() {
                     sink.touch(event);
@@ -493,7 +449,86 @@ impl KioskApp {
             _ => {}
         }
     }
+
+    /// Route one contact — a finger, or the primary mouse button standing in for one —
+    /// through the panel's own layers. Returns whether it was consumed; an unconsumed
+    /// contact belongs to whatever surface is underneath, in the caller's vocabulary
+    /// (a touch to the touch sink, a pointer event to the pointer sink).
+    fn route_contact(&mut self, event: TouchEvent) -> bool {
+        // Any contact raises the pill. Someone who does not know the gesture has to
+        // be shown the way out without knowing to ask for it.
+        self.wake_pill();
+        if let Some(render) = self.render.as_mut() {
+            render.note_touch();
+        }
+
+        // The navigation layer sees every phase, and sees them first. It is the
+        // only thing above a fullscreen cast, so it is the only thing that can
+        // offer a way out of one.
+        if self.route_navigation(&event) {
+            return true;
+        }
+
+        let phase = match event.phase {
+            TouchPhase::Down => Some(crate::transport::TouchPhase::Press),
+            TouchPhase::Up => Some(crate::transport::TouchPhase::Release),
+            // A move is neither: the strip acts on the two ends of a contact, and
+            // swallowing moves would break a drag that started on the browser and
+            // happened to pass over the strip.
+            TouchPhase::Move | TouchPhase::Cancel => None,
+        };
+        if let Some(phase) = phase {
+            if self.offer_to_transport(event.x, event.y, phase) {
+                return true;
+            }
+        }
+        // A drag over a shell screen scrolls it, rather than falling through to
+        // a browser that is not even visible there.
+        match event.phase {
+            TouchPhase::Down => {
+                // A minimized app restores on tap, before the shell or the
+                // page underneath can claim the press.
+                if self.restore_minimized(event.x, event.y) {
+                    return true;
+                }
+                if self
+                    .render
+                    .as_ref()
+                    .is_some_and(|r| r.shell_hit(event.x, event.y).is_some())
+                    || self
+                        .render
+                        .as_ref()
+                        .is_some_and(|r| r.shell_scrollable(event.x, event.y))
+                {
+                    self.drag_last.insert(event.id, event.y);
+                }
+                if self.offer_to_shell(event.x, event.y) {
+                    self.drag_last.remove(&event.id);
+                    return true;
+                }
+            }
+            TouchPhase::Move => {
+                if let Some(last) = self.drag_last.get_mut(&event.id) {
+                    let dy = event.y - *last;
+                    *last = event.y;
+                    if let Some(render) = self.render.as_mut() {
+                        if render.shell_scroll(dy) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            TouchPhase::Up | TouchPhase::Cancel => {
+                self.drag_last.remove(&event.id);
+            }
+        }
+        false
+    }
 }
+
+/// The contact id the primary mouse button reports as. Real winit touch ids are
+/// device-assigned and start low; the top of the range cannot collide with one.
+const POINTER_CONTACT: u32 = u32::MAX;
 
 /// The window's stable identity: Wayland `app_id`, X11 `WM_CLASS`, and the name the
 /// desktop entry and hicolor icons are installed under. The three have to agree or
@@ -734,6 +769,7 @@ pub fn run(
         drag_last: std::collections::HashMap::new(),
         last_frame: None,
         started_drag: false,
+        pointer_contact: false,
         drag_sample: None,
         pill_since: None,
         pill_drawn: false,
@@ -774,6 +810,7 @@ pub fn run_with_browser(
         drag_last: std::collections::HashMap::new(),
         last_frame: None,
         started_drag: false,
+        pointer_contact: false,
         drag_sample: None,
         pill_since: None,
         pill_drawn: false,

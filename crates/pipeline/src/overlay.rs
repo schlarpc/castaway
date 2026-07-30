@@ -42,6 +42,14 @@ pub const PILL_HOLD: std::time::Duration = std::time::Duration::from_millis(2200
 /// How long the fade itself takes.
 pub const PILL_FADE: std::time::Duration = std::time::Duration::from_millis(600);
 
+/// What the pill fades *to* while a session holds the whole panel — dim, but present.
+///
+/// On an app view (Spotify's card, YouTube, a cast) the pill is the one exit that is
+/// structurally in the same place everywhere, and an affordance faded to nothing reads
+/// as there being no way out. Dim enough not to fight the picture; the floor is 0 on
+/// the idle screen, where there is nothing to exit.
+pub const PILL_SESSION_FLOOR: f32 = 0.38;
+
 /// Where the pill sits, in device pixels.
 ///
 /// Bottom-left, near the edge the swipe comes from, so the two affordances teach each

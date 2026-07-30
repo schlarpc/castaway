@@ -1470,12 +1470,14 @@ impl RenderLoop {
         }
     }
 
-    /// What a touch at panel-normalized `(x, y)` means, if the strip is on screen.
-    ///
-    /// Returns the transaction rather than the hit: the caller is the input router and
-    /// has no business knowing about scrub fractions, and the mapping needs the model
-    /// this loop is holding anyway.
+    /// Whether a session surface currently holds the whole panel — the state in which
+    /// the home pill stays dimly present rather than fading out, because it is the one
+    /// exit affordance every app view shares.
     #[must_use]
+    pub fn session_fullscreen(&self) -> bool {
+        matches!(self.panel.focus(), crate::panel::Focus::Session)
+    }
+
     /// Whether the mascot overlay would actually be drawn this frame — present and
     /// not suppressed or yielded away. For tests.
     #[must_use]
@@ -1493,6 +1495,12 @@ impl RenderLoop {
             .and_then(TransportState::live_position)
     }
 
+    /// What a touch at panel-normalized `(x, y)` means, if the strip is on screen.
+    ///
+    /// Returns the transaction rather than the hit: the caller is the input router and
+    /// has no business knowing about scrub fractions, and the mapping needs the model
+    /// this loop is holding anyway.
+    #[must_use]
     pub fn transport_action(
         &self,
         x: f32,
