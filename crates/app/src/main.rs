@@ -899,6 +899,18 @@ async fn serve(
         "/screenshot.png",
         axum::routing::get(screenshot_route).with_state(screenshot),
     );
+    // The root answered 404, and the root is exactly the URL a person types after
+    // reading the advertised host:port off the panel — so "working as intended" read
+    // as "the receiver is down". A landing page is the cheapest health signal there
+    // is; a real web control UI can replace this handler without moving the URL.
+    let landing = landing_page(&config);
+    let http = http.route(
+        "/",
+        axum::routing::get(move || {
+            let page = landing.clone();
+            async move { axum::response::Html(page) }
+        }),
+    );
 
     info!(%addr, "HTTP host listening");
     let http_shutdown = shutdown.clone();
@@ -925,6 +937,51 @@ async fn serve(
     .await;
     drop(mdns);
     Ok(())
+}
+
+/// The page at `/`: who this receiver is and which surfaces it is offering.
+///
+/// Rendered once at startup from the loaded config — it states what this boot
+/// *advertises*, which is a config fact, not live session state. Anything dynamic
+/// belongs to the future control UI, not here.
+fn landing_page(config: &Config) -> String {
+    // The friendly name is operator input headed into markup; everything else
+    // interpolated below is our own constants.
+    let name = config
+        .friendly_name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let mut services = String::new();
+    for (on, label) in [
+        (config.enable.cast, "Google Cast"),
+        (config.enable.airplay, "AirPlay"),
+        (config.enable.dlna, "DLNA MediaRenderer"),
+        (config.enable.dial, "YouTube (DIAL)"),
+        (config.enable.spotify, "Spotify Connect"),
+        (config.enable.bluetooth, "Bluetooth audio"),
+        (config.enable.miracast, "Miracast"),
+        (config.enable.gamestream, "GameStream (Moonlight client)"),
+    ] {
+        if on {
+            services.push_str(&format!("<li>{label}</li>\n"));
+        }
+    }
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{name} · castaway</title>\
+         <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:38rem;\
+         margin:3rem auto;padding:0 1rem;background:#111;color:#eee}}\
+         a{{color:#8cf}}h1{{font-size:1.4rem}}li{{margin:.2rem 0}}</style>\
+         </head><body>\
+         <h1>{name}</h1>\
+         <p>castaway {version} is up. This box accepts:</p>\
+         <ul>{services}</ul>\
+         <p><a href=\"/screenshot.png\">What the panel is showing right now</a></p>\
+         </body></html>",
+        version = env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// Stand up the CASTv2 TLS listener, advertise what it asks for, and run it until
@@ -1603,6 +1660,26 @@ fn derive_mac(uuid: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::device_uuid;
+
+    /// The page at `/` names the box, says what is on, and omits what is off —
+    /// with the operator's name HTML-escaped on its way into markup.
+    #[test]
+    fn the_landing_page_states_the_advertised_surface() {
+        let mut config = crate::config::Config {
+            friendly_name: "Lab <TV> & friends".to_owned(),
+            ..Default::default()
+        };
+        config.enable.miracast = false;
+        let page = super::landing_page(&config);
+        assert!(page.contains("Lab &lt;TV&gt; &amp; friends"));
+        assert!(!page.contains("Lab <TV>"), "raw markup must not survive");
+        assert!(page.contains("Google Cast"));
+        assert!(
+            !page.contains("Miracast"),
+            "a disabled surface is not listed"
+        );
+        assert!(page.contains("/screenshot.png"));
+    }
 
     #[test]
     fn each_protocol_gets_its_own_device_uuid_and_keeps_it() {
