@@ -47,6 +47,11 @@ pub mod ffmpeg_decode;
 pub mod filterlists;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
+// The second decode backend: Sony's `libldacBT`, for the one A2DP codec libav has no
+// decoder for (Q22). Gated on the feature that links it, and `audio_decode::can_decode`
+// answers from whether this module is here rather than from the flag itself.
+#[cfg(feature = "ldac")]
+pub mod ldac_decode;
 /// How the panel *moves* between the states [`panel`] decides: springs, and the
 /// choreography table that says which one each transition gets. Pure.
 #[cfg(feature = "render")]
