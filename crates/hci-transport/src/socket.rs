@@ -232,6 +232,14 @@ mod tests {
             Ok(_) => panic!("hci200 should not exist"),
             Err(e) => {
                 let msg = format!("{e}");
+                // EAFNOSUPPORT is the Nix build sandbox (no AF_BLUETOOTH in its
+                // kernel view): the socket cannot even be created, so the error
+                // under test — what *bind* says about a missing controller — never
+                // forms. Any real box gets past socket() and lands in the asserts.
+                if msg.contains("Address family not supported") {
+                    eprintln!("skipped: no AF_BLUETOOTH in this environment ({msg})");
+                    return;
+                }
                 assert!(
                     msg.contains("no such controller")
                         || msg.contains("CAP_NET_ADMIN")

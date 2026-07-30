@@ -225,6 +225,9 @@
               || (pkgs.lib.hasSuffix ".png" path)
               || (pkgs.lib.hasSuffix ".svg" path)
               || (pkgs.lib.hasSuffix ".txt" path)
+              # cast-replay's trimmed AirServer databases (D44) — include_bytes!'d by
+              # its tests, so their absence is a sandbox-only compile failure.
+              || (pkgs.lib.hasSuffix ".sqlite" path)
               # The network-surface artifacts (D45): the app's freshness tests read
               # them at runtime and fail on drift, which is what keeps the firewall
               # JSON in lock-step with the registry — so the sandbox must see them.
