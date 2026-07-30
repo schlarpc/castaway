@@ -2590,15 +2590,23 @@ impl RenderLoop {
         let moved = self.panel.pop_screen();
         if moved {
             self.repaint_shell();
-            // The screen underneath was already whole, so it is only *launched* when it has
-            // somewhere to come from — a pop with no origin slides in from the left.
-            if matches!(leaving, Leaving::Slide { .. }) {
-                self.floor.launch(
+            // The screen underneath arrives too: from off-panel along the axis, or — when the
+            // one leaving is shrinking back into a tile — from that tile's place, so the pair
+            // reads as one movement rather than two.
+            let (from, spring) = match leaving {
+                Leaving::Slide { .. } => (
                     crate::motion::Choreography::off_panel(1.0),
                     crate::motion::Choreography::shared_axis(),
-                    0.0,
-                );
-            }
+                ),
+                // Home was already whole behind it; launching it from a hair inside itself
+                // gives `carried` something to interpolate for a driven drag without any
+                // visible movement of its own.
+                Leaving::Into(_) | Leaving::Yield => (
+                    crate::panel::NormRect::FULL,
+                    crate::motion::Choreography::container(),
+                ),
+            };
+            self.floor.launch(from, spring, 0.0);
             self.reflow_surfaces();
         }
         moved
@@ -2773,6 +2781,15 @@ impl RenderLoop {
             t.driven = true;
         }
         self.apply_transition(shown);
+        // The screen being navigated *to* comes with the finger as well. Only the outgoing one
+        // moved before, so a half-completed swipe slid one screen aside to reveal the next
+        // already sitting there whole — which reads as two unrelated things rather than as one
+        // navigation being carried.
+        let recessed = self.panel.focus() == crate::panel::Focus::Session;
+        if let Some(at) = self.floor.carried(shown, recessed) {
+            self.floor.drive(at);
+            self.apply_floor();
+        }
     }
 
     /// Let go: where it ends up is decided here, from where it was released and how fast

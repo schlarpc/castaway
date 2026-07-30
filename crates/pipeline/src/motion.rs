@@ -509,10 +509,10 @@ pub struct Floor {
     dim: f32,
     dim_vel: f32,
     spring: Option<Spring>,
-    /// The corner radius the arriving screen launched with, in device pixels, and the width it
-    /// launched at. Together they say how far through the growth it is, which is what the
-    /// radius decays over.
-    launch: Option<(f32, f32)>,
+    /// Where an arriving screen was launched from, and the corner radius it launched with (in
+    /// device pixels). The rect says how far through its growth it currently is — which is what
+    /// the radius decays over, and what a finger carrying it interpolates against.
+    launch: Option<(NormRect, f32)>,
 }
 
 impl Floor {
@@ -555,11 +555,7 @@ impl Floor {
             h: 0.0,
         };
         self.spring = Some(spring);
-        self.launch = if radius > 0.0 {
-            Some((radius, from.w.clamp(0.0, 0.999)))
-        } else {
-            None
-        };
+        self.launch = Some((from, radius));
     }
 
     /// The arriving screen's corner radius right now, in device pixels.
@@ -568,11 +564,43 @@ impl Floor {
     /// a screen at full size is too.
     #[must_use]
     pub fn radius(&self) -> f32 {
-        let (Some((radius, from_w)), Some(at)) = (self.launch, self.at) else {
+        let (Some((from, radius)), Some(at)) = (self.launch, self.at) else {
             return 0.0;
         };
-        let grown = ((at.w - from_w) / (1.0 - from_w)).clamp(0.0, 1.0);
+        if radius <= 0.0 {
+            return 0.0;
+        }
+        let span = 1.0 - from.w.clamp(0.0, 0.999);
+        let grown = ((at.w - from.w) / span).clamp(0.0, 1.0);
         radius * (1.0 - grown)
+    }
+
+    /// Put the floor exactly here, with no spring and no momentum.
+    ///
+    /// What a finger carrying a navigation needs: while a contact is down the position *is* the
+    /// finger's, not a spring's, so letting go part-way puts it back rather than completing
+    /// something nobody finished. The spring resumes on release, from wherever this left it and
+    /// with whatever velocity is handed over.
+    pub fn drive(&mut self, at: NormRect) {
+        self.at = Some(at);
+        self.vel = NormRect::default();
+    }
+
+    /// Between where a screen came from and where it rests, at `shown` — how much of the
+    /// *outgoing* screen still shows, so `1.0` is untouched and `0.0` is arrived.
+    ///
+    /// `None` when nothing was launched: there is no incoming screen to carry.
+    #[must_use]
+    pub fn carried(&self, shown: f32, recessed: bool) -> Option<NormRect> {
+        let (from, _) = self.launch?;
+        let (target, _) = Self::resting(recessed);
+        let p = shown.clamp(0.0, 1.0);
+        Some(NormRect {
+            x: target.x + (from.x - target.x) * p,
+            y: target.y + (from.y - target.y) * p,
+            w: target.w + (from.w - target.w) * p,
+            h: target.h + (from.h - target.h) * p,
+        })
     }
 
     /// Advance toward the arrangement `recessed` asks for. Returns whether it is still

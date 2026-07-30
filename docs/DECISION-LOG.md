@@ -1329,8 +1329,27 @@ demoted width and the whole panel. Degree rather than presence, so the change is
 no threshold, and a demoted *video* (which goes to the far corner, not the slot) correctly
 leaves her alone.
 
-Not done, and known: no transient content layers (above); no elevation shadow, so a demoted
-card reads as a flat inset rather than a lifted card; `CLEAR_GRACE` still debounces presence
-separately from the exit animation, which is right for VLC's stop-then-reload scrubbing and
-redundant for preemption; and the driven edge-drag still animates only the outgoing screen,
-so a half-completed swipe does not carry the incoming one with it.
+**The edge drag turned out never to have worked**, and finding it is the clearest argument for
+the model. The kiosk computed how far the finger had come and called `drive_transition` — but
+nothing *began* a transition, so it drove one that did not exist and nothing followed the hand.
+Worse, the flag meaning "a drag is in hand" was set and never cleared, which made the
+completed-swipe branch (`if complete && !dragging`) unreachable: **the swipe-to-home gesture
+stopped working permanently after the first time anyone dragged from the edge and let go
+early.** Two missing cases in an if-chain over five variables, in the one file with no test
+harness — the kiosk owns the winit event loop.
+
+So the decision is now `overlay::edge_drag`, pure and total: Ignore / Home / Begin / Carry, with
+the one ordering that matters stated (a completed swipe fires only with nothing in hand, because
+with a navigation being carried the swipe *is* that navigation). Only a screen-to-screen back is
+carried, because its whole animation is a position and a finger can be halfway through one;
+handing the glass back at Home is a change of focus rather than of place, so it stays a
+threshold gesture. And the incoming screen is carried too — `Floor::drive` sets a position with
+no spring while a contact is down, and the spring resumes from exactly there on release, which
+is what makes letting go part-way put it back.
+
+Not done, and known: no transient content layers (above), so a container transform still scales
+a finished screen; no elevation shadow, so a demoted card reads as a flat inset rather than as a
+lifted card; and `CLEAR_GRACE` still debounces presence separately from the exit animation —
+right for VLC's stop-then-reload scrubbing, redundant for preemption. The kiosk's input routing
+still has no test harness of its own; extracting `edge_drag` moved the part that had bugs in it
+out, but `route_input`'s ordering is next.

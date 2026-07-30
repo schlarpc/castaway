@@ -229,55 +229,66 @@ impl KioskApp {
                     return false;
                 };
                 let from_edge = contact.from_edge;
-                let complete = contact.is_home_swipe(event.x, event.y);
-                let travel = event.x - contact.start.0;
-                if complete && !self.started_drag {
-                    // Only when nothing is being dragged: with a card in hand the swipe
-                    // *is* the navigation, and finishing it is the release's job.
+                let intent = crate::overlay::edge_drag(
+                    contact,
+                    event.x,
+                    event.y,
+                    self.started_drag,
+                    self.render.as_ref().map_or(0, RenderLoop::shell_depth),
+                    self.render.as_ref().is_some_and(RenderLoop::can_hand_back),
+                );
+                if intent == crate::overlay::EdgeDrag::Home {
                     contact.fired = true;
-                    self.go_home();
-                    return true;
                 }
-                // Part-way: the panel follows the finger, so letting go without
-                // finishing puts it back. A gesture that only fires at a threshold feels
-                // like a switch; one that moves with the hand feels attached to it.
-                if from_edge && !self.started_drag {
-                    if let Some(render) = self.render.as_mut() {
-                        // Somewhere to go: a screen to leave, or something playing to hand
-                        // the glass back to. Asking "is the shell in front" instead would
-                        // say yes at Home with nothing on, and animate a drag that uncovers
-                        // nothing.
-                        if render.shell_depth() > 1 || render.can_hand_back() {
-                            self.started_drag = true;
+                match intent {
+                    crate::overlay::EdgeDrag::Ignore => {}
+                    crate::overlay::EdgeDrag::Home => self.go_home(),
+                    crate::overlay::EdgeDrag::Begin => {
+                        // Begin the navigation the finger is going to carry. Without this the
+                        // drag drove a transition that did not exist, so nothing followed the
+                        // hand — the behaviour the comment above described had never happened.
+                        // `started_drag` is only set if one really began, so every other case
+                        // leaves the completed-swipe branch reachable.
+                        if let Some(render) = self.render.as_mut() {
+                            if render.shell_back() {
+                                self.started_drag = true;
+                                self.drag_sample = None;
+                            }
                         }
                     }
-                }
-                if from_edge && self.started_drag {
-                    // The card follows the hand: how far across the panel the finger has
-                    // come *is* how far through the navigation it is. Not the gesture
-                    // threshold — that decides whether a flick counts, not where the card
-                    // sits.
-                    let shown = 1.0 - travel.clamp(0.0, 1.0);
-                    let now = std::time::Instant::now();
-                    let velocity =
-                        self.drag_sample
-                            .map_or(0.0, |(t, x): (std::time::Instant, f32)| {
-                                let dt = (now - t).as_secs_f32();
-                                if dt > 0.001 {
-                                    -(event.x - x) / dt
-                                } else {
-                                    0.0
-                                }
-                            });
-                    self.drag_sample = Some((now, event.x));
-                    if let Some(render) = self.render.as_mut() {
-                        render.drive_transition(shown, velocity);
+                    crate::overlay::EdgeDrag::Carry { shown } => {
+                        let now = std::time::Instant::now();
+                        let velocity =
+                            self.drag_sample
+                                .map_or(0.0, |(t, x): (std::time::Instant, f32)| {
+                                    let dt = (now - t).as_secs_f32();
+                                    if dt > 0.001 {
+                                        -(event.x - x) / dt
+                                    } else {
+                                        0.0
+                                    }
+                                });
+                        self.drag_sample = Some((now, event.x));
+                        if let Some(render) = self.render.as_mut() {
+                            render.drive_transition(shown, velocity);
+                        }
                     }
                 }
                 from_edge
             }
             TouchPhase::Up | TouchPhase::Cancel => {
-                self.contacts.remove(&event.id).is_some_and(|c| c.from_edge)
+                let from_edge = self.contacts.remove(&event.id).is_some_and(|c| c.from_edge);
+                // Let go. Where the navigation lands is decided from where it was released and
+                // how fast it was moving — and the flag has to be cleared here, or the
+                // completed-swipe branch stays unreachable for the rest of the process's life.
+                if self.started_drag {
+                    if let Some(render) = self.render.as_mut() {
+                        render.release_transition();
+                    }
+                    self.started_drag = false;
+                    self.drag_sample = None;
+                }
+                from_edge
             }
         }
     }
