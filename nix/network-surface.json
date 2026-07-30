@@ -1,0 +1,138 @@
+{
+  "GENERATED": "by crates/app/src/surface.rs; CASTAWAY_REGEN_SURFACE=1 cargo test -p castaway surface — a test fails when this file drifts",
+  "listeners": [
+    {
+      "gate": [],
+      "owner": "http",
+      "port": {
+        "config": [
+          "http_port"
+        ],
+        "default": 8080
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png"
+    },
+    {
+      "gate": [],
+      "owner": "mdns",
+      "port": {
+        "fixed": 5353
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "mDNS/DNS-SD responder (mdns-sd daemon)"
+    },
+    {
+      "gate": [],
+      "owner": "ssdp",
+      "port": {
+        "fixed": 1900
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "SSDP M-SEARCH responder + NOTIFY alive/byebye"
+    },
+    {
+      "gate": [
+        "airplay"
+      ],
+      "owner": "airplay",
+      "port": {
+        "fixed": 7000
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP"
+    },
+    {
+      "gate": [
+        "airplay"
+      ],
+      "owner": "airplay",
+      "port": {
+        "default_first": 41000,
+        "default_last": 41031,
+        "range_config": [
+          "media_ports"
+        ]
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "RAOP audio + control + timing (three sockets per session)"
+    },
+    {
+      "gate": [
+        "airplay"
+      ],
+      "owner": "airplay",
+      "port": {
+        "default_first": 41000,
+        "default_last": 41031,
+        "range_config": [
+          "media_ports"
+        ]
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "mirroring data channel (one listener per session)"
+    },
+    {
+      "gate": [
+        "cast"
+      ],
+      "owner": "cast",
+      "port": {
+        "fixed": 8009
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "CASTv2: length-prefixed protobuf over TLS"
+    },
+    {
+      "gate": [
+        "cast"
+      ],
+      "owner": "cast",
+      "port": {
+        "default_first": 41000,
+        "default_last": 41031,
+        "range_config": [
+          "media_ports"
+        ]
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "mirroring RTP + RTCP (one socket per session; audio and video SSRCs demuxed on it)"
+    },
+    {
+      "gate": [
+        "miracast"
+      ],
+      "owner": "miracast",
+      "port": {
+        "config": [
+          "miracast",
+          "rtp_port"
+        ],
+        "default": 1028
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "MPEG2-TS over RTP from the source"
+    },
+    {
+      "gate": [
+        "miracast"
+      ],
+      "owner": "miracast",
+      "port": {
+        "fixed": 67
+      },
+      "provider": "deployment",
+      "transport": "udp",
+      "wire": "DHCP server for the freshly-associated peer (Q7c)"
+    }
+  ]
+}

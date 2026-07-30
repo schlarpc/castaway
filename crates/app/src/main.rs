@@ -13,6 +13,9 @@ mod bluetooth;
 mod config;
 mod logging;
 mod screen;
+// The network-surface registry (#22/#30): every socket, as data, generating the doc,
+// the firewall JSON, and the --network-surface query.
+mod surface;
 // What the panel can change about itself, and how it persists. The types are always
 // compiled — the store's tests are the config-file contract, and they must run in the
 // build CI tests — but only the render build has screens to press them from, so the
@@ -59,6 +62,14 @@ use crate::config::Config;
 const MDNS_HOST: &str = "castaway";
 
 fn main() -> anyhow::Result<()> {
+    // A query, not a run: print what this config binds and exit before any socket is
+    // bound or log file created.
+    if let Some(format) = surface::requested(std::env::args().skip(1)) {
+        let format = format.map_err(|e| anyhow::anyhow!(e))?;
+        let config = Config::from_env().context("loading config")?;
+        print!("{}", surface::render(format, &config));
+        return Ok(());
+    }
     // Config first, because the file sink is configurable and a subscriber can only be
     // installed once. Nothing here logs — a config that fails to load returns an error
     // main prints itself, which is the same thing a `tracing` line would have said.
@@ -850,6 +861,10 @@ async fn serve(
 
     // HTTP host.
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.http_port));
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "registered: the http/tcp http_port entry in surface.rs"
+    )]
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding HTTP host on {addr}"))?;

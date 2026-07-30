@@ -406,6 +406,10 @@ impl SourceAdapter for AirPlayReceiver {
     }
 
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), CoreError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "registered: the airplay/tcp 7000 entry in crates/app/src/surface.rs"
+        )]
         let listener = TcpListener::bind(self.addr)
             .await
             .map_err(|e| CoreError::Adapter(format!("binding AirPlay on {}: {e}", self.addr)))?;
@@ -579,6 +583,10 @@ fn range_exhausted(media_ports: MediaPorts) -> std::io::Error {
 }
 
 /// Bind a UDP socket on the first free candidate port of `media_ports`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registered: the airplay/udp [media_ports] entry in crates/app/src/surface.rs"
+)]
 async fn bind_udp_media(host: IpAddr, media_ports: MediaPorts) -> std::io::Result<UdpSocket> {
     for port in media_ports.candidates() {
         match UdpSocket::bind(SocketAddr::new(host, port)).await {
@@ -591,6 +599,10 @@ async fn bind_udp_media(host: IpAddr, media_ports: MediaPorts) -> std::io::Resul
 }
 
 /// Bind a TCP listener on the first free candidate port of `media_ports`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registered: the airplay/tcp [media_ports] entry in crates/app/src/surface.rs"
+)]
 async fn bind_tcp_media(host: IpAddr, media_ports: MediaPorts) -> std::io::Result<TcpListener> {
     for port in media_ports.candidates() {
         match TcpListener::bind(SocketAddr::new(host, port)).await {

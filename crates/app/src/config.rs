@@ -963,6 +963,10 @@ impl Config {
 
 /// Best-effort default-route IPv4 detection: open a UDP socket "toward" a public
 /// address (no packets are sent by connect) and read the chosen local address.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registered: the 8.8.8.8 connect-only entry in surface.rs's outbound table"
+)]
 fn detect_ipv4() -> Option<Ipv4Addr> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     sock.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;

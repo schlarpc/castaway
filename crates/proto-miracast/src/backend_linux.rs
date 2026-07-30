@@ -287,6 +287,11 @@ impl GroupSubnet {
 /// never arrives — the side effect is the ARP request the kernel must send to deliver
 /// it, and the peer's reply is the neighbour-table entry [`peer_address`] is polling
 /// for. Needs no privileges and touches nothing outside the connected route.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registered: send-only ARP-priming sweep, in the outbound table of \
+              crates/app/src/surface.rs — nothing is ever received on it"
+)]
 async fn nudge_neighbours(subnet: GroupSubnet) {
     let Ok(socket) = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await else {
         return;

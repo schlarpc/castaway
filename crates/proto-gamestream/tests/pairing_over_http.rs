@@ -13,6 +13,9 @@
 //! complete it, rather than by standing up a second TLS listener whose certificate
 //! plumbing would be testing rustls rather than us.
 #![allow(clippy::unwrap_used)]
+// Tests bind ephemeral loopback sockets that never face the LAN; the registry
+// (crates/app/src/surface.rs) governs production binds.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

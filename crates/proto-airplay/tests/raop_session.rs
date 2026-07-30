@@ -7,6 +7,9 @@
 //! nothing, so it gets a test that uses the sockets rather than mocking them.
 
 #![allow(clippy::unwrap_used)]
+// Tests bind ephemeral loopback sockets that never face the LAN; the registry
+// (crates/app/src/surface.rs) governs production binds.
+#![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;
 use std::time::Duration;

@@ -131,6 +131,8 @@ impl DlnaService {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    // Tests bind ephemeral loopback sockets; the registry governs production binds.
+    #![allow(clippy::disallowed_methods)]
     use std::time::Duration;
 
     use super::*;

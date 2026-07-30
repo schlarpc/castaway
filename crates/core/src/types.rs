@@ -11,9 +11,12 @@ use crate::error::CoreError;
 /// A casting protocol family. Used to tag sources and pick advertisement records.
 ///
 /// Modeled as a closed enum so a `match` over protocols is exhaustive — adding a
-/// protocol forces every dispatch site to be updated (ground rule 1).
+/// protocol forces every dispatch site to be updated (ground rule 1). Deliberately
+/// *not* `#[non_exhaustive]`: that attribute would force downstream crates to carry
+/// `_` arms, which is exactly the escape hatch the network-surface registry
+/// (`crates/app/src/surface.rs`) must not have — a new protocol has to fail to
+/// compile until its network surface is declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum ProtocolKind {
     /// Apple AirPlay (mirroring, audio, video handoff).
     AirPlay,
@@ -35,6 +38,22 @@ pub enum ProtocolKind {
 }
 
 impl ProtocolKind {
+    /// Every protocol, in the order the network-surface registry documents them.
+    ///
+    /// Adding a variant fails the exhaustive matches over this enum first (the
+    /// registry's among them, `crates/app/src/surface.rs`); update this list in the
+    /// same change — `all_lists_every_variant` below holds you to the count.
+    pub const ALL: [Self; 8] = [
+        Self::AirPlay,
+        Self::Cast,
+        Self::Miracast,
+        Self::Dlna,
+        Self::YouTubeLounge,
+        Self::Spotify,
+        Self::Bluetooth,
+        Self::GameStream,
+    ];
+
     /// A short, stable, lowercase identifier used in logs and source ids.
     #[must_use]
     pub const fn slug(self) -> &'static str {
@@ -553,5 +572,30 @@ mod tests {
         // "youtube", not the transport that gets us there — this string ends up in a
         // picker and on the idle screen.
         assert_eq!(ProtocolKind::YouTubeLounge.to_string(), "youtube");
+    }
+
+    #[test]
+    fn all_lists_every_variant() {
+        // Adding a variant makes this match non-exhaustive, which is the compile error
+        // that walks you here; the count assertion is what makes forgetting ALL fail.
+        let noted = |k: ProtocolKind| match k {
+            ProtocolKind::AirPlay
+            | ProtocolKind::Cast
+            | ProtocolKind::Miracast
+            | ProtocolKind::Dlna
+            | ProtocolKind::YouTubeLounge
+            | ProtocolKind::Spotify
+            | ProtocolKind::Bluetooth
+            | ProtocolKind::GameStream => (),
+        };
+        for kind in ProtocolKind::ALL {
+            noted(kind);
+        }
+        assert_eq!(ProtocolKind::ALL.len(), 8);
+        // No duplicates: every slug appears once.
+        let mut slugs: Vec<_> = ProtocolKind::ALL.iter().map(|k| k.slug()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), ProtocolKind::ALL.len());
     }
 }

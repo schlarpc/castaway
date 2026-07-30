@@ -160,6 +160,10 @@ impl Responder {
 
 /// Bind a UDP socket to `0.0.0.0:1900` with address reuse and join the SSDP multicast
 /// group on `interface`. Reuse is required so we coexist with other multicast users.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registered: the ssdp/udp 1900 entry in crates/app/src/surface.rs"
+)]
 fn bind_multicast(interface: Ipv4Addr) -> Result<UdpSocket, SsdpError> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;

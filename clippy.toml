@@ -1,0 +1,16 @@
+# The network-surface ground rule (#22): every socket this project binds has an entry
+# in the registry (crates/app/src/surface.rs), which generates docs/network-surface.md
+# and nix/network-surface.json — the file the NixOS firewall is derived from. A bind
+# with no registry entry is a port the firewall silently blocks, so the raw bind calls
+# are denied by default. A registered site carries
+# `#[expect(clippy::disallowed_methods)]` with a reason naming its registry entry;
+# test modules allow the lint wholesale — tests bind ephemeral loopback sockets that
+# never face the LAN.
+
+disallowed-methods = [
+  { path = "tokio::net::TcpListener::bind", reason = "unregistered listener — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
+  { path = "tokio::net::UdpSocket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
+  { path = "std::net::TcpListener::bind", reason = "unregistered listener — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
+  { path = "std::net::UdpSocket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
+  { path = "socket2::Socket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
+]

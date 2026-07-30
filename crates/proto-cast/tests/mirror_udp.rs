@@ -9,6 +9,9 @@
 //! Nothing here needs hardware or a human, per ground rule 6. Loopback is enough.
 
 #![allow(clippy::unwrap_used)]
+// Tests bind ephemeral loopback sockets that never face the LAN; the registry
+// (crates/app/src/surface.rs) governs production binds.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

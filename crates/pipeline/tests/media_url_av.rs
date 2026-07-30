@@ -6,6 +6,9 @@
 //! while the DLNA sink advertised `http-get:*:audio/*:*` to every control point on the LAN.
 #![cfg(all(feature = "ffmpeg", feature = "render"))]
 #![allow(clippy::unwrap_used)]
+// Tests bind ephemeral loopback sockets that never face the LAN; the registry
+// (crates/app/src/surface.rs) governs production binds.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;

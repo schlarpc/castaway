@@ -20,6 +20,15 @@ pub use service::MdnsService;
 use mdns_sd::ServiceDaemon;
 use tracing::{debug, info};
 
+/// The mDNS port. `mdns-sd` binds it internally (UDP, `SO_REUSEADDR`/`SO_REUSEPORT`,
+/// joined to [`MDNS_GROUP`]) — the constant exists so the network-surface registry
+/// (`crates/app/src/surface.rs`) can name the port from the same crate that owns the
+/// socket, rather than repeating the number.
+pub const MDNS_PORT: u16 = 5353;
+
+/// The IPv4 multicast group mDNS queries and answers travel on.
+pub const MDNS_GROUP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(224, 0, 0, 251);
+
 /// The shared mDNS responder. Construct once, then [`Self::advertise`] each service.
 pub struct MdnsResponder {
     daemon: ServiceDaemon,

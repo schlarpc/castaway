@@ -617,6 +617,10 @@ impl SourceAdapter for CastReceiver {
     }
 
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), CoreError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "registered: the cast/tcp 8009 entry in crates/app/src/surface.rs"
+        )]
         let listener = TcpListener::bind(self.listen)
             .await
             .map_err(|e| CoreError::Adapter(format!("binding CASTv2 on {}: {e}", self.listen)))?;

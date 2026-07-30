@@ -190,6 +190,8 @@ fn status_of(response: &[u8]) -> Result<(), NotifyError> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    // Tests bind ephemeral loopback sockets; the registry governs production binds.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     #[test]

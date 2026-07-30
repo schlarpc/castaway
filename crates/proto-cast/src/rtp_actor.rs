@@ -74,6 +74,10 @@ impl MirrorSocket {
     /// # Errors
     /// [`CastError::Io`] if no candidate port can be bound or the port can't be read
     /// back.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "registered: the cast/udp [media_ports] entry in crates/app/src/surface.rs"
+    )]
     pub async fn bind(
         ip: std::net::IpAddr,
         media_ports: castaway_core::MediaPorts,

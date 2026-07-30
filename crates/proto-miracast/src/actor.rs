@@ -386,6 +386,10 @@ async fn write_message(
 ///
 /// # Errors
 /// [`MiracastError::Connection`] if the port is taken.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "registered: the miracast/udp rtp_port entry in crates/app/src/surface.rs"
+)]
 pub async fn bind_rtp(port: u16) -> Result<UdpSocket, MiracastError> {
     UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
         .await
@@ -445,6 +449,8 @@ impl castaway_core::SourceAdapter for MiracastAdapter {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    // Tests bind ephemeral loopback sockets; the registry governs production binds.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::params::{
         AudioCodecs, ClientRtpPorts, ConnectorType, ContentProtection, RtpProfile,
