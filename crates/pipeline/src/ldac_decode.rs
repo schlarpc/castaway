@@ -232,9 +232,10 @@ impl Decoder {
     ) -> Result<(), PipelineError> {
         let mut offset = 0usize;
         let mut pts = pts;
-        // A frame that consumes nothing would spin here forever; the loop below breaks on
-        // `used == 0` for that reason, and this bounds the pathological case where every
-        // frame in a packet is refused.
+        // Terminates because every iteration either advances `offset` by the bytes the
+        // library consumed or returns `None`. `decode_one` treats a zero-byte consume as
+        // `None` for exactly that reason: a frame that cannot be stepped over would
+        // otherwise spin here forever on a payload the decoder neither accepts nor rejects.
         while offset < payload.len() {
             let remaining = &payload[offset..];
             let Some(block) = self.decode_one(remaining, pts, &mut offset) else {
