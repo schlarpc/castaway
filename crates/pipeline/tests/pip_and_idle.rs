@@ -365,3 +365,75 @@ fn a_session_that_ends_leaves_rather_than_vanishing() {
         "it never finished leaving: {opacities:?}"
     );
 }
+
+#[test]
+fn a_screen_opened_from_a_tile_grows_out_of_that_tile_and_goes_back_into_it() {
+    // "Summoned from their icon". A screen that materialises in the middle of the panel has
+    // thrown away the one thing the person pressing knew — where they were looking — and a
+    // way out that does not reverse the way in makes the tile stop meaning anything.
+    let (_tx, mut render) = playing();
+    let scene = AttractScene::demo();
+    let hit = pipeline::attract::tile_layout(&scene, W, H)
+        .into_iter()
+        .find(|(id, _)| id == "cast")
+        .expect("the demo scene has a cast tile")
+        .1;
+    let tile = pipeline::panel::NormRect {
+        x: hit.x / W as f32,
+        y: hit.y / H as f32,
+        w: hit.w / W as f32,
+        h: hit.h / H as f32,
+    };
+
+    render.shell_push_from(a_screen(), Some(tile));
+    // The arriving screen is the floor's layer, launched at the tile.
+    let (at, _) = render
+        .floor_placement()
+        .expect("the floor should be placed");
+    assert!(
+        (at.w - tile.w).abs() < 0.01 && (at.x - tile.x).abs() < 0.01,
+        "the screen should start at the tile, got {at:?} vs {tile:?}"
+    );
+
+    let mut widths = vec![at.w];
+    for _ in 0..180 {
+        render.pump();
+        if let Some((rect, _)) = render.floor_placement() {
+            widths.push(rect.w);
+        }
+        if !render.tick_motion(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+    assert!(
+        widths.last().is_some_and(|w| (*w - 1.0).abs() < 0.01),
+        "it should arrive filling the panel: {:?}",
+        widths.last()
+    );
+    let midway = widths.iter().filter(|w| **w > 0.3 && **w < 0.9).count();
+    assert!(midway >= 3, "it jumped rather than grew: {widths:?}");
+
+    // And back goes into the same tile, rather than off along an axis.
+    assert!(render.shell_back());
+    let outgoing = render
+        .outgoing_screen_rect()
+        .expect("a transition is running");
+    assert!(
+        (outgoing.w - 1.0).abs() < 0.02,
+        "the leaving screen starts whole: {outgoing:?}"
+    );
+    let mut seen = Vec::new();
+    for _ in 0..180 {
+        if let Some(rect) = render.outgoing_screen_rect() {
+            seen.push(rect);
+        }
+        if !render.tick_transition(std::time::Duration::from_millis(16)) {
+            break;
+        }
+    }
+    let last = seen.last().copied().expect("it should have moved");
+    assert!(
+        (last.x - tile.x).abs() < 0.15 && last.w < 0.5,
+        "it should shrink back toward the tile at {tile:?}, ended at {last:?}"
+    );
+}

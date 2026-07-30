@@ -14,6 +14,7 @@
 //! the shell is still underneath it holding whatever screen it was on.
 
 use crate::attract::AttractScene;
+use crate::panel::NormRect;
 
 /// A screen the shell can draw.
 ///
@@ -63,21 +64,39 @@ impl Screen {
     #[must_use]
     pub fn hit(&self, width: u32, height: u32, x: f32, y: f32) -> Option<ScreenHit> {
         match self {
-            Self::Home(scene) => crate::attract::tile_hit(scene, width, height, x, y).map(|id| {
+            Self::Home(scene) => {
+                let layout = crate::attract::tile_layout(scene, width, height);
+                let (px, py) = (x * width as f32, y * height as f32);
+                let (id, rect) = layout.into_iter().find(|(_, rect)| rect.contains(px, py))?;
+                // The tile's own rectangle travels with the press. It is what the screen it
+                // opens grows *out of* — a person is looking at the tile they just touched,
+                // and a screen that materialises anywhere else has thrown that away
+                // (`crate::motion::Origin`).
+                let from = NormRect {
+                    x: rect.x / width.max(1) as f32,
+                    y: rect.y / height.max(1) as f32,
+                    w: rect.w / width.max(1) as f32,
+                    h: rect.h / height.max(1) as f32,
+                };
                 // A tile carrying its own instructions is answered here; one without
                 // is the app's to interpret.
-                scene
-                    .tiles
-                    .iter()
-                    .find(|t| t.id == id)
-                    .and_then(|t| t.detail.clone().map(|d| (t.clone(), d)))
-                    .map_or(ScreenHit::Event(ShellEvent::Tile(id)), |(tile, detail)| {
-                        ScreenHit::Push(Screen::Service(Box::new(crate::service::ServiceScreen {
-                            tile,
-                            detail,
-                        })))
-                    })
-            }),
+                Some(
+                    scene
+                        .tiles
+                        .iter()
+                        .find(|t| t.id == id)
+                        .and_then(|t| t.detail.clone().map(|d| (t.clone(), d)))
+                        .map_or(ScreenHit::Event(ShellEvent::Tile(id)), |(tile, detail)| {
+                            ScreenHit::Push {
+                                screen: Screen::Service(Box::new(crate::service::ServiceScreen {
+                                    tile,
+                                    detail,
+                                })),
+                                from: Some(from),
+                            }
+                        }),
+                )
+            }
             Self::Service(_) => {
                 crate::service::hit_back(width, height, x, y).then_some(ScreenHit::Back)
             }
@@ -93,7 +112,13 @@ impl Screen {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScreenHit {
     /// Go one screen deeper, with this.
-    Push(Screen),
+    Push {
+        /// The screen to open.
+        screen: Screen,
+        /// The rect it should grow out of, if the press had one — a tile's own rectangle.
+        /// `None` for a screen opened by something with no place on the panel.
+        from: Option<NormRect>,
+    },
     /// Go back one.
     Back,
     /// Not the shell's to decide — tell `app`.
@@ -111,8 +136,14 @@ pub enum ScreenHit {
 #[derive(Debug, Clone)]
 pub struct ScreenStack {
     home: Screen,
-    /// Screens above Home, innermost last.
-    above: Vec<Screen>,
+    /// Screens above Home, innermost last, each with the rect it was opened out of.
+    ///
+    /// The origin is part of the *navigation*, not of the screen — the same picker opened
+    /// from a tile and from an app event should arrive differently — so it is stored
+    /// alongside rather than inside `Screen`. `back` needs it to play the entrance in
+    /// reverse: a screen that grew out of a tile has to shrink back into it, or the way out
+    /// contradicts the way in.
+    above: Vec<(Screen, Option<NormRect>)>,
 }
 
 impl ScreenStack {
@@ -128,13 +159,21 @@ impl ScreenStack {
     /// What is on screen now. Total: there is always a screen.
     #[must_use]
     pub fn current(&self) -> &Screen {
-        self.above.last().unwrap_or(&self.home)
+        self.above.last().map_or(&self.home, |(screen, _)| screen)
+    }
+
+    /// Where the current screen was opened out of, if it had somewhere.
+    #[must_use]
+    pub fn current_origin(&self) -> Option<NormRect> {
+        self.above.last().and_then(|(_, from)| *from)
     }
 
     /// What is on screen now, mutably — for a screen that carries interaction state of
     /// its own, like a picker's scroll position.
     pub fn current_mut(&mut self) -> &mut Screen {
-        self.above.last_mut().unwrap_or(&mut self.home)
+        self.above
+            .last_mut()
+            .map_or(&mut self.home, |(screen, _)| screen)
     }
 
     /// How deep we are. `1` is Home.
@@ -149,9 +188,9 @@ impl ScreenStack {
         !self.above.is_empty()
     }
 
-    /// Push a screen on top of the current one.
-    pub fn push(&mut self, screen: Screen) {
-        self.above.push(screen);
+    /// Push a screen on top of the current one, recording what it grew out of.
+    pub fn push(&mut self, screen: Screen, from: Option<NormRect>) {
+        self.above.push((screen, from));
     }
 
     /// Go back one screen. Returns whether anything moved — `false` means we were
@@ -178,20 +217,22 @@ impl ScreenStack {
     /// burying it, so `back` still means one step rather than one step per refresh.
     pub fn replace_top(&mut self, screen: Screen) {
         match self.above.last_mut() {
-            Some(top) => *top = screen,
-            None => self.above.push(screen),
+            // The origin is the *navigation's*, and a refresh is not a new navigation: a
+            // picker that fills itself in still leaves the way it arrived.
+            Some((top, _)) => *top = screen,
+            None => self.above.push((screen, None)),
         }
     }
 
     /// Everything stacked above Home, for a navigation that may need putting back.
     #[must_use]
-    pub fn above_screens(&self) -> Vec<Screen> {
+    pub fn above_screens(&self) -> Vec<(Screen, Option<NormRect>)> {
         self.above.clone()
     }
 
     /// Put the stack back to `screens` above Home. The other half of
     /// [`Self::above_screens`], for a gesture abandoned half-way.
-    pub fn restore(&mut self, screens: Vec<Screen>) {
+    pub fn restore(&mut self, screens: Vec<(Screen, Option<NormRect>)>) {
         self.above = screens;
     }
 
@@ -233,7 +274,7 @@ mod tests {
         // this type exists to prevent.
         let mut s = stack();
         for _ in 0..64 {
-            s.push(Screen::Home(AttractScene::demo()));
+            s.push(Screen::Home(AttractScene::demo()), None);
         }
         let mut guard = 0;
         while s.pop() {
@@ -247,8 +288,8 @@ mod tests {
     #[test]
     fn going_home_unwinds_everything_at_once() {
         let mut s = stack();
-        s.push(Screen::Home(AttractScene::demo()));
-        s.push(Screen::Home(AttractScene::demo()));
+        s.push(Screen::Home(AttractScene::demo()), None);
+        s.push(Screen::Home(AttractScene::demo()), None);
         assert!(s.go_home());
         assert_eq!(s.depth(), 1);
         // Already home: nothing moved, still not an error.
@@ -275,7 +316,7 @@ mod tests {
         // Home is rebuilt whenever the receiver's state changes. If that yanked the
         // stack back, a host appearing on the LAN would close a picker mid-read.
         let mut s = stack();
-        s.push(Screen::Home(AttractScene::demo()));
+        s.push(Screen::Home(AttractScene::demo()), None);
         let deep = s.depth();
         s.update_home(AttractScene::demo());
         assert_eq!(s.depth(), deep);

@@ -43,11 +43,21 @@ fn pressing_a_service_tile_opens_that_service_and_back_returns() {
 
     let (x, y) = tile_centre(&scene, "cast");
     let hit = render.shell_hit(x, y).expect("the tile should be hittable");
-    let ScreenHit::Push(screen) = hit else {
+    let ScreenHit::Push { screen, from } = hit else {
         panic!("a service tile should open its own screen, got {hit:?}");
     };
     assert_eq!(screen.name(), "service");
-    render.shell_push(screen);
+    // The tile's own rect travels with the press, so the screen it opens can grow out of it
+    // rather than materialising in the middle of the panel.
+    let from = from.expect("a tile press knows where it was");
+    let tile = pipeline::attract::tile_layout(&scene, W, H)
+        .into_iter()
+        .find(|(id, _)| id == "cast")
+        .expect("the demo scene has a cast tile")
+        .1;
+    assert!((from.x - tile.x / W as f32).abs() < 1e-5, "{from:?}");
+    assert!((from.w - tile.w / W as f32).abs() < 1e-5, "{from:?}");
+    render.shell_push_from(screen, Some(from));
     assert_eq!(render.shell_depth(), 2);
 
     // Back, from where the service screen draws it.

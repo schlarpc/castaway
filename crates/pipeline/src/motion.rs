@@ -244,6 +244,31 @@ impl Choreography {
     pub const fn floor() -> Spring {
         Spring::new(0.30, 1.0)
     }
+
+    /// A screen arriving out of the thing that was pressed. The panel's most deliberate
+    /// motion — somebody asked for it and is watching the whole way — so it is the longest.
+    #[must_use]
+    pub const fn container() -> Spring {
+        Spring::new(0.40, 1.0)
+    }
+
+    /// A screen arriving with no origin, along the navigation axis.
+    #[must_use]
+    pub const fn shared_axis() -> Spring {
+        Spring::new(0.34, 1.0)
+    }
+
+    /// Where a screen with no origin comes from: one panel-width along the axis it is
+    /// travelling. A push arrives from the right, a pop from the left.
+    #[must_use]
+    pub fn off_panel(direction: f32) -> NormRect {
+        NormRect {
+            x: -direction,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        }
+    }
 }
 
 /// Where a surface is heading, and how visible it should be when it gets there.
@@ -471,13 +496,19 @@ fn settled_rect(at: NormRect, vel: NormRect, target: NormRect) -> bool {
         && Spring::settled(at.h, vel.h, target.h)
 }
 
-/// The floor's motion: the shell receding under a session that has the glass.
+/// The floor's motion: the shell, and the screen it is currently showing.
+///
+/// Two jobs, because they are the same layer. It recedes and dims under a session that has
+/// the glass — and it is also where a *pushed screen* arrives, growing out of whatever was
+/// pressed to open it. Both are the placement of one rect, so one motion answers both, and
+/// a screen that opens while a session is being demoted composes with it for free.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Floor {
-    scale: Option<f32>,
-    scale_vel: f32,
+    at: Option<NormRect>,
+    vel: NormRect,
     dim: f32,
     dim_vel: f32,
+    spring: Option<Spring>,
 }
 
 impl Floor {
@@ -485,46 +516,71 @@ impl Floor {
     /// so a renderer that never animates leaves the layer alone entirely.
     #[must_use]
     pub fn placement(&self) -> Option<(NormRect, f32)> {
-        let scale = self.scale?;
-        let inset = (1.0 - scale) / 2.0;
-        Some((
-            NormRect {
-                x: inset,
-                y: inset,
-                w: scale,
-                h: scale,
-            },
-            self.dim,
-        ))
+        Some((self.at?, self.dim))
+    }
+
+    /// Where the floor rests: overscanned and dimmed under a session, flat and bright when
+    /// the shell has the panel.
+    fn resting(recessed: bool) -> (NormRect, f32) {
+        if recessed {
+            (
+                NormRect::FULL.scaled(Choreography::FLOOR_RECESS),
+                Choreography::FLOOR_DIM,
+            )
+        } else {
+            (NormRect::FULL, 1.0)
+        }
+    }
+
+    /// A screen has just arrived on this layer: grow it out of `from`.
+    ///
+    /// The container transform. `from` is the tile that was pressed, so the screen expands
+    /// out of the thing somebody is looking at rather than replacing the panel wholesale; or,
+    /// for a screen opened by something with no place on the panel, an off-panel rect, which
+    /// makes the same mechanism a shared-axis slide.
+    pub fn launch(&mut self, from: NormRect, spring: Spring) {
+        self.at = Some(from);
+        self.vel = NormRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        self.spring = Some(spring);
     }
 
     /// Advance toward the arrangement `recessed` asks for. Returns whether it is still
     /// moving.
     pub fn step(&mut self, recessed: bool, dt: f32) -> bool {
-        let (target_scale, target_dim) = if recessed {
-            (Choreography::FLOOR_RECESS, Choreography::FLOOR_DIM)
-        } else {
-            (1.0, 1.0)
-        };
-        // First step: start where we are being asked to be, so nothing animates on boot.
-        let Some(scale) = self.scale else {
-            self.scale = Some(target_scale);
+        let (target, target_dim) = Self::resting(recessed);
+        // First step: start where we are being asked to be, so nothing animates on boot. A
+        // panel that fades its own idle screen in at startup looks like it is recovering from
+        // something.
+        let Some(at) = self.at else {
+            self.at = Some(target);
             self.dim = target_dim;
             return false;
         };
         let dt = dt.min(0.05);
-        let spring = Choreography::floor();
-        let (s, sv) = spring.step(scale, self.scale_vel, target_scale, dt);
+        let spring = self.spring.unwrap_or_else(Choreography::floor);
+        let (rect, vel) = step_rect(spring, at, self.vel, target, dt);
         let (d, dv) = spring.step(self.dim, self.dim_vel, target_dim, dt);
-        self.scale = Some(s);
-        self.scale_vel = sv;
+        self.at = Some(rect);
+        self.vel = vel;
         self.dim = d.clamp(0.0, 1.0);
         self.dim_vel = dv;
-        if Spring::settled(s, sv, target_scale) && Spring::settled(d, dv, target_dim) {
-            self.scale = Some(target_scale);
+        if settled_rect(rect, vel, target) && Spring::settled(d, dv, target_dim) {
+            self.at = Some(target);
             self.dim = target_dim;
-            self.scale_vel = 0.0;
+            self.vel = NormRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            };
             self.dim_vel = 0.0;
+            // Back to the floor's own spring: whatever launched a screen has landed.
+            self.spring = None;
             return false;
         }
         true

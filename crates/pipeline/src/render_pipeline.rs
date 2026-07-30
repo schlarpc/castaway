@@ -34,18 +34,40 @@ const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 /// that a genuine stop still reads as prompt.
 const CLEAR_GRACE: std::time::Duration = std::time::Duration::from_millis(1200);
 
+/// How the screen being navigated away from goes.
+///
+/// Two shapes, and which one it is comes from whether the navigation had a *place*. A screen
+/// that was opened out of a tile has to go back into that tile, or the way out contradicts the
+/// way in and the tile stops meaning anything. A screen with no origin leaves along the
+/// navigation axis, which is the shared-axis pattern and the only honest answer when there is
+/// nowhere in particular to go.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Leaving {
+    /// Travel one panel-width along the axis, shrinking to a card as it goes.
+    Slide {
+        /// -1.0 for a push (recede left), 1.0 for a pop (return right).
+        direction: f32,
+    },
+    /// Shrink into the rect it was opened out of, and fade only once it is nearly there.
+    Into(crate::panel::NormRect),
+    /// Hold still and fade out early, because the *arriving* screen is the one animating —
+    /// it is growing out of a tile over the top of this one. Material's container transform
+    /// crossfades exactly this way round: outgoing content goes in the first third, incoming
+    /// arrives over the rest.
+    Yield,
+}
+
 /// A navigation being animated.
 #[derive(Debug, Clone, Copy)]
 struct Transition {
+    /// How the outgoing screen leaves.
+    leaving: Leaving,
     /// 1.0 = the outgoing screen fills the panel, 0.0 = it is gone.
     progress: f32,
     /// Progress per second, carried from the finger so a flick keeps going.
     velocity: f32,
     /// Where it is heading once nobody is holding it.
     target: f32,
-    /// Which way the card leaves: `1.0` out to the right (going back), `-1.0` receding
-    /// left (going deeper).
-    direction: f32,
     /// While a finger is on the glass the progress is *its*, not the clock's.
     driven: bool,
 }
@@ -55,8 +77,8 @@ struct Transition {
 enum Undo {
     /// It pushed; pop it again.
     Pop,
-    /// It popped or went home; put these back.
-    Restore(Vec<crate::shell::Screen>),
+    /// It popped or went home; put these back, each with the rect it grew out of.
+    Restore(Vec<(crate::shell::Screen, Option<crate::panel::NormRect>)>),
 }
 
 /// How small the card gets on its way out. Not to nothing: it shrinks *into a preview*,
@@ -1969,6 +1991,30 @@ impl RenderLoop {
             .is_some_and(|(ox, oy, sx, sy)| x >= ox && y >= oy && x <= ox + sx && y <= oy + sy)
     }
 
+    /// Where the floor — the shell, and the screen it is showing — currently sits, and how
+    /// bright it is. For tests, and for the browser host's own viewport arithmetic.
+    #[must_use]
+    pub fn floor_placement(&self) -> Option<(crate::panel::NormRect, f32)> {
+        self.floor.placement()
+    }
+
+    /// Where the screen being navigated away from currently sits. `None` when no navigation is
+    /// animating.
+    ///
+    /// For tests: "did it go back into the tile it came out of" is the assertion that keeps
+    /// the way out from contradicting the way in, and it cannot be made from outside without
+    /// being able to watch the outgoing layer.
+    #[must_use]
+    pub fn outgoing_screen_rect(&self) -> Option<crate::panel::NormRect> {
+        let t = self.compositor.layer_transform(LayerId::ShellPrev)?;
+        Some(crate::panel::NormRect {
+            x: t.offset_x,
+            y: t.offset_y,
+            w: t.scale_x,
+            h: t.scale_y,
+        })
+    }
+
     /// Where the now-playing card actually is right now, mid-animation included.
     ///
     /// For tests: "did it travel or did it teleport" cannot be asked from outside without
@@ -2447,16 +2493,45 @@ impl RenderLoop {
         self.reflow_surfaces();
     }
 
-    /// Push a screen on top of the current one.
+    /// Push a screen on top of the current one, from nowhere in particular.
     pub fn shell_push(&mut self, screen: crate::shell::Screen) {
+        self.shell_push_from(screen, None);
+    }
+
+    /// Push a screen on top of the current one, recording what it grew out of.
+    ///
+    /// `from` is the rect of the thing that was pressed. It is both what the screen's own
+    /// entrance animates out of and — because the stack remembers it — what `back` shrinks it
+    /// back into, so the way out cannot contradict the way in.
+    pub fn shell_push_from(
+        &mut self,
+        screen: crate::shell::Screen,
+        from: Option<crate::panel::NormRect>,
+    ) {
         if self.panel.stack().is_none() {
             return;
         }
-        // Going deeper: the card recedes to the left.
-        self.begin_transition(false, -1.0);
+        // Going deeper. With a place to come from, the *arriving* screen is what moves —
+        // growing out of the tile — and the one being left holds still and fades early. With
+        // no place, the pair travels along the axis instead.
+        let (leaving, from_rect, spring) = match from {
+            Some(rect) => (
+                Leaving::Yield,
+                rect,
+                crate::motion::Choreography::container(),
+            ),
+            None => (
+                Leaving::Slide { direction: -1.0 },
+                crate::motion::Choreography::off_panel(-1.0),
+                crate::motion::Choreography::shared_axis(),
+            ),
+        };
+        self.begin_transition(false, leaving);
         self.transition_undo = Some(Undo::Pop);
-        self.panel.push(screen);
+        self.panel.push_from(screen, from);
         self.repaint_shell();
+        // After the repaint, so the layer it launches is already the new screen's texture.
+        self.floor.launch(from_rect, spring);
         self.reflow_surfaces();
     }
 
@@ -2469,12 +2544,25 @@ impl RenderLoop {
             return false;
         }
         // Before the stack changes, so the screen being left is still the current one
-        // and can be drawn into its own layer to travel away.
-        self.begin_transition(false, 1.0);
+        // and can be drawn into its own layer to travel away — and so its origin is still
+        // readable, which is what says where it has to go back to.
+        let leaving = match self.panel.current_origin() {
+            Some(rect) => Leaving::Into(rect),
+            None => Leaving::Slide { direction: 1.0 },
+        };
+        self.begin_transition(false, leaving);
         self.transition_undo = Some(Undo::Restore(self.panel.above_screens()));
         let moved = self.panel.pop_screen();
         if moved {
             self.repaint_shell();
+            // The screen underneath was already whole, so it is only *launched* when it has
+            // somewhere to come from — a pop with no origin slides in from the left.
+            if matches!(leaving, Leaving::Slide { .. }) {
+                self.floor.launch(
+                    crate::motion::Choreography::off_panel(1.0),
+                    crate::motion::Choreography::shared_axis(),
+                );
+            }
             self.reflow_surfaces();
         }
         moved
@@ -2484,7 +2572,13 @@ impl RenderLoop {
     pub fn shell_home(&mut self) -> bool {
         let deep = self.panel.depth() > 1;
         if deep {
-            self.begin_transition(false, 1.0);
+            // Home is a return, whatever route got here: the screen goes back where it came
+            // from if it came from somewhere, and otherwise off the way it arrived.
+            let leaving = match self.panel.current_origin() {
+                Some(rect) => Leaving::Into(rect),
+                None => Leaving::Slide { direction: 1.0 },
+            };
+            self.begin_transition(false, leaving);
             self.transition_undo = Some(Undo::Restore(self.panel.above_screens()));
         }
         self.panel.go_home();
@@ -2510,7 +2604,11 @@ impl RenderLoop {
         }
         let deep = self.panel.depth() > 1;
         if deep {
-            self.begin_transition(false, 1.0);
+            let leaving = match self.panel.current_origin() {
+                Some(rect) => Leaving::Into(rect),
+                None => Leaving::Slide { direction: 1.0 },
+            };
+            self.begin_transition(false, leaving);
             self.transition_undo = Some(Undo::Restore(self.panel.above_screens()));
         }
         self.panel.rest();
@@ -2557,7 +2655,7 @@ impl RenderLoop {
     ///
     /// Called *before* the stack changes, so the outgoing screen is still the current one
     /// and can be rasterised into its own layer.
-    fn begin_transition(&mut self, driven: bool, direction: f32) {
+    fn begin_transition(&mut self, driven: bool, leaving: Leaving) {
         // Re-rasterise rather than copy: the compositor has no texture-to-texture copy,
         // and this happens once per navigation — a human action, not a frame.
         let Some(screen) = self.panel.current() else {
@@ -2585,10 +2683,10 @@ impl RenderLoop {
             transform: Transform::default(),
         });
         self.transition = Some(Transition {
+            leaving,
             progress: 1.0,
             velocity: 0.0,
             target: 0.0,
-            direction,
             driven,
         });
         self.apply_transition(1.0);
@@ -2665,23 +2763,56 @@ impl RenderLoop {
         self.transition.is_some()
     }
 
-    /// Place the outgoing card for `p`: full-screen at 1.0, shrunk and travelled at 0.0.
+    /// Place the outgoing screen for `p`: whole at 1.0, gone at 0.0.
     fn apply_transition(&mut self, p: f32) {
-        let direction = self.transition.map_or(1.0, |t| t.direction);
-        let scale = CARD_MIN_SCALE + (1.0 - CARD_MIN_SCALE) * p;
-        // Centred as it shrinks, then carried a whole panel-width on its way out.
-        let centre = (1.0 - scale) / 2.0;
-        let travel = (1.0 - p) * direction;
+        let leaving = self
+            .transition
+            .map_or(Leaving::Slide { direction: 1.0 }, |t| t.leaving);
+        let (transform, opacity) = match leaving {
+            Leaving::Slide { direction } => {
+                let scale = CARD_MIN_SCALE + (1.0 - CARD_MIN_SCALE) * p;
+                // Centred as it shrinks, then carried a whole panel-width on its way out.
+                let centre = (1.0 - scale) / 2.0;
+                let travel = (1.0 - p) * direction;
+                (
+                    Transform {
+                        scale_x: scale,
+                        scale_y: scale,
+                        offset_x: centre + travel,
+                        offset_y: centre,
+                    },
+                    // Only fading at the very end, so the card stays a card rather than a
+                    // ghost.
+                    (p * 4.0).clamp(0.0, 1.0),
+                )
+            }
+            Leaving::Into(rect) => {
+                // Straight back into the thing it was opened out of. Linear in `p` because
+                // `p` is already the spring's own curve.
+                let lerp = |a: f32, b: f32| b + (a - b) * p;
+                (
+                    Transform {
+                        scale_x: lerp(1.0, rect.w),
+                        scale_y: lerp(1.0, rect.h),
+                        offset_x: lerp(0.0, rect.x),
+                        offset_y: lerp(0.0, rect.y),
+                    },
+                    // Late, so it is still legible as the screen right up to the tile.
+                    (p * 4.0).clamp(0.0, 1.0),
+                )
+            }
+            // Held still; the arriving screen is the one moving.
+            Leaving::Yield => (
+                Transform::default(),
+                // Early: gone by 40% of the way through, so what remains of the transition is
+                // the new screen growing over an empty panel rather than through a ghost.
+                ((p - 0.6) / 0.4).clamp(0.0, 1.0),
+            ),
+        };
         self.compositor.upsert_layer(Layer {
             id: LayerId::ShellPrev,
-            // Only fading at the very end, so the card stays a card rather than a ghost.
-            opacity: (p * 4.0).clamp(0.0, 1.0),
-            transform: Transform {
-                scale_x: scale,
-                scale_y: scale,
-                offset_x: centre + travel,
-                offset_y: centre,
-            },
+            opacity,
+            transform,
         });
     }
 

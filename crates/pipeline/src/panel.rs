@@ -393,11 +393,26 @@ impl Panel {
 
     /// Push a shell screen, bringing the shell forward — a screen nobody can see is not a
     /// screen anybody navigated to.
-    pub fn push(&mut self, screen: Screen) {
+    ///
+    /// `from` is what it grew out of: the rect of the tile that was pressed, or `None` for a
+    /// screen opened by something with no place on the panel. Kept with the navigation so
+    /// `back` can play the entrance in reverse — see [`ScreenStack`].
+    pub fn push_from(&mut self, screen: Screen, from: Option<NormRect>) {
         if let Some(stack) = &mut self.shell {
-            stack.push(screen);
+            stack.push(screen, from);
             self.shell_forward = true;
         }
+    }
+
+    /// Push a screen that came from nowhere in particular.
+    pub fn push(&mut self, screen: Screen) {
+        self.push_from(screen, None);
+    }
+
+    /// Where the current screen grew out of, if it had somewhere.
+    #[must_use]
+    pub fn current_origin(&self) -> Option<NormRect> {
+        self.shell.as_ref().and_then(ScreenStack::current_origin)
     }
 
     /// Replace the screen on top, or push if at Home. What a picker's own refreshes use,
@@ -437,7 +452,7 @@ impl Panel {
 
     /// Everything above Home, for a navigation that may need putting back.
     #[must_use]
-    pub fn above_screens(&self) -> Vec<Screen> {
+    pub fn above_screens(&self) -> Vec<(Screen, Option<NormRect>)> {
         self.shell
             .as_ref()
             .map(ScreenStack::above_screens)
@@ -445,7 +460,7 @@ impl Panel {
     }
 
     /// Put the stack back, for a gesture abandoned half-way.
-    pub fn restore_screens(&mut self, screens: Vec<Screen>) {
+    pub fn restore_screens(&mut self, screens: Vec<(Screen, Option<NormRect>)>) {
         if let Some(stack) = &mut self.shell {
             stack.restore(screens);
         }
@@ -536,7 +551,7 @@ pub const SESSION_SURFACES: [Surface; 3] = [Surface::Card, Surface::Video, Surfa
 /// Normalized rather than in pixels because that is what both consumers want — the
 /// compositor takes a [`crate::compositor::Transform`] and a hit test takes a fraction —
 /// and it keeps this module free of device pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct NormRect {
     /// Left edge, `0.0..=1.0`.
     pub x: f32,

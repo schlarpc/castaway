@@ -709,6 +709,20 @@ impl WgpuCompositor {
             .map(|(t, _)| (t.width(), t.height()))
     }
 
+    /// Where a layer is currently placed, if it is composited.
+    ///
+    /// The companion of [`Self::layer_size`], and there for the same reason: "did that screen
+    /// go back into the tile it came out of" is a question about the *placement* a test has to
+    /// be able to read, and measuring it out of the composited image depends on what the
+    /// screen happens to contain.
+    #[must_use]
+    pub fn layer_transform(&self, id: LayerId) -> Option<crate::compositor::Transform> {
+        self.layers
+            .get(&id)
+            .filter(|s| s.gpu.is_some())
+            .map(|s| s.meta.transform)
+    }
+
     pub fn has_layer(&self, id: LayerId) -> bool {
         self.layers.get(&id).is_some_and(|s| s.gpu.is_some())
     }

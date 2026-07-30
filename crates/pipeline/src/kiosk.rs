@@ -297,9 +297,12 @@ impl KioskApp {
             return false;
         };
         match hit {
-            ScreenHit::Push(screen) => {
+            ScreenHit::Push { screen, from } => {
                 info!(screen = screen.name(), "shell: a finger on the panel");
-                render.shell_push(screen);
+                // The rect the press landed on travels with it: the screen grows out of the
+                // tile somebody is looking at, and `back` shrinks it back into the same
+                // place.
+                render.shell_push_from(screen, from);
                 render.set_shell_foreground(true);
             }
             ScreenHit::Back => {
