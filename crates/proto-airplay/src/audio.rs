@@ -110,6 +110,14 @@ pub enum AudioError {
     #[error("audio predates the last FLUSH")]
     Stale,
 
+    /// A copy of a frame this stream has already delivered.
+    ///
+    /// Not loss and not an error: an iOS mirroring sender asks for `redundantAudio` and
+    /// then sends every frame three times on purpose. Exactly like [`Self::Priming`],
+    /// this travels as an error so the caller's drop-and-continue path handles it.
+    #[error("a redundant copy of a frame already delivered")]
+    Duplicate,
+
     /// A stream-priming packet, which carries no audio.
     ///
     /// Not really an error — it is the sender saying "not yet" — but it travels as one
@@ -198,6 +206,52 @@ pub enum AudioOutput {
     TimingReply(Box<[u8; 32]>),
 }
 
+/// The frames this stream has already handed on, so a copy of one is not handed on twice.
+///
+/// **Why a receiver needs this at all.** An iOS mirroring sender asks for
+/// `redundantAudio: 2` in its `SETUP` and then transmits every audio frame *three times*,
+/// in three packets, so that losing any two still delivers it. A receiver that plays what
+/// it is given plays everything three times: three times the samples through a sink that
+/// runs at one fixed rate, which sounds like the audio has been slowed down and shredded.
+/// Measured at 275.6 frames/s where AAC-ELD at 44.1 kHz has 91.875 — exactly threefold.
+///
+/// **Why the obvious test is the wrong one.** "Drop anything whose timestamp does not
+/// advance" also drops every *resend*, and the two arrive looking identical: an old
+/// timestamp under a new sequence number. They mean opposite things — a redundancy copy
+/// is audio already played, a resend is audio that never arrived — and the only thing
+/// that tells them apart is whether this receiver ever delivered that frame. So that is
+/// what is remembered, which makes this an anti-replay window and not a high-water mark.
+///
+/// Bounded by construction: the newest [`Self::WINDOW`] frames, about 0.7 s at 44.1 kHz,
+/// which is far longer than any redundancy depth or resend round trip and far shorter
+/// than the 27 hours the timestamp takes to wrap.
+#[derive(Debug, Default)]
+struct Delivered {
+    recent: std::collections::VecDeque<u32>,
+}
+
+impl Delivered {
+    /// How many delivered frames to remember.
+    const WINDOW: usize = 64;
+
+    /// Record `timestamp` as delivered, or report that it already was.
+    fn accept(&mut self, timestamp: u32) -> bool {
+        if self.recent.contains(&timestamp) {
+            return false;
+        }
+        if self.recent.len() == Self::WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(timestamp);
+        true
+    }
+
+    /// Forget everything, for a seek that may revisit these timestamps.
+    fn clear(&mut self) {
+        self.recent.clear();
+    }
+}
+
 /// The depacketiser for one RAOP audio session.
 pub struct AudioStream {
     codec: RaopCodec,
@@ -214,6 +268,10 @@ pub struct AudioStream {
     flush: Option<FlushPoint>,
     /// How many packets have been discarded as pre-flush.
     stale_dropped: u64,
+    /// What has already been played, so a redundant copy of it is not played again.
+    delivered: Delivered,
+    /// How many packets have been discarded as copies of frames already delivered.
+    duplicates_dropped: u64,
 }
 
 impl AudioStream {
@@ -235,6 +293,8 @@ impl AudioStream {
             anchor: None,
             flush: None,
             stale_dropped: 0,
+            delivered: Delivered::default(),
+            duplicates_dropped: 0,
         }
     }
 
@@ -264,6 +324,15 @@ impl AudioStream {
     /// packets that will never come.
     pub fn flush(&mut self, point: FlushPoint) {
         self.flush = Some(point);
+        // A seek can legitimately revisit timestamps this stream has already played, so
+        // what was delivered before it says nothing about what to expect after.
+        self.delivered.clear();
+    }
+
+    /// How many packets have been dropped as copies of frames already delivered.
+    #[must_use]
+    pub const fn duplicates_dropped(&self) -> u64 {
+        self.duplicates_dropped
     }
 
     /// How many packets have been dropped as stale since the last `FLUSH`.
@@ -357,6 +426,12 @@ impl AudioStream {
         // error per packet for the first second of every session.
         if payload.is_empty() || payload == AAC_ELD_PRIMING {
             return Err(AudioError::Priming);
+        }
+        // Before decrypting, because a copy of a frame already played costs nothing to
+        // recognise and a block cipher pass to decode.
+        if !self.delivered.accept(kind.timestamp) {
+            self.duplicates_dropped = self.duplicates_dropped.saturating_add(1);
+            return Err(AudioError::Duplicate);
         }
         let data = self.decrypt(payload);
 
@@ -568,6 +643,80 @@ mod tests {
             panic!()
         };
         assert_eq!(frame.pts, Duration::from_nanos(101 * 1_000_000_000 / 44100));
+    }
+
+    /// The same frame under a different sequence number, which is how a redundant copy
+    /// and a resend both arrive.
+    fn audio_packet_seq(seq: u16, ts: u32, payload: &[u8]) -> Vec<u8> {
+        let mut p = audio_packet(ts, payload);
+        p[2..4].copy_from_slice(&seq.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn a_redundant_copy_of_a_delivered_frame_is_not_delivered_again() {
+        // iOS asks for `redundantAudio: 2` on every mirroring session and then sends each
+        // frame three times. Playing all three is three times the samples through a sink
+        // running at one fixed rate — measured at 275.6 frames/s where 44.1 kHz AAC-ELD
+        // has 91.875 — which is what "slow and garbled" was.
+        let mut s = plain_stream();
+        assert!(s.on_audio(&audio_packet_seq(1, 1000, b"aaaa")).is_ok());
+        for seq in 2..=3 {
+            assert_eq!(
+                s.on_audio(&audio_packet_seq(seq, 1000, b"aaaa"))
+                    .unwrap_err(),
+                AudioError::Duplicate,
+                "copy {seq} of one frame must not be played again"
+            );
+        }
+        assert_eq!(s.duplicates_dropped(), 2);
+        // …and the next real frame still passes.
+        assert!(s.on_audio(&audio_packet_seq(4, 1480, b"bbbb")).is_ok());
+    }
+
+    #[test]
+    fn a_resend_of_a_frame_that_never_arrived_is_still_delivered() {
+        // The distinction the window exists for. A resend and a redundant copy arrive
+        // looking identical — an old timestamp under a new sequence number — and mean
+        // opposite things. A high-water mark on the timestamp cannot tell them apart and
+        // would silently break retransmission, which is the whole point of asking for it.
+        let mut s = plain_stream();
+        assert!(s.on_audio(&audio_packet_seq(1, 1000, b"aaaa")).is_ok());
+        // 1480 is lost; 1960 arrives.
+        assert!(s.on_audio(&audio_packet_seq(3, 1960, b"cccc")).is_ok());
+        // The sender resends the gap, out of order and older than what we have played.
+        let out = s.on_audio(&audio_packet_seq(2, 1480, b"bbbb")).unwrap();
+        let AudioOutput::Frame { frame, .. } = out else {
+            panic!("a resent frame must reach the decoder")
+        };
+        assert_eq!(frame.data.as_ref(), b"bbbb");
+        assert_eq!(s.duplicates_dropped(), 0);
+    }
+
+    #[test]
+    fn a_seek_may_revisit_timestamps_it_has_already_played() {
+        // Otherwise seeking back into audio that was played once would be silence.
+        let mut s = plain_stream();
+        assert!(s.on_audio(&audio_packet_seq(1, 1000, b"aaaa")).is_ok());
+        s.flush(FlushPoint {
+            rtp: Some(1000),
+            seq: Some(1),
+        });
+        let out = s.on_audio(&audio_packet_seq(9, 1000, b"aaaa")).unwrap();
+        assert!(matches!(out, AudioOutput::Frame { .. }));
+    }
+
+    #[test]
+    fn the_delivered_window_stays_bounded() {
+        // It is fed by the network for the length of a session, so it must not be a leak.
+        let mut d = Delivered::default();
+        for ts in 0..10_000u32 {
+            assert!(d.accept(ts * 480));
+        }
+        assert!(d.recent.len() <= Delivered::WINDOW);
+        // And what fell out of it is accepted again rather than blocked forever, which is
+        // the right failure: a copy that late is indistinguishable from a fresh frame.
+        assert!(d.accept(0));
     }
 
     #[test]

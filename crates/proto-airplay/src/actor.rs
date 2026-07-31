@@ -796,6 +796,9 @@ async fn run_audio(
             // the anchor or the flush point rather than with one packet.
             Err(crate::audio::AudioError::AwaitingSync) => diagnostics.audio_awaiting_sync(),
             Err(crate::audio::AudioError::Stale) => diagnostics.audio_stale(),
+            // Expected and continuous on a mirroring session: the sender asked for
+            // `redundantAudio` and is sending every frame three times.
+            Err(crate::audio::AudioError::Duplicate) => diagnostics.audio_duplicate(),
             // One bad datagram off a radio link must not take the music down.
             Err(e) => debug!(error = %e, ?which, %peer_ip, "dropping a datagram"),
         }

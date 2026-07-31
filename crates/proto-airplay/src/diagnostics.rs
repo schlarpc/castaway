@@ -46,6 +46,7 @@ pub struct SessionDiagnostics {
     audio_last_pts_ns: AtomicU64,
     /// Packets discarded because they predate a `FLUSH`.
     audio_stale: AtomicU64,
+    audio_duplicate: AtomicU64,
     /// Packets discarded because no sync packet had placed them on the timeline yet.
     audio_awaiting_sync: AtomicU64,
     resends_sent: AtomicU64,
@@ -68,6 +69,7 @@ impl Default for SessionDiagnostics {
             audio_dropped: AtomicU64::new(0),
             audio_last_pts_ns: AtomicU64::new(UNSET),
             audio_stale: AtomicU64::new(0),
+            audio_duplicate: AtomicU64::new(0),
             audio_awaiting_sync: AtomicU64::new(0),
             resends_sent: AtomicU64::new(0),
             clock_offset_ns: AtomicI64::new(i64::MIN),
@@ -110,6 +112,14 @@ impl SessionDiagnostics {
     }
 
     /// A packet was discarded as predating a `FLUSH`.
+    /// A redundant copy of a frame already delivered — see `audio::Delivered`. Counted
+    /// rather than ignored because it is how much of the sender's bandwidth is
+    /// redundancy, and a figure of *zero* on a mirroring session means the dedupe is
+    /// looking at the wrong thing.
+    pub fn audio_duplicate(&self) {
+        self.audio_duplicate.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn audio_stale(&self) {
         self.audio_stale.fetch_add(1, Ordering::Relaxed);
     }
@@ -150,6 +160,7 @@ impl SessionDiagnostics {
             audio_frames: self.audio_frames.load(Ordering::Relaxed),
             audio_dropped: self.audio_dropped.load(Ordering::Relaxed),
             audio_stale: self.audio_stale.load(Ordering::Relaxed),
+            audio_duplicate: self.audio_duplicate.load(Ordering::Relaxed),
             audio_awaiting_sync: self.audio_awaiting_sync.load(Ordering::Relaxed),
             resends_sent: self.resends_sent.load(Ordering::Relaxed),
             clock_offset_ns: match self.clock_offset_ns.load(Ordering::Relaxed) {
@@ -198,6 +209,8 @@ pub struct Snapshot {
     pub audio_dropped: u64,
     /// Packets discarded as predating a `FLUSH`.
     pub audio_stale: u64,
+    /// Redundant copies dropped: frames the sender sent more than once on purpose.
+    pub audio_duplicate: u64,
     /// Packets discarded for arriving before the stream was anchored.
     pub audio_awaiting_sync: u64,
     /// Packets we asked the sender to retransmit.
@@ -230,6 +243,7 @@ impl Snapshot {
             audio_frames = self.audio_frames,
             audio_dropped = self.audio_dropped,
             audio_stale = self.audio_stale,
+            audio_duplicate = self.audio_duplicate,
             audio_awaiting_sync = self.audio_awaiting_sync,
             resends = self.resends_sent,
             av_skew_ms = ?self.av_skew_ms,
