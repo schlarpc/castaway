@@ -1144,3 +1144,57 @@ the reasons are what a future reversal has to argue against.
   it is still a credential in plaintext, and leaving it set means every restart re-attempts
   a pairing that has already succeeded. Related to Q44: with a chooser, the PIN would be
   entered on the panel and never written down.
+
+## AirPlay
+
+- **Q49 — `av_skew_ms` reads in tens of thousands of seconds, and the two planes' clocks
+  run at different rates. OPEN; measured on a real device 2026-07-31, cause not
+  identified.** The number the diagnostics module calls "the number that matters most" is
+  currently meaningless, and it is meaningless in a way that says something is wrong
+  underneath it rather than in the arithmetic that prints it.
+
+  What a live iPhone mirroring session reports (`AirPlay session` lines, one per 5 s):
+
+  ```
+  elapsed_s=190  audio_frames=19569  av_skew_ms=-62591949
+  elapsed_s=195  audio_frames=20946  av_skew_ms=-62575466
+  elapsed_s=200  audio_frames=22326  av_skew_ms=-62558994
+  …
+  elapsed_s=285  audio_frames=39486  av_skew_ms=-33001477
+  ```
+
+  Three things are wrong at once:
+
+  1. **The magnitude.** −62,592,000 ms is 17.4 hours of audio being "ahead" of video. It
+     is not a lip-sync error; nothing in a session is 17 hours long.
+  2. **It moves, monotonically and fast.** +16,480 ms per 5 s of wall clock — 3.3× real
+     time — held to within 1% over minutes, while video ran at exactly 30 fps (150 frames
+     per 5 s) and audio at its own steady rate.
+  3. **The rate depends on which plane is alive.** When the audio plane stopped and only
+     video continued, it changed to +21,000 ms per 5 s (4.2×). Subtracting the two says
+     the *audio* presentation time advances at roughly wall rate — which is right — and
+     the *video* one at three to four times wall rate, which cannot be.
+
+  Both planes are supposed to be measured from one `StreamOrigin` in the sender's clock
+  (that is what `f8e7363` was for), so a difference of hours between them means they are
+  not on the same clock at all. The obvious suspect is that they are built from two
+  different sender quantities: the mirror data header carries a 64-bit little-endian
+  timestamp documented as *device uptime with no epoch offset*
+  (`airplay-research.md` §5.2), while the audio plane places itself with `SyncAnchor`,
+  which is an NTP-epoch value. An uptime-versus-epoch mix would produce exactly this
+  shape — a huge constant-looking offset — but it does **not** explain the rate
+  difference, so there is likely a second error in `StreamOrigin::pts` /
+  `SyncAnchor::sender_ns_of`, or in the units the mirror header's timestamp is read in.
+
+  **What it does and does not affect today.** Nothing visible: the mirror has no
+  presentation clock. Video frames are decoded and presented on arrival and late ones are
+  dropped, and audio is paced by its own sink, so both planes look and sound right
+  independently — which is precisely why this went unnoticed until the diagnostics were
+  read. What it blocks is everything downstream of measuring: lip-sync cannot be
+  *assessed*, let alone corrected, while the number is this. Every argument for or
+  against building a presentation clock rests on this figure, and right now it cannot
+  support one.
+
+  **Default until settled:** leave it reading wrong. Clamping it, or hiding it behind a
+  plausibility check, would convert a loud signal that something is broken into a quiet
+  one — and it is the only signal there is.
