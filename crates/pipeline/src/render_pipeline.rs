@@ -1186,6 +1186,54 @@ pub struct RenderLoop {
     failed_imports: u32,
     /// The transport strip currently on screen, if any.
     transport: Option<TransportState>,
+    /// The shape of the video currently on the glass, as width÷height.
+    ///
+    /// Kept because placement happens in [`Self::apply_motion`], which runs on motion
+    /// steps and reflows and has no frame in hand — while the only thing that knows the
+    /// decoded frame's shape is the frame itself. `None` until one arrives, and updated
+    /// when it changes, which on a mirroring phone is every rotation.
+    video_aspect: Option<f32>,
+}
+
+/// Fit a frame of the given aspect inside `slot`, centred, without distorting it.
+///
+/// Video is the one layer whose texture has a shape of its own. Everything else here is
+/// authored at the surface it will occupy, so stretching a layer to its slot is exactly
+/// right — and doing the same to video is exactly wrong, which nobody could see while
+/// every sender happened to be 16:9 on a 16:9 panel. A mirroring phone is not: iOS
+/// encodes its screen at 498×1080, and stretched to a 3840×2160 panel that is a picture
+/// four times too wide.
+///
+/// Letterbox rather than crop: a mirror is a *view of someone's screen* and cutting the
+/// edges off it loses the status bar, the home indicator and whatever is at the sides of
+/// the app. `cover_source` exists for the layers where filling matters more.
+///
+/// `aspect` is width÷height of the decoded frame, in square pixels.
+fn fit_aspect(
+    slot: crate::panel::NormRect,
+    panel: (u32, u32),
+    aspect: f32,
+) -> crate::panel::NormRect {
+    let (pw, ph) = (panel.0.max(1) as f32, panel.1.max(1) as f32);
+    // A degenerate frame or an unmeasurable panel: leave the slot alone rather than
+    // dividing by zero and placing the layer nowhere.
+    if !aspect.is_finite() || aspect <= 0.0 || slot.w <= 0.0 || slot.h <= 0.0 {
+        return slot;
+    }
+    let slot_aspect = (slot.w * pw) / (slot.h * ph);
+    let (w, h) = if aspect > slot_aspect {
+        // Wider than the slot: full width, shorter — bars above and below.
+        (slot.w, slot.w * pw / aspect / ph)
+    } else {
+        // Taller than the slot, which is the phone case: full height, narrower.
+        (slot.h * ph * aspect / pw, slot.h)
+    };
+    crate::panel::NormRect {
+        x: slot.x + (slot.w - w) / 2.0,
+        y: slot.y + (slot.h - h) / 2.0,
+        w,
+        h,
+    }
 }
 
 /// Place `inner` inside `outer`: the transform a sub-rect layer needs when the surface it
@@ -1263,6 +1311,7 @@ impl RenderLoop {
             mascot_base: None,
             last_touch: None,
             video_clear_due: None,
+            video_aspect: None,
             card_clear_due: None,
             close_badge_side: 0,
             card_shown: None,
@@ -1995,11 +2044,17 @@ impl RenderLoop {
         if !drawn {
             return;
         }
+        // Video is the one layer with a shape of its own, so it is fitted to its slot
+        // rather than stretched across it. See `fit_aspect`.
+        let frame = match (layer, self.video_aspect) {
+            (LayerId::Video, Some(aspect)) => {
+                fit_aspect(frame, self.compositor.target_size(), aspect)
+            }
+            _ => frame,
+        };
         // The card is authored at the surface's own shape, while the widget slot is a
         // hard-coded 16:9 — so on a panel that is not 16:9 a demoted card is stretched today.
-        // A no-op on one that is. Video is *not* cropped this way: its texture's aspect is the
-        // decoded frame's, not the panel's, and how a mismatched frame is fitted belongs to the
-        // decode path rather than here.
+        // A no-op on one that is.
         if layer == LayerId::NowPlaying {
             let (pw, ph) = self.compositor.target_size();
             self.compositor.set_source(
@@ -2594,6 +2649,24 @@ impl RenderLoop {
                     self.failed_imports = 0;
                 }
                 if landed.is_ok() {
+                    // The frame's shape decides how the layer is fitted, and it changes
+                    // under us: a phone being turned over re-encodes at the other
+                    // orientation and the next frame is a different shape entirely.
+                    // Re-place the layer when it moves, not just when the panel does.
+                    let aspect = frame.width as f32 / frame.height.max(1) as f32;
+                    if self
+                        .video_aspect
+                        .is_none_or(|old| (old - aspect).abs() > 1e-4)
+                    {
+                        debug!(
+                            width = frame.width,
+                            height = frame.height,
+                            aspect,
+                            "render loop: video shape changed; refitting"
+                        );
+                        self.video_aspect = Some(aspect);
+                        self.apply_motions();
+                    }
                     // Placed by the panel, not unconditionally full-screen: a cast that
                     // starts while someone is navigating arrives demoted rather than
                     // covering what they are reading.
@@ -3206,6 +3279,91 @@ impl RenderLoop {
         // whole module removes everywhere else.
         self.apply_floor();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+    use crate::panel::NormRect;
+
+    /// The panel on the wall.
+    const PANEL: (u32, u32) = (3840, 2160);
+    const FULL: NormRect = NormRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn a_mirroring_phone_is_pillarboxed_rather_than_stretched() {
+        // The captured geometry from a real session: iOS encodes its screen at
+        // 498×1080. Stretched across a 3840×2160 panel that is four times too wide,
+        // which is what the panel showed.
+        let fitted = fit_aspect(FULL, PANEL, 498.0 / 1080.0);
+        assert!(close(fitted.h, 1.0), "full height: {fitted:?}");
+        // 2160 × (498/1080) = 996 px of 3840.
+        assert!(close(fitted.w, 996.0 / 3840.0), "{fitted:?}");
+        // …and centred, so the bars are equal.
+        assert!(close(fitted.x, (1.0 - fitted.w) / 2.0), "{fitted:?}");
+        assert!(close(fitted.y, 0.0), "{fitted:?}");
+    }
+
+    #[test]
+    fn matching_content_is_left_exactly_alone() {
+        // 16:9 into 16:9 must be the identity, or this would move every existing
+        // session by a rounding error's worth of pixels.
+        let fitted = fit_aspect(FULL, PANEL, 16.0 / 9.0);
+        assert!(close(fitted.w, 1.0) && close(fitted.h, 1.0), "{fitted:?}");
+        assert!(close(fitted.x, 0.0) && close(fitted.y, 0.0), "{fitted:?}");
+    }
+
+    #[test]
+    fn wider_content_is_letterboxed() {
+        // 21:9 on a 16:9 panel: full width, bars above and below.
+        let fitted = fit_aspect(FULL, PANEL, 21.0 / 9.0);
+        assert!(close(fitted.w, 1.0), "{fitted:?}");
+        assert!(fitted.h < 1.0, "{fitted:?}");
+        assert!(close(fitted.y, (1.0 - fitted.h) / 2.0), "{fitted:?}");
+    }
+
+    #[test]
+    fn a_demoted_slot_fits_within_itself_and_never_outside() {
+        // The rule that matters for a fitted layer: it stays inside the slot the panel
+        // gave it, whatever shape arrives. Outside it would overlap what shares the glass.
+        let slot = NormRect {
+            x: 0.55,
+            y: 0.1,
+            w: 0.4,
+            h: 0.3,
+        };
+        for aspect in [0.4f32, 0.75, 1.0, 16.0 / 9.0, 3.0] {
+            let f = fit_aspect(slot, PANEL, aspect);
+            assert!(f.x >= slot.x - 1e-4, "{aspect}: {f:?}");
+            assert!(f.y >= slot.y - 1e-4, "{aspect}: {f:?}");
+            assert!(f.x + f.w <= slot.x + slot.w + 1e-4, "{aspect}: {f:?}");
+            assert!(f.y + f.h <= slot.y + slot.h + 1e-4, "{aspect}: {f:?}");
+            // And it fills one of the two dimensions exactly — a fit, not a shrink.
+            assert!(
+                close(f.w, slot.w) || close(f.h, slot.h),
+                "{aspect}: {f:?} touches neither edge of {slot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_shape_leaves_the_slot_alone() {
+        // Better an unfitted layer than one placed nowhere: these come from a decoder
+        // that reported a zero dimension, and the frame is wrong either way.
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(fit_aspect(FULL, PANEL, bad), FULL);
+        }
+        assert_eq!(fit_aspect(FULL, (0, 0), 1.0), FULL);
     }
 }
 
