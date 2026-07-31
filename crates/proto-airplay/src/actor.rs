@@ -398,7 +398,7 @@ impl SourceAdapter for AirPlayReceiver {
         .into_iter()
         .map(|svc| Advertisement::MdnsService {
             ty: svc.service_type,
-            instance: svc.instance,
+            instance: svc.instance.into_string(),
             port: self.addr.port(),
             txt: svc.txt,
         })

@@ -15,10 +15,10 @@ pub mod service;
 
 pub use browse::{BrowseEvent, Browser, DiscoveredService};
 pub use error::MdnsError;
-pub use service::MdnsService;
+pub use service::{InstanceLabel, MdnsService};
 
 use mdns_sd::ServiceDaemon;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// The mDNS port. `mdns-sd` binds it internally (UDP, `SO_REUSEADDR`/`SO_REUSEPORT`,
 /// joined to [`MDNS_GROUP`]) — the constant exists so the network-surface registry
@@ -76,6 +76,16 @@ impl MdnsResponder {
     /// # Errors
     /// [`MdnsError`] if the service type is malformed or registration fails.
     pub fn advertise(&mut self, service: &MdnsService) -> Result<(), MdnsError> {
+        // A rewritten instance label changes the name a picker shows, so say so once
+        // rather than letting the device quietly appear under a different name.
+        if let Some(requested) = service.instance.rewritten_from() {
+            warn!(
+                service = %service.service_type,
+                %requested,
+                advertised = %service.instance,
+                "instance name is not encodable as one DNS label; advertising a repaired name"
+            );
+        }
         let info = service.to_service_info()?;
         let fullname = info.get_fullname().to_string();
         self.daemon
