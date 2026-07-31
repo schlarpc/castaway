@@ -137,7 +137,7 @@ pub fn encrypt_blob(
 /// This is the encoder for a format we otherwise only ever decode, and it exists to make
 /// the pairing path testable end to end: with it, a scripted sender can pair with the
 /// receiver, and our understanding of the layout can be checked against librespot's real
-/// decoder rather than against our own decoder (OPEN-QUESTIONS Q10). That is a genuine
+/// decoder rather than against our own decoder (#48). That is a genuine
 /// cross-implementation check — librespot's side was derived from real senders.
 ///
 /// Layout, mirroring the reader exactly: a discarded byte, a discarded length-prefixed
@@ -278,7 +278,7 @@ mod tests {
         assert!(decrypt_blob(&[0u8; 10], &[0u8; 96]).is_err());
     }
 
-    /// The check Q10 actually wants, as far as it can be had without a phone.
+    /// The check #48 actually wants, as far as it can be had without a phone.
     ///
     /// Every other test in this file round-trips our own code against itself, which
     /// cannot catch a misunderstanding of the format — only an inconsistency. This one

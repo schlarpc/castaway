@@ -1127,7 +1127,7 @@ async fn spawn_cast(
                 "Cast device auth uses a self-generated dev credential; senders that verify \
                  the Google chain — which is every official one — will reject it. Set \
                  cast.credential in castaway.toml to provision a real one, or re-enable \
-                 cast.cks (#40/Q11)"
+                 cast.cks (#40/#51)"
             );
             (
                 CastIdentity::device_key(self_signed_tls()?, Arc::new(dev.signer)),

@@ -93,7 +93,7 @@ fn main() {
     // A Spotify Connect session, with exactly the fields `proto-spotify` emits. Worth a
     // case of its own because it is the one source with rich text and *no* artwork —
     // librespot hands over cover URLs rather than bytes, so the art panel is empty while
-    // the metadata is complete (OPEN-QUESTIONS Q39). It is also the only source whose
+    // the metadata is complete (#50). It is also the only source whose
     // description carries no address, because there is no device on the other end to have
     // one: the peer is Spotify's cloud.
     let spotify = NowPlayingCard {

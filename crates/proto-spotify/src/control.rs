@@ -11,7 +11,7 @@
 //! `SessionEvent::Play` for a Spotify URI typecheck and then fail at the decoder. The
 //! queueing that actually matters — the phone's queue reaching this device — happens
 //! inside the Connect state machine and needs no transaction from us (OPEN-QUESTIONS
-//! Q38 covers surfacing that queue on screen).
+//! #49 covers surfacing that queue on screen).
 //!
 //! [`MediaUri`]: castaway_core::MediaUri
 

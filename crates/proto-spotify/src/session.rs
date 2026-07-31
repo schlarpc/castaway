@@ -951,7 +951,7 @@ const UP_NEXT_LIMIT: usize = 24;
 ///
 /// This is the one piece of Connect state we read *ourselves* rather than through
 /// `Spirc`, because `Spirc` exposes no accessor for the track list and `PlayerEvent`
-/// carries only the current item (OPEN-QUESTIONS Q38). Subscribing a second listener to
+/// carries only the current item (#49). Subscribing a second listener to
 /// the same dealer URI is supported — the dealer keeps a vector of subscribers per URI —
 /// so this rides alongside spirc's own listener rather than replacing it.
 ///
@@ -1002,7 +1002,7 @@ fn queue_tracks(update: &ClusterUpdate) -> Option<Vec<&ProvidedTrack>> {
     let state = update.cluster.as_ref()?.player_state.as_ref()?;
 
     // One line, once per change, naming the keys the cloud actually sent. The metadata
-    // map is reverse-engineered surface (OPEN-QUESTIONS Q38) and this is what tells us
+    // map is reverse-engineered surface (#49) and this is what tells us
     // whether `title`/`artist_name` are the right guesses without another session.
     if let Some(first) = state.next_tracks.first() {
         debug!(
@@ -1185,7 +1185,7 @@ fn named_from_metadata(track: &ProvidedTrack) -> Option<castaway_core::QueueItem
 
 /// Metadata keys that have carried an artist name.
 ///
-/// Several spellings because this is reverse-engineered surface (Q38) and the set is not
+/// Several spellings because this is reverse-engineered surface (#49) and the set is not
 /// contractual — the `queued track metadata` debug line exists to tell us which one the
 /// cloud actually sent. Dropping these in favour of the album alone was a regression: a
 /// queue that used to name the artist started naming the record instead.
@@ -1317,7 +1317,7 @@ fn apply_track(snapshot: &mut NowPlaying, item: &AudioItem) {
 
     // Artwork arrives as a URL, not bytes, and `NowPlaying::artwork` wants the encoded
     // image. Fetching it is a separate step — leave it absent rather than holding the
-    // text hostage to a download (OPEN-QUESTIONS Q39).
+    // text hostage to a download (#50).
     snapshot.artwork = None;
 }
 
@@ -1601,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_well_sized_blob_that_is_not_a_credential_still_fails_cleanly() {
-        // Past the length guard, into librespot's parser. This is the Q10 shape: our
+        // Past the length guard, into librespot's parser. This is the #48 shape: our
         // crypto can succeed on bytes librespot then rejects. It must not reach the
         // network, and it must not panic.
         let (tx, _rx) = mpsc::channel(4);
@@ -1713,7 +1713,7 @@ mod tests {
 
     #[test]
     fn a_track_whose_metadata_has_no_title_still_renders_as_something() {
-        // The keys are reverse-engineered and not contractual (Q38). A blank row would be
+        // The keys are reverse-engineered and not contractual (#49). A blank row would be
         // indistinguishable from a rendering bug; the id at least identifies the track.
         let track = provided("spotify:track:1240iIrz36c", &[]);
         assert!(

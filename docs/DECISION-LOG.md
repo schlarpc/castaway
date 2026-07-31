@@ -21,7 +21,7 @@ Spotify Connect's full value (dealer WS + CDN audio) is credential-gated (Premiu
 large stack. The autonomous slice is the reimplementable, testable part: zeroconf
 advertise + `getInfo` + `addUser` DH pairing and blob decryption (librespot algorithm),
 matching the shape of the other HTTP protocols (`router()` + `mdns_service()`). Playback
-is logged in OPEN-QUESTIONS Q9. This keeps "appears in the Spotify picker and pairs"
+is logged in #47. This keeps "appears in the Spotify picker and pairs"
 working now without sinking the session into one protocol.
 
 ### D7 — HTTP-mounted protocols expose `router()` + `ssdp_device()`, not `SourceAdapter`
@@ -266,7 +266,7 @@ is `Identity` today; the encrypted control channel only starts after pair-verify
 #39 is a swap of that transform rather than a rewrite of the loop.
 
 Both stay OFF by default, but D16's reason has narrowed: the listeners answer now. What's
-still missing is a real Cast device key (#40/Q11) and AirPlay pairing (#39) — so AirPlay
+still missing is a real Cast device key (#40/#51) and AirPlay pairing (#39) — so AirPlay
 answers `501` at the pairing gate rather than faking a 200 and leaving a sender waiting
 forever for a media plane that can't start.
 

@@ -9,7 +9,7 @@
 //! What it is really guarding is the *join* between the two halves. Each half already has
 //! unit tests; the failure this catches is the one where `getInfo` advertises one device
 //! id and the blob is encrypted against another, which is invisible in either half alone
-//! and reaches the phone as an unexplained "pairing expired" (OPEN-QUESTIONS Q10).
+//! and reaches the phone as an unexplained "pairing expired" (#48).
 
 #![allow(clippy::unwrap_used)]
 
