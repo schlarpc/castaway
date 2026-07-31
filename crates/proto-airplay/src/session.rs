@@ -542,10 +542,14 @@ impl AirPlaySession {
             .header("Session", "1")
     }
 
-    /// Handle the mirroring `SETUP`, in its two phases.
+    /// Handle the mirroring `SETUP`: key material, a named stream, or both.
     ///
-    /// The first carries `ekey`/`eiv` and is answered with our timing port. The second
-    /// names the stream and is answered with the TCP port its video should be sent to.
+    /// The key material (`ekey`/`eiv`) is answered with our timing port; a `streams`
+    /// entry is answered with the port that plane should be sent to. They normally
+    /// arrive in that order in two requests, but nothing in the protocol says they must
+    /// — the reference receiver reads both blocks of *one* request — so each block is
+    /// read on its own rather than inferred from how far the negotiation has got. This
+    /// used to look at `streams` first and return `451` to a request carrying both.
     fn mirror_setup(&mut self, body: &[u8]) -> AirPlayResponse {
         let Ok(value) = plist::Value::from_reader(std::io::Cursor::new(body)) else {
             warn!("mirroring SETUP body is not a plist");
@@ -554,6 +558,17 @@ impl AirPlaySession {
         let Some(dict) = value.as_dictionary() else {
             return AirPlayResponse::status(400);
         };
+        debug!(keys = ?dict.keys().collect::<Vec<_>>(), "mirroring SETUP");
+        self.note_timing_regime(dict);
+
+        // Key material first, so a request that carries both blocks has a key by the
+        // time the stream derived from it is read.
+        let carries_key = dict.contains_key("ekey") || dict.contains_key("eiv");
+        if carries_key {
+            if let Err(refusal) = self.accept_key_material(dict) {
+                return *refusal;
+            }
+        }
 
         if let Some(streams) = dict.get("streams").and_then(plist::Value::as_array) {
             // One SETUP names one plane. Video comes first and audio, if the sender wants
@@ -575,29 +590,10 @@ impl AirPlaySession {
             return AirPlayResponse::status(400);
         }
 
-        let Some(ekey) = dict.get("ekey").and_then(plist::Value::as_data) else {
+        if !carries_key {
             warn!("mirroring SETUP has neither ekey nor streams");
             return AirPlayResponse::status(400);
-        };
-        let Ok(ekey) = <[u8; crypto_playfair::EKEY_LEN]>::try_from(ekey) else {
-            warn!(len = ekey.len(), "ekey is not 72 bytes");
-            return AirPlayResponse::status(400);
-        };
-        // `eiv` is the media IV and arrives unwrapped. It is kept now because the audio
-        // stream needs it later, by which time this SETUP is long gone.
-        let Some(eiv) = dict
-            .get("eiv")
-            .and_then(plist::Value::as_data)
-            .and_then(|d| <[u8; 16]>::try_from(d).ok())
-        else {
-            warn!("mirroring SETUP has no 16-byte eiv");
-            return AirPlayResponse::status(400);
-        };
-        self.pending_eiv = Some(eiv);
-        self.mirror = MirrorState::KeyMaterial {
-            ekey: Box::new(ekey),
-        };
-        log_info!("AirPlay mirroring key material received");
+        }
 
         let mut reply = plist::Dictionary::new();
         // Our own timing port, and no event channel: UxPlay returns 0 here and mirrors
@@ -608,6 +604,70 @@ impl AirPlaySession {
         );
         reply.insert("eventPort".into(), plist::Value::Integer(0i64.into()));
         plist_response(&reply)
+    }
+
+    /// Take the wrapped key and media IV out of a mirroring `SETUP`.
+    ///
+    /// `Err` carries the refusal to send, so the caller cannot forget to send one.
+    fn accept_key_material(
+        &mut self,
+        dict: &plist::Dictionary,
+    ) -> Result<(), Box<AirPlayResponse>> {
+        let refuse = |status| Err(Box::new(AirPlayResponse::status(status)));
+        let Some(ekey) = dict.get("ekey").and_then(plist::Value::as_data) else {
+            warn!("mirroring SETUP has an eiv but no ekey");
+            return refuse(400);
+        };
+        let Ok(ekey) = <[u8; crypto_playfair::EKEY_LEN]>::try_from(ekey) else {
+            warn!(len = ekey.len(), "ekey is not 72 bytes");
+            return refuse(400);
+        };
+        // `eiv` is the media IV and arrives unwrapped. It is kept now because the audio
+        // stream needs it later, by which time this SETUP is long gone.
+        let Some(eiv) = dict
+            .get("eiv")
+            .and_then(plist::Value::as_data)
+            .and_then(|d| <[u8; 16]>::try_from(d).ok())
+        else {
+            warn!("mirroring SETUP has no 16-byte eiv");
+            return refuse(400);
+        };
+        self.pending_eiv = Some(eiv);
+        self.mirror = MirrorState::KeyMaterial {
+            ekey: Box::new(ekey),
+        };
+        log_info!("AirPlay mirroring key material received");
+        Ok(())
+    }
+
+    /// Say so when a sender asks for a timing regime this receiver does not serve.
+    ///
+    /// Neither is refused — the sender decides what it does next, and both are things
+    /// the reference receiver merely reports. They are logged because they are otherwise
+    /// invisible: a session that dies straight after this `SETUP` looks identical
+    /// whether the sender wanted PTP, wanted the AirPlay 2 remote-control protocol, or
+    /// disliked something in the answer.
+    fn note_timing_regime(&self, dict: &plist::Dictionary) {
+        match dict.get("timingProtocol").and_then(plist::Value::as_string) {
+            Some("NTP") | None => {}
+            Some(other) => warn!(
+                timing_protocol = %other,
+                "sender asked for a timing protocol this receiver does not serve (NTP only)"
+            ),
+        }
+        if dict
+            .get("isRemoteControlOnly")
+            .and_then(plist::Value::as_boolean)
+            == Some(true)
+        {
+            warn!("sender asked for the AirPlay 2 remote-control protocol, which is not served");
+        }
+        if let Some(port) = dict
+            .get("timingPort")
+            .and_then(plist::Value::as_unsigned_integer)
+        {
+            debug!(sender_timing_port = port, "sender's NTP port");
+        }
     }
 
     /// The second mirroring `SETUP`: derive the stream keys and name the data port.
@@ -636,6 +696,16 @@ impl AirPlaySession {
             return AirPlayResponse::status(451);
         };
         let aes_key = crypto_playfair::decrypt_key(key_message, &ekey);
+        // Bit 27's other half, on the mirroring plane — the same rule `announce` applies
+        // to the audio one. A sender that completed `/pair-verify` encrypts with
+        // `SHA512(aeskey ‖ shared)[0..16]`; one that skipped it uses the unwrapped key
+        // as-is. Which happened is exactly `paired_secret`. This step was missing while
+        // bit 27 was clear and no sender ever paired; with the bit set every iOS sender
+        // pairs, and the failure it causes is not an error but a picture of noise.
+        let aes_key = match &self.paired_secret {
+            Some(shared) => crate::pairing::rekey_media(&aes_key, shared),
+            None => aes_key,
+        };
         // Kept for the audio stream, which uses the same key with the `eiv` verbatim
         // rather than the SHA-512 derivation the video stream needs.
         if let Some(iv) = self.pending_eiv.take() {
@@ -1370,6 +1440,147 @@ mod tests {
             body: &[],
         };
         assert_eq!(s.handle(&req).unwrap().status, 501);
+    }
+
+    /// A real `/fp-setup` SETUP2 body, and a wrapped key it unwraps (the same capture
+    /// the socket-level test drives a whole mirroring session from).
+    const FP_KEY_MESSAGE: &str = "46504c590301030000000098008f1a9ca548fdd57560a52926ff399f2eb154d0a7a0fffc997f58e27e00499eb9f310110d019e550e328047aea54308ab71b647041406878af96e06cf74127ae35941dceb58931b5543b39903f9f76a376248ee52e3656b561e1c1a0106ec6608df0ab4f2df528e65db6d622d3892d5b49c6c025606a574f19ebea7d93500bdd69db23333f22edcb3ccf7a6acde7389f2facabfa61b0b50";
+    const FP_EKEY: &str = "46504c59010201000000003c000000006d44ba12b91f48e061eb230fc53abfa2000000108a1060465d51b808df112d08b604501f9e3ea29ce0902f3c43b81d5319d0575f78517e01";
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2)
+            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The `streamConnectionID` the mirroring `SETUP` names, as a plist sends it.
+    const STREAM_ID: i64 = 4_964_383_553_955_644_435;
+
+    /// A session that has completed `/fp-setup` and has a data port, which is what any
+    /// mirroring `SETUP` needs behind it.
+    fn mirroring_session() -> AirPlaySession {
+        let mut s = session();
+        s.set_mirror_data_port(7100);
+        s.handle(&AirPlayRequest::new(
+            "POST",
+            "/fp-setup",
+            &unhex(FP_KEY_MESSAGE),
+        ))
+        .unwrap();
+        s
+    }
+
+    /// A mirroring `SETUP` body carrying whichever blocks are asked for.
+    fn mirror_setup_body(key_material: bool, stream: bool) -> Vec<u8> {
+        let mut d = plist::Dictionary::new();
+        if key_material {
+            d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+            d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+            d.insert("timingProtocol".into(), plist::Value::String("NTP".into()));
+        }
+        if stream {
+            let mut s0 = plist::Dictionary::new();
+            s0.insert("type".into(), plist::Value::Integer(110i64.into()));
+            s0.insert(
+                "streamConnectionID".into(),
+                plist::Value::Integer(STREAM_ID.into()),
+            );
+            d.insert(
+                "streams".into(),
+                plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+            );
+        }
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &d).unwrap();
+        buf
+    }
+
+    fn setup(s: &mut AirPlaySession, body: &[u8]) -> AirPlayResponse {
+        s.handle(&AirPlayRequest::new("SETUP", "rtsp://x/1", body))
+            .unwrap()
+    }
+
+    #[test]
+    fn one_setup_may_carry_both_the_key_and_the_stream_it_belongs_to() {
+        // The two blocks normally arrive in two requests, and this used to *require*
+        // that: `streams` was read first, found no key material, and answered 451 to a
+        // sender that had sent the key in the very same body.
+        let mut s = mirroring_session();
+        let r = setup(&mut s, &mirror_setup_body(true, true));
+        assert_eq!(r.status, 200);
+        assert!(
+            s.take_mirror_keys().is_some(),
+            "a combined SETUP must leave the stream ready"
+        );
+    }
+
+    #[test]
+    fn a_paired_sender_mirrors_with_the_rekeyed_media_key() {
+        // Bit 27's other half. With the bit advertised every iOS sender completes
+        // `/pair-verify`, and then encrypts the mirror with `SHA512(aeskey ‖ shared)` —
+        // so a receiver that skips the rehash decrypts to noise, with nothing anywhere
+        // reporting an error. `announce` has always done this for the audio plane; the
+        // mirroring plane did not.
+        let shared = [7u8; 32];
+        let mut paired = mirroring_session();
+        paired.paired_secret = Some(shared);
+        assert_eq!(
+            setup(&mut paired, &mirror_setup_body(true, false)).status,
+            200
+        );
+        assert_eq!(
+            setup(&mut paired, &mirror_setup_body(false, true)).status,
+            200
+        );
+        let keys = paired.take_mirror_keys().expect("the stream is ready");
+
+        let key_message: [u8; crypto_playfair::KEY_MESSAGE_LEN] =
+            unhex(FP_KEY_MESSAGE).try_into().unwrap();
+        let ekey: [u8; crypto_playfair::EKEY_LEN] = unhex(FP_EKEY).try_into().unwrap();
+        let aes_key = crypto_playfair::decrypt_key(&key_message, &ekey);
+        let id = StreamConnectionId::from_plist_signed(STREAM_ID);
+        let expected = MirrorKeys::derive(&crate::pairing::rekey_media(&aes_key, &shared), id);
+        assert_eq!(keys.key, expected.key);
+        assert_eq!(keys.iv, expected.iv);
+        // And it is genuinely a different key from the unpaired derivation, which is
+        // what makes getting this wrong invisible rather than fatal.
+        assert_ne!(keys.key, MirrorKeys::derive(&aes_key, id).key);
+    }
+
+    #[test]
+    fn an_unpaired_sender_mirrors_with_the_unwrapped_key() {
+        // Nothing forces a sender to pair — `/pair-verify` is its move — and one that
+        // skipped it uses the FairPlay key as-is.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        assert_eq!(setup(&mut s, &mirror_setup_body(false, true)).status, 200);
+        let keys = s.take_mirror_keys().expect("the stream is ready");
+
+        let key_message: [u8; crypto_playfair::KEY_MESSAGE_LEN] =
+            unhex(FP_KEY_MESSAGE).try_into().unwrap();
+        let ekey: [u8; crypto_playfair::EKEY_LEN] = unhex(FP_EKEY).try_into().unwrap();
+        let aes_key = crypto_playfair::decrypt_key(&key_message, &ekey);
+        let expected =
+            MirrorKeys::derive(&aes_key, StreamConnectionId::from_plist_signed(STREAM_ID));
+        assert_eq!(keys.key, expected.key);
+    }
+
+    #[test]
+    fn the_first_mirroring_setup_answers_with_a_timing_port_that_is_bound() {
+        let mut s = mirroring_session();
+        let r = setup(&mut s, &mirror_setup_body(true, false));
+        assert_eq!(r.status, 200);
+        let reply: plist::Value = plist::from_bytes(&r.body).unwrap();
+        let reply = reply.as_dictionary().unwrap();
+        assert_eq!(
+            reply.get("timingPort").unwrap().as_unsigned_integer(),
+            Some(6002)
+        );
+        // No event channel: UxPlay returns 0 here and mirrors from iOS 12 through 18.
+        assert_eq!(
+            reply.get("eventPort").unwrap().as_unsigned_integer(),
+            Some(0)
+        );
     }
 
     #[test]
