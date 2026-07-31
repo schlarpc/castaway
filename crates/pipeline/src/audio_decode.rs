@@ -189,6 +189,9 @@ impl AudioDecoder {
         config: Option<&[u8]>,
     ) -> Result<Self, PipelineError> {
         ensure_init();
+        // With `ldac` off the enum has one variant and this match is "infallible" — the
+        // shape is for the variant that is cfg'd in, so the lint is scoped out with it.
+        #[cfg_attr(not(feature = "ldac"), allow(clippy::infallible_destructuring_match))]
         let id = match Backend::for_codec(codec)? {
             Backend::Ffmpeg(id) => id,
             // LDAC takes none of what follows: no extradata (the configuration is in every
@@ -306,7 +309,11 @@ impl AudioDecoder {
             ldac.check_against_negotiation();
             return Ok(());
         }
-        let Decoder::Ffmpeg(decoder) = &mut self.decoder else {
+        // With `ldac` off the pattern is irrefutable — the guard is for the variant that
+        // is cfg'd in, so the lint is scoped out with it.
+        #[cfg_attr(not(feature = "ldac"), allow(irrefutable_let_patterns))]
+        let Decoder::Ffmpeg(decoder) = &mut self.decoder
+        else {
             // Unreachable: the only other variant returned above. Written as a guard
             // rather than a `match` so the ffmpeg body below stays unindented and the diff
             // that introduced the second backend stays readable.

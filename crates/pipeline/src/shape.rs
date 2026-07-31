@@ -117,15 +117,9 @@ mod draw {
                 if a == 0 {
                     continue;
                 }
-                crate::text::blend_over(
-                    buf,
-                    width,
-                    height,
-                    (ox + x as f32) as i32,
-                    (oy + y as f32) as i32,
-                    color,
-                    f32::from(a) / 255.0,
-                );
+                #[allow(clippy::cast_possible_truncation)]
+                let (px, py) = ((ox + x as f32) as i32, (oy + y as f32) as i32);
+                crate::text::blend_over(buf, width, height, px, py, color, f32::from(a) / 255.0);
             }
         }
     }

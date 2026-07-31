@@ -130,12 +130,6 @@ impl GpuImporter {
         backend_kind().map_or(SurfaceImport::Unsupported, SurfaceImport::Supported)
     }
 
-    /// Import one decoder surface as an NV12 texture on `device`.
-    ///
-    /// # Errors
-    /// [`PipelineError::GpuImport`] if the surface is not one this platform understands,
-    /// or the driver refused the import.
-    #[allow(unused_variables)]
     /// Import a single-plane browser frame (D36).
     ///
     /// Separate from [`Self::import`] because the producer is different in kind: a
@@ -158,6 +152,15 @@ impl GpuImporter {
             .import_single_plane(device, geometry, modifier, plane, owner)
     }
 
+    /// Import one decoder surface as an NV12 texture on `device`.
+    ///
+    /// # Errors
+    /// [`PipelineError::GpuImport`] if the surface is not one this platform understands,
+    /// or the driver refused the import.
+    #[cfg_attr(
+        not(all(feature = "hwaccel", any(unix, windows))),
+        allow(unused_variables)
+    )]
     pub fn import(
         &mut self,
         device: &wgpu::Device,

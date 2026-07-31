@@ -832,7 +832,7 @@ impl Pipeline for RenderPipeline {
         }
         #[cfg(not(feature = "audio"))]
         {
-            let _ = (source, format);
+            let _ = (source, format, config);
             // A typed refusal rather than a silent success: a build without the `audio`
             // feature has no decoder at all, and a phone that pairs, streams and plays
             // to silence is the worst possible thing to diagnose.
@@ -1662,6 +1662,7 @@ impl RenderLoop {
     /// [`PipelineError::GpuImport`] if this device cannot import external memory or the
     /// geometry is one the single-plane path does not describe.
     #[cfg(feature = "hwaccel")]
+    #[allow(clippy::too_many_arguments)]
     pub fn import_browser_frame(
         &mut self,
         geometry: crate::hwaccel::FrameGeometry,
