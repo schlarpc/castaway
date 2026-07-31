@@ -799,7 +799,21 @@ impl AirPlaySession {
     /// adds to its own figure. 11025 is a quarter second at 44.1 kHz and is what
     /// shairport-sync reports; it is a promise about the buffer depth the audio path
     /// keeps, so it and that buffer have to agree.
+    ///
+    /// **The two planes answer this differently, and conflating them cost a session.** A
+    /// mirroring sender sends `RECORD` too — iOS sends it between the `SETUP` carrying
+    /// the key material and the one naming the stream — and there is no `ANNOUNCE` or
+    /// transport `SETUP` anywhere in that flow to have reached `RaopState::SetUp`. So the
+    /// RAOP gate below answered `455` to a perfectly ordinary mirroring request, and the
+    /// sender hung up. On the mirror plane this is an acknowledgement and **not** a state
+    /// transition: the picture starts when the sender dials the data port, and moving
+    /// `RaopState` here would have the actor consume the audio sockets for a stream
+    /// nobody announced.
     fn record(&mut self) -> AirPlayResponse {
+        if self.mirroring() {
+            debug!("RECORD on the mirroring plane; acknowledged");
+            return Self::record_ack();
+        }
         let (RaopState::SetUp(params) | RaopState::Recording(params)) =
             std::mem::take(&mut self.raop)
         else {
@@ -810,7 +824,30 @@ impl AirPlaySession {
             return AirPlayResponse::status(455);
         };
         self.raop = RaopState::Recording(params);
-        AirPlayResponse::ok().header("Audio-Latency", "11025")
+        Self::record_ack()
+    }
+
+    /// The `RECORD` reply, which is the same on both planes.
+    ///
+    /// `Audio-Jack-Status` says the output is attached and analogue; every reference
+    /// receiver sends it here and senders read it to decide whether there is anything
+    /// on the other end to play to.
+    fn record_ack() -> AirPlayResponse {
+        AirPlayResponse::ok()
+            .header("Audio-Latency", "11025")
+            .header("Audio-Jack-Status", "connected; type=analog")
+    }
+
+    /// Whether a mirroring negotiation is under way on this session.
+    ///
+    /// The mirror plane's equivalent of `RaopState` being past `Idle`: from the moment
+    /// the key material arrives, requests belong to the mirror rather than to an audio
+    /// flow that never started.
+    const fn mirroring(&self) -> bool {
+        matches!(
+            self.mirror,
+            MirrorState::KeyMaterial { .. } | MirrorState::Ready(_)
+        )
     }
 
     /// Handle `GET_PARAMETER`: report a parameter the sender asked us for.
@@ -1656,6 +1693,27 @@ mod tests {
             body: b"volume\r\n",
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_mirroring_sender_may_record_without_ever_announcing() {
+        // Captured order from a real iPhone: SETUP (key material) → GET /info →
+        // GET_PARAMETER volume → RECORD → SETUP (streams). There is no ANNOUNCE and no
+        // transport SETUP anywhere in a mirroring session, so the RAOP gate answered 455
+        // to an ordinary request and the sender hung up.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        let r = s
+            .handle(&AirPlayRequest::new("RECORD", "rtsp://x/1", &[]))
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.headers.iter().any(|(k, _)| *k == "Audio-Latency"));
+        // And it is an acknowledgement, not a state transition: moving the RAOP state
+        // here would have the actor start an audio task for a stream nobody announced.
+        assert!(!s.is_recording(), "RECORD must not start the audio plane");
+        // The stream still negotiates afterwards, which is the request that follows it.
+        assert_eq!(setup(&mut s, &mirror_setup_body(false, true)).status, 200);
+        assert!(s.take_mirror_keys().is_some());
     }
 
     #[test]
