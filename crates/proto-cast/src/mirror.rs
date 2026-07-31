@@ -31,6 +31,8 @@ pub enum Codec {
     Hevc,
     /// VP8 video.
     Vp8,
+    /// VP9 video.
+    Vp9,
     /// Opus audio.
     Opus,
     /// AAC audio.
@@ -43,6 +45,7 @@ impl Codec {
             "h264" => Some(Codec::H264),
             "hevc" | "h265" => Some(Codec::Hevc),
             "vp8" => Some(Codec::Vp8),
+            "vp9" => Some(Codec::Vp9),
             "opus" => Some(Codec::Opus),
             "aac" => Some(Codec::Aac),
             _ => None,
@@ -50,7 +53,7 @@ impl Codec {
     }
 
     const fn is_video(self) -> bool {
-        matches!(self, Codec::H264 | Codec::Hevc | Codec::Vp8)
+        matches!(self, Codec::H264 | Codec::Hevc | Codec::Vp8 | Codec::Vp9)
     }
 
     /// How this codec is named to the pipeline, which is codec-aware but Cast-agnostic.
@@ -62,6 +65,7 @@ impl Codec {
             Codec::H264 => MediaKind::Video(VideoCodec::H264),
             Codec::Hevc => MediaKind::Video(VideoCodec::Hevc),
             Codec::Vp8 => MediaKind::Video(VideoCodec::Vp8),
+            Codec::Vp9 => MediaKind::Video(VideoCodec::Vp9),
             Codec::Opus => MediaKind::Audio(AudioCodec::Opus),
             Codec::Aac => MediaKind::Audio(AudioCodec::Aac),
         }
@@ -69,13 +73,16 @@ impl Codec {
 
     /// Which of two offered codecs to prefer, higher wins.
     ///
-    /// The deploy target hardware-decodes H.264 and HEVC but not VP8, and Chrome lists
-    /// VP8 first in its offer — so "take the first one we recognize" would
-    /// systematically land on the software path.
+    /// Ordered by how likely a fixed-function decoder is to exist for it: H.264 and
+    /// HEVC everywhere, VP9 nearly everywhere, VP8 nowhere this decade — and Chrome
+    /// lists VP8 in its offer anyway (before VP9 until ~148, after it since), so
+    /// "take the first one we recognize" would systematically land on the software
+    /// path.
     const fn preference(self) -> u8 {
         match self {
-            Codec::H264 => 3,
-            Codec::Hevc => 2,
+            Codec::H264 => 4,
+            Codec::Hevc => 3,
+            Codec::Vp9 => 2,
             Codec::Vp8 => 1,
             Codec::Opus => 2,
             Codec::Aac => 1,
@@ -85,7 +92,7 @@ impl Codec {
     /// The RTP clock rate to assume when an offered stream omits `timeBase`.
     const fn default_timebase(self) -> NonZeroU32 {
         match self {
-            Codec::H264 | Codec::Hevc | Codec::Vp8 => VIDEO_TIMEBASE,
+            Codec::H264 | Codec::Hevc | Codec::Vp8 | Codec::Vp9 => VIDEO_TIMEBASE,
             Codec::Opus | Codec::Aac => AUDIO_TIMEBASE,
         }
     }
@@ -189,6 +196,10 @@ struct OfferedStream {
     aes_key: String,
     #[serde(rename = "aesIvMask")]
     aes_iv_mask: String,
+    /// The sender's bitrate ceiling for this stream. Parsed for the negotiation log
+    /// only — the sender enforces it; we just want it on record when quality is bad.
+    #[serde(rename = "maxBitRate")]
+    max_bit_rate: Option<u32>,
 }
 
 /// Parse an offered `timeBase` — always written as the reciprocal, `"1/90000"`.
@@ -244,6 +255,34 @@ pub fn negotiate(offer_payload: &str, udp_port: u16) -> Result<(String, MirrorCo
             *slot = Some(cfg);
         }
     }
+
+    // What the sender put on the table, verbatim enough to answer "why did it pick
+    // that" from a log alone. Unrecognized codecs are marked: an offer whose best
+    // stream we cannot name (VP9 went unparsed for a while) looks exactly like a
+    // sender with nothing better, and only this line tells the two apart.
+    let offered: Vec<String> = env
+        .offer
+        .supported_streams
+        .iter()
+        .map(|s| {
+            let recognized = if Codec::parse(&s.codec_name).is_some() {
+                ""
+            } else {
+                "(unrecognized)"
+            };
+            let cap = s
+                .max_bit_rate
+                .map(|b| format!(" max={}kbps", b / 1000))
+                .unwrap_or_default();
+            format!("{}:{}{recognized}{cap}", s.index, s.codec_name)
+        })
+        .collect();
+    tracing::info!(
+        offered = ?offered,
+        video = ?video.as_ref().map(|v| v.codec),
+        audio = ?audio.as_ref().map(|a| a.codec),
+        "mirroring OFFER"
+    );
 
     let Some(video) = video else {
         return Err(CastError::Mirror("offer had no video stream we can decode"));
@@ -363,6 +402,39 @@ mod tests {
         let a = cfg.audio.unwrap();
         assert_eq!(a.codec, Codec::Opus);
         assert_eq!(a.sender_ssrc, 200);
+    }
+
+    /// Chrome's real mirroring offer (148): opus, then vp9, then vp8 — no H.264
+    /// unless the sender has a hardware encoder. VP9 must win over VP8: it is the one
+    /// of the two that fixed-function decoders exist for.
+    #[test]
+    fn vp9_is_chosen_over_vp8() {
+        let offer = r#"{"type":"OFFER","seqNum":3,"offer":{"supportedStreams":[
+          {"index":0,"type":"audio_source","codecName":"opus","rtpPayloadType":127,"ssrc":1,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"},
+          {"index":1,"type":"video_source","codecName":"vp9","rtpPayloadType":96,"ssrc":2,"maxBitRate":5000000,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"},
+          {"index":2,"type":"video_source","codecName":"vp8","rtpPayloadType":96,"ssrc":3,"maxBitRate":5000000,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"}
+        ]}}"#;
+        let (answer, cfg) = negotiate(offer, 5000).unwrap();
+        assert_eq!(cfg.video.codec, Codec::Vp9);
+        assert_eq!(cfg.video.sender_ssrc, 2);
+        assert!(answer.contains("\"sendIndexes\":[1,0]"));
+    }
+
+    /// An offered H.264 still beats VP9 — hardware decodes both, but H.264 senders
+    /// hardware-*encode* too.
+    #[test]
+    fn h264_still_beats_vp9() {
+        let offer = r#"{"type":"OFFER","seqNum":4,"offer":{"supportedStreams":[
+          {"index":0,"type":"video_source","codecName":"vp9","rtpPayloadType":96,"ssrc":1,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"},
+          {"index":1,"type":"video_source","codecName":"h264","rtpPayloadType":96,"ssrc":2,
+           "aesKey":"000102030405060708090a0b0c0d0e0f","aesIvMask":"0f0e0d0c0b0a09080706050403020100"}
+        ]}}"#;
+        let (_, cfg) = negotiate(offer, 5000).unwrap();
+        assert_eq!(cfg.video.codec, Codec::H264);
     }
 
     #[test]

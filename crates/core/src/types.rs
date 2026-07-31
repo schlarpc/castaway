@@ -169,6 +169,9 @@ pub enum VideoCodec {
     /// VP8 (Cast mirroring — Chrome offers it alongside H.264 and a sender may only
     /// have it).
     Vp8,
+    /// VP9 (Cast mirroring — Chrome 148+ offers it above VP8; hardware decodes it
+    /// nearly everywhere VP8 is software-only).
+    Vp9,
 }
 
 /// Audio codecs the decode path understands.

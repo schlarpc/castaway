@@ -767,6 +767,7 @@ fn codec_id(codec: VideoCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
         VideoCodec::H264 => Ok(ffmpeg::codec::Id::H264),
         VideoCodec::Hevc => Ok(ffmpeg::codec::Id::HEVC),
         VideoCodec::Vp8 => Ok(ffmpeg::codec::Id::VP8),
+        VideoCodec::Vp9 => Ok(ffmpeg::codec::Id::VP9),
         // `VideoCodec` is `#[non_exhaustive]`, so a codec added to `core` cannot break
         // this build — but it must not silently render black either. Fail loudly.
         other => Err(PipelineError::Decode(format!(
@@ -1323,7 +1324,12 @@ mod tests {
         // A codec we advertise in an OFFER/ANSWER but cannot actually decode is a black
         // screen at the far end of a successful handshake — the worst kind of failure.
         ensure_init();
-        for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Vp8] {
+        for codec in [
+            VideoCodec::H264,
+            VideoCodec::Hevc,
+            VideoCodec::Vp8,
+            VideoCodec::Vp9,
+        ] {
             let id = codec_id(codec).unwrap();
             assert!(
                 ffmpeg::decoder::find(id).is_some(),
