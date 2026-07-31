@@ -429,6 +429,57 @@
             # is trusted.
             electron = electronLinuxFor system;
 
+            # Punch the receiver's whole network surface through this box's firewall, for
+            # a native dev run (`cargo run` here, senders on the LAN). Same source of
+            # truth as the NixOS module's holes — nix/network-surface.json at its
+            # defaults, every gate open — so it cannot drift from the code either.
+            # Transient by design: `sudo nixos-firewall-tool reset` (or a rebuild)
+            # closes everything again. `nix run .#open-firewall`.
+            open-firewall =
+              let
+                lib = pkgs.lib;
+                surface = builtins.fromJSON (builtins.readFile ./nix/network-surface.json);
+                portsOf = l:
+                  if l.port ? fixed then
+                    [ l.port.fixed ]
+                  else if l.port ? config then
+                    [ l.port.default ]
+                  else
+                    lib.range l.port.default_first l.port.default_last;
+                # One hole per (transport, port), owners folded together: the RAOP and
+                # Cast media ranges are the same 32 ports, and opening them twice would
+                # double both the sudo calls and the noise.
+                holes = lib.attrValues (lib.foldl'
+                  (acc: h:
+                    let k = "${h.transport}:${toString h.port}"; in
+                    acc // {
+                      ${k} = {
+                        inherit (h) transport port;
+                        owners = lib.unique ((acc.${k}.owners or [ ]) ++ [ h.owner ]);
+                      };
+                    })
+                  { }
+                  (lib.concatMap
+                    (l: map (port: { inherit (l) transport owner; inherit port; })
+                      (portsOf l))
+                    surface.listeners));
+                open = h:
+                  "open ${h.transport} ${toString h.port} ${
+                    lib.escapeShellArg (lib.concatStringsSep "+" h.owners)}\n";
+              in
+              pkgs.writeShellApplication {
+                name = "castaway-open-firewall";
+                text = ''
+                  open() {
+                    echo "open $1 $2  ($3)"
+                    sudo ${pkgs.nixos-firewall-tool}/bin/nixos-firewall-tool open "$1" "$2"
+                  }
+                  ${lib.concatMapStrings open holes}
+                  echo "castaway's surface (${toString (builtins.length holes)} holes) is open" \
+                    "until 'sudo nixos-firewall-tool reset' or a rebuild"
+                '';
+              };
+
             # The Windows deploy artifacts, cross-compiled from Linux. `-electron` is the one
             # that ships; `-render` drops the browser, and the bare build is the toolchain
             # canary — if it stops linking, the toolchain broke, not the media stack.
