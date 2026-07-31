@@ -33,7 +33,8 @@ use crate::attract::AttractScene;
 use crate::shell::{Screen, ScreenHit, ScreenStack};
 
 /// Which corner a demoted video goes to. Bottom-right: the shell's own content runs down
-/// the left, and the home pill owns the bottom-left.
+/// the left, and the top-left is where every back affordance (the home pill included)
+/// lives.
 pub const PIP_CORNER: u8 = 3;
 
 /// A surface the panel can be showing.

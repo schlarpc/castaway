@@ -5,9 +5,15 @@
 //! panel — a hackerspace screen is mostly used by guests, and a discoverable affordance
 //! matters more than an elegant one. The swipe is for when the pill is in the way.
 //!
-//! The pill appears on any touch and fades. It cannot be permanent: it sits above a
-//! fullscreen cast, so a pill that never faded would be a smudge on every video anyone
-//! ever played here.
+//! The pill exists only while a session surface holds the whole panel — the one state
+//! in which the shell's own chrome (and its back button) is covered. On the shell's own
+//! screens the same corner already carries a back affordance, and at Home there is
+//! nothing to exit; [`pill_presence`] derives this from focus every frame, so a pill on
+//! the Home screen is unrepresentable rather than merely unlikely.
+//!
+//! While it exists it brightens on any touch and fades back to a dim floor. It cannot
+//! be full-bright forever: it sits above a fullscreen cast, and a pill that never faded
+//! would be a smudge on every video anyone ever played here.
 //!
 //! Geometry is pure and shared between drawing and hit-testing, so the pill cannot be
 //! pressed where it is not drawn (D33).
@@ -42,18 +48,19 @@ pub const PILL_HOLD: std::time::Duration = std::time::Duration::from_millis(2200
 /// How long the fade itself takes.
 pub const PILL_FADE: std::time::Duration = std::time::Duration::from_millis(600);
 
-/// What the pill fades *to* while a session holds the whole panel — dim, but present.
+/// What the pill fades *to* while it exists — dim, but present.
 ///
 /// On an app view (Spotify's card, YouTube, a cast) the pill is the one exit that is
 /// structurally in the same place everywhere, and an affordance faded to nothing reads
-/// as there being no way out. Dim enough not to fight the picture; the floor is 0 on
-/// the idle screen, where there is nothing to exit.
+/// as there being no way out. Dim enough not to fight the picture.
 pub const PILL_SESSION_FLOOR: f32 = 0.38;
 
 /// Where the pill sits, in device pixels.
 ///
-/// Bottom-left, near the edge the swipe comes from, so the two affordances teach each
-/// other: someone who taps the pill sees where the gesture lives.
+/// Top-left, vertically centred on the band the shell's own back affordance occupies
+/// (`picker`/`service` put theirs at `y = 60·s`, `96·s` tall): "the way out" lives in
+/// one corner everywhere, and the pill only ever shows where those buttons are covered.
+/// Still on the swipe's edge, so the two affordances keep teaching each other.
 #[must_use]
 pub fn pill_rect(width: u32, height: u32) -> Rect {
     let s = height as f32 / DESIGN_HEIGHT;
@@ -62,11 +69,11 @@ pub fn pill_rect(width: u32, height: u32) -> Rect {
     // Clear of the reserved edge, not merely near it. They are two affordances for one
     // action, and a swipe that starts on the pill should be a swipe rather than an
     // ambiguity the routing order happens to settle.
-    let x = (40.0 * s).max(EDGE_FRACTION * width as f32 + 24.0 * s);
+    let x = (70.0 * s).max(EDGE_FRACTION * width as f32 + 24.0 * s);
     clamp_into(
         Rect {
             x,
-            y: height as f32 - h - 40.0 * s,
+            y: 76.0 * s,
             w,
             h,
         },
@@ -104,6 +111,21 @@ pub fn pill_opacity(age: std::time::Duration) -> f32 {
         return 0.0;
     }
     1.0 - fading.as_secs_f32() / PILL_FADE.as_secs_f32()
+}
+
+/// How present the pill is, given who holds the panel and when it was last touched.
+///
+/// Zero — no layer at all, not a transparent one — unless a session surface holds the
+/// whole panel. Everywhere else the same corner already answers "how do I get out":
+/// the shell's screens carry their own back button there, and Home *is* where the pill
+/// goes. This is the whole visibility policy, recomputed from focus every frame; there
+/// is no flag that could be left set with the pill showing over the wrong screen.
+#[must_use]
+pub fn pill_presence(session_fullscreen: bool, touched: Option<std::time::Duration>) -> f32 {
+    if !session_fullscreen {
+        return 0.0;
+    }
+    touched.map_or(0.0, pill_opacity).max(PILL_SESSION_FLOOR)
 }
 
 struct Palette {
@@ -192,25 +214,30 @@ pub fn render_pill(width: u32, height: u32) -> Result<(Vec<u8>, Rect), PipelineE
     let (w, h) = (rect.w.ceil() as u32, rect.h.ceil() as u32);
     let mut buf = vec![0u8; (w * h * 4) as usize];
 
-    // Local coordinates: the texture is the pill.
+    // Local coordinates: the texture is the pill. Inset like the close badge, because the
+    // outline is stroked *centred* on the plate's boundary and antialiased past that — drawn
+    // at the texture's own bounds, half the rim falls outside the buffer and the pill shows
+    // up with its edge shaved flat.
+    let stroke = (2.0 * s).max(1.0);
+    let inset = stroke / 2.0 + 1.5;
     let local = Rect {
-        x: 0.0,
-        y: 0.0,
-        w: w as f32,
-        h: h as f32,
+        x: inset,
+        y: inset,
+        w: w as f32 - 2.0 * inset,
+        h: h as f32 - 2.0 * inset,
     };
     let radius = local.h / 2.0;
     shape::rounded_rect(&mut buf, w, h, local, radius, pal.plate);
-    shape::rounded_outline(&mut buf, w, h, local, radius, (2.0 * s).max(1.0), pal.edge);
+    shape::rounded_outline(&mut buf, w, h, local, radius, stroke, pal.edge);
 
     // A left chevron, matching the one every "back" on the panel uses, so the gesture and
     // the affordance and the screens all say the same thing with the same mark.
-    let cy = local.h / 2.0;
+    let cy = h as f32 / 2.0;
     shape::chevron(
         &mut buf,
         w,
         h,
-        local.h * 0.52,
+        inset + local.h * 0.52,
         cy,
         local.h * 0.20,
         (3.0 * s).max(1.5),
@@ -223,7 +250,7 @@ pub fn render_pill(width: u32, height: u32) -> Result<(Vec<u8>, Rect), PipelineE
         &mut buf,
         w,
         h,
-        local.h * 0.86,
+        inset + local.h * 0.86,
         cy + text::ascent(&f.regular, px) * 0.36,
         "Home",
         px,
@@ -454,6 +481,38 @@ mod tests {
             pill_opacity(PILL_HOLD + PILL_FADE * 10),
             0.0,
             "a pill that came back would be a smudge on every video"
+        );
+    }
+
+    #[test]
+    fn the_pill_only_exists_over_a_fullscreen_session() {
+        use std::time::Duration;
+        // Freshly touched with the shell foreground — at Home, or on a screen with its
+        // own back button — is still nothing: a pill offering "Home" on the Home screen
+        // has no representation.
+        assert_eq!(pill_presence(false, Some(Duration::ZERO)), 0.0);
+        assert_eq!(pill_presence(false, None), 0.0);
+        // Over a session it is never gone, only dim.
+        assert_eq!(pill_presence(true, None), PILL_SESSION_FLOOR);
+        assert_eq!(pill_presence(true, Some(Duration::ZERO)), 1.0);
+        assert_eq!(
+            pill_presence(true, Some(PILL_HOLD + PILL_FADE * 10)),
+            PILL_SESSION_FLOOR,
+            "faded hands back to the floor, not to nothing"
+        );
+    }
+
+    #[test]
+    fn the_pill_sits_in_the_back_buttons_band() {
+        // One corner means "the way out" everywhere: the pill is vertically centred on
+        // the band the picker's and service screens' back affordances occupy, and it
+        // only ever shows while those are covered.
+        let (w, h) = (1920, 1080);
+        let (_, pill_cy) = pill_rect(w, h).center();
+        let (_, back_cy) = crate::service::back_rect(w, h).center();
+        assert!(
+            (pill_cy - back_cy).abs() < 1.0,
+            "pill centre {pill_cy} vs back centre {back_cy}"
         );
     }
 

@@ -94,9 +94,10 @@ impl KioskApp {
         }
     }
 
-    /// Raise the home pill, or keep it up. Any touch does this: it is the affordance for
-    /// someone who does not know the gesture, so it has to appear for someone who does
-    /// not know to ask for it.
+    /// Note a touch for the home pill's brighten-and-fade. Any touch does this: it is the
+    /// affordance for someone who does not know the gesture, so it has to brighten for
+    /// someone who does not know to ask for it. Whether the pill exists at all is not
+    /// decided here — [`Self::tick_pill`] derives that from focus every frame.
     fn wake_pill(&mut self) {
         self.pill_since = Some(std::time::Instant::now());
     }
@@ -179,21 +180,13 @@ impl KioskApp {
         let Some(render) = self.render.as_mut() else {
             return;
         };
-        // While a session holds the whole panel, the pill never fully leaves: it dims
-        // to a floor instead. It is the one exit affordance that is *structurally* in
-        // the same place on every app view — Spotify's card, YouTube, a cast — and an
-        // affordance that has faded to nothing is indistinguishable from there being
-        // no way out (TODO 16/19). The idle screen keeps the old behavior: nothing is
-        // covering the shell there, so the pill has nothing to offer a way out of.
-        let floor = if render.session_fullscreen() {
-            crate::overlay::PILL_SESSION_FLOOR
-        } else {
-            0.0
-        };
-        let interaction = self
-            .pill_since
-            .map_or(0.0, |since| crate::overlay::pill_opacity(since.elapsed()));
-        let opacity = interaction.max(floor);
+        // The whole visibility policy is `pill_presence`, recomputed from focus every
+        // frame: the pill exists only while a session covers the shell (and with it the
+        // back button the shell's screens keep in the same corner), and while it exists
+        // it never fully leaves — an exit affordance faded to nothing is
+        // indistinguishable from there being no way out (TODO 16/19).
+        let touched = self.pill_since.map(|since| since.elapsed());
+        let opacity = crate::overlay::pill_presence(render.session_fullscreen(), touched);
         if opacity <= 0.0 {
             if self.pill_drawn {
                 render.clear_home_pill();
@@ -211,8 +204,8 @@ impl KioskApp {
             self.pill_drawn = true;
         }
         render.set_home_pill_opacity(opacity);
-        // A finished interaction fade hands over to the floor (or to nothing).
-        if interaction <= 0.0 {
+        // A finished brighten-and-fade hands back to the floor.
+        if touched.is_some_and(|age| crate::overlay::pill_opacity(age) <= 0.0) {
             self.pill_since = None;
         }
     }
