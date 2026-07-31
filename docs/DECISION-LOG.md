@@ -668,7 +668,7 @@ What each recorded problem gets:
   the last is the dmabuf shape the VA-API import already consumes — replacing the
   33 MB/frame CPU `on_paint` copy that CEF's buggy accelerated OSR (#44) forced us onto,
   and letting the browser keep GPU compositing and decode.
-- **Q19's triple pin**: the version-locked FFI ABI (cef crate ↔ cef-binary ↔ forged
+- **#63's triple pin**: the version-locked FFI ABI (cef crate ↔ cef-binary ↔ forged
   `archive.json`) is replaced by an IPC protocol we define — sans-I/O parser, golden
   transcripts, a fake browser in CI. The browser boundary becomes testable per rules 3/6,
   where today the whole path is `doCheck = false`.

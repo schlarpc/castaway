@@ -332,7 +332,7 @@ The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly a
   back through the page console (`castaway-injection-ok src=castaway://scriptlets`). Rules
   auto-update, **and so do the scriptlet bodies**: uBO's module graph is evaluated in QuickJS
   and its own `builtinScriptlets` registry read back, giving 148 resources (the pinned legacy
-  bundle gave 37) and a 38 KB injection on youtube.com — see Q17/Q36.
+  bundle gave 37) and a 38 KB injection on youtube.com — see #60/#62.
 - **Lists refresh daily**, not just at boot, and a *running* receiver picks it up: the engine
   is swapped behind a shared cell, and render processes rebuild when the cache timestamps
   move. Verified by editing the cache under a live receiver and watching a probe rule start

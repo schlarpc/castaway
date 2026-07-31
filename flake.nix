@@ -1092,8 +1092,8 @@
                   # The half that actually breaks is the render process: it loads the
                   # cache only, never fetches, so with nothing cached it injects no uBO
                   # scriptlets at all — while the browser process still blocks network
-                  # requests from its in-memory engine. Exactly the silent failure Q17 and
-                  # Q36 were written to prevent, reintroduced by the deployment.
+                  # requests from its in-memory engine. Exactly the silent failure #60 and
+                  # #62 were written to prevent, reintroduced by the deployment.
                   #
                   # %C is systemd's CacheDirectory root, so this also gives the browser
                   # profile (cookies, "watch as guest") somewhere to persist.

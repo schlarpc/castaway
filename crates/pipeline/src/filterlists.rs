@@ -9,7 +9,7 @@
 //!   code and its arguments; the code itself lives here. Without the bundle those rules
 //!   parse and then do nothing, which is the quietest possible failure.
 //!
-//! Same policy as before for each (OPEN-QUESTIONS Q17): fetch → cache → fall back to the
+//! Same policy as before for each (#60): fetch → cache → fall back to the
 //! cache → fall back to the compact built-in list. A kiosk with no network still blocks
 //! ads; a kiosk with network stays current without a redeploy.
 //!
