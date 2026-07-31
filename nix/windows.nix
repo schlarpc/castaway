@@ -13,7 +13,7 @@
 #
 # `ffmpegSrc`/`electronSrc` are the raw archives, pinned as flake inputs so they land in
 # flake.lock; the derivations beside this file unpack and rearrange them.
-{ pkgs, craneLib, commonArgs, rustToolchain, ffmpegSrc, electronSrc, widevineSrc }:
+{ pkgs, craneLib, commonArgs, rustToolchain, gitRev, ffmpegSrc, electronSrc, widevineSrc }:
 
 let
   inherit (pkgs) lib;
@@ -239,6 +239,15 @@ let
     find ${pkg.pname} | sort | zip -qX "$out/${pkg.pname}.zip" -@
   '';
 
+  # All four artifacts extend one bare dependency tree instead of each compiling every
+  # dependency from scratch: the feature variants differ from the canary only by what
+  # their features drag in. Crane's `buildDepsOnly` cannot chain, hence the helper.
+  depsOnlyFrom = import ./deps-only-from.nix { inherit craneLib lib; };
+  crossBaseArtifacts = craneLib.buildDepsOnly (crossArgs // {
+    pname = "castaway-windows";
+    cargoExtraArgs = "--package castaway";
+  });
+
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
   mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withBrowser ? false }:
@@ -249,7 +258,15 @@ let
       args = crossArgs // { inherit cargoExtraArgs; };
       pkg = craneLib.buildPackage (args // {
         inherit pname;
-        cargoArtifacts = craneLib.buildDepsOnly args;
+        cargoArtifacts =
+          if features == [ ] then
+            crossBaseArtifacts
+          else
+            depsOnlyFrom crossBaseArtifacts (args // { inherit pname; });
+
+        # The revision the idle screen's footer shows — final builds only, never
+        # `crossArgs`, where the deps trees would inherit it and rebuild each commit.
+        CASTAWAY_GIT_REV = gitRev;
 
         # Windows has no rpath and no /nix/store to resolve against: the loader looks for
         # DLLs next to the .exe. Anything dynamically linked has to be copied in, or the

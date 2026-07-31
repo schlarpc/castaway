@@ -259,11 +259,6 @@
           };
           strictDeps = true;
 
-          # The revision the footer on the idle screen shows. Passed in rather than shelled
-          # out for, because the build sandbox has no `.git` and no `git` — see the app's
-          # `build.rs`, which falls back to asking git only for a plain `cargo build`.
-          CASTAWAY_GIT_REV = self.shortRev or self.dirtyShortRev or "unknown";
-
           buildInputs = [
             # Add additional build inputs here
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
@@ -276,10 +271,29 @@
           ];
         };
 
+      # The revision the footer on the idle screen shows. Passed in rather than shelled
+      # out for, because the build sandbox has no `.git` and no `git` — see the app's
+      # `build.rs`, which falls back to asking git only for a plain `cargo build`.
+      #
+      # Set on the final package builds only, never in `commonArgs`: everything there is
+      # inherited by every `buildDepsOnly`, and an env var that changes at each commit
+      # invalidates all of the dependency trees each time — which is exactly the
+      # source-insensitivity crane's dummy-src machinery exists to prevent. The checks
+      # build with the "unknown" fallback instead; nothing shipped comes out of a check.
+      gitRev = self.shortRev or self.dirtyShortRev or "unknown";
+
       # Build only dependencies (for caching)
       cargoArtifactsFor = system:
         let craneLib = cranelibFor system;
         in craneLib.buildDepsOnly (commonArgsFor system);
+
+      # `buildDepsOnly`, but extending the base artifacts above rather than starting
+      # empty — see nix/deps-only-from.nix. The feature-set trees (kiosk, audio,
+      # hwaccel) compile only what their features add on top of the portable tree.
+      depsOnlyFromFor = system: import ./nix/deps-only-from.nix {
+        craneLib = cranelibFor system;
+        lib = nixpkgs.lib;
+      };
 
       # The Widevine CDM, staged into the browser's profile so a panel that has never
       # been online can still play protected video (G46, re-proven under D36/Q42).
@@ -328,6 +342,9 @@
         pkgs = pkgsFor system;
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
+        baseCargoArtifacts = cargoArtifactsFor system;
+        depsOnlyFrom = depsOnlyFromFor system;
+        inherit gitRev;
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
         moonlightCommonC = moonlightCommonCFor system;
@@ -341,6 +358,7 @@
         craneLib = cranelibFor system;
         commonArgs = commonArgsFor system;
         rustToolchain = rustToolchainFor system;
+        inherit gitRev;
         ffmpegSrc = ffmpeg-windows-src;
         electronSrc = electron-windows-src;
         widevineSrc = widevine-windows-src;
@@ -362,6 +380,7 @@
           # Darwin), and what `checks.build` compiles so `nix flake check` stays cheap.
           castaway-portable = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
+            CASTAWAY_GIT_REV = gitRev;
             # Only run tests during the check phase, not during build
             doCheck = false;
           });
@@ -431,6 +450,7 @@
           craneLib = cranelibFor system;
           commonArgs = commonArgsFor system;
           cargoArtifacts = cargoArtifactsFor system;
+          depsOnlyFrom = depsOnlyFromFor system;
 
           # What the `hwaccel` feature needs on top of a default build: ffmpeg's headers
           # for `ffmpeg-sys-next` (7.x, matching the crate — nixpkgs defaults to 8.x) and
@@ -558,8 +578,8 @@
           # tests assert on the decoded audio's level, so a path that produces silence
           # fails here rather than in the room.
           audio = craneLib.cargoNextest (commonArgs // {
-            cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
-              pname = "castaway-audio-deps";
+            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
+              pname = "castaway-audio";
               inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS LDACBT_LIB_DIR;
               cargoExtraArgs = audioArgs.cargoExtraArgs;
             });
@@ -577,8 +597,8 @@
           };
 
           hwaccel-clippy = craneLib.cargoClippy (commonArgs // {
-            cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
-              pname = "castaway-hwaccel-deps";
+            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
+              pname = "castaway-hwaccel";
               inherit (hwaccelArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
               cargoExtraArgs = hwaccelArgs.cargoExtraArgs;
             });

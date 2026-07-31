@@ -34,7 +34,7 @@
 # LD_LIBRARY_PATH is still set, but only for *our* binary now — the Vulkan/Wayland/X11
 # libraries winit and wgpu dlopen. The browser brings its own, because it is a separate
 # process with its own wrapper.
-{ pkgs, craneLib, commonArgs, electron, widevineCdm, moonlightCommonC, ldacbt }:
+{ pkgs, craneLib, commonArgs, baseCargoArtifacts, depsOnlyFrom, gitRev, electron, widevineCdm, moonlightCommonC, ldacbt }:
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
@@ -97,11 +97,18 @@ let
   ];
 in
 craneLib.buildPackage (commonArgs // kioskArgs // {
-  # Its own dependency build: the feature set differs from the portable package's, so it
-  # cannot share those artifacts.
-  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // kioskArgs // {
-    pname = "castaway-kiosk-deps";
+  # Its own dependency tree: the feature set differs from the portable package's, so the
+  # crates the features drag in (ffmpeg-sys, bindgen, pipewire, …) cannot come from those
+  # artifacts — but everything shared can, so this extends them instead of starting from
+  # an empty target dir.
+  cargoArtifacts = depsOnlyFrom baseCargoArtifacts (commonArgs // kioskArgs // {
+    pname = "castaway-kiosk";
   });
+
+  # The revision the idle screen's footer shows. On the final build only — in
+  # `kioskArgs`/`commonArgs` it would reach the deps build above and invalidate every
+  # compiled dependency at each commit.
+  CASTAWAY_GIT_REV = gitRev;
 
   # The render/browser tests want a GPU and a display; the sandbox has neither.
   doCheck = false;
