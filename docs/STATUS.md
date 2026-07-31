@@ -289,7 +289,7 @@ picker longer than the panel cannot scroll, and #24's theming is unstarted — t
 assets and palette are vendored, nothing uses them, and the font is still DejaVu.
 
 ## Biggest open items (see the issue tracker)
-0. ~~**Q44 — there is no chooser.**~~ **Done** — see the shell above. **Q43** remains: the
+0. ~~**#77 — there is no chooser.**~~ **Done** — see the shell above. **#33** remains: the
    GameStream media plane has never run against a host with a real encoder, and only
    hardware settles that.
 1. ~~**#56** — Cast TLS actor + AirPlay RTSP actor.~~ **Done**: both listen, both are

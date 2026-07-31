@@ -126,7 +126,7 @@ Three rules it exists to enforce:
   it is where the rows went.
 - **Picker** — a list with a title and a back affordance. Generic over what it lists:
   GameStream hosts, then that host's apps, then settings and output devices (see §6
-  item 12), later media files. This is the screen that closes Q44.
+  item 12), later media files. This is the screen that closes #77.
 - **Session** — something is playing. Video, or the now-playing card plus transport strip.
   Roughly what exists today.
 - **Browser** — a cast surface (YouTube leanback, Cast app surfaces) filling the panel.
@@ -291,7 +291,7 @@ Landed, in this order, each independently useful:
    thing anyone saw and none of it was about what they were doing.
 5. **Input routing.** Transport, then shell, then browser; the middle only where nothing
    covers it.
-6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes Q44. Pairing is
+6. **The Moonlight picker.** Tile → hosts → apps → streaming. Closes #77. Pairing is
    part of the walk-up now: pressing an unpaired host shows a panel-generated PIN and
    waits for it to be typed into Sunshine's web UI — one pairing at a time, a
    three-minute panel-side timeout (the protocol layer rightly has none), and a retry
