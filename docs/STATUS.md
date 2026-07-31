@@ -1,12 +1,20 @@
 # Build Status — autonomous session 2026-07-23
 
 Snapshot for our next sync. Companion to DECISION-LOG.md (why) and the issue tracker
-(what needs you; `docs/OPEN-QUESTIONS.md` was migrated there and deleted — see #105). Everything below builds with `cargo build`, passes `cargo test`
-(~150 tests), passes `cargo clippy --all-targets -- -D warnings`, `nix build` produces a
-running binary, and `nix build .#checks.x86_64-linux.integration-vm` passes the two-VM
-integration test.
+(what needs you; `docs/OPEN-QUESTIONS.md` was migrated there and deleted — see #105).
+Everything below builds with `cargo build`, passes `cargo nextest run` (1404 tests),
+passes `cargo clippy --all-targets -- -D warnings`, `nix build` produces a running
+binary, and `nix flake check` passes — which includes the VM tests (integration,
+miracast, bluetooth, gamestream), the openscreen differential checks, and the four
+Windows cross-build DLL-closure checks.
 
-## What exists (19 crates, workspace per architecture-substrate.md §2)
+## What exists (workspace per architecture-substrate.md §2)
+
+The table below describes 19 crates; the workspace now has 30. The Bluetooth stack
+(`proto-bluetooth-audio`, `substrate-hci`, `substrate-l2cap`, `substrate-sdp`,
+`hci-transport`, `ldac-sys`), `crypto-playfair`, `cast-replay`, `paths` and `sponsorblock`
+arrived after it was written and are covered in the sections further down rather than
+here.
 
 | Crate | State |
 |---|---|
@@ -30,7 +38,7 @@ integration test.
 | `moonlight-sys` | **Bindings, pinned and checked in.** FFI to moonlight-common-c, the linked GameStream core (D37). Regenerated from the same revision Nix builds; struct layouts guarded by bindgen's compile-time size/offset asserts. |
 | `proto-gamestream` | **Paired against real Sunshine; never yet streamed.** The one *inverted* protocol — the panel is the Moonlight client, so it browses and dials rather than advertising and waiting. Ours: mDNS host discovery, the NVHTTP API as request builders + rich response types, the gen-7 pairing handshake as a typestate machine, the client identity, per-host pairing persistence, and the adapter. Verified three ways: against Sunshine's own checked-in vectors (its `clientchallenge` ciphertext, its phase-4 hash, its `clientpairingsecret` signature), through all four phases over real sockets against a scripted host, and — the one that counts — against the **real `sunshine` binary in a VM**, which pairs, trusts us over mutual TLS, and serves its app list (`checks.gamestream-vm`). Linked, behind the off-by-default `stream` feature: RTSP, ENet control, FEC'd RTP video, encrypted Opus audio, input. **Not done:** no session has ever run against a real Sunshine host — everything between "the host said 200 to /launch" and pixels is unverified. The chooser exists now (D38's shell), and pairing is walk-up too: pressing an unpaired host puts a panel-generated PIN on the glass, holds the handshake open while someone types it into Sunshine's web UI, and refreshes into the app list — the config-driven startup pairing shares the same `pair()` and remains for headless boxes. The panel-initiated *screens* have never faced a real Sunshine (the underlying handshake has, via `checks.gamestream-vm`). The linked half is GPL-3.0 against this MIT tree, so `castaway-portable` does not link it. |
 | `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. Browser: the Electron subprocess host behind `electron` (D36). What is on the glass is one model — `panel` (screens, surfaces, focus; everything else derived) — and how it *moves* between those states is `motion` (springs, one choreography table), both pure and unit-tested with no GPU (D46). The compositor grew an animatable corner radius and an independent source rect so a container of the wrong shape crops rather than stretches. |
-| `control-display` | Null backend + Dell RS-232 frame encoder (opcodes placeholder, #21). |
+| `control-display` | **Trait and encoder only — no backend reaches hardware.** `NullDisplay` logs, and it is what `app` constructs unconditionally. `dell.rs` builds the RS-232 command frame (header/id/category/opcode/len/data/XOR) with **placeholder opcodes**, and nothing sends it. The `serial` and `ddc` features are empty feature lists — no `serialport`, no `ddc-hi`, no module behind either (#21). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to the browser *or* to the panel's transport strip, whichever owns the point touched (D33). |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. The network surface is a registry (D45): `surface.rs` generates `docs/network-surface.md` and `nix/network-surface.json` (freshness-tested), the NixOS firewall derives from the JSON, media planes bind from `[media_ports]`, raw binds are clippy-denied outside registered sites, and `--network-surface[=json\|netsh]` prints the resolved view. |
 
@@ -177,7 +185,9 @@ the resulting refresh token into `.env.local` itself rather than asking for a pa
   headless on Xvfb, and passed both `yt-selfplay` modes with real video composited at 4K.
 - `packages.castaway-portable` — no renderer, no browser, nothing platform-specific.
   Serves and discovers; **cannot** play YouTube, and honestly declines to advertise DIAL
-  (D27). What CI builds, and what `default` still is on Darwin.
+  (D27). What `default` still is on Darwin. CI builds it *and* all four Windows
+  artifacts — `nix flake check` folds in the `castaway-windows-*-dll-closure` checks,
+  each of which builds its `.exe` before reading its imports (#25).
 - `packages.castaway-windows-electron` — the Windows deploy artifact, cross-compiled
   (append `.archive` for the same tree as a single zip).
 
@@ -263,8 +273,10 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
   flag, and falls back to software mid-session with a log line. The Windows half
   (D3D11VA → shared NV12 texture → D3D12) is cross-compiled and DLL-closure-checked but
   needs the Dell to run.
-- **Kiosk**: winit borderless-fullscreen surface path — compile-verified (not run on the
-  dev box's live display).
+- **Kiosk**: winit borderless-fullscreen surface path. Now run on the dev box's live
+  display rather than only compile-checked — see #59, where the idle loop was measured at
+  0.00% of a core after the move to demand-driven rendering. The *panel* is still the
+  unknown: nothing here has met the C6522QT.
 - Run it: `nix develop --command cargo run -p castaway --features render` (opens a
   fullscreen window; cast a video via DLNA to see it decode+display).
 
@@ -284,31 +296,69 @@ the panel was touched in the last twenty seconds.
 screen to PNG, which is how the layout was reviewed — hit-testing is unit-tested, but
 whether a screen reads from across a room is not something a test can answer.
 
-**Not done:** transitions between screens (the only animation is the pill's fade), a
-picker longer than the panel cannot scroll, and #24's theming is unstarted — the brand
-assets and palette are vendored, nothing uses them, and the font is still DejaVu.
+**Since done:** screens animate between each other (`render_pipeline::Transition`, on
+the lossless command lane because a dropped transition desynchronises the panel from its
+own state machine), a picker longer than the panel scrolls (`picker.scroll`, fractional so
+a drag moves smoothly), and #24's theming is under way rather than unstarted —
+`pipeline::theme` is one palette for every surface, taken from dma.space's own CSS with
+provenance in `assets/brand/README.md`, and the mark and mascot are drawn. **Still not
+done** on the theming side: the font is still DejaVu, and the easter-egg palettes,
+scrolling long titles and blurred pillarbox borders #24 asks for are unwritten.
 
 ## Biggest open items (see the issue tracker)
-0. ~~**#77 — there is no chooser.**~~ **Done** — see the shell above. **#33** remains: the
-   GameStream media plane has never run against a host with a real encoder, and only
-   hardware settles that.
-1. ~~**#56** — Cast TLS actor + AirPlay RTSP actor.~~ **Done**: both listen, both are
-   driven end-to-end by the VM test. What's left behind them is the media plane, below.
-2. **#39** — FairPlay-SAP + AirPlay pairing captures (gates AirPlay mirroring).
-3. ~~**#57** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.~~ **Mostly
-   done**: all three `FrameSource` variants reach composited pixels in readback tests.
-   What's left is the kiosk surface on the real panel.
-4. ~~**#58** — hardware-accelerated decode.~~ **Done on Linux**, proven zero-copy by an
-   offscreen readback test; the Windows D3D11VA bridge is written and cross-compiled but
-   unverified until the Dell.
-5. **#40** — a real Cast device credential, and now the only thing between this receiver
-   and an official sender. ~~#51~~ is resolved as to mechanism: `checks.openscreen-device-auth`
-   compiles openscreen's sender-side verifier and shows our auth response passing every
-   check but the trust root. `[cast.credential]` reads one off disk; the acceptance test
-   is already written and currently red by design.
-6. ~~**#53/#54** — Cast mirroring RTP receive loop + IV validation.~~ **Done**: the
-   receive path is differential-tested against openscreen's `RtpPacketizer` +
-   `FrameCrypto`, compiled from a pinned checkout by the `openscreen-rtp-fixtures` check.
+
+Rewritten 2026-07-31 against the issue tracker, after the open-questions file was retired
+into it. The struck-through history this list used to carry now lives in the closed issues.
+
+**Blocked on the panel, or on hardware we do not have.** Nothing here is a code question:
+
+1. **#58** — the Windows D3D11VA → shared-NV12 → D3D12 decode bridge. Written,
+   cross-compiled, DLL-closure-checked, never run. Linux cannot exercise it.
+2. **#64** — the same shape one layer up: Electron's shared-texture OSR passed its gate on
+   Linux at true 4K/60 with zero drops, and its Windows leg (NT handle → `OpenSharedHandle`
+   + keyed mutex) is unproven. Production fd transport is still the spike's `pidfd_getfd`
+   shortcut rather than `SCM_RIGHTS`.
+3. **#33** — the GameStream media plane has never run against a host with a real encoder.
+   Everything up to `/launch` is proven against real Sunshine; past it, nothing is.
+4. **#17** — no real Miracast driver. hwsim is the best-behaved mac80211 there is; the
+   interface-combination parse and the 5 GHz NO-IR question both need a radio.
+5. **#65** — touch through CDP has never met glass.
+6. **#21 / #55** — there is still no display-control backend at all: `serial` and `ddc` are
+   empty feature lists, `dell.rs` is a frame encoder with placeholder opcodes, and `app`
+   constructs `NullDisplay` unconditionally. #55 is what that costs — the panel sleeps and
+   takes the HDMI audio sink, and a Bluetooth session with no pixels of its own goes silent.
+
+**Blocked on a capture or a credential.** Ground rule 9's cost, itemised:
+
+7. **#40** — a real Cast device credential, and the only thing between this receiver and an
+   identity of its own. `checks.openscreen-device-auth` compiles openscreen's sender-side
+   verifier and shows our response passing every check but the trust root; the borrowed CKS
+   and AirServer chains work today and are someone else's to revoke.
+8. **#74** — the Bluetooth cover-art chain runs end to end in the harness and has never met
+   a phone. One phone visit also answers #75 (`GetImageProperties`) and #76 (which player
+   application settings an iPhone exposes).
+9. **#48** — the Spotify pairing blob is round-trip tested against our own encoder and
+   nothing else. A wrong split fails as "pairing expired", indistinguishable from a stale
+   blob.
+10. **#41** — no golden YouTube Lounge bind-channel transcript.
+
+**Open on measurement, and cheap.** These need a session and a log line, not hardware:
+
+11. **#52** — a Cast `LOAD` from VLC-iOS plays at ~2 fps. The decode thread is *waiting* on
+    the media clock, not starved; the clock's audio master is the suspect and the next step
+    is ears plus two TRACE lines.
+12. **#79** — `av_skew_ms` reads 17 hours and moves at 3.3× wall rate. Nothing visible is
+    broken by it, but no presentation clock can be argued for while the only number that
+    would justify one is this.
+13. **#81** — the AirPlay card says "Unknown device" and 0:00 for data already on the wire.
+    Both halves are root-caused and small.
+14. **#83** — the card flashes on pause and the layout jumps when the transport strip
+    appears. Not investigated.
+
+**Open on a decision.** #80 (build AirPlay's HLS video path or keep advertising a session
+we do not serve), #82 (should an AirPlay session be controllable from the panel at all,
+given the phone is in the room), #72 (party mix, deferred and wanted), #16 (host real Cast
+receiver apps — the shape is decided, the platform shim is the unknown).
 
 ## Browser + adblock + YouTube (proven on CEF; the runtime is now Electron — D36)
 
