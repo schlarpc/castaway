@@ -1288,3 +1288,75 @@ the reasons are what a future reversal has to argue against.
   proven, and a sender that tries gets a session that negotiates cleanly and then shows
   nothing. That is the honest cost of the mask, and it is worth revisiting only together
   with this.
+
+- **Q51 — the AirPlay now-playing card is missing two things that are already on the
+  wire. OPEN, both root-caused, both small.** Observed on a live audio session
+  2026-07-31: the card says **"Unknown device"** and its scrubber sits at **0:00** while
+  showing the correct duration. Neither is a missing feature; both are data this
+  receiver already receives and drops.
+
+  **The sender's name.** The first `SETUP` plist carries `name: "iPhone"`,
+  `model: "iPhone17,1"` and `deviceID`, captured verbatim. `SourceDescription::
+  with_display_name` exists and every other adapter calls it; `proto-airplay` never
+  does, so the card falls back to its "Unknown device" placeholder. The next step is
+  literally to read those keys in `accept_key_material` and emit a `SourceInfo` carrying
+  them, with the peer address as `address`.
+
+  **The position.** `SET_PARAMETER` sends `progress: start/now/end` as RTP timestamps, so
+  it means nothing without the rate of the stream it belongs to — and `set_parameter`
+  reads that rate from `RaopState`, which **only the SDP path populates**. A session that
+  negotiated through a `SETUP` plist leaves `RaopState::Idle`, so `params()` is `None` and
+  the progress event is never emitted at all. The duration survives because it arrives by
+  a different road entirely: the DMAP `astm` tag in the metadata block. That is the whole
+  of "0:00 but the right duration".
+
+  The fix is to take the rate from whichever stream this session negotiated rather than
+  from the one path that happens to keep it. Note the plist path's parameters are *taken*
+  by the actor when the stream starts, so it cannot simply be read back later — the rate
+  has to be kept when it is negotiated. This is the same family of defect as `2265e09`
+  and `f546649`: state that only the SDP path fills in, read unconditionally.
+
+- **Q52 — no transport controls for an AirPlay session, and the credentials for them
+  arrive in every request. OPEN; needs a decision, then a small subsystem.** The panel
+  shows no play/pause/skip for AirPlay (`ControlCapabilities(0)` in the log) because
+  nothing here can send a command *to* an AirPlay sender. AirPlay's answer is **DACP**:
+  every request the sender makes carries `DACP-ID` and `Active-Remote` headers —
+  `DACP-ID: C6CC90609BE759A3`, `Active-Remote: 1294057596` in the capture — and those two
+  are exactly the credentials for the reverse channel. The receiver resolves
+  `<DACP-ID>._dacp._tcp` over mDNS to find the *sender's* HTTP port, then issues
+  `GET /ctrl-int/1/playpause`, `/nextitem`, `/previtem`, `/beginff`, `/setproperty?dmcp.
+  volume=` with `Active-Remote` as a bearer header.
+
+  Three things make this smaller than it sounds and one makes it bigger. Smaller: we
+  already capture both headers on every request; we already run an mDNS responder that
+  can browse (`proto-gamestream` browses `_nvstream._tcp` today); and the transport strip
+  and `ControlTxn` plumbing already exist and are driven by other adapters. Bigger: it is
+  a *browse plus outbound HTTP client* in a crate that has so far only ever been a
+  server, and it is the first time this receiver would act as a control point on the LAN.
+
+  Wants a decision on whether an AirPlay session should be controllable from the panel at
+  all, given the phone is in the room and is the obvious remote.
+
+- **Q53 — the now-playing card flashes on pause and jumps when the transport strip
+  appears. OPEN; not investigated, reported from a live session 2026-07-31.** Two
+  symptoms on the audio-session path, which is the card plus the strip and no video
+  layer:
+
+  1. **Pausing on the phone flashes the whole screen.** A state change re-rasterizes the
+     card, which is a full-surface raster — tens of megabytes at 4K. `card_shown` already
+     exists to skip the raster when the pixels would not differ (it is what keeps the
+     once-a-second position update cheap), so the question is why a pause is not caught
+     by it, and whether the flash is the raster itself or the texture being replaced
+     under a live layer.
+  2. **The layout shifts when the strip comes and goes.** The card is authored for a
+     surface, the strip is placed separately, and the card's geometry depends on whether
+     the strip is there — so its appearance moves everything. Whether the right answer is
+     to reserve the strip's space always, to float the strip over the card, or to
+     animate the change, is a design decision rather than a bug report.
+
+  Worth noting alongside: `LayerId::Transport` is ordered **below** `Video`, deliberately
+  ("a sender with pixels of its own outranks controls for a sender without them"). Since
+  `c3ada88` a pillarboxed video layer is opaque across its whole slot, so on a *video*
+  session the strip is now covered by the mattes rather than showing through the gap
+  beside the picture — which is the ordering working as written, but it does mean the
+  bars are the one place a strip could usefully live and currently cannot.
