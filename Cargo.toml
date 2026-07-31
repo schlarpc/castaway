@@ -109,7 +109,7 @@ prost = "0.13"
 prost-build = "0.13"
 
 # --- networking / discovery ---
-mdns-sd = "0.13"
+mdns-sd = "0.20"
 # Blocking HTTP, used off-runtime via spawn_blocking (EasyList; the Lounge screen lookup).
 ureq = "2"
 # Scriptlet resources in tests, and the CKS response fields, which arrive base64

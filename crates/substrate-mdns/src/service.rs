@@ -10,36 +10,58 @@ use crate::error::MdnsError;
 
 /// The longest a single DNS label may be, in octets (RFC 1035 §2.3.4).
 ///
-/// `mdns-sd` does not clamp: `DnsOutPacket::write_utf8` asserts `len < 64` and *panics*
-/// on the daemon thread, which takes the whole responder down without a log line.
+/// `mdns-sd` does not clamp to it: `DnsOutPacket::write_utf8` refuses a longer label
+/// with `WriteError::NameTooLong`, so the record is silently never written. (Before
+/// 0.20 it asserted instead and panicked on the daemon thread, taking the whole
+/// responder down with it.) Either way nothing reaches a log, so the clamp is ours.
 const MAX_LABEL_OCTETS: usize = 63;
 
 /// A DNS-SD service instance name, guaranteed to survive encoding as **exactly one DNS
 /// label**.
 ///
-/// This type exists because the alternative was invisible. `mdns-sd` composes the
-/// record's owner name as the *string* `"{instance}.{type}.{domain}"` and then encodes
-/// it by splitting on every `'.'` — it implements no escape (`\.`) at all, in either
-/// direction. So an instance name containing a dot silently becomes two labels on the
-/// wire, and the resulting PTR rdata (`dma.space/screen#airplay._airplay._tcp.local.`,
-/// five labels) is not a DNS-SD service instance name. Bonjour's
-/// `DeconstructServiceName()` requires exactly one instance label before `_app._proto`,
-/// so mDNSResponder — and Avahi — discard the record entirely. Observed directly: with
-/// `friendly_name = "dma.space/screen"` the receiver's own `avahi-browse -r -t
-/// _airplay._tcp` on the advertising host listed the LAN's Apple TV and Sony receiver
-/// and *not* the receiver itself, while a packet dump showed our PTR/SRV/TXT going out
-/// on the wire. Nothing logs; the receiver simply does not exist to any conformant
-/// resolver, which is exactly what "not visible in iOS Screen Mirroring" looks like.
+/// ## What may be in one
 ///
-/// So the label is a parsed type rather than a `String` that happens to be well-formed
-/// today (ground rule 1): every path into the responder goes through
-/// [`MdnsService::new`], and there is no way to hand it a name that cannot be encoded.
-/// The conversion is total on purpose — a fallible constructor would turn a cosmetic
-/// name problem into a *dropped advertisement*, which is the same invisibility with a
-/// different cause.
+/// Nearly anything. RFC 6763 §4.1.1 makes the instance portion "arbitrary Net-Unicode
+/// text", barring only ASCII control characters, and §4.3 says a literal `'.'` is
+/// carried by escaping it as `\.` when the three portions are concatenated into
+/// presentation format. `/` and `#` need no special handling at all, and neither does a
+/// dot once the encoder escapes it — the LDH (letters/digits/hyphen) rule people reach
+/// for here governs *host* names, which is the SRV target, not this. The Apple TV on the
+/// test LAN advertises `Living Room (2)`, spaces and parentheses included.
+///
+/// The one hard limit is length: 63 octets, measured on the *unescaped* label, because
+/// that is what is length-prefixed on the wire.
+///
+/// ## Why it is still a type
+///
+/// A too-long label is a silent failure. `mdns-sd` refuses to encode one
+/// (`WriteError::NameTooLong`), so the record simply does not go out; before 0.20 it
+/// asserted instead, taking down its own daemon thread and every other advertisement
+/// with it. The reachable case is RAOP, whose instance is `<DEVICEID>@<name>` — thirteen
+/// octets on top of a name the app already caps at 63.
+///
+/// Either way nothing that looks like an error reaches a log, and a receiver missing
+/// from the wire is indistinguishable from one that is switched off. So the bound is
+/// enforced by parsing at the boundary (ground rule 1): every path into the responder
+/// goes through [`MdnsService::new`], and there is no way to hand it a name that cannot
+/// be encoded. The conversion is total on purpose — a fallible constructor would turn a
+/// cosmetic name problem into a dropped advertisement, which is the same invisibility
+/// with a different cause.
+///
+/// ## History
+///
+/// This type first shipped substituting `'-'` for every `'.'`, because `mdns-sd` 0.13
+/// composed the owner name as the string `"{instance}.{type}.{domain}"` and split it on
+/// every dot with no escape implemented in either direction. `dma.space/screen` went out
+/// as five labels where DNS-SD permits one instance label, and mDNSResponder and Avahi
+/// both discard such a record — which is precisely what "not visible in iOS Screen
+/// Mirroring" looked like, with the RTSP listener bound and reporting ready and not one
+/// inbound connection ever. 0.20 implements RFC 6763 §4.3 properly, so the substitution
+/// is gone and the panel keeps the name it was given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceLabel {
-    /// The label as it will be encoded: no `'.'`, at most [`MAX_LABEL_OCTETS`] octets.
+    /// The label as it will be encoded: at most [`MAX_LABEL_OCTETS`] octets. Dots are
+    /// kept — escaping them is the encoder's job.
     label: String,
     /// What was asked for, when that differs — so the rewrite is visible in the log
     /// instead of quietly changing the name shown in a picker.
@@ -49,18 +71,13 @@ pub struct InstanceLabel {
 impl InstanceLabel {
     /// Parse an instance name into something encodable.
     ///
-    /// Two things are repaired, both of which are otherwise silent failures:
-    ///
-    /// - `'.'` becomes `'-'`, because a dot is `mdns-sd`'s label separator and there is
-    ///   no escape that survives its encoder.
-    /// - the label is truncated to [`MAX_LABEL_OCTETS`] on a character boundary. The
-    ///   reachable case is RAOP, whose instance is `<DEVICEID>@<name>` — thirteen octets
-    ///   on top of a name the app already caps at 63 — and the failure mode is a panic
-    ///   inside the mDNS daemon thread, not a rejected registration.
+    /// The label is truncated to [`MAX_LABEL_OCTETS`] on a character boundary, and
+    /// nothing else is touched: punctuation, spaces and dots are all legal in an
+    /// instance name and are the caller's to choose.
     #[must_use]
     pub fn new(raw: impl AsRef<str>) -> Self {
         let raw = raw.as_ref();
-        let mut label: String = raw.replace('.', "-");
+        let mut label: String = raw.to_owned();
         if label.len() > MAX_LABEL_OCTETS {
             let mut end = MAX_LABEL_OCTETS;
             while end > 0 && !label.is_char_boundary(end) {
@@ -236,15 +253,39 @@ mod tests {
         assert!(s.qualified_type().is_err());
     }
 
-    /// Encode a fullname the way `mdns-sd`'s `DnsOutPacket::write_name` does: split on
-    /// every `'.'`, one length-prefixed label each, terminated by a zero octet. No
-    /// escape processing, because `mdns-sd` implements none — this *is* its encoder.
+    /// Split a presentation-format name into labels the way a resolver does, honouring
+    /// RFC 6763 §4.3: `\.` is a literal dot inside a label, `\\` a literal backslash,
+    /// and only an *unescaped* dot ends a label.
+    ///
+    /// Deliberately written against the RFC rather than mirrored from `mdns-sd`, so the
+    /// assertions below say what a conformant peer sees and not what our dependency
+    /// happens to do.
+    fn labels_of(fullname: &str) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut current = String::new();
+        let mut chars = fullname.trim_end_matches('.').chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some(escaped) => current.push(escaped),
+                    None => current.push('\\'),
+                },
+                '.' => labels.push(std::mem::take(&mut current)),
+                other => current.push(other),
+            }
+        }
+        labels.push(current);
+        labels
+    }
+
+    /// The wire form: each label length-prefixed, terminated by a zero octet. The
+    /// length is measured on the *unescaped* label, which is what is actually written.
     fn wire_name(fullname: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        for label in fullname.trim_end_matches('.').split('.') {
+        for label in labels_of(fullname) {
             assert!(
                 label.len() < 64,
-                "mdns-sd panics on a {}-octet label",
+                "a {}-octet label cannot encode",
                 label.len()
             );
             out.push(u8::try_from(label.len()).unwrap());
@@ -254,77 +295,79 @@ mod tests {
         out
     }
 
-    /// Split a wire-format name back into labels, as any DNS-SD resolver does.
-    fn wire_labels(name: &[u8]) -> Vec<&[u8]> {
-        let mut labels = Vec::new();
-        let mut i = 0;
-        while name[i] != 0 {
-            let len = usize::from(name[i]);
-            labels.push(&name[i + 1..i + 1 + len]);
-            i += 1 + len;
-        }
-        labels
-    }
-
     #[test]
-    fn a_dotted_instance_name_still_encodes_as_one_label() {
-        // The receiver's real configured name. Before `InstanceLabel` this produced the
-        // five-label PTR rdata `dma | space/screen#airplay | _airplay | _tcp | local`,
-        // which Bonjour's DeconstructServiceName() rejects outright — so neither iOS
-        // Screen Mirroring nor `avahi-browse` on the advertising host ever listed us.
+    fn a_dotted_instance_name_occupies_exactly_one_label() {
+        // The receiver's real configured name, carried through the actual `ServiceInfo`
+        // rather than a hand-built string — the escaping is `mdns-sd`'s to do, and the
+        // point of the test is that we hand it something it can do that to.
+        //
+        // Under 0.13 this produced the five-label PTR rdata
+        // `dma | space/screen#airplay | _airplay | _tcp | local`, which Bonjour's
+        // DeconstructServiceName() rejects outright, so neither iOS Screen Mirroring nor
+        // `avahi-browse` on the advertising host ever listed us.
         let s = MdnsService::new(
             "_airplay._tcp",
             "dma.space/screen#airplay",
             "castaway",
             7000,
         );
-        let fullname = format!("{}.{}", s.instance, s.qualified_type().unwrap());
-        let wire = wire_name(&fullname);
-        let labels = wire_labels(&wire);
+        let fullname = s.to_service_info().unwrap().get_fullname().to_string();
 
-        // Byte-exact, against the shape every real receiver on the LAN puts on the wire
-        // (`STR-AZ1000ES | _airplay | _tcp | local`, four labels).
-        assert_eq!(
-            wire,
-            b"\x18dma-space/screen#airplay\x08_airplay\x04_tcp\x05local\x00".to_vec(),
+        assert!(
+            fullname.contains("dma\\.space"),
+            "the literal dot must be escaped in presentation format, got {fullname}"
         );
+
+        let labels = labels_of(&fullname);
         assert_eq!(
-            labels.len(),
-            4,
+            labels,
+            vec!["dma.space/screen#airplay", "_airplay", "_tcp", "local"],
             "instance name must occupy exactly one label"
         );
-        assert_eq!(labels[0], b"dma-space/screen#airplay");
-        assert_eq!(labels[1], b"_airplay");
+
+        // Byte-exact, against the shape every real receiver on the LAN puts on the wire
+        // (`STR-AZ1000ES | _airplay | _tcp | local`, four labels). `/` and `#` need no
+        // escape and no repair — RFC 6763 §4.1.1 allows any punctuation here.
+        assert_eq!(
+            wire_name(&fullname),
+            b"\x18dma.space/screen#airplay\x08_airplay\x04_tcp\x05local\x00".to_vec(),
+        );
     }
 
     #[test]
     fn the_raop_instance_cannot_overflow_a_label() {
         // RAOP prefixes `<DEVICEID>@`, thirteen octets on top of a friendly name the app
-        // already caps at the 63-octet label limit. `mdns-sd`'s encoder asserts
-        // `len < 64` and panics on its own daemon thread, so this is not a cosmetic cap:
-        // uncapped, the whole responder dies with no log line.
+        // already caps at the 63-octet label limit. Over that, `mdns-sd` returns
+        // `WriteError::NameTooLong` and the record is simply never written — and before
+        // 0.20 it asserted instead, killing its own daemon thread and taking every other
+        // advertisement with it. Neither produces anything that looks like an error.
         let name = format!("0E8C2E10CAAA@{}", "x".repeat(63));
         let s = MdnsService::new("_raop._tcp", &name, "castaway", 7000);
         assert_eq!(s.instance.as_str().len(), 63);
-        // Encodes without tripping mdns-sd's assertion.
-        wire_name(&format!("{}.{}", s.instance, s.qualified_type().unwrap()));
+        wire_name(s.to_service_info().unwrap().get_fullname());
     }
 
     #[test]
-    fn truncation_never_splits_a_character() {
+    fn the_limit_is_measured_in_octets_not_characters() {
+        // A 40-emoji name is 40 characters and 160 octets; the label limit is octets.
         let s = MdnsService::new("_raop._tcp", "\u{1f4fa}".repeat(40), "castaway", 7000);
         assert!(s.instance.as_str().len() <= 63);
         assert_eq!(s.instance.as_str().len() % 4, 0, "cut mid-codepoint");
     }
 
     #[test]
-    fn a_rewrite_is_recorded_so_it_can_be_logged() {
-        // Silently renaming the device is how this class of bug hides. A name that
-        // needed no repair carries no note; one that did carries what was asked for.
-        let ok = MdnsService::new("_airplay._tcp", "Hackerspace TV", "castaway", 7000);
-        assert_eq!(ok.instance.rewritten_from(), None);
-        let fixed = MdnsService::new("_airplay._tcp", "dma.space/screen", "castaway", 7000);
-        assert_eq!(fixed.instance.rewritten_from(), Some("dma.space/screen"));
+    fn only_an_unencodable_name_is_rewritten() {
+        // Silently renaming the device is how this class of bug hides, so a repair is
+        // recorded. A dotted name is *not* a repair any more — it encodes as-is.
+        let dotted = MdnsService::new("_airplay._tcp", "dma.space/screen", "castaway", 7000);
+        assert_eq!(dotted.instance.rewritten_from(), None);
+        assert_eq!(dotted.instance.as_str(), "dma.space/screen");
+
+        let too_long = MdnsService::new("_raop._tcp", "y".repeat(90), "castaway", 7000);
+        assert_eq!(
+            too_long.instance.rewritten_from(),
+            Some("y".repeat(90)).as_deref()
+        );
     }
 
     #[test]

@@ -71,7 +71,16 @@ impl Browser {
         loop {
             match self.rx.recv_async().await.ok()? {
                 ServiceEvent::ServiceResolved(info) => {
-                    let mut addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+                    // `get_addresses` yields `ScopedIp` since mdns-sd 0.15: a link-local
+                    // v6 address carries the interface it was learned on. We drop the
+                    // scope rather than widen `DiscoveredService`, because every
+                    // consumer here dials a v4 LAN address and none of them can act on
+                    // a scope id.
+                    let mut addresses: Vec<IpAddr> = info
+                        .get_addresses()
+                        .iter()
+                        .map(mdns_sd::ScopedIp::to_ip_addr)
+                        .collect();
                     // HashSet order is per-process random; sorted so the same records
                     // always produce the same event (fixtures pin this).
                     addresses.sort_unstable();

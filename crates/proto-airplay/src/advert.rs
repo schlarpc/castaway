@@ -463,13 +463,38 @@ mod tests {
         );
     }
 
-    /// Encode a DNS-SD fullname exactly as the responder's encoder does — split on
-    /// every `'.'`, one length-prefixed label each, zero-terminated. No escaping,
-    /// because `mdns-sd` implements none.
+    /// Encode a DNS-SD fullname the way a conformant peer reads one: only an
+    /// *unescaped* `'.'` ends a label, `\.` is a literal dot within one, and each label
+    /// is length-prefixed on its unescaped bytes (RFC 6763 §4.3).
+    ///
+    /// The instance is escaped here rather than taken pre-escaped because
+    /// `MdnsService` holds the name as the user typed it; escaping on concatenation is
+    /// what `mdns-sd`'s `escape_instance_name` does at registration.
     fn wire_name(svc: &MdnsService) -> Vec<u8> {
-        let fullname = format!("{}.{}.local.", svc.instance, svc.service_type);
+        let escaped = svc
+            .instance
+            .as_str()
+            .replace('\\', "\\\\")
+            .replace('.', "\\.");
+        let fullname = format!("{escaped}.{}.local.", svc.service_type);
+
+        let mut labels = Vec::new();
+        let mut current = String::new();
+        let mut chars = fullname.trim_end_matches('.').chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some(escaped) => current.push(escaped),
+                    None => current.push('\\'),
+                },
+                '.' => labels.push(std::mem::take(&mut current)),
+                other => current.push(other),
+            }
+        }
+        labels.push(current);
+
         let mut out = Vec::new();
-        for label in fullname.trim_end_matches('.').split('.') {
+        for label in labels {
             out.push(u8::try_from(label.len()).unwrap());
             out.extend_from_slice(label.as_bytes());
         }
@@ -491,14 +516,20 @@ mod tests {
     #[test]
     fn a_dotted_friendly_name_still_leaves_one_instance_label() {
         // The regression this pins is the reason iOS Screen Mirroring never listed this
-        // receiver: the deployed friendly name is `dma.space/screen`, and the responder
-        // encodes an instance name by splitting on `'.'`. That put a five-label PTR
-        // rdata on the wire — `dma | space/screen#airplay | _airplay | _tcp | local` —
-        // and Bonjour's DeconstructServiceName() takes exactly one instance label before
-        // `_app._proto`, so mDNSResponder discarded it. Confirmed on the LAN: with that
-        // name, `avahi-browse -r -t _airplay._tcp` run *on the advertising host* listed
-        // the Apple TV (AppleTV11,1, tvOS 26.5) and the Sony receiver and not us, while
-        // a 5353 capture showed our records going out. Nothing on our side logged.
+        // receiver: the deployed friendly name is `dma.space/screen`, and `mdns-sd` 0.13
+        // encoded an instance name by splitting on every `'.'` with no escape. That put
+        // a five-label PTR rdata on the wire — `dma | space/screen#airplay | _airplay |
+        // _tcp | local` — and Bonjour's DeconstructServiceName() takes exactly one
+        // instance label before `_app._proto`, so mDNSResponder discarded it. Confirmed
+        // on the LAN: with that name, `avahi-browse -r -t _airplay._tcp` run *on the
+        // advertising host* listed the Apple TV (AppleTV11,1, tvOS 26.5) and the Sony
+        // receiver and not us, while a 5353 capture showed our records going out.
+        // Nothing on our side logged.
+        //
+        // The dot is kept, not repaired: it is legal in an instance name and rides as
+        // `\.` in presentation format. `/` and `#` are legal unescaped — RFC 6763
+        // §4.1.1 allows any punctuation, and the LAN's Apple TV calls itself
+        // `Living Room (2)`.
         let id = AirPlayIdentity {
             name: "dma.space/screen#airplay".into(),
             ..ident()
@@ -508,7 +539,7 @@ mod tests {
         // (`STR-AZ1000ES | _airplay | _tcp | local`).
         assert_eq!(
             wire_name(&id.airplay_service()),
-            b"\x18dma-space/screen#airplay\x08_airplay\x04_tcp\x05local\x00".to_vec(),
+            b"\x18dma.space/screen#airplay\x08_airplay\x04_tcp\x05local\x00".to_vec(),
         );
         assert_eq!(label_count(&id.airplay_service()), 4);
         assert_eq!(label_count(&id.raop_service()), 4);
