@@ -1103,6 +1103,44 @@ the reasons are what a future reversal has to argue against.
   peer-gated the way Q29's ERTM lesson suggests (request the native variant, fall back
   to the thumbnail on any refusal).
 
+- **Q50 — Shuffle/repeat/repeat-one over Bluetooth: the protocol has it, the model has
+  it, only the adapter is missing. OPEN; scoped 2026-07-31, not started.** The ask is
+  parity with Spotify Connect for phone apps that support it: the transport strip
+  showing live shuffle and repeat state for a Bluetooth source, and the buttons working.
+
+  **The protocol side is settled — AVRCP 1.3+ player application settings**, a
+  first-class feature distinct from the passthrough buttons the adapter uses today.
+  Attribute 0x02 is repeat (off 0x01, *single track* 0x02 — "repeat one" —, all tracks
+  0x03, group 0x04); attribute 0x03 is shuffle (off/all/group). Writes go through
+  `SetPlayerApplicationSettingValue` (PDU 0x14), reads through
+  `GetCurrentPlayerApplicationSettingValue` (0x13), pushes through `RegisterNotification`
+  event 0x08 so the strip stays live when the phone's own UI toggles it, and
+  `ListPlayerApplicationSettingAttributes` (0x11) says which attributes the current
+  player exposes — the natural per-link capability gate. This is how car head units
+  toggle shuffle on phones, so sender support is real: iOS surfaces it for any app
+  adopting the shuffle/repeat remote commands (Apple Music, Spotify, YT Music), Android
+  maps it to MediaSession's modes. Coverage varies per app; gate on the 0x11 answer,
+  never assume.
+
+  **The receiver side already exists end-to-end** because Spotify Connect drove it:
+  `ControlTxn::{Shuffle, Repeat}`, `RepeatMode::{Off, Track, Context}`,
+  `ControlCapabilities::{SHUFFLE, REPEAT}`, `NowPlaying.shuffle/repeat`, and a strip
+  that draws and dispatches whenever a session claims the bits. The mapping is nearly
+  1:1 (`Track` ↔ 0x02, `Context` ↔ 0x03; fold the never-sent "group" values into
+  `Context`/`true` on read to keep the enum honest).
+
+  **The whole gap is `proto-bluetooth-audio`**: `avrcp.rs` defines none of PDUs
+  0x11–0x14 and does not know event 0x08, and the adapter registers only
+  status/track/position/volume notifications, so a Bluetooth link advertises bare
+  `TRANSPORT`. The work is additive and one crate wide: the four PDUs + event as
+  sans-I/O build/parse with captured fixtures (rule 6 — the frames are tiny), one 0x11
+  round trip at connect to decide the link's capabilities, event 0x08 folded into
+  `NowPlaying`, and a second dispatch arm in the control path, because these are
+  vendor-dependent commands, not passthrough. The fixture capture doubles as the
+  measurement this question actually turns on: **which attributes does an iPhone
+  expose for YT Music over AVRCP?** — the same session can also answer Q49's
+  `GetImageProperties` question, one phone visit for both.
+
 ## GameStream client (D37)
 
 - **Q43 — no session has been run against a real host, and the streaming half is where
