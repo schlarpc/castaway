@@ -359,6 +359,39 @@ mod tests {
         assert_eq!(db.generated_unix(), Some(1_710_925_317));
     }
 
+    /// The chain the *live* route yields, against the CRL we would attach to it.
+    ///
+    /// This is a different question from the one the table-based check answers, and the
+    /// difference is easy to wave away. A fetched database carries its own
+    /// `device_info.device_cert` and `device_cert_chain` (see [`AirServerDb::open`]) — it
+    /// does not borrow the checked-in constants — so the live path can in principle
+    /// present a device identity these fixtures have never seen. Today's database happens
+    /// to hold the same one, which is what `it_agrees_with_the_checked_in_fixtures`
+    /// pins, but that is an observation about this artifact and not a property of the
+    /// route.
+    ///
+    /// So this asserts the thing that is actually checkable offline: the chain this
+    /// database yields is not revoked by the CRL we ship as a fixture. What it cannot
+    /// cover — a future database bringing a device identity that *is* revoked — is
+    /// exactly why `CastCrl::servable_for` is evaluated per connection against the
+    /// credential in force rather than once against these fixtures.
+    #[test]
+    fn the_crl_does_not_revoke_the_chain_the_live_database_yields() {
+        let (_dir, db) = open_trimmed();
+        let credential = db.credential_at(1_710_892_800).unwrap();
+
+        let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
+        chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
+
+        let crl = crate::CastCrl::parse(include_bytes!("../fixtures/cast-crl-latest.bin")).unwrap();
+        assert_eq!(
+            crl.revokes(&chain).unwrap(),
+            None,
+            "the published CRL revokes the identity the AirServer database yields; \
+             attaching it would be how that identity stops working"
+        );
+    }
+
     /// The decrypted material must match what the checked-in fixtures hold, because
     /// the fixtures came out of this same database by a different route (the Python
     /// exporter). Agreement across two independent implementations is the real check

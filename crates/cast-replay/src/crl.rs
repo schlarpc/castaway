@@ -496,6 +496,24 @@ pub fn write_cache(path: &std::path::Path, raw: &[u8]) -> Result<(), ReplayError
         .map_err(|e| ReplayError::Cache(format!("writing {}: {e}", path.display())))
 }
 
+/// Test-only constructors, so another module's tests can build a CRL that revokes a
+/// chosen identity without `revoked_keys` becoming part of the public surface.
+#[cfg(test)]
+impl CastCrl {
+    /// `SHA-256(spki_tlv)` of a DER certificate — the hash the CRL lists.
+    pub(crate) fn spki_hash_of(der: &[u8]) -> [u8; 32] {
+        let (_, cert) = x509_parser::parse_x509_certificate(der).expect("a parseable certificate");
+        spki_hash(cert.tbs_certificate.subject_pki.raw)
+    }
+
+    /// A copy of this CRL that also revokes `hash`.
+    pub(crate) fn also_revoking(&self, hash: [u8; 32]) -> Self {
+        let mut copy = self.clone();
+        copy.revoked_keys.insert(hash);
+        copy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

@@ -50,7 +50,7 @@ impl ReplayIdentity {
     /// The credential currently in force.
     #[must_use]
     pub fn credential(&self) -> Arc<CastCredential> {
-        self.provider.current()
+        Arc::clone(self.provider.current().credential())
     }
 
     /// The acceptor and responder for one connection, from one credential.
@@ -60,58 +60,16 @@ impl ReplayIdentity {
     pub(crate) fn for_connection(
         &self,
     ) -> Result<(TlsAcceptor, Box<dyn DeviceAuthResponder>), CastError> {
-        let credential = self.provider.current();
-        let config = self.config_for(&credential)?;
-        let mut responder = ReplayAuthResponder::new(Arc::clone(&credential));
-        if let Some(crl) = self.servable_crl(&credential) {
-            responder = responder.with_crl(&crl);
+        // One value, so the CRL cannot be drawn from a different credential than the
+        // one presented — the provider will not hand out a `ServableCrl` that was not
+        // checked against the chain beside it (`cast_replay::ReceiverAuth`).
+        let auth = self.provider.current();
+        let config = self.config_for(auth.credential())?;
+        let mut responder = ReplayAuthResponder::new(Arc::clone(auth.credential()));
+        if let Some(crl) = auth.crl() {
+            responder = responder.with_crl(crl);
         }
         Ok((TlsAcceptor::from(config), Box::new(responder)))
-    }
-
-    /// The CRL to attach for `credential`, if one is held and does not revoke it.
-    ///
-    /// The check is per connection rather than per fetch because *which* chain we present
-    /// is a runtime decision — `identity_order`, table coverage and whether either
-    /// backend answers all move it — so "is this document safe to send" is only
-    /// answerable against the credential actually in force.
-    ///
-    /// A CRL that names us is withheld, not served. Attaching it would hand the sender
-    /// its own reason to refuse this receiver, turning a receiver that works in Chrome
-    /// into one that works nowhere; withholding it leaves exactly the behaviour we had
-    /// before there was a CRL at all. It is also the only notice we get that the
-    /// identity has been revoked, so it is logged at `error` rather than counted.
-    fn servable_crl(&self, credential: &CastCredential) -> Option<ServableCrl> {
-        let crl = self.provider.current_crl()?;
-        let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
-        chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok())?;
-
-        match crl.servable_for(&chain, now) {
-            Ok(Ok(servable)) => Some(servable),
-            Ok(Err(cast_replay::ServeRefusal::OutsideWindow)) => {
-                debug!("holding back a Cast CRL that is outside its validity window");
-                None
-            }
-            Ok(Err(refusal @ cast_replay::ServeRefusal::RevokesUs(_))) => {
-                tracing::error!(
-                    origin = %credential.origin(),
-                    reason = %refusal,
-                    "the published Cast CRL revokes the identity this receiver presents; \
-                     withholding it, which keeps Chrome working and leaves Chromium-based \
-                     senders refusing us. This identity needs replacing (D41)."
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not evaluate the Cast CRL against our chain");
-                None
-            }
-        }
     }
 
     /// The rustls config presenting `credential`'s peer certificate.
@@ -168,9 +126,8 @@ impl ReplayIdentity {
 pub struct ReplayAuthResponder {
     credential: Arc<CastCredential>,
     /// The CRL to attach, already checked against `credential`'s chain. `None` means
-    /// either that none is held or that the one held revokes us — the two are the same
-    /// decision here, and [`ReplayIdentity::servable_crl`] is where they are told apart
-    /// and logged.
+    /// either that none is held or that the one held revokes us; the two are told apart
+    /// and logged in `cast_replay`, where the pairing is made.
     crl: Option<Vec<u8>>,
 }
 

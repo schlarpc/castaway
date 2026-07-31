@@ -29,7 +29,8 @@ async fn the_backend_serves_a_usable_credential() {
     .await
     .expect("resolving a credential");
 
-    let credential = provider.current();
+    let auth = provider.current();
+    let credential = auth.credential();
     assert_eq!(
         credential.origin(),
         &CredentialOrigin::Network,

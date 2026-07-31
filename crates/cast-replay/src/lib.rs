@@ -127,7 +127,7 @@ pub use airserver::AirServerTable;
 pub use cks::CksTable;
 pub use crl::{CastCrl, ServableCrl, ServeRefusal};
 pub use crypto_cast_auth::{HashAlgo, NonceEcho, SigAlgo, SignedAuth};
-pub use provider::{Identity, ReplayConfig, ReplayProvider};
+pub use provider::{Identity, ReceiverAuth, ReplayConfig, ReplayProvider};
 pub use window::Window;
 
 /// Errors from credential acquisition.

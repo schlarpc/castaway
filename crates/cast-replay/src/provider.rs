@@ -6,6 +6,8 @@
 //!
 //! ## Resolution order
 //!
+//! Within one identity: **cache → backend → table**.
+//!
 //! 1. **The cache**, if it holds a credential still inside its window. A cached
 //!    credential *is* a previously fetched one, so using it is not a downgrade —
 //!    it just avoids spending a request per restart on material we already have.
@@ -13,6 +15,21 @@
 //!    indefinitely, where every table has a fixed end date.
 //! 3. **The checked-in tables**, in the order [`ReplayConfig::identity_order`] names,
 //!    taking the first that covers the instant wanted.
+//!
+//! Across identities, revocation outranks that order. Every candidate must be inside
+//! its window — outside it, nothing works at all — and among those,
+//! [`Resolver::resolve_preferring_unrevoked`] takes one the CRL does not name before
+//! one it does:
+//!
+//! | standing | outcome |
+//! |---|---|
+//! | valid, unrevoked | chosen first; the CRL is attached and every sender works |
+//! | valid, revoked | used only if nothing better exists; the CRL is withheld, so Chrome works and Chromium-based senders do not |
+//! | outside its window | never used |
+//!
+//! The credential and the verdict about it leave here together, as one
+//! [`ReceiverAuth`]. They are not independently gettable, because a CRL is only safe
+//! beside the chain it was checked against.
 //!
 //! A failed fetch is not fatal at any point — it falls through to the tables and
 //! is retried after [`ReplayConfig::failure_backoff`], matching the reference
@@ -31,10 +48,13 @@
 //!   identity, which would leave the panel completing TLS and failing auth with
 //!   nothing in the logs to explain it. The AirServer identity is a different
 //!   device under a different intermediate on a different branch of the Cast PKI
-//!   (see [`crate::airserver`]), so reversing the order is a config change instead
-//!   of a dead receiver. Nothing here can *detect* a revocation — that signal is
-//!   the sender refusing us — which is exactly why the order is operator-set
-//!   policy rather than something this module tries to infer.
+//!   (see [`crate::airserver`]), so a revocation is survivable rather than fatal.
+//!
+//!   This used to say that nothing here could *detect* a revocation — that the only
+//!   signal was the sender refusing us, and so the order had to be operator-set policy.
+//!   Holding the CRL changed that: the document names revoked keys and serials outright,
+//!   so the switch now happens on its own and `identity_order` only breaks ties between
+//!   identities of equal standing.
 //! * **A broken fixture set.** If one table fails to load, the other still
 //!   resolves, and startup does not fail.
 //!
@@ -52,7 +72,7 @@ use tracing::{debug, info, warn};
 use crate::airserver::AirServerTable;
 use crate::airserver_db::AirServerDb;
 use crate::cks::CksTable;
-use crate::crl::CastCrl;
+use crate::crl::{CastCrl, ServableCrl};
 use crate::{airserver_api, api, cache, crl, CastCredential, ReplayError};
 
 /// The two roots the reference client pins in place of the system trust store.
@@ -157,6 +177,78 @@ impl Default for ReplayConfig {
     }
 }
 
+/// The credential this receiver presents, together with the CRL it may attach.
+///
+/// One value rather than two gettable independently, because they are not independent:
+/// a CRL is only safe to attach to the chain it was checked against, and attaching one
+/// that revokes *us* turns a receiver that works in Chrome into one that works nowhere
+/// (see [`crate::crl`]). Handing a caller a credential and a CRL separately makes
+/// "check whether this document rejects this chain" something each caller has to
+/// remember; handing it this makes the check unskippable, because the only way to get a
+/// [`ServableCrl`] out of the provider is to get it from the credential it belongs to.
+///
+/// The same reason `proto_cast::CastIdentity` returns its acceptor and responder
+/// together.
+#[derive(Debug)]
+pub struct ReceiverAuth {
+    credential: Arc<CastCredential>,
+    crl: Option<ServableCrl>,
+}
+
+impl ReceiverAuth {
+    /// The credential: certificate chain, peer key, and precomputed signatures.
+    #[must_use]
+    pub fn credential(&self) -> &Arc<CastCredential> {
+        &self.credential
+    }
+
+    /// The CRL to put in `AuthResponse.crl`, if one is held, is in date, and does not
+    /// revoke [`Self::credential`]. `None` in every other case, which is the state this
+    /// receiver had before it fetched CRLs at all.
+    #[must_use]
+    pub fn crl(&self) -> Option<&ServableCrl> {
+        self.crl.as_ref()
+    }
+}
+
+/// Pair a credential with the CRL, if that CRL is safe to serve alongside it.
+///
+/// The single place the decision is made, so the reasons for withholding are stated
+/// once. A CRL naming our own chain is logged at `error`: it is the only notice this
+/// receiver ever gets that its identity has been revoked (D41).
+fn pair_with_crl(credential: CastCredential, crl: Option<&CastCrl>, now: i64) -> ReceiverAuth {
+    let credential = Arc::new(credential);
+    let servable = crl.and_then(|crl| {
+        let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
+        chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
+        match crl.servable_for(&chain, now) {
+            Ok(Ok(servable)) => Some(servable),
+            Ok(Err(crate::ServeRefusal::OutsideWindow)) => {
+                debug!("holding back a Cast CRL that is outside its validity window");
+                None
+            }
+            Ok(Err(refusal)) => {
+                tracing::error!(
+                    origin = %credential.origin(),
+                    reason = %refusal,
+                    "the published Cast CRL revokes the identity this receiver presents; \
+                     withholding it, which keeps Chrome working and leaves Chromium-based \
+                     senders refusing us. This identity needs replacing (D41)."
+                );
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "could not evaluate the Cast CRL against our chain");
+                None
+            }
+        }
+    });
+    ReceiverAuth {
+        credential,
+        crl: servable,
+    }
+}
+
 /// Everything needed to run the fallback chain, minus the credential it produces.
 ///
 /// Split out so [`ReplayProvider`] can be built with a real credential already in
@@ -193,11 +285,14 @@ struct Resolver {
 /// credential: one is resolved before the provider exists.
 pub struct ReplayProvider {
     resolver: Resolver,
-    current: RwLock<Arc<CastCredential>>,
+    current: RwLock<Arc<ReceiverAuth>>,
     /// The device CRL to attach to a challenge response, when one is held and safe to
     /// serve. Separate from the credential because it is a different document on a
     /// different schedule — about seven days against the credential's two.
     crl: RwLock<Option<Arc<CastCrl>>>,
+    /// When the CRL is next due to be refetched, in Unix seconds. Drives its share of
+    /// `next_wakeup`, so the loop wakes for whichever of the two documents is due first.
+    crl_next_attempt: AtomicI64,
 }
 
 impl ReplayProvider {
@@ -221,24 +316,39 @@ impl ReplayProvider {
             cks_retry_after: AtomicI64::new(0),
             airserver_retry_after: AtomicI64::new(0),
         };
-        let credential = resolver.resolve_once(local_now()).await?;
+        // The CRL is loaded before the credential, not after: which identity we should
+        // present depends on which ones it revokes.
+        let crl = load_crl(&resolver.config).await;
+        let credential = resolver
+            .resolve_preferring_unrevoked(local_now(), crl.as_ref())
+            .await?;
         info!(
             origin = %credential.origin(),
             window_start = credential.window().start_unix(),
             window_end = credential.window().end_unix(),
             "Cast receiver-auth credential resolved"
         );
-        let crl = load_crl(&resolver.config).await;
+        // A failed initial load retries on the ordinary failure backoff rather than
+        // waiting out a full day: coming up without a CRL costs Chromium-based senders.
+        let next_attempt = local_now()
+            + if crl.is_some() {
+                CRL_REFRESH_INTERVAL_SECS
+            } else {
+                i64::try_from(resolver.config.failure_backoff.as_secs()).unwrap_or(360)
+            };
+        let now = local_now();
         Ok(Self {
+            current: RwLock::new(Arc::new(pair_with_crl(credential, crl.as_ref(), now))),
             resolver,
-            current: RwLock::new(Arc::new(credential)),
             crl: RwLock::new(crl.map(Arc::new)),
+            crl_next_attempt: AtomicI64::new(next_attempt),
         })
     }
 
-    /// The CRL held for this receiver, if any.
-    #[must_use]
-    pub fn current_crl(&self) -> Option<Arc<CastCrl>> {
+    /// The raw CRL held, for re-pairing when the credential changes. Private: a caller
+    /// outside must go through [`ReceiverAuth`], which cannot hand out a CRL that was
+    /// not checked against the credential beside it.
+    fn current_crl(&self) -> Option<Arc<CastCrl>> {
         self.crl.read().ok().and_then(|c| c.clone())
     }
 
@@ -249,18 +359,24 @@ impl ReplayProvider {
     /// inline rather than handing back a credential every sender will reject.
     /// That costs one RSA signature, once per window.
     #[must_use]
-    pub fn current_at(&self, now_unix: i64) -> Arc<CastCredential> {
+    pub fn current_at(&self, now_unix: i64) -> Arc<ReceiverAuth> {
         let now = now_unix + self.resolver.clock_offset.load(Ordering::Relaxed);
         if let Ok(current) = self.current.read() {
-            if current.valid_at(now) {
+            if current.credential().valid_at(now) {
                 return Arc::clone(&current);
             }
         }
         match self.resolver.offline_credential(now) {
             Ok(fresh) => {
-                let fresh = Arc::new(fresh);
+                // Re-paired, not carried over: the CRL verdict belongs to the chain it
+                // was checked against, and this is a different one.
+                let fresh = Arc::new(pair_with_crl(
+                    fresh,
+                    self.current_crl().as_deref(),
+                    now_unix,
+                ));
                 warn!(
-                    origin = %fresh.origin(),
+                    origin = %fresh.credential().origin(),
                     "the Cast credential aged out; re-issued from a checked-in table"
                 );
                 if let Ok(mut slot) = self.current.write() {
@@ -279,9 +395,9 @@ impl ReplayProvider {
         }
     }
 
-    /// The credential for the current instant.
+    /// The credential for the current instant, and the CRL that may go with it.
     #[must_use]
-    pub fn current(&self) -> Arc<CastCredential> {
+    pub fn current(&self) -> Arc<ReceiverAuth> {
         self.current_at(local_now())
     }
 
@@ -297,10 +413,21 @@ impl ReplayProvider {
             debug!(seconds = delay.as_secs(), "next Cast credential refresh");
             tokio::time::sleep(delay).await;
 
-            match self.resolver.resolve_once(local_now()).await {
+            // The CRL first, so the credential is chosen against current revocation
+            // data: an identity revoked since the last tick is abandoned here rather
+            // than kept and quietly stripped of its CRL.
+            self.refresh_crl().await;
+            let crl = self.current_crl();
+
+            match self
+                .resolver
+                .resolve_preferring_unrevoked(local_now(), crl.as_deref())
+                .await
+            {
                 Ok(fresh) => {
                     let changed = self.current.read().is_ok_and(|c| {
-                        c.window() != fresh.window() || c.origin() != fresh.origin()
+                        c.credential().window() != fresh.window()
+                            || c.credential().origin() != fresh.origin()
                     });
                     if changed {
                         info!(
@@ -309,32 +436,50 @@ impl ReplayProvider {
                             "Cast receiver-auth credential refreshed"
                         );
                     }
+                    // Re-paired every time, so a CRL refreshed on this same tick is
+                    // re-evaluated against whatever chain we just settled on.
+                    let paired = pair_with_crl(fresh, crl.as_deref(), local_now());
                     if let Ok(mut slot) = self.current.write() {
-                        *slot = Arc::new(fresh);
+                        *slot = Arc::new(paired);
                     }
                 }
                 Err(e) => warn!(error = %e, "refreshing the Cast credential failed"),
             }
-            self.refresh_crl().await;
         }
     }
 
-    /// Refetch the CRL if the one held is missing or close enough to its end to be
-    /// worth replacing. A stale CRL is not merely useless — a sender hard-fails on one
-    /// outside its window — so this errs toward refreshing early.
+    /// Refetch the CRL, unconditionally, when its own schedule says so.
+    ///
+    /// No "is it nearly expired yet" test: the document is cheap, the schedule is
+    /// already daily, and a conditional refresh is how a fetch gets skipped at 25 hours
+    /// remaining and not retried until after the CRL has lapsed.
     async fn refresh_crl(&self) {
         let now = local_now();
-        let held_until = self.current_crl().map(|c| c.window().end_unix());
-        if held_until.is_some_and(|end| end - now > CRL_REFRESH_LEAD_SECS) {
+        if now < self.crl_next_attempt.load(Ordering::Relaxed) {
             return;
         }
-        if let Some(fresh) = load_crl(&self.resolver.config).await {
-            let end = fresh.window().end_unix();
-            if held_until != Some(end) {
-                info!(window_end = end, "Cast device CRL refreshed");
+        let held_until = self.current_crl().map(|c| c.window().end_unix());
+
+        match fetch_crl(&self.resolver.config).await {
+            Some(fresh) => {
+                let end = fresh.window().end_unix();
+                if held_until != Some(end) {
+                    info!(window_end = end, "Cast device CRL refreshed");
+                }
+                if let Ok(mut slot) = self.crl.write() {
+                    *slot = Some(Arc::new(fresh));
+                }
+                self.crl_next_attempt
+                    .store(now + CRL_REFRESH_INTERVAL_SECS, Ordering::Relaxed);
             }
-            if let Ok(mut slot) = self.crl.write() {
-                *slot = Some(Arc::new(fresh));
+            None => {
+                // Keep serving the CRL we hold — `servable_for` withholds it the moment
+                // it falls out of its window, so a failed refresh degrades to "no CRL"
+                // rather than to "a CRL a sender hard-fails on".
+                let backoff =
+                    i64::try_from(self.resolver.config.failure_backoff.as_secs()).unwrap_or(360);
+                self.crl_next_attempt
+                    .store(now + backoff, Ordering::Relaxed);
             }
         }
     }
@@ -343,10 +488,12 @@ impl ReplayProvider {
     fn next_wakeup(&self) -> Duration {
         let now = self.corrected_now();
         let current = self.current.read().ok().map(|c| Arc::clone(&c));
-        let window_end = current.as_ref().map_or(now, |c| c.window().end_unix());
+        let window_end = current
+            .as_ref()
+            .map_or(now, |c| c.credential().window().end_unix());
         let on_table = current
             .as_ref()
-            .is_some_and(|c| c.origin().is_offline_table());
+            .is_some_and(|c| c.credential().origin().is_offline_table());
 
         // Running on the table with a reachable backend is a state worth leaving:
         // the table expires, the backend does not.
@@ -355,6 +502,10 @@ impl ReplayProvider {
         } else {
             window_end - i64::try_from(REFRESH_LEAD.as_secs()).unwrap_or(3600)
         };
+        // The CRL is on its own clock, so the loop sleeps until whichever of the two is
+        // due first. Without this the CRL would inherit the credential's schedule, which
+        // on a fresh credential is most of two days.
+        let target = target.min(self.crl_next_attempt.load(Ordering::Relaxed));
         Duration::from_secs(u64::try_from(target - now).unwrap_or(0).max(60))
     }
 
@@ -370,7 +521,56 @@ impl Resolver {
     /// Returns the *last* failure rather than the first, because the last one comes
     /// from the least-preferred identity and so describes the widest gap — for a
     /// panel past every horizon, that is the message an operator needs.
+    /// Resolve without consulting a CRL. Only the tests want this now — production
+    /// always ranks against the CRL, and a path that quietly skips that check is
+    /// exactly the thing [`ReceiverAuth`] exists to prevent.
+    #[cfg(test)]
     async fn resolve_once(&self, now_local: i64) -> Result<CastCredential, ReplayError> {
+        self.resolve_pass(now_local, None).await
+    }
+
+    /// Resolve, preferring an identity the CRL does not revoke.
+    ///
+    /// Revocation is a *ranking* input, not a veto, and the order it imposes is:
+    ///
+    /// 1. **valid and unrevoked** — works everywhere, CRL attached;
+    /// 2. **valid but revoked** — the CRL is withheld, so it works in Chrome and not in
+    ///    a Chromium-based sender. Strictly better than nothing, so it is used;
+    /// 3. **outside its window** — never usable, and already excluded before this.
+    ///
+    /// Two passes rather than a score, because the fallback has to be able to reach a
+    /// credential the first pass rejected: an all-revoked LAN must still come up.
+    ///
+    /// This is what [`crate::provider`]'s module docs said could not be done — "nothing
+    /// here can *detect* a revocation, which is exactly why the order is operator-set
+    /// policy". Holding the CRL is what changed that. `identity_order` still decides
+    /// between identities of equal standing; it just no longer has to be edited by hand
+    /// on the day one of them is revoked.
+    async fn resolve_preferring_unrevoked(
+        &self,
+        now_local: i64,
+        crl: Option<&CastCrl>,
+    ) -> Result<CastCredential, ReplayError> {
+        if let Some(crl) = crl {
+            match self.resolve_pass(now_local, Some(crl)).await {
+                Ok(credential) => return Ok(credential),
+                Err(e) => debug!(
+                    error = %e,
+                    "no unrevoked Cast identity is available; falling back to a revoked one \
+                     and withholding the CRL"
+                ),
+            }
+        }
+        self.resolve_pass(now_local, None).await
+    }
+
+    /// One pass over `identity_order`. With `avoid` set, a credential the CRL revokes is
+    /// skipped as though that identity could not supply one.
+    async fn resolve_pass(
+        &self,
+        now_local: i64,
+        avoid: Option<&CastCrl>,
+    ) -> Result<CastCredential, ReplayError> {
         let now = now_local + self.clock_offset.load(Ordering::Relaxed);
         let mut last = None;
         for identity in &self.config.identity_order {
@@ -379,7 +579,22 @@ impl Resolver {
                 Identity::AirServer => self.resolve_airserver(now_local, now).await,
             };
             match attempt {
-                Ok(credential) => return Ok(credential),
+                Ok(credential) => {
+                    if let Some(crl) = avoid {
+                        if let Some(reason) = revoked_by(crl, &credential) {
+                            warn!(
+                                %identity,
+                                %reason,
+                                "the published Cast CRL revokes this identity; trying the next one"
+                            );
+                            last = Some(ReplayError::Table(format!(
+                                "the {identity} identity is revoked"
+                            )));
+                            continue;
+                        }
+                    }
+                    return Ok(credential);
+                }
                 Err(e) => {
                     debug!(%identity, error = %e, "identity cannot supply a credential");
                     last = Some(e);
@@ -656,10 +871,22 @@ fn log_load<T>(identity: &str, loaded: Result<T, ReplayError>) -> Option<T> {
     }
 }
 
-/// Refetch the CRL once it is within this long of expiring. The document runs about
-/// seven days, so a day of lead leaves several refresh attempts before a sender would
-/// start hard-failing on a stale one.
-const CRL_REFRESH_LEAD_SECS: i64 = 86_400;
+/// How often the CRL is refetched while the panel runs.
+///
+/// Daily, on its own clock, and deliberately not derived from the credential's: those
+/// windows are two days where the CRL's is about seven, and hanging one off the other
+/// means the CRL's schedule is set by something unrelated to it. `next_wakeup` sleeps
+/// until the credential's window is nearly out, which on a fresh credential is most of
+/// two days — long enough for a check to land at "25 hours left", skip, and not come
+/// back until well after the CRL has expired. A sender *hard-fails* on a stale CRL, so
+/// that is a worse state than never having fetched one.
+///
+/// Daily against a seven-day document also means six consecutive fetch failures before
+/// anything degrades.
+const CRL_REFRESH_INTERVAL_SECS: i64 = 86_400;
+
+/// How long a cached CRL must have left for startup to skip the network entirely.
+const CRL_CACHE_FRESH_SECS: i64 = 86_400;
 
 /// Load the Cast CRL: cache first, then the network.
 ///
@@ -680,12 +907,19 @@ async fn load_crl(config: &ReplayConfig) -> Option<CastCrl> {
     // A cached CRL with room left is the whole answer; the endpoint is only consulted
     // when it cannot be.
     if let Some(crl) = &cached {
-        if crl.window().end_unix() - now > CRL_REFRESH_LEAD_SECS {
+        if crl.window().end_unix() - now > CRL_CACHE_FRESH_SECS {
             return cached;
         }
     }
+    fetch_crl(config).await.or(cached)
+}
+
+/// Fetch the CRL from the endpoint and cache it. `None` on any failure, which is never
+/// fatal — see [`load_crl`].
+async fn fetch_crl(config: &ReplayConfig) -> Option<CastCrl> {
+    let path = config.crl_cache_path.clone()?;
     if !config.network {
-        return cached;
+        return None;
     }
 
     // ureq is blocking, so it does not belong on the runtime (ground rule 4).
@@ -705,7 +939,24 @@ async fn load_crl(config: &ReplayConfig) -> Option<CastCrl> {
         }
         Err(e) => {
             warn!(error = %e, "fetching the Cast CRL failed; Chromium-based senders will refuse this receiver");
-            cached
+            None
+        }
+    }
+}
+
+/// Whether `crl` revokes the chain `credential` presents, and why.
+///
+/// A chain that cannot be parsed is reported as *not* revoked: refusing an identity
+/// because we could not read its certificates would turn a parsing bug into a dead
+/// receiver, and the sender does its own check regardless.
+fn revoked_by(crl: &CastCrl, credential: &CastCredential) -> Option<crl::Revocation> {
+    let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
+    chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
+    match crl.revokes(&chain) {
+        Ok(found) => found,
+        Err(e) => {
+            warn!(error = %e, "could not evaluate the Cast CRL against a candidate identity");
+            None
         }
     }
 }
@@ -789,6 +1040,7 @@ mod tests {
 
         let at = 1_785_196_800; // 2026-07-28, window 652
         let credential = provider.current_at(at);
+        let credential = credential.credential();
         assert!(credential.valid_at(at));
         assert_eq!(
             credential.origin(),
@@ -816,6 +1068,7 @@ mod tests {
             .unwrap();
 
             let credential = provider.current_at(at);
+            let credential = credential.credential();
             assert!(
                 credential.valid_at(at),
                 "order {order:?} produced a stale window"
@@ -845,6 +1098,7 @@ mod tests {
         .unwrap();
 
         let credential = provider.current_at(at);
+        let credential = credential.credential();
         assert!(credential.valid_at(at));
         assert!(
             matches!(credential.origin(), CredentialOrigin::CksTable { .. }),
@@ -1028,7 +1282,9 @@ mod tests {
         .unwrap();
 
         let first = provider.current_at(1_785_196_800);
+        let first = first.credential();
         let second = provider.current_at(1_785_196_800 + 172_800);
+        let second = second.credential();
         assert_ne!(first.window(), second.window());
         assert_ne!(first.peer_cert_der(), second.peer_cert_der());
         assert!(second.valid_at(1_785_196_800 + 172_800));
@@ -1088,5 +1344,92 @@ mod tests {
             provider.resolver.resolve_once(0).await,
             Err(ReplayError::OutOfRange { .. })
         ));
+    }
+
+    /// An offline provider with no caches, so resolution comes from the tables alone
+    /// and the identity chosen is decided purely by order and revocation.
+    async fn offline_provider() -> ReplayProvider {
+        ReplayProvider::resolve(ReplayConfig {
+            network: false,
+            cache_path: None,
+            airserver_db_path: None,
+            crl_cache_path: None,
+            ..ReplayConfig::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A revoked identity is stepped over, not merely stripped of its CRL.
+    ///
+    /// This is the ordering the whole arrangement exists to produce:
+    ///
+    /// 1. valid and unrevoked — attaches the CRL, works in every sender;
+    /// 2. valid but revoked — CRL withheld, works in Chrome only;
+    /// 3. outside its window — never used.
+    ///
+    /// Without the first pass a revoked CKS identity would simply be served with the
+    /// CRL dropped, which needlessly costs every Chromium-based sender when a perfectly
+    /// good AirServer identity is sitting behind it on a different branch of the PKI.
+    #[tokio::test]
+    async fn a_revoked_identity_is_stepped_over_for_an_unrevoked_one() {
+        let provider = offline_provider().await;
+        // Inside both tables *and* inside the fixture CRL's window (which opens at
+        // 2026-07-28T20:24:28Z) — otherwise the CRL is withheld as out of date and the
+        // assertion below would pass or fail for the wrong reason.
+        let at = 1_785_300_000;
+
+        // Baseline: with no CRL, the configured order puts CKS first.
+        let plain = provider.resolver.resolve_once(at).await.unwrap();
+        assert!(matches!(plain.origin(), CredentialOrigin::CksTable { .. }));
+
+        // Now revoke exactly that identity.
+        let crl = crate::CastCrl::parse(include_bytes!("../fixtures/cast-crl-latest.bin")).unwrap();
+        let poisoned = crl.also_revoking(crate::CastCrl::spki_hash_of(plain.device_cert_der()));
+
+        let chosen = provider
+            .resolver
+            .resolve_preferring_unrevoked(at, Some(&poisoned))
+            .await
+            .unwrap();
+        assert!(
+            matches!(chosen.origin(), CredentialOrigin::AirServerTable { .. }),
+            "a revoked CKS identity must fall through to AirServer, got {}",
+            chosen.origin()
+        );
+        // And the one it fell through to keeps its CRL.
+        let paired = pair_with_crl(chosen, Some(&poisoned), at);
+        assert!(paired.crl().is_some());
+    }
+
+    /// When every identity is revoked there is nothing to fall through to, so the
+    /// configured order wins and the CRL is withheld — Chrome keeps working, which is
+    /// strictly better than refusing to come up at all.
+    #[tokio::test]
+    async fn all_identities_revoked_still_yields_a_credential_with_no_crl() {
+        let provider = offline_provider().await;
+        let at = 1_785_300_000;
+
+        let crl = crate::CastCrl::parse(include_bytes!("../fixtures/cast-crl-latest.bin")).unwrap();
+        let cks = provider.resolver.resolve_once(at).await.unwrap();
+        let air = crate::AirServerTable::load()
+            .unwrap()
+            .credential_at(at)
+            .unwrap();
+        let poisoned = crl
+            .also_revoking(crate::CastCrl::spki_hash_of(cks.device_cert_der()))
+            .also_revoking(crate::CastCrl::spki_hash_of(air.device_cert_der()));
+
+        let chosen = provider
+            .resolver
+            .resolve_preferring_unrevoked(at, Some(&poisoned))
+            .await
+            .expect("a revoked credential still beats no credential");
+        let paired = pair_with_crl(chosen, Some(&poisoned), at);
+        assert!(
+            paired.crl().is_none(),
+            "a CRL that revokes the chain we present must never be attached to it"
+        );
+        assert!(paired.credential().valid_at(at));
     }
 }
