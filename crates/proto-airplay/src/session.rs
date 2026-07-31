@@ -24,7 +24,7 @@ use crate::control::ControlUpdate;
 use crate::error::AirPlayError;
 use crate::info;
 use crate::mirror::{MirrorKeys, StreamConnectionId};
-use crate::sdp::{AnnounceParams, SessionKey};
+use crate::sdp::{AnnounceParams, RaopCodec, SessionKey};
 use crate::transport::{ReceiverPorts, SenderPorts};
 
 /// Parse an `AA:BB:CC:DD:EE:FF` device id into six bytes.
@@ -43,8 +43,69 @@ pub const APPLE_PLIST_MIME: &str = "application/x-apple-binary-plist";
 /// The `streams` entry type that means screen mirroring.
 const MIRROR_STREAM: i64 = 110;
 
-/// The `streams` entry type for the realtime audio that accompanies mirroring.
+/// The `streams` entry type for realtime audio — mirroring's, and a media session's.
 const MIRROR_AUDIO_STREAM: i64 = 96;
+
+/// The codec a plist `SETUP` stream names in its `ct` field.
+///
+/// The values are a bitmask elsewhere in the protocol (`cn=0,1,2,3` advertises the same
+/// four), but in a stream description exactly one arrives, so this is an enum: a stream
+/// has one codec, and "two codecs at once" should not be representable.
+///
+/// Mirroring says `ct: 8`; a sender casting media says `ct: 2`. Reading it rather than
+/// assuming is the difference between those two sessions working and only one of them
+/// working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamCodec {
+    /// `ct: 1` — uncompressed.
+    Pcm,
+    /// `ct: 2` — Apple Lossless, 352 samples a packet.
+    Alac,
+    /// `ct: 4` — AAC-LC. Not served: it needs an `AudioSpecificConfig` this path has no
+    /// way to know, and no observed sender asks for it.
+    AacLc,
+    /// `ct: 8` — AAC Enhanced Low Delay, 480 samples a packet. What mirroring uses.
+    AacEld,
+}
+
+impl StreamCodec {
+    fn parse(ct: i64) -> Option<Self> {
+        match ct {
+            1 => Some(Self::Pcm),
+            2 => Some(Self::Alac),
+            4 => Some(Self::AacLc),
+            8 => Some(Self::AacEld),
+            _ => None,
+        }
+    }
+
+    /// The negotiated stream this codec describes, given the rest of the stream entry.
+    fn negotiated(
+        self,
+        sample_rate: u32,
+        frames_per_packet: u32,
+        channels: u8,
+    ) -> Option<RaopCodec> {
+        match self {
+            Self::Pcm => Some(RaopCodec::Pcm {
+                sample_rate,
+                channels,
+            }),
+            Self::Alac => Some(RaopCodec::Alac(crate::sdp::AlacConfig::airplay(
+                frames_per_packet,
+                sample_rate,
+                channels,
+            ))),
+            Self::AacEld => Some(RaopCodec::AacEld {
+                sample_rate,
+                channels,
+            }),
+            // Refused rather than approximated: the decoder needs a config we would be
+            // inventing, and inventing one produces noise rather than an error.
+            Self::AacLc => None,
+        }
+    }
+}
 
 /// Serialize a reply dictionary as a binary plist.
 fn plist_response(dict: &plist::Dictionary) -> AirPlayResponse {
@@ -164,11 +225,11 @@ enum MirrorState {
     /// No mirroring `SETUP` seen.
     #[default]
     Idle,
-    /// The first `SETUP` gave us the wrapped key; waiting for the stream to be named.
-    KeyMaterial {
-        /// The FairPlay-wrapped AES key from the `ekey` field.
-        ekey: Box<[u8; crypto_playfair::EKEY_LEN]>,
-    },
+    /// The first `SETUP` gave us the key material; waiting for a stream to be named.
+    ///
+    /// It carries nothing, because the key it used to carry is unwrapped the moment it
+    /// arrives and kept in `media_key` — where a stream of *either* plane can reach it.
+    KeyMaterial,
     /// The second `SETUP` named the stream; the data channel can start.
     Ready(Box<MirrorKeys>),
 }
@@ -179,14 +240,14 @@ enum MirrorState {
 /// negotiation: a third `SETUP` asking for the session's *audio* needs the same key, and
 /// by then the video keys have been handed to the data-channel task.
 #[derive(Clone, Copy)]
-struct MirrorMediaKey {
+struct MediaKey {
     key: SessionKey,
     iv: [u8; 16],
 }
 
-impl std::fmt::Debug for MirrorMediaKey {
+impl std::fmt::Debug for MediaKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MirrorMediaKey(<redacted>)")
+        f.write_str("MediaKey(<redacted>)")
     }
 }
 
@@ -235,11 +296,9 @@ pub struct AirPlaySession {
     /// The TCP port the actor bound for the mirroring data channel.
     mirror_data_port: Option<u16>,
     /// The unwrapped media key, once a mirroring `SETUP` has provided one.
-    mirror_media_key: Option<MirrorMediaKey>,
+    media_key: Option<MediaKey>,
     /// Audio negotiated alongside a mirroring session, waiting for the actor.
     mirror_audio: Option<Box<AnnounceParams>>,
-    /// The `eiv` from the first mirroring `SETUP`, until the key is unwrapped.
-    pending_eiv: Option<[u8; 16]>,
     /// A `FLUSH` the actor has not yet passed to the audio task.
     pending_flush: Option<crate::audio::FlushPoint>,
     /// This receiver's long-term pairing identity (feature bit 27).
@@ -279,9 +338,8 @@ impl AirPlaySession {
             sender_ports: None,
             mirror: MirrorState::default(),
             mirror_data_port: None,
-            mirror_media_key: None,
+            media_key: None,
             mirror_audio: None,
-            pending_eiv: None,
             pending_flush: None,
             volume: crate::control::Volume::Level(0.0),
         }
@@ -607,8 +665,8 @@ impl AirPlaySession {
             if let Some(stream) = named(MIRROR_STREAM) {
                 return self.mirror_streams(stream);
             }
-            if named(MIRROR_AUDIO_STREAM).is_some() {
-                return self.mirror_audio_stream();
+            if let Some(stream) = named(MIRROR_AUDIO_STREAM) {
+                return self.mirror_audio_stream(stream);
             }
             warn!("mirroring SETUP names no stream we serve");
             return AirPlayResponse::status(400);
@@ -656,11 +714,31 @@ impl AirPlaySession {
             warn!("mirroring SETUP has no 16-byte eiv");
             return refuse(400);
         };
-        self.pending_eiv = Some(eiv);
-        self.mirror = MirrorState::KeyMaterial {
-            ekey: Box::new(ekey),
+        // Unwrapped here, at the message that carries it, rather than when a *video*
+        // stream is named. The key belongs to the session, not to one of its planes: a
+        // sender casting media negotiates audio and no video at all, and deferring the
+        // unwrap to the video path meant answering that session `451` and being torn
+        // down. It is also what the reference receiver does — `fairplay_decrypt` runs in
+        // its first-SETUP branch, and both planes are handed the result.
+        let Some(key_message) = self.fairplay.key_message() else {
+            warn!("SETUP carries key material but /fp-setup has not completed");
+            return refuse(451);
         };
-        log_info!("AirPlay mirroring key material received");
+        let aes_key = crypto_playfair::decrypt_key(key_message, &ekey);
+        // Bit 27's other half. A sender that completed `/pair-verify` encrypts with
+        // `SHA512(aeskey ‖ shared)[0..16]`; one that skipped it uses the unwrapped key
+        // as-is. Which happened is exactly `paired_secret`, and getting it wrong renders
+        // noise rather than failing.
+        let aes_key = match &self.paired_secret {
+            Some(shared) => crate::pairing::rekey_media(&aes_key, shared),
+            None => aes_key,
+        };
+        self.media_key = Some(MediaKey {
+            key: SessionKey::from_bytes(aes_key),
+            iv: eiv,
+        });
+        self.mirror = MirrorState::KeyMaterial;
+        log_info!("AirPlay session key material received");
         Ok(())
     }
 
@@ -696,7 +774,7 @@ impl AirPlaySession {
 
     /// The second mirroring `SETUP`: derive the stream keys and name the data port.
     fn mirror_streams(&mut self, stream: &plist::Dictionary) -> AirPlayResponse {
-        let MirrorState::KeyMaterial { ekey } = std::mem::take(&mut self.mirror) else {
+        let Some(media) = self.media_key else {
             warn!("mirroring streams SETUP before any key material");
             return AirPlayResponse::status(451);
         };
@@ -715,30 +793,11 @@ impl AirPlaySession {
                 StreamConnectionId::from_plist_signed,
             );
 
-        let Some(key_message) = self.fairplay.key_message() else {
-            warn!("mirroring SETUP before /fp-setup completed");
-            return AirPlayResponse::status(451);
-        };
-        let aes_key = crypto_playfair::decrypt_key(key_message, &ekey);
-        // Bit 27's other half, on the mirroring plane — the same rule `announce` applies
-        // to the audio one. A sender that completed `/pair-verify` encrypts with
-        // `SHA512(aeskey ‖ shared)[0..16]`; one that skipped it uses the unwrapped key
-        // as-is. Which happened is exactly `paired_secret`. This step was missing while
-        // bit 27 was clear and no sender ever paired; with the bit set every iOS sender
-        // pairs, and the failure it causes is not an error but a picture of noise.
-        let aes_key = match &self.paired_secret {
-            Some(shared) => crate::pairing::rekey_media(&aes_key, shared),
-            None => aes_key,
-        };
-        // Kept for the audio stream, which uses the same key with the `eiv` verbatim
-        // rather than the SHA-512 derivation the video stream needs.
-        if let Some(iv) = self.pending_eiv.take() {
-            self.mirror_media_key = Some(MirrorMediaKey {
-                key: SessionKey::from_bytes(aes_key),
-                iv,
-            });
-        }
-        self.mirror = MirrorState::Ready(Box::new(MirrorKeys::derive(&aes_key, id)));
+        // The video plane's own derivation on top of the session key: SHA-512 over a
+        // label and the stream id. The audio plane uses the same key with the `eiv`
+        // verbatim instead, which is why the session holds the key rather than either
+        // plane holding it for the other.
+        self.mirror = MirrorState::Ready(Box::new(MirrorKeys::derive(media.key.expose(), id)));
         log_info!(%id, port, "AirPlay mirroring stream ready");
 
         let mut stream_reply = plist::Dictionary::new();
@@ -755,22 +814,43 @@ impl AirPlaySession {
         plist_response(&reply)
     }
 
-    /// Answer a `SETUP` asking for the audio that rides alongside a mirroring session.
+    /// Answer a `SETUP` asking for a realtime audio stream (type 96).
     ///
     /// It arrives on the same UDP sockets the AirPlay 1 audio flow uses and obeys the
     /// same payload rules, so the reply names those ports and the depacketiser is the
     /// same one — only the codec and the key differ.
-    fn mirror_audio_stream(&mut self) -> AirPlayResponse {
-        let Some(media) = self.mirror_media_key else {
-            warn!("mirroring audio SETUP before the video stream provided a key");
+    ///
+    /// **Two kinds of session ask for this stream, and they ask for different codecs.**
+    /// Mirroring says `ct: 8, spf: 480` — AAC-ELD. A sender casting *media* (AirPlay from
+    /// an app's video, rather than the screen) says `ct: 2, spf: 352` — ALAC, and sets up
+    /// no video stream at all. Reading the codec from the request rather than assuming
+    /// mirroring's is what lets the second session exist; assuming was a `451` and a
+    /// teardown one request later.
+    fn mirror_audio_stream(&mut self, stream: &plist::Dictionary) -> AirPlayResponse {
+        let Some(media) = self.media_key else {
+            warn!("audio SETUP before any key material");
             return AirPlayResponse::status(451);
         };
         let Some(ports) = self.local_ports else {
             warn!("no audio ports were bound");
             return AirPlayResponse::status(500);
         };
-        let params = AnnounceParams::mirror_aac_eld(media.key, media.iv);
-        log_info!(link = %params.describe(), "AirPlay mirroring audio negotiated");
+        let number = |key: &str| stream.get(key).and_then(plist::Value::as_unsigned_integer);
+        // The defaults are the values every capture carries and are only reached by a
+        // sender that omits the field; the codec itself is never defaulted.
+        let sample_rate = u32::try_from(number("sr").unwrap_or(44_100)).unwrap_or(44_100);
+        let spf = u32::try_from(number("spf").unwrap_or(480)).unwrap_or(480);
+        let Some(codec) = stream
+            .get("ct")
+            .and_then(plist::Value::as_signed_integer)
+            .and_then(StreamCodec::parse)
+            .and_then(|c| c.negotiated(sample_rate, spf, 2))
+        else {
+            warn!(ct = ?stream.get("ct"), "audio SETUP names a codec this receiver cannot decode");
+            return AirPlayResponse::status(451);
+        };
+        let params = AnnounceParams::plist_stream(codec, media.key, media.iv);
+        log_info!(link = %params.describe(), spf, "AirPlay audio stream negotiated");
         self.mirror_audio = Some(Box::new(params));
 
         let mut stream = plist::Dictionary::new();
@@ -909,7 +989,7 @@ impl AirPlaySession {
     const fn mirroring(&self) -> bool {
         matches!(
             self.mirror,
-            MirrorState::KeyMaterial { .. } | MirrorState::Ready(_)
+            MirrorState::KeyMaterial | MirrorState::Ready(_)
         )
     }
 
@@ -1810,6 +1890,95 @@ mod tests {
             body: b"volume\r\n",
         })
         .unwrap()
+    }
+
+    /// The type-96 stream a *media* session sets up, verbatim from a captured
+    /// AirPlay-from-YouTube attempt: ALAC at 352 samples a packet, and no video stream
+    /// anywhere in the session.
+    fn media_audio_setup_body() -> Vec<u8> {
+        let mut s0 = plist::Dictionary::new();
+        for (k, v) in [
+            ("type", 96i64),
+            ("ct", 2),
+            ("spf", 352),
+            ("sr", 44100),
+            ("latencyMin", 11025),
+            ("latencyMax", 88200),
+            ("controlPort", 60284),
+            ("audioFormat", 262_144),
+        ] {
+            s0.insert(k.into(), plist::Value::Integer(v.into()));
+        }
+        s0.insert("isMedia".into(), plist::Value::Boolean(true));
+        let mut d = plist::Dictionary::new();
+        d.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+        );
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &d).unwrap();
+        buf
+    }
+
+    #[test]
+    fn a_media_session_sets_up_audio_with_no_video_stream_at_all() {
+        // AirPlay from an app's video rather than from the screen: the sender sends the
+        // key material, then *one* stream — ALAC audio — and no type 110 ever. Deferring
+        // the FairPlay unwrap to the video path meant this session was answered 451 and
+        // torn down one request later.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        let r = setup(&mut s, &media_audio_setup_body());
+        assert_eq!(r.status, 200, "a media session's audio must be set up");
+        let params = s.take_mirror_audio().expect("audio was negotiated");
+        // Read from the request, not assumed: mirroring's AAC-ELD would decode this to
+        // noise, and nothing downstream would say why.
+        assert!(
+            matches!(params.codec, RaopCodec::Alac(cfg) if cfg.frame_length == 352),
+            "expected ALAC at 352 samples, got {:?}",
+            params.codec
+        );
+        assert_eq!(params.codec.sample_rate(), 44_100);
+    }
+
+    #[test]
+    fn a_mirroring_audio_stream_is_still_aac_eld() {
+        // The other sender of the same stream type, so reading `ct` cannot have broken it.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        let mut s0 = plist::Dictionary::new();
+        s0.insert("type".into(), plist::Value::Integer(96i64.into()));
+        s0.insert("ct".into(), plist::Value::Integer(8i64.into()));
+        s0.insert("spf".into(), plist::Value::Integer(480i64.into()));
+        let mut d = plist::Dictionary::new();
+        d.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &d).unwrap();
+        assert_eq!(setup(&mut s, &body).status, 200);
+        let params = s.take_mirror_audio().unwrap();
+        assert!(matches!(params.codec, RaopCodec::AacEld { .. }));
+    }
+
+    #[test]
+    fn a_codec_we_cannot_decode_is_refused_rather_than_mis_decoded() {
+        // AAC-LC needs an AudioSpecificConfig this path has no way to know. Inventing one
+        // produces noise; saying so produces a log line.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        let mut s0 = plist::Dictionary::new();
+        s0.insert("type".into(), plist::Value::Integer(96i64.into()));
+        s0.insert("ct".into(), plist::Value::Integer(4i64.into()));
+        let mut d = plist::Dictionary::new();
+        d.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &d).unwrap();
+        assert_eq!(setup(&mut s, &body).status, 451);
     }
 
     #[test]

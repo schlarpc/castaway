@@ -61,6 +61,31 @@ pub struct AlacConfig {
 }
 
 impl AlacConfig {
+    /// The ALAC configuration a `SETUP` plist implies.
+    ///
+    /// The plist carries only `spf`, `sr` and a channel count — where an SDP body spells
+    /// out all eleven `fmtp` integers — so the rest are the constants every AirPlay
+    /// sender uses and every receiver assumes: the `40 10 14` Rice parameters and a
+    /// 255-sample maximum run, exactly the values in the classic
+    /// `a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100`. They are not guesses about this
+    /// sender; they are what ALAC-over-AirPlay is.
+    #[must_use]
+    pub const fn airplay(frame_length: u32, sample_rate: u32, channels: u8) -> Self {
+        Self {
+            frame_length,
+            compatible_version: 0,
+            bit_depth: 16,
+            pb: 40,
+            mb: 10,
+            kb: 14,
+            channels,
+            max_run: 255,
+            max_frame_bytes: 0,
+            avg_bit_rate: 0,
+            sample_rate,
+        }
+    }
+
     /// Build the 36-byte ALAC "magic cookie" (an `ALACSpecificConfig` atom).
     ///
     /// libavcodec's ALAC decoder refuses to open with fewer than 36 bytes of extradata
@@ -265,21 +290,37 @@ pub struct AnnounceParams {
 impl AnnounceParams {
     /// The audio stream that rides alongside a mirroring session.
     ///
-    /// Mirroring negotiates its audio through a `SETUP` plist rather than an SDP body,
-    /// and offers exactly one codec — so unlike [`Self::parse`] there is nothing to
-    /// discover. The key is the FairPlay-unwrapped one, and the IV is the `eiv` from the
-    /// same `SETUP` that carried the wrapped key; the payload rules are AirPlay 1's,
-    /// which is why this reuses the same depacketiser.
+    /// Mirroring negotiates its audio through a `SETUP` plist rather than an SDP body.
+    /// The key is the FairPlay-unwrapped one, and the IV is the `eiv` from the same
+    /// `SETUP` that carried the wrapped key; the payload rules are AirPlay 1's, which is
+    /// why this reuses the same depacketiser.
     #[must_use]
     pub const fn mirror_aac_eld(key: SessionKey, iv: [u8; 16]) -> Self {
-        Self {
-            generation: Generation::Mirroring,
-            codec: RaopCodec::AacEld {
+        Self::plist_stream(
+            RaopCodec::AacEld {
                 sample_rate: 44_100,
                 channels: 2,
             },
+            key,
+            iv,
+        )
+    }
+
+    /// A stream negotiated by a `SETUP` plist rather than an SDP body.
+    ///
+    /// The general form of [`Self::mirror_aac_eld`], and it exists because mirroring is
+    /// not the only session that negotiates this way: a sender casting *media* (a video
+    /// from an app, rather than the screen) sets up a plist stream too, and describes a
+    /// different codec in it — `ct: 2`, ALAC at 352 samples a packet, where mirroring
+    /// says `ct: 8`, AAC-ELD at 480. Which one is a property of the request, so it is a
+    /// parameter here rather than a constant.
+    #[must_use]
+    pub const fn plist_stream(codec: RaopCodec, key: SessionKey, iv: [u8; 16]) -> Self {
+        Self {
+            generation: Generation::Mirroring,
+            codec,
             crypto: StreamCrypto::Aes { key, iv },
-            // A mirroring sender declares its latency in the sync packets rather than
+            // A sender on this path declares its latency in the sync packets rather than
             // here; observed values are around 7497 frames against ALAC's 77175.
             min_latency: None,
             max_latency: None,
