@@ -57,32 +57,43 @@ pub(crate) fn auth_response(signed: SignedAuth) -> AuthResponse {
         // the intended path for a CRL-less receiver — ours, and every third-party one —
         // is `OK_FALLBACK_CRL`, and this field is genuinely optional.
         //
-        // Except that the fallback CRL is a constant compiled into the binary
-        // (`cast_fallback_crl.h`), and decoding it against `revocation.proto` gives
-        // `not_before 2023-08-04, not_after 2023-08-12`. It expired three years ago and
-        // the same bytes are still on `main`. `ParseAndVerifyFallbackCRL` therefore always
-        // fails ("CRL - Not time-valid"), `fallback_crl` is always null, and every
-        // receiver that does not supply its own CRL takes the middle branch:
-        // `ERR_FALLBACK_CRL_INVALID` → "Failed to provide a valid fallback CRL." →
-        // `AUTHENTICATION_ERROR`, dropped and retried forever. A receiver missing from
-        // the Chrome cast list is what that looks like from the room.
+        // Which is what **Google Chrome 150 does**: it accepts this receiver with this
+        // field empty — "Auth challenge verification succeeded", no CRL diagnostics at
+        // all. So on the browser that matters, no CRL is needed and none is sent.
         //
-        // Real Cast hardware is unaffected because it does not use that path: both
-        // devices on the test LAN answer the same challenge with a 3619-byte CRL of their
-        // own, so `crl` is non-null and the fallback is never consulted. Feeding one of
-        // theirs back through this field makes Chrome log "Auth challenge verification
-        // succeeded" against this receiver — measured, not inferred.
+        // **Chromium 148 rejects the same receiver.** Same box, same binary of ours,
+        // minutes apart, this field empty in both runs:
         //
-        // The prediction this makes, and it is a broad one: *every* CRL-less software
-        // receiver is currently unusable from Chrome, AirReceiver included — its response
-        // builder never assigns this field either. Worth falsifying against a shipping
-        // product before leaning on it.
+        //     Chromium 148  0 auth successes, 4 auth failures, 13 "CRL - Not time-valid"
+        //     Chrome   150  1 auth success,   0 auth failures,  0 "CRL - Not time-valid"
         //
-        // Left absent deliberately. Filling it in means shipping a Google-signed blob
-        // valid for about a week (the captured one ran 2026-07-28 → 2026-08-05) or taking
-        // a live source, which is a cloud dependency in D30's sense — a real cost to pay
-        // for working around someone else's stale constant, and one that stops being
-        // needed the day upstream refreshes it. See OPEN-QUESTIONS/D41.
+        // There its fallback CRL fails to verify, `fallback_crl` is null, and the middle
+        // branch returns `ERR_FALLBACK_CRL_INVALID` — "Failed to provide a valid fallback
+        // CRL." → `AUTHENTICATION_ERROR`, dropped and retried forever. Supplying a CRL
+        // borrowed from a real Cast device (they answer the same challenge with a
+        // 3619-byte one, which is why hardware never takes this path) makes Chromium
+        // accept us too. So the field is a working lever if we ever need it.
+        //
+        // What is *not* established is why the two differ, and it is worth being honest
+        // that the obvious explanation is wrong. The fallback CRL is a constant compiled
+        // into the binary, and it decodes to `not_before 2023-08-04, not_after
+        // 2023-08-12` — expired three years ago — but it is byte-identical across
+        // branch-heads 7778 (148), 7871 (150) and main, and the full 1791-byte blob is
+        // present in the shipped Chrome 150 binary. `cast_crl.cc` and `cast_auth_util.cc`
+        // are identical between the two branches, and `cast_cert_validator.cc` is
+        // restructured but returns `ERR_FALLBACK_CRL_INVALID` for this case in both. By
+        // the public source both builds should refuse us; one does not. Something
+        // build-specific is doing it, and this comment does not know what.
+        //
+        // The earlier version of this comment read that as "every CRL-less software
+        // receiver is dead in Chrome, AirReceiver included". That is false — Chrome is
+        // exactly where it works. Kept as a note because it was a satisfying theory that
+        // survived reading the source and died to one measurement.
+        //
+        // Left absent, then, on the strength of the measurement rather than the theory:
+        // Chrome does not need it, and filling it in costs a Google-signed blob valid for
+        // about a week (the captured one ran 2026-07-28 → 2026-08-05) or a live source,
+        // which is a cloud dependency in D30's sense. See OPEN-QUESTIONS/D41.
         //
         // openscreen's verifier defaults to `kCrlOptional` and has no fallback CRL at
         // all, which is why the `openscreen-device-auth` vectors judge this response `ok`
