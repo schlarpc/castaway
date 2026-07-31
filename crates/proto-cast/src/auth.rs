@@ -42,34 +42,52 @@ pub(crate) fn auth_response(signed: SignedAuth) -> AuthResponse {
         signature_algorithm: Some(signature_algorithm as i32),
         sender_nonce: signed.nonce_echo.as_bytes().map(<[u8]>::to_vec),
         hash_algorithm: Some(hash_algorithm as i32),
-        // No CRL — and this is the one remaining reason Chrome refuses this receiver.
+        // No CRL — which is *supposed* to be fine, and currently is not, for a reason
+        // that is Chrome's bug rather than our omission.
         //
-        // What this comment used to say ("Chrome fetches the Cast CRL itself") is wrong,
-        // and it was wrong in the direction that costs the whole protocol. Measured
-        // against Chromium 148:
+        // The rule, from `cast_cert_validator.cc` (Chromium 148, unchanged on main).
+        // Chrome verifies at `CRLPolicy::CRL_REQUIRED_WITH_FALLBACK`, and a receiver that
+        // sends no CRL is meant to be carried by Chrome's built-in *fallback* CRL:
         //
-        //   * `VerifyCredentials` (`cast_auth_util.cc`) runs at
-        //     `CRLPolicy::CRL_REQUIRED_WITH_FALLBACK` — *required*, not optional.
-        //   * The CRL it verifies is `response.crl()`, taken from this field. Chrome's
-        //     only other source is a built-in *fallback* CRL, which is time-expired in
-        //     any freshly-provisioned profile.
-        //   * With this field empty, the result is `ERR_CRL_INVALID` → "Failed to provide
-        //     a valid CRL." → `AUTHENTICATION_ERROR`, and the channel is dropped and
-        //     retried forever. That is what a receiver missing from the Chrome cast list
-        //     actually is.
-        //   * Both real Cast devices on the test LAN answer the same challenge with a
-        //     3619-byte CRL here. Feeding one of theirs back through this field makes
-        //     Chrome log "Auth challenge verification succeeded" against this receiver.
+        //     if (fallback_crl) { ...revocation check... }
+        //     else if (!crl)    { return ERR_FALLBACK_CRL_INVALID; }
+        //     if (!crl)         { return OK_FALLBACK_CRL; }
         //
-        // openscreen's verifier defaults to `kCrlOptional`, which is why the
-        // `openscreen-device-auth` vectors judge our response `ok` and Chrome still
-        // refuses it — the two disagree, and Chrome is the one in the room.
+        // and `AuthResult::success()` counts `ERROR_CRL_OK_FALLBACK_CRL` as success. So
+        // the intended path for a CRL-less receiver — ours, and every third-party one —
+        // is `OK_FALLBACK_CRL`, and this field is genuinely optional.
         //
-        // Left absent deliberately rather than filled in: a CRL is Google-signed, is
-        // valid for about a week (the captured one ran 2026-07-28 → 2026-08-05), and
-        // sourcing one is a policy question this layer does not get to answer — a shipped
-        // blob expires, and any live source is a cloud dependency in D30's sense. See
-        // OPEN-QUESTIONS/D41.
+        // Except that the fallback CRL is a constant compiled into the binary
+        // (`cast_fallback_crl.h`), and decoding it against `revocation.proto` gives
+        // `not_before 2023-08-04, not_after 2023-08-12`. It expired three years ago and
+        // the same bytes are still on `main`. `ParseAndVerifyFallbackCRL` therefore always
+        // fails ("CRL - Not time-valid"), `fallback_crl` is always null, and every
+        // receiver that does not supply its own CRL takes the middle branch:
+        // `ERR_FALLBACK_CRL_INVALID` → "Failed to provide a valid fallback CRL." →
+        // `AUTHENTICATION_ERROR`, dropped and retried forever. A receiver missing from
+        // the Chrome cast list is what that looks like from the room.
+        //
+        // Real Cast hardware is unaffected because it does not use that path: both
+        // devices on the test LAN answer the same challenge with a 3619-byte CRL of their
+        // own, so `crl` is non-null and the fallback is never consulted. Feeding one of
+        // theirs back through this field makes Chrome log "Auth challenge verification
+        // succeeded" against this receiver — measured, not inferred.
+        //
+        // The prediction this makes, and it is a broad one: *every* CRL-less software
+        // receiver is currently unusable from Chrome, AirReceiver included — its response
+        // builder never assigns this field either. Worth falsifying against a shipping
+        // product before leaning on it.
+        //
+        // Left absent deliberately. Filling it in means shipping a Google-signed blob
+        // valid for about a week (the captured one ran 2026-07-28 → 2026-08-05) or taking
+        // a live source, which is a cloud dependency in D30's sense — a real cost to pay
+        // for working around someone else's stale constant, and one that stops being
+        // needed the day upstream refreshes it. See OPEN-QUESTIONS/D41.
+        //
+        // openscreen's verifier defaults to `kCrlOptional` and has no fallback CRL at
+        // all, which is why the `openscreen-device-auth` vectors judge this response `ok`
+        // while Chrome refuses it. The vectors are not wrong about the signature; they
+        // simply cannot see this.
         crl: None,
     }
 }
