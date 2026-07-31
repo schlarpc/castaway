@@ -329,73 +329,92 @@ fn build_lines(
     lines
 }
 
-/// A decoded cover, square-cropped and ready to scale into the art panel.
+/// A decoded cover, already centre-cropped square and resampled to the art panel's
+/// exact size.
+///
+/// The size is on the type on purpose: a cover that exists is a cover that fits, so the
+/// blit has no scaling decision left to make — or get wrong. All resampling policy lives
+/// in [`decode_cover`], the boundary where a peer's bytes become our pixels.
 struct Cover {
-    width: u32,
-    height: u32,
+    side: u32,
     rgba: Vec<u8>,
 }
 
-/// Decode cover bytes into RGBA.
+/// Decode cover bytes into a card-ready `side` × `side` RGBA square.
 ///
 /// The declared [`ImageFormat`] is a hint, not a promise — it comes from a MIME type a
 /// peer supplied — so the bytes are sniffed instead. A JPEG labelled PNG should still
 /// appear on the wall.
-fn decode_cover(artwork: &castaway_core::Artwork) -> Result<Cover, PipelineError> {
+///
+/// Centre-crop rather than stretch, because a non-square cover stretched square is
+/// instantly, distractingly wrong. The resample filter is chosen by direction: art
+/// arrives at whatever size the source felt like — Bluetooth's linked thumbnail is a
+/// fixed 200×200 (Q49), a CDN might send 640 — while the panel square can be several
+/// times that. Upscales get Catmull-Rom, which stays sharp at those factors without
+/// Lanczos's ringing on the hard edges cover art is full of; downscales get Lanczos3,
+/// where the sharpness is the virtue and minification swallows the ringing.
+fn decode_cover(artwork: &castaway_core::Artwork, side: u32) -> Result<Cover, PipelineError> {
     let decoded = image::load_from_memory(&artwork.data)
         .map_err(|e| PipelineError::Decode(format!("cover art: {e}")))?
         .to_rgba8();
-    Ok(Cover {
-        width: decoded.width(),
-        height: decoded.height(),
-        rgba: decoded.into_raw(),
-    })
+    let (w, h) = decoded.dimensions();
+    let crop = w.min(h);
+    if crop == 0 || side == 0 {
+        return Err(PipelineError::Decode(
+            "cover art: nothing to draw (empty image or zero-size panel)".into(),
+        ));
+    }
+    let square = image::imageops::crop_imm(&decoded, (w - crop) / 2, (h - crop) / 2, crop, crop);
+    let rgba = if side == crop {
+        square.to_image().into_raw()
+    } else {
+        let filter = if side > crop {
+            image::imageops::FilterType::CatmullRom
+        } else {
+            image::imageops::FilterType::Lanczos3
+        };
+        image::imageops::resize(&square.to_image(), side, side, filter).into_raw()
+    };
+    Ok(Cover { side, rgba })
 }
 
-/// Draw `cover` into the square at `(x, y)` of side `side`, centre-cropped.
+/// Copy `cover` into place at `(x, y)`, clipped to the surface.
 ///
-/// Nearest-neighbour on purpose: the source is typically 300–640px scaling into a panel
-/// of a similar order, the result is looked at from across a room, and a good resampler
-/// is a dependency and a millisecond this does not need. Centre-crop rather than stretch
-/// because a non-square cover stretched to a square is instantly, distractingly wrong.
-fn draw_cover(buf: &mut [u8], width: u32, height: u32, cover: &Cover, x: f32, y: f32, side: f32) {
-    if cover.width == 0 || cover.height == 0 || side <= 0.0 {
+/// A row copy and nothing more — see [`Cover`] for why there is no scaling here.
+fn draw_cover(buf: &mut [u8], width: u32, height: u32, cover: &Cover, x: f32, y: f32) {
+    let side = i64::from(cover.side);
+    #[allow(clippy::cast_possible_truncation)]
+    let (x0, y0) = (x.round() as i64, y.round() as i64);
+    // The horizontal overlap with the surface, as cover-local columns. Vertical clipping
+    // is per row below; horizontal is the same for every row, so it is decided once.
+    let col0 = (-x0).clamp(0, side);
+    let col1 = (i64::from(width) - x0).clamp(0, side);
+    // `try_from` rather than `as`: all are already proven in range by the clamps above
+    // (and `x0 + col0 >= 0` because `col0 >= -x0`), and saying so with a fallible
+    // conversion keeps that proof local instead of resting on a lint allowance.
+    let (Ok(col0), Ok(col1), Ok(px)) = (
+        usize::try_from(col0),
+        usize::try_from(col1),
+        usize::try_from(x0 + col0),
+    ) else {
+        return;
+    };
+    if col0 >= col1 {
         return;
     }
-    let crop = cover.width.min(cover.height);
-    let crop_x = (cover.width - crop) / 2;
-    let crop_y = (cover.height - crop) / 2;
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (x0, y0, span) = (x.round() as i64, y.round() as i64, side.round() as i64);
-    for dy in 0..span {
+    let len = (col1 - col0) * 4;
+    for dy in 0..side {
         let py = y0 + dy;
         if py < 0 || py >= i64::from(height) {
             continue;
         }
-        for dx in 0..span {
-            let px = x0 + dx;
-            if px < 0 || px >= i64::from(width) {
-                continue;
-            }
-            // Map destination pixel back into the cropped source square.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let sx = crop_x + ((dx as u64 * u64::from(crop)) / span.max(1) as u64) as u32;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let sy = crop_y + ((dy as u64 * u64::from(crop)) / span.max(1) as u64) as u32;
-            let si = ((sy.min(cover.height - 1) as usize) * cover.width as usize
-                + sx.min(cover.width - 1) as usize)
-                * 4;
-            // `try_from` rather than `as`: both are already proven in range by the guards
-            // above, and saying so with a fallible conversion keeps that proof local
-            // instead of resting on a lint allowance.
-            let (Ok(py), Ok(px)) = (usize::try_from(py), usize::try_from(px)) else {
-                continue;
-            };
-            let di = (py * width as usize + px) * 4;
-            if let (Some(src), Some(dst)) = (cover.rgba.get(si..si + 4), buf.get_mut(di..di + 4)) {
-                dst.copy_from_slice(src);
-            }
+        let (Ok(py), Ok(dy)) = (usize::try_from(py), usize::try_from(dy)) else {
+            continue;
+        };
+        let si = (dy * cover.side as usize + col0) * 4;
+        let di = (py * width as usize + px) * 4;
+        if let (Some(src), Some(dst)) = (cover.rgba.get(si..si + len), buf.get_mut(di..di + len)) {
+            dst.copy_from_slice(src);
         }
     }
 }
@@ -463,8 +482,9 @@ pub fn render(card: &NowPlayingCard, width: u32, height: u32) -> Result<Vec<u8>,
     // artwork is the least important thing here and the most likely to be malformed,
     // since it is whatever bytes a phone or a CDN chose to send.
     if let Some(artwork) = &card.track.artwork {
-        match decode_cover(artwork) {
-            Ok(cover) => draw_cover(&mut buf, width, height, &cover, art_x, art_y, art),
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        match decode_cover(artwork, art.max(0.0).round() as u32) {
+            Ok(cover) => draw_cover(&mut buf, width, height, &cover, art_x, art_y),
             Err(e) => debug!(error = %e, "now-playing card: cover art did not decode"),
         }
     }

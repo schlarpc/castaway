@@ -1093,11 +1093,15 @@ the reasons are what a future reversal has to argue against.
   scale factor was ~1, not ~3.
 
   **Settle in this order:** (1) log one `GetImageProperties` listing from the iPhone —
-  it decides whether `GetImage` is worth the descriptor dance at all; (2) fix the
-  upscale filter regardless, since it degrades every source whose art is smaller than
-  the card square; (3) only then decide whether to claim bits 7/8 and implement the
-  full-image fetch, peer-gated the way Q29's ERTM lesson suggests (request the native
-  variant, fall back to the thumbnail on any refusal).
+  it decides whether `GetImage` is worth the descriptor dance at all; (2) ~~fix the
+  upscale filter~~ **DONE**: scaling now happens once at the boundary —
+  `decode_cover` produces the art square's exact size (Catmull-Rom up, Lanczos3 down)
+  and `Cover` carries its side on the type, so the blit is a row copy with no scaling
+  decision left to get wrong; verified pixel-exact against a bicubic reference (57 dB
+  PSNR, vs 29 dB for the old nearest path) via `card_preview` with a 200×200 source;
+  (3) only then decide whether to claim bits 7/8 and implement the full-image fetch,
+  peer-gated the way Q29's ERTM lesson suggests (request the native variant, fall back
+  to the thumbnail on any refusal).
 
 ## GameStream client (D37)
 
