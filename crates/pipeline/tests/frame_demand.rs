@@ -1,4 +1,4 @@
-//! The render loop knows when it next owes the glass a frame (Q48).
+//! The render loop knows when it next owes the glass a frame (#59).
 //!
 //! The property under test is the one the free-running kiosk never had: after a frame,
 //! [`RenderLoop::demand`] answers *continuous* while something moves, a *deadline* when

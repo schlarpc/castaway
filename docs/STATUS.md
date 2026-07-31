@@ -255,7 +255,7 @@ Behind `--features render` (+ `ffmpeg`/`kiosk`); needs the native devShell (`nix
   pixels (`encoded_mirror_decodes_and_composites_pixels`). Decode waits for a key frame
   (mirror sessions are joined mid-stream), carries the adapter's timestamps through the
   decoder's reorder buffer, and rebuilds swscale when the sender changes resolution.
-- **Hardware decode** (`hwaccel` feature, Q20): VA-API → DMA-BUF → Vulkan import → NV12
+- **Hardware decode** (`hwaccel` feature, #58): VA-API → DMA-BUF → Vulkan import → NV12
   sampled in the shader, with **no copy anywhere**. `tests/hwaccel_zero_copy.rs` decodes a
   known colour on the dev box's RX 7900 XTX and asserts on the composited pixels, which is
   what catches a wrong tiling, wrong plane pitches, or the wrong colour matrix — all of
@@ -298,7 +298,7 @@ assets and palette are vendored, nothing uses them, and the font is still DejaVu
 3. ~~**#57** — real pipeline (ffmpeg → wgpu → kiosk) behind the feature flags.~~ **Mostly
    done**: all three `FrameSource` variants reach composited pixels in readback tests.
    What's left is the kiosk surface on the real panel.
-4. ~~**Q20** — hardware-accelerated decode.~~ **Done on Linux**, proven zero-copy by an
+4. ~~**#58** — hardware-accelerated decode.~~ **Done on Linux**, proven zero-copy by an
    offscreen readback test; the Windows D3D11VA bridge is written and cross-compiled but
    unverified until the Dell.
 5. **#40** — a real Cast device credential, and now the only thing between this receiver

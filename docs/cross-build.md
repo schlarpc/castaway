@@ -37,7 +37,7 @@ exercises your *future* Linux target.
 |---|---|---|
 | `.#castaway-windows` | none | toolchain canary — if it stops linking, the toolchain broke, not the media stack |
 | `.#castaway-windows-render` | `render` | DX12 compositor + kiosk, no browser; bisect render problems without the browser runtime in the way |
-| `.#castaway-windows-hwaccel` | `hwaccel` | the D3D11VA → shared-NV12 → D3D12 decode bridge. Exists as its own artifact because it is the one part of Q20 Linux cannot exercise: the VA-API half has an offscreen readback test, this half has only the compiler until it reaches the Dell |
+| `.#castaway-windows-hwaccel` | `hwaccel` | the D3D11VA → shared-NV12 → D3D12 decode bridge. Exists as its own artifact because it is the one part of #58 Linux cannot exercise: the VA-API half has an offscreen readback test, this half has only the compiler until it reaches the Dell |
 | `.#castaway-windows-electron` | `electron` | the deploy artifact: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
 

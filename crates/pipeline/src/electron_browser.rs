@@ -642,7 +642,7 @@ struct Wiring<'a> {
     audio: &'a Arc<Mutex<Option<BrowserAudio>>>,
     probes: &'a Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
     ready_tx: &'a std::sync::mpsc::Sender<u32>,
-    /// Wakes the kiosk loop (Q48): a stored paint and a posted fault are both consumed
+    /// Wakes the kiosk loop (#59): a stored paint and a posted fault are both consumed
     /// by the main-thread pump, which no longer runs unless something asks it to.
     waker: &'a castaway_core::Waker,
 }
@@ -990,7 +990,7 @@ pub struct RespawnSpec {
     pub audio_out: Option<AudioOutputFactory>,
     /// The user agent leanback keys off.
     pub user_agent: String,
-    /// The kiosk-loop waker a respawned browser's reader thread wakes with (Q48).
+    /// The kiosk-loop waker a respawned browser's reader thread wakes with (#59).
     pub waker: castaway_core::Waker,
 }
 
@@ -1447,7 +1447,7 @@ impl ElectronHost {
     }
 
     /// When this host next needs the kiosk loop to run it without being asked: a
-    /// scheduled recovery's due time (Q48). Everything else it does is either driven by
+    /// scheduled recovery's due time (#59). Everything else it does is either driven by
     /// a wake (paints and faults, from the reader thread; commands, from their senders)
     /// or is a reaction to panel state that only moves when the loop runs anyway.
     #[must_use]
@@ -1459,7 +1459,7 @@ impl ElectronHost {
     /// path's own session log — because "is it in sync" must be answerable from the
     /// journal rather than from someone standing in front of the panel.
     ///
-    /// The cadence is best-effort under demand-driven pacing (Q48): the line is written
+    /// The cadence is best-effort under demand-driven pacing (#59): the line is written
     /// on the first pump at least 5 s after the last one. A video session paints — and
     /// therefore wakes — continuously, so the cadence holds where sync matters; a page
     /// playing audio under a static picture logs only as often as something else runs

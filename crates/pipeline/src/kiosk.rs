@@ -3,7 +3,7 @@
 //! run on the **main thread** (architecture §6) — the tokio runtime and decode threads
 //! live elsewhere and feed frames in over the [`RenderLoop`]'s channel.
 //!
-//! Presenting is demand-driven (Q48). Every producer that queues work for this loop —
+//! Presenting is demand-driven (#59). Every producer that queues work for this loop —
 //! render commands, video frames, browser paints, OSD banners, the exit flag — wakes it
 //! through a [`castaway_core::Waker`] armed with the event loop's proxy, and each frame
 //! the loop recomputes what it owes the glass next ([`crate::demand::Demand`]): another
@@ -54,7 +54,7 @@ struct KioskApp {
     render: Option<RenderLoop>,
     /// External shutdown request (ctrl-c / service failure): checked whenever the loop
     /// runs, since a borderless-fullscreen kiosk has no chrome to close. The setter
-    /// wakes the loop, which is what makes "whenever it runs" mean "now" (Q48).
+    /// wakes the loop, which is what makes "whenever it runs" mean "now" (#59).
     exit: Option<Arc<AtomicBool>>,
     /// Last cursor position in window pixels (winit reports buttons without one).
     cursor: (f64, f64),
@@ -84,7 +84,7 @@ struct KioskApp {
     pill_drawn: bool,
     /// Whether an event arrived since the last redraw, so the panel owes the glass one
     /// more frame regardless of what the standing facts say. Set by input and by wakes,
-    /// cleared by the redraw itself (Q48).
+    /// cleared by the redraw itself (#59).
     dirty: bool,
     /// The earliest the next redraw may present, from the last one plus the display's
     /// refresh interval — the cap that turns "everything wakes the loop" into "at most
@@ -229,7 +229,7 @@ impl KioskApp {
     }
 
     /// What the panel owes the glass next, recomputed from standing facts every time the
-    /// loop is about to sleep (Q48). Merged across every part that keeps time: the
+    /// loop is about to sleep (#59). Merged across every part that keeps time: the
     /// render loop's motions and deadlines, the pill's fade, the browser host's
     /// scheduled recovery, and the one-more-frame owed to whatever event just arrived.
     fn demand(&self, now: std::time::Instant) -> crate::demand::Demand {
@@ -701,7 +701,7 @@ impl ApplicationHandler for KioskApp {
         }
         self.size = (size.width, size.height);
         // The redraw cap comes from the panel itself: presenting faster than the display
-        // refreshes is discarded by the Mailbox swapchain unseen (Q48). Monitors that
+        // refreshes is discarded by the Mailbox swapchain unseen (#59). Monitors that
         // will not say (some Wayland compositors) keep the 60 Hz default.
         if let Some(mhz) = window
             .current_monitor()
@@ -923,7 +923,7 @@ fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
     let event_loop = EventLoop::<()>::with_user_event()
         .build()
         .map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
-    // The wake path (Q48): every producer that queues work for this loop holds a
+    // The wake path (#59): every producer that queues work for this loop holds a
     // `Waker`, and the wakers are armed with the loop's proxy here — the first moment a
     // proxy exists. Wakes that arrived before this fired are latched and land now.
     let arm = |waker: castaway_core::Waker| {

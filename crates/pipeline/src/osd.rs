@@ -67,7 +67,7 @@ impl OsdController {
         Self { rx, showing: None }
     }
 
-    /// The waker the channel's sinks share, for the kiosk loop to arm (Q48): a banner
+    /// The waker the channel's sinks share, for the kiosk loop to arm (#59): a banner
     /// posted while the panel sleeps has to wake it to be seen.
     #[must_use]
     pub fn waker(&self) -> castaway_core::Waker {

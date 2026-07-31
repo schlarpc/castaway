@@ -1,4 +1,4 @@
-//! A cross-thread wake handle for a demand-driven render loop (Q48).
+//! A cross-thread wake handle for a demand-driven render loop (#59).
 //!
 //! The kiosk sleeps between frames; everything that queues work for it — a render
 //! command, a browser paint, an OSD banner, the exit flag — holds a clone of the same

@@ -35,7 +35,7 @@ pub mod resample;
 pub mod browser_proto;
 pub mod color;
 pub mod compositor;
-/// When the kiosk next needs to draw (Q48). Pure.
+/// When the kiosk next needs to draw (#59). Pure.
 #[cfg(feature = "render")]
 pub mod demand;
 pub mod error;

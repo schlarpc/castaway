@@ -403,7 +403,7 @@ rec {
   };
 
   # Same, plus the D3D11VA → shared-NV12-texture → D3D12 decode bridge. It exists as its
-  # own artifact because it is the *only* part of Q20 that Linux cannot exercise: the
+  # own artifact because it is the *only* part of #58 that Linux cannot exercise: the
   # VA-API half is proven by an offscreen readback test on the dev box, but the Windows
   # half has no substitute for the Dell. Building it here at least keeps the winapi/d3d12
   # interop compiling, so it does not rot silently between visits to the panel.

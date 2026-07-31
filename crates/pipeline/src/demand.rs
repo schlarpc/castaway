@@ -1,4 +1,4 @@
-//! When the kiosk next needs to draw (Q48).
+//! When the kiosk next needs to draw (#59).
 //!
 //! The render loop used to free-run — redraw requested unconditionally at the end of
 //! every redraw — and the idle panel burned a core presenting ~970 identical frames a

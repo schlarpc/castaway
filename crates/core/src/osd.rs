@@ -53,7 +53,7 @@ pub enum OsdCommand {
 #[derive(Debug, Clone)]
 pub struct OsdSink {
     tx: Sender<OsdCommand>,
-    /// Wakes the render loop, which polls this channel only when awake (Q48). A banner
+    /// Wakes the render loop, which polls this channel only when awake (#59). A banner
     /// posted while the panel is idle would otherwise wait for the next touch to show.
     waker: crate::wake::Waker,
 }

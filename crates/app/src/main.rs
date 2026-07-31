@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
     let shutdown = Arc::new(Notify::new());
     // A fullscreen kiosk has no window chrome, so ctrl-c must also stop the winit loop;
-    // the flag is checked on every wake, and setting it comes with a wake (Q48).
+    // the flag is checked on every wake, and setting it comes with a wake (#59).
     let kiosk_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // The OSD channel: the session manager posts "Now casting from …", and any other
@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
-        // The kiosk loop sleeps between frames (Q48); everything outside the render
+        // The kiosk loop sleeps between frames (#59); everything outside the render
         // channel that queues work for it wakes it through clones of this. The kiosk
         // arms it once the event loop exists.
         let wake = render_pipeline.waker();
@@ -512,7 +512,7 @@ fn spawn_ctrl_c(
             }
         }
         kiosk_exit.store(true, std::sync::atomic::Ordering::Relaxed);
-        // The kiosk sleeps between frames (Q48) and checks the flag when awake; a
+        // The kiosk sleeps between frames (#59) and checks the flag when awake; a
         // ctrl-c on an idle panel has to wake it to be noticed.
         kiosk_wake.wake();
         shutdown.notify_waiters();

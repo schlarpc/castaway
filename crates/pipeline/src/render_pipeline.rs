@@ -163,7 +163,7 @@ pub enum RenderCommand {
 pub struct RenderTx {
     frames: SyncSender<RenderCommand>,
     control: std::sync::mpsc::Sender<RenderCommand>,
-    /// Wakes the kiosk loop, which sleeps between frames (Q48). Every send wakes it:
+    /// Wakes the kiosk loop, which sleeps between frames (#59). Every send wakes it:
     /// a command sitting in a channel nobody is spinning on is otherwise invisible.
     waker: castaway_core::Waker,
 }
@@ -241,7 +241,7 @@ impl RenderRx {
     }
 
     /// The waker the senders on this channel share, for the kiosk loop to arm with its
-    /// real wake mechanism once the event loop exists (Q48).
+    /// real wake mechanism once the event loop exists (#59).
     #[must_use]
     pub fn waker(&self) -> castaway_core::Waker {
         self.waker.clone()
@@ -459,7 +459,7 @@ impl RenderPipeline {
         self.tx.clone()
     }
 
-    /// The process-wide render-loop waker (Q48). Everything that queues work for the
+    /// The process-wide render-loop waker (#59). Everything that queues work for the
     /// kiosk outside the render channel — the exit flag, the browser command lane, the
     /// browser subprocess itself — takes a clone, so the loop can sleep between frames
     /// without any of them going unnoticed.
@@ -2452,7 +2452,7 @@ impl RenderLoop {
         Some(role.view(self.compositor.target_size()))
     }
 
-    /// One demand-driven frame (Q48): drain pending commands, advance every animation by
+    /// One demand-driven frame (#59): drain pending commands, advance every animation by
     /// `dt`, present once, and answer when the next frame is owed.
     ///
     /// Commands are applied *before* the ticks so a motion a command just started is
