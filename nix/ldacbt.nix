@@ -1,7 +1,7 @@
 # libldacBT — Sony's own LDAC codec library, built with the **decoder** in it.
 #
 # The one A2DP codec libav cannot decode, and the reason the LDAC endpoint went
-# unadvertised for as long as it did (OPEN-QUESTIONS Q22). `ldac-sys` links this;
+# unadvertised for as long as it did (#14). `ldac-sys` links this;
 # `pipeline::ldac_decode` is the safe wrapper.
 #
 # ## Why this is not just `pkgs.ldacbt`

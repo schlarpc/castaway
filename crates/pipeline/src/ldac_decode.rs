@@ -1,7 +1,7 @@
 //! LDAC decode: the safe boundary over [`ldac_sys`].
 //!
 //! The only A2DP codec libav cannot decode, and therefore the only reason this pipeline
-//! has a second decode backend at all (OPEN-QUESTIONS Q22). Everything here exists to
+//! has a second decode backend at all (#14). Everything here exists to
 //! turn a C API with four sharp edges into something [`crate::audio_decode`] can call the
 //! same way it calls ffmpeg.
 //!
@@ -63,7 +63,7 @@ const OUTPUT_CAPACITY: usize = sys::LDACBT_MAX_LSU as usize * 2 * 4;
 /// Whether this build can decode LDAC.
 ///
 /// Answers by allocating a handle, not by reporting a feature flag. The distinction is the
-/// whole of Q22: `can_decode` used to answer `cfg!(feature = "ldac")` while the feature
+/// whole of #14: `can_decode` used to answer `cfg!(feature = "ldac")` while the feature
 /// bound no decoder, so a build advertised an LDAC endpoint, a phone picked it, and every
 /// packet failed. Asking the library is the only answer that cannot drift.
 #[must_use]

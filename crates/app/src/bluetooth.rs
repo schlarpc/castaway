@@ -137,7 +137,7 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
 
     // The codec table follows what this build can actually decode. Advertising a codec
     // we cannot decode means the phone picks it and the session is silence rather than a
-    // clean fallback to one we can (Q22) — and the phone picks the *best* one it shares
+    // clean fallback to one we can (#14) — and the phone picks the *best* one it shares
     // with us, so the ones most likely to be missing are exactly the ones it reaches for
     // first. This used to check LDAC alone, which left aptX HD, aptX and AAC unguarded.
     let decodable = decodable();
@@ -163,7 +163,7 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
         info!(?codecs, "bluetooth: advertising a restricted codec table");
     }
 
-    // Persist each new key as it is issued, so a repeat guest never re-pairs (Q23). A
+    // Persist each new key as it is issued, so a repeat guest never re-pairs (#68). A
     // write failure costs one re-pairing next time, which is not worth ending a live
     // session over.
     let store_path = keys_path.clone();
@@ -270,7 +270,7 @@ async fn open_transport(config: &Config) -> anyhow::Result<(Arc<dyn HciTransport
 /// Codecs a build can decode but does not advertise unless the config names them.
 ///
 /// This is a *policy* list, and it is deliberately separate from `decodable()`, which is a
-/// statement of fact. Conflating the two is what Q22 was about in the other direction:
+/// statement of fact. Conflating the two is what #14 was about in the other direction:
 /// `can_decode` answered a feature flag instead of "is there a decoder", and a build
 /// advertised LDAC with nothing behind it. So the fact stays honest and the reticence lives
 /// here, where it can be read and argued with.
@@ -321,7 +321,7 @@ fn parse_usb_id(spec: &str) -> anyhow::Result<UsbId> {
     ))
 }
 
-/// Read stored link keys, so a repeat guest reconnects without pairing again (Q23).
+/// Read stored link keys, so a repeat guest reconnects without pairing again (#68).
 ///
 /// A corrupt or unreadable file is a warning, not a failure: the worst case is that
 /// everyone re-pairs once, which is a far better outcome than refusing to start.
@@ -413,7 +413,7 @@ mod tests {
     #[cfg(feature = "audio")]
     #[test]
     fn we_never_advertise_an_endpoint_this_build_cannot_decode() {
-        // The invariant Q22 actually needs, and the one nothing was checking. The test in
+        // The invariant #14 actually needs, and the one nothing was checking. The test in
         // `pipeline` asserts `can_decode` over `decodable_codecs()`, which is true by
         // construction; it cannot see the advertised table at all, because that lives in
         // `proto-bluetooth-audio`. This crate is the only one that depends on both.

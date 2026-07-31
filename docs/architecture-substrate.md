@@ -326,7 +326,7 @@ ldac-sys/             FFI to libldacBT, the one codec libav cannot decode (D47)
 `substrate-*` crate at `unsafe_code = "forbid"`, and the Linux `HCI_CHANNEL_USER` socket
 needs raw syscalls. So the backends live in `hci-transport`, declared as an FFI/interop
 crate alongside `pipeline` and `input-touch`. Note the USB backend needs no `unsafe` at all
-— `nusb` is a safe API — which also makes the Realtek firmware uploader (Q21) pure safe Rust
+— `nusb` is a safe API — which also makes the Realtek firmware uploader (#67) pure safe Rust
 on both platforms.
 
 Dependencies flow toward `core` as always; `proto-bluetooth-audio` is the only one that
@@ -416,7 +416,7 @@ start, because one implementation behind a trait is just a trait-shaped hardcodi
 | After | reset, done | wait for the boot vendor event, `Intel_Reset` `0xFC01`, then push the `.ddc` config via `0xFC8B` |
 | Reference | `btrtl.c` | `btintel.c` |
 
-Intel is the more involved of the two — which is why Q21 originally rejected it — but having
+Intel is the more involved of the two — which is why #67 originally rejected it — but having
 one in the tree makes the seam real, and the AX200 in the dev box is hardware we already have.
 
 **Testing it against the kernel.** `btintel.c` is the specification, and the kernel driving
@@ -663,7 +663,7 @@ need a real phone, or `mpris-proxy` with a player behind it.
 
   Two filters stand between that order and what a sender actually sees, and they answer
   different questions. `codec::advertised(decodable)` drops anything this *build* cannot
-  decode — the invariant Q22 is about, because the table is best-first and an endpoint we
+  decode — the invariant #14 is about, because the table is best-first and an endpoint we
   cannot decode is not a missed opportunity but the one the phone reaches for. On top of
   that, `bluetooth::OPT_IN` drops anything we can decode and are not ready to *offer*; LDAC
   is there today, so the shipped table is aptX HD → aptX → AAC → SBC until a config says
@@ -673,7 +673,7 @@ need a real phone, or `mpris-proxy` with a player behind it.
 
 Worth its own heading because conflating the two has now gone wrong in both directions.
 
-Q22 was the first: `can_decode` answered a feature flag instead of "is there a decoder", so
+#14 was the first: `can_decode` answered a feature flag instead of "is there a decoder", so
 a build advertised LDAC with nothing behind it and handed a connected phone silence. The fix
 was to make the fact honest — `can_decode` allocates a decoder handle and reports what
 happened.

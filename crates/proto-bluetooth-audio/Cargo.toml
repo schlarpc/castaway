@@ -38,7 +38,7 @@ default = []
 # exist to be run by hand against `btvirt`, not by CI.
 bench = []
 # Advertise the LDAC endpoint. Still gated, because advertising a codec we cannot decode
-# is worse than omitting it: the sender picks it and the session is silence (Q22). What
+# is worse than omitting it: the sender picks it and the session is silence (#14). What
 # changed is that there is now something to gate — `pipeline/ldac` links Sony's own
 # library — and the app keeps the two in step by deriving `decodable` from what the
 # pipeline reports rather than from this flag. This only sets the default for a caller

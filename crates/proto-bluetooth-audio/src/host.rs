@@ -1,6 +1,6 @@
 //! Controller bring-up and pairing policy, as a pure state machine.
 //!
-//! Everything Q23 decided lives here and is therefore testable: Just Works pairing with
+//! Everything #68 decided lives here and is therefore testable: Just Works pairing with
 //! no prompt on either side, link keys persisted so a repeat guest reconnects silently,
 //! discoverable only while no session is active, and legacy PIN pairing refused outright.
 //!
@@ -69,7 +69,7 @@ pub enum HostAction {
         /// Its friendly name.
         name: String,
     },
-    /// Pairing produced a link key the caller should persist (Q23).
+    /// Pairing produced a link key the caller should persist (#68).
     Paired {
         /// The peer it belongs to.
         peer: BdAddr,
@@ -104,7 +104,7 @@ pub struct HostConfig {
     /// Whether to be discoverable at all.
     ///
     /// Not "when idle": a receiver anyone in the room should be able to use has to stay
-    /// findable while it is in use, or the second person to want it cannot pair (Q23, as
+    /// findable while it is in use, or the second person to want it cannot pair (#68, as
     /// amended). Turning this off is for a box that should only ever serve devices that
     /// already know it.
     pub discoverable: bool,
@@ -175,7 +175,7 @@ impl HostController {
     }
 
     /// Seed the controller with link keys loaded from disk, so a repeat guest
-    /// reconnects without pairing again (Q23).
+    /// reconnects without pairing again (#68).
     pub fn load_link_keys(&mut self, keys: impl IntoIterator<Item = (BdAddr, LinkKey)>) {
         self.link_keys.extend(keys);
     }
@@ -237,7 +237,7 @@ impl HostController {
             // active A2DP link starves even that, which is why a receiver in use vanishes
             // from every scan list in the room. For a mains-powered box that anyone
             // should be able to walk up to, that is the wrong trade: spend ~9% of the
-            // radio on being findable (Q23).
+            // radio on being findable (#68).
             Command::WriteInquiryScanActivity {
                 interval: INQUIRY_SCAN_INTERVAL,
                 window: INQUIRY_SCAN_WINDOW,
@@ -252,7 +252,7 @@ impl HostController {
         vec![HostAction::Send(Command::Reset)]
     }
 
-    /// Set discoverability directly — used to go quiet while a session is active (Q23).
+    /// Set discoverability directly — used to go quiet while a session is active (#68).
     #[must_use]
     pub fn set_discoverable(&mut self, discoverable: bool) -> Vec<HostAction> {
         let scan = if discoverable {
@@ -368,7 +368,7 @@ impl HostController {
                 }]
             }
 
-            // --- pairing (Q23: Just Works, bonded, no prompt) ---
+            // --- pairing (#68: Just Works, bonded, no prompt) ---
             Event::IoCapabilityRequest(addr) => {
                 vec![HostAction::Send(Command::IoCapabilityRequestReply {
                     addr: *addr,
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn pairing_is_just_works_with_no_prompt_on_either_side() {
-        // Q23's decision, made testable. Claiming NoInputNoOutput is what *selects*
+        // #68's decision, made testable. Claiming NoInputNoOutput is what *selects*
         // Just Works; any other claim makes the controller run numeric comparison and
         // wait for a confirmation a kiosk has no way to collect.
         let mut host = HostController::new(HostConfig::default());
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn a_returning_guest_reconnects_with_the_stored_key_and_a_new_one_pairs() {
-        // The bonding half of Q23: keys persist, so a repeat visitor never sees a
+        // The bonding half of #68: keys persist, so a repeat visitor never sees a
         // pairing prompt again.
         let mut host = HostController::new(HostConfig::default());
         let known: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn going_quiet_for_a_session_stays_connectable() {
         // Undiscoverable, but a phone that already paired must still be able to
-        // reconnect while someone else streams — otherwise takeover never works (Q23).
+        // reconnect while someone else streams — otherwise takeover never works (#68).
         let mut host = HostController::new(HostConfig::default());
         assert_eq!(
             sent(&host.set_discoverable(false)),
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn bring_up_scans_hard_enough_to_be_found_while_streaming() {
-        // Q23 as amended: the receiver stays findable while it is in use, which the
+        // #68 as amended: the receiver stays findable while it is in use, which the
         // controller defaults will not do — an 11.25 ms window every 1.28 s loses to an
         // active A2DP link, and the box silently disappears from every scan list.
         let mut host = HostController::new(HostConfig::default());

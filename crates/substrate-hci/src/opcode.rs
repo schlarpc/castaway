@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn vendor_opcodes_decompose_correctly() {
         // Realtek's firmware download command, which the Windows transport has to send
-        // itself because no driver is there to do it (OPEN-QUESTIONS Q21).
+        // itself because no driver is there to do it (#67).
         let download = OpCode::new(0xFC20);
         assert_eq!(download.ogf(), Ogf::Vendor);
         assert_eq!(download.ocf(), 0x020);

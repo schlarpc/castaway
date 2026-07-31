@@ -5,7 +5,7 @@
 //! `libldacBT` behind the `ldac` feature (see [`crate::ldac_decode`]). Which backend a
 //! codec uses is settled once, in [`Backend::for_codec`], and the absence of one must keep
 //! the endpoint out of the advertised table rather than fail at decode time
-//! (OPEN-QUESTIONS Q22).
+//! (#14).
 //!
 //! AAC arrives here already unwrapped from its LATM multiplex — see
 //! `proto_bluetooth_audio::latm` for why that is a separate step and what happens if it is
@@ -54,7 +54,7 @@ pub use castaway_core::PcmFrame as PcmBlock;
 ///
 /// An enum rather than an `Option<ffmpeg::codec::Id>` because "no ffmpeg decoder" and "not
 /// decodable" stopped being the same thing when LDAC got a backend of its own, and the
-/// place that used to conflate them is where Q22's silence came from. Every question this
+/// place that used to conflate them is where #14's silence came from. Every question this
 /// module answers about a codec — can it be decoded, what opens it, what closes over the
 /// state — routes through here, so there is one decision and not three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +79,11 @@ impl Backend {
             // Without the feature there is no LDAC decoder in the process, and saying so
             // here is what keeps the endpoint off the advertised table. The old wording
             // said libav has none and left it at that, which was true and not the point:
-            // what matters is that *nothing* does (Q22).
+            // what matters is that *nothing* does (#14).
             #[cfg(not(feature = "ldac"))]
             AudioCodec::Ldac => Err(PipelineError::Decode(
                 "no LDAC decoder in this build: libav has none, and the `ldac` feature \
-                 that binds Sony's own library is off (Q22)"
+                 that binds Sony's own library is off (#14)"
                     .into(),
             )),
             other => codec_id(other).map(Self::Ffmpeg),
@@ -132,13 +132,13 @@ fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
 ///
 /// The A2DP endpoint table must be built from this, not from optimism: advertising a
 /// codec we cannot decode means the sender picks it and the session is silence rather
-/// than a clean fallback to one we can (Q22).
+/// than a clean fallback to one we can (#14).
 #[must_use]
 pub fn can_decode(codec: AudioCodec) -> bool {
     // One source of truth, and it is whether a decoder actually exists. This used to
     // answer `cfg!(feature = "ldac")` for LDAC, which is a different question: the `ldac`
     // feature reserved a slot and bound no decoder, so a build with it on advertised an
-    // LDAC endpoint and then failed every packet — the exact silence Q22 is about. The
+    // LDAC endpoint and then failed every packet — the exact silence #14 is about. The
     // feature now binds a real backend, and this still does not ask about the feature.
     ensure_init();
     Backend::for_codec(codec).is_ok_and(Backend::is_available)
@@ -536,7 +536,7 @@ where
 pub(crate) fn warn_undecodable(codec: AudioCodec) {
     warn!(
         ?codec,
-        "no decoder in this build; the endpoint should not have been advertised (Q22)"
+        "no decoder in this build; the endpoint should not have been advertised (#14)"
     );
 }
 
@@ -983,7 +983,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(not(feature = "ldac"))]
     fn a_build_without_the_ldac_backend_does_not_claim_ldac() {
-        // Q22, and the way it actually went wrong: `can_decode` answered the feature flag
+        // #14, and the way it actually went wrong: `can_decode` answered the feature flag
         // rather than "is there a decoder", so a build with `--features ldac` advertised an
         // LDAC endpoint, a phone picked it, and every packet failed. The flag now binds a
         // real backend — but this side of the invariant still has to hold, because
@@ -1012,7 +1012,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_codecs_we_advertise_are_the_codecs_we_can_decode() {
-        // The invariant Q22 turns on. If this fails, some phone will negotiate a codec
+        // The invariant #14 turns on. If this fails, some phone will negotiate a codec
         // that produces silence.
         for codec in [AudioCodec::Sbc, AudioCodec::AptX, AudioCodec::AptXHd] {
             assert!(can_decode(codec), "{codec:?} must be decodable");

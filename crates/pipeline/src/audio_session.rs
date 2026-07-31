@@ -248,7 +248,7 @@ pub fn run(
     }
     if let Err(e) = result {
         // The most likely cause is a codec we advertised but cannot decode, which is
-        // the failure Q22 exists to prevent — so name it loudly.
+        // the failure #14 exists to prevent — so name it loudly.
         warn!(error = %e, ?codec, "audio session ended with an error");
         crate::audio_decode::warn_undecodable(codec);
         if refused.is_none() {
@@ -487,7 +487,7 @@ impl Pace {
 ///
 /// The adapter's endpoint table must be built from this. Advertising a codec we cannot
 /// decode means the sender picks it and the session is silence rather than a clean
-/// fallback to one we can (Q22).
+/// fallback to one we can (#14).
 #[must_use]
 pub fn decodable_codecs() -> Vec<AudioCodec> {
     [
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn the_advertised_table_never_contains_a_codec_we_cannot_decode() {
-        // The invariant Q22 actually needs. The old version of this test asserted the
+        // The invariant #14 actually needs. The old version of this test asserted the
         // table followed the *feature flag*, which is what let a build advertise LDAC
         // with no decoder behind it and hand a phone five minutes of silence.
         for codec in decodable_codecs() {

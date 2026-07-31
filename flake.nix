@@ -103,7 +103,7 @@
       flake = false;
     };
 
-    # Sony's LDAC library, for the one A2DP codec ffmpeg has no decoder for (Q22).
+    # Sony's LDAC library, for the one A2DP codec ffmpeg has no decoder for (#14).
     #
     # Its own input rather than `pkgs.ldacbt` because under the nixpkgs pinned above that
     # attribute is EHfive/ldacBT 2.0.2.3, built `_ENCODE_ONLY` — a shared object with no
@@ -330,7 +330,7 @@
       };
 
       # Sony's LDAC library, with the decoder in it — which `pkgs.ldacbt` under this pin
-      # does not have. `ldac-sys/build.rs` finds it through `LDACBT_LIB_DIR` (Q22).
+      # does not have. `ldac-sys/build.rs` finds it through `LDACBT_LIB_DIR` (#14).
       ldacbtFor = system: import ./nix/ldacbt.nix {
         pkgs = pkgsFor system;
         src = external-libldac-src;
@@ -535,7 +535,7 @@
           # *silent* — a receiver with no decoder pairs, streams, and plays nothing.
           # `ldac` rides along here rather than getting a check of its own. It is part of
           # the same silent-failure story — a codec we advertise and cannot decode is a
-          # session of silence (Q22) — and its tests are the only ones that decode LDAC at
+          # session of silence (#14) — and its tests are the only ones that decode LDAC at
           # all, so leaving them out of `nix flake check` would mean the endpoint's
           # correctness rested on somebody remembering to pass a feature flag.
           audioArgs = {
@@ -663,7 +663,7 @@
 
           # The bindings for a library that ships no headers, regenerated and diffed.
           # Nothing at build time can catch a wrong FFI signature here, so this is the only
-          # thing standing between a nixpkgs bump and a decoder that reads noise (Q22).
+          # thing standing between a nixpkgs bump and a decoder that reads noise (#14).
           ldac-bindings = import ./nix/ldac-bindings.nix {
             inherit pkgs;
             rustToolchain = rustToolchainFor system;
@@ -740,7 +740,7 @@
               # ALSA dev libs for `cpal`, the PCM output behind the `audio-out` feature.
               # Linux-only: the Windows build reaches WASAPI through the OS.
               pkgs.alsa-lib
-              # Sony's LDAC library, for the one A2DP codec ffmpeg cannot decode (Q22).
+              # Sony's LDAC library, for the one A2DP codec ffmpeg cannot decode (#14).
               # Ours rather than `pkgs.ldacbt`, which under this nixpkgs pin is built
               # encoder-only — see nix/ldacbt.nix.
               (ldacbtFor system)
@@ -766,7 +766,7 @@
             MOONLIGHT_COMMON_C_LIB_DIR =
               "${moonlightCommonCFor system}/lib:${pkgs.openssl.out}/lib";
 
-            # Where `ldac-sys`'s build.rs finds `libldacBT` (Q22). Set even though the
+            # Where `ldac-sys`'s build.rs finds `libldacBT` (#14). Set even though the
             # library is in `buildInputs` and the ld wrapper would find it anyway: the
             # build script emits no link directive at all without this, so that a build
             # without the `ldac` feature does not depend on the library being present.

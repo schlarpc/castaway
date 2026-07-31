@@ -355,7 +355,7 @@ fn a_closed_stream_frees_its_endpoint_for_the_next_sender() {
     Phone::accepted(&phone.send(Signal::Close, &[seid.shifted()]));
     assert!(phone.session.endpoints().iter().all(|s| !s.in_use));
 
-    // Last-writer-wins (Q23): the next phone configures the same endpoint immediately.
+    // Last-writer-wins (#68): the next phone configures the same endpoint immediately.
     let again = configure(&mut phone, &aptx_config());
     assert_eq!(again, seid);
 }

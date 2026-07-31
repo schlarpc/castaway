@@ -83,7 +83,7 @@ fn format(rate: u32, channels: u16) -> AudioFormat {
 #[test]
 fn ldac_is_decodable_when_the_feature_that_binds_the_library_is_on() {
     // The inverse of the test in `audio_decode` that asserts LDAC is *not* claimed on a
-    // build with no backend. Together they are the whole of Q22: the advertised endpoint
+    // build with no backend. Together they are the whole of #14: the advertised endpoint
     // table follows what exists, in both directions. If this fails while the feature is on,
     // the endpoint silently disappears and every sender falls back — better than silence,
     // but not what was asked for.

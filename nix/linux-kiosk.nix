@@ -7,11 +7,11 @@
 # the GameStream client can actually stream — which makes *this artifact* GPL-3.0-bound
 # (D37): fine for the panel it runs on, but it is why `castaway-portable` and the MIT
 # source tree stay clean of it. `ldac` links Sony's `libldacBT` for the one A2DP codec
-# ffmpeg cannot decode (Q22) — Apache-2.0, so unlike GameStream it binds nothing.
+# ffmpeg cannot decode (#14) — Apache-2.0, so unlike GameStream it binds nothing.
 #
 # `ldac` used to be the one exception here, and the reason is worth keeping: the feature
 # bound nothing, so a build with it on advertised a codec it would then fail to decode and
-# turned a session that should have fallen back to SBC into silence (Q22). That cannot
+# turned a session that should have fallen back to SBC into silence (#14). That cannot
 # recur — `can_decode` asks the library for a handle rather than reading the flag.
 #
 # Note what having the feature on does *not* do: advertise the endpoint. LDAC is in
@@ -71,7 +71,7 @@ let
     MOONLIGHT_COMMON_C_LIB_DIR =
       "${moonlightCommonC}/lib:${pkgs.openssl.out}/lib";
 
-    # Where `ldac-sys`'s build.rs finds `libldacBT` (Q22). Without it the crate emits no
+    # Where `ldac-sys`'s build.rs finds `libldacBT` (#14). Without it the crate emits no
     # link directive at all, so this artifact would build and then fail to resolve
     # `ldacBT_decode` — which is the honest failure, but only if the variable is set here.
     LDACBT_LIB_DIR = "${ldacbt}/lib";

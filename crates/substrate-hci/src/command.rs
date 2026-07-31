@@ -45,7 +45,7 @@ impl std::fmt::Debug for LinkKey {
 /// Which scans the controller answers — i.e. whether we are discoverable, connectable,
 /// both, or invisible.
 ///
-/// This is the whole of the receiver's "can a guest find me" policy (OPEN-QUESTIONS Q23),
+/// This is the whole of the receiver's "can a guest find me" policy (#68),
 /// so it is an enum rather than two booleans: "discoverable but not connectable" is a
 /// real, useless state that this makes impossible to reach by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,7 +104,7 @@ pub enum IoCapability {
     /// Can enter a number.
     KeyboardOnly,
     /// Neither. Selects the Just Works model, which is what a kiosk wants: no prompt on
-    /// either side (OPEN-QUESTIONS Q23).
+    /// either side (#68).
     #[default]
     NoInputNoOutput,
 }
@@ -272,7 +272,7 @@ pub enum Command {
         /// Why.
         reason: Status,
     },
-    /// A vendor command — the escape hatch firmware upload rides on (Q21).
+    /// A vendor command — the escape hatch firmware upload rides on (#67).
     Vendor {
         /// Vendor opcode.
         opcode: OpCode,
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn just_works_pairing_claims_no_io_and_general_bonding() {
         // NoInputNoOutput on our side is what selects Just Works, and general bonding is
-        // what makes a repeat guest reconnect without re-pairing (Q23).
+        // what makes a repeat guest reconnect without re-pairing (#68).
         let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
         let out = bytes_of(&Command::IoCapabilityRequestReply {
             addr,

@@ -71,7 +71,7 @@ ureq = { version = "2", optional = true }
 # Cross-platform audio output: ALSA on Linux, WASAPI on Windows.
 cpal = { version = "0.15", optional = true }
 # The LDAC decoder. The only A2DP codec libav has no decoder for, so the only one that
-# needs a second decode backend beside ffmpeg (Q22). Sony's own library, via nixpkgs
+# needs a second decode backend beside ffmpeg (#14). Sony's own library, via nixpkgs
 # `ldacbt`; the safe wrapper is `ldac_decode` and it is the only consumer.
 ldac-sys = { workspace = true, optional = true }
 interprocess = { version = "2.4.3", default-features = false }
@@ -159,7 +159,7 @@ audio-out = ["audio", "dep:cpal"]
 # ALSA host (see `audio_select::active_backend`); on Windows it is inert, so a shared
 # feature list cross-builds cleanly.
 audio-pipewire = ["audio", "dep:pipewire"]
-# The LDAC decoder, over FFI to Sony's own `libldacBT` (Q22). Off by default because it
+# The LDAC decoder, over FFI to Sony's own `libldacBT` (#14). Off by default because it
 # is the one decoder that is not already in the ffmpeg the rest of `audio` links: a build
 # without `ldacbt` available would fail to link rather than fail to decode. Implies
 # `audio` because the PCM it produces goes through the same session and output path.
@@ -167,7 +167,7 @@ audio-pipewire = ["audio", "dep:pipewire"]
 # The feature no longer merely reserves a slot. `can_decode` asks whether a decoder
 # exists rather than whether this flag is set, so with it off the LDAC endpoint is absent
 # from the advertised table and with it on the endpoint is backed by something real —
-# which is what the flag failing to mean anything cost us the first time (Q22).
+# which is what the flag failing to mean anything cost us the first time (#14).
 ldac = ["audio", "dep:ldac-sys"]
 # `hwaccel` gates whether the hardware decode backends are *compiled*, never whether they
 # are *used* — that is a runtime decision (`HwPreference`), so a build with this on still

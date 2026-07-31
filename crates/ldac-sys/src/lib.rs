@@ -2,7 +2,7 @@
 //!
 //! Raw FFI bindings to `libldacBT` — Sony's own LDAC library, as forked by open-vela and
 //! built by `nix/ldacbt.nix`. This is the one A2DP codec libav cannot decode, and the
-//! reason the LDAC endpoint went unadvertised for as long as it did (OPEN-QUESTIONS Q22).
+//! reason the LDAC endpoint went unadvertised for as long as it did (#14).
 //!
 //! The original premise for this crate was wrong in a way worth recording: AOSP's
 //! `libldac` is encoder-only, so the plan was the reverse-engineered `libldacdec` over

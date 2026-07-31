@@ -71,7 +71,7 @@ pub struct BluetoothConfig {
     ///
     /// Not a preference — a capability. A sender takes the first endpoint it supports
     /// from a best-first list, so an endpoint we cannot decode is the one it will pick,
-    /// and the session becomes silence rather than a clean fallback (Q22). The app fills
+    /// and the session becomes silence rather than a clean fallback (#14). The app fills
     /// this in by asking the pipeline what decoders the build actually has.
     pub decodable: Vec<castaway_core::AudioCodec>,
     /// Restrict the advertised endpoints to these codecs. `None` advertises everything
@@ -82,7 +82,7 @@ pub struct BluetoothConfig {
     /// offering the ones it would otherwise prefer. Narrowing this to SBC is how the
     /// mandatory fallback path gets tested at all.
     pub codecs: Option<Vec<castaway_core::AudioCodec>>,
-    /// Link keys loaded from disk, so repeat guests reconnect silently (Q23).
+    /// Link keys loaded from disk, so repeat guests reconnect silently (#68).
     pub link_keys: Vec<(BdAddr, LinkKey)>,
     /// Called with each newly paired peer's key. Without one, pairing works for the
     /// current session and every guest re-pairs after a restart.
@@ -334,7 +334,7 @@ impl BluetoothAdapter {
         let mut sdp = SdpServer::new();
         sdp.add(a2dp_sink(0x0001_0000, &name));
         // Both AVRCP records: Controller so we can drive the phone's player, Target so
-        // its volume rocker reaches us (Q24). Publishing one loses half the feature.
+        // its volume rocker reaches us (#69). Publishing one loses half the feature.
         sdp.add(avrcp_controller(0x0001_0001, &name));
         sdp.add(avrcp_target(0x0001_0002, &name));
         let mut capabilities = advertised(&config.decodable);
@@ -562,7 +562,7 @@ impl SourceAdapter for BluetoothAdapter {
                         )
                         .await?;
 
-                    // One phone at a time owns the speakers (Q23). When one starts, every
+                    // One phone at a time owns the speakers (#68). When one starts, every
                     // other one that is streaming gets told, rather than being left to
                     // play into a decoder that has stopped listening.
                     if let Some(winner) = started {
@@ -940,7 +940,7 @@ impl BluetoothAdapter {
                     // Preempt every other phone on this controller, politely. Two A2DP
                     // sources feeding one output do not mix — they fight — and the phone
                     // that loses deserves to be told rather than left streaming into a
-                    // decoder nobody is listening to (Q23: last writer wins).
+                    // decoder nobody is listening to (#68: last writer wins).
                     out.started = Some(link.peer);
                     // START cannot precede SET_CONFIGURATION in the sink state machine,
                     // so a missing format means a bug here rather than a sender problem —
@@ -1340,7 +1340,7 @@ impl BluetoothAdapter {
                 }
             }
             avrcp::pdu::SET_ABSOLUTE_VOLUME if is_command || frame.ctype == Ctype::Accepted => {
-                // Q24: the phone is authoritative. Accept and mirror it.
+                // #69: the phone is authoritative. Accept and mirror it.
                 if let Some(&raw) = vendor.parameters.first() {
                     let fraction = avrcp::volume_to_fraction(raw);
                     if link.session_open {

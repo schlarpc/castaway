@@ -394,7 +394,7 @@ async fn the_adapter_brings_a_controller_up_and_becomes_discoverable() {
 
 #[tokio::test]
 async fn a_phone_pairs_without_any_prompt() {
-    // Q23 end to end: the controller asks, the adapter answers, nobody is prompted.
+    // #68 end to end: the controller asks, the adapter answers, nobody is prompted.
     let (transport, _rx) = connected().await;
     let addr: BdAddr = PEER.parse().unwrap();
 

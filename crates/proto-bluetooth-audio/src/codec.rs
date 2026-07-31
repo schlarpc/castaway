@@ -246,7 +246,7 @@ pub enum CodecCapability {
         channels: ChannelModes,
     },
     /// Sony LDAC — the highest bitrate on offer, and the only one libav cannot decode
-    /// (see OPEN-QUESTIONS Q22).
+    /// (see #14).
     Ldac {
         /// Sample rates, in LDAC's own 6-bit field.
         rate_bits: u8,
@@ -711,7 +711,7 @@ pub const ALL: &[AudioCodec] = &[
 /// *not* be advertised: a sender takes the first endpoint it supports, and this list is
 /// ordered best-first, so an endpoint we cannot decode is not a missed opportunity — it
 /// is the one the phone will pick. The session then runs, the card fills in, and nothing
-/// comes out of the speakers (Q22).
+/// comes out of the speakers (#14).
 ///
 /// This used to gate LDAC alone, which left the same trap open for the four codecs above
 /// it: an ffmpeg without `aptx_hd` still advertised aptX HD, first in the list.
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn ldac_is_absent_from_the_table_when_the_decoder_is_not_built() {
         // Advertising an endpoint we cannot decode is worse than not advertising it: the
-        // sender picks it and the session is silence rather than a clean fallback (Q22).
+        // sender picks it and the session is silence rather than a clean fallback (#14).
         let with = advertised(ALL);
         let without = advertised(&[
             AudioCodec::Sbc,

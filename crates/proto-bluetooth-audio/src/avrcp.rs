@@ -4,7 +4,7 @@
 //! Role note, because it reads backwards: the *phone* owns the media player, so the phone
 //! is the AVRCP **Target** and we are the **Controller**. We ask it for metadata and send
 //! it play/pause. We are additionally a Target for one thing only — absolute volume — so
-//! the phone's volume rocker reaches us (Q24).
+//! the phone's volume rocker reaches us (#69).
 //!
 //! **Attribute 8 is the point.** It carries a BIP image handle, and fetching that handle
 //! over OBEX is the only route to album art. `bluetoothd` parses this exact response and

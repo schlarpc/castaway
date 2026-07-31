@@ -1373,7 +1373,7 @@ harness of its own; extracting `edge_drag` moved the part that had bugs in it ou
 LDAC is the one A2DP codec libav has no decoder for, and it was the last unimplemented thing in
 the Bluetooth sink. It is now implemented by **linking** `libldacBT` — Sony's own library, via
 open-vela's fork — behind `ldac-sys` and a safe wrapper in `pipeline::ldac_decode`, with the
-endpoint kept out of the advertised table until the config names it (OPEN-QUESTIONS Q22,
+endpoint kept out of the advertised table until the config names it (#14,
 architecture-substrate.md §11.4a).
 
 **This is not a third carve-out from ground rule 9,** and the distinction is worth stating so
@@ -1387,7 +1387,7 @@ happens not to be contentious.
 
 Three findings, each of which looked settled and was not:
 
-- **A reverse-engineered decoder was never needed.** Q22 had it that AOSP's `libldac` is
+- **A reverse-engineered decoder was never needed.** #14 had it that AOSP's `libldac` is
   encoder-only, so decode meant the RE'd `libldacdec`. The premise is true and the conclusion is
   false: open-vela's fork builds Sony's complete codec, decoder included.
 - **`pkgs.ldacbt` is not that library.** Under the nixpkgs this flake pins, it is EHfive/ldacBT
@@ -1399,7 +1399,7 @@ Three findings, each of which looked settled and was not:
   The feature is off by default for a build-dependency reason — it needs `LDACBT_LIB_DIR` at link
   time — and not a licence one.
 
-**Advertising is now separated from decoding, in both directions.** Q22 was the failure in one
+**Advertising is now separated from decoding, in both directions.** #14 was the failure in one
 direction: `can_decode` answered `cfg!(feature = "ldac")` while the feature bound nothing, so a
 build advertised LDAC, a phone picked it — LDAC is *first* in preference order — and every packet
 failed. A connected phone, a running session, and silence. That is fixed at the root: `can_decode`

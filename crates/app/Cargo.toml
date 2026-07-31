@@ -87,7 +87,7 @@ audio-out = ["audio", "pipeline/audio-out"]
 # there: the ALSA shim shows one "pipewire" device, the native backend shows the sinks.
 # Takes precedence over audio-out's ALSA host at compile time; inert on Windows.
 audio-pipewire = ["audio", "pipeline/audio-pipewire"]
-# LDAC decode, over FFI to Sony's own library (OPEN-QUESTIONS Q22). Off by default
+# LDAC decode, over FFI to Sony's own library (#14). Off by default
 # because it needs `LDACBT_LIB_DIR` at link time, not because the decoder is in doubt —
 # a build without it would fail to link rather than fail to decode.
 #

@@ -340,7 +340,7 @@ pub fn avrcp_controller(handle: u32, name: &str) -> ServiceRecord {
 ///
 /// We publish this *as well* as the controller record, for one reason: absolute volume.
 /// The phone's volume rocker sends `SetAbsoluteVolume` to a Target, so being only a
-/// Controller means the rocker does nothing — which is the behaviour Q24 chose against.
+/// Controller means the rocker does nothing — which is the behaviour #69 chose against.
 #[must_use]
 pub fn avrcp_target(handle: u32, name: &str) -> ServiceRecord {
     base(handle, name, vec![Uuid::AV_REMOTE_CONTROL_TARGET])
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn we_publish_controller_and_target_because_they_do_different_jobs() {
         // Controller = we drive the phone's player (metadata, play/pause).
-        // Target = the phone's volume rocker reaches us (absolute volume, Q24).
+        // Target = the phone's volume rocker reaches us (absolute volume, #69).
         // Publishing only one of these silently loses half the feature.
         let ct = avrcp_controller(1, "x");
         let tg = avrcp_target(2, "x");

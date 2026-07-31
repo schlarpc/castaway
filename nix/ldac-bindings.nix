@@ -5,7 +5,7 @@
 # wrong *silently*: `ldacBT_init_handle_decode` takes six ints, three of which are reserved,
 # and getting the arity or the order wrong produces a handle that decodes noise rather than
 # an error. Nothing at build time would catch it — the crate declares the functions itself,
-# so there is no header for a compiler to disagree with (OPEN-QUESTIONS Q22).
+# so there is no header for a compiler to disagree with (#14).
 #
 # The header comes from the `ldacbt` derivation rather than from `pkgs.ldacbt` or from the
 # source tarball directly, so it is by construction the header belonging to the *same*
