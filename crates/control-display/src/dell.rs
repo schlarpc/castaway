@@ -3,7 +3,7 @@
 //! (power, input select) and encodes the wire frame.
 //!
 //! NOTE: the exact opcode bytes must be confirmed against Dell's C6522QT RS232 manual
-//! (OPEN-QUESTIONS Q14). The frame *shape* below follows Dell's large-format-monitor
+//! (#21). The frame *shape* below follows Dell's large-format-monitor
 //! convention (`header, id, category, opcode, len, data..., checksum`); the opcode
 //! constants are placeholders until verified.
 
@@ -26,7 +26,7 @@ const HEADER: u8 = 0xA6;
 const CATEGORY_POWER: u8 = 0x01;
 const CATEGORY_INPUT: u8 = 0x02;
 
-// Placeholder opcodes — verify against the Dell manual (Q14).
+// Placeholder opcodes — verify against the Dell manual (#21).
 const OP_POWER: u8 = 0x18;
 const OP_INPUT: u8 = 0xAC;
 

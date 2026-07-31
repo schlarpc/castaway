@@ -558,7 +558,7 @@ that happens the `Secure_Send` sequencing is verified against `ScriptedTransport
 
 **Diffing against the kernel.** `btintel.c` is the specification, and the kernel driving
 the same radio is the oracle — the `nix/openscreen-fixtures.nix` pattern that settled
-Q13's IV derivation. Capture the kernel's own bring-up with `btmon -w intel.btsnoop`
+#54's IV derivation. Capture the kernel's own bring-up with `btmon -w intel.btsnoop`
 while re-binding `btusb`, then compare the command sequence against what the probe emits.
 Divergence in *order* matters as much as divergence in content: Intel's secure boot
 rejects out-of-order fragments, and a controller that accepts a partial upload boots an
@@ -807,7 +807,7 @@ a PSM in Enhanced Retransmission Mode and echoes what arrives, so BlueZ's `l2tes
 Linux kernel's own L2CAP, as a peer — marks our control field, sequence numbers, frame
 check sequence and segmentation instead of our own decoder marking them. Everything else
 that exercises ERTM judges our frames against ourselves, which cannot catch a shared
-misreading of the spec. Same idea as the openscreen fixtures in Q13, applied to a protocol:
+misreading of the spec. Same idea as the openscreen fixtures in #54, applied to a protocol:
 
 ```sh
 sudo btvirt -l2 &
@@ -854,6 +854,6 @@ For byte-level ground truth, **Fuchsia's Bluetooth profile layer is Rust and BSD
 (`src/connectivity/bluetooth/profiles/bt-a2dp`, `bt-avrcp`, `lib/bt-avdtp`) and implements the
 sink role. It is not a dependency — it is pinned as a **differential-test oracle** the way
 `nix/openscreen-fixtures.nix` pins openscreen's packetizer to settle Cast's IV derivation
-(Q13). AVDTP capability records and AVRCP attribute encodings are exactly the bit-packed
+(#54). AVDTP capability records and AVRCP attribute encodings are exactly the bit-packed
 surfaces where a golden encoder beats careful reading (ground rule 9: findings land here,
 the reference impl never ships).

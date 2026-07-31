@@ -89,7 +89,7 @@ stream, echoes the sender-provided AES key/IV) and the per-frame AES-128-CTR cry
 pure + tested. The session surfaces a `MirrorConfig` via `Reaction::start_mirror`; the
 actor (future) pre-binds the UDP port, receives Cast RTP, decrypts, and emits
 `SessionEvent::Mirror`. The RTP depacketize/reassembly + exact per-frame IV derivation
-need a real capture to validate (Q12/Q13).
+need a real capture to validate (#53/#54).
 
 ### D13 — RTP depacketization stays per-protocol; only parse + reorder are shared
 `substrate-rtp` hand-rolls the RFC 3550 header parse (no webrtc-rs pull-in — keeps the
@@ -246,7 +246,7 @@ with a datagram sent to the multicast group, so the default firewall drops every
 the test fails for entirely the wrong reason.
 
 ### D26 — Socket actors: the adapter advertises itself; the app supplies only the hostname
-Q15's Cast TLS actor and AirPlay RTSP actor are the first adapters that own real listeners,
+#56's Cast TLS actor and AirPlay RTSP actor are the first adapters that own real listeners,
 which forced the question of who decides what gets advertised. Answer: the adapter.
 `Advertisement::MdnsService` gained a required `instance` field, and the actor fills it from
 the port it will actually bind — so a TXT record can't advertise a port nothing answers, and
@@ -429,7 +429,7 @@ credential we cannot get or something we could have fixed this afternoon.
 So `checks.openscreen-device-auth` compiles openscreen's sender-side verifier —
 `cast/sender/channel/cast_auth_util.cc` plus the path builder under
 `cast/common/certificate/`, the code Chrome runs — and has it judge auth responses this
-receiver really produced. It is Q13's pattern with the arrow reversed: there openscreen
+receiver really produced. It is #54's pattern with the arrow reversed: there openscreen
 generates bytes and our receiver consumes them; here we generate and openscreen rules.
 Ground rule 9 forbids reference implementations in the shipping binary and says nothing
 about using them as oracles, which is the whole of why this is allowed.

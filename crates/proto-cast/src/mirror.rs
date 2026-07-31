@@ -465,7 +465,7 @@ mod tests {
         assert_ne!(c1, c2);
     }
 
-    /// The nonce layout is the whole of Q13, and a round-trip test cannot catch a
+    /// The nonce layout is the whole of #54, and a round-trip test cannot catch a
     /// wrong offset — our encrypt and decrypt would agree with each other while
     /// disagreeing with every real sender. So assert the bytes.
     #[test]

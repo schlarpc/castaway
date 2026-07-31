@@ -1,4 +1,4 @@
-//! The CASTv2 socket actor (OPEN-QUESTIONS Q15): the thin async shell around the pure
+//! The CASTv2 socket actor (#56): the thin async shell around the pure
 //! [`CastSession`]. It owns the TLS listener and one task per sender connection, and
 //! does exactly three things per frame — decode, hand to the session, write back what
 //! the session says to write. No protocol decisions live here (ground rule 3).

@@ -1,4 +1,4 @@
-//! The Cast mirroring RTP actor (OPEN-QUESTIONS Q12): the thin async shell around
+//! The Cast mirroring RTP actor (#53): the thin async shell around
 //! [`CastRtpReceiver`].
 //!
 //! Everything about *what* a datagram means lives in [`crate::rtp`], [`crate::receiver`]

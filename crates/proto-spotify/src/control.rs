@@ -38,7 +38,7 @@ impl SpotifyRemote {
     ///
     /// `MUTE` is absent because `Spirc` has no mute: the only way to fake it is setting
     /// the volume to zero, which throws away the level we would need to restore, and a
-    /// mute that cannot be lifted leaves a silent panel — the failure mode Q31 already
+    /// mute that cannot be lifted leaves a silent panel — the failure mode #55 already
     /// caught once by a different route.
     ///
     /// `SET_QUEUE` is absent for the typing reason in the module docs.

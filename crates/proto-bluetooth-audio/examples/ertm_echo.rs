@@ -5,7 +5,7 @@
 //! frames against *our own* decoder, which cannot catch a shared misreading of the spec.
 //! Here the peer is the Linux kernel's L2CAP, driven by BlueZ's `l2test`, so the control
 //! field, the sequence numbers and the frame check sequence are all marked by the
-//! reference implementation. It is the pattern Q13 settled on, applied to a protocol
+//! reference implementation. It is the pattern #54 settled on, applied to a protocol
 //! rather than a codec: pin the reference, run the real bytes through it.
 //!
 //! ```text

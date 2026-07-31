@@ -1,4 +1,4 @@
-//! The AirPlay RTSP socket actor (OPEN-QUESTIONS Q15): the thin async shell around the
+//! The AirPlay RTSP socket actor (#56): the thin async shell around the
 //! pure [`AirPlaySession`]. It owns the listeners and one task per sender connection,
 //! and per request does exactly three things — parse, hand to the session, write back
 //! what the session decided. No protocol decisions live here (ground rule 3).
