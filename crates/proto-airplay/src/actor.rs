@@ -28,7 +28,7 @@ use substrate_rtsp::{ByteTransform, Identity, RtspMessage};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::advert::{AirPlayIdentity, AIRPLAY_PORT, SOURCE_VERSION};
 use crate::audio::{AudioOutput, AudioStream};
@@ -50,6 +50,19 @@ const MAX_MESSAGE: usize = 1 << 20;
 /// latency, and senders do the reverse to us. Built from [`SOURCE_VERSION`] so the two
 /// cannot drift; they were `377.40.00` here and `220.68` there a moment ago.
 const SERVER_HEADER_PREFIX: &str = "AirTunes/";
+
+/// Bytes as hex, for the `trace`-level wire capture.
+///
+/// A whole message per line and no truncation: a capture that elides the middle of a
+/// body is not a capture you can replay as a fixture, which is the only reason to take
+/// one (ground rule 9).
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 /// A listening AirPlay receiver: one TCP listener, one [`AirPlaySession`] per
 /// connection.
@@ -130,7 +143,7 @@ impl AirPlayReceiver {
         // of this transform, not a rewrite of the loop.
         let mut transform: Box<dyn ByteTransform> = Box::new(Identity);
 
-        if let Err(e) = pump(
+        match pump(
             &mut stream,
             &mut session,
             &mut *transform,
@@ -141,13 +154,21 @@ impl AirPlayReceiver {
         )
         .await
         {
-            warn!(%peer, error = %e, "AirPlay connection ended with an error");
+            // Which of these it was is the difference between "the sender said it was
+            // done" and "the sender walked off mid-conversation", and the two want
+            // opposite things looked at next. They used to log the same line.
+            Ok(PumpEnd::PeerClosed) => {
+                info!(%peer, "AirPlay sender disconnected: the peer closed the connection")
+            }
+            Ok(PumpEnd::EndedByRequest) => {
+                info!(%peer, "AirPlay sender disconnected: the session was ended by request")
+            }
+            Err(e) => warn!(%peer, error = %e, "AirPlay connection ended with an error"),
         }
         // A dropped connection is a finished session, however it ended: tell the manager
         // so the pipeline doesn't hold the screen for a sender that walked away.
         let _ = sink.emit(SessionEvent::End).await;
         let _ = stream.shutdown().await;
-        info!(%peer, "AirPlay sender disconnected");
     }
 
     /// Accept connections on `listener` until it fails fatally, serving each in its own
@@ -170,6 +191,20 @@ impl AirPlayReceiver {
     }
 }
 
+/// How a served connection finished, when it finished cleanly.
+///
+/// The two are not the same event and must not read as one in a log: a sender that sent
+/// `TEARDOWN` processed everything we answered and chose to stop, while one that just
+/// closed the socket rejected something we said. Which of those happened is the first
+/// question asked of any session that dies in the handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpEnd {
+    /// The peer closed the connection (clean EOF), saying nothing about why.
+    PeerClosed,
+    /// A request ended the session — `TEARDOWN`, normally.
+    EndedByRequest,
+}
+
 /// Read requests until the peer closes, folding each through the session.
 async fn pump(
     stream: &mut TcpStream,
@@ -179,7 +214,7 @@ async fn pump(
     peer: SocketAddr,
     audio_sockets: &mut Option<AudioSockets>,
     mirror_listener: &mut Option<TcpListener>,
-) -> Result<(), AirPlayError> {
+) -> Result<PumpEnd, AirPlayError> {
     // The sending half of the mirror's audio channel, created with the video and filled
     // in later: a sender negotiates mirroring audio *after* its video is already
     // flowing, so the channel has to exist before there is anything to put in it.
@@ -203,8 +238,12 @@ async fn pump(
             .await
             .map_err(|e| AirPlayError::Connection(e.to_string()))?;
         if n == 0 {
-            return Ok(()); // clean EOF
+            return Ok(PumpEnd::PeerClosed);
         }
+        // The raw control channel, for when nothing above the bytes explains what a
+        // sender did. `trace` because it is a per-message hexdump of a live session —
+        // this is the RE capture facility (ground rule 9), not diagnostics.
+        trace!(%peer, bytes = %hex(&chunk[..n]), "airplay rx");
         // Decrypt per chunk, not per accumulated buffer: the transform is a stream
         // cipher with position, so re-running it over bytes already decrypted would
         // desynchronize it.
@@ -231,6 +270,7 @@ async fn pump(
             };
             let mut bytes = substrate_rtsp::write(&reply.message)
                 .map_err(|e| AirPlayError::Connection(e.to_string()))?;
+            trace!(%peer, bytes = %hex(&bytes), "airplay tx");
             transform
                 .encrypt_outbound(&mut bytes)
                 .map_err(|e| AirPlayError::Connection(e.to_string()))?;
@@ -316,7 +356,7 @@ async fn pump(
                     .await
                     .map_err(|e| AirPlayError::Connection(e.to_string()))?;
                 if ended {
-                    return Ok(());
+                    return Ok(PumpEnd::EndedByRequest);
                 }
             }
         }

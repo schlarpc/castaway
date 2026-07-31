@@ -355,7 +355,16 @@ impl AirPlaySession {
     /// gates that aren't implemented return a `501` response, not an `Err`.
     pub fn handle(&mut self, req: &AirPlayRequest<'_>) -> Result<AirPlayResponse, AirPlayError> {
         let (method, path, body) = (req.method, req.path, req.body);
-        debug!(%method, %path, body = body.len(), "airplay request");
+        // Headers as well as the request line: the protocol puts load-bearing values in
+        // them, and a session that dies at a given request cannot be read from the
+        // method alone.
+        debug!(
+            %method,
+            %path,
+            body = body.len(),
+            headers = ?req.headers,
+            "airplay request"
+        );
         let resp = match (method, path) {
             ("OPTIONS", _) => self.options(req),
             // The body is not decoration: a sender's first request names the TXT record
@@ -408,7 +417,11 @@ impl AirPlaySession {
                 r
             }
             (m, p) => {
-                debug!(method = %m, path = %p, "unhandled AirPlay request; 200 lenient");
+                // Lenient, but not silent. A sender asking for something this receiver
+                // does not implement gets a bare `200`, which it may well reject — and
+                // at `debug` that was invisible, so a session dying on a request we
+                // never knew existed looked like a session dying for no reason.
+                warn!(method = %m, path = %p, body = body.len(), "unhandled AirPlay request; answering 200");
                 AirPlayResponse::ok()
             }
         };
