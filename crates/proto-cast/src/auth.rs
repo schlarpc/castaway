@@ -42,8 +42,34 @@ pub(crate) fn auth_response(signed: SignedAuth) -> AuthResponse {
         signature_algorithm: Some(signature_algorithm as i32),
         sender_nonce: signed.nonce_echo.as_bytes().map(<[u8]>::to_vec),
         hash_algorithm: Some(hash_algorithm as i32),
-        // No CRL. Openscreen senders default to `kCrlOptional`, so a receiver that
-        // supplies none is still accepted; Chrome fetches the Cast CRL itself.
+        // No CRL — and this is the one remaining reason Chrome refuses this receiver.
+        //
+        // What this comment used to say ("Chrome fetches the Cast CRL itself") is wrong,
+        // and it was wrong in the direction that costs the whole protocol. Measured
+        // against Chromium 148:
+        //
+        //   * `VerifyCredentials` (`cast_auth_util.cc`) runs at
+        //     `CRLPolicy::CRL_REQUIRED_WITH_FALLBACK` — *required*, not optional.
+        //   * The CRL it verifies is `response.crl()`, taken from this field. Chrome's
+        //     only other source is a built-in *fallback* CRL, which is time-expired in
+        //     any freshly-provisioned profile.
+        //   * With this field empty, the result is `ERR_CRL_INVALID` → "Failed to provide
+        //     a valid CRL." → `AUTHENTICATION_ERROR`, and the channel is dropped and
+        //     retried forever. That is what a receiver missing from the Chrome cast list
+        //     actually is.
+        //   * Both real Cast devices on the test LAN answer the same challenge with a
+        //     3619-byte CRL here. Feeding one of theirs back through this field makes
+        //     Chrome log "Auth challenge verification succeeded" against this receiver.
+        //
+        // openscreen's verifier defaults to `kCrlOptional`, which is why the
+        // `openscreen-device-auth` vectors judge our response `ok` and Chrome still
+        // refuses it — the two disagree, and Chrome is the one in the room.
+        //
+        // Left absent deliberately rather than filled in: a CRL is Google-signed, is
+        // valid for about a week (the captured one ran 2026-07-28 → 2026-08-05), and
+        // sourcing one is a policy question this layer does not get to answer — a shipped
+        // blob expires, and any live source is a cloud dependency in D30's sense. See
+        // OPEN-QUESTIONS/D41.
         crl: None,
     }
 }

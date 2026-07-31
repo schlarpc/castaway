@@ -25,22 +25,32 @@ pub enum PayloadType {
 
 /// The CASTv2 envelope: every message on the TLS channel is one of these,
 /// length-prefixed (see [`crate::framing`]).
+///
+/// The five `required` markers are load-bearing and must not be dropped. Google's
+/// `cast_channel.proto` is **proto2**, where `required` means the field is written even
+/// when it holds its default — and where a parser rejects the whole message if it is
+/// missing. prost defaults to proto3 semantics, under which a plain scalar equal to its
+/// default is *omitted*, so without `required` here `protocol_version` (`CASTV2_1_0` is
+/// 0) and `payload_type` (`STRING` is 0) silently vanish from the wire. A real sender
+/// then fails `ParseFromString` on every message we send — Chrome logs "Error parsing
+/// packet body." and drops the channel, which from the room looks like the receiver not
+/// existing at all. See `tests/proto2_required.rs`.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct CastMessage {
     /// Protocol version.
-    #[prost(enumeration = "ProtocolVersion", tag = "1")]
+    #[prost(enumeration = "ProtocolVersion", required, tag = "1")]
     pub protocol_version: i32,
     /// Virtual-connection source id (`sender-0`, `receiver-0`, a transport id…).
-    #[prost(string, tag = "2")]
+    #[prost(string, required, tag = "2")]
     pub source_id: String,
     /// Virtual-connection destination id.
-    #[prost(string, tag = "3")]
+    #[prost(string, required, tag = "3")]
     pub destination_id: String,
     /// The namespace URN this message belongs to.
-    #[prost(string, tag = "4")]
+    #[prost(string, required, tag = "4")]
     pub namespace: String,
     /// Which payload field carries the body.
-    #[prost(enumeration = "PayloadType", tag = "5")]
+    #[prost(enumeration = "PayloadType", required, tag = "5")]
     pub payload_type: i32,
     /// JSON body (when `payload_type == String`).
     #[prost(string, optional, tag = "6")]
@@ -90,10 +100,10 @@ pub struct AuthChallenge {
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct AuthResponse {
     /// Signature over the TLS-cert-hash (+ nonce), per the chosen algorithm.
-    #[prost(bytes = "vec", tag = "1")]
+    #[prost(bytes = "vec", required, tag = "1")]
     pub signature: Vec<u8>,
     /// The device (leaf) certificate, DER.
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(bytes = "vec", required, tag = "2")]
     pub client_auth_certificate: Vec<u8>,
     /// Intermediate certificates, DER.
     #[prost(bytes = "vec", repeated, tag = "3")]
@@ -116,7 +126,7 @@ pub struct AuthResponse {
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct AuthError {
     /// The error type.
-    #[prost(enumeration = "auth_error::ErrorType", tag = "1")]
+    #[prost(enumeration = "auth_error::ErrorType", required, tag = "1")]
     pub error_type: i32,
 }
 
