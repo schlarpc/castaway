@@ -243,12 +243,10 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   path (pulled A/V against `MediaClock`) is shared with DLNA and AirPlay video, so a
   local `LOAD` of any VP8+Vorbis WebM should show it without the phone.
 
-  Found while sampling, probably orthogonal, recorded so it isn't re-discovered: the
-  main render thread burns ~94% of a core from launch — continuous-redraw kiosk loop
-  (`ControlFlow::Poll` + `request_redraw` per frame) with Mailbox present mode means
-  the winit thread spins submit→present→acquire flat out even on an idle shell.
-  `kiosk.rs` says continuous redraw is deliberate; a full core on a fanless panel
-  deserves its own question if it survives contact with the Windows target.
+  Found while sampling and since investigated in its own right: the main render
+  thread burns a full core from launch, session or no session. Promoted to **Q48**
+  (App / hardware wiring), which has the measurements and the decided shape of the
+  fix; confirmed there to be orthogonal to this question.
 
 ## Deferred (per docs, not blockers)
 
@@ -424,6 +422,53 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   - **`Play(url)` restarts demuxing on a mid-stream fallback**, which for a file means
     seeking back to the start. Acceptable for a rare event; the mirror path has no such
     problem because it just resyncs on the next key frame.
+
+- **Q48 — The kiosk loop free-runs at ~970 fps and burns a core drawing an idle shell.
+  OPEN; the fix is decided in shape (wake-driven redraw), the work is the wake path.**
+  Found while stack-sampling Q47, then measured on its own 2026-07-31: with the panel
+  idle — no session, nothing moving — the main thread spins the full
+  submit→present→acquire cycle at ~970 iterations/s (3,879 Wayland flushes in 4 s of
+  strace), ~29 DRM ioctls and ~6 sync-fd create/close pairs per iteration (~23,500
+  `close()` in those 4 s), 81% of a core averaged over the process's whole life. The
+  display refreshes at 60 Hz, so ~15 of every 16 composites are discarded by the
+  Mailbox swapchain unseen.
+
+  **The mechanism is three pieces that are individually defensible and jointly a
+  furnace.** (1) `kiosk.rs` self-perpetuates unconditionally: `ControlFlow::Poll` plus
+  `request_redraw()` at the end of every `RedrawRequested` *and* in `about_to_wait`.
+  (2) Mailbox present never blocks, so the driver never throttles the loop — and
+  Mailbox was chosen for a real reason (Wayland Fifo acquire stalls on some
+  compositors, `wgpu_compositor.rs`), so "just use Fifo" is not the answer.
+  (3) There is **no wake mechanism**: no `EventLoopProxy` exists in the workspace.
+  Video frames arrive on a plain mpsc channel drained only when the loop happens to
+  spin; Electron paints and browser commands are poll-only (`ElectronHost::pump`); the
+  ctrl-c exit flag is polled per iteration. *That* is the load-bearing content of the
+  "continuous redraw is deliberate" comment — the redraw is the only thing servicing
+  every queue in the process.
+
+  **The demand-driven design already half-exists and is being thrown away.**
+  `tick_motion` returns whether anything is still moving, with a doc comment saying
+  verbatim "so the kiosk knows to ask for another frame" — the kiosk discards the
+  return. `tick_transition` returns the same bool; discarded. `RenderLoop::pump`
+  returns how many commands were applied (0 = nothing changed); discarded, and
+  `present_and_serve_taps()` re-presents the identical frame regardless. Even
+  `pump_blocking(timeout)` already exists, for tests. The idle signal is computed
+  every iteration; it is just never obeyed.
+
+  **The missing primitive is a wake path into winit**: an `EventLoopProxy` handed to
+  the render-command sender, the browser paint/reader side, and the exit handler; then
+  `ControlFlow::Wait` when the three discarded booleans all say idle, `WaitUntil`
+  (next frame interval) while animating or playing. Mailbox stays — it is compatible
+  with a paced loop; the pacing just has to come from `ControlFlow` because Mailbox
+  will never provide it.
+
+  **One measurement owed to the deploy target:** where Mailbox is not offered the code
+  falls back to Fifo, whose present/acquire blocks at refresh rate — so the free-run
+  is partly a property of this Wayland box, and the Windows/DX12 box may already be
+  throttled, or may not (wgpu's DX12 backend does offer Mailbox). Measure there rather
+  than assume; a fanless commercial panel is exactly where a wasted core becomes heat.
+  Confirmed orthogonal to Q47: the 2 fps video thread is asleep on the media clock,
+  not starved by this loop.
 
 ## CEF / adblock / YouTube Lounge
 
