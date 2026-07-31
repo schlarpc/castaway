@@ -1060,6 +1060,45 @@ the reasons are what a future reversal has to argue against.
   new node, so "reconnect to the same device" is not a thing — the audio path has to be
   re-established against whatever the default is when it comes back.
 
+- **Q49 — Bluetooth album art looks ~64–128 px on the card (YouTube Music at least).
+  OPEN; it is not Bluetooth's ceiling, it is two of our own choices compounding.**
+  Reported 2026-07-31 from live use. First, the measurement that reframes the report:
+  the art we *receive* is not 64 or 128 px. The wire capture from the same day's iPhone
+  AAC session (log 08:09:36, ERTM cid 0x0044) carries the cover JPEG, and its SOF0 and
+  Exif headers both read exactly **200×200** — which is the BIP linked thumbnail's
+  fixed size, arriving as specified. The 64-ish look is what happens to that 200×200
+  after our own drawing path (below).
+
+  **Choice one: we only ever ask for the thumbnail.** `proto-bluetooth-audio/obex.rs`
+  fetches `x-bt/img-thm` — fixed 200×200, no image descriptor to negotiate — and the
+  SDP record deliberately claims only `GetLinkedThumbnail` (bit 9), on the recorded
+  grounds that `x-bt/img-img` "requires describing the exact encoding and dimensions
+  wanted and is where interop goes to die" and that advertising `GetImage` unimplemented
+  would invite requests we answer wrongly (Q29 has the history). So the 200 px cap is
+  self-imposed. The protocol goes higher: `GetImageProperties` on the handle lists the
+  peer's available variants and `GetImage` with a descriptor fetches the native one,
+  which phones commonly export at several hundred px and up. Unknown, and cheaply
+  measurable since we already hold the BIP session open per link (Q29): **what does an
+  iPhone actually list in `GetImageProperties` for a YT Music track?** If the answer is
+  "200×200 and nothing else", the fetch side is already optimal and this half closes.
+
+  **Choice two: the blit assumes art we don't have.** `nowplaying_card.rs::draw_cover`
+  upscales **nearest-neighbour on purpose**, justified by "the source is typically
+  300–640px scaling into a panel of a similar order". That assumption is from the
+  Spotify path (Q39) and is simply false for Bluetooth: 200×200 stretched
+  nearest-neighbour to an art square of several hundred px on a 2160p panel is exactly
+  the blocky "is this 64 px?" look reported. A bilinear tap in that loop (or `image`'s
+  triangle filter at decode time) is a few lines and no new dependency at the scale
+  factors involved; the "millisecond this does not need" argument was made when the
+  scale factor was ~1, not ~3.
+
+  **Settle in this order:** (1) log one `GetImageProperties` listing from the iPhone —
+  it decides whether `GetImage` is worth the descriptor dance at all; (2) fix the
+  upscale filter regardless, since it degrades every source whose art is smaller than
+  the card square; (3) only then decide whether to claim bits 7/8 and implement the
+  full-image fetch, peer-gated the way Q29's ERTM lesson suggests (request the native
+  variant, fall back to the thumbnail on any refusal).
+
 ## GameStream client (D37)
 
 - **Q43 — no session has been run against a real host, and the streaming half is where
