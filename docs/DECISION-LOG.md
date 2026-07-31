@@ -81,7 +81,7 @@ hand-constructed fixtures; the need for a *real* capture is logged in OPEN-QUEST
 `AuthResponse`, so the dependency flows `proto-cast → crypto-cast-auth` (never a cycle).
 `proto-cast::auth::CastAuthResponder` binds the shared signer to one connection's TLS
 cert and assembles the proto. `generate_dev()` makes an ephemeral key for local runs;
-real gen-1 cert material is provisioned out of band (Q2).
+real gen-1 cert material is provisioned out of band (#40).
 
 ### D12 — Cast mirroring: pure negotiation now, RTP receive loop deferred
 Implemented the webrtc-namespace OFFER→ANSWER negotiator (picks one video + one audio
@@ -111,7 +111,7 @@ core tests without constructing rtsp-types messages.
 gated on the FairPlay-SAP session key (`crypto-fairplay`, stubbed at the captured-tables
 boundary) and HomeKit transient pairing (not implemented) — both return `501` at the
 gate. This makes castaway appear in the AirPlay picker and models every transaction; the
-media plane slots in once Q1's captures land.
+media plane slots in once #39's captures land.
 
 ### D16 — app composes HTTP protocols live; socket protocols advertise-gated
 `app` wires the null pipeline + null display into the session manager and stands up ONE
@@ -263,10 +263,10 @@ Where they differ is the crypto seam. Cast keeps its TLS certificate DER because
 signs over it — self-signed is *correct* there, not a shortcut, since CASTv2 authenticates
 the device and senders never build a chain. AirPlay carries a `Box<dyn ByteTransform>` that
 is `Identity` today; the encrypted control channel only starts after pair-verify, so landing
-Q1 is a swap of that transform rather than a rewrite of the loop.
+#39 is a swap of that transform rather than a rewrite of the loop.
 
 Both stay OFF by default, but D16's reason has narrowed: the listeners answer now. What's
-still missing is a real Cast device key (Q2/Q11) and AirPlay pairing (Q1) — so AirPlay
+still missing is a real Cast device key (#40/Q11) and AirPlay pairing (#39) — so AirPlay
 answers `501` at the pairing gate rather than faking a 200 and leaving a sender waiting
 forever for a media plane that can't start.
 
@@ -941,7 +941,7 @@ which it had never actually carried; until now the full Windows build had no PCM
 at all.
 
 ### D41 — Cast device auth by replay: someone else's identity, deliberately, with the exit named
-Q2 — "we need a real Cast device credential" — has been the last thing standing between
+#40 — "we need a real Cast device credential" — has been the last thing standing between
 this receiver and an official sender, and it was posed as a hardware problem: device keys
 are fused into licensed silicon, so get one off a panel you own. That framing was right
 about where keys live and wrong about what the protocol requires.
@@ -970,7 +970,7 @@ Cast device CRL, so Google can revoke it and Cast stops working with no warning 
 for us to see it coming. The table expires 2027-12-06; the chain's own ceiling is
 2032-12-12, set by `Eureka Root CA`. This is a borrowed credential with a known end date,
 not a solved problem — which is why the exit stays first in precedence: `cast.credential`,
-an operator's own provisioned key, wins over CKS whenever it is set, and Q2 is rewritten
+an operator's own provisioned key, wins over CKS whenever it is set, and #40 is rewritten
 rather than deleted.
 
 **Two invariants went into the type system rather than into comments**, because both fail

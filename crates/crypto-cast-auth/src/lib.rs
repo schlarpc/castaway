@@ -6,7 +6,7 @@
 //! owns that signing — pure, given the key + cert material as bytes (no protobuf, no
 //! socket), so `proto-cast` assembles the `AuthResponse` proto from a [`SignedAuth`].
 //!
-//! At n=1 the credential is a fixed local input (hackerspace notes / OPEN-QUESTIONS Q2);
+//! At n=1 the credential is a fixed local input (hackerspace notes / #40);
 //! [`CastDeviceSigner::generate_dev`] makes an ephemeral one for local testing.
 #![forbid(unsafe_code)]
 
@@ -154,7 +154,7 @@ impl CastDeviceSigner {
     /// Generate an ephemeral development credential: a self-signed dev root and a
     /// device certificate issued under it, with the extensions a Cast sender's path
     /// builder insists on. For local dev/tests only — a real sender only trusts a chain
-    /// rooted in Google's device CA (OPEN-QUESTIONS Q2), and the returned
+    /// rooted in Google's device CA (#40), and the returned
     /// [`DevCredential::root_ca_der`] is exactly the thing it will not have.
     ///
     /// The point of issuing real X.509 here rather than a placeholder byte string is

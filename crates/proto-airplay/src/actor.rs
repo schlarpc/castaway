@@ -139,7 +139,7 @@ impl AirPlayReceiver {
             Err(e) => warn!(%peer, error = %e, "could not bind the RAOP audio sockets"),
         }
         // Identity today: the encrypted control channel starts only after pair-verify,
-        // which is not implemented (Q1). The seam is here so landing pairing is a swap
+        // which is not implemented (#39). The seam is here so landing pairing is a swap
         // of this transform, not a rewrite of the loop.
         let mut transform: Box<dyn ByteTransform> = Box::new(Identity);
 

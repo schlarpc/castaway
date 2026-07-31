@@ -14,7 +14,7 @@
 | 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png | plaintext HTTP (LAN control plane) | always | ours |
 | 5353 | udp | mdns | mDNS/DNS-SD responder (mdns-sd daemon) | plaintext multicast | always | spec |
 | 1900 | udp | ssdp | SSDP M-SEARCH responder + NOTIFY alive/byebye | plaintext multicast | always | spec |
-| 7000 | tcp | airplay | RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP | plaintext — pair-verify/FairPlay not implemented (Q1) | enable.airplay | convention |
+| 7000 | tcp | airplay | RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP | plaintext — pair-verify/FairPlay not implemented (#39) | enable.airplay | convention |
 | 41000–41031 (`[media_ports]`) | udp | airplay | RAOP audio + control + timing (three sockets per session) | RTP; AES-CBC when the sender negotiates it | enable.airplay | ours |
 | 41000–41031 (`[media_ports]`) | tcp | airplay | mirroring data channel (one listener per session) | AES-CTR frames (MirrorKeys) | enable.airplay | ours |
 | 8009 | tcp | cast | CASTv2: length-prefixed protobuf over TLS | TLS, self-signed or CKS-replayed certificate; the device-auth signature covers it (D41/D43) | enable.cast | convention |

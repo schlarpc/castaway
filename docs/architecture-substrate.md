@@ -306,7 +306,7 @@ packets"*, which is the smallest and most stable seam available (ground rule 5).
 Two things make this smaller than it sounds:
 - **BR/EDR pairing crypto lives in the controller.** Secure Simple Pairing does P-192/P-256
   ECDH and link-key derivation on the chip. Just Works needs no `crypto-*` crate — the host
-  does IO-capability exchange and confirmation only. (Contrast FairPlay, Q1.)
+  does IO-capability exchange and confirmation only. (Contrast FairPlay, #39.)
 - **These are small, well-documented binary protocols** in exactly the sans-I/O shape the
   project already builds (`fn(state, bytes) -> (state, outputs)`), so they are fixture-tested
   without a radio.

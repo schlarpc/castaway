@@ -253,7 +253,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 port: PortSpec::Fixed(proto_airplay::AIRPLAY_PORT),
                 bind: "0.0.0.0",
                 wire: "RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP",
-                security: "plaintext — pair-verify/FairPlay not implemented (Q1)",
+                security: "plaintext — pair-verify/FairPlay not implemented (#39)",
                 gate: Gate::AnyOf(&[ProtocolKind::AirPlay]),
                 provider: Provider::Process,
                 chosen_by: Provenance::Convention,

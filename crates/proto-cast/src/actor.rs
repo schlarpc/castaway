@@ -228,7 +228,7 @@ pub enum CastIdentity {
     ///
     /// Correct by construction, and rejected by every official sender unless the
     /// chain roots in Google's device CA — which, for a locally generated
-    /// credential, it does not (OPEN-QUESTIONS Q2).
+    /// credential, it does not (#40).
     DeviceKey {
         /// The TLS identity whose certificate the signature covers.
         tls: TlsIdentity,

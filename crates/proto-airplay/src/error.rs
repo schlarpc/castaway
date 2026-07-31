@@ -14,7 +14,7 @@ pub enum AirPlayError {
     #[error("malformed request: {0}")]
     Malformed(&'static str),
 
-    /// The FairPlay-SAP handshake could not complete (see `crypto-fairplay`, Q1).
+    /// The FairPlay-SAP handshake could not complete (see `crypto-fairplay`, #39).
     #[error("fairplay: {0}")]
     FairPlay(#[from] crypto_fairplay::FairPlayError),
 

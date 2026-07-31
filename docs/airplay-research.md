@@ -142,7 +142,7 @@ from here, not successive rungs, and AP2 does not bring mirroring closer.
 The UxPlay-shaped alternative — AP2 with `timingProtocol: NTP` instead of PTP — trades
 PTP for FairPlay, so it is not actually cheaper.
 
-## 3. Q1 is largely retired
+## 3. The FairPlay question (#39) is largely retired
 
 Q1 (now issue #39) said FairPlay-SAP "needs real captures from `airplay2-receiver`/UxPlay
 against a live iOS sender." Three findings each independently reduce that.
@@ -378,7 +378,7 @@ HEVC, and the failure mode is a type-1 packet with `payload_size == 0`.
 
 ### 5.3 What FairPlay actually costs
 
-Two distinct things, and Q1 conflates them:
+Two distinct things, and #39 conflated them:
 
 - **The 4 × 142 canned replies** — 568 bytes, published since ~2012, byte-identical
   everywhere. Ship them.

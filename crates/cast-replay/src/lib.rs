@@ -19,7 +19,7 @@
 //! private key. No software receiver has one: Cast device keys are provisioned
 //! into hardware. That is why `castaway` has, until now, only been able to
 //! authenticate to senders that trust a locally-generated root, which is none of
-//! the official ones (OPEN-QUESTIONS Q2).
+//! the official ones (#40).
 //!
 //! The mechanism every shipping software receiver uses instead is **replay**, and
 //! it turns on one detail of Openscreen's sender:
