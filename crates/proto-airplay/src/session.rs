@@ -358,9 +358,12 @@ impl AirPlaySession {
         debug!(%method, %path, body = body.len(), "airplay request");
         let resp = match (method, path) {
             ("OPTIONS", _) => self.options(req),
-            ("GET", "/info") => {
-                AirPlayResponse::ok_body(APPLE_PLIST_MIME, info::info_plist(&self.identity)?)
-            }
+            // The body is not decoration: a sender's first request names the TXT record
+            // it wants read back, and is answered with that and nothing else.
+            ("GET", "/info") => AirPlayResponse::ok_body(
+                APPLE_PLIST_MIME,
+                info::info_plist(&self.identity, &info::InfoQuery::parse(body))?,
+            ),
             ("POST", "/fp-setup") => self.fp_setup(body),
             // Legacy pairing (bit 27). HomeKit's flows arrive at the same paths but
             // carry `X-Apple-HKP`, and we advertise none of their bits — a sender that

@@ -14,17 +14,145 @@
 //!
 //! It is a *binary* plist. The XML form with `text/x-apple-plist+xml` belongs to the
 //! different, legacy `GET /server-info` endpoint.
+//!
+//! 3. **The request has a body, and it changes what the answer is.** An iOS sender's
+//!    *first* request of every session is `GET /info` carrying a plist
+//!    `{qualifier: ["txtAirPlay"]}`, which asks for one thing: the receiver's mDNS TXT
+//!    record, byte for byte, read back over the connection it is already on. The answer
+//!    is that record and nothing else — see [`InfoQuery`].
 
 use plist::{Dictionary, Value};
+use tracing::{debug, warn};
 
 use crate::advert::{AirPlayIdentity, MODEL, SOURCE_VERSION};
 use crate::error::AirPlayError;
 
-/// Build the `/info` binary plist for this receiver.
+/// Which mDNS TXT record a `/info` qualifier is asking for.
+///
+/// An enum rather than the string off the wire because the answer is a *different
+/// advertisement* per variant, and a name we don't serve has to be distinguishable from
+/// one we do — a sender asking for an unknown record gets a reply without it, not a
+/// reply with the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxtQualifier {
+    /// `txtAirPlay`: the `_airplay._tcp` record.
+    AirPlay,
+    /// `txtRAOP`: the `_raop._tcp` record.
+    Raop,
+}
+
+impl TxtQualifier {
+    /// The qualifier name, which is also the reply key it is answered under.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::AirPlay => "txtAirPlay",
+            Self::Raop => "txtRAOP",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "txtAirPlay" => Some(Self::AirPlay),
+            "txtRAOP" => Some(Self::Raop),
+            other => {
+                debug!(qualifier = %other, "/info asks for a record we do not advertise");
+                None
+            }
+        }
+    }
+}
+
+/// What a `GET /info` is asking for.
+///
+/// The two are not variations on one answer, they are different answers: a qualified
+/// request is answered with the named TXT records **and nothing else** (which is what
+/// UxPlay does, and it is what iOS is served by every receiver it mirrors to), while an
+/// unqualified one gets the capability dictionary. Modelling it as an enum is what stops
+/// the two from being merged into a single "everything" reply — which is what this used
+/// to send, and it left the `txtAirPlay` the sender asked for absent from the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InfoQuery {
+    /// No parsable qualifier: the full capability dictionary.
+    Full,
+    /// The TXT records named by the request's `qualifier` array, in order.
+    Txt(Vec<TxtQualifier>),
+}
+
+impl InfoQuery {
+    /// Read the request body. Anything that is not a plist with a `qualifier` array —
+    /// including the empty body of a plain `GET /info` — is [`Self::Full`].
+    #[must_use]
+    pub fn parse(body: &[u8]) -> Self {
+        let Ok(value) = plist::Value::from_reader(std::io::Cursor::new(body)) else {
+            return Self::Full;
+        };
+        let Some(qualifier) = value
+            .as_dictionary()
+            .and_then(|d| d.get("qualifier"))
+            .and_then(Value::as_array)
+        else {
+            return Self::Full;
+        };
+        Self::Txt(
+            qualifier
+                .iter()
+                .filter_map(Value::as_string)
+                .filter_map(TxtQualifier::parse)
+                .collect(),
+        )
+    }
+}
+
+/// Encode a TXT record as it goes on the wire: each `key=value` string prefixed with its
+/// own length in one octet (RFC 6763 §6.1).
+///
+/// The entries come from the same [`AirPlayIdentity`] the responder advertises from, so
+/// the record read back here and the record on the wire cannot disagree — which is the
+/// only reason a sender asks for it over a connection it has already made.
+fn txt_record(entries: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, value) in entries {
+        let pair = format!("{key}={value}");
+        match u8::try_from(pair.len()) {
+            Ok(len) => {
+                out.push(len);
+                out.extend_from_slice(pair.as_bytes());
+            }
+            // A single TXT string cannot exceed 255 octets; one that does was never
+            // advertised either, so omitting it keeps the two records identical.
+            Err(_) => warn!(%key, "TXT entry too long for one record string; omitted"),
+        }
+    }
+    out
+}
+
+/// Serialize a reply dictionary as the binary plist `/info` answers with.
+fn finish(dict: &Dictionary) -> Result<Vec<u8>, AirPlayError> {
+    let mut buf = Vec::new();
+    plist::to_writer_binary(&mut buf, dict).map_err(|e| AirPlayError::Plist(e.to_string()))?;
+    Ok(buf)
+}
+
+/// Build the `/info` binary plist answering `query`.
 ///
 /// # Errors
 /// [`AirPlayError::Plist`] if serialization fails (not expected for this fixed shape).
-pub fn info_plist(ident: &AirPlayIdentity) -> Result<Vec<u8>, AirPlayError> {
+pub fn info_plist(ident: &AirPlayIdentity, query: &InfoQuery) -> Result<Vec<u8>, AirPlayError> {
+    if let InfoQuery::Txt(qualifiers) = query {
+        let mut dict = Dictionary::new();
+        for qualifier in qualifiers {
+            let service = match qualifier {
+                TxtQualifier::AirPlay => ident.airplay_service(),
+                TxtQualifier::Raop => ident.raop_service(),
+            };
+            dict.insert(
+                qualifier.key().into(),
+                Value::Data(txt_record(&service.txt)),
+            );
+        }
+        return finish(&dict);
+    }
+
     let mut dict = Dictionary::new();
     dict.insert("deviceID".into(), Value::String(ident.device_id.clone()));
     dict.insert("macAddress".into(), Value::String(ident.device_id.clone()));
@@ -84,10 +212,7 @@ pub fn info_plist(ident: &AirPlayIdentity) -> Result<Vec<u8>, AirPlayError> {
         Value::Array(vec![Value::Dictionary(display)]),
     );
 
-    let mut buf = Vec::new();
-    plist::to_writer_binary(&mut buf, &Value::Dictionary(dict))
-        .map_err(|e| AirPlayError::Plist(e.to_string()))?;
-    Ok(buf)
+    finish(&dict)
 }
 
 #[cfg(test)]
@@ -107,10 +232,75 @@ mod tests {
     }
 
     fn parsed(ident: &AirPlayIdentity) -> Dictionary {
-        let bytes = info_plist(ident).unwrap();
+        answer(ident, &InfoQuery::Full)
+    }
+
+    fn answer(ident: &AirPlayIdentity, query: &InfoQuery) -> Dictionary {
+        let bytes = info_plist(ident, query).unwrap();
         assert!(bytes.starts_with(b"bplist00"), "should be a binary plist");
         let val: Value = plist::from_bytes(&bytes).unwrap();
         val.as_dictionary().unwrap().clone()
+    }
+
+    /// A qualifier request body, as an iOS sender's first request carries it.
+    fn qualifier_body(name: &str) -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "qualifier".into(),
+            Value::Array(vec![Value::String(name.into())]),
+        );
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &dict).unwrap();
+        buf
+    }
+
+    /// Decode a wire TXT record back into its pairs.
+    fn decode_txt(mut bytes: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        while let Some((&len, rest)) = bytes.split_first() {
+            let (entry, tail) = rest.split_at(usize::from(len));
+            let text = String::from_utf8(entry.to_vec()).unwrap();
+            let (k, v) = text.split_once('=').unwrap();
+            out.push((k.to_string(), v.to_string()));
+            bytes = tail;
+        }
+        out
+    }
+
+    #[test]
+    fn an_empty_body_is_the_full_capability_dictionary() {
+        assert_eq!(InfoQuery::parse(&[]), InfoQuery::Full);
+        assert!(parsed(&ident()).contains_key("displays"));
+    }
+
+    #[test]
+    fn a_qualified_request_is_answered_with_that_txt_record_and_nothing_else() {
+        // The defect this replaces: every `GET /info` was answered with the capability
+        // dictionary, so the one thing an iOS sender's *first* request asks for — the
+        // `txtAirPlay` record — was absent from every answer we ever sent.
+        let id = ident();
+        let query = InfoQuery::parse(&qualifier_body("txtAirPlay"));
+        assert_eq!(query, InfoQuery::Txt(vec![TxtQualifier::AirPlay]));
+        let dict = answer(&id, &query);
+        assert_eq!(dict.len(), 1, "only the record asked for: {dict:?}");
+        let txt = dict.get("txtAirPlay").unwrap().as_data().unwrap();
+        // Byte-for-byte the record the responder advertises: a sender that reads both
+        // can see a difference.
+        assert_eq!(decode_txt(txt), id.airplay_service().txt);
+    }
+
+    #[test]
+    fn the_raop_record_can_be_asked_for_by_its_own_name() {
+        let id = ident();
+        let dict = answer(&id, &InfoQuery::parse(&qualifier_body("txtRAOP")));
+        let txt = dict.get("txtRAOP").unwrap().as_data().unwrap();
+        assert_eq!(decode_txt(txt), id.raop_service().txt);
+    }
+
+    #[test]
+    fn a_qualifier_we_do_not_serve_leaves_the_answer_empty_rather_than_wrong() {
+        let dict = answer(&ident(), &InfoQuery::parse(&qualifier_body("txtSomething")));
+        assert!(dict.is_empty(), "{dict:?}");
     }
 
     #[test]
