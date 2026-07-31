@@ -301,6 +301,9 @@ pub enum TexelFormat {
     /// compositor blends in linear, and the swapchain re-encodes — a round trip that
     /// preserves the colour that was chosen.
     Rgba8Srgb,
+    /// Packed BGRA8 holding sRGB-encoded values. [`Self::Rgba8Srgb`] with the browser
+    /// path's channel order.
+    Bgra8Srgb,
 }
 
 impl TexelFormat {
@@ -309,6 +312,7 @@ impl TexelFormat {
             Self::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
             Self::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
             Self::Rgba8Srgb => wgpu::TextureFormat::Rgba8UnormSrgb,
+            Self::Bgra8Srgb => wgpu::TextureFormat::Bgra8UnormSrgb,
         }
     }
 }

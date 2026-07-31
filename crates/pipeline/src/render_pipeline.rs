@@ -2558,12 +2558,17 @@ impl RenderLoop {
                 // produced on the GPU (hwaccel). Only the second one avoids the copy.
                 let landed = match &frame.image {
                     FrameImage::Cpu { format, data } => {
+                        // Video samples are gamma-encoded (BT.709/601 transfer, which the
+                        // NV12 shader already treats as sRGB) — the sampler must decode
+                        // them before the compositor blends in linear, or the sRGB
+                        // swapchain re-encodes on store and the picture reaches the panel
+                        // washed out. The same double-encode the hardware path fixed.
                         let format = match format {
-                            PixelFormat::Bgra8 => TexelFormat::Bgra8,
+                            PixelFormat::Bgra8 => TexelFormat::Bgra8Srgb,
                             // Planar YUV is converted by swscale in the decoder; if a
                             // frame slips through (or a future variant appears), treat
                             // the bytes as RGBA (better a wrong frame than a panic).
-                            _ => TexelFormat::Rgba8,
+                            _ => TexelFormat::Rgba8Srgb,
                         };
                         self.compositor.upload_texture(
                             LayerId::Video,
