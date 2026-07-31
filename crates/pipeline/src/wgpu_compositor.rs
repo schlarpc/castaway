@@ -101,12 +101,24 @@ fn rounded_alpha(uv: vec2<f32>, size: vec2<f32>, r: f32) -> f32 {
     return 1.0 - clamp(d + 0.5, 0.0, 1.0);
 }
 
+// Whether a sampled coordinate lies outside the texture — which happens only when the
+// source rect was widened past the texture to fit content of another shape (see
+// `contain_source`). Sampling there would smear the edge texel across the bar, so the
+// bar is painted instead.
+fn outside(uv: vec2<f32>) -> bool {
+    return uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // The container's own coordinates for the mask; the cropped ones for the content. That
     // difference is the whole of "clip, do not stretch".
-    let c = textureSample(tex, smp, in.uv * u.source.zw + u.source.xy);
+    let src = in.uv * u.source.zw + u.source.xy;
+    let c = textureSample(tex, smp, src);
     let mask = rounded_alpha(in.uv, u.size, u.radius);
+    // Opaque black outside the content: the matte belongs to the layer, so a fitted layer
+    // still covers its whole slot and nothing underneath shows through the bars.
+    if (outside(src)) { return vec4<f32>(0.0, 0.0, 0.0, u.opacity * mask); }
     return vec4<f32>(c.rgb, c.a * u.opacity * mask);
 }
 "#;
@@ -168,12 +180,21 @@ fn rounded_alpha(uv: vec2<f32>, size: vec2<f32>, r: f32) -> f32 {
     return 1.0 - clamp(d + 0.5, 0.0, 1.0);
 }
 
+// See `SHADER`'s `outside`: the matte for a layer fitted to a slot of another shape.
+fn outside(uv: vec2<f32>) -> bool {
+    return uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Plane 0 is full-resolution luma (R8); plane 1 is half-resolution interleaved
     // chroma (RG8). Both are sampled with the same normalized uv — the hardware handles
     // the 2× chroma upsample as part of filtering.
     let uv = in.uv * u.source.zw + u.source.xy;
+    if (outside(uv)) {
+        let bar_mask = rounded_alpha(in.uv, u.shape.yz, u.shape.x);
+        return vec4<f32>(0.0, 0.0, 0.0, u.offset.w * bar_mask);
+    }
     let y = textureSample(luma, smp, uv).r;
     let cbcr = textureSample(chroma, smp, uv).rg;
     let s = vec3<f32>(y, cbcr.r, cbcr.g) - u.offset.xyz;

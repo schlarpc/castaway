@@ -110,6 +110,57 @@ pub fn cover_source(dest: (f32, f32), src: (f32, f32)) -> [f32; 4] {
     [(1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h]
 }
 
+/// The other way a container of the wrong shape can present its content: *fit* it whole
+/// and matte the remainder, rather than [`cover_source`]'s fill-and-crop.
+///
+/// Same return shape, and the numbers are the mirror image — cover keeps one axis whole
+/// and shrinks the other below 1.0, fit keeps one axis whole and grows the other *past*
+/// 1.0, sampling outside the texture. Outside is painted opaque black by the shader,
+/// which is what makes this the whole answer rather than half of one: the layer still
+/// covers every pixel of its slot, so there is no gap for what is underneath to show
+/// through, and no second "matte" layer that could be forgotten, mispositioned, or left
+/// behind. A letterboxed video is one layer, exactly as a full-screen one is.
+///
+/// Video is the case: a mirroring phone encodes at 498×1080 and the panel is 16:9, so
+/// the picture must be pillarboxed. Cropping it instead would cut off the status bar and
+/// both sides of whatever app is on screen, which for a *mirror* — a view of someone
+/// else's display — is the wrong trade. For the layers where filling matters more, the
+/// other function is right there.
+///
+/// A no-op whenever the two aspects agree, so it is safe to apply unconditionally.
+#[must_use]
+pub fn contain_source(dest: (f32, f32), src: (f32, f32)) -> [f32; 4] {
+    let (dest_aspect, src_aspect) = (
+        dest.0 / dest.1.max(f32::EPSILON),
+        src.0 / src.1.max(f32::EPSILON),
+    );
+    if !dest_aspect.is_finite()
+        || !src_aspect.is_finite()
+        || dest_aspect <= 0.0
+        || src_aspect <= 0.0
+    {
+        return FULL_SOURCE;
+    }
+    // Wider destination than content → bars at the sides, so the sampled region has to
+    // reach beyond the texture horizontally. Narrower → bars above and below.
+    let (w, h) = if dest_aspect > src_aspect {
+        (dest_aspect / src_aspect, 1.0)
+    } else {
+        (1.0, src_aspect / dest_aspect)
+    };
+    // The same half-texel deadband `cover_source` uses, for the same reason: the slots
+    // are not exactly 16:9 and a bar thinner than half a pixel is not a bar.
+    let whole = |scale: f32, extent: f32| {
+        if (scale - 1.0) * extent < 0.5 {
+            1.0
+        } else {
+            scale
+        }
+    };
+    let (w, h) = (whole(w, src.0), whole(h, src.1));
+    [(1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h]
+}
+
 /// The whole texture: what a layer samples unless something says otherwise.
 pub const FULL_SOURCE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
@@ -486,6 +537,85 @@ mod tests {
         assert!(sh < 0.2, "height should crop hard, got {sh}");
         assert!(ox.abs() < 1e-6);
         assert!((oy - (1.0 - sh) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_mirroring_phone_is_pillarboxed_rather_than_stretched() {
+        // The captured geometry from a real session: iOS encodes its screen at 498×1080,
+        // and stretched across a 3840×2160 panel that is a picture four times too wide.
+        let [ox, oy, sw, sh] = contain_source((3840.0, 2160.0), (498.0, 1080.0));
+        assert!((sh - 1.0).abs() < 1e-6, "height stays whole, got {sh}");
+        // The sampled region reaches well past the texture: that excess *is* the bars.
+        assert!(sw > 3.8, "should sample far outside the texture, got {sw}");
+        assert!(ox < 0.0, "the region starts left of the texture, got {ox}");
+        assert!(oy.abs() < 1e-6);
+        // The picture lands 996 px wide on a 3840 px panel, centred.
+        let width_fraction = 1.0 / sw;
+        assert!((width_fraction * 3840.0 - 996.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_fitted_picture_keeps_its_shape_and_touches_exactly_one_pair_of_edges() {
+        // The property that makes this "fit": the content lands undistorted — its
+        // displayed aspect is its own, not the container's — and it is as large as it can
+        // be, i.e. it reaches the container's edges on one axis and leaves bars on the
+        // other. Everything else here is arithmetic; this is the definition.
+        //
+        // Note the two functions are duals *across* axes, not along them: where cover
+        // crops the height, fit pads the width. Asserting a per-axis reciprocal is what a
+        // first draft of this test did, and it was wrong.
+        for (dest, src) in [
+            ((3840.0f32, 2160.0f32), (498.0f32, 1080.0f32)),
+            ((3840.0, 2160.0), (1080.0, 1920.0)),
+            ((100.0, 400.0), (1920.0, 1080.0)),
+            ((400.0, 100.0), (1080.0, 1920.0)),
+            ((1920.0, 1080.0), (640.0, 480.0)),
+        ] {
+            let [ox, oy, w, h] = contain_source(dest, src);
+            // The content occupies 1/scale of each axis of the container.
+            let shown = (dest.0 / w, dest.1 / h);
+            let (shown_aspect, src_aspect) = (shown.0 / shown.1, src.0 / src.1);
+            assert!(
+                (shown_aspect - src_aspect).abs() < 1e-3,
+                "{dest:?}/{src:?}: shown {shown_aspect} vs source {src_aspect}"
+            );
+            assert!(
+                (shown.0 - dest.0).abs() < 1.0 || (shown.1 - dest.1).abs() < 1.0,
+                "{dest:?}/{src:?}: fills neither axis, shown {shown:?}"
+            );
+            assert!(w >= 1.0 && h >= 1.0, "fit never crops: {dest:?}/{src:?}");
+            // Centred: the bars are equal on both sides.
+            assert!((ox - (1.0 - w) / 2.0).abs() < 1e-6);
+            assert!((oy - (1.0 - h) / 2.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn fitting_matching_aspects_samples_the_whole_texture() {
+        // The same unconditional-application property `cover_source` has: 16:9 into 16:9
+        // must be exactly the identity, or every ordinary session would grow a bar a
+        // fraction of a pixel wide.
+        assert_eq!(
+            contain_source((1920.0, 1080.0), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+        assert_eq!(
+            contain_source((806.0, 453.4), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+        assert_eq!(
+            contain_source((3840.0, 2160.0), (1920.0, 1080.0)),
+            FULL_SOURCE
+        );
+    }
+
+    #[test]
+    fn a_degenerate_container_fits_the_whole_texture_rather_than_dividing_by_zero() {
+        for dest in [(0.0, 0.0), (0.0, 100.0), (-5.0, 100.0)] {
+            assert_eq!(contain_source(dest, (1920.0, 1080.0)), FULL_SOURCE);
+        }
+        // And a frame a decoder reported a zero dimension for.
+        assert_eq!(contain_source((1920.0, 1080.0), (0.0, 0.0)), FULL_SOURCE);
     }
 
     #[test]
