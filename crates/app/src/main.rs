@@ -797,17 +797,35 @@ async fn serve(
         mpsc::Sender<proto_gamestream::GameStreamCommand>,
     )> = None;
     if config.enable.cast {
-        adapter_handles.push(
-            spawn_cast(
-                &config,
-                media_ports,
-                &mut mdns,
-                event_tx.clone(),
-                shutdown.clone(),
-                playback.clone(),
-            )
-            .await?,
-        );
+        // Logged and skipped rather than fatal, for the same reason as GameStream,
+        // Miracast and Bluetooth below — and this one is not hypothetical.
+        //
+        // Cast is the only adapter whose *startup* can fail for a reason that has
+        // nothing to do with hardware: the replayed device identities stop covering the
+        // calendar on 2027-03-21 (AirServer) and 2027-12-06 (CKS), so a panel with no
+        // uplink past the later of those resolves no credential at all. Until this was a
+        // `?`, that took the whole process with it — DLNA, AirPlay, Bluetooth, Spotify
+        // and the screen — on every boot.
+        //
+        // A panel that happened to already be running degraded gracefully instead
+        // (`ReplayProvider::current_at` keeps serving the stale credential and says so),
+        // which made the failure mode "runs untended for years, then dies at the first
+        // power cut". That is precisely backwards for something screwed to a wall.
+        match spawn_cast(
+            &config,
+            media_ports,
+            &mut mdns,
+            event_tx.clone(),
+            shutdown.clone(),
+            playback.clone(),
+        )
+        .await
+        {
+            Ok(handle) => adapter_handles.push(handle),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Cast unavailable; continuing without it");
+            }
+        }
     }
     if config.enable.airplay {
         adapter_handles.push(spawn_airplay(

@@ -554,10 +554,13 @@ impl Resolver {
         if let Some(crl) = crl {
             match self.resolve_pass(now_local, Some(crl)).await {
                 Ok(credential) => return Ok(credential),
+                // Deliberately does not name revocation as the cause: this pass also
+                // comes back empty when no identity is configured, or when every table
+                // has run out of calendar. When revocation *is* the reason,
+                // `resolve_pass` has already said so per identity, at `warn`.
                 Err(e) => debug!(
                     error = %e,
-                    "no unrevoked Cast identity is available; falling back to a revoked one \
-                     and withholding the CRL"
+                    "no identity passed the revocation filter; retrying without it"
                 ),
             }
         }
@@ -1107,10 +1110,15 @@ mod tests {
         );
     }
 
-    /// Past every table, resolution fails loudly instead of handing back something
-    /// a sender will reject with no explanation.
+    /// Past every table, *resolution* fails loudly instead of handing back something a
+    /// sender will reject with no explanation.
+    ///
+    /// Loudly, but no longer fatally: the app logs this and starts without Cast rather
+    /// than refusing to boot, because the panel's other six protocols do not depend on
+    /// it. The distinction matters — this crate's job is to be honest that it has
+    /// nothing to offer, and the caller's job is to decide what that costs.
     #[tokio::test]
-    async fn past_every_table_startup_fails() {
+    async fn past_every_table_resolution_fails() {
         let far_future_config = ReplayConfig {
             network: false,
             cache_path: None,
