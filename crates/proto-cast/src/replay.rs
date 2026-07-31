@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cast_replay::{CastCredential, ReplayProvider, Window};
+use cast_replay::{CastCredential, ReplayProvider, ServableCrl, Window};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tracing::debug;
@@ -62,10 +62,56 @@ impl ReplayIdentity {
     ) -> Result<(TlsAcceptor, Box<dyn DeviceAuthResponder>), CastError> {
         let credential = self.provider.current();
         let config = self.config_for(&credential)?;
-        Ok((
-            TlsAcceptor::from(config),
-            Box::new(ReplayAuthResponder::new(Arc::clone(&credential))),
-        ))
+        let mut responder = ReplayAuthResponder::new(Arc::clone(&credential));
+        if let Some(crl) = self.servable_crl(&credential) {
+            responder = responder.with_crl(&crl);
+        }
+        Ok((TlsAcceptor::from(config), Box::new(responder)))
+    }
+
+    /// The CRL to attach for `credential`, if one is held and does not revoke it.
+    ///
+    /// The check is per connection rather than per fetch because *which* chain we present
+    /// is a runtime decision — `identity_order`, table coverage and whether either
+    /// backend answers all move it — so "is this document safe to send" is only
+    /// answerable against the credential actually in force.
+    ///
+    /// A CRL that names us is withheld, not served. Attaching it would hand the sender
+    /// its own reason to refuse this receiver, turning a receiver that works in Chrome
+    /// into one that works nowhere; withholding it leaves exactly the behaviour we had
+    /// before there was a CRL at all. It is also the only notice we get that the
+    /// identity has been revoked, so it is logged at `error` rather than counted.
+    fn servable_crl(&self, credential: &CastCredential) -> Option<ServableCrl> {
+        let crl = self.provider.current_crl()?;
+        let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
+        chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())?;
+
+        match crl.servable_for(&chain, now) {
+            Ok(Ok(servable)) => Some(servable),
+            Ok(Err(cast_replay::ServeRefusal::OutsideWindow)) => {
+                debug!("holding back a Cast CRL that is outside its validity window");
+                None
+            }
+            Ok(Err(refusal @ cast_replay::ServeRefusal::RevokesUs(_))) => {
+                tracing::error!(
+                    origin = %credential.origin(),
+                    reason = %refusal,
+                    "the published Cast CRL revokes the identity this receiver presents; \
+                     withholding it, which keeps Chrome working and leaves Chromium-based \
+                     senders refusing us. This identity needs replacing (D41)."
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not evaluate the Cast CRL against our chain");
+                None
+            }
+        }
     }
 
     /// The rustls config presenting `credential`'s peer certificate.
@@ -121,6 +167,11 @@ impl ReplayIdentity {
 /// table.
 pub struct ReplayAuthResponder {
     credential: Arc<CastCredential>,
+    /// The CRL to attach, already checked against `credential`'s chain. `None` means
+    /// either that none is held or that the one held revokes us — the two are the same
+    /// decision here, and [`ReplayIdentity::servable_crl`] is where they are told apart
+    /// and logged.
+    crl: Option<Vec<u8>>,
 }
 
 impl ReplayAuthResponder {
@@ -130,7 +181,21 @@ impl ReplayAuthResponder {
     /// TLS; [`ReplayIdentity`] is the thing that guarantees it.
     #[must_use]
     pub fn new(credential: Arc<CastCredential>) -> Self {
-        Self { credential }
+        Self {
+            credential,
+            crl: None,
+        }
+    }
+
+    /// Attach a CRL that has already been cleared against this credential's chain.
+    ///
+    /// Takes a [`ServableCrl`] rather than bytes so the check cannot be skipped: the
+    /// only way to obtain one is [`cast_replay::CastCrl::servable_for`], which is handed
+    /// the chain and refuses when it names us.
+    #[must_use]
+    pub fn with_crl(mut self, crl: &ServableCrl) -> Self {
+        self.crl = Some(crl.bytes().to_vec());
+        self
     }
 }
 
@@ -142,6 +207,7 @@ impl DeviceAuthResponder for ReplayAuthResponder {
         // absent `sender_nonce`, which is what makes the replay verify.
         Ok(auth_response(
             self.credential.signed_auth(requested_hash(challenge)),
+            self.crl.clone(),
         ))
     }
 }

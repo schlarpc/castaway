@@ -52,7 +52,8 @@ use tracing::{debug, info, warn};
 use crate::airserver::AirServerTable;
 use crate::airserver_db::AirServerDb;
 use crate::cks::CksTable;
-use crate::{airserver_api, api, cache, CastCredential, ReplayError};
+use crate::crl::CastCrl;
+use crate::{airserver_api, api, cache, crl, CastCredential, ReplayError};
 
 /// The two roots the reference client pins in place of the system trust store.
 /// `cast.remotetogo.com` is CloudFront-fronted, so this is the Starfield /
@@ -133,6 +134,10 @@ pub struct ReplayConfig {
     /// Where to keep AirServer's fetched credential database. `None` disables that
     /// identity's live path, leaving it on its bundled table.
     pub airserver_db_path: Option<PathBuf>,
+    /// Where to cache the fetched Cast CRL. `None` disables the CRL entirely, which
+    /// leaves `AuthResponse.crl` empty — fine for Chrome, fatal for Chromium-based
+    /// senders (see [`crate::crl`]).
+    pub crl_cache_path: Option<PathBuf>,
 }
 
 impl Default for ReplayConfig {
@@ -147,6 +152,7 @@ impl Default for ReplayConfig {
             // AirServer is carried at all.
             identity_order: vec![Identity::Cks, Identity::AirServer],
             airserver_db_path: Some(airserver_api::default_db_path()),
+            crl_cache_path: Some(crl::default_cache_path()),
         }
     }
 }
@@ -188,6 +194,10 @@ struct Resolver {
 pub struct ReplayProvider {
     resolver: Resolver,
     current: RwLock<Arc<CastCredential>>,
+    /// The device CRL to attach to a challenge response, when one is held and safe to
+    /// serve. Separate from the credential because it is a different document on a
+    /// different schedule — about seven days against the credential's two.
+    crl: RwLock<Option<Arc<CastCrl>>>,
 }
 
 impl ReplayProvider {
@@ -218,10 +228,18 @@ impl ReplayProvider {
             window_end = credential.window().end_unix(),
             "Cast receiver-auth credential resolved"
         );
+        let crl = load_crl(&resolver.config).await;
         Ok(Self {
             resolver,
             current: RwLock::new(Arc::new(credential)),
+            crl: RwLock::new(crl.map(Arc::new)),
         })
+    }
+
+    /// The CRL held for this receiver, if any.
+    #[must_use]
+    pub fn current_crl(&self) -> Option<Arc<CastCrl>> {
+        self.crl.read().ok().and_then(|c| c.clone())
     }
 
     /// The credential to use for a connection at `now_unix`.
@@ -296,6 +314,27 @@ impl ReplayProvider {
                     }
                 }
                 Err(e) => warn!(error = %e, "refreshing the Cast credential failed"),
+            }
+            self.refresh_crl().await;
+        }
+    }
+
+    /// Refetch the CRL if the one held is missing or close enough to its end to be
+    /// worth replacing. A stale CRL is not merely useless — a sender hard-fails on one
+    /// outside its window — so this errs toward refreshing early.
+    async fn refresh_crl(&self) {
+        let now = local_now();
+        let held_until = self.current_crl().map(|c| c.window().end_unix());
+        if held_until.is_some_and(|end| end - now > CRL_REFRESH_LEAD_SECS) {
+            return;
+        }
+        if let Some(fresh) = load_crl(&self.resolver.config).await {
+            let end = fresh.window().end_unix();
+            if held_until != Some(end) {
+                info!(window_end = end, "Cast device CRL refreshed");
+            }
+            if let Ok(mut slot) = self.crl.write() {
+                *slot = Some(Arc::new(fresh));
             }
         }
     }
@@ -613,6 +652,60 @@ fn log_load<T>(identity: &str, loaded: Result<T, ReplayError>) -> Option<T> {
                 "an offline Cast identity failed to load; continuing without it"
             );
             None
+        }
+    }
+}
+
+/// Refetch the CRL once it is within this long of expiring. The document runs about
+/// seven days, so a day of lead leaves several refresh attempts before a sender would
+/// start hard-failing on a stale one.
+const CRL_REFRESH_LEAD_SECS: i64 = 86_400;
+
+/// Load the Cast CRL: cache first, then the network.
+///
+/// Best-effort by design and never fatal. Without a CRL this receiver still
+/// authenticates to Chrome (its fallback carries us); what is lost is Chromium-based
+/// senders. Failing startup over that would trade a partial receiver for none.
+async fn load_crl(config: &ReplayConfig) -> Option<CastCrl> {
+    let path = config.crl_cache_path.clone()?;
+    let now = local_now();
+
+    let cached = match crl::read_cache(&path) {
+        Ok(cached) => cached,
+        Err(e) => {
+            warn!(error = %e, "reading the cached Cast CRL failed");
+            None
+        }
+    };
+    // A cached CRL with room left is the whole answer; the endpoint is only consulted
+    // when it cannot be.
+    if let Some(crl) = &cached {
+        if crl.window().end_unix() - now > CRL_REFRESH_LEAD_SECS {
+            return cached;
+        }
+    }
+    if !config.network {
+        return cached;
+    }
+
+    // ureq is blocking, so it does not belong on the runtime (ground rule 4).
+    let timeout = config.timeout;
+    let fetched = tokio::task::spawn_blocking(move || crl::fetch_blocking(timeout))
+        .await
+        .map_err(|e| ReplayError::Http(format!("joining the Cast CRL fetch: {e}")))
+        .and_then(|r| r)
+        .and_then(|raw| CastCrl::parse(&raw).map(|crl| (raw, crl)));
+
+    match fetched {
+        Ok((raw, fresh)) => {
+            if let Err(e) = crl::write_cache(&path, &raw) {
+                warn!(error = %e, "caching the Cast CRL failed");
+            }
+            Some(fresh)
+        }
+        Err(e) => {
+            warn!(error = %e, "fetching the Cast CRL failed; Chromium-based senders will refuse this receiver");
+            cached
         }
     }
 }

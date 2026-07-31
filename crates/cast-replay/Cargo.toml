@@ -27,6 +27,9 @@ ctr.workspace = true
 md-5.workspace = true
 
 base64.workspace = true
+# The Cast CRL is a protobuf document; decoded with hand-written prost types so the
+# build needs no protoc (D9), same as `proto-cast` carries `cast_channel.proto`.
+prost.workspace = true
 # AirServer's live endpoint answers with a SQLite database; read-only, and only ever
 # pointed at a file we just wrote ourselves.
 rusqlite.workspace = true

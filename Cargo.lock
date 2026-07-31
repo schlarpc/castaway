@@ -616,6 +616,7 @@ dependencies = [
  "ctr",
  "hex-literal",
  "md-5",
+ "prost",
  "rsa",
  "rusqlite",
  "rustls 0.23.42",
