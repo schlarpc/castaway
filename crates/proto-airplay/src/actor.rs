@@ -305,41 +305,64 @@ async fn pump(
                 }
             }
 
-            // Audio negotiated alongside a mirroring session. It rides the same UDP
-            // sockets the AirPlay 1 flow uses, and feeds the channel already handed to
-            // the pipeline with the video — *not* a session of its own, which would
-            // preempt the picture it belongs to.
+            // A `SETUP` for stream type 96 negotiated audio, and there are two things
+            // that can be, decided by whether this session has a picture for it to
+            // belong to.
             //
-            // The `is_some()` guard is load-bearing and the reason mirror audio never
-            // played: this was one `if let` over the tuple
+            // *With* one, it is the mirror's second plane: it feeds the channel already
+            // handed to the pipeline with the video, and must **not** be announced as a
+            // session of its own — that preempts and tears down the picture it belongs
+            // to. *Without* one, a session of its own is exactly what it is: a sender
+            // casting audio (an app's media, rather than its screen) negotiates this
+            // stream and no video at all. Requiring the mirror channel meant that
+            // session negotiated cleanly, started nothing, and had its metadata dropped
+            // with `no active session for source airplay/…` — which is a phone that says
+            // "connected" and plays on by itself.
+            //
+            // The `has_mirror_audio()` guard is load-bearing and was the reason mirror
+            // audio never played at all: this was one `if let` over the tuple
             // `(session.take_mirror_audio(), mirror_audio_tx.take())`, and Rust evaluates
             // both operands before matching. Every request that was not the audio SETUP —
             // a `/feedback` two seconds after the video started, say — therefore *took*
-            // the sender out of `mirror_audio_tx` and dropped it on the floor. By the
-            // time the sender negotiated audio, forty seconds later, there was nothing
-            // left to feed, and the params were taken and discarded with it. Neither is
-            // consumed now unless both are there.
-            if session.has_mirror_audio() && mirror_audio_tx.is_some() && audio_sockets.is_some() {
+            // the sender out of `mirror_audio_tx` and dropped it on the floor. Nothing is
+            // consumed now unless it is going to be used.
+            if session.has_mirror_audio() && audio_sockets.is_some() {
                 let params = session.take_mirror_audio();
-                let tx = mirror_audio_tx.take();
                 let sockets = audio_sockets.take();
-                if let (Some(params), Some(tx), Some(sockets)) = (params, tx, sockets) {
-                    let stream = AudioStream::new(&params);
-                    info!(%peer, link = %params.describe(), "AirPlay mirroring audio starting");
-                    let _ = sink
-                        .emit(SessionEvent::SourceInfo(
-                            castaway_core::SourceDescription::new().with_link(params.describe()),
-                        ))
-                        .await;
-                    tokio::spawn(run_audio(
-                        sockets,
-                        stream,
-                        tx,
-                        peer.ip(),
-                        session.sender_ports(),
-                        flush_rx.clone(),
-                        Arc::clone(&diagnostics),
-                    ));
+                if let (Some(params), Some(sockets)) = (params, sockets) {
+                    match mirror_audio_tx.take() {
+                        Some(tx) => {
+                            let stream = AudioStream::new(&params);
+                            info!(%peer, link = %params.describe(), "AirPlay mirroring audio starting");
+                            let _ = sink
+                                .emit(SessionEvent::SourceInfo(
+                                    castaway_core::SourceDescription::new()
+                                        .with_link(params.describe()),
+                                ))
+                                .await;
+                            tokio::spawn(run_audio(
+                                sockets,
+                                stream,
+                                tx,
+                                peer.ip(),
+                                session.sender_ports(),
+                                flush_rx.clone(),
+                                Arc::clone(&diagnostics),
+                            ));
+                        }
+                        None => {
+                            start_negotiated_audio(
+                                &params,
+                                sockets,
+                                session.sender_ports(),
+                                flush_rx.clone(),
+                                Arc::clone(&diagnostics),
+                                sink,
+                                peer,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
 

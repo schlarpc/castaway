@@ -644,3 +644,117 @@ async fn setup_advertises_ports_from_the_declared_media_range() {
         "SETUP advertised {audio_port}, outside the declared range 42510-42517"
     );
 }
+
+/// A sender casting an app's *media* rather than its screen: key material, then one
+/// audio stream and no video stream at all.
+///
+/// Captured from an iPhone AirPlaying from YouTube (2026-07-31). The whole session used
+/// to negotiate cleanly and then start nothing: the audio was only ever started by being
+/// handed the mirror's channel, and there is no mirror here. On the phone that looks
+/// like "connected" and no sound; in the log it was one line —
+/// `no active session for source airplay/…` — as the sender's metadata was dropped on
+/// the floor.
+#[tokio::test]
+async fn an_audio_only_session_starts_without_a_picture_to_belong_to() {
+    let (tx, mut events) = mpsc::channel(64);
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let receiver = std::sync::Arc::new(
+        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
+    );
+    tokio::spawn(async move {
+        let _ = receiver.run(sink).await;
+    });
+
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(addr).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut stream = stream.expect("the receiver started listening");
+
+    let fp = request(
+        &mut stream,
+        "POST /fp-setup",
+        &[("Content-Type", "application/octet-stream")],
+        &unhex(FP_KEY_MESSAGE),
+        1,
+    )
+    .await;
+    assert!(fp.starts_with("RTSP/1.0 200"), "{fp}");
+
+    // The key material — with no `isScreenMirroringSession`, which is what says this is
+    // a media session rather than a mirror.
+    let mut d = plist::Dictionary::new();
+    d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+    d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+    d.insert("timingProtocol".into(), plist::Value::String("NTP".into()));
+    let setup1 = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        2,
+    )
+    .await;
+    assert!(setup1.starts_with("RTSP/1.0 200"), "{setup1}");
+
+    // One stream: ALAC audio, exactly as the capture has it.
+    let mut s0 = plist::Dictionary::new();
+    s0.insert("type".into(), plist::Value::Integer(96i64.into()));
+    s0.insert("ct".into(), plist::Value::Integer(2i64.into()));
+    s0.insert("spf".into(), plist::Value::Integer(352i64.into()));
+    s0.insert("sr".into(), plist::Value::Integer(44100i64.into()));
+    s0.insert("isMedia".into(), plist::Value::Boolean(true));
+    let mut d = plist::Dictionary::new();
+    d.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+    );
+    let setup2 = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        3,
+    )
+    .await;
+    assert!(setup2.starts_with("RTSP/1.0 200"), "{setup2}");
+
+    // The point of the test: an audio session reaches the pipeline, with the codec the
+    // sender named rather than mirroring's, and a decoder config it can open.
+    let mut described = None;
+    let mut started = false;
+    for _ in 0..8 {
+        let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            break;
+        };
+        match msg.event {
+            SessionEvent::SourceInfo(d) => described = d.link,
+            SessionEvent::Audio { format, config, .. } => {
+                assert_eq!(format.sample_rate(), 44_100);
+                let config = config.expect("ALAC must carry its magic cookie");
+                assert_eq!(config.len(), 36, "the 36-byte ALACSpecificConfig");
+                assert_eq!(&config[4..8], b"alac");
+                // The frame length the sender asked for, not mirroring's 480.
+                assert_eq!(&config[12..16], &352u32.to_be_bytes());
+                started = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(started, "an audio-only session must start an audio session");
+    assert_eq!(
+        described.as_deref(),
+        Some("AirPlay mirroring · ALAC · 44.1 kHz · stereo")
+    );
+}
