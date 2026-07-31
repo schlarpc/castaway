@@ -959,6 +959,42 @@ mod tests {
     }
 
     #[test]
+    fn the_thumbnail_get_is_byte_for_byte_what_goes_on_the_wire() {
+        // A golden fixture for the exact request the log shows going unanswered
+        // (05:04:16.619, handle "1000002"), so the hex the adapter now logs has something
+        // to be diffed against rather than reasoned about. Every byte here is a decision
+        // that has a wrong answer a responder reacts to by going quiet:
+        //
+        //   83                  GET, final bit set
+        //   002d                length, counting the opcode and itself
+        //   cb 00000007         Connection ID — first, and mandatory after a CONNECT that
+        //                       carried a Target
+        //   97 01               Single Response Mode, enabled; GOEP 2.0 §4.6 makes SRM
+        //                       support mandatory over L2CAP, and it goes immediately
+        //                       after the Connection ID
+        //   42 0010 …00         Type, *ASCII* and null-terminated: "x-bt/img-thm"
+        //   30 0013 …0000       Img-Handle (0x30, not Name 0x01), UTF-16 **big-endian**
+        //                       and null-terminated
+        let mut session = connected();
+        assert!(session.fetch("1000002"));
+        let request = session.next_request().expect("the get");
+        let actual: String = request.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            actual,
+            [
+                "83002d",
+                "cb00000007",
+                "9701",
+                "420010782d62742f696d672d74686d00",
+                "300013",
+                "00310030003000300030003000320000",
+            ]
+            .concat(),
+            "the thumbnail GET changed shape; a responder is entitled to notice"
+        );
+    }
+
+    #[test]
     fn the_obex_length_counts_its_own_header() {
         // Unlike L2CAP, whose length counts neither the length nor the CID.
         let pkt = ObexPacket {

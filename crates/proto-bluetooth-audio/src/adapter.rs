@@ -200,7 +200,7 @@ struct Link {
     /// for: a Target strips the image handle from its metadata response when no BIP
     /// client is connected, so a receiver that waits to see a handle before connecting
     /// waits forever (Q29).
-    art: Option<(Cid, Box<CoverArtSession>)>,
+    art: Option<(Cid, CoverArt)>,
     /// Fetches this link's peer has answered by closing the image channel, ever.
     ///
     /// A count rather than a flag for the same reason `media_failures` is: the log can
@@ -218,6 +218,41 @@ struct Link {
 /// one so a single coincidental teardown (a phone switching outputs mid-song) does not
 /// cost the whole link its artwork.
 const ART_STRIKES_LIMIT: u8 = 2;
+
+/// The image channel, and the OBEX session on it once there is one to have.
+///
+/// Two states rather than an `Option<Box<CoverArtSession>>` beside a `Cid`, because the
+/// gap between them is where a real bug lived: the OBEX `MaxPacketLength` we advertise in
+/// the CONNECT is derived from the channel's receive MTU, and that number is *not final*
+/// until the channel finishes configuring. Building the session at dial time read the MTU
+/// we had proposed and promised the responder a packet size the peer had not yet agreed
+/// to. Splitting the states makes a session built on a provisional MTU unrepresentable:
+/// there is no session until [`L2capEvent::ChannelOpen`] says what was actually negotiated.
+#[derive(Debug)]
+enum CoverArt {
+    /// Dialled, still configuring. Nothing can be asked of it yet.
+    Dialling,
+    /// Open, with a session built against the MTU that was really agreed.
+    Session(Box<CoverArtSession>),
+}
+
+impl CoverArt {
+    /// The session, if the channel has got far enough to have one.
+    const fn session(&self) -> Option<&CoverArtSession> {
+        match self {
+            Self::Dialling => None,
+            Self::Session(session) => Some(session),
+        }
+    }
+
+    /// The session, mutably.
+    const fn session_mut(&mut self) -> Option<&mut CoverArtSession> {
+        match self {
+            Self::Dialling => None,
+            Self::Session(session) => Some(session),
+        }
+    }
+}
 
 impl Link {
     fn new(peer: BdAddr, capabilities: Vec<crate::codec::CodecCapability>) -> Self {
@@ -689,10 +724,16 @@ impl BluetoothAdapter {
                             }
                         }
                     } else if link.art.as_ref().is_some_and(|(c, _)| *c == cid) {
-                        if let Some((_, session)) = &mut link.art {
-                            if let Some(request) = session.next_request() {
-                                out.replies.push((cid, request));
-                            }
+                        // Only now is the receive MTU final, and only now can the OBEX
+                        // `MaxPacketLength` be honest about what we can reassemble.
+                        let max_packet = link.mux.channel(cid).map_or(0x0400, |c| c.local_mtu);
+                        let mut session = CoverArtSession::new(max_packet);
+                        let request = session.next_request();
+                        debug!(%cid, max_packet, "cover art: image channel open; connecting obex");
+                        link.art = Some((cid, CoverArt::Session(Box::new(session))));
+                        if let Some(request) = request {
+                            debug!(request = %hex(&request), "cover art: obex tx");
+                            out.replies.push((cid, request));
                         }
                     }
                     debug!(%cid, %psm, "l2cap channel open");
@@ -714,10 +755,10 @@ impl BluetoothAdapter {
                         // and each strike counts toward giving cover art up for this
                         // link. An idle close is routine housekeeping; the PSM is
                         // remembered and the next track brings the session back.
-                        let mid_fetch = link
-                            .art
-                            .as_ref()
-                            .is_some_and(|(_, s)| s.state() == FetchState::Fetching);
+                        let mid_fetch = link.art.as_ref().is_some_and(|(_, art)| {
+                            art.session()
+                                .is_some_and(|s| s.state() == FetchState::Fetching)
+                        });
                         if mid_fetch {
                             link.art_strikes += 1;
                             info!(
@@ -1386,7 +1427,10 @@ impl BluetoothAdapter {
     /// connected, so the early request *teaches us nothing* and the card would wait on a
     /// second round trip for text it could have had immediately (Q29).
     fn request_metadata(link: &mut Link, cid: Cid, out: &mut Outbox) {
-        let ready = link.art.as_ref().is_some_and(|(_, s)| s.is_ready());
+        let ready = link
+            .art
+            .as_ref()
+            .is_some_and(|(_, art)| art.session().is_some_and(CoverArtSession::is_ready));
         let attributes: &[u32] = if ready {
             &avrcp::attribute::ALL
         } else {
@@ -1447,9 +1491,10 @@ impl BluetoothAdapter {
             .connect_with(psm, ChannelMode::EnhancedRetransmission)
         {
             Ok((cid, events)) => {
-                debug!(%psm, "bluetooth: connecting to the image server");
-                let max_packet = link.mux.channel(cid).map_or(0x0400, |c| c.local_mtu);
-                link.art = Some((cid, Box::new(CoverArtSession::new(max_packet))));
+                debug!(%psm, %cid, "bluetooth: connecting to the image server");
+                // No session yet: see [`CoverArt`]. The OBEX CONNECT is built when the
+                // channel opens and the MTU it has to be sized against is settled.
+                link.art = Some((cid, CoverArt::Dialling));
                 Self::queue_signalling(events, &mut out.signalling);
             }
             Err(e) => warn!(error = %e, "cover art: no channel for the image server"),
@@ -1458,10 +1503,14 @@ impl BluetoothAdapter {
 
     /// Ask the image server for a handle the peer just gave us.
     fn fetch_cover_art(link: &mut Link, handle: &str, out: &mut Outbox) {
-        let Some((cid, session)) = &mut link.art else {
+        let Some((cid, art)) = &mut link.art else {
             return;
         };
         let cid = *cid;
+        let Some(session) = art.session_mut() else {
+            debug!(handle, "cover art: the image channel is still configuring");
+            return;
+        };
         if !session.fetch(handle) {
             // Either the session is still connecting or an image is already coming. A
             // skipped-through album would otherwise queue art for tracks nobody is on.
@@ -1469,7 +1518,12 @@ impl BluetoothAdapter {
             return;
         }
         if let Some(request) = session.next_request() {
-            debug!(handle, "bluetooth: fetching cover art");
+            // The bytes, not just the fact. This request is the one thing in the chain
+            // that has never been visible, and it is the only thing that can settle
+            // whether a peer that goes silent after it is answering a malformed GET or
+            // never received one — see the log window at 05:04:16.619, where a fetch was
+            // followed by two seconds of nothing and then a teardown.
+            debug!(handle, request = %hex(&request), "bluetooth: fetching cover art");
             out.replies.push((cid, request));
         }
     }
@@ -1541,10 +1595,18 @@ impl BluetoothAdapter {
         sink: &SessionSink,
         out: &mut Outbox,
     ) -> Result<(), CoreError> {
-        let Some((cid, session)) = &mut link.art else {
+        let Some((cid, art)) = &mut link.art else {
             return Ok(());
         };
         let cid = *cid;
+        let Some(session) = art.session_mut() else {
+            debug!("cover art: obex bytes on a channel that has no session yet");
+            return Ok(());
+        };
+        // Both halves of the exchange in full. An OBEX conversation that a peer walks away
+        // from cannot be diagnosed from our side's opinion of it — the same reasoning the
+        // SDP exchange is already logged under.
+        debug!(response = %hex(payload), "cover art: obex rx");
         // Whether this packet is the one that brings the session up decides what we do
         // next, and it has to be sampled before the packet is fed in.
         let was_connecting = session.state() == FetchState::Connecting;
@@ -1567,6 +1629,7 @@ impl BluetoothAdapter {
             // asked for.
             Ok(None) => {
                 if let Some(request) = next {
+                    debug!(request = %hex(&request), "cover art: obex tx");
                     out.replies.push((cid, request));
                 }
             }

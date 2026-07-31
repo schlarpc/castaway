@@ -415,6 +415,37 @@ impl Signal {
         }
     }
 
+    /// The identifier of the request this signal *answers*, or `None` if it is not an
+    /// answer at all.
+    ///
+    /// Every L2CAP response carries the identifier of the request it settles, and the one
+    /// thing a stack must do on receiving one is stop timing that request. Deriving "is
+    /// this an answer" from the variant — exhaustively, so a new response cannot be added
+    /// without saying — is what keeps that pairing structural instead of a habit each
+    /// handler has to remember.
+    ///
+    /// It was a habit, and `ConfigurationResponse` forgot: every channel we configured
+    /// stayed on the response timer forever, was re-proposed at four and eight seconds,
+    /// and was torn down by us at twelve — mid-stream, on a channel the peer was perfectly
+    /// happy with. A `Command Reject` counts as an answer too: it settles the request by
+    /// refusing it.
+    #[must_use]
+    pub const fn answers(&self) -> Option<u8> {
+        match self {
+            Self::CommandReject { id, .. }
+            | Self::ConnectionResponse { id, .. }
+            | Self::ConfigurationResponse { id, .. }
+            | Self::DisconnectionResponse { id, .. }
+            | Self::EchoResponse { id, .. }
+            | Self::InformationResponse { id, .. } => Some(*id),
+            Self::ConnectionRequest { .. }
+            | Self::ConfigurationRequest { .. }
+            | Self::DisconnectionRequest { .. }
+            | Self::EchoRequest { .. }
+            | Self::InformationRequest { .. } => None,
+        }
+    }
+
     const fn code(&self) -> u8 {
         match self {
             Self::CommandReject { .. } => code::COMMAND_REJECT,

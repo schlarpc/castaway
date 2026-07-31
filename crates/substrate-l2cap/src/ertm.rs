@@ -27,6 +27,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use tracing::debug;
 
 use crate::error::L2capError;
 use crate::pdu::Cid;
@@ -725,12 +726,26 @@ impl Ertm {
     pub fn receive(&mut self, payload: &[u8]) -> Result<ErtmOutput, L2capError> {
         let frame = match Frame::decode(payload, self.params.local_cid, self.params.fcs) {
             Ok(frame) => frame,
-            Err(L2capError::BadFcs { .. }) => {
+            Err(L2capError::BadFcs {
+                expected, actual, ..
+            }) => {
                 self.discarded = self.discarded.saturating_add(1);
+                // A dropped frame used to be a number nobody could see. It is the one
+                // failure that looks exactly like a peer gone quiet from the layer above —
+                // the transfer simply stops — so it says so once per frame, with the bytes.
+                debug!(
+                    cid = %self.params.local_cid,
+                    expected,
+                    actual,
+                    discarded = self.discarded,
+                    raw = %hex(payload),
+                    "ertm: dropping a frame whose checksum does not match"
+                );
                 return Ok(ErtmOutput::default());
             }
             Err(other) => return Err(other),
         };
+        debug!(cid = %self.params.local_cid, ?frame, "ertm: rx");
 
         let mut out = ErtmOutput::default();
         // An acknowledgement rides on every frame, data or not, so it is taken before the
@@ -806,6 +821,12 @@ impl Ertm {
 
     /// Ask the peer where it has got to, and start waiting for the answer.
     fn poll(&mut self, out: &mut ErtmOutput) {
+        debug!(
+            cid = %self.params.local_cid,
+            unacked = self.unacked.len(),
+            attempt = self.polls.saturating_add(1),
+            "ertm: nothing acknowledged within the retransmission timeout; polling the peer"
+        );
         self.polls = self.polls.saturating_add(1);
         self.waiting_for_final = true;
         self.monitor_timer = Some(self.params.monitor_timeout);
@@ -906,6 +927,12 @@ impl Ertm {
                     // confused or hostile; either way we do not allocate for it.
                     self.discarded = self.discarded.saturating_add(1);
                     self.reassembly = None;
+                    debug!(
+                        cid = %self.params.local_cid,
+                        expected,
+                        local_mtu = self.params.local_mtu,
+                        "ertm: refusing an sdu larger than the mtu we agreed to receive"
+                    );
                 } else {
                     let mut buffer = BytesMut::with_capacity(expected);
                     buffer.extend_from_slice(&payload);
@@ -923,6 +950,10 @@ impl Ertm {
                     // alone would hand the layer above a truncated object.
                     None => {
                         self.discarded = self.discarded.saturating_add(1);
+                        debug!(
+                            cid = %self.params.local_cid,
+                            "ertm: dropping a continuation with no start"
+                        );
                         false
                     }
                 };
@@ -932,6 +963,12 @@ impl Ertm {
                             out.sdus.push(state.buffer.freeze());
                         } else {
                             self.discarded = self.discarded.saturating_add(1);
+                            debug!(
+                                cid = %self.params.local_cid,
+                                got = state.buffer.len(),
+                                expected = state.expected,
+                                "ertm: dropping an sdu that did not reassemble to its declared length"
+                            );
                         }
                     }
                 }
@@ -957,6 +994,14 @@ impl Ertm {
             frame.tx_seq = self.next_tx_seq;
             frame.transmissions = 1;
             self.next_tx_seq = next_seq(self.next_tx_seq);
+            debug!(
+                cid = %self.params.local_cid,
+                tx_seq = frame.tx_seq,
+                req_seq = self.expected_tx_seq,
+                sar = ?frame.sar,
+                len = frame.payload.len(),
+                "ertm: tx"
+            );
             out.frames.push(self.encode_information(&frame, false));
             self.unacked.push_back(frame);
         }
@@ -998,6 +1043,13 @@ impl Ertm {
 
     fn retransmit(&mut self, frame: &Unacked, out: &mut ErtmOutput) {
         let attempts = frame.transmissions.saturating_add(1);
+        debug!(
+            cid = %self.params.local_cid,
+            tx_seq = frame.tx_seq,
+            attempts,
+            max_transmit = self.params.max_transmit,
+            "ertm: retransmitting"
+        );
         if attempts > self.params.max_transmit {
             out.failed = true;
             return;
@@ -1008,6 +1060,22 @@ impl Ertm {
         out.frames.push(self.encode_information(frame, false));
         self.retransmission_timer = Some(self.params.retransmission_timeout);
     }
+}
+
+/// Bytes as hex, for the log lines that exist to be compared against a capture.
+///
+/// Truncated, because a frame is up to an ACL packet long and the interesting part of a
+/// misframed one is always its head.
+fn hex(bytes: &[u8]) -> String {
+    const SHOWN: usize = 32;
+    let mut out = String::with_capacity(bytes.len().min(SHOWN) * 2 + 8);
+    for byte in bytes.iter().take(SHOWN) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    if bytes.len() > SHOWN {
+        out.push('…');
+    }
+    out
 }
 
 /// The next sequence number, wrapping at 64.

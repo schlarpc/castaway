@@ -801,3 +801,206 @@ fn a_configuration_split_across_requests_does_not_open_the_channel_early() {
         "the final request is still answered: {events:?}"
     );
 }
+
+// --- the twelve-second fuse ---
+
+/// Advance both ends of a link in one-second steps, delivering anything either produces,
+/// and return everything they observed along the way.
+///
+/// A second at a time rather than `next_timeout()` because the point of these tests is what
+/// happens when *nothing* is due: a channel with no timer running must survive an arbitrary
+/// amount of wall clock, and the bug they pin was invisible to any harness that only
+/// advanced to the next scheduled event on a channel it had already given up on.
+fn run_for(link: &mut Link, seconds: u64) -> (Vec<L2capEvent>, Vec<L2capEvent>) {
+    let (mut sink_seen, mut peer_seen) = (Vec::new(), Vec::new());
+    for _ in 0..seconds {
+        let sink_events = link.sink.tick(Duration::from_secs(1));
+        let (s, p) = link.settle(false, sink_events);
+        sink_seen.extend(s);
+        peer_seen.extend(p);
+        let peer_events = link.peer.tick(Duration::from_secs(1));
+        let (s, p) = link.settle(true, peer_events);
+        sink_seen.extend(s);
+        peer_seen.extend(p);
+    }
+    (sink_seen, peer_seen)
+}
+
+#[test]
+fn an_open_channel_survives_far_longer_than_the_response_timeout() {
+    // The bug, exactly as the logs recorded it. `ConfigurationResponse` was the one answer
+    // that did not retire the request it answered, so every channel we ever configured sat
+    // on a response timer that could never be satisfied: re-proposed at four seconds,
+    // re-proposed at eight, and torn down by *us* at twelve.
+    //
+    // On the wall panel that is an iPhone twelve seconds into a track having its AVDTP
+    // signalling, AVDTP media and AVCTP channels all disconnected out from under it by the
+    // receiver, and then hanging up the ACL link a second later with reason 0x13 — which
+    // reads, from our side, as "the phone dropped us".
+    //
+    // Twenty seconds is well past the give-up point and past two more RTX periods after it.
+    let mut link = Link::new();
+    let (sink_cid, _) = link.connect(Psm::AVDTP);
+    let (sink_avctp, _) = link.connect(Psm::AVCTP);
+
+    let (sink_seen, peer_seen) = run_for(&mut link, 20);
+
+    assert!(
+        sink_seen.is_empty(),
+        "an idle open channel must produce nothing at all: {sink_seen:?}"
+    );
+    assert!(
+        peer_seen.is_empty(),
+        "and the peer must see nothing either: {peer_seen:?}"
+    );
+    assert!(
+        link.sink.channel(sink_cid).is_some() && link.sink.channel(sink_avctp).is_some(),
+        "both channels must still exist"
+    );
+    assert_eq!(
+        link.sink.next_timeout(),
+        None,
+        "a settled channel must not be waiting on time at all"
+    );
+}
+
+#[test]
+fn a_configured_channel_still_carries_data_after_the_timeout_would_have_fired() {
+    // The failure was not merely bookkeeping: audio stops. This is the same twenty seconds
+    // with the thing that actually matters asserted at the end of it.
+    let mut link = Link::new();
+    let (sink_cid, peer_cid) = link.connect(Psm::AVDTP);
+    run_for(&mut link, 20);
+
+    let payload = Bytes::from_static(&[0x80, 0x60, 0x01, 0x02]);
+    let sends = link.peer.send(peer_cid, payload.clone()).expect("send");
+    let (sink_seen, _) = link.settle(true, sends);
+    assert_eq!(
+        sink_seen,
+        vec![L2capEvent::Data {
+            cid: sink_cid,
+            psm: Psm::AVDTP,
+            payload,
+        }],
+        "media must still arrive twenty seconds in"
+    );
+}
+
+#[test]
+fn a_cover_art_channel_mid_fetch_does_not_take_the_audio_channels_with_it() {
+    // Requirement (2) as a test: album art is decoration, and no failure of it may cost the
+    // link its audio. The shape is the one in the log — AVDTP and AVCTP up, an ERTM channel
+    // out to the phone's image server, a request sent on it that is never answered — and
+    // the assertion is that the audio channels are untouched however that ends.
+    let mut link = Link::new();
+    let (sink_avdtp, peer_avdtp) = link.connect(Psm::AVDTP);
+    let (sink_avctp, _) = link.connect(Psm::AVCTP);
+    link.peer
+        .listen_with(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+    let (sink_art, peer_art) =
+        link.connect_out(cover_art_psm(), ChannelMode::EnhancedRetransmission);
+
+    // An OBEX GET that goes out and is never answered — delivered nowhere, so no
+    // acknowledgement comes back. This is the state the image channel was in at the moment
+    // the phone gave up on it.
+    let get = Bytes::from_static(&[0x83, 0x00, 0x08, 0xCB, 0, 0, 0, 1]);
+    for event in link.sink.send(sink_art, get).expect("the get goes out") {
+        drop(event);
+    }
+    // …and then the responder closes the image session mid-fetch, which is what the log
+    // records the iPhone doing two seconds later.
+    let teardown = link.peer.disconnect(peer_art).expect("the peer hangs up");
+    let (sink_seen, _) = link.settle(true, teardown);
+    assert!(
+        sink_seen.iter().any(|e| matches!(
+            e,
+            L2capEvent::ChannelClosed { cid, .. } if *cid == sink_art
+        )),
+        "the image channel really did close: {sink_seen:?}"
+    );
+
+    // Long past the point at which every channel used to be torn down.
+    let (sink_seen, _) = run_for(&mut link, 20);
+
+    let closed_audio: Vec<&L2capEvent> = sink_seen
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                L2capEvent::ChannelClosed { psm, .. } if *psm == Psm::AVDTP || *psm == Psm::AVCTP
+            )
+        })
+        .collect();
+    assert!(
+        closed_audio.is_empty(),
+        "a cover-art failure must not close an audio channel: {closed_audio:?}"
+    );
+    assert!(
+        link.sink.channel(sink_avdtp).is_some() && link.sink.channel(sink_avctp).is_some(),
+        "and both audio channels must still be open"
+    );
+    assert!(
+        link.sink.channel(sink_art).is_none(),
+        "while the image channel, which really did fail, stays gone"
+    );
+
+    // The thing the panel is for: audio still plays.
+    let payload = Bytes::from_static(&[0x80, 0x60, 0xAA, 0xBB]);
+    let sends = link.peer.send(peer_avdtp, payload.clone()).expect("send");
+    let (sink_seen, _) = link.settle(true, sends);
+    assert_eq!(
+        sink_seen,
+        vec![L2capEvent::Data {
+            cid: sink_avdtp,
+            psm: Psm::AVDTP,
+            payload,
+        }]
+    );
+}
+
+#[test]
+fn a_channel_that_never_finishes_configuring_is_still_given_up_on() {
+    // The other side of the fix: retiring timers must not blunt the timer. A peer that
+    // answers the connection request and then goes silent still has to be abandoned in
+    // bounded time, or the CID leaks and the caller waits forever.
+    let mut listener = Multiplexer::new(672);
+    listener.listen(Psm::SDP);
+    let mut dialler = Multiplexer::new(672);
+    let (_, events) = dialler.connect(Psm::SDP).expect("dial");
+
+    // The listener answers the connection request only; its configuration request and our
+    // own proposal are both dropped on the floor from here on.
+    for event in events {
+        if let L2capEvent::Send(pdu) = event {
+            for reply in listener.handle_pdu(&pdu).expect("connect") {
+                if let L2capEvent::Send(pdu) = reply {
+                    if let Ok(signals) = Signal::decode_all(&pdu.payload) {
+                        if signals
+                            .iter()
+                            .any(|s| matches!(s, Signal::ConnectionResponse { .. }))
+                        {
+                            let _ = dialler.handle_pdu(&pdu);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut closed = None;
+    for _ in 0..40 {
+        for event in dialler.tick(Duration::from_secs(1)) {
+            if let L2capEvent::ChannelClosed { psm, .. } = event {
+                closed = Some(psm);
+            }
+        }
+        if closed.is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        closed,
+        Some(Psm::SDP),
+        "a configuration nobody answers must still fail the channel"
+    );
+}

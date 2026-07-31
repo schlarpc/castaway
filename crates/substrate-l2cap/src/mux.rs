@@ -468,6 +468,9 @@ impl Multiplexer {
         ch.state = ChannelState::WaitDisconnect;
         let (dest, src) = (ch.remote_cid, ch.local_cid);
         self.ertm.remove(&cid.raw());
+        // Whatever we were still timing for this channel is moot: we are tearing it down.
+        // Only the disconnection request itself deserves a timer from here on.
+        self.retire_timers(cid.raw());
         let request = Signal::DisconnectionRequest {
             id,
             dest_cid: dest,
@@ -520,9 +523,15 @@ impl Multiplexer {
         );
     }
 
-    /// A response arrived (or the request became moot): stop timing it.
-    fn answered(&mut self, id: u8) {
-        self.outstanding.remove(&id);
+    /// Forget every request still being timed for one channel.
+    ///
+    /// A response timer is only meaningful while the thing it times can still be answered.
+    /// Once a channel is *open* its configuration is settled — by definition, since that is
+    /// what opened it — and once it is gone there is nothing left to configure. Leaving the
+    /// timer running in either case arms a delayed teardown of a channel that is working,
+    /// which is precisely how a receiver drops a phone's audio twelve seconds into a track.
+    fn retire_timers(&mut self, raw_cid: u16) {
+        self.outstanding.retain(|_, out| out.raw_cid != raw_cid);
     }
 
     /// Advance every retransmission engine by `elapsed`.
@@ -550,6 +559,17 @@ impl Multiplexer {
                 out.retries += 1;
                 out.remaining = RTX;
                 let request = out.request.clone();
+                let (raw_cid, retries) = (out.raw_cid, out.retries);
+                // Loud, because a *healthy* link should never produce one of these: every
+                // request we send is answered by the next packet on the wire. A run of them
+                // four seconds apart is the whole signature of a request whose answer was
+                // never recorded, and it took a log with none of these to find that.
+                debug!(
+                    cid = %Cid::new(raw_cid),
+                    attempt = retries,
+                    request = ?request,
+                    "l2cap: no answer within the response timeout; asking again"
+                );
                 if let Ok(event) = Self::signal(&request) {
                     events.push(event);
                 }
@@ -557,6 +577,10 @@ impl Multiplexer {
                 let raw_cid = out.raw_cid;
                 self.outstanding.remove(&id);
                 self.pending.remove(&id);
+                debug!(
+                    cid = %Cid::new(raw_cid),
+                    "l2cap: giving up on a request the peer never answered; failing the channel"
+                );
                 failed.push(Cid::new(raw_cid));
             }
         }
@@ -651,6 +675,7 @@ impl Multiplexer {
     /// A retransmission engine gave up: tell the peer and the caller, once.
     fn fail_channel(&mut self, cid: Cid) -> Vec<L2capEvent> {
         self.ertm.remove(&cid.raw());
+        self.retire_timers(cid.raw());
         let Some(ch) = self.channels.remove(&cid.raw()) else {
             return Vec::new();
         };
@@ -671,6 +696,12 @@ impl Multiplexer {
     }
 
     fn handle_signal(&mut self, sig: Signal) -> Result<Vec<L2capEvent>, L2capError> {
+        // Every answer retires the request it answers, here and only here. Doing it in the
+        // individual handlers is what let `ConfigurationResponse` forget, and a forgotten
+        // response timer is not inert: it re-sends the request at four and eight seconds
+        // and tears the channel down at twelve, which on a phone streaming audio reads as
+        // "the receiver hung up on me".
+        let retired = sig.answers().and_then(|id| self.outstanding.remove(&id));
         match sig {
             Signal::ConnectionRequest {
                 id,
@@ -708,6 +739,7 @@ impl Multiplexer {
                     source_cid,
                 })?];
                 self.ertm.remove(&dest_cid.raw());
+                self.retire_timers(dest_cid.raw());
                 if let Some(ch) = self.channels.remove(&dest_cid.raw()) {
                     out.push(L2capEvent::ChannelClosed {
                         cid: ch.local_cid,
@@ -716,12 +748,12 @@ impl Multiplexer {
                 }
                 Ok(out)
             }
-            Signal::DisconnectionResponse { id, source_cid, .. } => {
+            Signal::DisconnectionResponse { source_cid, .. } => {
                 // The peer named our channel by *its* source CID in the response's
                 // dest field; our own CID is the one we sent as source.
-                self.answered(id);
                 let mut out = Vec::new();
                 self.ertm.remove(&source_cid.raw());
+                self.retire_timers(source_cid.raw());
                 if let Some(ch) = self.channels.remove(&source_cid.raw()) {
                     out.push(L2capEvent::ChannelClosed {
                         cid: ch.local_cid,
@@ -754,7 +786,7 @@ impl Multiplexer {
                 // The peer refused something we sent. Swallowing this meant waiting out
                 // the response timer for an answer that is never coming — and before
                 // there *was* a response timer, waiting forever.
-                let Some(out) = self.outstanding.remove(&id) else {
+                let Some(out) = retired else {
                     return Ok(Vec::new());
                 };
                 let cid = Cid::new(out.raw_cid);
@@ -831,7 +863,6 @@ impl Multiplexer {
             .get(&id)
             .copied()
             .unwrap_or_else(|| source_cid.raw());
-        self.answered(id);
         let Some(ch) = self.channels.get_mut(&local_raw) else {
             return Ok(Vec::new());
         };
@@ -854,6 +885,10 @@ impl Multiplexer {
     fn request_configuration(&mut self, raw_cid: u16) -> Result<L2capEvent, L2capError> {
         let config_id = self.alloc_id();
         let receive_mps = self.receive_mps();
+        // A new proposal withdraws the previous one, so the previous one's timer has
+        // nothing left to wait for. `config_id` already encodes that a stale *response* is
+        // ignored; this is the same statement about a stale *request*.
+        self.retire_timers(raw_cid);
         let Some(ch) = self.channels.get_mut(&raw_cid) else {
             return Err(L2capError::UnknownChannel(Cid::new(raw_cid)));
         };
@@ -1051,13 +1086,16 @@ impl Multiplexer {
             // channel the peer is still describing.
             return Ok(out);
         }
+        // Promote *before* re-proposing, not after: promotion retires the timers of the
+        // proposals it settles, and a re-proposal issued first would have its own brand-new
+        // timer retired along with them.
+        out.extend(self.promote_if_configured(dest_cid.raw()));
         if repropose {
             if attempts >= MAX_CONFIG_ATTEMPTS {
                 return Ok(self.fail_configuration(dest_cid));
             }
             out.push(self.request_configuration(dest_cid.raw())?);
         }
-        out.extend(self.promote_if_configured(dest_cid.raw()));
         Ok(out)
     }
 
@@ -1141,6 +1179,7 @@ impl Multiplexer {
     /// Give up on a channel whose configuration will not converge.
     fn fail_configuration(&mut self, cid: Cid) -> Vec<L2capEvent> {
         self.ertm.remove(&cid.raw());
+        self.retire_timers(cid.raw());
         let Some(ch) = self.channels.remove(&cid.raw()) else {
             return Vec::new();
         };
@@ -1182,6 +1221,14 @@ impl Multiplexer {
             return Vec::new();
         }
         ch.state = ChannelState::Open;
+        // An open channel has no unanswered configuration: that is what "open" means. Say
+        // so by construction rather than trusting each response handler to have retired its
+        // own timer — the belt to `Signal::answers`'s braces, and the one that makes it
+        // impossible for a *working* channel to be sitting on a fuse.
+        self.retire_timers(raw_cid);
+        let Some(ch) = self.channels.get_mut(&raw_cid) else {
+            return Vec::new();
+        };
         if ch.mode == ChannelMode::EnhancedRetransmission {
             self.ertm.insert(
                 raw_cid,
