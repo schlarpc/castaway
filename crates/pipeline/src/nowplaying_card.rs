@@ -349,7 +349,7 @@ struct Cover {
 /// Centre-crop rather than stretch, because a non-square cover stretched square is
 /// instantly, distractingly wrong. The resample filter is chosen by direction: art
 /// arrives at whatever size the source felt like — Bluetooth's linked thumbnail is a
-/// fixed 200×200 (Q49), a CDN might send 640 — while the panel square can be several
+/// fixed 200×200 (#75), a CDN might send 640 — while the panel square can be several
 /// times that. Upscales get Catmull-Rom, which stays sharp at those factors without
 /// Lanczos's ringing on the hard edges cover art is full of; downscales get Lanczos3,
 /// where the sharpness is the virtue and minification swallows the ringing.
