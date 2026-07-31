@@ -163,6 +163,9 @@ pub enum RenderCommand {
 pub struct RenderTx {
     frames: SyncSender<RenderCommand>,
     control: std::sync::mpsc::Sender<RenderCommand>,
+    /// Wakes the kiosk loop, which sleeps between frames (Q48). Every send wakes it:
+    /// a command sitting in a channel nobody is spinning on is otherwise invisible.
+    waker: castaway_core::Waker,
 }
 
 impl RenderTx {
@@ -176,6 +179,7 @@ impl RenderTx {
             RenderCommand::Video(_) => drop(self.frames.try_send(cmd)),
             control => drop(self.control.send(control)),
         }
+        self.waker.wake();
     }
 
     /// Send a video frame, answering whether the render loop is still there.
@@ -183,10 +187,20 @@ impl RenderTx {
     /// `false` only on disconnect — a full lane just drops the frame. The decode and
     /// mirror loops use the answer to stop pushing at a loop that is gone.
     pub fn send_frame(&self, frame: DecodedFrame) -> bool {
-        !matches!(
+        let alive = !matches!(
             self.frames.try_send(RenderCommand::Video(frame)),
             Err(TrySendError::Disconnected(_))
-        )
+        );
+        self.waker.wake();
+        alive
+    }
+
+    /// The waker every sender on this channel shares. For the app to hand to producers
+    /// that bypass the channel (the exit flag, the browser command lane) so their events
+    /// reach a sleeping loop too.
+    #[must_use]
+    pub fn waker(&self) -> castaway_core::Waker {
+        self.waker.clone()
     }
 }
 
@@ -194,6 +208,7 @@ impl RenderTx {
 pub struct RenderRx {
     frames: Receiver<RenderCommand>,
     control: Receiver<RenderCommand>,
+    waker: castaway_core::Waker,
 }
 
 impl RenderRx {
@@ -224,6 +239,13 @@ impl RenderRx {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    /// The waker the senders on this channel share, for the kiosk loop to arm with its
+    /// real wake mechanism once the event loop exists (Q48).
+    #[must_use]
+    pub fn waker(&self) -> castaway_core::Waker {
+        self.waker.clone()
+    }
 }
 
 /// A render channel: a bounded frame lane of `frame_depth` and an unbounded
@@ -232,14 +254,17 @@ impl RenderRx {
 pub fn render_channel(frame_depth: usize) -> (RenderTx, RenderRx) {
     let (frames_tx, frames_rx) = sync_channel(frame_depth.max(1));
     let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let waker = castaway_core::Waker::new();
     (
         RenderTx {
             frames: frames_tx,
             control: control_tx,
+            waker: waker.clone(),
         },
         RenderRx {
             frames: frames_rx,
             control: control_rx,
+            waker,
         },
     )
 }
@@ -428,6 +453,15 @@ impl RenderPipeline {
     /// session manager at startup.
     pub fn commands(&self) -> RenderTx {
         self.tx.clone()
+    }
+
+    /// The process-wide render-loop waker (Q48). Everything that queues work for the
+    /// kiosk outside the render channel — the exit flag, the browser command lane, the
+    /// browser subprocess itself — takes a clone, so the loop can sleep between frames
+    /// without any of them going unnoticed.
+    #[must_use]
+    pub fn waker(&self) -> castaway_core::Waker {
+        self.tx.waker()
     }
 
     pub fn new(depth: usize) -> (Self, RenderRx) {
@@ -2370,6 +2404,74 @@ impl RenderLoop {
             }
         }
         Some(role.view(self.compositor.target_size()))
+    }
+
+    /// One demand-driven frame (Q48): drain pending commands, advance every animation by
+    /// `dt`, present once, and answer when the next frame is owed.
+    ///
+    /// Commands are applied *before* the ticks so a motion a command just started is
+    /// stepped — and counted as animating — in this same frame; the old
+    /// ticks-then-pump order left the loop believing it was idle on exactly the frame
+    /// something began to move.
+    pub fn frame(&mut self, dt: std::time::Duration) -> crate::demand::Demand {
+        // Clamped, because under demand-driven pacing `dt` is "time since the last
+        // frame", and after an idle sleep that is minutes: a spring stepped by minutes
+        // diverges rather than settles. A motion that begins after a long sleep starts
+        // from its beginning, which is also what a person watching expects.
+        let dt = dt.min(std::time::Duration::from_millis(50));
+        while let Some(cmd) = self.rx.try_recv() {
+            self.apply(cmd);
+        }
+        self.tick_transition(dt);
+        self.tick_motion(dt);
+        self.tick_transport();
+        self.update_osd();
+        self.present_and_serve_taps();
+        self.demand(std::time::Instant::now())
+    }
+
+    /// When this loop next owes the glass a frame, from standing facts alone.
+    ///
+    /// No flag anywhere is set to "schedule" a redraw; everything time-driven in the
+    /// loop is either *continuous* (a spring mid-flight, a driven transition, a tap
+    /// consuming output) or *scheduled* (a deferred clear, a banner's TTL, the
+    /// transport clock's next visible second), and this reads both kinds off the state
+    /// that already exists. Events from outside arrive by waking the kiosk instead.
+    #[must_use]
+    pub fn demand(&self, now: std::time::Instant) -> crate::demand::Demand {
+        use crate::demand::Demand;
+        // A tap holds the loop at display rate while attached: a screenshot retires
+        // itself after one present, and a future HLS/DASH tap (Q30 phase 2) wants a
+        // steady cadence anyway.
+        if self.transition.is_some() || self.animating || !self.taps.is_empty() {
+            return Demand::Frame;
+        }
+        [
+            self.video_clear_due,
+            self.card_clear_due,
+            self.transport_due(now),
+            self.osd
+                .as_ref()
+                .and_then(crate::osd::OsdController::next_change),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(Demand::Idle, Demand::At)
+    }
+
+    /// When the transport strip's clock next changes what it shows: the strip repaints
+    /// when the position's whole second rolls over ([`Self::tick_transport`]), so while
+    /// something is playing the next repaint is due at that boundary.
+    fn transport_due(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        let state = self.transport.as_ref()?;
+        if !state.model.state.is_active() {
+            return None;
+        }
+        let live = state.live_position()?;
+        let to_boundary = Duration::from_secs(1)
+            .saturating_sub(Duration::from_nanos(u64::from(live.subsec_nanos())));
+        Some(now + to_boundary)
     }
 
     /// Drain all pending commands (non-blocking) and present once. Returns the number of

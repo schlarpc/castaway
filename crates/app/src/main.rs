@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<SourceMessage>(64);
     let shutdown = Arc::new(Notify::new());
     // A fullscreen kiosk has no window chrome, so ctrl-c must also stop the winit loop;
-    // it polls this flag every iteration.
+    // the flag is checked on every wake, and setting it comes with a wake (Q48).
     let kiosk_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // The OSD channel: the session manager posts "Now casting from …", and any other
@@ -145,6 +145,10 @@ fn main() -> anyhow::Result<()> {
     {
         use pipeline::{OsdController, RenderPipeline};
         let (render_pipeline, rx) = RenderPipeline::new(3);
+        // The kiosk loop sleeps between frames (Q48); everything outside the render
+        // channel that queues work for it wakes it through clones of this. The kiosk
+        // arms it once the event loop exists.
+        let wake = render_pipeline.waker();
         // Which device sound leaves through. Config decides where it starts, the
         // settings screen moves it live, and every session factory reads it at
         // stream-open — so a pick reaches the *next* session of every source with no
@@ -188,8 +192,10 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "electron")]
         {
             let release_tx = nav_tx.clone();
+            let release_wake = wake.clone();
             render_pipeline.set_screen_release(Arc::new(move || {
                 let _ = release_tx.send(pipeline::BrowserCommand::Hide);
+                release_wake.wake();
             }));
         }
 
@@ -208,15 +214,21 @@ fn main() -> anyhow::Result<()> {
         runtime.spawn(manager.run(event_rx));
 
         #[cfg(feature = "electron")]
-        let on_dial = move |event: proto_dial::DialEvent| match event {
-            proto_dial::DialEvent::Launched(params) => {
-                let url = params.leanback_url();
-                info!(%url, "DIAL launch: navigating kiosk browser");
-                let _ = nav_tx.send(pipeline::BrowserCommand::Navigate(url));
-            }
-            proto_dial::DialEvent::Stopped => {
-                info!("DIAL stop: hiding kiosk browser");
-                let _ = nav_tx.send(pipeline::BrowserCommand::Hide);
+        let on_dial = {
+            let dial_wake = wake.clone();
+            move |event: proto_dial::DialEvent| {
+                match event {
+                    proto_dial::DialEvent::Launched(params) => {
+                        let url = params.leanback_url();
+                        info!(%url, "DIAL launch: navigating kiosk browser");
+                        let _ = nav_tx.send(pipeline::BrowserCommand::Navigate(url));
+                    }
+                    proto_dial::DialEvent::Stopped => {
+                        info!("DIAL stop: hiding kiosk browser");
+                        let _ = nav_tx.send(pipeline::BrowserCommand::Hide);
+                    }
+                }
+                dial_wake.wake();
             }
         };
         #[cfg(feature = "electron")]
@@ -296,6 +308,7 @@ fn main() -> anyhow::Result<()> {
                 // one per session, like every other source.
                 Some(&audio_factory),
                 pipeline::TV_USER_AGENT,
+                wake.clone(),
             )
             .map_err(|e| anyhow::anyhow!("browser: {e}"))?;
 
@@ -307,6 +320,7 @@ fn main() -> anyhow::Result<()> {
                     adblock: blocker,
                     audio_out: Some(StdArc::clone(&audio_factory)),
                     user_agent: pipeline::TV_USER_AGENT.to_string(),
+                    waker: wake.clone(),
                 },
                 nav_rx,
             );
@@ -369,7 +383,7 @@ fn main() -> anyhow::Result<()> {
         // Chromium's SIGINT handler used to be installed into *this* process during
         // `cef_initialize`, silently replacing ours, so this had to come after it. The
         // browser owns its own signals now.
-        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
+        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
         let attract = build_attract(&config);
@@ -420,7 +434,14 @@ fn main() -> anyhow::Result<()> {
         runtime.spawn(manager.run(event_rx));
         // Headless: no renderer, so drain the OSD channel to the log.
         std::thread::spawn(move || drain_osd_to_log(&osd_rx));
-        spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, remote);
+        // No kiosk loop to wake in this build; the waker stays unarmed and inert.
+        spawn_ctrl_c(
+            &runtime,
+            &shutdown,
+            &kiosk_exit,
+            castaway_core::Waker::new(),
+            remote,
+        );
         // Headless: no renderer at all, so certainly no browser to launch YouTube in.
         let on_dial: Option<NoLauncher> = None;
         // No renderer in this build: no screenshot to take, and nothing with a position
@@ -465,6 +486,7 @@ fn spawn_ctrl_c(
     runtime: &tokio::runtime::Runtime,
     shutdown: &Arc<Notify>,
     kiosk_exit: &Arc<std::sync::atomic::AtomicBool>,
+    kiosk_wake: castaway_core::Waker,
     remote: castaway_core::RemoteHandle,
 ) {
     let shutdown = shutdown.clone();
@@ -490,6 +512,9 @@ fn spawn_ctrl_c(
             }
         }
         kiosk_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The kiosk sleeps between frames (Q48) and checks the flag when awake; a
+        // ctrl-c on an idle panel has to wake it to be noticed.
+        kiosk_wake.wake();
         shutdown.notify_waiters();
     });
 }

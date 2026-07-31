@@ -30,6 +30,9 @@ pub mod browser;
 pub mod browser_proto;
 pub mod color;
 pub mod compositor;
+/// When the kiosk next needs to draw (Q48). Pure.
+#[cfg(feature = "render")]
+pub mod demand;
 pub mod error;
 pub mod hwaccel;
 pub mod null;
@@ -102,6 +105,8 @@ pub use null::NullPipeline;
 
 #[cfg(feature = "render")]
 pub use attract::{AttractScene, InsetRect, ServiceDetail, Tile, TileGlyph, WidgetSlot};
+#[cfg(feature = "render")]
+pub use demand::Demand;
 #[cfg(feature = "electron")]
 pub use electron_browser::{Electron, ElectronHost, TV_USER_AGENT};
 #[cfg(feature = "render")]

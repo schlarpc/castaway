@@ -67,6 +67,20 @@ impl OsdController {
         Self { rx, showing: None }
     }
 
+    /// The waker the channel's sinks share, for the kiosk loop to arm (Q48): a banner
+    /// posted while the panel sleeps has to wake it to be seen.
+    #[must_use]
+    pub fn waker(&self) -> castaway_core::Waker {
+        self.rx.waker()
+    }
+
+    /// When the banner on screen next changes by itself: its TTL expiry, if it has one.
+    /// New messages are the sender's business — they arrive with a wake.
+    #[must_use]
+    pub fn next_change(&self) -> Option<Instant> {
+        self.showing.as_ref().and_then(|s| s.deadline)
+    }
+
     /// Drain pending commands (latest wins), apply TTL expiry, and re-rasterize if
     /// `surface` changed since the current banner was drawn.
     pub fn poll(&mut self, now: Instant, surface: (u32, u32)) -> OsdUpdate {

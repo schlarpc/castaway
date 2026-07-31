@@ -3,9 +3,15 @@
 //! run on the **main thread** (architecture §6) — the tokio runtime and decode threads
 //! live elsewhere and feed frames in over the [`RenderLoop`]'s channel.
 //!
-//! Presenting is driven by continuous redraw; each redraw drains queued frames and
-//! composites. Late frames were already dropped at the bounded channel, so the window
-//! always shows the freshest available frame.
+//! Presenting is demand-driven (Q48). Every producer that queues work for this loop —
+//! render commands, video frames, browser paints, OSD banners, the exit flag — wakes it
+//! through a [`castaway_core::Waker`] armed with the event loop's proxy, and each frame
+//! the loop recomputes what it owes the glass next ([`crate::demand::Demand`]): another
+//! frame at display rate while something moves, a timer for the next scheduled change,
+//! or nothing at all. Redraws are capped at the display's own refresh interval either
+//! way; Mailbox present never blocks, so the pacing comes from `ControlFlow`, which is
+//! the only place it can come from. Late frames are still dropped at the bounded
+//! channel, so the window always shows the freshest available frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,8 +52,9 @@ struct KioskApp {
     osd: Option<OsdController>,
     window: Option<Arc<Window>>,
     render: Option<RenderLoop>,
-    /// External shutdown request (ctrl-c / service failure): checked every loop
-    /// iteration, since a borderless-fullscreen kiosk has no chrome to close.
+    /// External shutdown request (ctrl-c / service failure): checked whenever the loop
+    /// runs, since a borderless-fullscreen kiosk has no chrome to close. The setter
+    /// wakes the loop, which is what makes "whenever it runs" mean "now" (Q48).
     exit: Option<Arc<AtomicBool>>,
     /// Last cursor position in window pixels (winit reports buttons without one).
     cursor: (f64, f64),
@@ -75,6 +82,17 @@ struct KioskApp {
     pill_since: Option<std::time::Instant>,
     /// Whether the pill's texture is currently a layer, so the fade only uploads once.
     pill_drawn: bool,
+    /// Whether an event arrived since the last redraw, so the panel owes the glass one
+    /// more frame regardless of what the standing facts say. Set by input and by wakes,
+    /// cleared by the redraw itself (Q48).
+    dirty: bool,
+    /// The earliest the next redraw may present, from the last one plus the display's
+    /// refresh interval — the cap that turns "everything wakes the loop" into "at most
+    /// display rate". `None` before the first frame.
+    next_frame_at: Option<std::time::Instant>,
+    /// One display refresh, read off the monitor when the window comes up; the 60 Hz
+    /// fallback covers a compositor that will not say.
+    frame_interval: std::time::Duration,
     /// The main-thread browser host (this loop is its message pump — architecture §6).
     #[cfg(feature = "electron")]
     browser: Option<crate::electron_browser::ElectronHost>,
@@ -208,6 +226,30 @@ impl KioskApp {
         if touched.is_some_and(|age| crate::overlay::pill_opacity(age) <= 0.0) {
             self.pill_since = None;
         }
+    }
+
+    /// What the panel owes the glass next, recomputed from standing facts every time the
+    /// loop is about to sleep (Q48). Merged across every part that keeps time: the
+    /// render loop's motions and deadlines, the pill's fade, the browser host's
+    /// scheduled recovery, and the one-more-frame owed to whatever event just arrived.
+    fn demand(&self, now: std::time::Instant) -> crate::demand::Demand {
+        use crate::demand::Demand;
+        let mut demand = if self.dirty || self.pill_since.is_some() {
+            // An event needs one frame to land; a raised pill is mid-fade. (The pill's
+            // *resting* presence over a fullscreen session clears `pill_since` and costs
+            // nothing — it only animates while a touch is fresh.)
+            Demand::Frame
+        } else {
+            Demand::Idle
+        };
+        if let Some(render) = self.render.as_ref() {
+            demand = demand.merge(render.demand(now));
+        }
+        #[cfg(feature = "electron")]
+        if let Some(host) = self.browser.as_ref() {
+            demand = demand.merge(Demand::deadline(host.next_due()));
+        }
+        demand
     }
 
     /// The navigation layer: the home pill, and the reserved left edge the swipe starts
@@ -523,6 +565,9 @@ impl KioskApp {
 /// device-assigned and start low; the top of the range cannot collide with one.
 const POINTER_CONTACT: u32 = u32::MAX;
 
+/// One frame at 60 Hz, until the monitor says otherwise (see `resumed`).
+const FALLBACK_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+
 /// The window's stable identity: Wayland `app_id`, X11 `WM_CLASS`, and the name the
 /// desktop entry and hicolor icons are installed under. The three have to agree or
 /// the Wayland icon lookup finds nothing, so it is one constant.
@@ -655,12 +700,33 @@ impl ApplicationHandler for KioskApp {
             host.resize(size.width, size.height);
         }
         self.size = (size.width, size.height);
-        info!(width = size.width, height = size.height, "kiosk window up");
+        // The redraw cap comes from the panel itself: presenting faster than the display
+        // refreshes is discarded by the Mailbox swapchain unseen (Q48). Monitors that
+        // will not say (some Wayland compositors) keep the 60 Hz default.
+        if let Some(mhz) = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|mhz| *mhz > 0)
+        {
+            self.frame_interval = std::time::Duration::from_secs_f64(1000.0 / f64::from(mhz));
+        }
+        info!(
+            width = size.width,
+            height = size.height,
+            frame_interval = ?self.frame_interval,
+            "kiosk window up"
+        );
         window.request_redraw();
         self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Any event but the redraw itself can change what the glass should show — a
+        // finger raises the pill, a resize moves every layer — so each one earns the
+        // panel exactly one more frame, capped at display rate by `about_to_wait`.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.dirty = true;
+        }
         self.route_input(&event);
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
@@ -690,6 +756,9 @@ impl ApplicationHandler for KioskApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let now = std::time::Instant::now();
+                self.dirty = false;
+                self.next_frame_at = Some(now + self.frame_interval);
                 // Browser first: its pump may deliver a fresh frame, which
                 // then lands in this same redraw's present.
                 #[cfg(feature = "electron")]
@@ -698,26 +767,26 @@ impl ApplicationHandler for KioskApp {
                 }
                 self.tick_pill();
                 if let Some(render) = self.render.as_mut() {
-                    let now = std::time::Instant::now();
                     let dt = self
                         .last_frame
                         .map_or(std::time::Duration::ZERO, |t: std::time::Instant| now - t);
                     self.last_frame = Some(now);
-                    render.tick_transition(dt);
-                    // Every surface's own motion, on the same clock. Continuous redraw means
-                    // this is called whether or not anything is moving; a motion that has
-                    // settled costs one enum comparison per surface.
-                    render.tick_motion(dt);
-                }
-                if let Some(r) = &mut self.render {
-                    r.pump();
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                    // Commands, animations, transport, OSD, present — and the answer to
+                    // "when next" is `demand`'s, read in `about_to_wait`. Nothing here
+                    // requests a redraw: whether another frame is owed is a standing
+                    // fact, not a habit.
+                    render.frame(dt);
                 }
             }
             _ => {}
         }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
+        // A wake: some producer put something where the next redraw will find it — a
+        // render command, a browser paint, a banner, or the exit flag, which
+        // `about_to_wait` checks on every pass.
+        self.dirty = true;
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -730,8 +799,31 @@ impl ApplicationHandler for KioskApp {
             event_loop.exit();
             return;
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        use crate::demand::Demand;
+        let now = std::time::Instant::now();
+        // What the panel owes the glass, and when it is allowed to pay: a demanded
+        // frame waits for the display-rate cap; a scheduled change waits for its
+        // moment; an idle panel sleeps until a wake arrives. This is the whole
+        // replacement for the old unconditional `request_redraw` — the ~970 fps
+        // free-run that burned a core drawing an idle shell.
+        match self.demand(now) {
+            Demand::Frame => {
+                let due = self.next_frame_at.filter(|due| *due > now);
+                match (due, &self.window) {
+                    (None, Some(window)) => window.request_redraw(),
+                    (Some(due), _) => event_loop.set_control_flow(ControlFlow::WaitUntil(due)),
+                    (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
+                }
+            }
+            Demand::At(at) if at <= now => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
+            }
+            Demand::At(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            Demand::Idle => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 }
@@ -766,6 +858,9 @@ pub fn run(
         drag_sample: None,
         pill_since: None,
         pill_drawn: false,
+        dirty: true,
+        next_frame_at: None,
+        frame_interval: FALLBACK_FRAME_INTERVAL,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),
@@ -807,6 +902,9 @@ pub fn run_with_browser(
         drag_sample: None,
         pill_since: None,
         pill_drawn: false,
+        dirty: true,
+        next_frame_at: None,
+        frame_interval: FALLBACK_FRAME_INTERVAL,
         exit,
         cursor: (0.0, 0.0),
         size: (1, 1),
@@ -822,9 +920,25 @@ pub fn run_with_browser(
 }
 
 fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
-    let event_loop =
-        EventLoop::new().map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let event_loop = EventLoop::<()>::with_user_event()
+        .build()
+        .map_err(|e| PipelineError::GpuInit(format!("event loop: {e}")))?;
+    // The wake path (Q48): every producer that queues work for this loop holds a
+    // `Waker`, and the wakers are armed with the loop's proxy here — the first moment a
+    // proxy exists. Wakes that arrived before this fired are latched and land now.
+    let arm = |waker: castaway_core::Waker| {
+        let proxy = event_loop.create_proxy();
+        // A closed loop means the process is leaving; a wake with nowhere to go is fine.
+        waker.arm(move || {
+            let _ = proxy.send_event(());
+        });
+    };
+    if let Some(rx) = &app.rx {
+        arm(rx.waker());
+    }
+    if let Some(osd) = &app.osd {
+        arm(osd.waker());
+    }
     let result = event_loop
         .run_app(app)
         .map_err(|e| PipelineError::Surface(format!("event loop: {e}")));

@@ -53,12 +53,16 @@ pub enum OsdCommand {
 #[derive(Debug, Clone)]
 pub struct OsdSink {
     tx: Sender<OsdCommand>,
+    /// Wakes the render loop, which polls this channel only when awake (Q48). A banner
+    /// posted while the panel is idle would otherwise wait for the next touch to show.
+    waker: crate::wake::Waker,
 }
 
 impl OsdSink {
     /// Show a message. Silently no-ops if the consumer has gone away.
     pub fn show(&self, message: OsdMessage) {
         let _ = self.tx.send(OsdCommand::Show(message));
+        self.waker.wake();
     }
 
     /// Show a transient banner for `ttl` (convenience over [`Self::show`]).
@@ -69,15 +73,23 @@ impl OsdSink {
     /// Clear the overlay.
     pub fn clear(&self) {
         let _ = self.tx.send(OsdCommand::Clear);
+        self.waker.wake();
     }
 }
 
 /// The single consumer end of the OSD channel.
 pub struct OsdReceiver {
     rx: Receiver<OsdCommand>,
+    waker: crate::wake::Waker,
 }
 
 impl OsdReceiver {
+    /// The waker every sink on this channel shares, for the consumer to arm.
+    #[must_use]
+    pub fn waker(&self) -> crate::wake::Waker {
+        self.waker.clone()
+    }
+
     /// Non-blocking receive (for the render loop, polled each frame).
     #[must_use]
     pub fn try_recv(&self) -> Option<OsdCommand> {
@@ -96,7 +108,14 @@ impl OsdReceiver {
 #[must_use]
 pub fn osd_channel() -> (OsdSink, OsdReceiver) {
     let (tx, rx) = std::sync::mpsc::channel();
-    (OsdSink { tx }, OsdReceiver { rx })
+    let waker = crate::wake::Waker::new();
+    (
+        OsdSink {
+            tx,
+            waker: waker.clone(),
+        },
+        OsdReceiver { rx, waker },
+    )
 }
 
 #[cfg(test)]

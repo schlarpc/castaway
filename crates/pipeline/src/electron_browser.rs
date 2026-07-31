@@ -281,6 +281,7 @@ impl Electron {
         adblock: Arc<AdBlocker>,
         audio_out: Option<&AudioOutputFactory>,
         user_agent: &str,
+        waker: castaway_core::Waker,
     ) -> Result<Self, PipelineError> {
         let mut child = Command::new(program)
             .arg(app_dir)
@@ -335,6 +336,7 @@ impl Electron {
                             audio: &audio,
                             probes: &probes,
                             ready_tx: &ready_tx,
+                            waker: &waker,
                         },
                     );
                 }
@@ -518,6 +520,9 @@ struct Wiring<'a> {
     audio: &'a Arc<Mutex<Option<BrowserAudio>>>,
     probes: &'a Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
     ready_tx: &'a std::sync::mpsc::Sender<u32>,
+    /// Wakes the kiosk loop (Q48): a stored paint and a posted fault are both consumed
+    /// by the main-thread pump, which no longer runs unless something asks it to.
+    waker: &'a castaway_core::Waker,
 }
 
 /// Read the browser's stdout until it closes, dispatching each message.
@@ -551,6 +556,7 @@ fn reader_loop(stdout: std::process::ChildStdout, w: &Wiring<'_>) {
     debug!(target: "castaway::browser", "browser stdout closed");
     // The process, not a window: both surfaces are gone with it.
     w.health.set_fault(None, "browser stdout closed".into());
+    w.waker.wake();
 }
 
 fn handle(msg: FromBrowser, w: &Wiring<'_>) {
@@ -562,6 +568,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
         audio,
         probes,
         ready_tx,
+        waker,
     } = *w;
     match msg {
         FromBrowser::Ready { pid } => {
@@ -633,6 +640,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             if let Some(old) = superseded {
                 release(stdin, old.id);
             }
+            waker.wake();
         }
         FromBrowser::Dropped { total } => {
             health.drops.store(total, Ordering::Relaxed);
@@ -674,10 +682,12 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
         } => {
             warn!(target: "castaway::browser", ?surface, %url, %error, "load error");
             health.set_fault(Some(surface), format!("load failed: {error}"));
+            waker.wake();
         }
         FromBrowser::RenderGone { surface, reason } => {
             warn!(target: "castaway::browser", ?surface, %reason, "render process gone");
             health.set_fault(Some(surface), format!("render process {reason}"));
+            waker.wake();
         }
         FromBrowser::Audio {
             surface,
@@ -857,6 +867,8 @@ pub struct RespawnSpec {
     pub audio_out: Option<AudioOutputFactory>,
     /// The user agent leanback keys off.
     pub user_agent: String,
+    /// The kiosk-loop waker a respawned browser's reader thread wakes with (Q48).
+    pub waker: castaway_core::Waker,
 }
 
 impl ElectronHost {
@@ -1179,6 +1191,7 @@ impl ElectronHost {
                 Arc::clone(&self.respawn.adblock),
                 self.respawn.audio_out.as_ref(),
                 &self.respawn.user_agent,
+                self.respawn.waker.clone(),
             ) {
                 Ok(e) => {
                     info!(target: "castaway::browser", "browser respawned");
@@ -1310,9 +1323,24 @@ impl ElectronHost {
         crate::browser::hit_view_px(view.rect, self.size, x, y).map(|_| surface)
     }
 
+    /// When this host next needs the kiosk loop to run it without being asked: a
+    /// scheduled recovery's due time (Q48). Everything else it does is either driven by
+    /// a wake (paints and faults, from the reader thread; commands, from their senders)
+    /// or is a reaction to panel state that only moves when the loop runs anyway.
+    #[must_use]
+    pub fn next_due(&self) -> Option<std::time::Instant> {
+        self.retry.map(|r| r.at)
+    }
+
     /// One structured line every 5 s while the browser has audio, mirroring the mirroring
     /// path's own session log — because "is it in sync" must be answerable from the
     /// journal rather than from someone standing in front of the panel.
+    ///
+    /// The cadence is best-effort under demand-driven pacing (Q48): the line is written
+    /// on the first pump at least 5 s after the last one. A video session paints — and
+    /// therefore wakes — continuously, so the cadence holds where sync matters; a page
+    /// playing audio under a static picture logs only as often as something else runs
+    /// the loop, which is a diagnostic delayed, not a frame dropped.
     fn report(&mut self) {
         let Some(electron) = &self.electron else {
             return;

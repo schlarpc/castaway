@@ -64,6 +64,7 @@ fn spec(
         adblock,
         audio_out,
         user_agent: pipeline::TV_USER_AGENT.to_string(),
+        waker: castaway_core::Waker::new(),
     }
 }
 
@@ -99,6 +100,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
         Arc::clone(&blocker),
         None,
         pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
     )
     .expect("browser should start");
 
@@ -183,6 +185,7 @@ fn a_touch_reaches_the_page() {
         Arc::clone(&blocker),
         None,
         pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
     )
     .expect("browser should start");
 
@@ -260,6 +263,7 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
         Arc::clone(&blocker),
         Some(&factory),
         pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
     )
     .expect("browser should start");
 
@@ -387,6 +391,7 @@ fn a_cast_page_comes_and_goes_without_disturbing_the_widget() {
         Arc::clone(&blocker),
         None,
         pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
     )
     .expect("browser should start");
 
@@ -483,6 +488,7 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
         Arc::clone(&blocker),
         None,
         pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
     )
     .expect("browser should start");
 
