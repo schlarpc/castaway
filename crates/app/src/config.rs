@@ -1,5 +1,5 @@
 //! Runtime configuration. Loaded from `castaway.toml` if present, else defaults.
-//! (OPEN-QUESTIONS Q4: confirm TOML is the config source you want.)
+//! (TOML over env-only or a Nix-generated file — #42.)
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};

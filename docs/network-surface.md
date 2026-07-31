@@ -20,7 +20,7 @@
 | 8009 | tcp | cast | CASTv2: length-prefixed protobuf over TLS | TLS, self-signed or CKS-replayed certificate; the device-auth signature covers it (D41/D43) | enable.cast | convention |
 | 41000–41031 (`[media_ports]`) | udp | cast | mirroring RTP + RTCP (one socket per session; audio and video SSRCs demuxed on it) | AES-CTR per Cast mirroring keys | enable.cast | ours |
 | 1028 (`miracast.rtp_port`) | udp | miracast | MPEG2-TS over RTP from the source | plaintext RTP; WPA2 protects the P2P link at layer 2 | enable.miracast | convention |
-| 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (Q7c) | plaintext | enable.miracast | spec |
+| 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (#45) | plaintext | enable.miracast | spec |
 
 **Chosen by** answers "could we move this port?", in three tiers:
 
@@ -33,7 +33,7 @@ The tiers correlate with the config surface, and a test holds the line: every *s
 Notes, per listener that has one:
 
 - **8080 (`http_port`)/tcp (http)** — binds 0.0.0.0. One host shared by three protocols (D7); a disabled protocol's routes are simply not mounted. /screenshot.png always answers.
-- **5353/udp (mdns)** — binds 0.0.0.0, multicast 224.0.0.251, SO_REUSEADDR/SO_REUSEPORT. Advertises only enabled protocols, restricted to the serving interface. GameStream's host browser runs a second daemon — a second 5353 socket — when enabled. Contends with Avahi/Bonjour for answers (Q5); the NixOS module warns when Avahi is on.
+- **5353/udp (mdns)** — binds 0.0.0.0, multicast 224.0.0.251, SO_REUSEADDR/SO_REUSEPORT. Advertises only enabled protocols, restricted to the serving interface. GameStream's host browser runs a second daemon — a second 5353 socket — when enabled. Contends with Avahi/Bonjour for answers (#43); the NixOS module warns when Avahi is on.
 - **1900/udp (ssdp)** — binds 0.0.0.0, multicast 239.255.255.250, SO_REUSEADDR/SO_REUSEPORT. Bound even with DLNA and DIAL both off; it then answers for no device type.
 - **7000/tcp (airplay)** — binds 0.0.0.0. Both _airplay._tcp and _raop._tcp advertise this one port. Nothing binds 7011: it is the AirPlay 1 UDP timing port, not a listener, and the listener once bound there was removed.
 - **41000–41031 (`[media_ports]`)/udp (airplay)** — binds the accepted connection's local address. Bound per sender before SETUP answers, so the Transport header only ever names ports that are already listening.

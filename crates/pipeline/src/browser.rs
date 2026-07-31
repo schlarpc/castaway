@@ -5,7 +5,7 @@
 //! (architecture §5).
 //!
 //! Here we define the trait + a [`NullBrowser`] stub used when `electron` is off (the
-//! Lounge path then falls back to a headless player — see OPEN-QUESTIONS Q6).
+//! Lounge path then falls back to a headless player — see #44).
 
 // The browser's *geometry* is expressed in the attract scene's types, so it exists
 // only where that scene does. `BrowserCommand` above does not, and must not: `app`

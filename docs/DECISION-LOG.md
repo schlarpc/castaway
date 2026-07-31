@@ -177,7 +177,7 @@ OSD banner composites as a transparent overlay). The app posts a startup banner 
 worked example of a non-session producer.
 
 ### D22 — CEF pulled in, reproducibly, against nixpkgs cef-binary (the boss fight, won)
-CEF is real now, behind the `cef` feature. The doc's "boss fight" (cross-build.md/Q6) turned
+CEF is real now, behind the `cef` feature. The doc's "boss fight" (cross-build.md/#44) turned
 out tractable: the `cef` crate 147.1.0 exactly matches nixpkgs `cef-binary` 147.0.10, which is
 already NixOS-linked. The flake builds a *flattened* `cefDist` (libcef.so + .pak/ICU/locales at
 the root, not the Release/Resources split CEF ships) + a crafted `archive.json` to pass the
@@ -605,8 +605,8 @@ Four decisions inside it, each of which had a plausible alternative:
 
 What is deferred with eyes open: Miracast-over-Infrastructure (MS-MICE) is documented and
 unbuilt — it removes the P2P *data* path but not the beacon, so it does not rescue us from
-the driver question, and it is only worth building once a group forms. See OPEN-QUESTIONS
-Q7 and Q26 for what has to be true before either can be promised on the deploy target.
+the driver question, and it is only worth building once a group forms. See #45 and
+#17 for what has to be true before either can be promised on the deploy target.
 
 ### D36 — The browser runtime: Electron over CEF, gated on one spike
 The browser stopped being an implementation detail the moment G56 became intent. Hosting
@@ -666,7 +666,7 @@ What each recorded problem gets:
 - **The frame path**: Electron's shared-texture OSR (`useSharedTexture`) delivers GPU
   handles on all three platforms — NT HANDLE, IOSurface, `NativePixmapHandle` plane fds;
   the last is the dmabuf shape the VA-API import already consumes — replacing the
-  33 MB/frame CPU `on_paint` copy that CEF's buggy accelerated OSR (Q6) forced us onto,
+  33 MB/frame CPU `on_paint` copy that CEF's buggy accelerated OSR (#44) forced us onto,
   and letting the browser keep GPU compositing and decode.
 - **Q19's triple pin**: the version-locked FFI ABI (cef crate ↔ cef-binary ↔ forged
   `archive.json`) is replaced by an IPC protocol we define — sans-I/O parser, golden

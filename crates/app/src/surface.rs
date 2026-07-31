@@ -221,7 +221,7 @@ fn shared_listeners() -> Vec<Listener> {
             notes: "Advertises only enabled protocols, restricted to the serving \
                     interface. GameStream's host browser runs a second daemon — a \
                     second 5353 socket — when enabled. Contends with Avahi/Bonjour \
-                    for answers (Q5); the NixOS module warns when Avahi is on.",
+                    for answers (#43); the NixOS module warns when Avahi is on.",
         },
         Listener {
             owner: Owner::Ssdp,
@@ -339,7 +339,7 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 transport: Transport::Udp,
                 port: PortSpec::Fixed(67),
                 bind: "the P2P group interface",
-                wire: "DHCP server for the freshly-associated peer (Q7c)",
+                wire: "DHCP server for the freshly-associated peer (#45)",
                 security: "plaintext",
                 gate: Gate::AnyOf(&[ProtocolKind::Miracast]),
                 provider: Provider::Deployment("systemd-networkd, via the NixOS module"),

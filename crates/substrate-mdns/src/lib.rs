@@ -38,7 +38,7 @@ pub struct MdnsResponder {
 
 impl MdnsResponder {
     /// Create the shared daemon. It owns port 5353; on the kiosk box Avahi/Bonjour
-    /// should be disabled so there's no contention (see OPEN-QUESTIONS Q5).
+    /// should be disabled so there's no contention (see #43).
     ///
     /// # Errors
     /// [`MdnsError::Daemon`] if the daemon can't be created.

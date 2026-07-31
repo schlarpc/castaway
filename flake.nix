@@ -621,7 +621,7 @@
 
           # The Miracast radio path end to end on mac80211_hwsim: real mac80211 radios,
           # real P2P group formation and WPS, DHCP across the group, and the sink
-          # dialling out over it — the whole surface Q7 said only hardware could touch,
+          # dialling out over it — the whole surface #45 said only hardware could touch,
           # minus the driver's own quirks (§7.6), which remain the hardware's to prove.
           miracast-vm = import ./nix/miracast-vm-test.nix { inherit pkgs self; };
 
@@ -819,7 +819,7 @@
             configFile = settingsFormat.generate "castaway.toml" cfg.settings;
 
             # Miracast is the one protocol that needs a radio rather than a socket, and
-            # the radio side is a *deployment*, not code (OPEN-QUESTIONS Q7c/Q7d): a
+            # the radio side is a *deployment*, not code (#45): a
             # wpa_supplicant castaway can command, and a DHCP server on the group
             # interface. Both are derived from the same settings the binary reads, so
             # the daemon castaway talks to and the daemon the module runs cannot drift.
@@ -986,7 +986,7 @@
               # One source of truth for the port: the option feeds the config file.
               services.castaway.settings.http_port = lib.mkDefault cfg.httpPort;
 
-              # castaway runs its own mDNS responder on 5353 (OPEN-QUESTIONS Q5). Both
+              # castaway runs its own mDNS responder on 5353 (#43). Both
               # can bind with SO_REUSEPORT, so this is a warning rather than an
               # assertion — but which one answers a given query becomes a race.
               warnings = lib.optional config.services.avahi.enable ''
@@ -1021,7 +1021,7 @@
                 };
               };
 
-              # As group owner we are expected to run the DHCP server (Q7c) — the peer's
+              # As group owner we are expected to run the DHCP server (#45) — the peer's
               # address is how the backend finds who to dial, via the neighbour table.
               # networkd carries this whole obligation declaratively: the group interface
               # (`p2p-<parent>-N`) does not exist until the group forms and is named

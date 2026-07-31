@@ -1737,7 +1737,7 @@ impl RenderLoop {
     /// Import a browser frame's GPU buffer and make it the browser layer.
     ///
     /// The zero-copy counterpart of [`Self::upload_browser`], which took a CPU copy of
-    /// every frame because CEF's accelerated offscreen path was unusable upstream (Q6). At
+    /// every frame because CEF's accelerated offscreen path was unusable upstream (#44). At
     /// 4K that copy was 33 MB per frame; this is a handful of driver objects.
     ///
     /// `handle` is the browser's buffer, already pulled into this process. It is consumed

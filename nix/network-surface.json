@@ -142,7 +142,7 @@
       },
       "provider": "deployment",
       "transport": "udp",
-      "wire": "DHCP server for the freshly-associated peer (Q7c)"
+      "wire": "DHCP server for the freshly-associated peer (#45)"
     }
   ]
 }

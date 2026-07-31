@@ -51,3 +51,5 @@ htmlcov/
 # name their config with `$CASTAWAY_CONFIG` (the NixOS module generates one), so anything
 # here is somebody's dev box and not the panel on the wall.
 /castaway.toml
+
+/TODO.md

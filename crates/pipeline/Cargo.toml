@@ -45,7 +45,7 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
 ], optional = true }
-# Brave's adblock engine — request-level ad/tracker blocking in the browser host (Q6
+# Brave's adblock engine — request-level ad/tracker blocking in the browser host (#44
 # answer). Drop the default `single-thread` feature so the Engine is Arc-based
 # (Send+Sync) — resource queries arrive across threads. Keep `embedded-domain-resolver`
 # (needed for URL parsing) and `full-regex-handling`.

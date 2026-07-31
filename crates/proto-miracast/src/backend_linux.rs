@@ -36,7 +36,7 @@
 //! (`nix/miracast-vm-test.nix`). What that cannot vouch for is a *driver*: hwsim is the
 //! best-behaved mac80211 implementation there is, and §7.6 of the protocol notes is a
 //! table of real chipsets that advertise `P2P-GO` and then fail at group formation. The
-//! driver check (OPEN-QUESTIONS Q7a) remains the hardware's to pass.
+//! driver check (#17) remains the hardware's to pass.
 //!
 //! The peer's IP address is not something wpa_supplicant knows: as group owner we are
 //! expected to run a DHCP server on the group interface (the NixOS module does, via

@@ -369,7 +369,7 @@ everything above this line is tested once.
 that decides *when* a packet may be written lives above it, in a single `AclWriter` task
 that owns the outbound side of every link. Nothing else writes ACL data.
 
-Two things force this, and OPEN-QUESTIONS Q26 is what having neither looks like:
+Two things force this, and Q26 is what having neither looks like:
 
 - **Credits.** A controller advertises a fixed number of ACL buffers in
   `HCI_Read_Buffer_Size` and the host must not exceed them. There is no backpressure to
