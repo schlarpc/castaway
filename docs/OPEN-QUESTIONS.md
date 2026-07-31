@@ -202,6 +202,54 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   device certification beyond the protocol (Netflix-class) will not run on any emulated
   receiver; YouTube (leanback + vendored Widevine) should.
 
+- **Q47 — VLC-iOS Cast LOAD plays at ~2 fps; the video thread is *waiting*, not
+  losing. OPEN; the next measurement is the audio thread's position reports.** Observed
+  2026-07-31 (log 08:21 and 08:27 UTC): iPhone VLC casts via media-URL LOAD, pulling
+  `http://<phone>:8010/chromecast/…/stream` — VLC transcodes on the phone to VP8
+  1080p60 + Vorbis in WebM and serves it over its own HTTP server. The panel shows
+  roughly two frames a second.
+
+  **Eliminated, with measurements, working outside-in:**
+  - *The sender and the network.* `ffprobe` confirms VP8/Vorbis 1080p60; a second
+    connection downloaded 15.2 s of stream (911 frames) at **53× realtime** before
+    VLC's server cut it. The phone encodes faster than realtime and the wire is idle.
+  - *The hardware-decode fallback.* Every PLAY logs `vaapi offered no hardware pixel
+    format for this stream` (`HwGiveUp::FormatRejected`) and falls back to software.
+    That is correct behaviour, not the bug: desktop VAAPI largely has no VP8 decode,
+    and this box software-decodes 1080p60 VP8 without effort.
+  - *Decode throughput.* Stack-sampled the live process (sudo gdb): the decode thread
+    sits at ~5% CPU and every sample lands in the `drain_paced` pacing wait
+    (`clock_nanosleep` under the 50 ms slice loop, `ffmpeg_decode.rs`). It is not
+    starved, not blocked on the bounded audio send, and not behind — it decodes a
+    frame, asks the `MediaClock` for its turn, and the clock keeps answering "not
+    yet". The 2 fps is video *obeying* a clock that is crawling.
+
+  **The suspect is therefore the clock's master.** `MediaClock` is audio-mastered by
+  design (`clock.rs`: audio paces itself to real time and publishes via
+  `observe_audio`; video waits). A clock advancing at ~1/30 speed means either the
+  audio path truly consumes at 1/30 realtime (pipewire stream misconfigured/underrun,
+  44.1 kHz Vorbis on this path) or audio plays fine and the *position reports* feeding
+  `observe_audio` are wrong or missing — e.g. the anchor never re-arms and `now()`
+  interpolates from a stale anchor only when nudged. Note `pipeline::audio_pw` and
+  `pcm session: playing rate=44100 channels=2` both come up clean in the log, so
+  whatever it is, it is quiet.
+
+  **Cheaply answerable, in order:** (1) ears — during the 2 fps repro, is audio
+  normal-speed and continuous, or slow/stuttering/silent? Broken audio → the bug is
+  audio playback itself; perfect audio → the bug is position reporting into the clock.
+  (2) A TRACE line on `observe_audio(media)` and one on `wait_for`'s answer would show
+  the clock's advance rate directly against wall time. (3) If the clock is the victim
+  and audio the culprit, the same defect should reproduce protocol-agnostically — this
+  path (pulled A/V against `MediaClock`) is shared with DLNA and AirPlay video, so a
+  local `LOAD` of any VP8+Vorbis WebM should show it without the phone.
+
+  Found while sampling, probably orthogonal, recorded so it isn't re-discovered: the
+  main render thread burns ~94% of a core from launch — continuous-redraw kiosk loop
+  (`ControlFlow::Poll` + `request_redraw` per frame) with Mailbox present mode means
+  the winit thread spins submit→present→acquire flat out even on an idle shell.
+  `kiosk.rs` says continuous redraw is deliberate; a full core on a fanless panel
+  deserves its own question if it survives contact with the Windows target.
+
 ## Deferred (per docs, not blockers)
 
 - **Q7 — Miracast: the protocol is done; the radio now forms in CI; the *driver* is the
