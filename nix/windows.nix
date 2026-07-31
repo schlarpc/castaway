@@ -203,7 +203,7 @@ let
   # The browser ships beside the .exe as its own tree: Electron is a separate process
   # with its own DLLs, so nothing browser-side has to be flattened into ours. What we
   # stage is the ECS distribution plus our host app, and the Widevine CDM for the profile
-  # pre-staging that makes first-boot DRM work offline (D36/Q42).
+  # pre-staging that makes first-boot DRM work offline (D36/#66).
   stageBrowser = ''
     # The whole ECS distribution, unmodified: it is what EVS signs, and a modified tree
     # invalidates the VMP signature. Our host app travels beside it.
@@ -220,7 +220,7 @@ let
     # from here: ECS finds its CDM under `<userDataDir>/WidevineCdm/<version>/`, which is
     # a runtime path. `stageWidevine()` in browser-host/main.js does the copy and finds
     # this directory beside the exe — there is no wrapper here to hand it a path, which is
-    # why the location matters. Q42 has the measurement.
+    # why the location matters. #66 has the measurement.
     cp -r --no-preserve=mode,ownership ${widevine}/WidevineCdm "$out/bin/"
   '';
 

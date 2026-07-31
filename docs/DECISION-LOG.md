@@ -693,7 +693,7 @@ hosting yields DComp visuals wgpu cannot sample — and no Linux story); **a ful
 under CDP** (screencast is JPEG-grade, useless as a 4K playback surface); **Servo** (not a
 YouTube/EME runtime).
 
-**The gate.** CEF stays behind its feature flag until the spike (Q40) proves
+**The gate.** CEF stays behind its feature flag until the spike (#64) proves
 shared-texture handles importing into the wgpu compositor at 4K with sane pacing on
 Linux; the Windows import (NT handle → D3D12 `OpenSharedHandle` + keyed mutex) is
 deploy-critical and is proven separately on the box. The honest worst case, recorded so

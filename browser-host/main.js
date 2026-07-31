@@ -117,7 +117,7 @@ const USER_AGENT = process.env.CASTAWAY_USER_AGENT || undefined;
 
 // ---------------------------------------------------------------------------
 // Widevine. Two halves: pre-staging the pinned CDM into the profile, then waiting for
-// ECS to pick it up. See OPEN-QUESTIONS Q42 for the measurement behind both.
+// ECS to pick it up. See #66 for the measurement behind both.
 // ---------------------------------------------------------------------------
 
 /**

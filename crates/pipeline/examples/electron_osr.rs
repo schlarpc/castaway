@@ -1,4 +1,4 @@
-//! The D36 gate, executable — OPEN-QUESTIONS Q40.
+//! The D36 gate, executable — #64.
 //!
 //! Spawns Electron on `browser-host/`, receives shared-texture paint events over the
 //! line protocol, pulls each frame's dmabuf plane fd out of the child with
@@ -547,7 +547,7 @@ fn pidfd_getfd(pidfd: &OwnedFd, remote: RawFd) -> Result<LocalFd, String> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), remote, 0u32) };
     if fd < 0 {
         return Err(format!(
-            "pidfd_getfd({remote}): {} (production uses SCM_RIGHTS — see Q40)",
+            "pidfd_getfd({remote}): {} (production uses SCM_RIGHTS — see #64)",
             std::io::Error::last_os_error()
         ));
     }

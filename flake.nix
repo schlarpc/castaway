@@ -296,7 +296,7 @@
       };
 
       # The Widevine CDM, staged into the browser's profile so a panel that has never
-      # been online can still play protected video (G46, re-proven under D36/Q42).
+      # been online can still play protected video (G46, re-proven under D36/#66).
       #
       # `tryEval` because the CDM is unfree: a nixpkgs without `allowUnfree` still builds
       # a working receiver, it just cannot play protected streams. A hard dependency would

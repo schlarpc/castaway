@@ -160,7 +160,7 @@ splat behaviour can break the hash even though `crtVersion`/`sdkVersion` haven't
   fixups — deliberately, see the runtime-layout section: EVS signs these exact files.
 
 - **Widevine CDM** (`nix/widevine-windows.nix`) — the CRX3 that Chrome's own component updater
-  installs, pre-staged so DRM-gated video plays on a panel that has never been online (Q42).
+  installs, pre-staged so DRM-gated video plays on a panel that has never been online (#66).
   Pinned by hand to the same version nixpkgs' `widevine-cdm` pins for Linux; there is **no
   eval-time assert** tying the two, so a `nix flake update` that moves the nixpkgs side is a
   drift to catch by hand at review time. The CDM is unfree: unpacking is gated by
@@ -226,7 +226,7 @@ needs flattening into ours:
 - `bin/browser-host/` — our Electron host app, launched from the receiver.
 - `bin/WidevineCdm/` — staged for the receiver to copy into the browser profile on first run,
   not loaded from here: ECS resolves its CDM under `<userDataDir>/WidevineCdm/<version>/`, a
-  runtime path (see `browser-host/stage-widevine.sh` and Q42). Present only when the unfree
+  runtime path (see `browser-host/stage-widevine.sh` and #66). Present only when the unfree
   gate allows it.
 - `bin/vmp-sign.sh` — the VMP signing step travels with the artifact rather than living only
   in the repo: it runs on whoever deploys, after Authenticode, and needs the tree beside it.

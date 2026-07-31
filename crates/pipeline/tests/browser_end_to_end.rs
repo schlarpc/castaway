@@ -1,6 +1,6 @@
 //! The browser, through the *whole* path — D36's integrated proof.
 //!
-//! The Q40 spike proved a frame can cross from Electron into a wgpu texture. It did that
+//! The #64 spike proved a frame can cross from Electron into a wgpu texture. It did that
 //! in isolation, with its own device and its own import call, which leaves the thing that
 //! actually ships unexercised: `ElectronHost` driving `RenderLoop`, a compositor layer,
 //! and the release/borrow discipline between them. A passing spike and a broken product
@@ -183,7 +183,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
 
 /// Touch has to reach the *page*, not merely leave us.
 ///
-/// Q41 recorded this as needing hands on glass, and the coordinate mapping still does —
+/// #65 recorded this as needing hands on glass, and the coordinate mapping still does —
 /// but "does a touch arrive at all, through CDP, and fire a DOM handler" is answerable
 /// without a panel, and it is the half that silently regresses.
 #[test]

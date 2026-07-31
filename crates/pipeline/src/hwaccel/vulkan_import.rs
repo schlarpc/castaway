@@ -240,7 +240,7 @@ impl VulkanImporter {
 
     /// Import a single-plane RGBA-family DMA-BUF as a `wgpu::Texture`.
     ///
-    /// This is the shape an offscreen browser delivers (D36/Q40): Electron's
+    /// This is the shape an offscreen browser delivers (D36/#64): Electron's
     /// shared-texture OSR hands over one `NativePixmapHandle` plane of BGRA, where the
     /// decoder path above hands two planes of NV12. Same extensions, same explicit
     /// modifier layout, no disjoint case and no `MUTABLE_FORMAT` — an RGBA image is

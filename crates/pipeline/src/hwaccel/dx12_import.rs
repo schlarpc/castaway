@@ -221,7 +221,7 @@ impl std::fmt::Debug for ImportedFrame {
 
 impl Dx12Importer {
     /// Import a single-plane BGRA/RGBA shared texture — the shape an offscreen browser
-    /// delivers (D36/Q40).
+    /// delivers (D36/#64).
     ///
     /// The Windows counterpart of
     /// [`super::vulkan_import::VulkanImporter::import_single_plane`], and shorter for the

@@ -774,7 +774,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                     target: "castaway::browser",
                     %detail,
                     "browser cannot produce GPU frames; the zero-copy path is unavailable \
-                     and the browser layer will stay empty (D36/Q40)"
+                     and the browser layer will stay empty (D36/#64)"
                 );
             }
         }
