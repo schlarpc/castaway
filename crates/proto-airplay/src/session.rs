@@ -319,6 +319,16 @@ impl AirPlaySession {
         self.pending_flush.take()
     }
 
+    /// Whether a mirroring session has negotiated audio the actor has not started yet.
+    ///
+    /// Exists so the actor can ask *before* consuming anything: taking the parameters
+    /// when it has nowhere to put them throws away the only copy, which is how mirror
+    /// audio came to be negotiated on the wire and silent in the room.
+    #[must_use]
+    pub const fn has_mirror_audio(&self) -> bool {
+        self.mirror_audio.is_some()
+    }
+
     /// The audio stream a mirroring session negotiated, once it has.
     ///
     /// Taken rather than borrowed, for the same reason as the video keys: the actor

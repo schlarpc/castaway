@@ -305,15 +305,25 @@ async fn pump(
                 }
             }
 
-            // A mirroring SETUP that named the stream leaves the keys behind; the
-            // sender is about to dial the data port we advertised.
             // Audio negotiated alongside a mirroring session. It rides the same UDP
             // sockets the AirPlay 1 flow uses, and feeds the channel already handed to
             // the pipeline with the video — *not* a session of its own, which would
             // preempt the picture it belongs to.
-            if let (Some(params), Some(tx)) = (session.take_mirror_audio(), mirror_audio_tx.take())
-            {
-                if let Some(sockets) = audio_sockets.take() {
+            //
+            // The `is_some()` guard is load-bearing and the reason mirror audio never
+            // played: this was one `if let` over the tuple
+            // `(session.take_mirror_audio(), mirror_audio_tx.take())`, and Rust evaluates
+            // both operands before matching. Every request that was not the audio SETUP —
+            // a `/feedback` two seconds after the video started, say — therefore *took*
+            // the sender out of `mirror_audio_tx` and dropped it on the floor. By the
+            // time the sender negotiated audio, forty seconds later, there was nothing
+            // left to feed, and the params were taken and discarded with it. Neither is
+            // consumed now unless both are there.
+            if session.has_mirror_audio() && mirror_audio_tx.is_some() && audio_sockets.is_some() {
+                let params = session.take_mirror_audio();
+                let tx = mirror_audio_tx.take();
+                let sockets = audio_sockets.take();
+                if let (Some(params), Some(tx), Some(sockets)) = (params, tx, sockets) {
                     let stream = AudioStream::new(&params);
                     info!(%peer, link = %params.describe(), "AirPlay mirroring audio starting");
                     let _ = sink

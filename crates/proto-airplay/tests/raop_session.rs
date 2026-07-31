@@ -499,6 +499,15 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
 
     // --- and now the audio that rides alongside it ---
 
+    // A heartbeat first, because a real sender sends dozens of them between negotiating
+    // the video and negotiating the audio — and *that* is what used to break mirror
+    // audio. The actor took the audio channel out of its slot while evaluating a tuple
+    // pattern that then did not match, so every unrelated request in between quietly
+    // threw the channel away and the audio arrived with nowhere to go. Without a request
+    // in this gap the test passes with the bug present.
+    let feedback = request(&mut stream, "POST /feedback", &[], &[], 4).await;
+    assert!(feedback.starts_with("RTSP/1.0 200"), "{feedback}");
+
     let mut s0 = plist::Dictionary::new();
     s0.insert("type".into(), plist::Value::Integer(96i64.into()));
     s0.insert("ct".into(), plist::Value::Integer(8i64.into()));
@@ -510,7 +519,7 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
     );
     let body = plist_body(d);
     let mut req = format!(
-        "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 4\r\nContent-Type: \
+        "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 5\r\nContent-Type: \
          application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
         body.len()
     )
