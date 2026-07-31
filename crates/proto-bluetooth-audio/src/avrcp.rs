@@ -76,7 +76,7 @@ pub mod attribute {
     /// The set to ask for before a BIP session exists. AOSP's Target *strips* attribute 8
     /// from a response when no cover-art client is connected, so asking for it early buys
     /// nothing — and asking for the text separately means the card appears immediately
-    /// rather than waiting on an SDP query and a second L2CAP channel (Q29).
+    /// rather than waiting on an SDP query and a second L2CAP channel (#74).
     pub const TEXT: [u32; 7] = [
         TITLE,
         ARTIST,

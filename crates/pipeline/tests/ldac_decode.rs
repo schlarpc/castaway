@@ -177,7 +177,7 @@ fn the_stream_decodes_at_its_own_rate_and_not_the_one_we_negotiated() {
     // rate out of the frame header and reconfigures itself, so the audio is fine; the point
     // is that the blocks say 96 kHz. If they said 44.1, the output device would be opened
     // at the wrong rate and everything would play more than twice too slow, with every
-    // layer reporting success (Q25, in the one codec where the stream can be checked).
+    // layer reporting success (#70, in the one codec where the stream can be checked).
     let blocks = decode_all(
         include_bytes!("fixtures/ldac-96000-dual.bin"),
         format(44_100, 2),

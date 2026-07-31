@@ -39,7 +39,7 @@ pub trait Pipeline: Send + Sync {
     ///
     /// `format` is not optional and has no default: aptX and aptX HD carry no in-band
     /// configuration, so the negotiated rate has to arrive from the adapter or the stream
-    /// plays at the wrong pitch (OPEN-QUESTIONS Q25).
+    /// plays at the wrong pitch (#70).
     ///
     /// # Errors
     /// [`CoreError::Pipeline`] if the audio session can't be established.

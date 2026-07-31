@@ -114,7 +114,7 @@ pub enum ConfigOption {
     /// Flush timeout.
     FlushTimeout(u16),
     /// Retransmission and flow control: which mode the channel runs in, and the window,
-    /// timers and frame size that go with it. The option cover art turns on (Q29).
+    /// timers and frame size that go with it. The option cover art turns on (#74).
     Retransmission(RetransmissionConfig),
     /// Whether frames carry a frame check sequence.
     Fcs(FcsType),

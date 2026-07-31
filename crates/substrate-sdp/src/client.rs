@@ -120,7 +120,7 @@ impl Query {
     /// channel is in there and comes first. Taking the first PSM found opens a browsing
     /// channel and then speaks OBEX at it — which fails in a way indistinguishable from
     /// the peer having no cover art at all, and is why an iPhone appeared not to support
-    /// it (Q29).
+    /// it (#74).
     ///
     /// # Errors
     /// A parse error if the response could not be decoded.

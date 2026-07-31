@@ -86,7 +86,7 @@ fn main() {
         // The other half of the format space: 96 kHz puts 256 samples in a frame instead
         // of 128, and dual channel codes two channels independently. A fixture set that
         // was all 44.1 kHz stereo would leave both of those untested, and 96 kHz is
-        // exactly where a rate assumed rather than read goes wrong (Q25).
+        // exactly where a rate assumed rather than read goes wrong (#70).
         Config {
             rate: 96_000,
             channel_mode: ldac::LDACBT_CHANNEL_MODE_DUAL_CHANNEL,

@@ -26,7 +26,7 @@
 //!    and the library re-configures itself from them. So the [`PcmBlock`]s here report
 //!    what the *handle* says after each frame rather than the negotiated
 //!    [`AudioFormat`] — the opposite of aptX, which has no header and must be told
-//!    (Q25). A mismatch between the two is worth a log line and is not worth failing over:
+//!    (#70). A mismatch between the two is worth a log line and is not worth failing over:
 //!    the audio is fine, the endpoint table is what is wrong.
 //!
 //! `LDACBT_SMPL_FMT_F32` is the format asked for throughout, because it is interleaved

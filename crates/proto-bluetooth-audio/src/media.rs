@@ -564,7 +564,7 @@ mod tests {
         // what the *frames* say, because that is what the decoder will follow: LDAC
         // reconfigures itself from the frame header and keeps playing, so a receiver that
         // trusted its own negotiation here would log 44.1 kHz for a 96 kHz stream and
-        // nothing would ever contradict it (the aptX shape of Q25, in the one codec that
+        // nothing would ever contradict it (the aptX shape of #70, in the one codec that
         // can actually be checked).
         let packets = records(include_bytes!("../tests/fixtures/a2dp-ldac-96000-dual.bin"));
         assert_eq!(packets.len(), 7);

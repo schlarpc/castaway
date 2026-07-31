@@ -589,7 +589,7 @@ impl WgpuCompositor {
         let config = wgpu::SurfaceConfiguration {
             // COPY_SRC so the composited surface can be read back: screenshots and the
             // stream tee both need it, and it cannot be added after configuration
-            // (Q30). Costs nothing when nothing reads.
+            // (#18). Costs nothing when nothing reads.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             width: width.max(1),

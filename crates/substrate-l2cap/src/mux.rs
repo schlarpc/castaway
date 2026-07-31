@@ -363,7 +363,7 @@ impl Multiplexer {
 
     /// Open a channel to `psm` on the peer, running it in `mode` — used for the AVRCP
     /// cover-art fetch, where *we* are the one connecting out and GOEP 2.0 requires
-    /// Enhanced Retransmission Mode (Q29).
+    /// Enhanced Retransmission Mode (#74).
     ///
     /// Returns the identifier we allocated along with the request to send. The caller
     /// needs it: an outgoing channel is only recognisable later by the id it was given,
@@ -769,7 +769,7 @@ impl Multiplexer {
                 // The extended-features mask is what tells a peer whether it is worth
                 // proposing Enhanced Retransmission Mode. Answering zero here is what
                 // made cover art unreachable: a GOEP 2.0 responder that believes we have
-                // no ERTM never gets as far as OBEX (Q29).
+                // no ERTM never gets as far as OBEX (#74).
                 let (result, data) = match info_type {
                     0x0002 => (0x0000, Bytes::from_static(&[0x28, 0, 0, 0])),
                     0x0003 => (0x0000, Bytes::from_static(&[0x02, 0, 0, 0, 0, 0, 0, 0])),

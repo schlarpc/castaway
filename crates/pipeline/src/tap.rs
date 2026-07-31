@@ -14,7 +14,7 @@
 //! The frame is deliberately shaped like [`castaway_core::FrameImage`] — CPU pixels or an
 //! opaque GPU surface — so an encoder tap that wants the texture without a round trip
 //! through system memory is a new variant here, not a redesign of the seam
-//! (OPEN-QUESTIONS Q30).
+//! (#18).
 
 use std::time::Instant;
 

@@ -159,7 +159,7 @@ struct Link {
     avctp: Option<Cid>,
     depacketizer: Option<Depacketizer>,
     /// What AVDTP negotiated, held from SET_CONFIGURATION until START. aptX carries no
-    /// in-band rate, so this is the decoder's only source of it (OPEN-QUESTIONS Q25).
+    /// in-band rate, so this is the decoder's only source of it (#70).
     audio_format: Option<AudioFormat>,
     audio_tx: Option<mpsc::Sender<EncodedFrame>>,
     /// Whether a `SessionEvent::Audio` has already been emitted for this link.
@@ -202,7 +202,7 @@ struct Link {
     /// One per link, not one per image, and brought up *before* attribute 8 is ever asked
     /// for: a Target strips the image handle from its metadata response when no BIP
     /// client is connected, so a receiver that waits to see a handle before connecting
-    /// waits forever (Q29).
+    /// waits forever (#74).
     art: Option<(Cid, CoverArt)>,
     /// Fetches this link's peer has answered by closing the image channel, ever.
     ///
@@ -390,7 +390,7 @@ impl SourceAdapter for BluetoothAdapter {
         let mut links: HashMap<u16, Link> = HashMap::new();
         // Every outbound PDU goes through here: one writer, paced by the controller's
         // buffer credits, so nothing is written into a buffer that does not exist and no
-        // two PDUs interleave their fragments (Q26).
+        // two PDUs interleave their fragments (#71).
         let acl = AclWriter::spawn(Arc::clone(&self.transport));
 
         // Retransmission timers are the one thing in this actor that is driven by time
@@ -680,7 +680,7 @@ impl BluetoothAdapter {
                         // Ask for metadata straight away rather than waiting for a
                         // notification; a track already playing produces no change event.
                         // The text only: attribute 8 is asked for once the image server
-                        // is connected, because a Target strips it when it is not (Q29).
+                        // is connected, because a Target strips it when it is not (#74).
                         Self::request_metadata(link, cid, &mut out);
                         // …and subscribe, or the card is a snapshot of this instant and
                         // nothing ever moves it again. RegisterNotification answers
@@ -918,7 +918,7 @@ impl BluetoothAdapter {
                     // A RECONFIGURE mid-session can change the rate or channel count, and
                     // the session that is already open was opened *with* the old one — the
                     // decoder and the output device were both sized by it. Carrying on
-                    // would play the new stream at the old pitch, which is Q25 arriving by
+                    // would play the new stream at the old pitch, which is #70 arriving by
                     // a second route. Dropping the channel ends that audio session; the
                     // START that follows the reconfiguration opens a fresh one with the
                     // right shape.
@@ -945,7 +945,7 @@ impl BluetoothAdapter {
                     // START cannot precede SET_CONFIGURATION in the sink state machine,
                     // so a missing format means a bug here rather than a sender problem —
                     // and starting a session without one would decode at a guessed rate,
-                    // which is exactly what Q25 was.
+                    // which is exactly what #70 was.
                     let Some(format) = link.audio_format else {
                         warn!("bluetooth: stream started with no negotiated format");
                         continue;
@@ -1195,7 +1195,7 @@ impl BluetoothAdapter {
             // Inbound *command*, not a response to ours. Real GM and Hyundai-Kia head
             // units enumerate attributes 1..=8 unconditionally, and this used to fall
             // into the response branch below — where the request's eight-byte track
-            // identifier parses as an attribute count of zero and empties the card (Q29).
+            // identifier parses as an attribute count of zero and empties the card (#74).
             avrcp::pdu::GET_ELEMENT_ATTRIBUTES if !frame.ctype.is_response() => {
                 let requested = avrcp::parse_attribute_request(&vendor.parameters)
                     .unwrap_or_else(|_| avrcp::attribute::ALL.to_vec());
@@ -1495,7 +1495,7 @@ impl BluetoothAdapter {
     /// Attribute 8 only once the image server is connected. Asking earlier is not merely
     /// useless — AOSP's Target strips the attribute from a response when no BIP client is
     /// connected, so the early request *teaches us nothing* and the card would wait on a
-    /// second round trip for text it could have had immediately (Q29).
+    /// second round trip for text it could have had immediately (#74).
     fn request_metadata(link: &mut Link, cid: Cid, out: &mut Outbox) {
         let ready = link
             .art
@@ -1549,7 +1549,7 @@ impl BluetoothAdapter {
     ///
     /// In Enhanced Retransmission Mode, because that is what GOEP 2.0 requires of a cover
     /// art channel — a basic-mode channel here is refused by the responder, which is what
-    /// made this whole path unreachable (Q29). A peer that counter-proposes basic mode
+    /// made this whole path unreachable (#74). A peer that counter-proposes basic mode
     /// gets it: GOEP 1.x moves a thumbnail perfectly well.
     fn connect_cover_art(&self, link: &mut Link, psm: u16, out: &mut Outbox) {
         let Ok(psm) = Psm::new(psm) else {
@@ -1722,7 +1722,7 @@ impl BluetoothAdapter {
     ///
     /// Queues through the same [`AclWriter`] as everything else rather than writing to
     /// the transport directly: two tasks fragmenting onto one handle would interleave
-    /// their fragments, and basic-mode L2CAP has no way to sort that out (Q26).
+    /// their fragments, and basic-mode L2CAP has no way to sort that out (#71).
     fn spawn_control_writer(
         handle: ConnectionHandle,
         cid: Cid,

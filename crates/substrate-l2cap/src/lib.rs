@@ -9,7 +9,7 @@
 //! OS's — see architecture-substrate.md §11.1. Everything an A2DP sink does rides here:
 //! AVDTP on PSM `0x0019`, AVCTP on `0x0017`, and the OBEX cover-art channel on whichever
 //! PSM the peer's SDP record names — the last of which is why ERTM exists here at all,
-//! since GOEP 2.0 requires it and album art rides on GOEP (Q29).
+//! since GOEP 2.0 requires it and album art rides on GOEP (#74).
 //!
 //! Pure and synchronous by design (ground rule 3): feed it reassembled PDUs, write out
 //! the [`L2capEvent::Send`]s it returns, and advance retransmission timers with

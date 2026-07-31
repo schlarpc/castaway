@@ -369,7 +369,7 @@ everything above this line is tested once.
 that decides *when* a packet may be written lives above it, in a single `AclWriter` task
 that owns the outbound side of every link. Nothing else writes ACL data.
 
-Two things force this, and Q26 is what having neither looks like:
+Two things force this, and #71 is what having neither looks like:
 
 - **Credits.** A controller advertises a fixed number of ACL buffers in
   `HCI_Read_Buffer_Size` and the host must not exceed them. There is no backpressure to
@@ -616,7 +616,7 @@ bluetoothctl remove AC:A7:F1:BD:45:19       # …then scan on, pair, trust, conn
 with `target.object` set correctly and WirePlumber's policy overrides it, linking to the
 default sink instead. Nothing errors; the BlueZ `MediaTransport1` simply stays `"idle"`,
 no AVDTP START is ever sent, and it looks exactly like the receiver failing to start a
-stream. This is what Q26 spent an afternoon on.
+stream. This is what #71 spent an afternoon on.
 
 **Do not fix it by making the Bluetooth sink the default.** It works, and it creates a
 feedback loop: castaway's `audio-out` opens whatever the default device is, so it decodes
@@ -697,7 +697,7 @@ sender has streamed to it.
   — the one whose second protocol layer is OBEX, since a phone publishes its AVCTP browsing
   channel in the same list and browsing comes first. That channel runs in **Enhanced
   Retransmission Mode**: AVRCP 1.6.3 §14 requires GOEP 2.0 and GOEP §7.1.2 requires ERTM, so
-  a basic-mode channel here is refused (Q29). Audio stays in basic mode — A2DP has no use for
+  a basic-mode channel here is refused (#74). Audio stays in basic mode — A2DP has no use for
   retransmission, and the mode is decided per PSM before either end proposes anything.
   The OBEX session is opened when AVCTP connects and held for the life of the link, *before*
   attribute 8 is ever asked for: a Target strips the image handle from its response when no

@@ -45,7 +45,7 @@ fn transport() -> Arc<ScriptedTransport> {
 /// `report_completions` decides whether it hands those buffers back the way a real
 /// controller does. Withholding them is how the flow-control path is exercised: a
 /// controller with infinite buffers is a fiction, and it is the fiction under which an
-/// unpaced writer looks like it works (Q26).
+/// unpaced writer looks like it works (#71).
 fn controller(acl_packets: u16, report_completions: bool) -> Arc<ScriptedTransport> {
     Arc::new(ScriptedTransport::new().with_responder(move |sent| {
         // A real controller frees each ACL buffer and says so. Nothing else ever returns
@@ -483,7 +483,7 @@ fn sent_a_config_response(transport: &ScriptedTransport) -> bool {
 
 #[tokio::test]
 async fn writes_wait_for_controller_buffers_instead_of_vanishing_into_them() {
-    // Q26, reproduced: a controller with two ACL buffers that has not yet freed either.
+    // #71, reproduced: a controller with two ACL buffers that has not yet freed either.
     // An unpaced host writes a third fragment anyway, the controller discards it without
     // a word, and the peer waits for a reply that this end believes it sent. On the
     // bench that lost fragment was an L2CAP configuration response, so BlueZ never
@@ -845,7 +845,7 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
 
     // Configure it down to one rate and one channel mode. 48 kHz on purpose: it is what
     // BlueZ actually picked on hardware, and it is not the rate a defaulted decoder would
-    // have guessed — which is the whole of Q25.
+    // have guessed — which is the whole of #70.
     let chosen = CodecCapability::AptX {
         rates: SampleRates::HZ_48000,
         channels: ChannelModes::JOINT_STEREO,
@@ -875,7 +875,7 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
         panic!("expected an audio session, got {:?}", msg.event);
     };
     // The negotiated rate must reach the pipeline, not a default. aptX has no in-band
-    // rate, so getting this wrong plays the stream ~9% slow and logs nothing (Q25).
+    // rate, so getting this wrong plays the stream ~9% slow and logs nothing (#70).
     assert_eq!(
         format.sample_rate(),
         48_000,
@@ -1354,7 +1354,7 @@ async fn an_inbound_metadata_request_is_answered_and_does_not_empty_the_card() {
 
 #[tokio::test]
 async fn the_image_server_is_connected_before_the_handle_is_asked_for() {
-    // The ordering Q29 turned on. AOSP's Target strips attribute 8 from a metadata
+    // The ordering #74 turned on. AOSP's Target strips attribute 8 from a metadata
     // response whenever no cover-art client is connected, so a receiver that waits to see
     // a handle before connecting waits forever — which is exactly what an iPhone streaming
     // happily and never sending a handle looked like.

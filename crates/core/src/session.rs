@@ -615,7 +615,7 @@ mod tests {
         let src = SourceId::new(ProtocolKind::Bluetooth, "aa:bb:cc:dd:ee:ff");
         mgr.handle(audio_msg(&src)).await.unwrap();
         assert_eq!(counts.audio.load(Ordering::SeqCst), 1);
-        // Q25: the negotiated rate must survive the trip to the pipeline. Losing it here
+        // #70: the negotiated rate must survive the trip to the pipeline. Losing it here
         // is inaudible in a test and plays 9% slow on a real 48 kHz aptX stream.
         assert_eq!(
             *counts.audio_format.lock().unwrap(),

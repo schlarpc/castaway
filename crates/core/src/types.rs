@@ -201,7 +201,7 @@ pub enum AudioCodec {
 /// Deliberately has **no `Default`**. aptX and aptX HD carry no in-band configuration at
 /// all, so a decoder handed the wrong rate plays the stream at the wrong pitch with
 /// nothing in any log to say so — which is exactly what a defaultable format invites
-/// (OPEN-QUESTIONS Q25). The only way to obtain one is to state both fields, so the
+/// (#70). The only way to obtain one is to state both fields, so the
 /// negotiated values have to be carried from the protocol to the decoder rather than
 /// re-guessed at the far end.
 ///

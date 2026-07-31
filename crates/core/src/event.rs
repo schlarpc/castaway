@@ -125,7 +125,7 @@ pub enum SessionEvent {
         /// On the event rather than on each [`crate::EncodedFrame`] because it is a
         /// property of the *session*: it is settled once, at configuration, and a codec
         /// that carries no in-band rate (aptX, aptX HD) gives the decoder no other way to
-        /// learn it (OPEN-QUESTIONS Q25).
+        /// learn it (#70).
         format: AudioFormat,
         /// The codec's out-of-band configuration, if the protocol carried one.
         ///

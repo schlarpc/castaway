@@ -2,7 +2,7 @@
 //!
 //! Every other codec here has to be *told* what it is playing. aptX and aptX HD carry no
 //! header at all, so a stream decoded at the wrong rate plays at the wrong pitch with
-//! nothing in any log (OPEN-QUESTIONS Q25); SBC states its bitpool but not its rate; AAC
+//! nothing in any log (#70); SBC states its bitpool but not its rate; AAC
 //! hides its configuration in a LATM multiplex. LDAC puts the sample rate and the channel
 //! configuration in the first three bytes of every frame, which makes it the only codec
 //! where the negotiated configuration can be **checked** rather than trusted.

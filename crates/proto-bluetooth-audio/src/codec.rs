@@ -465,7 +465,7 @@ impl CodecCapability {
     /// `None` for an *offer* — a capability that still names a set of rates or channel
     /// modes has no single answer. This is what the decoder must be told: aptX and aptX
     /// HD carry no in-band configuration, so a stream decoded at the wrong rate plays at
-    /// the wrong pitch with nothing in any log (OPEN-QUESTIONS Q25).
+    /// the wrong pitch with nothing in any log (#70).
     #[must_use]
     pub fn format(&self) -> Option<AudioFormat> {
         AudioFormat::from_hz(self.sample_rate()?, u16::from(self.channel_count()?))

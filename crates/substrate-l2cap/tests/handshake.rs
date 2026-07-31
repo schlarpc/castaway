@@ -347,7 +347,7 @@ fn data_for_an_unknown_channel_is_an_error() {
 
 #[test]
 fn a_cover_art_channel_negotiates_enhanced_retransmission_end_to_end() {
-    // The channel Q29 was blocked on. GOEP 2.0 requires ERTM for the OBEX transfer, so a
+    // The channel #74 was blocked on. GOEP 2.0 requires ERTM for the OBEX transfer, so a
     // channel that quietly settles into basic mode is a channel the peer will not serve
     // an image over — both ends have to *agree* on ERTM, not merely tolerate it.
     let mut link = Link::new();

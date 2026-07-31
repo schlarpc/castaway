@@ -6,7 +6,7 @@
 //! that answers the extended-features request with a zero mask and refuses the
 //! retransmission option by name never gets an image, no matter how correct everything
 //! above it is — the peer's OBEX CONNECT is answered with a configuration refusal and the
-//! transfer dies there (Q29).
+//! transfer dies there (#74).
 //!
 //! Three things make ERTM more than "basic mode with sequence numbers":
 //!

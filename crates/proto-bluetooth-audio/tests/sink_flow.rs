@@ -173,7 +173,7 @@ fn configuration_reports_the_codec_and_rate_the_decoder_needs() {
             _ => None,
         })
         .expect("configuration must report what to decode with");
-    // Both halves matter: Q25 was the rate reaching the log and not the decoder, and a
+    // Both halves matter: #70 was the rate reaching the log and not the decoder, and a
     // channel count that came from a default rather than the negotiation is the same bug.
     assert_eq!(configured.0, AudioCodec::Ldac);
     assert_eq!(configured.1.sample_rate(), 48_000);

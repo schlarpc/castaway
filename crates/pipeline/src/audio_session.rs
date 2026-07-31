@@ -11,8 +11,8 @@
 //!
 //! The *format* is the opposite: it cannot come from the stream, because aptX and aptX HD
 //! have no header to carry it. It is a required parameter, handed down from the AVDTP
-//! negotiation via [`castaway_core::SessionEvent::Audio`] — the bug Q25 recorded was this
-//! function inventing 44.1 kHz while the phone was sending 48 (OPEN-QUESTIONS Q25).
+//! negotiation via [`castaway_core::SessionEvent::Audio`] — the bug #70 recorded was this
+//! function inventing 44.1 kHz while the phone was sending 48 (#70).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -295,7 +295,7 @@ pub fn spawn_pcm(
 ///
 /// There is no `format` parameter, and that is the whole point of the variant: unlike the
 /// A2DP path — where aptX carries no in-band rate and the negotiated one has to be handed
-/// down separately (Q25) — every [`PcmFrame`] states its own rate and channel count. The
+/// down separately (#70) — every [`PcmFrame`] states its own rate and channel count. The
 /// shape cannot disagree with the samples because it travels with them.
 pub fn run_pcm(
     frames: std::sync::mpsc::Receiver<PcmFrame>,
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn a_pcm_session_opens_the_output_with_the_shape_the_samples_state() {
         // Nothing hands this session a negotiated format, so if it ever invents one the
-        // stream plays at the wrong pitch — the Q25 failure, arriving by a new route.
+        // stream plays at the wrong pitch — the #70 failure, arriving by a new route.
         let log = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         tx.send(pcm(44_100, 2, 512)).unwrap();

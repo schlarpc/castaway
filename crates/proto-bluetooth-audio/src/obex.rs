@@ -13,7 +13,7 @@
 //! The session is opened **once per link and held**, not once per image. That is not an
 //! optimisation: a Target strips attribute 8 from its metadata response when no BIP
 //! client is connected, so a receiver that only connects after seeing a handle never sees
-//! one (Q29). Connecting first is what makes the handle appear.
+//! one (#74). Connecting first is what makes the handle appear.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use castaway_core::{Artwork, ImageFormat};
@@ -348,7 +348,7 @@ enum Srm {
 /// It is a *session* rather than a fetch because of the ordering AOSP enforces — a Target
 /// strips attribute 8 from its metadata response unless a BIP client is already connected
 /// — so this has to be up before the handle is asked for, and staying up across tracks is
-/// then free (Q29).
+/// then free (#74).
 #[derive(Debug)]
 pub struct CoverArtSession {
     state: FetchState,

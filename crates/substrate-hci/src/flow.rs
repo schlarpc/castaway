@@ -5,7 +5,7 @@
 //! There is no backpressure on the transport to discover this with: a dongle handed a
 //! fragment it has no buffer for discards it and says nothing. The peer then waits
 //! forever for a reply that was written, acknowledged by the USB stack, and thrown away
-//! — which is exactly the shape of OPEN-QUESTIONS Q26, where an L2CAP configuration
+//! — which is exactly the shape of #71, where an L2CAP configuration
 //! response never reached BlueZ and the link idled out with no error anywhere.
 //!
 //! Buffers come back via `HCI_Number_Of_Completed_Packets`, per connection handle. This

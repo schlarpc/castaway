@@ -61,7 +61,7 @@ pub enum SinkEvent {
         /// The negotiated codec.
         codec: AudioCodec,
         /// The negotiated rate and channel count, which the decoder must be told: aptX
-        /// and aptX HD carry no in-band configuration (OPEN-QUESTIONS Q25).
+        /// and aptX HD carry no in-band configuration (#70).
         format: AudioFormat,
         /// The full negotiated capability, for anything the decoder needs.
         configuration: Box<CodecCapability>,
@@ -261,8 +261,8 @@ impl SinkSession {
     /// is not true — the codec block is exactly what RECONFIGURE carries, and AOSP sends
     /// one when the rate or bitpool changes from Developer Options, as do some stacks on
     /// stream restart. The sender switched its encoder and we kept decoding at the old
-    /// rate: wrong pitch, or noise, with nothing logged. The same failure class as Q25,
-    /// through a door Q25 did not close.
+    /// rate: wrong pitch, or noise, with nothing logged. The same failure class as #70,
+    /// through a door #70 did not close.
     ///
     /// Validated exactly as SET_CONFIGURATION is, because it is the same decision being
     /// made a second time — and answered with the same category-first reject shape, which

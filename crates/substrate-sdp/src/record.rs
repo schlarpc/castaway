@@ -45,7 +45,7 @@ pub mod a2dp_features {
 /// trap: bit 6 is "supports browsing" in a Controller record, and the cover-art bits sit
 /// at 7, 8 and 9 — one per BIP operation. Claiming bit 6 for cover art advertises a
 /// browsing channel we do not implement *and* leaves the peer with no reason to send an
-/// image handle, so it fails in both directions at once (Q29).
+/// image handle, so it fails in both directions at once (#74).
 pub mod avrcp_features {
     /// Category 1: player/recorder. The category that carries play/pause/next/previous.
     pub const CATEGORY_1_PLAYER: u16 = 1 << 0;
@@ -144,7 +144,7 @@ impl ServiceRecord {
     /// `AdditionalProtocolDescriptorList` routinely holds *several* stacks: an iPhone
     /// publishes its AVCTP **browsing** channel there too, and it comes first. Taking the
     /// first PSM in the list therefore opens a browsing channel and speaks OBEX at it,
-    /// which fails in a way that looks like the peer having no cover art at all (Q29).
+    /// which fails in a way that looks like the peer having no cover art at all (#74).
     ///
     /// BlueZ does exactly this test — `sdp_uuid_to_proto(...) == OBEX_UUID`, then
     /// `sdp_get_proto_port` on the *same* stack.

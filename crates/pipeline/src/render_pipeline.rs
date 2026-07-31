@@ -138,7 +138,7 @@ pub enum RenderCommand {
     /// back. Both are declined the same way, by the same predicate: not while someone is
     /// using the panel.
     RestPanel,
-    /// Attach a consumer of composited frames (Q30). Sent as a command rather than set
+    /// Attach a consumer of composited frames (#18). Sent as a command rather than set
     /// on the loop directly because the loop lives on the main thread and everything
     /// that wants to tap it does not.
     AddTap(Box<dyn crate::tap::OutputTap>),
@@ -2487,7 +2487,7 @@ impl RenderLoop {
     pub fn demand(&self, now: std::time::Instant) -> crate::demand::Demand {
         use crate::demand::Demand;
         // A tap holds the loop at display rate while attached: a screenshot retires
-        // itself after one present, and a future HLS/DASH tap (Q30 phase 2) wants a
+        // itself after one present, and a future HLS/DASH tap (#18 phase 2) wants a
         // steady cadence anyway.
         if self.transition.is_some() || self.animating || !self.taps.is_empty() {
             return Demand::Frame;

@@ -1,7 +1,7 @@
 //! The one place ACL data leaves this process.
 //!
 //! Everything outbound — AVDTP replies, SDP responses, L2CAP signaling, AVRCP commands —
-//! funnels through a single writer task. That is two guarantees, and OPEN-QUESTIONS Q26
+//! funnels through a single writer task. That is two guarantees, and #71
 //! was most likely one of them being missing:
 //!
 //! 1. **Credits.** The controller advertises a fixed number of ACL buffers and silently
