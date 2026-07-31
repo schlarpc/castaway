@@ -159,6 +159,49 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
   looking at device auth, and the `_googlecast._tcp` TXT record must carry `st` or a
   strict sender discards the advertisement and never connects at all.
 
+- **Q46 — Hosting real Cast receiver apps: generic platform, not per-app bridges. OPEN;
+  the shape is decided, the shim surface is the unknown.** This is G56 made concrete,
+  and it has a fresh forcing function: when a mirrored tab lands on youtube.com, Chrome
+  *deliberately* stops the streaming session and sends `LAUNCH 233637DE` on the same
+  socket (observed 2026-07-31 with a scripted sender; it does this even after our
+  `GET_APP_AVAILABILITY` answered unavailable). Today we decline it and the cast ends
+  with an error toast; hosting the app is what turns that into a native handoff.
+
+  **Decided: the mechanism must be Cast-generic.** The expedient alternative — special-
+  casing YouTube's app id inside `proto-cast` and bridging to the DIAL/Lounge machinery
+  — comingles vendor semantics with protocol machinery and was rejected on those
+  grounds. The split that keeps responsibilities whole: `proto-cast` resolves
+  `LAUNCH(appId)` → receiver URL, surfaces "host this URL" as a session event, reports
+  the session in `RECEIVER_STATUS`, and forwards app-namespace messages between senders
+  and the hosted page *opaquely*; the browser host provides the platform surface the
+  page's own SDK expects; vendor protocol stays in the vendor's JS, as on a real
+  Chromecast. `proto-cast` never learns YouTube exists.
+
+  **Measured 2026-07-31:** the app registry is public and unauthenticated —
+  `GET https://clients3.google.com/cast/chromecast/device/app?a=233637DE` returns
+  `{"display_name":"YouTube","url":"https://www.youtube.com/tv?castv=2.0",
+  "uses_ipc":true,…}` — so the "actual app" for YouTube *is* the leanback page the
+  browser already renders (STATUS.md), reached through a generic lookup. Responses
+  should be cached/pinned so a cloud blip doesn't break launches (D30 applies: this is
+  a read-only cloud surface, not a wire protocol we own).
+
+  **G56's historical blockers have fallen:** browser H.264/AAC is measured-true on the
+  Electron runtime (D36/G55); the CKS device credential now passes a real Chrome's
+  device-auth check end to end (observed in the same session: `Auth challenge
+  verification succeeded`, SSL_VERIFIED); outbound app identification is not needed
+  (D42).
+
+  **The load-bearing unknown is the platform shim.** `uses_ipc: true` and the
+  `castv=2.0` URL parameter are the eureka-era receiver model, where the page's SDK
+  talks to the platform over a local IPC channel — a surface RE'd publicly years ago
+  and much smaller than modern CAF's injected `cast.__platform__` bindings (which are
+  undocumented, minified, and move under Google's control). Which of the two the page
+  actually needs decides whether this is "next feature" or "own project", and it is
+  cheaply answerable: load `youtube.com/tv?castv=2.0` in the Electron host and catalog
+  what the page tries to connect to and call. One ceiling either way: apps that gate on
+  device certification beyond the protocol (Netflix-class) will not run on any emulated
+  receiver; YouTube (leanback + vendored Widevine) should.
+
 ## Deferred (per docs, not blockers)
 
 - **Q7 — Miracast: the protocol is done; the radio now forms in CI; the *driver* is the
