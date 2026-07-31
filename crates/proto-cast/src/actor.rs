@@ -511,6 +511,17 @@ impl CastReceiver {
 
             while let Some((msg, consumed)) = framing::try_decode(&buf)? {
                 buf.drain(..consumed);
+                // The only view of sender traffic on a box nobody can attach a
+                // debugger to. Payloads are logged whole: a session that dies on one
+                // message can only be diagnosed by seeing that message.
+                tracing::trace!(
+                    %peer,
+                    namespace = %msg.namespace,
+                    source = %msg.source_id,
+                    destination = %msg.destination_id,
+                    payload = %msg.payload_utf8.as_deref().unwrap_or("<binary>"),
+                    "cast message in"
+                );
                 // Where playback has reached, handed to the session as an input so it stays
                 // a pure fold — the same shape `proto-dlna` uses, and what keeps every
                 // status test free of a live decoder.
@@ -523,7 +534,30 @@ impl CastReceiver {
                         .await
                         .map_err(|e| CastError::Io(e.to_string()))?;
                     if ended {
-                        return Ok(());
+                        // The session is over; the channel is not. This socket is
+                        // shared transport for every sender on this peer, and a STOP
+                        // is routinely followed on the same socket by the sender's
+                        // next move — Chrome's YouTube handoff sends STOP and then
+                        // LAUNCH back-to-back. Hanging up here snapped that LAUNCH
+                        // mid-flight and turned every handoff into "Failed to cast".
+                        if let Some(task) = mirror_task.take() {
+                            task.abort();
+                        }
+                        if rtp.is_none() {
+                            // The old socket was consumed by the mirror that just
+                            // ended; re-arm so a fresh OFFER on this connection gets
+                            // a live port in its ANSWER rather than the dead one.
+                            match MirrorSocket::bind(self.listen.ip(), self.media_ports).await {
+                                Ok(socket) => {
+                                    session.set_mirror_port(Some(socket.port()));
+                                    *rtp = Some(socket);
+                                }
+                                Err(e) => {
+                                    warn!(%peer, error = %e, "could not re-arm mirroring after session end");
+                                    session.set_mirror_port(None);
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(config) = reaction.start_mirror {

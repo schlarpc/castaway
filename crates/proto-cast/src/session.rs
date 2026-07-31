@@ -181,6 +181,15 @@ impl CastSession {
         self
     }
 
+    /// Point future ANSWERs at a different RTP port — or at nothing.
+    ///
+    /// The actor calls this when a session ends on a still-open connection: the old
+    /// socket died with the mirror that used it, and an ANSWER naming a dead port is a
+    /// sender streaming into a black hole.
+    pub fn set_mirror_port(&mut self, port: Option<u16>) {
+        self.mirror_port = port;
+    }
+
     /// Fold one inbound message into a [`Reaction`].
     ///
     /// # Errors
@@ -241,9 +250,20 @@ impl CastSession {
             .and_then(|p| Envelope::parse(p).ok())
             .map(|e| e.r#type)
             .unwrap_or_default();
-        // A CLOSE to the receiver ends the whole session; virtual-connection setup
-        // (CONNECT) is silent.
-        if ty == "CLOSE" && msg.destination_id == self.receiver_id {
+        // CLOSE tears down one virtual connection, not the channel — several senders
+        // multiplex over this socket (Chrome's platform sender, a page's Cast SDK
+        // client, the one actually casting), and each opens and closes its own.
+        // Only the session owner's departure ends the running app; anyone else's
+        // CLOSE is that sender leaving, which is not our business. Ending on every
+        // CLOSE meant a page probing the receiver could kill an unrelated mirror.
+        if ty == "CLOSE"
+            && self
+                .app
+                .as_ref()
+                .is_some_and(|app| app.controller == msg.source_id)
+        {
+            self.app = None;
+            self.player_state = None;
             return Reaction::reply_with(vec![], SessionEvent::End);
         }
         Reaction::default()
@@ -314,7 +334,7 @@ impl CastSession {
                         messages::launch_error(req.request_id, refusal),
                     )]));
                 }
-                self.launch(&req);
+                self.launch(&req, &sender);
                 Ok(self.reply_receiver_status(&sender, req.request_id))
             }
             "SET_VOLUME" => {
@@ -478,7 +498,7 @@ impl CastSession {
         }
     }
 
-    fn launch(&mut self, req: &LaunchRequest) {
+    fn launch(&mut self, req: &LaunchRequest, controller: &str) {
         self.id_counter += 1;
         let n = self.id_counter;
         self.app = Some(RunningApp {
@@ -487,6 +507,7 @@ impl CastSession {
             session_id: format!("sess-{n}"),
             transport_id: format!("transport-{n}"),
             status_text: "Ready To Cast".to_string(),
+            controller: controller.to_string(),
         });
     }
 
@@ -1139,8 +1160,47 @@ mod tests {
         ));
     }
 
+    /// CLOSE tears down one virtual connection, and only the session owner's CLOSE
+    /// ends the running app. Several senders share the socket — Chrome's platform
+    /// sender, a page's Cast SDK client, the one actually casting — and a bystander
+    /// closing its own connection must not take the session with it: a mirrored tab
+    /// navigating to youtube.com does exactly that.
     #[test]
-    fn connection_close_to_receiver_ends_session() {
+    fn only_the_controlling_senders_close_ends_the_session() {
+        let mut s = session();
+        s.handle(&recv_msg(
+            ns::RECEIVER,
+            "sender-1",
+            "receiver-0",
+            r#"{"requestId":1,"type":"LAUNCH","appId":"CC1AD845"}"#,
+        ))
+        .unwrap();
+
+        // A bystander leaving is its own business.
+        let r = s
+            .handle(&recv_msg(
+                ns::CONNECTION,
+                "client-777",
+                "receiver-0",
+                r#"{"type":"CLOSE"}"#,
+            ))
+            .unwrap();
+        assert!(r.events.is_empty());
+
+        // The sender that launched the app leaving ends it.
+        let r = s
+            .handle(&recv_msg(
+                ns::CONNECTION,
+                "sender-1",
+                "receiver-0",
+                r#"{"type":"CLOSE"}"#,
+            ))
+            .unwrap();
+        assert!(matches!(r.events.first(), Some(SessionEvent::End)));
+    }
+
+    #[test]
+    fn a_close_with_nothing_running_ends_nothing() {
         let mut s = session();
         let r = s
             .handle(&recv_msg(
@@ -1150,7 +1210,7 @@ mod tests {
                 r#"{"type":"CLOSE"}"#,
             ))
             .unwrap();
-        assert!(matches!(r.events.first(), Some(SessionEvent::End)));
+        assert!(r.events.is_empty());
     }
 
     #[test]

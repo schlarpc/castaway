@@ -454,6 +454,9 @@ pub struct RunningApp {
     pub transport_id: String,
     /// Status line text.
     pub status_text: String,
+    /// The sender that launched the app — the one whose departure ends the session.
+    /// Any sender may STOP; only this one's CLOSE means "the session's owner left".
+    pub controller: String,
 }
 
 #[cfg(test)]
@@ -484,6 +487,7 @@ mod tests {
             session_id: "sess-1".into(),
             transport_id: "transport-1".into(),
             status_text: "Ready".into(),
+            controller: "sender-0".into(),
         };
         let s = receiver_status(1, Some(&app), 1.0, false);
         assert!(s.contains("\"transportId\":\"transport-1\""));
