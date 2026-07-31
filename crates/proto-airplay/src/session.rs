@@ -416,16 +416,7 @@ impl AirPlaySession {
                 }
                 AirPlayResponse::ok()
             }
-            ("TEARDOWN", _) => {
-                self.raop = RaopState::Idle;
-                self.sender_ports = None;
-                // `Connection: close` is not decoration: shairport-sync answers TEARDOWN
-                // with it and then closes the socket, and a sender that does not see it
-                // may hold the connection open expecting to reuse the session.
-                let mut r = AirPlayResponse::ok().header("Connection", "close");
-                r.event = Some(SessionEvent::End);
-                r
-            }
+            ("TEARDOWN", _) => self.teardown(body),
             (m, p) => {
                 // Lenient, but not silent. A sender asking for something this receiver
                 // does not implement gets a bare `200`, which it may well reject — and
@@ -793,6 +784,68 @@ impl AirPlaySession {
         plist_response(&reply)
     }
 
+    /// Handle `TEARDOWN`, which is **two requests wearing one method name**.
+    ///
+    /// A bare `TEARDOWN` ends the session. A `TEARDOWN` whose body names `streams` ends
+    /// only those streams and leaves everything else running — and iOS sends exactly
+    /// that in the middle of a healthy session. Starting a video in a mirrored app makes
+    /// it switch `audioMode` to `moviePlayback` and tear down **stream type 96, the
+    /// mirror's audio**, so it can renegotiate it; a receiver that reads that as "end the
+    /// session" takes the picture down with it and the sender reports a failure. That is
+    /// the whole of the "opening YouTube disconnects" symptom, captured from the wire:
+    ///
+    /// ```text
+    /// TEARDOWN {"streams": [{"type": 96, "streamID": 0, …}]}
+    /// ```
+    ///
+    /// Neither plane needs anything stopped here, which is why this looks quiet for a
+    /// request that sounds so final. Both are torn down by their own transport: the
+    /// mirror's data channel is a TCP connection the sender closes, and the audio is UDP
+    /// that simply stops arriving — the receive task stays on its sockets and picks the
+    /// stream back up when the sender resumes it, on the same ports and the same key.
+    fn teardown(&mut self, body: &[u8]) -> AirPlayResponse {
+        let named = Self::teardown_streams(body);
+        if !named.is_empty() {
+            log_info!(streams = ?named, "AirPlay stream teardown; the session continues");
+            // Deliberately no `Connection: close` and no `End`. Both would be this
+            // receiver ending a session the sender is still using.
+            return AirPlayResponse::ok();
+        }
+        self.raop = RaopState::Idle;
+        self.sender_ports = None;
+        self.mirror = MirrorState::Idle;
+        self.mirror_audio = None;
+        // `Connection: close` is not decoration: shairport-sync answers TEARDOWN
+        // with it and then closes the socket, and a sender that does not see it
+        // may hold the connection open expecting to reuse the session.
+        let mut r = AirPlayResponse::ok().header("Connection", "close");
+        r.event = Some(SessionEvent::End);
+        r
+    }
+
+    /// The stream types a `TEARDOWN` body names, empty for a whole-session teardown.
+    ///
+    /// Types rather than a `bool`: which plane the sender is dropping is worth having in
+    /// the log, and a sender that names a stream we never served should be visible as
+    /// exactly that rather than as "not a session teardown".
+    fn teardown_streams(body: &[u8]) -> Vec<i64> {
+        let Ok(value) = plist::Value::from_reader(std::io::Cursor::new(body)) else {
+            return Vec::new();
+        };
+        value
+            .as_dictionary()
+            .and_then(|d| d.get("streams"))
+            .and_then(plist::Value::as_array)
+            .map(|streams| {
+                streams
+                    .iter()
+                    .filter_map(plist::Value::as_dictionary)
+                    .filter_map(|s| s.get("type").and_then(plist::Value::as_signed_integer))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Handle `RECORD`: the sender is about to stream.
     ///
     /// `Audio-Latency` is the receiver's own minimum latency in frames, which the sender
@@ -1067,6 +1120,60 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(r.status, 400);
+    }
+
+    /// A `TEARDOWN` body naming one stream type, as iOS sends it.
+    fn teardown_body(ty: i64) -> Vec<u8> {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(ty.into()));
+        stream.insert("streamID".into(), plist::Value::Integer(0i64.into()));
+        let mut d = plist::Dictionary::new();
+        d.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &d).unwrap();
+        buf
+    }
+
+    #[test]
+    fn tearing_down_the_mirror_audio_does_not_tear_down_the_session() {
+        // Captured from a real session: starting a video in a mirrored app switches
+        // `audioMode` to `moviePlayback` and tears down stream type 96 so it can be
+        // renegotiated. Reading that as "end the session" takes the picture down with
+        // it — which is the whole of the "opening YouTube disconnects" symptom.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, true)).status, 200);
+        let r = s
+            .handle(&AirPlayRequest::new(
+                "TEARDOWN",
+                "rtsp://x/1",
+                &teardown_body(96),
+            ))
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.event.is_none(), "the session must survive: {:?}", r.event);
+        assert!(
+            !r.headers.iter().any(|(k, _)| *k == "Connection"),
+            "`Connection: close` would end a session the sender is still using"
+        );
+    }
+
+    #[test]
+    fn tearing_down_the_mirror_video_leaves_the_connection_open_too() {
+        // Type 110 is the other half of the same rule. The picture stops because the
+        // sender closes the data channel, not because we end the session.
+        let mut s = mirroring_session();
+        let r = s
+            .handle(&AirPlayRequest::new(
+                "TEARDOWN",
+                "rtsp://x/1",
+                &teardown_body(110),
+            ))
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.event.is_none());
     }
 
     #[test]
