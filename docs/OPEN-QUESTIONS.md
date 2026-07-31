@@ -1198,3 +1198,51 @@ the reasons are what a future reversal has to argue against.
   **Default until settled:** leave it reading wrong. Clamping it, or hiding it behind a
   plausibility check, would convert a loud signal that something is broken into a quiet
   one — and it is the only signal there is.
+
+- **Q50 — AirPlay *video* (the "HLS" path) is advertised and not implemented. OPEN; wants
+  a decision on whether to build it, and the decision is smaller than it looks.** Tapping
+  AirPlay inside an app that has its own video — YouTube's AirPlay button rather than
+  Screen Mirroring — starts a session this receiver has never served. It is a genuinely
+  distinct protocol from mirroring, not a variant of it, and UxPlay treats it as one: a
+  separate `CONNECTION_TYPE_HLS`, a separate ~1000-line `airplay_video.c`, and an
+  `-hls` flag that is **off by default** because it is the newest and least settled part
+  of that project.
+
+  **What a media session looks like**, captured 2026-07-31 from iOS 26.5.2:
+
+  - The RTSP half is the one we already serve, minus one key: the first `SETUP` carries
+    `ekey`/`eiv`/`timingProtocol` exactly as mirroring does but **has no
+    `isScreenMirroringSession`**. That absence is the discriminator.
+  - Then one stream, and it is *audio only* — `{"type": 96, "ct": 2, "spf": 352,
+    "sr": 44100, "isMedia": true, "latencyMin": 11025, "latencyMax": 88200}`. ALAC, the
+    classic RAOP framing, no type 110 anywhere in the session.
+  - The video never comes over RTSP at all. It arrives as **HTTP/1.1 on the same port**:
+    `POST /play` with the media URL, then `/scrub`, `/rate`, `/stop`, `/action`,
+    `GET /playback-info`, `GET /server-info`, `POST /reverse` for the event channel.
+
+  `2265e09` fixed the RTSP half — the session now survives its audio negotiation instead
+  of being refused a key. Everything above `POST /play` is missing, and today falls into
+  the lenient `200` branch, which answers "fine" and plays nothing.
+
+  **Why this is a smaller job than UxPlay's 1000 lines suggest.** UxPlay implements HLS
+  itself: fetching playlists, selecting a language, feeding segments. This project does
+  not need to. `POST /play` hands over *a URL*, and "play the media at this URL" is
+  already a first-class operation here — it is what DLNA `SetAVTransportURI` and Cast
+  `LOAD` both reduce to, through `MediaUri` and the same pipeline. The work is the
+  control surface (six small HTTP endpoints, a `/reverse` event channel, and mapping
+  scrub/rate onto the transport we already have), not a media stack.
+
+  **What is genuinely unknown**, and why this is a question rather than a task: (1)
+  whether the audio stream negotiated over RTSP is *used* in this mode or is vestigial
+  when the HLS URL carries its own audio — the capture stops before `/play`, so this is
+  unresolved and it decides whether the two halves need synchronising at all; (2) whether
+  YouTube's AirPlay URLs are plain HLS or FairPlay-Streaming protected, which is a
+  different problem entirely and not one to solve; (3) whether `POST /fp-setup2` in this
+  flow is load-bearing or, like `/fp-setup`, another table.
+
+  **Default until decided:** leave it. The feature bits that invite this session are
+  UxPlay's whole mask (`0x5A7FFEE6`), adopted as a unit for the reasons in `advert.rs` —
+  so the invitation cannot be withdrawn without diverging from a mask that is otherwise
+  proven, and a sender that tries gets a session that negotiates cleanly and then shows
+  nothing. That is the honest cost of the mask, and it is worth revisiting only together
+  with this.
