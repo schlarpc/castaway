@@ -54,6 +54,84 @@ impl Volume {
             Self::Level(db) => (db - MIN_DBFS) / -MIN_DBFS,
         }
     }
+
+    /// Back to the dBFS number a sender wrote, mute sentinel included.
+    ///
+    /// The inverse of [`Self::from_dbfs`] over everything a sender can send, which is
+    /// what makes it safe to answer a `GET_PARAMETER` with the value we were given.
+    #[must_use]
+    pub const fn as_dbfs(self) -> f32 {
+        match self {
+            Self::Muted => MUTE_DBFS,
+            Self::Level(db) => db,
+        }
+    }
+}
+
+/// A parameter a `GET_PARAMETER` asked us to report.
+///
+/// An enum with one variant rather than a string, because answering is a promise: a name
+/// is in here only when there is a value behind it to send. A sender that gets a `200`
+/// with no line for what it asked for treats the receiver as broken — which is exactly
+/// what iOS did to this receiver, hanging up on the empty answer to `volume`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Parameter {
+    /// `volume` — the receiver's current level, in dBFS.
+    Volume,
+}
+
+impl Parameter {
+    fn parse(name: &str) -> Option<Self> {
+        name.eq_ignore_ascii_case("volume").then_some(Self::Volume)
+    }
+
+    /// The line answering this parameter, given the session's current volume.
+    #[must_use]
+    pub fn answer(self, volume: Volume) -> String {
+        match self {
+            // The width and precision are the reference receiver's `%9.6f`. Senders
+            // parse the number rather than the layout, but there is no reason to be the
+            // one implementation that formats it differently.
+            Self::Volume => format!("volume: {:9.6}\r\n", volume.as_dbfs()),
+        }
+    }
+}
+
+/// Parse a `GET_PARAMETER` body into the parameters it names.
+///
+/// The body is one bare parameter name per line — `volume\r\n` — and not the
+/// `name: value` shape `SET_PARAMETER` uses, which is why this is its own parser rather
+/// than a mode of that one.
+///
+/// # Errors
+/// [`ControlError`] if the content type is missing or is not `text/parameters`.
+pub fn parse_get_parameter(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<Vec<Parameter>, ControlError> {
+    let content_type = content_type.ok_or(ControlError::NoContentType)?;
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    if !base.eq_ignore_ascii_case("text/parameters") {
+        return Err(ControlError::UnsupportedContentType(base.to_string()));
+    }
+    let text = std::str::from_utf8(body).map_err(|_| ControlError::NotUtf8)?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let parameter = Parameter::parse(line);
+            if parameter.is_none() {
+                tracing::warn!(parameter = %line, "GET_PARAMETER asks for something we cannot report");
+            }
+            parameter
+        })
+        .collect())
 }
 
 /// Playback progress, as `progress: start/now/end` in RTP timestamps.

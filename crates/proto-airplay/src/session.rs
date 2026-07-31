@@ -59,6 +59,9 @@ fn plist_response(dict: &plist::Dictionary) -> AirPlayResponse {
 /// The content type for raw byte bodies — `/fp-setup` replies are not plists.
 pub const OCTET_STREAM_MIME: &str = "application/octet-stream";
 
+/// The content type both parameter endpoints use, in each direction.
+pub const TEXT_PARAMETERS_MIME: &str = "text/parameters";
+
 /// One request, as the actor received it.
 ///
 /// Headers are here because the protocol puts load-bearing values in them and not in
@@ -245,6 +248,12 @@ pub struct AirPlaySession {
     /// the type cannot be constructed any other way, so a stage-2 body arriving first
     /// has nothing to verify against and is refused.
     pair_verify: Option<crate::pairing::PairVerify>,
+    /// The level this receiver reports to a sender that asks for it.
+    ///
+    /// Held here rather than read back from the pipeline because it is the *sender's*
+    /// number: what a `GET_PARAMETER` wants is the value it last set, so its slider and
+    /// ours agree. Full scale until a sender says otherwise.
+    volume: crate::control::Volume,
     /// The verified ECDH secret, once a sender has proved itself.
     ///
     /// With bit 27 advertised this is not optional decoration: the audio key becomes
@@ -274,6 +283,7 @@ impl AirPlaySession {
             mirror_audio: None,
             pending_eiv: None,
             pending_flush: None,
+            volume: crate::control::Volume::Level(0.0),
         }
     }
 
@@ -392,7 +402,7 @@ impl AirPlaySession {
             ("SETUP", _) => self.setup(req),
             ("RECORD", _) => self.record(),
             ("SET_PARAMETER", _) => self.set_parameter(req),
-            ("GET_PARAMETER", _) => AirPlayResponse::ok(),
+            ("GET_PARAMETER", _) => self.get_parameter(req),
             ("FLUSH", _) => {
                 // `RTP-Info` is where the sender says the new position starts. Ignoring
                 // it was the audible half of a skip: a moment of the old position plays
@@ -803,6 +813,41 @@ impl AirPlaySession {
         AirPlayResponse::ok().header("Audio-Latency", "11025")
     }
 
+    /// Handle `GET_PARAMETER`: report a parameter the sender asked us for.
+    ///
+    /// **This is not optional decoration, and answering it emptily ends the session.**
+    /// An iOS mirroring sender asks for `volume` immediately after the mirroring `SETUP`
+    /// — it is the last request of the handshake — and hangs up on a `200` that carries
+    /// no `volume:` line, with no error anywhere on either side. This endpoint returned
+    /// exactly that empty `200` for as long as it has existed, which is why no iPhone
+    /// has ever got past the handshake.
+    ///
+    /// The value reported is the last one a `SET_PARAMETER` set, so the sender's slider
+    /// agrees with what it told us; full scale until it says otherwise.
+    fn get_parameter(&self, req: &AirPlayRequest<'_>) -> AirPlayResponse {
+        let content_type = req.header("Content-Type");
+        let parameters = match crate::control::parse_get_parameter(content_type, req.body) {
+            Ok(p) => p,
+            Err(e) => {
+                // 451 "Parameter not understood", which is what the reference receiver
+                // answers a `GET_PARAMETER` it cannot read. Unlike `SET_PARAMETER`, a
+                // lenient 200 here is a lie: the sender is waiting for a value.
+                warn!(error = %e, "refusing a GET_PARAMETER we cannot read");
+                return AirPlayResponse::status(451);
+            }
+        };
+        if parameters.is_empty() {
+            return AirPlayResponse::ok();
+        }
+        let body: String = parameters
+            .iter()
+            .map(|p| p.answer(self.volume))
+            .collect::<Vec<_>>()
+            .concat();
+        debug!(reported = %body.trim_end(), "GET_PARAMETER answered");
+        AirPlayResponse::ok_body(TEXT_PARAMETERS_MIME, body.into_bytes())
+    }
+
     /// Handle `SET_PARAMETER`: volume, progress, metadata and artwork.
     ///
     /// A body we cannot use is answered `200` rather than refused. These are the
@@ -823,6 +868,9 @@ impl AirPlaySession {
         resp.event = match update {
             ControlUpdate::Volume(v) => {
                 log_info!(fraction = v.as_fraction(), "AirPlay volume");
+                // Kept so a later `GET_PARAMETER` reports what this sender set rather
+                // than a constant, which is the whole point of the sender asking.
+                self.volume = v;
                 Some(SessionEvent::Control(ControlTxn::Volume(v.as_fraction())))
             }
             ControlUpdate::Metadata(now) => Some(SessionEvent::NowPlaying(*now)),
@@ -1594,6 +1642,93 @@ mod tests {
             reply.get("eventPort").unwrap().as_unsigned_integer(),
             Some(0)
         );
+    }
+
+    /// A `GET_PARAMETER` exactly as an iOS mirroring sender sends it — the request the
+    /// whole handshake used to die on (`AirPlay/950.7.1`, CSeq 7, right after the
+    /// mirroring `SETUP`).
+    fn get_volume(s: &mut AirPlaySession) -> AirPlayResponse {
+        let headers = [("Content-Type".to_string(), "text/parameters".to_string())];
+        s.handle(&AirPlayRequest {
+            method: "GET_PARAMETER",
+            path: "/14390981983348410438",
+            headers: &headers,
+            body: b"volume\r\n",
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_get_parameter_for_volume_is_answered_with_a_volume() {
+        // The defect this replaces ended every iPhone session: an empty `200`. iOS asks
+        // for `volume` as the last request of the mirroring handshake and hangs up on an
+        // answer that does not contain it — no error, no retry, nothing in any log.
+        let mut s = session();
+        let r = get_volume(&mut s);
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type.as_deref(), Some(TEXT_PARAMETERS_MIME));
+        let body = String::from_utf8(r.body).unwrap();
+        assert!(body.starts_with("volume: "), "{body:?}");
+        assert!(body.ends_with("\r\n"), "{body:?}");
+        // Parsable as the number the sender is actually after.
+        let level: f32 = body
+            .trim_start_matches("volume: ")
+            .trim()
+            .parse()
+            .expect("a dBFS number");
+        assert!(
+            (level - 0.0).abs() < 1e-6,
+            "full scale until told otherwise"
+        );
+    }
+
+    #[test]
+    fn the_volume_reported_is_the_one_the_sender_set() {
+        // Otherwise the sender's slider and ours disagree the moment it moves one.
+        let mut s = session();
+        let headers = [("Content-Type".to_string(), "text/parameters".to_string())];
+        s.handle(&AirPlayRequest {
+            method: "SET_PARAMETER",
+            path: "rtsp://x/s",
+            headers: &headers,
+            body: b"volume: -15.000000\r\n",
+        })
+        .unwrap();
+        let body = String::from_utf8(get_volume(&mut s).body).unwrap();
+        let level: f32 = body.trim_start_matches("volume: ").trim().parse().unwrap();
+        assert!((level - -15.0).abs() < 1e-6, "{body:?}");
+    }
+
+    #[test]
+    fn a_get_parameter_we_cannot_read_is_refused_rather_than_answered_emptily() {
+        // 451 Parameter not understood. Unlike `SET_PARAMETER`, a lenient 200 here is a
+        // lie: the sender is waiting for a value, and an empty answer is what it treats
+        // as a broken receiver.
+        let mut s = session();
+        let r = s
+            .handle(&AirPlayRequest::new(
+                "GET_PARAMETER",
+                "rtsp://x/s",
+                b"volume\r\n",
+            ))
+            .unwrap();
+        assert_eq!(r.status, 451, "a GET_PARAMETER with no Content-Type");
+    }
+
+    #[test]
+    fn a_parameter_we_cannot_report_leaves_the_answer_empty_rather_than_wrong() {
+        let mut s = session();
+        let headers = [("Content-Type".to_string(), "text/parameters".to_string())];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "GET_PARAMETER",
+                path: "rtsp://x/s",
+                headers: &headers,
+                body: b"something-we-do-not-have\r\n",
+            })
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.body.is_empty());
     }
 
     #[test]
