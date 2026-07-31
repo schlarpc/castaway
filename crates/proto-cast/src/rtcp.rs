@@ -18,6 +18,7 @@ use crate::rtp::{FrameId, NackTarget, PacketNack};
 const REQUIRED_VERSION_AND_PADDING: u8 = 0b100;
 const REPORT_COUNT_BITS: u32 = 5;
 
+const PT_SENDER_REPORT: u8 = 200;
 const PT_RECEIVER_REPORT: u8 = 201;
 const PT_PAYLOAD_SPECIFIC: u8 = 206;
 const PT_EXTENDED_REPORTS: u8 = 207;
@@ -42,6 +43,23 @@ const MIN_ACK_BITVECTOR_OCTETS: usize = 2;
 const MAX_ACK_BITVECTOR_OCTETS: usize = 254;
 /// The loss-field count is a `u8`.
 const MAX_LOSS_FIELDS: usize = 255;
+
+/// The echo of the sender's last Sender Report, carried in our Receiver Report block.
+///
+/// This is the sender's *only* way to measure the network round trip: it subtracts
+/// `delay` from the time between sending that report and hearing this echo. A receiver
+/// that never echoes leaves the sender's RTT estimate at zero, which pins its in-flight
+/// media budget at the floor — and Chrome's bitrate governor reads the frame drops that
+/// budget causes as congestion, so the encoder bitrate walks down to its minimum and
+/// stays there. Openscreen: `SenderImpl::OnReceiverReport`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderReportEcho {
+    /// [`status_report_id`] of the last Sender Report heard.
+    pub report_id: u32,
+    /// Time elapsed between hearing that report and sending this feedback, in units of
+    /// 1/65536 second (RFC 3550's DLSR).
+    pub delay: u32,
+}
 
 /// Everything the receiver knows that the sender needs to hear.
 #[derive(Debug, Clone)]
@@ -69,6 +87,9 @@ pub struct Feedback {
     /// The NTP timestamp to report, if the caller has a clock reading to offer.
     /// Optional because the pure builder has no clock of its own (ground rule 3).
     pub ntp_timestamp: Option<u64>,
+    /// The last Sender Report heard, echoed so the sender can measure the round trip.
+    /// `None` until one arrives (the sender sends its first within a frame or two).
+    pub last_sender_report: Option<SenderReportEcho>,
 }
 
 /// How much of the feedback fitted into the packet.
@@ -95,10 +116,31 @@ pub struct BuildReport {
 pub fn build(feedback: &Feedback, max_size: usize) -> (Vec<u8>, BuildReport) {
     let mut out = Vec::with_capacity(max_size.min(1500));
 
-    // 1. Empty Receiver Report. RFC 3550 requires a receiver's compound packet to
-    //    begin with one, and it costs eight bytes.
-    append_header(&mut out, PT_RECEIVER_REPORT, 0, 4);
-    out.extend_from_slice(&feedback.receiver_ssrc.to_be_bytes());
+    // 1. Receiver Report. RFC 3550 requires a receiver's compound packet to begin
+    //    with one. Once a Sender Report has been heard it carries one report block
+    //    echoing it — that echo is what lets the sender measure the round trip (see
+    //    [`SenderReportEcho`]). Before then it is empty.
+    match &feedback.last_sender_report {
+        Some(echo) => {
+            append_header(&mut out, PT_RECEIVER_REPORT, 1, 4 + 24);
+            out.extend_from_slice(&feedback.receiver_ssrc.to_be_bytes());
+            out.extend_from_slice(&feedback.sender_ssrc.to_be_bytes());
+            // Loss, extended-highest-sequence and jitter are zero: the one consumer of
+            // this block (openscreen's `SenderImpl::OnReceiverReport`) reads only the
+            // two report-id fields, and loss is already reported precisely by the NACK
+            // fields below. Wiring real numbers here means tracking RTP sequence
+            // numbers per packet, which nothing yet needs.
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.extend_from_slice(&echo.report_id.to_be_bytes());
+            out.extend_from_slice(&echo.delay.to_be_bytes());
+        }
+        None => {
+            append_header(&mut out, PT_RECEIVER_REPORT, 0, 4);
+            out.extend_from_slice(&feedback.receiver_ssrc.to_be_bytes());
+        }
+    }
 
     // 2. Receiver Reference Time Report, when the caller gave us a clock reading.
     //    Optional per the Cast spec, but it is what lets the sender estimate the
@@ -298,6 +340,68 @@ fn append_ack_fields(out: &mut Vec<u8>, feedback: &Feedback, max_size: usize) ->
     dropped
 }
 
+/// Whether a datagram on the shared media socket is RTCP rather than RTP.
+///
+/// RFC 5761's demultiplexing rule: RTCP packet types occupy 192..=223, a range RTP's
+/// marker-bit-plus-payload-type byte avoids (Cast payload types are 96/97, which read
+/// as 96/97 or 224/225 there).
+#[must_use]
+pub fn is_rtcp(datagram: &[u8]) -> bool {
+    matches!(datagram, [first, second, ..]
+        if *first >> 6 == 0b10 && (192..=223).contains(second))
+}
+
+/// A Sender Report's identifying fields (RFC 3550 §6.4.1), as Cast senders emit them.
+///
+/// The NTP/RTP pair is the stream's lip-sync anchor; the NTP timestamp doubles as the
+/// report's identity, which our Receiver Report echoes back (see [`SenderReportEcho`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderReport {
+    /// The sender's SSRC — which stream this report describes.
+    pub sender_ssrc: u32,
+    /// The sender's clock at the moment of the report, as a 64-bit NTP timestamp.
+    pub ntp_timestamp: u64,
+    /// The same moment on the stream's RTP clock.
+    pub rtp_timestamp: u32,
+}
+
+/// Find the Sender Report in a compound RTCP datagram, if it carries one.
+///
+/// Walks the compound structure the way RFC 3550 prescribes — each packet's length
+/// field names the next — and gives up on the first malformed header rather than
+/// resynchronize on garbage.
+#[must_use]
+pub fn find_sender_report(datagram: &[u8]) -> Option<SenderReport> {
+    let mut rest = datagram;
+    loop {
+        let header = rest.get(..4)?;
+        if header[0] >> 6 != 0b10 {
+            return None;
+        }
+        let words = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        let body = rest.get(4..4 + words * 4)?;
+        if header[1] == PT_SENDER_REPORT {
+            return Some(SenderReport {
+                sender_ssrc: u32::from_be_bytes(body.get(0..4)?.try_into().ok()?),
+                ntp_timestamp: u64::from_be_bytes(body.get(4..12)?.try_into().ok()?),
+                rtp_timestamp: u32::from_be_bytes(body.get(12..16)?.try_into().ok()?),
+            });
+        }
+        rest = rest.get(4 + words * 4..)?;
+    }
+}
+
+/// The 32-bit id under which a Sender Report is later named: the middle 32 bits of its
+/// NTP timestamp (openscreen's `ToStatusReportId`).
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the truncation is the definition: the id is the middle 32 of 64 bits"
+)]
+pub const fn status_report_id(ntp_timestamp: u64) -> u32 {
+    (ntp_timestamp >> 16) as u32
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -322,6 +426,7 @@ mod tests {
             feedback_count: 7,
             picture_loss: false,
             ntp_timestamp: None,
+            last_sender_report: None,
         }
     }
 
@@ -369,6 +474,79 @@ mod tests {
         assert_eq!(body[13], 0); // no loss fields
         assert_eq!(u16::from_be_bytes([body[14], body[15]]), 400);
         assert_eq!(&body[16..20], b"CST2");
+    }
+
+    /// The report block layout is what openscreen's `RtcpReportBlock::ParseOne` walks:
+    /// 24 bytes, sender SSRC first, report id and delay last. The sender computes its
+    /// round-trip time from those last two fields, so their position is load-bearing.
+    #[test]
+    fn a_heard_sender_report_is_echoed_in_a_report_block() {
+        let mut fb = base();
+        fb.last_sender_report = Some(SenderReportEcho {
+            report_id: 0xA1B2_C3D4,
+            delay: 0x0001_8000, // 1.5 s in 1/65536ths
+        });
+        let (packet, _) = build(&fb, 1472);
+        assert_word_aligned(&packet);
+        let parts = walk(&packet);
+        assert_eq!(parts[0].0, PT_RECEIVER_REPORT);
+        assert_eq!(parts[0].1, 1, "report count must say one block");
+        let body = &parts[0].2;
+        assert_eq!(body.len(), 4 + 24);
+        assert_eq!(&body[0..4], &0x1111_2222u32.to_be_bytes()); // our ssrc
+        assert_eq!(&body[4..8], &0x3333_4444u32.to_be_bytes()); // the block names the sender
+        assert_eq!(&body[20..24], &0xA1B2_C3D4u32.to_be_bytes());
+        assert_eq!(&body[24..28], &0x0001_8000u32.to_be_bytes());
+    }
+
+    #[test]
+    fn rtcp_is_told_apart_from_rtp_by_the_second_byte() {
+        // A Cast RTP packet: version 2, payload type 96 (or 224 with the marker bit).
+        assert!(!is_rtcp(&[0x80, 96, 0, 0, 0, 0, 0, 0]));
+        assert!(!is_rtcp(&[0x80, 224, 0, 0, 0, 0, 0, 0]));
+        // A sender report and a receiver report.
+        assert!(is_rtcp(&[0x80, 200, 0, 0]));
+        assert!(is_rtcp(&[0x81, 201, 0, 0]));
+        // Wrong version bits: not RTP or RTCP at all.
+        assert!(!is_rtcp(&[0x40, 200, 0, 0]));
+        assert!(!is_rtcp(&[]));
+    }
+
+    /// A sender report as openscreen's `SenderReportBuilder` lays it out, preceded by
+    /// another RTCP packet so the compound walk is exercised.
+    #[test]
+    fn the_sender_report_is_found_inside_a_compound_packet() {
+        let mut packet = Vec::new();
+        // A leading receiver report (senders do not send these, but the walk must not
+        // care what comes first).
+        packet.extend_from_slice(&[0x80, 201, 0, 1]);
+        packet.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        // The sender report: SSRC, 8-byte NTP, RTP timestamp, packet + octet counts.
+        packet.extend_from_slice(&[0x80, 200, 0, 6]);
+        packet.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        packet.extend_from_slice(&0x0192_A3B4_C5D6_E7F8u64.to_be_bytes());
+        packet.extend_from_slice(&0x0055_AA55u32.to_be_bytes());
+        packet.extend_from_slice(&42u32.to_be_bytes());
+        packet.extend_from_slice(&4200u32.to_be_bytes());
+
+        let report = find_sender_report(&packet).unwrap();
+        assert_eq!(report.sender_ssrc, 0x0102_0304);
+        assert_eq!(report.ntp_timestamp, 0x0192_A3B4_C5D6_E7F8);
+        assert_eq!(report.rtp_timestamp, 0x0055_AA55);
+
+        // Pinned to openscreen's own static_assert for ToStatusReportId.
+        assert_eq!(status_report_id(report.ntp_timestamp), 0xA3B4_C5D6);
+    }
+
+    #[test]
+    fn a_truncated_or_alien_datagram_yields_no_sender_report() {
+        // Length field runs past the end.
+        assert_eq!(find_sender_report(&[0x80, 200, 0, 6, 0, 0]), None);
+        // Not RTCP at all.
+        assert_eq!(find_sender_report(b"GET / HTTP/1.1"), None);
+        // A compound packet with no sender report in it.
+        let (packet, _) = build(&base(), 1472);
+        assert_eq!(find_sender_report(&packet), None);
     }
 
     #[test]

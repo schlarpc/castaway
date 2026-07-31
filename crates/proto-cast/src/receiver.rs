@@ -299,6 +299,9 @@ impl CastRtpReceiver {
             feedback_count,
             picture_loss: self.picture_loss,
             ntp_timestamp,
+            // The receiver has no clock, so the sender-report echo — a *delay*
+            // measurement — is the actor's to fill in (see `HeardSenderReport`).
+            last_sender_report: None,
         }
     }
 

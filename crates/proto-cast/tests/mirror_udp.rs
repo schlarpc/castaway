@@ -187,6 +187,66 @@ async fn datagrams_for_another_ssrc_are_ignored_rather_than_misparsed() {
     );
 }
 
+/// A sender report heard on the media port must be echoed in the next receiver
+/// report's block — LSR is the middle 32 bits of its NTP timestamp. That echo is the
+/// sender's only round-trip measurement; without it Chrome's in-flight budget stays at
+/// the floor and its bitrate governor walks the encoder down to the minimum.
+#[tokio::test]
+async fn a_sender_report_is_echoed_in_the_receiver_report_block() {
+    let mut harness = start().await;
+
+    // A sender report as openscreen builds it: header, SSRC, NTP, RTP ts, counts.
+    let mut sr = Vec::new();
+    sr.extend_from_slice(&[0x80, 200, 0, 6]);
+    sr.extend_from_slice(&SENDER_SSRC.to_be_bytes());
+    sr.extend_from_slice(&0x0192_A3B4_C5D6_E7F8u64.to_be_bytes());
+    sr.extend_from_slice(&[0u8; 12]);
+    harness
+        .sender
+        .send_to(&sr, harness.receiver_addr)
+        .await
+        .unwrap();
+
+    // A frame, so there is something to acknowledge.
+    harness
+        .sender
+        .send_to(&datagrams()[0], harness.receiver_addr)
+        .await
+        .unwrap();
+    let _ = collect(&mut harness, 1).await;
+
+    // Every feedback packet starts with the receiver report; once the sender report
+    // has been heard, it must carry exactly one block naming it.
+    let mut buf = [0u8; 1500];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (len, _) = tokio::time::timeout_at(deadline, harness.sender.recv_from(&mut buf))
+            .await
+            .expect("no RTCP feedback within 5s")
+            .unwrap();
+        let report = &buf[..len];
+        assert_eq!(report[1], 201, "feedback must start with a receiver report");
+        if report[0] & 0x1f == 0 {
+            continue; // Sent before the SR was processed; keep listening.
+        }
+        assert_eq!(report[0] & 0x1f, 1, "exactly one report block");
+        // Header (4) + our SSRC (4), then the block: sender SSRC, loss word, extended
+        // highest sequence, jitter, LSR, DLSR.
+        assert_eq!(&report[8..12], &SENDER_SSRC.to_be_bytes());
+        assert_eq!(
+            &report[24..28],
+            &0xA3B4_C5D6u32.to_be_bytes(),
+            "LSR must be the middle 32 bits of the sender report's NTP timestamp"
+        );
+        let dlsr = u32::from_be_bytes(report[28..32].try_into().unwrap());
+        assert!(
+            dlsr < 5 * 65_536,
+            "DLSR of {dlsr}/65536 s puts the report before the SR it echoes"
+        );
+        break;
+    }
+}
+
 #[tokio::test]
 async fn the_receive_loop_stops_when_the_pipeline_drops_its_end() {
     let socket = MirrorSocket::bind(LOCALHOST, castaway_core::MediaPorts::Ephemeral)

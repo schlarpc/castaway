@@ -30,12 +30,17 @@ use crate::error::CastError;
 use crate::mirror::{self, MediaKind, MirrorConfig, StreamConfig};
 use crate::receiver::{CastRtpReceiver, Consume};
 use crate::rtcp;
-use crate::rtp::{Dependency, RtpTimestamp};
+use crate::rtp::{Dependency, FrameId, RtpTimestamp};
 
-/// How often feedback goes back to the sender. openscreen's `kRtcpReportInterval`.
+/// How often feedback goes back to the sender when nothing eventful happens.
 ///
-/// This also paces frame delivery: every wakeup re-examines what is deliverable, and
-/// 33 ms of granularity is invisible against a playout delay measured in hundreds.
+/// This is the *fallback* cadence. The checkpoint advancing sends feedback
+/// immediately (see [`MirrorRtp::run`]) — openscreen does the same, then paces NACKs
+/// at 30 ms (`kNackFeedbackInterval`) and keepalives at 500 ms; one flat 33 ms tick
+/// stands in for those two.
+///
+/// The tick also paces frame delivery: every wakeup re-examines what is deliverable,
+/// and 33 ms of granularity is invisible against a playout delay measured in hundreds.
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Receive buffer size. Senders keep packets inside one Ethernet MTU; anything larger
@@ -173,38 +178,66 @@ impl MirrorRtp {
         info!("Cast mirroring RTP receive loop started");
 
         loop {
-            tokio::select! {
+            let checkpoints_before = self.checkpoints();
+            let fed_back = tokio::select! {
                 result = self.socket.recv_from(&mut buf) => match result {
                     Ok((len, from)) => {
                         self.peer = Some(from);
                         // The pure layers take `Bytes` so a frame's payload can be
                         // assembled without recopying every packet.
                         self.dispatch(&Bytes::copy_from_slice(&buf[..len]));
+                        false
                     }
                     Err(e) => {
                         warn!(error = %e, "Cast mirroring socket failed");
                         return;
                     }
                 },
-                _ = ticker.tick() => self.send_feedback().await,
-            }
+                _ = ticker.tick() => {
+                    self.send_feedback().await;
+                    true
+                }
+            };
 
             if !self.deliver(Instant::now()) {
                 info!("Cast mirroring consumer went away; stopping RTP receive");
                 return;
             }
+
+            // Acknowledge the moment the checkpoint moves rather than on the next
+            // tick. The sender budgets in-flight media at clamp(2·RTT, 66 ms,
+            // playout/3); an ACK that sits out a 33 ms timer window pushes it over
+            // that budget often enough that Chrome's bitrate governor reads the
+            // resulting frame drops as congestion and walks the encoder down to its
+            // minimum. Openscreen's receiver likewise sends RTCP from within
+            // `SetCheckpointFrame`.
+            if !fed_back && self.checkpoints() != checkpoints_before {
+                self.send_feedback().await;
+                ticker.reset();
+            }
         }
     }
 
-    /// Hand a datagram to whichever stream owns its SSRC.
+    /// Where each stream's checkpoint currently stands — the "anything new to
+    /// acknowledge?" fingerprint the receive loop compares across an iteration.
+    fn checkpoints(&self) -> (FrameId, Option<FrameId>) {
+        (
+            self.video.receiver.checkpoint(),
+            self.audio.as_ref().map(|s| s.receiver.checkpoint()),
+        )
+    }
+
+    /// Hand a datagram to whichever stream owns it.
     fn dispatch(&mut self, datagram: &Bytes) {
+        if rtcp::is_rtcp(datagram) {
+            self.dispatch_rtcp(datagram);
+            return;
+        }
         let Some(ssrc) = peek_ssrc(datagram) else {
             trace!(len = datagram.len(), "datagram too short to carry an SSRC");
             return;
         };
         let Some(stream) = self.stream_for(ssrc) else {
-            // Cast senders put RTCP sender reports on this same port. We do not consume
-            // them yet, and they carry the *receiver* SSRC, so they land here.
             trace!(ssrc, "datagram for an SSRC this session does not own");
             return;
         };
@@ -212,6 +245,32 @@ impl MirrorRtp {
             Ok(outcome) => trace!(?outcome, "RTP datagram"),
             Err(e) => debug!(error = %e, "malformed RTP datagram dropped"),
         }
+    }
+
+    /// Consume the sender's RTCP, which shares the media port (RFC 5761).
+    ///
+    /// Only the Sender Report matters: its NTP timestamp is remembered so the next
+    /// feedback can echo it (the sender's round-trip measurement — see
+    /// [`rtcp::SenderReportEcho`]). Everything else a sender emits is ignorable.
+    fn dispatch_rtcp(&mut self, datagram: &Bytes) {
+        let Some(report) = rtcp::find_sender_report(datagram) else {
+            trace!(
+                len = datagram.len(),
+                "RTCP without a sender report; ignored"
+            );
+            return;
+        };
+        let Some(stream) = self.stream_for(report.sender_ssrc) else {
+            trace!(
+                ssrc = report.sender_ssrc,
+                "sender report for an SSRC this session does not own"
+            );
+            return;
+        };
+        stream.last_sender_report = Some(HeardSenderReport {
+            report_id: rtcp::status_report_id(report.ntp_timestamp),
+            heard_at: Instant::now(),
+        });
     }
 
     fn stream_for(&mut self, ssrc: u32) -> Option<&mut Stream> {
@@ -239,9 +298,14 @@ impl MirrorRtp {
             return; // nothing has been heard from yet; nowhere to send.
         };
         let ntp = ntp_now();
+        let now = Instant::now();
         let streams = std::iter::once(&mut self.video).chain(self.audio.as_mut());
         for stream in streams {
-            let feedback = stream.receiver.feedback(ntp);
+            let mut feedback = stream.receiver.feedback(ntp);
+            feedback.last_sender_report = stream
+                .last_sender_report
+                .as_ref()
+                .map(|heard| heard.echo(now));
             let (packet, report) = rtcp::build(&feedback, MAX_DATAGRAM);
             if report.nacks_dropped > 0 || report.acks_dropped > 0 {
                 // Truncated feedback still works — the sender resends what it did not
@@ -256,6 +320,31 @@ impl MirrorRtp {
             if let Err(e) = self.socket.send_to(&packet, peer).await {
                 debug!(%peer, error = %e, "could not send RTCP feedback");
             }
+        }
+    }
+}
+
+/// The sender report most recently heard for one stream, held for echoing.
+///
+/// The pure layer's [`rtcp::SenderReportEcho`] wants a *delay*, and only this actor
+/// has a clock — so the arrival instant lives here and the subtraction happens at
+/// feedback time (ground rule 3).
+#[derive(Debug, Clone, Copy)]
+struct HeardSenderReport {
+    report_id: u32,
+    heard_at: Instant,
+}
+
+impl HeardSenderReport {
+    fn echo(&self, now: Instant) -> rtcp::SenderReportEcho {
+        let elapsed = now.duration_since(self.heard_at);
+        // DLSR is counted in 1/65536ths of a second. Saturating: a delay that
+        // overflows 18 hours describes a session nobody is watching anyway.
+        let ticks = elapsed.as_secs().saturating_mul(65_536)
+            + u64::from(elapsed.subsec_nanos()) * 65_536 / 1_000_000_000;
+        rtcp::SenderReportEcho {
+            report_id: self.report_id,
+            delay: u32::try_from(ticks).unwrap_or(u32::MAX),
         }
     }
 }
@@ -275,6 +364,9 @@ struct Stream {
     /// The first timestamp seen, so presentation times start at zero. Senders start
     /// their RTP clock at a random offset.
     epoch: Option<RtpTimestamp>,
+    /// The last sender report heard for this stream, echoed in every feedback so the
+    /// sender can measure the network round trip.
+    last_sender_report: Option<HeardSenderReport>,
 }
 
 impl Stream {
@@ -292,6 +384,7 @@ impl Stream {
             audio_codec,
             stalled_since: None,
             epoch: None,
+            last_sender_report: None,
         };
         (stream, rx)
     }
