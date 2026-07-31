@@ -74,7 +74,8 @@ tokio. This is what makes wire-fixture tests (rule 6) possible.
 The captures rule 9 asks for need hardware and senders this session can't drive. Where a golden
 capture is needed (FairPlay-SAP bytes, a real Cast auth challenge, a Lounge bind
 transcript), the core is built to the documented wire shape and tested with
-hand-constructed fixtures; the need for a *real* capture is logged in OPEN-QUESTIONS.
+hand-constructed fixtures; the need for a *real* capture is logged as an issue (#39,
+#40, #41).
 
 ### D11 — Cast device-auth signer is protobuf-agnostic; proto-cast bridges it
 `crypto-cast-auth` returns a `SignedAuth` (raw signature + cert bytes), not a proto

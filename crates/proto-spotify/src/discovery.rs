@@ -3,7 +3,7 @@
 //! `addUser` with an encrypted credentials blob we decrypt with the shared secret.
 //!
 //! Playback after onboarding (the "dealer" WebSocket + audio pull from the CDN) is
-//! deferred — see OPEN-QUESTIONS. This module gets us discoverable + paired.
+//! deferred — see #47. This module gets us discoverable + paired.
 
 use base64::Engine as _;
 use serde::Deserialize;

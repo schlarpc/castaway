@@ -3,7 +3,7 @@
 //!
 //! This is the genuinely reimplementable part of Spotify Connect. It's tested by
 //! round-trip (our own [`encrypt_blob`] against [`decrypt_blob`]); validating the exact
-//! byte framing against a *real* Spotify sender is an open question (OPEN-QUESTIONS).
+//! byte framing against a *real* Spotify sender is an open question (#48).
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};

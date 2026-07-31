@@ -5,7 +5,7 @@
 //! sender picks them), so the receiver learns how to decrypt from the negotiation.
 //!
 //! This module is the pure negotiator + the per-frame AES-128-CTR crypto. The UDP RTP
-//! receive/reassembly loop is the actor's job and is deferred (OPEN-QUESTIONS): the
+//! receive/reassembly loop is the actor's job and is deferred (#53): the
 //! negotiator hands the actor a [`MirrorConfig`] to drive it.
 
 use std::num::NonZeroU32;

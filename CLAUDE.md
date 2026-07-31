@@ -27,7 +27,10 @@ are **RE sources / wire-behavior specs, not runtime dependencies** — we reimpl
 **Work items live in GitHub issues, not in `docs/`.** `docs/` holds decisions and records —
 why a thing is the way it is, what a protocol actually does, what has been measured. It does
 **not** hold backlogs. A defect, a gap, or a question for the next sync goes straight to
-`gh issue create`; do not start a new tracking document for it. `docs/GAPS.md` and
+`gh issue create` — but *first* check whether an open issue already covers it: several do,
+and a duplicate is worse than a comment on the real one. Do not start a new tracking
+document for it, under any name. Reference issues from code and docs as `#<n>`, or
+"issue `#<n>`" where the prose needs a noun. `docs/GAPS.md` and
 `docs/OPEN-QUESTIONS.md` were exactly that mistake — both were migrated to issues and deleted
 on 2026-08-01, after the tracker and the files had already drifted apart.
 
