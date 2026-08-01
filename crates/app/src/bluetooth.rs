@@ -199,6 +199,10 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
             codecs,
             link_keys,
             on_paired: Some(on_paired),
+            // What we tell a phone we hold, so it can delay its video to match. The
+            // default is the output queue's own depth; there is no measurement to
+            // improve on it with yet (#89).
+            sink_delay: proto_bluetooth_audio::sink::DEFAULT_SINK_DELAY,
         },
     ));
 

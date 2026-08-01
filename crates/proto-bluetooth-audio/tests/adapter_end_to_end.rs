@@ -753,6 +753,86 @@ async fn replies_are_addressed_with_the_peers_channel_id_not_our_own() {
 }
 
 #[tokio::test]
+async fn the_sink_reports_its_delay_on_the_wire() {
+    // #89 through the actor. The pure session decides to send it; this is the half that
+    // was structurally missing — the adapter could only ever push a *reply*, so a sink
+    // that wanted to originate a command had nowhere to put it. Everything below the
+    // assert is a phone configuring a stream and asking, by naming the category, for the
+    // number it needs to keep its video in sync.
+    let (transport, _rx) = connected().await;
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = discover
+        .payload
+        .chunks(2)
+        .filter_map(|c| Seid::from_shifted(c[0]).ok())
+        .nth(2)
+        .expect("an aptX endpoint");
+    let caps = avdtp(
+        &transport,
+        signaling,
+        2,
+        Signal::GetAllCapabilities,
+        &[seid.shifted()],
+    )
+    .await;
+    let advertised = proto_bluetooth_audio::avdtp::find_codec_capability(&caps.payload).unwrap();
+    assert_eq!(advertised.audio_codec(), AudioCodec::AptX);
+    assert!(
+        proto_bluetooth_audio::avdtp::lists_category(
+            &caps.payload,
+            proto_bluetooth_audio::avdtp::category::DELAY_REPORTING
+        ),
+        "the capability is what makes the phone ask for the report"
+    );
+
+    // Narrowed to one rate and one channel mode, as a configuration must be.
+    let codec = CodecCapability::AptX {
+        rates: SampleRates::HZ_48000,
+        channels: ChannelModes::JOINT_STEREO,
+    }
+    .encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    set.push(0x08); // delay reporting: the phone will accept a DELAYREPORT
+    set.push(0x00);
+
+    let before = sent_pdus(&transport).len();
+    let accept = avdtp(&transport, signaling, 3, Signal::SetConfiguration, &set).await;
+    assert_eq!(
+        accept.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "the endpoint advertised this configuration, so it must take it"
+    );
+
+    let report = eventually("a delay report", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .filter_map(|pdu| Message::decode(&pdu.payload).ok())
+            .find(|m| m.signal == Signal::DelayReport)
+    })
+    .await;
+    assert_eq!(
+        report.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::Command,
+        "SNK→SRC: this is us telling the phone, not answering it"
+    );
+    assert_eq!(report.payload[0], seid.shifted());
+    let tenths = u16::from_be_bytes([report.payload[1], report.payload[2]]);
+    assert_ne!(
+        tenths, 0,
+        "zero is what the phone assumed before this existed"
+    );
+    assert_eq!(
+        u64::from(tenths) * 100,
+        u64::try_from(proto_bluetooth_audio::sink::DEFAULT_SINK_DELAY.as_micros()).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn avdtp_replies_also_use_the_peers_channel_id() {
     // Same bug, the path that actually carries audio: an AVDTP reply sent to our own id
     // means the sender never learns what we support and the stream never starts.

@@ -251,6 +251,24 @@ impl Message {
         }
     }
 
+    /// Build a `DELAYREPORT` command: how long this sink holds audio before it is heard.
+    ///
+    /// **SNK→SRC, which is why this is the one command a sink originates.** Everything
+    /// else on this channel is the phone asking and us answering; this is us telling the
+    /// phone a number only we know, so that it can delay its *video* to match. Without
+    /// it the phone assumes zero and video is out of lip-sync by the whole depth of our
+    /// output path, with nothing anywhere reporting a fault (#89).
+    ///
+    /// The payload is the ACP SEID — *our* endpoint, the one the source configured —
+    /// followed by the delay in tenths of a millisecond, big-endian (AVDTP 1.3 §8.19).
+    #[must_use]
+    pub fn delay_report(transaction: u8, seid: Seid, delay: SinkDelay) -> Self {
+        let mut payload = BytesMut::with_capacity(3);
+        payload.put_u8(seid.shifted());
+        payload.put_u16(delay.tenths_of_a_millisecond());
+        Self::command(transaction, Signal::DelayReport, payload.freeze())
+    }
+
     /// Encode as a single-packet message.
     ///
     /// Fragmentation (start/continue/end packets) is deliberately not implemented on the
@@ -299,9 +317,13 @@ impl Message {
 }
 
 /// Service capability categories.
-mod category {
+pub mod category {
+    /// The transport itself. Every endpoint has one.
     pub const MEDIA_TRANSPORT: u8 = 0x01;
+    /// The codec block: what is being sent, and how.
     pub const MEDIA_CODEC: u8 = 0x07;
+    /// AVDTP 1.3's delay reporting. An initiator that names it in `SET_CONFIGURATION` is
+    /// asking for `DELAYREPORT` on this stream.
     pub const DELAY_REPORTING: u8 = 0x08;
 }
 
@@ -364,6 +386,56 @@ impl StreamEndpoint {
         }
         buf.freeze()
     }
+}
+
+/// The latency a sink reports to a source, in the unit AVDTP puts on the wire.
+///
+/// A newtype because the wire unit is *tenths of a millisecond* and the number is
+/// otherwise indistinguishable from milliseconds — an off-by-ten here is a phone
+/// compensating for 30 ms when the sink is holding 300, which looks like the sync error
+/// it was meant to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SinkDelay(u16);
+
+impl SinkDelay {
+    /// The delay this duration represents, saturating at the 6.5 s the field can hold.
+    ///
+    /// Saturating rather than failing: a delay too large to express is still better
+    /// reported as the largest expressible one than not reported at all, and no real
+    /// output path is anywhere near it.
+    #[must_use]
+    pub fn from_duration(delay: std::time::Duration) -> Self {
+        Self(u16::try_from(delay.as_micros() / 100).unwrap_or(u16::MAX))
+    }
+
+    /// The raw field: tenths of a millisecond.
+    #[must_use]
+    pub const fn tenths_of_a_millisecond(self) -> u16 {
+        self.0
+    }
+}
+
+/// Whether a capability list names `category`.
+///
+/// Used on a `SET_CONFIGURATION` payload: an initiator that lists
+/// [`category::DELAY_REPORTING`] there is saying it will accept `DELAYREPORT` on this
+/// stream, which is the protocol's own answer to "may we send one".
+///
+/// A malformed list reads as "not named" rather than as an error: this decides whether to
+/// send an optional report, and the configuration itself is validated elsewhere.
+#[must_use]
+pub fn lists_category(mut buf: &[u8], category: u8) -> bool {
+    while buf.len() >= 2 {
+        let len = usize::from(buf[1]);
+        if buf[0] == category {
+            return true;
+        }
+        if buf.len() < 2 + len {
+            return false;
+        }
+        buf = &buf[2 + len..];
+    }
+    false
 }
 
 /// Pull the Media Codec capability out of a capability list.

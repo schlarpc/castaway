@@ -80,6 +80,23 @@ impl Phone {
 
 /// Configure `codec` on whichever endpoint advertises it, returning the SEID used.
 fn configure(phone: &mut Phone, chosen: &CodecCapability) -> Seid {
+    configure_with(phone, chosen, false).0
+}
+
+/// The same, optionally naming the Delay Reporting category — which is how an AVDTP 1.3
+/// initiator says it will accept a `DELAYREPORT` on this stream.
+fn configure_with_delay_reporting(
+    phone: &mut Phone,
+    chosen: &CodecCapability,
+) -> (Seid, Vec<SinkEvent>) {
+    configure_with(phone, chosen, true)
+}
+
+fn configure_with(
+    phone: &mut Phone,
+    chosen: &CodecCapability,
+    delay_reporting: bool,
+) -> (Seid, Vec<SinkEvent>) {
     let discover = phone.send(Signal::Discover, &[]);
     let seps = Phone::accepted(&discover).payload.clone();
 
@@ -104,9 +121,86 @@ fn configure(phone: &mut Phone, chosen: &CodecCapability) -> Seid {
     set.push(u8::try_from(codec.len()).unwrap());
     set.extend_from_slice(&codec);
 
+    if delay_reporting {
+        set.push(0x08); // delay reporting category
+        set.push(0x00);
+    }
+
     let events = phone.send(Signal::SetConfiguration, &set);
     Phone::accepted(&events);
-    seid
+    (seid, events)
+}
+
+/// The `DELAYREPORT` command in `events`, if the sink sent one.
+fn delay_report(events: &[SinkEvent]) -> Option<&Message> {
+    events.iter().find_map(|e| match e {
+        SinkEvent::Command(m) if m.signal == Signal::DelayReport => Some(m),
+        _ => None,
+    })
+}
+
+#[test]
+fn the_sink_tells_a_source_how_long_it_holds_audio() {
+    // #89: the capability was advertised in GET_ALL_CAPABILITIES and the SDP record
+    // claimed A2DP 1.3, but no DELAYREPORT ever left the box — so every phone assumed a
+    // sink latency of zero and every video watched through this speaker was out of
+    // lip-sync by the whole depth of the output path, silently.
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
+    let (seid, events) = configure_with_delay_reporting(&mut phone, &aptx_config());
+
+    let report = delay_report(&events).expect("a configured stream must be told the delay");
+    assert_eq!(report.message_type, MessageType::Command, "SNK→SRC");
+    // ACP SEID — *ours*, the endpoint the source configured — then the delay in tenths
+    // of a millisecond, big-endian (AVDTP 1.3 §8.19).
+    assert_eq!(report.payload[0], seid.shifted());
+    let tenths = u16::from_be_bytes([report.payload[1], report.payload[2]]);
+    assert_eq!(
+        u32::from(tenths) * 100,
+        u32::try_from(proto_bluetooth_audio::sink::DEFAULT_SINK_DELAY.as_micros()).unwrap(),
+        "the number on the wire must be the delay the sink promises"
+    );
+    assert_ne!(tenths, 0, "zero is exactly what the phone already assumed");
+
+    // It comes after the accept: the source is still inside that transaction until it
+    // sees one.
+    let reply_at = events
+        .iter()
+        .position(|e| matches!(e, SinkEvent::Reply(_)))
+        .unwrap();
+    let report_at = events
+        .iter()
+        .position(|e| matches!(e, SinkEvent::Command(_)))
+        .unwrap();
+    assert!(reply_at < report_at);
+}
+
+#[test]
+fn a_source_that_did_not_negotiate_delay_reporting_is_not_sent_one() {
+    // The initiator names the category in SET_CONFIGURATION when it wants the report.
+    // One that did not is entitled to reject a command it never negotiated.
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
+    let (_, events) = configure_with(&mut phone, &aptx_config(), false);
+    assert!(
+        delay_report(&events).is_none(),
+        "nothing asked for it: {events:?}"
+    );
+}
+
+#[test]
+fn the_reported_delay_is_the_one_the_output_path_was_configured_with() {
+    // It is a promise about the output path, so the number has to be settable by
+    // whoever knows the depth — not baked into the protocol crate.
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
+    phone
+        .session
+        .set_reported_delay(std::time::Duration::from_millis(150));
+    let (_, events) = configure_with_delay_reporting(&mut phone, &aptx_config());
+    let report = delay_report(&events).expect("delay reporting was negotiated");
+    assert_eq!(
+        u16::from_be_bytes([report.payload[1], report.payload[2]]),
+        1500,
+        "150 ms is 1500 tenths of a millisecond, not 150"
+    );
 }
 
 fn aptx_config() -> CodecCapability {

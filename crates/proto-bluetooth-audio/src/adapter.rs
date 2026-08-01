@@ -87,6 +87,13 @@ pub struct BluetoothConfig {
     /// Called with each newly paired peer's key. Without one, pairing works for the
     /// current session and every guest re-pairs after a restart.
     pub on_paired: Option<OnPaired>,
+    /// How long this receiver holds audio before it is heard, reported to every source
+    /// that negotiates delay reporting (#89).
+    ///
+    /// A promise about the output path rather than a preference: a phone delays its
+    /// *video* by this much to keep lip-sync, so a number larger than the truth is as
+    /// wrong as one smaller. See [`crate::sink::DEFAULT_SINK_DELAY`].
+    pub sink_delay: std::time::Duration,
 }
 
 impl std::fmt::Debug for BluetoothConfig {
@@ -97,6 +104,7 @@ impl std::fmt::Debug for BluetoothConfig {
             .field("codecs", &self.codecs)
             .field("link_keys", &self.link_keys.len())
             .field("persists_keys", &self.on_paired.is_some())
+            .field("sink_delay", &self.sink_delay)
             .finish()
     }
 }
@@ -123,6 +131,7 @@ impl Default for BluetoothConfig {
             codecs: None,
             link_keys: Vec::new(),
             on_paired: None,
+            sink_delay: crate::sink::DEFAULT_SINK_DELAY,
         }
     }
 }
@@ -258,7 +267,11 @@ impl CoverArt {
 }
 
 impl Link {
-    fn new(peer: BdAddr, capabilities: Vec<crate::codec::CodecCapability>) -> Self {
+    fn new(
+        peer: BdAddr,
+        capabilities: Vec<crate::codec::CodecCapability>,
+        sink_delay: std::time::Duration,
+    ) -> Self {
         // The receive MTU we advertise, and the lever that actually decides SBC quality
         // per unit of airtime. A controller's ACL buffer is 1021 bytes and an L2CAP header
         // is 4, so 1017 is the largest SDU that still lands in one ACL packet.
@@ -278,7 +291,11 @@ impl Link {
             peer,
             reassembler: Reassembler::new(),
             mux,
-            sink: SinkSession::new(capabilities),
+            sink: {
+                let mut sink = SinkSession::new(capabilities);
+                sink.set_reported_delay(sink_delay);
+                sink
+            },
             avdtp_signaling: None,
             avdtp_media: None,
             avctp: None,
@@ -492,7 +509,11 @@ impl SourceAdapter for BluetoothAdapter {
                                 acl.link_up(*handle).await;
                                 links.insert(
                                     handle.raw(),
-                                    Link::new(*peer, self.capabilities.clone()),
+                                    Link::new(
+                                        *peer,
+                                        self.capabilities.clone(),
+                                        self.config.sink_delay,
+                                    ),
                                 );
                             }
                             HostAction::PeerName { peer, name } => {
@@ -924,6 +945,15 @@ impl BluetoothAdapter {
         for event in link.sink.handle(&msg) {
             match event {
                 SinkEvent::Reply(reply) => out.replies.push((cid, reply.encode())),
+                SinkEvent::Command(command) => {
+                    // The one command a sink originates. It goes out on the same channel
+                    // and by the same path as a reply; what is different is that the
+                    // phone now owes *us* a response, which we do not wait for — a
+                    // source that rejects it simply keeps assuming zero latency, which
+                    // is where it started (#89).
+                    debug!(signal = command.signal.name(), "avdtp: sending a command");
+                    out.replies.push((cid, command.encode()));
+                }
                 SinkEvent::Configured {
                     codec,
                     format,

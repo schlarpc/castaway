@@ -9,9 +9,26 @@ use bytes::{BufMut, Bytes, BytesMut};
 use castaway_core::{AudioCodec, AudioFormat};
 
 use crate::avdtp::StreamEndpoint;
-use crate::avdtp::{error_code, find_codec_capability, Message, MessageType, Seid, Signal};
+use crate::avdtp::{
+    category, error_code, find_codec_capability, lists_category, Message, MessageType, Seid,
+    Signal, SinkDelay,
+};
 use crate::codec::CodecCapability;
 use crate::error::AudioError;
+
+/// What a sink reports as its own latency when nobody has measured one.
+///
+/// The output queue is 96 blocks of ~128 frames at 44.1 kHz (`QUEUE_BLOCKS`,
+/// `pipeline::audio_out`) — 279 ms — plus decode and whatever the device holds below
+/// that. 300 ms is that figure rounded up, and it is a *promise*: the number and the
+/// buffer depth have to move together, exactly as AirPlay's `Audio-Latency` and its
+/// buffer do. Override it with [`SinkSession::set_reported_delay`] once there is a
+/// measurement to override it with.
+///
+/// Note what is *not* in it. The 250 ms `LEAD` the pull-based sources pace against is not
+/// on this path: A2DP arrives already-encoded and the phone is the clock, so nothing
+/// paces it (#89).
+pub const DEFAULT_SINK_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Where one stream endpoint is in its lifecycle.
 ///
@@ -56,6 +73,13 @@ impl StreamState {
 pub enum SinkEvent {
     /// Write this message back on the signaling channel.
     Reply(Message),
+    /// Send this command on the signaling channel — a transaction *we* are opening.
+    ///
+    /// Distinct from [`SinkEvent::Reply`] even though the caller writes both the same
+    /// way, because the direction is the whole point: a reply closes a transaction the
+    /// phone opened, and a command opens one it must answer. `DELAYREPORT` is the only
+    /// one a sink originates, and there was no way to express it at all (#89).
+    Command(Message),
     /// A configuration was accepted; the caller should prepare a decoder.
     Configured {
         /// The negotiated codec.
@@ -85,6 +109,19 @@ pub struct SinkSession {
     active: Option<Seid>,
     configuration: Option<CodecCapability>,
     delay_reporting: bool,
+    /// How long this sink holds audio before it is heard, as reported to the source.
+    reported_delay: SinkDelay,
+    /// Whether the source asked for delay reporting on the configured stream.
+    ///
+    /// Set from the `SET_CONFIGURATION` payload: an initiator that lists the Delay
+    /// Reporting category there is saying it will accept `DELAYREPORT`. A source that did
+    /// not ask is not told, because a command it never negotiated is one it may reject.
+    delay_reporting_configured: bool,
+    /// The transaction label for the next command *we* send.
+    ///
+    /// Ours alone: AVDTP labels are chosen by whoever opens the transaction, and every
+    /// other message this session emits is a response carrying the phone's label back.
+    next_transaction: u8,
 }
 
 impl SinkSession {
@@ -115,7 +152,19 @@ impl SinkSession {
             active: None,
             configuration: None,
             delay_reporting: true,
+            reported_delay: SinkDelay::from_duration(DEFAULT_SINK_DELAY),
+            delay_reporting_configured: false,
+            next_transaction: 0,
         }
+    }
+
+    /// Set the latency this sink reports to a source (#89).
+    ///
+    /// A promise about the output path, so it and that path have to agree — the same
+    /// contract as AirPlay's `Audio-Latency`. See [`DEFAULT_SINK_DELAY`] for where the
+    /// default comes from.
+    pub fn set_reported_delay(&mut self, delay: std::time::Duration) {
+        self.reported_delay = SinkDelay::from_duration(delay);
     }
 
     /// The endpoints this session advertises.
@@ -244,14 +293,47 @@ impl SinkSession {
         self.state = StreamState::Configured;
         self.active = Some(seid);
         self.configuration = Some(capability.clone());
-        vec![
+        // The initiator names the Delay Reporting category here when it wants
+        // `DELAYREPORT` on this stream. That is the protocol's own answer to "may we send
+        // one", and it is why this is read from the payload rather than assumed from our
+        // having advertised the capability.
+        self.delay_reporting_configured =
+            self.delay_reporting && lists_category(&msg.payload[2..], category::DELAY_REPORTING);
+        let mut events = vec![
             SinkEvent::Reply(Message::accept(msg, Bytes::new())),
             SinkEvent::Configured {
                 codec: capability.audio_codec(),
                 format,
                 configuration: Box::new(capability),
             },
-        ]
+        ];
+        events.extend(self.delay_report());
+        events
+    }
+
+    /// Tell the source how long we hold audio, if this stream negotiated it.
+    ///
+    /// **The advertisement without this was a promise we never kept.** The capability is
+    /// in GET_ALL_CAPABILITIES and the SDP record claims A2DP 1.3, but no `DELAYREPORT`
+    /// ever left the box, so every phone assumed a sink latency of zero and every video
+    /// watched through this speaker was out of lip-sync by the whole depth of the output
+    /// path — silently, since the pairing works and the stream plays (#89).
+    ///
+    /// Sent after the `SET_CONFIGURATION` response, which is where the ordering matters:
+    /// the source is still in the middle of that transaction until it sees the accept.
+    fn delay_report(&mut self) -> Option<SinkEvent> {
+        let seid = self.active?;
+        if !self.delay_reporting_configured {
+            return None;
+        }
+        let transaction = self.next_transaction;
+        // Four bits on the wire, so it wraps at 16 rather than at 256.
+        self.next_transaction = (self.next_transaction + 1) % 16;
+        Some(SinkEvent::Command(Message::delay_report(
+            transaction,
+            seid,
+            self.reported_delay,
+        )))
     }
 
     /// RECONFIGURE: the sender is changing the codec block mid-session.
