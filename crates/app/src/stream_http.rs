@@ -38,12 +38,31 @@ pub type Stream = std::convert::Infallible;
 /// documentation both quote it.
 pub const PLAYLIST_PATH: &str = "/stream/live.m3u8";
 
+/// Where the segments live.
+///
+/// The `.m4s` is not decoration and the whole filename is one path parameter for a
+/// reason. ffmpeg's HLS demuxer keeps an `allowed_segment_extensions` whitelist and
+/// refuses a segment URI whose extension is not on it — a playlist pointing at `seg/3`
+/// fails to open with "not in allowed_segment_extensions", which takes ffplay, VLC and
+/// anything else built on libavformat out. So the sequence number arrives here with its
+/// suffix attached and [`segment_sequence`] takes it off.
+pub const SEGMENT_ROUTE: &str = "/stream/seg/{name}";
+
+/// The sequence number in a segment filename, or `None` if that is not one.
+///
+/// A stranger on the LAN types whatever they like into this, so it is a lookup that
+/// misses rather than a parse that fails.
+#[must_use]
+pub fn segment_sequence(name: &str) -> Option<u32> {
+    name.strip_suffix(".m4s")?.parse().ok()
+}
+
 /// Mount `/stream/*`.
 pub fn routes(stream: Option<Stream>) -> Router {
     Router::new()
         .route(PLAYLIST_PATH, get(playlist_route))
         .route("/stream/init.mp4", get(init_route))
-        .route("/stream/seg/{sequence}", get(segment_route))
+        .route(SEGMENT_ROUTE, get(segment_route))
         .route("/stream/status.json", get(status_route))
         .with_state(stream)
 }
@@ -79,7 +98,7 @@ mod live {
 
     /// How a playlist URI spells a segment, relative to the playlist itself.
     fn segment_uri(sequence: u32) -> String {
-        format!("seg/{sequence}")
+        format!("seg/{sequence}.m4s")
     }
 
     /// `GET /stream/live.m3u8` — the media playlist, and the request that starts the
@@ -126,22 +145,24 @@ mod live {
         )
     }
 
-    /// `GET /stream/seg/{n}` — one media segment, while it is still in the window.
+    /// `GET /stream/seg/{n}.m4s` — one media segment, while it is still in the window.
     pub async fn segment_route(
         State(handle): State<Option<Stream>>,
-        Path(sequence): Path<u32>,
+        Path(name): Path<String>,
     ) -> Response {
         let Some(handle) = handle else {
             return super::no_encoder();
         };
         touch(handle.stream());
-        handle.stream().segment(sequence).map_or_else(
-            // A player that asks for one this old has fallen out of the window, which is a
-            // 404 rather than an error: reloading the playlist is the cure and every
-            // player already does it.
-            || (StatusCode::NOT_FOUND, "that segment has expired\n").into_response(),
-            |bytes| uncacheable("video/iso.segment", bytes.to_vec()),
-        )
+        super::segment_sequence(&name)
+            .and_then(|sequence| handle.stream().segment(sequence))
+            .map_or_else(
+                // A player that asks for one this old has fallen out of the window, which is a
+                // 404 rather than an error: reloading the playlist is the cure and every
+                // player already does it.
+                || (StatusCode::NOT_FOUND, "that segment has expired\n").into_response(),
+                |bytes| uncacheable("video/iso.segment", bytes.to_vec()),
+            )
     }
 
     /// `GET /stream/status.json` — what the stream is doing, and the codec string the
@@ -203,7 +224,7 @@ mod dead {
     pub async fn init_route(State(_): State<Option<Stream>>) -> Response {
         super::no_encoder()
     }
-    pub async fn segment_route(State(_): State<Option<Stream>>, Path(_): Path<u32>) -> Response {
+    pub async fn segment_route(State(_): State<Option<Stream>>, Path(_): Path<String>) -> Response {
         super::no_encoder()
     }
     pub async fn status_route(State(_): State<Option<Stream>>) -> Response {
@@ -377,7 +398,7 @@ mod tests {
         for path in [
             PLAYLIST_PATH,
             "/stream/init.mp4",
-            "/stream/seg/1",
+            "/stream/seg/1.m4s",
             "/stream/status.json",
         ] {
             let (status, text) = get_path(path).await;
@@ -386,11 +407,30 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_segment_number_that_is_not_a_number_is_not_a_panic() {
+    #[test]
+    fn a_segment_name_that_is_not_a_segment_is_a_miss_not_a_panic() {
         // The path parameter is whatever a stranger on the LAN typed.
-        let (status, _) = get_path("/stream/seg/nonsense").await;
-        assert!(status.is_client_error(), "{status}");
+        assert_eq!(segment_sequence("12.m4s"), Some(12));
+        for name in [
+            "nonsense",
+            "12",
+            "12.mp4",
+            "",
+            "-1.m4s",
+            "99999999999999.m4s",
+        ] {
+            assert_eq!(segment_sequence(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_segments_are_named_with_an_extension_libavformat_will_accept() {
+        // ffmpeg's HLS demuxer refuses a segment URI whose extension is not on its
+        // `allowed_segment_extensions` list, so a playlist pointing at `seg/3` opens
+        // nowhere — no ffplay, no VLC, nothing built on libavformat. Found by pointing
+        // ffmpeg at a live panel.
+        assert!(SEGMENT_ROUTE.ends_with(".m4s") || segment_sequence("1.m4s").is_some());
+        assert!(PLAYER.contains(".m4s") || PLAYER.contains("'/stream/' + uri"));
     }
 
     #[test]

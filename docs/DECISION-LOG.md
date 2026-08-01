@@ -1506,3 +1506,128 @@ the icon, the name and the UUIDs correct the entire time. The bug was two layers
 Not done: the bluedevil bug is unreported upstream. Both halves are one-line fixes there
 (`OtherAudio` → `AudioVideo`, and checking `AudioSink` in the fallback), and reporting it is
 strictly better than our workaround for everyone who is not us.
+
+### D49 — The output duplicate is ours from the encoder outwards, and it costs nothing when nobody is watching
+
+#101 asked for two things with one root: a screenshot endpoint and a live duplicate of the
+panel's output. Phase 1 landed the `OutputTap` seam and the screenshot. This is phase 2 —
+the encoder tap — and the calls worth recording are these.
+
+**wgpu cannot encode, so the encoder is libavcodec's.** wgpu is a WebGPU implementation:
+graphics and compute, no video encode surface, and none in the spec — browsers put encode in
+WebCodecs, which is a different API. There is no "encoded readback" to ask for. libavcodec
+is already linked for decode, so the encoder is a thin `ffmpeg-sys-next` wrapper over
+whichever H.264 encoder the box turns out to have, probed at runtime in preference order.
+Runtime rather than compile-time because one binary has to meet Mesa on the dev box,
+whatever the Windows panel has, and CI with neither; and because the LGPL ffmpeg the Windows
+artifact ships has no libx264 in it, so "which encoders exist" is genuinely not knowable
+until the process is running against a driver.
+
+**The colour conversion is a render pass, not swscale.** Encoders want NV12, the compositor
+renders RGBA, and converting on the CPU would have cost more than the encode. It is the
+inverse of the YUV→RGB the compositor already runs for hardware-decoded video, in the same
+crate, for the same reason `crate::color` derives its matrix rather than pasting one: a
+stream that is quietly BT.601 looks merely cheap and nobody files a bug for it. Two
+consequences fell out of doing it on the GPU and both are load-bearing. The readback is 1.5
+bytes a pixel instead of 4. And the planes render at whatever size the stream wants, so a 4K
+panel streaming at 1080p reads back 3 MB a frame rather than 12 — the downscale is free
+because the sampler was going to filter anyway.
+
+The subtlety that cost the most thought: the scene is sampled through a **non-sRGB view** of
+an sRGB texture. BT.709's matrix is defined on gamma-encoded R'G'B', and handing it linear
+light produces a washed-out picture of exactly the kind that survives review. Black and
+white are identical under both readings, which is why the test colour is a mid-grey.
+
+**A capture frame composes into a scene texture and is blitted.** A swapchain image cannot
+be sampled on any backend we ship, and the conversion has to sample the composite. The extra
+pass is on capture frames only; with no taps attached the path is byte-identical to what it
+was. This is the same discipline as `wants_frame` being asked before the readback — a tap
+that declines costs nothing, and no taps cost nothing at all.
+
+**Ground rule 4 inverts for a stream.** The glass drops late frames; a stream cannot, because
+a dropped frame there is not a dropped frame but a hole in the timeline — either the
+presentation clock runs slow by that much or the player stalls. So the cadence duplicates
+into slots the panel did not present into, and an encoder codes a repeated picture as almost
+nothing, which makes that the cheap answer as well as the correct one. A gap longer than two
+seconds rebases the grid instead of replaying it: the timeline stays contiguous, and only its
+agreement with the wall clock is given up.
+
+**The muxing is ours (ground rule 9), and this is not dogma.** ffmpeg has an HLS muxer; it
+writes files to a directory, which is the wrong shape for something served out of memory by
+our own HTTP host. A pure fMP4 boxer is a few hundred lines, has no I/O in it, and its output
+is something a test can assert on byte by byte — which is what caught a `traf` whose size was
+never backfilled, and would not have been visible through a muxer we did not own.
+
+**The peer is not a device speaking a spec that holds still — but the *format* is.** Neither
+carve-out (D30's cloud services, D37's volume-and-shape) applies. HLS and fMP4 are frozen
+documents and the players are the ones already on people's machines.
+
+**Nothing runs until somebody asks, and this one really does matter.** A tap holds the render
+loop at display rate (`RenderLoop::demand`), so an output stream left permanently attached
+would keep an unattended panel converting and reading back forever. Fetching the playlist is
+what starts the encoder; the tap retires ten seconds after the last request. And if the
+encoder falls behind, the tap stops *asking* for frames rather than queueing them — which
+skips the expensive part entirely and turns the missed slots into duplicates. A queue would
+have inverted that: buffered frames are latency, and dropping from the back of one is the
+hole in the timeline the cadence exists to avoid.
+
+#### Measured on the dev box, 2026-08-01
+
+A 3840x2160 panel at 138 Hz, Radeon RX 7900, streaming 1920x1080 at 30 fps. `h264_vaapi`
+opened, so the encode is on the GPU.
+
+* **Nobody watching: 0 jiffies of CPU over ten seconds.** Not "low" — zero. The demand-driven
+  loop (#59) is asleep, no tap is attached, and no readback happens.
+* **Streaming: 54 jiffies over ten seconds**, i.e. about 5.4% of one core, for the whole
+  chain — conversion, readback, encode, boxing, and serving it over HTTP.
+* Decoded back with libavformat and compared against `/screenshot.png` at the same points:
+  every tile accent within 2/255. Verified in a browser both ways — this Chromium
+  (148.0.7778.215) turns out to answer `maybe` to `application/vnd.apple.mpegurl` and plays
+  the playlist natively, so the MSE shim had to be forced by stubbing `canPlayType`, which is
+  the branch Firefox takes.
+
+One interoperability finding, from pointing ffmpeg at a live panel: libavformat's HLS demuxer
+keeps an `allowed_segment_extensions` whitelist and refuses a segment URI whose extension is
+not on it. The segments were `seg/3`, and `ffmpeg -i .../live.m3u8` failed to open with
+"not in allowed_segment_extensions" — which is ffplay, VLC and everything else built on
+libavformat. They are `seg/3.m4s` now.
+
+#### The finding that justifies the round-trip test
+
+The first working end-to-end run produced segments that were structurally perfect and decoded
+to flat grey. libavformat parsed every box, reported 320x176 High/bt709/tv, and handed back
+frames — grey ones.
+
+`h264_vaapi` on Mesa publishes an `extradata` PPS that **disagrees with the PPS it emits
+in-band**: `68 ee 38 b0` against `68 ee 38 30`, one bit of `transform_8x8_mode_flag` apart.
+fMP4 wants the parameter sets in `avcC` and not in every access unit, so we wrote the former
+and stripped the latter — and every slice was then CABAC-decoded against a PPS it had not
+been coded with. The decoder desynchronises at macroblock 0 of the first frame and abandons
+the picture.
+
+Decided: the bitstream wins over `extradata`. `AvcConfig::absorb` takes the parameter sets an
+access unit carries in-band, and the init segment is written from the *first frame's* rather
+than at encoder-open time — which is also why the stream reports `Starting` until a frame has
+come out of it. `H264Encoder::describe` latches that answer, so a set that changes afterwards
+— which an `avc1` track has nowhere to put — is a warning rather than a silent degradation.
+
+What this cost, and what it bought: the unit tests all passed throughout. Every stage was
+self-consistent and the composition of them was wrong. `tests/output_stream.rs` now composites
+a known colour, runs the whole chain, and hands the result back to libavformat — every box we
+wrote parsed by something that did not write it, and the picture compared with the one that
+went in. That is the shape any future encoder-tap change should be checked in.
+
+#### Not done
+
+The upload to the hardware encoder is `av_hwframe_transfer_data` from the readback, not a
+zero-copy handle export. The zero-copy version is `crate::hwaccel`'s import path run backwards
+— pull the native handle out of the wgpu texture, export it, import it into the encoder's
+device — and it is a *third* interop path per vendor, not a reuse of the first: NVENC wants a
+CUDA or D3D11 frames context, so on NVIDIA/Linux it is `VK_EXT_external_memory_fd` →
+`cuImportExternalMemory` rather than the VA-API → dma-buf route. It stays open on #101. What
+the current shape costs is one readback per stream frame, which is 3 MB at 1080p and is the
+same copy `/screenshot.png` has always done.
+
+There is no audio in the duplicate. The panel's audio is mixed by us (D36) and could be
+tapped the same way, but a video-only mirror answers the want in the issue — see what the
+panel is showing — and an audio track is a second clock to keep in step with the first.
