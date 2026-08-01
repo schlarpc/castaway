@@ -408,14 +408,47 @@ Grouped by subsystem. Each: the question, why it's blocked, and my current defau
     hour of "why does VA-API refuse this"; test fixtures must use a normal CRF or the
     fixture itself forces the software fallback the test exists to rule out.
 
+  **The Windows bridge ran, 2026-07-31.** The Dell became reachable and the artifact
+  reached it (docs/cross-build.md, "Deploying to the box"). The compositor opened with
+  `backend=d3d11va` and a 3840×2160 kiosk window, so the device, the NV12 feature and the
+  D3D12 import path are real rather than merely linking. Two of the unknowns below
+  resolved, in opposite directions:
+
+  - **The `Arc`-count reuse gate is *not* conservative enough — but it was not the first
+    problem.** Ahead of it sat a plain logic bug: `Dx12Importer` cached opened resources in
+    a `HashMap` keyed on the shared handle's *value*, while `D3d11Exporter::export` mints a
+    fresh NT handle per frame and closes it on release. Windows recycles handle-table slots,
+    so "hits" returned the resource for an unrelated pool slot. That is what mirroring
+    juddering with stale frames was, and — via a rebuilt ring after a resolution change
+    minting values that collide with just-freed ones — what "the letterbox is right and the
+    picture inside it is stretched" was. One cache, both symptoms; the cache is gone.
+    The aspect math was never implicated and remains correct and unit-tested.
+  - **The producer-side `D3D11_QUERY_EVENT` wait is still unjudged** — nothing observed
+    implicates it, but nothing exercised it under load either.
+
+  What the run also showed, and what the *next* piece of work is: the consumer→producer
+  direction has no synchronisation at all, and the asymmetry with Linux is now precisely
+  located. `vulkan_import` hands the surface `Arc` to wgpu as a drop guard, so it is
+  released when the last submission sampling it retires; wgpu's DX12 `texture_from_raw`
+  accepts no guard, so on Windows the only thing reserving a pool slot is the compositor's
+  layer, dropped synchronously when the render thread swaps in the next frame. The decode
+  thread's `Arc::strong_count == 1` gate therefore frees a slot that D3D12 may still be
+  reading. A keyed mutex (`D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, absent from
+  `create_shared_nv12`) or a shared fence is the real answer, for this and for the browser
+  path, which now has the same shape.
+
+  Two smaller findings from the same session, neither yet acted on:
+  - `CopySubresourceRegion` passes a null `pSrcBox`, so the whole source subresource is
+    copied. libavcodec allocates the decoder texture at *coded* height (1088 for 1080p)
+    into a destination created at display height — an out-of-bounds copy whose documented
+    behaviour is undefined, and which drivers either clip (benign) or drop (a destination
+    that never updates, i.e. more stale frames).
+  - The size guard in `wgpu_compositor` compares `texture.width()` against the frame's
+    width, but the importer fabricated that extent *from* the frame's width. The comparison
+    is tautological and cannot detect a resource whose real dimensions differ — which is
+    exactly the class of bug above. It should read `GetDesc()`.
+
   Still open:
-  - **The Windows bridge needs the Dell.** `nix build .#castaway-windows-hwaccel` keeps it
-    compiling and its DLL closure checked, which is all Linux can do. Unverified in
-    particular: whether the `D3D11_QUERY_EVENT` producer-side wait is sufficient
-    synchronisation in practice (it should be — it blocks until the copy has retired
-    before the handle is published — but a shared `ID3D11Fence` would be cheaper, and
-    needs D3D11.4 interfaces `winapi` 0.3 does not declare), and whether the pool's
-    `Arc`-count reuse gate is conservative enough under real frame latency.
   - **10-bit.** P010 is refused by `DmaBufSurface` rather than reinterpreted, so an HDR or
     10-bit sender falls back to software cleanly. Adding it is a second Vulkan format and
     a second shader variant, not a redesign.
