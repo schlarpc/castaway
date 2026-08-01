@@ -20,7 +20,11 @@
 //! calls that could get out of step is exactly the bug this would otherwise introduce: an
 //! inhibit leaked once is a panel that never sleeps again.
 
-use tracing::{debug, warn};
+use tracing::debug;
+// Only the Windows backend has a failure to report; every other platform's "no backend
+// here" is a debug line, not a warning.
+#[cfg(windows)]
+use tracing::warn;
 
 /// A held request that the display stay on. Dropping it releases the request.
 ///
