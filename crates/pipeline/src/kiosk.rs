@@ -16,7 +16,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use input_touch::{ContactId, InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase};
+use input_touch::{
+    ContactId, Input, InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase,
+};
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -422,12 +424,59 @@ impl KioskApp {
         true
     }
 
-    fn route_input(&mut self, event: &WindowEvent) {
+    /// Turn a winit window event into a normalized [`Input`], or nothing if it is not
+    /// input at all.
+    ///
+    /// The *only* part of the input path that knows what winit is. Everything past here
+    /// takes [`Input`], which is what lets a remote peer drive the same routing over a
+    /// socket (#18) and lets the routing be tested without opening a window.
+    ///
+    /// The one piece of state it keeps is the cursor position, because winit reports a
+    /// button press without one and the router should not have to know that.
+    fn decode_window_event(&mut self, event: &WindowEvent) -> Option<Input> {
         let size = self.size;
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 let (x, y) = normalize(position.x, position.y, size);
+                Some(Input::Pointer(PointerEvent::Move { x, y }))
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = pointer_button(*button)?;
+                let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
+                Some(Input::Pointer(PointerEvent::Button {
+                    x,
+                    y,
+                    button,
+                    down: state.is_pressed(),
+                }))
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = wheel_pixels(*delta);
+                let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
+                Some(Input::Pointer(PointerEvent::Wheel { x, y, dx, dy }))
+            }
+            WindowEvent::Touch(touch) => Some(Input::Touch(translate_touch(touch, size))),
+            _ => None,
+        }
+    }
+
+    /// Route one decoded input through the panel's layers and on to whatever is
+    /// underneath.
+    ///
+    /// Sans-window and sans-socket: the same function serves the glass and every remote
+    /// peer, which is the whole point of the split (ground rule 3).
+    fn apply(&mut self, input: Input) {
+        match input {
+            Input::Touch(event) => {
+                if self.route_contact(event) {
+                    return;
+                }
+                if let Some(sink) = self.input_sink() {
+                    sink.touch(event);
+                }
+            }
+            Input::Pointer(PointerEvent::Move { x, y }) => {
                 // A held primary button is a contact mid-drag: it takes the same road a
                 // finger does, or the gesture half of the panel only exists for touch.
                 if self.pointer_contact
@@ -444,17 +493,16 @@ impl KioskApp {
                     sink.pointer(PointerEvent::Move { x, y });
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                let Some(button) = pointer_button(*button) else {
-                    return;
-                };
-                let down = state.is_pressed();
-                let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
+            Input::Pointer(PointerEvent::Button { x, y, button, down }) => {
                 // The primary button is a finger. It used to get a hand-rolled subset of
                 // the touch routing — transport, restore, shell, but never the navigation
                 // layer — so on any box whose screen reports as a *pointer* (a dev
                 // mouse, and some HID touch stacks under Wayland) the edge swipe and the
                 // home pill simply did not exist, while Esc worked. One path now.
+                //
+                // This is the panel's own mouse, and both `ContactId::POINTER` and
+                // `pointer_contact` are singular because there is one of it. A remote
+                // peer's clicks arrive as `Input::Touch` under their own origin instead.
                 if button == PointerButton::Left {
                     let phase = if down {
                         TouchPhase::Down
@@ -470,23 +518,11 @@ impl KioskApp {
                     sink.pointer(PointerEvent::Button { x, y, button, down });
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = wheel_pixels(*delta);
-                let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
+            Input::Pointer(wheel @ PointerEvent::Wheel { .. }) => {
                 if let Some(sink) = self.input_sink() {
-                    sink.pointer(PointerEvent::Wheel { x, y, dx, dy });
+                    sink.pointer(wheel);
                 }
             }
-            WindowEvent::Touch(touch) => {
-                let event = translate_touch(touch, size);
-                if self.route_contact(event) {
-                    return;
-                }
-                if let Some(sink) = self.input_sink() {
-                    sink.touch(event);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -729,7 +765,9 @@ impl ApplicationHandler for KioskApp {
         if !matches!(event, WindowEvent::RedrawRequested) {
             self.dirty = true;
         }
-        self.route_input(&event);
+        if let Some(input) = self.decode_window_event(&event) {
+            self.apply(input);
+        }
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 // Escape backs out one level, and is handled *here*, never delegated to
@@ -956,6 +994,161 @@ fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use input_touch::RemoteId;
+
+    /// A router with no window and no compositor behind it.
+    ///
+    /// This is what the decode/apply split buys: the layers that decide *where* a
+    /// contact goes — the reserved edge, the pill, the per-contact bookkeeping — are
+    /// reachable without opening a window or standing up a GPU, so the cases that used
+    /// to need a person and a panel are ordinary unit tests. Everything that needs the
+    /// compositor (the transport strip, shell hits, scrolling) simply declines with
+    /// `render: None`, which is the same road a press takes on a panel showing nothing.
+    fn router() -> KioskApp {
+        KioskApp {
+            rx: None,
+            attract: None,
+            osd: None,
+            window: None,
+            render: None,
+            controls: None,
+            shell_sink: None,
+            contacts: std::collections::HashMap::new(),
+            drag_last: std::collections::HashMap::new(),
+            last_frame: None,
+            started_drag: false,
+            pointer_contact: false,
+            drag_sample: None,
+            pill_since: None,
+            pill_drawn: false,
+            dirty: false,
+            next_frame_at: None,
+            frame_interval: FALLBACK_FRAME_INTERVAL,
+            exit: None,
+            cursor: (0.0, 0.0),
+            size: (3840, 2160),
+            #[cfg(feature = "electron")]
+            browser: None,
+        }
+    }
+
+    fn down(id: ContactId, x: f32, y: f32) -> Input {
+        Input::Touch(TouchEvent::new(id, TouchPhase::Down, x, y))
+    }
+
+    fn up(id: ContactId, x: f32, y: f32) -> Input {
+        Input::Touch(TouchEvent::new(id, TouchPhase::Up, x, y))
+    }
+
+    #[test]
+    fn two_peers_numbering_their_fingers_the_same_are_two_contacts() {
+        // The failure `ContactId` exists to prevent, at the layer that would have
+        // suffered it: the router's own contact map. Before the origin was part of the
+        // identity these three presses were one entry, and the first release ended all
+        // of them.
+        let mut app = router();
+        let (alice, bob) = (RemoteId::new(1), RemoteId::new(2));
+        app.apply(down(ContactId::remote(alice, 0), 0.3, 0.3));
+        app.apply(down(ContactId::remote(bob, 0), 0.5, 0.5));
+        app.apply(down(ContactId::panel(0), 0.7, 0.7));
+        assert_eq!(app.contacts.len(), 3);
+
+        app.apply(up(ContactId::remote(alice, 0), 0.3, 0.3));
+        assert_eq!(app.contacts.len(), 2);
+        assert!(app.contacts.contains_key(&ContactId::remote(bob, 0)));
+        assert!(app.contacts.contains_key(&ContactId::panel(0)));
+    }
+
+    #[test]
+    fn a_remote_contact_reaches_the_reserved_edge_like_a_finger() {
+        // "As if they were actual touches on the screen" is the whole ask, and the edge
+        // strip is the sharpest test of it: a contact starting there is swallowed by the
+        // navigation layer rather than passed to whatever is underneath.
+        let mut app = router();
+        let remote = ContactId::remote(RemoteId::new(1), 0);
+        app.apply(down(remote, 0.001, 0.5));
+        let contact = app.contacts.get(&remote).expect("tracked");
+        assert!(
+            contact.from_edge,
+            "a remote press on the reserved edge is the panel's, exactly as a finger's is"
+        );
+    }
+
+    #[test]
+    fn a_remote_contact_does_not_touch_the_panel_mouse_state() {
+        // `pointer_contact` and `ContactId::POINTER` are singular because the panel has
+        // one mouse. A remote's press must not claim them, or two drivers would fight
+        // over one flag and a remote release would end the local drag.
+        let mut app = router();
+        app.apply(down(ContactId::remote(RemoteId::new(1), 0), 0.5, 0.5));
+        assert!(!app.pointer_contact);
+        assert!(!app.contacts.contains_key(&ContactId::POINTER));
+    }
+
+    #[test]
+    fn the_local_mouse_still_becomes_a_contact() {
+        // The behaviour the split had to preserve: a press is a finger, so the gesture
+        // layer sees it. Regressing this would silently remove the edge swipe and the
+        // home pill on every box whose screen reports as a pointer.
+        let mut app = router();
+        app.apply(Input::Pointer(PointerEvent::Button {
+            x: 0.5,
+            y: 0.5,
+            button: PointerButton::Left,
+            down: true,
+        }));
+        assert!(app.pointer_contact);
+        assert!(app.contacts.contains_key(&ContactId::POINTER));
+
+        app.apply(Input::Pointer(PointerEvent::Button {
+            x: 0.5,
+            y: 0.5,
+            button: PointerButton::Left,
+            down: false,
+        }));
+        assert!(!app.pointer_contact);
+        assert!(app.contacts.is_empty());
+    }
+
+    #[test]
+    fn a_non_primary_button_is_not_a_contact() {
+        let mut app = router();
+        app.apply(Input::Pointer(PointerEvent::Button {
+            x: 0.5,
+            y: 0.5,
+            button: PointerButton::Right,
+            down: true,
+        }));
+        assert!(!app.pointer_contact);
+        assert!(app.contacts.is_empty());
+    }
+
+    #[test]
+    fn any_contact_raises_the_pill_whoever_it_belongs_to() {
+        // The pill is the affordance for someone who does not know the gesture. Someone
+        // driving from a phone needs it for the same reason — more so, since they cannot
+        // see the bezel.
+        let mut app = router();
+        assert!(app.pill_since.is_none());
+        app.apply(down(ContactId::remote(RemoteId::new(1), 0), 0.5, 0.5));
+        assert!(app.pill_since.is_some());
+    }
+
+    #[test]
+    fn a_cancel_ends_a_contact_as_thoroughly_as_a_release() {
+        // What a dropped peer's contacts become. If `Cancel` left the entry behind, the
+        // router would believe a finger was down for the rest of the process's life.
+        let mut app = router();
+        let id = ContactId::remote(RemoteId::new(1), 0);
+        app.apply(down(id, 0.5, 0.5));
+        app.apply(Input::Touch(TouchEvent::new(
+            id,
+            TouchPhase::Cancel,
+            0.5,
+            0.5,
+        )));
+        assert!(app.contacts.is_empty());
+    }
 
     #[test]
     fn normalize_clamps_and_scales() {
