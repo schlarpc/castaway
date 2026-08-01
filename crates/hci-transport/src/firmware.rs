@@ -24,17 +24,33 @@ pub enum Firmware {
 impl Firmware {
     /// The image bytes.
     ///
+    /// Async, and deliberately the *only* way to get at a file-backed image: the loaders
+    /// call this from inside `ControllerInit::init`, which runs on the tokio runtime, and
+    /// a `std::fs::read` there parks a runtime thread for a megabyte of disk (#94). There
+    /// is no synchronous accessor to reach for by mistake.
+    ///
     /// # Errors
     /// [`TransportError::Firmware`] if a file-backed image cannot be read.
-    pub fn load(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>, TransportError> {
+    pub async fn load(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>, TransportError> {
         match self {
             Self::Embedded(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
-            Self::File(path) => std::fs::read(path)
-                .map(std::borrow::Cow::Owned)
+            Self::File(path) => {
+                let path = path.clone();
+                let read = tokio::task::spawn_blocking({
+                    let path = path.clone();
+                    move || std::fs::read(path)
+                })
+                .await
                 .map_err(|e| TransportError::Firmware {
                     name: name.to_owned(),
                     detail: format!("reading {}: {e}", path.display()),
-                }),
+                })?;
+                read.map(std::borrow::Cow::Owned)
+                    .map_err(|e| TransportError::Firmware {
+                        name: name.to_owned(),
+                        detail: format!("reading {}: {e}", path.display()),
+                    })
+            }
         }
     }
 }
@@ -84,9 +100,24 @@ impl FirmwareSet {
 
     /// Load every file in `dir` whose name matches a firmware image, recursively.
     ///
+    /// Async because the walk is `read_dir` plus a `stat` per entry, and it runs from the
+    /// async controller bring-up path; the whole traversal goes to `spawn_blocking` (#94).
+    ///
     /// # Errors
     /// [`TransportError::Firmware`] if the directory cannot be walked.
-    pub fn from_dir(dir: &Path) -> Result<Self, TransportError> {
+    pub async fn from_dir(dir: &Path) -> Result<Self, TransportError> {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::walk_dir(&dir))
+            .await
+            .map_err(|e| TransportError::Firmware {
+                name: "firmware directory".to_owned(),
+                detail: e.to_string(),
+            })?
+    }
+
+    /// The blocking half of [`Self::from_dir`]. Private, so the only route to it is the
+    /// async wrapper that puts it on a blocking thread.
+    fn walk_dir(dir: &Path) -> Result<Self, TransportError> {
         let mut set = Self::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
@@ -114,7 +145,7 @@ impl FirmwareSet {
     /// # Errors
     /// [`TransportError::Firmware`] naming the missing file, so the message says what to
     /// go and find rather than that something went wrong.
-    pub fn get(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>, TransportError> {
+    pub async fn get(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>, TransportError> {
         self.images
             .get(name)
             .ok_or_else(|| TransportError::Firmware {
@@ -122,6 +153,7 @@ impl FirmwareSet {
                 detail: "not present in this build; see architecture §11.3b".to_owned(),
             })?
             .load(name)
+            .await
     }
 
     /// Whether an image is available.
@@ -147,27 +179,27 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    #[test]
-    fn a_missing_image_names_the_file_it_wanted() {
+    #[tokio::test]
+    async fn a_missing_image_names_the_file_it_wanted() {
         // The failure mode this exists to improve: "firmware missing" is useless,
         // "intel/ibt-20-1-3.sfi missing" tells you what to go and fetch.
         let set = FirmwareSet::new();
-        let err = set.get("intel/ibt-20-1-3.sfi").unwrap_err();
+        let err = set.get("intel/ibt-20-1-3.sfi").await.unwrap_err();
         assert!(
             format!("{err}").contains("intel/ibt-20-1-3.sfi"),
             "got: {err}"
         );
     }
 
-    #[test]
-    fn an_embedded_image_round_trips() {
+    #[tokio::test]
+    async fn an_embedded_image_round_trips() {
         let set = FirmwareSet::new().with(
             "rtl_bt/rtl8761bu_fw.bin",
             Firmware::Embedded(&[0xDE, 0xAD, 0xBE, 0xEF]),
         );
         assert!(set.has("rtl_bt/rtl8761bu_fw.bin"));
         assert_eq!(
-            &*set.get("rtl_bt/rtl8761bu_fw.bin").unwrap(),
+            &*set.get("rtl_bt/rtl8761bu_fw.bin").await.unwrap(),
             &[0xDE, 0xAD, 0xBE, 0xEF]
         );
     }
@@ -179,18 +211,18 @@ mod tests {
         let _ = FirmwareSet::embedded();
     }
 
-    #[test]
-    fn a_directory_is_walked_with_linux_firmware_style_names() {
+    #[tokio::test]
+    async fn a_directory_is_walked_with_linux_firmware_style_names() {
         let dir = tempdir();
         std::fs::create_dir_all(dir.join("intel")).unwrap();
         std::fs::write(dir.join("intel/ibt-20-1-3.sfi"), b"fw").unwrap();
         std::fs::write(dir.join("intel/ibt-20-1-3.ddc"), b"ddc").unwrap();
 
-        let set = FirmwareSet::from_dir(&dir).unwrap();
+        let set = FirmwareSet::from_dir(&dir).await.unwrap();
         let mut names: Vec<&str> = set.names().collect();
         names.sort_unstable();
         assert_eq!(names, ["intel/ibt-20-1-3.ddc", "intel/ibt-20-1-3.sfi"]);
-        assert_eq!(&*set.get("intel/ibt-20-1-3.sfi").unwrap(), b"fw");
+        assert_eq!(&*set.get("intel/ibt-20-1-3.sfi").await.unwrap(), b"fw");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -130,7 +130,15 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
     let (transport, id) = open_transport(config).await?;
 
     let keys_path = link_keys_path(&config.state_dir());
-    let link_keys = load_link_keys(&keys_path);
+    let link_keys = {
+        let path = keys_path.clone();
+        // A file read on the runtime, at bring-up and on every controller restart. Cheap
+        // enough that it was missed the first time, but it is the same rule as the write
+        // below and the same two lines away (#94).
+        tokio::task::spawn_blocking(move || load_link_keys(&path))
+            .await
+            .context("reading stored link keys")?
+    };
     if !link_keys.is_empty() {
         info!(count = link_keys.len(), "loaded stored link keys");
     }
@@ -166,10 +174,16 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
     // Persist each new key as it is issued, so a repeat guest never re-pairs (#68). A
     // write failure costs one re-pairing next time, which is not worth ending a live
     // session over.
-    let store_path = keys_path.clone();
+    //
+    // The callback itself must not touch the disk. It runs *inline* on the adapter's
+    // single `select!` loop, which is also the only thing draining HCI events, ACL
+    // fragments and A2DP media packets — so for as long as it blocks, the controller's
+    // buffers back up, at the most timing-sensitive moment a connection has (#94). It
+    // does one non-blocking send and returns; the writer below owns the file.
+    let (writer, _drain) = spawn_link_key_writer(keys_path.clone());
     let on_paired: proto_bluetooth_audio::adapter::OnPaired = Arc::new(move |addr, key| {
-        if let Err(e) = store_link_key(&store_path, addr, key.as_ref()) {
-            warn!(error = %format!("{e:#}"), %addr, "could not update the stored link key");
+        if writer.send((addr, key)).is_err() {
+            warn!(%addr, "link-key writer is gone; this peer will re-pair next time");
         }
     });
 
@@ -251,6 +265,7 @@ async fn open_transport(config: &Config) -> anyhow::Result<(Arc<dyn HciTransport
     // rebuild), then whatever `build.rs` embedded.
     let firmware = match &config.bluetooth.firmware_dir {
         Some(dir) => FirmwareSet::from_dir(Path::new(dir))
+            .await
             .with_context(|| format!("loading firmware from {dir}"))?,
         None => FirmwareSet::embedded(),
     };
@@ -356,6 +371,45 @@ fn parse_link_key(line: &str) -> Option<(BdAddr, LinkKey)> {
         *slot = u8::from_str_radix(key.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
     Some((addr, LinkKey::new(bytes)))
+}
+
+/// Spawn the task that owns the link-key file, and hand back its inbox.
+///
+/// Serialising through one task is not just about keeping the disk off the adapter's
+/// thread: [`store_link_key`] is read-modify-write on a whole file, so two pairings close
+/// together would otherwise race two `File::create`s at the same path and one key would
+/// vanish. In arrival order, through one owner, they cannot.
+///
+/// Unbounded because the producer is the adapter loop and it must never wait — the queue
+/// is one small entry per pairing, which is a human pressing a button on a phone.
+///
+/// The task ends when the last sender drops, which is when the adapter it belongs to is
+/// dropped: a controller restart builds a new adapter and a new writer. The handle comes
+/// back so a test can drop the sender and await the drain rather than poll for it;
+/// nothing in production joins it.
+fn spawn_link_key_writer(
+    path: PathBuf,
+) -> (
+    mpsc::UnboundedSender<(BdAddr, Option<LinkKey>)>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<(BdAddr, Option<LinkKey>)>();
+    let task = tokio::spawn(async move {
+        while let Some((addr, key)) = rx.recv().await {
+            let path = path.clone();
+            let written =
+                tokio::task::spawn_blocking(move || store_link_key(&path, addr, key.as_ref()))
+                    .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %format!("{e:#}"), %addr, "could not update the stored link key");
+                }
+                Err(e) => warn!(error = %e, %addr, "the link-key write panicked"),
+            }
+        }
+    });
+    (tx, task)
 }
 
 /// Record a newly paired peer's key.
@@ -569,5 +623,68 @@ mod tests {
     #[test]
     fn a_missing_store_is_simply_no_keys() {
         assert!(load_link_keys(Path::new("/nonexistent/castaway/keys")).is_empty());
+    }
+
+    /// The property #94 is actually about: `on_paired` returns without having touched the
+    /// disk.
+    ///
+    /// A single-threaded runtime is what makes this an assertion rather than a hope. The
+    /// send happens with nothing else able to run, so if the write were still inline the
+    /// file would exist the instant the callback returned. It must not — the key may only
+    /// appear after the writer task has been given a chance to run.
+    ///
+    /// This is the closest thing to a test for a timing property: not "the write was
+    /// fast", which is unassertable, but "the write had not happened yet", which is exact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pairing_does_not_write_to_disk_on_the_callers_thread() {
+        let dir = temp_dir("deferred");
+        let path = link_keys_path(&dir);
+        let addr: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+
+        let (writer, drain) = spawn_link_key_writer(path.clone());
+        writer.send((addr, Some(LinkKey::new([0x33; 16])))).unwrap();
+
+        assert!(
+            !path.exists(),
+            "the link key was written inline; the adapter loop was parked for a disk \
+             round trip (#94)"
+        );
+
+        // Closing the channel ends the task once it has drained, so awaiting it is an
+        // exact wait rather than a poll.
+        drop(writer);
+        drain.await.unwrap();
+
+        let loaded = load_link_keys(&path);
+        assert_eq!(loaded.len(), 1, "the key still lands, just not inline");
+        assert_eq!(loaded[0].1.as_bytes(), &[0x33; 16]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two pairings in quick succession must not race two `File::create`s at one path.
+    ///
+    /// The queue is ordered and single-owner, so the second key wins deterministically
+    /// rather than by whichever `create` truncated last.
+    #[tokio::test(flavor = "current_thread")]
+    async fn back_to_back_pairings_serialise_through_one_owner() {
+        let dir = temp_dir("serialise");
+        let path = link_keys_path(&dir);
+        let a: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let b: BdAddr = "11:22:33:44:55:66".parse().unwrap();
+
+        let (writer, drain) = spawn_link_key_writer(path.clone());
+        writer.send((a, Some(LinkKey::new([0x11; 16])))).unwrap();
+        writer.send((b, Some(LinkKey::new([0x22; 16])))).unwrap();
+        // Same peer again: last write wins, which only holds if they are ordered.
+        writer.send((a, Some(LinkKey::new([0x44; 16])))).unwrap();
+        writer.send((b, None)).unwrap();
+        drop(writer);
+        drain.await.unwrap();
+
+        let loaded = load_link_keys(&path);
+        assert_eq!(loaded.len(), 1, "b was forgotten, a survives: {loaded:?}");
+        assert_eq!(loaded[0].0, a);
+        assert_eq!(loaded[0].1.as_bytes(), &[0x44; 16], "the newest key for a");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

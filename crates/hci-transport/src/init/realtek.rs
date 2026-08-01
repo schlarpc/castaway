@@ -198,12 +198,12 @@ impl ControllerInit for RealtekInit {
 
         let firmware_name = format!("rtl_bt/{stem}_fw.bin");
         let config_name = format!("rtl_bt/{stem}_config.bin");
-        let fw = firmware.get(&firmware_name)?;
+        let fw = firmware.get(&firmware_name).await?;
 
         // The config is appended to the *extracted patch*, not to the container, and not
         // sent separately. It is optional — a controller without one uses its defaults —
         // so a missing file is a debug line rather than a refusal to start.
-        let config = match firmware.get(&config_name) {
+        let config = match firmware.get(&config_name).await {
             Ok(config) => config.to_vec(),
             Err(e) => {
                 debug!(error = %e, "realtek: no config blob; using controller defaults");
@@ -730,15 +730,16 @@ mod tests {
     ///
     /// Synthetic containers prove the parser handles the shape; only the real file proves
     /// it handles the shape that actually ships.
-    #[test]
-    fn the_real_ub500_firmware_parses() {
+    #[tokio::test]
+    async fn the_real_ub500_firmware_parses() {
         let firmware = FirmwareSet::embedded();
-        let Ok(fw) = firmware.get("rtl_bt/rtl8761bu_fw.bin") else {
+        let Ok(fw) = firmware.get("rtl_bt/rtl8761bu_fw.bin").await else {
             eprintln!("no embedded Realtek firmware in this build; skipping");
             return;
         };
         let config = firmware
             .get("rtl_bt/rtl8761bu_config.bin")
+            .await
             .map(|c| c.to_vec())
             .unwrap_or_default();
 

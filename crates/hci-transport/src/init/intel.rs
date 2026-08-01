@@ -180,7 +180,7 @@ impl ControllerInit for IntelInit {
         }
 
         let sfi_name = format!("{image_stem}.sfi");
-        let sfi = firmware.get(&sfi_name)?;
+        let sfi = firmware.get(&sfi_name).await?;
         download_firmware(hci, &sfi, &sfi_name).await?;
 
         // Reset into the image just uploaded. The parameters are `btintel`'s verbatim:
@@ -200,7 +200,7 @@ impl ControllerInit for IntelInit {
         // just not to spec for this antenna layout — so a build without the file logs
         // and continues rather than refusing to start.
         let ddc_name = format!("{image_stem}.ddc");
-        match firmware.get(&ddc_name) {
+        match firmware.get(&ddc_name).await {
             Ok(ddc) => load_ddc(hci, &ddc).await?,
             Err(e) => debug!(error = %e, "intel: no DDC config; using controller defaults"),
         }
