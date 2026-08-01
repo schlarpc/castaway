@@ -1494,6 +1494,14 @@ They escape the bug only because their minor class is Headphones, which is a liv
 that switch. That is the control which proves the class list, not our SDP, is what decides
 the label.
 
+Verified on hardware, 2026-08-01. After redeploying, `bluetoothctl remove` and a fresh scan
+showed the panel arriving with its name already attached and all five service classes
+present at `Paired: no` — so the list came from the extended inquiry response rather than
+from SDP — and Plasma's applet now labels it "Audio" instead of "Other device". Worth noting
+which prediction was wrong on the way there: the first hypothesis was a stale `Class=` in
+BlueZ's cache from before the class of device was set, and it was not. BlueZ had the class,
+the icon, the name and the UUIDs correct the entire time. The bug was two layers above.
+
 Not done: the bluedevil bug is unreported upstream. Both halves are one-line fixes there
 (`OtherAudio` → `AudioVideo`, and checking `AudioSink` in the fallback), and reporting it is
 strictly better than our workaround for everyone who is not us.

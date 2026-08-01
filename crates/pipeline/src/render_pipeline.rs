@@ -794,6 +794,13 @@ impl Pipeline for RenderPipeline {
                             self.audio_output(),
                             Arc::clone(&stop),
                             Arc::clone(&self.gain),
+                            // No failure report, for the same reason this path does not
+                            // preempt: a mirror's audio and its picture share a stop
+                            // flag, so ending the session over a refused output would
+                            // take the screen down too. Losing the sound and keeping the
+                            // mirror is the better half of a bad trade; the ERROR the
+                            // session logs is what says so.
+                            None,
                         );
                     } else {
                         warn!("mirror audio is not encoded frames; ignoring it");
