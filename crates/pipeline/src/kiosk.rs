@@ -95,6 +95,10 @@ struct KioskApp {
     /// One display refresh, read off the monitor when the window comes up; the 60 Hz
     /// fallback covers a compositor that will not say.
     frame_interval: std::time::Duration,
+    /// Input from off this thread — remote peers driving the panel (#18). Drained
+    /// wherever the loop runs, so it obeys the same wake-and-sleep discipline as every
+    /// other producer rather than needing a winit user-event type of its own.
+    remote_input: Option<Arc<input_touch::RemoteInputQueue>>,
     /// The main-thread browser host (this loop is its message pump — architecture §6).
     #[cfg(feature = "electron")]
     browser: Option<crate::electron_browser::ElectronHost>,
@@ -422,6 +426,46 @@ impl KioskApp {
             }
         }
         true
+    }
+
+    /// Apply everything a remote peer has queued since the last time the loop ran.
+    ///
+    /// Called from both the wake path and the pre-sleep pass: the queue is empty almost
+    /// always, so a second check costs one uncontended lock, and it means no plausible
+    /// interleaving of a push against a wake can leave input sitting until the *next*
+    /// thing happens to wake the panel.
+    fn drain_remote_input(&mut self) {
+        let Some(queue) = self.remote_input.clone() else {
+            return;
+        };
+        let batch = queue.drain();
+        if batch.is_empty() {
+            return;
+        }
+        // Input earns a frame for the same reason a finger on the glass does.
+        self.dirty = true;
+        for event in batch {
+            match event {
+                input_touch::RemoteEvent::Input(input) => self.apply(input),
+                input_touch::RemoteEvent::Gone(origin) => self.forget_origin(origin),
+            }
+        }
+    }
+
+    /// A peer has gone away: drop everything the router holds for it, and tell whatever
+    /// is underneath to let go too.
+    ///
+    /// Cancelled rather than released, and only for this origin. A dropped connection did
+    /// not *finish* a gesture — synthesising the release would commit whatever it was
+    /// over, which on the transport strip means seeking to wherever the finger happened
+    /// to be when the phone lost Wi-Fi.
+    fn forget_origin(&mut self, origin: input_touch::InputOrigin) {
+        self.contacts.retain(|id, _| !id.is_from(origin));
+        self.drag_last.retain(|id, _| !id.is_from(origin));
+        if let Some(sink) = self.input_sink() {
+            sink.cancel_origin(origin);
+        }
+        info!(?origin, "remote input: peer gone, contacts cancelled");
     }
 
     /// Turn a winit window event into a normalized [`Input`], or nothing if it is not
@@ -827,9 +871,14 @@ impl ApplicationHandler for KioskApp {
         // render command, a browser paint, a banner, or the exit flag, which
         // `about_to_wait` checks on every pass.
         self.dirty = true;
+        self.drain_remote_input();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Before deciding whether the panel may sleep, take anything a peer queued: a
+        // pending input is work owed, and sleeping on it would hold the contact until
+        // something unrelated woke the loop.
+        self.drain_remote_input();
         if self
             .exit
             .as_ref()
@@ -868,46 +917,68 @@ impl ApplicationHandler for KioskApp {
     }
 }
 
+/// Everything the kiosk loop needs besides its render channel.
+///
+/// A struct rather than eight positional arguments: every one of them is optional, most
+/// are `Option<Arc<dyn Fn…>>`, and at that width a caller swapping two of them typechecks
+/// and misbehaves at runtime. `Default` gives the "none of it" case, which is what the
+/// tests and the headless build want.
+#[derive(Default)]
+pub struct KioskWiring {
+    /// The idle scene shown before and between casts.
+    pub attract: Option<AttractImage>,
+    /// The on-screen-display banner controller.
+    pub osd: Option<OsdController>,
+    /// External shutdown request (ctrl-c, or a service that failed).
+    pub exit: Option<Arc<AtomicBool>>,
+    /// Where a press on the transport strip goes.
+    pub controls: Option<ControlSink>,
+    /// Where a shell press the panel cannot answer itself goes.
+    pub shell_sink: Option<ShellSink>,
+    /// Input queued from off the main thread by remote peers (#18).
+    pub remote_input: Option<Arc<input_touch::RemoteInputQueue>>,
+}
+
+impl KioskWiring {
+    /// Build the loop's state around this wiring.
+    fn into_app(self, rx: crate::render_pipeline::RenderRx) -> KioskApp {
+        KioskApp {
+            rx: Some(rx),
+            attract: self.attract,
+            osd: self.osd,
+            exit: self.exit,
+            controls: self.controls,
+            shell_sink: self.shell_sink,
+            remote_input: self.remote_input,
+            window: None,
+            render: None,
+            contacts: std::collections::HashMap::new(),
+            drag_last: std::collections::HashMap::new(),
+            last_frame: None,
+            started_drag: false,
+            pointer_contact: false,
+            drag_sample: None,
+            pill_since: None,
+            pill_drawn: false,
+            dirty: true,
+            next_frame_at: None,
+            frame_interval: FALLBACK_FRAME_INTERVAL,
+            cursor: (0.0, 0.0),
+            size: (1, 1),
+            #[cfg(feature = "electron")]
+            browser: None,
+        }
+    }
+}
+
 /// Run the kiosk to completion (blocks the calling — main — thread). Consumes render
-/// commands from `rx` and displays them fullscreen until the window is closed or `exit`
-/// is set (ctrl-c). `attract` is the idle scene shown before/between casts.
+/// commands from `rx` and displays them fullscreen until the window is closed or
+/// `wiring.exit` is set (ctrl-c).
 ///
 /// # Errors
 /// [`PipelineError`] if the event loop can't be created or run.
-pub fn run(
-    rx: crate::render_pipeline::RenderRx,
-    attract: Option<AttractImage>,
-    osd: Option<OsdController>,
-    exit: Option<Arc<AtomicBool>>,
-    controls: Option<ControlSink>,
-    shell_sink: Option<ShellSink>,
-) -> Result<(), PipelineError> {
-    let mut app = KioskApp {
-        rx: Some(rx),
-        attract,
-        osd,
-        window: None,
-        render: None,
-        controls,
-        shell_sink,
-        contacts: std::collections::HashMap::new(),
-        drag_last: std::collections::HashMap::new(),
-        last_frame: None,
-        started_drag: false,
-        pointer_contact: false,
-        drag_sample: None,
-        pill_since: None,
-        pill_drawn: false,
-        dirty: true,
-        next_frame_at: None,
-        frame_interval: FALLBACK_FRAME_INTERVAL,
-        exit,
-        cursor: (0.0, 0.0),
-        size: (1, 1),
-        #[cfg(feature = "electron")]
-        browser: None,
-    };
-    run_app(&mut app)
+pub fn run(rx: crate::render_pipeline::RenderRx, wiring: KioskWiring) -> Result<(), PipelineError> {
+    run_app(&mut wiring.into_app(rx))
 }
 
 /// [`run`], plus a main-thread [`ElectronHost`](crate::electron_browser::ElectronHost)
@@ -919,37 +990,11 @@ pub fn run(
 #[cfg(feature = "electron")]
 pub fn run_with_browser(
     rx: crate::render_pipeline::RenderRx,
-    attract: Option<AttractImage>,
-    osd: Option<OsdController>,
-    exit: Option<Arc<AtomicBool>>,
-    controls: Option<ControlSink>,
-    shell_sink: Option<ShellSink>,
+    wiring: KioskWiring,
     browser: crate::electron_browser::ElectronHost,
 ) -> Result<(), PipelineError> {
-    let mut app = KioskApp {
-        rx: Some(rx),
-        attract,
-        osd,
-        window: None,
-        render: None,
-        controls,
-        shell_sink,
-        contacts: std::collections::HashMap::new(),
-        drag_last: std::collections::HashMap::new(),
-        last_frame: None,
-        started_drag: false,
-        pointer_contact: false,
-        drag_sample: None,
-        pill_since: None,
-        pill_drawn: false,
-        dirty: true,
-        next_frame_at: None,
-        frame_interval: FALLBACK_FRAME_INTERVAL,
-        exit,
-        cursor: (0.0, 0.0),
-        size: (1, 1),
-        browser: Some(browser),
-    };
+    let mut app = wiring.into_app(rx);
+    app.browser = Some(browser);
     let result = run_app(&mut app);
     // The browser is stopped on this (main) thread after the loop stops driving it,
     // so every borrowed frame is released before the subprocess goes away.
@@ -994,7 +1039,7 @@ fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use input_touch::RemoteId;
+    use input_touch::{InputOrigin, RemoteId};
 
     /// A router with no window and no compositor behind it.
     ///
@@ -1013,6 +1058,7 @@ mod tests {
             render: None,
             controls: None,
             shell_sink: None,
+            remote_input: None,
             contacts: std::collections::HashMap::new(),
             drag_last: std::collections::HashMap::new(),
             last_frame: None,
@@ -1148,6 +1194,81 @@ mod tests {
             0.5,
         )));
         assert!(app.contacts.is_empty());
+    }
+
+    #[test]
+    fn a_drained_queue_reaches_the_router() {
+        // The whole path a remote contact takes, minus the socket: queued off-thread,
+        // drained where the loop runs, routed exactly as a finger would be.
+        let mut app = router();
+        let queue = Arc::new(input_touch::RemoteInputQueue::new(
+            castaway_core::Waker::new(),
+        ));
+        app.remote_input = Some(Arc::clone(&queue));
+        let id = ContactId::remote(RemoteId::new(1), 0);
+
+        queue.push_input(down(id, 0.5, 0.5));
+        assert!(app.contacts.is_empty(), "nothing lands before a drain");
+
+        app.drain_remote_input();
+        assert!(app.contacts.contains_key(&id));
+        assert!(app.dirty, "input owes the glass a frame");
+    }
+
+    #[test]
+    fn a_departed_peer_leaves_nothing_behind_in_the_router() {
+        // `Gone` has to clear the router's own maps, not just tell the sink. A contact
+        // left in `contacts` keeps its origin's edge-swipe state alive forever, and one
+        // left in `drag_last` keeps scrolling a screen with a finger that went home.
+        let mut app = router();
+        let queue = Arc::new(input_touch::RemoteInputQueue::new(
+            castaway_core::Waker::new(),
+        ));
+        app.remote_input = Some(Arc::clone(&queue));
+        let peer = RemoteId::new(1);
+        let gone = ContactId::remote(peer, 0);
+        let staying = ContactId::panel(0);
+
+        queue.push_input(down(gone, 0.5, 0.5));
+        queue.push_input(down(staying, 0.7, 0.7));
+        queue.push_gone(InputOrigin::Remote(peer));
+        app.drain_remote_input();
+
+        assert!(
+            !app.contacts.contains_key(&gone),
+            "the peer's contact is gone"
+        );
+        assert!(
+            app.contacts.contains_key(&staying),
+            "and nobody else's went with it"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_presses_and_immediately_drops_strands_nothing() {
+        // The ordering the queue exists to preserve. If the cancellation were tracked
+        // beside the input rather than in it, this could apply the press *after* the
+        // cancel and leave the contact down for the life of the process.
+        let mut app = router();
+        let queue = Arc::new(input_touch::RemoteInputQueue::new(
+            castaway_core::Waker::new(),
+        ));
+        app.remote_input = Some(Arc::clone(&queue));
+        let peer = RemoteId::new(1);
+
+        queue.push_input(down(ContactId::remote(peer, 0), 0.5, 0.5));
+        queue.push_gone(InputOrigin::Remote(peer));
+        app.drain_remote_input();
+
+        assert!(app.contacts.is_empty());
+    }
+
+    #[test]
+    fn draining_without_a_queue_is_nothing() {
+        // The headless build, and every build before a peer has ever connected.
+        let mut app = router();
+        app.drain_remote_input();
+        assert!(!app.dirty);
     }
 
     #[test]

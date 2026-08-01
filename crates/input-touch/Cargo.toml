@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Touch input for the C6522QT 4K touch wall: a TouchSource trait routing HID touch into the compositor/browser. evdev (Linux) / Raw Input (Windows) behind features."
 
 [dependencies]
+castaway-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }

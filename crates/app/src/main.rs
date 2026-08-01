@@ -183,6 +183,10 @@ fn main() -> anyhow::Result<()> {
         // channel that queues work for it wakes it through clones of this. The kiosk
         // arms it once the event loop exists.
         let wake = render_pipeline.waker();
+        // Where a remote peer's contacts land on their way to the main thread (#18). Made
+        // here, beside the waker, because it is the same kind of thing: a producer off
+        // this thread queues work and wakes the loop, and the loop drains when it runs.
+        let remote_input = Arc::new(input_touch::RemoteInputQueue::new(wake.clone()));
         // Which device sound leaves through. Config decides where it starts, the
         // settings screen moves it live, and every session factory reads it at
         // stream-open — so a pick reaches the *next* session of every source with no
@@ -451,27 +455,19 @@ fn main() -> anyhow::Result<()> {
         // The winit event loop MUST own the main thread. It no longer doubles as a
         // message pump — the browser has its own — but it still drives the per-frame
         // import and stops the subprocess when the loop exits.
+        let wiring = pipeline::kiosk::KioskWiring {
+            attract,
+            osd: Some(osd_controller),
+            exit: Some(kiosk_exit),
+            controls,
+            shell_sink,
+            remote_input: Some(remote_input),
+        };
         #[cfg(feature = "electron")]
-        pipeline::kiosk::run_with_browser(
-            rx,
-            attract,
-            Some(osd_controller),
-            Some(kiosk_exit),
-            controls,
-            shell_sink,
-            browser_host,
-        )
-        .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        pipeline::kiosk::run_with_browser(rx, wiring, browser_host)
+            .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         #[cfg(not(feature = "electron"))]
-        pipeline::kiosk::run(
-            rx,
-            attract,
-            Some(osd_controller),
-            Some(kiosk_exit),
-            controls,
-            shell_sink,
-        )
-        .map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
+        pipeline::kiosk::run(rx, wiring).map_err(|e| anyhow::anyhow!("kiosk: {e}"))?;
         shutdown.notify_waiters();
         // Dropping the runtime waits for every blocking task that has already started —
         // and the SponsorBlock Lounge stream is a blocking read that can sit inside its

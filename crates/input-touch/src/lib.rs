@@ -10,6 +10,10 @@
 //! carries a `// SAFETY:` note (rule 8). Coordinates are normalized `0.0..=1.0` so the
 //! consumer maps them to the render surface regardless of panel resolution.
 
+pub mod remote;
+
+pub use remote::{RemoteEvent, RemoteInputQueue};
+
 use tokio::sync::mpsc;
 
 /// The phase of a touch contact.
