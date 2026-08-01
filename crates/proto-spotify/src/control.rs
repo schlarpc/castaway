@@ -96,7 +96,10 @@ impl RemoteControl for SpotifyRemote {
             ControlTxn::Seek(position) => {
                 spirc.set_position_ms(u32::try_from(position.as_millis()).unwrap_or(u32::MAX))
             }
-            ControlTxn::Volume(level) => spirc.set_volume(volume_to_spotify(*level)),
+            // Spotify's 16-bit volume is a slider position like everyone else's — it is
+            // what the phone's own control shows — so it takes the position back out
+            // rather than the amplitude (#85). librespot owns the taper on its side.
+            ControlTxn::Volume(level) => spirc.set_volume(volume_to_spotify(level.position())),
             ControlTxn::Next => spirc.next(),
             ControlTxn::Previous => spirc.prev(),
             ControlTxn::Shuffle(on) => spirc.shuffle(*on),
@@ -151,7 +154,7 @@ mod tests {
             ControlTxn::Pause,
             ControlTxn::Stop,
             ControlTxn::Seek(std::time::Duration::from_secs(1)),
-            ControlTxn::Volume(0.5),
+            ControlTxn::Volume(castaway_core::Volume::from_position(0.5)),
             ControlTxn::Next,
             ControlTxn::Previous,
             ControlTxn::Shuffle(true),

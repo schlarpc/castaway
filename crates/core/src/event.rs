@@ -57,8 +57,12 @@ pub enum ControlTxn {
     Stop,
     /// Seek to an absolute position from the start of the current item.
     Seek(Duration),
-    /// Set output volume in the range `0.0..=1.0`.
-    Volume(f32),
+    /// Set output volume.
+    ///
+    /// A [`Volume`] rather than an `f32` because a sender's number and the mixer's number
+    /// are different scales that look the same (#85): whoever parses the wire says which
+    /// one it read, and everything downstream gets an amplitude.
+    Volume(crate::Volume),
     /// Mute or unmute without changing the volume level.
     Mute(bool),
     /// Skip to the next item in the sender's queue.

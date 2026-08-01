@@ -1342,12 +1342,12 @@ impl BluetoothAdapter {
             avrcp::pdu::SET_ABSOLUTE_VOLUME if is_command || frame.ctype == Ctype::Accepted => {
                 // #69: the phone is authoritative. Accept and mirror it.
                 if let Some(&raw) = vendor.parameters.first() {
-                    let fraction = avrcp::volume_to_fraction(raw);
+                    let position = avrcp::volume_to_position(raw);
                     if link.session_open {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::Control(castaway_core::ControlTxn::Volume(
-                                fraction,
+                                castaway_core::Volume::from_position(position),
                             )))
                             .await?;
                     }

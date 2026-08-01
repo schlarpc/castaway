@@ -160,7 +160,9 @@ impl CastSession {
                 self.player_state = None;
                 self.position = None;
             }
-            ControlTxn::Volume(level) => self.volume = level.clamp(0.0, 1.0),
+            // `RECEIVER_STATUS` reports the sender's own scale back to it, so what is
+            // stored is the slider position, not the amplitude behind it (#85).
+            ControlTxn::Volume(level) => self.volume = level.position(),
             ControlTxn::Mute(muted) => self.muted = *muted,
             // A seek moves the position and nothing else; the position is read from the
             // pipeline, so there is nothing to store.
@@ -345,7 +347,9 @@ impl CastSession {
                 let mut events = Vec::new();
                 if let Some(level) = req.volume.level {
                     self.volume = level.clamp(0.0, 1.0);
-                    events.push(SessionEvent::Control(ControlTxn::Volume(self.volume)));
+                    events.push(SessionEvent::Control(ControlTxn::Volume(
+                        castaway_core::Volume::from_position(self.volume),
+                    )));
                 }
                 if let Some(muted) = req.volume.muted {
                     self.muted = muted;
@@ -730,7 +734,8 @@ mod tests {
 
         assert!(matches!(
             r.events.first(),
-            Some(SessionEvent::Control(ControlTxn::Volume(v))) if (*v - 0.25).abs() < f32::EPSILON
+            Some(SessionEvent::Control(ControlTxn::Volume(v)))
+                if *v == castaway_core::Volume::from_position(0.25)
         ));
         let p = payload(&r.outgoing[0]);
         assert!((p["status"]["volume"]["level"].as_f64().unwrap() - 0.25).abs() < 1e-6);
@@ -775,7 +780,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             r.events.first(),
-            Some(SessionEvent::Control(ControlTxn::Volume(v))) if (*v - 1.0).abs() < f32::EPSILON
+            Some(SessionEvent::Control(ControlTxn::Volume(v)))
+                if *v == castaway_core::Volume::FULL
         ));
     }
 
@@ -930,7 +936,11 @@ mod tests {
                 "SEEK",
                 ControlTxn::Seek(std::time::Duration::from_secs(1)),
             ),
-            (STREAM_VOLUME, "STREAM_VOLUME", ControlTxn::Volume(0.5)),
+            (
+                STREAM_VOLUME,
+                "STREAM_VOLUME",
+                ControlTxn::Volume(castaway_core::Volume::from_position(0.5)),
+            ),
             (STREAM_MUTE, "STREAM_MUTE", ControlTxn::Mute(true)),
         ] {
             assert_eq!(

@@ -21,6 +21,7 @@ pub mod ports;
 pub mod session;
 pub mod source;
 pub mod types;
+pub mod volume;
 pub mod wake;
 
 pub use adapter::{MiracastBackend, SessionSink, SourceAdapter, SourceId, SourceMessage};
@@ -40,4 +41,5 @@ pub use types::{
     FrameImage, FrameSource, FriendlyName, GpuSurface, MediaUri, PcmFrame, PixelFormat,
     ProtocolKind, VideoCodec,
 };
+pub use volume::Volume;
 pub use wake::Waker;

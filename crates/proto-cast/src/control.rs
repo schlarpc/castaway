@@ -142,7 +142,7 @@ mod tests {
             ControlTxn::Pause,
             ControlTxn::Stop,
             ControlTxn::Seek(Duration::from_secs(1)),
-            ControlTxn::Volume(0.5),
+            ControlTxn::Volume(castaway_core::Volume::from_position(0.5)),
             ControlTxn::Mute(true),
         ] {
             assert!(caps.supports(&txn), "{txn:?} should be offered");

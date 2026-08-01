@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame};
+use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame, Volume};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -59,20 +59,26 @@ impl Default for Gain {
 }
 
 impl Gain {
-    /// Set the level, clamped to `0.0..=1.0`.
-    pub fn set(&self, level: f32) {
-        let level = if level.is_finite() {
-            level.clamp(0.0, 1.0)
-        } else {
-            // A NaN would compare false against every bound and multiply every sample
-            // into silence-that-is-not-silence. Ignore it rather than pass it on.
-            return;
-        };
-        self.level
-            .store(level.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    /// Set the level.
+    ///
+    /// Takes a [`Volume`] rather than an `f32` because the number a sender sends and the
+    /// number this multiplies by are different scales that look identical (#85). The
+    /// conversion happened at whichever protocol boundary parsed the wire; by the time it
+    /// arrives here there is nothing left to interpret, and no way to hand it a slider
+    /// position by accident.
+    pub fn set(&self, level: Volume) {
+        self.level.store(
+            level.amplitude().to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
-    /// The current level.
+    /// The current level, as the amplitude samples are multiplied by.
+    ///
+    /// Deliberately not a [`Volume`]: there is no constructor from a bare amplitude, and
+    /// there should not be one. Every sender that needs its slider told where it ended up
+    /// keeps its own authoritative copy in its own scale — Cast a position, DLNA a
+    /// percent, AirPlay a dBFS figure — so nothing has to reverse the taper to answer.
     #[must_use]
     pub fn level(&self) -> f32 {
         f32::from_bits(self.level.load(std::sync::atomic::Ordering::Relaxed))
@@ -672,13 +678,17 @@ mod tests {
         // The bug: AVRCP absolute volume was parsed, answered `Accepted`, and dropped by
         // a pipeline whose `control` only logged — so the phone's rocker did nothing, and
         // a phone that had taken absolute-volume control pinned us at full scale.
-        for (level, muted, expected) in [(1.0, false, 1.0), (0.5, false, 0.5), (1.0, true, 0.0)] {
+        // Positions, not amplitudes — the middle entry is the one that changed with
+        // #85: half the slider travel is -30 dB, so the peak is 0.0316 and not 0.5.
+        for (position, muted, expected) in
+            [(1.0, false, 1.0), (0.5, false, 0.031_623), (1.0, true, 0.0)]
+        {
             let peak = Arc::new(Mutex::new(0.0f32));
             let (tx, rx) = std::sync::mpsc::sync_channel(2);
             tx.send(loud(64)).unwrap();
             drop(tx);
             let gain = Gain::default();
-            gain.set(level);
+            gain.set(Volume::from_position(position));
             gain.set_muted(muted);
             run_pcm(
                 rx,
@@ -691,27 +701,36 @@ mod tests {
             );
             let got = *peak.lock().unwrap();
             assert!(
-                (got - expected).abs() < 1e-6,
-                "level {level} muted {muted}: peak {got}, want {expected}"
+                (got - expected).abs() < 1e-5,
+                "position {position} muted {muted}: peak {got}, want {expected}"
             );
         }
     }
 
     #[test]
-    fn a_level_outside_the_scale_is_clamped_rather_than_passed_on() {
+    fn a_level_outside_the_scale_cannot_reach_the_output() {
         // A protocol that scales wrong (or a NaN out of a division) must not be able to
         // hand the output a factor that clips every sample or silences it by accident.
+        //
+        // This used to be `Gain`'s job, done by clamping whatever `f32` it was passed.
+        // It is now the type's, done at construction, and `Gain` has no way to receive a
+        // bad value at all (#85) — so what is left to check here is that the mixer holds
+        // exactly what the boundary produced, with no second opinion applied.
         let gain = Gain::default();
-        gain.set(4.0);
-        assert!((gain.level() - 1.0).abs() < f32::EPSILON);
-        gain.set(-1.0);
-        assert!(gain.level().abs() < f32::EPSILON);
-        gain.set(0.5);
-        gain.set(f32::NAN);
+        gain.set(Volume::from_position(4.0));
         assert!(
-            (gain.level() - 0.5).abs() < f32::EPSILON,
-            "NaN must not stick"
+            (gain.level() - 1.0).abs() < f32::EPSILON,
+            "saturates at unity"
         );
+        gain.set(Volume::from_position(-1.0));
+        assert!(gain.level().abs() < f32::EPSILON, "a hard zero, not -60 dB");
+        gain.set(Volume::from_position(f32::NAN));
+        assert!(
+            gain.level().abs() < f32::EPSILON,
+            "a NaN never reaches a sample"
+        );
+        gain.set(Volume::from_dbfs(-6.0));
+        assert!((gain.level() - 0.501_187).abs() < 1e-5, "stored verbatim");
     }
 
     #[test]

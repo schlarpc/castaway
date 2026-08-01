@@ -1047,11 +1047,11 @@ impl AirPlaySession {
         let mut resp = AirPlayResponse::ok();
         resp.event = match update {
             ControlUpdate::Volume(v) => {
-                log_info!(fraction = v.as_fraction(), "AirPlay volume");
+                log_info!(dbfs = v.as_dbfs(), "AirPlay volume");
                 // Kept so a later `GET_PARAMETER` reports what this sender set rather
                 // than a constant, which is the whole point of the sender asking.
                 self.volume = v;
-                Some(SessionEvent::Control(ControlTxn::Volume(v.as_fraction())))
+                Some(SessionEvent::Control(ControlTxn::Volume(v.as_level())))
             }
             ControlUpdate::Metadata(now) => Some(SessionEvent::NowPlaying(*now)),
             ControlUpdate::Progress(progress) => {
@@ -1610,7 +1610,9 @@ mod tests {
         let Some(SessionEvent::Control(ControlTxn::Volume(v))) = r.event else {
             panic!("expected a volume change, got {:?}", r.event)
         };
-        assert!((v - 0.5).abs() < 1e-6, "{v}");
+        // -15 dBFS is what the sender wrote, so the amplitude is the exact
+        // 10^(-15/20) and not the 0.5 slider position it used to be (#85).
+        assert!((v.amplitude() - 0.177_828).abs() < 1e-5, "{v:?}");
     }
 
     #[test]

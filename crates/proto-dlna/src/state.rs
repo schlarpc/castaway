@@ -630,8 +630,14 @@ impl Renderer {
                     .parse()
                     .map_err(|_| DlnaError::InvalidArgument("DesiredVolume not 0-100"))?;
                 self.volume = v.min(100);
-                let scaled = f32::from(self.volume) / 100.0;
-                Ok(with_event(ControlTxn::Volume(scaled)))
+                // `DesiredVolume` is a percent of the control point's slider, not an
+                // amplitude — the conversion belongs at this boundary and nowhere else
+                // (#85). The percent is what we keep, because it is what `GetVolume`
+                // must hand back unchanged.
+                let position = f32::from(self.volume) / 100.0;
+                Ok(with_event(ControlTxn::Volume(
+                    castaway_core::Volume::from_position(position),
+                )))
             }
             "GetMute" => Ok(Outcome::args(vec![(
                 "CurrentMute".into(),
@@ -808,7 +814,10 @@ mod tests {
         assert_eq!(r.volume, 75);
         match out.events.first() {
             Some(SessionEvent::Control(ControlTxn::Volume(v))) => {
-                assert!((v - 0.75).abs() < 1e-6);
+                // 75% of slider travel, which is -15 dB on the shared taper, not 0.75
+                // of amplitude (#85).
+                assert_eq!(*v, castaway_core::Volume::from_position(0.75));
+                assert!((v.amplitude() - 0.177_828).abs() < 1e-5, "{v:?}");
             }
             _ => panic!("expected volume control"),
         }

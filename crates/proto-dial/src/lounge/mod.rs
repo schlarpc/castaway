@@ -106,9 +106,10 @@ pub fn to_event(cmd: &LoungeCommand) -> Option<SessionEvent> {
         }
         "setVolume" => {
             let vol = cmd.payload.get("volume").and_then(Value::as_f64)?;
+            // A percentage off the sender's slider, so a position (#85).
             #[allow(clippy::cast_possible_truncation)]
             Some(SessionEvent::Control(ControlTxn::Volume(
-                (vol / 100.0).clamp(0.0, 1.0) as f32,
+                castaway_core::Volume::from_position((vol / 100.0) as f32),
             )))
         }
         _ => None,
@@ -235,7 +236,7 @@ mod tests {
         ));
         assert!(matches!(
             to_event(&mk("setVolume", serde_json::json!({"volume": 50}))),
-            Some(SessionEvent::Control(ControlTxn::Volume(v))) if (v - 0.5).abs() < 1e-6
+            Some(SessionEvent::Control(ControlTxn::Volume(v))) if v == castaway_core::Volume::from_position(0.5)
         ));
         assert!(to_event(&mk("getNowPlaying", Value::Null)).is_none());
     }

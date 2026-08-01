@@ -626,17 +626,21 @@ pub const fn playback_state(raw: u8) -> PlaybackState {
 
 /// Volume as AVRCP carries it: seven bits, `0..=127`.
 ///
+/// A **position** on the phone's volume rocker, not an amplitude — named as such since
+/// #85, because the number this returns used to go straight into a sample multiply.
+/// [`castaway_core::Volume::from_position`] is what turns it into one.
+///
 /// Scaling matters and is easy to get wrong: dividing by 128 never reaches 1.0, so a
 /// phone at maximum volume would leave us fractionally quiet forever.
 #[must_use]
-pub fn volume_to_fraction(raw: u8) -> f32 {
+pub fn volume_to_position(raw: u8) -> f32 {
     f32::from(raw & 0x7F) / 127.0
 }
 
-/// The inverse of [`volume_to_fraction`], clamped into the legal range.
+/// The inverse of [`volume_to_position`], clamped into the legal range.
 #[must_use]
-pub fn fraction_to_volume(fraction: f32) -> u8 {
-    let clamped = fraction.clamp(0.0, 1.0);
+pub fn position_to_volume(position: f32) -> u8 {
+    let clamped = position.clamp(0.0, 1.0);
     // `round` rather than truncate, so a round trip through both functions is stable.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scaled = (clamped * 127.0).round() as u8;
@@ -866,7 +870,12 @@ mod tests {
             operation_for(&ControlTxn::Seek(Duration::from_secs(30))),
             None
         );
-        assert_eq!(operation_for(&ControlTxn::Volume(0.5)), None);
+        assert_eq!(
+            operation_for(&ControlTxn::Volume(castaway_core::Volume::from_position(
+                0.5
+            ))),
+            None
+        );
 
         let caps = capabilities_for_passthrough();
         assert!(caps.supports(&ControlTxn::Play));
@@ -881,17 +890,22 @@ mod tests {
     fn volume_scaling_reaches_both_ends_of_the_range() {
         // Dividing by 128 never reaches 1.0, so a phone at full volume would leave us
         // permanently a little quiet.
-        assert_eq!(volume_to_fraction(0), 0.0);
-        assert!((volume_to_fraction(127) - 1.0).abs() < f32::EPSILON);
-        assert_eq!(fraction_to_volume(1.0), 127);
-        assert_eq!(fraction_to_volume(0.0), 0);
+        assert_eq!(volume_to_position(0), 0.0);
+        assert!((volume_to_position(127) - 1.0).abs() < f32::EPSILON);
+        assert_eq!(position_to_volume(1.0), 127);
+        assert_eq!(position_to_volume(0.0), 0);
         // Out-of-range input is clamped, not wrapped.
-        assert_eq!(fraction_to_volume(2.0), 127);
-        assert_eq!(fraction_to_volume(-1.0), 0);
+        assert_eq!(position_to_volume(2.0), 127);
+        assert_eq!(position_to_volume(-1.0), 0);
         // Round trip is stable.
         for raw in [0u8, 1, 63, 64, 126, 127] {
-            assert_eq!(fraction_to_volume(volume_to_fraction(raw)), raw);
+            assert_eq!(position_to_volume(volume_to_position(raw)), raw);
         }
+
+        // What these two functions are *not*: an amplitude. The rocker at its midpoint
+        // means half the travel, which is -30 dB and not half-scale (#85).
+        let mid = castaway_core::Volume::from_position(volume_to_position(64));
+        assert!(mid.amplitude() < 0.05, "{mid:?}");
     }
 
     #[test]

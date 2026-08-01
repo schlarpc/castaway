@@ -243,7 +243,7 @@ mod tests {
         let none = ControlCapabilities::NONE;
         assert!(none.is_empty());
         assert!(!none.supports(&ControlTxn::Play));
-        assert!(!none.supports(&ControlTxn::Volume(0.5)));
+        assert!(!none.supports(&ControlTxn::Volume(crate::Volume::from_position(0.5))));
     }
 
     #[tokio::test]

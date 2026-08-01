@@ -89,9 +89,12 @@ impl RemoteControl for DlnaRemote {
                 ControlTxn::Pause => renderer.state = TransportState::PausedPlayback,
                 ControlTxn::Stop => renderer.state = TransportState::Stopped,
                 ControlTxn::Volume(level) => {
+                    // Back to the control point's own scale: `GetVolume` answers in
+                    // percent of slider travel, which is a position, not the amplitude
+                    // the mixer holds (#85).
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
-                        renderer.volume = (level.clamp(0.0, 1.0) * 100.0).round() as u8;
+                        renderer.volume = (level.position() * 100.0).round() as u8;
                     }
                 }
                 ControlTxn::Mute(muted) => renderer.muted = *muted,
@@ -187,7 +190,7 @@ mod tests {
             ControlTxn::Pause,
             ControlTxn::Stop,
             ControlTxn::Seek(Duration::from_secs(1)),
-            ControlTxn::Volume(0.5),
+            ControlTxn::Volume(castaway_core::Volume::from_position(0.5)),
             ControlTxn::Mute(true),
         ] {
             assert!(caps.supports(&txn), "{txn:?} should be offered");
@@ -226,10 +229,20 @@ mod tests {
     #[tokio::test]
     async fn volume_is_stored_on_the_scale_upnp_answers_with() {
         let (remote, renderer, _rx) = remote();
-        remote.issue(ControlTxn::Volume(0.25)).await.unwrap();
+        remote
+            .issue(ControlTxn::Volume(castaway_core::Volume::from_position(
+                0.25,
+            )))
+            .await
+            .unwrap();
         assert_eq!(renderer.lock().await.volume, 25);
         // A slider that overshoots saturates rather than wrapping to silence.
-        remote.issue(ControlTxn::Volume(1.5)).await.unwrap();
+        remote
+            .issue(ControlTxn::Volume(castaway_core::Volume::from_position(
+                1.5,
+            )))
+            .await
+            .unwrap();
         assert_eq!(renderer.lock().await.volume, 100);
     }
 

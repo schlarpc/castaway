@@ -44,14 +44,22 @@ impl Volume {
         Self::Level(raw.clamp(MIN_DBFS, 0.0))
     }
 
-    /// As a 0.0..=1.0 fraction, for a pipeline that thinks in linear gain positions.
+    /// As the amplitude the mixer multiplies by.
     ///
-    /// Linear **in dB**, which is how the sender's slider behaves — not in amplitude.
+    /// This used to be `as_fraction`, which returned `(db - MIN_DBFS) / -MIN_DBFS` — a
+    /// *slider position*, correctly documented as one, and then handed to an amplitude
+    /// multiply that made it ~9–10 dB hot across the middle of the range and silent at
+    /// the bottom instead of the −30 dB the sender asked for (#85).
+    ///
+    /// AirPlay is the only protocol here that sends a real dB figure, so this is the
+    /// exact conversion with nothing invented. The old name is gone rather than
+    /// deprecated: a correctly-named-but-wrong function left in reach is how it gets
+    /// used again.
     #[must_use]
-    pub fn as_fraction(self) -> f32 {
+    pub fn as_level(self) -> castaway_core::Volume {
         match self {
-            Self::Muted => 0.0,
-            Self::Level(db) => (db - MIN_DBFS) / -MIN_DBFS,
+            Self::Muted => castaway_core::Volume::SILENT,
+            Self::Level(db) => castaway_core::Volume::from_dbfs(db),
         }
     }
 
@@ -322,17 +330,38 @@ mod tests {
         // The discontinuity this type exists for: a linear read of the raw value would
         // make the bottom of the slider do nothing and then jump.
         assert_eq!(Volume::from_dbfs(-144.0), Volume::Muted);
-        assert_eq!(Volume::from_dbfs(-144.0).as_fraction(), 0.0);
-        // And the usable floor is -30, not -144.
-        assert_eq!(Volume::from_dbfs(-30.0).as_fraction(), 0.0);
-        assert_eq!(Volume::from_dbfs(0.0).as_fraction(), 1.0);
-        assert!((Volume::from_dbfs(-15.0).as_fraction() - 0.5).abs() < 1e-6);
+        assert_eq!(
+            Volume::from_dbfs(-144.0).as_level(),
+            castaway_core::Volume::SILENT
+        );
+        assert_eq!(
+            Volume::from_dbfs(0.0).as_level(),
+            castaway_core::Volume::FULL
+        );
+    }
+
+    /// What #85 changed, stated as the difference it makes.
+    ///
+    /// The bottom of AirPlay's travel is −30 dBFS, and −30 dBFS is audible. It used to
+    /// come out as a true `0.0` — the sender asking for its quietest setting and getting
+    /// silence — because the old `as_fraction` mapped the floor of the range to the floor
+    /// of the fraction. And the middle of the range came out ~9 dB hot for the same
+    /// reason, in the other direction.
+    #[test]
+    fn the_bottom_of_the_slider_is_quiet_rather_than_silent() {
+        let floor = Volume::from_dbfs(-30.0).as_level();
+        assert_ne!(floor, castaway_core::Volume::SILENT, "-30 dB is not mute");
+        assert!((floor.amplitude() - 0.031_623).abs() < 1e-5, "{floor:?}");
+
+        // Mid-travel: the sender means -15 dB, which is 0.178, not 0.5.
+        let mid = Volume::from_dbfs(-15.0).as_level();
+        assert!((mid.amplitude() - 0.177_828).abs() < 1e-5, "{mid:?}");
     }
 
     #[test]
     fn a_volume_below_the_floor_is_clamped_rather_than_negative() {
         assert_eq!(Volume::from_dbfs(-45.0), Volume::Level(-30.0));
-        assert!(Volume::from_dbfs(-45.0).as_fraction() >= 0.0);
+        assert!(Volume::from_dbfs(-45.0).as_level().amplitude() >= 0.0);
     }
 
     #[test]

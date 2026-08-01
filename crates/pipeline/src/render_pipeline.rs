@@ -975,7 +975,14 @@ impl Pipeline for RenderPipeline {
                 #[cfg(feature = "audio")]
                 {
                     self.gain.set(level);
-                    info!(level = self.gain.level(), "render pipeline: volume");
+                    // Both numbers, because they are the two that used to be confused:
+                    // where the sender's slider is, and what the samples get multiplied
+                    // by (#85). A log showing only one cannot tell you the taper ran.
+                    info!(
+                        position = level.position(),
+                        amplitude = self.gain.level(),
+                        "render pipeline: volume"
+                    );
                 }
                 #[cfg(not(feature = "audio"))]
                 let _ = level;
