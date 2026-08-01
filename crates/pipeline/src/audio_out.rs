@@ -172,6 +172,7 @@ mod cpal_backend {
     #[cfg(not(all(feature = "audio-pipewire", target_os = "linux")))]
     use super::OutputDeviceInfo;
     use super::{AudioOut, OutputSelection, PcmBlock, PipelineError};
+    use crate::resample::Resampler;
 
     /// How many blocks may queue before the decoder is told to slow down.
     ///
@@ -192,6 +193,10 @@ mod cpal_backend {
         samples: Option<SyncSender<Vec<f32>>>,
         shutdown: Option<SyncSender<()>>,
         underruns: Arc<AtomicU64>,
+        /// Present only when the device would not take the source's rate. `None` is both
+        /// the common case and the fast path — no conversion, no allocation, no quality
+        /// question to answer.
+        resampler: Option<Resampler>,
     }
 
     impl std::fmt::Debug for CpalAudioOut {
@@ -224,6 +229,7 @@ mod cpal_backend {
                 samples: None,
                 shutdown: None,
                 underruns: Arc::new(AtomicU64::new(0)),
+                resampler: None,
             }
         }
 
@@ -246,15 +252,17 @@ mod cpal_backend {
             // The thread reports whether the device opened, so `start` can still fail
             // synchronously — a receiver that pairs and then silently plays nothing is
             // the failure this whole path exists to avoid.
-            let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
+            // The thread reports the rate it actually opened at, which is not always the
+            // one asked for — see `choose_rate`.
+            let (ready_tx, ready_rx) = sync_channel::<Result<u32, String>>(1);
             let underruns = Arc::clone(&self.underruns);
             let selection = self.selection.clone();
 
             std::thread::spawn(move || {
                 let stream =
                     match open_stream(&selection, sample_rate, channels, samples_rx, underruns) {
-                        Ok(s) => {
-                            let _ = ready_tx.send(Ok(()));
+                        Ok((s, opened_at)) => {
+                            let _ = ready_tx.send(Ok(opened_at));
                             s
                         }
                         Err(e) => {
@@ -269,8 +277,22 @@ mod cpal_backend {
             });
 
             match ready_rx.recv() {
-                Ok(Ok(())) => {
-                    info!(sample_rate, channels, "audio output started");
+                Ok(Ok(opened_at)) => {
+                    self.resampler = if opened_at == sample_rate {
+                        info!(sample_rate, channels, "audio output started");
+                        None
+                    } else {
+                        // Say it plainly. The original design refused to resample so that
+                        // a pitch shift could never appear from nowhere; the answer to
+                        // that concern is to convert *and name it*, not to play nothing.
+                        info!(
+                            source_rate = sample_rate,
+                            device_rate = opened_at,
+                            channels,
+                            "audio output started; resampling to the device's rate (soxr)"
+                        );
+                        Some(Resampler::new(sample_rate, opened_at, channels)?)
+                    };
                     self.samples = Some(samples_tx);
                     self.shutdown = Some(shutdown_tx);
                     Ok(())
@@ -281,10 +303,18 @@ mod cpal_backend {
         }
 
         fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
+            // Convert before borrowing the sender: resampling needs `&mut self` and is
+            // deliberately done here, on the decode thread, rather than in the device
+            // callback where allocating would be a dropout.
+            let converted = match self.resampler.as_mut() {
+                Some(r) => Some(r.convert(block)?),
+                None => None,
+            };
             let Some(tx) = self.samples.as_ref() else {
                 return Err(PipelineError::Audio("audio output not started".into()));
             };
-            match tx.try_send(block.samples.clone()) {
+            let payload = converted.unwrap_or_else(|| block.samples.clone());
+            match tx.try_send(payload) {
                 Ok(()) => Ok(()),
                 // A full queue means the device is behind. Dropping the newest and
                 // saying so beats blocking the decode thread, which would back up into
@@ -300,6 +330,18 @@ mod cpal_backend {
         }
 
         fn stop(&mut self) {
+            // Push the resampler's tail before dropping the queue, or the last few
+            // milliseconds of every resampled session are left in the filter.
+            if let (Some(r), Some(tx)) = (self.resampler.as_mut(), self.samples.as_ref()) {
+                match r.flush() {
+                    Ok(tail) if !tail.is_empty() => {
+                        let _ = tx.try_send(tail);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "audio output: resampler tail was lost"),
+                }
+            }
+            self.resampler = None;
             self.samples = None;
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.try_send(());
@@ -345,23 +387,78 @@ mod cpal_backend {
             .ok_or_else(|| "no default output device".to_owned())
     }
 
+    /// The rate to open `device` at, given the source is at `wanted`.
+    ///
+    /// Asking for exactly what the sender sends is right on Linux and wrong on Windows,
+    /// and the asymmetry is the whole reason this function exists. ALSA and PipeWire
+    /// accept any rate and convert underneath. **WASAPI shared mode does not**: the
+    /// endpoint has one fixed mix format, and a request for anything else fails with
+    /// "the requested stream configuration is not supported by the device" — which is
+    /// how a phone streaming 44.1 kHz aptX HD onto a 48 kHz panel paired, negotiated,
+    /// decoded, and played to nothing at all.
+    ///
+    /// So: prefer the source's own rate whenever the device will take it (no conversion
+    /// at all, which is always the best resampler), and otherwise pick a rate the device
+    /// actually offers and convert into it.
+    fn choose_rate(device: &cpal::Device, wanted: u32, channels: u16) -> Result<u32, String> {
+        let ranges: Vec<_> = device
+            .supported_output_configs()
+            .map_err(|e| format!("querying output configs: {e}"))?
+            .filter(|c| c.channels() == channels)
+            .collect();
+        if ranges.is_empty() {
+            // A channel-count mismatch is a different failure and is not something a
+            // resampler fixes, so it is named rather than folded into the rate story.
+            return Err(format!(
+                "device offers no {channels}-channel output configuration"
+            ));
+        }
+
+        let wanted_sr = cpal::SampleRate(wanted);
+        let supported = |sr: cpal::SampleRate| {
+            ranges
+                .iter()
+                .any(|r| r.min_sample_rate() <= sr && sr <= r.max_sample_rate())
+        };
+        if supported(wanted_sr) {
+            return Ok(wanted);
+        }
+
+        // The device's own default is the endpoint mix format on WASAPI — the one rate
+        // guaranteed to open in shared mode — so it is tried before anything cleverer.
+        if let Ok(default) = device.default_output_config() {
+            if supported(default.sample_rate()) {
+                return Ok(default.sample_rate().0);
+            }
+        }
+
+        // Otherwise the offered rate closest to the source, which keeps the conversion
+        // ratio small and avoids inventing bandwidth that was never there.
+        ranges
+            .iter()
+            .map(|r| wanted.clamp(r.min_sample_rate().0, r.max_sample_rate().0))
+            .min_by_key(|rate| rate.abs_diff(wanted))
+            .ok_or_else(|| format!("device offers no usable rate near {wanted} Hz"))
+    }
+
     /// Build and start the output stream. Runs on the audio thread.
+    ///
+    /// Returns the stream and the rate it actually opened at, which the caller compares
+    /// against the source rate to decide whether a resampler is needed.
     fn open_stream(
         selection: &OutputSelection,
         sample_rate: u32,
         channels: u16,
         rx: Receiver<Vec<f32>>,
         underruns: Arc<AtomicU64>,
-    ) -> Result<cpal::Stream, String> {
+    ) -> Result<(cpal::Stream, u32), String> {
         let host = cpal::default_host();
         let device = pick_device(&host, selection)?;
+        let opened_at = choose_rate(&device, sample_rate, channels)?;
 
-        // Ask for exactly what the stream is. A device that refuses gets the
-        // conversation resolved here rather than by something downstream silently
-        // resampling, where the pitch shift becomes a mystery.
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate: cpal::SampleRate(opened_at),
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -401,7 +498,7 @@ mod cpal_backend {
         stream
             .play()
             .map_err(|e| format!("start output stream: {e}"))?;
-        Ok(stream)
+        Ok((stream, opened_at))
     }
 }
 

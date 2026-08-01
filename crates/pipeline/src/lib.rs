@@ -25,6 +25,11 @@ pub mod audio_select;
 #[cfg(feature = "audio")]
 pub mod audio_session;
 pub mod browser;
+// Sample-rate conversion, for outputs that will not take the sender's rate — which is
+// every WASAPI endpoint and no ALSA one. See the module docs for why that asymmetry hid
+// a silent Windows-only failure for so long.
+#[cfg(feature = "audio")]
+pub mod resample;
 // The browser subprocess protocol (D36). Pure and always compiled, so the wire types
 // are fixture-tested in every build rather than only where a browser exists.
 pub mod browser_proto;
