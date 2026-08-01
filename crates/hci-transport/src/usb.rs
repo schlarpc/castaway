@@ -269,12 +269,20 @@ impl UsbTransport {
 ///
 /// This is the error everyone hits first, and "Access denied" alone sends people looking
 /// in the wrong place.
+///
+/// Both hints name the *command*, not just the condition. Binding a controller away from
+/// the OS stack is a once-per-box administrative act, and deliberately not something the
+/// receiver does to its own machine: it runs unprivileged, terminates six untrusted
+/// protocols and hosts a browser, so giving it driver-install rights would buy one command
+/// a human runs once at the cost of a very large blast radius. The least this can do is
+/// finish the sentence.
 fn claim_hint(detail: &str) -> String {
     let hint = if cfg!(target_os = "linux") {
         "the kernel's btusb driver is probably still bound — unbind it \
          (/sys/bus/usb/drivers/btusb/unbind) and check udev permissions"
     } else {
-        "the device must be bound to WinUSB rather than the Microsoft Bluetooth driver"
+        "the device must be bound to WinUSB rather than the Microsoft Bluetooth driver — \
+         `nix run .#windows-winusb` does that (and `-- --undo` gives it back)"
     };
     format!("{detail} ({hint})")
 }
