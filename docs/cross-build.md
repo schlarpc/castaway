@@ -52,6 +52,60 @@ For an incremental loop, `nix develop .#windows` exports the whole cross environ
 `default` on purpose** — exporting `CARGO_BUILD_TARGET` into the default shell would silently
 hijack the native dev loop.
 
+## Deploying to the box
+
+The archive is the *artifact*; getting it onto the panel and running is `nix run
+.#deploy-windows` (`nix/deploy-windows.nix`). The box address is not in the repo — it is one
+machine on one LAN — so both scripts read `CASTAWAY_WINDOWS_HOST=user@address`.
+
+```
+export CASTAWAY_WINDOWS_HOST=user@panel
+nix run .#windows-firewall            # once per box; --close takes it down again
+nix run .#deploy-windows              # build → wipe → copy → verify → launch → stream the log
+nix run .#deploy-windows -- --force   # re-copy even if the box already has these bits
+nix run .#deploy-windows -- --no-launch castaway-windows-render
+```
+
+`deploy-windows` is built around the assumption that **a stale tree that looks deployed is the
+expensive failure**: you change something, the copy silently doesn't land, and you spend the
+session debugging the old binary against the new source. So every step that could leave the box
+half-updated is checked rather than assumed — `rmdir` is followed by asking whether the
+directory is still there (it reports success while leaving a locked tree behind), the
+transferred zip is hashed on the box against the local one, and the extracted `castaway.exe` is
+hashed against the one in the store. Only after all of that does it write
+`.deployed-sha256`, which is what lets the *next* run skip the 235 MB copy — a half-finished
+deploy leaves no stamp, so the fast path cannot inherit a lie.
+
+Three things about the box drove the design, all measured rather than assumed:
+
+- **An SSH login lands in session 0.** Start `castaway.exe` from `ssh` and it runs on the
+  services desktop: no window anywhere, and from the Linux side it looks exactly like a
+  successful launch. The panel is the *console* session, and `schtasks /create … /IT` — run with
+  the interactive token of the logged-on user — is what reaches it. `tasklist /V` confirming
+  `Session#: 2` is how this was established, and is how to re-establish it if a launch ever
+  stops showing up.
+- **Nothing sets `CASTAWAY_ELECTRON` on Windows.** The Linux artifact is `wrapProgram`ped
+  (`nix/linux-kiosk.nix`); the Windows tree is a flat directory with no wrapper, so the receiver
+  would look for a bare `electron` on `PATH` and not find it. The generated `run.cmd` supplies
+  `CASTAWAY_ELECTRON` and `CASTAWAY_BROWSER_APP` relative to itself. Launching `castaway.exe`
+  by hand on the box without those is a browser-less run that reports no error worth noticing.
+- **The SSH session is elevated and cmd.exe is the shell.** `netsh`/`New-NetFirewallRule` work
+  without a UAC dance, which is what makes `windows-firewall` possible at all; and `;` is not a
+  separator, `&` is.
+
+Output comes back over a small PowerShell tail (`tail.ps1`, staged beside the exe) rather than
+`Get-Content -Wait`, for two reasons: it opens with `FileShare.ReadWrite` so it cannot trip the
+writer, and it exits when `castaway.exe` is gone — a receiver that died three seconds in
+otherwise leaves you watching an idle stream that looks identical to one that is working.
+
+`windows-firewall` generates its rules from `nix/network-surface.json`, the same source of truth
+as the Linux `open-firewall` and as the app's own `--network-surface`, so it cannot drift from
+the code that binds the sockets (`crates/app/src/surface.rs` regenerates the file and a test
+fails on drift). It differs from the Linux script in one way: `New-NetFirewallRule` takes a port
+*range* as one rule, so the 32-port AirPlay/Cast media range is one rule rather than 32 holes.
+Everything is tagged `-Group castaway`, which makes re-running idempotent and `--close` a single
+`Remove-NetFirewallRule`.
+
 ## Target + toolchain: `x86_64-pc-windows-msvc`
 
 Use the **MSVC** target, not MinGW/`windows-gnu`: windows-rs/WinRT is happiest on MSVC, and the
@@ -207,8 +261,9 @@ compiled in — it isn't selected.
 - **Cross-build checks (`nix flake check`):** the Windows artifacts link, and their DLL closures
   are satisfied. No execution.
 - **Physical Windows box (C6522QT-attached):** the *only* place Miracast/WinRT/DX12-interop/
-  browser-frame-import integration is real. Deploy the artifact here for hardware tests. Wine
-  has no Miracast receiver API, no real Wi-Fi Direct, dicey DX12 — not a test path.
+  browser-frame-import integration is real. `nix run .#deploy-windows` puts the artifact there
+  and streams its log back (see "Deploying to the box"). Wine has no Miracast receiver API, no
+  real Wi-Fi Direct, dicey DX12 — not a test path.
 
 ## Bottom line
 
