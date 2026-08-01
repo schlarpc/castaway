@@ -9,10 +9,11 @@
 #      desktop, so its window is nowhere — launching `castaway.exe` straight from `ssh` puts
 #      no pixels on the panel and looks, from here, exactly like a successful launch. The
 #      console session is where the panel is, and `schtasks /IT` is what reaches it.
-#   2. **Nothing sets `CASTAWAY_ELECTRON` on Windows.** The Linux artifact is `wrapProgram`ped
-#      (nix/linux-kiosk.nix); the Windows tree is a flat directory with no wrapper, so the
-#      browser subprocess would be looked up as bare `electron` on `PATH` and not found. The
-#      launcher below supplies both paths relative to itself.
+#   2. **The launcher supplies no paths.** It used to have to: the Windows tree is flat with
+#      no wrapper, so a receiver that relied on `$CASTAWAY_ELECTRON` could not find its own
+#      browser. That is fixed in the receiver instead — it resolves the browser, the host app
+#      and the CDM beside its own executable — and `run.cmd` is left bare so a regression
+#      shows up here rather than being papered over by the deploy script.
 #
 # The host is deliberately *not* baked in: `CASTAWAY_WINDOWS_HOST=user@host`. It is one box on
 # one LAN, and the repo is not the place for it.
@@ -78,10 +79,9 @@ let
     setlocal
     rem `%~dp0` keeps a trailing backslash, which `cd /d "..."` chokes on — hence the `.`.
     cd /d "%~dp0."
-    rem The Windows artifact has no wrapper (see the header): point the receiver at the
-    rem browser tree that shipped beside it, or it looks for bare `electron` on PATH.
-    set "CASTAWAY_ELECTRON=%~dp0browser\electron.exe"
-    set "CASTAWAY_BROWSER_APP=%~dp0browser-host"
+    rem Deliberately sets no CASTAWAY_ELECTRON / CASTAWAY_BROWSER_APP / CASTAWAY_WIDEVINE_CDM:
+    rem the receiver finds all three beside its own executable. If that ever regresses, this
+    rem script is where it would be papered over, so it is left bare on purpose.
     if exist "%~dp0castaway.log" del /q "%~dp0castaway.log"
     if exist "%~dp0castaway.exit" del /q "%~dp0castaway.exit"
     castaway.exe > "%~dp0castaway.log" 2>&1
@@ -200,7 +200,7 @@ let
 
   deploy = pkgs.writeShellApplication {
     name = "castaway-deploy-windows";
-    runtimeInputs = [ pkgs.openssh pkgs.coreutils ];
+    runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.unzip ];
     text = preamble + ''
       artifact="castaway-windows-electron"
       force=""
@@ -218,16 +218,20 @@ let
       say() { printf '\n==> %s\n' "$*"; }
       die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
 
-      say "building .#$artifact"
-      # The directory output and the zip are the same build; asking for both costs nothing
-      # and gives us a local copy of castaway.exe to hash the deployed one against.
-      tree=$(nix build --no-link --print-out-paths ".#$artifact")
+      say "building .#$artifact.archive"
+      # Only the archive is built, and the reference hash for castaway.exe is read back out
+      # of it. Building `.#$artifact` as well to get a local exe to compare against looks
+      # free and is not: it is a second derivation, so it links the Windows binary a second
+      # time and the two outputs are not bit-identical — which surfaced as a "deployed
+      # castaway.exe hashes X, built one hashes Y" failure on a deploy that was fine.
+      # Hashing the member of the zip is also the stronger check: it verifies the bits being
+      # shipped rather than a parallel build of them.
       store=$(nix build --no-link --print-out-paths ".#$artifact.archive")
       zip="$store/$artifact.zip"
       [ -f "$zip" ] || die "no archive at $zip"
-      [ -f "$tree/bin/castaway.exe" ] || die "$artifact has no bin/castaway.exe"
       zip_sha=$(sha256sum "$zip" | cut -d' ' -f1)
-      exe_sha=$(sha256sum "$tree/bin/castaway.exe" | cut -d' ' -f1)
+      exe_sha=$(unzip -p "$zip" "$artifact/castaway.exe" | sha256sum | cut -d' ' -f1)
+      [ "''${#exe_sha}" -eq 64 ] || die "no $artifact/castaway.exe inside $zip"
       printf '    %s (%s bytes)\n' "$zip" "$(stat -c%s "$zip")"
 
       home_dir=$(on_box 'echo %USERPROFILE%' | unix)
