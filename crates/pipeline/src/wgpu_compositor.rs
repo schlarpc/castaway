@@ -345,10 +345,21 @@ impl TexelFormat {
 /// plane views and a color matrix, an uploaded one binds a single packed texture. A
 /// mismatch between the two must not be representable.
 enum LayerTexture {
-    /// A packed RGBA/BGRA texture we own and write into.
+    /// A packed RGBA/BGRA texture — either one we own and write into, or an imported
+    /// browser frame, which draws identically.
     Packed {
         texture: wgpu::Texture,
         format: TexelFormat,
+        /// For an imported frame: the producer-side borrow whose `Drop` acks the frame
+        /// back to the browser. `None` for a texture we allocated.
+        ///
+        /// The Linux import hands this to Vulkan's drop guard instead, so wgpu releases it
+        /// when the last submission sampling the texture retires. wgpu's DX12
+        /// `texture_from_raw` accepts no guard, so on Windows there is nowhere to hang it
+        /// and the layer holds it until the layer is replaced. That is *later than never*
+        /// but earlier than retirement — the same gap the NV12 path has, and the
+        /// consumer→producer half of Q20.
+        _owner: Option<std::sync::Arc<dyn GpuSurface>>,
     },
     /// A two-plane NV12 surface produced by a hardware decoder and imported in place.
     Nv12 {
@@ -374,7 +385,9 @@ impl LayerGpu {
     /// one.
     const fn packed(&self) -> Option<(&wgpu::Texture, TexelFormat)> {
         match &self.texture {
-            LayerTexture::Packed { texture, format } => Some((texture, *format)),
+            LayerTexture::Packed {
+                texture, format, ..
+            } => Some((texture, *format)),
             LayerTexture::Nv12 { .. } => None,
         }
     }
@@ -762,7 +775,11 @@ impl WgpuCompositor {
             LayerState {
                 meta,
                 gpu: Some(LayerGpu {
-                    texture: LayerTexture::Packed { texture, format },
+                    texture: LayerTexture::Packed {
+                        texture,
+                        format,
+                        _owner: None,
+                    },
                     uniform,
                     bind_group,
                 }),
@@ -798,7 +815,7 @@ impl WgpuCompositor {
         span: crate::hwaccel::PlaneSpan,
         handle: crate::hwaccel::remote_handle::LocalHandle,
         borrow: Box<dyn std::any::Any + Send + Sync>,
-    ) -> Result<wgpu::Texture, PipelineError> {
+    ) -> Result<(wgpu::Texture, Option<std::sync::Arc<dyn GpuSurface>>), PipelineError> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
@@ -817,7 +834,10 @@ impl WgpuCompositor {
             // become the surface the import hangs its drop guard on.
             let owner: std::sync::Arc<dyn GpuSurface> =
                 std::sync::Arc::new(BorrowedFrame(handle, borrow));
-            importer.import_single_plane(&self.device, geometry, modifier, plane, owner)
+            // Vulkan's drop guard already owns it; nothing for the layer to hold.
+            importer
+                .import_single_plane(&self.device, geometry, modifier, plane, owner)
+                .map(|texture| (texture, None))
         }
         #[cfg(windows)]
         {
@@ -830,9 +850,12 @@ impl WgpuCompositor {
                 &self.device,
                 geometry,
                 raw,
-                owner,
+                std::sync::Arc::clone(&owner),
             )?;
-            Ok(frame.into_texture())
+            // The owner goes to the layer rather than being forgotten with the frame: it is
+            // the borrow whose `Drop` acks the frame back to Chromium, and dropping it on
+            // the floor meant the browser stopped painting after MAX_INFLIGHT_FRAMES.
+            Ok((frame.into_texture(), Some(owner)))
         }
     }
 
@@ -973,7 +996,12 @@ impl WgpuCompositor {
     /// while a browser frame is single-plane BGRA that the *caller* keeps borrowed from
     /// the browser until the GPU is done with it. Sharing one entry point would mean one
     /// of those two lifetimes being wrong.
-    pub fn adopt_rgba_texture(&mut self, id: LayerId, texture: wgpu::Texture) {
+    pub fn adopt_rgba_texture(
+        &mut self,
+        id: LayerId,
+        texture: wgpu::Texture,
+        owner: Option<std::sync::Arc<dyn GpuSurface>>,
+    ) {
         let format = match texture.format() {
             wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {
                 TexelFormat::Rgba8
@@ -1030,9 +1058,13 @@ impl WgpuCompositor {
                 gpu: Some(LayerGpu {
                     // `Packed` rather than a new variant: from the draw's point of view an
                     // imported browser frame *is* a packed RGBA texture. The difference is
-                    // entirely in who owns the memory, and that is the caller's borrow,
-                    // held above this layer — see `electron_browser::InFlight`.
-                    texture: LayerTexture::Packed { texture, format },
+                    // entirely in who owns the memory — `owner` on Windows, Vulkan's drop
+                    // guard on Linux.
+                    texture: LayerTexture::Packed {
+                        texture,
+                        format,
+                        _owner: owner,
+                    },
                     uniform,
                     bind_group,
                 }),

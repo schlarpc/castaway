@@ -182,7 +182,7 @@ pub struct ImportedFrame {
 }
 
 impl ImportedFrame {
-    /// Yield the texture, leaking the resource reference into it.
+    /// Yield the texture, leaking the *resource* reference into it.
     ///
     /// The compositor stores textures, not frames, so the resource has to outlive this
     /// type without the caller holding it separately. `std::mem::forget` on the resource
@@ -190,6 +190,14 @@ impl ImportedFrame {
     /// refcounted, and the reference is released when the texture wgpu owns is dropped
     /// along with the layer. The alternative — a drop guard — is exactly what wgpu's DX12
     /// `texture_from_raw` does not accept.
+    ///
+    /// `_owner` is emphatically *not* forgotten, though it used to be. It is the borrow
+    /// whose `Drop` acks the frame back to Chromium, so forgetting it meant no frame was
+    /// ever acked: the browser stops sending once `MAX_INFLIGHT_FRAMES` are unreleased, so
+    /// the page painted four frames on Windows and then froze — the deadlock this file's
+    /// own module docs describe, arrived at from the other direction. It is dropped here
+    /// because the caller keeps its own clone and hangs it on the layer; this type's job
+    /// ends with the texture.
     #[must_use]
     pub fn into_texture(self) -> wgpu::Texture {
         let Self {
@@ -198,7 +206,7 @@ impl ImportedFrame {
             _owner,
         } = self;
         std::mem::forget(_resource);
-        std::mem::forget(_owner);
+        drop(_owner);
         texture
     }
 }

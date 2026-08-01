@@ -1715,10 +1715,10 @@ impl RenderLoop {
         transform: Transform,
         layer: LayerId,
     ) -> Result<(), PipelineError> {
-        let texture = self
+        let (texture, owner) = self
             .compositor
             .import_browser_frame(geometry, modifier, span, handle, borrow)?;
-        self.compositor.adopt_rgba_texture(layer, texture);
+        self.compositor.adopt_rgba_texture(layer, texture, owner);
         self.compositor.upsert_layer(Layer {
             id: layer,
             opacity: 1.0,
