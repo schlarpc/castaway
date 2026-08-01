@@ -338,6 +338,24 @@ let
     "propsys.dll"
     "secur32.dll"
     "setupapi.dll"
+    # The USB pair `nusb` needs, and so `hci-transport`'s Bluetooth transport. Both were
+    # omitted by oversight rather than judgement — their sibling `setupapi.dll` is right
+    # above — and `nix flake check` had been red on them since the USB transport landed
+    # (#110).
+    #
+    # `cfgmgr32.dll` is the configuration manager (`CM_Get_Device_*`), used to enumerate
+    # devices; in System32 since Vista. `winusb.dll` is WinUSB's user-mode half, and it is
+    # in-box for the same span: "WinUSB is a generic driver for USB devices that is
+    # included with all versions of Windows since Windows Vista", whose INF "references the
+    # in-box driver, Winusb.sys, found in Windows\System32 folder".
+    #
+    # Worth separating two things that are easy to conflate, because getting it wrong
+    # argues for shipping a DLL that cannot be shipped: what `nix run .#windows-winusb`
+    # installs is not the library, it is the *binding* of WinUSB to a particular device,
+    # which is a driver-ranking problem against the inbox WHQL driver. The library is
+    # already there on any supported Windows; only the binding is ours to arrange.
+    "cfgmgr32.dll"
+    "winusb.dll"
     "shell32.dll"
     "shlwapi.dll"
     "user32.dll"
