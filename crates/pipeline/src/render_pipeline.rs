@@ -832,6 +832,19 @@ impl Pipeline for RenderPipeline {
             self.preempt();
             let stop = Arc::new(AtomicBool::new(false));
             self.set_active(Arc::clone(&stop));
+            // Taken after `preempt`, so it is this session's ticket. `play` has always
+            // done this; the audio path never did, which is why an audio session that
+            // could not open the device had no way to say so and the source streamed on
+            // into nothing.
+            let ends = self.end_report().map(|r| {
+                let ticket = r.ticket();
+                (r, ticket)
+            });
+            let failed: Option<crate::audio_session::SessionFailed> =
+                ends.map(|(report, ticket)| {
+                    Box::new(move |why: String| report.report(ticket, PlaybackEnd::Failed(why)))
+                        as crate::audio_session::SessionFailed
+                });
             match source {
                 FrameSource::Encoded(rx) => {
                     crate::audio_session::spawn(
@@ -841,6 +854,7 @@ impl Pipeline for RenderPipeline {
                         self.audio_output(),
                         stop,
                         Arc::clone(&self.gain),
+                        failed,
                     );
                     Ok(())
                 }

@@ -128,6 +128,9 @@ impl Pipeline for NullPipeline {
                     self.audio_output(),
                     stop,
                     std::sync::Arc::new(crate::audio_session::Gain::default()),
+                    // The null pipeline has no session manager to tell, so a refused
+                    // output is simply logged by the session itself.
+                    None,
                 );
             } else {
                 info!("null pipeline: MIRROR audio is not encoded frames; draining");
@@ -172,6 +175,9 @@ impl Pipeline for NullPipeline {
                     self.audio_output(),
                     stop,
                     std::sync::Arc::new(crate::audio_session::Gain::default()),
+                    // The null pipeline has no session manager to tell, so a refused
+                    // output is simply logged by the session itself.
+                    None,
                 );
                 return Ok(());
             }

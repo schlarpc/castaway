@@ -849,6 +849,7 @@ pub(crate) mod tests {
             Box::new(std::sync::Arc::clone(&speaker)),
             &std::sync::atomic::AtomicBool::new(false),
             &crate::audio_session::Gain::default(),
+            None,
         );
 
         let played = speaker.frames.load(std::sync::atomic::Ordering::SeqCst);
@@ -864,6 +865,70 @@ pub(crate) mod tests {
         assert!(
             *speaker.peak.lock().unwrap() > 0.05,
             "the output received silence"
+        );
+    }
+
+    /// An output that will not open — what a WASAPI endpoint does when asked for a rate
+    /// it does not have.
+    #[derive(Debug)]
+    struct RefusingOutput;
+
+    impl crate::audio_out::AudioOut for RefusingOutput {
+        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
+            Err(PipelineError::Audio(
+                "the requested stream configuration is not supported by the device".into(),
+            ))
+        }
+        fn write(&mut self, _block: &PcmBlock) -> Result<(), PipelineError> {
+            panic!("nothing may be written to an output that refused to start");
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[test]
+    fn a_session_whose_output_refuses_says_so_instead_of_playing_silently() {
+        // The bug this ends, measured on the panel: a phone streaming 44.1 kHz aptX HD at
+        // a WASAPI endpoint fixed to 48 kHz. `build_output_stream` refused, the session
+        // thread returned — and nothing else was told. The adapter went on accepting
+        // media into a dead channel for another 46 seconds, logging "audio queue full"
+        // once per packet, while the now-playing card claimed to be playing throughout.
+        //
+        // Resampling (see `crate::resample`) is what stops the refusal happening at all.
+        // This is the other half: if it ever *does* happen, somebody has to be told, or
+        // the symptom is once again silence with a healthy-looking session on top of it.
+        let rate = 44_100;
+        let frames = encode(AudioCodec::Sbc, rate, &sine(rate, rate as usize));
+        if frames.is_empty() {
+            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(frames.len() + 1);
+        for frame in frames {
+            tx.blocking_send(frame).unwrap();
+        }
+        drop(tx);
+
+        let reported: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&reported);
+        crate::audio_session::run(
+            rx,
+            format(rate, 2),
+            None,
+            Box::new(RefusingOutput),
+            &std::sync::atomic::AtomicBool::new(false),
+            &crate::audio_session::Gain::default(),
+            Some(Box::new(move |why| {
+                *sink.lock().expect("poisoned") = Some(why);
+            })),
+        );
+
+        let why = reported.lock().unwrap().clone();
+        let why = why.expect("a session that cannot open its output must report it");
+        assert!(
+            why.contains("44100"),
+            "the report should name the rate that was refused, got {why:?}"
         );
     }
 
@@ -992,6 +1057,7 @@ pub(crate) mod tests {
                 Box::new(sink),
                 &stop,
                 &crate::audio_session::Gain::default(),
+                None,
             );
             let blocks = counted.lock().unwrap().clone();
             blocks

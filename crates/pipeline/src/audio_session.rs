@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::audio_decode::decode_audio_stream;
 use crate::audio_out::AudioOut;
@@ -141,9 +141,28 @@ pub fn spawn(
     output: Box<dyn AudioOut>,
     stop: Arc<AtomicBool>,
     gain: Arc<Gain>,
+    failed: Option<SessionFailed>,
 ) {
-    std::thread::spawn(move || run(frames, format, config.as_deref(), output, &stop, &gain));
+    std::thread::spawn(move || {
+        run(
+            frames,
+            format,
+            config.as_deref(),
+            output,
+            &stop,
+            &gain,
+            failed,
+        );
+    });
 }
+
+/// How a session says it could not play, so the source can be told to stop.
+///
+/// A callback rather than a channel because the reporting machinery
+/// (`RenderPipeline::end_report`) is private to that module and threading it through
+/// here would export it for one caller. Called at most once, and only for failures — a
+/// session that ends normally is already handled by the frame channel closing.
+pub type SessionFailed = Box<dyn FnOnce(String) + Send>;
 
 /// Drive one audio session to completion. Blocking; call it on its own thread.
 pub fn run(
@@ -153,6 +172,7 @@ pub fn run(
     mut output: Box<dyn AudioOut>,
     stop: &AtomicBool,
     gain: &Gain,
+    failed: Option<SessionFailed>,
 ) {
     // Wait for the first frame so the codec comes from the stream itself.
     let Some(first) = frames.blocking_recv() else {
@@ -165,6 +185,9 @@ pub fn run(
 
     let mut started = false;
     let mut pending = Some(first);
+    // Why the output could not be opened, if it could not. Set inside the sink closure
+    // and reported after it, because the closure cannot consume the `FnOnce`.
+    let mut refused: Option<String> = None;
 
     let result = decode_audio_stream(
         codec,
@@ -183,7 +206,22 @@ pub fn run(
             gain.apply(&mut block);
             if !started {
                 if let Err(e) = output.start(block.sample_rate, block.channels) {
-                    warn!(error = %e, "audio session: output refused the stream");
+                    // ERROR, not WARN: with the rate negotiated and resampled this should
+                    // now be unreachable for a mismatch, so if it fires the box genuinely
+                    // cannot play and somebody has to be told. The session used to stop
+                    // here and say nothing further — the source kept streaming into a
+                    // dead channel, the card kept saying "playing", and the only symptom
+                    // was silence.
+                    error!(
+                        error = %e,
+                        rate = block.sample_rate,
+                        channels = block.channels,
+                        "audio session: the output device refused the stream; ending the session"
+                    );
+                    refused = Some(format!(
+                        "output device refused {} Hz x {}: {e}",
+                        block.sample_rate, block.channels
+                    ));
                     return false;
                 }
                 info!(
@@ -213,8 +251,17 @@ pub fn run(
         // the failure Q22 exists to prevent — so name it loudly.
         warn!(error = %e, ?codec, "audio session ended with an error");
         crate::audio_decode::warn_undecodable(codec);
+        if refused.is_none() {
+            refused = Some(format!("{codec:?} decode failed: {e}"));
+        }
     }
     output.stop();
+    // Tell the source. Without this the session is over here and still running there:
+    // the phone keeps sending, the adapter keeps dropping into a closed channel, and the
+    // now-playing card keeps claiming playback that is not happening.
+    if let (Some(why), Some(report)) = (refused, failed) {
+        report(why);
+    }
 }
 
 /// What a media-URL session shares with the thread that plays its sound.
@@ -484,6 +531,30 @@ mod tests {
             Box::new(NullAudioOut::new()),
             &running(),
             &Gain::default(),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_session_that_plays_normally_reports_no_failure() {
+        // The other half: the failure path must not fire for an ordinary session, or
+        // every Bluetooth stream would tear itself down on the first frame.
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let reported = Arc::new(Mutex::new(false));
+        let sink = Arc::clone(&reported);
+        run(
+            rx,
+            format(),
+            None,
+            Box::new(NullAudioOut::new()),
+            &running(),
+            &Gain::default(),
+            Some(Box::new(move |_| *sink.lock().expect("poisoned") = true)),
+        );
+        assert!(
+            !*reported.lock().unwrap(),
+            "reported a failure that was not"
         );
     }
 
@@ -507,6 +578,7 @@ mod tests {
             Box::new(NullAudioOut::new()),
             &running(),
             &Gain::default(),
+            None,
         );
     }
 
