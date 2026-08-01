@@ -21,7 +21,16 @@ tracing.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+    "sync",
+    "rt",
+    "macros",
+    "time",
+    "rt-multi-thread",
+    # `start_paused`: the command watchdog is a five-second deadline, and a test that
+    # waits five real seconds for it is a test nobody runs.
+    "test-util",
+] }
 # For the ERTM bench only: it drives the real engine against the Linux kernel's L2CAP
 # through a virtual controller, which needs a transport. Nothing in the library depends
 # on it, and the example is gated so a non-Linux build never reaches for it.

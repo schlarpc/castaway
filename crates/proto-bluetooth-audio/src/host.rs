@@ -10,13 +10,14 @@
 //! tests with no radio.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use tracing::{debug, warn};
 
 use bytes::Bytes;
 use substrate_hci::{
-    AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, ConnectionHandle, Eir, Event,
-    IoCapability, LinkKey, LinkType, ScanEnable, Status,
+    AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, CommandCredits, ConnectionHandle,
+    Eir, Event, IoCapability, LinkKey, LinkType, ScanEnable, Status,
 };
 
 /// How far controller bring-up has got.
@@ -137,6 +138,16 @@ const SERVICE_CLASSES: [u16; 5] = [
     0x110F, // A/V Remote Control Controller — the role we play toward the phone's player.
 ];
 
+/// How long a command may go unanswered before the host gives up on it.
+///
+/// Five seconds, which is what the firmware loaders already allow their own exchanges
+/// (`hci-transport/src/init/intel.rs`, `.../realtek.rs`) — the same wait for the same
+/// reason, and the loaders having it was exactly why bring-up's own silence went
+/// unnoticed. Long enough that a controller merely busy with the radio is not written
+/// off; short enough that a receiver which came up half-configured says so while
+/// somebody is still in the room to hear it.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Inquiry scan interval: 1024 slots of 0.625 ms = 640 ms.
 const INQUIRY_SCAN_INTERVAL: u16 = 0x0400;
 /// Inquiry scan window: 96 slots = 60 ms, so ~9% of the radio goes to being findable.
@@ -156,6 +167,14 @@ pub struct HostController {
     link_keys: HashMap<BdAddr, LinkKey>,
     /// Live connections, so a disconnection can name its peer.
     connections: HashMap<u16, BdAddr>,
+    /// The controller's command window. Every command this host emits passes through it,
+    /// so nothing is written into a slot the controller does not have (#90).
+    commands: CommandCredits,
+    /// How long the oldest unanswered command has been outstanding.
+    ///
+    /// Advanced by [`HostController::tick`] rather than read from a clock: this is a pure
+    /// state machine and the actor above owns the time (ground rule 3).
+    unanswered_for: Duration,
 }
 
 impl HostController {
@@ -171,6 +190,8 @@ impl HostController {
             acl_mtu: 339,
             link_keys: HashMap::new(),
             connections: HashMap::new(),
+            commands: CommandCredits::new(),
+            unanswered_for: Duration::ZERO,
         }
     }
 
@@ -249,7 +270,7 @@ impl HostController {
             Command::WritePageScanType(true),
             Command::WriteScanEnable(self.idle_scan()),
         ];
-        vec![HostAction::Send(Command::Reset)]
+        self.pace(vec![HostAction::Send(Command::Reset)])
     }
 
     /// Set discoverability directly — used to go quiet while a session is active (#68).
@@ -262,7 +283,7 @@ impl HostController {
             // reconnect even while someone else is streaming, or takeover never works.
             ScanEnable::ConnectableOnly
         };
-        vec![HostAction::Send(Command::WriteScanEnable(scan))]
+        self.pace(vec![HostAction::Send(Command::WriteScanEnable(scan))])
     }
 
     /// The inquiry response payload: what we serve, and what to call us.
@@ -290,8 +311,100 @@ impl HostController {
     }
 
     /// Feed one controller event.
+    ///
+    /// Commands the controller has no room for are held back here rather than written and
+    /// discarded; they go out on their own as the window reopens, which is why one event
+    /// can produce commands that have nothing to do with it.
     #[must_use]
     pub fn on_event(&mut self, event: &Event) -> Vec<HostAction> {
+        // The window opens *before* the event is handled, because what the event produces
+        // is usually the very next command — during bring-up it always is.
+        let mut actions = match event {
+            Event::CommandComplete {
+                opcode,
+                allowed_packets,
+                ..
+            }
+            | Event::CommandStatus {
+                opcode,
+                allowed_packets,
+                ..
+            } => {
+                self.unanswered_for = Duration::ZERO;
+                self.commands
+                    .answered(*opcode, *allowed_packets)
+                    .into_iter()
+                    .map(HostAction::Send)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let fresh = self.handle(event);
+        actions.extend(self.pace(fresh));
+        actions
+    }
+
+    /// How long until the oldest in-flight command is declared lost, if one is in flight.
+    ///
+    /// `None` means there is nothing to wait for, and the actor should not arm a timer.
+    #[must_use]
+    pub fn next_timeout(&self) -> Option<Duration> {
+        (self.commands.in_flight() > 0).then(|| COMMAND_TIMEOUT.saturating_sub(self.unanswered_for))
+    }
+
+    /// Advance the command watchdog by `elapsed`.
+    ///
+    /// **This is the whole of the fix for a controller that stops answering.** Bring-up
+    /// is a queue advanced only by a completion, so one lost completion — the documented
+    /// idle stall on this project's dongle — left the queue stopped with no `Ready`, no
+    /// `WriteScanEnable` and nothing in the log: the panel came up, the UI looked
+    /// healthy, and the receiver was simply never discoverable over Bluetooth.
+    #[must_use]
+    pub fn tick(&mut self, elapsed: Duration) -> Vec<HostAction> {
+        if self.commands.in_flight() == 0 {
+            self.unanswered_for = Duration::ZERO;
+            return Vec::new();
+        }
+        self.unanswered_for = self.unanswered_for.saturating_add(elapsed);
+        if self.unanswered_for < COMMAND_TIMEOUT {
+            return Vec::new();
+        }
+        self.unanswered_for = Duration::ZERO;
+        let (lost, released) = self.commands.abandon_oldest();
+        warn!(
+            ?lost,
+            state = ?self.state,
+            "bluetooth: the controller did not answer a command; giving up on it and moving on"
+        );
+        let mut actions: Vec<HostAction> = released.into_iter().map(HostAction::Send).collect();
+        // The abandoned command was almost certainly bring-up's own — that queue is one
+        // deep and only a completion moves it — so the sequence has to be pushed along by
+        // hand, or a half-configured controller stays half-configured forever.
+        if self.state == HostState::Initializing {
+            let next = self.advance_bring_up();
+            actions.extend(self.pace(next));
+        }
+        actions
+    }
+
+    /// Take a command slot for every [`HostAction::Send`], holding back what will not fit.
+    ///
+    /// Every command this host emits goes through here. Most controllers advertise
+    /// `Num_HCI_Command_Packets = 1`, and sending on every event put two in flight during
+    /// a two-phone connect storm — the second silently discarded, which presents as one
+    /// phone stuck in "Connecting…" (#90).
+    fn pace(&mut self, actions: Vec<HostAction>) -> Vec<HostAction> {
+        actions
+            .into_iter()
+            .filter_map(|action| match action {
+                HostAction::Send(command) => self.commands.submit(command).map(HostAction::Send),
+                other => Some(other),
+            })
+            .collect()
+    }
+
+    /// Decide what one event means, before any pacing.
+    fn handle(&mut self, event: &Event) -> Vec<HostAction> {
         match event {
             Event::CommandComplete { opcode, params, .. } => {
                 self.on_command_complete(*opcode, params)
@@ -607,13 +720,27 @@ mod tests {
 
     /// A command-complete for `opcode` with the given return parameters.
     fn complete(opcode: OpCode, params: &[u8]) -> Event {
+        complete_granting(opcode, 1, params)
+    }
+
+    /// The same, from a controller that will accept `allowed_packets` more commands.
+    fn complete_granting(opcode: OpCode, allowed_packets: u8, params: &[u8]) -> Event {
         Event::parse(code::COMMAND_COMPLETE, &{
-            let mut v = vec![0x01];
+            let mut v = vec![allowed_packets];
             v.extend_from_slice(&opcode.raw().to_le_bytes());
             v.extend_from_slice(params);
             v
         })
         .unwrap()
+    }
+
+    /// The controller answering `command` and granting one more slot.
+    ///
+    /// Real exchanges are never two commands in a row: the controller answers each, and
+    /// the answer is what returns the credit the next one needs (#90). Tests that skipped
+    /// it were testing a controller that does not exist.
+    fn answer(host: &mut HostController, command: &Command) -> Vec<Command> {
+        sent(&host.on_event(&complete(command.opcode(), &[0x00])))
     }
 
     fn sent(actions: &[HostAction]) -> Vec<Command> {
@@ -778,6 +905,7 @@ mod tests {
                 auth: AuthRequirements::GeneralBondingNoMitm,
             }]
         );
+        assert!(answer(&mut host, &io[0]).is_empty());
 
         let confirm = sent(&host.on_event(&Event::UserConfirmationRequest {
             addr,
@@ -812,10 +940,12 @@ mod tests {
         host.load_link_keys([(known, key)]);
 
         assert!(host.knows(known));
+        let reply = sent(&host.on_event(&Event::LinkKeyRequest(known)));
         assert_eq!(
-            sent(&host.on_event(&Event::LinkKeyRequest(known))),
+            reply,
             vec![Command::LinkKeyRequestReply { addr: known, key }]
         );
+        assert!(answer(&mut host, &reply[0]).is_empty());
         assert_eq!(
             sent(&host.on_event(&Event::LinkKeyRequest(stranger))),
             vec![Command::LinkKeyRequestNegativeReply(stranger)],
@@ -937,10 +1067,12 @@ mod tests {
         // Undiscoverable, but a phone that already paired must still be able to
         // reconnect while someone else streams — otherwise takeover never works (#68).
         let mut host = HostController::new(HostConfig::default());
+        let quiet = sent(&host.set_discoverable(false));
         assert_eq!(
-            sent(&host.set_discoverable(false)),
+            quiet,
             vec![Command::WriteScanEnable(ScanEnable::ConnectableOnly)]
         );
+        assert!(answer(&mut host, &quiet[0]).is_empty());
         assert_eq!(
             sent(&host.set_discoverable(true)),
             vec![Command::WriteScanEnable(
@@ -1028,6 +1160,141 @@ mod tests {
                 "EIR advertises {class:#06x}, which no published record backs"
             );
         }
+    }
+
+    #[test]
+    fn a_controller_that_stops_answering_does_not_stop_bring_up_forever() {
+        // #90, and the reason it was invisible: bring-up is a queue advanced only by a
+        // completion, so the documented idle stall on this dongle left it stopped with no
+        // `Ready`, no `WriteScanEnable` and nothing in the log. The panel came up, the UI
+        // looked healthy, and the receiver was simply never discoverable.
+        let mut host = HostController::new(HostConfig::default());
+        let first = sent(&host.start());
+        assert_eq!(first, vec![Command::Reset]);
+
+        // Nothing answers. Short of the deadline, nothing happens — a controller busy
+        // with the radio is not written off.
+        assert!(host.tick(Duration::from_secs(4)).is_empty());
+        assert_eq!(host.state(), HostState::Initializing);
+        assert!(
+            host.next_timeout().is_some(),
+            "a command is in flight, so there is a deadline to arm a timer on"
+        );
+
+        let moved_on = sent(&host.tick(Duration::from_secs(2)));
+        assert_eq!(
+            moved_on,
+            vec![Command::ReadLocalVersion],
+            "the queue moves to the next command rather than waiting forever"
+        );
+        // And nothing is re-sent: a merely late completion would otherwise run twice.
+        assert!(!moved_on.contains(&Command::Reset));
+    }
+
+    #[test]
+    fn bring_up_reaches_ready_across_a_lost_completion() {
+        // The observable half: the box ends up discoverable even though the controller
+        // swallowed an answer along the way.
+        let mut host = HostController::new(HostConfig::default());
+        let mut last = sent(&host.start()).pop().unwrap();
+        let mut ready = false;
+        let mut swallowed_one = false;
+        for _ in 0..64 {
+            // Swallow exactly one completion, part way through the sequence.
+            let actions = if last.opcode() == OpCode::WRITE_LOCAL_NAME && !swallowed_one {
+                swallowed_one = true;
+                host.tick(COMMAND_TIMEOUT)
+            } else {
+                let params: &[u8] = match last.opcode() {
+                    OpCode::READ_BUFFER_SIZE => &[0x00, 0x54, 0x01, 0xff, 0x08, 0x00, 0x08, 0x00],
+                    OpCode::READ_BD_ADDR => &[0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa],
+                    _ => &[0x00],
+                };
+                host.on_event(&complete(last.opcode(), params))
+            };
+            ready |= actions
+                .iter()
+                .any(|a| matches!(a, HostAction::Ready { .. }));
+            if ready {
+                break;
+            }
+            let Some(next) = sent(&actions).pop() else {
+                panic!("bring-up produced nothing after {last:?}")
+            };
+            last = next;
+        }
+        assert!(swallowed_one, "the test must actually lose a completion");
+        assert!(ready, "bring-up must still reach Ready");
+        assert_eq!(host.state(), HostState::Ready);
+    }
+
+    #[test]
+    fn there_is_no_deadline_when_nothing_is_in_flight() {
+        // The actor arms its timer off this, and a deadline with nothing behind it would
+        // wake the loop every five seconds for the life of the process.
+        let mut started = HostController::new(HostConfig::default());
+        assert_eq!(started.next_timeout(), None, "nothing has been sent yet");
+        let _ = started.start();
+        assert!(
+            started.next_timeout().is_some(),
+            "the Reset is in flight and may be lost"
+        );
+
+        let mut host = HostController::new(HostConfig::default());
+        assert!(!bring_up(&mut host).is_empty());
+        assert_eq!(host.state(), HostState::Ready);
+        assert_eq!(
+            host.next_timeout(),
+            None,
+            "every command was answered, so there is nothing left to time out"
+        );
+    }
+
+    #[test]
+    fn two_events_in_a_row_do_not_put_two_commands_in_flight() {
+        // SUSPECTED at runtime as a phone hanging in "Connecting…" during a two-phone
+        // connect storm: most controllers advertise one command packet, and the second
+        // command was written into a slot that did not exist and discarded (#90).
+        let mut host = HostController::new(HostConfig::default());
+        let a: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let b: BdAddr = "11:22:33:44:55:66".parse().unwrap();
+
+        let first = sent(&host.on_event(&Event::IoCapabilityRequest(a)));
+        assert_eq!(first.len(), 1);
+        let second = sent(&host.on_event(&Event::IoCapabilityRequest(b)));
+        assert!(
+            second.is_empty(),
+            "the second reply must wait for a slot, not be written into none: {second:?}"
+        );
+
+        // The controller answers the first, which is what makes room for the second.
+        let released = sent(&host.on_event(&complete(first[0].opcode(), &[0x00])));
+        assert_eq!(
+            released,
+            vec![Command::IoCapabilityRequestReply {
+                addr: b,
+                io: IoCapability::NoInputNoOutput,
+                auth: AuthRequirements::GeneralBondingNoMitm,
+            }],
+            "held back, not dropped: it is a reply the phone is waiting for"
+        );
+    }
+
+    #[test]
+    fn a_wider_window_is_believed() {
+        // A controller entitled to more than one in flight should get it; the pacing is
+        // there to respect the limit, not to impose one of our own.
+        let mut host = HostController::new(HostConfig::default());
+        let a: BdAddr = "AA:BB:CC:DD:EE:FF".parse().unwrap();
+        let b: BdAddr = "11:22:33:44:55:66".parse().unwrap();
+        // An unsolicited Command Complete granting two, which is how a controller says so.
+        let _ = host.on_event(&complete_granting(OpCode::new(0x0000), 2, &[]));
+        let _ = host.on_event(&Event::LinkKeyRequest(a));
+        assert_eq!(
+            sent(&host.on_event(&Event::LinkKeyRequest(b))).len(),
+            1,
+            "with two credits, both replies go straight out"
+        );
     }
 
     #[test]

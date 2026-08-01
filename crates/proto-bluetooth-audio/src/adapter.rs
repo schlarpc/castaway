@@ -398,16 +398,31 @@ impl SourceAdapter for BluetoothAdapter {
         // only on the timer's own, because a link busy with audio would otherwise never
         // credit its cover-art channel any elapsed time and never notice a peer that has
         // stopped answering.
-        let mut last_tick = std::time::Instant::now();
+        // The runtime's clock, not the system's: every deadline in this loop is a tokio
+        // timer, so the elapsed time fed to the state machines has to come from the same
+        // clock — which is also what lets a test pause it and prove the watchdog without
+        // waiting five real seconds.
+        let mut last_tick = tokio::time::Instant::now();
         loop {
-            let due = links.values().filter_map(|l| l.mux.next_timeout()).min();
+            // The host's own deadline belongs in this minimum too, and its absence was
+            // the whole of #90: during bring-up `links` is empty, so the loop blocked on
+            // `recv()` with no deadline of any kind and a controller that stopped
+            // answering stopped the receiver, silently and for good.
+            let due = links
+                .values()
+                .filter_map(|l| l.mux.next_timeout())
+                .chain(host.next_timeout())
+                .min();
             let received = tokio::select! {
                 packet = self.transport.recv() => Some(packet),
                 () = sleep_until_due(due) => None,
             };
 
             let elapsed = last_tick.elapsed();
-            last_tick = std::time::Instant::now();
+            last_tick = tokio::time::Instant::now();
+            for action in host.tick(elapsed) {
+                self.apply_host_action(&action, &mut host).await?;
+            }
             let ticks: Vec<(ConnectionHandle, Vec<L2capEvent>)> = links
                 .iter_mut()
                 .filter_map(|(raw, link)| {

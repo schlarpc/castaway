@@ -47,63 +47,76 @@ fn transport() -> Arc<ScriptedTransport> {
 /// controller with infinite buffers is a fiction, and it is the fiction under which an
 /// unpaced writer looks like it works (#71).
 fn controller(acl_packets: u16, report_completions: bool) -> Arc<ScriptedTransport> {
-    Arc::new(ScriptedTransport::new().with_responder(move |sent| {
-        // A real controller frees each ACL buffer and says so. Nothing else ever returns
-        // a credit, so a host that ignores this event stalls after `acl_packets` writes.
-        if let HciPacket::Acl(acl) = sent {
-            if !report_completions {
-                return Vec::new();
-            }
-            let mut params = vec![0x01];
-            params.extend_from_slice(&acl.handle.raw().to_le_bytes());
-            params.extend_from_slice(&1u16.to_le_bytes());
-            return vec![HciPacket::Event {
-                code: code::NUMBER_OF_COMPLETED_PACKETS,
-                params: Bytes::from(params),
-            }];
-        }
-        let HciPacket::Command { opcode, .. } = sent else {
+    Arc::new(
+        ScriptedTransport::new()
+            .with_responder(move |sent| respond(acl_packets, report_completions, sent)),
+    )
+}
+
+/// What that controller answers with, as a plain function so a test can wrap it.
+fn respond(acl_packets: u16, report_completions: bool, sent: &HciPacket) -> Vec<HciPacket> {
+    // A real controller frees each ACL buffer and says so. Nothing else ever returns
+    // a credit, so a host that ignores this event stalls after `acl_packets` writes.
+    if let HciPacket::Acl(acl) = sent {
+        if !report_completions {
             return Vec::new();
-        };
-        let mut params = vec![0x01];
-        params.extend_from_slice(&opcode.raw().to_le_bytes());
-        match *opcode {
-            substrate_hci::OpCode::READ_BUFFER_SIZE => {
-                // 340-byte ACL buffer — a typical dongle, and small enough that
-                // fragmentation is exercised rather than skipped.
-                params.extend_from_slice(&[0x00, 0x54, 0x01, 0xff]);
-                params.extend_from_slice(&acl_packets.to_le_bytes());
-                params.extend_from_slice(&[0x08, 0x00]);
-            }
-            substrate_hci::OpCode::READ_BD_ADDR => {
-                params.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
-            }
-            substrate_hci::OpCode::ACCEPT_CONNECTION_REQUEST => {
-                // Command status, then the link coming up.
-                let addr: BdAddr = PEER.parse().unwrap();
-                let mut complete = vec![Status::SUCCESS.0];
-                complete.extend_from_slice(&HANDLE.to_le_bytes());
-                complete.extend_from_slice(&addr.to_wire());
-                complete.push(0x01); // ACL
-                complete.push(0x00); // encryption off
-                return vec![
-                    HciPacket::Event {
-                        code: code::COMMAND_STATUS,
-                        params: Bytes::from(params),
-                    },
-                    HciPacket::Event {
-                        code: code::CONNECTION_COMPLETE,
-                        params: Bytes::from(complete),
-                    },
-                ];
-            }
-            _ => params.push(0x00),
         }
-        vec![HciPacket::Event {
-            code: code::COMMAND_COMPLETE,
+        let mut params = vec![0x01];
+        params.extend_from_slice(&acl.handle.raw().to_le_bytes());
+        params.extend_from_slice(&1u16.to_le_bytes());
+        return vec![HciPacket::Event {
+            code: code::NUMBER_OF_COMPLETED_PACKETS,
             params: Bytes::from(params),
-        }]
-    }))
+        }];
+    }
+    let HciPacket::Command { opcode, .. } = sent else {
+        return Vec::new();
+    };
+    let mut params = vec![0x01];
+    params.extend_from_slice(&opcode.raw().to_le_bytes());
+    match *opcode {
+        substrate_hci::OpCode::READ_BUFFER_SIZE => {
+            // 340-byte ACL buffer — a typical dongle, and small enough that
+            // fragmentation is exercised rather than skipped.
+            params.extend_from_slice(&[0x00, 0x54, 0x01, 0xff]);
+            params.extend_from_slice(&acl_packets.to_le_bytes());
+            params.extend_from_slice(&[0x08, 0x00]);
+        }
+        substrate_hci::OpCode::READ_BD_ADDR => {
+            params.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        }
+        substrate_hci::OpCode::ACCEPT_CONNECTION_REQUEST => {
+            // Command status, then the link coming up.
+            let addr: BdAddr = PEER.parse().unwrap();
+            let mut complete = vec![Status::SUCCESS.0];
+            complete.extend_from_slice(&HANDLE.to_le_bytes());
+            complete.extend_from_slice(&addr.to_wire());
+            complete.push(0x01); // ACL
+            complete.push(0x00); // encryption off
+                                 // Command Status is status, credits, opcode — *not* the Command Complete
+                                 // layout `params` was built for. It used to be sent with that layout, so
+                                 // it failed to parse and was dropped as an undecodable event: harmless
+                                 // while nothing counted command credits, and a stall the moment anything
+                                 // did (#90).
+            let mut status = vec![Status::SUCCESS.0, 0x01];
+            status.extend_from_slice(&opcode.raw().to_le_bytes());
+            return vec![
+                HciPacket::Event {
+                    code: code::COMMAND_STATUS,
+                    params: Bytes::from(status),
+                },
+                HciPacket::Event {
+                    code: code::CONNECTION_COMPLETE,
+                    params: Bytes::from(complete),
+                },
+            ];
+        }
+        _ => params.push(0x00),
+    }
+    vec![HciPacket::Event {
+        code: code::COMMAND_COMPLETE,
+        params: Bytes::from(params),
+    }]
 }
 
 /// Poll until `f` returns something, or fail the test.
@@ -390,6 +403,60 @@ async fn the_adapter_brings_a_controller_up_and_becomes_discoverable() {
     assert_eq!(cmds.first(), Some(&substrate_hci::OpCode::RESET));
     assert!(cmds.contains(&substrate_hci::OpCode::WRITE_SIMPLE_PAIRING_MODE));
     assert!(cmds.contains(&substrate_hci::OpCode::WRITE_CLASS_OF_DEVICE));
+}
+
+/// A controller that answers everything except one bring-up command, which it swallows.
+///
+/// The documented idle stall on this project's dongle, reduced to one lost completion.
+fn controller_that_swallows(lost: substrate_hci::OpCode) -> Arc<ScriptedTransport> {
+    Arc::new(ScriptedTransport::new().with_responder(move |sent| {
+        if matches!(sent, HciPacket::Command { opcode, .. } if *opcode == lost) {
+            return Vec::new();
+        }
+        respond(8, true, sent)
+    }))
+}
+
+#[tokio::test(start_paused = true)]
+async fn bring_up_survives_a_controller_that_swallows_a_completion() {
+    // #90 at the seam it lives at. Bring-up is a queue advanced only by a completion, so
+    // one lost answer stopped it dead: no `Ready`, no `WriteScanEnable`, and nothing in
+    // the log — the panel came up, the UI looked healthy, and the receiver was simply
+    // never discoverable over Bluetooth. The unit tests pin the watchdog; this pins the
+    // actor actually *arming* it, which is the half that was missing (during bring-up
+    // `links` is empty, so the loop had no deadline of any kind).
+    let transport = controller_that_swallows(substrate_hci::OpCode::WRITE_LOCAL_NAME);
+    let adapter = Arc::new(BluetoothAdapter::new(
+        Arc::clone(&transport) as Arc<dyn HciTransport>,
+        BluetoothConfig::default(),
+    ));
+    let (tx, _rx) = mpsc::channel(16);
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::Bluetooth, "listener"), tx);
+    tokio::spawn(Arc::clone(&adapter).run(sink));
+
+    eventually("the swallowed command", || {
+        transport
+            .sent_commands()
+            .contains(&substrate_hci::OpCode::WRITE_LOCAL_NAME)
+            .then_some(())
+    })
+    .await;
+    assert!(
+        !transport
+            .sent_commands()
+            .contains(&substrate_hci::OpCode::WRITE_SCAN_ENABLE),
+        "bring-up is stopped on the unanswered command, which is the premise"
+    );
+
+    // Past the deadline. The clock is the runtime's, so this costs no real time.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    eventually("bring-up finishing anyway", || {
+        transport
+            .sent_commands()
+            .contains(&substrate_hci::OpCode::WRITE_SCAN_ENABLE)
+            .then_some(())
+    })
+    .await;
 }
 
 #[tokio::test]
