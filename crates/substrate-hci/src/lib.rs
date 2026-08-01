@@ -19,6 +19,7 @@
 
 pub mod addr;
 pub mod command;
+pub mod eir;
 pub mod error;
 pub mod event;
 pub mod flow;
@@ -31,6 +32,7 @@ pub use addr::BdAddr;
 pub use command::{
     AcceptRole, AuthRequirements, ClassOfDevice, Command, IoCapability, LinkKey, ScanEnable,
 };
+pub use eir::Eir;
 pub use error::HciError;
 pub use event::{BufferSize, Event, LinkType};
 pub use flow::AclCredits;
