@@ -13,7 +13,7 @@
       },
       "provider": "process",
       "transport": "tcp",
-      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS)"
+      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS), /remote/* (the remote-control page and its WHEP signalling)"
     },
     {
       "chosen_by": "spec",
@@ -36,6 +36,24 @@
       "provider": "process",
       "transport": "udp",
       "wire": "SSDP M-SEARCH responder + NOTIFY alive/byebye"
+    },
+    {
+      "chosen_by": "ours",
+      "gate": [
+        "remote.enable"
+      ],
+      "owner": "remote",
+      "port": {
+        "default_first": 41032,
+        "default_last": 41063,
+        "range_config": [
+          "remote",
+          "ice_ports"
+        ]
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "WebRTC: SRTP media (the panel's duplicate) and an SCTP data channel carrying that peer's contacts"
     },
     {
       "chosen_by": "convention",

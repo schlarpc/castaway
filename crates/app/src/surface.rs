@@ -22,7 +22,7 @@
 use castaway_core::ProtocolKind;
 use serde_json::json;
 
-use crate::config::{Config, Enable, MediaPortsConfig};
+use crate::config::{Config, Enable, IcePortsConfig, MediaPortsConfig};
 
 /// TCP or UDP. No third thing binds here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,8 @@ pub enum PortSpec {
     },
     /// The `[media_ports]` range — per-session sockets allocated lowest-free-first.
     MediaRange,
+    /// The `[remote.ice_ports]` range — one UDP socket per connected remote peer.
+    IceRange,
 }
 
 /// Who answers on a listener.
@@ -67,6 +69,8 @@ pub enum Owner {
     Mdns,
     /// The process-wide SSDP responder.
     Ssdp,
+    /// The remote-control web UI's WebRTC peer connections (#18).
+    Remote,
     /// One protocol's own socket.
     Protocol(ProtocolKind),
 }
@@ -78,6 +82,7 @@ impl Owner {
             Self::SharedHttp => "http",
             Self::Mdns => "mdns",
             Self::Ssdp => "ssdp",
+            Self::Remote => "remote",
             Self::Protocol(kind) => kind.slug(),
         }
     }
@@ -130,6 +135,9 @@ pub enum Gate {
     Always,
     /// Bound when any of these protocols is enabled.
     AnyOf(&'static [ProtocolKind]),
+    /// Bound when the remote-control web UI is enabled. Not a [`ProtocolKind`]: nothing
+    /// casts to it, it is the panel's own surface served back out.
+    RemoteControl,
 }
 
 /// One inbound socket: the unit the firewall, the docs, and `--network-surface` share.
@@ -200,8 +208,10 @@ fn shared_listeners() -> Vec<Listener> {
             },
             bind: "0.0.0.0",
             wire: "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, \
-                   Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS)",
-            security: "plaintext HTTP (LAN control plane)",
+                   Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS), \
+                   /remote/* (the remote-control page and its WHEP signalling)",
+            security: "plaintext HTTP, unauthenticated — anyone who can reach this \
+                       port can *drive* the panel, not merely watch it (#18)",
             gate: Gate::Always,
             provider: Provider::Process,
             chosen_by: Provenance::Ours,
@@ -211,7 +221,11 @@ fn shared_listeners() -> Vec<Listener> {
                     Fetching /stream/live.m3u8 starts an encoder and holds the \
                     render loop at display rate until ten seconds after the last \
                     request (#101), so it is the one endpoint here that costs the \
-                    panel anything.",
+                    panel anything. /remote/ serves the control page and answers the \
+                    WHEP offer that sets up a peer connection; the media and the input \
+                    channel then ride UDP in `[remote.ice_ports]`, not this port. \
+                    `remote.input = false` keeps the viewing half and drops every \
+                    input message at the boundary.",
         },
         Listener {
             owner: Owner::Mdns,
@@ -240,6 +254,25 @@ fn shared_listeners() -> Vec<Listener> {
             chosen_by: Provenance::Spec,
             notes: "Bound even with DLNA and DIAL both off; it then answers for no \
                     device type.",
+        },
+        Listener {
+            owner: Owner::Remote,
+            transport: Transport::Udp,
+            port: PortSpec::IceRange,
+            bind: "0.0.0.0 (one socket per connected peer)",
+            wire: "WebRTC: SRTP media (the panel's duplicate) and an SCTP data \
+                   channel carrying that peer's contacts",
+            security: "DTLS-SRTP, but the offer is answered unauthenticated — the \
+                       encryption protects the path, not who may use it",
+            gate: Gate::RemoteControl,
+            provider: Provider::Process,
+            chosen_by: Provenance::Ours,
+            notes: "Pinned rather than ephemeral, which is not a preference: this \
+                    registry generates the firewall, so an ICE candidate outside a \
+                    declared range is one the deployed box silently drops — the \
+                    connection would negotiate and then carry nothing. One peer takes \
+                    one port. Bound by webrtc-rs, which is why the range is handed to \
+                    its SettingEngine rather than being bound here.",
         },
     ]
 }
@@ -525,6 +558,10 @@ fn port_label(spec: PortSpec) -> String {
     match spec {
         PortSpec::Fixed(p) => p.to_string(),
         PortSpec::Configurable { key, default } => format!("{default} (`{key}`)"),
+        PortSpec::IceRange => {
+            let d = IcePortsConfig::default();
+            format!("{}–{} (`[remote.ice_ports]`)", d.first, d.last)
+        }
         PortSpec::MediaRange => {
             let d = MediaPortsConfig::default();
             format!("{}–{} (`[media_ports]`)", d.first, d.last)
@@ -536,6 +573,7 @@ fn port_label(spec: PortSpec) -> String {
 fn gate_label(gate: Gate) -> String {
     match gate {
         Gate::Always => "always".to_owned(),
+        Gate::RemoteControl => "remote.enable".to_owned(),
         Gate::AnyOf(kinds) => kinds
             .iter()
             .map(|k| format!("enable.{}", enable_flag(*k)))
@@ -678,6 +716,14 @@ pub fn spec_json() -> String {
                     "config": key.split('.').collect::<Vec<_>>(),
                     "default": default,
                 }),
+                PortSpec::IceRange => {
+                    let d = IcePortsConfig::default();
+                    json!({
+                        "range_config": ["remote", "ice_ports"],
+                        "default_first": d.first,
+                        "default_last": d.last,
+                    })
+                }
                 PortSpec::MediaRange => {
                     let d = MediaPortsConfig::default();
                     json!({
@@ -689,6 +735,7 @@ pub fn spec_json() -> String {
             };
             let gate: Vec<&str> = match l.gate {
                 Gate::Always => vec![],
+                Gate::RemoteControl => vec!["remote.enable"],
                 Gate::AnyOf(kinds) => kinds.iter().map(|k| enable_flag(*k)).collect(),
             };
             json!({
@@ -744,9 +791,11 @@ fn resolve(config: &Config) -> Vec<Resolved> {
                     (p, p)
                 }
                 PortSpec::MediaRange => (config.media_ports.first, config.media_ports.last),
+                PortSpec::IceRange => (config.remote.ice_ports.first, config.remote.ice_ports.last),
             };
             let enabled = match l.gate {
                 Gate::Always => true,
+                Gate::RemoteControl => config.remote.enable,
                 Gate::AnyOf(kinds) => kinds.iter().any(|k| flag_value(*k, &config.enable)),
             };
             Resolved {
@@ -936,6 +985,66 @@ mod tests {
                  a key the config schema does not have"
             );
         }
+    }
+
+    /// The remote-control gate is not a [`ProtocolKind`], so the loop above cannot
+    /// cover it — and the firewall is generated from it, so an entry naming a key the
+    /// schema does not have would open a range nothing binds, or worse leave one closed
+    /// that something does.
+    #[test]
+    fn the_remote_gate_is_a_real_config_key() {
+        let off: Config = toml::from_str("[remote]\nenable = false\n").unwrap();
+        assert!(!off.remote.enable);
+        assert!(
+            resolve(&off)
+                .iter()
+                .filter(|r| r.owner == "remote")
+                .all(|r| !r.enabled),
+            "remote.enable = false must close the ICE range"
+        );
+        assert!(
+            !render_netsh(&off).contains("41032-41063"),
+            "and the firewall must not open it"
+        );
+        let on = Config::default();
+        assert!(on.remote.enable, "the panel is drivable out of the box");
+        assert!(
+            resolve(&on)
+                .iter()
+                .any(|r| r.owner == "remote" && r.enabled),
+            "and enabled it must open one"
+        );
+    }
+
+    /// Watch-but-do-not-touch does not change the socket surface: the peer connection is
+    /// still made and the stream still flows, and only the input messages are dropped.
+    /// If this ever started closing the range, the page would stop working entirely.
+    #[test]
+    fn refusing_input_still_serves_the_stream() {
+        let config: Config = toml::from_str("[remote]\ninput = false\n").unwrap();
+        assert!(config.remote.enable);
+        assert!(!config.remote.input);
+        assert!(resolve(&config)
+            .iter()
+            .any(|r| r.owner == "remote" && r.enabled));
+    }
+
+    /// The ICE range must not overlap `[media_ports]`. They are bound by different
+    /// subsystems that do not know about each other, so an overlap is a collision that
+    /// shows up as a mirroring session failing whenever someone opens the remote page.
+    #[test]
+    fn the_ice_range_is_clear_of_the_media_range() {
+        let c = Config::default();
+        let (ice, media) = (c.remote.ice_ports, c.media_ports);
+        assert!(ice.first <= ice.last, "the ICE range runs forwards");
+        assert!(
+            ice.first > media.last || ice.last < media.first,
+            "ICE {}–{} overlaps media {}–{}",
+            ice.first,
+            ice.last,
+            media.first,
+            media.last
+        );
     }
 
     /// Every configurable port key the registry names must resolve, or

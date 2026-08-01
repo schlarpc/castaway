@@ -935,6 +935,10 @@
               bluetooth = cfg.settings.enable.bluetooth or true;
               gamestream = cfg.settings.enable.gamestream or true;
               miracast = miracastEnabled;
+              # Not under `[enable]`: the remote-control UI is the panel's own surface
+              # served back out rather than a protocol anything casts to, so its switch
+              # lives in its own section and the registry names the dotted path (#18).
+              "remote.enable" = cfg.settings.remote.enable or true;
             };
 
             # Strict lookup on purpose: a gate flag the registry names and this set

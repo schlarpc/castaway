@@ -58,6 +58,9 @@ pub struct Config {
     pub miracast: Miracast,
     /// GameStream / Sunshine client settings.
     pub gamestream: GameStream,
+    /// The remote-control web UI (#18).
+    #[serde(default)]
+    pub remote: Remote,
     /// Where the browser subprocess lives (D36). Defaults work for a Nix-built artifact
     /// and for running from the repo, so most deployments never set these.
     #[serde(default)]
@@ -681,6 +684,62 @@ impl Config {
     }
 }
 
+/// The remote-control web UI: watching the panel, and driving it (#18).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Remote {
+    /// Whether the page is served and peers may connect at all.
+    pub enable: bool,
+    /// Whether a connected peer's touches reach the panel.
+    ///
+    /// Separate from [`Self::enable`] because "watch but do not touch" is a real
+    /// operational want: with this off the stream still plays and the page still loads,
+    /// and every input message a peer sends is dropped at the boundary. It is not a
+    /// security boundary against someone who can already reach the port — see
+    /// `docs/network-surface.md` for what that port means — it is a way to stop a
+    /// demo, a projector, or a wall display from being able to drive the panel.
+    pub input: bool,
+    /// The UDP range ICE binds its host candidates from.
+    ///
+    /// Pinned rather than ephemeral because the registry in `surface.rs` generates the
+    /// firewall (`nix/network-surface.json`): a socket outside a declared range is one
+    /// the deployed box silently blocks, and WebRTC would then negotiate a candidate
+    /// that can never carry a packet.
+    pub ice_ports: IcePortsConfig,
+}
+
+impl Default for Remote {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            input: true,
+            ice_ports: IcePortsConfig::default(),
+        }
+    }
+}
+
+/// The UDP range ICE allocates host candidates from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct IcePortsConfig {
+    /// First port of the inclusive range.
+    pub first: u16,
+    /// Last port of the inclusive range.
+    pub last: u16,
+}
+
+impl Default for IcePortsConfig {
+    fn default() -> Self {
+        Self {
+            // Immediately above `[media_ports]`, in the same unassigned-in-practice
+            // block. One peer needs one port; 32 is far more concurrent viewers than a
+            // panel has, and the range is contiguous so the firewall rule stays one line.
+            first: 41032,
+            last: 41063,
+        }
+    }
+}
+
 /// The port range AirPlay and Cast bind their per-session media sockets from.
 ///
 /// These are the sockets a `SETUP` or an ANSWER names — RAOP audio/control/timing and
@@ -887,6 +946,7 @@ impl Default for Config {
             cast: Cast::default(),
             miracast: Miracast::default(),
             gamestream: GameStream::default(),
+            remote: Remote::default(),
             audio: Audio::default(),
         }
     }

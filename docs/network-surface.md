@@ -11,9 +11,10 @@
 
 | Port | Transport | Owner | Carries | Security | Exists when | Chosen by |
 |---|---|---|---|---|---|---|
-| 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS) | plaintext HTTP (LAN control plane) | always | ours |
+| 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS), /remote/* (the remote-control page and its WHEP signalling) | plaintext HTTP, unauthenticated — anyone who can reach this port can *drive* the panel, not merely watch it (#18) | always | ours |
 | 5353 | udp | mdns | mDNS/DNS-SD responder (mdns-sd daemon) | plaintext multicast | always | spec |
 | 1900 | udp | ssdp | SSDP M-SEARCH responder + NOTIFY alive/byebye | plaintext multicast | always | spec |
+| 41032–41063 (`[remote.ice_ports]`) | udp | remote | WebRTC: SRTP media (the panel's duplicate) and an SCTP data channel carrying that peer's contacts | DTLS-SRTP, but the offer is answered unauthenticated — the encryption protects the path, not who may use it | remote.enable | ours |
 | 7000 | tcp | airplay | RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP | plaintext — pair-verify/FairPlay not implemented (#39) | enable.airplay | convention |
 | 41000–41031 (`[media_ports]`) | udp | airplay | RAOP audio + control + timing (three sockets per session) | RTP; AES-CBC when the sender negotiates it | enable.airplay | ours |
 | 41000–41031 (`[media_ports]`) | tcp | airplay | mirroring data channel (one listener per session) | AES-CTR frames (MirrorKeys) | enable.airplay | ours |
@@ -32,9 +33,10 @@ The tiers correlate with the config surface, and a test holds the line: every *s
 
 Notes, per listener that has one:
 
-- **8080 (`http_port`)/tcp (http)** — binds 0.0.0.0. One host shared by three protocols (D7); a disabled protocol's routes are simply not mounted. /screenshot.png and /stream/* always answer — in a build with no encoder, by saying so. Fetching /stream/live.m3u8 starts an encoder and holds the render loop at display rate until ten seconds after the last request (#101), so it is the one endpoint here that costs the panel anything.
+- **8080 (`http_port`)/tcp (http)** — binds 0.0.0.0. One host shared by three protocols (D7); a disabled protocol's routes are simply not mounted. /screenshot.png and /stream/* always answer — in a build with no encoder, by saying so. Fetching /stream/live.m3u8 starts an encoder and holds the render loop at display rate until ten seconds after the last request (#101), so it is the one endpoint here that costs the panel anything. /remote/ serves the control page and answers the WHEP offer that sets up a peer connection; the media and the input channel then ride UDP in `[remote.ice_ports]`, not this port. `remote.input = false` keeps the viewing half and drops every input message at the boundary.
 - **5353/udp (mdns)** — binds 0.0.0.0, multicast 224.0.0.251, SO_REUSEADDR/SO_REUSEPORT. Advertises only enabled protocols, restricted to the serving interface. GameStream's host browser runs a second daemon — a second 5353 socket — when enabled. Contends with Avahi/Bonjour for answers (#43); the NixOS module warns when Avahi is on.
 - **1900/udp (ssdp)** — binds 0.0.0.0, multicast 239.255.255.250, SO_REUSEADDR/SO_REUSEPORT. Bound even with DLNA and DIAL both off; it then answers for no device type.
+- **41032–41063 (`[remote.ice_ports]`)/udp (remote)** — binds 0.0.0.0 (one socket per connected peer). Pinned rather than ephemeral, which is not a preference: this registry generates the firewall, so an ICE candidate outside a declared range is one the deployed box silently drops — the connection would negotiate and then carry nothing. One peer takes one port. Bound by webrtc-rs, which is why the range is handed to its SettingEngine rather than being bound here.
 - **7000/tcp (airplay)** — binds 0.0.0.0. Both _airplay._tcp and _raop._tcp advertise this one port. Nothing binds 7011: it is the AirPlay 1 UDP timing port, not a listener, and the listener once bound there was removed.
 - **41000–41031 (`[media_ports]`)/udp (airplay)** — binds the accepted connection's local address. Bound per sender before SETUP answers, so the Transport header only ever names ports that are already listening.
 - **41000–41031 (`[media_ports]`)/tcp (airplay)** — binds the accepted connection's local address. Answered as dataPort in the second SETUP reply.
