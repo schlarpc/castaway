@@ -580,6 +580,36 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
         .expect("an audio frame arrived")
         .expect("the channel is open");
     assert_eq!(frame.data.as_ref(), plain.as_slice());
+
+    // --- and now the end of it ---
+    //
+    // Stopping a mirror is the sender closing the data channel. It is *not* a `TEARDOWN`
+    // (iOS tears down named streams mid-session to renegotiate, which `session.rs`
+    // deliberately does not treat as an end, with two tests pinning that) and it does not
+    // require the RTSP control connection to close — that stays up here, as it does on a
+    // real phone.
+    //
+    // Nothing consumed that close. The picture stopped and the session never ended, so
+    // `Pipeline::stop` never ran, the video surface stayed claimed, and the panel held the
+    // last decoded frame with no way back Home. Observed on the Dell, 2026-07-31.
+    drop(data);
+
+    let mut ended = false;
+    for _ in 0..8 {
+        let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            break;
+        };
+        if matches!(msg.event, SessionEvent::End) {
+            ended = true;
+            break;
+        }
+    }
+    assert!(
+        ended,
+        "closing the mirror data channel must end the session — otherwise the panel keeps \
+         the last frame forever"
+    );
 }
 
 /// With a declared media range, the ports a `SETUP` advertises come from that range —

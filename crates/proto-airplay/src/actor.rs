@@ -964,11 +964,34 @@ async fn start_mirroring(
         warn!(%peer, "session manager gone; not starting mirroring");
         return None;
     }
-    tokio::spawn(run_mirroring(listener, keys, origin, tx, peer, diagnostics));
+    tokio::spawn(run_mirroring(
+        listener,
+        keys,
+        origin,
+        tx,
+        peer,
+        diagnostics,
+        sink.clone(),
+    ));
     Some(audio_tx)
 }
 
-/// Accept the sender's data connection and feed frames until it ends.
+/// Accept the sender's data connection and feed frames until it ends, then end the session.
+///
+/// Ending it here is the point. A mirroring session does not finish with `TEARDOWN`: iOS
+/// tears down *named streams* mid-session to renegotiate (see `session.rs`, which
+/// deliberately does not treat that as an end, with two tests pinning it), and it commonly
+/// keeps the RTSP control connection open afterwards — so the connection-closed path in
+/// `serve` never fires either. What actually says "the picture is over" is this data
+/// channel closing, which is exactly what `session.rs` already says in its own comment:
+/// "The picture stops because the sender closes the data channel, not because we end the
+/// session."
+///
+/// Nothing consumed that. The loop below broke, logged, and dropped the frame sender; the
+/// decode thread saw a closed channel and returned quietly; no `SessionEvent::End` was ever
+/// emitted, so `Pipeline::stop` never ran, the video surface stayed claimed, and the panel
+/// held the last decoded frame forever with no way back Home. The design delegated
+/// session-end to a mechanism that was never wired up. This is the wire.
 async fn run_mirroring(
     listener: TcpListener,
     keys: MirrorKeys,
@@ -976,9 +999,13 @@ async fn run_mirroring(
     frames: mpsc::Sender<EncodedFrame>,
     peer: SocketAddr,
     diagnostics: Arc<SessionDiagnostics>,
+    sink: SessionSink,
 ) {
     let Ok((mut stream, from)) = listener.accept().await else {
         warn!(%peer, "no mirroring data connection arrived");
+        // A session announced but never connected is still a session that is over; leaving
+        // it open would hold the panel for a picture that is never coming.
+        let _ = sink.emit(SessionEvent::End).await;
         return;
     };
     info!(%from, "AirPlay mirroring data channel connected");
@@ -1034,6 +1061,10 @@ async fn run_mirroring(
         }
     }
     info!(%peer, "AirPlay mirroring ended");
+    // However it ended — sender closed the channel, lost sync, consumer gone — the session
+    // is over. The manager is what turns that into `Pipeline::stop`, which clears the video
+    // surface and lets the panel go Home.
+    let _ = sink.emit(SessionEvent::End).await;
 }
 
 /// How often a live session reports itself.
