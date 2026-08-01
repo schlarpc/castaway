@@ -1664,13 +1664,24 @@ and an audio track that simply stops is one a player stalls on.
 
 **Sessions are followed, not sampled.** Each carries a cursor — its first block's instant
 plus the duration of every block since — and blocks are placed at that, not at the instant
-they arrive. "The session writes in real time" is only true when something consumes in real
-time. The first run against a real panel proved it: a box with no audio device gets a
-`NullAudioOut`, which accepts a block instantly, so the decoder raced through a file as
-fast as it could read it and placing by arrival put a minute of audio into the first
-second. The correction is one-sided on purpose — a cursor *ahead* of the clock is a session
-with a buffer, which every source has; a cursor *behind* it is audio being laid down where
-the encoder has already been, and is silently lost.
+they arrive. The first run against a real panel proved it was needed: the audio came back
+quiet, at the wrong frequency, and mostly absent. The correction is one-sided on purpose —
+a cursor *ahead* of the clock is a session with a buffer, which every source has; a cursor
+*behind* it is audio being laid down where the encoder has already been, and is silently
+lost.
+
+*(Corrected 2026-08-01, and worth keeping because the wrong explanation was plausible.
+This originally said a session with a null sink "raced through a file as fast as it could
+read it", on the assumption that `AudioOut::write` blocking on a full device queue is what
+paces a decoder. It is not. `write` **never** blocks — both real backends `try_send` and
+drop the newest block on a full queue, deliberately, "rather than back the decode thread up
+into the adapter". Pacing is `audio_session::Pace`, which sleeps to keep at most
+`clock::OUTPUT_LEAD` — 250 ms — submitted ahead of **wall clock**, and it runs on every PCM
+session whatever the sink. So the decoder never raced. What it does is hand over 250 ms in a
+burst and then sleep, so several blocks arrive within microseconds of each other; placing
+them by arrival piled a quarter-second of audio onto one position, where it summed with
+itself and left the rest silent. The cursor unpacks the burst by block duration, which is
+the same fix for a different reason.)*
 
 Two tracks in one movie and one `moof`, rather than a track per HLS rendition. That is what
 keeps the player trivial: one playlist, one `SourceBuffer`, and nothing to synchronise in
