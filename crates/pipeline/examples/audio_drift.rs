@@ -166,17 +166,28 @@ fn main() {
         ppm * 3.6,
         ppm * 0.6
     );
-    // ITU-R BT.1359: roughly +45 ms (audio early) to -125 ms (audio late) before anyone
-    // notices. The tighter side is what a drift budget has to respect.
-    let hour = (ppm * 3.6).abs();
+    // ITU-R BT.1359, and the direction is half the answer: audio *early* stops being
+    // acceptable at about +45 ms, audio *late* not until about -125 ms. A device running
+    // slow — negative ppm — makes its audio late, which is the forgiving side, so
+    // comparing the magnitude against the tight threshold would call a tolerable drift
+    // intolerable.
+    let ms_per_hour = ppm * 3.6;
+    let budget = if ms_per_hour < 0.0 { 125.0 } else { 45.0 };
+    println!(
+        "audio runs        {}",
+        if ppm < 0.0 {
+            "late (the forgiving direction)"
+        } else {
+            "early (the tight direction)"
+        }
+    );
     println!(
         "verdict           {}",
         if ppm.abs() < 3.0 * ppm_error.max(0.1) {
-            "indistinguishable from zero at this run length"
-        } else if hour < 45.0 {
-            "under the perception threshold even after an hour; no correction needed"
+            "indistinguishable from zero at this run length".to_string()
         } else {
-            "past the threshold within an hour; the stream needs one clock or the other"
+            let hours = budget / ms_per_hour.abs();
+            format!("perceptible after about {hours:.1} h of watching (ITU-R BT.1359, {budget:.0} ms this way)")
         }
     );
 }
