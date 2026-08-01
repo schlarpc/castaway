@@ -120,6 +120,36 @@ const USER_AGENT = process.env.CASTAWAY_USER_AGENT || undefined;
 // ECS to pick it up. See OPEN-QUESTIONS Q42 for the measurement behind both.
 // ---------------------------------------------------------------------------
 
+/**
+ * The Windows shared-texture handle, whatever Electron decided to call it this release.
+ *
+ * The docs describe `sharedTextureHandle`, a number. Electron 43 on Windows actually
+ * delivers `ntHandle`: an 8-byte little-endian Buffer holding the HANDLE. Reading only the
+ * documented name meant every paint on the panel was rejected with "handle carries neither
+ * nativePixmap nor sharedTextureHandle" and the browser layer stayed empty — the browser
+ * ran, painted, and had all of its frames thrown away at this line.
+ *
+ * Both spellings are accepted rather than switching on version, because the cost of the
+ * wrong guess here is a black panel with a message that sounds like a GPU problem.
+ *
+ * @returns {number|undefined} the handle value, or undefined if this is not a Windows
+ *   shared texture.
+ */
+function sharedHandleValue(handle) {
+  if (handle.sharedTextureHandle !== undefined && handle.sharedTextureHandle !== null) {
+    return Number(handle.sharedTextureHandle);
+  }
+  const nt = handle.ntHandle;
+  if (nt === undefined || nt === null) return undefined;
+  // A Buffer over the protocol boundary, or a plain number if a future release simplifies.
+  if (typeof nt === 'number') return nt;
+  const buf = Buffer.isBuffer(nt) ? nt : Buffer.from(nt.data || nt);
+  if (buf.length < 8) return undefined;
+  // HANDLE is pointer-sized, but the values Windows hands out are small enough that the
+  // BigInt lands well inside Number's exact-integer range.
+  return Number(buf.readBigUInt64LE(0));
+}
+
 /** `_platform_specific` leaf name, in ECS's spelling. */
 function cdmPlatform() {
   const os = { win32: 'win', darwin: 'mac', linux: 'linux' }[process.platform] || process.platform;
@@ -524,10 +554,11 @@ function createWindow(surface, width, height) {
       return;
     }
     const info = event.texture.textureInfo;
-    const pixmap = info.handle && info.handle.nativePixmap;
-    const shared = info.handle && info.handle.sharedTextureHandle;
+    const handle = info.handle || {};
+    const pixmap = handle.nativePixmap;
+    const shared = sharedHandleValue(handle);
     if (!pixmap && shared === undefined) {
-      send({ type: 'no-texture', detail: `handle carries neither nativePixmap nor sharedTextureHandle: ${JSON.stringify(info.handle)}` });
+      send({ type: 'no-texture', detail: `handle carries no usable texture: ${JSON.stringify(info.handle)}` });
       event.texture.release();
       return;
     }
