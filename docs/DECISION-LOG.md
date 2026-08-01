@@ -1631,3 +1631,105 @@ same copy `/screenshot.png` has always done.
 There is no audio in the duplicate. The panel's audio is mixed by us (D36) and could be
 tapped the same way, but a video-only mirror answers the want in the issue — see what the
 panel is showing — and an audio track is a second clock to keep in step with the first.
+
+### D50 — The stream's audio is tapped at the factory, not at a mixer, because there is no mixer
+
+Adding sound to the output duplicate (#101, D49) started by looking for the place the
+panel's audio exists as one stream. There is no such place, and that is deliberate:
+`AudioOutputFactory` hands **each session its own device**, because two sessions writing
+to one device fight rather than mix, and the OS is what mixes them. So "what the panel is
+playing" is not a thing this process holds.
+
+What it does hold is the factory — one, installed at startup, and every session's audio
+goes through a `Box<dyn AudioOut>` that came from it: Cast, AirPlay, DLNA, Spotify,
+Bluetooth, and the browser's captured page audio. So the tee wraps the factory. Nothing in
+the audio path changes, and a session cannot be added later that reaches the speakers and
+misses the stream without also missing its own sink.
+
+**Both tracks measure themselves against one origin** (`stream::timeline`). Video slots and
+audio sample positions are each derived from wall-clock time, and they have to be derived
+from the *same* wall-clock time: a stream whose audio runs 40 ppm fast is in sync for the
+first minute and half a frame out by the tenth, which is the kind of fault that gets blamed
+on the network. Sharing the origin also means a rebase — the cadence giving up on a gap it
+will not paper over — moves both, because it moves the thing they are both measured from.
+
+Silence is what a zeroed window already contains, so nothing has to *write* silence for
+silence to come out. That matters more than it sounds: a silent panel is the normal case,
+and an audio track that simply stops is one a player stalls on.
+
+**Sessions are followed, not sampled.** Each carries a cursor — its first block's instant
+plus the duration of every block since — and blocks are placed at that, not at the instant
+they arrive. "The session writes in real time" is only true when something consumes in real
+time. The first run against a real panel proved it: a box with no audio device gets a
+`NullAudioOut`, which accepts a block instantly, so the decoder raced through a file as
+fast as it could read it and placing by arrival put a minute of audio into the first
+second. The correction is one-sided on purpose — a cursor *ahead* of the clock is a session
+with a buffer, which every source has; a cursor *behind* it is audio being laid down where
+the encoder has already been, and is silently lost.
+
+Two tracks in one movie and one `moof`, rather than a track per HLS rendition. That is what
+keeps the player trivial: one playlist, one `SourceBuffer`, and nothing to synchronise in
+JavaScript, because the tracks arrive interleaved and already agreeing about where they are.
+
+The AAC encoder's priming delay is cancelled by discarding exactly `initial_padding`
+samples of its *input*, so coded frame *k* carries mix position `k × 1024` again. The
+alternative is an `elst` edit list, which is more boxes and which several players ignore.
+
+#### The finding: the panel has been playing YouTube silently
+
+Validating against the Electron build rather than the renderer-only one — on the grounds
+that zero-copy shared-texture frames *plus* page audio routed back through our own sink is
+where the risk actually is — turned up a defect that has nothing to do with the stream.
+
+`audio-tap.js` installs an `AudioWorkletProcessor`, and `audioWorklet.addModule` takes a
+URL; there is no inline form. So the module is a Blob and the URL is `blob:`. YouTube's
+policy is:
+
+    script-src 'unsafe-inline' https: http: 'unsafe-eval'
+
+which does not list `blob:`. `addModule` rejected with `AbortError: Unable to load a
+worklet's module`, no media element was ever tapped, and the page's audio went to a system
+device the browser subprocess does not have. Every launch logged it and nothing was
+watching, because the picture is perfect and the failure is inaudible from the room. It is
+the same class as G61 and it was found only because something finally *measured* the audio.
+
+Decided: amend the policy on the way past — append `blob:` to `script-src` in
+`onHeadersReceived`. A deviation, marked as one at the site. What it permits is a page
+executing script from a Blob it built itself, which that same policy already grants through
+`'unsafe-eval'`; it opens nothing remote and applies only to what this kiosk loads. Every
+other route is worse: `data:` is excluded by the same directive, serving the module from an
+`https:` origin means standing up a server and hoping no policy tightens, and
+`ScriptProcessorNode` needs no module but runs on the main thread, where a page as heavy as
+leanback will glitch it.
+
+#### Two more, both about running many GPU devices in one process
+
+**Opening two driver stacks at once segfaults inside Mesa.** The stream's VA-API encoder
+device and the compositor's Vulkan device, brought up concurrently, crash in the driver.
+Not only a test artefact: a cast starting as the output stream starts puts a decode device
+and an encode device in the same race, on an unattended panel, where the symptom is the
+process disappearing. Every device open now takes one process-wide lock (`gpu_lock`) —
+opens happen a handful of times in a process's life and none is on a per-frame path.
+
+**The Vulkan loader is not safe against concurrent device create/destroy.** wgpu names each
+Vulkan object as it creates it; the loader resolves the device dispatch table on every such
+call, while another thread may be mutating it. Measured rather than assumed: at `01c862e`,
+before any of this work, the pipeline test binary crashed 1 run in 20; with five more
+concurrent GPU tests, 6 in 20. The hazard is upstream's and predates us — what changed is
+how often it is reached. `InstanceFlags::DEBUG` is dropped, which is what makes wgpu name
+objects at all and which `from_build_config` only sets in debug builds, so the panel never
+had those labels. Validation is kept. 60 runs, no crashes.
+
+#### Measured, 2026-08-01
+
+Electron build, YouTube leanback playing through DIAL, streaming 1920x1080 at 30 fps:
+`h264_vaapi + aac`, both tracks starting at 0.000 and running 10.000 s and 10.005 s. The
+music arrives at a peak of 0.76 and a steady RMS across every second. Chromium plays it
+both natively and through the MSE shim, decoding both tracks.
+
+#### Not done
+
+No `elst`, so the *first* AAC frame's priming is cancelled by input discard rather than
+described in the container. Audio is stereo only. And the stream's audio leads the panel's
+own speakers by the output queue's depth — tens of milliseconds — because a block is placed
+where it was handed to the device, not where the device played it.
