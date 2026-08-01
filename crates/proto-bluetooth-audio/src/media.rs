@@ -71,6 +71,21 @@ pub struct Depacketizer {
     /// read it; the parser is stateful because a sender may send the configuration once
     /// and reuse it (RFC 3016 §4.1).
     latm: Option<LatmParser>,
+    /// The RTP sequence number of the previous packet, for loss detection.
+    ///
+    /// A2DP numbers its media packets and we were throwing that away, which left the one
+    /// question that matters when audio breaks up unanswerable: were the packets lost
+    /// before they reached us, or did we mishandle packets we did receive? A decoder
+    /// complaining is a *symptom* of either, so it cannot tell them apart — but a
+    /// sequence gap is proof of the first, and its absence is proof of the second.
+    last_sequence: Option<u16>,
+    /// How many packets the sequence numbers say went missing.
+    lost_packets: u64,
+    /// How many discontinuities were seen, which is not the same number — one gap may
+    /// swallow many packets, and a burst of small gaps means something different from a
+    /// single large one.
+    sequence_gaps: u64,
+
     /// What the most recent LDAC payload said it was, read from its first frame header.
     ///
     /// The counterpart of `sbc_bitpool`, and for the same reason: it is the number the
@@ -91,6 +106,9 @@ impl Depacketizer {
             sample_rate: sample_rate.max(1),
             base_timestamp: None,
             frames_seen: 0,
+            last_sequence: None,
+            lost_packets: 0,
+            sequence_gaps: 0,
             sbc_bitpool: None,
             latm: (codec == AudioCodec::Aac).then(LatmParser::new),
             ldac_stream: None,
@@ -101,6 +119,40 @@ impl Depacketizer {
     #[must_use]
     pub const fn codec(&self) -> AudioCodec {
         self.codec
+    }
+
+    /// Record an RTP sequence number and count anything missing between it and the last.
+    ///
+    /// Wrapping is normal — the field is 16 bits and a 44.1 kHz stream exhausts it every
+    /// few minutes — so the delta is computed with `wrapping_sub`, which makes 0xFFFF →
+    /// 0x0000 a delta of one rather than a 65535-packet catastrophe.
+    ///
+    /// A delta of zero (a duplicate) or a large delta (reordering, or a stream that
+    /// restarted) is deliberately *not* counted as loss: neither is a missing packet, and
+    /// counting them would inflate exactly the number we want to trust.
+    fn note_sequence(&mut self, sequence: u16) {
+        let Some(previous) = self.last_sequence.replace(sequence) else {
+            return;
+        };
+        let delta = sequence.wrapping_sub(previous);
+        // 1 is the healthy case. 0 is a duplicate. Anything past half the sequence space
+        // is far likelier to be a restart or reordering than a real run of losses.
+        if delta > 1 && delta < u16::MAX / 2 {
+            self.sequence_gaps += 1;
+            self.lost_packets += u64::from(delta - 1);
+        }
+    }
+
+    /// How many media packets the sequence numbers say never arrived.
+    #[must_use]
+    pub const fn lost_packets(&self) -> u64 {
+        self.lost_packets
+    }
+
+    /// How many separate discontinuities produced [`Self::lost_packets`].
+    #[must_use]
+    pub const fn sequence_gaps(&self) -> u64 {
+        self.sequence_gaps
     }
 
     /// The bitpool the most recent SBC frame was coded at, if this is an SBC stream.
@@ -154,6 +206,7 @@ impl Depacketizer {
             Framing::Rtp | Framing::RtpWithHeader => {
                 let rtp = RtpPacket::parse(packet)
                     .map_err(|_| AudioError::BadMediaPacket("malformed RTP header"))?;
+                self.note_sequence(rtp.header.sequence);
                 let pts = self.pts_from(rtp.header.timestamp);
                 let mut payload = rtp.payload;
                 if self.framing == Framing::RtpWithHeader {
@@ -257,6 +310,80 @@ mod tests {
         buf.put_u32(0xDEAD_BEEF); // ssrc
         buf.extend_from_slice(payload);
         buf.freeze()
+    }
+
+    /// The same, at an explicit sequence number.
+    fn rtp_seq(sequence: u16, payload: &[u8]) -> Bytes {
+        let mut buf = BytesMut::with_capacity(12 + payload.len());
+        buf.put_u8(0x80);
+        buf.put_u8(96);
+        buf.put_u16(sequence);
+        buf.put_u32(0);
+        buf.put_u32(0xDEAD_BEEF);
+        buf.extend_from_slice(payload);
+        buf.freeze()
+    }
+
+    #[test]
+    fn a_clean_stream_reports_no_loss() {
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        for seq in 100..200 {
+            d.push(rtp_seq(seq, &[0xAA; 6])).unwrap();
+        }
+        assert_eq!(d.lost_packets(), 0);
+        assert_eq!(d.sequence_gaps(), 0);
+    }
+
+    #[test]
+    fn a_gap_in_the_sequence_counts_the_packets_that_never_arrived() {
+        // The measurement that decides whether a break-up is the radio's fault or ours.
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        d.push(rtp_seq(10, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(11, &[0xAA; 6])).unwrap();
+        // 12, 13 and 14 never arrive.
+        d.push(rtp_seq(15, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(16, &[0xAA; 6])).unwrap();
+        assert_eq!(d.sequence_gaps(), 1, "one discontinuity");
+        assert_eq!(d.lost_packets(), 3, "three packets inside it");
+    }
+
+    #[test]
+    fn the_sequence_number_wrapping_is_not_sixty_five_thousand_losses() {
+        // The field is 16 bits and a 44.1 kHz stream exhausts it every few minutes, so
+        // this happens in every real session. Subtracting the wrong way round turns a
+        // healthy stream into a catastrophic-looking one, on a timer.
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        d.push(rtp_seq(0xFFFE, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(0xFFFF, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(0x0000, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(0x0001, &[0xAA; 6])).unwrap();
+        assert_eq!(d.lost_packets(), 0);
+        assert_eq!(d.sequence_gaps(), 0);
+    }
+
+    #[test]
+    fn duplicates_and_reordering_are_not_counted_as_loss() {
+        // Neither is a missing packet, and counting them would inflate the one number
+        // this exists to make trustworthy.
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        d.push(rtp_seq(50, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(50, &[0xAA; 6])).unwrap(); // duplicate
+        assert_eq!(d.lost_packets(), 0, "a duplicate is not a loss");
+        // A jump backwards is reordering or a restarted stream, not 65k losses.
+        d.push(rtp_seq(20, &[0xAA; 6])).unwrap();
+        assert_eq!(d.lost_packets(), 0, "a backwards jump is not a loss");
+    }
+
+    #[test]
+    fn loss_is_counted_for_every_rtp_codec_not_just_one() {
+        // AAC and SBC ride the same RTP framing, so the diagnostic has to work there
+        // too — SBC is the codec every sender falls back to when the link is bad, which
+        // is exactly when this number matters most.
+        let mut sbc = Depacketizer::new(AudioCodec::Sbc, 44_100);
+        let payload = [&[0x05][..], &sbc_frame(35)].concat();
+        sbc.push(rtp_seq(1, &payload)).unwrap();
+        sbc.push(rtp_seq(4, &payload)).unwrap();
+        assert_eq!(sbc.lost_packets(), 2);
     }
 
     #[test]

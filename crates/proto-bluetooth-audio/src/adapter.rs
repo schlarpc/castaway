@@ -182,6 +182,9 @@ struct Link {
     /// packet or every packet — the difference between a glitch and a session that is
     /// never going to make a sound.
     media_failures: u64,
+    /// The last gap count reported for this link, so the powers-of-two schedule fires
+    /// once per threshold rather than on every packet once the count sits on one.
+    reported_gaps: u64,
     /// A fragmented AVRCP response being reassembled: the PDU id and what has arrived.
     ///
     /// One at a time, because AVRCP allows exactly one continuation in flight per
@@ -289,6 +292,7 @@ impl Link {
             control: None,
             avrcp_control: None,
             media_failures: 0,
+            reported_gaps: 0,
             avrcp_reassembly: None,
             art_psm: None,
             art_sdp: None,
@@ -1020,6 +1024,25 @@ impl BluetoothAdapter {
                     }
                     link.reported_bitpool = bitpool;
                 }
+                // Packet loss, reported on the same powers-of-two schedule as the
+                // depacketize failures below and for the same reason: a burst is worth a
+                // line, the thousand packets after it are the same line.
+                //
+                // This is the number that decides where a break-up came from. The
+                // decoder complaining ("Synchronization error", an SBC frame that will
+                // not parse) is a symptom of either a lossy radio or a bug in our
+                // framing, and cannot distinguish them. A sequence gap can: it is proof
+                // the packet never arrived, so the fault is below us.
+                let gaps = depacketizer.sequence_gaps();
+                if gaps > link.reported_gaps && gaps.is_power_of_two() {
+                    warn!(
+                        gaps,
+                        lost = depacketizer.lost_packets(),
+                        codec = ?depacketizer.codec(),
+                        "bluetooth: media packets are being lost before they reach us"
+                    );
+                }
+                link.reported_gaps = gaps;
                 // `try_send` rather than `send`: blocking here would stall the whole
                 // adapter, including the signaling channel, so a phone could not even
                 // pause. A full queue means decode is behind, which is worth saying.
