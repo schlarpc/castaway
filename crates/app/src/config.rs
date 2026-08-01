@@ -595,19 +595,48 @@ impl Default for SponsorBlock {
     }
 }
 
+/// Where the packaging puts the browser subprocess, relative to `castaway` itself.
+///
+/// The Windows artifact is a flat directory — `castaway.exe` with `browser/` and
+/// `browser-host/` beside it (nix/windows.nix `stageBrowser`) — and nothing wraps it, so
+/// the receiver has to be able to find its own subprocess. The Linux kiosk wrapper sets
+/// the environment variables and therefore never reaches this, but the layout it stages
+/// is the same shape.
+///
+/// Existence is checked rather than assumed: under `cargo run` the sibling is
+/// `target/debug/browser/electron`, which does not exist, and the right answer there is
+/// to fall through to `PATH` rather than to hand [`std::process::Command`] a path that
+/// cannot work.
+fn beside_exe(relative: &str) -> Option<std::path::PathBuf> {
+    let candidate = std::env::current_exe().ok()?.parent()?.join(relative);
+    candidate.exists().then_some(candidate)
+}
+
+/// The Electron executable's name, which is the one part of the layout that differs.
+const ELECTRON_EXE: &str = if cfg!(windows) {
+    "browser/electron.exe"
+} else {
+    "browser/electron"
+};
+
 impl Config {
     /// The Electron binary to run the browser host with.
     ///
     /// `$CASTAWAY_ELECTRON` first so a developer can point at a build under test without
-    /// editing config, then the configured path, then `electron` on `PATH`. The packaged
-    /// artifacts set the environment variable, which is why there is no clever search
-    /// here: on a panel the answer is known at build time.
+    /// editing config, then the configured path, then the copy the packaging staged beside
+    /// this executable, then `electron` on `PATH` for a devshell run.
+    ///
+    /// The sibling probe is what makes the Windows artifact work: it has no wrapper to set
+    /// the environment variable, so without it a packaged receiver looks for a bare
+    /// `electron` on `PATH`, does not find one, and reports a browser failure that reads
+    /// like a browser bug rather than a packaging one.
     #[must_use]
     #[cfg_attr(not(feature = "electron"), allow(dead_code))]
     pub fn browser_program(&self) -> std::path::PathBuf {
         std::env::var_os("CASTAWAY_ELECTRON")
             .map(std::path::PathBuf::from)
             .or_else(|| self.browser.electron_path.clone().map(Into::into))
+            .or_else(|| beside_exe(ELECTRON_EXE))
             .unwrap_or_else(|| std::path::PathBuf::from("electron"))
     }
 
@@ -618,6 +647,7 @@ impl Config {
         std::env::var_os("CASTAWAY_BROWSER_APP")
             .map(std::path::PathBuf::from)
             .or_else(|| self.browser.app_dir.clone().map(Into::into))
+            .or_else(|| beside_exe("browser-host"))
             .unwrap_or_else(|| std::path::PathBuf::from("browser-host"))
     }
 
