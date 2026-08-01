@@ -74,6 +74,7 @@ cpal = { version = "0.15", optional = true }
 # needs a second decode backend beside ffmpeg (Q22). Sony's own library, via nixpkgs
 # `ldacbt`; the safe wrapper is `ldac_decode` and it is the only consumer.
 ldac-sys = { workspace = true, optional = true }
+interprocess = { version = "2.4.3", default-features = false }
 
 # The native PipeWire output backend (`audio-pipewire`): real sink names for the
 # settings screen and per-stream routing via `target.object`, neither of which the ALSA

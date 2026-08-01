@@ -53,9 +53,127 @@
 //! fought over the layer.
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use interprocess::local_socket::traits::{Listener as _, Stream as _};
+use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName as _};
+
+/// The two ends of the control channel.
+///
+/// This used to be the child's stdin and stdout, and on Linux that worked. It cannot work
+/// on Windows: Electron's *main process* `process.stdin` is unusable there — GUI-subsystem
+/// startup loses the piped handle, so Node emits `end` immediately and never delivers a
+/// byte (electron#4218, #10580, #11680, #22809, open for a decade). Measured on the panel:
+/// `shutting down` — main.js's stdin `end` handler — arrived before `ready`, while the
+/// parent was demonstrably still holding the pipe open and never wrote to it again.
+///
+/// So the protocol runs over a local socket, the same on both platforms: a Unix socket
+/// under the runtime directory, a named pipe under `\\.\pipe\`. `GenericFilePath` maps
+/// both from an ordinary path string, which is also exactly what Node's `net.connect`
+/// takes, so the two sides agree on one spelling.
+///
+/// Moving off stdio buys a second thing worth having: stdout goes back to being
+/// diagnostics. It was the control channel *and* whatever Chromium decided to print, which
+/// is a framing hazard the protocol had to be careful about — and on Windows Chromium
+/// writes `\r\n` and a stray leading blank line (electron#12578, seen in the probe).
+type WireSend = interprocess::local_socket::SendHalf;
+type WireRecv = interprocess::local_socket::RecvHalf;
+
+/// How long the browser gets to connect back before we call the install broken.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bind the control socket and return the address to hand the child.
+///
+/// The address is per-process and per-spawn: a respawned browser gets a fresh socket, so a
+/// previous child that has not finished dying cannot connect to the new listener and be
+/// mistaken for it. On Unix the socket lives under the runtime directory and interprocess
+/// unlinks it on drop; on Windows `\\.\pipe\` names are not filesystem entries and go away
+/// with the handle.
+fn bind_control_socket() -> Result<(String, interprocess::local_socket::Listener), PipelineError> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let unique = format!(
+        "castaway-browser-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+
+    #[cfg(windows)]
+    let address = format!(r"\\.\pipe\{unique}");
+    // The cache directory rather than state: a socket outlives nothing, and the crate's
+    // own rule for cache is "may be deleted at any time", which is exactly right for a
+    // file whose only job is to exist while two processes are both running.
+    #[cfg(not(windows))]
+    let address = {
+        let dir = castaway_paths::host().cache();
+        std::fs::create_dir_all(dir).map_err(|e| {
+            PipelineError::GpuInit(format!("browser socket directory {}: {e}", dir.display()))
+        })?;
+        dir.join(format!("{unique}.sock"))
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    let name = address
+        .clone()
+        .to_fs_name::<GenericFilePath>()
+        .map_err(|e| PipelineError::GpuInit(format!("browser socket name {address}: {e}")))?;
+    let listener = ListenerOptions::new()
+        .name(name)
+        // A socket file left by a killed receiver would otherwise make every subsequent
+        // start fail with AddrInUse — a panel that never comes back after one bad exit.
+        .try_overwrite(true)
+        .create_sync()
+        .map_err(|e| PipelineError::GpuInit(format!("binding browser socket {address}: {e}")))?;
+    Ok((address, listener))
+}
+
+/// Wait for the browser to connect, giving up if it dies or takes too long.
+///
+/// Polls rather than blocking in `accept`, because a browser that exits during startup —
+/// a missing DLL, a refused GPU — would otherwise leave this blocked forever on a
+/// connection that is never coming. Noticing the exit is the difference between a clear
+/// error and a hung panel.
+fn accept_within(
+    listener: &interprocess::local_socket::Listener,
+    timeout: std::time::Duration,
+    child: &mut Child,
+) -> Result<interprocess::local_socket::Stream, PipelineError> {
+    listener
+        .set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)
+        .map_err(|e| PipelineError::GpuInit(format!("browser socket nonblocking: {e}")))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok(stream) => {
+                // Back to blocking: the reader thread wants a plain blocking read, and the
+                // accepted stream inherits the listener's mode on some platforms.
+                stream.set_nonblocking(false).map_err(|e| {
+                    PipelineError::GpuInit(format!("browser socket back to blocking: {e}"))
+                })?;
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                return Err(PipelineError::GpuInit(format!(
+                    "browser did not connect: {e}"
+                )))
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(PipelineError::GpuInit(format!(
+                "browser exited before connecting ({status})"
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(PipelineError::GpuInit(format!(
+                "browser did not connect within {timeout:?}"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 
 use tracing::{debug, error, info, trace, warn};
 
@@ -114,16 +232,16 @@ struct InFlight {
     id: u64,
     /// The channel back to the browser. `Weak`-ish by hand: if the browser is gone the
     /// release is pointless, so a send failure here is not worth reporting.
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    wire: Arc<Mutex<Option<WireSend>>>,
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.stdin.lock() {
-            if let Some(stdin) = guard.as_mut() {
+        if let Ok(mut guard) = self.wire.lock() {
+            if let Some(wire) = guard.as_mut() {
                 if let Ok(bytes) = encode(&ToBrowser::Release { id: self.id }) {
-                    let _ = stdin.write_all(&bytes);
-                    let _ = stdin.flush();
+                    let _ = wire.write_all(&bytes);
+                    let _ = wire.flush();
                 }
             }
         }
@@ -255,7 +373,7 @@ impl PendingPaints {
 /// The browser subprocess: spawn, protocol, supervision.
 pub struct Electron {
     child: Child,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    wire: Arc<Mutex<Option<WireSend>>>,
     /// Newest painted frame per window, not yet imported.
     pending: Arc<Mutex<PendingPaints>>,
     health: Arc<Health>,
@@ -283,25 +401,33 @@ impl Electron {
         user_agent: &str,
         waker: castaway_core::Waker,
     ) -> Result<Self, PipelineError> {
+        // Listen *before* spawning, so the child cannot lose a race to connect.
+        let (address, listener) = bind_control_socket()?;
         let mut child = Command::new(program)
             .arg(app_dir)
             .env("CASTAWAY_USER_AGENT", user_agent)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Chromium's own logging goes to the terminal/journal rather than through the
-            // protocol: it is voluminous, and mixing it into the control channel would
-            // mean one stray line could desynchronize framing.
+            .env("CASTAWAY_BROWSER_SOCKET", &address)
+            // Chromium's own logging is voluminous and, on Windows, punctuated with stray
+            // blank lines and CRLF. It used to share a channel with the protocol, where one
+            // stray line could desynchronize framing; now both are just diagnostics.
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| {
                 PipelineError::GpuInit(format!("spawning browser {}: {e}", program.display()))
             })?;
 
-        let stdin = Arc::new(Mutex::new(child.stdin.take()));
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| PipelineError::GpuInit("browser has no stdout".into()))?;
+        let stream = match accept_within(&listener, CONNECT_TIMEOUT, &mut child) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        let (rx, tx) = stream.split();
+        let wire = Arc::new(Mutex::new(Some(tx)));
 
         let pending: Arc<Mutex<PendingPaints>> = Arc::new(Mutex::new(PendingPaints::default()));
         // A factory rather than a device: a respawned browser takes a *fresh* output, the
@@ -322,16 +448,16 @@ impl Electron {
             .spawn({
                 let pending = Arc::clone(&pending);
                 let health = Arc::clone(&health);
-                let stdin = Arc::clone(&stdin);
+                let wire = Arc::clone(&wire);
                 let audio = Arc::clone(&audio);
                 let probes = Arc::clone(&probes);
                 move || {
                     reader_loop(
-                        stdout,
+                        rx,
                         &Wiring {
                             pending: &pending,
                             health: &health,
-                            stdin: &stdin,
+                            wire: &wire,
                             adblock: &adblock,
                             audio: &audio,
                             probes: &probes,
@@ -355,7 +481,7 @@ impl Electron {
         let process = ProcessRef::open_for(&child, pid)?;
         let electron = Self {
             child,
-            stdin,
+            wire,
             pending,
             health,
             process,
@@ -374,15 +500,11 @@ impl Electron {
             warn!(target: "castaway::browser", ?msg, "could not encode a browser command");
             return;
         };
-        if let Ok(mut guard) = self.stdin.lock() {
-            if let Some(stdin) = guard.as_mut() {
-                if stdin
-                    .write_all(&bytes)
-                    .and_then(|()| stdin.flush())
-                    .is_err()
-                {
+        if let Ok(mut guard) = self.wire.lock() {
+            if let Some(wire) = guard.as_mut() {
+                if wire.write_all(&bytes).and_then(|()| wire.flush()).is_err() {
                     // The browser died; the reader thread will have posted the fault.
-                    debug!(target: "castaway::browser", "browser stdin closed");
+                    debug!(target: "castaway::browser", "browser control channel closed");
                 }
             }
         }
@@ -461,9 +583,9 @@ impl Electron {
     /// So this escalates rather than hoping.
     pub fn shutdown(mut self) {
         self.send(&ToBrowser::Quit);
-        // Close stdin: a host app blocked on a read sees EOF and exits even if it
-        // mishandled `quit`.
-        if let Ok(mut guard) = self.stdin.lock() {
+        // Drop our end of the socket: a host app blocked on a read sees EOF and exits
+        // even if it mishandled `quit`.
+        if let Ok(mut guard) = self.wire.lock() {
             *guard = None;
         }
 
@@ -488,7 +610,7 @@ impl Electron {
                 }
             }
         }
-        // The reader thread ends when stdout closes, which the child's exit guarantees.
+        // The reader thread ends when the socket closes, which the child's exit guarantees.
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -515,7 +637,7 @@ impl Drop for Electron {
 struct Wiring<'a> {
     pending: &'a Arc<Mutex<PendingPaints>>,
     health: &'a Arc<Health>,
-    stdin: &'a Arc<Mutex<Option<ChildStdin>>>,
+    wire: &'a Arc<Mutex<Option<WireSend>>>,
     adblock: &'a Arc<AdBlocker>,
     audio: &'a Arc<Mutex<Option<BrowserAudio>>>,
     probes: &'a Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
@@ -525,14 +647,14 @@ struct Wiring<'a> {
     waker: &'a castaway_core::Waker,
 }
 
-/// Read the browser's stdout until it closes, dispatching each message.
+/// Read the browser's half of the control socket until it closes, dispatching each message.
 ///
 /// On its own thread rather than the render loop because blocking decisions must not wait
 /// for the next frame: a page stalls on a pending request, so answering at 60 Hz would
 /// make every blocked resource cost up to 16 ms.
-fn reader_loop(stdout: std::process::ChildStdout, w: &Wiring<'_>) {
+fn reader_loop(rx: WireRecv, w: &Wiring<'_>) {
     let mut framer = LineFramer::default();
-    let mut reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(rx);
     loop {
         let consumed = {
             let Ok(buf) = reader.fill_buf() else { break };
@@ -553,9 +675,10 @@ fn reader_loop(stdout: std::process::ChildStdout, w: &Wiring<'_>) {
         };
         reader.consume(consumed);
     }
-    debug!(target: "castaway::browser", "browser stdout closed");
+    debug!(target: "castaway::browser", "browser control channel closed");
     // The process, not a window: both surfaces are gone with it.
-    w.health.set_fault(None, "browser stdout closed".into());
+    w.health
+        .set_fault(None, "browser control channel closed".into());
     w.waker.wake();
 }
 
@@ -563,7 +686,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
     let Wiring {
         pending,
         health,
-        stdin,
+        wire,
         adblock,
         audio,
         probes,
@@ -638,7 +761,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             // The frame we just displaced was never drawn; return its buffer at once
             // rather than making the browser wait out our frame interval for it.
             if let Some(old) = superseded {
-                release(stdin, old.id);
+                release(wire, old.id);
             }
             waker.wake();
         }
@@ -657,7 +780,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
         }
         FromBrowser::ScriptletQuery { id, url } => {
             let source = adblock.injected_script(&url).unwrap_or_default();
-            reply(stdin, &ToBrowser::ScriptletSource { id, source });
+            reply(wire, &ToBrowser::ScriptletSource { id, source });
         }
         FromBrowser::AdblockQuery {
             id,
@@ -666,7 +789,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             kind,
         } => {
             let block = adblock.should_block(&url, &source, &kind);
-            reply(stdin, &ToBrowser::AdblockVerdict { id, block });
+            reply(wire, &ToBrowser::AdblockVerdict { id, block });
         }
         FromBrowser::LoadEnd {
             surface,
@@ -757,16 +880,16 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
     }
 }
 
-fn release(stdin: &Arc<Mutex<Option<ChildStdin>>>, id: u64) {
-    reply(stdin, &ToBrowser::Release { id });
+fn release(wire: &Arc<Mutex<Option<WireSend>>>, id: u64) {
+    reply(wire, &ToBrowser::Release { id });
 }
 
-fn reply(stdin: &Arc<Mutex<Option<ChildStdin>>>, msg: &ToBrowser) {
+fn reply(wire: &Arc<Mutex<Option<WireSend>>>, msg: &ToBrowser) {
     let Ok(bytes) = encode(msg) else { return };
-    if let Ok(mut guard) = stdin.lock() {
-        if let Some(stdin) = guard.as_mut() {
-            let _ = stdin.write_all(&bytes);
-            let _ = stdin.flush();
+    if let Ok(mut guard) = wire.lock() {
+        if let Some(wire) = guard.as_mut() {
+            let _ = wire.write_all(&bytes);
+            let _ = wire.flush();
         }
     }
 }
@@ -1021,7 +1144,7 @@ impl ElectronHost {
 
         let borrow = InFlight {
             id: paint.id,
-            stdin: Arc::clone(&electron.stdin),
+            wire: Arc::clone(&electron.wire),
         };
         // Nothing is meant to be showing in this window. A blanked page still paints —
         // about:blank is a white frame, importing it would put a fullscreen white layer

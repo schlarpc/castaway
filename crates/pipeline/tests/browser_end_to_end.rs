@@ -126,9 +126,26 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
     // The layer must be *the page*. An import that succeeds and yields an empty or
     // scrambled texture is the documented trap, so this reads pixels rather than
     // trusting the absence of an error.
-    render.pump();
-    let shot = render.read_rgba().expect("offscreen readback");
-    let px = center_pixel(&shot, 1280, 720);
+    //
+    // The *first* frame to arrive is not necessarily the one with the colour on it: the
+    // page paints its background as soon as it has a surface, and the styled body a beat
+    // later. Asserting on one frame made this a race that only lost when the browser
+    // started quickly — which is why it survived until the control channel moved off
+    // stdio and shifted startup timing. Waiting for the colour keeps what the assertion
+    // is actually for (real pixels, correctly imported) without depending on which frame
+    // carries them.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut px = [0_u8; 4];
+    while Instant::now() < deadline {
+        host.pump(&mut render);
+        render.pump();
+        let shot = render.read_rgba().expect("offscreen readback");
+        px = center_pixel(&shot, 1280, 720);
+        if near(px[1], 128) && near(px[2], 255) && near(px[0], 0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
     assert!(
         near(px[1], 128) && near(px[2], 255) && near(px[0], 0),
         "composited centre is {px:?}, expected ~[0,128,255] — the layer is not the page"

@@ -5,7 +5,7 @@
 // condition of the decision that let JavaScript into this repo at all.
 //
 // This process owns no policy. It renders, reports, and asks — blocking decisions, page
-// choice and scriptlet content all come from castaway over stdio. Everything here is
+// choice and scriptlet content all come from castaway over the control socket. Everything here is
 // mechanism, so that the parts worth testing stay in Rust where they can be
 // fixture-tested (`pipeline::browser_proto`).
 //
@@ -15,13 +15,15 @@
 //   1. A painted frame is *lent*, not given. `texture.release()` happens when castaway
 //      says `release`, never before — it is still sampling. Frames beyond MAX_INFLIGHT
 //      are dropped rather than queued, because for live output latency beats freshness.
-//   2. stdout is the control channel. Nothing else may write to it, or framing
-//      desynchronizes. Diagnostics go to stderr, which castaway inherits.
+//   2. The control channel is a local socket, not stdio — see the `SOCKET` comment below
+//      for why Windows forced that. stdout and stderr are diagnostics, inherited by
+//      castaway, and nothing on them can desynchronize framing.
 
 'use strict';
 
 const { app, BrowserWindow, components, dialog, session } = require('electron');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 
 // Injected into every page's main world: routes the page's audio to castaway instead of
@@ -47,8 +49,32 @@ process.on('unhandledRejection', (err) => log('error', `unhandled rejection: ${e
 // on castaway's side, so a 60 fps page must not be able to spend the clock's budget.
 const MAX_INFLIGHT = 4;
 
+// The control channel. Not stdio: Electron's main-process `process.stdin` is unusable on
+// Windows — GUI-subsystem startup loses the piped handle, so it emits `end` immediately
+// and never delivers a byte (electron#4218, #10580, #11680, #22809). castaway listens on a
+// local socket before spawning us and names it here; `net.connect` takes a Unix socket path
+// and a `\\.\pipe\` name identically, so one spelling serves both platforms.
+//
+// stdout is no longer the control channel, which is a relief rather than a cost: it was
+// shared with everything Chromium decides to print, and on Windows that includes CRLF and
+// a stray leading blank line (electron#12578). Diagnostics can have it back.
+const SOCKET = process.env.CASTAWAY_BROWSER_SOCKET;
+if (!SOCKET) {
+  // Nothing to report the failure *over*, so this is the one place stderr is the channel.
+  process.stderr.write('castaway: CASTAWAY_BROWSER_SOCKET is unset; nothing to talk to\n');
+  process.exit(2);
+}
+// Node queues writes issued before the connection completes, so `send` is usable
+// immediately — which matters, because staging the CDM logs before the socket is up.
+const wire = net.connect(SOCKET);
+wire.setNoDelay(true);
+wire.on('error', (e) => {
+  process.stderr.write(`castaway: control socket ${SOCKET}: ${e}\n`);
+  app.exit(1);
+});
+
 function send(msg) {
-  process.stdout.write(JSON.stringify(msg) + '\n');
+  wire.write(JSON.stringify(msg) + '\n');
 }
 function log(level, message) {
   send({ type: 'log', level, message });
@@ -650,7 +676,12 @@ function handle(msg) {
   }
 }
 
+let shuttingDown = false;
 function shutdown() {
+  // 'end' and 'close' both arrive on a dropped socket; quitting twice is harmless but
+  // releasing the lent textures twice is not.
+  if (shuttingDown) return;
+  shuttingDown = true;
   // Return every lent frame before going: Chromium asserts on a texture destroyed while
   // still lent out, and an assert here is a crash rather than a clean exit.
   for (const [, lent] of inflight) {
@@ -668,7 +699,8 @@ function shutdown() {
 let appReady = false;
 const queued = [];
 let buffered = '';
-process.stdin.on('data', (chunk) => {
+wire.setEncoding('utf8');
+wire.on('data', (chunk) => {
   buffered += chunk;
   let newline;
   while ((newline = buffered.indexOf('\n')) >= 0) {
@@ -697,8 +729,10 @@ process.stdin.on('data', (chunk) => {
   }
 });
 // castaway vanishing is a quit, not an error loop — this is the backstop that stops an
-// orphaned browser holding the GPU and the profile lock.
-process.stdin.on('end', shutdown);
+// orphaned browser holding the GPU and the profile lock. Both events, because a peer that
+// dies rather than closing cleanly delivers only `close`.
+wire.on('end', shutdown);
+wire.on('close', shutdown);
 
 app.whenReady().then(async () => {
   await readyComponents();
