@@ -1628,9 +1628,14 @@ CUDA or D3D11 frames context, so on NVIDIA/Linux it is `VK_EXT_external_memory_f
 the current shape costs is one readback per stream frame, which is 3 MB at 1080p and is the
 same copy `/screenshot.png` has always done.
 
-There is no audio in the duplicate. The panel's audio is mixed by us (D36) and could be
-tapped the same way, but a video-only mirror answers the want in the issue — see what the
-panel is showing — and an audio track is a second clock to keep in step with the first.
+There is no audio in the duplicate. A video-only mirror answers the want in the issue —
+see what the panel is showing — and an audio track is a second clock to keep in step with
+the first.
+
+*(Corrected 2026-08-01: this paragraph originally said "the panel's audio is mixed by us
+(D36)". Both halves were wrong. D36 is the browser-runtime decision and says nothing about
+mixing, and the panel has no mixer at all — every session opens its own output device and
+the OS mixes. D50 is what found that out, by needing the mix and having to build one.)*
 
 ### D50 — The stream's audio is tapped at the factory, not at a mixer, because there is no mixer
 
