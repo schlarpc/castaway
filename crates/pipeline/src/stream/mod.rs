@@ -29,6 +29,7 @@
 //!   watching costs exactly nothing.
 
 pub mod cadence;
+pub mod feed;
 pub mod fmp4;
 pub mod hls;
 pub mod timeline;
@@ -59,6 +60,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cadence::FrameRate;
+use feed::LiveFeed;
 use hls::{LiveWindow, Segment};
 
 /// How the duplicate is produced. Every field here is a trade between what the stream
@@ -187,6 +189,10 @@ pub struct LiveStream {
     /// The window's shape, kept so [`Self::go_live`] can build a fresh one.
     capacity: usize,
     target: Duration,
+    /// The same pictures, fanned out to real-time subscribers (#18). Beside the window
+    /// rather than behind the mutex: a WebRTC peer reads it from its own task and must
+    /// not contend with a playlist being rendered.
+    feed: Arc<LiveFeed>,
 }
 
 #[derive(Debug)]
@@ -214,7 +220,14 @@ impl LiveStream {
             running: AtomicBool::new(false),
             capacity: config.window,
             target: config.segment,
+            feed: Arc::new(LiveFeed::new()),
         }
+    }
+
+    /// The real-time fan-out of the same encoded pictures the segments are built from.
+    #[must_use]
+    pub fn feed(&self) -> &Arc<LiveFeed> {
+        &self.feed
     }
 
     /// Take responsibility for starting the stream, if nobody else already has.
@@ -266,6 +279,12 @@ impl LiveStream {
     /// A stream that has never been asked for counts as wanted: the tap is installed by
     /// the first request and the segment it is about to produce is that request's answer.
     pub fn wanted(&self, now: Instant, timeout: Duration) -> bool {
+        // A connected WebRTC peer is a viewer that never fetches anything, so the
+        // request clock would retire the tap out from under it after ten seconds of a
+        // perfectly healthy session. Being attached *is* the request (#18).
+        if self.feed.watched() {
+            return true;
+        }
         self.inner.lock().is_ok_and(|inner| {
             inner
                 .last_request

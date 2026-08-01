@@ -116,6 +116,7 @@ ureq = "2"
 # over a fixed keystream.
 base64 = "0.22"
 axum = "0.8"
+webrtc = "0.20"
 hyper = "1"
 rtsp-types = "0.1"
 plist = "1"

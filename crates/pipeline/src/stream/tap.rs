@@ -273,6 +273,13 @@ fn encode_loop(
             .flatten()
             .chain(std::iter::once(&job.planes));
         let mut failed = None;
+        // A peer that just joined, or one whose decoder lost sync, cannot use anything
+        // until an IDR arrives — and at a keyframe a second, waiting one out is most of a
+        // second of black. Asked for here, once per job, so a burst of requests inside one
+        // GOP costs one keyframe rather than one each.
+        if state.feed().take_keyframe_request() {
+            video.request_keyframe();
+        }
         for planes in frames {
             match video.encode(planes) {
                 Ok(samples) => {
@@ -287,6 +294,9 @@ fn encode_loop(
                         go_live(state, &mut video, sound.as_ref(), width, height);
                     }
                     for sample in samples {
+                        // Both shapes of the same picture, from one encode: Annex-B to
+                        // whoever is watching live, AVCC into the segment being cut.
+                        state.feed().publish(&sample, video.config());
                         if let Some(segment) = segmenter.push_video(sample) {
                             state.publish(segment);
                         }
@@ -318,6 +328,7 @@ fn encode_loop(
     // viewer who joined a second ago would otherwise sit on a playlist whose last segment
     // never appears.
     for sample in video.flush() {
+        state.feed().publish(&sample, video.config());
         if let Some(segment) = segmenter.push_video(sample) {
             state.publish(segment);
         }

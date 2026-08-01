@@ -170,6 +170,12 @@ pub struct H264Encoder {
     /// change in the parameter sets is a *correction*; after it, there is nowhere left to
     /// put one.
     described: bool,
+    /// Whether the next frame must be coded as an IDR, whatever the GOP says.
+    ///
+    /// Set from another thread's request (a WebRTC peer that just joined, or one whose
+    /// decoder lost sync) and consumed by the next [`Self::encode`]. See
+    /// [`super::feed::LiveFeed`].
+    force_keyframe: bool,
 }
 
 // SAFETY: every pointer here is owned solely by this struct, is created and destroyed by
@@ -254,6 +260,7 @@ impl H264Encoder {
             duration: rate.sample_duration_ticks(),
             pts: 0,
             described: false,
+            force_keyframe: false,
         };
         // SAFETY: `encoder` is freshly constructed with every pointer null, which is what
         // `build` requires and what `Drop` tolerates if this returns early.
@@ -497,6 +504,16 @@ impl H264Encoder {
         &self.config
     }
 
+    /// Code the next frame as an IDR, whatever the GOP interval says.
+    ///
+    /// What a live subscriber needs to be able to start decoding at all: there is no init
+    /// segment in RTP, so a viewer that joins mid-GOP has nothing until the next keyframe.
+    /// At a keyframe a second that is most of a second of black, and after a loss it is
+    /// most of a second of smear.
+    pub const fn request_keyframe(&mut self) {
+        self.force_keyframe = true;
+    }
+
     /// Encode one frame, returning whatever coded pictures came out.
     ///
     /// Usually one, sometimes none — an encoder is entitled to buffer — so the caller
@@ -561,8 +578,25 @@ impl H264Encoder {
             },
         };
 
+        // Asking for an IDR is done on whichever frame is actually sent, which on the
+        // upload path is the hardware one — `av_hwframe_transfer_data` copies pixels, not
+        // the picture type. Cleared immediately: it is one frame's instruction, and a
+        // sticky one would code every frame as a keyframe at several times the bitrate.
+        if self.force_keyframe {
+            self.force_keyframe = false;
+            // SAFETY: `source` is one of the two frames this struct owns, both live.
+            unsafe {
+                (*source).pict_type = sys::AVPictureType::AV_PICTURE_TYPE_I;
+            }
+        }
+
         // SAFETY: an opened encoder and a frame it accepts.
         let rc = unsafe { sys::avcodec_send_frame(self.ctx, source) };
+        // Back to "the encoder decides" for every frame after this one.
+        // SAFETY: as above; the send has returned, so libavcodec is done with the frame.
+        unsafe {
+            (*source).pict_type = sys::AVPictureType::AV_PICTURE_TYPE_NONE;
+        }
         if rc < 0 && rc != sys::AVERROR(sys::EAGAIN) {
             return Err(PipelineError::Encode(format!(
                 "send_frame failed ({})",

@@ -76,6 +76,13 @@ cpal = { version = "0.15", optional = true }
 ldac-sys = { workspace = true, optional = true }
 interprocess = { version = "2.4.3", default-features = false }
 
+# The remote-control UI's transport (#18). Optional only because it is a large tree a
+# headless or test build has no use for; `render` turns it on, for the same reason
+# `render` turns on `stream` — a build that can draw can serve what it drew, and gating
+# the two apart would only produce builds where /remote/ exists and structurally cannot
+# work.
+webrtc = { workspace = true, optional = true }
+
 # The native PipeWire output backend (`audio-pipewire`): real sink names for the
 # settings screen and per-stream routing via `target.object`, neither of which the ALSA
 # compatibility shim can express. Linux-only by nature — the Windows panel reaches
@@ -168,6 +175,9 @@ libav-sys = ["dep:ffmpeg-sys-next"]
 # factory, so it needs `PcmBlock` and libswresample. It does not need an output *device* —
 # a headless build still encodes what the sessions produced.
 stream = ["render", "ffmpeg", "audio", "libav-sys"]
+# WebRTC: the low-latency duplicate and the input channel behind it (#18).
+# Needs `stream`, which is where the encoder it feeds from lives.
+remote = ["stream", "dep:webrtc"]
 # `audio` = A2DP/audio decode (libav) plus a PCM output device (cpal). Separate from
 # `ffmpeg` because the decoders are useful in tests without pulling in an audio device,
 # and a headless CI box has no sound card.
