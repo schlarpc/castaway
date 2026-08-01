@@ -58,6 +58,7 @@ use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
     RTCPeerConnectionState,
 };
+use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::{default_runtime, Runtime};
 
 use crate::error::PipelineError;
@@ -66,11 +67,12 @@ use crate::stream::feed::{LiveFeed, Subscription};
 mod ports;
 pub use ports::PortPool;
 
-/// The H.264 payload type the answer offers.
+/// The H.264 payload type this end *registers*.
 ///
-/// 102 with `packetization-mode=1` and the constrained-baseline profile, which is what
-/// every browser accepts and what our encoders emit. Fixed rather than negotiated from a
-/// table because there is exactly one codec on offer.
+/// Not the one packets go out stamped with — an answerer uses the offerer's numbering, and
+/// a browser picks its own. See [`negotiated_payload_type`], which is what the pump asks.
+/// 102 with `packetization-mode=1` and the constrained-baseline profile is what every
+/// browser accepts and what our encoders emit.
 const H264_PAYLOAD_TYPE: PayloadType = 102;
 
 /// How long to wait for ICE gathering before answering anyway.
@@ -124,6 +126,9 @@ struct Peer {
     /// transport comes up, because that is when the pump may start.
     track: Arc<TrackLocalStaticSample>,
     ssrc: u32,
+    /// The sender `add_track` returned, kept for one reason: it is the only thing that
+    /// knows the payload type this peer actually negotiated. See [`RemoteService::spawn_pump`].
+    sender: Arc<dyn RtpSender>,
     /// Whether the pump has been started. `Connected` can be reported more than once —
     /// an ICE restart passes back through it — and two pumps on one track would
     /// interleave two copies of every frame into one sequence number space.
@@ -171,6 +176,28 @@ impl RemoteService {
     #[must_use]
     pub fn peer_count(&self) -> usize {
         self.peers.lock().map_or(0, |peers| peers.len())
+    }
+
+    /// What each connected peer's video actually goes out stamped with.
+    ///
+    /// A diagnostic, and the answer to the one question a silent-but-connected peer
+    /// raises: an answerer uses the *offerer's* payload numbering, so this is whatever the
+    /// browser picked and not what this end registers. When they disagreed, every packet
+    /// was rejected by the transceiver as "unsupported codec type" while the connection
+    /// itself stayed healthy — no video, and nothing but log noise to say why.
+    pub async fn peer_payload_types(&self) -> Vec<(RemoteId, Option<PayloadType>)> {
+        let senders: Vec<(RemoteId, Arc<dyn RtpSender>)> = match self.peers.lock() {
+            Ok(peers) => peers
+                .iter()
+                .map(|p| (p.id, Arc::clone(&p.sender)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut out = Vec::with_capacity(senders.len());
+        for (id, sender) in senders {
+            out.push((id, negotiated_payload_type(&sender).await));
+        }
+        out
     }
 
     /// Answer a peer's offer, standing up its connection.
@@ -259,7 +286,7 @@ impl RemoteService {
             ))
             .map_err(|e| PipelineError::Remote(format!("track: {e}")))?,
         );
-        connection
+        let sender = connection
             .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
             .await
             .map_err(|e| PipelineError::Remote(format!("add_track: {e}")))?;
@@ -292,6 +319,7 @@ impl RemoteService {
                 port,
                 track,
                 ssrc,
+                sender,
                 pumping: false,
             });
         }
@@ -332,11 +360,11 @@ impl RemoteService {
                 .filter(|p| !p.pumping)
                 .map(|p| {
                     p.pumping = true;
-                    (Arc::clone(&p.track), p.ssrc)
+                    (Arc::clone(&p.track), p.ssrc, Arc::clone(&p.sender))
                 }),
             Err(_) => None,
         };
-        let Some((track, ssrc)) = started else {
+        let Some((track, ssrc, sender)) = started else {
             return;
         };
         info!(peer = id.get(), "remote: streaming to peer");
@@ -345,24 +373,45 @@ impl RemoteService {
         // otherwise subscribe to a feed nothing is publishing to. Idempotent — the claim
         // is a compare-exchange — so this costs nothing in the normal case.
         (self.start)();
-        self.spawn_pump(id, track, ssrc);
+        self.spawn_pump(id, track, ssrc, sender);
     }
 
     /// Feed one peer's track from the live encoder output until either goes away.
-    fn spawn_pump(self: &Arc<Self>, id: RemoteId, track: Arc<TrackLocalStaticSample>, ssrc: u32) {
+    fn spawn_pump(
+        self: &Arc<Self>,
+        id: RemoteId,
+        track: Arc<TrackLocalStaticSample>,
+        ssrc: u32,
+        sender: Arc<dyn RtpSender>,
+    ) {
         let mut subscription: Subscription = self.feed.subscribe();
         let service = Arc::clone(self);
         self.runtime.spawn(Box::pin(async move {
+            // **Not the payload type we registered.** An answerer must use the *offerer's*
+            // numbering, and a browser picks its own — Chromium's H.264 is rarely the 102
+            // this end registers. Stamping our own number produced a stream every packet of
+            // which the transceiver rejected as "unsupported codec type", at the full frame
+            // rate, with the connection otherwise perfectly healthy: no video and a torrent
+            // of log lines. The sender is the only thing that knows what was agreed.
+            let payload_type = match negotiated_payload_type(&sender).await {
+                Some(payload_type) => payload_type,
+                None => {
+                    warn!(
+                        peer = id.get(),
+                        "remote: peer negotiated no codec; nothing to send"
+                    );
+                    service.forget(id);
+                    return;
+                }
+            };
+            debug!(peer = id.get(), payload_type, "remote: sending video");
             while let Some(frame) = subscription.next().await {
                 let sample = rtc::media::Sample {
                     data: bytes::Bytes::copy_from_slice(&frame.data),
                     duration: frame.duration,
                     ..Default::default()
                 };
-                if let Err(e) = track
-                    .write_sample(ssrc, H264_PAYLOAD_TYPE, &sample, &[])
-                    .await
-                {
+                if let Err(e) = track.write_sample(ssrc, payload_type, &sample, &[]).await {
                     debug!(peer = id.get(), error = %e, "remote: track closed");
                     break;
                 }
@@ -439,6 +488,19 @@ impl RemoteService {
             let _ = peer.connection.close().await;
         }
     }
+}
+
+/// What this peer actually agreed to send under, which is the offerer's numbering and not
+/// ours. `None` if the negotiation left the sender with no codec at all.
+async fn negotiated_payload_type(sender: &Arc<dyn RtpSender>) -> Option<PayloadType> {
+    sender
+        .get_parameters()
+        .await
+        .ok()?
+        .rtp_parameters
+        .codecs
+        .first()
+        .map(|codec| codec.payload_type)
 }
 
 /// The codec the answer offers: H.264 constrained baseline, packetization mode 1.

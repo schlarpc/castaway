@@ -32,12 +32,21 @@ use pipeline::stream::feed::LiveFeed;
 /// property of the test harness, not of the pool, which is single-service by design.
 const BASE: u16 = 45032;
 
+/// The payload type the offer numbers H.264 with.
+///
+/// Deliberately **not** the 102 this end registers. An answerer must use the *offerer's*
+/// numbering, and a browser picks its own — Chromium's H.264 is usually not 102. This file
+/// used to offer 102, which made the two numbers accidentally equal and hid a bug where
+/// every packet went out stamped with ours: the transceiver rejected all of them as
+/// "unsupported codec type", at frame rate, with the connection otherwise healthy.
+const OFFERED_PAYLOAD_TYPE: u8 = 96;
+
 /// A minimal offer of the shape a browser sends: one recvonly video m-line and one
 /// application m-line for the data channel.
 ///
 /// Hand-written rather than captured because what matters is the *shape* — a receiver
-/// asking for H.264 and a data channel — and a captured one would carry a fingerprint and
-/// ufrag that expire into noise.
+/// asking for H.264 under its own payload type, and a data channel — and a captured one
+/// would carry a fingerprint and ufrag that expire into noise.
 fn browser_offer() -> String {
     [
         "v=0",
@@ -46,7 +55,7 @@ fn browser_offer() -> String {
         "t=0 0",
         "a=group:BUNDLE 0 1",
         "a=msid-semantic: WMS",
-        "m=video 9 UDP/TLS/RTP/SAVPF 102",
+        &format!("m=video 9 UDP/TLS/RTP/SAVPF {OFFERED_PAYLOAD_TYPE}"),
         "c=IN IP4 0.0.0.0",
         "a=rtcp:9 IN IP4 0.0.0.0",
         "a=ice-ufrag:sTuV",
@@ -59,8 +68,11 @@ fn browser_offer() -> String {
         "a=mid:0",
         "a=recvonly",
         "a=rtcp-mux",
-        "a=rtpmap:102 H264/90000",
-        "a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+        &format!("a=rtpmap:{OFFERED_PAYLOAD_TYPE} H264/90000"),
+        &format!(
+            "a=fmtp:{OFFERED_PAYLOAD_TYPE} \
+             level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+        ),
         "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
         "c=IN IP4 0.0.0.0",
         "a=ice-ufrag:sTuV",
@@ -125,6 +137,42 @@ async fn an_offer_is_answered_with_something_a_browser_could_use() {
         answer.contains("a=candidate:"),
         "gathering produced no candidate: {answer}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_speaks_the_offerers_payload_type_not_ours() {
+    // The bug this file did not catch, because it used to offer the same number this end
+    // registers. An answerer must adopt the offerer's numbering; stamping our own on every
+    // packet gave a healthy connection that carried nothing but rejections.
+    let (service, _input) = service((BASE + 30, BASE + 33), true);
+    let answer = service.answer(&browser_offer()).await.unwrap();
+
+    assert!(
+        answer.contains(&format!("a=rtpmap:{OFFERED_PAYLOAD_TYPE} H264/90000")),
+        "the answer should carry H.264 under the offer's payload type, not ours: {answer}"
+    );
+    let video_line = answer
+        .lines()
+        .find(|line| line.starts_with("m=video"))
+        .expect("a video m-line");
+    assert!(
+        video_line
+            .split_whitespace()
+            .any(|f| f == OFFERED_PAYLOAD_TYPE.to_string()),
+        "the m-line should list the offered payload type: {video_line}"
+    );
+
+    // …and, the part that actually broke: what the *pump* will stamp on every packet. The
+    // SDP above was always correct — webrtc-rs generates it. The bug was writing samples
+    // under our own registered number regardless of what the SDP had just agreed.
+    let stamped = service.peer_payload_types().await;
+    assert_eq!(stamped.len(), 1);
+    assert_eq!(
+        stamped[0].1,
+        Some(OFFERED_PAYLOAD_TYPE),
+        "packets would go out under our number instead of the negotiated one"
+    );
+    service.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
