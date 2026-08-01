@@ -573,7 +573,7 @@ impl SourceAdapter for BluetoothAdapter {
                             let Ok(other_handle) = ConnectionHandle::new(*raw) else {
                                 continue;
                             };
-                            self.pause_preempted(other_handle, other, &acl);
+                            self.pause_peer(other_handle, other, &acl);
                         }
                     }
                 }
@@ -798,10 +798,16 @@ impl BluetoothAdapter {
                     } else if psm == Psm::AVDTP {
                         if Some(cid) == link.avdtp_media {
                             if self.on_media(link, payload).await {
-                                // The pipeline let go of the stream. Ending the session
-                                // is what pauses the phone (the manager's teardown sends
-                                // AVRCP pause) and clears the card that is still claiming
-                                // to be playing.
+                                // The pipeline let go of the stream. Telling the phone is
+                                // not optional: our AVDTP state machine is responder-only,
+                                // so clearing our side leaves the peer's stream STARTED
+                                // and every packet it sends afterwards falls on the floor
+                                // — pause/play cannot recover it, because the phone was
+                                // never in a state that needs re-STARTing. An AVRCP pause
+                                // makes it suspend, which is the event that legitimately
+                                // clears our side and lets the next play open a new
+                                // stream.
+                                self.pause_peer(handle, link, acl);
                                 let link_sink = sink.with_instance(link.peer.to_string());
                                 link_sink.emit(SessionEvent::End).await?;
                             }
@@ -845,13 +851,18 @@ impl BluetoothAdapter {
 
     /// Tell a phone we are no longer listening to it.
     ///
+    /// Two callers, and the second is the reason this is not called `pause_preempted` any
+    /// more: preemption, where another source took the panel, and teardown, where our own
+    /// output died under a peer that is still streaming. Both leave the phone sending into
+    /// nothing, and both need it to stop for the same reason.
+    ///
     /// AVRCP pause rather than AVDTP suspend, deliberately. Pausing the *player* is what
     /// the person holding the phone sees and understands, and a phone that pauses stops
     /// its own stream and sends us the suspend itself — which keeps our sink state
     /// machine driven by what it receives, rather than diverging from a command we sent.
     /// A phone that ignores the keypress costs nothing: the pipeline has already stopped
     /// decoding it.
-    fn pause_preempted(&self, handle: ConnectionHandle, link: &mut Link, acl: &AclWriter) {
+    fn pause_peer(&self, handle: ConnectionHandle, link: &mut Link, acl: &AclWriter) {
         let Some(cid) = link.avctp else { return };
         let Some(peer_cid) = link.mux.channel(cid).map(|c| c.remote_cid) else {
             return;

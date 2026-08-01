@@ -716,6 +716,105 @@ async fn avdtp_replies_also_use_the_peers_channel_id() {
 }
 
 #[tokio::test]
+async fn a_pipeline_that_lets_go_gets_the_phone_paused_so_play_can_recover() {
+    // The failure this ends, measured on the panel: the output device vanished (the
+    // monitor slept, taking the HDMI endpoint with it), the session was torn down — and
+    // the phone stayed connected, kept streaming, and pause/play could not bring the
+    // audio back. Only a full disconnect/reconnect recovered it.
+    //
+    // The cause is a state-machine desync. Our AVDTP side is responder-only, so clearing
+    // our sink state leaves the peer's stream STARTED; it keeps sending, we keep dropping,
+    // and pause/play does nothing because the phone was never in a state that needed
+    // re-STARTing. An AVRCP pause is the lever that makes the phone suspend, which is the
+    // event that legitimately clears our side and lets the next play open a new stream.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+    // AVRCP needs somewhere to go, or the pause is silently skipped.
+    // The second element is the phone's channel id, which is what our outbound PDUs
+    // are addressed to.
+    let (_, avctp_peer) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = eventually("an aptX endpoint", || {
+        discover
+            .payload
+            .chunks(2)
+            .filter_map(|c| Seid::from_shifted(c[0]).ok())
+            .nth(2)
+    })
+    .await;
+    let caps = avdtp(
+        &transport,
+        signaling,
+        2,
+        Signal::GetAllCapabilities,
+        &[seid.shifted()],
+    )
+    .await;
+    let advertised = proto_bluetooth_audio::avdtp::find_codec_capability(&caps.payload).unwrap();
+    assert_eq!(advertised.audio_codec(), AudioCodec::AptX);
+    // Narrowed to one rate and one channel mode: a configuration that still carries the
+    // whole advertised range is not a configuration, and is refused.
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_48000,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 3, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 4, Signal::Open, &[seid.shifted()]).await;
+    let (media, _) = open_channel(&transport, Psm::AVDTP, 0x0041).await;
+    avdtp(&transport, signaling, 5, Signal::Start, &[seid.shifted()]).await;
+
+    let msg = eventually("an audio session event", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::Audio { .. }))
+    })
+    .await;
+    let SessionEvent::Audio { source, .. } = msg.event else {
+        panic!("expected an audio session");
+    };
+    let FrameSource::Encoded(frames) = source else {
+        panic!("audio must arrive as encoded frames");
+    };
+
+    // The pipeline lets go — exactly what happened when WASAPI reported the endpoint
+    // "no longer available" and the audio session thread returned.
+    drop(frames);
+
+    let before = sent_pdus(&transport).len();
+    // The phone, knowing nothing about any of this, keeps sending.
+    for _ in 0..4 {
+        push_pdu(
+            &transport,
+            &L2capPdu::new(
+                media,
+                Bytes::copy_from_slice(&[0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28]),
+            ),
+        );
+    }
+
+    // It must be told to stop, on the AVRCP channel, with a passthrough PAUSE.
+    let paused = eventually("an avrcp pause", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            // 0x7C is the PASS_THROUGH opcode, 0x46 the PAUSE operand.
+            .find(|pdu| {
+                pdu.cid == avctp_peer && pdu.payload.windows(2).any(|w| w == [0x7C, 0x46])
+            })
+    })
+    .await;
+    assert_eq!(
+        paused.cid, avctp_peer,
+        "the pause must go out on the AVRCP channel"
+    );
+}
+
+#[tokio::test]
 async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
     // The whole point. A phone connects, negotiates aptX, opens a media channel, and
     // pushes packets — and the session manager sees an audio session with real frames.
