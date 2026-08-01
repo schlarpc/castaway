@@ -172,40 +172,39 @@ impl Dx12Importer {
 /// the same "only under load, only on some drivers" symptom. Drop it, then ack release
 /// to the browser; not the other way round.
 pub struct ImportedFrame {
-    /// The sampleable texture.
+    /// The sampleable texture. It owns the only reference to the shared resource: the
+    /// resource is *moved* into `texture_from_raw`, so wgpu's release when the texture
+    /// drops is the one that balances `OpenSharedHandle`.
     pub texture: wgpu::Texture,
-    /// Our reference to the shared resource. Released when this drops.
-    _resource: d3d12::Resource,
     /// The duplicated NT handle. `OpenSharedHandle` does not need it kept open, but the
     /// frame's owner may carry other state, so it rides along and closes here.
     _owner: std::sync::Arc<dyn GpuSurface>,
 }
 
 impl ImportedFrame {
-    /// Yield the texture, leaking the *resource* reference into it.
+    /// Yield the texture, dropping everything this type was holding for it.
     ///
-    /// The compositor stores textures, not frames, so the resource has to outlive this
-    /// type without the caller holding it separately. `std::mem::forget` on the resource
-    /// is deliberate and is *not* a leak in the usual sense: D3D12 resources are
-    /// refcounted, and the reference is released when the texture wgpu owns is dropped
-    /// along with the layer. The alternative — a drop guard — is exactly what wgpu's DX12
-    /// `texture_from_raw` does not accept.
+    /// Nothing is forgotten here, and both of the things that used to be are worth naming,
+    /// because each cost a distinct failure on the panel.
     ///
-    /// `_owner` is emphatically *not* forgotten, though it used to be. It is the borrow
-    /// whose `Drop` acks the frame back to Chromium, so forgetting it meant no frame was
-    /// ever acked: the browser stops sending once `MAX_INFLIGHT_FRAMES` are unreleased, so
-    /// the page painted four frames on Windows and then froze — the deadlock this file's
-    /// own module docs describe, arrived at from the other direction. It is dropped here
-    /// because the caller keeps its own clone and hangs it on the layer; this type's job
-    /// ends with the texture.
+    /// `_resource` was `std::mem::forget`-ed on the reasoning that "D3D12 resources are
+    /// refcounted, and the reference is released when the texture wgpu owns is dropped".
+    /// True of *a* reference, but there were two: `open_shared` returned one and the
+    /// texture was built from a `clone()` of it. wgpu released the clone; the original was
+    /// forgotten, so the resource was never freed. One leaked shared texture per browser
+    /// paint at 60 Hz — the receiver ran for about three minutes on the Dell and then died
+    /// in `Queue::write_buffer` with "Not enough memory left". The resource is now moved
+    /// into the texture at import, so there is only ever one reference and this field is
+    /// gone entirely.
+    ///
+    /// `_owner` was forgotten too. It is the borrow whose `Drop` acks the frame back to
+    /// Chromium, so no frame was ever acked; the browser stops sending once
+    /// `MAX_INFLIGHT_FRAMES` are unreleased, which would have frozen the page after four
+    /// frames. It is dropped here because the caller keeps its own clone and hangs it on
+    /// the layer for the texture's lifetime.
     #[must_use]
     pub fn into_texture(self) -> wgpu::Texture {
-        let Self {
-            texture,
-            _resource,
-            _owner,
-        } = self;
-        std::mem::forget(_resource);
+        let Self { texture, _owner } = self;
         drop(_owner);
         texture
     }
@@ -261,11 +260,11 @@ impl Dx12Importer {
 
         let extent = geometry.extent();
         // SAFETY: the resource was opened on this device and is a 2D texture with one mip
-        // and one sample, matching the descriptor. No drop guard is passed because
-        // `ImportedFrame` owns the resource; wgpu must not release it.
+        // and one sample, matching the descriptor. Moved, not cloned: one reference in,
+        // one release out, when wgpu drops the texture with its layer.
         let hal_texture = unsafe {
             wgpu::hal::dx12::Device::texture_from_raw(
-                resource.clone(),
+                resource,
                 geometry.format,
                 wgpu::TextureDimension::D2,
                 extent,
@@ -292,7 +291,6 @@ impl Dx12Importer {
 
         Ok(ImportedFrame {
             texture,
-            _resource: resource,
             _owner: owner,
         })
     }
