@@ -398,6 +398,10 @@ pub struct RenderPipeline {
     /// Stop flag for the currently-running decode thread, so a new `Play`/`stop`
     /// preempts the old one.
     active: Mutex<Option<Arc<AtomicBool>>>,
+    /// Held for exactly as long as a session is active, so the panel does not idle out
+    /// from under something that is playing (#109). Any session — audio, video, mirror,
+    /// browser — because all of them mean somebody is using it.
+    awake: Mutex<Option<crate::keepawake::KeepAwake>>,
     /// Whether decode threads may use hardware decode. A *runtime* setting, never a
     /// compile-time one — see [`crate::hwaccel`].
     hw: HwPreference,
@@ -470,6 +474,7 @@ impl RenderPipeline {
             Self {
                 tx,
                 active: Mutex::new(None),
+                awake: Mutex::new(None),
                 hw: HwPreference::Auto,
                 card: Mutex::new(crate::nowplaying_card::NowPlayingCard::default()),
                 playback: Arc::new(Mutex::new(None)),
@@ -619,6 +624,12 @@ impl RenderPipeline {
                 flag.store(true, Ordering::SeqCst);
             }
         }
+        // Let the display idle again. A session taking over re-acquires through
+        // `set_active` a moment later; the gap is sub-millisecond and no idle timer has
+        // that resolution.
+        if let Ok(mut awake) = self.awake.lock() {
+            *awake = None;
+        }
         // Whatever decode thread is still alive belongs to a session that is over, so
         // retire its ticket: a thread that had already passed its stop-flag check must
         // not end the session that is taking the screen right now.
@@ -627,10 +638,27 @@ impl RenderPipeline {
         }
     }
 
-    fn set_active(&self, flag: Arc<AtomicBool>) {
+    /// Begin a session: mint its stop flag and hold the panel awake for it.
+    ///
+    /// The two are deliberately the same call, and that is the whole point. Every session
+    /// needs a stop flag — without one, preemption cannot reach it — so a new source type
+    /// cannot obtain one without also taking the keep-awake guard. There is no separate
+    /// step to forget.
+    ///
+    /// This replaced a `set_active(flag)` that each caller invoked by convention, which is
+    /// exactly the shape that goes wrong the first time somebody adds a session type and
+    /// does not know the convention exists. `preempt` drops both together for the same
+    /// reason (#109).
+    #[must_use]
+    fn begin_session(&self) -> Arc<AtomicBool> {
+        let stop = Arc::new(AtomicBool::new(false));
         if let Ok(mut guard) = self.active.lock() {
-            *guard = Some(flag);
+            *guard = Some(Arc::clone(&stop));
         }
+        if let Ok(mut awake) = self.awake.lock() {
+            *awake = Some(crate::keepawake::KeepAwake::acquire());
+        }
+        stop
     }
 }
 
@@ -640,8 +668,7 @@ impl Pipeline for RenderPipeline {
         self.release_screen();
         self.claim_panel();
         self.preempt();
-        let stop = Arc::new(AtomicBool::new(false));
-        self.set_active(stop.clone());
+        let stop = self.begin_session();
         info!(%source, ?start, "render pipeline: PLAY (decode → compositor)");
 
         let tx = self.tx.clone();
@@ -777,8 +804,7 @@ impl Pipeline for RenderPipeline {
             }
             FrameSource::Encoded(rx) => {
                 info!("render pipeline: MIRROR (encoded frames → decode → compositor)");
-                let stop = Arc::new(AtomicBool::new(false));
-                self.set_active(stop.clone());
+                let stop = self.begin_session();
                 // The audio half shares the video's stop flag, because it is the same
                 // session: ending one has to end the other. It also deliberately does
                 // *not* go through `play_audio`, which preempts — a mirror announcing
@@ -837,8 +863,7 @@ impl Pipeline for RenderPipeline {
             // Preempt first: the flag slot holds whichever session is live, video or
             // audio, because only one source may own the output at a time.
             self.preempt();
-            let stop = Arc::new(AtomicBool::new(false));
-            self.set_active(Arc::clone(&stop));
+            let stop = self.begin_session();
             // Taken after `preempt`, so it is this session's ticket. `play` has always
             // done this; the audio path never did, which is why an audio session that
             // could not open the device had no way to say so and the source streamed on

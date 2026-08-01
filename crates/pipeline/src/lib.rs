@@ -57,6 +57,10 @@ pub mod filterlists;
 pub mod icon;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
+// Keeping the panel lit while something is playing. Platform-specific behind one seam
+// (ground rule 5); see the module docs for why a sleeping monitor cost us the audio
+// device entirely.
+pub mod keepawake;
 // The second decode backend: Sony's `libldacBT`, for the one A2DP codec libav has no
 // decoder for (Q22). Gated on the feature that links it, and `audio_decode::can_decode`
 // answers from whether this module is here rather than from the flag itself.

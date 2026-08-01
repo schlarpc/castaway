@@ -97,7 +97,9 @@ ash = { version = "0.38", optional = true }
 libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", optional = true, features = [
+# Not optional: `keepawake` is compiled in every Windows build, not just hwaccel ones —
+# a receiver that lets the monitor sleep mid-playback loses its audio device with it.
+winapi = { version = "0.3", features = [
     "d3d11",
     "d3d12",
     "dxgi",
@@ -110,6 +112,8 @@ winapi = { version = "0.3", optional = true, features = [
     "processthreadsapi",
     "winerror",
     "winnt",
+    # SetThreadExecutionState, for holding the display awake during playback (#109).
+    "winbase",
 ] }
 d3d12 = { version = "22", optional = true }
 
@@ -175,7 +179,6 @@ hwaccel = [
     "dep:ffmpeg-sys-next",
     "dep:ash",
     "dep:libc",
-    "dep:winapi",
     "dep:d3d12",
 ]
 # The browser subprocess (D36). Needs `render` for the compositor it paints into and
