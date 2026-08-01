@@ -32,6 +32,7 @@ mod shell_nav;
 mod sponsorblock;
 // `/stream/*`: the composited output, live, in a browser (#101). Always compiled — a build
 // with no encoder still answers, saying why.
+mod remote_http;
 mod stream_http;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -307,12 +308,41 @@ fn main() -> anyhow::Result<()> {
                 audio_selector.clone(),
                 settings::ConfigStore::at(&location),
             ))]);
+        // The remote-control transport (#18). Built here because this is where all three
+        // of its halves exist at once: the encoder's live fan-out, the input queue the
+        // kiosk drains, and the handle that starts the tap.
+        #[cfg(feature = "remote")]
+        let remote_service = if config.remote.enable {
+            let starter = stream_handle.clone();
+            pipeline::remote::RemoteService::new(
+                pipeline::remote::RemoteConfig {
+                    ice_ports: (config.remote.ice_ports.first, config.remote.ice_ports.last),
+                    // The serving interface, so the candidate a peer is handed is one it
+                    // can route to. A candidate on the wrong interface negotiates and
+                    // then carries nothing.
+                    bind_ip: std::net::IpAddr::V4(config.resolved_interface()),
+                    accept_input: config.remote.input,
+                },
+                std::sync::Arc::clone(stream_handle.stream().feed()),
+                std::sync::Arc::clone(&remote_input),
+                std::sync::Arc::new(move || starter.ensure_running()),
+            )
+            .inspect_err(|e| warn!(error = %e, "remote control is unavailable"))
+            .ok()
+        } else {
+            info!("remote control is disabled by config");
+            None
+        };
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
             #[cfg(feature = "stream")]
             stream: Some(stream_handle),
             #[cfg(not(feature = "stream"))]
             stream: None,
+            #[cfg(feature = "remote")]
+            remote: remote_service,
+            #[cfg(not(feature = "remote"))]
+            remote: None,
             playback: Some(playback),
             shell: Some(ShellChannels {
                 events: shell_event_rx,
@@ -605,6 +635,9 @@ struct PipelineHandles {
     /// …and what it is showing *continuously*, for `/stream/*` (#101). Costs nothing
     /// until something fetches the playlist, which is what starts the encoder.
     stream: Option<stream_http::Stream>,
+    /// …and what makes that duplicate *touchable*, for `/remote/*` (#18). `None` when
+    /// `remote.enable` is off, or when no async runtime could be found to drive it.
+    remote: Option<remote_http::Remote>,
     /// Where the media-URL session has got to, for the protocols in which the receiver is
     /// the player and has to report its own position. Absent in a build with no decoder,
     /// which then honestly answers "no such information" rather than inventing a zero.
@@ -650,6 +683,7 @@ async fn serve(
     let PipelineHandles {
         screenshot,
         stream,
+        remote,
         playback,
         #[cfg(feature = "render")]
         shell,
@@ -1036,7 +1070,8 @@ async fn serve(
             "/screenshot.png",
             axum::routing::get(screenshot_route).with_state(screenshot),
         )
-        .merge(stream_http::routes(stream));
+        .merge(stream_http::routes(stream))
+        .merge(remote_http::routes(remote));
     // The root answered 404, and the root is exactly the URL a person types after
     // reading the advertised host:port off the panel — so "working as intended" read
     // as "the receiver is down". A landing page is the cheapest health signal there
@@ -1120,6 +1155,8 @@ fn landing_page(config: &Config) -> String {
          <p>castaway {version} is up. This box accepts:</p>\
          <ul>{services}</ul>\
          {player}\
+         <p><a href=\"{remote}\">Drive the panel from here</a> — the same picture with a \
+         tenth of the delay, and your touches go through.</p>\
          <p><a href=\"/screenshot.png\">A still of what the panel is showing</a></p>\
          </body></html>",
         version = env!("CARGO_PKG_VERSION"),
@@ -1127,6 +1164,9 @@ fn landing_page(config: &Config) -> String {
         // player says so, which is the same answer `/screenshot.png` gives and for the
         // same reason.
         player = stream_http::PLAYER,
+        // The interactive duplicate (#18). Named from the constant the routes are
+        // mounted at, so the link and the route cannot drift.
+        remote = remote_http::PAGE_PATH,
     )
 }
 

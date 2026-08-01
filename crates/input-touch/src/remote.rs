@@ -48,6 +48,13 @@ pub enum RemoteEvent {
     /// a dropped connection did not *finish* a gesture and completing one would commit
     /// whatever it was over.
     Gone(InputOrigin),
+    /// Go back to the home screen.
+    ///
+    /// In the queue rather than a callback beside it, for the same reason [`Self::Gone`]
+    /// is: order against the input matters. Home cancels whatever is down, so a press
+    /// applied *after* it would be stranded — and a callback racing the drain could
+    /// deliver them either way round.
+    Home,
 }
 
 /// The queue itself. Cloneable by `Arc`; every producer and the loop share one.
@@ -101,6 +108,11 @@ impl RemoteInputQueue {
     /// Say that an origin has gone away.
     pub fn push_gone(&self, origin: InputOrigin) {
         self.push(RemoteEvent::Gone(origin));
+    }
+
+    /// Ask the panel to go home.
+    pub fn push_home(&self) {
+        self.push(RemoteEvent::Home);
     }
 
     /// Take everything waiting, with stale moves already removed.
@@ -295,6 +307,20 @@ mod tests {
             drained[drained.len() - 1],
             RemoteEvent::Gone(InputOrigin::Remote(RemoteId::new(1)))
         );
+    }
+
+    #[test]
+    fn home_keeps_its_place_against_the_input_around_it() {
+        // Home cancels whatever is down, so a press applied after it would be stranded.
+        // A callback beside the queue could deliver these either way round.
+        let q = queue();
+        let id = ContactId::remote(RemoteId::new(1), 0);
+        q.push(touch(id, TouchPhase::Down, 0.5));
+        q.push_home();
+        q.push(touch(id, TouchPhase::Up, 0.5));
+        let drained = q.drain();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[1], RemoteEvent::Home);
     }
 
     #[test]

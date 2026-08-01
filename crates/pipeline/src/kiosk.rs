@@ -448,6 +448,9 @@ impl KioskApp {
             match event {
                 input_touch::RemoteEvent::Input(input) => self.apply(input),
                 input_touch::RemoteEvent::Gone(origin) => self.forget_origin(origin),
+                // The same road the pill and the edge swipe take, so a remote's way home
+                // and the panel's are one behaviour rather than two that drift.
+                input_touch::RemoteEvent::Home => self.go_home(),
             }
         }
     }

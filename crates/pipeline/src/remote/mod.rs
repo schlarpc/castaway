@@ -101,9 +101,6 @@ pub struct RemoteService {
     config: RemoteConfig,
     feed: Arc<LiveFeed>,
     input: Arc<RemoteInputQueue>,
-    /// Called when a peer asks to go home. The gesture is unperformable from a phone —
-    /// the browser eats an edge swipe — so the page has a button and it lands here.
-    home: Arc<dyn Fn() + Send + Sync>,
     /// Starts the encoder if it is not already running. The first peer to connect is what
     /// wakes the tap, exactly as the first playlist fetch is for HLS.
     start: Arc<dyn Fn() + Send + Sync>,
@@ -145,7 +142,6 @@ impl RemoteService {
         config: RemoteConfig,
         feed: Arc<LiveFeed>,
         input: Arc<RemoteInputQueue>,
-        home: Arc<dyn Fn() + Send + Sync>,
         start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Arc<Self>, PipelineError> {
         let runtime = default_runtime()
@@ -155,7 +151,6 @@ impl RemoteService {
             config,
             feed,
             input,
-            home,
             start,
             runtime,
             ports,
@@ -375,8 +370,11 @@ impl RemoteService {
                 }
             }
             Ok(input_touch::RemoteCommand::Home) => {
+                // Queued rather than called, so it keeps its place against the contacts
+                // around it: home cancels whatever is down, and a press applied after it
+                // would be stranded.
                 if self.config.accept_input {
-                    (self.home)();
+                    self.input.push_home();
                 }
             }
             // A keepalive says the peer is alive, which the connection already says. It

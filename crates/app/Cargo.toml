@@ -85,9 +85,19 @@ default = []
 # without the decode path there is no factory to tap — a renderer that cannot duplicate its
 # own sound is not a trade worth having, and on a box with no output device the sessions
 # still decode into a null sink and the stream still carries them.
-render = ["pipeline/kiosk", "pipeline/ffmpeg", "pipeline/stream", "stream", "audio"]
+render = [
+    "pipeline/kiosk",
+    "pipeline/ffmpeg",
+    "pipeline/stream",
+    "pipeline/remote",
+    "stream",
+    "remote",
+    "audio",
+]
 # Internal: mirrors `pipeline/stream` so `crates/app` can `cfg` on it directly.
 stream = []
+# Internal: likewise for `pipeline/remote`, the remote-control UI (#18).
+remote = []
 # Compile the hardware decode backends (VA-API on Linux, D3D11VA on Windows). Whether they
 # are *used* is a runtime decision, so this is safe to leave on: a box with no GPU decode
 # still plays, on the CPU, with a log line saying so.
