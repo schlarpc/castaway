@@ -1099,7 +1099,7 @@ impl Default for Config {
             interface: None,
             enable: Enable::default(),
             log: Log::default(),
-            attract_widget_url: Some("https://digitalclock.live/".to_string()),
+            attract_widget_url: Some("https://wiki.dma.space/".to_string()),
             bluetooth: Bluetooth::default(),
             airplay: AirPlay::default(),
             spotify: Spotify::default(),

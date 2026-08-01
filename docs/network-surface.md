@@ -87,7 +87,7 @@ Documentation, not firewall input — outbound plus established/related is assum
 | the paired GameStream host: TCP 47989 (NVHTTP), 47984 (mutual TLS), 48010 (RTSP); UDP 47998/47999/48000/48010 (video, control, audio, RTSP-enc) | pairing and launch are ours; the UDP media plane is moonlight-common-c (D37) | enable.gamestream; the UDP half needs the `stream` feature |
 | the Miracast source's TCP 7236, on the P2P link | the WFD RTSP session — the sink is the RTSP client | a Miracast session (plus an ARP-priming UDP sweep to port 9, discard, on the group subnet) |
 | each DLNA subscriber's GENA CALLBACK URL | eventing NOTIFYs (ack-only today, D8) | enable.dlna, per subscription |
-| the attract widget URL (default digitalclock.live:443) and adblock filter-list hosts | the idle screen's widget card; uBO filter lists for the browser | electron builds |
+| the attract widget URL (default wiki.dma.space:443) and adblock filter-list hosts | the idle screen's widget card; uBO filter lists for the browser | electron builds |
 | 8.8.8.8:80 (UDP connect only — no packet is ever sent) | reading the default-route local address off the socket | startup, when `interface` is unset |
 
 ## Non-IP surfaces

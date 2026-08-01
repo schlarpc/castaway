@@ -632,7 +632,7 @@ fn outbound() -> Vec<Outbound> {
             when: "enable.dlna, per subscription",
         },
         Outbound {
-            to: "the attract widget URL (default digitalclock.live:443) and adblock \
+            to: "the attract widget URL (default wiki.dma.space:443) and adblock \
              filter-list hosts",
             purpose: "the idle screen's widget card; uBO filter lists for the browser",
             when: "electron builds",
