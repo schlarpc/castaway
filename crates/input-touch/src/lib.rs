@@ -11,8 +11,10 @@
 //! consumer maps them to the render surface regardless of panel resolution.
 
 pub mod remote;
+pub mod wire;
 
 pub use remote::{RemoteEvent, RemoteInputQueue};
+pub use wire::{RemoteCommand, WireError};
 
 use tokio::sync::mpsc;
 

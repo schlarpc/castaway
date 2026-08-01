@@ -9,6 +9,8 @@ description = "Touch input for the C6522QT 4K touch wall: a TouchSource trait ro
 
 [dependencies]
 castaway-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
