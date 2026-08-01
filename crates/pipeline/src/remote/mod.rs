@@ -120,6 +120,14 @@ struct Peer {
     connection: Arc<dyn PeerConnection>,
     /// The port its ICE socket took, returned to the pool when it goes.
     port: u16,
+    /// The track its pictures go out on, and the SSRC they go out under. Held until the
+    /// transport comes up, because that is when the pump may start.
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    /// Whether the pump has been started. `Connected` can be reported more than once —
+    /// an ICE restart passes back through it — and two pumps on one track would
+    /// interleave two copies of every frame into one sequence number space.
+    pumping: bool,
 }
 
 impl std::fmt::Debug for RemoteService {
@@ -282,14 +290,18 @@ impl RemoteService {
                 id,
                 connection: Arc::clone(&connection),
                 port,
+                track,
+                ssrc,
+                pumping: false,
             });
         }
-        info!(peer = id.get(), port, "remote: peer connected");
+        info!(peer = id.get(), port, "remote: peer answered");
 
-        // The pump starts now rather than on `connected`: `write_sample` before the
-        // transport is up is dropped rather than an error, and starting here means the
-        // first keyframe is already in flight when it comes up.
-        self.spawn_pump(id, track, ssrc);
+        // The pump does *not* start here. `write_sample` fails until the track is bound
+        // and the transport is up, and the pump treats a write error as "this peer is
+        // gone" — so starting it now would tear down every peer on its first frame,
+        // before the connection it is waiting for had a chance to come up. It starts on
+        // `Connected` instead.
         Ok(local.sdp)
     }
 
@@ -306,6 +318,34 @@ impl RemoteService {
         {
             warn!("remote: ICE gathering did not complete; answering with what we have");
         }
+    }
+
+    /// Start feeding a peer's track, once its transport is up.
+    ///
+    /// Idempotent: `Connected` can be reported more than once, and two pumps on one track
+    /// would interleave two copies of every frame into a single sequence number space.
+    fn start_pump(self: &Arc<Self>, id: RemoteId) {
+        let started = match self.peers.lock() {
+            Ok(mut peers) => peers
+                .iter_mut()
+                .find(|p| p.id == id)
+                .filter(|p| !p.pumping)
+                .map(|p| {
+                    p.pumping = true;
+                    (Arc::clone(&p.track), p.ssrc)
+                }),
+            Err(_) => None,
+        };
+        let Some((track, ssrc)) = started else {
+            return;
+        };
+        info!(peer = id.get(), "remote: streaming to peer");
+        // Asked for again, not only at `answer`. The tap retires when nothing has wanted
+        // it for ten seconds, and a peer that took longer than that to come up would
+        // otherwise subscribe to a feed nothing is publishing to. Idempotent — the claim
+        // is a compare-exchange — so this costs nothing in the normal case.
+        (self.start)();
+        self.spawn_pump(id, track, ssrc);
     }
 
     /// Feed one peer's track from the live encoder output until either goes away.
@@ -444,6 +484,9 @@ impl PeerConnectionEventHandler for PeerHandler {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         debug!(peer = self.id.get(), ?state, "remote: connection state");
         match state {
+            // The transport is up, so the track is writable. Until this moment every
+            // `write_sample` would fail.
+            RTCPeerConnectionState::Connected => self.service.start_pump(self.id),
             // `Disconnected` can recover, but a stuck finger is worse than a cancelled
             // gesture, so the contacts go now and the connection is given its chance.
             RTCPeerConnectionState::Disconnected => {
