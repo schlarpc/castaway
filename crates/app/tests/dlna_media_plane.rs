@@ -36,10 +36,19 @@ use proto_dlna::DlnaService;
 use tokio::sync::mpsc;
 use tower::ServiceExt as _;
 
-/// Build a short A/V clip, or `None` when ffmpeg is not available to build one.
-fn make_clip() -> Option<std::path::PathBuf> {
+/// Build a short A/V clip.
+///
+/// Panics rather than skipping when ffmpeg is missing, and that is the point (#98). This
+/// used to `eprintln!` and return, which meant a CI job that turned the `render` feature on
+/// without putting the ffmpeg *binary* on `PATH` would report success having proved
+/// nothing — the same shape of failure as the missing gate itself, one level up. A test
+/// whose prerequisite is absent has not passed.
+///
+/// The dev shell and the `media-plane` check both supply it, so there is no honest
+/// environment where this fires.
+fn make_clip() -> std::path::PathBuf {
     let path = std::env::temp_dir().join("castaway-dlna-plane.mp4");
-    let ok = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args([
             "-f",
@@ -51,8 +60,18 @@ fn make_clip() -> Option<std::path::PathBuf> {
         .args(["-c:v", "libx264", "-c:a", "aac"])
         .arg(&path)
         .status()
-        .ok()?;
-    (ok.success() && path.exists()).then_some(path)
+        .unwrap_or_else(|e| {
+            panic!(
+                "this test needs the ffmpeg CLI on PATH to build its clip, and running it \
+                 failed: {e}. Use `nix develop`, or run the `media-plane` flake check."
+            )
+        });
+    assert!(
+        status.success() && path.exists(),
+        "ffmpeg ran but produced no clip (exit {status}); this build of ffmpeg may lack \
+         libx264 or the aac encoder"
+    );
+    path
 }
 
 /// Serve `body` over HTTP on an ephemeral port, and return the URL.
@@ -108,10 +127,7 @@ fn envelope(action: &str, args: &str) -> String {
 /// transport says so.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cast_from_a_control_point_decodes_and_then_reports_that_it_finished() {
-    let Some(clip) = make_clip() else {
-        eprintln!("skipping: ffmpeg is not available to build a test clip");
-        return;
-    };
+    let clip = make_clip();
     let url = serve(std::fs::read(&clip).unwrap());
 
     // The pipeline, wired exactly as `main` wires it: a handle for the position, a channel

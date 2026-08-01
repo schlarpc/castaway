@@ -235,6 +235,8 @@
               (craneLib.filterCargoSources path type)
               || (pkgs.lib.hasSuffix ".xml" path)
               || (pkgs.lib.hasSuffix ".ttf" path)
+              # The CJK fallback subset (#88) is OpenType/CFF, not TrueType.
+              || (pkgs.lib.hasSuffix ".otf" path)
               || (pkgs.lib.hasSuffix ".bin" path)
               || (pkgs.lib.hasSuffix ".der" path)
               || (pkgs.lib.hasSuffix ".pem" path)
@@ -554,6 +556,23 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
           };
+
+          # The media plane: `castaway` with `render` on, which is the feature the
+          # end-to-end DLNA test is `cfg`'d behind (#98).
+          #
+          # `pkgs.ffmpeg_7` appears in *both* lists on purpose, and that is the whole
+          # point of this check. As a `buildInput` it is the libraries `ffmpeg-sys-next`
+          # links; as a `nativeBuildInput` it puts the `ffmpeg` **binary** on `PATH`,
+          # which is what `dlna_media_plane.rs` shells out to for its clip. Turning the
+          # feature on without the second one would compile the test, run it, and have it
+          # do nothing — the same silent pass this check exists to end.
+          mediaPlaneArgs = {
+            cargoExtraArgs = "--package castaway --features render";
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.ffmpeg_7 ];
+            buildInputs = [ pkgs.ffmpeg_7 ];
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+          };
         in
         {
           # Build the crate as part of checks. Deliberately the *portable* build and not
@@ -678,6 +697,56 @@
             });
             inherit (hwaccelArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
             cargoClippyExtraArgs = "${hwaccelArgs.cargoExtraArgs} --all-targets -- --deny warnings";
+          });
+
+          # The DLNA media plane, end to end, in CI (#98).
+          #
+          # `crates/app/tests/dlna_media_plane.rs` drives a real SOAP envelope into the
+          # real router, through the real session manager, into a `RenderPipeline` fetching
+          # a real HTTP URL with a real demuxer. It has worked for a while — but nothing in
+          # CI compiled it, because the file is `#![cfg(feature = "render")]` and
+          # `castaway`'s `default = []`, while `test`/`coverage`/`clippy` all take
+          # `commonArgs` unmodified. A test CI does not compile is a test that rots, and it
+          # rots green: `506f405` had to repair this file three days after it landed,
+          # because a refactor deleted a method its drainers called and no gate noticed.
+          #
+          # Scoped to the one test target rather than the whole `render` feature's tests:
+          # the rest of that set wants a GPU, which a sandbox has not got, and they skip
+          # themselves with "no usable GPU". Asserting real composited pixels needs Xvfb
+          # and a software Vulkan ICD in the VM (nix/vm-test.nix names this as the shape of
+          # the fix) — worth doing, and a separate nix lift.
+          #
+          # What this therefore does *not* prove, stated so the green tick is not read as
+          # more than it is: nothing is presented to a GPU, and only video is claimed —
+          # the drainer counts `RenderCommand::Video` and `ClearVideo`, so "a cast that
+          # produced sound" is still asserted only at the `pipeline` layer.
+          media-plane = craneLib.cargoNextest (commonArgs // {
+            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
+              pname = "castaway-media-plane";
+              inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+              cargoExtraArgs = mediaPlaneArgs.cargoExtraArgs;
+            });
+            inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+            cargoExtraArgs = "${mediaPlaneArgs.cargoExtraArgs} --test dlna_media_plane";
+            partitions = 1;
+            partitionType = "count";
+          });
+
+          # Compile everything the `render` feature reaches, warnings denied.
+          #
+          # The other half of the same gap: `clippy` runs on default features, so the whole
+          # render tree — the kiosk, the compositor, every test cfg'd behind it — was
+          # invisible to the lint gate as well as to the test gate. This is what catches a
+          # `render`-only test that no longer builds, which is how `ldac_decode.rs` sat
+          # broken under `--all-features` without anything noticing.
+          media-plane-clippy = craneLib.cargoClippy (commonArgs // {
+            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
+              pname = "castaway-media-plane";
+              inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+              cargoExtraArgs = mediaPlaneArgs.cargoExtraArgs;
+            });
+            inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+            cargoClippyExtraArgs = "${mediaPlaneArgs.cargoExtraArgs} --all-targets -- --deny warnings";
           });
         }
         # Cross-build the Windows artifacts and verify each one's DLL closure. The Windows
