@@ -4148,6 +4148,7 @@ dependencies = [
  "raw-window-handle",
  "resvg",
  "rquickjs",
+ "rtc",
  "serde",
  "serde_json",
  "tempfile",

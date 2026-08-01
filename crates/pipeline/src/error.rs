@@ -14,6 +14,10 @@ pub enum PipelineError {
     #[error("surface error: {0}")]
     Surface(String),
 
+    /// A remote-control peer connection could not be set up or kept (#18).
+    #[error("remote: {0}")]
+    Remote(String),
+
     /// The decoder could not open or decode the input.
     #[error("decode error: {0}")]
     Decode(String),
