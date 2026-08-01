@@ -11,6 +11,7 @@
 
 mod bluetooth;
 mod config;
+mod instance;
 mod logging;
 mod screen;
 // The network-surface registry (#22/#30): every socket, as data, generating the doc,
@@ -113,6 +114,36 @@ fn main() -> anyhow::Result<()> {
              outro, preview, music_offtopic, filler, exclusive_access"
         );
     }
+    // Before the runtime, the kiosk window and the browser child — all three of which used
+    // to come up on a doubled start, leaving a second full-screen kiosk that discovered
+    // nothing and answered nothing (#100). The port bind that would have said so happens
+    // far too late and inside a task that only warns.
+    //
+    // Keyed on the state directory, because that is what actually collides: the link-key
+    // file, the pairing store and the browser profile are all under it, and an operator
+    // who deliberately points a second castaway at a second state directory is running a
+    // genuinely separate receiver.
+    //
+    // Held for the life of the process. Dropping it releases the lock.
+    let _instance = match instance::acquire(&config.state_dir()) {
+        Ok(lock) => {
+            debug!(path = %lock.path().display(), "instance lock");
+            lock
+        }
+        Err(e @ instance::InstanceError::AlreadyRunning { .. }) => {
+            // Both, deliberately. stderr is for whoever typed the command; the log is for
+            // the panel, where there is no terminal and the service manager swallows it.
+            error!("{e}");
+            // No prefix: the error already names the program, and "castaway: castaway is
+            // already running" is what adding one produces.
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        // A lock file that cannot be opened at all is an operator problem, not a second
+        // launch, and must not be reported as one.
+        Err(e) => return Err(anyhow::Error::new(e).context("taking the instance lock")),
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

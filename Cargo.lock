@@ -657,6 +657,7 @@ dependencies = [
  "proto-gamestream",
  "proto-miracast",
  "proto-spotify",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sponsorblock",

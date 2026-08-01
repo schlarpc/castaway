@@ -54,6 +54,13 @@ toml_edit = "0.22"
 uuid.workspace = true
 url.workspace = true
 
+
+# The unix half of the single-instance guard (#100). `flock` rather than a PID file so
+# the lock dies with the process however it dies; rustix rather than raw libc so the
+# wiring crate needs no `unsafe`. Already in the lock file via other dependencies.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 # Driving the DLNA media plane end to end: a real SOAP envelope into the real router.
 tower = { version = "0.5", features = ["util"] }

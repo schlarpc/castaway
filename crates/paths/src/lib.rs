@@ -214,8 +214,12 @@ impl Dirs {
         &self.state
     }
 
-    /// Files that may be deleted at any time at the cost of a refetch: filter lists, the
-    /// browser profile.
+    /// Files that may be deleted at any time at the cost of a refetch: filter lists.
+    ///
+    /// **Not** the browser profile, which this used to claim (#100). Nothing passes
+    /// `--user-data-dir` and nothing calls `app.setPath('userData')`, so every browser
+    /// child uses Electron's own default — `$XDG_CONFIG_HOME/castaway-browser-host`, or
+    /// `%APPDATA%\castaway-browser-host` — which is under neither of these directories.
     #[must_use]
     pub fn cache(&self) -> &Path {
         &self.cache
