@@ -153,6 +153,28 @@ async fn the_answer_names_a_port_from_the_declared_range() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn answering_does_not_wait_out_the_gather_timeout() {
+    // A regression test for a bug that was invisible because it *worked*: gathering was
+    // signalled with `notify_waiters`, which wakes only tasks already parked. On a LAN the
+    // candidates are gathered before the answer path gets as far as waiting, so the
+    // notification went on the floor and every connection sat out the full three-second
+    // timeout before answering. Nothing failed — the panel was just unusably slow to
+    // connect, and no assertion in this file noticed.
+    //
+    // The bound is deliberately loose. What is being caught is a timeout being waited out,
+    // which is an order of magnitude away, not a slow CI box.
+    let (service, _input) = service((BASE + 20, BASE + 23), true);
+    let started = std::time::Instant::now();
+    service.answer(&browser_offer()).await.unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(750),
+        "answering took {took:?}, which means gathering was waited out rather than noticed"
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn several_peers_get_different_ports() {
     let (service, _input) = service((45100, 45115), true);
     let first = service.answer(&browser_offer()).await.unwrap();

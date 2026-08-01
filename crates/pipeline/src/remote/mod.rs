@@ -430,6 +430,12 @@ struct PeerHandler {
     id: RemoteId,
     service: Arc<RemoteService>,
     /// Fired once gathering completes, which is what lets the answer be sent.
+    ///
+    /// Signalled with `notify_one`, not `notify_waiters`: on a LAN, host candidates are
+    /// gathered before the answer path gets as far as waiting, and `notify_waiters` wakes
+    /// only tasks *already* parked — the notification would be dropped on the floor and
+    /// every single connection would sit out the full timeout before answering.
+    /// `notify_one` stores a permit, so arriving late costs nothing.
     gathered: Arc<tokio::sync::Notify>,
 }
 
@@ -452,7 +458,7 @@ impl PeerConnectionEventHandler for PeerHandler {
 
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         if state == RTCIceGatheringState::Complete {
-            self.gathered.notify_waiters();
+            self.gathered.notify_one();
         }
     }
 

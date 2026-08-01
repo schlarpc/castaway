@@ -36,13 +36,20 @@ pub const WHEP_PATH: &str = "/remote/whep";
 ///
 /// A real one is two or three kilobytes. This is generous enough that no browser will hit
 /// it and small enough that a stranger on the LAN cannot make the panel allocate.
+///
+/// Enforced as a body limit on the route rather than by measuring the string afterwards:
+/// by the time a handler can check `offer.len()`, axum has already read and buffered the
+/// whole thing, so the check would report a size it had just finished allocating.
 const MAX_OFFER: usize = 64 * 1024;
 
 /// Mount `/remote/*`.
 pub fn routes(remote: Option<Remote>) -> Router {
     Router::new()
         .route(PAGE_PATH, get(page_route))
-        .route(WHEP_PATH, post(whep_route))
+        .route(
+            WHEP_PATH,
+            post(whep_route).layer(axum::extract::DefaultBodyLimit::max(MAX_OFFER)),
+        )
         .with_state(remote)
 }
 
@@ -61,14 +68,6 @@ async fn whep_route(State(remote): State<Option<Remote>>, offer: String) -> Resp
     let Some(remote) = remote else {
         return unavailable();
     };
-    if offer.len() > MAX_OFFER {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            [(header::CACHE_CONTROL, "no-store")],
-            "that offer is not an offer\n",
-        )
-            .into_response();
-    }
     match remote.answer(&offer).await {
         Ok(answer) => (
             StatusCode::CREATED,
@@ -94,7 +93,7 @@ async fn whep_route(State(remote): State<Option<Remote>>, offer: String) -> Resp
 #[cfg(not(feature = "remote"))]
 #[allow(clippy::unused_async)]
 async fn whep_route(State(_): State<Option<Remote>>, offer: String) -> Response {
-    let _ = (offer, MAX_OFFER);
+    let _ = offer;
     unavailable()
 }
 
@@ -391,6 +390,19 @@ mod tests {
         let (status, text) = body(routes(None).oneshot(request).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(text.contains("<video"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_offer_larger_than_an_offer_is_refused_before_it_is_buffered() {
+        // The limit is a layer rather than a length check in the handler: by the time a
+        // handler can measure the string, axum has already allocated it.
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(WHEP_PATH)
+            .body(axum::body::Body::from("v".repeat(MAX_OFFER + 1)))
+            .unwrap();
+        let (status, _) = body(routes(None).oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
