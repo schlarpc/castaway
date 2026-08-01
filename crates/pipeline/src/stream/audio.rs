@@ -587,7 +587,9 @@ mod tests {
         // A second of audio should occupy a second of timeline. Measured over two, so the
         // answer is a proportion rather than an edge: stacked blocks would put everything
         // in a fraction of the first second and leave the rest silent.
-        let out = mix.take(t0 + Duration::from_secs(3), 96_000, SETTLE).unwrap();
+        let out = mix
+            .take(t0 + Duration::from_secs(3), 96_000, SETTLE)
+            .unwrap();
         let loud = out.iter().filter(|s| s.abs() > 1e-6).count();
         let fraction = loud as f64 / out.len() as f64;
         assert!(
@@ -604,7 +606,10 @@ mod tests {
         // encoder has already been.
         let now = Instant::now();
         assert_eq!(follow(None, now), Place::At(now));
-        assert_eq!(follow(Some(now - RESYNC - Duration::from_secs(1)), now), Place::At(now));
+        assert_eq!(
+            follow(Some(now - RESYNC - Duration::from_secs(1)), now),
+            Place::At(now)
+        );
 
         // …ordinary jitter is followed rather than fought…
         let jittered = now - Duration::from_millis(20);
@@ -616,7 +621,10 @@ mod tests {
 
         // …and one racing through a file faster than real time is dropped rather than
         // buffered, because a live duplicate has nowhere to keep it.
-        assert_eq!(follow(Some(now + MAX_LEAD + Duration::from_secs(1)), now), Place::Drop);
+        assert_eq!(
+            follow(Some(now + MAX_LEAD + Duration::from_secs(1)), now),
+            Place::Drop
+        );
     }
 
     #[test]

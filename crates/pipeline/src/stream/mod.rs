@@ -221,10 +221,32 @@ impl LiveStream {
     ///
     /// Exactly one caller gets `true`, and that caller installs the tap. Released by
     /// [`Self::stopped`] when the tap retires.
+    ///
+    /// Claiming also retires the previous presentation's segments, and that is not
+    /// housekeeping — it is the fix for a race that made every restarted stream unplayable.
+    /// The tap takes about a second to publish its first segment, and until [`Self::go_live`]
+    /// the window still held the *last* run's. A player asking in that gap got a playlist
+    /// naming segments that `go_live` was about to delete, fetched one, got 404, and gave
+    /// up. ffmpeg reported "Segment N failed too many times, skipping" and exited; the tap
+    /// then retired ten seconds later having served nobody.
+    ///
+    /// So the moment a new presentation is claimed, the old one stops being on offer. The
+    /// playlist 503s for the second it takes to have something real to say, which is a
+    /// state every player already retries through — it is what the first request of all
+    /// gets.
     pub fn claim(&self) -> bool {
-        self.running
+        let claimed = self
+            .running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if claimed {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.window = LiveWindow::new(self.capacity, self.target);
+                inner.init = None;
+                inner.status = StreamStatus::Starting;
+            }
+        }
+        claimed
     }
 
     /// Whether a tap is attached.
@@ -284,9 +306,9 @@ impl LiveStream {
 
     /// Release the claim, so the next request starts a fresh tap.
     ///
-    /// The window keeps what it has until the next [`Self::go_live`] replaces it, so a
-    /// player that was mid-fetch when the stream retired still gets an answer instead of a
-    /// 404 it has to guess the meaning of.
+    /// The window keeps what it has until the next [`Self::claim`] retires it, so a player
+    /// that was mid-fetch when the stream stopped still gets an answer instead of a 404 it
+    /// has to guess the meaning of.
     pub fn stopped(&self) {
         self.running.store(false, Ordering::Release);
         if let Ok(mut inner) = self.inner.lock() {
@@ -382,6 +404,48 @@ mod tests {
         stream.touch(now);
         assert!(stream.wanted(now + Duration::from_secs(9), Duration::from_secs(10)));
         assert!(!stream.wanted(now + Duration::from_secs(11), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn claiming_the_stream_takes_the_previous_run_off_offer() {
+        // The bug this exists for: a restarted stream served the *old* presentation's
+        // playlist for the second it took the new tap to publish anything. A player
+        // fetched a segment named there, `go_live` deleted it, and the 404 made ffmpeg
+        // give up on the stream entirely.
+        let stream = LiveStream::new(&StreamConfig::default());
+        assert!(stream.claim());
+        stream.go_live(
+            vec![1, 2, 3],
+            StreamStatus::Live {
+                encoder: "test".into(),
+                width: 16,
+                height: 16,
+                codec: "avc1.42000a".into(),
+            },
+        );
+        stream.publish(Segment {
+            sequence: 1,
+            base_decode_time: 0,
+            duration_ticks: 90_000,
+            bytes: vec![4, 5, 6].into(),
+        });
+        assert!(stream
+            .playlist("init.mp4", &|n| format!("seg-{n}.m4s"))
+            .is_some());
+
+        // The tap retires. What it left is still fetchable — a player mid-request gets an
+        // answer rather than a 404 it has to interpret.
+        stream.stopped();
+        assert!(stream.segment(1).is_some());
+
+        // …and the moment somebody starts it again, none of it is on offer.
+        assert!(stream.claim());
+        assert!(stream.segment(1).is_none());
+        assert!(stream.init_segment().is_none());
+        assert!(stream
+            .playlist("init.mp4", &|n| format!("seg-{n}.m4s"))
+            .is_none());
+        assert_eq!(stream.status(), StreamStatus::Starting);
     }
 
     #[test]

@@ -628,6 +628,8 @@ impl WgpuCompositor {
     /// # Errors
     /// [`PipelineError::GpuInit`] if no adapter/device is available.
     pub fn new_offscreen(width: u32, height: u32) -> Result<Self, PipelineError> {
+        // Serialised against every other device open in the process; see `gpu_lock`.
+        let _opening = crate::gpu_lock::opening_device();
         let instance = create_instance();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -688,6 +690,8 @@ impl WgpuCompositor {
         width: u32,
         height: u32,
     ) -> Result<Self, PipelineError> {
+        // Serialised against every other device open in the process; see `gpu_lock`.
+        let _opening = crate::gpu_lock::opening_device();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),

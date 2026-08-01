@@ -73,6 +73,8 @@ impl HwDevice {
     /// [`HwGiveUp::DeviceUnavailable`] if libavutil cannot create the context.
     pub fn open(kind: HwBackendKind) -> Result<Self, HwGiveUp> {
         let mut ptr: *mut sys::AVBufferRef = std::ptr::null_mut();
+        // Serialised against every other device open in the process; see `crate::gpu_lock`.
+        let _opening = crate::gpu_lock::opening_device();
         // SAFETY: `av_hwdevice_ctx_create` writes a new reference into `ptr` on success
         // and leaves it untouched on failure. Null device/opts asks libavutil to pick the
         // default adapter, which is what we want on a single-GPU box.

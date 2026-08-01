@@ -94,7 +94,7 @@ fn uncacheable(content_type: &'static str, body: Vec<u8>) -> Response {
 #[cfg(feature = "stream")]
 mod live {
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::{
         header, uncacheable, IntoResponse as _, Path, Response, State, StatusCode, Stream,
@@ -106,6 +106,15 @@ mod live {
         format!("seg/{sequence}.m4s")
     }
 
+    /// How long the first request waits for the encoder it just started.
+    ///
+    /// Long enough for the candidate probe, a GPU encoder to open, and the first segment
+    /// to be cut. **Waiting rather than 503ing is what makes `ffmpeg -i .../live.m3u8`
+    /// work at all**: a browser retries a failed playlist and ffmpeg's *initial* open does
+    /// not, so a cold stream was unopenable by every player built on libavformat — which
+    /// is ffplay, VLC and mpv.
+    const WARMUP: Duration = Duration::from_secs(6);
+
     /// `GET /stream/live.m3u8` — the media playlist, and the request that starts the
     /// encoder.
     pub async fn playlist_route(State(handle): State<Option<Stream>>) -> Response {
@@ -114,11 +123,21 @@ mod live {
         };
         handle.ensure_running();
         let stream = handle.stream();
-        if let Some(text) = stream.playlist("init.mp4", &segment_uri) {
-            return uncacheable("application/vnd.apple.mpegurl", text.into_bytes());
+        let deadline = Instant::now() + WARMUP;
+        loop {
+            if let Some(text) = stream.playlist("init.mp4", &segment_uri) {
+                return uncacheable("application/vnd.apple.mpegurl", text.into_bytes());
+            }
+            if matches!(stream.status(), StreamStatus::Failed(_)) || Instant::now() >= deadline {
+                break;
+            }
+            // Each pass counts as somebody asking, so a slow encoder cannot have its own
+            // tap retired out from under it by the caller waiting patiently.
+            stream.touch(Instant::now());
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // No segments yet. Which of the two reasons that is matters to whoever is waiting:
-        // one resolves itself in a second and the other never will.
+        // Nothing to play, and which of the two reasons that is matters to whoever is
+        // waiting: one may still resolve itself and the other never will.
         match stream.status() {
             StreamStatus::Failed(why) => (
                 StatusCode::SERVICE_UNAVAILABLE,

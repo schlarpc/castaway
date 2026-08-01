@@ -43,6 +43,8 @@ pub mod compositor;
 #[cfg(feature = "render")]
 pub mod demand;
 pub mod error;
+/// One lock over "open a device on the GPU", shared by every API that does.
+pub mod gpu_lock;
 pub mod hwaccel;
 pub mod null;
 

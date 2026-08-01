@@ -285,6 +285,66 @@ function installAdblock(ses) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Letting the audio tap's worklet load at all.
+//
+// `audio-tap.js` installs an `AudioWorkletProcessor`, and the only way to install one is
+// `audioWorklet.addModule(url)` — there is no inline form. The module is built as a Blob,
+// so the URL is `blob:`, and YouTube's policy is:
+//
+//     script-src 'unsafe-inline' https: http: 'unsafe-eval'
+//
+// which does not list `blob:`. So `addModule` rejects with `AbortError: Unable to load a
+// worklet's module`, no element is ever tapped, and the page plays through the system
+// device instead of through castaway — which on the panel is *silence*, because the
+// browser process has no output of its own. That is the same class of failure as G61, and
+// it is invisible from the room: the picture is perfect.
+//
+// Every other way in is worse. `data:` is excluded by the same policy; serving the module
+// from an `https:` origin means standing up a server and hoping no CSP tightens; the
+// deprecated `ScriptProcessorNode` needs no module but runs on the main thread, where a
+// page as heavy as leanback will glitch it.
+//
+// So: append `blob:` to `script-src` on the way past. This is a deliberate deviation and
+// is marked as one. What it permits is a page executing script from a Blob it made itself
+// — which it can already do with `'unsafe-eval'`, which that same policy grants. It does
+// not open the page to anything remote, and it applies only to what this kiosk loads.
+// ---------------------------------------------------------------------------
+function allowWorkletBlobs(ses) {
+  ses.webRequest.onHeadersReceived({ urls: ['<all_urls>'] }, (details, callback) => {
+    const headers = details.responseHeaders;
+    if (!headers) {
+      callback({});
+      return;
+    }
+    let amended = false;
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() !== 'content-security-policy') continue;
+      const values = headers[name];
+      if (!Array.isArray(values)) continue;
+      headers[name] = values.map((policy) => {
+        const directives = policy.split(';');
+        const script = directives.findIndex((d) => d.trim().toLowerCase().startsWith('script-src'));
+        if (script >= 0) {
+          if (/(^|\s)blob:/.test(directives[script])) return policy;
+          directives[script] = `${directives[script].trimEnd()} blob:`;
+          amended = true;
+          return directives.join(';');
+        }
+        // No `script-src`, so `default-src` is what governs the worklet. Deriving a
+        // `script-src` from it rather than widening `default-src` keeps the relaxation to
+        // the one directive that needs it.
+        const fallback = directives.find((d) => d.trim().toLowerCase().startsWith('default-src'));
+        if (!fallback) return policy;
+        const sources = fallback.trim().slice('default-src'.length).trim();
+        amended = true;
+        return `${policy.trimEnd().replace(/;$/, '')}; script-src ${sources} blob:`;
+      });
+    }
+    callback(amended ? { responseHeaders: headers } : {});
+  });
+}
+
 /** The document URL a request came from, for domain-scoped rules. With two windows the
  * requester matters: a rule scoped to youtube.com must not fire on the clock's requests,
  * so the window is found by the request's own webContents rather than assumed. */
@@ -768,6 +828,7 @@ wire.on('close', shutdown);
 app.whenReady().then(async () => {
   await readyComponents();
   installAdblock(session.defaultSession);
+  allowWorkletBlobs(session.defaultSession);
   appReady = true;
   send({ type: 'ready', pid: process.pid });
   for (const msg of queued.splice(0)) {

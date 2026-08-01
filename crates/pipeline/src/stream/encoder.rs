@@ -404,6 +404,10 @@ impl H264Encoder {
     /// # Safety
     /// `self.ctx` must be live and unopened; `self.device` and `self.frames` must be null.
     unsafe fn attach_hw_frames(&mut self, family: HwFamily) -> Result<(), PipelineError> {
+        // Serialised against every other device open in the process — the compositor's
+        // Vulkan device, the decoder's VA-API one — because bringing up two driver stacks
+        // on one GPU at once segfaults inside Mesa. See `crate::gpu_lock`.
+        let _opening = crate::gpu_lock::opening_device();
         // SAFETY: writes a new reference into `self.device` on success and leaves it
         // untouched on failure. A null device name asks libavutil for the default render
         // node, which is right on a single-GPU box and is what the panel is.
