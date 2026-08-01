@@ -793,7 +793,14 @@ impl BluetoothAdapter {
                         out.replies.push((cid, response));
                     } else if psm == Psm::AVDTP {
                         if Some(cid) == link.avdtp_media {
-                            self.on_media(link, payload).await;
+                            if self.on_media(link, payload).await {
+                                // The pipeline let go of the stream. Ending the session
+                                // is what pauses the phone (the manager's teardown sends
+                                // AVRCP pause) and clears the card that is still claiming
+                                // to be playing.
+                                let link_sink = sink.with_instance(link.peer.to_string());
+                                link_sink.emit(SessionEvent::End).await?;
+                            }
                         } else {
                             self.on_avdtp(link, cid, &payload, sink, &mut out).await?;
                         }
@@ -987,10 +994,14 @@ impl BluetoothAdapter {
     }
 
     /// A media packet: depacketize and push the frame at the pipeline.
-    async fn on_media(&self, link: &mut Link, payload: Bytes) {
+    ///
+    /// Returns whether the consumer has gone away, in which case the caller must end the
+    /// session — there is nothing left to play into and the phone is still sending.
+    async fn on_media(&self, link: &mut Link, payload: Bytes) -> bool {
+        let mut consumer_gone = false;
         let (Some(depacketizer), Some(tx)) = (link.depacketizer.as_mut(), link.audio_tx.as_ref())
         else {
-            return;
+            return false;
         };
         match depacketizer.push(payload) {
             Ok(frame) => {
@@ -1012,8 +1023,24 @@ impl BluetoothAdapter {
                 // `try_send` rather than `send`: blocking here would stall the whole
                 // adapter, including the signaling channel, so a phone could not even
                 // pause. A full queue means decode is behind, which is worth saying.
-                if tx.try_send(frame).is_err() {
-                    warn!("audio queue full; dropping a frame");
+                //
+                // Full and Closed are told apart deliberately. They used to collapse into
+                // one `is_err()`, and the difference is the difference between a hiccup
+                // and a dead session: when the decode side went away, *every* subsequent
+                // packet logged "audio queue full" — thousands of lines blaming
+                // backpressure for a channel with no receiver at all.
+                match tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("audio queue full; dropping a frame");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // The consumer is gone and is not coming back, so stop pretending
+                        // there is a session. Logged once, because the whole point is to
+                        // stop repeating a per-packet message.
+                        warn!("bluetooth: the audio consumer is gone; ending the session");
+                        consumer_gone = true;
+                    }
                 }
             }
             Err(e) => {
@@ -1037,6 +1064,15 @@ impl BluetoothAdapter {
                 }
             }
         }
+        // After the match, so the borrows of `depacketizer` and `audio_tx` above are
+        // finished and these fields can be cleared.
+        if consumer_gone {
+            link.audio_tx = None;
+            link.depacketizer = None;
+            link.audio_format = None;
+            link.session_open = false;
+        }
+        consumer_gone
     }
 
     /// AVCTP: metadata responses and volume commands.
