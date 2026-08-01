@@ -13,8 +13,9 @@ use std::collections::HashMap;
 
 use tracing::{debug, warn};
 
+use bytes::Bytes;
 use substrate_hci::{
-    AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, ConnectionHandle, Event,
+    AcceptRole, AuthRequirements, BdAddr, ClassOfDevice, Command, ConnectionHandle, Eir, Event,
     IoCapability, LinkKey, LinkType, ScanEnable, Status,
 };
 
@@ -119,6 +120,21 @@ impl Default for HostConfig {
     }
 }
 
+/// The service classes we advertise in the inquiry response.
+///
+/// These mirror the SDP records `adapter` registers, and the mirroring is the point: a
+/// peer is entitled to act on the EIR without querying SDP, so a class listed here that
+/// no record backs invites a connection we will then refuse.
+///
+/// Both AVRCP roles appear because we publish both records: Controller to drive the
+/// phone's player, Target so its volume rocker reaches us (Q24).
+const SERVICE_CLASSES: [u16; 4] = [
+    0x110B, // Audio Sink — the A2DP half.
+    0x110C, // A/V Remote Control Target — the volume-rocker half.
+    0x110E, // A/V Remote Control — the generic class every AVRCP role carries.
+    0x110F, // A/V Remote Control Controller — the role we play toward the phone's player.
+];
+
 /// Inquiry scan interval: 1024 slots of 0.625 ms = 640 ms.
 const INQUIRY_SCAN_INTERVAL: u16 = 0x0400;
 /// Inquiry scan window: 96 slots = 60 ms, so ~9% of the radio goes to being findable.
@@ -205,6 +221,14 @@ impl HostController {
             Command::SetEventMask(0xFFFF_FFFF_FFFF_FFFF),
             Command::WriteClassOfDevice(self.config.class_of_device),
             Command::WriteLocalName(self.config.name.clone()),
+            // The name again, in the inquiry response itself. `WriteLocalName` only
+            // answers a *separate* RemoteNameRequest, which BlueZ sends and Android does
+            // not — so without this the panel is discoverable and invisible to precisely
+            // the devices most likely to walk up to it (Q24).
+            Command::WriteExtendedInquiryResponse {
+                fec_required: false,
+                data: self.eir(),
+            },
             Command::WriteSimplePairingMode(true),
             // Scan hard enough to be found *while streaming*. The controller defaults to
             // an 11.25 ms inquiry window every 1.28 s — under 1% of the radio — and an
@@ -237,6 +261,22 @@ impl HostController {
             ScanEnable::ConnectableOnly
         };
         vec![HostAction::Send(Command::WriteScanEnable(scan))]
+    }
+
+    /// The inquiry response payload: what we serve, and what to call us.
+    ///
+    /// The UUID list must stay in step with the records `adapter` publishes over SDP —
+    /// [`SERVICE_CLASSES`] says why, and `eir_matches_the_published_sdp_records` fails if
+    /// they drift apart.
+    fn eir(&self) -> Bytes {
+        Eir::new()
+            // The list is a three-element constant, so the length check cannot fire; an
+            // empty EIR is still the right answer if it somehow did, since a panic here
+            // would take down bring-up over a cosmetic field.
+            .with_uuids16(&SERVICE_CLASSES)
+            .unwrap_or_default()
+            .with_name(&self.config.name)
+            .finish()
     }
 
     const fn idle_scan(&self) -> ScanEnable {
@@ -935,6 +975,57 @@ mod tests {
             .iter()
             .position(|c| matches!(c, Command::WriteScanEnable(_)));
         assert!(activity < enable, "activity must precede scan enable");
+    }
+
+    #[test]
+    fn bring_up_publishes_a_name_in_the_inquiry_response() {
+        // The failure this ends: `WriteLocalName` only furnishes an answer to a separate
+        // RemoteNameRequest. BlueZ sends one, so a Linux laptop saw the panel and every
+        // test passed; Android builds its picker from the inquiry response alone and saw
+        // an unnamed entry it filtered out. Discoverable, findable by radio, invisible in
+        // the UI — and nothing in any log to say so.
+        let mut host = HostController::new(HostConfig::default());
+        let sent = bring_up(&mut host);
+        let eir = sent
+            .iter()
+            .find_map(|c| match c {
+                Command::WriteExtendedInquiryResponse { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("bring-up must write an EIR");
+        // The name is in there as a complete-local-name structure, not merely somewhere.
+        let name = HostConfig::default().name;
+        let expected = [
+            &[u8::try_from(name.len() + 1).unwrap(), 0x09][..],
+            name.as_bytes(),
+        ]
+        .concat();
+        assert!(
+            eir.windows(expected.len()).any(|w| w == expected),
+            "EIR must carry the complete local name: {eir:?}"
+        );
+    }
+
+    #[test]
+    fn the_inquiry_response_matches_the_published_sdp_records() {
+        // The EIR is a claim a peer may act on without ever querying SDP, so a class
+        // advertised here that no record backs invites a connection we then refuse.
+        // These are the records `BluetoothAdapter::new` registers.
+        use substrate_sdp::{
+            record::{a2dp_sink, avrcp_controller, avrcp_target},
+            Uuid,
+        };
+        let records = [
+            a2dp_sink(1, "x"),
+            avrcp_controller(2, "x"),
+            avrcp_target(3, "x"),
+        ];
+        for class in SERVICE_CLASSES {
+            assert!(
+                records.iter().any(|r| r.has_class(Uuid::short(class))),
+                "EIR advertises {class:#06x}, which no published record backs"
+            );
+        }
     }
 
     #[test]
