@@ -463,6 +463,27 @@ impl KioskApp {
     /// over, which on the transport strip means seeking to wherever the finger happened
     /// to be when the phone lost Wi-Fi.
     fn forget_origin(&mut self, origin: input_touch::InputOrigin) {
+        // Routed as real cancellations rather than deleted from the maps, because the
+        // navigation layer keeps state *outside* them: a contact that had begun an edge
+        // swipe left `started_drag` set and a transition being driven by a finger. Just
+        // dropping the entry would strand the shell mid-transition with nothing left to
+        // release it — the panel would sit at a half-open screen until someone touched
+        // the glass. `route_navigation`'s cancel branch already unwinds all of it, so the
+        // fix is to use it rather than to reimplement it here.
+        //
+        // The position is where the contact went down. Nothing reads it on a cancel, and
+        // it is the only position this end ever knew.
+        let doomed: Vec<(ContactId, (f32, f32))> = self
+            .contacts
+            .iter()
+            .filter(|(id, _)| id.is_from(origin))
+            .map(|(id, contact)| (*id, contact.start))
+            .collect();
+        for (id, (x, y)) in doomed {
+            self.route_contact(TouchEvent::new(id, TouchPhase::Cancel, x, y));
+        }
+        // Whatever the navigation layer did not own — a contact that was scrolling a
+        // shell screen, or one the maps still hold because it never reached them.
         self.contacts.retain(|id, _| !id.is_from(origin));
         self.drag_last.retain(|id, _| !id.is_from(origin));
         if let Some(sink) = self.input_sink() {
@@ -1264,6 +1285,38 @@ mod tests {
         app.drain_remote_input();
 
         assert!(app.contacts.is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_drops_mid_swipe_does_not_strand_the_navigation() {
+        // The navigation layer keeps state outside the contact map: a contact that began
+        // an edge swipe sets `started_drag` and leaves a transition being driven by a
+        // finger. Dropping the map entry alone would leave the shell at a half-open
+        // screen with nothing left to release it.
+        let mut app = router();
+        let peer = RemoteId::new(1);
+        let id = ContactId::remote(peer, 0);
+        app.apply(down(id, 0.001, 0.5));
+        app.started_drag = true;
+
+        app.forget_origin(InputOrigin::Remote(peer));
+
+        assert!(!app.started_drag, "the drag was never released");
+        assert!(app.drag_sample.is_none());
+        assert!(app.contacts.is_empty());
+    }
+
+    #[test]
+    fn forgetting_an_origin_leaves_every_other_origins_contacts_alone() {
+        let mut app = router();
+        let peer = RemoteId::new(1);
+        app.apply(down(ContactId::remote(peer, 0), 0.3, 0.3));
+        app.apply(down(ContactId::panel(0), 0.6, 0.6));
+
+        app.forget_origin(InputOrigin::Remote(peer));
+
+        assert_eq!(app.contacts.len(), 1);
+        assert!(app.contacts.contains_key(&ContactId::panel(0)));
     }
 
     #[test]
