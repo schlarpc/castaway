@@ -104,6 +104,9 @@ pub struct PipeWireAudioOut {
     samples: Option<SyncSender<Vec<f32>>>,
     quit: Option<pipewire::channel::Sender<()>>,
     underruns: Arc<AtomicU64>,
+    /// Sample frames the graph's callback has consumed. The device's own clock; see
+    /// [`AudioOut::frames_played`] for why this is not the same as frames written.
+    played: Arc<AtomicU64>,
     /// The shape the session is feeding us, kept so the stream can be rebuilt without
     /// the session noticing.
     shape: Option<(u32, u16)>,
@@ -133,6 +136,7 @@ impl PipeWireAudioOut {
             samples: None,
             quit: None,
             underruns: Arc::new(AtomicU64::new(0)),
+            played: Arc::new(AtomicU64::new(0)),
             shape: None,
             lost: Arc::new(AtomicBool::new(false)),
             last_attempt: None,
@@ -145,6 +149,12 @@ impl PipeWireAudioOut {
     #[must_use]
     pub fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
+    }
+
+    /// See [`AudioOut::frames_played`].
+    #[must_use]
+    pub fn frames_played(&self) -> u64 {
+        self.played.load(Ordering::Relaxed)
     }
 }
 
@@ -202,6 +212,7 @@ impl PipeWireAudioOut {
         let (quit_tx, quit_rx) = pipewire::channel::channel::<()>();
         let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
         let underruns = Arc::clone(&self.underruns);
+        let played = Arc::clone(&self.played);
         let selection = self.selection.clone();
         let lost = Arc::clone(&self.lost);
         lost.store(false, Ordering::Relaxed);
@@ -214,7 +225,7 @@ impl PipeWireAudioOut {
                 samples_rx,
                 quit_rx,
                 &ready_tx,
-                &underruns,
+                &crate::audio_out::StreamCounters { underruns, played },
                 &lost,
             );
         });
@@ -249,6 +260,10 @@ impl AudioOut for PipeWireAudioOut {
         self.stop();
         self.shape = Some((sample_rate, channels));
         self.open(sample_rate, channels)
+    }
+
+    fn frames_played(&self) -> Option<u64> {
+        Some(self.played.load(Ordering::Relaxed))
     }
 
     fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
@@ -297,10 +312,10 @@ fn run_stream(
     samples: Receiver<Vec<f32>>,
     quit: pipewire::channel::Receiver<()>,
     ready: &SyncSender<Result<(), String>>,
-    underruns: &Arc<AtomicU64>,
+    counters: &crate::audio_out::StreamCounters,
     lost: &Arc<AtomicBool>,
 ) {
-    match open_stream(selection, sample_rate, channels, samples, underruns, lost) {
+    match open_stream(selection, sample_rate, channels, samples, counters, lost) {
         Ok((mainloop, _stream, _listener)) => {
             // `stop()` reaches this thread through the channel; quitting the loop ends
             // this scope, and everything the stream owns unwinds with it. Attached
@@ -327,6 +342,7 @@ struct StreamData {
     pending: VecDeque<f32>,
     stride: usize,
     underruns: Arc<AtomicU64>,
+    played: Arc<AtomicU64>,
 }
 
 /// Build and connect the stream. Runs on (and its results must stay on) the audio
@@ -337,7 +353,7 @@ fn open_stream(
     sample_rate: u32,
     channels: u16,
     samples: Receiver<Vec<f32>>,
-    underruns: &Arc<AtomicU64>,
+    counters: &crate::audio_out::StreamCounters,
     lost: &Arc<AtomicBool>,
 ) -> Result<
     (
@@ -387,7 +403,8 @@ fn open_stream(
         rx: samples,
         pending: VecDeque::new(),
         stride,
-        underruns: Arc::clone(underruns),
+        underruns: Arc::clone(&counters.underruns),
+        played: Arc::clone(&counters.played),
     };
     let lost_on_state = Arc::clone(lost);
     let listener = stream
@@ -442,6 +459,10 @@ fn open_stream(
                 if ran_dry {
                     data.underruns.fetch_add(1, Ordering::Relaxed);
                 }
+                // What the graph took, on the device's own clock. Counted even when it
+                // ran dry: the callback still consumed that much time, and a counter that
+                // stalled during an underrun would read as the clock slowing down.
+                data.played.fetch_add(n_frames as u64, Ordering::Relaxed);
                 n_frames
             } else {
                 0

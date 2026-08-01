@@ -5,21 +5,23 @@
 //! audio drifts against its wall-clock video by 40 ms an hour and something has to
 //! reconcile them.
 //!
-//! ## Why this is not two timestamps far apart
+//! ## What has to be counted, and what must not be
 //!
-//! It cannot be read off the stream at all: `stream::audio` places blocks by wall clock
-//! *by construction*, so the tap tracks wall clock no matter what the device does. It has
-//! to be measured at the device.
+//! It cannot be read off the stream: `stream::audio` places blocks by wall clock *by
+//! construction*, so the tap tracks wall clock whatever the device does.
 //!
-//! And the obvious way at the device does not work either. Counting frames a real
-//! [`AudioOut`] accepts measures the device's consumption — a blocking write is accepted
-//! only when the device has made room — but the *queue depth* is a few thousand frames of
-//! noise against a signal of 2.4 frames a second at 50 ppm. Two samples an hour apart
-//! would do it; nobody wants to run this for an hour.
+//! It cannot be read off writes either, and the first version of this tried. `AudioOut::write`
+//! **never blocks** — both real backends `try_send` and drop the newest block on a full
+//! queue rather than back the decode thread up into the adapter — so frames written
+//! measure the *caller's* loop and nothing about the device. Run that way this reported
+//! 4.59 GHz, which is a satisfying kind of wrong: it was measuring how fast a `for` loop
+//! can call `try_send`.
 //!
-//! So it samples once a second and fits a line. The noise is uncorrelated between samples
-//! and the slope's standard error falls as `1/(σ·N^1.5)`: ten minutes at 1 Hz resolves
-//! single-digit ppm, which is far below what would matter.
+//! What advances on the device's clock is the audio callback, so the count comes from
+//! [`AudioOut::frames_played`]. It is sampled once a second and fitted, rather than
+//! divided from two endpoints, because the callback's period quantises each reading by up
+//! to one buffer; the noise is uncorrelated between samples and the slope's standard error
+//! falls as `1/(σ·N^1.5)`, so ten minutes at 1 Hz resolves single-digit ppm.
 //!
 //! ## Reading it
 //!
@@ -68,6 +70,11 @@ fn main() {
     }
     eprintln!("measuring {selection:?} for {seconds}s at {RATE} Hz…");
 
+    if out.frames_played().is_none() {
+        eprintln!("this backend cannot report what the device consumed; nothing to measure");
+        std::process::exit(1);
+    }
+
     // Silence, so this can run against the panel's real sink without anyone hearing it.
     let block = PcmBlock {
         sample_rate: RATE,
@@ -78,33 +85,48 @@ fn main() {
 
     let began = Instant::now();
     let deadline = began + Duration::from_secs(seconds);
-    let mut frames_written: u64 = 0;
-    // (seconds since the fit's origin, frames since the fit's origin).
+    // (seconds since the fit's origin, frames the device consumed since it).
     let mut samples: Vec<(f64, f64)> = Vec::new();
     let mut origin: Option<(Instant, u64)> = None;
     let mut next_sample = began + SETTLE;
+    // Keep roughly this much queued. Writes do not block, so the loop has to pace itself
+    // or it spins; and if it falls behind, the device underruns and the callback consumes
+    // silence — which still advances the clock being measured, but is worth not doing.
+    let mut submitted = Duration::ZERO;
 
     while Instant::now() < deadline {
+        let elapsed = Instant::now().saturating_duration_since(began);
+        if let Some(ahead) = submitted.checked_sub(elapsed) {
+            if let Some(excess) = ahead.checked_sub(Duration::from_millis(200)) {
+                std::thread::sleep(excess);
+            }
+        }
         if let Err(e) = out.write(&block) {
-            eprintln!("the device stopped accepting after {frames_written} frames: {e}");
+            eprintln!("the device stopped accepting: {e}");
             break;
         }
-        frames_written += BLOCK as u64;
+        submitted +=
+            Duration::from_nanos((BLOCK as u64).saturating_mul(1_000_000_000) / u64::from(RATE));
 
         let now = Instant::now();
         if now < next_sample {
             continue;
         }
         next_sample = now + Duration::from_secs(1);
-        let (at, from) = *origin.get_or_insert((now, frames_written));
+        let Some(played) = out.frames_played() else {
+            break;
+        };
+        let (at, from) = *origin.get_or_insert((now, played));
         samples.push((
             now.saturating_duration_since(at).as_secs_f64(),
-            (frames_written - from) as f64,
+            (played - from) as f64,
         ));
     }
+    let underran = out.frames_played().unwrap_or(0);
     out.stop();
+    let _ = underran;
 
-    // Least squares through the samples. The intercept absorbs the queue's standing depth,
+    // Least squares through the samples. The intercept absorbs the callback's phase,
     // which is exactly why this is a fit and not a division.
     let n = samples.len() as f64;
     if n < 10.0 {

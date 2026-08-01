@@ -32,6 +32,40 @@ pub trait AudioOut: Send {
 
     /// Stop and release the device.
     fn stop(&mut self);
+
+    /// How many sample frames the device has actually consumed, if this backend can say.
+    ///
+    /// Not the same as what has been *written*: [`Self::write`] never blocks — both real
+    /// backends drop the newest block on a full queue rather than back the decode thread
+    /// up into the adapter — so frames written measure the *caller's* pace and nothing
+    /// about the device. This counts what the audio callback took, which advances on the
+    /// device's own clock.
+    ///
+    /// That distinction is the whole reason this exists. Sessions pace themselves against
+    /// wall clock (`audio_session::Pace`), the device runs on a crystal that is not wall
+    /// clock, and nothing today reconciles the two — the difference is absorbed as a
+    /// dropped block or an underrun every few minutes. Measuring it is the first step of
+    /// #111, and a mixer would need this to know its own clock.
+    ///
+    /// `None` where the backend cannot answer, which is the honest reply from a sink that
+    /// is not a device.
+    fn frames_played(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// What a live output stream reports about itself, shared with the thread that owns it.
+///
+/// Two counters that always travel together: how often the callback found nothing to play,
+/// and how much it has played. Bundled because they are handed to the same thread at the
+/// same moment and neither is meaningful without knowing the run it belongs to.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamCounters {
+    /// Callbacks that ran dry.
+    pub underruns: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Sample frames the callback consumed — the device's own clock. See
+    /// [`AudioOut::frames_played`].
+    pub played: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// How a pipeline obtains an audio output device.
@@ -202,6 +236,9 @@ mod cpal_backend {
         samples: Option<SyncSender<Vec<f32>>>,
         shutdown: Option<SyncSender<()>>,
         underruns: Arc<AtomicU64>,
+        /// Sample frames the device's callback has consumed. The device's own clock; see
+        /// [`AudioOut::frames_played`] for why this is not the same as frames written.
+        played: Arc<AtomicU64>,
         /// Present only when the device would not take the source's rate. `None` is both
         /// the common case and the fast path — no conversion, no allocation, no quality
         /// question to answer.
@@ -258,6 +295,7 @@ mod cpal_backend {
                 samples: None,
                 shutdown: None,
                 underruns: Arc::new(AtomicU64::new(0)),
+                played: Arc::new(AtomicU64::new(0)),
                 resampler: None,
                 shape: None,
                 opened: None,
@@ -277,6 +315,12 @@ mod cpal_backend {
         #[must_use]
         pub fn underruns(&self) -> u64 {
             self.underruns.load(Ordering::Relaxed)
+        }
+
+        /// See [`AudioOut::frames_played`].
+        #[must_use]
+        pub fn frames_played(&self) -> u64 {
+            self.played.load(Ordering::Relaxed)
         }
     }
 
@@ -309,6 +353,7 @@ mod cpal_backend {
             // audio actually went.
             let (ready_tx, ready_rx) = sync_channel::<Result<(u32, String), String>>(1);
             let underruns = Arc::clone(&self.underruns);
+            let played = Arc::clone(&self.played);
             let selection = self.selection.clone();
             let lost = Arc::clone(&self.lost);
             lost.store(false, Ordering::Relaxed);
@@ -320,7 +365,7 @@ mod cpal_backend {
                     sample_rate,
                     channels,
                     samples_rx,
-                    underruns,
+                    super::StreamCounters { underruns, played },
                     strict,
                     &lost,
                 ) {
@@ -448,6 +493,10 @@ mod cpal_backend {
     }
 
     impl AudioOut for CpalAudioOut {
+        fn frames_played(&self) -> Option<u64> {
+            Some(self.played.load(Ordering::Relaxed))
+        }
+
         fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
             self.stop();
             self.shape = Some((sample_rate, channels));
@@ -652,7 +701,7 @@ mod cpal_backend {
         sample_rate: u32,
         channels: u16,
         rx: Receiver<Vec<f32>>,
-        underruns: Arc<AtomicU64>,
+        counters: super::StreamCounters,
         strict: bool,
         lost: &Arc<AtomicBool>,
     ) -> Result<(cpal::Stream, u32, String), String> {
@@ -666,6 +715,9 @@ mod cpal_backend {
             sample_rate: cpal::SampleRate(opened_at),
             buffer_size: cpal::BufferSize::Default,
         };
+        // Samples per frame, for turning the callback's slice length into a frame count.
+        let frame_size = usize::from(channels.max(1));
+        let super::StreamCounters { underruns, played } = counters;
 
         let mut pending: std::collections::VecDeque<f32> = std::collections::VecDeque::new();
         let stream = device
@@ -692,6 +744,10 @@ mod cpal_backend {
                             }
                         }
                     }
+                    // What the device took, on its own clock. Counted even when it ran
+                    // dry: the callback still consumed that much time, and a counter that
+                    // stalled during an underrun would read as the clock slowing down.
+                    played.fetch_add((out.len() / frame_size) as u64, Ordering::Relaxed);
                     if ran_dry {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
