@@ -637,6 +637,25 @@ during the port, in the order they can kill or reshape it.
   milliseconds also says the CDM was *found* rather than fetched — this is not a cache
   hit dressed up as offline support.
 
+  **The staging is now part of the receiver — 2026-07-31.** For as long as this entry has
+  existed, the property above was true only of a profile a *human* had staged: nothing
+  invoked `stage-widevine.sh`, and the `CASTAWAY_WIDEVINE_CDM` the Linux wrapper has
+  always set had no reader anywhere in the tree. On Windows there is not even a shell to
+  run it with. So a measurement that was real described no shipped artifact. It is now
+  `stageWidevine()` in `browser-host/main.js` — synchronous at module load, before
+  `components` starts looking, idempotent after first boot, and warning-only on every
+  failure path (G31). Re-measured on Linux under `unshare -r -n`, with the control:
+
+  | profile | network | result |
+  |---|---|---|
+  | cold, staging on | **none** | staged 4.10.2934.0, ECS reports it `new`, `ready` sent |
+  | cold, staging off | **none** | `Failed to install required components` |
+  | warm | — | no re-copy, `ready` sent |
+
+  The script stays as the standalone reproducer for the table below — it stages a profile
+  without launching castaway, which is what lets `widevine-probe.js` judge one against an
+  empty one — but it is no longer what ships.
+
   The staging layout is ECS's own, read off a run that fetched rather than from docs:
   `WidevineCdm/<version>/{manifest.json,_platform_specific/<plat>/}` plus a
   `latest-component-updated-widevine-cdm` marker holding an **absolute** path to the

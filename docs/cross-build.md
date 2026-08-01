@@ -84,11 +84,14 @@ Three things about the box drove the design, all measured rather than assumed:
   the interactive token of the logged-on user — is what reaches it. `tasklist /V` confirming
   `Session#: 2` is how this was established, and is how to re-establish it if a launch ever
   stops showing up.
-- **Nothing sets `CASTAWAY_ELECTRON` on Windows.** The Linux artifact is `wrapProgram`ped
-  (`nix/linux-kiosk.nix`); the Windows tree is a flat directory with no wrapper, so the receiver
-  would look for a bare `electron` on `PATH` and not find it. The generated `run.cmd` supplies
-  `CASTAWAY_ELECTRON` and `CASTAWAY_BROWSER_APP` relative to itself. Launching `castaway.exe`
-  by hand on the box without those is a browser-less run that reports no error worth noticing.
+- **The Windows tree has no wrapper.** The Linux artifact is `wrapProgram`ped
+  (`nix/linux-kiosk.nix`) and so has `$CASTAWAY_ELECTRON` handed to it; the Windows tree is a
+  flat directory, and a receiver that only knew the environment variable looked for a bare
+  `electron` on `PATH`. Fixed in the receiver rather than in the launcher: `Config::
+  browser_program`/`browser_app_dir` fall back to `browser/electron[.exe]` and `browser-host/`
+  beside `current_exe()`, and `stageWidevine()` finds `WidevineCdm/` the same way. `run.cmd`
+  therefore sets nothing, on purpose — if the sibling resolution regresses, it should surface
+  here rather than be papered over by the deploy script.
 - **The SSH session is elevated and cmd.exe is the shell.** `netsh`/`New-NetFirewallRule` work
   without a UAC dance, which is what makes `windows-firewall` possible at all; and `;` is not a
   separator, `&` is.
