@@ -119,6 +119,8 @@ d3d12 = { version = "22", optional = true }
 
 [dev-dependencies]
 base64.workspace = true
+# The output-stream round trip writes its segments somewhere libavformat can open them.
+tempfile.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 serde.workspace = true
@@ -236,6 +238,12 @@ required-features = ["render"]
 [[test]]
 name = "hwaccel_zero_copy"
 required-features = ["hwaccel"]
+
+# The output duplicate, end to end and back through libavformat (#101). Needs a GPU and an
+# H.264 encoder; where either is missing it says so and passes.
+[[test]]
+name = "output_stream"
+required-features = ["stream"]
 
 # Regenerates the checked-in LDAC test vectors with the library's own encoder. Not part of
 # any test run — the fixtures it writes are, and they are checked in so the decode tests do

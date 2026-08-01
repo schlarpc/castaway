@@ -211,18 +211,11 @@ fn encode_loop(
                 return;
             }
         };
-    state.go_live(
-        fmp4::init_segment(encoder.config(), width, height),
-        StreamStatus::Live {
-            encoder: encoder.name().to_string(),
-            width,
-            height,
-            codec: encoder.config().codec_string(),
-        },
-    );
-
     let mut segmenter = Segmenter::new(config.segment);
     let mut previous: Option<Nv12Planes> = None;
+    // Whether the init segment has been published. Deliberately not "has the encoder
+    // opened": the track cannot be described until a frame has come out of it.
+    let mut live = false;
     while let Ok(job) = jobs.recv() {
         // The duplicates go first: they are the slots between the last published frame and
         // this one, and an encoder codes a repeated picture as almost nothing.
@@ -237,6 +230,25 @@ fn encode_loop(
         for planes in frames {
             match encoder.encode(planes) {
                 Ok(samples) => {
+                    // The init segment is written from the first frame's parameter sets,
+                    // not from the encoder's `extradata`, and this is where the difference
+                    // lands: `h264_vaapi` publishes an `extradata` PPS that disagrees with
+                    // the one its bitstream actually uses, and describing the track with
+                    // the wrong one produces segments that are structurally perfect and
+                    // decode to grey (`AvcConfig::absorb`).
+                    if !samples.is_empty() && !live {
+                        live = true;
+                        let config = encoder.describe().clone();
+                        state.go_live(
+                            fmp4::init_segment(&config, width, height),
+                            StreamStatus::Live {
+                                encoder: encoder.name().to_string(),
+                                width,
+                                height,
+                                codec: config.codec_string(),
+                            },
+                        );
+                    }
                     for sample in samples {
                         if let Some(segment) = segmenter.push(sample) {
                             state.publish(segment);

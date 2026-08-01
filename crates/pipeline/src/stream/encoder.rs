@@ -166,6 +166,10 @@ pub struct H264Encoder {
     duration: u32,
     /// The next frame's timestamp, in the encoder's own `1/fps` time base.
     pts: i64,
+    /// Set once an init segment has been written from [`Self::config`]. Before that, a
+    /// change in the parameter sets is a *correction*; after it, there is nowhere left to
+    /// put one.
+    described: bool,
 }
 
 // SAFETY: every pointer here is owned solely by this struct, is created and destroyed by
@@ -249,6 +253,7 @@ impl H264Encoder {
             height,
             duration: rate.sample_duration_ticks(),
             pts: 0,
+            described: false,
         };
         // SAFETY: `encoder` is freshly constructed with every pointer null, which is what
         // `build` requires and what `Drop` tolerates if this returns early.
@@ -470,9 +475,21 @@ impl H264Encoder {
         self.choice.delivery
     }
 
-    /// The parameter sets, for the init segment.
+    /// The parameter sets as currently understood.
+    ///
+    /// Not final until at least one frame has been encoded: the sets an encoder publishes
+    /// in `extradata` are not always the ones its bitstream uses, and the first access
+    /// unit is what settles it ([`AvcConfig::absorb`]). Use [`Self::describe`] when the
+    /// answer is about to be written into an init segment.
     #[must_use]
     pub const fn config(&self) -> &AvcConfig {
+        &self.config
+    }
+
+    /// The parameter sets, taken as final because an init segment is about to be written
+    /// from them. A later change is then reported rather than silently applied.
+    pub fn describe(&mut self) -> &AvcConfig {
+        self.described = true;
         &self.config
     }
 
@@ -588,6 +605,18 @@ impl H264Encoder {
                     packet.flags & sys::AV_PKT_FLAG_KEY as c_int != 0,
                 )
             };
+            // The parameter sets this access unit carries in-band, if they disagree with
+            // what `extradata` said. See `AvcConfig::absorb` for why one encoder does.
+            if self.config.absorb(bytes) && self.described {
+                // Past the init segment there is nowhere to put a new `avcC`: an `avc1`
+                // track describes its decoder once. Nothing here can fix that, and a
+                // silent one would be a picture that degrades for no visible reason.
+                tracing::warn!(
+                    encoder = self.choice.name,
+                    "the encoder changed its parameter sets mid-stream; the init segment \
+                     no longer describes it"
+                );
+            }
             // `None` where the access unit was nothing but parameter sets, which some
             // encoders emit beside a keyframe and which is not a picture.
             if let Some(data) = fmp4::annexb_to_avcc(bytes) {

@@ -80,14 +80,36 @@ impl AvcConfig {
 
     fn from_annexb(data: &[u8]) -> Self {
         let mut out = Self::default();
-        for nal in nal_units(data) {
+        out.absorb(data);
+        out
+    }
+
+    /// Replace these parameter sets with the ones `access_unit` carries in-band, if it
+    /// carries any. Answers whether that changed anything.
+    ///
+    /// **The bitstream wins over `extradata`, and this is not paranoia.** `h264_vaapi` on
+    /// Mesa publishes an `extradata` PPS that disagrees with the PPS it then emits beside
+    /// every keyframe — one bit of `transform_8x8_mode_flag` apart. Describe the track
+    /// with the former and every slice is CABAC-decoded against the wrong PPS: the
+    /// decoder desynchronises at macroblock 0 of the first frame and the picture is a flat
+    /// grey. The segments are structurally perfect, so nothing short of decoding one
+    /// notices — which is what `tests/output_stream.rs` is for.
+    pub fn absorb(&mut self, access_unit: &[u8]) -> bool {
+        let mut found = Self::default();
+        for nal in nal_units(access_unit) {
             match NalKind::of(nal) {
-                Some(NalKind::Sps) => out.sps.push(nal.to_vec()),
-                Some(NalKind::Pps) => out.pps.push(nal.to_vec()),
+                Some(NalKind::Sps) => found.sps.push(nal.to_vec()),
+                Some(NalKind::Pps) => found.pps.push(nal.to_vec()),
                 _ => {}
             }
         }
-        out
+        // A partial set is not a set: an access unit with a PPS and no SPS must not blank
+        // the SPS the encoder published.
+        if found.sps.is_empty() || found.pps.is_empty() || found == *self {
+            return false;
+        }
+        *self = found;
+        true
     }
 
     /// Unpack an `AVCDecoderConfigurationRecord` back into its parameter sets.

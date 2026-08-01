@@ -51,8 +51,11 @@ use hls::{LiveWindow, Segment};
 
 /// How the duplicate is produced. Every field here is a trade between what the stream
 /// costs the panel and what it looks like at the other end.
+///
+/// Not `#[non_exhaustive]`: that would stop a caller writing `StreamConfig { rate, ..
+/// Default::default() }`, which is exactly the idiom this is for, and the struct already
+/// has a `Default` that absorbs a new field for anyone who does not care about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct StreamConfig {
     /// Frames a second the stream publishes.
     pub rate: FrameRate,
