@@ -162,7 +162,7 @@ pub(crate) fn cpal_devices() -> Result<Vec<OutputDeviceInfo>, PipelineError> {
 
 #[cfg(feature = "audio-out")]
 mod cpal_backend {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
     use std::sync::Arc;
 
@@ -181,6 +181,15 @@ mod cpal_backend {
     /// a beat later.
     const QUEUE_BLOCKS: usize = 96;
 
+    /// How often a lost endpoint is retried. Fast enough that a waking monitor costs a
+    /// beat rather than a song, slow enough that a device which is never coming back does
+    /// not spin a core.
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// How often the OS default is re-checked under `SystemDefault`. Enumerating audio
+    /// endpoints is a COM round trip, so it does not belong on the per-block path.
+    const CHECK_DEFAULT_EVERY: std::time::Duration = std::time::Duration::from_millis(1000);
+
     /// A real output device.
     ///
     /// The `cpal::Stream` handle is deliberately *not* stored here. It is not `Send` on
@@ -197,6 +206,26 @@ mod cpal_backend {
         /// the common case and the fast path — no conversion, no allocation, no quality
         /// question to answer.
         resampler: Option<Resampler>,
+        /// The shape the session is feeding us, kept so the output can be reopened
+        /// without the session having to notice anything happened.
+        shape: Option<(u32, u16)>,
+        /// The device we actually landed on, which is not the same as the selection —
+        /// `SystemDefault` is a rule for *choosing*, and this is what it chose.
+        opened: Option<String>,
+        /// Set by the device callback when the endpoint is invalidated. An `Arc` because
+        /// that callback lives on the audio thread and outlives any borrow of `self`.
+        lost: Arc<AtomicBool>,
+        /// When recovery last tried, so a dead endpoint is not hammered once per block.
+        last_attempt: Option<std::time::Instant>,
+        /// When the default device was last checked, so enumerating the OS's endpoints
+        /// does not happen on the audio path once per block either.
+        last_check: Option<std::time::Instant>,
+        /// Whether the current outage has been logged, so it is one line and not one per
+        /// audio block.
+        outage_logged: bool,
+        /// How many times the endpoint has been invalidated this session. A flapping
+        /// device should read as one recurring fault, not a series of unrelated ones.
+        invalidations: u64,
     }
 
     impl std::fmt::Debug for CpalAudioOut {
@@ -230,6 +259,13 @@ mod cpal_backend {
                 shutdown: None,
                 underruns: Arc::new(AtomicU64::new(0)),
                 resampler: None,
+                shape: None,
+                opened: None,
+                lost: Arc::new(AtomicBool::new(false)),
+                last_attempt: None,
+                last_check: None,
+                outage_logged: false,
+                invalidations: 0,
             }
         }
 
@@ -244,32 +280,59 @@ mod cpal_backend {
         }
     }
 
-    impl AudioOut for CpalAudioOut {
-        fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
-            self.stop();
+    /// How hard an open should hold to the device the session is already using.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Loyalty {
+        /// Resolve the selection from scratch. What a fresh session does.
+        AsSelected,
+        /// Reopening mid-session. Under `Device` the named endpoint is the only
+        /// acceptable answer; under `SystemDefault` the *current* default is, because
+        /// that selection means "follow the default" and following it is the point.
+        Reopening,
+    }
+
+    impl CpalAudioOut {
+        /// Open the device and start the stream, replacing anything already open.
+        fn open(
+            &mut self,
+            sample_rate: u32,
+            channels: u16,
+            loyalty: Loyalty,
+        ) -> Result<(), PipelineError> {
             let (samples_tx, samples_rx) = sync_channel::<Vec<f32>>(QUEUE_BLOCKS);
             let (shutdown_tx, shutdown_rx) = sync_channel::<()>(1);
-            // The thread reports whether the device opened, so `start` can still fail
+            // The thread reports whether the device opened, so this can still fail
             // synchronously — a receiver that pairs and then silently plays nothing is
-            // the failure this whole path exists to avoid.
-            // The thread reports the rate it actually opened at, which is not always the
-            // one asked for — see `choose_rate`.
+            // the failure this whole path exists to avoid. It reports the rate it landed
+            // on too, which is not always the one asked for (see `choose_rate`), and the
+            // device's name, which under `SystemDefault` is the only record of where the
+            // audio actually went.
             let (ready_tx, ready_rx) = sync_channel::<Result<(u32, String), String>>(1);
             let underruns = Arc::clone(&self.underruns);
             let selection = self.selection.clone();
+            let lost = Arc::clone(&self.lost);
+            lost.store(false, Ordering::Relaxed);
+            let strict = loyalty == Loyalty::Reopening;
 
             std::thread::spawn(move || {
-                let stream =
-                    match open_stream(&selection, sample_rate, channels, samples_rx, underruns) {
-                        Ok((s, opened_at, device)) => {
-                            let _ = ready_tx.send(Ok((opened_at, device)));
-                            s
-                        }
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(e));
-                            return;
-                        }
-                    };
+                let stream = match open_stream(
+                    &selection,
+                    sample_rate,
+                    channels,
+                    samples_rx,
+                    underruns,
+                    strict,
+                    &lost,
+                ) {
+                    Ok((s, opened_at, device)) => {
+                        let _ = ready_tx.send(Ok((opened_at, device)));
+                        s
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
                 // Park until stop() drops the sender or sends. The stream lives exactly
                 // as long as this scope, on this thread, and never crosses a boundary.
                 let _ = shutdown_rx.recv();
@@ -294,6 +357,7 @@ mod cpal_backend {
                         );
                         Some(Resampler::new(sample_rate, opened_at, channels)?)
                     };
+                    self.opened = Some(device);
                     self.samples = Some(samples_tx);
                     self.shutdown = Some(shutdown_tx);
                     Ok(())
@@ -303,7 +367,116 @@ mod cpal_backend {
             }
         }
 
+        /// Tear down the stream but keep the session's shape, so it can be reopened.
+        fn release(&mut self) {
+            self.resampler = None;
+            self.samples = None;
+            self.opened = None;
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.try_send(());
+            }
+        }
+
+        /// Reopen after an invalidation, at most once every [`RETRY_EVERY`].
+        ///
+        /// Returns whether the output is playable again. A `false` is not a failure — it
+        /// is a device that has not come back yet, and the session stays alive across it.
+        /// The alternative, which this replaces, was ending a session someone was
+        /// listening to because their monitor went to sleep.
+        fn recover(&mut self) -> bool {
+            let Some((rate, channels)) = self.shape else {
+                return false;
+            };
+            let now = std::time::Instant::now();
+            if self
+                .last_attempt
+                .is_some_and(|last| now.duration_since(last) < RETRY_EVERY)
+            {
+                return false;
+            }
+            self.last_attempt = Some(now);
+            self.release();
+            match self.open(rate, channels, Loyalty::Reopening) {
+                Ok(()) => {
+                    info!("audio output recovered");
+                    self.outage_logged = false;
+                    true
+                }
+                Err(e) => {
+                    if !self.outage_logged {
+                        self.outage_logged = true;
+                        // Named once per outage rather than per block, and at WARN because
+                        // it is survivable: the session is still up and will resume the
+                        // moment the endpoint returns.
+                        warn!(
+                            error = %e,
+                            invalidations = self.invalidations,
+                            "audio output is gone; waiting for it rather than ending the session"
+                        );
+                    }
+                    false
+                }
+            }
+        }
+
+        /// Whether the device we are on is no longer the one we should be on.
+        ///
+        /// Only meaningful for [`OutputSelection::SystemDefault`], which means "follow the
+        /// default" — so when the OS default moves (headphones arrive, a slept monitor's
+        /// HDMI endpoint comes back), the stream should move with it. A pinned
+        /// `Device` selection deliberately does not drift.
+        fn default_moved(&mut self) -> bool {
+            if self.selection != OutputSelection::SystemDefault {
+                return false;
+            }
+            let now = std::time::Instant::now();
+            if self
+                .last_check
+                .is_some_and(|last| now.duration_since(last) < CHECK_DEFAULT_EVERY)
+            {
+                return false;
+            }
+            self.last_check = Some(now);
+            let Some(opened) = self.opened.as_deref() else {
+                return false;
+            };
+            let host = cpal::default_host();
+            host.default_output_device()
+                .and_then(|d| d.name().ok())
+                .is_some_and(|current| current != opened)
+        }
+    }
+
+    impl AudioOut for CpalAudioOut {
+        fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
+            self.stop();
+            self.shape = Some((sample_rate, channels));
+            // Honour the selection as written, falling back if a named device is absent:
+            // at session start there is nothing to be loyal to yet.
+            self.open(sample_rate, channels, Loyalty::AsSelected)
+        }
+
         fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
+            // An endpoint that went away, or a default that moved out from under us.
+            // Neither ends the session any more: live audio is dropped while the output
+            // is unavailable, which is the same trade the rest of the pipeline makes
+            // (latency beats freshness), and playback resumes when it returns.
+            if self.lost.swap(false, Ordering::Relaxed) {
+                self.invalidations += 1;
+                self.release();
+            }
+            if self.samples.is_none() {
+                if !self.recover() {
+                    return Ok(());
+                }
+            } else if self.default_moved() {
+                info!("audio output: the system default moved; following it");
+                self.last_attempt = None;
+                if !self.recover() {
+                    return Ok(());
+                }
+            }
+
             // Convert before borrowing the sender: resampling needs `&mut self` and is
             // deliberately done here, on the decode thread, rather than in the device
             // callback where allocating would be a dropout.
@@ -312,7 +485,7 @@ mod cpal_backend {
                 None => None,
             };
             let Some(tx) = self.samples.as_ref() else {
-                return Err(PipelineError::Audio("audio output not started".into()));
+                return Ok(());
             };
             let payload = converted.unwrap_or_else(|| block.samples.clone());
             match tx.try_send(payload) {
@@ -324,8 +497,11 @@ mod cpal_backend {
                     warn!("audio output queue full; dropping a block");
                     Ok(())
                 }
+                // The owning thread is gone, which is not the same as the device being
+                // invalidated: nothing will bring it back on its own, so reopen.
                 Err(TrySendError::Disconnected(_)) => {
-                    Err(PipelineError::Audio("audio device went away".into()))
+                    self.release();
+                    Ok(())
                 }
             }
         }
@@ -342,11 +518,11 @@ mod cpal_backend {
                     Err(e) => warn!(error = %e, "audio output: resampler tail was lost"),
                 }
             }
-            self.resampler = None;
-            self.samples = None;
-            if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.try_send(());
-            }
+            self.release();
+            self.shape = None;
+            self.last_attempt = None;
+            self.last_check = None;
+            self.outage_logged = false;
         }
     }
 
@@ -373,7 +549,25 @@ mod cpal_backend {
     /// rather than failing the session: the case this happens in is a USB DAC that was
     /// unplugged, and a panel that goes silent because its favourite device left is
     /// worse than one that plays from the wrong speakers and says so.
-    fn pick_device(host: &cpal::Host, selection: &OutputSelection) -> Result<cpal::Device, String> {
+    fn pick_device(
+        host: &cpal::Host,
+        selection: &OutputSelection,
+        strict: bool,
+    ) -> Result<cpal::Device, String> {
+        if let OutputSelection::Device(name) = selection {
+            if strict {
+                // Reopening mid-session: the named endpoint is the only acceptable
+                // answer. Falling back here is what turns a sleeping monitor into audio
+                // played out of a disconnected analog jack — a retry that substitutes
+                // does not wait, it succeeds immediately on the wrong device, and nothing
+                // ever moves it back.
+                return host
+                    .output_devices()
+                    .map_err(|e| format!("listing output devices: {e}"))?
+                    .find(|d| d.name().is_ok_and(|n| n == *name))
+                    .ok_or_else(|| format!("device {name:?} is not present"));
+            }
+        }
         if let OutputSelection::Device(name) = selection {
             let found = host
                 .output_devices()
@@ -459,9 +653,11 @@ mod cpal_backend {
         channels: u16,
         rx: Receiver<Vec<f32>>,
         underruns: Arc<AtomicU64>,
+        strict: bool,
+        lost: &Arc<AtomicBool>,
     ) -> Result<(cpal::Stream, u32, String), String> {
         let host = cpal::default_host();
-        let device = pick_device(&host, selection)?;
+        let device = pick_device(&host, selection, strict)?;
         let name = device.name().unwrap_or_else(|_| "<unnamed>".to_owned());
         let opened_at = choose_rate(&device, sample_rate, channels)?;
 
@@ -500,7 +696,19 @@ mod cpal_backend {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
                 },
-                move |err| warn!(error = %err, "audio output stream error"),
+                {
+                    let lost = Arc::clone(lost);
+                    move |err| {
+                        // `DeviceNotAvailable` is what cpal reports for
+                        // AUDCLNT_E_DEVICE_INVALIDATED — the endpoint was removed or
+                        // reconfigured. Recoverable, and flagged rather than logged here
+                        // because this runs on the audio thread.
+                        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                            lost.store(true, Ordering::Relaxed);
+                        }
+                        warn!(error = %err, "audio output stream error");
+                    }
+                },
                 None,
             )
             .map_err(|e| format!("build output stream: {e}"))?;
