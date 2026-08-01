@@ -238,6 +238,13 @@ required-features = ["render"]
 name = "shell_preview"
 required-features = ["render"]
 
+# Stage 0 of #111: the audio device's clock against CLOCK_MONOTONIC, in ppm. Needs a real
+# output device — the whole point is to measure one — so it is an example rather than a
+# test: CI has no sound card and the answer is hardware's, not the code's.
+[[example]]
+name = "audio_drift"
+required-features = ["audio-out"]
+
 [[test]]
 name = "hwaccel_zero_copy"
 required-features = ["hwaccel"]
