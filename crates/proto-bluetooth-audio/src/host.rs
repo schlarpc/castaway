@@ -128,9 +128,11 @@ impl Default for HostConfig {
 ///
 /// Both AVRCP roles appear because we publish both records: Controller to drive the
 /// phone's player, Target so its volume rocker reaches us (Q24).
-const SERVICE_CLASSES: [u16; 4] = [
+const SERVICE_CLASSES: [u16; 5] = [
     0x110B, // Audio Sink — the A2DP half.
     0x110C, // A/V Remote Control Target — the volume-rocker half.
+    0x110D, // Advanced Audio Distribution — a profile UUID, published as a class on
+    // purpose so KDE stops calling us "Other device"; see `a2dp_sink` and D48.
     0x110E, // A/V Remote Control — the generic class every AVRCP role carries.
     0x110F, // A/V Remote Control Controller — the role we play toward the phone's player.
 ];

@@ -253,24 +253,42 @@ fn base(handle: u32, name: &str, classes: Vec<Uuid>) -> ServiceRecord {
 }
 
 /// The A2DP Sink record: "this device accepts an audio stream on PSM 0x0019".
+///
+/// The class list carries `0x110D` (Advanced Audio Distribution) alongside `0x110B`, and
+/// that is a **deliberate deviation** — do not "correct" it. A2DP puts `0x110D` in the
+/// profile descriptor list, where we also publish it; a strictly conformant sink's
+/// `ServiceClassIDList` holds `0x110B` alone.
+///
+/// It is here for KDE. Plasma's Bluetooth applet labels a device by mapping its class of
+/// device, and for a loudspeaker that lands on `Device::AudioVideo` — a case its QML
+/// tests for under a name (`OtherAudio`) that exists in no version of BlueZ-Qt, so the
+/// branch is dead and every speaker falls through to a fallback that searches the UUID
+/// list for `0x110D` and never for `0x110B`. A spec-correct sink is therefore guaranteed
+/// to render as "Other device". Publishing the profile UUID as a class costs nothing a
+/// sender can observe — the record still says AudioSink over AVDTP — and is the only
+/// lever we hold on that label. See D48.
 #[must_use]
 pub fn a2dp_sink(handle: u32, name: &str) -> ServiceRecord {
-    base(handle, name, vec![Uuid::AUDIO_SINK])
-        .with(
-            attr::PROTOCOL_DESCRIPTOR_LIST,
-            DataElement::Sequence(vec![
-                proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0019)]),
-                proto(Uuid::AVDTP, vec![DataElement::Uint16(0x0103)]),
-            ]),
-        )
-        .with(
-            attr::BLUETOOTH_PROFILE_DESCRIPTOR_LIST,
-            DataElement::Sequence(vec![profile(Uuid::ADVANCED_AUDIO_DISTRIBUTION, 0x0103)]),
-        )
-        .with(
-            attr::SUPPORTED_FEATURES,
-            DataElement::Uint16(a2dp_features::SPEAKER),
-        )
+    base(
+        handle,
+        name,
+        vec![Uuid::AUDIO_SINK, Uuid::ADVANCED_AUDIO_DISTRIBUTION],
+    )
+    .with(
+        attr::PROTOCOL_DESCRIPTOR_LIST,
+        DataElement::Sequence(vec![
+            proto(Uuid::L2CAP, vec![DataElement::Uint16(0x0019)]),
+            proto(Uuid::AVDTP, vec![DataElement::Uint16(0x0103)]),
+        ]),
+    )
+    .with(
+        attr::BLUETOOTH_PROFILE_DESCRIPTOR_LIST,
+        DataElement::Sequence(vec![profile(Uuid::ADVANCED_AUDIO_DISTRIBUTION, 0x0103)]),
+    )
+    .with(
+        attr::SUPPORTED_FEATURES,
+        DataElement::Uint16(a2dp_features::SPEAKER),
+    )
 }
 
 /// The AVRCP **Controller** record.
@@ -355,6 +373,24 @@ mod tests {
         assert_eq!(rec.l2cap_psm(attr::PROTOCOL_DESCRIPTOR_LIST), Some(0x0019));
         assert_eq!(rec.name(), Some("Hackerspace TV"));
         assert_eq!(rec.handle(), Some(0x0001_0000));
+    }
+
+    #[test]
+    fn the_sink_record_deliberately_over_advertises_the_a2dp_profile_uuid() {
+        // Reads like a bug and is not one. A2DP puts 0x110D in the profile descriptor
+        // list; a conformant sink's class list holds 0x110B alone. KDE's Bluetooth
+        // applet searches the UUID list for 0x110D and never for 0x110B, so a correct
+        // sink is labelled "Other device" (D48). If this assertion is ever "fixed",
+        // read D48 first — the deviation is the point.
+        let rec = a2dp_sink(0x0001_0000, "x");
+        assert!(rec.has_class(Uuid::AUDIO_SINK));
+        assert!(
+            rec.has_class(Uuid::ADVANCED_AUDIO_DISTRIBUTION),
+            "0x110D is published as a service class on purpose; see D48"
+        );
+        // The lie stops at the class list: the record still describes a sink, so nothing
+        // a sender actually acts on has changed.
+        assert_eq!(rec.l2cap_psm(attr::PROTOCOL_DESCRIPTOR_LIST), Some(0x0019));
     }
 
     #[test]

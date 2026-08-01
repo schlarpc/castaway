@@ -1450,3 +1450,50 @@ re-reporting the new rate on its blocks, which is correct as far as it goes; the
 not reopened, so a sender that switches rate mid-session will play at the wrong pitch until the
 session restarts. That is a pre-existing property of `audio_session::run` rather than something
 LDAC introduced — but LDAC is the first codec that can actually trigger it.
+
+### D48 — Advertise A2DP's profile UUID as a service class, because KDE's label is unreachable otherwise
+
+The panel showed up in Plasma's Bluetooth applet as "Other device". Nothing about that was
+our bug, and the fix is still ours, which is the whole reason this entry exists.
+
+The chain, traced against BlueZ-Qt 6.26.0 and bluedevil 6.6.5 on the dev box. Our class of
+device is `0x00240414` — major Audio/Video, minor Loudspeaker, service bits Audio and
+Rendering. BlueZ-Qt's `classToType` reads the minor class, finds no special case for a
+loudspeaker, and returns `Device::AudioVideo`. Correct. Then `DeviceItem.qml` switches on
+that type and tests `case BluezQt.Device.OtherAudio` — an enumerator that exists in no
+version of BlueZ-Qt, master included. In QML that expression is `undefined`, never equals
+an integer, and the "Audio device" branch is dead code. Every device whose minor class maps
+to `AudioVideo` — which is to say every loudspeaker — falls through to a fallback that
+searches the UUID list for `0x110D` (Advanced Audio Distribution) and never for `0x110B`
+(Audio Sink). A2DP puts `0x110D` in the profile descriptor list, not the class list, so a
+strictly conformant sink does not publish it where BlueZ collects device UUIDs from. The
+fallback finds nothing and prints "Other device".
+
+So a spec-correct A2DP loudspeaker is *guaranteed* to be mislabelled by Plasma 6.6.5. Two
+stacked upstream defects, neither of which we can reach from the wire.
+
+Decided: publish `0x110D` in the sink record's `ServiceClassIDList` alongside `0x110B`, and
+list it in the extended inquiry response for the same reason. This is a deviation and is
+marked as one at both sites, with a test that fails if someone tidies it away.
+
+What justifies it: nothing a sender acts on changes. The record still describes AudioSink
+over AVDTP on PSM 0x0019, the profile descriptor list is untouched, and a sender searching
+for `0x110B` finds exactly what it found before. A sender that searches for `0x110D` now
+matches and gets a record that correctly identifies itself as a sink. The cost is one extra
+UUID in a list; the benefit is the device naming itself correctly in the desktop environment
+most likely to be sitting next to it.
+
+What it forecloses: little, but it is a precedent worth bounding. The test that this is a
+*claim about a service*, not a *claim about a capability we lack* — the profile genuinely is
+implemented, it is merely being announced in the adjacent field. A future request to
+advertise something we do not implement, to satisfy some other control point's parser, does
+not follow from this and should be refused.
+
+Corroboration worth keeping: the AirPods Pro paired to the same adapter also omit `0x110D`.
+They escape the bug only because their minor class is Headphones, which is a live branch in
+that switch. That is the control which proves the class list, not our SDP, is what decides
+the label.
+
+Not done: the bluedevil bug is unreported upstream. Both halves are one-line fixes there
+(`OtherAudio` → `AudioVideo`, and checking `AudioSink` in the fallback), and reporting it is
+strictly better than our workaround for everyone who is not us.
