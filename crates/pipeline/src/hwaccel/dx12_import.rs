@@ -8,10 +8,26 @@
 //! What it does need is [`wgpu::Features::TEXTURE_FORMAT_NV12`], for the same reason
 //! Linux does: without per-plane views there is no way to sample the surface.
 //!
-//! Opened resources are cached by handle value. The producer cycles a small ring of
-//! textures ([`super::d3d11va::POOL_DEPTH`] of them), so the same handles recur and the
-//! cache converges to that ring after the first few frames rather than re-opening on
-//! every one.
+//! Resources are opened per frame, not cached. There *was* a cache keyed on the shared
+//! handle's value, on the stated premise that "the producer cycles a small ring of
+//! textures, so the same handles recur". The premise was false about its own producer:
+//! [`super::d3d11va::D3d11Exporter::export`] mints a fresh NT handle with
+//! `CreateSharedHandle` on every frame and closes it when that frame is released. The ring
+//! it cycles is textures, not handles.
+//!
+//! Windows reuses freed handle-table slots aggressively, so the values recurred anyway —
+//! on a period unrelated to the four-slot texture ring. A "hit" therefore returned the
+//! D3D12 resource belonging to *a different pool slot*: a texture holding an older frame,
+//! or one the decode thread was writing into at that moment. That is what stale, juddering
+//! mirroring looked like, and — because a rebuilt ring after a resolution change mints
+//! handles whose values collide with the just-freed old ones — what "the aspect is right
+//! but the picture inside it is stretched" looked like too. One cache, both symptoms.
+//!
+//! [`Self::import_single_plane`] had already reasoned this out correctly for the browser
+//! path and declined to cache. Both paths mint per-frame handles; only one drew the right
+//! conclusion. If `OpenSharedHandle` per frame ever shows up in a profile on the box, the
+//! fix is a cache keyed on something the producer guarantees stable — a pool-slot
+//! generation carried on the surface — never on the handle value.
 //!
 //! **Compile-checked, not hardware-verified** — see the note in [`super::d3d11va`].
 #![allow(
@@ -21,8 +37,6 @@
     clippy::cast_possible_wrap,
     clippy::ptr_as_ptr
 )]
-
-use std::collections::HashMap;
 
 use castaway_core::GpuSurface;
 use wgpu::hal::api::Dx12;
@@ -34,19 +48,11 @@ use winapi::Interface as _;
 use super::d3d11va::D3d11SharedSurface;
 use crate::error::PipelineError;
 
-/// A resource opened on the D3D12 device, kept alive for reuse.
-struct OpenedResource(d3d12::Resource);
-
-// SAFETY: the importer lives on the render thread and is never shared; the COM pointer is
-// only touched there. `Send` is claimed so the importer can be moved into the compositor
-// at construction.
-unsafe impl Send for OpenedResource {}
-
 /// Imports D3D11-produced shared NV12 textures into the compositor's D3D12 device.
-pub struct Dx12Importer {
-    /// Cache from shared-handle value to the resource opened on our device.
-    opened: HashMap<usize, OpenedResource>,
-}
+///
+/// Stateless: see the module note on why the handle-keyed cache that used to live here was
+/// not a cache but an aliasing bug.
+pub struct Dx12Importer;
 
 impl Dx12Importer {
     /// Open a DX12 device with NV12 sampling, and an importer for it.
@@ -88,13 +94,7 @@ impl Dx12Importer {
         ))
         .map_err(|e| PipelineError::GpuInit(format!("request_device (interop): {e}")))?;
 
-        Ok((
-            device,
-            queue,
-            Self {
-                opened: HashMap::new(),
-            },
-        ))
+        Ok((device, queue, Self))
     }
 
     /// Import one shared surface as an NV12 `wgpu::Texture`.
@@ -111,17 +111,10 @@ impl Dx12Importer {
             PipelineError::GpuImport("surface is not a D3D11 shared texture".into())
         })?;
 
-        let key = surface.handle() as usize;
-        if !self.opened.contains_key(&key) {
-            // SAFETY: the device is live and `handle` is an NT handle owned by the
-            // surface, which outlives this call.
-            let resource = unsafe { open_shared(device, surface.handle()) }?;
-            self.opened.insert(key, OpenedResource(resource));
-        }
-        let resource = self
-            .opened
-            .get(&key)
-            .ok_or_else(|| PipelineError::GpuImport("shared resource vanished".into()))?;
+        // SAFETY: the device is live and `handle` is an NT handle owned by the surface,
+        // which outlives this call. Opened fresh each frame — the handle identifies *this*
+        // frame's texture and nothing else (module note).
+        let resource = unsafe { open_shared(device, surface.handle()) }?;
 
         let extent = wgpu::Extent3d {
             width: surface.width,
@@ -129,11 +122,14 @@ impl Dx12Importer {
             depth_or_array_layers: 1,
         };
         // SAFETY: the resource was opened on this device and is an NV12 2D texture with
-        // one mip and one sample, matching the descriptor. No drop guard is passed
-        // because the cache owns the resource; wgpu must not release it.
+        // one mip and one sample, matching the descriptor. The reference is *moved* into
+        // the texture rather than cloned: with no cache there is no second owner, so
+        // wgpu's release when the layer drops is the one that balances `OpenSharedHandle`.
+        // The producer's surface is kept alive independently by the compositor's layer
+        // (`LayerTexture::Nv12::_surface`), which is what keeps the handle valid.
         let hal_texture = unsafe {
             wgpu::hal::dx12::Device::texture_from_raw(
-                resource.0.clone(),
+                resource,
                 wgpu::TextureFormat::NV12,
                 wgpu::TextureDimension::D2,
                 extent,
