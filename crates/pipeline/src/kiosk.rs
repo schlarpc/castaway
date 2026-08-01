@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use input_touch::{InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase};
+use input_touch::{ContactId, InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase};
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -74,10 +74,10 @@ struct KioskApp {
     /// The last position and time of that drag, for the velocity a flick carries.
     drag_sample: Option<(std::time::Instant, f32)>,
     /// Where each contact was last seen, for turning a drag into a scroll.
-    drag_last: std::collections::HashMap<u32, f32>,
+    drag_last: std::collections::HashMap<ContactId, f32>,
     /// Live touch contacts, for the edge swipe. Nothing else in the tree tracked these:
     /// ids were carried faithfully to the browser and then forgotten (D38).
-    contacts: std::collections::HashMap<u32, crate::overlay::Contact>,
+    contacts: std::collections::HashMap<ContactId, crate::overlay::Contact>,
     /// When the home pill was last raised, or `None` when it is not showing.
     pill_since: Option<std::time::Instant>,
     /// Whether the pill's texture is currently a layer, so the fade only uploads once.
@@ -431,7 +431,12 @@ impl KioskApp {
                 // A held primary button is a contact mid-drag: it takes the same road a
                 // finger does, or the gesture half of the panel only exists for touch.
                 if self.pointer_contact
-                    && self.route_contact(TouchEvent::new(POINTER_CONTACT, TouchPhase::Move, x, y))
+                    && self.route_contact(TouchEvent::new(
+                        ContactId::POINTER,
+                        TouchPhase::Move,
+                        x,
+                        y,
+                    ))
                 {
                     return;
                 }
@@ -457,7 +462,7 @@ impl KioskApp {
                         TouchPhase::Up
                     };
                     self.pointer_contact = down;
-                    if self.route_contact(TouchEvent::new(POINTER_CONTACT, phase, x, y)) {
+                    if self.route_contact(TouchEvent::new(ContactId::POINTER, phase, x, y)) {
                         return;
                     }
                 }
@@ -561,10 +566,6 @@ impl KioskApp {
     }
 }
 
-/// The contact id the primary mouse button reports as. Real winit touch ids are
-/// device-assigned and start low; the top of the range cannot collide with one.
-const POINTER_CONTACT: u32 = u32::MAX;
-
 /// One frame at 60 Hz, until the monitor says otherwise (see `resumed`).
 const FALLBACK_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 
@@ -614,8 +615,9 @@ fn pointer_button(button: winit::event::MouseButton) -> Option<PointerButton> {
     }
 }
 
-/// Map a winit multi-touch contact to a normalized [`TouchEvent`]. winit ids are u64
-/// but stay small in practice; wrap into the sink's u32 space keeping distinctness.
+/// Map a winit multi-touch contact to a normalized [`TouchEvent`]. winit ids are u64 but
+/// stay small in practice; the truncation into the router's `u32` is only ever compared
+/// against other *panel* contacts, since [`ContactId`] keeps the origins apart.
 fn translate_touch(touch: &winit::event::Touch, size: (u32, u32)) -> TouchEvent {
     let phase = match touch.phase {
         winit::event::TouchPhase::Started => TouchPhase::Down,
@@ -625,7 +627,7 @@ fn translate_touch(touch: &winit::event::Touch, size: (u32, u32)) -> TouchEvent 
     };
     let (x, y) = normalize(touch.location.x, touch.location.y, size);
     #[allow(clippy::cast_possible_truncation)]
-    TouchEvent::new(touch.id as u32, phase, x, y)
+    TouchEvent::new(ContactId::panel(touch.id as u32), phase, x, y)
 }
 
 impl ApplicationHandler for KioskApp {

@@ -25,11 +25,105 @@ pub enum TouchPhase {
     Cancel,
 }
 
+/// One remote peer, for as long as it is connected.
+///
+/// Allocated by whoever accepts the connection and never reused within a process run, so
+/// a peer that drops and reconnects is a *different* origin — which is what keeps a
+/// reconnect from inheriting the contacts the previous connection left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RemoteId(u64);
+
+impl RemoteId {
+    /// Wrap a peer counter. The caller owns the counter; this is a newtype, not a
+    /// registry.
+    #[must_use]
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The underlying counter, for logging.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Where a contact came from.
+///
+/// Contacts from different origins share one router and one set of maps, so the origin
+/// has to be part of a contact's *identity* rather than tracked beside it. Two phones
+/// both numbering their first finger `0` are two contacts, not one, and a peer that drops
+/// mid-drag must cancel its own contacts without disturbing anyone else's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum InputOrigin {
+    /// The physical panel: winit touch, or an HID/evdev backend.
+    Panel,
+    /// The primary mouse button on the panel's own machine, standing in for a finger.
+    PanelPointer,
+    /// One remote peer driving the panel over the network.
+    Remote(RemoteId),
+}
+
+/// A contact's identity: which device it belongs to, and which of that device's contacts
+/// it is.
+///
+/// Replaces the bare `u32` the router used to key its maps on, where the mouse's
+/// stand-in contact reserved `u32::MAX` and a comment claimed real ids could not collide
+/// with it. With remotes in the picture that claim stops being true — and it was never
+/// something the compiler checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContactId {
+    origin: InputOrigin,
+    raw: u32,
+}
+
+impl ContactId {
+    /// A contact from the physical panel, with the backend's own tracking id.
+    #[must_use]
+    pub const fn panel(raw: u32) -> Self {
+        Self {
+            origin: InputOrigin::Panel,
+            raw,
+        }
+    }
+
+    /// The single contact the primary mouse button stands in for.
+    pub const POINTER: Self = Self {
+        origin: InputOrigin::PanelPointer,
+        raw: 0,
+    };
+
+    /// A contact from a remote peer.
+    ///
+    /// `raw` is whatever that peer calls the contact; it is only ever compared against
+    /// other contacts from the *same* peer, so a hostile or careless one can collide with
+    /// nothing but itself.
+    #[must_use]
+    pub const fn remote(peer: RemoteId, raw: u32) -> Self {
+        Self {
+            origin: InputOrigin::Remote(peer),
+            raw,
+        }
+    }
+
+    /// Which device this contact belongs to.
+    #[must_use]
+    pub const fn origin(self) -> InputOrigin {
+        self.origin
+    }
+
+    /// Whether this contact belongs to `origin`.
+    #[must_use]
+    pub fn is_from(self, origin: InputOrigin) -> bool {
+        self.origin == origin
+    }
+}
+
 /// A single touch contact update. Coordinates are normalized to the panel surface.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TouchEvent {
-    /// Contact/tracking id (stable for the life of one finger's contact).
-    pub id: u32,
+    /// Contact identity, stable for the life of one finger's contact.
+    pub id: ContactId,
     /// Phase of this update.
     pub phase: TouchPhase,
     /// X position, 0.0 (left) .. 1.0 (right).
@@ -41,13 +135,19 @@ pub struct TouchEvent {
 impl TouchEvent {
     /// Build a normalized event, clamping coordinates into range.
     #[must_use]
-    pub fn new(id: u32, phase: TouchPhase, x: f32, y: f32) -> Self {
+    pub fn new(id: ContactId, phase: TouchPhase, x: f32, y: f32) -> Self {
         Self {
             id,
             phase,
             x: x.clamp(0.0, 1.0),
             y: y.clamp(0.0, 1.0),
         }
+    }
+
+    /// Whether this contact ends here — the two phases after which its id is dead.
+    #[must_use]
+    pub fn ends_contact(&self) -> bool {
+        matches!(self.phase, TouchPhase::Up | TouchPhase::Cancel)
     }
 }
 
@@ -97,12 +197,31 @@ pub enum PointerEvent {
     },
 }
 
+/// One routed input event, in the router's own vocabulary.
+///
+/// The seam between decoding and routing. Everything upstream — winit window events, an
+/// HID backend, a remote peer's wire messages — turns into one of these, and everything
+/// downstream takes them without knowing which. It is what lets the routing be tested
+/// without a window and driven from a socket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Input {
+    /// A contact: a finger, or a button standing in for one.
+    Touch(TouchEvent),
+    /// A pointer update that carries no per-origin state — a hover, or a wheel.
+    ///
+    /// Deliberately *not* origin-tagged, because there is only one cursor. A remote peer
+    /// emits [`PointerEvent::Wheel`], which is positional and stateless, and its clicks
+    /// and drags arrive as [`Input::Touch`] instead; hover from a remote is dropped
+    /// rather than fighting the panel's own cursor for the same hover state.
+    Pointer(PointerEvent),
+}
+
 /// A consumer of routed panel/window input: the surface that currently "owns" the
 /// screen. The kiosk (or any input router) decodes raw events — winit window events
-/// today, HID/evdev on the physical panel — into normalized [`TouchEvent`]s /
-/// [`PointerEvent`]s and delivers them to exactly one focused sink. The browser
-/// layer is the first implementor; protocol adapters or native UI layers that want
-/// direct interaction implement this same trait and take focus.
+/// today, HID/evdev on the physical panel, a remote peer over the network — into
+/// normalized [`TouchEvent`]s / [`PointerEvent`]s and delivers them to exactly one
+/// focused sink. The browser layer is the first implementor; protocol adapters or native
+/// UI layers that want direct interaction implement this same trait and take focus.
 pub trait InputSink {
     /// A touch contact update.
     fn touch(&mut self, event: TouchEvent);
@@ -115,6 +234,16 @@ pub trait InputSink {
     /// far side believing a finger is down for the rest of the session. The default is a
     /// no-op for sinks that keep no such state.
     fn cancel_all(&mut self) {}
+    /// Abandon every contact belonging to one origin, leaving the rest alone.
+    ///
+    /// What a dropped remote peer gets. [`Self::cancel_all`] is the wrong tool there: two
+    /// phones can be driving at once, and cancelling everything because one of them lost
+    /// Wi-Fi yanks the other person's drag out from under them.
+    ///
+    /// The default is a no-op, for sinks that keep no contact state.
+    fn cancel_origin(&mut self, origin: InputOrigin) {
+        let _ = origin;
+    }
 }
 
 /// A source of touch events. The backend spawns a reader and forwards events on the
@@ -151,9 +280,55 @@ mod tests {
 
     #[test]
     fn coordinates_are_clamped() {
-        let e = TouchEvent::new(1, TouchPhase::Down, 1.5, -0.2);
+        let e = TouchEvent::new(ContactId::panel(1), TouchPhase::Down, 1.5, -0.2);
         assert_eq!(e.x, 1.0);
         assert_eq!(e.y, 0.0);
+    }
+
+    #[test]
+    fn the_same_raw_id_from_different_origins_is_different_contacts() {
+        // The whole reason ContactId exists. Two phones both numbering their first
+        // finger 0, and the panel's own contact 0, are three contacts — and the router
+        // keys its maps on this, so if they compared equal their drags would merge.
+        let a = ContactId::remote(RemoteId::new(1), 0);
+        let b = ContactId::remote(RemoteId::new(2), 0);
+        let panel = ContactId::panel(0);
+        assert_ne!(a, b);
+        assert_ne!(a, panel);
+        assert_ne!(b, panel);
+    }
+
+    #[test]
+    fn the_mouse_stand_in_collides_with_nothing() {
+        // It used to be `u32::MAX` plus a comment asserting real ids stayed low. Now it
+        // is a different origin, which is a fact rather than a hope — including against
+        // a panel contact whose raw id really is u32::MAX.
+        assert_ne!(ContactId::POINTER, ContactId::panel(u32::MAX));
+        assert_ne!(ContactId::POINTER, ContactId::panel(0));
+        assert_ne!(
+            ContactId::POINTER,
+            ContactId::remote(RemoteId::new(0), u32::MAX)
+        );
+        assert_eq!(ContactId::POINTER.origin(), InputOrigin::PanelPointer);
+    }
+
+    #[test]
+    fn a_reconnecting_peer_is_a_new_origin() {
+        // RemoteId is never reused, so contacts the dropped connection left behind can
+        // never be inherited by the reconnect.
+        assert_ne!(
+            ContactId::remote(RemoteId::new(7), 0),
+            ContactId::remote(RemoteId::new(8), 0)
+        );
+    }
+
+    #[test]
+    fn is_from_matches_only_its_own_origin() {
+        let peer = RemoteId::new(3);
+        let c = ContactId::remote(peer, 5);
+        assert!(c.is_from(InputOrigin::Remote(peer)));
+        assert!(!c.is_from(InputOrigin::Remote(RemoteId::new(4))));
+        assert!(!c.is_from(InputOrigin::Panel));
     }
 
     #[test]

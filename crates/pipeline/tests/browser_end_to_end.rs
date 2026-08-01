@@ -223,10 +223,10 @@ fn a_touch_reaches_the_page() {
     assert!(browser_layer_present(&render), "page never painted");
 
     // Middle of the panel, in the normalized coordinates the kiosk's input router emits.
-    use input_touch::{InputSink as _, TouchEvent, TouchPhase};
+    use input_touch::{ContactId, InputSink as _, TouchEvent, TouchPhase};
     for phase in [TouchPhase::Down, TouchPhase::Up] {
         host.touch(TouchEvent {
-            id: 1,
+            id: ContactId::panel(1),
             phase,
             x: 0.5,
             y: 0.5,

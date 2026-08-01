@@ -937,9 +937,28 @@ pub struct ElectronHost {
     /// Touch contacts a window owns — the ones whose press landed inside its viewport,
     /// mapped to the window that took the press. Tracked per id because ownership is a
     /// property of the whole contact, not of each event.
-    contacts: std::collections::HashMap<u32, Surface>,
+    ///
+    /// Keyed by [`input_touch::ContactId`], so the panel's own fingers and every remote
+    /// peer's occupy one map without their raw ids colliding. The value carries the
+    /// browser-facing id as well, because the protocol to the child speaks a flat `u32`
+    /// (it becomes a CDP touch point) and the child must not have to know what an origin
+    /// is — see [`ElectronHost::next_wire_contact`].
+    contacts: std::collections::HashMap<input_touch::ContactId, TrackedContact>,
+    /// The counter behind the browser-facing contact ids.
+    next_wire_contact: u32,
     /// When the next session line is due.
     next_report: std::time::Instant,
+}
+
+/// A live contact, as the host tracks it: which window took the press, and the flat id
+/// the child knows it by.
+#[derive(Clone, Copy)]
+struct TrackedContact {
+    /// The window that owns the contact until it ends — recorded once, at the press, so
+    /// a drag that wanders off still ends where it began.
+    surface: Surface,
+    /// What the child calls it. See [`ElectronHost::next_wire_contact`].
+    wire: u32,
 }
 
 /// The applied view per window. A struct rather than a map for the same reason
@@ -1016,6 +1035,7 @@ impl ElectronHost {
             gave_up: None,
             left_down: None,
             contacts: std::collections::HashMap::new(),
+            next_wire_contact: 0,
             next_report: std::time::Instant::now(),
         }
     }
@@ -1446,6 +1466,40 @@ impl ElectronHost {
         crate::browser::hit_view_px(view.rect, self.size, x, y).map(|_| surface)
     }
 
+    /// The next browser-facing contact id.
+    ///
+    /// The panel's routing keys contacts on [`input_touch::ContactId`], which carries an
+    /// origin; the protocol to the child speaks a flat `u32` because it becomes a CDP
+    /// touch point id, and CDP has never heard of an origin. Rather than packing the two
+    /// halves into 32 bits — which would put a width limit on both, and silently alias
+    /// once either overflowed it — each contact is handed a fresh number for its
+    /// lifetime, freed when it ends.
+    ///
+    /// Wrapping is not a collision: it takes 2^32 contacts to come back around, and only
+    /// a contact still down at that point could clash.
+    fn next_wire_contact(&mut self) -> u32 {
+        let id = self.next_wire_contact;
+        self.next_wire_contact = self.next_wire_contact.wrapping_add(1);
+        id
+    }
+
+    /// Tell the child that these contacts have stopped, each in its own window.
+    ///
+    /// Shared by [`input_touch::InputSink::cancel_all`] and
+    /// [`input_touch::InputSink::cancel_origin`], which differ only in which contacts
+    /// they select — so the message they send has one spelling.
+    fn cancel_tracked(&mut self, contacts: Vec<TrackedContact>) {
+        for tracked in contacts {
+            self.send(&ToBrowser::Touch {
+                surface: tracked.surface,
+                id: tracked.wire,
+                phase: crate::browser_proto::TouchPhase::Cancel,
+                x: 0.0,
+                y: 0.0,
+            });
+        }
+    }
+
     /// When this host next needs the kiosk loop to run it without being asked: a
     /// scheduled recovery's due time (#59). Everything else it does is either driven by
     /// a wake (paints and faults, from the reader thread; commands, from their senders)
@@ -1553,22 +1607,26 @@ impl input_touch::InputSink for ElectronHost {
         // Ownership is recorded as *which window*, not merely "ours": the panel can move
         // the page mid-drag, and the end of that drag must still go to the page rather
         // than being re-aimed at whatever owns the glass by then.
-        let owned: Option<Surface> = match event.phase {
+        let owned: Option<TrackedContact> = match event.phase {
             TouchPhase::Down => {
                 let target = self.hit_target(event.x, event.y);
-                if let Some(surface) = target {
-                    self.contacts.insert(event.id, surface);
-                }
-                target
+                target.map(|surface| {
+                    let tracked = TrackedContact {
+                        surface,
+                        wire: self.next_wire_contact(),
+                    };
+                    self.contacts.insert(event.id, tracked);
+                    tracked
+                })
             }
             TouchPhase::Move => self.contacts.get(&event.id).copied(),
             TouchPhase::Up | TouchPhase::Cancel => self.contacts.remove(&event.id),
         };
-        let Some(surface) = owned else { return };
-        let (x, y) = self.to_view(surface, event.x, event.y);
+        let Some(tracked) = owned else { return };
+        let (x, y) = self.to_view(tracked.surface, event.x, event.y);
         self.send(&ToBrowser::Touch {
-            surface,
-            id: event.id,
+            surface: tracked.surface,
+            id: tracked.wire,
             phase: event.phase.into(),
             x,
             y,
@@ -1580,17 +1638,29 @@ impl input_touch::InputSink for ElectronHost {
         // owns it. Without this a page keeps a phantom finger for the life of the
         // session: the browser host holds a contact map keyed by id and only an end or a
         // cancel removes an entry.
-        let contacts: Vec<(u32, Surface)> = self.contacts.drain().collect();
-        for (id, surface) in contacts {
-            self.send(&ToBrowser::Touch {
-                surface,
-                id,
-                phase: crate::browser_proto::TouchPhase::Cancel,
-                x: 0.0,
-                y: 0.0,
-            });
-        }
+        let contacts: Vec<TrackedContact> = self.contacts.drain().map(|(_, t)| t).collect();
+        self.cancel_tracked(contacts);
         self.left_down = None;
+    }
+
+    fn cancel_origin(&mut self, origin: input_touch::InputOrigin) {
+        // The same thing for one device only. A remote peer that drops mid-drag must not
+        // take the panel's own fingers — or a second peer's — down with it, which is
+        // exactly what `cancel_all` would do.
+        //
+        // `left_down` is deliberately untouched: it tracks the panel's own mouse, and a
+        // remote's clicks arrive as contacts rather than through the pointer path.
+        let doomed: Vec<input_touch::ContactId> = self
+            .contacts
+            .keys()
+            .copied()
+            .filter(|id| id.is_from(origin))
+            .collect();
+        let tracked: Vec<TrackedContact> = doomed
+            .into_iter()
+            .filter_map(|id| self.contacts.remove(&id))
+            .collect();
+        self.cancel_tracked(tracked);
     }
 
     fn pointer(&mut self, event: input_touch::PointerEvent) {
