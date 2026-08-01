@@ -198,6 +198,38 @@ let
     '';
   };
 
+  # Handing a USB device to castaway's own stack, which on Windows means taking it away
+  # from Windows'. Two steps because they fail differently: installing the package is a
+  # signing problem, binding it to the device is a *ranking* problem, and conflating them
+  # made the first success look like a failure.
+  winusb = pkgs.writeShellApplication {
+    name = "castaway-windows-winusb";
+    runtimeInputs = [ pkgs.openssh ];
+    text = preamble + ''
+      hwid="''${1:-USB\\VID_8087&PID_0033}"
+      case "''${1:-}" in
+        --undo)
+          scp "''${ssh_opts[@]}" -q ${./winusb-bind.ps1} "$host:winusb-bind.ps1"
+          on_box 'powershell -NoProfile -ExecutionPolicy Bypass -File winusb-bind.ps1 -Undo'
+          exit 0 ;;
+      esac
+
+      if ! on_box 'net session >nul 2>&1'; then
+        echo "error: the SSH session on $host is not elevated; driver install will fail" >&2
+        exit 1
+      fi
+
+      scp "''${ssh_opts[@]}" -q ${./winusb-bind.ps1} "$host:winusb-bind.ps1"
+      scp "''${ssh_opts[@]}" -q ${./winusb-force.ps1} "$host:winusb-force.ps1"
+      # Step one installs the package and *may* bind it; step two forces the bind when
+      # ranking refused, which for a self-signed package against an inbox WHQL driver is
+      # always. Running both unconditionally is idempotent and one round trip cheaper than
+      # deciding.
+      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-bind.ps1 -HardwareId '$hwid'" || true
+      on_box "powershell -NoProfile -ExecutionPolicy Bypass -File winusb-force.ps1 -HardwareId '$hwid'"
+    '';
+  };
+
   deploy = pkgs.writeShellApplication {
     name = "castaway-deploy-windows";
     runtimeInputs = [ pkgs.openssh pkgs.coreutils pkgs.unzip ];
@@ -346,4 +378,4 @@ let
     '';
   };
 in
-{ inherit deploy firewall; }
+{ inherit deploy firewall winusb; }

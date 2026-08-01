@@ -510,6 +510,10 @@
             # nix/network-surface.json, against the Windows box's firewall:
             # `nix run .#windows-firewall` (`-- --close` to take it down again).
             windows-firewall = windowsDeploy.firewall;
+
+            # Hand a USB device to castaway's own stack: `nix run .#windows-winusb`
+            # (`-- --undo` gives it back to Windows). Defaults to the Intel radio.
+            windows-winusb = windowsDeploy.winusb;
           }
         ));
 
