@@ -200,13 +200,18 @@ fn shared_listeners() -> Vec<Listener> {
             },
             bind: "0.0.0.0",
             wire: "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, \
-                   Spotify zeroconf pairing, /screenshot.png",
+                   Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS)",
             security: "plaintext HTTP (LAN control plane)",
             gate: Gate::Always,
             provider: Provider::Process,
             chosen_by: Provenance::Ours,
             notes: "One host shared by three protocols (D7); a disabled protocol's \
-                    routes are simply not mounted. /screenshot.png always answers.",
+                    routes are simply not mounted. /screenshot.png and /stream/* \
+                    always answer — in a build with no encoder, by saying so. \
+                    Fetching /stream/live.m3u8 starts an encoder and holds the \
+                    render loop at display rate until ten seconds after the last \
+                    request (#101), so it is the one endpoint here that costs the \
+                    panel anything.",
         },
         Listener {
             owner: Owner::Mdns,

@@ -13,7 +13,7 @@
       },
       "provider": "process",
       "transport": "tcp",
-      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png"
+      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS)"
     },
     {
       "chosen_by": "spec",

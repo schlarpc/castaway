@@ -11,7 +11,7 @@
 
 | Port | Transport | Owner | Carries | Security | Exists when | Chosen by |
 |---|---|---|---|---|---|---|
-| 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png | plaintext HTTP (LAN control plane) | always | ours |
+| 8080 (`http_port`) | tcp | http | HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS) | plaintext HTTP (LAN control plane) | always | ours |
 | 5353 | udp | mdns | mDNS/DNS-SD responder (mdns-sd daemon) | plaintext multicast | always | spec |
 | 1900 | udp | ssdp | SSDP M-SEARCH responder + NOTIFY alive/byebye | plaintext multicast | always | spec |
 | 7000 | tcp | airplay | RTSP + HTTP/1.1 on one socket: AirPlay control and RAOP | plaintext — pair-verify/FairPlay not implemented (#39) | enable.airplay | convention |
@@ -32,7 +32,7 @@ The tiers correlate with the config surface, and a test holds the line: every *s
 
 Notes, per listener that has one:
 
-- **8080 (`http_port`)/tcp (http)** — binds 0.0.0.0. One host shared by three protocols (D7); a disabled protocol's routes are simply not mounted. /screenshot.png always answers.
+- **8080 (`http_port`)/tcp (http)** — binds 0.0.0.0. One host shared by three protocols (D7); a disabled protocol's routes are simply not mounted. /screenshot.png and /stream/* always answer — in a build with no encoder, by saying so. Fetching /stream/live.m3u8 starts an encoder and holds the render loop at display rate until ten seconds after the last request (#101), so it is the one endpoint here that costs the panel anything.
 - **5353/udp (mdns)** — binds 0.0.0.0, multicast 224.0.0.251, SO_REUSEADDR/SO_REUSEPORT. Advertises only enabled protocols, restricted to the serving interface. GameStream's host browser runs a second daemon — a second 5353 socket — when enabled. Contends with Avahi/Bonjour for answers (#43); the NixOS module warns when Avahi is on.
 - **1900/udp (ssdp)** — binds 0.0.0.0, multicast 239.255.255.250, SO_REUSEADDR/SO_REUSEPORT. Bound even with DLNA and DIAL both off; it then answers for no device type.
 - **7000/tcp (airplay)** — binds 0.0.0.0. Both _airplay._tcp and _raop._tcp advertise this one port. Nothing binds 7011: it is the AirPlay 1 UDP timing port, not a listener, and the listener once bound there was removed.

@@ -62,7 +62,8 @@ url.workspace = true
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
-# Driving the DLNA media plane end to end: a real SOAP envelope into the real router.
+# Driving the DLNA media plane end to end, and the `/stream/*` routes without a socket:
+# a real request into the real router.
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
@@ -77,7 +78,12 @@ embed-resource = "3"
 default = []
 # Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)
 # and run the winit fullscreen kiosk on the main thread. Native deps required (see flake).
-render = ["pipeline/kiosk", "pipeline/ffmpeg"]
+# Also brings the output duplicate (#101): anything that can draw can stream what it
+# drew, and gating that separately would only produce builds where `/stream/*` exists and
+# structurally cannot work. Which *encoder* opens is still a runtime probe.
+render = ["pipeline/kiosk", "pipeline/ffmpeg", "pipeline/stream", "stream"]
+# Internal: mirrors `pipeline/stream` so `crates/app` can `cfg` on it directly.
+stream = []
 # Compile the hardware decode backends (VA-API on Linux, D3D11VA on Windows). Whether they
 # are *used* is a runtime decision, so this is safe to leave on: a box with no GPU decode
 # still plays, on the CPU, with a log line saying so.

@@ -115,8 +115,12 @@ pub fn stream_size(panel: (u32, u32), max_height: u32) -> (u32, u32) {
 }
 
 /// What the stream is doing, for anything that has to answer a request about it.
+///
+/// Deliberately *not* `#[non_exhaustive]`: the only consumer is the app's `/stream/*`
+/// routes, and a fifth state that the status endpoint silently reported as one of the
+/// other four would be worse than a build failure. Ground rule 1 — if the match could go
+/// stale tomorrow, make the compiler say so.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum StreamStatus {
     /// Nothing is being encoded. The next request starts it.
     Idle,
