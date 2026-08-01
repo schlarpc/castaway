@@ -151,10 +151,14 @@ pub const PAGE: &str = r##"<!doctype html>
      keeps the press that starts outside the letterbox from selecting the page instead. */
   #grab  { position:absolute; inset:0; touch-action:none; user-select:none;
            -webkit-user-select:none; -webkit-touch-callout:none; }
+  /* The bar itself must not swallow presses: it sits over the bottom of the picture,
+     which is exactly where the panel draws its transport strip. Only the buttons take
+     input; everything between and around them falls through to the capture layer. */
   #bar   { position:absolute; left:0; right:0; bottom:0; display:flex; gap:.5rem;
-           padding:.5rem; background:linear-gradient(transparent,#000a); }
+           padding:.5rem; pointer-events:none; }
   button { font:inherit; color:#eee; background:#222c; border:1px solid #444;
-           border-radius:.4rem; padding:.5rem .9rem; touch-action:manipulation; }
+           border-radius:.4rem; padding:.5rem .9rem; touch-action:manipulation;
+           pointer-events:auto; backdrop-filter:blur(4px); }
   button:active { background:#333c; }
   #note  { position:absolute; top:.5rem; left:.5rem; right:.5rem; color:#bbb;
            font-size:.85rem; text-shadow:0 1px 2px #000; pointer-events:none; }
@@ -440,6 +444,28 @@ mod tests {
         for hook in ["pointerup", "pointercancel", "visibilitychange", "pagehide"] {
             assert!(PAGE.contains(hook), "{hook} is not handled");
         }
+    }
+
+    #[test]
+    fn the_control_bar_does_not_shadow_the_panels_own_transport_strip() {
+        // The bar sits over the bottom of the picture, which is where the panel draws its
+        // transport strip. If the container took pointer events, the whole bottom strip
+        // of the panel would be untouchable from the remote and nothing would say why.
+        let bar = PAGE
+            .split("#bar")
+            .nth(1)
+            .expect("the bar is styled")
+            .split('}')
+            .next()
+            .expect("a rule body");
+        assert!(
+            bar.contains("pointer-events:none"),
+            "the bar container must fall through: {bar}"
+        );
+        assert!(
+            PAGE.contains("pointer-events:auto"),
+            "…and the buttons themselves must not"
+        );
     }
 
     #[test]
