@@ -37,7 +37,7 @@ here.
 | `proto-miracast` | **The whole protocol, none of the radio.** The WFD information element (byte-identical to what MiracleCast and lazycast put on the air), the `wfd-kv` parameter language as one type per parameter, the M1–M16 exchange with its two independent CSeq counters, MPEG2-TS-over-RTP demuxed to `EncodedFrame`, UIBC touch/HIDC encoding with a coordinate type that cannot carry panel pixels, and a tokio actor driven end-to-end by a scripted source over real sockets. AOSP's format chooser is reimplemented as an oracle, so what an Android phone *would* pick is asserted in tests rather than guessed. On by default in `app`; a radio that cannot be group owner logs and skips, and `[enable] miracast = false` is for boxes whose uplink *is* that radio. **And now the radio, minus the driver.** The Linux backend forms a real autonomous P2P group in CI (`checks.miracast-vm`, mac80211_hwsim): a second radio in its own network namespace discovers the sink's WFD IE over the air, joins by WPS push-button, takes a DHCP lease from the group the NixOS module serves, and the sink resolves the peer with its own neighbour-table sweep (in WFD the peer never speaks first), dials its 7236, negotiates M1→M7 to a running mirror, receives hand-rolled MPEG2-TS-over-RTP across the group — PAT, PMT, and an IDR-first PES the pipeline counts as decoded-plane frames, proving the advertised RTP port is really reachable (the §7.2 two-minute-watchdog failure) — and ends with a clean triggered teardown. The backend speaks to all three of wpa_supplicant's control surfaces — the `p2p-dev-*` management socket that actually delivers P2P events, the group interface's socket where the WPS registrar lives, and an abstract-namespace reply path that survives `PrivateTmp=`. **Not done:** any *real* driver — hwsim is the best-behaved mac80211 there is, and the §7.6 driver check and 5 GHz both remain the hardware's to pass (#17); Miracast-over-Infrastructure (MS-MICE) is documented and unimplemented; HDCP is deliberately `none`. |
 | `moonlight-sys` | **Bindings, pinned and checked in.** FFI to moonlight-common-c, the linked GameStream core (D37). Regenerated from the same revision Nix builds; struct layouts guarded by bindgen's compile-time size/offset asserts. |
 | `proto-gamestream` | **Paired against real Sunshine; never yet streamed.** The one *inverted* protocol — the panel is the Moonlight client, so it browses and dials rather than advertising and waiting. Ours: mDNS host discovery, the NVHTTP API as request builders + rich response types, the gen-7 pairing handshake as a typestate machine, the client identity, per-host pairing persistence, and the adapter. Verified three ways: against Sunshine's own checked-in vectors (its `clientchallenge` ciphertext, its phase-4 hash, its `clientpairingsecret` signature), through all four phases over real sockets against a scripted host, and — the one that counts — against the **real `sunshine` binary in a VM**, which pairs, trusts us over mutual TLS, and serves its app list (`checks.gamestream-vm`). Linked, behind the off-by-default `stream` feature: RTSP, ENet control, FEC'd RTP video, encrypted Opus audio, input. **Not done:** no session has ever run against a real Sunshine host — everything between "the host said 200 to /launch" and pixels is unverified. The chooser exists now (D38's shell), and pairing is walk-up too: pressing an unpaired host puts a panel-generated PIN on the glass, holds the handshake open while someone types it into Sunshine's web UI, and refreshes into the app list — the config-driven startup pairing shares the same `pair()` and remains for headless boxes. The panel-initiated *screens* have never faced a real Sunshine (the underlying handshake has, via `checks.gamestream-vm`). The linked half is GPL-3.0 against this MIT tree, so `castaway-portable` does not link it. |
-| `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. Browser: the Electron subprocess host behind `electron` (D36). What is on the glass is one model — `panel` (screens, surfaces, focus; everything else derived) — and how it *moves* between those states is `motion` (springs, one choreography table), both pure and unit-tested with no GPU (D46). The compositor grew an animatable corner radius and an independent source rect so a container of the wrong shape crops rather than stretches. The composited output is also *readable*: `/screenshot.png` is a one-shot CPU readback, and `/stream/*` is a live HLS duplicate of the glass (#101, D49) — RGBA→NV12 in a wgpu pass at the stream's own size, whichever H.264 encoder the box turns out to have, and fMP4/HLS boxing that is ours and byte-tested. Nothing is encoded until something fetches the playlist, and the tap retires ten seconds after the last request: measured on the dev box, zero CPU with nobody watching and ~5.4% of one core streaming 1080p30 off a 4K panel. The duplicate carries the panel's **sound** as well (D50): tapped at the one seam every session's audio passes through — the `AudioOut` factory, because each session takes its own device and there is no central mixer — and muxed as a second track in the same segments, both measured against one wall-clock origin so they cannot drift. **Not done:** the upload to the hardware encoder is a readback, not a zero-copy handle export (#101); audio is stereo only, and leads the panel's own speakers by the output queue's depth. |
+| `pipeline` | **Render path real.** Null backend (default) + wgpu compositor + ffmpeg decoder + RenderPipeline + winit kiosk behind `render`/`ffmpeg`/`kiosk` features. Browser: the Electron subprocess host behind `electron` (D36). What is on the glass is one model — `panel` (screens, surfaces, focus; everything else derived) — and how it *moves* between those states is `motion` (springs, one choreography table), both pure and unit-tested with no GPU (D46). The compositor grew an animatable corner radius and an independent source rect so a container of the wrong shape crops rather than stretches. The composited output is also *readable*: `/screenshot.png` is a one-shot CPU readback, and `/stream/*` is a live HLS duplicate of the glass (#101, D49) — RGBA→NV12 in a wgpu pass at the stream's own size, whichever H.264 encoder the box turns out to have, and fMP4/HLS boxing that is ours and byte-tested. Nothing is encoded until something fetches the playlist, and the tap retires ten seconds after the last request: measured on the dev box, zero CPU with nobody watching and ~5.4% of one core streaming 1080p30 off a 4K panel. The duplicate carries the panel's **sound** as well (D50): tapped at the one seam every session's audio passes through — the `AudioOut` factory, because each session takes its own device and there is no central mixer — and muxed as a second track in the same segments, both measured against one wall-clock origin so they cannot drift. The same encoded pictures are also fanned out live, in Annex-B with the parameter sets in band, to **WebRTC peers** (#18): `/remote/` is the panel made *touchable* from a phone, over one PeerConnection carrying the duplicate out and that peer's contacts back. **Not done:** the upload to the hardware encoder is a readback, not a zero-copy handle export (#101); audio is stereo only, and leads the panel's own speakers by the output queue's depth; the remote's video track is silent — WebRTC audio wants Opus and the stream encodes AAC. |
 | `control-display` | **Trait and encoder only — no backend reaches hardware.** `NullDisplay` logs, and it is what `app` constructs unconditionally. `dell.rs` builds the RS-232 command frame (header/id/category/opcode/len/data/XOR) with **placeholder opcodes**, and nothing sends it. The `serial` and `ddc` features are empty feature lists — no `serialport`, no `ddc-hi`, no module behind either (#21). |
 | `input-touch` | `TouchSource` trait + null; evdev/winuser feature stubs. The kiosk now routes each press to the browser *or* to the panel's transport strip, whichever owns the point touched (D33). |
 | `app` | **Runs.** One HTTP host (DLNA+Spotify+DIAL) + one SSDP + one mDNS + session mgr. TOML config. The network surface is a registry (D45): `surface.rs` generates `docs/network-surface.md` and `nix/network-surface.json` (freshness-tested), the NixOS firewall derives from the JSON, media planes bind from `[media_ports]`, raw binds are clippy-denied outside registered sites, and `--network-surface[=json\|netsh]` prints the resolved view. |
@@ -305,6 +305,64 @@ provenance in `assets/brand/README.md`, and the mark and mascot are drawn. **Sti
 done** on the theming side: the font is still DejaVu, and the easter-egg palettes,
 scrolling long titles and blurred pillarbox borders #24 asks for are unwritten.
 
+## Driving the panel from a phone (`/remote/`, #18)
+
+The sibling of `/stream/*` and a different want: not "show me the panel" but "let me use
+it". Everything below is code-complete and tested without hardware; **none of it has been
+driven from a real phone against a real panel**, which is the gap that matters.
+
+**Why WebRTC and not the HLS the same encoder already feeds.** Latency, and then the
+deployment. HLS is one-second segments with a window of eight — three to six seconds
+glass-to-glass, which is fine for watching and unusable for control, where you cannot tell
+which tap did what. And the far end is a phone on Wi-Fi: a fixed-bitrate stream over TCP
+turns a lossy link into an unbounded stall whose only recovery is falling behind and then
+seeking to the live edge. UDP with a jitter buffer degrades instead. One encode feeds both
+— HLS gets AVCC boxed into segments, a peer gets Annex-B with the parameter sets in band,
+because there is no init segment in RTP.
+
+**The input rides the same connection.** A data channel defaults to reliable and ordered,
+which is what input needs — a lost `Up` after a `Down` strands a contact for the session.
+Given that, one PeerConnection is one *lifecycle*: "the peer went away" is a single event
+with a single handler, and that is where the nastiest bug in the feature lives.
+
+**A contact's identity carries its origin.** The router used to key its maps on a bare
+`u32`, with the mouse's stand-in reserving `u32::MAX` behind a comment. Two phones both
+numbering their first finger `0` would have merged into one drag. `ContactId { origin, raw }`
+makes that unrepresentable, `RemoteId` is never reused so a reconnect cannot inherit what
+the last connection left behind, and `cancel_origin` lets one peer drop without yanking
+anybody else's gesture. A dropped peer's contacts are **cancelled, not released**:
+completing the gesture would commit whatever it was over, which on the transport strip
+means seeking to wherever the finger was when Wi-Fi died.
+
+**A remote contact takes the same road as a finger**, so the edge swipe, the home pill, the
+transport strip and the shell all work on it for free — that is what the decode/apply split
+in `kiosk` bought. The one thing it cannot do is the *gesture* home: a left-edge swipe is
+the Android back gesture and iOS swipe-to-go-back, and the browser eats it before the page
+sees it. So the page has a Home button, and it travels through the same queue as the
+contacts so it keeps its place against them.
+
+**ICE ports are pinned and declared** (`[remote.ice_ports]`, 41032–41063). Not tidiness:
+`surface.rs` generates `nix/network-surface.json` and the NixOS module derives the firewall
+from it, so a candidate outside a declared range is one the deployed box silently drops —
+the connection would negotiate and then carry nothing.
+
+**Security is a real change of kind.** Port 8080 has no authentication, so this turns
+"anyone on the LAN can watch the panel" into "anyone on the LAN can drive it". That is
+stated in `docs/network-surface.md`'s Security column rather than left implicit, and
+`remote.input = false` keeps the viewing half while dropping every input message at the
+boundary. It is not a control against someone who can already reach the port.
+
+**Tested without hardware:** the wire parse (a peer cannot name another peer's contact; a
+coordinate that is not finite is refused before anything clamps it), the coalescing queue
+(a run of moves collapses; an `Up` is never dropped under flood; a departure keeps its
+place in the order), the router (three contacts all numbered zero stay three), and a real
+negotiation over real sockets — a browser-shaped offer in, an answer with a fingerprint,
+both m-lines, the registered codec and a candidate from the declared range out.
+
+**Not done:** no audio on the remote track (Opus vs the stream's AAC); no keyboard, which
+is arguably the killer feature and is scoped separately; and the whole thing has never met
+a phone.
+
 ## Biggest open items (see the issue tracker)
 
 Rewritten 2026-07-31 against the issue tracker, after the open-questions file was retired
@@ -322,7 +380,9 @@ into it. The struck-through history this list used to carry now lives in the clo
    Everything up to `/launch` is proven against real Sunshine; past it, nothing is.
 4. **#17** — no real Miracast driver. hwsim is the best-behaved mac80211 there is; the
    interface-combination parse and the 5 GHz NO-IR question both need a radio.
-5. **#65** — touch through CDP has never met glass.
+5. **#65** — touch through CDP has never met glass. **#18** now rides the same path from
+   the other end: the remote UI is code-complete and negotiates against real sockets in a
+   test, but no phone has ever driven a real panel through it.
 6. **#21 / #55** — there is still no display-control backend at all: `serial` and `ddc` are
    empty feature lists, `dell.rs` is a frame encoder with placeholder opcodes, and `app`
    constructs `NullDisplay` unconditionally. #55 is what that costs — the panel sleeps and

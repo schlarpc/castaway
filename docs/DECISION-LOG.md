@@ -1749,3 +1749,117 @@ No `elst`, so the *first* AAC frame's priming is cancelled by input discard rath
 described in the container. Audio is stereo only. And the stream's audio leads the panel's
 own speakers by the output queue's depth — tens of milliseconds — because a block is placed
 where it was handed to the device, not where the device played it.
+
+### D51 — The remote UI is WebRTC end to end, and a contact's identity carries the device it came from
+
+**2026-08-01.** #18 asked for two things: the panel's output in a browser, and touches from
+that browser landing on the panel as if they were fingers on the glass. The first half was
+already there — D49's HLS duplicate. The second half made the first half's transport wrong,
+and made a bare `u32` contact id unsafe.
+
+#### HLS cannot carry an interactive surface, and neither can a WebSocket
+
+The duplicate is one-second segments with a window of eight: three to six seconds
+glass-to-glass. That is fine for "show me what the panel is doing" and unusable for "drive
+it" — at four seconds you cannot tell which tap did what, so you tap again, and now you have
+two.
+
+Three transports were considered and two rejected. Per-frame CMAF chunks over a WebSocket
+into MSE would have been nearly free — `fmp4` already builds that shape — and raw access
+units into WebCodecs would have been faster still. Both were dropped, and the deciding
+argument is not the latency figure. **The far end is a phone on Wi-Fi.** A fixed-bitrate
+stream over TCP is close to the worst available combination for that: head-of-line blocking
+turns a lossy 2.4 GHz link at the far end of a building into an unbounded stall, and the
+only recovery is to fall behind and then seek to the live edge — which is the hack the HLS
+player already performs. WebRTC over UDP degrades instead of stalling, and its jitter buffer
+is the only one of the three with a closed loop on latency. MSE's sub-300 ms behaviour is a
+per-browser-version fight whose failure mode is gradual drift you never finish tuning.
+
+Two arguments *against* WebRTC turned out not to hold. The protocol stack is not ours to
+write — `webrtc-rs` does ICE, DTLS-SRTP, packetization and RTCP behind a small surface, and
+signalling is WHEP, which is one POST. And the cross-build risk was already retired: `ring`
+and `rustls` cross-build to `x86_64-pc-windows-msvc` in this tree today. On ground rule 9,
+this is D37's argument with the same shape — DTLS-SRTP plus ICE is not a spec we reimplement
+to own.
+
+One encode feeds both consumers. HLS takes AVCC boxed into segments; a peer takes Annex-B
+with the parameter sets prepended to every keyframe, because there is no init segment in
+RTP and a viewer that joined ten seconds in has never seen an SPS.
+
+#### The input rides the same connection
+
+A data channel defaults to reliable and ordered, which is exactly what input needs: a lost
+`Up` after a `Down` strands a contact for the rest of the session. Given that the semantics
+are identical to a WebSocket's, the reason to prefer it is that one `PeerConnection` is **one
+lifecycle**. "The peer went away" becomes a single event with a single handler — and that is
+the code path where the nastiest bug in this feature lives. Two connections would have meant
+inventing a reconciliation problem: which identity binds them, what happens when one drops
+and not the other, what happens to a finger that is down when only one side notices.
+
+#### A contact id had to stop being a bare `u32`
+
+The router keyed `contacts` and `drag_last` on a `u32`, and the mouse's stand-in contact
+reserved `u32::MAX` behind a comment claiming real ids stayed low enough not to collide.
+Nothing checked that, and it stops being true the moment a second device can produce
+contacts: two phones both numbering their first finger `0` would have merged into one drag.
+
+So `ContactId { origin, raw }`, and `raw` is only ever compared within an origin — which
+makes a hostile or careless peer able to collide with nothing but itself. `RemoteId` is never
+reused within a process run, so a peer that drops and reconnects cannot inherit the contacts
+the previous connection left behind. `cancel_all` gained the narrow sibling the whole design
+turns on: a peer that loses Wi-Fi mid-drag must let go of *its* contacts and nobody else's.
+
+They are **cancelled, not released.** `Up` means the gesture completed — it fires
+`release_transition`, commits transport-strip actions, commits a shell tap. Synthesising one
+for a dropped connection would commit whatever the finger was over, which on the scrub track
+means seeking to wherever it happened to be when the phone died.
+
+#### Everything else follows from routing a remote contact down the same road
+
+`route_input` used to decode winit's vocabulary *and* decide which layer a press belonged
+to. Splitting `decode_window_event` from `apply` is ground rule 3 applied to input, and it
+is what lets a remote contact reach the reserved edge, the home pill, the transport strip
+and the shell for free — plus it made the routing unit-testable without opening a window,
+which it had never been.
+
+The one thing a remote *cannot* do is the gesture home. A left-edge swipe is the Android
+back gesture and iOS swipe-to-go-back, and `touch-action: none` does not suppress system
+edge gestures — the browser eats it before the page sees it. So the page carries a Home
+button, and it travels through the same queue as the contacts so it keeps its place against
+them: home cancels whatever is down, and a press applied after it would be stranded.
+
+On the client the load-bearing parts are unobvious. The `<video>` is never fullscreened — a
+native fullscreen video hands control to the browser's own player, which cannot be overlaid
+and delivers no pointer events, so the remote would silently become view-only; the container
+goes fullscreen instead. `setPointerCapture` on `pointerdown`, or a drag that leaves the
+element stops delivering moves. Coordinates are measured against the *rendered video box*,
+because `object-fit: contain` letterboxes and the element's rectangle is not the picture's.
+
+#### ICE ports are declared before anything binds one
+
+`webrtc-rs` would take an ephemeral port. D45's registry generates
+`nix/network-surface.json` and the NixOS module derives the firewall from it, so a candidate
+outside a declared range is one the deployed box silently drops — the connection negotiates
+perfectly and then carries nothing, which is the worst shape a networking bug has.
+`clippy.toml` would not have caught it either: the bind happens inside the crate. So
+`[remote.ice_ports]` is pinned (41032–41063, tested clear of `[media_ports]`) and handed to
+the peer connection as an explicit address.
+
+#### What this costs, stated plainly
+
+Port 8080 has no authentication. This turns "anyone on the LAN can watch the panel" into
+"anyone on the LAN can drive it", including typing into whatever page is up. For a
+hackerspace panel that is close to the point, but it is a change of kind and the Security
+column in `docs/network-surface.md` now says so in a sentence rather than leaving it
+implicit. `remote.input = false` keeps the viewing half and drops every input message at the
+boundary — a way to stop a wall display being drivable, not a control against someone who
+can already reach the port.
+
+#### Not done
+
+No audio on the remote track: WebRTC wants Opus and the stream encodes AAC. No keyboard —
+`InputSink` has touch and pointer and no keys, and typing a URL or a Wi-Fi password from a
+phone is arguably the point of a remote UI; it is scoped separately. And **no phone has ever
+driven a real panel through this.** The negotiation is exercised against real sockets in
+`remote_negotiation.rs` and every pure layer is unit-tested, but the end-to-end path is
+unproven in exactly the way #65 is unproven from the other end.
