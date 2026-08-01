@@ -13,7 +13,7 @@
 //! panel gone silent over an unplugged DAC.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
@@ -104,6 +104,15 @@ pub struct PipeWireAudioOut {
     samples: Option<SyncSender<Vec<f32>>>,
     quit: Option<pipewire::channel::Sender<()>>,
     underruns: Arc<AtomicU64>,
+    /// The shape the session is feeding us, kept so the stream can be rebuilt without
+    /// the session noticing.
+    shape: Option<(u32, u16)>,
+    /// Set when the stream errors or is unlinked — see `node.dont-reconnect` below.
+    lost: Arc<AtomicBool>,
+    /// When recovery last tried, so a missing sink is not retried once per block.
+    last_attempt: Option<std::time::Instant>,
+    /// Whether the current outage has been logged, so it is one line, not one per block.
+    outage_logged: bool,
 }
 
 impl std::fmt::Debug for PipeWireAudioOut {
@@ -124,6 +133,10 @@ impl PipeWireAudioOut {
             samples: None,
             quit: None,
             underruns: Arc::new(AtomicU64::new(0)),
+            shape: None,
+            lost: Arc::new(AtomicBool::new(false)),
+            last_attempt: None,
+            outage_logged: false,
         }
     }
 
@@ -135,14 +148,63 @@ impl PipeWireAudioOut {
     }
 }
 
-impl AudioOut for PipeWireAudioOut {
-    fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
-        self.stop();
+/// How often a lost sink is retried. Matches the cpal backend deliberately: the same
+/// trade between a waking device costing a beat and a dead one spinning a core.
+const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl PipeWireAudioOut {
+    /// Tear the stream down but keep the session's shape, so it can be rebuilt.
+    fn release(&mut self) {
+        self.samples = None;
+        if let Some(quit) = self.quit.take() {
+            let _ = quit.send(());
+        }
+    }
+
+    /// Rebuild the stream after a loss, at most once every [`RETRY_EVERY`].
+    ///
+    /// Returns whether output is playable again. `false` means the sink has not come back
+    /// yet, and the session deliberately stays alive across it.
+    fn recover(&mut self) -> bool {
+        let Some((rate, channels)) = self.shape else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if self
+            .last_attempt
+            .is_some_and(|last| now.duration_since(last) < RETRY_EVERY)
+        {
+            return false;
+        }
+        self.last_attempt = Some(now);
+        self.release();
+        match self.open(rate, channels) {
+            Ok(()) => {
+                info!("pipewire output recovered");
+                self.outage_logged = false;
+                true
+            }
+            Err(e) => {
+                if !self.outage_logged {
+                    self.outage_logged = true;
+                    warn!(
+                        error = %e,
+                        "pipewire output is gone; waiting for it rather than ending the session"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
         let (samples_tx, samples_rx) = sync_channel::<Vec<f32>>(QUEUE_BLOCKS);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<()>();
         let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
         let underruns = Arc::clone(&self.underruns);
         let selection = self.selection.clone();
+        let lost = Arc::clone(&self.lost);
+        lost.store(false, Ordering::Relaxed);
 
         std::thread::spawn(move || {
             run_stream(
@@ -153,6 +215,7 @@ impl AudioOut for PipeWireAudioOut {
                 quit_rx,
                 &ready_tx,
                 &underruns,
+                &lost,
             );
         });
 
@@ -179,10 +242,27 @@ impl AudioOut for PipeWireAudioOut {
             )),
         }
     }
+}
+
+impl AudioOut for PipeWireAudioOut {
+    fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
+        self.stop();
+        self.shape = Some((sample_rate, channels));
+        self.open(sample_rate, channels)
+    }
 
     fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
+        // A sink that errored or was unlinked. As on the cpal side this no longer ends
+        // the session: live audio is dropped while there is nowhere to put it, and
+        // playback resumes when the sink returns.
+        if self.lost.swap(false, Ordering::Relaxed) {
+            self.release();
+        }
+        if self.samples.is_none() && !self.recover() {
+            return Ok(());
+        }
         let Some(tx) = self.samples.as_ref() else {
-            return Err(PipelineError::Audio("audio output not started".into()));
+            return Ok(());
         };
         match tx.try_send(block.samples.clone()) {
             Ok(()) => Ok(()),
@@ -192,17 +272,19 @@ impl AudioOut for PipeWireAudioOut {
                 warn!("pipewire output queue full; dropping a block");
                 Ok(())
             }
+            // The loop thread is gone, which nothing will undo on its own — reopen.
             Err(TrySendError::Disconnected(_)) => {
-                Err(PipelineError::Audio("audio device went away".into()))
+                self.release();
+                Ok(())
             }
         }
     }
 
     fn stop(&mut self) {
-        self.samples = None;
-        if let Some(quit) = self.quit.take() {
-            let _ = quit.send(());
-        }
+        self.release();
+        self.shape = None;
+        self.last_attempt = None;
+        self.outage_logged = false;
     }
 }
 
@@ -216,8 +298,9 @@ fn run_stream(
     quit: pipewire::channel::Receiver<()>,
     ready: &SyncSender<Result<(), String>>,
     underruns: &Arc<AtomicU64>,
+    lost: &Arc<AtomicBool>,
 ) {
-    match open_stream(selection, sample_rate, channels, samples, underruns) {
+    match open_stream(selection, sample_rate, channels, samples, underruns, lost) {
         Ok((mainloop, _stream, _listener)) => {
             // `stop()` reaches this thread through the channel; quitting the loop ends
             // this scope, and everything the stream owns unwinds with it. Attached
@@ -255,6 +338,7 @@ fn open_stream(
     channels: u16,
     samples: Receiver<Vec<f32>>,
     underruns: &Arc<AtomicU64>,
+    lost: &Arc<AtomicBool>,
 ) -> Result<
     (
         pipewire::main_loop::MainLoop,
@@ -280,12 +364,20 @@ fn open_stream(
         *pipewire::keys::NODE_NAME => "castaway",
     };
     if let OutputSelection::Device(node) = selection {
-        // The chosen sink, by node.name. If it has left the building, the session
-        // manager links us to the default instead — the fallback the cpal backend
-        // implements by hand. The raw key: pipewire-rs 0.8 does not export a
+        // The chosen sink, by node.name. The raw key: pipewire-rs 0.8 does not export a
         // constant for `target.object` (only the deprecated `node.target`).
         props.insert("target.object", node.as_str());
+        // Pin it. Without this the session manager helpfully relinks us to the default
+        // when the named sink disappears — which is the silent substitution the cpal
+        // backend had to grow a `strict` flag to avoid, except here it happens *below*
+        // us and we would never learn about it. With it, the stream errors instead, and
+        // recovery waits for the sink the user actually chose.
+        props.insert("node.dont-reconnect", "true");
     }
+    // `SystemDefault` deliberately sets neither. PipeWire already moves a stream when the
+    // default sink changes — the behaviour the Windows side had to implement by polling
+    // the OS default — so following it is free here and re-implementing it would fight
+    // the session manager.
 
     let stream = pipewire::stream::Stream::new(&core, "castaway-out", props)
         .map_err(|e| format!("pipewire stream: {e}"))?;
@@ -297,8 +389,22 @@ fn open_stream(
         stride,
         underruns: Arc::clone(underruns),
     };
+    let lost_on_state = Arc::clone(lost);
     let listener = stream
         .add_local_listener_with_user_data(data)
+        .state_changed(move |_stream, _data, _old, new| {
+            // Error is a sink that went away with `node.dont-reconnect` set; Unconnected
+            // is the link being torn down under us. Either way there is nowhere for audio
+            // to go, and the flag is what `write` acts on — this callback runs on the
+            // PipeWire loop thread, so it does no work of its own.
+            if matches!(
+                new,
+                pipewire::stream::StreamState::Error(_)
+                    | pipewire::stream::StreamState::Unconnected
+            ) {
+                lost_on_state.store(true, Ordering::Relaxed);
+            }
+        })
         .process(|stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
