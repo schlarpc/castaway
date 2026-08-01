@@ -13,7 +13,8 @@
 #
 # `ffmpegSrc`/`electronSrc` are the raw archives, pinned as flake inputs so they land in
 # flake.lock; the derivations beside this file unpack and rearrange them.
-{ pkgs, craneLib, commonArgs, rustToolchain, gitRev, ffmpegSrc, electronSrc, widevineSrc }:
+{ pkgs, craneLib, commonArgs, rustToolchain, gitRev, ffmpegSrc, electronSrc, widevineSrc
+, bluetoothFirmware }:
 
 let
   inherit (pkgs) lib;
@@ -274,6 +275,14 @@ let
         # The revision the idle screen's footer shows — final builds only, never
         # `crossArgs`, where the deps trees would inherit it and rebuild each commit.
         CASTAWAY_GIT_REV = gitRev;
+
+        # Where `hci-transport`'s build.rs finds controller firmware to embed. Windows has
+        # no /lib/firmware, so the blobs have to ride inside the .exe (architecture 11.3b).
+        # This was set in the devShell and *only* there, so every shipped artifact was
+        # built with an empty firmware set and said so at startup — "no bluetooth firmware
+        # in this build; only ROM-based controllers will initialise" — which reads like a
+        # deliberate build choice rather than a wiring gap.
+        CASTAWAY_FIRMWARE_DIR = bluetoothFirmware;
 
         # Windows has no rpath and no /nix/store to resolve against: the loader looks for
         # DLLs next to the .exe. Anything dynamically linked has to be copied in, or the

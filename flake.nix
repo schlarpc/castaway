@@ -347,6 +347,7 @@
         inherit gitRev;
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
+        bluetoothFirmware = bluetoothFirmwareFor system;
         moonlightCommonC = moonlightCommonCFor system;
         ldacbt = ldacbtFor system;
       };
@@ -362,6 +363,10 @@
         ffmpegSrc = ffmpeg-windows-src;
         electronSrc = electron-windows-src;
         widevineSrc = widevine-windows-src;
+        # Controller firmware travels *inside* the binary on Windows, which has no
+        # /lib/firmware. The blobs are platform-independent data, so the Linux-built
+        # firmware tree is the right input for a cross build.
+        bluetoothFirmware = bluetoothFirmwareFor system;
       };
 
     in

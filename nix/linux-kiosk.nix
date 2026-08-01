@@ -34,7 +34,8 @@
 # LD_LIBRARY_PATH is still set, but only for *our* binary now — the Vulkan/Wayland/X11
 # libraries winit and wgpu dlopen. The browser brings its own, because it is a separate
 # process with its own wrapper.
-{ pkgs, craneLib, commonArgs, baseCargoArtifacts, depsOnlyFrom, gitRev, electron, widevineCdm, moonlightCommonC, ldacbt }:
+{ pkgs, craneLib, commonArgs, baseCargoArtifacts, depsOnlyFrom, gitRev, electron, widevineCdm, moonlightCommonC, ldacbt
+, bluetoothFirmware }:
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
@@ -109,6 +110,10 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
   # `kioskArgs`/`commonArgs` it would reach the deps build above and invalidate every
   # compiled dependency at each commit.
   CASTAWAY_GIT_REV = gitRev;
+
+  # Same gap as the Windows artifact had: the firmware directory was named only in the
+  # devShell, so the kiosk that ships embedded none of it (architecture 11.3b).
+  CASTAWAY_FIRMWARE_DIR = bluetoothFirmware;
 
   # The render/browser tests want a GPU and a display; the sandbox has neither.
   doCheck = false;
