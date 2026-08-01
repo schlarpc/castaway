@@ -22,8 +22,13 @@ use crate::error::PipelineError;
 /// is exact and the presentation timeline never accumulates rounding.
 pub const TIMESCALE: u32 = 90_000;
 
-/// The track id. One video track, and nothing here is general enough to want a second.
-const TRACK_ID: u32 = 1;
+/// The video track's id, and the audio track's.
+///
+/// Fixed rather than allocated: there are two tracks at most, the encode loop builds both,
+/// and a number that moved would have to be threaded through the segmenter to no purpose.
+pub const VIDEO_TRACK: u32 = 1;
+/// See [`VIDEO_TRACK`].
+pub const AUDIO_TRACK: u32 = 2;
 
 /// One coded picture, ready to go in an `mdat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,15 +355,146 @@ fn u16_be(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+// --- tracks ------------------------------------------------------------------------
+
+/// An AAC decoder's configuration: the `AudioSpecificConfig` an encoder publishes, which
+/// is the whole of what a decoder needs before its first frame.
+///
+/// Opaque on purpose. Unlike H.264's parameter sets there is nothing here we choose or
+/// correct — the encoder emits five bytes or fewer and they go into `esds` verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AacConfig {
+    /// The raw `AudioSpecificConfig`.
+    pub asc: Vec<u8>,
+}
+
+impl AacConfig {
+    /// The RFC 6381 codec string.
+    ///
+    /// `mp4a.40.N` where N is the MPEG-4 audio object type, which is the first five bits
+    /// of the configuration. Read rather than assumed: an encoder configured for HE-AAC
+    /// would answer 5, and a player told `.2` would decode it at half rate.
+    #[must_use]
+    pub fn codec_string(&self) -> String {
+        let object_type = self.asc.first().map_or(2, |b| b >> 3);
+        format!("mp4a.40.{object_type}")
+    }
+}
+
+/// What a track carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Media {
+    /// H.264 video.
+    Avc {
+        /// Parameter sets.
+        config: AvcConfig,
+        /// Coded width.
+        width: u32,
+        /// Coded height.
+        height: u32,
+    },
+    /// AAC audio.
+    Aac {
+        /// The `AudioSpecificConfig`.
+        config: AacConfig,
+        /// Samples per second.
+        sample_rate: u32,
+        /// Channel count.
+        channels: u16,
+    },
+}
+
+/// One track in the movie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Track {
+    /// Its identifier, unique within the movie and quoted by every `traf`.
+    pub id: u32,
+    /// Ticks per second on this track's own timeline.
+    ///
+    /// Per-track rather than one for the movie, because audio's natural timescale is its
+    /// sample rate: at 48 kHz an AAC frame is exactly 1024 ticks, and expressing it in
+    /// 90 kHz would be 1920 ticks with a remainder that accumulates into audible drift.
+    pub timescale: u32,
+    /// What it carries.
+    pub media: Media,
+}
+
+impl Track {
+    /// This track's RFC 6381 codec string.
+    #[must_use]
+    pub fn codec_string(&self) -> String {
+        match &self.media {
+            Media::Avc { config, .. } => config.codec_string(),
+            Media::Aac { config, .. } => config.codec_string(),
+        }
+    }
+
+    const fn handler(&self) -> &'static [u8; 4] {
+        match self.media {
+            Media::Avc { .. } => b"vide",
+            Media::Aac { .. } => b"soun",
+        }
+    }
+}
+
+/// The codec parameter for a whole presentation, as an MSE `SourceBuffer` mime wants it:
+/// every track's codec string, comma-separated, in track order.
+#[must_use]
+pub fn codec_string(tracks: &[Track]) -> String {
+    tracks
+        .iter()
+        .map(Track::codec_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// One track's contribution to one media segment.
+#[derive(Debug, Clone)]
+pub struct Fragment {
+    /// Which track these belong to.
+    pub track_id: u32,
+    /// Where they start on that track's timeline, in its own timescale.
+    pub base_decode_time: u64,
+    /// The samples, in decode order.
+    pub samples: Vec<Sample>,
+}
+
+// --- box plumbing (part two) ---------------------------------------------------------
+
+/// Write a descriptor: tag, expandable length, body.
+///
+/// MPEG-4 descriptors size themselves with a base-128 varint rather than the fixed 32-bit
+/// length ISO-BMFF boxes use, which is the one place inside `esds` where a hand-rolled
+/// writer usually goes wrong. Everything written here fits in one byte; the loop is here
+/// so that stays true rather than being assumed.
+fn descriptor(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
+    out.push(tag);
+    let mut len = body.len();
+    let mut bytes = Vec::new();
+    loop {
+        bytes.push(u8::try_from(len & 0x7f).unwrap_or(0));
+        len >>= 7;
+        if len == 0 {
+            break;
+        }
+    }
+    // Most significant group first, every byte but the last carrying the continuation bit.
+    for (i, b) in bytes.iter().rev().enumerate() {
+        out.push(if i + 1 == bytes.len() { *b } else { *b | 0x80 });
+    }
+    out.extend_from_slice(body);
+}
+
 // --- init segment -------------------------------------------------------------------
 
 /// The initialisation segment: everything a player needs before the first sample.
 ///
-/// `width`/`height` are the coded dimensions, which for this stream are also the display
-/// dimensions — the compositor's output is square-pixel, so there is no aspect ratio to
-/// carry separately.
+/// Every track goes in one movie and, later, one `moof` per segment — rather than a track
+/// per HLS rendition. That is the choice that keeps the player trivial: one playlist, one
+/// `SourceBuffer`, and no synchronisation to do in JavaScript, because the two tracks
+/// arrive already interleaved and already agreeing about where they are.
 #[must_use]
-pub fn init_segment(config: &AvcConfig, width: u32, height: u32) -> Vec<u8> {
+pub fn init_segment(tracks: &[Track]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1024);
 
     let at = open_box(&mut out, b"ftyp");
@@ -370,15 +506,17 @@ pub fn init_segment(config: &AvcConfig, width: u32, height: u32) -> Vec<u8> {
     close_box(&mut out, at);
 
     let moov = open_box(&mut out, b"moov");
-    write_mvhd(&mut out);
-    write_trak(&mut out, config, width, height);
-    write_mvex(&mut out);
+    write_mvhd(&mut out, tracks);
+    for track in tracks {
+        write_trak(&mut out, track);
+    }
+    write_mvex(&mut out, tracks);
     close_box(&mut out, moov);
 
     out
 }
 
-fn write_mvhd(out: &mut Vec<u8>) {
+fn write_mvhd(out: &mut Vec<u8>, tracks: &[Track]) {
     let at = open_full_box(out, b"mvhd", 0, 0);
     u32_be(out, 0); // creation time
     u32_be(out, 0); // modification time
@@ -395,7 +533,7 @@ fn write_mvhd(out: &mut Vec<u8>) {
     for _ in 0..6 {
         u32_be(out, 0); // pre_defined
     }
-    u32_be(out, TRACK_ID + 1); // next_track_ID
+    u32_be(out, tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1);
     close_box(out, at);
 }
 
@@ -406,32 +544,49 @@ fn write_unity_matrix(out: &mut Vec<u8>) {
     }
 }
 
-fn write_trak(out: &mut Vec<u8>, config: &AvcConfig, width: u32, height: u32) {
+fn write_trak(out: &mut Vec<u8>, track: &Track) {
     let trak = open_box(out, b"trak");
 
     // flags 0x7: enabled, in the movie, in the preview.
     let at = open_full_box(out, b"tkhd", 0, 0x7);
     u32_be(out, 0);
     u32_be(out, 0);
-    u32_be(out, TRACK_ID);
+    u32_be(out, track.id);
     u32_be(out, 0); // reserved
     u32_be(out, 0); // duration, as in `mvhd`
     u32_be(out, 0);
     u32_be(out, 0);
     u16_be(out, 0); // layer
     u16_be(out, 0); // alternate group
-    u16_be(out, 0); // volume: zero for video
+                    // Full volume on a sound track and none on a picture one. A muted audio track here is
+                    // a stream that plays silently with no error anywhere.
+    u16_be(
+        out,
+        if track.handler() == b"soun" {
+            0x0100
+        } else {
+            0
+        },
+    );
     u16_be(out, 0);
     write_unity_matrix(out);
-    u32_be(out, width << 16); // 16.16 fixed point
-    u32_be(out, height << 16);
+    match track.media {
+        Media::Avc { width, height, .. } => {
+            u32_be(out, width << 16); // 16.16 fixed point
+            u32_be(out, height << 16);
+        }
+        Media::Aac { .. } => {
+            u32_be(out, 0);
+            u32_be(out, 0);
+        }
+    }
     close_box(out, at);
 
     let mdia = open_box(out, b"mdia");
     let at = open_full_box(out, b"mdhd", 0, 0);
     u32_be(out, 0);
     u32_be(out, 0);
-    u32_be(out, TIMESCALE);
+    u32_be(out, track.timescale);
     u32_be(out, 0);
     // ISO 639-2/T packed five bits per letter: "und".
     u16_be(out, 0x55c4);
@@ -440,21 +595,34 @@ fn write_trak(out: &mut Vec<u8>, config: &AvcConfig, width: u32, height: u32) {
 
     let at = open_full_box(out, b"hdlr", 0, 0);
     u32_be(out, 0); // pre_defined
-    out.extend_from_slice(b"vide");
+    out.extend_from_slice(track.handler());
     u32_be(out, 0);
     u32_be(out, 0);
     u32_be(out, 0);
-    out.extend_from_slice(b"VideoHandler\0");
+    out.extend_from_slice(match track.media {
+        Media::Avc { .. } => b"VideoHandler\0".as_slice(),
+        Media::Aac { .. } => b"SoundHandler\0".as_slice(),
+    });
     close_box(out, at);
 
     let minf = open_box(out, b"minf");
-    // flags 1: the graphics mode below is the only one, per spec.
-    let at = open_full_box(out, b"vmhd", 0, 1);
-    u16_be(out, 0); // graphicsmode: copy
-    for _ in 0..3 {
-        u16_be(out, 0); // opcolor
+    match track.media {
+        Media::Avc { .. } => {
+            // flags 1: the graphics mode below is the only one, per spec.
+            let at = open_full_box(out, b"vmhd", 0, 1);
+            u16_be(out, 0); // graphicsmode: copy
+            for _ in 0..3 {
+                u16_be(out, 0); // opcolor
+            }
+            close_box(out, at);
+        }
+        Media::Aac { .. } => {
+            let at = open_full_box(out, b"smhd", 0, 0);
+            u16_be(out, 0); // balance: centred
+            u16_be(out, 0); // reserved
+            close_box(out, at);
+        }
     }
-    close_box(out, at);
 
     let dinf = open_box(out, b"dinf");
     let at = open_full_box(out, b"dref", 0, 0);
@@ -468,7 +636,18 @@ fn write_trak(out: &mut Vec<u8>, config: &AvcConfig, width: u32, height: u32) {
     let stbl = open_box(out, b"stbl");
     let at = open_full_box(out, b"stsd", 0, 0);
     u32_be(out, 1); // entry_count
-    write_avc1(out, config, width, height);
+    match &track.media {
+        Media::Avc {
+            config,
+            width,
+            height,
+        } => write_avc1(out, config, *width, *height),
+        Media::Aac {
+            config,
+            sample_rate,
+            channels,
+        } => write_mp4a(out, config, *sample_rate, *channels),
+    }
     close_box(out, at);
     // Four empty tables. A fragmented track carries its timing in `trun`, but the boxes
     // themselves are mandatory and a parser that does not find them gives up on the track.
@@ -528,18 +707,58 @@ fn write_avc1(out: &mut Vec<u8>, config: &AvcConfig, width: u32, height: u32) {
     close_box(out, at);
 }
 
-fn write_mvex(out: &mut Vec<u8>) {
-    let mvex = open_box(out, b"mvex");
-    let at = open_full_box(out, b"trex", 0, 0);
-    u32_be(out, TRACK_ID);
-    u32_be(out, 1); // default_sample_description_index
-                    // Every other default is zero, because `trun` states duration, size and flags for
-                    // every sample explicitly. Defaults that disagree with an explicit value are a class
-                    // of bug that only shows up in one player.
+fn write_mp4a(out: &mut Vec<u8>, config: &AacConfig, sample_rate: u32, channels: u16) {
+    let at = open_box(out, b"mp4a");
+    for _ in 0..6 {
+        out.push(0); // reserved
+    }
+    u16_be(out, 1); // data_reference_index
+    u32_be(out, 0); // reserved
     u32_be(out, 0);
-    u32_be(out, 0);
-    u32_be(out, 0);
+    u16_be(out, channels);
+    u16_be(out, 16); // samplesize: the field is fixed at 16 regardless of the coding
+    u16_be(out, 0); // pre_defined
+    u16_be(out, 0); // reserved
+                    // 16.16 fixed point, so a rate above 65535 needs the version-1 entry. Nothing this
+                    // stream produces gets near it — the mixer runs at 48 kHz — and truncating silently
+                    // would be a track that plays at the wrong speed, so it saturates instead.
+    u32_be(out, sample_rate.min(u32::from(u16::MAX)) << 16);
+
+    let esds = open_full_box(out, b"esds", 0, 0);
+    let mut decoder_config = vec![
+        0x40, // objectTypeIndication: MPEG-4 Audio
+        0x15, // streamType 5 (audio) << 2, upStream 0, reserved 1
+        0, 0, 0, // bufferSizeDB
+    ];
+    // Bitrates are advisory and every player this targets ignores them; zero is the
+    // honest answer for a live stream whose rate control has not run yet.
+    decoder_config.extend_from_slice(&0u32.to_be_bytes()); // maxBitrate
+    decoder_config.extend_from_slice(&0u32.to_be_bytes()); // avgBitrate
+    descriptor(&mut decoder_config, 0x05, &config.asc); // DecoderSpecificInfo
+
+    let mut es = vec![0x00, 0x01, 0x00]; // ES_ID = 1, no dependency, no URL, no OCR
+    descriptor(&mut es, 0x04, &decoder_config); // DecoderConfigDescriptor
+    descriptor(&mut es, 0x06, &[0x02]); // SLConfigDescriptor: MP4 framing
+    descriptor(out, 0x03, &es); // ES_Descriptor
+    close_box(out, esds);
+
     close_box(out, at);
+}
+
+fn write_mvex(out: &mut Vec<u8>, tracks: &[Track]) {
+    let mvex = open_box(out, b"mvex");
+    for track in tracks {
+        let at = open_full_box(out, b"trex", 0, 0);
+        u32_be(out, track.id);
+        u32_be(out, 1); // default_sample_description_index
+                        // Every other default is zero, because `trun` states duration, size and flags for
+                        // every sample explicitly. Defaults that disagree with an explicit value are a class
+                        // of bug that only shows up in one player.
+        u32_be(out, 0);
+        u32_be(out, 0);
+        u32_be(out, 0);
+        close_box(out, at);
+    }
     close_box(out, mvex);
 }
 
@@ -550,66 +769,86 @@ const SAMPLE_FLAGS_KEY: u32 = 0x0200_0000;
 /// …and its opposite: depends on others, and is not a sync sample.
 const SAMPLE_FLAGS_DELTA: u32 = 0x0101_0000;
 
-/// One media segment: `moof` + `mdat`, self-contained and playable after the init segment.
+/// One media segment: a `moof` carrying a `traf` per track, then one `mdat` holding all of
+/// their samples.
 ///
-/// `base_decode_time` is where this segment sits on the track timeline in [`TIMESCALE`]
-/// ticks. It is the only thing tying a segment to its neighbours, which is what lets the
-/// ring in [`super::hls`] forget old ones without renumbering anything.
+/// Each fragment's `base_decode_time` is where it sits on *its own* track's timeline, in
+/// that track's timescale. Both are derived from the same wall-clock origin
+/// ([`super::timeline`]), which is what makes the tracks agree about when they are without
+/// either having to reference the other.
 #[must_use]
-pub fn media_segment(sequence: u32, base_decode_time: u64, samples: &[Sample]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(samples.iter().map(|s| s.data.len()).sum::<usize>() + 256);
+pub fn media_segment(sequence: u32, fragments: &[Fragment]) -> Vec<u8> {
+    let payload: usize = fragments
+        .iter()
+        .flat_map(|f| &f.samples)
+        .map(|s| s.data.len())
+        .sum();
+    let mut out = Vec::with_capacity(payload + 256 * (fragments.len() + 1));
 
     let moof = open_box(&mut out, b"moof");
     let at = open_full_box(&mut out, b"mfhd", 0, 0);
     u32_be(&mut out, sequence);
     close_box(&mut out, at);
 
-    let traf = open_box(&mut out, b"traf");
-    // flags 0x020000: default-base-is-moof. The alternative is a base offset into the
-    // whole file, which a live stream delivered as separate resources does not have.
-    let at = open_full_box(&mut out, b"tfhd", 0, 0x0002_0000);
-    u32_be(&mut out, TRACK_ID);
-    close_box(&mut out, at);
+    // Where each track's `trun` left room for the offset of its samples in the `mdat`, and
+    // how far into that payload those samples start. Backfilled together once the `moof`
+    // is closed, because the offset is measured from the start of the `moof` and the
+    // `moof` is not finished until every `trun` inside it is.
+    let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(fragments.len());
+    let mut payload_at = 0usize;
 
-    let at = open_full_box(&mut out, b"tfdt", 1, 0);
-    out.extend_from_slice(&base_decode_time.to_be_bytes());
-    close_box(&mut out, at);
+    for fragment in fragments {
+        let traf = open_box(&mut out, b"traf");
+        // flags 0x020000: default-base-is-moof. The alternative is a base offset into the
+        // whole file, which a live stream delivered as separate resources does not have.
+        let at = open_full_box(&mut out, b"tfhd", 0, 0x0002_0000);
+        u32_be(&mut out, fragment.track_id);
+        close_box(&mut out, at);
 
-    // data-offset (0x1), sample-duration (0x100), sample-size (0x200), sample-flags
-    // (0x400). No composition offsets: the encoder is opened with no B-frames, so
-    // decode order is presentation order and there is nothing to shift.
-    let trun = open_full_box(&mut out, b"trun", 0, 0x0000_0701);
-    u32_be(&mut out, u32::try_from(samples.len()).unwrap_or(u32::MAX));
-    // Backfilled once the `moof` is closed: the offset is measured from the start of the
-    // `moof`, and the `moof` is not finished until the `trun` inside it is.
-    let data_offset_at = out.len();
-    u32_be(&mut out, 0);
-    for sample in samples {
-        u32_be(&mut out, sample.duration);
+        let at = open_full_box(&mut out, b"tfdt", 1, 0);
+        out.extend_from_slice(&fragment.base_decode_time.to_be_bytes());
+        close_box(&mut out, at);
+
+        // data-offset (0x1), sample-duration (0x100), sample-size (0x200), sample-flags
+        // (0x400). No composition offsets: the video encoder is opened with no B-frames,
+        // so decode order is presentation order, and AAC has none to begin with.
+        let trun = open_full_box(&mut out, b"trun", 0, 0x0000_0701);
         u32_be(
             &mut out,
-            u32::try_from(sample.data.len()).unwrap_or(u32::MAX),
+            u32::try_from(fragment.samples.len()).unwrap_or(u32::MAX),
         );
-        u32_be(
-            &mut out,
-            if sample.keyframe {
-                SAMPLE_FLAGS_KEY
-            } else {
-                SAMPLE_FLAGS_DELTA
-            },
-        );
+        offsets.push((out.len(), payload_at));
+        u32_be(&mut out, 0);
+        for sample in &fragment.samples {
+            u32_be(&mut out, sample.duration);
+            u32_be(
+                &mut out,
+                u32::try_from(sample.data.len()).unwrap_or(u32::MAX),
+            );
+            u32_be(
+                &mut out,
+                if sample.keyframe {
+                    SAMPLE_FLAGS_KEY
+                } else {
+                    SAMPLE_FLAGS_DELTA
+                },
+            );
+            payload_at += sample.data.len();
+        }
+        close_box(&mut out, trun);
+        close_box(&mut out, traf);
     }
-    close_box(&mut out, trun);
-    close_box(&mut out, traf);
     close_box(&mut out, moof);
 
     let moof_len = out.len() - moof;
-    // The `mdat` payload starts eight bytes past the box header that follows the `moof`.
-    let data_offset = u32::try_from(moof_len + 8).unwrap_or(u32::MAX);
-    out[data_offset_at..data_offset_at + 4].copy_from_slice(&data_offset.to_be_bytes());
+    for (field_at, within) in offsets {
+        // The `mdat` payload starts eight bytes past the box header that follows the `moof`.
+        let offset = u32::try_from(moof_len + 8 + within).unwrap_or(u32::MAX);
+        out[field_at..field_at + 4].copy_from_slice(&offset.to_be_bytes());
+    }
 
     let at = open_box(&mut out, b"mdat");
-    for sample in samples {
+    for sample in fragments.iter().flat_map(|f| &f.samples) {
         out.extend_from_slice(&sample.data);
     }
     close_box(&mut out, at);
@@ -666,17 +905,19 @@ mod tests {
 
     /// How far into a box's body its child boxes start, for the boxes that have any.
     ///
-    /// Most containers are pure — their body *is* the children. Two are not: `stsd` puts
-    /// a version/flags word and an entry count first, and a visual sample entry has 78
-    /// bytes of fields before `avcC`. Walking into either at offset zero would read a
-    /// field as a length and wander off the end, which is why this is a table rather than
-    /// a set.
+    /// Most containers are pure — their body *is* the children. Three are not: `stsd` puts
+    /// a version/flags word and an entry count first, and the sample entries have their own
+    /// fields before their codec boxes. Walking into any of them at offset zero would read
+    /// a field as a length and wander off the end, which is why this is a table rather
+    /// than a set.
     fn child_offset(kind: &[u8; 4]) -> Option<usize> {
         match kind {
             b"moov" | b"trak" | b"mdia" | b"minf" | b"dinf" | b"stbl" | b"mvex" | b"moof"
             | b"traf" => Some(0),
             b"stsd" => Some(8),
             b"avc1" => Some(78),
+            // An audio sample entry is 28 bytes of fields before `esds`.
+            b"mp4a" => Some(28),
             _ => None,
         }
     }
@@ -714,6 +955,50 @@ mod tests {
         AvcConfig {
             sps: vec![SPS.to_vec()],
             pps: vec![PPS.to_vec()],
+        }
+    }
+
+    fn video_track(width: u32, height: u32) -> Track {
+        Track {
+            id: VIDEO_TRACK,
+            timescale: TIMESCALE,
+            media: Media::Avc {
+                config: config(),
+                width,
+                height,
+            },
+        }
+    }
+
+    /// AAC-LC, 48 kHz, stereo: object type 2, frequency index 3, channel config 2 —
+    /// which packs into exactly these two bytes.
+    fn audio_track() -> Track {
+        Track {
+            id: AUDIO_TRACK,
+            timescale: 48_000,
+            media: Media::Aac {
+                config: AacConfig {
+                    asc: vec![0x11, 0x90],
+                },
+                sample_rate: 48_000,
+                channels: 2,
+            },
+        }
+    }
+
+    fn fragment(track_id: u32, base_decode_time: u64, samples: Vec<Sample>) -> Fragment {
+        Fragment {
+            track_id,
+            base_decode_time,
+            samples,
+        }
+    }
+
+    fn picture(keyframe: bool) -> Sample {
+        Sample {
+            data: vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }],
+            duration: 3000,
+            keyframe,
         }
     }
 
@@ -792,7 +1077,7 @@ mod tests {
 
     #[test]
     fn the_init_segment_has_the_boxes_a_player_looks_for() {
-        let init = init_segment(&config(), 1280, 720);
+        let init = init_segment(&[video_track(1280, 720)]);
         let boxes: Vec<String> = top_level(&init).into_iter().map(|(k, _)| k).collect();
         assert_eq!(boxes, vec!["ftyp", "moov"]);
         // The sizes have to add up exactly, or every parser stops at the first box whose
@@ -820,22 +1105,14 @@ mod tests {
         // by-name assertions above all still passed — a parser reading the tree is the
         // only thing that notices.
         let mut names = Vec::new();
-        walk(&init_segment(&config(), 640, 360), 0, &mut names);
+        walk(&init_segment(&[video_track(640, 360)]), 0, &mut names);
         for kind in ["moov", "trak", "stbl", "avcC", "trex"] {
             assert!(names.contains(&kind.to_string()), "missing {kind}");
         }
 
         let mut names = Vec::new();
         walk(
-            &media_segment(
-                1,
-                0,
-                &[Sample {
-                    data: vec![0, 0, 0, 1, 0x65],
-                    duration: 3000,
-                    keyframe: true,
-                }],
-            ),
+            &media_segment(1, &[fragment(VIDEO_TRACK, 0, vec![picture(true)])]),
             0,
             &mut names,
         );
@@ -847,7 +1124,7 @@ mod tests {
 
     #[test]
     fn the_track_carries_the_dimensions_it_was_given() {
-        let init = init_segment(&config(), 1280, 720);
+        let init = init_segment(&[video_track(1280, 720)]);
         let avc1 = find_box(&init, b"avc1").unwrap();
         // Width and height sit 24 bytes past the box name in a visual sample entry.
         let w = u16::from_be_bytes(init[avc1 + 4 + 24..avc1 + 4 + 26].try_into().unwrap());
@@ -879,7 +1156,7 @@ mod tests {
                 keyframe: false,
             },
         ];
-        let seg = media_segment(7, 90_000, &samples);
+        let seg = media_segment(7, &[fragment(VIDEO_TRACK, 90_000, samples.clone())]);
         let boxes = top_level(&seg);
         assert_eq!(
             boxes.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
@@ -913,7 +1190,7 @@ mod tests {
                 keyframe: false,
             },
         ];
-        let seg = media_segment(1, 0, &samples);
+        let seg = media_segment(1, &[fragment(VIDEO_TRACK, 0, samples)]);
         let trun = find_box(&seg, b"trun").unwrap();
         let first = trun + 4 + 4 + 4 + 4; // …past name, version/flags, count, data offset
         let flags = u32::from_be_bytes(seg[first + 8..first + 12].try_into().unwrap());
@@ -924,16 +1201,75 @@ mod tests {
     }
 
     #[test]
-    fn the_segment_timeline_is_carried_in_tfdt() {
-        let seg = media_segment(
-            3,
-            270_000,
-            &[Sample {
-                data: vec![0, 0, 0, 1, 0x65],
-                duration: 3000,
-                keyframe: true,
-            }],
+    fn an_audio_track_carries_an_esds_a_decoder_can_configure_itself_from() {
+        // The whole of what an AAC decoder needs is in `esds`, wrapped in three nested
+        // MPEG-4 descriptors whose lengths are base-128 varints rather than the fixed
+        // 32-bit ones every other box uses. That is the one place a hand-rolled writer
+        // usually goes wrong, and the symptom is a track a player skips silently.
+        let init = init_segment(&[video_track(640, 360), audio_track()]);
+        let mut names = Vec::new();
+        walk(&init, 0, &mut names);
+        for kind in ["mp4a", "esds", "smhd"] {
+            assert!(names.contains(&kind.to_string()), "missing {kind}");
+        }
+        assert_eq!(names.iter().filter(|n| *n == "trak").count(), 2);
+        assert_eq!(names.iter().filter(|n| *n == "trex").count(), 2);
+
+        // The `AudioSpecificConfig` has to arrive verbatim, at the end of the descriptor
+        // chain: `05 02 11 90` is the DecoderSpecificInfo tag, its length, and the bytes.
+        let esds = find_box(&init, b"esds").unwrap();
+        let body = &init[esds..];
+        assert!(
+            body.windows(4).any(|w| w == [0x05, 0x02, 0x11, 0x90]),
+            "the AudioSpecificConfig is not in the esds"
         );
+    }
+
+    #[test]
+    fn the_codec_string_names_every_track_in_order() {
+        // What an MSE `SourceBuffer` is opened with. One track missing from it and the
+        // browser refuses the whole stream.
+        assert_eq!(
+            codec_string(&[video_track(640, 360), audio_track()]),
+            "avc1.64001F,mp4a.40.2"
+        );
+    }
+
+    #[test]
+    fn each_track_in_a_segment_points_at_its_own_samples() {
+        // Two `traf`s share one `mdat`, so the second track's `trun` offset has to clear
+        // the first track's bytes. Getting it wrong gives audio that decodes video and
+        // vice versa — which is silence and a stutter, with no error anywhere.
+        let audio = Sample {
+            data: vec![0xaa; 40],
+            duration: 1024,
+            keyframe: true,
+        };
+        let seg = media_segment(
+            5,
+            &[
+                fragment(VIDEO_TRACK, 90_000, vec![picture(true), picture(false)]),
+                fragment(AUDIO_TRACK, 48_000, vec![audio.clone(), audio.clone()]),
+            ],
+        );
+        let mut names = Vec::new();
+        walk(&seg, 0, &mut names);
+        assert_eq!(names.iter().filter(|n| *n == "traf").count(), 2);
+
+        // Both `trun`s, in order: name(4) version+flags(4) sample_count(4) then the offset.
+        let first = find_box(&seg, b"trun").unwrap();
+        let second = find_box_from(&seg, b"trun", first + 4).unwrap();
+        let offset = |trun: usize| {
+            u32::from_be_bytes(seg[trun + 12..trun + 16].try_into().unwrap()) as usize
+        };
+        // Video's two samples are five bytes each; audio starts after them.
+        assert_eq!(offset(second) - offset(first), 10);
+        assert_eq!(&seg[offset(second)..offset(second) + 40], &audio.data[..]);
+    }
+
+    #[test]
+    fn the_segment_timeline_is_carried_in_tfdt() {
+        let seg = media_segment(3, &[fragment(VIDEO_TRACK, 270_000, vec![picture(true)])]);
         let tfdt = find_box(&seg, b"tfdt").unwrap();
         let base = u64::from_be_bytes(seg[tfdt + 8..tfdt + 16].try_into().unwrap());
         assert_eq!(base, 270_000);

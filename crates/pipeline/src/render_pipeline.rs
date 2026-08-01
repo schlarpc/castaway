@@ -151,6 +151,9 @@ pub enum RenderCommand {
         state: Arc<crate::stream::LiveStream>,
         /// Rate, size cap, bitrate, and how long the tap outlives its last viewer.
         config: crate::stream::StreamConfig,
+        /// The panel's sound, if this build has an audio path. `None` is a video-only
+        /// stream, which is a whole stream rather than a degraded one.
+        audio: Option<Arc<crate::stream::StreamAudio>>,
     },
     /// The URL that was opened turned out to be audio-only, with whatever the container
     /// tags said about it. The surface answers with a now-playing card rather than a
@@ -290,6 +293,9 @@ pub struct StreamHandle {
     tx: RenderTx,
     state: Arc<crate::stream::LiveStream>,
     config: crate::stream::StreamConfig,
+    /// The panel's sound. Created once by the app because the factory it tees is installed
+    /// once, where the tap comes and goes with whoever is watching.
+    audio: Option<Arc<crate::stream::StreamAudio>>,
 }
 
 #[cfg(feature = "stream")]
@@ -322,6 +328,7 @@ impl StreamHandle {
             self.tx.send(RenderCommand::StartStream {
                 state: Arc::clone(&self.state),
                 config: self.config,
+                audio: self.audio.clone(),
             });
         }
     }
@@ -581,11 +588,16 @@ impl RenderPipeline {
     /// [`Self::screenshot_handle`] and costing the same nothing until something asks.
     #[cfg(feature = "stream")]
     #[must_use]
-    pub fn stream_handle(&self, config: crate::stream::StreamConfig) -> StreamHandle {
+    pub fn stream_handle(
+        &self,
+        config: crate::stream::StreamConfig,
+        audio: Option<Arc<crate::stream::StreamAudio>>,
+    ) -> StreamHandle {
         StreamHandle {
             tx: self.tx.clone(),
             state: Arc::new(crate::stream::LiveStream::new(&config)),
             config,
+            audio,
         }
     }
 
@@ -2923,12 +2935,16 @@ impl RenderLoop {
                 false
             }
             #[cfg(feature = "stream")]
-            RenderCommand::StartStream { state, config } => {
+            RenderCommand::StartStream {
+                state,
+                config,
+                audio,
+            } => {
                 let (width, height) =
                     crate::stream::stream_size(self.compositor.target_size(), config.max_height);
                 info!(width, height, "starting the output stream");
                 self.taps.push(Box::new(crate::stream::StreamTap::new(
-                    state, config, width, height,
+                    state, config, width, height, audio,
                 )));
                 false
             }

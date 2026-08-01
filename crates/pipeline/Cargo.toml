@@ -164,7 +164,10 @@ libav-sys = ["dep:ffmpeg-sys-next"]
 #
 # The boxing, segmenting and cadence are pure and compiled without it, so their fixtures
 # run in every build rather than only where a GPU exists.
-stream = ["render", "ffmpeg", "libav-sys"]
+# `audio` is not optional: the stream's own audio track is tapped at the `AudioOut`
+# factory, so it needs `PcmBlock` and libswresample. It does not need an output *device* —
+# a headless build still encodes what the sessions produced.
+stream = ["render", "ffmpeg", "audio", "libav-sys"]
 # `audio` = A2DP/audio decode (libav) plus a PCM output device (cpal). Separate from
 # `ffmpeg` because the decoders are useful in tests without pulling in an audio device,
 # and a headless CI box has no sound card.

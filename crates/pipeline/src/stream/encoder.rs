@@ -785,7 +785,7 @@ mod tests {
         let mut segments = Vec::new();
         for i in 0..90 {
             for sample in encoder.encode(&planes(320, 240, 40 + (i % 8) * 8)).unwrap() {
-                if let Some(segment) = segmenter.push(sample) {
+                if let Some(segment) = segmenter.push_video(sample) {
                     segments.push(segment);
                 }
             }

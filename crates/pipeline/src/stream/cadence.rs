@@ -17,9 +17,11 @@
 //! Pure: `Instant` in, slot arithmetic out. No sleeping happens here.
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::fmp4::TIMESCALE;
+use super::timeline::Timeline;
 
 /// How many pictures a second the stream publishes.
 ///
@@ -110,22 +112,25 @@ pub struct Cadence {
     /// instead: a panel that stopped presenting for a minute should not produce a minute
     /// of identical frames that a viewer then has to sit through to reach the present.
     max_duplicates: u32,
-    /// When slot zero was due. Established by the first frame rather than at
-    /// construction, so a tap that is installed and then waits for the render loop does
-    /// not open with a burst of duplicates for slots that elapsed before it saw anything.
-    origin: Option<Instant>,
+    /// The wall-clock origin slot zero sits on — shared with the audio mixer, which is
+    /// what keeps the two tracks from drifting apart (see [`Timeline`]). Established by
+    /// the first frame rather than at construction, so a tap that is installed and then
+    /// waits for the render loop does not open with a burst of duplicates for slots that
+    /// elapsed before it saw anything.
+    timeline: Arc<Timeline>,
     /// The next slot owed a picture.
     next_slot: u64,
 }
 
 impl Cadence {
-    /// A grid at `rate`, papering over gaps of up to `max_gap` before rebasing.
+    /// A grid at `rate` on `timeline`, papering over gaps of up to `max_gap` before
+    /// rebasing.
     #[must_use]
-    pub fn new(rate: FrameRate, max_gap: Duration) -> Self {
+    pub fn new(rate: FrameRate, max_gap: Duration, timeline: Arc<Timeline>) -> Self {
         Self {
             rate,
             max_duplicates: u32::try_from(rate.slot_at(max_gap)).unwrap_or(u32::MAX),
-            origin: None,
+            timeline,
             next_slot: 0,
         }
     }
@@ -142,10 +147,10 @@ impl Cadence {
     /// 60 Hz panel feeding a 30 fps stream costs one readback in two rather than two.
     #[must_use]
     pub fn due(&self, now: Instant) -> bool {
-        let Some(origin) = self.origin else {
+        let Some(elapsed) = self.timeline.elapsed(now) else {
             return true;
         };
-        now.saturating_duration_since(origin) >= self.rate.slot_offset(self.next_slot)
+        elapsed >= self.rate.slot_offset(self.next_slot)
     }
 
     /// Consume the slot that is due, and say what to publish.
@@ -153,8 +158,7 @@ impl Cadence {
     /// Advances past every slot that has already elapsed, so the grid tracks wall time
     /// rather than drifting behind it by however long the caller took to notice.
     pub fn take(&mut self, now: Instant) -> Publish {
-        let origin = *self.origin.get_or_insert(now);
-        let elapsed = now.saturating_duration_since(origin);
+        let elapsed = self.timeline.anchor(now);
         // Which slot `now` falls in, clamped forward: the arithmetic below must never
         // hand back a slot behind the one already published.
         let slot = self.rate.slot_at(elapsed).max(self.next_slot);
@@ -165,7 +169,7 @@ impl Cadence {
             // Stream time stays contiguous — which is what the player reconstructs — and
             // only its agreement with the wall clock is given up.
             let skipped = missed - u64::from(self.max_duplicates);
-            self.origin = Some(origin + self.rate.slot_offset(skipped));
+            self.timeline.rebase(self.rate.slot_offset(skipped));
             self.max_duplicates
         } else {
             // Fits in a `u32` because it is at most `max_duplicates`, which is one.
@@ -185,7 +189,11 @@ mod tests {
     use super::*;
 
     fn cadence() -> Cadence {
-        Cadence::new(FrameRate::DEFAULT, Duration::from_secs(2))
+        Cadence::new(
+            FrameRate::DEFAULT,
+            Duration::from_secs(2),
+            Arc::new(Timeline::new()),
+        )
     }
 
     #[test]

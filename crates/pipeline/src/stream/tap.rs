@@ -25,11 +25,15 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use super::aac::AacEncoder;
+use super::audio::{StreamAudio, CHANNELS, RATE};
 use super::cadence::Cadence;
 use super::encoder::H264Encoder;
+use super::fmp4::{AacConfig, Media, Track, AUDIO_TRACK, TIMESCALE, VIDEO_TRACK};
 use super::hls::Segmenter;
+use super::timeline::Timeline;
 use super::{fmp4, LiveStream, StreamConfig, StreamStatus};
 use crate::nv12::Nv12Planes;
 use crate::tap::{FrameWant, OutputTap, TappedFrame};
@@ -81,18 +85,46 @@ impl StreamTap {
     /// The encoder is opened on the thread this spawns, not here: probing five candidates
     /// against a driver can take tens of milliseconds, and this is called from the render
     /// loop while it is applying commands.
+    /// `audio` is the panel's sound, if this build and this box have any. Without it the
+    /// stream is video-only — which is a whole, playable stream, not a degraded one.
     #[must_use]
-    pub fn new(state: Arc<LiveStream>, config: StreamConfig, width: u32, height: u32) -> Self {
+    pub fn new(
+        state: Arc<LiveStream>,
+        config: StreamConfig,
+        width: u32,
+        height: u32,
+        audio: Option<Arc<StreamAudio>>,
+    ) -> Self {
         let (jobs, rx) = sync_channel(DEPTH);
         let queued = Arc::new(AtomicUsize::new(0));
+        // A new presentation: a fresh origin, and nothing left in the mix from the last
+        // one. Done here rather than on the encode thread so the cadence below and the
+        // audio tee agree from the first frame.
+        if let Some(audio) = audio.as_ref() {
+            audio.restart();
+        }
+        let timeline = audio
+            .as_ref()
+            .map_or_else(|| Arc::new(Timeline::new()), |a| a.timeline());
         {
             let owned = Arc::clone(&state);
             let queued = Arc::clone(&queued);
+            let audio = audio.clone();
             // Named, because a stuck thread in a `perf` capture that says
             // `castaway-stream` is a diagnosis and one that says `thread-14` is a hunt.
             let spawned = std::thread::Builder::new()
                 .name("castaway-stream".into())
-                .spawn(move || encode_loop(&rx, &owned, config, width, height, &queued));
+                .spawn(move || {
+                    encode_loop(
+                        &rx,
+                        &owned,
+                        config,
+                        width,
+                        height,
+                        &queued,
+                        audio.as_deref(),
+                    );
+                });
             if let Err(e) = spawned {
                 state.failed(format!("could not start the encode thread: {e}"));
             }
@@ -100,7 +132,7 @@ impl StreamTap {
         Self {
             state,
             config,
-            cadence: Cadence::new(config.rate, config.max_gap),
+            cadence: Cadence::new(config.rate, config.max_gap, timeline),
             width,
             height,
             jobs: Some(jobs),
@@ -183,7 +215,8 @@ impl Drop for StreamTap {
     }
 }
 
-/// Open the encoder, then turn frames into published segments until the tap goes away.
+/// Open the encoders, then turn frames and sound into published segments until the tap
+/// goes away.
 fn encode_loop(
     jobs: &Receiver<Job>,
     state: &Arc<LiveStream>,
@@ -191,6 +224,7 @@ fn encode_loop(
     width: u32,
     height: u32,
     queued: &AtomicUsize,
+    audio: Option<&StreamAudio>,
 ) {
     // The keyframe interval *is* the segment length: a segment has to start on one, so a
     // GOP that disagreed would give the segmenter nowhere to cut at the target.
@@ -202,18 +236,30 @@ fn encode_loop(
             / 1000,
     )
     .unwrap_or(u32::MAX);
-    let mut encoder =
-        match H264Encoder::open(width, height, config.rate, config.bitrate, gop.max(1)) {
-            Ok(encoder) => encoder,
-            Err(e) => {
-                tracing::warn!(error = %e, "the output stream has no encoder");
-                state.failed(e.to_string());
-                return;
-            }
-        };
+    let mut video = match H264Encoder::open(width, height, config.rate, config.bitrate, gop.max(1))
+    {
+        Ok(encoder) => encoder,
+        Err(e) => {
+            tracing::warn!(error = %e, "the output stream has no encoder");
+            state.failed(e.to_string());
+            return;
+        }
+    };
+
+    // Audio is optional twice over: this build may have no audio path at all, and a box
+    // may have no AAC encoder. Either way the video track still goes out — a stream with
+    // no sound beats no stream.
+    let mut sound = audio.and_then(|audio| match AacEncoder::open(RATE, config.audio_bitrate) {
+        Ok(encoder) => Some(Sound::new(encoder, audio)),
+        Err(e) => {
+            tracing::warn!(error = %e, "the output stream will be silent");
+            None
+        }
+    });
+
     let mut segmenter = Segmenter::new(config.segment);
     let mut previous: Option<Nv12Planes> = None;
-    // Whether the init segment has been published. Deliberately not "has the encoder
+    // Whether the init segment has been published. Deliberately not "have the encoders
     // opened": the track cannot be described until a frame has come out of it.
     let mut live = false;
     while let Ok(job) = jobs.recv() {
@@ -228,7 +274,7 @@ fn encode_loop(
             .chain(std::iter::once(&job.planes));
         let mut failed = None;
         for planes in frames {
-            match encoder.encode(planes) {
+            match video.encode(planes) {
                 Ok(samples) => {
                     // The init segment is written from the first frame's parameter sets,
                     // not from the encoder's `extradata`, and this is where the difference
@@ -238,19 +284,10 @@ fn encode_loop(
                     // decode to grey (`AvcConfig::absorb`).
                     if !samples.is_empty() && !live {
                         live = true;
-                        let config = encoder.describe().clone();
-                        state.go_live(
-                            fmp4::init_segment(&config, width, height),
-                            StreamStatus::Live {
-                                encoder: encoder.name().to_string(),
-                                width,
-                                height,
-                                codec: config.codec_string(),
-                            },
-                        );
+                        go_live(state, &mut video, sound.as_ref(), width, height);
                     }
                     for sample in samples {
-                        if let Some(segment) = segmenter.push(sample) {
+                        if let Some(segment) = segmenter.push_video(sample) {
                             state.publish(segment);
                         }
                     }
@@ -268,14 +305,26 @@ fn encode_loop(
             return;
         }
         previous = Some(job.planes);
+
+        // Then whatever sound has settled. Pulled by absolute position on the shared
+        // timeline rather than by "whatever arrived", which is what keeps the audio track
+        // from drifting against the video one however long the stream runs.
+        if let Some(sound) = sound.as_mut() {
+            sound.drain(&mut segmenter, state, config.audio_settle);
+        }
     }
 
-    // The tap has gone. Whatever the encoder is still holding is worth publishing: a
+    // The tap has gone. Whatever the encoders are still holding is worth publishing: a
     // viewer who joined a second ago would otherwise sit on a playlist whose last segment
     // never appears.
-    for sample in encoder.flush() {
-        if let Some(segment) = segmenter.push(sample) {
+    for sample in video.flush() {
+        if let Some(segment) = segmenter.push_video(sample) {
             state.publish(segment);
+        }
+    }
+    if let Some(sound) = sound.as_mut() {
+        for sample in sound.encoder.flush() {
+            segmenter.push_audio(sample);
         }
     }
     if let Some(segment) = segmenter.flush() {
@@ -283,6 +332,112 @@ fn encode_loop(
     }
     tracing::info!("output stream stopped; nobody is watching");
     state.stopped();
+}
+
+/// Describe both tracks and publish the init segment.
+fn go_live(
+    state: &Arc<LiveStream>,
+    video: &mut H264Encoder,
+    sound: Option<&Sound>,
+    width: u32,
+    height: u32,
+) {
+    let mut tracks = vec![Track {
+        id: VIDEO_TRACK,
+        timescale: TIMESCALE,
+        media: Media::Avc {
+            config: video.describe().clone(),
+            width,
+            height,
+        },
+    }];
+    if let Some(sound) = sound {
+        tracks.push(Track {
+            id: AUDIO_TRACK,
+            // The audio track's own sample rate, so an AAC frame is exactly 1024 ticks.
+            timescale: RATE,
+            media: Media::Aac {
+                config: sound.config.clone(),
+                sample_rate: RATE,
+                channels: CHANNELS,
+            },
+        });
+    }
+    let codec = fmp4::codec_string(&tracks);
+    state.go_live(
+        fmp4::init_segment(&tracks),
+        StreamStatus::Live {
+            encoder: match sound {
+                Some(sound) => format!("{} + {}", video.name(), sound.name),
+                None => video.name().to_string(),
+            },
+            width,
+            height,
+            codec,
+        },
+    );
+}
+
+/// The audio half of the encode loop.
+struct Sound {
+    encoder: AacEncoder,
+    mix: Arc<super::audio::AudioMix>,
+    config: AacConfig,
+    name: String,
+    /// Samples of the mix still to be thrown away before the first coded frame.
+    ///
+    /// An encoder does not answer the first frame until it has seen a few: its output lags
+    /// its input by `initial_padding` samples. Discarding exactly that much of the mix up
+    /// front means coded frame *k* carries mix position `k * frame_size` again — the
+    /// encoder's own delay cancelled by not feeding it the samples it would have delayed.
+    /// The alternative is an `elst` edit list, which is more boxes and which several
+    /// players ignore.
+    prime: usize,
+}
+
+impl Sound {
+    fn new(encoder: AacEncoder, audio: &StreamAudio) -> Self {
+        Self {
+            mix: audio.mix(),
+            config: encoder.config().clone(),
+            name: encoder.name().to_string(),
+            prime: encoder.initial_padding(),
+            encoder,
+        }
+    }
+
+    /// Encode every frame of sound that has settled, and hand the samples to `segmenter`.
+    fn drain(&mut self, segmenter: &mut Segmenter, state: &Arc<LiveStream>, settle: Duration) {
+        let frame_size = self.encoder.frame_size();
+        loop {
+            let now = Instant::now();
+            if self.prime > 0 {
+                let Some(_) = self.mix.take(now, self.prime, settle) else {
+                    return;
+                };
+                self.prime = 0;
+                continue;
+            }
+            let Some(frames) = self.mix.take(now, frame_size, settle) else {
+                return;
+            };
+            match self.encoder.encode(&frames) {
+                Ok(samples) => {
+                    for sample in samples {
+                        segmenter.push_audio(sample);
+                    }
+                }
+                Err(e) => {
+                    // The video track keeps going. An audio encoder that stopped mid-run
+                    // leaves a track that ends where it stopped, which players handle;
+                    // taking the whole stream down for it would not be a trade worth making.
+                    tracing::warn!(error = %e, "the output stream's audio stopped");
+                    let _ = state;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,7 +469,7 @@ mod tests {
             StreamTap {
                 state,
                 config,
-                cadence: Cadence::new(config.rate, config.max_gap),
+                cadence: Cadence::new(config.rate, config.max_gap, Arc::new(Timeline::new())),
                 width: 64,
                 height: 32,
                 jobs: Some(jobs),

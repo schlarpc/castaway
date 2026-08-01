@@ -31,12 +31,24 @@
 pub mod cadence;
 pub mod fmp4;
 pub mod hls;
+pub mod timeline;
+
+/// The panel's sound, tapped at the one seam every session's audio passes through.
+/// Needs the decode path for its PCM types and libswresample for the rate conversion.
+#[cfg(feature = "stream")]
+pub mod aac;
+#[cfg(feature = "stream")]
+pub mod audio;
 
 #[cfg(feature = "stream")]
 mod encoder;
 #[cfg(feature = "stream")]
 mod tap;
 
+#[cfg(feature = "stream")]
+pub use aac::AacEncoder;
+#[cfg(feature = "stream")]
+pub use audio::{AudioMix, StreamAudio};
 #[cfg(feature = "stream")]
 pub use encoder::{EncoderChoice, H264Encoder};
 #[cfg(feature = "stream")]
@@ -62,8 +74,14 @@ pub struct StreamConfig {
     /// The tallest the stream will be. A 4K panel streams at 1080p: the conversion pass
     /// scales for free, and the difference is 12 MB a frame read back versus 3.
     pub max_height: u32,
-    /// Target bitrate in bits per second.
+    /// Target video bitrate in bits per second.
     pub bitrate: u32,
+    /// Target audio bitrate in bits per second.
+    pub audio_bitrate: u32,
+    /// How long a session's block gets to arrive late and still land where it belongs on
+    /// the timeline (see [`audio::AudioMix::take`]). The one knob trading the stream's
+    /// audio latency against how much of a slow session's block is clipped off its front.
+    pub audio_settle: Duration,
     /// How long each segment aims to be, which is also the keyframe interval — a segment
     /// has to start on one.
     pub segment: Duration,
@@ -86,6 +104,12 @@ impl Default for StreamConfig {
             // Enough for text on a shell screen to stay readable at 1080p, which is what
             // this is for — somebody checking a layout without walking to the panel.
             bitrate: 6_000_000,
+            // AAC-LC stereo at 128 kbit/s is transparent enough for a panel duplicate and
+            // is a rounding error next to the video.
+            audio_bitrate: 128_000,
+            // Comfortably more than any output queue in this box, and small next to the
+            // seconds of latency HLS has already spent by the time a player starts.
+            audio_settle: Duration::from_millis(150),
             // One-second segments: a player buffers a few of them before it starts, so
             // this is most of the end-to-end latency. Shorter costs keyframes, and a
             // keyframe a second is already the expensive end of a screen-content stream.

@@ -38,21 +38,6 @@ impl Segment {
     }
 }
 
-/// Accumulates samples and cuts a segment when one is due.
-#[derive(Debug)]
-pub struct Segmenter {
-    /// The length a segment aims for. Actual lengths land on the first keyframe at or
-    /// after it, which with a fixed GOP means "exactly", and with a GOP the encoder
-    /// decided to change means "close enough that the playlist's target duration still
-    /// holds".
-    target_ticks: u64,
-    pending: Vec<Sample>,
-    pending_ticks: u64,
-    /// Where the *pending* segment starts on the timeline.
-    base_decode_time: u64,
-    next_sequence: u32,
-}
-
 /// A duration in [`TIMESCALE`] ticks. Integer throughout: a segment boundary derived from
 /// a float is one that lands a tick either side of where the playlist says it does.
 fn ticks(duration: Duration) -> u64 {
@@ -65,17 +50,64 @@ fn ticks(duration: Duration) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// Accumulates samples and cuts a segment when one is due.
+///
+/// Both tracks go through one segmenter and come out in one segment, because a segment
+/// carrying both is what lets the player be a `<video>` and one `SourceBuffer` rather than
+/// two renditions somebody has to keep in step.
+#[derive(Debug)]
+pub struct Segmenter {
+    /// The length a segment aims for, in the *video* track's timescale. Actual lengths
+    /// land on the first keyframe at or after it, which with a fixed GOP means "exactly",
+    /// and with a GOP the encoder decided to change means "close enough that the
+    /// playlist's target duration still holds".
+    target_ticks: u64,
+    video: Pending,
+    /// Absent until the first audio sample, and absent for the whole run in a build or on
+    /// a box with no AAC encoder — which is a video-only stream rather than an error.
+    audio: Option<Pending>,
+    next_sequence: u32,
+}
+
+/// One track's accumulated samples and where they sit on its own timeline.
+#[derive(Debug, Default)]
+struct Pending {
+    samples: Vec<Sample>,
+    /// Ticks accumulated in the *pending* segment.
+    ticks: u64,
+    /// Where the pending segment starts on this track's timeline.
+    base: u64,
+}
+
+impl Pending {
+    fn push(&mut self, sample: Sample) {
+        self.ticks += u64::from(sample.duration);
+        self.samples.push(sample);
+    }
+
+    /// Close what is pending, returning the fragment and advancing the base.
+    fn cut(&mut self, track_id: u32) -> Option<fmp4::Fragment> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let base_decode_time = self.base;
+        self.base += std::mem::take(&mut self.ticks);
+        Some(fmp4::Fragment {
+            track_id,
+            base_decode_time,
+            samples: std::mem::take(&mut self.samples),
+        })
+    }
+}
+
 impl Segmenter {
     /// A segmenter aiming for `target`-long segments.
     #[must_use]
     pub fn new(target: Duration) -> Self {
         Self {
-            // Whole ticks, from whole nanoseconds: a target expressed as a float and cast
-            // could round to something a keyframe interval never reaches exactly.
             target_ticks: ticks(target),
-            pending: Vec::new(),
-            pending_ticks: 0,
-            base_decode_time: 0,
+            video: Pending::default(),
+            audio: None,
             next_sequence: 1,
         }
     }
@@ -83,13 +115,19 @@ impl Segmenter {
     /// Offer one coded picture. Returns the segment this sample *closed*, if any.
     ///
     /// The cut happens before the sample is taken, not after: a segment must begin with a
-    /// keyframe, so the frame that triggers the boundary belongs to the next one.
-    pub fn push(&mut self, sample: Sample) -> Option<Segment> {
-        let cut = sample.keyframe && self.pending_ticks >= self.target_ticks;
+    /// keyframe, so the frame that triggers the boundary belongs to the next one. Only
+    /// video can close a segment — an audio frame cannot, because every one of them is a
+    /// sync sample and cutting on one would produce a segment a player cannot start.
+    pub fn push_video(&mut self, sample: Sample) -> Option<Segment> {
+        let cut = sample.keyframe && self.video.ticks >= self.target_ticks;
         let finished = cut.then(|| self.flush()).flatten();
-        self.pending_ticks += u64::from(sample.duration);
-        self.pending.push(sample);
+        self.video.push(sample);
         finished
+    }
+
+    /// Offer one coded audio frame. Never closes a segment.
+    pub fn push_audio(&mut self, sample: Sample) {
+        self.audio.get_or_insert_with(Pending::default).push(sample);
     }
 
     /// Close whatever is pending, whether or not it reached the target.
@@ -97,20 +135,24 @@ impl Segmenter {
     /// Used when the stream stops: the last GOP is still worth serving, and a viewer who
     /// joined late would otherwise sit on a playlist whose final segment never appears.
     pub fn flush(&mut self) -> Option<Segment> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        let samples = std::mem::take(&mut self.pending);
-        let duration_ticks = std::mem::take(&mut self.pending_ticks);
+        let duration_ticks = self.video.ticks;
+        let base_decode_time = self.video.base;
+        let video = self.video.cut(fmp4::VIDEO_TRACK)?;
+        // Audio's fragment is emitted only when it has something in it. A `trun` with no
+        // samples is legal and pointless, and the next fragment's `tfdt` says where the
+        // track actually is regardless — so a starved audio track leaves a gap the player
+        // waits out rather than a run of empty fragments it has to parse.
+        let fragments: Vec<fmp4::Fragment> = std::iter::once(video)
+            .chain(self.audio.as_mut().and_then(|a| a.cut(fmp4::AUDIO_TRACK)))
+            .collect();
+
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        let base_decode_time = self.base_decode_time;
-        self.base_decode_time += duration_ticks;
         Some(Segment {
             sequence,
             base_decode_time,
             duration_ticks,
-            bytes: fmp4::media_segment(sequence, base_decode_time, &samples).into(),
+            bytes: fmp4::media_segment(sequence, &fragments).into(),
         })
     }
 }
@@ -236,9 +278,9 @@ mod tests {
         let mut seg = segmenter();
         // A second's worth, then the keyframe that opens the next segment.
         for _ in 0..30 {
-            assert!(seg.push(frame(false)).is_none());
+            assert!(seg.push_video(frame(false)).is_none());
         }
-        let finished = seg.push(frame(true)).expect("the second is up");
+        let finished = seg.push_video(frame(true)).expect("the second is up");
         assert_eq!(finished.sequence, 1);
         assert_eq!(finished.duration_ticks, u64::from(TIMESCALE));
         assert_eq!(finished.base_decode_time, 0);
@@ -250,9 +292,9 @@ mod tests {
         // decision — produces a playlist full of 100 ms segments, and every player that
         // reads it buffers for the target duration it was told to expect.
         let mut seg = segmenter();
-        seg.push(frame(true));
+        seg.push_video(frame(true));
         for _ in 0..5 {
-            assert!(seg.push(frame(true)).is_none(), "too early to cut");
+            assert!(seg.push_video(frame(true)).is_none(), "too early to cut");
         }
     }
 
@@ -263,13 +305,13 @@ mod tests {
         // no player can join.
         let mut seg = segmenter();
         for _ in 0..30 {
-            seg.push(frame(false));
+            seg.push_video(frame(false));
         }
-        let first = seg.push(frame(true)).unwrap();
+        let first = seg.push_video(frame(true)).unwrap();
         for _ in 0..30 {
-            seg.push(frame(false));
+            seg.push_video(frame(false));
         }
-        let second = seg.push(frame(true)).unwrap();
+        let second = seg.push_video(frame(true)).unwrap();
         assert_eq!(second.base_decode_time, first.duration_ticks);
         // 30 delta frames plus the keyframe that opened it.
         assert_eq!(second.duration_ticks, u64::from(TIMESCALE) + 3000);
@@ -282,7 +324,7 @@ mod tests {
         let mut seg = segmenter();
         let mut got = Vec::new();
         for i in 0..200 {
-            if let Some(s) = seg.push(frame(i % 30 == 0)) {
+            if let Some(s) = seg.push_video(frame(i % 30 == 0)) {
                 got.push(s);
             }
         }
@@ -298,8 +340,8 @@ mod tests {
     #[test]
     fn flushing_publishes_a_short_final_segment() {
         let mut seg = segmenter();
-        seg.push(frame(true));
-        seg.push(frame(false));
+        seg.push_video(frame(true));
+        seg.push_video(frame(false));
         let last = seg.flush().unwrap();
         assert_eq!(last.duration_ticks, 6000);
         assert!(seg.flush().is_none(), "nothing left to publish");
@@ -311,7 +353,7 @@ mod tests {
         let mut seg = segmenter();
         let mut published = 0;
         for i in 0..300 {
-            if let Some(s) = seg.push(frame(i % 30 == 0)) {
+            if let Some(s) = seg.push_video(frame(i % 30 == 0)) {
                 window.push(s);
                 published += 1;
             }
@@ -337,7 +379,7 @@ mod tests {
         let mut window = LiveWindow::new(4, Duration::from_secs(1));
         let mut seg = segmenter();
         for i in 0..150 {
-            if let Some(s) = seg.push(frame(i % 30 == 0)) {
+            if let Some(s) = seg.push_video(frame(i % 30 == 0)) {
                 window.push(s);
             }
         }
@@ -366,9 +408,9 @@ mod tests {
         let mut window = LiveWindow::new(4, Duration::from_secs(1));
         let mut seg = Segmenter::new(Duration::from_secs(1));
         for _ in 0..100 {
-            seg.push(frame(false));
+            seg.push_video(frame(false));
         }
-        window.push(seg.push(frame(true)).unwrap());
+        window.push(seg.push_video(frame(true)).unwrap());
         let text = window.playlist("init.mp4", &|n| format!("seg-{n}.m4s"));
         let target: f64 = text
             .lines()

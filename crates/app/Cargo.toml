@@ -81,7 +81,11 @@ default = []
 # Also brings the output duplicate (#101): anything that can draw can stream what it
 # drew, and gating that separately would only produce builds where `/stream/*` exists and
 # structurally cannot work. Which *encoder* opens is still a runtime probe.
-render = ["pipeline/kiosk", "pipeline/ffmpeg", "pipeline/stream", "stream"]
+# `audio` comes with it: the stream's audio track is tapped at the `AudioOut` factory, and
+# without the decode path there is no factory to tap — a renderer that cannot duplicate its
+# own sound is not a trade worth having, and on a box with no output device the sessions
+# still decode into a null sink and the stream still carries them.
+render = ["pipeline/kiosk", "pipeline/ffmpeg", "pipeline/stream", "stream", "audio"]
 # Internal: mirrors `pipeline/stream` so `crates/app` can `cfg` on it directly.
 stream = []
 # Compile the hardware decode backends (VA-API on Linux, D3D11VA on Windows). Whether they

@@ -197,6 +197,15 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "audio")]
         let audio_factory: pipeline::audio_out::AudioOutputFactory =
             pipeline::audio_out::output_factory(audio_selector.clone());
+        // The output stream's audio (#101). The panel has no central mixer — each session
+        // takes its own device and the OS mixes — so the one place "everything the panel
+        // is playing" passes through is this factory. Teeing it here, before anything is
+        // handed a copy, is what makes a session impossible to add later that reaches the
+        // speakers and misses the stream.
+        #[cfg(all(feature = "audio", feature = "stream"))]
+        let stream_audio = Arc::new(pipeline::stream::StreamAudio::new());
+        #[cfg(all(feature = "audio", feature = "stream"))]
+        let audio_factory = stream_audio.factory(audio_factory);
         #[cfg(feature = "audio")]
         let render_pipeline = render_pipeline.with_audio_output(Arc::clone(&audio_factory));
         // A second handle on the render channel, for the shell: it pushes screens in
@@ -210,9 +219,14 @@ fn main() -> anyhow::Result<()> {
         // Taken here for the same reason as the screenshot handle, and just as inert: no
         // encoder is opened and no frame is read back until `/stream/live.m3u8` is asked
         // for (#101).
+        #[cfg(all(feature = "audio", feature = "stream"))]
+        let stream_sound = Some(Arc::clone(&stream_audio));
+        // A build with no audio path streams pictures only, which is a whole stream.
+        #[cfg(all(not(feature = "audio"), feature = "stream"))]
+        let stream_sound = None;
         #[cfg(feature = "stream")]
         let stream_handle =
-            render_pipeline.stream_handle(pipeline::stream::StreamConfig::default());
+            render_pipeline.stream_handle(pipeline::stream::StreamConfig::default(), stream_sound);
         // Taken here for the same reason as the screenshot handle: after the pipeline is
         // moved into the session manager, nothing out here holds it, and the DLNA service
         // that has to answer "how far through is this" is built inside `serve`.
