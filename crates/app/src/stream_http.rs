@@ -52,6 +52,11 @@ pub const SEGMENT_ROUTE: &str = "/stream/seg/{name}";
 ///
 /// A stranger on the LAN types whatever they like into this, so it is a lookup that
 /// misses rather than a parse that fails.
+///
+/// Compiled in every build even though only the encoding one calls it: the route it spells
+/// exists in every build too, and a helper that vanished with the feature would let the two
+/// halves of that URL drift apart unnoticed.
+#[cfg_attr(not(feature = "stream"), allow(dead_code))]
 #[must_use]
 pub fn segment_sequence(name: &str) -> Option<u32> {
     name.strip_suffix(".m4s")?.parse().ok()
