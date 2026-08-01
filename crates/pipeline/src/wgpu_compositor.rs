@@ -38,6 +38,23 @@ pub(crate) fn create_instance() -> wgpu::Instance {
 
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::util::backend_bits_from_env().unwrap_or(backends),
+        // Everything the build config asks for *except* `DEBUG`, which is what makes
+        // wgpu name each Vulkan object as it is created.
+        //
+        // Those names go through `vkSetDebugUtilsObjectNameEXT`, and the Vulkan loader
+        // resolves the device's dispatch table on every such call — while another thread
+        // may be creating or destroying a device and mutating that same table. It
+        // segfaults inside `loader_get_icd_and_device`, with no Rust frame in the stack.
+        // On this tree the test suite reproduced it about once in three runs; at
+        // `01c862e`, before any of the output-stream work added more concurrent GPU tests,
+        // about once in twenty. The hazard is upstream's and predates us; what changed is
+        // how often it is reached.
+        //
+        // `from_build_config` only sets this in debug builds, so the panel never had these
+        // labels — this costs object names in a graphics debugger on a developer's
+        // machine, and buys a test suite that does not randomly disappear. Validation is
+        // deliberately kept.
+        flags: wgpu::InstanceFlags::from_build_config().difference(wgpu::InstanceFlags::DEBUG),
         ..Default::default()
     })
 }

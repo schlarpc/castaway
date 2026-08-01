@@ -33,7 +33,6 @@ fn lock() -> &'static Mutex<()> {
 /// the *driver's*, not ours, and a previous opener that panicked holding this has left
 /// nothing of ours inconsistent. Refusing to open a device ever again because one did
 /// would turn a survivable failure into a permanent one.
-#[must_use]
 pub fn opening_device() -> MutexGuard<'static, ()> {
     lock()
         .lock()
