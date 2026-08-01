@@ -415,6 +415,15 @@ struct LayerState {
     gpu: Option<LayerGpu>,
 }
 
+/// What a texture the composite is drawn into has to allow.
+///
+/// `TEXTURE_BINDING` is the one that is not obvious, and it is the whole reason capture
+/// frames go through a scene texture: the NV12 conversion *samples* the composite, and a
+/// swapchain image cannot be sampled on any backend we ship.
+const SCENE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHMENT
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::TEXTURE_BINDING);
+
 enum Target {
     Offscreen {
         texture: wgpu::Texture,
@@ -497,6 +506,119 @@ pub struct WgpuCompositor {
     /// Set when the device was opened with the external-memory extensions a hardware
     /// decoder's surfaces need. `None` once we have concluded it cannot import.
     importer: Option<GpuImporter>,
+    /// Where the composite is drawn on a frame something wants to *read*.
+    ///
+    /// A swapchain texture cannot be sampled — its usage is fixed at configuration and
+    /// `TEXTURE_BINDING` is not guaranteed on any backend — so a capture frame renders
+    /// here and is then blitted to the glass. Absent until the first capture, and absent
+    /// forever on an offscreen target, whose own texture is already sampleable.
+    scene: Option<wgpu::Texture>,
+    /// The passthrough program that puts [`Self::scene`] on the swapchain. Built with the
+    /// surface's format, and only once anything has asked for a capture.
+    blit: Option<Blit>,
+    /// The RGBA → NV12 conversion, for encoder taps. Built on first use: a panel nobody
+    /// is streaming should not carry two render pipelines it never binds.
+    nv12: Option<crate::nv12::Nv12Converter>,
+}
+
+/// The fullscreen passthrough that moves the scene texture onto the swapchain.
+struct Blit {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
+}
+
+const BLIT_SHADER: &str = r#"
+@group(0) @binding(0) var scene: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+    var corners = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0),
+    );
+    let xy = corners[vi];
+    var out: VsOut;
+    out.pos = vec4<f32>(xy, 0.0, 1.0);
+    out.uv = vec2<f32>((xy.x + 1.0) * 0.5, (1.0 - xy.y) * 0.5);
+    return out;
+}
+
+// Source and destination are the same size and the same format, and both are sRGB — so
+// the sampler's decode and the target's encode cancel and this is a copy. It is a draw
+// rather than `copy_texture_to_texture` because that would need `COPY_DST` on the
+// swapchain, which is not a usage every backend will configure a surface with.
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(scene, smp, in.uv);
+}
+"#;
+
+impl Blit {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit-layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        Self {
+            pipeline: device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("blit"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(format.into())],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            }),
+            layout,
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("blit-sampler"),
+                ..Default::default()
+            }),
+            format,
+        }
+    }
 }
 
 impl WgpuCompositor {
@@ -532,8 +654,8 @@ impl WgpuCompositor {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            usage: SCENE_USAGE,
+            view_formats: &[format.remove_srgb_suffix()],
         });
 
         Ok(Self {
@@ -549,6 +671,9 @@ impl WgpuCompositor {
             radii: std::collections::BTreeMap::new(),
             sources: std::collections::BTreeMap::new(),
             importer,
+            scene: None,
+            blit: None,
+            nv12: None,
         })
     }
 
@@ -612,6 +737,9 @@ impl WgpuCompositor {
             radii: std::collections::BTreeMap::new(),
             sources: std::collections::BTreeMap::new(),
             importer,
+            scene: None,
+            blit: None,
+            nv12: None,
         })
     }
 
@@ -644,6 +772,10 @@ impl WgpuCompositor {
                 config.width = width;
                 config.height = height;
                 surface.configure(&self.device, config);
+                // Rebuilt at the new size by the next capture. Dropping it here rather
+                // than resizing keeps "the scene texture matches the target" a fact
+                // nobody has to remember to maintain.
+                self.scene = None;
             }
             // The offscreen target used to ignore this, which meant anything that only
             // happens on a resize could not be tested without a window — including the
@@ -663,8 +795,8 @@ impl WgpuCompositor {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: texture.format(),
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
+                    usage: SCENE_USAGE,
+                    view_formats: &[texture.format().remove_srgb_suffix()],
                 });
                 *size = (width, height);
             }
@@ -1224,36 +1356,209 @@ impl WgpuCompositor {
     ///
     /// # Errors
     /// [`PipelineError`] if called on a surface target or the map fails.
-    /// Present, optionally reading the frame back as RGBA8.
+    /// Present, reading the frame back once per requested shape.
     ///
-    /// The capture happens *inside* the frame because a surface texture only exists
-    /// between acquire and present — there is nothing to copy from afterwards. Returns
-    /// `None` when not asked, or when the readback failed, which must not stop the panel
-    /// from presenting.
-    pub fn present_and_capture(&mut self, capture: bool) -> Option<Vec<u8>> {
-        if !capture {
+    /// Answers positionally: the `n`th entry is what the `n`th want produced, or `None` if
+    /// that readback failed — which must never stop the panel from presenting. Callers
+    /// pass *distinct* wants; two taps that want the same thing share one readback, and
+    /// deciding that is [`crate::render_pipeline::RenderLoop`]'s job because it is the one
+    /// that knows the taps.
+    ///
+    /// A capture frame renders into [`Self::scene`] and is then blitted to the glass,
+    /// rather than rendering straight to the swapchain as an ordinary frame does. That is
+    /// not an optimisation missed: a swapchain texture cannot be *sampled*, and the NV12
+    /// conversion has to sample the composite. The extra pass is on capture frames only,
+    /// so a panel nobody is watching pays nothing for the possibility.
+    pub fn present_and_capture(
+        &mut self,
+        wants: &[crate::tap::FrameWant],
+    ) -> Vec<Option<crate::tap::CapturedFrame>> {
+        use crate::tap::{CapturedFrame, FrameWant};
+
+        let mut out: Vec<Option<CapturedFrame>> = wants.iter().map(|_| None).collect();
+        if wants.is_empty() {
             self.present();
-            return None;
+            return out;
         }
+        let Some(format) = self.ensure_scene() else {
+            self.present();
+            return out;
+        };
+        let (target_w, target_h) = self.target_size();
+
+        // Compose once, then serve every shape off the same picture.
+        let sample_view = {
+            let Some(scene) = self.scene_texture() else {
+                self.present();
+                return out;
+            };
+            self.render_into(&scene.create_view(&wgpu::TextureViewDescriptor::default()));
+            for (slot, want) in out.iter_mut().zip(wants) {
+                if let FrameWant::Rgba = want {
+                    *slot = self
+                        .copy_back(scene, target_w, target_h, format)
+                        .map(|data| CapturedFrame::Rgba {
+                            width: target_w,
+                            height: target_h,
+                            data,
+                        })
+                        .map_err(|e| tracing::error!(error = %e, "rgba readback failed"))
+                        .ok();
+                }
+            }
+            // The conversion reads display-referred bytes, not their linearisation — see
+            // `crate::nv12`. An sRGB texture hands those over only through a view that
+            // does not claim to be sRGB.
+            scene.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(format.remove_srgb_suffix()),
+                ..Default::default()
+            })
+        };
+
+        if wants.iter().any(|w| matches!(w, FrameWant::Nv12 { .. })) {
+            // Taken out of `self` for the duration: the converter needs `&mut`, and the
+            // device and queue it also needs live in the same struct.
+            let mut converter = self
+                .nv12
+                .take()
+                .unwrap_or_else(|| crate::nv12::Nv12Converter::new(&self.device));
+            for (slot, want) in out.iter_mut().zip(wants) {
+                let &FrameWant::Nv12 { width, height } = want else {
+                    continue;
+                };
+                *slot = converter
+                    .convert(
+                        &self.device,
+                        &self.queue,
+                        &sample_view,
+                        (target_w, target_h),
+                        width,
+                        height,
+                    )
+                    .map(CapturedFrame::Nv12)
+                    .map_err(|e| tracing::error!(error = %e, "nv12 conversion failed"))
+                    .ok();
+            }
+            self.nv12 = Some(converter);
+        }
+
+        self.present_scene(format);
+        out
+    }
+
+    /// Put the composed scene on the glass.
+    ///
+    /// An offscreen target *is* the scene, so there is nothing left to do; a surface takes
+    /// a passthrough draw, because `copy_texture_to_texture` would need `COPY_DST` on the
+    /// swapchain and that is not a usage every backend will configure a surface with.
+    fn present_scene(&mut self, format: wgpu::TextureFormat) {
+        let Target::Surface { .. } = &self.target else {
+            return;
+        };
+        if self.blit.as_ref().is_none_or(|b| b.format != format) {
+            self.blit = Some(Blit::new(&self.device, format));
+        }
+        let (Some(blit), Some(scene)) = (self.blit.as_ref(), self.scene.as_ref()) else {
+            return;
+        };
+        let Target::Surface { surface, config } = &self.target else {
+            return;
+        };
+        let frame = match surface.get_current_texture() {
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                tracing::warn!(error = ?e, "surface frame acquire failed; reconfiguring");
+                surface.configure(&self.device, config);
+                surface.get_current_texture().ok()
+            }
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit-bind"),
+            layout: &blit.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &scene.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit.sampler),
+                },
+            ],
+        });
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("blit"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&blit.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+    }
+
+    /// Make sure there is a sampleable texture to compose into, and say what format it is.
+    fn ensure_scene(&mut self) -> Option<wgpu::TextureFormat> {
+        let (width, height, format) = match &self.target {
+            // Already sampleable: `new_offscreen` gives its target `TEXTURE_BINDING` and a
+            // non-sRGB view format, precisely so a capture needs no second texture here.
+            Target::Offscreen { texture, .. } => return Some(texture.format()),
+            Target::Surface { config, .. } => (config.width, config.height, config.format),
+        };
+        if self
+            .scene
+            .as_ref()
+            .is_some_and(|t| (t.width(), t.height(), t.format()) == (width, height, format))
+        {
+            return Some(format);
+        }
+        self.scene = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: SCENE_USAGE,
+            view_formats: &[format.remove_srgb_suffix()],
+        }));
+        Some(format)
+    }
+
+    /// The texture a capture frame composes into.
+    fn scene_texture(&self) -> Option<&wgpu::Texture> {
         match &self.target {
-            Target::Offscreen { texture, size } => {
-                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                self.render_into(&view);
-                let (w, h) = *size;
-                self.copy_back(texture, w, h, wgpu::TextureFormat::Rgba8Unorm)
-                    .ok()
-            }
-            Target::Surface { surface, config } => {
-                let frame = surface.get_current_texture().ok()?;
-                let view = frame
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                self.render_into(&view);
-                let (w, h) = (config.width, config.height);
-                let out = self.copy_back(&frame.texture, w, h, config.format).ok();
-                frame.present();
-                out
-            }
+            Target::Offscreen { texture, .. } => Some(texture),
+            Target::Surface { .. } => self.scene.as_ref(),
         }
     }
 

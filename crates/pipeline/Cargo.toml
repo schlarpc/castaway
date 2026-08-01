@@ -150,10 +150,23 @@ render = [
 ]
 kiosk = ["render", "dep:winit", "dep:raw-window-handle"]
 ffmpeg = ["dep:ffmpeg-next"]
+# Internal: "raw libav is linked". Set by every feature that reaches past `ffmpeg-next`
+# into `ffmpeg-sys-next`, so the helpers shared across those paths (`crate::av`) carry one
+# cfg rather than a list of feature names that goes stale the next time one is added.
+libav-sys = ["dep:ffmpeg-sys-next"]
+# The composited output, duplicated as an HLS stream (#101). Needs both halves for the
+# same reason `hwaccel` does: `render` produces the frames and converts them to NV12 on
+# the GPU, `ffmpeg` encodes them. Which *encoder* opens is a runtime decision — the
+# candidate table in `stream::encoder` prefers the vendor ones and falls back to
+# software — so this flag gates whether a build can stream at all, never how.
+#
+# The boxing, segmenting and cadence are pure and compiled without it, so their fixtures
+# run in every build rather than only where a GPU exists.
+stream = ["render", "ffmpeg", "libav-sys"]
 # `audio` = A2DP/audio decode (libav) plus a PCM output device (cpal). Separate from
 # `ffmpeg` because the decoders are useful in tests without pulling in an audio device,
 # and a headless CI box has no sound card.
-audio = ["ffmpeg", "dep:ffmpeg-sys-next"]
+audio = ["ffmpeg", "libav-sys"]
 audio-out = ["audio", "dep:cpal"]
 # The native PipeWire backend. On Linux it takes precedence over `audio-out`'s
 # ALSA host (see `audio_select::active_backend`); on Windows it is inert, so a shared
@@ -176,7 +189,7 @@ ldac = ["audio", "dep:ldac-sys"]
 hwaccel = [
     "ffmpeg",
     "render",
-    "dep:ffmpeg-sys-next",
+    "libav-sys",
     "dep:ash",
     "dep:libc",
     "dep:d3d12",

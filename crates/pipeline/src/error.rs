@@ -43,6 +43,16 @@ pub enum PipelineError {
     #[error("gpu surface import failed: {0}")]
     GpuImport(String),
 
+    /// The output duplicate could not be produced or described (#101). Never fatal to the
+    /// panel — the glass keeps presenting whatever the stream is doing — so this is
+    /// carried back to whoever asked for the stream rather than escalated.
+    #[error("stream: {0}")]
+    Stream(String),
+
+    /// An encoder could not be opened, or refused a frame.
+    #[error("encode: {0}")]
+    Encode(String),
+
     /// The Widevine CDM could not be pointed out to the browser. Never fatal — the panel
     /// runs, it just cannot play EME-gated video — but reported rather than swallowed,
     /// because that failure is otherwise indistinguishable from a network problem.

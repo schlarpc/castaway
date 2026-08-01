@@ -24,6 +24,10 @@ pub mod audio_pw;
 pub mod audio_select;
 #[cfg(feature = "audio")]
 pub mod audio_session;
+/// The bits of raw libav that both the hardware decoder and the encoder need. Compiled
+/// wherever `ffmpeg-sys-next` is linked.
+#[cfg(feature = "libav-sys")]
+pub mod av;
 pub mod browser;
 // Sample-rate conversion, for outputs that will not take the sender's rate — which is
 // every WASAPI endpoint and no ALSA one. See the module docs for why that asymmetry hid
@@ -72,6 +76,10 @@ pub mod ldac_decode;
 pub mod motion;
 #[cfg(feature = "render")]
 pub mod nowplaying_card;
+/// RGBA → NV12 on the GPU, for anything that wants to hand the composited output to a
+/// video encoder (#101).
+#[cfg(feature = "render")]
+pub mod nv12;
 #[cfg(feature = "render")]
 pub mod osd;
 #[cfg(feature = "render")]
@@ -90,6 +98,10 @@ pub mod service;
 pub mod shape;
 #[cfg(feature = "render")]
 pub mod shell;
+/// The composited output as a web stream (#101 phase 2). The boxing, segmenting and
+/// cadence are pure and compiled everywhere so their fixtures run in every build; only
+/// the encoder and the tap need `stream`.
+pub mod stream;
 #[cfg(feature = "render")]
 pub mod tap;
 #[cfg(feature = "render")]
@@ -120,11 +132,15 @@ pub use demand::Demand;
 pub use electron_browser::{Electron, ElectronHost, TV_USER_AGENT};
 #[cfg(feature = "render")]
 pub use osd::{Banner, OsdController, OsdUpdate};
+#[cfg(feature = "stream")]
+pub use render_pipeline::StreamHandle;
 #[cfg(feature = "render")]
 pub use render_pipeline::{
     render_channel, RenderCommand, RenderLoop, RenderPipeline, RenderRx, RenderTx,
 };
 #[cfg(feature = "render")]
 pub use render_pipeline::{PlaybackHandle, ScreenshotHandle};
+#[cfg(feature = "stream")]
+pub use stream::{LiveStream, StreamConfig, StreamStatus};
 #[cfg(feature = "render")]
 pub use wgpu_compositor::WgpuCompositor;

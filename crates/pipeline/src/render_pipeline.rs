@@ -142,6 +142,16 @@ pub enum RenderCommand {
     /// on the loop directly because the loop lives on the main thread and everything
     /// that wants to tap it does not.
     AddTap(Box<dyn crate::tap::OutputTap>),
+    /// Start duplicating the output as a web stream (#101). Separate from
+    /// [`Self::AddTap`] because the tap's coded size is derived from the panel's, and the
+    /// panel's size is something only the loop knows.
+    #[cfg(feature = "stream")]
+    StartStream {
+        /// Where segments are published and where requests are counted.
+        state: Arc<crate::stream::LiveStream>,
+        /// Rate, size cap, bitrate, and how long the tap outlives its last viewer.
+        config: crate::stream::StreamConfig,
+    },
     /// The URL that was opened turned out to be audio-only, with whatever the container
     /// tags said about it. The surface answers with a now-playing card rather than a
     /// black screen over music.
@@ -267,6 +277,54 @@ pub fn render_channel(frame_depth: usize) -> (RenderTx, RenderRx) {
             waker,
         },
     )
+}
+
+/// Asks the render thread to keep duplicating what it is showing, as a web stream (#101).
+///
+/// Cheap to clone and cheap to hold: nothing is encoded, and no readback happens, until
+/// something actually fetches the playlist. [`Self::ensure_running`] is what a request
+/// calls, and it is idempotent — a page with a player on it fires several at once.
+#[cfg(feature = "stream")]
+#[derive(Clone)]
+pub struct StreamHandle {
+    tx: RenderTx,
+    state: Arc<crate::stream::LiveStream>,
+    config: crate::stream::StreamConfig,
+}
+
+#[cfg(feature = "stream")]
+impl std::fmt::Debug for StreamHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamHandle")
+            .field("status", &self.state.status())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "stream")]
+impl StreamHandle {
+    /// What is currently on offer: the playlist, the segments, and why there is none.
+    #[must_use]
+    pub fn stream(&self) -> &Arc<crate::stream::LiveStream> {
+        &self.state
+    }
+
+    /// Note a request and start the stream if it is not already running.
+    ///
+    /// The touch is the point: it is what keeps the tap alive, so "somebody is watching"
+    /// is derived from requests actually arriving rather than from a subscriber count
+    /// somebody has to remember to decrement.
+    pub fn ensure_running(&self) {
+        self.state.touch(std::time::Instant::now());
+        if self.state.claim() {
+            // The stream's coded size depends on the panel's, which only the render loop
+            // knows — so the loop builds the tap, and this says no more than "start".
+            self.tx.send(RenderCommand::StartStream {
+                state: Arc::clone(&self.state),
+                config: self.config,
+            });
+        }
+    }
 }
 
 /// Asks the render thread to capture what it is showing.
@@ -516,6 +574,18 @@ impl RenderPipeline {
     pub fn screenshot_handle(&self) -> ScreenshotHandle {
         ScreenshotHandle {
             tx: self.tx.clone(),
+        }
+    }
+
+    /// A handle on the output duplicate (#101), taken for the same reason as
+    /// [`Self::screenshot_handle`] and costing the same nothing until something asks.
+    #[cfg(feature = "stream")]
+    #[must_use]
+    pub fn stream_handle(&self, config: crate::stream::StreamConfig) -> StreamHandle {
+        StreamHandle {
+            tx: self.tx.clone(),
+            state: Arc::new(crate::stream::LiveStream::new(&config)),
+            config,
         }
     }
 
@@ -2699,25 +2769,30 @@ impl RenderLoop {
             return;
         }
         let now = std::time::Instant::now();
-        let mut wanted = Vec::with_capacity(self.taps.len());
+        // Ask everyone first, then read back once per *distinct* shape. Two screenshots
+        // racing, or a screenshot taken while the stream is running, must not cost two
+        // full-surface copies — and which taps can share one is a fact only this loop has,
+        // which is why the compositor is handed the deduplicated list rather than working
+        // it out itself.
+        let mut shapes: Vec<crate::tap::FrameWant> = Vec::new();
+        let mut served: Vec<(usize, usize)> = Vec::new();
         for (i, tap) in self.taps.iter_mut().enumerate() {
-            if tap.wants_frame(now) {
-                wanted.push(i);
-            }
-        }
-        let captured = self.compositor.present_and_capture(!wanted.is_empty());
-        if let Some(rgba) = captured {
-            let (width, height) = self.compositor.target_size();
-            let frame = crate::tap::TappedFrame::Rgba {
-                width,
-                height,
-                data: &rgba,
+            let Some(want) = tap.wants_frame(now) else {
+                continue;
             };
-            for i in wanted {
-                if let Some(tap) = self.taps.get_mut(i) {
-                    tap.on_frame(&frame);
-                }
-            }
+            let slot = shapes.iter().position(|w| *w == want).unwrap_or_else(|| {
+                shapes.push(want);
+                shapes.len() - 1
+            });
+            served.push((i, slot));
+        }
+        let captured = self.compositor.present_and_capture(&shapes);
+        for (tap_index, slot) in served {
+            let (Some(Some(frame)), Some(tap)) = (captured.get(slot), self.taps.get_mut(tap_index))
+            else {
+                continue;
+            };
+            tap.on_frame(&frame.as_tapped());
         }
         self.taps.retain(|t| !t.finished());
     }
@@ -2845,6 +2920,16 @@ impl RenderLoop {
             }
             RenderCommand::RestPanel => {
                 self.rest_panel_if_idle();
+                false
+            }
+            #[cfg(feature = "stream")]
+            RenderCommand::StartStream { state, config } => {
+                let (width, height) =
+                    crate::stream::stream_size(self.compositor.target_size(), config.max_height);
+                info!(width, height, "starting the output stream");
+                self.taps.push(Box::new(crate::stream::StreamTap::new(
+                    state, config, width, height,
+                )));
                 false
             }
             RenderCommand::AddTap(tap) => {

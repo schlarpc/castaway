@@ -343,18 +343,10 @@ const fn signalled_range(range: sys::AVColorRange) -> SignalledRange {
 }
 
 /// Render a libav return code as something a log line can carry.
-pub fn av_error(code: c_int) -> String {
-    let mut buf = [0_i8; sys::AV_ERROR_MAX_STRING_SIZE];
-    // SAFETY: `av_strerror` writes at most `buf.len()` bytes including the NUL into the
-    // buffer we own, and returns <0 without writing if the code is unknown.
-    let ok = unsafe { sys::av_strerror(code, buf.as_mut_ptr(), buf.len()) } == 0;
-    if !ok {
-        return format!("error {code}");
-    }
-    // SAFETY: `av_strerror` NUL-terminates on success, and the buffer outlives the slice.
-    let bytes = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-    bytes.to_string_lossy().into_owned()
-}
+///
+/// Lives in [`crate::av`] now: the encoder needs it too, and it is not gated on this
+/// module's feature.
+pub use crate::av::av_error;
 
 /// Unused-parameter sink for the `c_void` import, which only some platforms need.
 const _: Option<*mut c_void> = None;
