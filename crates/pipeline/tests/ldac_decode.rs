@@ -344,6 +344,9 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
         Box::new(Speaker(Arc::clone(&speaker))),
         &AtomicBool::new(false),
         &pipeline::audio_session::Gain::default(),
+        // No failure sink: this fixture drives a decode that must succeed, and a
+        // callback here would have nothing to report.
+        None,
     );
 
     let played = speaker.frames.load(Ordering::SeqCst);

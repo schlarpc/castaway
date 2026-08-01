@@ -17,28 +17,85 @@ use crate::error::PipelineError;
 
 const FONT_REGULAR: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
+const FONT_CJK_REGULAR: &[u8] = include_bytes!("../assets/NotoSansCJK-Regular-subset.otf");
+const FONT_CJK_BOLD: &[u8] = include_bytes!("../assets/NotoSansCJK-Bold-subset.otf");
 
 /// An RGBA color.
 pub use crate::theme::Rgba;
 
+/// One weight, plus the fonts that cover what it does not.
+///
+/// DejaVu has never shipped CJK, so a Japanese track title used to draw as blanks — and
+/// worse, silently: `glyph_id` answers `GlyphId(0)` for an uncovered character with no
+/// error, so `measure` summed `.notdef` advances and the layout went out too (#88).
+///
+/// A chain rather than a bigger font, because a bigger font only moves the hole. Lookup is
+/// per character, first font with a real glyph wins, and adding coverage later means
+/// appending to `fallbacks` — no signature in this module changes and no caller is
+/// touched.
+pub struct Face {
+    /// Tried first. Its metrics define the line box.
+    primary: FontRef<'static>,
+    /// Tried in order for characters `primary` has no glyph for.
+    fallbacks: Vec<FontRef<'static>>,
+}
+
+impl Face {
+    /// The font that actually has a glyph for `ch`, and that glyph's id *in that font*.
+    ///
+    /// Glyph ids are per-font, so the id and the font it came from must travel together —
+    /// looking one up here and measuring it against a different font is exactly the class
+    /// of bug this replaced.
+    ///
+    /// Falls back to the primary's `.notdef` when nothing covers the character: something
+    /// has to be drawn, and a visible box is a better report than a silent gap.
+    fn resolve(&self, ch: char) -> (&FontRef<'static>, GlyphId) {
+        let gid = self.primary.glyph_id(ch);
+        if gid.0 != 0 {
+            return (&self.primary, gid);
+        }
+        for font in &self.fallbacks {
+            let gid = font.glyph_id(ch);
+            if gid.0 != 0 {
+                return (font, gid);
+            }
+        }
+        (&self.primary, gid)
+    }
+
+    /// Whether any font in the chain can draw `ch`.
+    #[must_use]
+    pub fn covers(&self, ch: char) -> bool {
+        self.resolve(ch).1 .0 != 0
+    }
+}
+
 /// The two embedded weights.
 pub struct Fonts {
     /// Regular weight.
-    pub regular: FontRef<'static>,
+    pub regular: Face,
     /// Bold weight.
-    pub bold: FontRef<'static>,
+    pub bold: Face,
 }
 
-/// Load the embedded DejaVu fonts.
+/// Load the embedded fonts: DejaVu, with the Noto Sans CJK subset behind it.
 ///
 /// # Errors
 /// [`PipelineError`] if the embedded font data fails to parse (never, in practice).
 pub fn fonts() -> Result<Fonts, PipelineError> {
+    let load = |bytes: &'static [u8], what: &'static str| {
+        FontRef::try_from_slice(bytes)
+            .map_err(move |e| PipelineError::InvalidFrame(what).context(e))
+    };
     Ok(Fonts {
-        regular: FontRef::try_from_slice(FONT_REGULAR)
-            .map_err(|e| PipelineError::InvalidFrame("bad regular font").context(e))?,
-        bold: FontRef::try_from_slice(FONT_BOLD)
-            .map_err(|e| PipelineError::InvalidFrame("bad bold font").context(e))?,
+        regular: Face {
+            primary: load(FONT_REGULAR, "bad regular font")?,
+            fallbacks: vec![load(FONT_CJK_REGULAR, "bad regular CJK font")?],
+        },
+        bold: Face {
+            primary: load(FONT_BOLD, "bad bold font")?,
+            fallbacks: vec![load(FONT_CJK_BOLD, "bad bold CJK font")?],
+        },
     })
 }
 
@@ -158,15 +215,22 @@ pub fn draw_text(
     text: &str,
     px: f32,
     color: Rgba,
-    font: &FontRef,
+    face: &Face,
 ) -> f32 {
     let scale = PxScale::from(px);
-    let scaled = font.as_scaled(scale);
-    let mut prev: Option<GlyphId> = None;
+    // The previous glyph *and* the font it came from. Kerning is a per-font table keyed on
+    // a pair of that font's own glyph ids, so a pair drawn from two different fonts has no
+    // kern to look up — feeding one font's id into another's table would read a real
+    // number for an unrelated pair.
+    let mut prev: Option<(usize, GlyphId)> = None;
     for ch in text.chars() {
-        let gid = font.glyph_id(ch);
-        if let Some(p) = prev {
-            x += scaled.kern(p, gid);
+        let (font, gid) = face.resolve(ch);
+        let scaled = font.as_scaled(scale);
+        let key = std::ptr::from_ref::<FontRef<'static>>(font) as usize;
+        if let Some((prev_key, p)) = prev {
+            if prev_key == key {
+                x += scaled.kern(p, gid);
+            }
         }
         let glyph = gid.with_scale_and_position(scale, ab_glyph::point(x, baseline));
         if let Some(outline) = font.outline_glyph(glyph) {
@@ -178,32 +242,47 @@ pub fn draw_text(
             });
         }
         x += scaled.h_advance(gid);
-        prev = Some(gid);
+        prev = Some((key, gid));
     }
     x
 }
 
 /// Measure the advance width of `text` at `px`.
+///
+/// Must resolve through the same chain [`draw_text`] does, or a fallback glyph is drawn at
+/// one width and measured at another — which is how centring goes wrong for exactly the
+/// strings that render.
 #[must_use]
-pub fn measure(font: &FontRef, text: &str, px: f32) -> f32 {
-    let scaled = font.as_scaled(PxScale::from(px));
+pub fn measure(face: &Face, text: &str, px: f32) -> f32 {
+    let scale = PxScale::from(px);
     let mut width = 0.0;
-    let mut prev: Option<GlyphId> = None;
+    let mut prev: Option<(usize, GlyphId)> = None;
     for ch in text.chars() {
-        let gid = font.glyph_id(ch);
-        if let Some(p) = prev {
-            width += scaled.kern(p, gid);
+        let (font, gid) = face.resolve(ch);
+        let scaled = font.as_scaled(scale);
+        let key = std::ptr::from_ref::<FontRef<'static>>(font) as usize;
+        if let Some((prev_key, p)) = prev {
+            if prev_key == key {
+                width += scaled.kern(p, gid);
+            }
         }
         width += scaled.h_advance(gid);
-        prev = Some(gid);
+        prev = Some((key, gid));
     }
     width
 }
 
 /// The ascent (baseline-to-top) at `px`.
+///
+/// From the primary font only, deliberately. Taking the maximum across the chain would
+/// make every line box taller the moment a CJK fallback was bundled, moving every existing
+/// layout for text that never uses it; taking it per-string would make the line box depend
+/// on its contents, so a card would change height when the track changed. The primary's
+/// ascent is 0.928em and a CJK ideograph's ink reaches about 0.88em, so the glyphs the
+/// fallback draws still sit inside the box.
 #[must_use]
-pub fn ascent(font: &FontRef, px: f32) -> f32 {
-    font.as_scaled(PxScale::from(px)).ascent()
+pub fn ascent(face: &Face, px: f32) -> f32 {
+    face.primary.as_scaled(PxScale::from(px)).ascent()
 }
 
 /// The descent at `px`. Negative, as `ab_glyph` reports it: the bottom of the line box
@@ -211,8 +290,8 @@ pub fn ascent(font: &FontRef, px: f32) -> f32 {
 /// from the font's own metrics — `(box.h + ascent + descent) / 2` below the box top —
 /// instead of a guessed fraction of the size.
 #[must_use]
-pub fn descent(font: &FontRef, px: f32) -> f32 {
-    font.as_scaled(PxScale::from(px)).descent()
+pub fn descent(face: &Face, px: f32) -> f32 {
+    face.primary.as_scaled(PxScale::from(px)).descent()
 }
 
 /// Source-over composite one pixel: works on opaque and transparent canvases alike.
@@ -284,6 +363,121 @@ mod tests {
         let transparent = buf.chunks_exact(4).filter(|p| p[3] == 0).count();
         assert!(opaque > 0, "glyphs should be drawn");
         assert!(transparent > opaque, "background should stay transparent");
+    }
+
+    /// The table from #88, as an assertion.
+    ///
+    /// These are the exact codepoints the issue read out of DejaVu's `cmap` to establish
+    /// the fault. Every one of them must now resolve to a real glyph — the CJK ones
+    /// through the fallback, the others still through DejaVu.
+    #[test]
+    fn the_codepoints_dejavu_has_never_shipped_now_resolve() {
+        let f = fonts().unwrap();
+        for face in [&f.regular, &f.bold] {
+            for ch in ['\u{3041}', '\u{30A2}', '\u{65E5}'] {
+                assert!(face.covers(ch), "U+{:04X} still has no glyph", ch as u32);
+            }
+            // Unchanged, and worth pinning: the fallback must not have displaced anything.
+            for ch in ['A', '\u{03A9}', '\u{042F}'] {
+                assert!(face.covers(ch), "U+{:04X} regressed", ch as u32);
+            }
+        }
+    }
+
+    /// Latin still comes from DejaVu, not from Noto.
+    ///
+    /// The chain is only correct if the primary wins whenever it can: a fallback that
+    /// captured characters DejaVu covers would silently restyle the whole interface.
+    #[test]
+    fn the_primary_font_wins_for_everything_it_covers() {
+        let f = fonts().unwrap();
+        for ch in "ABCdef0123 ,.!?".chars() {
+            let (font, _) = f.regular.resolve(ch);
+            assert!(
+                std::ptr::eq(font, &f.regular.primary),
+                "{ch:?} was taken by a fallback"
+            );
+        }
+        // And the reverse: a kanji must not come from the primary.
+        let (font, gid) = f.regular.resolve('\u{65E5}');
+        assert!(!std::ptr::eq(font, &f.regular.primary));
+        assert_ne!(gid.0, 0);
+    }
+
+    /// The half of #88 that was not about blank glyphs.
+    ///
+    /// `measure` summed `.notdef` advances for uncovered text, so layout and centring were
+    /// wrong for the same strings that failed to draw. A Japanese title must now measure
+    /// like real text: wider than nothing, and — since these are full-width glyphs —
+    /// wider than the same number of Latin characters.
+    #[test]
+    fn uncovered_text_is_no_longer_measured_from_notdef() {
+        let f = fonts().unwrap();
+        let jp = measure(&f.regular, "\u{65E5}\u{672C}\u{8A9E}", 40.0);
+        let latin = measure(&f.regular, "abc", 40.0);
+        assert!(jp > 0.0, "japanese measured as nothing");
+        assert!(
+            jp > latin,
+            "three full-width glyphs ({jp}) should be wider than three latin ({latin})"
+        );
+    }
+
+    /// Mixed scripts have to lay out as one run.
+    ///
+    /// The failure this guards is an off-by-one in the chain: measuring a mixed string
+    /// must equal the sum of its parts, or a card centring "supercell -
+    /// \u{6771}\u{4EAC}" puts it off-centre by however much the fallback disagreed.
+    #[test]
+    fn a_mixed_script_string_measures_as_the_sum_of_its_runs() {
+        let f = fonts().unwrap();
+        let both = measure(&f.regular, "ab\u{65E5}", 32.0);
+        let sum = measure(&f.regular, "ab", 32.0) + measure(&f.regular, "\u{65E5}", 32.0);
+        // Not exactly equal: "ab" alone kerns its pair the same way, but splitting drops
+        // no kern here, so the difference must be nil.
+        assert!((both - sum).abs() < 0.01, "{both} vs {sum}");
+    }
+
+    /// Japanese must put ink on the buffer, which is the actual user-visible complaint.
+    #[test]
+    fn japanese_actually_rasterises() {
+        let (w, h) = (256u32, 96u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let f = fonts().unwrap();
+        draw_text(
+            &mut buf,
+            w,
+            h,
+            8.0,
+            64.0,
+            "\u{65E5}\u{672C}\u{8A9E}",
+            48.0,
+            [255, 255, 255, 255],
+            &f.regular,
+        );
+        let inked = buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(inked > 200, "only {inked} pixels drawn; glyphs are blank");
+    }
+
+    /// A character nothing in the chain covers must still not panic or measure as zero.
+    ///
+    /// The chain is deliberately not all of Unicode — the issue named Thai and Devanagari
+    /// as remaining holes and they still are — so this path is reachable and has to
+    /// degrade to a visible box rather than to a gap.
+    ///
+    /// Devanagari and Thai rather than emoji: DejaVu does ship a monochrome emoticon set,
+    /// so U+1F600 is covered and would have made this test assert nothing.
+    #[test]
+    fn a_character_no_font_covers_degrades_rather_than_failing() {
+        let f = fonts().unwrap();
+        for ch in ['\u{0905}', '\u{0E01}'] {
+            assert!(
+                !f.regular.covers(ch),
+                "U+{:04X} is covered now; pick another hole for this test",
+                ch as u32
+            );
+            let width = measure(&f.regular, &ch.to_string(), 32.0);
+            assert!(width > 0.0, "notdef must still occupy space");
+        }
     }
 
     #[test]

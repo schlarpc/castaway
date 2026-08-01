@@ -7,8 +7,6 @@
 //! Pure/deterministic, so it unit-tests without a GPU and can be dumped to PNG ([`to_png`]).
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use ab_glyph::FontRef;
-
 use crate::compositor::Transform;
 use crate::error::PipelineError;
 use crate::text::{self, Rgba};
@@ -523,7 +521,7 @@ impl Default for Palette {
 
 /// Shrink `px` until `text` fits in `avail`. The rasterizer clips at the surface edge,
 /// not at the widget card, so a long friendly name would otherwise run straight under it.
-fn fit_px(font: &FontRef, text: &str, px: f32, avail: f32) -> f32 {
+fn fit_px(font: &text::Face, text: &str, px: f32, avail: f32) -> f32 {
     let w = text::measure(font, text, px);
     if w <= avail || w <= 0.0 || avail <= 0.0 {
         px

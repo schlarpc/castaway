@@ -140,7 +140,7 @@ pub fn background_span(from: f32, to: f32) -> (crate::text::Rgba, crate::text::R
 }
 
 /// Shrink `px` until `text` fits `avail`, so a long title lays out instead of overrunning.
-fn fit_px(font: &ab_glyph::FontRef<'static>, s: &str, px: f32, avail: f32) -> f32 {
+fn fit_px(font: &text::Face, s: &str, px: f32, avail: f32) -> f32 {
     let mut size = px;
     while size > 8.0 && text::measure(font, s, size) > avail {
         size *= 0.94;
