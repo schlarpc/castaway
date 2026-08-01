@@ -416,7 +416,11 @@
             '';
           });
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
-          let windows = windowsFor system; in {
+          let
+            windows = windowsFor system;
+            windowsDeploy = import ./nix/deploy-windows.nix { inherit pkgs; };
+          in
+          {
             # On Linux the default is the real receiver: every optional feature except
             # `ldac` (see nix/linux-kiosk.nix for why that one stays off). `nix run .`
             # should hand you something that can actually display a cast, not a build that
@@ -491,6 +495,16 @@
             # The MSVC CRT + Windows SDK sysroot they build against. Exposed on its own so
             # it can be built and cached independently of the Rust build.
             msvc-sysroot = windows.sysroot;
+
+            # Getting the artifact onto the physical panel and watching it run:
+            # `nix run .#deploy-windows`. Build, wipe, copy, verify the bits actually
+            # landed, launch on the *console* session, stream the log back.
+            deploy-windows = windowsDeploy.deploy;
+
+            # The same hole-punching as `open-firewall`, from the same
+            # nix/network-surface.json, against the Windows box's firewall:
+            # `nix run .#windows-firewall` (`-- --close` to take it down again).
+            windows-firewall = windowsDeploy.firewall;
           }
         ));
 
