@@ -144,7 +144,7 @@ PTP for FairPlay, so it is not actually cheaper.
 
 ## 3. Q1 is largely retired
 
-`OPEN-QUESTIONS.md` Q1 says FairPlay-SAP "needs real captures from `airplay2-receiver`/UxPlay
+Q1 (now issue #39) said FairPlay-SAP "needs real captures from `airplay2-receiver`/UxPlay
 against a live iOS sender." Three findings each independently reduce that.
 
 **3.1 "The ~568 bytes" is not a message size.** It is exactly `4 × 142` — the four canned

@@ -460,7 +460,7 @@ result rather than a belief.
 transport id. For `CC1AD845` that is true. For Netflix, Spotify or YouTube's own receiver
 it is a lie with consequences: the sender opens a virtual connection to a transport id
 nothing is listening on, starts talking on a custom namespace, and gets silence. A
-connected phone and a black panel (GAPS.md G56).
+connected phone and a black panel (issue #16).
 
 `App::classify` now sorts an `appId` into what we can actually do with it — a media URL
 we play ourselves, an RTP stream we terminate, or somebody else's web receiver — and an

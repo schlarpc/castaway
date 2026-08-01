@@ -24,6 +24,18 @@ The design docs are the spec — read them before touching a subsystem:
 Reference implementations named in the docs (UxPlay, openscreen, librespot, yt-cast-receiver, …)
 are **RE sources / wire-behavior specs, not runtime dependencies** — we reimplement.
 
+**Work items live in GitHub issues, not in `docs/`.** `docs/` holds decisions and records —
+why a thing is the way it is, what a protocol actually does, what has been measured. It does
+**not** hold backlogs. A defect, a gap, or a question for the next sync goes straight to
+`gh issue create`; do not start a new tracking document for it. `docs/GAPS.md` and
+`docs/OPEN-QUESTIONS.md` were exactly that mistake — both were migrated to issues and deleted
+on 2026-08-01, after the tracker and the files had already drifted apart.
+
+`G##` and `Q##` in code comments and older docs refer to those two files. The manifests that
+map every number to its outcome are issues **#104** (`GAPS.md`, the 2026-07-26 audit) and
+**#105** (`OPEN-QUESTIONS.md`); full text is at `git show a556938:docs/GAPS.md` and
+`git show a556938:docs/OPEN-QUESTIONS.md`. Do not add new `G##`/`Q##` anchors — cite the issue.
+
 ## Ground rules
 
 These are binding engineering constraints for this project. They override general defaults.

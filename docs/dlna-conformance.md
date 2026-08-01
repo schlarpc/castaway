@@ -3,7 +3,8 @@
 A spec-grounded adversarial review of `proto-dlna` and the media path it feeds, done
 2026-07-27 against the normative documents rather than from memory.
 
-**GAPS.md holds the defects it found** (G68–G82). This file holds everything else, which
+**GAPS.md held the defects it found** (G68–G82, all since closed; that file was migrated to
+issues and deleted — see #104). This file holds everything else, which
 turned out to be the larger half: the things that are *correct* and must not be "fixed",
 the claims the review made and then withdrew, how real control points behave where the
 spec is silent, and what the citations here are actually worth.

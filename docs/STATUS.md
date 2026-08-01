@@ -1,7 +1,7 @@
 # Build Status — autonomous session 2026-07-23
 
-Snapshot for our next sync. Companion to DECISION-LOG.md (why) and OPEN-QUESTIONS.md
-(what needs you). Everything below builds with `cargo build`, passes `cargo test`
+Snapshot for our next sync. Companion to DECISION-LOG.md (why) and the issue tracker
+(what needs you; `docs/OPEN-QUESTIONS.md` was migrated there and deleted — see #105). Everything below builds with `cargo build`, passes `cargo test`
 (~150 tests), passes `cargo clippy --all-targets -- -D warnings`, `nix build` produces a
 running binary, and `nix build .#checks.x86_64-linux.integration-vm` passes the two-VM
 integration test.
@@ -52,7 +52,7 @@ where the buttons still draw correctly and answer to a different part of the gla
 `docs/dlna-conformance.md` records a spec-grounded adversarial review of `proto-dlna` and
 the media path it feeds — held against AVTransport/RenderingControl/ConnectionManager, UDA
 1.1, the UPnP AV schemas, and the Rygel and gmrender-resurrect sources rather than against
-memory. The defects it found are GAPS.md G68–G82; that file holds the rest, which is the
+memory. The defects it found were GAPS.md G68–G82, all since closed (see #104); this file holds the rest, which is the
 larger half: what is correct and must not be "fixed", how real control points diverge from
 the text, and what the citations are worth (DLNA Guidelines Part 1 is paywalled, so every
 `7.x` section number in these docs is secondhand).
@@ -288,7 +288,7 @@ whether a screen reads from across a room is not something a test can answer.
 picker longer than the panel cannot scroll, and #24's theming is unstarted — the brand
 assets and palette are vendored, nothing uses them, and the font is still DejaVu.
 
-## Biggest open items (see OPEN-QUESTIONS.md)
+## Biggest open items (see the issue tracker)
 0. ~~**Q44 — there is no chooser.**~~ **Done** — see the shell above. **Q43** remains: the
    GameStream media plane has never run against a host with a real encoder, and only
    hardware settles that.

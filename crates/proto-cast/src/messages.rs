@@ -54,7 +54,7 @@ pub enum App {
     Streaming,
     /// Somebody else's web receiver — Netflix, Spotify, YouTube's own Cast app. Hosting
     /// these means running the vendor's receiver page and speaking the Cast receiver
-    /// SDK's platform protocol to it — GAPS.md G56, scoped as OPEN-QUESTIONS Q46 — and
+    /// SDK's platform protocol to it — see issue #16 — and
     /// is not built.
     Unhostable,
 }
