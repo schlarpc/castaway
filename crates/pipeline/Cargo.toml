@@ -269,6 +269,12 @@ required-features = ["hwaccel"]
 name = "output_stream"
 required-features = ["stream"]
 
+# The remote transport, negotiated against real sockets (#18). No GPU: what is under test
+# is that an offer is answered with something a browser could use, not the pictures.
+[[test]]
+name = "remote_negotiation"
+required-features = ["remote"]
+
 # Regenerates the checked-in LDAC test vectors with the library's own encoder. Not part of
 # any test run — the fixtures it writes are, and they are checked in so the decode tests do
 # not need an encoder (or this feature) to have bytes to chew on.
