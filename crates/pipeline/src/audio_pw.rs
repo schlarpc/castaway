@@ -158,7 +158,17 @@ impl AudioOut for PipeWireAudioOut {
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
-                info!(sample_rate, channels, "pipewire output started");
+                // What we *asked* for. Unlike the cpal backend, we do not choose the sink
+                // — the session manager links us — so this is the request, not
+                // necessarily the destination. It still answers the question that matters
+                // when a panel is silent: whether we named a sink or took the default
+                // (#106). Reporting the sink actually linked would mean watching the
+                // registry for our node's links, which is not wired up.
+                let target = match &self.selection {
+                    OutputSelection::Device(node) => node.clone(),
+                    OutputSelection::SystemDefault => "<session manager default>".to_owned(),
+                };
+                info!(%target, sample_rate, channels, "pipewire output started");
                 self.samples = Some(samples_tx);
                 self.quit = Some(quit_tx);
                 Ok(())

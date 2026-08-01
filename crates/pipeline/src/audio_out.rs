@@ -254,15 +254,15 @@ mod cpal_backend {
             // the failure this whole path exists to avoid.
             // The thread reports the rate it actually opened at, which is not always the
             // one asked for — see `choose_rate`.
-            let (ready_tx, ready_rx) = sync_channel::<Result<u32, String>>(1);
+            let (ready_tx, ready_rx) = sync_channel::<Result<(u32, String), String>>(1);
             let underruns = Arc::clone(&self.underruns);
             let selection = self.selection.clone();
 
             std::thread::spawn(move || {
                 let stream =
                     match open_stream(&selection, sample_rate, channels, samples_rx, underruns) {
-                        Ok((s, opened_at)) => {
-                            let _ = ready_tx.send(Ok(opened_at));
+                        Ok((s, opened_at, device)) => {
+                            let _ = ready_tx.send(Ok((opened_at, device)));
                             s
                         }
                         Err(e) => {
@@ -277,15 +277,16 @@ mod cpal_backend {
             });
 
             match ready_rx.recv() {
-                Ok(Ok(opened_at)) => {
+                Ok(Ok((opened_at, device))) => {
                     self.resampler = if opened_at == sample_rate {
-                        info!(sample_rate, channels, "audio output started");
+                        info!(%device, sample_rate, channels, "audio output started");
                         None
                     } else {
                         // Say it plainly. The original design refused to resample so that
                         // a pitch shift could never appear from nowhere; the answer to
                         // that concern is to convert *and name it*, not to play nothing.
                         info!(
+                            %device,
                             source_rate = sample_rate,
                             device_rate = opened_at,
                             channels,
@@ -443,17 +444,25 @@ mod cpal_backend {
 
     /// Build and start the output stream. Runs on the audio thread.
     ///
-    /// Returns the stream and the rate it actually opened at, which the caller compares
-    /// against the source rate to decide whether a resampler is needed.
+    /// Returns the stream, the rate it actually opened at, and the *name* of the device
+    /// it landed on.
+    ///
+    /// The name is not decoration. Under [`OutputSelection::SystemDefault`] the device is
+    /// whatever the OS currently calls default, and this panel has two active render
+    /// endpoints — the DELL panel over HDMI, which is the only real speaker, and a Realtek
+    /// analog output with nothing plugged into it. A default pointed at the wrong one
+    /// plays to silence and looks identical to working, so the identity has to reach the
+    /// log (#106).
     fn open_stream(
         selection: &OutputSelection,
         sample_rate: u32,
         channels: u16,
         rx: Receiver<Vec<f32>>,
         underruns: Arc<AtomicU64>,
-    ) -> Result<(cpal::Stream, u32), String> {
+    ) -> Result<(cpal::Stream, u32, String), String> {
         let host = cpal::default_host();
         let device = pick_device(&host, selection)?;
+        let name = device.name().unwrap_or_else(|_| "<unnamed>".to_owned());
         let opened_at = choose_rate(&device, sample_rate, channels)?;
 
         let config = cpal::StreamConfig {
@@ -498,7 +507,7 @@ mod cpal_backend {
         stream
             .play()
             .map_err(|e| format!("start output stream: {e}"))?;
-        Ok((stream, opened_at))
+        Ok((stream, opened_at, name))
     }
 }
 
