@@ -217,7 +217,9 @@ let
   '' + lib.optionalString (widevine != null) ''
     # Staged for the receiver to copy into the browser profile on first run, not loaded
     # from here: ECS finds its CDM under `<userDataDir>/WidevineCdm/<version>/`, which is
-    # a runtime path. See browser-host/stage-widevine.sh, and Q42 for the measurement.
+    # a runtime path. `stageWidevine()` in browser-host/main.js does the copy and finds
+    # this directory beside the exe — there is no wrapper here to hand it a path, which is
+    # why the location matters. Q42 has the measurement.
     cp -r --no-preserve=mode,ownership ${widevine}/WidevineCdm "$out/bin/"
   '';
 
@@ -225,18 +227,23 @@ let
   # to copy `result` into: `nix build .#castaway-windows-electron.archive` →
   # `result/castaway-windows-electron.zip`, unzipping to a single folder. zip rather than
   # tar because Explorer opens it.
-  mkArchive = pkg: pkgs.runCommand "${pkg.pname}-archive"
+  #
+  # `pname` is passed rather than read off `pkg`, so that `pkg` can be the *same*
+  # derivation the package attribute exposes without the reference cycle that reading
+  # `pkg.pname` from inside its own `passthru` would create. Interpolating `${pkg}` only
+  # forces its output path, which does not force the passthru back.
+  mkArchive = pname: pkg: pkgs.runCommand "${pname}-archive"
     {
       nativeBuildInputs = [ pkgs.zip ];
-      meta.description = "The ${pkg.pname} deploy tree as a single zip";
+      meta.description = "The ${pname} deploy tree as a single zip";
     } ''
-    cp -rL --no-preserve=mode,ownership ${pkg}/bin ${pkg.pname}
+    cp -rL --no-preserve=mode,ownership ${pkg}/bin ${pname}
     # The store's 1970 mtimes predate the zip format's 1980 DOS epoch; pin them at the
     # epoch rather than letting zip clamp them with a warning per file. `-X` and the
     # sorted name list keep the rebuild byte-identical.
-    find ${pkg.pname} -exec touch -d '1980-01-01 00:00:00 UTC' {} +
+    find ${pname} -exec touch -d '1980-01-01 00:00:00 UTC' {} +
     mkdir -p "$out"
-    find ${pkg.pname} | sort | zip -qX "$out/${pkg.pname}.zip" -@
+    find ${pname} | sort | zip -qX "$out/${pname}.zip" -@
   '';
 
   # All four artifacts extend one bare dependency tree instead of each compiling every
@@ -275,13 +282,22 @@ let
           cp ${ffmpeg}/bin/*.dll "$out/bin/"
         '' + lib.optionalString withBrowser stageBrowser;
       });
+
+      # `.archive` rides along on every artifact (`nix build .#<name>.archive`) instead of
+      # doubling the package set in flake.nix. passthru only, so it costs nothing unless
+      # asked for and doesn't change the package's own hash.
+      #
+      # It zips `final`, not `pkg`. Zipping `pkg` made `.archive` depend on the *un*-
+      # overridden derivation, which is a different store path from the one the package
+      # attribute exposes — so `nix build .#x .#x.archive` linked the Windows binary twice
+      # and produced two binaries that were not bit-identical. The self-reference is safe
+      # because interpolating `final` forces only its output path; `pname` comes from the
+      # function argument precisely so nothing has to read an attribute back off `final`.
+      final = pkg.overrideAttrs (prev: {
+        passthru = (prev.passthru or { }) // { archive = mkArchive pname final; };
+      });
     in
-    # `.archive` rides along on every artifact (`nix build .#<name>.archive`) instead of
-    # doubling the package set in flake.nix. passthru only, so it costs nothing unless
-    # asked for and doesn't change the package's own hash.
-    pkg.overrideAttrs (prev: {
-      passthru = (prev.passthru or { }) // { archive = mkArchive pkg; };
-    });
+    final;
 
   # DLLs Windows itself guarantees. Everything else has to travel with the binary.
   #

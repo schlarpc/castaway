@@ -90,11 +90,88 @@ let scriptletSeq = 0;
 const USER_AGENT = process.env.CASTAWAY_USER_AGENT || undefined;
 
 // ---------------------------------------------------------------------------
-// Widevine. Blocking here would be a hang on a path castaway awaits, so it is raced
-// against a deadline: a pre-staged CDM makes this resolve instantly, and a box with no
-// route to Google gets a receiver that starts without DRM rather than one that never
-// starts. See OPEN-QUESTIONS Q42.
+// Widevine. Two halves: pre-staging the pinned CDM into the profile, then waiting for
+// ECS to pick it up. See OPEN-QUESTIONS Q42 for the measurement behind both.
 // ---------------------------------------------------------------------------
+
+/** `_platform_specific` leaf name, in ECS's spelling. */
+function cdmPlatform() {
+  const os = { win32: 'win', darwin: 'mac', linux: 'linux' }[process.platform] || process.platform;
+  return `${os}_${process.arch === 'x64' ? 'x64' : process.arch}`;
+}
+
+/**
+ * Copy the pinned CDM into the profile, in the layout ECS's own component updater writes.
+ *
+ * This is G46's property — a panel that has never been online can still play protected
+ * video — and it is a *startup* step rather than something the packaging can do, because
+ * the marker file holds an **absolute** path to the profile, which is not known until the
+ * receiver is running. That is why it lives here and not in Nix.
+ *
+ * It used to live in `stage-widevine.sh`, which meant it only ever ran when a human ran
+ * it: nothing invoked the script, and the `CASTAWAY_WIDEVINE_CDM` the Linux wrapper has
+ * always set had no reader. On Windows there is not even a shell to run it with. So the
+ * offline-DRM property was real when measured and dead in every shipped artifact.
+ *
+ * Synchronous, and at module load rather than inside `readyComponents()`: `components`
+ * begins its own work as the app starts, so staging has to be finished before it looks.
+ * The cost is a ~6 MB copy on first boot only — afterwards the marker matches and this
+ * returns without touching the disk.
+ *
+ * Every failure here is a warning, never a throw. A receiver that cannot stage a CDM
+ * should come up without DRM, not fail to come up (G31).
+ */
+function stageWidevine() {
+  // The Linux wrapper points at the store path; the Windows artifact stages `WidevineCdm/`
+  // beside castaway.exe, which is `browser-host/`'s parent.
+  const src = process.env.CASTAWAY_WIDEVINE_CDM || path.join(__dirname, '..', 'WidevineCdm');
+  const manifest = path.join(src, 'manifest.json');
+  if (!fs.existsSync(manifest)) {
+    log('info', `widevine: no CDM to stage at ${src}; ECS will fetch one if it can`);
+    return;
+  }
+  const version = JSON.parse(fs.readFileSync(manifest, 'utf8')).version;
+  if (!version) {
+    log('warn', `widevine: no version in ${manifest}; not staging`);
+    return;
+  }
+
+  const plat = cdmPlatform();
+  const libDir = path.join(src, '_platform_specific', plat);
+  const lib = ['libwidevinecdm.so', 'widevinecdm.dll', 'libwidevinecdm.dylib']
+    .map((n) => path.join(libDir, n))
+    .find((p) => fs.existsSync(p));
+  if (!lib) {
+    log('warn', `widevine: no CDM binary for ${plat} under ${src}; not staging`);
+    return;
+  }
+
+  const root = path.join(app.getPath('userData'), 'WidevineCdm');
+  const dest = path.join(root, version);
+  const marker = path.join(root, 'latest-component-updated-widevine-cdm');
+  const staged = path.join(dest, '_platform_specific', plat, path.basename(lib));
+  if (fs.existsSync(staged) && fs.existsSync(marker)) {
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(staged), { recursive: true });
+  fs.copyFileSync(manifest, path.join(dest, 'manifest.json'));
+  fs.copyFileSync(lib, staged);
+  // Absolute, because that is what the component updater writes and what Chromium reads
+  // back. A relative path here silently yields no CDM.
+  fs.writeFileSync(marker, JSON.stringify({ Path: dest }));
+  log('info', `widevine: staged ${version} for ${plat} into ${root}`);
+}
+
+try {
+  stageWidevine();
+} catch (e) {
+  log('warn', `widevine: staging failed (${e}); protected playback will fail, the rest is unaffected`);
+}
+
+// Blocking here would be a hang on a path castaway awaits, so it is raced against a
+// deadline: a pre-staged CDM makes this resolve in milliseconds, and a box with no route
+// to Google gets a receiver that starts without DRM rather than one that never starts.
 async function readyComponents() {
   const deadline = Number(process.env.CASTAWAY_CDM_DEADLINE_MS || 20000);
   let timer;

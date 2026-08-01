@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Pre-stage a Widevine CDM into an Electron profile, so first launch needs no network.
 #
+# NOTE: the shipping receiver no longer needs this — `stageWidevine()` in main.js does it
+# at startup, on both platforms, which is where it belongs (the marker's absolute path
+# means only a running receiver knows what to write). This is kept as the standalone
+# reproducer for Q42's table: it stages a profile *without* launching castaway, which is
+# what lets `widevine-probe.js` judge a pre-staged profile against an empty one. Keep the
+# two in step, or the reproducer stops reproducing what ships.
+#
 # This is G46's property under D36's mechanism. Left alone, ECS fetches the CDM from
 # Google's component updater on first run — measured, and it *blocks* while doing so. A
 # panel that has never been online would then have no DRM, and would wait on the fetch
