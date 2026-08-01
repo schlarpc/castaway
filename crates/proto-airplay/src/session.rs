@@ -19,6 +19,7 @@ use tracing::{debug, info as log_info, warn};
 
 use crate::advert::AirPlayIdentity;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 
 use crate::control::ControlUpdate;
 use crate::error::AirPlayError;
@@ -319,6 +320,23 @@ pub struct AirPlaySession {
     /// `SHA512(aeskey ‖ shared)[0..16]`, so a session that skipped pairing and one that
     /// completed it derive *different* media keys from the same `rsaaeskey`.
     paired_secret: Option<[u8; 32]>,
+    /// What this session has learned about the sender, accumulated as it says it.
+    ///
+    /// Held rather than emitted at the message that carries it, because every fact
+    /// arrives before there is a session to attach it to: the name comes with the first
+    /// `SETUP` and the codec with `ANNOUNCE`, both of which precede the stream event that
+    /// makes this source the active one — and the session manager drops a description for
+    /// a source that is not active yet. The actor emits this once the stream starts.
+    sender: SourceDescription,
+    /// The sample rate of whatever stream this session negotiated.
+    ///
+    /// Kept here rather than read back from the negotiation because the plist path's
+    /// parameters are *taken* by the actor when the stream starts
+    /// ([`Self::take_mirror_audio`]), so by the time a `SET_PARAMETER` arrives there is
+    /// nothing left to ask. A `progress` report is in RTP timestamps and means nothing
+    /// without it, which is the whole of "the scrubber sits at 0:00 with the right
+    /// duration" on a mirroring session.
+    audio_rate: Option<NonZeroU32>,
 }
 
 impl AirPlaySession {
@@ -342,6 +360,8 @@ impl AirPlaySession {
             mirror_audio: None,
             pending_flush: None,
             volume: crate::control::Volume::Level(0.0),
+            sender: SourceDescription::new(),
+            audio_rate: None,
         }
     }
 
@@ -351,6 +371,35 @@ impl AirPlaySession {
     /// so a response captured from one receiver cannot be replayed for another.
     pub fn set_local_addr(&mut self, addr: IpAddr) {
         self.local_addr = Some(addr);
+    }
+
+    /// Tell the session where the sender connected from.
+    ///
+    /// The address is what the card falls back to when a sender never names itself, and
+    /// it is worth having even when one does: two phones in a room are routinely both
+    /// called "iPhone" (see [`SourceDescription::label`]).
+    pub fn set_peer_addr(&mut self, addr: IpAddr) {
+        self.sender.address = Some(addr.to_string());
+    }
+
+    /// What is known about the sender: its name, where it connected from, and what was
+    /// negotiated to carry the media.
+    ///
+    /// Cloned rather than borrowed because the actor turns it into an event, which
+    /// outlives the borrow it would otherwise have to hold across an `await`.
+    #[must_use]
+    pub fn sender_description(&self) -> SourceDescription {
+        self.sender.clone()
+    }
+
+    /// Record what a negotiation settled: the link description the panel shows, and the
+    /// rate a `progress` report needs to mean anything.
+    ///
+    /// One function for both because they are one fact learned at one moment, and
+    /// splitting them is how the plist path came to fill in a link and no rate.
+    fn negotiated(&mut self, params: &AnnounceParams) {
+        self.sender.link = Some(params.describe());
+        self.audio_rate = NonZeroU32::new(params.codec.sample_rate());
     }
 
     /// Tell the session which TCP port the actor bound for the mirroring data channel.
@@ -555,16 +604,15 @@ impl AirPlaySession {
                 if let Some(shared) = &self.paired_secret {
                     params.rekey_with(shared);
                 }
-                let link = params.describe();
-                log_info!(%link, "AirPlay audio announced");
-                self.raop = RaopState::Announced(Box::new(params));
-                let mut r = AirPlayResponse::ok();
+                log_info!(link = %params.describe(), "AirPlay audio announced");
                 // What the panel shows. The generation and codec are only knowable
-                // here, so this is the one chance to say them.
-                r.event = Some(SessionEvent::SourceInfo(
-                    SourceDescription::new().with_link(link),
-                ));
-                r
+                // here, so this is the one chance to learn them — but *not* the moment
+                // to say them: nothing is playing yet, and a description for a source
+                // that is not the active one is dropped by the session manager. The
+                // actor emits it when the stream starts.
+                self.negotiated(&params);
+                self.raop = RaopState::Announced(Box::new(params));
+                AirPlayResponse::ok()
             }
             Err(e) => {
                 warn!(error = %e, "refusing ANNOUNCE");
@@ -642,6 +690,7 @@ impl AirPlaySession {
         };
         debug!(keys = ?dict.keys().collect::<Vec<_>>(), "mirroring SETUP");
         self.note_timing_regime(dict);
+        self.note_sender(dict);
 
         // Key material first, so a request that carries both blocks has a key by the
         // time the stream derived from it is read.
@@ -740,6 +789,31 @@ impl AirPlaySession {
         self.mirror = MirrorState::KeyMaterial;
         log_info!("AirPlay session key material received");
         Ok(())
+    }
+
+    /// Take the sender's own account of itself out of a mirroring `SETUP`.
+    ///
+    /// The first `SETUP` plist carries `name` ("iPhone"), `model` ("iPhone17,1") and
+    /// `deviceID`, and all three were parsed and dropped — which is the whole of the
+    /// card saying "Unknown device" for a phone that had already introduced itself.
+    ///
+    /// Only `name` reaches the card. `model` is a part number and is the *fallback*
+    /// rather than an addition: showing it beside a name would be noise, and showing it
+    /// instead of nothing is still an improvement. `deviceID` is logged and no more —
+    /// the address a person can act on is the one the sender connected from, not an
+    /// identifier they cannot see from anywhere else in the room.
+    fn note_sender(&mut self, dict: &plist::Dictionary) {
+        let text = |key: &str| dict.get(key).and_then(plist::Value::as_string);
+        let Some(name) = text("name").or_else(|| text("model")) else {
+            return;
+        };
+        log_info!(
+            %name,
+            model = ?text("model"),
+            device_id = ?text("deviceID"),
+            "AirPlay sender named itself"
+        );
+        self.sender.display_name = Some(name.to_string());
     }
 
     /// Say so when a sender asks for a timing regime this receiver does not serve.
@@ -851,6 +925,9 @@ impl AirPlaySession {
         };
         let params = AnnounceParams::plist_stream(codec, media.key, media.iv);
         log_info!(link = %params.describe(), spf, "AirPlay audio stream negotiated");
+        // Before the move: the actor takes these parameters when it starts the stream,
+        // and a `SET_PARAMETER` arriving afterwards still needs the rate they carried.
+        self.negotiated(&params);
         self.mirror_audio = Some(Box::new(params));
 
         let mut stream = plist::Dictionary::new();
@@ -905,6 +982,10 @@ impl AirPlaySession {
         self.sender_ports = None;
         self.mirror = MirrorState::Idle;
         self.mirror_audio = None;
+        // What was negotiated goes with the negotiation; who the sender is does not —
+        // it is the same phone on the same connection, and it may set up again.
+        self.sender.link = None;
+        self.audio_rate = None;
         // `Connection: close` is not decoration: shairport-sync answers TEARDOWN
         // with it and then closes the socket, and a sender that does not see it
         // may hold the connection open expecting to reuse the session.
@@ -1055,10 +1136,11 @@ impl AirPlaySession {
             }
             ControlUpdate::Metadata(now) => Some(SessionEvent::NowPlaying(*now)),
             ControlUpdate::Progress(progress) => {
-                // Progress is in RTP timestamps, so it only means anything once
-                // ANNOUNCE has said what the sample rate is.
-                self.raop.params().map(|params| {
-                    let (position, duration) = progress.as_seconds(params.codec.sample_rate());
+                // Progress is in RTP timestamps, so it only means anything once a
+                // negotiation has said what the sample rate is — from *whichever* path
+                // negotiated this session, which is why this is not `raop.params()`.
+                self.audio_rate.map(|rate| {
+                    let (position, duration) = progress.as_seconds(rate);
                     let mut now = NowPlaying::default();
                     now.position = Some(std::time::Duration::from_secs_f64(position.max(0.0)));
                     now.duration = Some(std::time::Duration::from_secs_f64(duration.max(0.0)));
@@ -1342,7 +1424,9 @@ mod tests {
     #[test]
     fn announce_tells_the_panel_what_is_playing_and_how() {
         // The UI thread of this: an adapter merges this into the source card, the same
-        // way Bluetooth does with its negotiated codec.
+        // way Bluetooth does with its negotiated codec. Held rather than emitted here —
+        // see `sender_description`; the actor sends it when the stream starts, which is
+        // the first moment the session manager will accept it.
         let mut s = session();
         let r = s
             .handle(&AirPlayRequest::new(
@@ -1351,13 +1435,25 @@ mod tests {
                 ANNOUNCE_BODY.as_bytes(),
             ))
             .unwrap();
-        let Some(SessionEvent::SourceInfo(desc)) = r.event else {
-            panic!("ANNOUNCE should describe the source, got {:?}", r.event)
-        };
+        assert_eq!(r.status, 200);
+        assert!(
+            r.event.is_none(),
+            "nothing is playing yet, so there is no session to describe: {:?}",
+            r.event
+        );
         assert_eq!(
-            desc.link.as_deref(),
+            s.sender_description().link.as_deref(),
             Some("AirPlay 1 · ALAC · 44.1 kHz · stereo")
         );
+    }
+
+    #[test]
+    fn the_address_stands_in_for_a_sender_that_never_names_itself() {
+        // `label()` falls back to the address, so this is the difference between
+        // "Unknown device" and something a person can act on.
+        let mut s = session();
+        s.set_peer_addr(IpAddr::from([10, 0, 0, 9]));
+        assert_eq!(s.sender_description().label(), Some("10.0.0.9"));
     }
 
     #[test]
@@ -1878,6 +1974,78 @@ mod tests {
             reply.get("eventPort").unwrap().as_unsigned_integer(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn the_sender_names_itself_in_the_first_setup_and_the_card_keeps_it() {
+        // "Unknown device" was never a missing feature: `name`, `model` and `deviceID`
+        // are all in the first mirroring SETUP and were all parsed and dropped (#81).
+        let mut s = mirroring_session();
+        s.set_peer_addr(IpAddr::from([10, 0, 0, 9]));
+        let mut d = plist::Dictionary::new();
+        d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+        d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+        d.insert("name".into(), plist::Value::String("Chaz's iPhone".into()));
+        d.insert("model".into(), plist::Value::String("iPhone17,1".into()));
+        d.insert(
+            "deviceID".into(),
+            plist::Value::String("AA:BB:CC:DD:EE:FF".into()),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &d).unwrap();
+        assert_eq!(setup(&mut s, &body).status, 200);
+
+        let described = s.sender_description();
+        assert_eq!(described.display_name.as_deref(), Some("Chaz's iPhone"));
+        // Alongside the name, not instead of it: two phones in a room are routinely
+        // both called "iPhone".
+        assert_eq!(described.address.as_deref(), Some("10.0.0.9"));
+    }
+
+    #[test]
+    fn a_sender_that_sends_only_a_model_gets_the_model_on_the_card() {
+        // A part number is a poor name and a much better one than nothing.
+        let mut s = mirroring_session();
+        let mut d = plist::Dictionary::new();
+        d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+        d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+        d.insert("model".into(), plist::Value::String("AppleTV6,2".into()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &d).unwrap();
+        assert_eq!(setup(&mut s, &body).status, 200);
+        assert_eq!(
+            s.sender_description().display_name.as_deref(),
+            Some("AppleTV6,2")
+        );
+    }
+
+    #[test]
+    fn progress_works_on_a_session_that_negotiated_through_a_plist() {
+        // The scrubber sat at 0:00 with the right duration for exactly one reason: the
+        // rate came from `RaopState`, which only the SDP path fills in, so a plist
+        // session emitted no progress event at all (#81). The duration survived because
+        // it arrives by a different road — the DMAP `astm` tag.
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        assert_eq!(setup(&mut s, &media_audio_setup_body()).status, 200);
+        // The actor takes the parameters the moment the stream starts; the rate has to
+        // outlive that, which is what this pins.
+        let _taken = s.take_mirror_audio().expect("audio was negotiated");
+
+        let headers = vec![("Content-Type".to_string(), "text/parameters".to_string())];
+        let r = s
+            .handle(&AirPlayRequest {
+                method: "SET_PARAMETER",
+                path: "rtsp://x/s",
+                headers: &headers,
+                body: b"progress: 1000/45100/265600\r\n",
+            })
+            .unwrap();
+        let Some(SessionEvent::NowPlaying(now)) = r.event else {
+            panic!("a plist session's progress must reach the card, got {r:?}")
+        };
+        assert_eq!(now.position, Some(std::time::Duration::from_secs(1)));
+        assert_eq!(now.duration, Some(std::time::Duration::from_secs(6)));
     }
 
     /// A `GET_PARAMETER` exactly as an iOS mirroring sender sends it — the request the

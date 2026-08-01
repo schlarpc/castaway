@@ -110,6 +110,9 @@ impl AirPlayReceiver {
             .local_addr()
             .map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip());
         session.set_local_addr(local_ip);
+        // Where the sender is, for the card. Known before it says anything, and the only
+        // thing we know about a sender that never names itself.
+        session.set_peer_addr(peer.ip());
         // The mirroring data channel is a second TCP listener, bound now for the same
         // reason the UDP sockets are: a SETUP has to answer with a port that already
         // exists, not one we intend to create.
@@ -297,9 +300,12 @@ async fn pump(
                         session,
                         sockets,
                         flush_rx.clone(),
-                        Arc::clone(&diagnostics),
-                        sink,
-                        peer,
+                        StreamReport {
+                            sink,
+                            peer,
+                            description: session.sender_description(),
+                            diagnostics: Arc::clone(&diagnostics),
+                        },
                     )
                     .await;
                 }
@@ -334,11 +340,11 @@ async fn pump(
                         Some(tx) => {
                             let stream = AudioStream::new(&params);
                             info!(%peer, link = %params.describe(), "AirPlay mirroring audio starting");
+                            // The mirror is already the active session, so this lands:
+                            // it is the codec arriving after the picture, merged onto
+                            // the name the first SETUP gave us.
                             let _ = sink
-                                .emit(SessionEvent::SourceInfo(
-                                    castaway_core::SourceDescription::new()
-                                        .with_link(params.describe()),
-                                ))
+                                .emit(SessionEvent::SourceInfo(session.sender_description()))
                                 .await;
                             tokio::spawn(run_audio(
                                 sockets,
@@ -356,9 +362,12 @@ async fn pump(
                                 sockets,
                                 session.sender_ports(),
                                 flush_rx.clone(),
-                                Arc::clone(&diagnostics),
-                                sink,
-                                peer,
+                                StreamReport {
+                                    sink,
+                                    peer,
+                                    description: session.sender_description(),
+                                    diagnostics: Arc::clone(&diagnostics),
+                                },
                             )
                             .await;
                         }
@@ -378,6 +387,7 @@ async fn pump(
                         Arc::clone(&diagnostics),
                         sink,
                         peer,
+                        session.sender_description(),
                     )
                     .await;
                 }
@@ -836,21 +846,32 @@ enum Socket {
     Timing,
 }
 
+/// Who a starting stream reports to, as distinct from what it runs on.
+///
+/// One argument rather than four because they travel together everywhere and mean one
+/// thing: the session this stream belongs to, and how to describe it to the panel.
+struct StreamReport<'a> {
+    sink: &'a SessionSink,
+    peer: SocketAddr,
+    /// What the panel shows for this sender. Built by the pure session as the sender
+    /// says it, and emitted only once there is an active session to attach it to.
+    description: castaway_core::SourceDescription,
+    diagnostics: Arc<SessionDiagnostics>,
+}
+
 /// Hand the negotiated stream to the pipeline and start receiving it.
 async fn start_audio(
     session: &AirPlaySession,
     sockets: AudioSockets,
     flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
-    diagnostics: Arc<SessionDiagnostics>,
-    sink: &SessionSink,
-    peer: SocketAddr,
+    report: StreamReport<'_>,
 ) {
     let Some(params) = session.announced() else {
-        warn!(%peer, "RECORD with nothing announced; not starting audio");
+        warn!(peer = %report.peer, "RECORD with nothing announced; not starting audio");
         return;
     };
     let ports = session.sender_ports();
-    start_negotiated_audio(params, sockets, ports, flush, diagnostics, sink, peer).await;
+    start_negotiated_audio(params, sockets, ports, flush, report).await;
 }
 
 /// Start an audio receive session for whatever was negotiated.
@@ -863,10 +884,14 @@ async fn start_negotiated_audio(
     sockets: AudioSockets,
     sender_ports: Option<SenderPorts>,
     flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
-    diagnostics: Arc<SessionDiagnostics>,
-    sink: &SessionSink,
-    peer: SocketAddr,
+    report: StreamReport<'_>,
 ) {
+    let StreamReport {
+        sink,
+        peer,
+        description,
+        diagnostics,
+    } = report;
     let codec = params.codec;
     let Some(format) = AudioFormat::from_hz(codec.sample_rate(), u16::from(codec.channels()))
     else {
@@ -882,13 +907,6 @@ async fn start_negotiated_audio(
     let (tx, rx) = mpsc::channel(512);
     let stream = AudioStream::new(params);
     info!(%peer, %link, "AirPlay audio starting");
-    // Say what was negotiated before the stream event, so the card is populated by the
-    // time the first frame lands.
-    let _ = sink
-        .emit(SessionEvent::SourceInfo(
-            castaway_core::SourceDescription::new().with_link(link),
-        ))
-        .await;
     if sink
         .emit(SessionEvent::Audio {
             source: FrameSource::Encoded(rx),
@@ -901,6 +919,13 @@ async fn start_negotiated_audio(
         warn!(%peer, "session manager gone; not starting audio");
         return;
     }
+    // Who is casting, and how — *after* the stream event and not before it. The session
+    // manager drops a description for a source that is not the active one, and the
+    // stream event is what makes this source active: emitting first meant every fact
+    // this receiver knew about the sender was thrown away with a "dropped an event"
+    // warning, which is the whole of the card reading "Unknown device" (#81). It still
+    // arrives long before a frame does, so the card is populated in time.
+    let _ = sink.emit(SessionEvent::SourceInfo(description)).await;
     tokio::spawn(run_audio(
         sockets,
         stream,
@@ -938,6 +963,7 @@ async fn start_mirroring(
     diagnostics: Arc<SessionDiagnostics>,
     sink: &SessionSink,
     peer: SocketAddr,
+    description: castaway_core::SourceDescription,
 ) -> Option<mpsc::Sender<EncodedFrame>> {
     let (tx, rx) = mpsc::channel(8);
     // The audio channel is created now even though nothing will feed it until a later
@@ -964,6 +990,9 @@ async fn start_mirroring(
         warn!(%peer, "session manager gone; not starting mirroring");
         return None;
     }
+    // The sender named itself in the `SETUP` that carried the key material, two requests
+    // ago; this is the first moment there is a session for that name to belong to.
+    let _ = sink.emit(SessionEvent::SourceInfo(description)).await;
     tokio::spawn(run_mirroring(
         listener,
         keys,

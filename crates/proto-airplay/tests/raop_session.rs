@@ -164,7 +164,9 @@ async fn a_raop_session_negotiates_and_audio_reaches_the_pipeline() {
     assert!(record.starts_with("RTSP/1.0 200"), "{record}");
     assert!(record.contains("Audio-Latency"), "{record}");
 
-    // The description reaches the panel, naming the generation and codec.
+    // The description reaches the panel, naming the generation and codec — *after* the
+    // stream event, because the session manager drops a description for a source that is
+    // not active yet, and the stream event is what makes it active (#81).
     let mut described = None;
     let mut frames = None;
     for _ in 0..8 {
@@ -173,7 +175,12 @@ async fn a_raop_session_negotiates_and_audio_reaches_the_pipeline() {
             break;
         };
         match msg.event {
-            SessionEvent::SourceInfo(d) => described = d.link,
+            SessionEvent::SourceInfo(d) => {
+                described = Some(d);
+                if frames.is_some() {
+                    break;
+                }
+            }
             SessionEvent::Audio {
                 source,
                 format,
@@ -189,17 +196,19 @@ async fn a_raop_session_negotiates_and_audio_reaches_the_pipeline() {
                     panic!("expected encoded frames")
                 };
                 frames = Some(rx);
-                break;
             }
             _ => {}
         }
     }
-    assert_eq!(
-        described.as_deref(),
-        Some("AirPlay 1 · ALAC · 44.1 kHz · stereo"),
-        "the panel should be told what was negotiated"
-    );
     let mut frames = frames.expect("RECORD should have started an audio session");
+    let described = described.expect("the panel should be told what was negotiated");
+    assert_eq!(
+        described.link.as_deref(),
+        Some("AirPlay 1 · ALAC · 44.1 kHz · stereo")
+    );
+    // A RAOP sender never names itself, so the address is all the card has to identify
+    // which phone in the room this is.
+    assert_eq!(described.address.as_deref(), Some("127.0.0.1"));
 
     // Now the part only real sockets can prove: audio sent to the advertised port comes
     // out as frames.
@@ -726,6 +735,9 @@ async fn an_audio_only_session_starts_without_a_picture_to_belong_to() {
     d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
     d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
     d.insert("timingProtocol".into(), plist::Value::String("NTP".into()));
+    // The sender introduces itself here and nowhere else in the session.
+    d.insert("name".into(), plist::Value::String("Chaz's iPhone".into()));
+    d.insert("model".into(), plist::Value::String("iPhone17,1".into()));
     let setup1 = request(
         &mut stream,
         "SETUP rtsp://127.0.0.1/1",
@@ -768,7 +780,12 @@ async fn an_audio_only_session_starts_without_a_picture_to_belong_to() {
             break;
         };
         match msg.event {
-            SessionEvent::SourceInfo(d) => described = d.link,
+            SessionEvent::SourceInfo(d) => {
+                described = Some(d);
+                if started {
+                    break;
+                }
+            }
             SessionEvent::Audio { format, config, .. } => {
                 assert_eq!(format.sample_rate(), 44_100);
                 let config = config.expect("ALAC must carry its magic cookie");
@@ -777,14 +794,187 @@ async fn an_audio_only_session_starts_without_a_picture_to_belong_to() {
                 // The frame length the sender asked for, not mirroring's 480.
                 assert_eq!(&config[12..16], &352u32.to_be_bytes());
                 started = true;
-                break;
             }
             _ => {}
         }
     }
     assert!(started, "an audio-only session must start an audio session");
+    let described = described.expect("the panel should be told who is casting, and how");
     assert_eq!(
-        described.as_deref(),
+        described.link.as_deref(),
         Some("AirPlay mirroring · ALAC · 44.1 kHz · stereo")
     );
+    // The name the sender gave in its first SETUP, three requests ago. This is the whole
+    // of "Unknown device": every fact was on the wire and none of it was kept (#81).
+    assert_eq!(described.display_name.as_deref(), Some("Chaz's iPhone"));
+    assert_eq!(described.address.as_deref(), Some("127.0.0.1"));
+}
+
+/// A pipeline that keeps the last description it was told, and nothing else.
+///
+/// The other tests in this file read events straight off the sink, which is one seam
+/// short of the truth: the session manager *gates* descriptions on the source being the
+/// active one, so a `SourceInfo` emitted before the stream event is dropped and never
+/// reaches a pipeline at all. That gate is only visible with a real manager behind it.
+struct CardPipeline(mpsc::UnboundedSender<castaway_core::SourceDescription>);
+
+#[async_trait::async_trait]
+impl castaway_core::Pipeline for CardPipeline {
+    async fn play(
+        &self,
+        _source: castaway_core::MediaUri,
+        _start: Option<Duration>,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn mirror(
+        &self,
+        _video: FrameSource,
+        _audio: Option<castaway_core::MirrorAudio>,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn play_audio(
+        &self,
+        _source: FrameSource,
+        _format: castaway_core::AudioFormat,
+        _config: Option<bytes::Bytes>,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn now_playing(
+        &self,
+        _snapshot: castaway_core::NowPlaying,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn up_next(
+        &self,
+        _items: Vec<castaway_core::QueueItem>,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn source_info(
+        &self,
+        source: castaway_core::SourceDescription,
+    ) -> Result<(), castaway_core::CoreError> {
+        let _ = self.0.send(source);
+        Ok(())
+    }
+    async fn controls(
+        &self,
+        _capabilities: castaway_core::ControlCapabilities,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn control(
+        &self,
+        _txn: castaway_core::ControlTxn,
+    ) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<(), castaway_core::CoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_card_learns_who_is_casting_once_the_session_is_the_active_one() {
+    // #81, at the seam that produced it. Every fact about the sender — its name from the
+    // first SETUP, its address, the codec from the stream entry — is known before there
+    // is a session to attach it to, and the manager drops a description from a source
+    // that is not active yet. Emitted in the wrong order, all of it lands in a
+    // "dropped an event" warning and the card reads "Unknown device".
+    let (cards_tx, mut cards) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(64);
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
+    tokio::spawn(
+        castaway_core::SessionManager::new(
+            CardPipeline(cards_tx),
+            None,
+            castaway_core::SessionConfig::default(),
+        )
+        .run(rx),
+    );
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let receiver = std::sync::Arc::new(
+        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
+    );
+    tokio::spawn(async move {
+        let _ = receiver.run(sink).await;
+    });
+
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(addr).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut stream = stream.expect("the receiver started listening");
+
+    let fp = request(
+        &mut stream,
+        "POST /fp-setup",
+        &[("Content-Type", "application/octet-stream")],
+        &unhex(FP_KEY_MESSAGE),
+        1,
+    )
+    .await;
+    assert!(fp.starts_with("RTSP/1.0 200"), "{fp}");
+
+    let mut d = plist::Dictionary::new();
+    d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+    d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+    d.insert("name".into(), plist::Value::String("Chaz's iPhone".into()));
+    d.insert("model".into(), plist::Value::String("iPhone17,1".into()));
+    let setup1 = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        2,
+    )
+    .await;
+    assert!(setup1.starts_with("RTSP/1.0 200"), "{setup1}");
+
+    let mut s0 = plist::Dictionary::new();
+    s0.insert("type".into(), plist::Value::Integer(96i64.into()));
+    s0.insert("ct".into(), plist::Value::Integer(2i64.into()));
+    s0.insert("spf".into(), plist::Value::Integer(352i64.into()));
+    s0.insert("sr".into(), plist::Value::Integer(44100i64.into()));
+    s0.insert("isMedia".into(), plist::Value::Boolean(true));
+    let mut d = plist::Dictionary::new();
+    d.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+    );
+    let setup2 = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        3,
+    )
+    .await;
+    assert!(setup2.starts_with("RTSP/1.0 200"), "{setup2}");
+
+    let card = tokio::time::timeout(Duration::from_secs(5), cards.recv())
+        .await
+        .expect("the pipeline should be told who is casting")
+        .expect("the manager should still be running");
+    assert_eq!(card.display_name.as_deref(), Some("Chaz's iPhone"));
+    assert_eq!(card.address.as_deref(), Some("127.0.0.1"));
+    assert_eq!(
+        card.link.as_deref(),
+        Some("AirPlay mirroring · ALAC · 44.1 kHz · stereo")
+    );
+    // And it is what a person reads, rather than the placeholder.
+    assert_eq!(card.label(), Some("Chaz's iPhone"));
 }

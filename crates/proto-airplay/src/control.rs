@@ -9,6 +9,8 @@
 //! `image/<type>` header is unreliable, so the image kind is sniffed from the bytes
 //! instead of trusted from the header.
 
+use std::num::NonZeroU32;
+
 use castaway_core::NowPlaying;
 
 use crate::error::ControlError;
@@ -155,9 +157,12 @@ pub struct Progress {
 
 impl Progress {
     /// Position and duration in seconds, given the stream's sample rate.
+    ///
+    /// The rate is a [`NonZeroU32`] because this divides by it: a caller with no rate has
+    /// nothing to report and must not be able to reach here with a plausible-looking zero.
     #[must_use]
-    pub fn as_seconds(&self, sample_rate: u32) -> (f64, f64) {
-        let rate = f64::from(sample_rate.max(1));
+    pub fn as_seconds(&self, sample_rate: NonZeroU32) -> (f64, f64) {
+        let rate = f64::from(sample_rate.get());
         let position = f64::from(self.now.wrapping_sub(self.start)) / rate;
         let duration = f64::from(self.end.wrapping_sub(self.start)) / rate;
         (position, duration)
@@ -384,7 +389,8 @@ mod tests {
         let ControlUpdate::Progress(p) = u else {
             panic!("expected progress")
         };
-        let (position, duration) = p.as_seconds(44_100);
+        let (position, duration) =
+            p.as_seconds(NonZeroU32::new(44_100).expect("44100 is not zero"));
         assert!((position - 1.0).abs() < 1e-9, "{position}");
         assert!((duration - 6.0).abs() < 1e-9, "{duration}");
     }
