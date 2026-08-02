@@ -32,8 +32,13 @@
 use bytes::Bytes;
 use thiserror::Error;
 
-/// Ethernet MTU minus IPv4 and UDP headers — the largest Cast RTP packet on a
-/// typical LAN. Used to size the receive buffer.
+/// Ethernet MTU minus IPv4 and UDP headers — the largest *UDP payload* that crosses a
+/// typical LAN unfragmented, and so the budget anything we build to send must fit.
+///
+/// AOSP names the same number `kMaxUDPPacketSize` and glosses it "Really UDP _payload_
+/// size". Budgeting at the 1500 MTU instead sends a 1528-byte IP packet, which fragments
+/// — and for RTCP feedback that only happens under heavy loss, when fragmentation is
+/// exactly what one does not want.
 pub const MAX_PACKET_SIZE_IPV4: usize = 1500 - 20 - 8;
 
 /// The smallest packet that can carry a complete Cast header: 12 RTP + 6 Cast.

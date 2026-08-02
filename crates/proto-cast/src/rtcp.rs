@@ -109,9 +109,12 @@ pub struct BuildReport {
 
 /// Serialize the compound RTCP packet.
 ///
-/// `max_size` bounds the result — pass the path MTU. The mandatory parts (receiver
-/// report, feedback header) are always written; the optional NACK and ACK lists are
-/// trimmed to fit and reported in [`BuildReport`].
+/// `max_size` bounds the result, which is written straight to the socket as one UDP
+/// payload — so pass the payload budget ([`crate::rtp::MAX_PACKET_SIZE_IPV4`]), not the
+/// path MTU. The two differ by the 28 bytes of IP and UDP header, and the difference is
+/// a fragmented feedback packet. The mandatory parts (receiver report, feedback header)
+/// are always written; the optional NACK and ACK lists are trimmed to fit and reported
+/// in [`BuildReport`].
 #[must_use]
 pub fn build(feedback: &Feedback, max_size: usize) -> (Vec<u8>, BuildReport) {
     let mut out = Vec::with_capacity(max_size.min(1500));

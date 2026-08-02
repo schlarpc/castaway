@@ -30,7 +30,7 @@ use crate::error::CastError;
 use crate::mirror::{self, MediaKind, MirrorConfig, StreamConfig};
 use crate::receiver::{CastRtpReceiver, Consume};
 use crate::rtcp;
-use crate::rtp::{Dependency, FrameId, RtpTimestamp};
+use crate::rtp::{self, Dependency, FrameId, RtpTimestamp};
 
 /// How often feedback goes back to the sender when nothing eventful happens.
 ///
@@ -46,6 +46,10 @@ const FEEDBACK_INTERVAL: Duration = Duration::from_millis(33);
 /// Receive buffer size. Senders keep packets inside one Ethernet MTU; anything larger
 /// is not a Cast packet, and truncating it makes it fail parsing rather than succeed
 /// with the wrong bytes.
+///
+/// The full MTU rather than [`rtp::MAX_PACKET_SIZE_IPV4`] on purpose: oversizing a recv
+/// buffer costs nothing, and a too-small one silently truncates. It is *not* a send
+/// budget — what we build goes out as a UDP payload, so that uses the other constant.
 const MAX_DATAGRAM: usize = 1500;
 
 /// Frames that may be queued toward the pipeline before we start dropping them.
@@ -306,7 +310,7 @@ impl MirrorRtp {
                 .last_sender_report
                 .as_ref()
                 .map(|heard| heard.echo(now));
-            let (packet, report) = rtcp::build(&feedback, MAX_DATAGRAM);
+            let (packet, report) = rtcp::build(&feedback, rtp::MAX_PACKET_SIZE_IPV4);
             if report.nacks_dropped > 0 || report.acks_dropped > 0 {
                 // Truncated feedback still works — the sender resends what it did not
                 // hear an ACK for — but it means loss is outrunning one datagram's worth
