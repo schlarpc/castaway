@@ -1,0 +1,24 @@
+name: Say why the runner died
+description: >
+  What a failed Nix build on a hosted runner does not tell you: whether it ran out of
+  disk or out of memory. Both kill the build without naming themselves — the disk shows
+  up as a builder error somewhere unrelated, and the memory as the Nix daemon
+  disconnecting, or as the runner service disappearing mid-log. Run on failure only.
+
+runs:
+  using: composite
+  steps:
+    - name: Disk and memory at the point of failure
+      shell: bash
+      run: |
+        echo "::group::Disk"
+        df -h / /nix 2>/dev/null || df -h /
+        echo "::endgroup::"
+        echo "::group::Memory"
+        free -h || true
+        echo "::endgroup::"
+        echo "::group::Kernel — the OOM killer says so here and nowhere else"
+        sudo dmesg --ctime 2>/dev/null \
+          | grep -iE "out of memory|oom-kill|killed process" | tail -20 \
+          || echo "(nothing from the kernel; not an OOM)"
+        echo "::endgroup::"
