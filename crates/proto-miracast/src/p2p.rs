@@ -19,11 +19,6 @@
 
 use std::fmt;
 
-/// The interface name pattern wpa_supplicant gives a P2P group. The group interface is
-/// not the one we configured — it is created when the group starts, and the RTSP listener
-/// has to bind to *it*, not to the parent.
-pub const GROUP_IFACE_PREFIX: &str = "p2p-";
-
 /// A command sent to wpa_supplicant.
 ///
 /// An enum rather than strings because the failure mode of a typo'd control command is
@@ -184,8 +179,12 @@ pub enum WpaEvent {
         /// The peer's device address.
         peer: MacAddr,
     },
-    /// The group is up. Its interface — *not* the one we configured — is where the RTSP
-    /// listener and the media sockets have to bind.
+    /// The group is up, on a *new* interface that this event names — not the one we
+    /// configured. It is where the source becomes reachable: the sink dials the source's
+    /// RTSP port over it (there is no listener on this side; WFD makes the source the TCP
+    /// server), and `backend_linux` attaches its control socket to it and resolves the
+    /// peer's address by it. The media sockets are a separate question and bind
+    /// `0.0.0.0` on purpose — see `actor::bind_rtp` for why.
     GroupStarted {
         /// The newly created group interface.
         iface: String,
@@ -356,8 +355,9 @@ mod tests {
 
     #[test]
     fn a_group_started_event_names_the_interface_to_bind_to() {
-        // The group interface is created by the event; binding to the parent silently
-        // listens on the wrong radio path and the sender's SETUP times out.
+        // The group interface is created by the event, and everything that has to reach
+        // the source goes over it. Reading the parent name instead leaves the sink dialling
+        // RTSP down the wrong radio path, where the source is not.
         let e = WpaEvent::parse(
             "<3>P2P-GROUP-STARTED p2p-wlan0-0 GO ssid=\"DIRECT-Ab\" freq=5180 \
              passphrase=\"hunter2xy\" go_dev_addr=02:11:22:33:44:55",
