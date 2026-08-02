@@ -434,10 +434,12 @@ impl Renderer {
                 Ok(Outcome::with_events(self.start(&uri)?))
             }
             "Pause" => {
+                self.require_action("Pause")?;
                 self.state = TransportState::PausedPlayback;
                 Ok(with_event(ControlTxn::Pause))
             }
             "Stop" => {
+                self.require_action("Stop")?;
                 self.state = TransportState::Stopped;
                 Ok(with_event(ControlTxn::Stop))
             }
@@ -453,6 +455,10 @@ impl Renderer {
                 }
                 let target = action.require("Target")?;
                 let pos = parse_upnp_time(target).ok_or(DlnaError::IllegalSeekTarget)?;
+                // After the argument checks, not before: a bad unit or target is a
+                // malformed request whatever the state, and 710/711 say so precisely.
+                // 701 is for the request that is fine and the transition that is not.
+                self.require_action("Seek")?;
                 Ok(with_event(ControlTxn::Seek(pos)))
             }
             // Next and Previous are *required* actions, so they stay advertised — but a
@@ -591,17 +597,47 @@ impl Renderer {
     /// most states, and every button it wrongly offers is a fault the person pressing it
     /// has to interpret.
     pub(crate) fn available_actions(&self) -> String {
-        let mut actions: Vec<&str> = Vec::new();
+        self.actions().join(",")
+    }
+
+    /// The same list, before it is flattened for the wire.
+    ///
+    /// Split out so the dispatch can *gate* on it rather than merely publish it. The two
+    /// used to disagree: `Pause` and `Seek` executed unconditionally, so a renderer with
+    /// no media answered 200, moved to `PAUSED_PLAYBACK` with no `CurrentURI`, emitted a
+    /// control to a pipeline with no session, and evented that state to LastChange
+    /// subscribers — a state this very function had just called unreachable.
+    fn actions(&self) -> Vec<&'static str> {
+        let mut actions: Vec<&'static str> = Vec::new();
         match self.state {
             TransportState::NoMediaPresent => {}
             TransportState::Playing => actions.extend(["Pause", "Stop", "Seek"]),
             TransportState::PausedPlayback => actions.extend(["Play", "Stop", "Seek"]),
-            TransportState::Stopped | TransportState::Transitioning => actions.push("Play"),
+            // `Stop` once media is set, in every state that has some: a control point
+            // sending a redundant Stop is doing the ordinary defensive thing, and one
+            // sent to cancel a load is the point of `Transitioning`. It is idempotent
+            // either way. `Seek` is not offered — there is no position to seek within.
+            TransportState::Stopped | TransportState::Transitioning => {
+                actions.extend(["Play", "Stop"]);
+            }
         }
         if self.next_uri.is_some() {
             actions.push("Next");
         }
-        actions.join(",")
+        actions
+    }
+
+    /// Refuse a transport verb this state does not offer.
+    ///
+    /// 701 rather than 402, for the reason `Play` states below: the request was well
+    /// formed, the transition is what is unavailable, and a control point reading 402
+    /// concludes its own message was wrong.
+    fn require_action(&self, verb: &'static str) -> Result<(), DlnaError> {
+        if self.actions().contains(&verb) {
+            Ok(())
+        } else {
+            Err(DlnaError::TransitionNotAvailable(verb))
+        }
     }
 
     /// Dispatch a RenderingControl action.
@@ -793,6 +829,14 @@ mod tests {
     #[test]
     fn seek_parses_target_time() {
         let mut r = Renderer::default();
+        // Seeking needs something to seek *within* — a fresh renderer refuses it now,
+        // which the state check below covers.
+        r.av_transport(&action(
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://h/a.mp4")],
+        ))
+        .unwrap();
+        r.av_transport(&action("Play", &[])).unwrap();
         let out = r
             .av_transport(&action(
                 "Seek",
@@ -1338,7 +1382,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.upnp_code(), 711);
 
-        // Both units we advertise really work.
+        // Both units we advertise really work — once there is something to seek within,
+        // which is a separate refusal (701) and deliberately checked after these two.
+        r.av_transport(&action(
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://h/a.mp4")],
+        ))
+        .unwrap();
+        r.av_transport(&action("Play", &[])).unwrap();
         for unit in ["REL_TIME", "ABS_TIME"] {
             let out = r
                 .av_transport(&action("Seek", &[("Unit", unit), ("Target", "0:02:03")]))
@@ -1434,7 +1485,7 @@ mod tests {
             &[("CurrentURI", "http://h/a.mp4")],
         ))
         .unwrap();
-        assert_eq!(actions(&mut r), "Play");
+        assert_eq!(actions(&mut r), "Play,Stop");
 
         r.av_transport(&action("Play", &[])).unwrap();
         assert_eq!(actions(&mut r), "Pause,Stop,Seek");
@@ -1448,6 +1499,50 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(actions(&mut r), "Play,Stop,Seek,Next");
+    }
+
+    /// The published list and the dispatch have to be the same list, or the renderer says
+    /// one thing to `GetCurrentTransportActions` and does another when the button is
+    /// pressed.
+    #[test]
+    fn a_verb_the_state_does_not_offer_is_refused_rather_than_executed() {
+        let mut r = Renderer::default();
+        for verb in ["Pause", "Stop"] {
+            let err = r.av_transport(&action(verb, &[])).unwrap_err();
+            assert_eq!(err.upnp_code(), 701, "{verb} with no media");
+        }
+        let err = r
+            .av_transport(&action(
+                "Seek",
+                &[("Unit", "REL_TIME"), ("Target", "0:00:10")],
+            ))
+            .unwrap_err();
+        assert_eq!(err.upnp_code(), 701, "Seek with no media");
+        assert_eq!(
+            r.state,
+            TransportState::NoMediaPresent,
+            "and none of them moved the transport into a state it just called unreachable"
+        );
+        assert!(r.current_uri.is_none());
+
+        // Stopped keeps Stop — a redundant one is idempotent and control points send it —
+        // but not Pause, which has nothing to pause, and not Seek.
+        r.av_transport(&action(
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://h/a.mp4")],
+        ))
+        .unwrap();
+        assert_eq!(
+            r.av_transport(&action("Stop", &[])).unwrap().events.len(),
+            1
+        );
+        assert_eq!(
+            r.av_transport(&action("Pause", &[]))
+                .unwrap_err()
+                .upnp_code(),
+            701,
+            "Pause from Stopped"
+        );
     }
 
     /// A URI nothing could ever fetch is refused while the control point is still
