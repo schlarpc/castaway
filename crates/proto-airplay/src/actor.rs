@@ -751,7 +751,7 @@ async fn run_audio(
                     // behind, and stop asking it to resend across a gap it made on
                     // purpose.
                     stream.flush(point);
-                    resends.reset();
+                    resends.reset(point.seq);
                     debug!(rtp = ?point.rtp, "AirPlay audio flushed");
                 }
                 continue;

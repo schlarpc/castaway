@@ -139,7 +139,8 @@ pub struct FlushPoint {
     ///
     /// shairport-sync reads only `rtptime` and UxPlay only `seq`; senders send both, so
     /// both are taken and each is used for what it is good for — the timestamp decides
-    /// which audio is stale, the sequence number stops the gap being read as loss.
+    /// which audio is stale, and the sequence number re-seeds the resend tracker, so the
+    /// gap is not read as loss and real loss right after it still is.
     pub seq: Option<u16>,
 }
 

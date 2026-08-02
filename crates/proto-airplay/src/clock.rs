@@ -347,9 +347,16 @@ impl ResendTracker {
         })
     }
 
-    /// Forget where we were — for a `FLUSH`, which restarts the sequence.
-    pub fn reset(&mut self) {
-        self.next_expected = None;
+    /// Re-seed at where a `FLUSH` said the stream restarts.
+    ///
+    /// `Some(seq)` is the sequence number the new position starts at, from `RTP-Info`, so
+    /// the gap the sender made on purpose is not read as loss *and* real loss of the
+    /// first packets after it still is. Forgetting entirely — which is all this used to
+    /// do — buys the first half only: the tracker re-seeds from whatever turns up, so if
+    /// the first post-flush packets are the ones that go missing, nothing asks for them.
+    /// `None` for a sender that sent no `seq`, which is the old behaviour.
+    pub fn reset(&mut self, seq: Option<u16>) {
+        self.next_expected = seq;
     }
 }
 
@@ -594,7 +601,31 @@ mod tests {
     fn a_flush_forgets_where_the_stream_was() {
         let mut t = ResendTracker::new();
         t.on_packet(100);
-        t.reset();
+        t.reset(None);
         assert_eq!(t.on_packet(9_000), None, "a seek is not a gap");
+    }
+
+    #[test]
+    fn a_flush_that_names_its_sequence_still_notices_loss_right_after_it() {
+        // The half that forgetting cannot do. `RTP-Info: seq=` says where the new
+        // position starts, so the deliberate gap is not loss — but if the first packets
+        // of the *new* stream go missing, that is loss and worth asking about. A tracker
+        // that re-seeds from whatever turns up cannot tell the two apart.
+        let mut t = ResendTracker::new();
+        t.on_packet(100);
+        t.reset(Some(9_000));
+        assert_eq!(t.on_packet(9_000), None, "the packet the flush pointed at");
+
+        let mut t = ResendTracker::new();
+        t.on_packet(100);
+        t.reset(Some(9_000));
+        assert_eq!(
+            t.on_packet(9_003),
+            Some(ResendRequest {
+                first: 9_000,
+                count: 3
+            }),
+            "three packets of the new position never arrived"
+        );
     }
 }
