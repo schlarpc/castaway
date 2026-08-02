@@ -569,6 +569,16 @@ pub fn resend_request(our_sequence: u16, first: u16, count: u16) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    /// The AirPort key is carved at build time rather than checked in, so a build
+    /// without it cannot exercise the RSA paths. `nix flake check` always has it.
+    fn skip_without_airport_key() -> bool {
+        if crypto_raop::has_airport_key() {
+            return false;
+        }
+        eprintln!("skipping: this build has no AirPort key");
+        true
+    }
     use super::*;
     use crate::sdp::AnnounceParams;
 
@@ -971,13 +981,10 @@ mod tests {
     /// Build an encrypted stream plus the key/iv used, so a test can encrypt for it.
     fn encrypted_stream() -> (AudioStream, [u8; 16], [u8; 16]) {
         use base64::Engine as _;
-        use rsa::pkcs1::DecodeRsaPrivateKey as _;
         let key = *b"0123456789abcdef";
         let iv = *b"ABCDEFGHIJKLMNOP";
-        let private =
-            rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../../crypto-raop/src/airport.pem"))
-                .unwrap();
-        let wrapped = rsa::RsaPublicKey::from(&private)
+        let wrapped = crypto_raop::airport_public_key()
+            .unwrap()
             .encrypt(
                 &mut rsa::rand_core::OsRng,
                 rsa::Oaep::new::<sha1::Sha1>(),
@@ -1012,6 +1019,9 @@ mod tests {
 
     #[test]
     fn an_encrypted_payload_round_trips() {
+        if skip_without_airport_key() {
+            return;
+        }
         let (mut s, key, iv) = encrypted_stream();
         let plain = b"sixteen bytes!!! and a ragged tail";
         let cipher = encrypt_like_a_sender(&key, &iv, plain);
@@ -1024,6 +1034,9 @@ mod tests {
 
     #[test]
     fn the_ragged_tail_is_copied_verbatim_not_decrypted() {
+        if skip_without_airport_key() {
+            return;
+        }
         // 33 bytes: two whole blocks and one left over. If the tail went through the
         // cipher, or were dropped as padding, this fails.
         let (mut s, key, iv) = encrypted_stream();
@@ -1040,6 +1053,9 @@ mod tests {
 
     #[test]
     fn the_iv_resets_every_packet_rather_than_chaining() {
+        if skip_without_airport_key() {
+            return;
+        }
         // The bug this exists to prevent: carrying CBC state across packets. Two
         // identical payloads must decrypt identically, and the second must not depend
         // on the first having been seen.
@@ -1060,6 +1076,9 @@ mod tests {
 
     #[test]
     fn a_payload_shorter_than_one_block_is_left_alone() {
+        if skip_without_airport_key() {
+            return;
+        }
         let (mut s, _, _) = encrypted_stream();
         let out = s.on_audio(&audio_packet(0, b"short")).unwrap();
         let AudioOutput::Frame { frame, .. } = out else {

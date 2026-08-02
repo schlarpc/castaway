@@ -1227,6 +1227,16 @@ impl AirPlaySession {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    /// The AirPort key is carved at build time rather than checked in, so a build
+    /// without it cannot exercise the RSA paths. `nix flake check` always has it.
+    fn skip_without_airport_key() -> bool {
+        if crypto_raop::has_airport_key() {
+            return false;
+        }
+        eprintln!("skipping: this build has no AirPort key");
+        true
+    }
     use super::*;
 
     /// A session with ports already bound, as the actor always supplies.
@@ -1644,6 +1654,9 @@ mod tests {
 
     #[test]
     fn an_apple_challenge_is_answered_with_a_signature() {
+        if skip_without_airport_key() {
+            return;
+        }
         // iTunes and macOS will not proceed without this.
         let mut s = session();
         s.set_local_addr("10.0.0.9".parse().unwrap());

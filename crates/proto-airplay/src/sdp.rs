@@ -503,6 +503,16 @@ fn parse_fmtp(fmtp: Option<&str>) -> Result<AlacConfig, SdpError> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    /// The AirPort key is carved at build time rather than checked in, so a build
+    /// without it cannot exercise the RSA paths. `nix flake check` always has it.
+    fn skip_without_airport_key() -> bool {
+        if crypto_raop::has_airport_key() {
+            return false;
+        }
+        eprintln!("skipping: this build has no AirPort key");
+        true
+    }
     use super::*;
 
     /// An ALAC announcement in the shape iOS sends.
@@ -576,14 +586,11 @@ mod tests {
     /// Wrap a session key the way a sender does, so the test exercises the real unwrap.
     fn wrap_for_us(session_key: &[u8; 16]) -> String {
         use base64::Engine as _;
-        use rsa::pkcs1::DecodeRsaPrivateKey as _;
         // The public half of the key `crypto-raop` carries: exactly what an iPhone
-        // encrypts to.
-        let private =
-            rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../../crypto-raop/src/airport.pem"))
-                .unwrap();
-        let public = rsa::RsaPublicKey::from(&private);
-        let wrapped = public
+        // encrypts to. Asked for rather than read out of that crate's source, because
+        // the key is carved at build time and is not a file in this tree.
+        let wrapped = crypto_raop::airport_public_key()
+            .unwrap()
             .encrypt(
                 &mut rsa::rand_core::OsRng,
                 rsa::Oaep::new::<sha1::Sha1>(),
@@ -595,6 +602,9 @@ mod tests {
 
     #[test]
     fn both_encryption_attributes_present_yields_an_unwrapped_key() {
+        if skip_without_airport_key() {
+            return;
+        }
         // End to end: a key wrapped the way a sender wraps it comes back out usable.
         let session_key = *b"0123456789abcdef";
         let body = format!(
@@ -627,6 +637,9 @@ mod tests {
 
     #[test]
     fn a_session_key_does_not_appear_in_debug_output() {
+        if skip_without_airport_key() {
+            return;
+        }
         // AnnounceParams is logged. A key in the journal is a key on disk.
         let session_key = *b"0123456789abcdef";
         let body = format!(
@@ -644,6 +657,9 @@ mod tests {
 
     #[test]
     fn exactly_one_encryption_attribute_is_refused() {
+        if skip_without_airport_key() {
+            return;
+        }
         // The case that matters: a sender that believes it negotiated encryption talking
         // to a receiver that would play noise. shairport-sync answers 456 to this.
         let only_key = format!(
@@ -665,6 +681,9 @@ mod tests {
 
     #[test]
     fn an_iv_of_the_wrong_length_is_refused() {
+        if skip_without_airport_key() {
+            return;
+        }
         let body = format!(
             "{IOS_ALAC}a=rsaaeskey:{}\r\na=aesiv:QUJD\r\n",
             wrap_for_us(b"0123456789abcdef")

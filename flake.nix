@@ -192,6 +192,7 @@
               "airserver-cast-carve"
               "libAirReceiver"
               "airreceiver-cast-carve"
+              "airport-express-key"
             ];
         };
       };
@@ -331,6 +332,7 @@
           CASTAWAY_AIRSERVER_KEK_PERSON_FILE = "${airserver}/kek_person.bin";
           CASTAWAY_AIRSERVER_KEK_PASS_FILE = "${airserver}/kek_pass.bin";
           CASTAWAY_AIRRECEIVER_CARVE = "${airreceiver}";
+          CASTAWAY_AIRPORT_KEY_FILE = "${airportKeyFor system}/airport.pem";
         };
 
       # Build only dependencies (for caching)
@@ -379,6 +381,17 @@
         enetSrc = moonlight-enet-src;
         nanorsSrc = moonlight-nanors-src;
       };
+
+      # The AirPort Express key AirPlay 1 signs with, out of shairplay's source rather
+      # than this tree. Not a secret in any meaningful sense — it is in every AirPlay
+      # implementation there is, nixpkgs included — but there is no reason for us to be
+      # one more copy of it. See nix/airport-key.nix.
+      airportKeyFor = system:
+        let pkgs = pkgsFor system; in
+        import ./nix/airport-key.nix {
+          inherit (pkgs) lib stdenvNoCC openssl;
+          shairplaySrc = pkgs.shairplay.src;
+        };
 
       # SoftMedia's `libAirReceiver.so`, for the CKS identity and backend credentials.
       # A fixed-output derivation rather than a flake input: there is no stable URL for
@@ -484,6 +497,8 @@
           # Same idea as `airserver-carve`: buildable on its own so a version bump or
           # a fetch failure is diagnosable without a full rebuild.
           airreceiver-carve = airreceiverCarveFor system;
+
+          airport-key = airportKeyFor system;
 
           # The linked GameStream core (D37), exposed on its own so it can be built and
           # cached independently — and so a bump can be checked before anything that

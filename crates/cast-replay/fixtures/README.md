@@ -11,15 +11,31 @@ tooling and notes in `re-shell/artifacts/airreceiver-cast-signatures/`
 (`dbio.py`, `cks_store.py`); the container format, the key derivation and the
 on-device re-issue are documented in `CKS_5.1.7.md` there.
 
-Landed here as **fixtures, not a dependency** — ground rule 9. Nothing in this
-tree links, ships or shells out to AirReceiver; these are bytes plus a
-reimplementation of the derivation that makes them usable.
+**No longer checked in.** The device certificate, its intermediate, the peer
+template and key, and the 900 windows of signatures are SoftMedia's identity — a
+Google-issued Cast device credential with an RSA private key — so they are carved
+out of `libAirReceiver.so` at build time by `nix/airreceiver-carve.nix` and embedded
+by `cast-replay/build.rs`. A build without the carve has no bundled CKS identity at
+all (`ReplayError::NoIdentity`). What the carve produces is byte-identical to what
+used to live here, which is how the change was verified.
+
+The same is true of `src/api.rs`'s two backend constants, which are carved from the
+same library rather than written down.
+
+Landed as **fixtures, not a dependency** — ground rule 9. Nothing in this tree links,
+ships or shells out to AirReceiver; what we keep is a reimplementation of the
+derivation that makes the carved bytes usable.
+
+Reproduce the carved half with `nix build .#airreceiver-carve`.
 
 **To re-derive these from scratch, see [`../PROVENANCE.md`](../PROVENANCE.md) §1**,
 which carries the source-artifact hashes, the APK and ABI they came from, the `dbio`
 container offsets, the KEK recovery, and the commands. §2 covers the backend request
 `src/api.rs` reimplements. The tooling referenced above is **not** under version
 control, so that file is the durable record rather than a pointer to one.
+
+The first six names below are what the carve writes into its output directory; only
+`pinned_roots.pem` and `roots/` are files in this repository.
 
 | File | Contents |
 |---|---|

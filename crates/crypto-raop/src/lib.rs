@@ -2,10 +2,12 @@
 //!
 //! The two RSA operations AirPlay 1 needs, and nothing else.
 //!
-//! Both use the same key: the RSA private key of the original AirPort Express. It is
-//! quarantined in this crate rather than spread through `proto-airplay` so there is
-//! exactly one place to look for it, and exactly one place to change if it ever needs
-//! to become configurable.
+//! Both use the same key: the RSA private key of the original AirPort Express. Its use
+//! is quarantined in this crate rather than spread through `proto-airplay` so there is
+//! exactly one place to look for it — and the key itself is not in this repository at
+//! all. `nix/airport-key.nix` takes it out of shairplay's source, which nixpkgs already
+//! pins, and `build.rs` hands it over; a build without it answers every operation with
+//! [`RaopCryptoError::KeyUnavailable`].
 //!
 //! ## About the key
 //!
@@ -62,8 +64,17 @@ pub enum RaopCryptoError {
     Sign,
 }
 
-/// The AirPort Express private key, PEM-encoded.
-const AIRPORT_PEM: &str = include_str!("airport.pem");
+// `AIRPORT_PEM`: the AirPort Express private key, or `None` on a build that was not
+// given it.
+//
+// **Not checked in.** This is not a secret being protected: the key was extracted from
+// the original AirPort Express in 2011, AirPlay 1 cannot be spoken without it, and every
+// implementation carries it — nixpkgs ships it in both `shairplay` and `shairport-sync`.
+// It is simply not ours to carry, so `nix/airport-key.nix` takes it out of shairplay's
+// source and `build.rs` names the file. A build without it resolves to
+// `RaopCryptoError::KeyUnavailable` at the point of use, which is exactly what an
+// unparseable key already did.
+include!(concat!(env!("OUT_DIR"), "/airport_key.rs"));
 
 /// An AES-128 session key is 16 bytes.
 const AES_KEY_LEN: usize = 16;
@@ -74,10 +85,33 @@ const MAX_CHALLENGE_LEN: usize = 16;
 /// The signed challenge buffer is zero-padded to at least this length before signing.
 const CHALLENGE_PAD_TO: usize = 0x20;
 
+/// Whether this build was given the AirPort key.
+///
+/// Exposed so crates that exercise the RAOP path can skip rather than panic on a build
+/// that has none — the `cfg` this crate gates its own tests on is not visible across a
+/// crate boundary.
+#[must_use]
+pub const fn has_airport_key() -> bool {
+    AIRPORT_PEM.is_some()
+}
+
+/// The public half of the AirPort key: what a sender encrypts a session key to.
+///
+/// Exposed for tests in `proto-airplay`, which used to reach across and `include_str!`
+/// the PEM out of this crate's source directory. That stopped working when the key left
+/// the tree, and it was the wrong shape anyway — a test wanting to act like an iPhone
+/// needs the public half, not the private one.
+///
+/// # Errors
+/// [`RaopCryptoError::KeyUnavailable`] on a build without the key.
+pub fn airport_public_key() -> Result<rsa::RsaPublicKey, RaopCryptoError> {
+    Ok(rsa::RsaPublicKey::from(airport_key()?))
+}
+
 /// Parse the embedded key once.
 fn airport_key() -> Result<&'static RsaPrivateKey, RaopCryptoError> {
     static KEY: OnceLock<Option<RsaPrivateKey>> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::from_pkcs1_pem(AIRPORT_PEM).ok())
+    KEY.get_or_init(|| RsaPrivateKey::from_pkcs1_pem(AIRPORT_PEM?).ok())
         .as_ref()
         .ok_or(RaopCryptoError::KeyUnavailable)
 }
@@ -148,12 +182,20 @@ mod tests {
     use rsa::RsaPublicKey;
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn the_embedded_key_is_the_2048_bit_airport_key() {
         let key = airport_key().unwrap();
         assert_eq!(key.size(), 256, "2048-bit modulus");
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn a_key_wrapped_to_the_public_half_round_trips() {
         // Exactly what a sender does: OAEP/SHA-1 to the public key that pairs with the
         // one we carry. If this passes, an `a=rsaaeskey:` from a real iPhone unwraps.
@@ -173,6 +215,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn a_fairplay_wrapped_key_fails_rather_than_producing_noise() {
         // et=3/et=5 wrap with FairPlay, not RSA. The failure has to be an error, not 16
         // arbitrary bytes that would decrypt the stream into static.
@@ -181,6 +227,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn a_challenge_is_signed_to_the_key_length() {
         let sig = sign_apple_challenge(
             b"0123456789abcdef",
@@ -192,6 +242,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn the_signature_binds_the_address_and_mac_not_just_the_challenge() {
         // This is the point of the construction: a response captured from one receiver
         // must not verify for another. Same challenge, different box, different answer.
@@ -205,6 +259,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn signing_is_deterministic() {
         // PKCS#1 v1.5 has no randomness, so a sender retrying a challenge gets the same
         // answer — and this test would catch a switch to PSS, which would not verify.
@@ -220,12 +278,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn an_ipv6_address_is_signed_whole() {
         let sig = sign_apple_challenge(b"short", "fe80::1".parse().unwrap(), [1, 2, 3, 4, 5, 6]);
         assert!(sig.is_ok(), "a v6 address is 16 bytes and still fits");
     }
 
     #[test]
+    #[cfg_attr(
+        not(airport_key),
+        ignore = "needs the AirPort key from nix/airport-key.nix"
+    )]
     fn an_over_long_challenge_is_refused() {
         assert_eq!(
             sign_apple_challenge(&[0u8; 17], "10.0.0.9".parse().unwrap(), [0; 6]),

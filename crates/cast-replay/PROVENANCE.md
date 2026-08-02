@@ -14,8 +14,13 @@ because the tooling that produced them lives in `re-shell/artifacts/`, which is
 and cannot be assumed to survive. If they are gone, this is what is left, and it
 should be enough to rebuild them.
 
-Ground rule 9 applies throughout: what landed here is bytes plus reimplementations.
-Nothing in this tree links, ships or shells out to either product.
+Ground rule 9 applies throughout: what lands here is reimplementations, not bytes.
+Nothing in this tree links, ships or shells out to either product — and as of the
+carve work, nothing in it *carries* either product's material either. Both offline
+identities and all four sets of constants are recovered at build time by
+`nix/airserver-carve.nix` and `nix/airreceiver-carve.nix`; a build without them has
+no offline Cast identity and says so. This file remains the record of how the
+recovery works, and is the only place the recovered values are written down.
 
 ## Source artifacts
 
