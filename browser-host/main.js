@@ -598,9 +598,16 @@ function createWindow(surface, width, height) {
   w.setContentSize(width, height);
   if (USER_AGENT) w.webContents.setUserAgent(USER_AGENT);
   w.webContents.setFrameRate(60);
-  // Audio plays through the system device, mixed by the OS with castaway's own output.
-  // Electron exposes no PCM tap the way CEF's audio handler did, so this is the honest
-  // arrangement rather than a chosen one; see GAPS for what it costs.
+  // Not muted, and that is the *fallback* rather than the arrangement. Tapped media
+  // elements make no sound here at all: audio-tap.js routes them through an AudioWorklet
+  // deliberately never connected to `ctx.destination`, and castaway mixes the PCM into
+  // its own output. What is left unmuted for is the elements the tap cannot reach —
+  // cross-origin without CORS, or already wired into another graph — which audio-tap.js
+  // leaves alone on purpose and which would otherwise be silent. Muting the webContents
+  // because the mixer is audible would silence exactly those (#148).
+  //
+  // (Electron really does expose no host-side PCM API the way CEF's audio handler did.
+  // The tap is the page-world workaround for that, not an absence of one.)
   w.webContents.setAudioMuted(false);
   // A window with nothing loaded has no CDP *target*, and commands sent to it never
   // answer — they do not fail, they hang, which took the whole navigate chain down with

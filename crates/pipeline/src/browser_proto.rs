@@ -1,7 +1,7 @@
 //! The wire protocol between castaway and its browser subprocess (D36).
 //!
 //! Pure, per ground rule 3: types and a line framer, no sockets and no process handling.
-//! The actor in [`crate::electron_browser`] owns the pipes and feeds bytes to this.
+//! The actor in [`crate::electron_browser`] owns the socket and feeds bytes to this.
 //!
 //! ## Why this exists at all
 //!
@@ -386,7 +386,12 @@ pub enum PointerKind {
     Up,
 }
 
-/// Accumulates bytes from the browser's stdout and yields whole messages.
+/// Accumulates bytes from the browser's control socket and yields whole messages.
+///
+/// The *socket*, not stdout. The channel moved off the child's stdio because Electron's
+/// main-process stdin is unusable on Windows, and the child's stdout and stderr are
+/// inherited Chromium diagnostics — CRLF-punctuated log spew that this framer would read
+/// as a stream of decode errors. Not desynchronizing framing is the point of the move.
 ///
 /// A framer rather than a `BufRead::lines()` loop because the actor reads from an async
 /// pipe in arbitrary chunks: a message can arrive split across two reads, and two
@@ -433,7 +438,7 @@ impl LineFramer {
     }
 }
 
-/// Encode a message for the browser's stdin, newline-terminated.
+/// Encode a message for the browser's control socket, newline-terminated.
 ///
 /// # Errors
 /// [`ProtocolError::Encode`] if the message cannot be serialized, which for these types

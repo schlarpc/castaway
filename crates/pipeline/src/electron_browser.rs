@@ -251,7 +251,8 @@ impl Drop for InFlight {
 /// A fault the reader thread observed, and where.
 #[derive(Debug, Clone)]
 struct Fault {
-    /// The window it happened in, or `None` for the process itself (stdout closed).
+    /// The window it happened in, or `None` for the process itself (the control socket
+    /// closed).
     /// Recovery is scoped by this: a crashing cast page reloads the page, not the clock.
     surface: Option<Surface>,
     /// What happened, for the log.
