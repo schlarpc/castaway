@@ -523,12 +523,35 @@ async fn run(
                     Some(pending) if pending.user.user_name == user_name => {
                         pending.attempts += 1;
                         if pending.attempts > RECONNECT_ATTEMPTS {
+                            let attempts = pending.attempts;
                             standing = None;
+                            warn!(
+                                attempts,
+                                "spotify: giving up on logging in; the credentials \
+                                 are probably stale, so re-pair from the app"
+                            );
                             // Stop claiming to be logged in as someone we cannot log in
                             // as. The endpoint set the name optimistically when the
                             // pairing arrived, because it had to answer the phone before
                             // the login was attempted; this is where that optimism ends.
                             active.release(&user_name).await;
+                            if let Some(osd) = &osd {
+                                osd.banner(
+                                    "Spotify: disconnected — pair again to resume".to_owned(),
+                                    Duration::from_secs(8),
+                                );
+                            }
+                            // The same ending as the session-ended give-up above, and the
+                            // *common* one: a live session that dies non-deliberately
+                            // sets attempts = 1 there, so every attempt after it fails
+                            // inside `start()` and lands here instead. Without this the
+                            // panel keeps a stale now-playing card and transport controls
+                            // wired to an aborted Spirc, indefinitely — nothing else
+                            // tears a Spotify session down, because the PCM path passes
+                            // no failure callback and the manager's media-ended synthesis
+                            // never fires for it. Harmless if the source is no longer
+                            // active: the manager no-ops.
+                            let _ = sink.emit(SessionEvent::End).await;
                         }
                     }
                     _ => {
@@ -924,9 +947,11 @@ async fn pump_events(
             _ => false,
         };
 
-        // Recorded even when it is not republished: `PositionChanged` deliberately does
-        // not go down the channel (a 33 MB re-raster for a number the card does not draw),
-        // but a session that reopens should still come back at the right position.
+        // Recorded even when it is not republished — `SessionClientChanged` and
+        // everything under the wildcard return `false` — because a session that reopens
+        // should come back with the state it had. `PositionChanged` used to be the
+        // example here and is not one any more: it returns `true` now, and the scrubber
+        // re-anchoring documented on that arm depends on it.
         presentation.set_now_playing(&snapshot);
         if changed
             && sink
@@ -1208,18 +1233,18 @@ async fn fetch_track_name(session: &Session, uri: &str) -> Option<castaway_core:
     Some(queued)
 }
 
-/// Turn one `ProvidedTrack` into something worth putting on a wall.
-///
-/// The names come from the track's `metadata` map rather than from a metadata lookup per
-/// URI: `Track::get` would be one round trip per queued item, and its `artists` are URIs
-/// that would each need another. The map is what the cloud already sent us.
-///
-/// Keys are checked in several spellings because this is reverse-engineered surface and
-/// the exact set is not contractual; the URI is the last resort so a queue entry is never
+/// The last resort for one `ProvidedTrack`: its id, formatted, so a queue row is never
 /// blank.
+///
+/// The metadata-map reading this doc used to describe moved to [`named_from_metadata`]
+/// when the two were split. What is left is the URI tail.
+///
+/// It is reached at drawn positions, not only past `RESOLVE_LIMIT`: [`QueueNames::resolve`]
+/// falls back here for any entry whose lookup has failed `FAILED_TRIES` times, and for a
+/// within-limit fetch that has just failed. So a raw `spotify:<id>` row really does go on
+/// the wall — which [`Known::Failed`] says outright — and that is the intended outcome,
+/// since the id is at least greppable against the log where an empty row is nothing.
 fn fallback_item(track: &ProvidedTrack) -> castaway_core::QueueItem {
-    // Only reached for entries past `RESOLVE_LIMIT`, which the card counts but never
-    // draws. Still better than an empty row: the id is greppable against the log.
     castaway_core::QueueItem::new(
         track
             .uri
