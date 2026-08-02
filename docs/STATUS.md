@@ -352,16 +352,29 @@ stated in `docs/network-surface.md`'s Security column rather than left implicit,
 `remote.input = false` keeps the viewing half while dropping every input message at the
 boundary. It is not a control against someone who can already reach the port.
 
+**One player, on `/`, stopped until pressed.** It is not a page of its own: a viewer at
+`/` and a driver elsewhere is one place too many to look at the panel. Nothing is
+negotiated or encoded until the button is pressed, and pressing it is also what turns the
+picture from a video into an input surface — there is nothing to pause or scrub about the
+panel as it is right now. The two states are exclusive by construction, not by ordering:
+the capture layer is `display:none` until `ontrack` fires.
+
 **Tested without hardware:** the wire parse (a peer cannot name another peer's contact; a
 coordinate that is not finite is refused before anything clamps it), the coalescing queue
 (a run of moves collapses; an `Up` is never dropped under flood; a departure keeps its
 place in the order), the router (three contacts all numbered zero stay three), and a real
-negotiation over real sockets — a browser-shaped offer in, an answer with a fingerprint,
-both m-lines, the registered codec and a candidate from the declared range out.
+negotiation over real sockets.
+
+**Tested with a real browser** (`remote_browser.rs`, `#[ignore]`, needs a GPU and an
+Electron — which is Chromium): the real player loads stopped, connects when pressed, and
+the *browser itself* reports frames out of its decoder; then a touch goes in through the
+browser and comes back out of the panel's input queue as a contact belonging to that peer.
+This is the test that matters, and writing it found three bugs the fixture-based one
+structurally could not — a fixture agrees with whatever you send it.
 
 **Not done:** no audio on the remote track (Opus vs the stream's AAC); no keyboard, which
-is arguably the killer feature and is scoped separately; and the whole thing has never met
-a phone.
+is arguably the killer feature and is scoped separately; and no *phone* has driven a real
+panel, though a real browser now has.
 
 ## Biggest open items (see the issue tracker)
 
@@ -380,9 +393,10 @@ into it. The struck-through history this list used to carry now lives in the clo
    Everything up to `/launch` is proven against real Sunshine; past it, nothing is.
 4. **#17** — no real Miracast driver. hwsim is the best-behaved mac80211 there is; the
    interface-combination parse and the 5 GHz NO-IR question both need a radio.
-5. **#65** — touch through CDP has never met glass. **#18** now rides the same path from
-   the other end: the remote UI is code-complete and negotiates against real sockets in a
-   test, but no phone has ever driven a real panel through it.
+5. **#65** — touch through CDP has never met glass. **#18** rides the same path from the
+   other end and is further along: a real browser drives the real player end to end in
+   `remote_browser.rs`, frames decoded and touches round-tripped. What is untested there
+   is a *phone*, and the panel's own glass.
 6. **#21 / #55** — there is still no display-control backend at all: `serial` and `ddc` are
    empty feature lists, `dell.rs` is a frame encoder with placeholder opcodes, and `app`
    constructs `NullDisplay` unconditionally. #55 is what that costs — the panel sleeps and

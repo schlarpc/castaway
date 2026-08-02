@@ -1855,11 +1855,33 @@ implicit. `remote.input = false` keeps the viewing half and drops every input me
 boundary — a way to stop a wall display being drivable, not a control against someone who
 can already reach the port.
 
+#### A fixture cannot disagree with you
+
+`remote_negotiation.rs` drives the real service over real sockets with a hand-written
+offer, and it is worth having. It is also structurally blind, and three bugs walked
+through it:
+
+- the pump stamped every packet with the payload type we *register* rather than the one
+  the peer negotiated. A browser rejects all of them; the fixture could not, because it
+  offered the same number. The symptom was the worst kind of working — ICE connected, DTLS
+  came up, the data channel opened, and the transceiver refused every frame at frame rate.
+- gathering completion was signalled with `notify_waiters`, which wakes only tasks already
+  parked. On a LAN the candidates are gathered before the answer path waits, so every
+  connection sat out a three-second timeout. Nothing failed; the only evidence was wall
+  clock nothing asserted on.
+- ICE bound the one address the receiver advertises. A browser gathers its real interfaces
+  and never offers a loopback candidate, so a browser *on the panel* had nothing to pair
+  with. `bind_ips` is plural now.
+
+So the real test is `remote_browser.rs`: Electron — which is Chromium, already vendored and
+already driven over CDP here — loads the real player against the real transport, and the
+browser reports frames out of its own decoder. Then a touch goes in through the browser and
+has to come back out of the input queue as a contact belonging to that peer. It is
+`#[ignore]`d and needs a GPU and an Electron, like the other browser tests.
+
 #### Not done
 
 No audio on the remote track: WebRTC wants Opus and the stream encodes AAC. No keyboard —
 `InputSink` has touch and pointer and no keys, and typing a URL or a Wi-Fi password from a
-phone is arguably the point of a remote UI; it is scoped separately. And **no phone has ever
-driven a real panel through this.** The negotiation is exercised against real sockets in
-`remote_negotiation.rs` and every pure layer is unit-tested, but the end-to-end path is
-unproven in exactly the way #65 is unproven from the other end.
+phone is arguably the point of a remote UI; it is scoped separately. And no *phone* has
+driven a real panel: a real browser has, on a dev box, which is not the same as glass.
