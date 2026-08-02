@@ -238,6 +238,19 @@ impl RenderRx {
         }
     }
 
+    /// Throw away every video frame queued right now, and answer how many there were.
+    ///
+    /// For the end of an item: those frames are pixels of something that is over, and the
+    /// loop is about to take the layer down. Only the frame lane is touched — a control
+    /// command is never stale in this sense, and dropping one would lose a transition.
+    pub fn discard_queued_frames(&self) -> usize {
+        let mut dropped = 0;
+        while self.frames.try_recv().is_ok() {
+            dropped += 1;
+        }
+        dropped
+    }
+
     /// Block up to `timeout` for the next command. Two receivers share the timeout by
     /// polling in millisecond slices — only tests block here, so coarse is fine.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<RenderCommand> {
@@ -2985,12 +2998,25 @@ impl RenderLoop {
                 false
             }
             RenderCommand::ClearVideo => {
-                // Not yet. A control point that cannot seek in-band restarts the item —
-                // VLC's live stream sends STOP then a fresh LOAD for every scrub — and
-                // clearing here bared the idle screen for the half-second between them.
-                // The clear is scheduled instead, and the next frame cancels it; a stop
-                // that really is the end of the session clears when the grace runs out,
-                // which is too brief to read as the frozen-frame bug this used to be.
+                // The item is over, so the frames of it still queued are frames of
+                // something that has ended. Dropping them is not an optimisation: the
+                // control lane is drained before the frame lane, so a clear is always
+                // seen *before* the stragglers it refers to — and since applying a frame
+                // cancels a pending clear (below), leaving them queued means the last one
+                // cancels this clear and nothing ever re-arms it. The panel then holds the
+                // final frame of a finished cast for the life of the session, which is
+                // exactly the frozen-frame bug the grace was added to fix, arriving
+                // through the grace instead of around it. Found by #98's first
+                // end-to-end run against a real compositor.
+                self.rx.discard_queued_frames();
+
+                // Only *then*, and not yet. A control point that cannot seek in-band
+                // restarts the item — VLC's live stream sends STOP then a fresh LOAD for
+                // every scrub — and clearing here bared the idle screen for the
+                // half-second between them. The clear is scheduled instead, and a frame
+                // of the *next* item cancels it; a stop that really is the end of the
+                // session clears when the grace runs out, which is too brief to read as
+                // the frozen frame it would otherwise be.
                 self.video_clear_due = Some(std::time::Instant::now() + CLEAR_GRACE);
                 false
             }
