@@ -338,7 +338,17 @@ async fn pump(
                 if let (Some(params), Some(sockets)) = (params, sockets) {
                     match mirror_audio_tx.take() {
                         Some(tx) => {
-                            let stream = AudioStream::new(&params);
+                            // The *shared* origin, not this plane's own first packet.
+                            // Mirror audio and mirror video are one session with one
+                            // timeline; measuring each from whatever arrived first
+                            // discards the relationship between them, and two sets of
+                            // perfectly correct timestamps then land seconds apart. This
+                            // is the wiring f8e7363 introduced `StreamOrigin` for and
+                            // then only applied to the video side, which left the
+                            // `AwaitingSync` handling below unreachable and its test
+                            // asserting a configuration nothing built.
+                            let stream =
+                                AudioStream::new(&params).with_origin(Arc::clone(&mirror_origin));
                             info!(%peer, link = %params.describe(), "AirPlay mirroring audio starting");
                             // The mirror is already the active session, so this lands:
                             // it is the codec arriving after the picture, merged onto

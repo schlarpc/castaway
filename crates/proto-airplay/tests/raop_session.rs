@@ -554,12 +554,39 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
         .and_then(|d| d.get("dataPort"))
         .and_then(plist::Value::as_unsigned_integer)
         .expect("a dataPort for the audio stream");
+    let control_port = reply
+        .as_dictionary()
+        .and_then(|d| d.get("streams"))
+        .and_then(plist::Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|d| d.get("controlPort"))
+        .and_then(plist::Value::as_unsigned_integer)
+        .expect("a controlPort for the audio stream");
 
     // The audio key is the FairPlay one with the `eiv` verbatim — no SHA-512 derivation,
     // which is the video stream's alone. Encrypt the way a sender does and check it lands.
     let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
+
+    // The sync packet first, which is what a real sender emits at stream start. Mirror
+    // audio shares its origin with mirror video, so it cannot place a frame on that
+    // timeline until a sync has anchored it to the sender's clock — a packet before the
+    // anchor is `AwaitingSync` and dropped, deliberately. 20 bytes, and *not* an RTP
+    // header plus payload: the NTP stamp sits where an SSRC would.
+    let mut sync = vec![0x90u8, 0x80 | 84, 0, 7];
+    sync.extend_from_slice(&0u32.to_be_bytes()); // rtp now, less latency
+    sync.extend_from_slice(&0x0001_0000_0000_0000u64.to_be_bytes()); // sender NTP
+    sync.extend_from_slice(&0u32.to_be_bytes()); // rtp anchor
+    sender
+        .send_to(
+            &sync,
+            SocketAddr::from(([127, 0, 0, 1], u16::try_from(control_port).unwrap())),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let mut plain = vec![0x8cu8];
     plain.extend_from_slice(b"an-aac-eld-access-unit!!");
     let mut cipher_text = plain.clone();
