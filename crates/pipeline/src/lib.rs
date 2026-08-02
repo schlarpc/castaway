@@ -63,8 +63,9 @@ pub mod filterlists;
 pub mod icon;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
-// The remote-control transport: WebRTC out, contacts back (#18).
-#[cfg(feature = "remote")]
+// The remote-control transport: WebRTC out, contacts back (#18). Always compiled —
+// the player it serves is a string with no dependencies, and only the transport
+// underneath it needs the feature.
 pub mod remote;
 // Keeping the panel lit while something is playing. Platform-specific behind one seam
 // (ground rule 5); see the module docs for why a sleeping monitor cost us the audio

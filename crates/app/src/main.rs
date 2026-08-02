@@ -1155,18 +1155,20 @@ fn landing_page(config: &Config) -> String {
          <p>castaway {version} is up. This box accepts:</p>\
          <ul>{services}</ul>\
          {player}\
-         <p><a href=\"{remote}\">Drive the panel from here</a> — the same picture with a \
-         tenth of the delay, and your touches go through.</p>\
-         <p><a href=\"/screenshot.png\">A still of what the panel is showing</a></p>\
+         <p><a href=\"/screenshot.png\">A still of what the panel is showing</a>, or \
+         <a href=\"{playlist}\">the same output as HLS</a> for a player that wants a URL.</p>\
          </body></html>",
         version = env!("CARGO_PKG_VERSION"),
         // The live duplicate (#101). Present in every build: where there is no encoder the
         // player says so, which is the same answer `/screenshot.png` gives and for the
         // same reason.
-        player = stream_http::PLAYER,
-        // The interactive duplicate (#18). Named from the constant the routes are
-        // mounted at, so the link and the route cannot drift.
-        remote = remote_http::PAGE_PATH,
+        // The panel, live and drivable (#18) — stopped until somebody presses it, so a
+        // landing page left open in a tab costs nothing. This replaced the HLS `<video>`
+        // that used to sit here: two players for the same output, one of them seconds
+        // behind and untouchable, was one too many. The HLS routes stay for players that
+        // want a URL rather than a page.
+        player = pipeline::remote::PLAYER,
+        playlist = stream_http::PLAYLIST_PATH,
     )
 }
 
