@@ -803,7 +803,7 @@ pub const SINK_VIDEO_FORMATS: &str =
 /// `port=none` is correct and not a placeholder: the sink says *what* it can send, and the
 /// **source** fills in where. Both categories are offered because Windows advertises HIDC
 /// only, and GENERIC is the only thing an Android fork would use.
-pub const SINK_UIBC_CAPABILITY: &str = "input_category_list=GENERIC, HIDC;     generic_cap_list=Mouse, SingleTouch, MultiTouch;     hidc_cap_list=Keyboard/USB, Mouse/USB, MultiTouch/USB;port=none";
+pub const SINK_UIBC_CAPABILITY: &str = "input_category_list=GENERIC, HIDC;generic_cap_list=Mouse, SingleTouch, MultiTouch;hidc_cap_list=Keyboard/USB, Mouse/USB, MultiTouch/USB;port=none";
 
 impl SinkCapabilities {
     /// The advertisement this sink makes, on `rtp_port`.
