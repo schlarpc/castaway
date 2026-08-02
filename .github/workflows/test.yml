@@ -13,13 +13,19 @@ concurrency:
 
 jobs:
   # Everything that is a mistake in the flake rather than in the code, found in a minute
-  # instead of ninety. `--no-build` evaluates every check, package, devShell and NixOS
-  # module without realising any of them, which is where an assertion like the CEF
-  # version-agreement guard fires — that one took out a dependabot PR at the end of an
-  # hour-long build, having been knowable at the start of it.
+  # instead of ninety: forcing every check to a derivation runs all of its evaluation, so a
+  # guard that throws — a version-agreement assertion between a pinned blob and nixpkgs,
+  # say — fires here rather than at the end of an hour-long build. One did exactly that to
+  # a dependabot PR, having been knowable at the start of the run.
   #
-  # It also enumerates the checks for the matrix below, so the two cannot drift: a check
-  # added to `flake.nix` becomes a job here, and nobody has to remember to list it.
+  # `nix flake check --no-build` is the obvious way to write this and does not work: this
+  # flake needs import-from-derivation to evaluate (crane vendors sources *through* a
+  # derivation), and `--no-build` refuses to realise it — "error: path
+  # '…-source.drv' is not valid". It passes on a warm store and fails on a cold runner,
+  # which is the worst way for a gate to be wrong.
+  #
+  # The same step enumerates the checks for the matrix below, so the two cannot drift: a
+  # check added to `flake.nix` becomes a job here, and nobody has to remember to list it.
   discover:
     runs-on: ubuntu-latest
     permissions:
@@ -30,9 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/nix-runner
-      - run: nix flake check --no-build
       - id: list
         run: |
+          nix eval --raw .#checks.x86_64-linux \
+            --apply 'cs: builtins.concatStringsSep "\n" (map (c: c.drvPath) (builtins.attrValues cs))'
+          echo
           checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
           echo "checks=$checks" >> "$GITHUB_OUTPUT"
           echo "$checks"
