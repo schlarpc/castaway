@@ -199,7 +199,7 @@ impl KioskApp {
     }
 
     /// Update the pill layer for this frame. Cheap: while it is up and unchanging this
-    /// writes one 32-byte uniform, and it only rasterizes when it first appears.
+    /// writes one 48-byte uniform, and it only rasterizes when it first appears.
     fn tick_pill(&mut self) {
         let Some(render) = self.render.as_mut() else {
             return;

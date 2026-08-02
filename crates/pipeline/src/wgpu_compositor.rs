@@ -60,8 +60,6 @@ pub(crate) fn create_instance() -> wgpu::Instance {
 }
 
 const SHADER: &str = r#"
-// {vec4, f32} lays out as 32 bytes (struct align 16), matching the Rust `Uniform`
-// which pads to 32. Do NOT add a vec3 pad here — that would round the size up to 48.
 // 48 bytes, matching the Rust `Uniform`: vec4 (0..16), f32 (16), f32 (20), vec2 (24..32),
 // vec4 (32..48). Scalars for radius and size *because* of alignment: a `vec4<f32>` has 16-byte
 // alignment, so putting them in one would have pushed them to offset 32 while the Rust side kept
@@ -233,9 +231,9 @@ struct Uniform {
     transform: [f32; 4],
     opacity: f32,
     /// Corner radius in device pixels, and the on-screen size it is a radius *of*. Three
-    /// floats, which is exactly the padding this struct already carried — so it stays 32 bytes
-    /// and the buffer layout is unchanged. A `[f32; 4]` here would *not* have worked: the WGSL
-    /// side would align a `vec4` to 16 and read from offset 32.
+    /// scalars rather than a `[f32; 4]`, which would *not* have worked: the WGSL side aligns a
+    /// `vec4` to 16 and would read them from offset 32, where `source` now lives. They sit at
+    /// 16, 20 and 24..32, inside the 48 bytes the assert at the bottom of this file pins.
     radius: f32,
     size: [f32; 2],
     source: [f32; 4],
