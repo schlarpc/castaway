@@ -168,9 +168,17 @@ impl AudioMix {
                 *slot += *sample;
             }
         }
+        // `base` counts frames and `samples` holds interleaved ones, so the trim has to
+        // drop a whole frame at a time. Popping one sample per `base += 1` advanced the
+        // label at twice the rate for stereo: what was still in the window came back
+        // relabelled half a trim late, and once pinned at cap the base outran the wall
+        // clock — heads of live blocks lost to `skip_frames`, and `take` refusing until
+        // the clock caught up. It lasted until the next `restart()`.
         let cap = usize::try_from(Self::frames_at(MAX_BUFFERED)).unwrap_or(usize::MAX) * channels;
         while window.samples.len() > cap {
-            window.samples.pop_front();
+            for _ in 0..channels {
+                window.samples.pop_front();
+            }
             window.base += 1;
         }
     }
@@ -450,6 +458,44 @@ mod tests {
             .expect("a second has passed, so the first frames are settled");
         assert_eq!(out.len(), 2048);
         assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn the_overflow_trim_drops_whole_frames_not_half_of_one() {
+        // The backstop fires when the encode loop — the mix's only reader — stalls past
+        // MAX_BUFFERED while a session keeps writing. It used to pop one *sample* per
+        // `base += 1`, so for stereo the label ran at twice the rate the audio was
+        // actually discarded: what stayed in the window came back half a trim late
+        // against the video it shares a timeline with, and once pinned at cap `base`
+        // outran the wall clock — live blocks losing their heads to `skip_frames`, and
+        // `take` refusing to settle until the clock caught up.
+        let (timeline, mix) = mix();
+        let t0 = Instant::now();
+        timeline.anchor(t0);
+
+        let capacity = usize::try_from(AudioMix::frames_at(MAX_BUFFERED)).unwrap();
+        // Write past the cap in one go, at position zero.
+        mix.add(t0, &tone(capacity + 4800, 0.5));
+
+        let (base, held) = {
+            let window = mix.inner.lock().unwrap();
+            (window.base, window.samples.len())
+        };
+        assert_eq!(held, capacity * 2, "trimmed back to the cap");
+        // A frame of audio discarded is a frame of `base`, and no more.
+        assert_eq!(
+            base, 4800,
+            "base must advance by the frames dropped, not by the samples"
+        );
+        // …and the label still points at real audio: the next take from `base` is the
+        // tone, not silence read off the end.
+        let out = mix
+            .take(t0 + MAX_BUFFERED + Duration::from_secs(1), 1024, SETTLE)
+            .expect("well past settle");
+        assert!(
+            out.iter().all(|s| (*s - 0.5).abs() < f32::EPSILON),
+            "{out:?}"
+        );
     }
 
     #[test]
