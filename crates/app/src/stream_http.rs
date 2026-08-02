@@ -12,10 +12,11 @@
 //! first playlist request usually 503s while the encoder opens, which is why the player
 //! below retries rather than giving up.
 //!
-//! Two players are served by one set of routes. Safari plays HLS natively, so it is handed
-//! the playlist URL and nothing else happens. Everything else gets ~80 lines of Media
-//! Source Extensions, which is enough *because we are both ends*: the playlist this serves
-//! is a fixed shape, so there is no general HLS parser to vendor half a megabyte of.
+//! **Nothing in this repo plays this any more.** The landing page carries the WebRTC
+//! player instead (#18) — one player, a tenth of the latency, and touchable. These routes
+//! stay because HLS is what a *player given a URL* wants: ffplay, VLC, mpv, anything built
+//! on libavformat, and Safari natively. The MSE shim that used to sit on the landing page
+//! went with the page it was on.
 
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -270,127 +271,6 @@ fn no_encoder() -> Response {
         .into_response()
 }
 
-/// The landing page's player: a `<video>`, and enough script to feed it.
-///
-/// Kept as one constant rather than assembled, because it is markup and script and neither
-/// wants interpolation — the one URL it needs is [`PLAYLIST_PATH`], and it is spelled the
-/// same on both sides.
-pub const PLAYER: &str = r##"
-<section id="stream">
-  <h2>Live</h2>
-  <video id="panel" autoplay muted playsinline controls></video>
-  <p id="stream-note">Connecting…</p>
-</section>
-<script>
-(function () {
-  var video = document.getElementById('panel');
-  var note = document.getElementById('stream-note');
-  var say = function (text) { note.textContent = text; };
-
-  // Safari plays HLS natively, so there is nothing to do but point it at the playlist.
-  // Asking for the playlist is also what starts the encoder, which is why this is enough.
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = '/stream/live.m3u8';
-    say('');
-    return;
-  }
-  if (!window.MediaSource) { say('This browser cannot play the stream.'); return; }
-
-  var buffer = null;
-  var pending = [];
-  var have = {};
-
-  function pump() {
-    if (buffer && !buffer.updating && pending.length) { buffer.appendBuffer(pending.shift()); }
-  }
-
-  function bytes(url) {
-    return fetch(url, { cache: 'no-store' }).then(function (r) {
-      if (!r.ok) { throw new Error(url + ' → ' + r.status); }
-      return r.arrayBuffer();
-    });
-  }
-
-  // The playlist 503s until the first segment exists, which is a second or so after the
-  // first request starts the encoder. Retrying is the normal path here, not error handling.
-  function playlist(tries) {
-    return fetch('/stream/live.m3u8', { cache: 'no-store' }).then(function (r) {
-      if (r.ok) { return r.text(); }
-      if (r.status !== 503 || tries <= 0) { return r.text().then(function (t) { throw new Error(t); }); }
-      say('Starting the encoder…');
-      return new Promise(function (go) { setTimeout(go, 500); }).then(function () {
-        return playlist(tries - 1);
-      });
-    });
-  }
-
-  // Only the URI lines matter, and every other line in what we serve begins with '#'.
-  function segments(text) {
-    return text.split('\n').filter(function (line) {
-      return line.length > 0 && line.charAt(0) !== '#';
-    });
-  }
-
-  function follow() {
-    playlist(0).then(function (text) {
-      var wanted = segments(text);
-      // Fetched in playlist order and appended in fetch order, because a SourceBuffer in
-      // 'segments' mode places each fragment by its own `tfdt` — so arriving out of order
-      // is a gap the player waits out rather than a reorder it fixes.
-      var chain = Promise.resolve();
-      wanted.forEach(function (uri) {
-        if (have[uri]) { return; }
-        have[uri] = true;
-        chain = chain.then(function () {
-          return bytes('/stream/' + uri).then(function (buf) {
-            pending.push(new Uint8Array(buf));
-            pump();
-          });
-        });
-      });
-      return chain;
-    }).catch(function (e) {
-      say(String(e.message || e));
-    }).then(function () {
-      // Stay near the live edge. A tab that was backgrounded comes back with the whole
-      // window buffered, and playing it out from the front means watching the last ten
-      // seconds of the panel instead of the panel.
-      if (video.buffered.length) {
-        var edge = video.buffered.end(video.buffered.length - 1);
-        if (edge - video.currentTime > 4) { video.currentTime = edge - 1; }
-      }
-      setTimeout(follow, 500);
-    });
-  }
-
-  playlist(60).then(function () {
-    return fetch('/stream/status.json', { cache: 'no-store' }).then(function (r) { return r.json(); });
-  }).then(function (status) {
-    var mime = 'video/mp4; codecs="' + status.codec + '"';
-    if (!window.MediaSource.isTypeSupported(mime)) { throw new Error('unsupported: ' + mime); }
-    var source = new MediaSource();
-    video.src = URL.createObjectURL(source);
-    return new Promise(function (open) {
-      source.addEventListener('sourceopen', function () { open(source); }, { once: true });
-    }).then(function (ms) {
-      ms.duration = Infinity;
-      buffer = ms.addSourceBuffer(mime);
-      buffer.mode = 'segments';
-      buffer.addEventListener('updateend', pump);
-      return bytes('/stream/init.mp4');
-    }).then(function (init) {
-      pending.push(new Uint8Array(init));
-      pump();
-      say(status.encoder + ' · ' + status.width + '×' + status.height);
-      follow();
-    });
-  }).catch(function (e) {
-    say(String(e.message || e));
-  });
-})();
-</script>
-"##;
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -452,20 +332,13 @@ mod tests {
         // ffmpeg's HLS demuxer refuses a segment URI whose extension is not on its
         // `allowed_segment_extensions` list, so a playlist pointing at `seg/3` opens
         // nowhere — no ffplay, no VLC, nothing built on libavformat. Found by pointing
-        // ffmpeg at a live panel.
-        assert!(SEGMENT_ROUTE.ends_with(".m4s") || segment_sequence("1.m4s").is_some());
-        assert!(PLAYER.contains(".m4s") || PLAYER.contains("'/stream/' + uri"));
-    }
-
-    #[test]
-    fn the_player_asks_for_the_playlist_this_module_actually_serves() {
-        // The script is a constant and the route is a constant, and nothing but this
-        // checks that they are the same string.
-        assert!(PLAYER.contains(PLAYLIST_PATH));
-        assert!(PLAYER.contains("/stream/init.mp4"));
-        assert!(PLAYER.contains("/stream/status.json"));
-        // The playlist's own segment URIs are relative, and the player resolves them
-        // against `/stream/` — so the prefix it prepends has to match `segment_uri`.
-        assert!(PLAYER.contains("'/stream/' + uri"));
+        // ffmpeg at a live panel. That is now the *whole* audience for these routes: the
+        // landing page carries the WebRTC player instead (#18), so nothing in this repo
+        // consumes the playlist and only a real external player will notice a regression.
+        // The whole filename is one path parameter, which is what lets the extension
+        // travel in the URI at all, and the suffix comes back off here.
+        assert!(SEGMENT_ROUTE.ends_with("{name}"));
+        assert_eq!(segment_sequence("1.m4s"), Some(1));
+        assert_eq!(segment_sequence("1"), None, "the extension is not optional");
     }
 }
