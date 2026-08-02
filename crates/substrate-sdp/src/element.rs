@@ -62,6 +62,16 @@ const TYPE_SEQUENCE: u8 = 6;
 const TYPE_ALTERNATIVE: u8 = 7;
 const TYPE_URL: u8 = 8;
 
+/// How deep nested sequences may go before a decode is refused.
+///
+/// A real record is nowhere near this: a `ServiceSearchAttributeResponse` carrying an
+/// `AdditionalProtocolDescriptorLists` — about the deepest thing a phone sends — nests
+/// five or six levels. Sixteen leaves room for something exotic and still bounds the
+/// stack the decoder's recursion consumes, which is the whole point: the depth is
+/// chosen by the peer's bytes, and past a few thousand frames the process aborts
+/// instead of erroring (#142).
+pub const MAX_DEPTH: usize = 16;
+
 impl DataElement {
     /// Convenience: a sequence of short UUIDs.
     #[must_use]
@@ -187,8 +197,22 @@ impl DataElement {
     ///
     /// # Errors
     /// [`SdpError::Truncated`] on a short buffer, [`SdpError::BadElement`] on a type or
-    /// size combination that isn't legal.
+    /// size combination that isn't legal, [`SdpError::TooDeep`] if sequences nest past
+    /// [`MAX_DEPTH`].
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), SdpError> {
+        Self::decode_at(buf, 0)
+    }
+
+    fn decode_at(buf: &[u8], depth: usize) -> Result<(Self, usize), SdpError> {
+        // Nesting is peer-controlled and the recursion is real, so this is the only thing
+        // standing between a ~30 kB request of nested sequence headers and a stack
+        // overflow — which aborts the process rather than returning an `Err`, on a path
+        // any unauthenticated BR-EDR peer can reach (the SDP server answers a search
+        // pattern it has not authenticated, and the cover-art client parses whatever a
+        // phone returns).
+        if depth > MAX_DEPTH {
+            return Err(SdpError::TooDeep { limit: MAX_DEPTH });
+        }
         let &header = buf.first().ok_or(SdpError::Truncated {
             what: "data element header",
             need: 1,
@@ -253,7 +277,7 @@ impl DataElement {
                 let mut items = Vec::new();
                 let mut rest = body;
                 while !rest.is_empty() {
-                    let (item, used) = Self::decode(rest)?;
+                    let (item, used) = Self::decode_at(rest, depth + 1)?;
                     items.push(item);
                     rest = &rest[used..];
                 }
@@ -485,6 +509,39 @@ mod tests {
         assert!(matches!(
             DataElement::decode(&hex!("1b 00 00 00 00 00 00 00 00")),
             Err(SdpError::BadElement { .. })
+        ));
+    }
+
+    /// `depth` nested sequence headers, each declaring the rest of the buffer as its
+    /// body — the shape the overflow was measured with (`36 hi lo`, three bytes a level).
+    fn nested_sequences(depth: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(depth * 3);
+        for i in 0..depth {
+            // Type 6 (sequence), size index 6 (two length bytes).
+            buf.push((TYPE_SEQUENCE << 3) | 6);
+            let remaining = u16::try_from((depth - i - 1) * 3).unwrap();
+            buf.extend_from_slice(&remaining.to_be_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn nesting_deeper_than_the_ceiling_is_an_error_not_a_stack_overflow() {
+        // The depth is chosen by the peer's bytes, on paths an unauthenticated BR-EDR
+        // peer reaches: the SDP server decodes a search pattern before anything has
+        // authenticated, and the cover-art client decodes whatever a phone returns.
+        // Unbounded, a few tens of kB of these headers aborts the process — a stack
+        // overflow is not a catchable `Err`, so no amount of caller care recovers it.
+        assert!(matches!(
+            DataElement::decode(&nested_sequences(MAX_DEPTH + 2)),
+            Err(SdpError::TooDeep { limit: MAX_DEPTH })
+        ));
+        // Nothing near the ceiling is refused: real records nest five or six deep.
+        assert!(DataElement::decode(&nested_sequences(MAX_DEPTH)).is_ok());
+        // …and a payload that would have overflowed the stack now just errors.
+        assert!(matches!(
+            DataElement::decode(&nested_sequences(10_000)),
+            Err(SdpError::TooDeep { .. })
         ));
     }
 }

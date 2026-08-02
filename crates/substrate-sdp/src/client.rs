@@ -14,6 +14,15 @@ use crate::record::{attr, ServiceRecord};
 use crate::server::{join, parse_records};
 use crate::uuid::Uuid;
 
+/// How much reassembled record data one query will accumulate before giving up.
+///
+/// The number of continuation rounds is the *peer's* choice — it decides there is another
+/// one by returning another token, and the adapter loop above obliges for as long as it
+/// keeps doing so. A real AVRCP Target record with browsing and cover art is a couple of
+/// kilobytes, so this is far more than any handset needs and still bounds what one phone
+/// can make us hold and parse (#142).
+pub const MAX_QUERY_BYTES: usize = 64 * 1024;
+
 /// Drives one SDP query across however many continuation round trips it takes.
 ///
 /// Continuation is not optional in practice: a phone's AVRCP Target record with browsing
@@ -26,6 +35,7 @@ pub struct Query {
     max_bytes: u16,
     tid: u16,
     fragments: Vec<Bytes>,
+    total: usize,
     cont: Continuation,
     done: bool,
 }
@@ -45,6 +55,7 @@ impl Query {
             max_bytes,
             tid,
             fragments: Vec::new(),
+            total: 0,
             cont: Continuation::none(),
             done: false,
         }
@@ -87,11 +98,32 @@ impl Query {
     /// Feed a response PDU. Returns `true` when the query is complete.
     ///
     /// # Errors
-    /// [`SdpError::PeerError`] if the peer returned an error response, or a parse error
-    /// if the PDU is malformed.
+    /// [`SdpError::PeerError`] if the peer returned an error response,
+    /// [`SdpError::TooLarge`] if the peer returns a fragment bigger than the one we asked
+    /// for or drives the reassembly past [`MAX_QUERY_BYTES`], or a parse error if the PDU
+    /// is malformed.
     pub fn feed(&mut self, response: &[u8]) -> Result<bool, SdpError> {
         match SdpResponse::decode(response)? {
             SdpResponse::ServiceSearchAttribute { lists, cont, .. } => {
+                // `max_bytes` is what we asked for; a peer returning more than that is
+                // not answering our question, and the only reason to accept it is to be
+                // made to hold and parse it.
+                if lists.len() > usize::from(self.max_bytes) {
+                    return Err(SdpError::TooLarge {
+                        what: "attribute list fragment",
+                        limit: usize::from(self.max_bytes),
+                        got: lists.len(),
+                    });
+                }
+                let total = self.total.saturating_add(lists.len());
+                if total > MAX_QUERY_BYTES {
+                    return Err(SdpError::TooLarge {
+                        what: "reassembled attribute lists",
+                        limit: MAX_QUERY_BYTES,
+                        got: total,
+                    });
+                }
+                self.total = total;
                 self.fragments.push(lists);
                 if cont.is_more() {
                     self.cont = cont;
@@ -199,6 +231,55 @@ mod tests {
                 ])]),
             );
         SdpServer::new().with(record)
+    }
+
+    #[test]
+    fn a_peer_cannot_drive_the_reassembly_without_limit() {
+        // How many continuation rounds there are is the peer's choice, and the adapter
+        // loop obliges for as long as it keeps returning a token. Without a budget one
+        // phone — hostile or merely broken — decides how much we hold and parse.
+        let mut q = Query::avrcp_target(1);
+        let fragment = SdpResponse::ServiceSearchAttribute {
+            tid: 1,
+            lists: Bytes::from(vec![0u8; 600]),
+            cont: Continuation::at(1),
+        }
+        .encode();
+        let mut rounds = 0;
+        let err = loop {
+            rounds += 1;
+            assert!(rounds < 10_000, "the budget never fired");
+            match q.feed(&fragment) {
+                Ok(false) => {}
+                Ok(true) => panic!("a continuation token should keep the query open"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(
+            err,
+            SdpError::TooLarge {
+                limit: MAX_QUERY_BYTES,
+                ..
+            }
+        ));
+
+        // …and a fragment larger than the ceiling we asked for is refused on its own,
+        // since it is not an answer to the question we sent.
+        let mut q = Query::new(1, vec![Uuid::AV_REMOTE_CONTROL_TARGET], vec![], 64);
+        let oversized = SdpResponse::ServiceSearchAttribute {
+            tid: 1,
+            lists: Bytes::from(vec![0u8; 65]),
+            cont: Continuation::none(),
+        }
+        .encode();
+        assert!(matches!(
+            q.feed(&oversized),
+            Err(SdpError::TooLarge {
+                limit: 64,
+                got: 65,
+                ..
+            })
+        ));
     }
 
     #[test]

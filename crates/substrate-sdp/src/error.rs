@@ -41,4 +41,22 @@ pub enum SdpError {
     /// A response was structurally valid but didn't contain what was asked for.
     #[error("sdp response missing {0}")]
     Missing(&'static str),
+
+    /// Nested data elements went deeper than the decoder will follow.
+    #[error("sdp data element nested deeper than {limit} levels")]
+    TooDeep {
+        /// The ceiling that was hit.
+        limit: usize,
+    },
+
+    /// A peer sent more than we agreed to accept.
+    #[error("sdp {what} over budget: {got} bytes, limit {limit}")]
+    TooLarge {
+        /// What overran.
+        what: &'static str,
+        /// The ceiling that was hit.
+        limit: usize,
+        /// What the peer actually sent.
+        got: usize,
+    },
 }
