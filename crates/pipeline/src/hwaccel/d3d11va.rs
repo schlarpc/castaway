@@ -44,7 +44,7 @@ use winapi::shared::dxgiformat::DXGI_FORMAT_NV12;
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED,
     D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use winapi::um::handleapi::CloseHandle;
@@ -274,8 +274,43 @@ impl D3d11Exporter {
             self.pool.clear();
             self.size = (width, height);
         }
+        // SAFETY: `source` is a live texture from the decoded frame.
+        let src = unsafe { describe(source) };
+        if src.Width < width || src.Height < height {
+            // The decoder's own texture cannot supply the picture the frame claims. This
+            // is not a copy to attempt with a clamped box — it means the frame metadata
+            // and the surface behind it have come apart, and a partial blit would put a
+            // plausible-looking crop on the panel rather than a visible failure.
+            return Err(HwGiveUp::ExportFailed(format!(
+                "decoder texture is {}×{} but the frame claims {width}×{height}",
+                src.Width, src.Height
+            )));
+        }
+
         // SAFETY: `self.device` is live for the exporter's lifetime.
         let slot = unsafe { self.acquire_slot(width, height) }?;
+
+        // The destination is created at *display* size; libavcodec allocates the decoder
+        // texture at *coded* size — 1088 rows for 1080p, because H.264 codes in 16-row
+        // macroblocks. A null `pSrcBox` copies the whole source subresource, so those
+        // eight extra rows were being written past the end of a 1080-row destination.
+        // The documented behaviour of an out-of-bounds `CopySubresourceRegion` is
+        // undefined: a driver may clip it, or may drop the call entirely — and the second
+        // case reads on the panel as a destination that simply never updates, i.e. a
+        // frozen or juddering mirror with no error anywhere (#102).
+        //
+        // Both bounds are even, which NV12 requires of a box: `height` is the frame's
+        // display height and `create_shared_nv12` has already accepted it, and D3D11
+        // rejects an odd extent for a planar format at creation — so a destination that
+        // exists is one whose extent is a legal box.
+        let src_box = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: width,
+            bottom: height,
+            back: 1,
+        };
 
         // SAFETY: the immediate context is shared with libavcodec's decode calls, so
         // ffmpeg's own mutex must be held across our use of it.
@@ -289,7 +324,7 @@ impl D3d11Exporter {
                     0,
                     source.cast(),
                     index,
-                    std::ptr::null(),
+                    &src_box,
                 );
                 this.wait_for_gpu()
             })
@@ -434,6 +469,26 @@ unsafe fn create_shared_nv12(
         )));
     }
     Ok(texture)
+}
+
+/// Read a texture's real descriptor.
+///
+/// The point of asking rather than assuming: the decoder's texture is allocated by
+/// libavcodec at a size we never chose, and the frame's `width`/`height` are metadata
+/// travelling alongside it rather than a property of the resource. Anywhere those two can
+/// disagree — a coded/display mismatch, a resolution change the pool did not see — the
+/// only authority is the descriptor (#102, #103).
+///
+/// # Safety
+/// `texture` must be a live `ID3D11Texture2D`.
+unsafe fn describe(texture: *mut ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
+    // Zeroed rather than uninitialised: every field is a plain integer or an enum
+    // newtype over one, so all-zero is a valid value, and `GetDesc` overwrites it whole.
+    // SAFETY: `D3D11_TEXTURE2D_DESC` is POD; zero is a valid bit pattern for it.
+    let mut desc: D3D11_TEXTURE2D_DESC = unsafe { std::mem::zeroed() };
+    // SAFETY: `texture` is live and `GetDesc` writes through the pointer; it cannot fail.
+    unsafe { (*texture).GetDesc(&raw mut desc) };
+    desc
 }
 
 /// Produce an NT handle for a shareable texture.
