@@ -110,6 +110,10 @@ pub mod shell;
 pub mod stream;
 #[cfg(feature = "render")]
 pub mod tap;
+/// How a test that needs a GPU tells "there isn't one here" from "there was supposed to
+/// be one" (#98). In the library because the tests that use it live in two crates.
+#[cfg(feature = "render")]
+pub mod test_gpu;
 #[cfg(feature = "render")]
 pub mod text;
 // Not gated behind `render`, unlike every other drawing module: `ThemeChoice` is a field

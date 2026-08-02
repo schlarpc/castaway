@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use castaway_core::{ControlCapabilities, NowPlaying, PlaybackState};
 use pipeline::nowplaying_card::NowPlayingCard;
-use pipeline::render_pipeline::{RenderCommand, RenderLoop};
+use pipeline::render_pipeline::RenderCommand;
 
 fn card(title: &str, duration: Duration) -> NowPlayingCard {
     let mut track = NowPlaying::default().with_title(title);
@@ -28,14 +28,11 @@ fn card(title: &str, duration: Duration) -> NowPlayingCard {
 
 #[test]
 fn a_new_reading_re_anchors_the_clock_and_a_repeat_does_not() {
-    let Ok(mut render) = ({
-        let (tx, rx) = pipeline::render_channel(8);
-        RenderLoop::offscreen(640, 360, rx).map(|r| (tx, r))
-    }) else {
-        eprintln!("no GPU adapter here; skipping");
+    let (tx, rx) = pipeline::render_channel(8);
+    let Some(mut render) = pipeline::test_gpu::render_loop(640, 360, rx) else {
         return;
     };
-    let (tx, ref mut render) = render;
+    let render = &mut render;
 
     // Track one starts at 0:00 and plays.
     tx.send(RenderCommand::NowPlaying(Box::new(card(

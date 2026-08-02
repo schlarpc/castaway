@@ -273,12 +273,8 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
 
     let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
     let (width, height) = (1280, 720);
-    let mut render = match pipeline::render_pipeline::RenderLoop::offscreen(width, height, cmd_rx) {
-        Ok(render) => render,
-        Err(e) => {
-            eprintln!("skipping: no usable GPU ({e})");
-            return;
-        }
+    let Some(mut render) = pipeline::test_gpu::render_loop(width, height, cmd_rx) else {
+        return;
     };
 
     let feed = Arc::new(LiveFeed::new());

@@ -173,12 +173,8 @@ fn vaapi_decode_imports_zero_copy_and_composites_the_right_colour() {
 
     // Opening the compositor is also what opens the interop-capable device and records
     // the capability the decode side consults.
-    let mut compositor = match WgpuCompositor::new_offscreen(WIDTH, HEIGHT) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("skipping: no GPU ({e})");
-            return;
-        }
+    let Some(mut compositor) = pipeline::test_gpu::compositor(WIDTH, HEIGHT) else {
+        return;
     };
     if compositor.surface_import() == SurfaceImport::Unsupported {
         eprintln!("skipping: this device cannot import GPU surfaces");
@@ -299,8 +295,7 @@ fn a_stream_the_gpu_refuses_falls_back_to_software_and_keeps_playing() {
     // Opening a compositor first is what tells the decode side that GPU surfaces have
     // somewhere to go — otherwise the policy declines hardware before ever asking the
     // driver, and this would pass without exercising the refusal at all.
-    let Ok(compositor) = WgpuCompositor::new_offscreen(WIDTH, HEIGHT) else {
-        eprintln!("skipping: no GPU");
+    let Some(compositor) = pipeline::test_gpu::compositor(WIDTH, HEIGHT) else {
         return;
     };
     if compositor.surface_import() == SurfaceImport::Unsupported {

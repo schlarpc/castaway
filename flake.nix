@@ -672,6 +672,39 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
           };
+
+          # A GPU in the sandbox, in software — the other half of #98.
+          #
+          # Everything that composites is written against an offscreen wgpu device, so what
+          # stood between CI and a composited pixel was never a window: it was an adapter.
+          # `nix build` has no render node, so `WgpuCompositor::new_offscreen` fails there
+          # and two dozen tests take their skip branch and report `ok` having drawn
+          # nothing. Mesa's lavapipe is a Vulkan ICD implemented on the CPU — no hardware,
+          # no display, no `/dev/dri` — which is exactly the adapter those tests were
+          # missing, and it is why this closes the entry without the Xvfb-plus-VM lift the
+          # issue anticipated. Xvfb would only be needed for the *kiosk* window, and no
+          # test asks for one.
+          #
+          # `VK_DRIVER_FILES` names the one ICD rather than pointing at Mesa's whole
+          # `icd.d`: the directory also holds the hardware drivers, and on a machine that
+          # has one, a check meant to prove the software path would quietly run on the GPU.
+          # `LD_LIBRARY_PATH` is for the loader itself, which wgpu `dlopen`s by soname.
+          # `WGPU_BACKEND` is belt and braces here — the sandbox has no GL to fall back to
+          # — but it is what makes the same three variables reproduce the check on a
+          # developer's box, where `Backends::all()` will otherwise pick the real GPU's GL
+          # and fail on a downlevel flag rather than running what CI ran.
+          #
+          # `CASTAWAY_REQUIRE_GPU` is what keeps this honest. With it set, a test that
+          # cannot open an adapter fails instead of skipping (`pipeline::test_gpu`), so if
+          # a mesa bump moves that ICD path the check goes red — rather than reverting,
+          # silently, to the green-and-empty state this exists to end.
+          lavapipe = {
+            LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib";
+            WGPU_BACKEND = "vulkan";
+            VK_DRIVER_FILES =
+              "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
+            CASTAWAY_REQUIRE_GPU = "1";
+          };
         in
         {
           # Build the crate as part of checks. Deliberately the *portable* build and not
@@ -809,16 +842,15 @@
           # rots green: `506f405` had to repair this file three days after it landed,
           # because a refactor deleted a method its drainers called and no gate noticed.
           #
-          # Scoped to the one test target rather than the whole `render` feature's tests:
-          # the rest of that set wants a GPU, which a sandbox has not got, and they skip
-          # themselves with "no usable GPU". Asserting real composited pixels needs Xvfb
-          # and a software Vulkan ICD in the VM (nix/vm-test.nix names this as the shape of
-          # the fix) — worth doing, and a separate nix lift.
+          # Scoped to the one test target rather than the whole `render` feature's tests;
+          # the rest of that set is `render-pixels`' job, below.
           #
-          # What this therefore does *not* prove, stated so the green tick is not read as
-          # more than it is: nothing is presented to a GPU, and only video is claimed —
-          # the drainer counts `RenderCommand::Video` and `ClearVideo`, so "a cast that
-          # produced sound" is still asserted only at the `pipeline` layer.
+          # It now runs on `lavapipe`, which is what lets the cast be asserted in pixels
+          # rather than in channel traffic: the frames go through a real compositor and the
+          # test reads the panel back. What is still *not* proven, stated so the green tick
+          # is not read as more than it is: only video is claimed — the drainer counts
+          # `RenderCommand::Video` and `ClearVideo`, so "a cast that produced sound" is
+          # asserted only at the `pipeline` layer.
           media-plane = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
               pname = "castaway-media-plane";
@@ -826,7 +858,32 @@
               cargoExtraArgs = mediaPlaneArgs.cargoExtraArgs;
             });
             inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
+            inherit (lavapipe) LD_LIBRARY_PATH WGPU_BACKEND VK_DRIVER_FILES CASTAWAY_REQUIRE_GPU;
             cargoExtraArgs = "${mediaPlaneArgs.cargoExtraArgs} --test dlna_media_plane";
+            partitions = 1;
+            partitionType = "count";
+          });
+
+          # Everything that draws, drawn — the rest of #98's second remainder.
+          #
+          # `pipeline`'s render tests are the ones that open a compositor, push commands
+          # through it and read the surface back: the transport clock, the shell's
+          # navigation and screens, picture-in-picture, the widget slot, the transitions.
+          # Twenty-four of them skipped for want of an adapter, and a skip reports `ok`, so
+          # nothing here had ever executed under any gate. With lavapipe supplying the
+          # adapter they all run, and `CASTAWAY_REQUIRE_GPU` means they cannot go back to
+          # skipping without the check noticing.
+          #
+          # Software rasterisation, so this proves the drawing and not the driver: what a
+          # real Vulkan implementation does differently — the panel's DX12 path especially
+          # — is still the hardware's to prove.
+          render-pixels = craneLib.cargoNextest (commonArgs // {
+            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
+              pname = "castaway-render-pixels";
+              cargoExtraArgs = "--package pipeline --features render";
+            });
+            inherit (lavapipe) LD_LIBRARY_PATH WGPU_BACKEND VK_DRIVER_FILES CASTAWAY_REQUIRE_GPU;
+            cargoExtraArgs = "--package pipeline --features render";
             partitions = 1;
             partitionType = "count";
           });

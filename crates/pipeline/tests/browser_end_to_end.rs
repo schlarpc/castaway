@@ -85,12 +85,8 @@ fn app_dir() -> std::path::PathBuf {
 #[ignore = "needs a GPU and an Electron"]
 fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
     let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
-    let mut render = match pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("skipping: no usable GPU ({e})");
-            return;
-        }
+    let Some(mut render) = pipeline::test_gpu::render_loop(1280, 720, cmd_rx) else {
+        return;
     };
 
     let blocker = Arc::new(AdBlocker::with_defaults());
@@ -190,8 +186,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
 #[ignore = "needs a GPU and an Electron"]
 fn a_touch_reaches_the_page() {
     let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
-    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(640, 480, cmd_rx) else {
-        eprintln!("skipping: no usable GPU");
+    let Some(mut render) = pipeline::test_gpu::render_loop(640, 480, cmd_rx) else {
         return;
     };
 
@@ -260,8 +255,7 @@ fn a_touch_reaches_the_page() {
 #[ignore = "needs a GPU and an Electron"]
 fn page_audio_arrives_as_pcm_with_a_media_clock() {
     let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
-    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(640, 480, cmd_rx) else {
-        eprintln!("skipping: no usable GPU");
+    let Some(mut render) = pipeline::test_gpu::render_loop(640, 480, cmd_rx) else {
         return;
     };
 
@@ -396,8 +390,7 @@ fn a_cast_page_comes_and_goes_without_disturbing_the_widget() {
     use pipeline::BrowserWindowSurface as Surface;
 
     let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
-    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
-        eprintln!("skipping: no usable GPU");
+    let Some(mut render) = pipeline::test_gpu::render_loop(1280, 720, cmd_rx) else {
         return;
     };
 
@@ -493,8 +486,7 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
     use pipeline::compositor::LayerId;
 
     let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
-    let Ok(mut render) = pipeline::render_pipeline::RenderLoop::offscreen(1280, 720, cmd_rx) else {
-        eprintln!("skipping: no usable GPU");
+    let Some(mut render) = pipeline::test_gpu::render_loop(1280, 720, cmd_rx) else {
         return;
     };
 
