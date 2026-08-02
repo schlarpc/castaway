@@ -82,6 +82,11 @@ pkgs.testers.runNixOSTest {
     };
 
     virtualisation.memorySize = 2048;
+    # btvirt emulates the air interface in userspace, so it and the kernel's HCI layer
+    # are two runnable things: on the single vCPU a nixosTest defaults to, a loaded host
+    # can starve one long enough for an HCI command to hit its 2s timeout. A second core
+    # is cheap and takes most of that window away.
+    virtualisation.cores = 2;
     systemd.tmpfiles.rules = [ "d /var/lib/castaway 0755 root root -" ];
   };
 
@@ -113,9 +118,35 @@ pkgs.testers.runNixOSTest {
         out = machine.succeed(f"hciconfig {dev} | grep -oE '([0-9A-F]{{2}}:){{5}}[0-9A-F]{{2}}'")
         return out.strip().splitlines()[0]
 
+    # `hciconfig <dev> up` issues an HCI_Reset (opcode 0x0c03), and bluetoothd — left
+    # running above on purpose — issues its own against the same controllers as it
+    # initialises them. The two collide, the kernel times the command out at 2s, and the
+    # whole test fails on `Opcode 0x0c03 failed: -110`. That is a race, not a real
+    # failure: it only shows up when the host is loaded enough to stretch the window,
+    # which made it look like flakiness for a while.
+    #
+    # So bring each controller up on its own and retry, rather than one compound
+    # `succeed`. `up` on an already-up controller is a no-op, so retrying is safe, and
+    # doing them separately means a failure names which one.
+    def bring_up(dev):
+        machine.wait_until_succeeds(f"hciconfig {dev} up", timeout=120)
+        # `up` returning 0 is not the same as the controller being usable; wait for the
+        # kernel to actually report it running before anything is asked of it.
+        machine.wait_until_succeeds(f"hciconfig {dev} | grep -q 'UP RUNNING'", timeout=120)
+
     with subtest("the two controllers can see each other"):
-        machine.succeed("hciconfig hci0 up && hciconfig hci1 up && hciconfig hci1 piscan")
-        machine.sleep(2)
+        # Best-effort settle: give bluetoothd a chance to finish claiming the controllers
+        # over DBus before we reset them, which removes most of the collision window
+        # rather than retrying through it. Deliberately `execute` and not
+        # `wait_until_succeeds` — the retry in `bring_up` is the actual guarantee, so this
+        # must never become a failure of its own if bluetoothd is slow or renames things.
+        machine.execute(
+            "timeout 60 sh -c 'until busctl --system tree org.bluez 2>/dev/null "
+            "| grep -q /org/bluez/hci; do sleep 1; done'"
+        )
+        bring_up("hci0")
+        bring_up("hci1")
+        machine.wait_until_succeeds("hciconfig hci1 piscan", timeout=60)
         global sink_addr
         sink_addr = address_of("hci1")
         print(f"source=hci0 {address_of('hci0')}  sink=hci1 {sink_addr}")
@@ -132,7 +163,9 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(f"l2ping -i hci0 -c 2 -t 5 {sink_addr}", timeout=60)
 
     with subtest("the receiver claims the second controller"):
-        machine.succeed("hciconfig hci1 down")
+        # Same race in the other direction: bringing a controller down is an HCI command
+        # too, and the receiver is about to reset it anyway.
+        machine.wait_until_succeeds("hciconfig hci1 down", timeout=60)
         machine.succeed(
             "systemd-run --unit=castaway --setenv=RUST_LOG=info "
             "--setenv=CASTAWAY_CONFIG=${config} ${castaway}/bin/castaway"
