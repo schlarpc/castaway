@@ -25,7 +25,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -82,7 +82,8 @@ impl Default for StreamConfig {
 
 /// A live streaming session. Dropping it stops the stream.
 pub struct StreamSession {
-    _private: (),
+    /// Which connection this handle owns — see [`GENERATION`].
+    generation: u64,
 }
 
 impl StreamSession {
@@ -129,6 +130,10 @@ impl StreamSession {
             *guard = Some(sinks);
         }
         LAST_STAGE_ERROR.store(0, Ordering::SeqCst);
+        TERMINATED.store(false, Ordering::SeqCst);
+        // Claimed before the handshake, so a `connection_terminated` that fires during it
+        // cannot land on a generation this session does not yet hold.
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
 
         let result = unsafe { start_connection(server, host_address, session_url, config) };
         if let Err(e) = result {
@@ -150,7 +155,7 @@ impl StreamSession {
             // Opus carries its own configuration in-band.
             config: None,
         };
-        Ok((Self { _private: () }, FrameSource::Encoded(video_rx), audio))
+        Ok((Self { generation }, FrameSource::Encoded(video_rx), audio))
     }
 
     /// Stop the session and release the singleton. Blocking.
@@ -161,8 +166,17 @@ impl StreamSession {
 
 impl Drop for StreamSession {
     fn drop(&mut self) {
-        // SAFETY: the singleton guarantees exactly one live session, so this is the
-        // matching LiStopConnection for the LiStartConnection that built `self`.
+        // Only if the library still holds *this* connection. The generation is what makes
+        // that checkable: a `StreamSession` outliving its connection is an ordinary state
+        // (the host quits the game, `connection_terminated` fires, the owner still has the
+        // handle), and stopping unconditionally from there would issue LiStopConnection
+        // against whatever connection came next and clear its sinks.
+        if GENERATION.load(Ordering::SeqCst) != self.generation {
+            return;
+        }
+        // SAFETY: the generation check above establishes that the library's current
+        // connection is the one `LiStartConnection` opened for `self`, and the singleton
+        // slot admits only one at a time — so this is its matching stop.
         unsafe { sys::LiStopConnection() };
         clear_session();
     }
@@ -185,6 +199,14 @@ struct Sinks {
 }
 
 static SESSION: OnceLock<Mutex<Option<Sinks>>> = OnceLock::new();
+/// Which connection the library currently holds, as a counter that only goes up.
+///
+/// The singleton slot is not enough to tell a live session from a dead one:
+/// `connection_terminated` clears it from a callback thread while the owner still holds
+/// the `StreamSession`, so an emptied slot means either "nobody has started one" or "the
+/// host ended yours". A generation distinguishes them, which is what lets `Drop` know
+/// whether the connection it is about to stop is still its own.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// The last `stageFailed` code, since `LiStartConnection`'s return value alone does not
 /// say which stage broke.
 static LAST_STAGE_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -445,7 +467,13 @@ extern "C" fn audio_sample(data: *mut c_char, length: c_int) {
     };
     let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }.to_vec();
 
-    with_sinks(|sinks| {
+    // The sender is cloned out and the guard released *before* the send. Blocking under
+    // the singleton lock defeats the very split that makes blocking right here: the
+    // library's video thread takes the same mutex before it can reach its non-blocking
+    // `try_send`, so a stalled audio consumer froze video instead of dropping frames, and
+    // `clear_session` and `LiStopConnection` — which joins these threads — both parked on
+    // it, wedging teardown until the consumer drained.
+    let Some((audio, pts)) = with_sinks(|sinks| {
         // Opus packets arrive at a fixed cadence with no timestamp of their own, so
         // the presentation clock is counted here. 5 ms is GameStream's frame duration;
         // a host negotiating something else moves the sample rate, not the cadence.
@@ -454,17 +482,20 @@ extern "C" fn audio_sample(data: *mut c_char, length: c_int) {
             *p += Duration::from_micros(5_000);
             now
         });
-        let frame = EncodedFrame {
-            video_codec: None,
-            audio_codec: Some(AudioCodec::Opus),
-            pts,
-            keyframe: false,
-            data: bytes::Bytes::from(bytes),
-        };
-        // Blocking is right here: these are not tokio threads, and audio that arrives
-        // late is worse than audio that arrives slowly.
-        let _ = sinks.audio.blocking_send(frame);
-    });
+        (sinks.audio.clone(), pts)
+    }) else {
+        return;
+    };
+    let frame = EncodedFrame {
+        video_codec: None,
+        audio_codec: Some(AudioCodec::Opus),
+        pts,
+        keyframe: false,
+        data: bytes::Bytes::from(bytes),
+    };
+    // Blocking is right here: these are not tokio threads, and audio that arrives
+    // late is worse than audio that arrives slowly.
+    let _ = audio.blocking_send(frame);
 }
 
 extern "C" fn stage_starting(stage: c_int) {

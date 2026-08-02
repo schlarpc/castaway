@@ -368,6 +368,15 @@ impl GameStreamAdapter {
         app: Option<&str>,
         sink: &SessionSink,
     ) -> Result<(), GameStreamError> {
+        // Retire whatever came before, first. The streaming core is a singleton and wants
+        // LiStopConnection between connections — and after a host-side termination the
+        // slot has been cleared by the callback while the adapter still holds the handle,
+        // so nothing else would have issued it. Starting on top of that used to leave the
+        // stale session to be dropped *after* the new one was installed, at which point
+        // its Drop stopped the new connection and cleared the new sinks: session B came
+        // up, emitted Mirror, and died on the spot. An explicit Stop in between happened
+        // to work, which is what hid it.
+        self.stop_session().await;
         let client = self.client_for(host).await?;
         let info = client.server_info().await?;
         if !info.paired {
@@ -495,8 +504,8 @@ impl GameStreamAdapter {
         .map_err(|_: CoreError| GameStreamError::SinkClosed)?;
         // Held, not leaked: dropping a `StreamSession` calls LiStopConnection and
         // releases the library's process-wide singleton, so the adapter has to own it
-        // until `Stop` or shutdown. A previous session in the slot is dropped here,
-        // which is also what makes starting a second one work.
+        // until `Stop` or shutdown. The slot is empty by now — `handle_start` retires the
+        // previous session before any of this — so nothing is dropped on this line.
         *self.session.lock().await = Some(session);
         Ok(())
     }
@@ -582,9 +591,22 @@ impl SourceAdapter for GameStreamAdapter {
                 },
                 command = commands.recv() => match command {
                     Some(GameStreamCommand::Pair { host, pin }) => {
-                        if let Err(e) = self.pair(&host, &pin).await {
-                            warn!(%host, error = %e, "GameStream pairing failed");
-                        }
+                        // Spawned, not awaited. `pair` deliberately has no timeout — the
+                        // host parks its phase-1 response until a human types the PIN,
+                        // and that is a wait to allow rather than one to tune — but a
+                        // `select!` arm runs to completion before the loop polls again,
+                        // so awaiting it inline stopped the actor dead: no Stop for a
+                        // live session, no Start, and a host list that never updated
+                        // again. Configured pair_host/pair_pin queue this at startup
+                        // ahead of the autostart, so a PIN nobody types disabled the
+                        // whole adapter. The timeout belongs to a caller with a screen
+                        // to keep honest, and the shell already has one.
+                        let adapter = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            if let Err(e) = adapter.pair(&host, &pin).await {
+                                warn!(%host, error = %e, "GameStream pairing failed");
+                            }
+                        });
                     }
                     Some(GameStreamCommand::Start { host, app }) => {
                         if let Err(e) = self.handle_start(&host, app.as_deref(), &sink).await {
