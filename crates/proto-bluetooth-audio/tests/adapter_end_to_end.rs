@@ -2053,13 +2053,21 @@ async fn position_reaches_the_card_and_not_applicable_is_not_shown_as_49_days() 
     // A CHANGED notification ends the subscription (AVRCP notifications are one-shot), so
     // position must be re-registered or it moves exactly twice and then stops.
     let events = registered_events(&transport);
+    let positions: Vec<u32> = events
+        .iter()
+        .filter(|(id, _)| *id == proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED)
+        .map(|(_, interval)| *interval)
+        .collect();
     assert!(
-        events
-            .iter()
-            .filter(|(id, _)| *id == proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED)
-            .count()
-            > 1,
+        positions.len() > 1,
         "position must be re-subscribed after each CHANGED: {events:x?}"
+    );
+    // …and re-subscribed with a *reporting interval*, not with 0. The renewal is what a
+    // phone spends almost all of its time registered under, so a Target that honours the
+    // field literally reports position once and then never again.
+    assert!(
+        positions.iter().all(|interval| *interval > 0),
+        "every position registration needs a nonzero interval, renewals included: {positions:?}"
     );
 }
 

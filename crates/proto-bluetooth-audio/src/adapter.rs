@@ -7,6 +7,7 @@
 //! L2CAP channel data to whichever of SDP, AVDTP or AVRCP owns that PSM (ground rule 3).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -33,11 +34,17 @@ use crate::obex::{CoverArtSession, FetchState};
 use crate::sink::{SinkEvent, SinkSession};
 use crate::{avdtp, Message};
 
-/// How many encoded frames may queue before the oldest are dropped.
+/// How many encoded frames may queue before arriving ones are dropped.
 ///
 /// Audio, unlike video, must not drop frames casually — a gap is audible where a dropped
 /// video frame is not. The buffer is sized generously and a full one is logged rather
 /// than silently absorbed, because it means decode is not keeping up.
+///
+/// A full queue drops the frame *arriving*, not the oldest queued one: this is a bounded
+/// `mpsc` and a sender cannot pop its head. The offset that leaves is bounded downstream
+/// rather than here — `audio_out`'s device queue is about a third of a second and
+/// newest-drops too, so a recovered decoder drains this backlog at CPU speed and most of
+/// it is discarded there.
 const AUDIO_QUEUE_DEPTH: usize = 256;
 
 /// Ceiling on a reassembled AVRCP response.
@@ -53,6 +60,19 @@ const MAX_AVRCP_REASSEMBLY: usize = 64 * 1024;
 /// is `PLAYBACK_POS_CHANGED`. One second is the coarsest value that still reads as
 /// movement on a scrubber, and the cheapest: each report is one small AVCTP frame.
 const POSITION_INTERVAL_SECS: u32 = 1;
+
+/// The `REGISTER_NOTIFICATION` interval for one event.
+///
+/// One function so the initial subscription and the renewal after every CHANGED cannot
+/// disagree — AVRCP notifications are one-shot, so the renewal is what a phone spends
+/// almost all of its time registered under.
+const fn notification_interval(event: u8) -> u32 {
+    match event {
+        avrcp::event::PLAYBACK_POS_CHANGED => POSITION_INTERVAL_SECS,
+        // Every other event we subscribe to is edge-triggered; the field is ignored.
+        _ => 0,
+    }
+}
 
 /// Called when a phone pairs, so the caller can persist its link key.
 ///
@@ -178,7 +198,14 @@ struct Link {
     /// Metadata accumulated for this link, re-emitted as a full snapshot on change.
     now_playing: NowPlaying,
     /// Next AVCTP transaction label.
-    avctp_transaction: u8,
+    ///
+    /// Shared with the control writer task rather than duplicated: the label is what
+    /// correlates a response with its command, and the writer pumps panel passthrough
+    /// frames onto the *same* L2CAP channel this loop sends registrations on. Two
+    /// counters meant the first keypress reused labels 0 and 1, which the channel-open
+    /// RegisterNotifications still had outstanding, and the peer had two in-flight
+    /// commands it could not tell apart.
+    avctp_transaction: Arc<AtomicU8>,
     /// The handle that lets the panel drive this phone, held until there is a session to
     /// attach it to.
     control: Option<Arc<dyn castaway_core::RemoteControl>>,
@@ -305,7 +332,7 @@ impl Link {
             session_open: false,
             reported_bitpool: None,
             now_playing: NowPlaying::default(),
-            avctp_transaction: 0,
+            avctp_transaction: Arc::new(AtomicU8::new(0)),
             control: None,
             avrcp_control: None,
             media_failures: 0,
@@ -319,10 +346,10 @@ impl Link {
         }
     }
 
-    fn next_transaction(&mut self) -> u8 {
-        let t = self.avctp_transaction;
-        self.avctp_transaction = (self.avctp_transaction + 1) & 0x0F;
-        t
+    fn next_transaction(&self) -> u8 {
+        // Labels are four bits; `u8` wraps at a multiple of 16, so masking the previous
+        // value is the whole cycle.
+        self.avctp_transaction.fetch_add(1, Ordering::Relaxed) & 0x0F
     }
 }
 
@@ -709,7 +736,13 @@ impl BluetoothAdapter {
                         // outlives this borrow and cannot consult the multiplexer later.
                         let peer_cid = link.mux.channel(cid).map(|c| c.remote_cid);
                         if let Some(peer_cid) = peer_cid {
-                            Self::spawn_control_writer(handle, peer_cid, rx, acl.clone());
+                            Self::spawn_control_writer(
+                                handle,
+                                peer_cid,
+                                rx,
+                                acl.clone(),
+                                Arc::clone(&link.avctp_transaction),
+                            );
                         } else {
                             warn!(%cid, "avctp channel vanished before its writer started");
                         }
@@ -723,17 +756,12 @@ impl BluetoothAdapter {
                         // INTERIM with the value *now* and CHANGED when it moves, so one
                         // subscription supplies both the initial play state and every
                         // transition after it.
-                        for (event, interval) in [
-                            (avrcp::event::PLAYBACK_STATUS_CHANGED, 0),
-                            (avrcp::event::TRACK_CHANGED, 0),
-                            // The interval field is only meaningful for this one, and it
-                            // is in *seconds*. BlueZ sets it to `UINT32_MAX / 1000`
-                            // because it only wants position to resync a clock it keeps
-                            // itself; a panel has no such clock and wants the number, so
-                            // one second — the coarsest value that still looks like it is
-                            // moving.
-                            (avrcp::event::PLAYBACK_POS_CHANGED, POSITION_INTERVAL_SECS),
+                        for event in [
+                            avrcp::event::PLAYBACK_STATUS_CHANGED,
+                            avrcp::event::TRACK_CHANGED,
+                            avrcp::event::PLAYBACK_POS_CHANGED,
                         ] {
+                            let interval = notification_interval(event);
                             let transaction = link.next_transaction();
                             out.replies.push((
                                 cid,
@@ -1294,9 +1322,16 @@ impl BluetoothAdapter {
                 let changed = frame.ctype == Ctype::Changed;
                 if changed {
                     let transaction = link.next_transaction();
+                    // …with the same interval the first registration used. Renewing
+                    // POS_CHANGED at 0 asks a Target that honours the field literally to
+                    // never report position again, and the scrubber freezes after the
+                    // first update — nothing else polls it.
                     out.replies.push((
                         cid,
-                        avctp_body(transaction, &avrcp::register_notification(event, 0)),
+                        avctp_body(
+                            transaction,
+                            &avrcp::register_notification(event, notification_interval(event)),
+                        ),
                     ));
                 }
                 match event {
@@ -1773,12 +1808,13 @@ impl BluetoothAdapter {
         cid: Cid,
         mut rx: mpsc::Receiver<AvcFrame>,
         acl: AclWriter,
+        labels: Arc<AtomicU8>,
     ) {
         tokio::spawn(async move {
-            let mut transaction = 0u8;
             while let Some(frame) = rx.recv().await {
+                // The link's allocator, not a second one: see `Link::avctp_transaction`.
+                let transaction = labels.fetch_add(1, Ordering::Relaxed) & 0x0F;
                 acl.send(handle, avctp_pdu(cid, transaction, &frame));
-                transaction = (transaction + 1) & 0x0F;
             }
         });
     }
