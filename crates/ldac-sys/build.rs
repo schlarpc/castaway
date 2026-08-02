@@ -1,11 +1,13 @@
-//! Emits link directives for `libldacBT`, the LDAC codec library from nixpkgs' `ldacbt`.
+//! Emits link directives for `libldacBT`, the LDAC codec library built by
+//! `nix/ldacbt.nix` from open-vela's fork — *not* nixpkgs' `ldacbt`, which under this
+//! flake's pin is encoder-only and has no `ldacBT_decode` to link. See that file.
 //! The devShell and the crane builds export `LDACBT_LIB_DIR`; when it is absent nothing
 //! is emitted, so `cargo check` and rlib builds of the workspace still work — only a
 //! final artifact that actually calls into the library will fail to link, with an
 //! unresolved-symbol error naming `ldacBT_decode`, which is the honest failure. Same
 //! shape as `moonlight-sys/build.rs`, for the same reason.
 //!
-//! Dynamic, not static: `ldacbt` ships `libldacBT.so` and no archive.
+//! Dynamic, not static: that build installs `libldacBT.so` and no archive.
 
 fn main() {
     println!("cargo:rerun-if-env-changed=LDACBT_LIB_DIR");
