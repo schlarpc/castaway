@@ -45,10 +45,12 @@
       flake = false;
     };
 
-    # AirServer's Windows installer, for the two BLAKE2b constants that open its Cast
-    # credential database (PROVENANCE §3). Pinned so those constants can be carved at
-    # build time instead of living as string literals in `src/airserver_db.rs` — this
-    # tree redistributes neither the installer nor what comes out of it.
+    # AirServer's Windows installer: the two BLAKE2b constants that open its Cast
+    # credential database (PROVENANCE §3), and the identity fixtures `proto-cast`
+    # presents. Pinned so both are carved at build time rather than living in this tree —
+    # the constants used to be string literals in `src/airserver_db.rs`, and the identity
+    # (a Google-issued device certificate and its RSA private key) used to be checked in
+    # under `crates/cast-replay/fixtures/airserver/`.
     #
     # The classic MSI rather than the Store MSIX: its URL is version-stamped and stable,
     # whereas the `.appinstaller` line rolls forward on its own 48-hour schedule. Both

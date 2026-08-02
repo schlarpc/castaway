@@ -62,12 +62,69 @@ fn main() {
         _ => panic!("exactly one of {PERSON_VAR} and {PASS_VAR} is set; set both or neither"),
     };
 
-    let out = Path::new(&std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("airserver_kek.rs");
+    let outdir = Path::new(&std::env::var_os("OUT_DIR").expect("OUT_DIR")).to_path_buf();
+    let out = outdir.join("airserver_kek.rs");
     std::fs::write(
         &out,
         format!(
             "/// The carved constants, or `None` when this build was not given them.\n\
              pub(crate) const PROVISIONED: Option<Kek<'static>> = {provisioned};\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
+
+    airserver_identity(&outdir);
+}
+
+/// The AirServer identity fixtures, `include_bytes!`'d from wherever the carve put them.
+///
+/// Absolute paths rather than copies: the bytes are App Dynamic's, and the one place
+/// they are allowed to exist is the carve derivation's output. Emitting `None` when the
+/// variable is unset is what lets a plain `cargo build` still compile.
+fn airserver_identity(outdir: &Path) {
+    const VAR: &str = "CASTAWAY_AIRSERVER_CARVE";
+    println!("cargo:rerun-if-env-changed={VAR}");
+
+    // A cfg as well as the constant, so the tests that need a real identity can be
+    // gated on it rather than failing on a build that legitimately has none.
+    println!("cargo:rustc-check-cfg=cfg(airserver_identity)");
+
+    let body = match std::env::var_os(VAR) {
+        None => "None".to_owned(),
+        Some(dir) => {
+            println!("cargo:rustc-cfg=airserver_identity");
+            let dir = PathBuf::from(dir);
+            let f = |name: &str| {
+                let p = dir.join(name);
+                assert!(p.is_file(), "{VAR} is set but {} is missing", p.display());
+                println!("cargo:rerun-if-changed={}", p.display());
+                format!("include_bytes!(r\"{}\")", p.display())
+            };
+            format!(
+                "Some(BundledIdentity {{\n    \
+                   device_cert_der: {},\n    \
+                   chain_der: [{}, {}],\n    \
+                   peer_key_der: {},\n    \
+                   peer_certs: {},\n    \
+                   signatures_sha1: {},\n    \
+                   signatures_sha256: {},\n}})",
+                f("airserver_device_crt.der"),
+                f("airserver_chain0.der"),
+                f("airserver_chain1.der"),
+                f("airserver_peer_key.der"),
+                f("airserver_peer_certs.bin"),
+                f("airserver_sha1.bin"),
+                f("airserver_sha256.bin"),
+            )
+        }
+    };
+
+    let out = outdir.join("airserver_identity.rs");
+    std::fs::write(
+        &out,
+        format!(
+            "/// The carved AirServer identity, or `None` on a build without the carve.\n\
+             pub(crate) const BUNDLED: Option<BundledIdentity> = {body};\n"
         ),
     )
     .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));

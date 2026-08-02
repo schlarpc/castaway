@@ -169,6 +169,23 @@ pub enum ReplayError {
     )]
     NoKek,
 
+    /// This build was not given a checked-in identity for `identity`.
+    ///
+    /// The offline identities are other companies' Cast device credentials — a
+    /// Google-issued certificate and its RSA private key — so they are not in this
+    /// tree. They are carved from pinned vendor artifacts at build time
+    /// (`nix/airserver-carve.nix`, `nix/airreceiver-carve.nix`); a build that skipped
+    /// that has no offline identity and falls back to a self-generated development
+    /// credential, which real senders will refuse.
+    #[error(
+        "this build has no bundled {identity} identity; build through nix so the carve \
+         derivations can supply one, or accept the self-generated dev credential"
+    )]
+    NoIdentity {
+        /// Which offline identity was asked for.
+        identity: Identity,
+    },
+
     /// A validity window could not be constructed or rendered.
     #[error("validity window: {0}")]
     Window(String),

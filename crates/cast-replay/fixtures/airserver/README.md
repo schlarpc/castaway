@@ -17,13 +17,21 @@ Recovered with the tooling and notes in
 libsodium `crypto_secretbox` (XSalsa20-Poly1305) under a BLAKE2b-derived key
 whose two constants are literals in the shipped binary.
 
-Landed here as **fixtures, not a dependency** — ground rule 9. Nothing in this
-tree links, ships or shells out to AirServer.
+**No longer checked in.** The device certificate, its chain, the RSA peer key and
+the 1095 windows of peer certificates and signatures are App Dynamic's identity, so
+they are carved out of the pinned installer at build time by
+`nix/airserver-carve.nix` and embedded by `cast-replay/build.rs`. A build without the
+carve has no bundled AirServer identity at all (`ReplayError::NoIdentity`). What the
+carve produces is byte-identical to what used to live here, which is how the change
+was verified.
 
-Regenerate with:
+Landed as **fixtures, not a dependency** — ground rule 9. Nothing in this tree links,
+ships or shells out to AirServer.
+
+Reproduce with:
 
 ```sh
-airserver_castdb.py <cast.db> --export crates/cast-replay/fixtures/airserver
+nix build .#airserver-carve      # writes all of the below, plus the KEK constants
 ```
 
 **To get a `cast.db` in the first place, and to re-derive any of this from the
@@ -61,6 +69,9 @@ Openscreen accepts it: 1095/1095 windows pass the sender-side acceptance path.
 That independence is the entire reason to carry a second identity — see the
 module docs on `src/airserver.rs`.
 
+These are the names the carve writes into its output directory; none of them are
+files in this repository.
+
 | File | Contents |
 |---|---|
 | `airserver_device_crt.der` | the Google device certificate — `AuthResponse.client_auth_certificate` |
@@ -88,8 +99,8 @@ Two structural differences from the CKS table, both load-bearing:
   template and one key. AirServer's also differ in serial (linear in the index)
   and in **subject CN, which is a fresh random UUID per window**. That UUID is
   not derivable, and the device signature covers the certificate's exact DER, so
-  a rebuilt certificate would be rejected. Hence 790 KiB of certificates checked
-  in verbatim rather than a template.
+  a rebuilt certificate would be rejected. Hence 790 KiB of certificates carried
+  verbatim rather than a template.
 
 ## Caveats
 
@@ -120,8 +131,7 @@ opens them is ours. That is what lets `cargo nextest run` exercise the whole rea
 machine that has never seen the installer — the real constants are carved at build time
 and are not in this tree (PROVENANCE §3). Re-key with `rekey.py`: it decrypts each BLOB
 under the real KEK, re-seals it under the test one, and leaves anything that does not
-authenticate (the salt row, the empty `jwt_token`) untouched. Regenerate them with the snippet in that module's tests if the
-schema ever moves.
+authenticate (the salt row, the empty `jwt_token`) untouched.
 
 The second exists because its page size is 512 bytes, so the 778-byte encrypted
 certificates span several pages where the default 4096 keeps each one inline.

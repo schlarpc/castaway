@@ -557,10 +557,11 @@ mod tests {
     /// AirServer's chain: a different device, a different intermediate, and a different
     /// root (`Widevine Cast Subroot` rather than `Eureka Root CA`).
     fn airserver_chain() -> Vec<Vec<u8>> {
+        let id = crate::airserver::BUNDLED.expect("carved AirServer identity");
         vec![
-            include_bytes!("../fixtures/airserver/airserver_device_crt.der").to_vec(),
-            include_bytes!("../fixtures/airserver/airserver_chain0.der").to_vec(),
-            include_bytes!("../fixtures/airserver/airserver_chain1.der").to_vec(),
+            id.device_cert_der.to_vec(),
+            id.chain_der[0].to_vec(),
+            id.chain_der[1].to_vec(),
         ]
     }
 
@@ -577,6 +578,10 @@ mod tests {
     /// from these tables only in the peer certificate they mint, are covered by the same
     /// two chains.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn the_real_crl_revokes_none_of_the_identities_we_can_present() {
         let crl = CastCrl::parse(REAL_CRL).unwrap();
         for (name, chain) in [("cks", chain()), ("airserver", airserver_chain())] {

@@ -32,7 +32,7 @@ stdenvNoCC.mkDerivation {
 
   nativeBuildInputs = [
     p7zip
-    (python3.withPackages (ps: [ ps.pynacl ]))
+    (python3.withPackages (ps: [ ps.pynacl ps.cryptography ]))
   ];
 
   buildPhase = ''

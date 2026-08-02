@@ -76,6 +76,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn each_shipped_chain_finds_its_own_anchor() {
         // The whole point: both identities top out one below the root, and which root it
         // is differs between them. Getting this wrong is silent — the chain still checks,
@@ -83,7 +87,9 @@ mod tests {
         let ica = pem_der(include_str!("../fixtures/ica.pem"));
         assert_eq!(anchor_for(&ica), Some(EUREKA_ROOT_CA), "CKS -> Eureka Root");
 
-        let subroot: &[u8] = include_bytes!("../fixtures/airserver/airserver_chain1.der");
+        let subroot: &[u8] = crate::airserver::BUNDLED
+            .expect("carved AirServer identity")
+            .chain_der[1];
         assert_eq!(
             anchor_for(subroot),
             Some(CAST_ROOT_CA),

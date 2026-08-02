@@ -463,6 +463,10 @@ mod tests {
     /// exporter). Agreement across two independent implementations is the real check
     /// on the crypto.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn it_agrees_with_the_checked_in_fixtures() {
         let (_dir, db) = open_trimmed();
         let table = crate::AirServerTable::load().unwrap();

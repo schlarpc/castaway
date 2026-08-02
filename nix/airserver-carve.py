@@ -40,6 +40,7 @@ import tempfile
 from pathlib import Path
 
 import nacl.bindings as nb
+from cryptography import x509
 
 # The tables without which the reader cannot produce a credential. `metadata` is
 # deliberately absent: it arrived after the database did (5.7.0 has no such table,
@@ -233,6 +234,87 @@ def find_constants(d, salt, sample):
     return None, None, f"exhausted ({n} adjacent trials)"
 
 
+def export_identity(blob, person, passwd, out):
+    """Decrypt the database into the fixture set `crates/cast-replay` consumes.
+
+    These used to be checked in under `fixtures/airserver/`. They are App Dynamic's
+    identity — a Google-issued device certificate and its RSA private key — so they
+    are produced here instead and never enter the source tree.
+
+    JWTs are deliberately not touched: `jwt_token` holds live bearer credentials for
+    outbound app identification, which this project does not implement (D42). A
+    receiver-auth signature is inert without the peer certificate it covers; a
+    pre-signed JWT is itself a usable credential. Only the former is written.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        f.write(blob)
+        p = f.name
+    try:
+        c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        salt = bytes(c.execute("SELECT data FROM salt LIMIT 1").fetchone()[0])
+        key = derive(salt, person, passwd)
+
+        def openbox(b):
+            b = bytes(b)
+            return nb.crypto_secretbox_open(b[NONCE:], b[:NONCE], key)
+
+        device_cert = openbox(c.execute("SELECT device_cert FROM device_info LIMIT 1").fetchone()[0])
+        chain = [
+            openbox(r[0])
+            for r in c.execute("SELECT data FROM device_cert_chain ORDER BY pos")
+        ]
+        peer_key = openbox(c.execute("SELECT data FROM daily_private LIMIT 1").fetchone()[0])
+        wins = [
+            (r[0], r[1], openbox(r[2]), openbox(r[3]), openbox(r[4]))
+            for r in c.execute(
+                "SELECT start_time, end_time, cert, sha1, sha256 FROM daily_cert "
+                "ORDER BY start_time"
+            )
+        ]
+        c.close()
+    finally:
+        Path(p).unlink(missing_ok=True)
+
+    if not wins:
+        raise SystemExit("no windows in the database")
+
+    # Each per-window certificate carries a random UUID as its subject CN, so unlike
+    # the CKS identity these cannot be re-issued from a template — the bytes have to
+    # be kept, at a fixed stride the reader indexes by.
+    strides = {len(w[2]) for w in wins}
+    if len(strides) != 1:
+        raise SystemExit(f"peer certificates are not a uniform length: {sorted(strides)}")
+    stride = strides.pop()
+
+    (out / "airserver_device_crt.der").write_bytes(device_cert)
+    for i, b in enumerate(chain):
+        (out / f"airserver_chain{i}.der").write_bytes(b)
+    (out / "airserver_peer_key.der").write_bytes(peer_key)
+    (out / "airserver_peer_certs.bin").write_bytes(b"".join(w[2] for w in wins))
+    (out / "airserver_sha1.bin").write_bytes(b"".join(w[3] for w in wins))
+    (out / "airserver_sha256.bin").write_bytes(b"".join(w[4] for w in wins))
+
+    steps = {wins[i + 1][0] - wins[i][0] for i in range(len(wins) - 1)}
+    validity = {w[1] - w[0] for w in wins}
+    cn = x509.load_der_x509_certificate(device_cert).subject.rfc4514_string()
+    manifest = {
+        "windows": len(wins),
+        "epoch_unix": wins[0][0],
+        "step_secs": sorted(steps) if len(steps) != 1 else steps.pop(),
+        "validity_secs": sorted(validity) if len(validity) != 1 else validity.pop(),
+        "peer_cert_stride": stride,
+        "signature_len": 256,
+        "last_end_unix": wins[-1][1],
+        "device_cn": cn,
+    }
+    (out / "airserver_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    log(f"  identity: {cn}")
+    log(f"  exported {len(wins)} windows, stride {stride}, {len(chain)} chain certs")
+    return manifest
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("exe", type=Path, help="AirServer.exe from the installer payload")
@@ -260,6 +342,7 @@ def main():
     (args.out / "castdb.sqlite").write_bytes(blob)
     (args.out / "kek_person.bin").write_bytes(person)
     (args.out / "kek_pass.bin").write_bytes(passwd)
+    manifest = export_identity(blob, person, passwd, args.out)
     (args.out / "carve.json").write_text(
         json.dumps(
             {
@@ -271,6 +354,7 @@ def main():
                 "db_tables": tables,
                 "db_windows": rows,
                 "how": how,
+                "identity": manifest,
             },
             indent=2,
         )

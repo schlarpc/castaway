@@ -36,10 +36,13 @@
 //! * **subject CN** — a *random UUID per window* (`CN=c1cafd47-251c-…`).
 //!
 //! The UUID is not derivable from anything, and the device signature covers the
-//! certificate's exact DER, so a certificate we rebuilt would be rejected. The
-//! 1095 certificates are therefore checked in verbatim, 738 bytes each at a fixed
-//! stride. This costs ~790 KiB and buys the absence of a whole class of silent
-//! failure, which is the trade ground rule 1 asks for.
+//! certificate's exact DER, so a certificate we rebuilt would be rejected. All 1095
+//! certificates are therefore carried verbatim, 738 bytes each at a fixed stride —
+//! ~790 KiB, which buys the absence of a whole class of silent failure.
+//!
+//! They are **not checked in**. Together with the device certificate and the RSA peer
+//! key they are App Dynamic's identity, so `nix/airserver-carve.nix` recovers them from
+//! a pinned installer at build time and `build.rs` embeds them; see [`BundledIdentity`].
 //!
 //! ## Windows overlap here, unlike CKS
 //!
@@ -49,8 +52,8 @@
 //! today — because it has the most remaining life, which minimises the chance of
 //! a roll landing mid-session.
 //!
-//! Provenance, and the tool that regenerates these fixtures, are in
-//! `fixtures/airserver/README.md`.
+//! Provenance, and how the carve reproduces this identity, are in
+//! `fixtures/airserver/README.md` and PROVENANCE §3.
 
 use rsa::pkcs1::DecodeRsaPrivateKey as _;
 use rsa::pkcs8::EncodePrivateKey as _;
@@ -80,13 +83,31 @@ const PEER_CERT_STRIDE: usize = 738;
 /// Bytes per precomputed signature (RSA-2048).
 const SIGNATURE_LEN: usize = 256;
 
-const DEVICE_CERT_DER: &[u8] = include_bytes!("../fixtures/airserver/airserver_device_crt.der");
-const CHAIN0_DER: &[u8] = include_bytes!("../fixtures/airserver/airserver_chain0.der");
-const CHAIN1_DER: &[u8] = include_bytes!("../fixtures/airserver/airserver_chain1.der");
-const PEER_KEY_DER: &[u8] = include_bytes!("../fixtures/airserver/airserver_peer_key.der");
-const PEER_CERTS: &[u8] = include_bytes!("../fixtures/airserver/airserver_peer_certs.bin");
-const SIGNATURES_SHA1: &[u8] = include_bytes!("../fixtures/airserver/airserver_sha1.bin");
-const SIGNATURES_SHA256: &[u8] = include_bytes!("../fixtures/airserver/airserver_sha256.bin");
+/// The bundled AirServer identity: a Google-issued device certificate, its chain, the
+/// RSA peer key, and 1095 windows of precomputed receiver-auth signatures.
+///
+/// **Not checked in.** This is App Dynamic's identity, not ours, so it is carved out of
+/// a pinned installer at build time (`nix/airserver-carve.nix`) and reaches the crate
+/// through `build.rs`. A build that never saw the installer has no bundled AirServer
+/// identity at all — [`BUNDLED`] is `None` and [`AirServerTable::bundled`] says so
+/// rather than presenting a half-built one.
+#[derive(Clone, Copy, Debug)]
+pub struct BundledIdentity {
+    /// The Google-issued device certificate, DER.
+    pub device_cert_der: &'static [u8],
+    /// The intermediate chain, DER, leaf-ward first.
+    pub chain_der: [&'static [u8]; 2],
+    /// The RSA-2048 peer private key, DER.
+    pub peer_key_der: &'static [u8],
+    /// Per-window peer certificates, concatenated at [`PEER_CERT_STRIDE`].
+    pub peer_certs: &'static [u8],
+    /// Per-window SHA-1 receiver-auth signatures, concatenated.
+    pub signatures_sha1: &'static [u8],
+    /// Per-window SHA-256 receiver-auth signatures, concatenated.
+    pub signatures_sha256: &'static [u8],
+}
+
+include!(concat!(env!("OUT_DIR"), "/airserver_identity.rs"));
 
 /// The bundled AirServer identity, parsed.
 #[derive(Debug, Clone)]
@@ -94,35 +115,42 @@ pub struct AirServerTable {
     peer_key_pkcs8_der: Vec<u8>,
     device_cert_der: Vec<u8>,
     chain_der: Vec<Vec<u8>>,
+    identity: BundledIdentity,
 }
 
 impl AirServerTable {
     /// Parse the embedded fixtures.
     ///
     /// # Errors
+    /// [`ReplayError::NoIdentity`] on a build that was not given the carved identity,
     /// [`ReplayError::Table`] if a fixture is not the length the layout requires, or
-    /// [`ReplayError::InvalidKey`] if the peer key does not parse. Every input is a
-    /// compile-time constant, so this either always succeeds or always fails — the
-    /// tests are what turn that into a checked property.
+    /// [`ReplayError::InvalidKey`] if the peer key does not parse. Given an identity
+    /// every input is a compile-time constant, so this either always succeeds or always
+    /// fails — the tests are what turn that into a checked property.
     pub fn load() -> Result<Self, ReplayError> {
+        let identity = BUNDLED.ok_or(ReplayError::NoIdentity {
+            identity: Identity::AirServer,
+        })?;
         let expect_certs = WINDOW_COUNT as usize * PEER_CERT_STRIDE;
         let expect_sigs = WINDOW_COUNT as usize * SIGNATURE_LEN;
-        if PEER_CERTS.len() != expect_certs {
+        if identity.peer_certs.len() != expect_certs {
             return Err(ReplayError::Table(format!(
                 "AirServer peer certificates are {} bytes; {WINDOW_COUNT} windows at \
                  stride {PEER_CERT_STRIDE} needs {expect_certs}",
-                PEER_CERTS.len()
+                identity.peer_certs.len()
             )));
         }
-        if SIGNATURES_SHA1.len() != expect_sigs || SIGNATURES_SHA256.len() != expect_sigs {
+        if identity.signatures_sha1.len() != expect_sigs
+            || identity.signatures_sha256.len() != expect_sigs
+        {
             return Err(ReplayError::Table(format!(
                 "AirServer signature tables are {} and {} bytes; {WINDOW_COUNT} windows needs {expect_sigs}",
-                SIGNATURES_SHA1.len(),
-                SIGNATURES_SHA256.len()
+                identity.signatures_sha1.len(),
+                identity.signatures_sha256.len()
             )));
         }
 
-        let peer_key = RsaPrivateKey::from_pkcs1_der(PEER_KEY_DER)
+        let peer_key = RsaPrivateKey::from_pkcs1_der(identity.peer_key_der)
             .map_err(|e| ReplayError::InvalidKey(format!("embedded AirServer peer key: {e}")))?;
         let peer_key_pkcs8_der = peer_key
             .to_pkcs8_der()
@@ -134,8 +162,9 @@ impl AirServerTable {
 
         Ok(Self {
             peer_key_pkcs8_der,
-            device_cert_der: DEVICE_CERT_DER.to_vec(),
-            chain_der: vec![CHAIN0_DER.to_vec(), CHAIN1_DER.to_vec()],
+            device_cert_der: identity.device_cert_der.to_vec(),
+            chain_der: identity.chain_der.iter().map(|c| c.to_vec()).collect(),
+            identity,
         })
     }
 
@@ -200,10 +229,10 @@ impl AirServerTable {
         CastCredential::new(
             self.device_cert_der.clone(),
             self.chain_der.clone(),
-            PEER_CERTS[cert_at..cert_at + PEER_CERT_STRIDE].to_vec(),
+            self.identity.peer_certs[cert_at..cert_at + PEER_CERT_STRIDE].to_vec(),
             self.peer_key_pkcs8_der.clone(),
-            SIGNATURES_SHA1[sig_at..sig_at + SIGNATURE_LEN].to_vec(),
-            SIGNATURES_SHA256[sig_at..sig_at + SIGNATURE_LEN].to_vec(),
+            self.identity.signatures_sha1[sig_at..sig_at + SIGNATURE_LEN].to_vec(),
+            self.identity.signatures_sha256[sig_at..sig_at + SIGNATURE_LEN].to_vec(),
             window,
             CredentialOrigin::AirServerTable { index },
         )
@@ -227,16 +256,25 @@ mod tests {
 
     fn device_key() -> RsaPublicKey {
         use rsa::pkcs8::DecodePublicKey as _;
-        let (_, cert) = x509_parser::parse_x509_certificate(DEVICE_CERT_DER).unwrap();
+        let (_, cert) =
+            x509_parser::parse_x509_certificate(BUNDLED.unwrap().device_cert_der).unwrap();
         RsaPublicKey::from_public_key_der(cert.public_key().raw).unwrap()
     }
 
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn the_fixtures_load() {
         let _ = table();
     }
 
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn the_table_covers_the_range_it_is_documented_to() {
         let t = table();
         // 2024-03-20 .. 2024-03-22
@@ -253,6 +291,10 @@ mod tests {
     /// stopped overlapping, `index_at` would be picking between windows that do
     /// not exist.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn consecutive_windows_overlap_by_one_day() {
         let t = table();
         let a = t.window(10).unwrap();
@@ -264,6 +306,10 @@ mod tests {
 
     /// Two windows cover any given instant; the later one is the useful one.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn lookup_prefers_the_window_with_more_life_left() {
         let t = table();
         let day10 = EPOCH_UNIX + 10 * STEP_SECS;
@@ -273,6 +319,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn the_tail_of_the_last_window_still_resolves() {
         let t = table();
         // Past the last window's start, inside its validity: a naive index
@@ -284,6 +334,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn outside_the_range_is_out_of_range_not_a_wrong_credential() {
         let t = table();
         assert_eq!(t.index_at(EPOCH_UNIX - 1), None);
@@ -302,6 +356,10 @@ mod tests {
     /// Sampled rather than exhaustive to keep the suite fast; the exporter verifies
     /// all 1095 and `fixtures/airserver/README.md` records that.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn stored_signatures_verify_over_stored_certificates() {
         let t = table();
         let key = device_key();
@@ -334,6 +392,10 @@ mod tests {
     /// the UUID, the cheaper representation becomes discoverable rather than
     /// staying a paragraph of prose nobody rechecks.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn each_window_has_a_distinct_random_subject() {
         let t = table();
         let mut seen = std::collections::HashSet::new();
@@ -350,14 +412,20 @@ mod tests {
     /// The identity is a different device on a different branch from the CKS one,
     /// which is the entire reason this module exists.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn the_identity_is_not_the_cks_one() {
-        let (_, device) = x509_parser::parse_x509_certificate(DEVICE_CERT_DER).unwrap();
+        let (_, device) =
+            x509_parser::parse_x509_certificate(BUNDLED.unwrap().device_cert_der).unwrap();
         assert!(
             device.subject().to_string().contains("2001805200936810051"),
             "unexpected device subject: {}",
             device.subject()
         );
-        let (_, subroot) = x509_parser::parse_x509_certificate(CHAIN1_DER).unwrap();
+        let (_, subroot) =
+            x509_parser::parse_x509_certificate(BUNDLED.unwrap().chain_der[1]).unwrap();
         assert!(
             subroot
                 .subject()
@@ -371,6 +439,10 @@ mod tests {
     /// A replayed signature is only valid with an empty nonce echo, whichever
     /// identity produced it.
     #[test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     fn a_replayed_response_echoes_no_nonce() {
         let t = table();
         let c = t.credential_at(EPOCH_UNIX).unwrap();

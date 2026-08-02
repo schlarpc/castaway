@@ -1112,6 +1112,10 @@ mod tests {
     /// Reversing the order is the whole mitigation for a revoked identity, so it
     /// has to actually change which identity is presented.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn the_identity_order_selects_the_identity() {
         let at = 1_785_196_800; // 2026-07-28: inside both tables
 
@@ -1176,6 +1180,10 @@ mod tests {
     /// it. The distinction matters — this crate's job is to be honest that it has
     /// nothing to offer, and the caller's job is to decide what that costs.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn past_every_table_resolution_fails() {
         let far_future_config = ReplayConfig {
             network: false,
@@ -1239,6 +1247,10 @@ mod tests {
     /// A cached database answers with no network at all. This is the state a panel
     /// spends almost all its time in: one fetch bought ~30 windows.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn a_cached_database_is_used_without_network() {
         let (_dir, path) = with_database();
         let provider = ReplayProvider::resolve(ReplayConfig {
@@ -1261,6 +1273,10 @@ mod tests {
     /// cannot run it must still be used. An expiring credential beats none, and this
     /// is the path a panel with no uplink takes.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn an_expiring_database_is_still_used_when_no_fetch_is_possible() {
         let (_dir, path) = with_database();
         let provider = ReplayProvider::resolve(ReplayConfig {
@@ -1285,6 +1301,10 @@ mod tests {
     /// With no database path the identity is table-only, which is what an operator who
     /// does not want the endpoint contacted gets.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn without_a_database_path_airserver_uses_its_table() {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
@@ -1401,6 +1421,10 @@ mod tests {
     /// A clock so wrong that no window covers it must be a typed error, not a
     /// credential from the wrong window.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn a_time_outside_the_table_is_an_error() {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
@@ -1441,6 +1465,10 @@ mod tests {
     /// CRL dropped, which needlessly costs every Chromium-based sender when a perfectly
     /// good AirServer identity is sitting behind it on a different branch of the PKI.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn a_revoked_identity_is_stepped_over_for_an_unrevoked_one() {
         let provider = offline_provider().await;
         // Inside both tables *and* inside the fixture CRL's window (which opens at
@@ -1475,6 +1503,10 @@ mod tests {
     /// configured order wins and the CRL is withheld — Chrome keeps working, which is
     /// strictly better than refusing to come up at all.
     #[tokio::test]
+    #[cfg_attr(
+        not(airserver_identity),
+        ignore = "needs the carved AirServer identity"
+    )]
     async fn all_identities_revoked_still_yields_a_credential_with_no_crl() {
         let provider = offline_provider().await;
         let at = 1_785_300_000;
