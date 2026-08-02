@@ -11,7 +11,9 @@
 //! clear once the rest of the crate existed: handing libav a socket puts the *network* on
 //! the far side of an FFI boundary that owns its own I/O (ground rule 3 says no), and the
 //! sink has to see the elementary stream anyway — an IDR arriving is what answers a
-//! source's `wfd_idr_request`, and a PCR discontinuity is what says the source re-keyed.
+//! source's `wfd_idr_request`, and a PTS that steps backwards is what says the source
+//! re-keyed (see [`PtsOrigin`]; no PCR is read, and on a re-key Android does not set the
+//! adaptation field's discontinuity indicator either, so the timestamps are the signal).
 //! A demuxer we can unit-test against fixture bytes is worth the ~400 lines.
 //!
 //! Everything here is sans-I/O and synchronous: [`TsDemux::push`] takes bytes and returns
@@ -43,6 +45,21 @@ const PTS_MODULUS: u64 = 1 << 33;
 /// Half the PTS range. A backwards step larger than this is read as a wrap rather than a
 /// seek, which is the standard disambiguation and the only one available in-band.
 const PTS_WRAP_THRESHOLD: u64 = PTS_MODULUS / 2;
+
+/// A backwards step larger than this, but smaller than a wrap, is the counter being
+/// restarted rather than timestamps arriving out of order.
+///
+/// Two seconds. What has to fit underneath it is B-frame reordering, which is a frame or
+/// two, and the audio/video interleave — both planes share one origin, so alternating
+/// packets step backwards by whatever the mux offset is. What has to fall outside it is a
+/// re-key, which restarts the counter near zero and so steps back by the whole elapsed
+/// session. There is a wide gap between the two and this sits in it.
+///
+/// The notes recommend re-basing on any jump over a few hundred milliseconds, since
+/// Android's source never sets `discontinuity_indicator` and there is nothing else to go
+/// on. Only *backwards* jumps are treated this way: a forward one is as likely to be a
+/// gap in a stream we are still measuring correctly.
+const PTS_RESTART_THRESHOLD: u64 = 2 * PTS_HZ;
 
 /// A 13-bit transport stream packet identifier.
 ///
@@ -203,21 +220,42 @@ pub struct PtsOrigin {
     previous: u64,
     /// How many times the counter has rolled over.
     wraps: u64,
+    /// Ticks already resolved before the most recent restart, so a re-key continues the
+    /// timeline instead of returning to zero.
+    carried: u64,
 }
 
 impl PtsOrigin {
     /// Convert a raw 33-bit PTS to time since the first one this origin saw.
     pub fn resolve(&mut self, pts: u64) -> Duration {
-        let first = *self.first.get_or_insert(pts);
-        // A big step backwards is the counter wrapping; a small one is B-frame reordering
-        // or two streams whose PTSs simply interleave, and must not be counted as a wrap.
-        if self.previous > pts && self.previous - pts > PTS_WRAP_THRESHOLD {
-            self.wraps = self.wraps.saturating_add(1);
+        let mut first = *self.first.get_or_insert(pts);
+        if self.previous > pts {
+            let back = self.previous - pts;
+            if back > PTS_WRAP_THRESHOLD {
+                // A big step backwards is the counter wrapping.
+                self.wraps = self.wraps.saturating_add(1);
+            } else if back > PTS_RESTART_THRESHOLD {
+                // A middling one is a re-key restarting the counter — the case this type
+                // exists to hide and used not to. Subtracting the *old* origin from a
+                // restarted PTS sends resolved time backwards by the whole session and
+                // then pins it at zero until the counter climbs past where it began. So
+                // bank what has elapsed and start measuring again from here.
+                let previous_extended = self
+                    .previous
+                    .saturating_add(self.wraps.saturating_mul(PTS_MODULUS));
+                self.carried = self
+                    .carried
+                    .saturating_add(previous_extended.saturating_sub(first));
+                first = pts;
+                self.first = Some(pts);
+                self.wraps = 0;
+            }
+            // Anything smaller is B-frame reordering or two streams whose PTSs simply
+            // interleave, and must not move anything.
         }
         self.previous = pts;
         let extended = pts.saturating_add(self.wraps.saturating_mul(PTS_MODULUS));
-        let origin = first;
-        let ticks = extended.saturating_sub(origin);
+        let ticks = self.carried.saturating_add(extended.saturating_sub(first));
         Duration::from_nanos(
             ticks
                 .saturating_mul(1_000_000_000)
@@ -955,6 +993,42 @@ mod tests {
         assert_eq!(origin.resolve(90_000), Duration::ZERO);
         assert_eq!(origin.resolve(96_000), THIRTY_FPS_FRAME * 2);
         assert_eq!(origin.resolve(93_000), THIRTY_FPS_FRAME);
+    }
+
+    #[test]
+    fn a_rekey_that_restarts_the_counter_does_not_send_time_backwards() {
+        // What a source does mid-session when it re-keys: the PTS starts again near zero.
+        // It is far too small a step to be a wrap, so it used to fall through to
+        // `extended - first`, which saturates — an hour into a session, every frame after
+        // the restart resolved to zero until the counter climbed past where it began, and
+        // the time handed to A/V pacing stepped back by the whole hour.
+        let mut origin = PtsOrigin::default();
+        let start = 90_000;
+        assert_eq!(origin.resolve(start), Duration::ZERO);
+        let an_hour_in = start + 3600 * PTS_HZ;
+        assert_eq!(origin.resolve(an_hour_in), Duration::from_secs(3600));
+
+        // …and the source re-keys, restarting at a fresh small value.
+        assert_eq!(
+            origin.resolve(0),
+            Duration::from_secs(3600),
+            "the timeline continues from where it was"
+        );
+        assert_eq!(origin.resolve(PTS_HZ), Duration::from_secs(3601));
+        assert_eq!(origin.resolve(2 * PTS_HZ), Duration::from_secs(3602));
+    }
+
+    #[test]
+    fn an_interleaved_plane_is_not_mistaken_for_a_restart() {
+        // Audio and video share one origin deliberately, so their timestamps step back
+        // and forth past each other by the mux offset. Re-basing on that would restart the
+        // timeline on every other packet.
+        let mut origin = PtsOrigin::default();
+        assert_eq!(origin.resolve(10 * PTS_HZ), Duration::ZERO);
+        // A plane a second behind the other, alternating.
+        assert_eq!(origin.resolve(9 * PTS_HZ), Duration::ZERO);
+        assert_eq!(origin.resolve(11 * PTS_HZ), Duration::from_secs(1));
+        assert_eq!(origin.resolve(10 * PTS_HZ), Duration::ZERO);
     }
 
     #[test]
