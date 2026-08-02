@@ -2221,3 +2221,504 @@ async fn a_reconfigured_stream_gets_a_session_at_the_new_rate() {
         "the decoder must follow the sender's new rate, not the one it opened with"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// A stream that is running, and the things that happen to it (#95).
+//
+// Everything above gets a stream *up*. What follows is thin in exactly the place the panel
+// is not: the codec that every sender falls back to, the packet that will not parse, the
+// queue that fills, the volume knob on the phone, and the two ways a sender ends a stream
+// without disconnecting. The shape of each of these, when it breaks, is the same and is
+// the reason they are worth pinning: the panel looks connected and plays nothing, or plays
+// it at the wrong pitch, and says nothing about either.
+// ---------------------------------------------------------------------------------------
+
+/// One RTP media packet carrying `payload`, which is what every codec here but classic
+/// aptX rides in.
+fn rtp(sequence: u16, payload: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(12 + payload.len());
+    buf.put_u8(0x80); // version 2, no padding, no extension, no CSRCs
+    buf.put_u8(96); // dynamic payload type
+    buf.put_u16(sequence);
+    buf.put_u32(u32::from(sequence) * 128); // a timestamp that advances with the stream
+    buf.put_u32(0xDEAD_BEEF); // ssrc
+    buf.extend_from_slice(payload);
+    buf.freeze()
+}
+
+/// One SBC media packet: the one-byte frame-count header A2DP prepends, then a frame whose
+/// header states the bitpool it was coded at.
+fn sbc_packet(sequence: u16, bitpool: u8) -> Bytes {
+    // Syncword, stream parameters, bitpool, CRC, and two bytes standing in for the coded
+    // subband data — this side never decodes it, it only has to survive framing.
+    let frame = [0x9C, 0x31, bitpool, 0x00, 0xAA, 0xBB];
+    let mut payload = vec![0x01]; // one frame in this packet
+    payload.extend_from_slice(&frame);
+    rtp(sequence, &payload)
+}
+
+/// Bring a stream up on the endpoint advertising `chosen`'s codec, configured as `chosen`.
+///
+/// The endpoint is found by *asking* — discover, then get the last endpoint's capabilities
+/// and check them — rather than by counting into the table the way the aptX helper above
+/// does. SBC is always advertised and always last (a sink without it is not an A2DP sink),
+/// so this pins that ordering as well as using it.
+async fn stream_up_as(
+    transport: &ScriptedTransport,
+    signaling_cid: u16,
+    media_cid: u16,
+    chosen: &CodecCapability,
+) -> (Cid, Cid, Seid) {
+    let (signaling, _) = open_channel(transport, Psm::AVDTP, signaling_cid).await;
+    let discover = avdtp(transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = eventually("the last endpoint", || {
+        discover
+            .payload
+            .chunks(2)
+            .filter_map(|c| Seid::from_shifted(c[0]).ok())
+            .next_back()
+    })
+    .await;
+
+    let caps = avdtp(
+        transport,
+        signaling,
+        2,
+        Signal::GetAllCapabilities,
+        &[seid.shifted()],
+    )
+    .await;
+    let advertised = proto_bluetooth_audio::avdtp::find_codec_capability(&caps.payload).unwrap();
+    assert_eq!(
+        advertised.audio_codec(),
+        chosen.audio_codec(),
+        "the endpoint asked for is not the one the table put here"
+    );
+
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    let reply = avdtp(transport, signaling, 3, Signal::SetConfiguration, &set).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "configuration should be accepted"
+    );
+    avdtp(transport, signaling, 4, Signal::Open, &[seid.shifted()]).await;
+    let (media, _) = open_channel(transport, Psm::AVDTP, media_cid).await;
+    avdtp(transport, signaling, 5, Signal::Start, &[seid.shifted()]).await;
+    (signaling, media, seid)
+}
+
+/// The SBC capability a sender narrows ours down to: one rate, one channel mode.
+fn sbc_at(rates: SampleRates) -> CodecCapability {
+    CodecCapability::Sbc {
+        rates,
+        channels: ChannelModes::JOINT_STEREO,
+        block_lengths: 0b1000, // 16 blocks
+        subbands: 0b01,        // 8 subbands
+        allocations: 0b10,     // loudness
+        min_bitpool: 2,
+        max_bitpool: 53,
+    }
+}
+
+/// Wait for the audio session an established stream opens, and take its frames.
+async fn audio_session(
+    rx: &mut mpsc::Receiver<SourceMessage>,
+) -> (
+    tokio::sync::mpsc::Receiver<castaway_core::EncodedFrame>,
+    castaway_core::AudioFormat,
+) {
+    let msg = eventually("an audio session event", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::Audio { .. }))
+    })
+    .await;
+    let SessionEvent::Audio { source, format, .. } = msg.event else {
+        unreachable!("filtered")
+    };
+    let FrameSource::Encoded(frames) = source else {
+        panic!("audio must arrive as encoded frames");
+    };
+    (frames, format)
+}
+
+#[tokio::test]
+async fn an_sbc_stream_reaches_the_pipeline_the_way_aptx_does() {
+    // The only end-to-end codec here was aptX, chosen by counting to the third endpoint —
+    // so the mandatory one, the one every sender falls back to when the radio is bad and
+    // the only one whose decoder is ours rather than ffmpeg's, had never carried a byte
+    // through the adapter. `a_restricted_codec_table_advertises_only_what_it_was_given`
+    // restricts a build to SBC but only checks what gets *advertised*.
+    let (transport, mut rx) = connected().await;
+    let (_signaling, media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+
+    let (mut frames, format) = audio_session(&mut rx).await;
+    assert_eq!(
+        format.sample_rate(),
+        44_100,
+        "the negotiated rate must reach the decoder"
+    );
+
+    push_pdu(&transport, &L2capPdu::new(media, sbc_packet(1, 35)));
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("an SBC packet should become a frame")
+        .expect("the frame channel should be open");
+    assert_eq!(frame.audio_codec, Some(AudioCodec::Sbc));
+    // The RTP header and the one-byte frame count are framing, not audio. Leaving either
+    // in shifts every frame and decodes to noise, silently — which is the whole reason
+    // this assertion is on the bytes and not on the count.
+    assert_eq!(
+        &frame.data[..],
+        &[0x9C, 0x31, 35, 0x00, 0xAA, 0xBB],
+        "the frame must start at the SBC syncword"
+    );
+}
+
+#[tokio::test]
+async fn a_packet_that_cannot_be_depacketized_leaves_the_stream_running() {
+    // `on_media`'s error arm is the one that produces this project's signature failure —
+    // a connected phone, a running session, a populated now-playing card, and total
+    // silence. Nothing had ever entered it, so nothing said whether a bad packet costs a
+    // frame or costs the session.
+    let (transport, mut rx) = connected().await;
+    let (_signaling, media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (mut frames, _) = audio_session(&mut rx).await;
+
+    // Too short to be an RTP packet at all — the shape a truncated ACL reassembly or a
+    // sender with a different idea of the framing produces.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(media, Bytes::from_static(&[0x80, 0x60, 0x00])),
+    );
+    // …and one whose RTP header is fine but which carries nothing after the codec header.
+    push_pdu(&transport, &L2capPdu::new(media, rtp(2, &[0x01])));
+
+    // The next good packet still arrives, which is the whole claim: a packet we cannot
+    // parse is a dropped frame, not a dead session.
+    push_pdu(&transport, &L2capPdu::new(media, sbc_packet(3, 35)));
+    let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("the stream must survive a packet it cannot parse")
+        .expect("the frame channel should still be open");
+    assert_eq!(
+        &frame.data[..],
+        &[0x9C, 0x31, 35, 0x00, 0xAA, 0xBB],
+        "and the frame that arrives must be the good one, not a mangled earlier packet"
+    );
+    assert!(
+        !session_ended(&mut rx),
+        "a malformed packet must not end the session"
+    );
+}
+
+/// Whether the session has been told to end, without waiting for one that is not coming.
+fn session_ended(rx: &mut mpsc::Receiver<SourceMessage>) -> bool {
+    std::iter::from_fn(|| rx.try_recv().ok()).any(|m| matches!(m.event, SessionEvent::End))
+}
+
+#[tokio::test]
+async fn a_queue_that_fills_drops_frames_rather_than_the_session() {
+    // The `Full` and `Closed` arms of the same `try_send` are deliberately distinguished —
+    // the difference between a hiccup and a dead session, and they used to collapse into
+    // one `is_err()`. `Closed` is covered by the pipeline-lets-go test above; `Full` was
+    // not covered at all, and it is the one that must *not* end anything.
+    let (transport, mut rx) = connected().await;
+    let (_signaling, media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (mut frames, _) = audio_session(&mut rx).await;
+
+    // Past the queue's depth without reading a single one, which is what a decode thread
+    // that has stalled looks like from here.
+    for sequence in 0..(AUDIO_QUEUE_DEPTH + 64) {
+        push_pdu(
+            &transport,
+            &L2capPdu::new(media, sbc_packet(u16::try_from(sequence).unwrap(), 35)),
+        );
+    }
+
+    // Drain what did fit, then prove the stream is still live: a frame pushed after the
+    // overflow still arrives. A dropped frame is a hiccup; this is what says it stayed one.
+    // The queue is full long before the flood ends, so waiting for it to reach its depth is
+    // waiting for something that has already happened by the time the adapter has caught up.
+    eventually("the queue to fill", || {
+        (frames.len() >= AUDIO_QUEUE_DEPTH).then_some(())
+    })
+    .await;
+    let drained = std::iter::from_fn(|| frames.try_recv().ok()).count();
+    assert_eq!(
+        drained, AUDIO_QUEUE_DEPTH,
+        "the queue should have held its whole depth"
+    );
+    assert!(
+        !session_ended(&mut rx),
+        "a full queue must not end the session"
+    );
+
+    push_pdu(&transport, &L2capPdu::new(media, sbc_packet(9000, 41)));
+    let after = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("audio must keep flowing once the queue drains")
+        .expect("the frame channel should still be open");
+    assert_eq!(
+        after.data[2], 41,
+        "and it must be the packet sent after the flood"
+    );
+}
+
+/// The depth of the adapter's audio queue, mirrored from `adapter.rs`. Not public, and not
+/// worth making public — what matters here is only that the test overshoots it.
+const AUDIO_QUEUE_DEPTH: usize = 256;
+
+/// Build an AVRCP vendor-dependent *command*, as a phone sends one to us.
+fn avrcp_command(
+    transaction: u8,
+    ctype: proto_bluetooth_audio::Ctype,
+    pdu: u8,
+    params: &[u8],
+) -> Bytes {
+    proto_bluetooth_audio::AvctpMessage::command(
+        transaction,
+        proto_bluetooth_audio::avrcp::vendor_command(ctype, pdu, params).encode(),
+    )
+    .encode()
+}
+
+/// Every vendor-dependent AVRCP *response* the adapter has sent, as (pdu, ctype, params).
+fn avrcp_responses(
+    transport: &ScriptedTransport,
+) -> Vec<(u8, proto_bluetooth_audio::Ctype, Bytes)> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+        .filter(|msg| msg.cr == CommandResponse::Response)
+        .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+        .filter_map(|frame| {
+            proto_bluetooth_audio::VendorPdu::parse(&frame.operands)
+                .ok()
+                .map(|vendor| (vendor.pdu_id, frame.ctype, vendor.parameters))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_volume_slider_on_the_phone_moves_the_panel_and_is_echoed_back() {
+    // #69 made the phone authoritative over volume, and nothing in this crate had ever
+    // sent us a `SET_ABSOLUTE_VOLUME`. Two halves, and both matter: the value has to reach
+    // the session (or the slider moves nothing), and it has to be echoed (or the phone's
+    // own volume UI springs back to where it was, which reads as the panel refusing).
+    let (transport, mut rx) = connected().await;
+    let (_signaling, _media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (_frames, _) = audio_session(&mut rx).await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    // 0x40 of 0x7F — a little under half, and not a value a defaulted path would produce.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                3,
+                proto_bluetooth_audio::Ctype::Control,
+                proto_bluetooth_audio::avrcp::pdu::SET_ABSOLUTE_VOLUME,
+                &[0x40],
+            ),
+        ),
+    );
+
+    let volume = eventually("the volume reaching the session", || {
+        rx.try_recv().ok().and_then(|m| match m.event {
+            SessionEvent::Control(castaway_core::ControlTxn::Volume(v)) => Some(v),
+            _ => None,
+        })
+    })
+    .await;
+    assert!(
+        (volume.position() - 0x40 as f32 / 127.0).abs() < 0.01,
+        "the panel must follow the phone's slider, got {volume:?}"
+    );
+
+    let echo = eventually("the accepted value echoed back", || {
+        avrcp_responses(&transport)
+            .into_iter()
+            .find(|(pdu, ..)| *pdu == proto_bluetooth_audio::avrcp::pdu::SET_ABSOLUTE_VOLUME)
+    })
+    .await;
+    assert_eq!(
+        echo.1,
+        proto_bluetooth_audio::Ctype::Accepted,
+        "a volume we honoured must be answered ACCEPTED"
+    );
+    assert_eq!(
+        echo.2.first().copied(),
+        Some(0x40),
+        "the echo must carry the value we accepted, or the phone's UI sticks"
+    );
+}
+
+#[tokio::test]
+async fn a_notification_the_phone_registers_on_us_is_answered_rather_than_left_hanging() {
+    // We register notifications *on* phones all the time; a phone registering one on us
+    // reaches a handler that only models the response direction, falls through to the
+    // catch-all, and gets `NOT IMPLEMENTED`. That is very likely the right answer — we are
+    // not a Target with a playlist — but nothing said so, so nobody would notice it
+    // becoming the wrong one. What must never happen is silence: AVCTP has no "ignored",
+    // so a stack that gets none waits out its transaction timeout and some abort the link.
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                5,
+                proto_bluetooth_audio::Ctype::Notify,
+                proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION,
+                &[
+                    proto_bluetooth_audio::avrcp::event::PLAYBACK_STATUS_CHANGED,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+        ),
+    );
+
+    let answer = eventually("an answer to the registration", || {
+        avrcp_responses(&transport)
+            .into_iter()
+            .find(|(pdu, ..)| *pdu == proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION)
+    })
+    .await;
+    assert_eq!(
+        answer.1,
+        proto_bluetooth_audio::Ctype::NotImplemented,
+        "we are not a Target with events to report, and saying nothing is not an option"
+    );
+}
+
+#[tokio::test]
+async fn an_abort_ends_the_session_and_leaves_the_endpoint_free() {
+    // ABORT is the sender's escape hatch: legal from any state, used when it has given up
+    // on the exchange rather than finished with it. `sink_flow.rs` accepts one at the
+    // state-machine level; what was never checked is the consequence — whether the session
+    // ends, and whether the endpoint it held is available to the next sender or is stuck
+    // `in_use` for the life of the process.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _media, seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (_frames, _) = audio_session(&mut rx).await;
+
+    let reply = avdtp(&transport, signaling, 6, Signal::Abort, &[seid.shifted()]).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "an abort is legal from any state"
+    );
+    eventually("the session ending", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::End))
+    })
+    .await;
+
+    // The next sender has to be able to take the endpoint, and there are two separate
+    // ways it could find it held. What it *sees* first is DISCOVER's in-use bit — the only
+    // place that flag is ever published — so an endpoint left flagged is one a sender
+    // skips before it tries anything.
+    assert!(
+        !endpoint_in_use(&transport, signaling, 7, seid).await,
+        "the aborted endpoint is still advertised as in use: a sender will not even try it"
+    );
+    // …and then whether the configuration is actually accepted, which is the sink's state
+    // rather than the flag, and can be stuck independently of it.
+    let chosen = sbc_at(SampleRates::HZ_48000);
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    let reply = avdtp(&transport, signaling, 8, Signal::SetConfiguration, &set).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "the aborted endpoint is still held: the next cast gets nothing"
+    );
+}
+
+/// Whether a fresh DISCOVER reports `seid` as in use.
+///
+/// The flag rides bit 1 of the first byte of each endpoint's pair, and it is the only
+/// place AVDTP publishes it — a sender reads it here and skips a busy endpoint without
+/// ever sending a SET_CONFIGURATION, so an endpoint left flagged is invisible to the
+/// state machine that would otherwise refuse it.
+async fn endpoint_in_use(
+    transport: &ScriptedTransport,
+    signaling: Cid,
+    transaction: u8,
+    seid: Seid,
+) -> bool {
+    let discover = avdtp(transport, signaling, transaction, Signal::Discover, &[]).await;
+    discover
+        .payload
+        .chunks(2)
+        .find(|c| Seid::from_shifted(c[0]).ok() == Some(seid))
+        .is_some_and(|c| c[0] & 0x02 != 0)
+}
+
+#[tokio::test]
+async fn a_closed_stream_can_be_configured_again_at_a_new_rate() {
+    // CLOSE is how a well-behaved sender ends a stream it intends to reopen — switching
+    // codec, or changing rate on a track boundary, without dropping the link. RECONFIGURE
+    // (covered above) keeps the configuration; this throws it away and builds a new one,
+    // and it is the path that leaves an endpoint stuck if the teardown is incomplete.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _media, seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (_frames, format) = audio_session(&mut rx).await;
+    assert_eq!(format.sample_rate(), 44_100);
+
+    let reply = avdtp(&transport, signaling, 6, Signal::Close, &[seid.shifted()]).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept
+    );
+    eventually("the session ending", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::End))
+    })
+    .await;
+
+    // Straight back up at a different rate, which is what a phone changing tracks between
+    // a 44.1 kHz and a 48 kHz album does.
+    assert!(
+        !endpoint_in_use(&transport, signaling, 7, seid).await,
+        "a closed endpoint must be advertised as free again"
+    );
+
+    let chosen = sbc_at(SampleRates::HZ_48000);
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 8, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 9, Signal::Open, &[seid.shifted()]).await;
+    let (_media, _) = open_channel(&transport, Psm::AVDTP, 0x0042).await;
+    avdtp(&transport, signaling, 10, Signal::Start, &[seid.shifted()]).await;
+
+    let (_frames, format) = audio_session(&mut rx).await;
+    assert_eq!(
+        format.sample_rate(),
+        48_000,
+        "the second session must be sized for what was negotiated the second time"
+    );
+}
