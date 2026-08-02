@@ -90,7 +90,8 @@ pub struct ModeParameters {
     /// Frames we may have unacknowledged — ours to propose, theirs to reduce in the
     /// *response*.
     pub send_window: u8,
-    /// Retransmissions of one frame before we give up on the channel. Ours.
+    /// Total transmissions of one frame before we give up on the channel (1 = no
+    /// retransmission), per the Core spec's `MaxTransmit`. Ours.
     pub max_transmit: u8,
     /// How long an unacknowledged frame waits before we poll. The responder's choice, so
     /// this comes out of their *response* to our request.

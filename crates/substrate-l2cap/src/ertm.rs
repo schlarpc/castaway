@@ -42,7 +42,9 @@ pub const MAX_OVERHEAD: usize = 6;
 /// Frames we may have outstanding before waiting for an acknowledgement.
 pub const DEFAULT_TX_WINDOW: u8 = 32;
 
-/// How many times one frame is retransmitted before the channel is declared dead.
+/// Total transmissions of one frame before the channel is declared dead — 1 means no
+/// retransmission at all, as the Core spec's `MaxTransmit` defines it (Vol 3 Part A §5.4).
+/// So 3 is one send and two retries, not three retries.
 pub const DEFAULT_MAX_TRANSMIT: u8 = 3;
 
 /// How long an unacknowledged frame waits before we poll for its acknowledgement.
@@ -105,7 +107,8 @@ pub struct RetransmissionConfig {
     pub mode: ChannelMode,
     /// Frames the sender may have unacknowledged.
     pub tx_window: u8,
-    /// Retransmissions of one frame before the channel is abandoned.
+    /// Total transmissions of one frame before the channel is abandoned (1 = no
+    /// retransmission), per the Core spec's `MaxTransmit`.
     pub max_transmit: u8,
     /// Retransmission time-out, in milliseconds. Zero in a request: the responder fills
     /// it in, and a requester that puts a real number here is proposing a value it has no
@@ -549,7 +552,8 @@ pub struct ErtmParameters {
     pub send_mps: u16,
     /// Frames we may have unacknowledged.
     pub send_window: u8,
-    /// Retransmissions before the channel is declared dead.
+    /// Total transmissions of one frame before the channel is declared dead (1 = no
+    /// retransmission).
     pub max_transmit: u8,
     /// How long an unacknowledged frame waits before we poll.
     pub retransmission_timeout: Duration,
@@ -751,13 +755,28 @@ impl Ertm {
         // An acknowledgement rides on every frame, data or not, so it is taken before the
         // frame's own business is looked at.
         self.acknowledge(frame.req_seq());
+        // REJ and SREJ name what they want resent, and the dispatch below does exactly
+        // that. Retransmitting the window here *as well* — which a REJ(F=1) answering our
+        // poll would trigger — puts every unacked frame on the wire twice and spends two
+        // of `max_transmit`'s attempts per cycle, so a channel dies after two loss events
+        // instead of three transmissions. It is the mirror image of the duplicate-REJ
+        // behaviour `on_information` goes out of its way not to inflict on the peer.
+        let names_its_own = matches!(
+            frame,
+            Frame::Supervisory {
+                function: Supervisory::Reject | Supervisory::SelectiveReject,
+                ..
+            }
+        );
         if frame.final_bit() && self.waiting_for_final {
             self.waiting_for_final = false;
             self.monitor_timer = None;
             self.polls = 0;
             // The peer has answered our poll and told us where it got to; anything still
             // outstanding was lost rather than merely slow.
-            self.retransmit_all(&mut out);
+            if !names_its_own {
+                self.retransmit_all(&mut out);
+            }
         }
 
         match frame {
@@ -1346,6 +1365,60 @@ mod tests {
             vec![0, 1],
             "both unacknowledged frames come back"
         );
+    }
+
+    #[test]
+    fn a_reject_answering_a_poll_retransmits_the_window_once_not_twice() {
+        // REJ(F=1) is a legal answer to our RR(P=1), and it used to hit two independent
+        // retransmit triggers: the final-bit branch and the REJ arm. Every frame went out
+        // twice and `retransmit` wrote the bumped count back, so one poll/REJ cycle spent
+        // two of max_transmit's three attempts and the channel died after two loss events.
+        let mut sender = Ertm::new(params());
+        sender.send(Bytes::from_static(b"one")).unwrap();
+        sender.send(Bytes::from_static(b"two")).unwrap();
+
+        let polled = sender.tick(params().retransmission_timeout);
+        assert!(
+            matches!(
+                peer_view(&polled.frames[0], &params()),
+                Frame::Supervisory { poll: true, .. }
+            ),
+            "the timeout polls the peer"
+        );
+
+        let reject = Frame::Supervisory {
+            function: Supervisory::Reject,
+            req_seq: 0,
+            poll: false,
+            final_bit: true,
+        }
+        .encode(params().local_cid, FcsType::Crc16);
+        let replayed = sender.receive(&reject).unwrap();
+        let sequences: Vec<u8> = replayed
+            .frames
+            .iter()
+            .filter_map(|f| match peer_view(f, &params()) {
+                Frame::Information { tx_seq, .. } => Some(tx_seq),
+                Frame::Supervisory { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            sequences,
+            vec![0, 1],
+            "each outstanding frame comes back once"
+        );
+        assert!(!replayed.failed);
+
+        // …and the allowance is spent at one attempt per event, so max_transmit = 3
+        // survives a second cycle and fails on the third.
+        let polled = sender.tick(params().monitor_timeout);
+        assert!(!polled.failed);
+        let second = sender.receive(&reject).unwrap();
+        assert!(!second.failed, "two transmissions used, one left");
+        let polled = sender.tick(params().monitor_timeout);
+        assert!(!polled.failed);
+        let third = sender.receive(&reject).unwrap();
+        assert!(third.failed, "the fourth transmission exceeds max_transmit");
     }
 
     #[test]
