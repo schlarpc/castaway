@@ -34,16 +34,18 @@ const LOUNGE: &str = "https://www.youtube.com/api/lounge";
 /// video someone actually wants to watch.
 const TOAST: Duration = Duration::from_secs(3);
 
-/// Run the actor until the process ends. Never returns an error to its caller: a receiver
-/// that cannot reach SponsorBlock is a receiver that plays sponsors, not a broken one.
 /// How long the screen may sit with no video before the panel takes itself back.
 ///
-/// "Ready to cast" with an empty queue is nobody watching anything; three minutes
-/// covers someone browsing the leanback UI by remote (every press is channel traffic
-/// that resets this) without leaving the splash up all evening. A *paused* video never
-/// counts as idle — the screen still has a video, and someone means to come back.
+/// "Ready to cast" with an empty queue is nobody watching anything. The clock is on the
+/// *video-less* state, not on channel silence: browsing the leanback UI by remote
+/// generates plenty of traffic and none of it resets this, so three minutes is the budget
+/// for picking something to watch, not for idling. Only a `nowPlaying` that names a video
+/// clears it. A *paused* video never counts as idle — the screen still has a video, and
+/// someone means to come back.
 const IDLE_EXIT: Duration = Duration::from_secs(180);
 
+/// Run the actor until the process ends. Never returns an error to its caller: a receiver
+/// that cannot reach SponsorBlock is a receiver that plays sponsors, not a broken one.
 pub async fn run(
     config: SponsorBlockConfig,
     screen: ScreenSlot,
