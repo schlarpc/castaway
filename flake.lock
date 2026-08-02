@@ -1,5 +1,17 @@
 {
   "nodes": {
+    "airserver-msi-src": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-StYhpZzcZTnULcr84caKC4sqTh9bljcgTghdpQA9bSg=",
+        "type": "file",
+        "url": "https://dl.airserver.com/pc32/AirServer-5.7.2-x64.msi"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://dl.airserver.com/pc32/AirServer-5.7.2-x64.msi"
+      }
+    },
     "crane": {
       "locked": {
         "lastModified": 1785631643,
@@ -197,6 +209,7 @@
     },
     "root": {
       "inputs": {
+        "airserver-msi-src": "airserver-msi-src",
         "crane": "crane",
         "electron-linux-src": "electron-linux-src",
         "electron-windows-src": "electron-windows-src",

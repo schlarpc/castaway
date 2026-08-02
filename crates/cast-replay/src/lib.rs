@@ -155,6 +155,20 @@ pub enum ReplayError {
     #[error("signature table: {0}")]
     Table(String),
 
+    /// This build was not given the constants that open an AirServer database.
+    ///
+    /// Not a failure of the database or of the operator's configuration: the two
+    /// BLAKE2b constants are carved out of a pinned installer at build time
+    /// (`nix/airserver-carve.nix`), and a build that skipped that step — any plain
+    /// `cargo build`, and the portable artifact — cannot read one. Failing here rather
+    /// than falling back is deliberate; the alternative is a receiver that quietly has
+    /// no AirServer identity and presents as a protocol bug much later.
+    #[error(
+        "this build has no AirServer KEK constants, so its credential databases cannot \
+         be opened; build through nix so nix/airserver-carve.nix can supply them"
+    )]
+    NoKek,
+
     /// A validity window could not be constructed or rendered.
     #[error("validity window: {0}")]
     Window(String),

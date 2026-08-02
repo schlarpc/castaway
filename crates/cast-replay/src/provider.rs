@@ -70,7 +70,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::airserver::AirServerTable;
-use crate::airserver_db::AirServerDb;
+use crate::airserver_db::{AirServerDb, Kek};
 use crate::cks::CksTable;
 use crate::crl::{CastCrl, ServableCrl};
 use crate::{airserver_api, api, cache, crl, CastCredential, ReplayError};
@@ -154,6 +154,13 @@ pub struct ReplayConfig {
     /// Where to keep AirServer's fetched credential database. `None` disables that
     /// identity's live path, leaving it on its bundled table.
     pub airserver_db_path: Option<PathBuf>,
+    /// The constants that open an AirServer database.
+    ///
+    /// Defaults to whatever the build was given ([`Kek::provisioned`]), which is `None`
+    /// on a build that never saw the installer — so this identity's live path is simply
+    /// unavailable there, and says so rather than pretending. Overridable so the tests
+    /// can drive the whole path against fixtures keyed under a constant of our own.
+    pub airserver_kek: Option<Kek<'static>>,
     /// Where to cache the fetched Cast CRL. `None` disables the CRL entirely, which
     /// leaves `AuthResponse.crl` empty — fine for Chrome, fatal for Chromium-based
     /// senders (see [`crate::crl`]).
@@ -172,6 +179,7 @@ impl Default for ReplayConfig {
             // AirServer is carried at all.
             identity_order: vec![Identity::Cks, Identity::AirServer],
             airserver_db_path: Some(airserver_api::default_db_path()),
+            airserver_kek: Kek::provisioned(),
             crl_cache_path: Some(crl::default_cache_path()),
         }
     }
@@ -744,8 +752,11 @@ impl Resolver {
         }
         let path = self.config.airserver_db_path.clone()?;
         let opened = path.clone();
+        let kek = self.config.airserver_kek?;
         let found = tokio::task::spawn_blocking(move || {
-            opened.exists().then(|| AirServerDb::open(&opened))
+            opened
+                .exists()
+                .then(|| AirServerDb::open_with_kek(&opened, kek))
         })
         .await;
         let found = match found {
@@ -789,8 +800,9 @@ impl Resolver {
             .map_err(|e| ReplayError::Http(format!("joining the AirServer request: {e}")))??;
         debug!(bytes, path = %path.display(), "wrote an AirServer credential database");
 
+        let kek = self.config.airserver_kek.ok_or(ReplayError::NoKek)?;
         let opened = path.clone();
-        tokio::task::spawn_blocking(move || AirServerDb::open(&opened))
+        tokio::task::spawn_blocking(move || AirServerDb::open_with_kek(&opened, kek))
             .await
             .map_err(|e| ReplayError::Database(format!("joining the database open: {e}")))?
     }
@@ -1234,6 +1246,7 @@ mod tests {
             cache_path: None,
             identity_order: vec![Identity::AirServer],
             airserver_db_path: Some(path),
+            airserver_kek: Some(crate::airserver_db::TEST_KEK),
             ..ReplayConfig::default()
         })
         .await
@@ -1255,6 +1268,7 @@ mod tests {
             cache_path: None,
             identity_order: vec![Identity::AirServer],
             airserver_db_path: Some(path),
+            airserver_kek: Some(crate::airserver_db::TEST_KEK),
             ..ReplayConfig::default()
         })
         .await
@@ -1301,6 +1315,7 @@ mod tests {
             cache_path: None,
             identity_order: vec![Identity::Cks, Identity::AirServer],
             airserver_db_path: Some(path),
+            airserver_kek: Some(crate::airserver_db::TEST_KEK),
             ..ReplayConfig::default()
         })
         .await

@@ -14,13 +14,19 @@
 //! key = BLAKE2b-256(message = "", key = PASS, salt = <salt table>, person = PERSON)
 //! ```
 //!
-//! which is libsodium's `crypto_generichash_blake2b_salt_personal`. `PASS` and
-//! `PERSON` are string literals in AirServer's shipped binary; the salt is a row in
-//! the database's own `salt` table, so it varies per database and the key must be
+//! which is libsodium's `crypto_generichash_blake2b_salt_personal`. The salt is a row
+//! in the database's own `salt` table, so it varies per database and the key must be
 //! derived from the file rather than hardcoded.
 //!
-//! Provenance and the recovery of those two constants:
-//! `re-shell/artifacts/airreceiver-cast-signatures/AIRSERVER_HANDOFF.md`.
+//! `PASS` and `PERSON` are string literals in AirServer's shipped binary — and are
+//! **not** literals here. They are App Dynamic's, so this tree does not carry them:
+//! `nix/airserver-carve.nix` recovers them from a pinned installer at build time and
+//! `build.rs` hands them over as [`Kek`]. A build that never saw the installer gets
+//! [`Kek::provisioned`] `== None` and fails closed with [`ReplayError::NoKek`]; the
+//! offline fixtures are re-keyed under [`TEST_KEK`] so the reader is still fully
+//! testable there.
+//!
+//! Provenance and the recovery of those two constants: PROVENANCE §3.
 //!
 //! ## Scope
 //!
@@ -43,11 +49,46 @@ use crate::provider::Identity;
 use crate::window::Window;
 use crate::{CastCredential, CredentialOrigin, ReplayError};
 
-/// The BLAKE2b personalisation constant, from AirServer's binary.
-const PERSON: &[u8] = b"***REMOVED: App Dynamic BLAKE2b personalisation, PROVENANCE S5***";
+/// The two BLAKE2b constants that open an AirServer credential database.
+///
+/// Deliberately **not** literals in this tree: they are App Dynamic's, and are carved
+/// out of a pinned installer at build time by `nix/airserver-carve.nix`, reaching the
+/// crate through `build.rs`. Passing them as a value rather than reading two globals is
+/// what lets the offline tests bring their own — the fixtures are re-keyed under a test
+/// constant precisely so that `cargo test` needs nothing from App Dynamic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kek<'a> {
+    /// BLAKE2b personalisation, at most 16 bytes.
+    pub person: &'a [u8],
+    /// BLAKE2b key, at most 64 bytes.
+    pub pass: &'a [u8],
+}
 
-/// The BLAKE2b key constant, from AirServer's binary.
-const PASS: &[u8] = b"***REMOVED: App Dynamic BLAKE2b key, PROVENANCE S6***";
+include!(concat!(env!("OUT_DIR"), "/airserver_kek.rs"));
+
+impl Kek<'static> {
+    /// The constants this build was given, if any.
+    ///
+    /// `None` on any build that never saw the installer — every `cargo build` on a
+    /// developer machine, and the portable artifact. Callers turn that into
+    /// [`ReplayError::NoKek`] rather than falling back, because a receiver that quietly
+    /// drops its AirServer identity presents months later as a protocol bug.
+    #[must_use]
+    pub const fn provisioned() -> Option<Self> {
+        PROVISIONED
+    }
+}
+
+/// The constants the checked-in fixtures are sealed under.
+///
+/// Arbitrary — their only job is to not be somebody else's. The trimmed databases in
+/// `fixtures/airserver/` were re-keyed to these so the reader can be exercised offline
+/// by a build that has never seen AirServer's installer.
+#[cfg(test)]
+pub(crate) const TEST_KEK: Kek<'static> = Kek {
+    person: b"castaway-test",
+    pass: b"castaway offline fixture key",
+};
 
 /// `crypto_secretbox` nonce length.
 const NONCE_LEN: usize = 24;
@@ -90,6 +131,17 @@ impl AirServerDb {
     /// Poly1305 authentication failure, which is the honest description of "this is
     /// not an AirServer database".
     pub fn open(path: &Path) -> Result<Self, ReplayError> {
+        Self::open_with_kek(path, Kek::provisioned().ok_or(ReplayError::NoKek)?)
+    }
+
+    /// Open and decrypt a database under an explicit KEK.
+    ///
+    /// Exists because the offline fixtures are keyed under a test constant rather than
+    /// App Dynamic's, so the reader can be exercised end to end without the installer.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_with_kek(path: &Path, kek: Kek<'_>) -> Result<Self, ReplayError> {
         let conn = rusqlite::Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -99,7 +151,7 @@ impl AirServerDb {
         let salt: Vec<u8> = conn
             .query_row("SELECT data FROM salt LIMIT 1", [], |r| r.get(0))
             .map_err(|e| ReplayError::Database(format!("reading the salt: {e}")))?;
-        let key = derive_key(&salt)?;
+        let key = derive_key(&salt, kek)?;
 
         // `metadata.json` is the one column in the schema that is *not* a secretbox —
         // it is declared TEXT and stored in the clear, holding `{"generated": <unix>}`.
@@ -262,24 +314,33 @@ impl AirServerDb {
 }
 
 /// `crypto_generichash_blake2b_salt_personal` with an empty message.
-fn derive_key(salt: &[u8]) -> Result<[u8; 32], ReplayError> {
+fn derive_key(salt: &[u8], kek: Kek<'_>) -> Result<[u8; 32], ReplayError> {
     // libsodium's salt and personal fields are exactly 16 bytes; it zero-pads a
     // shorter input and rejects a longer one. blake2b_simd requires exactly 16, so
     // pad here rather than letting a short salt panic.
     let mut salt16 = [0_u8; 16];
     let mut person16 = [0_u8; 16];
-    if salt.len() > 16 || PERSON.len() > 16 {
+    if salt.len() > 16 || kek.person.len() > 16 {
         return Err(ReplayError::Database(format!(
-            "salt is {} bytes; BLAKE2b takes at most 16",
-            salt.len()
+            "salt is {} bytes and personalisation is {}; BLAKE2b takes at most 16 of each",
+            salt.len(),
+            kek.person.len()
+        )));
+    }
+    // blake2b_simd panics on an over-long key, so bound it here too rather than
+    // trusting whatever the carve produced.
+    if kek.pass.is_empty() || kek.pass.len() > 64 {
+        return Err(ReplayError::Database(format!(
+            "KEK key is {} bytes; BLAKE2b takes 1..=64",
+            kek.pass.len()
         )));
     }
     salt16[..salt.len()].copy_from_slice(salt);
-    person16[..PERSON.len()].copy_from_slice(PERSON);
+    person16[..kek.person.len()].copy_from_slice(kek.person);
 
     let hash = Blake2bParams::new()
         .hash_length(32)
-        .key(PASS)
+        .key(kek.pass)
         .salt(&salt16)
         .personal(&person16)
         .to_state()
@@ -339,13 +400,18 @@ mod tests {
     /// Trimmed from AirServer's bundled database by
     /// `airserver_castdb.py`: full schema, the six tables the receiver reads, three
     /// windows, and `jwt_token` deliberately empty.
+    ///
+    /// **Re-keyed under [`TEST_KEK`]**, not App Dynamic's constants. The structure,
+    /// the secretbox framing and every plaintext are theirs; only the key that opens
+    /// them is ours, so this corpus exercises the whole reader without the build
+    /// having to have seen the installer. Regenerate with `rekey.py` (PROVENANCE §3).
     const TRIMMED: &[u8] = include_bytes!("../fixtures/airserver/db_trimmed.sqlite");
 
     fn open_trimmed() -> (tempfile::TempDir, AirServerDb) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cast.db");
         std::fs::write(&path, TRIMMED).unwrap();
-        let db = AirServerDb::open(&path).unwrap();
+        let db = AirServerDb::open_with_kek(&path, TEST_KEK).unwrap();
         (dir, db)
     }
 
@@ -432,8 +498,8 @@ mod tests {
         std::fs::write(&a_path, TRIMMED).unwrap();
         std::fs::write(&b_path, TRIMMED_512).unwrap();
 
-        let a = AirServerDb::open(&a_path).unwrap();
-        let b = AirServerDb::open(&b_path).unwrap();
+        let a = AirServerDb::open_with_kek(&a_path, TEST_KEK).unwrap();
+        let b = AirServerDb::open_with_kek(&b_path, TEST_KEK).unwrap();
         assert_eq!(a.window_count(), b.window_count());
         assert_eq!(a.covers_until(), b.covers_until());
 
@@ -478,7 +544,7 @@ mod tests {
         let path = dir.path().join("junk.db");
         std::fs::write(&path, b"not a database at all").unwrap();
         assert!(matches!(
-            AirServerDb::open(&path),
+            AirServerDb::open_with_kek(&path, TEST_KEK),
             Err(ReplayError::Database(_))
         ));
     }
@@ -495,7 +561,7 @@ mod tests {
         conn.execute("UPDATE salt SET data = ?1", [vec![0_u8; 16]])
             .unwrap();
         drop(conn);
-        match AirServerDb::open(&path) {
+        match AirServerDb::open_with_kek(&path, TEST_KEK) {
             Err(ReplayError::Database(msg)) => {
                 assert!(
                     msg.contains("authentication failed"),
@@ -512,16 +578,16 @@ mod tests {
     fn kdf_matches_the_reference_implementation() {
         let salt = hex_literal::hex!("a8c8de87cdfc203a9cae9f361f82e253");
         let expect =
-            hex_literal::hex!("bb358af411634b3b21312fa267bafe6a681d233441e6ce6c55b1ca132947a6da");
-        assert_eq!(derive_key(&salt).unwrap(), expect);
+            hex_literal::hex!("05087bde74996d58974a618bf58b8cbdb2689c9692b23941b6ee2f62dff81e20");
+        assert_eq!(derive_key(&salt, TEST_KEK).unwrap(), expect);
     }
 
     #[test]
     fn the_kdf_bounds_its_inputs() {
-        assert!(derive_key(&[1, 2, 3]).is_ok());
-        assert!(derive_key(&[0_u8; 16]).is_ok());
+        assert!(derive_key(&[1, 2, 3], TEST_KEK).is_ok());
+        assert!(derive_key(&[0_u8; 16], TEST_KEK).is_ok());
         assert!(matches!(
-            derive_key(&[0_u8; 17]),
+            derive_key(&[0_u8; 17], TEST_KEK),
             Err(ReplayError::Database(_))
         ));
     }

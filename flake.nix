@@ -45,6 +45,24 @@
       flake = false;
     };
 
+    # AirServer's Windows installer, for the two BLAKE2b constants that open its Cast
+    # credential database (PROVENANCE §3). Pinned so those constants can be carved at
+    # build time instead of living as string literals in `src/airserver_db.rs` — this
+    # tree redistributes neither the installer nor what comes out of it.
+    #
+    # The classic MSI rather than the Store MSIX: its URL is version-stamped and stable,
+    # whereas the `.appinstaller` line rolls forward on its own 48-hour schedule. Both
+    # carry a byte-identical database. Note the *fetch* happens on every evaluation of
+    # this flake, the same way the CDM's does.
+    #
+    # nix/airserver-carve.nix does the carving and is deliberately offset-free, so a
+    # version bump here should not need a code change: verified against 5.7.0, 5.7.1 and
+    # 5.7.2, whose databases sit at three different offsets under two different schemas.
+    airserver-msi-src = {
+      url = "file+https://dl.airserver.com/pc32/AirServer-5.7.2-x64.msi";
+      flake = false;
+    };
+
     # castLabs "Electron for Content Security" — the browser runtime (D36), pinned on
     # *both* platforms rather than taking nixpkgs' Electron on Linux. Same Chromium major
     # everywhere is the point: developing against one Chrome and shipping another means
@@ -128,6 +146,7 @@
     , nix-direnv
     , ffmpeg-windows-src
     , widevine-windows-src
+    , airserver-msi-src
     , electron-linux-src
     , electron-windows-src
     , openscreen-src
@@ -168,6 +187,7 @@
               "linux-firmware"
               "widevine-cdm"
               "widevine-cdm-windows"
+              "airserver-cast-carve"
             ];
         };
       };
@@ -284,6 +304,22 @@
       # build with the "unknown" fallback instead; nothing shipped comes out of a check.
       gitRev = self.shortRev or self.dirtyShortRev or "unknown";
 
+      # Where `cast-replay`'s build.rs finds the two BLAKE2b constants that open an
+      # AirServer credential database — carved out of the pinned installer rather than
+      # written down (nix/airserver-carve.nix).
+      #
+      # Set on the final package builds only, for the same reason as `gitRev` and one
+      # more: everything in `commonArgs` is inherited by every check, and the checks must
+      # not depend on unfree third-party material. They build unprovisioned, which is a
+      # supported state — `Kek::provisioned()` is `None`, the offline fixtures are keyed
+      # under a constant of our own, and the live AirServer path reports `NoKek` instead
+      # of pretending.
+      airserverKekEnvFor = system:
+        let carve = airserverCarveFor system; in {
+          CASTAWAY_AIRSERVER_KEK_PERSON_FILE = "${carve}/kek_person.bin";
+          CASTAWAY_AIRSERVER_KEK_PASS_FILE = "${carve}/kek_pass.bin";
+        };
+
       # Build only dependencies (for caching)
       cargoArtifactsFor = system:
         let craneLib = cranelibFor system;
@@ -331,6 +367,14 @@
         nanorsSrc = moonlight-nanors-src;
       };
 
+      # AirServer's Cast credential database and the two BLAKE2b constants that open it,
+      # carved out of the pinned installer so neither lives in this tree. `cast-replay`
+      # takes the constants through `CASTAWAY_AIRSERVER_KEK_{PERSON,PASS}_FILE`.
+      airserverCarveFor = system: import ./nix/airserver-carve.nix {
+        inherit (pkgsFor system) lib stdenvNoCC python3 p7zip;
+        airserverMsi = airserver-msi-src;
+      };
+
       # Sony's LDAC library, with the decoder in it — which `pkgs.ldacbt` under this pin
       # does not have. `ldac-sys/build.rs` finds it through `LDACBT_LIB_DIR` (#14).
       ldacbtFor = system: import ./nix/ldacbt.nix {
@@ -347,6 +391,7 @@
         baseCargoArtifacts = cargoArtifactsFor system;
         depsOnlyFrom = depsOnlyFromFor system;
         inherit gitRev;
+        airserverKekEnv = airserverKekEnvFor system;
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
         bluetoothFirmware = bluetoothFirmwareFor system;
@@ -385,7 +430,7 @@
           # No renderer, no browser, nothing platform-specific: the build that proves the
           # protocol stack. It is `default` everywhere the full kiosk cannot be built (i.e.
           # Darwin), and what `checks.build` compiles so `nix flake check` stays cheap.
-          castaway-portable = craneLib.buildPackage (commonArgs // {
+          castaway-portable = craneLib.buildPackage (commonArgs // airserverKekEnvFor system // {
             inherit cargoArtifacts;
             CASTAWAY_GIT_REV = gitRev;
             # Only run tests during the check phase, not during build
@@ -400,6 +445,11 @@
           # servers are a third party to the session, so this needs the real internet
           # and a running receiver. `nix run .#yt-selfplay -- http://<receiver>:8080`.
           yt-selfplay = import ./nix/yt-selfplay.nix { inherit pkgs; };
+
+          # The AirServer carve, exposed on its own so a version bump can be verified
+          # before anything that consumes it is rebuilt: `nix build .#airserver-carve`
+          # prints where the database was found and how the constants were confirmed.
+          airserver-carve = airserverCarveFor system;
 
           # The linked GameStream core (D37), exposed on its own so it can be built and
           # cached independently — and so a bump can be checked before anything that

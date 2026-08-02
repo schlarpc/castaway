@@ -126,10 +126,17 @@ Confirmed live with two GETs on 2026-07-29 (`cks_api.py --fetch`).
 
 Depends on: `fixtures/airserver/airserver_*.{der,bin,json}`.
 
-In **5.7.2** the credential database ships as a loose encrypted SQLite file inside
-the MSI. In **2025.7.23** it is gone from the filesystem and linked into
-`AirServer.exe` as the "builtin db" (the giveaway is the string
-`Reverting to builtin db`). Both extract to byte-identical databases.
+The database is linked into `AirServer.exe` as the "builtin db" (the giveaway is the
+string `Reverting to builtin db`) in **both** the 5.7.2 MSI and the 2025.7.23 MSIX,
+and they carve to byte-identical files. An earlier revision of this file said 5.7.2
+shipped it as a loose encrypted SQLite file inside the MSI; it does not — the WiX
+payload cab holds `AirServer.exe` and its DLLs and nothing database-shaped.
+
+It arrived in **5.7.0**: 5.6.1 and earlier contain no SQLite image at all. 5.7.0's is a
+different, smaller file (2 936 832 bytes, `75ddb897…`, eight tables) that carries the
+same 1095 windows but has no `metadata` table; 5.7.1 and 5.7.2 both carry the
+5 488 640-byte nine-table file below. So `metadata` is a schema addition, not a
+constant of the format, and nothing may gate on its presence.
 
 Carving is exact rather than heuristic, because a SQLite header carries its own
 length — page size at `+16` (big-endian u16, `1` meaning 65536) and page count at
@@ -153,11 +160,37 @@ PERSON = "***REMOVED: App Dynamic BLAKE2b personalisation, PROVENANCE S5***"
 PASS   = "***REMOVED: App Dynamic BLAKE2b key, PROVENANCE S6***"
 ```
 
-Both constants are plain literals in the shipped binary — in 5.7.2's
-`AirServer.exe` at `0x1549558` (`PERSON`) and `0x1549588` (`PASS`), adjacent in
-`.rdata`, so `strings | grep 'App Dynamic'` finds them. The **salt is per-database**
-and lives in the file's own `salt` table, so the key must be derived from the file
-rather than hardcoded.
+Both constants are plain literals in the shipped binary — in 5.7.2's `AirServer.exe`
+at file offset `0x1549558` (`PERSON`) and `0x1549588` (`PASS`), adjacent, so
+`strings | grep 'App Dynamic'` finds them. (Those offsets fall in `.data`, not
+`.rdata` as this file used to say; `.rdata`'s raw range in that build ends at
+`0x1521200`.) The **salt is per-database** and lives in the file's own `salt` table, so
+the key must be derived from the file rather than hardcoded.
+
+**Neither constant is checked in.** `src/airserver_db.rs` used to carry them as string
+literals, which meant this repository redistributed App Dynamic's material;
+`nix/airserver-carve.nix` now recovers them at build time from the pinned installer and
+`cast-replay/build.rs` hands them to the crate. A build without them is a supported
+state: `Kek::provisioned()` is `None` and the live AirServer path reports
+`ReplayError::NoKek` rather than silently dropping the identity.
+
+The carver hardcodes **no offsets**, because the offsets above are per-build — across
+5.7.0/5.7.1/5.7.2 the database alone sits at `0xbc7284`, `0xbcb244` and `0xbcff24`.
+Instead:
+
+* the database is located by its own `SQLite format 3\0` header, sized from the page
+  size at `+16` and page count at `+28`, and accepted only after a full
+  `PRAGMA integrity_check` plus the schema the reader needs — the integrity check being
+  the load-bearing gate, since a carve of the wrong length still parses its first page;
+* the constants are located by candidate search anchored on `CompanyName` from the PE
+  version resource, and confirmed by Poly1305 against the carved database. The anchor is
+  *not* either constant (`App Dynamic ehf`, 15 bytes, against a 16-byte personalisation
+  ending in a period) but narrows ~5 M candidate pairs to four. Because the oracle is an
+  AEAD tag, a wrong pair cannot be emitted — the carve either produces the right answer
+  or fails.
+
+Verified against all three 5.7.x builds; `nix build .#airserver-carve` prints where the
+database was found and how the constants were confirmed.
 
 One exception worth knowing, because it fails confusingly: `metadata.json` is
 declared `TEXT` and is **not** a secretbox. It is plaintext `{"generated": <unix>}`.

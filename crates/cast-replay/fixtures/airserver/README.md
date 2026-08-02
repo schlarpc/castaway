@@ -112,7 +112,15 @@ Two structural differences from the CKS table, both load-bearing:
 `db_trimmed.sqlite` and `db_trimmed_512.sqlite` are not credentials the receiver
 uses — they are the corpus `src/airserver_db.rs` is tested against offline. Both
 hold the full schema, the six tables the reader reads, three windows, and an
-*empty* `jwt_token`. Regenerate them with the snippet in that module's tests if the
+*empty* `jwt_token`.
+
+They are **re-keyed under `airserver_db::TEST_KEK`**, not App Dynamic's constants. The
+structure, the secretbox framing and every plaintext are still theirs; only the key that
+opens them is ours. That is what lets `cargo nextest run` exercise the whole reader on a
+machine that has never seen the installer — the real constants are carved at build time
+and are not in this tree (PROVENANCE §3). Re-key with `rekey.py`: it decrypts each BLOB
+under the real KEK, re-seals it under the test one, and leaves anything that does not
+authenticate (the salt row, the empty `jwt_token`) untouched. Regenerate them with the snippet in that module's tests if the
 schema ever moves.
 
 The second exists because its page size is 512 bytes, so the 778-byte encrypted
