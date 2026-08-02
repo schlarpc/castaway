@@ -4,15 +4,73 @@ on:
   pull_request:
   push:
 
+# A push that lands while the previous one is still building makes the older run
+# irrelevant, and these jobs are long enough that letting both finish wastes a lot of
+# runner time. Not on `main`: there, every commit's result is worth having on its own.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  tests:
+  # Everything that is a mistake in the flake rather than in the code, found in a minute
+  # instead of ninety. `--no-build` evaluates every check, package, devShell and NixOS
+  # module without realising any of them, which is where an assertion like the CEF
+  # version-agreement guard fires — that one took out a dependabot PR at the end of an
+  # hour-long build, having been knowable at the start of it.
+  #
+  # It also enumerates the checks for the matrix below, so the two cannot drift: a check
+  # added to `flake.nix` becomes a job here, and nobody has to remember to list it.
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      checks: ${{ steps.list.outputs.checks }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/nix-runner
+      - run: nix flake check --no-build
+      - id: list
+        run: |
+          checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
+          echo "checks=$checks" >> "$GITHUB_OUTPUT"
+          echo "$checks"
+
+  # The shipped artifact, and the job that warms the cache for everything below: most of
+  # what the checks build is the same dependency tree this needs, so running it first
+  # turns the matrix from N full builds into N mostly-cached ones.
+  build:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: DeterminateSystems/nix-installer-action@v22
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
-      - run: nix build
-      - run: nix flake check
+      - uses: ./.github/actions/nix-runner
+      - run: nix build --print-build-logs
+
+  # One job per check, which buys two things.
+  #
+  # It is the disk fix that keeps working as the project grows: each check gets a whole
+  # runner rather than sharing one with twenty others, so what broke here cannot come back
+  # by accretion.
+  #
+  # And it is a legible result. `nix flake check` in a single step produced one red X and a
+  # log that stopped mid-build; this names the check that failed, and `fail-fast: false`
+  # means a red `clippy` no longer hides whether the VM tests would have passed.
+  check:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(needs.discover.outputs.checks) }}
+    name: check (${{ matrix.check }})
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/nix-runner
+      - run: nix build --print-build-logs '.#checks.x86_64-linux.${{ matrix.check }}'

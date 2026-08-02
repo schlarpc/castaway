@@ -1,0 +1,41 @@
+name: Prepare a Nix runner
+description: >
+  Free enough disk for a Nix build, install Nix, and attach the build cache.
+  Shared by every job in the test workflow so the disk fix cannot drift between them.
+
+runs:
+  using: composite
+  steps:
+    # The reason CI was red from 2026-07-24 to 2026-08-02, on every commit and every
+    # dependabot PR: `No space left on device` writing rmeta into a crane target dir. Not a
+    # test failure — the job simply grew past the runner's disk, and the shape it fails in
+    # is misleading. Sometimes nix reports it; more often the root filesystem fills, the
+    # runner service dies with "the runner has received a shutdown signal", and the log
+    # just stops mid-build with no error in it at all.
+    #
+    # A GitHub-hosted runner has ~14 GB free on `/`, which is where `/nix` lives, and this
+    # build wants considerably more: a dozen crane derivations that each compile the whole
+    # dependency tree into their own `target/`, four NixOS VM tests that build full system
+    # closures and disk images, Electron, Widevine, ffmpeg, LLVM and an MSVC sysroot.
+    #
+    # The image also ships ~25 GB of toolchains this project never touches. Deleting them
+    # costs about a minute and buys more room than everything above needs. `df` on both
+    # sides so the next person to hit this can see the headroom rather than guess at it.
+    - name: Make room for the build
+      shell: bash
+      run: |
+        echo "::group::Disk before"
+        df -h /
+        echo "::endgroup::"
+        # `|| true` throughout: these are the runner image's business, not ours, and a
+        # path that has moved or gone away must not fail the build we are making room for.
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                    /usr/share/swift /usr/local/share/powershell /usr/local/share/boost \
+                    /opt/hostedtoolcache /usr/lib/google-cloud-sdk || true
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        echo "::group::Disk after"
+        df -h /
+        echo "::endgroup::"
+
+    - uses: DeterminateSystems/nix-installer-action@v22
+    - uses: DeterminateSystems/magic-nix-cache-action@v14
