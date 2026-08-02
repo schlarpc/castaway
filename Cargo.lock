@@ -1313,6 +1313,9 @@ dependencies = [
 [[package]]
 name = "crypto-playfair"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+]
 
 [[package]]
 name = "crypto-raop"

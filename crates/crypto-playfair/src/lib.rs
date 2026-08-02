@@ -46,6 +46,46 @@ pub const EKEY_LEN: usize = 72;
 /// The length of the SETUP2 key message retained from `/fp-setup`.
 pub const KEY_MESSAGE_LEN: usize = 164;
 
+/// How many derivation modes the recovered tables hold.
+const MODE_COUNT: usize = 4;
+
+/// Why a key message could not be unwrapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PlayFairError {
+    /// The key message's derivation-mode byte names a mode the tables do not hold.
+    #[error("unknown fairplay derivation mode {0}")]
+    UnknownMode(u8),
+}
+
+/// Which of the four recovered derivation tables a key message selects.
+///
+/// A newtype because the raw byte is offset 12 of a body a sender POSTs to `/fp-setup`,
+/// and every use of it is an unchecked index into a four-entry table. Validating it here
+/// is what stops `MESSAGE_KEY[255]` from aborting the session actor — the same treatment
+/// `crypto_fairplay::Mode` already gives SETUP1's selector at offset 14.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DerivationMode(usize);
+
+impl DerivationMode {
+    /// The mode a key message selects.
+    ///
+    /// # Errors
+    /// [`PlayFairError::UnknownMode`] if byte 12 does not name one of the four.
+    fn of(message_in: &[u8; KEY_MESSAGE_LEN]) -> Result<Self, PlayFairError> {
+        let raw = message_in[12];
+        if usize::from(raw) < MODE_COUNT {
+            Ok(Self(usize::from(raw)))
+        } else {
+            Err(PlayFairError::UnknownMode(raw))
+        }
+    }
+
+    const fn get(self) -> usize {
+        self.0
+    }
+}
+
 /// Read a little-endian `u32`. The transcribed C aliases byte arrays as `uint32_t*`
 /// throughout, which is native-endian; every machine this targets is little-endian.
 fn rd32(b: &[u8], i: usize) -> u32 {
@@ -227,9 +267,9 @@ fn cycle(block: &mut [u8; 16], schedule: &[[u32; 4]; 11]) {
 }
 
 /// Decrypt the 164-byte key message into 128 bytes.
-fn decrypt_message(message_in: &[u8; KEY_MESSAGE_LEN]) -> [u8; 128] {
+fn decrypt_message(message_in: &[u8; KEY_MESSAGE_LEN], mode: DerivationMode) -> [u8; 128] {
     let mut out = [0u8; 128];
-    let mode = usize::from(message_in[12]);
+    let mode = mode.get();
     let mut buffer = [0u8; 16];
 
     for i in 0..8 {
@@ -501,8 +541,12 @@ fn sap_hash(block_in: &[u8; 64], key_out: &mut [u8; 16]) {
 }
 
 /// Five rounds of MD5-plus-scramble over the reassembled SAP.
-fn generate_session_key(old_sap: &[u8], message_in: &[u8; KEY_MESSAGE_LEN]) -> [u8; 16] {
-    let decrypted = decrypt_message(message_in);
+fn generate_session_key(
+    old_sap: &[u8],
+    message_in: &[u8; KEY_MESSAGE_LEN],
+    mode: DerivationMode,
+) -> [u8; 16] {
+    let decrypted = decrypt_message(message_in, mode);
 
     let mut new_sap = [0u8; 320];
     new_sap[0x000..0x011].copy_from_slice(&STATIC_SOURCE_1);
@@ -537,9 +581,17 @@ fn generate_session_key(old_sap: &[u8], message_in: &[u8; KEY_MESSAGE_LEN]) -> [
 ///
 /// `key_message` is the 164-byte SETUP2 body retained from `/fp-setup`; `cipher_text` is
 /// the 72-byte `ekey` from the RTSP `SETUP` plist.
-#[must_use]
-pub fn decrypt_key(key_message: &[u8; KEY_MESSAGE_LEN], cipher_text: &[u8; EKEY_LEN]) -> [u8; 16] {
-    let sap_key = generate_session_key(&DEFAULT_SAP, key_message);
+///
+/// # Errors
+/// [`PlayFairError::UnknownMode`] if the key message's derivation-mode byte is not one
+/// of the four the tables hold. It is sender-controlled and unauthenticated, so this is
+/// a refusal rather than an assertion.
+pub fn decrypt_key(
+    key_message: &[u8; KEY_MESSAGE_LEN],
+    cipher_text: &[u8; EKEY_LEN],
+) -> Result<[u8; 16], PlayFairError> {
+    let mode = DerivationMode::of(key_message)?;
+    let sap_key = generate_session_key(&DEFAULT_SAP, key_message, mode);
     let schedule = generate_key_schedule(&sap_key);
 
     let mut block = [0u8; 16];
@@ -553,7 +605,7 @@ pub fn decrypt_key(key_message: &[u8; KEY_MESSAGE_LEN], cipher_text: &[u8; EKEY_
     let mut tmp = [0u8; 16];
     key_xor(&out, &mut tmp, &X_KEY, 1);
     key_xor(&tmp, &mut out, &Z_KEY, 1);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

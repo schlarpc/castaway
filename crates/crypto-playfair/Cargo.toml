@@ -8,6 +8,7 @@ repository.workspace = true
 description = "FairPlay v3 key derivation: the ekey-to-AES unwrap that gates AirPlay mirroring."
 
 [dependencies]
+thiserror.workspace = true
 
 [lints]
 workspace = true

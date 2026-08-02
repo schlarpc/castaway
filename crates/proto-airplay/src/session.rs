@@ -773,7 +773,16 @@ impl AirPlaySession {
             warn!("SETUP carries key material but /fp-setup has not completed");
             return refuse(451);
         };
-        let aes_key = crypto_playfair::decrypt_key(key_message, &ekey);
+        // The derivation mode is byte 12 of a body the sender POSTed to `/fp-setup`, and
+        // it selects one of four recovered tables. A value outside that range is a
+        // sender that is not speaking FairPlay, not a receiver bug — refuse the SETUP.
+        let aes_key = match crypto_playfair::decrypt_key(key_message, &ekey) {
+            Ok(key) => key,
+            Err(e) => {
+                warn!(error = %e, "SETUP key material could not be unwrapped");
+                return refuse(451);
+            }
+        };
         // Bit 27's other half. A sender that completed `/pair-verify` encrypts with
         // `SHA512(aeskey ‖ shared)[0..16]`; one that skipped it uses the unwrapped key
         // as-is. Which happened is exactly `paired_secret`, and getting it wrong renders
@@ -1930,7 +1939,7 @@ mod tests {
         let key_message: [u8; crypto_playfair::KEY_MESSAGE_LEN] =
             unhex(FP_KEY_MESSAGE).try_into().unwrap();
         let ekey: [u8; crypto_playfair::EKEY_LEN] = unhex(FP_EKEY).try_into().unwrap();
-        let aes_key = crypto_playfair::decrypt_key(&key_message, &ekey);
+        let aes_key = crypto_playfair::decrypt_key(&key_message, &ekey).unwrap();
         let id = StreamConnectionId::from_plist_signed(STREAM_ID);
         let expected = MirrorKeys::derive(&crate::pairing::rekey_media(&aes_key, &shared), id);
         assert_eq!(keys.key, expected.key);
@@ -1952,7 +1961,7 @@ mod tests {
         let key_message: [u8; crypto_playfair::KEY_MESSAGE_LEN] =
             unhex(FP_KEY_MESSAGE).try_into().unwrap();
         let ekey: [u8; crypto_playfair::EKEY_LEN] = unhex(FP_EKEY).try_into().unwrap();
-        let aes_key = crypto_playfair::decrypt_key(&key_message, &ekey);
+        let aes_key = crypto_playfair::decrypt_key(&key_message, &ekey).unwrap();
         let expected =
             MirrorKeys::derive(&aes_key, StreamConnectionId::from_plist_signed(STREAM_ID));
         assert_eq!(keys.key, expected.key);

@@ -47,7 +47,7 @@ fn every_published_vector_derives_its_key() {
     for (i, (msg, ekey, expected)) in VECTORS.iter().enumerate() {
         let msg: [u8; KEY_MESSAGE_LEN] = unhex(msg).try_into().expect("164-byte key message");
         let ekey: [u8; EKEY_LEN] = unhex(ekey).try_into().expect("72-byte ekey");
-        let got = decrypt_key(&msg, &ekey);
+        let got = decrypt_key(&msg, &ekey).expect("a published vector names a real mode");
         if hex(&got) != *expected {
             failures.push(format!("  vector {i}: got {} want {expected}", hex(&got)));
         }
@@ -76,4 +76,26 @@ fn all_four_modes_are_covered() {
         seen[mode] = true;
     }
     assert!(seen.iter().all(|&s| s), "modes covered: {seen:?}");
+}
+
+#[test]
+fn a_mode_byte_the_tables_do_not_hold_is_refused_rather_than_panicking() {
+    // Byte 12 comes straight off the wire: a sender POSTs the whole 164-byte SETUP2 body
+    // to /fp-setup and it is retained verbatim. The four recovered tables are indexed by
+    // it without a bounds check, so anything >= 4 used to abort the session actor on the
+    // *next* RTSP SETUP, which is not something a caller can catch (#121).
+    let mut msg: [u8; KEY_MESSAGE_LEN] = unhex(VECTORS[0].0).try_into().expect("164 bytes");
+    let ekey: [u8; EKEY_LEN] = unhex(VECTORS[0].1).try_into().expect("72 bytes");
+    for raw in [4u8, 5, 128, 255] {
+        msg[12] = raw;
+        assert_eq!(
+            decrypt_key(&msg, &ekey),
+            Err(crypto_playfair::PlayFairError::UnknownMode(raw))
+        );
+    }
+    // …and all four real modes still derive, which the published vectors cover in full.
+    for raw in 0..4u8 {
+        msg[12] = raw;
+        assert!(decrypt_key(&msg, &ekey).is_ok());
+    }
 }
