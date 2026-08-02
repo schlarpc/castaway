@@ -400,10 +400,24 @@ pub fn build_payload(
 /// wrapping is the normal case rather than an edge one. Masking wrong makes the
 /// controller reassemble in the wrong order, which produces a part that accepts the
 /// upload and then does not work.
+///
+/// It is *not* `n & 0x7F`. The kernel's `rtl_download_firmware` runs
+/// `dl_cmd->index = j++; if (dl_cmd->index == 0x7f) j = 1;` — index 0 marks the start of
+/// a download, so it is emitted once and never again. The first cycle is 0..=0x7F and
+/// every cycle after it is 1..=0x7F, period 127. A plain mask re-emits 0 at fragment 128
+/// and disagrees with the controller on every fragment from there on; the only blob we
+/// ship is 120 fragments, so the difference is latent rather than absent.
 #[must_use]
+// Both casts are of a value already reduced to 0..=0x7F by the branch above them.
+#[allow(clippy::cast_possible_truncation)]
 pub const fn index_byte(n: usize, last: bool) -> u8 {
-    #[allow(clippy::cast_possible_truncation)]
-    let counter = (n as u8) & INDEX_MASK;
+    const PERIOD: usize = INDEX_MASK as usize;
+    let counter = if n <= PERIOD {
+        n as u8
+    } else {
+        // Cycles of 127 over 1..=0x7F, skipping the download-start marker.
+        ((n - PERIOD - 1) % PERIOD + 1) as u8
+    };
     if last {
         counter | END_FLAG
     } else {
@@ -541,10 +555,14 @@ mod tests {
         // upload and then simply does not work.
         assert_eq!(index_byte(0, false), 0x00);
         assert_eq!(index_byte(127, false), 0x7F);
-        assert_eq!(index_byte(128, false), 0x00, "counter wraps");
-        assert_eq!(index_byte(129, false), 0x01);
+        // btrtl.c wraps to 1, not to 0: index 0 marks the start of a download and is
+        // emitted once. Every cycle after the first runs 1..=0x7F, period 127.
+        assert_eq!(index_byte(128, false), 0x01, "counter wraps to 1, not 0");
+        assert_eq!(index_byte(129, false), 0x02);
+        assert_eq!(index_byte(254, false), 0x7F, "end of the second cycle");
+        assert_eq!(index_byte(255, false), 0x01, "and round again");
         assert_eq!(index_byte(3, true), 0x83, "end flag on the last fragment");
-        assert_eq!(index_byte(128, true), 0x80);
+        assert_eq!(index_byte(128, true), 0x81);
     }
 
     #[tokio::test]
@@ -594,8 +612,8 @@ mod tests {
         let indices = indices(&transport);
         assert_eq!(indices.len(), 130);
         assert_eq!(indices[127], 0x7F);
-        assert_eq!(indices[128], 0x00, "wrapped");
-        assert_eq!(indices[129], 0x01 | END_FLAG);
+        assert_eq!(indices[128], 0x01, "wrapped to 1, as btrtl.c does");
+        assert_eq!(indices[129], 0x02 | END_FLAG);
     }
 
     #[tokio::test]
