@@ -34,6 +34,32 @@ use tokio::sync::mpsc;
 const PEER: &str = "AA:BB:CC:DD:EE:FF";
 const HANDLE: u16 = 0x000B;
 
+/// A second phone, and the link the scripted controller gives it.
+///
+/// Two of them is not an exotic case — it is a room with two people in it, which is the
+/// room this panel lives in.
+const PEER2: &str = "99:88:77:66:55:44";
+const HANDLE2: u16 = 0x000C;
+
+/// The ACL handle the scripted controller hands a peer.
+///
+/// Derived from the address rather than remembered, so the responder stays a pure
+/// function of the command it is answering — and pinned, so the first phone keeps the
+/// handle every test above names.
+///
+/// This is what stopped the two-phone case from being written before: the responder
+/// answered *every* `ACCEPT_CONNECTION_REQUEST` with `PEER` on `HANDLE`, whatever address
+/// had actually paged us. A second phone's link therefore arrived as a duplicate of the
+/// first, its AVDTP landed on a link belonging to someone else, and the symptom was the
+/// adapter appearing not to answer.
+fn handle_for(addr: BdAddr) -> u16 {
+    if addr == PEER2.parse().unwrap() {
+        HANDLE2
+    } else {
+        HANDLE
+    }
+}
+
 /// A transport that answers every command with a plausible completion, so bring-up
 /// proceeds without the test scripting eight round trips by hand.
 fn transport() -> Arc<ScriptedTransport> {
@@ -69,7 +95,11 @@ fn respond(acl_packets: u16, report_completions: bool, sent: &HciPacket) -> Vec<
             params: Bytes::from(params),
         }];
     }
-    let HciPacket::Command { opcode, .. } = sent else {
+    let HciPacket::Command {
+        opcode,
+        params: cmd,
+    } = sent
+    else {
         return Vec::new();
     };
     let mut params = vec![0x01];
@@ -86,10 +116,15 @@ fn respond(acl_packets: u16, report_completions: bool, sent: &HciPacket) -> Vec<
             params.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         }
         substrate_hci::OpCode::ACCEPT_CONNECTION_REQUEST => {
-            // Command status, then the link coming up.
-            let addr: BdAddr = PEER.parse().unwrap();
+            // Command status, then the link coming up — for the address that actually
+            // paged us, on a handle of its own. Answering with a fixed peer is what a
+            // controller with one phone in the world would do, and it is invisible until
+            // there are two (see `handle_for`).
+            let addr = <[u8; 6]>::try_from(&cmd[..6])
+                .map(BdAddr::from_wire)
+                .unwrap_or_else(|_| PEER.parse().unwrap());
             let mut complete = vec![Status::SUCCESS.0];
-            complete.extend_from_slice(&HANDLE.to_le_bytes());
+            complete.extend_from_slice(&handle_for(addr).to_le_bytes());
             complete.extend_from_slice(&addr.to_wire());
             complete.push(0x01); // ACL
             complete.push(0x00); // encryption off
@@ -276,9 +311,16 @@ async fn open_channel_on(
     })
     .await;
 
-    // Accept its configuration, and configure our own direction.
-    push_pdu(
+    // Accept its configuration, and configure our own direction — on the link this
+    // channel belongs to. These two used to go out on `HANDLE` whatever link the caller
+    // named, which is invisible with one phone connected and fatal with two: L2CAP channel
+    // ids are per-link, so a second phone's 0x0040 is a *different* channel that happens
+    // to share a number. The configuration handshake landed on the first phone's channel,
+    // the second one never reached Open, and every AVDTP signal it then sent was dropped —
+    // which is what "the second link's signalling goes unanswered" in #95 was.
+    push_pdu_on(
         transport,
+        handle,
         &L2capPdu::new(
             Cid::SIGNALING,
             L2capSignal::ConfigurationResponse {
@@ -292,8 +334,9 @@ async fn open_channel_on(
             .unwrap(),
         ),
     );
-    push_pdu(
+    push_pdu_on(
         transport,
+        handle,
         &L2capPdu::new(
             Cid::SIGNALING,
             L2capSignal::ConfigurationRequest {
@@ -2461,15 +2504,22 @@ async fn a_queue_that_fills_drops_frames_rather_than_the_session() {
         "a full queue must not end the session"
     );
 
+    // A packet coded at a bitpool nothing in the flood used, so it is identifiable, and
+    // read for as long as the backlog takes to clear rather than expected next: the
+    // adapter is still delivering the overflow while this is sent, and which frame arrives
+    // first is a race. What is being claimed is that audio *keeps flowing*, not that a
+    // queue that just overflowed is empty on the instant.
     push_pdu(&transport, &L2capPdu::new(media, sbc_packet(9000, 41)));
-    let after = tokio::time::timeout(Duration::from_secs(2), frames.recv())
-        .await
-        .expect("audio must keep flowing once the queue drains")
-        .expect("the frame channel should still be open");
-    assert_eq!(
-        after.data[2], 41,
-        "and it must be the packet sent after the flood"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let frame = tokio::time::timeout_at(deadline, frames.recv())
+            .await
+            .expect("audio must keep flowing after the queue has overflowed")
+            .expect("the frame channel should still be open");
+        if frame.data[2] == 41 {
+            break;
+        }
+    }
 }
 
 /// The depth of the adapter's audio queue, mirrored from `adapter.rs`. Not public, and not
@@ -2720,5 +2770,261 @@ async fn a_closed_stream_can_be_configured_again_at_a_new_rate() {
         format.sample_rate(),
         48_000,
         "the second session must be sized for what was negotiated the second time"
+    );
+}
+
+/// Drive an adapter built from `config` to the point where `peer`'s ACL link exists.
+///
+/// The two-adapter half of [`connected`]: a test that restarts the receiver, or connects a
+/// second phone, needs to choose the configuration and the address rather than take the
+/// one address the helper above hardcodes.
+async fn connected_as(
+    transport: &Arc<ScriptedTransport>,
+    config: BluetoothConfig,
+    peer: &str,
+) -> mpsc::Receiver<SourceMessage> {
+    let adapter = Arc::new(BluetoothAdapter::new(
+        Arc::clone(transport) as Arc<dyn HciTransport>,
+        config,
+    ));
+    let (tx, rx) = mpsc::channel(64);
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::Bluetooth, "listener"), tx);
+    tokio::spawn(Arc::clone(&adapter).run(sink));
+    eventually("scan enable", || {
+        transport
+            .sent_commands()
+            .contains(&substrate_hci::OpCode::WRITE_SCAN_ENABLE)
+            .then_some(())
+    })
+    .await;
+    page_us(transport, peer).await;
+    rx
+}
+
+/// A phone paging the receiver, and the receiver accepting.
+async fn page_us(transport: &ScriptedTransport, peer: &str) {
+    let addr: BdAddr = peer.parse().unwrap();
+    let before = transport
+        .sent_commands()
+        .iter()
+        .filter(|c| **c == substrate_hci::OpCode::ACCEPT_CONNECTION_REQUEST)
+        .count();
+    let mut params = addr.to_wire().to_vec();
+    params.extend_from_slice(&[0x0C, 0x02, 0x5A]); // class of device
+    params.push(0x01); // ACL
+    transport.push(HciPacket::Event {
+        code: code::CONNECTION_REQUEST,
+        params: Bytes::from(params),
+    });
+    eventually("connection accepted", || {
+        (transport
+            .sent_commands()
+            .iter()
+            .filter(|c| **c == substrate_hci::OpCode::ACCEPT_CONNECTION_REQUEST)
+            .count()
+            > before)
+            .then_some(())
+    })
+    .await;
+}
+
+/// The parameters of the last command of `opcode` the adapter sent.
+fn last_command(transport: &ScriptedTransport, want: substrate_hci::OpCode) -> Option<Bytes> {
+    transport
+        .sent()
+        .into_iter()
+        .filter_map(|p| match p {
+            HciPacket::Command { opcode, params } if opcode == want => Some(params),
+            _ => None,
+        })
+        .next_back()
+}
+
+#[tokio::test]
+async fn a_bonded_phone_reconnects_after_a_restart_and_gets_straight_to_audio() {
+    // #68's whole promise: a guest pairs once and every visit afterwards is silent — no
+    // prompt, no confirmation, no re-pairing. `host.rs` covers the key store as a pure
+    // unit; nothing had ever carried a key across a *restart* and out the other side to a
+    // second stream, which is the only form in which the promise is actually made.
+    let first = transport();
+    let bonded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = BluetoothConfig {
+        decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
+        on_paired: Some(Arc::new({
+            let bonded = Arc::clone(&bonded);
+            move |addr, key| {
+                if let Some(key) = key {
+                    bonded.lock().unwrap().push((addr, key));
+                }
+            }
+        })),
+        ..BluetoothConfig::default()
+    };
+    let _rx = connected_as(&first, config, PEER).await;
+
+    // The controller finishes pairing and hands up the key, which is the moment the
+    // receiver is supposed to write it down.
+    let addr: BdAddr = PEER.parse().unwrap();
+    let key = [0x5Au8; 16];
+    let mut params = addr.to_wire().to_vec();
+    params.extend_from_slice(&key);
+    params.push(0x04); // unauthenticated combination key, P-192
+    first.push(HciPacket::Event {
+        code: code::LINK_KEY_NOTIFICATION,
+        params: Bytes::from(params),
+    });
+    let stored = eventually("the key being persisted", || {
+        bonded.lock().unwrap().first().copied()
+    })
+    .await;
+    assert_eq!(
+        stored.0, addr,
+        "the key must be filed under the right phone"
+    );
+
+    // Restart: a second adapter, a second controller, nothing in common with the first
+    // but what was written down.
+    let restarted = transport();
+    let mut rx = connected_as(
+        &restarted,
+        BluetoothConfig {
+            decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
+            link_keys: vec![stored],
+            ..BluetoothConfig::default()
+        },
+        PEER,
+    )
+    .await;
+
+    // The controller asks who this is. A receiver that has forgotten answers negatively,
+    // and the phone prompts its owner to pair again — in a hackerspace, at the panel,
+    // with the music already playing on someone else's phone.
+    restarted.push(HciPacket::Event {
+        code: code::LINK_KEY_REQUEST,
+        params: Bytes::from(addr.to_wire().to_vec()),
+    });
+    let reply = eventually("the stored key being offered", || {
+        last_command(&restarted, substrate_hci::OpCode::LINK_KEY_REQUEST_REPLY)
+    })
+    .await;
+    assert!(
+        !restarted
+            .sent_commands()
+            .contains(&substrate_hci::OpCode::LINK_KEY_REQUEST_NEGATIVE_REPLY),
+        "a bonded phone must never be asked to pair again"
+    );
+    assert_eq!(&reply[..6], &addr.to_wire(), "answered for the right phone");
+    assert_eq!(&reply[6..22], &key, "and with the key that was stored");
+
+    // …and the point of all of it: audio, without a human touching anything.
+    let (_signaling, media, _seid) =
+        stream_up_as(&restarted, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (mut frames, _) = audio_session(&mut rx).await;
+    push_pdu(&restarted, &L2capPdu::new(media, sbc_packet(1, 35)));
+    tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("a reconnected phone must reach the speakers")
+        .expect("the frame channel should be open");
+}
+
+#[tokio::test]
+async fn a_second_phone_that_starts_playing_takes_the_speakers_and_pauses_the_first() {
+    // Two phones at once, which is a room with two people in it. The policy is #68's —
+    // one phone at a time owns the speakers, and the one that loses is *told*, with an
+    // AVRCP pause, rather than left playing into a decoder that has stopped listening.
+    //
+    // Pinned rather than assumed because #72 proposes changing it: blending several
+    // senders instead of preempting. When that lands this test is what says what the old
+    // behaviour was, and it should be rewritten rather than deleted.
+    let (transport, mut rx) = connected().await;
+    let (_signaling, media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (mut frames, _) = audio_session(&mut rx).await;
+    // The first phone needs a control channel, or there is nowhere to send the pause and
+    // the preemption is silently skipped.
+    let (_, first_avctp_peer) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    push_pdu(&transport, &L2capPdu::new(media, sbc_packet(1, 35)));
+    tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("the first phone should be playing")
+        .expect("open");
+
+    // A second phone connects on a link of its own and starts.
+    page_us(&transport, PEER2).await;
+    let (signaling2, _) = open_channel_on(&transport, HANDLE2, Psm::AVDTP, 0x0060).await;
+    let discover = avdtp_on(&transport, HANDLE2, signaling2, 1, Signal::Discover, &[]).await;
+    let seid2 = eventually("the last endpoint on the second link", || {
+        discover
+            .payload
+            .chunks(2)
+            .filter_map(|c| Seid::from_shifted(c[0]).ok())
+            .next_back()
+    })
+    .await;
+    let chosen = sbc_at(SampleRates::HZ_48000);
+    let codec = chosen.encode();
+    let mut set = vec![seid2.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    let reply = avdtp_on(
+        &transport,
+        HANDLE2,
+        signaling2,
+        3,
+        Signal::SetConfiguration,
+        &set,
+    )
+    .await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "the second phone gets its own endpoint, on its own link"
+    );
+    avdtp_on(
+        &transport,
+        HANDLE2,
+        signaling2,
+        4,
+        Signal::Open,
+        &[seid2.shifted()],
+    )
+    .await;
+    let (_media2, _) = open_channel_on(&transport, HANDLE2, Psm::AVDTP, 0x0061).await;
+
+    let before = sent_pdus(&transport).len();
+    avdtp_on(
+        &transport,
+        HANDLE2,
+        signaling2,
+        5,
+        Signal::Start,
+        &[seid2.shifted()],
+    )
+    .await;
+
+    // The second phone's session opens…
+    let (_frames2, format2) = audio_session(&mut rx).await;
+    assert_eq!(
+        format2.sample_rate(),
+        48_000,
+        "the second session must be the second phone's negotiation, not the first's"
+    );
+
+    // …and the first is told to stop, on its own AVRCP channel. Without this it keeps
+    // sending into a decoder that has moved on, and pause/play cannot recover it, because
+    // it was never in a state that needed re-starting.
+    let paused = eventually("the first phone being paused", || {
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            // 0x7C is PASS THROUGH, 0x46 the PAUSE operand.
+            .find(|pdu| {
+                pdu.cid == first_avctp_peer && pdu.payload.windows(2).any(|w| w == [0x7C, 0x46])
+            })
+    })
+    .await;
+    assert_eq!(
+        paused.cid, first_avctp_peer,
+        "the pause belongs to the phone that lost the speakers, not the one that took them"
     );
 }
