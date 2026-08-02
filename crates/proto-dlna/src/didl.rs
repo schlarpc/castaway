@@ -118,10 +118,17 @@ pub fn parse(blob: &str) -> Didl {
         return out;
     }
     let mut reader = quick_xml::Reader::from_str(blob);
-    reader.config_mut().trim_text(true);
+    // A bare `&` in a title is malformed XML that control points nonetheless send, and
+    // quick-xml 0.38 began failing the *read* on one rather than only the unescape. Since
+    // a read error ends the scan, refusing it would drop every field after the offending
+    // one — the opposite of what the "never fails" contract above promises.
+    reader.config_mut().allow_dangling_amp = true;
 
     // The element whose text we are currently collecting, by local name.
     let mut field: Option<String> = None;
+    // Its text so far: character data arrives in fragments split around entity
+    // references (see `xmlref`), so the value is only complete at the closing tag.
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
@@ -133,6 +140,7 @@ pub fn parse(blob: &str) -> Didl {
                     }
                 }
                 field = Some(name);
+                text.clear();
             }
             Ok(Event::Empty(e)) => {
                 if local_name(e.name().as_ref()) == "res" {
@@ -142,30 +150,34 @@ pub fn parse(blob: &str) -> Didl {
                 }
                 field = None;
             }
-            Ok(Event::Text(t)) => {
-                let Some(name) = field.as_deref() else {
-                    continue;
-                };
-                let Ok(value) = t.unescape() else { continue };
-                let value = value.trim();
-                if value.is_empty() {
-                    continue;
+            Ok(Event::Text(t)) if field.is_some() => {
+                if let Ok(v) = t.xml10_content() {
+                    text.push_str(&v);
                 }
-                assign(&mut out, name, value);
+            }
+            // An entity reference is its own event now. One this parser cannot resolve is
+            // dropped rather than failing the field: `&nbsp;` in a title should cost the
+            // space, not the title.
+            Ok(Event::GeneralRef(r)) if field.is_some() => {
+                if let Some(v) = crate::xmlref::resolve(&r) {
+                    text.push_str(&v);
+                }
             }
             // Same reason as the SOAP layer: a title wrapped in CDATA is legal, and the
             // old comment here claimed to tolerate it while the code dropped it.
-            Ok(Event::CData(c)) => {
-                let Some(name) = field.as_deref() else {
-                    continue;
-                };
-                let value = String::from_utf8_lossy(c.as_ref());
-                let value = value.trim();
-                if !value.is_empty() {
-                    assign(&mut out, name, value);
-                }
+            Ok(Event::CData(c)) if field.is_some() => {
+                text.push_str(&String::from_utf8_lossy(c.as_ref()));
             }
-            Ok(Event::End(_)) => field = None,
+            Ok(Event::End(_)) => {
+                // The text is complete only here, so this is where the field is recorded.
+                if let Some(name) = field.take() {
+                    let value = text.trim();
+                    if !value.is_empty() {
+                        assign(&mut out, &name, value);
+                    }
+                }
+                text.clear();
+            }
             Ok(Event::Eof) | Err(_) => break,
             // Comments, CDATA, the declaration and the rest carry nothing this reads, but
             // must not end the scan: a control point that wraps a title in CDATA or leads
@@ -312,6 +324,44 @@ mod tests {
         assert_eq!(d.art_url.as_deref(), Some("http://server/art.jpg"));
         assert_eq!(d.duration, Some(Duration::from_secs(366)));
         assert_eq!(d.kind, ItemKind::Audio);
+    }
+
+    /// quick-xml 0.38 began delivering entity references as their own events, splitting a
+    /// text run into fragments. Taking only the first one silently truncates every value
+    /// at its first entity — "Simon & Garfunkel" would reach the card as "Simon", which
+    /// looks like correct metadata rather than a parser bug.
+    #[test]
+    fn a_title_is_not_truncated_at_its_first_entity() {
+        let d = parse(
+            r#"<DIDL-Lite><item><dc:title>Tom &amp; Jerry &lt;1940&gt;</dc:title>
+               <upnp:artist>AC&#47;DC</upnp:artist>
+               <upnp:albumArtURI>http://s/art?w=1&amp;h=2</upnp:albumArtURI>
+               </item></DIDL-Lite>"#,
+        );
+        assert_eq!(d.title.as_deref(), Some("Tom & Jerry <1940>"));
+        assert_eq!(d.artist.as_deref(), Some("AC/DC"));
+        assert_eq!(d.art_url.as_deref(), Some("http://s/art?w=1&h=2"));
+    }
+
+    /// The contract above says parsing never fails. quick-xml 0.38 made a bare `&` fail
+    /// the *read*, and a read error ends the scan — so one sloppy title would have cost
+    /// every field after it, not just its own.
+    #[test]
+    fn a_bare_ampersand_does_not_discard_the_rest_of_the_item() {
+        let d = parse(
+            r#"<DIDL-Lite><item><dc:title>AT&T Bare</dc:title>
+               <upnp:album>After</upnp:album></item></DIDL-Lite>"#,
+        );
+        assert_eq!(d.album.as_deref(), Some("After"));
+    }
+
+    /// An undeclared entity has no defined expansion. Dropping it keeps the rest of the
+    /// title, which is the forgiving half of the contract; failing the field would trade
+    /// a whole title for one character.
+    #[test]
+    fn an_unresolvable_entity_costs_only_itself() {
+        let d = parse(r#"<item><dc:title>Hard&nbsp;Rock</dc:title></item>"#);
+        assert_eq!(d.title.as_deref(), Some("HardRock"));
     }
 
     /// Prefixes are matched on local name because control points disagree about them —

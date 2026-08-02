@@ -65,13 +65,20 @@ impl SoapAction {
     /// [`DlnaError::MalformedSoap`] on unparseable XML or a missing action element.
     pub fn parse(body: &str) -> Result<Self, DlnaError> {
         let mut reader = Reader::from_str(body);
-        reader.config_mut().trim_text(true);
+        // A bare `&` is malformed XML, and quick-xml 0.38 began failing the *read* on one
+        // rather than only the unescape. Failing the read discards every remaining
+        // argument, so one sloppy title would take the URI down with it; tolerate it and
+        // let the character stand for itself, which is what this parser did before.
+        reader.config_mut().allow_dangling_amp = true;
 
         // Walk to the first element inside <...:Body>. Track whether we've entered Body.
         let mut in_body = false;
         let mut action: Option<String> = None;
         let mut args: Vec<(String, String)> = Vec::new();
         let mut current_arg: Option<String> = None;
+        // An argument's text arrives in fragments (see `xmlref`), so it is accumulated
+        // here and recorded when the element closes rather than at the first `Text`.
+        let mut arg_text = String::new();
         let mut depth_in_action = 0i32;
 
         loop {
@@ -94,18 +101,26 @@ impl SoapAction {
                         depth_in_action += 1;
                         if depth_in_action == 1 {
                             current_arg = Some(local);
+                            arg_text.clear();
                         }
                     }
                 }
-                Event::Text(t) => {
-                    if let Some(name) = &current_arg {
-                        let text = t
-                            .unescape()
-                            .map_err(|_| DlnaError::MalformedSoap("bad text escape"))?
-                            .into_owned();
-                        args.push((name.clone(), text));
-                        current_arg = None; // recorded; ignore until next arg element
-                    }
+                // Only an argument's *own* character data counts, which is what
+                // `depth_in_action == 1` says: text belonging to a nested element is not
+                // this argument's value, and was never recorded as one.
+                Event::Text(t) if current_arg.is_some() && depth_in_action == 1 => {
+                    arg_text.push_str(
+                        &t.xml10_content()
+                            .map_err(|_| DlnaError::MalformedSoap("bad text encoding"))?,
+                    );
+                }
+                // An entity reference is its own event now. An undeclared one is malformed
+                // XML, and this parser rejected the body for it before.
+                Event::GeneralRef(r) if current_arg.is_some() && depth_in_action == 1 => {
+                    arg_text.push_str(
+                        &crate::xmlref::resolve(&r)
+                            .ok_or(DlnaError::MalformedSoap("bad text escape"))?,
+                    );
                 }
                 // CDATA is character data too, and control points really do wrap the DIDL
                 // blob in it — it is the natural way to embed an XML document in an XML
@@ -113,12 +128,8 @@ impl SoapAction {
                 // the catch-all below, so the argument was recorded as empty and the card
                 // came up blank with nothing logged. Not unescaped, because the whole
                 // point of CDATA is that its content is already literal.
-                Event::CData(c) => {
-                    if let Some(name) = &current_arg {
-                        let text = String::from_utf8_lossy(c.as_ref()).into_owned();
-                        args.push((name.clone(), text));
-                        current_arg = None;
-                    }
+                Event::CData(c) if current_arg.is_some() && depth_in_action == 1 => {
+                    arg_text.push_str(&String::from_utf8_lossy(c.as_ref()));
                 }
                 Event::End(_) => {
                     if in_body && action.is_some() {
@@ -126,9 +137,11 @@ impl SoapAction {
                             break; // closing the action element
                         }
                         if depth_in_action == 1 {
-                            // Empty-element arg (no text) — record empty string.
+                            // The argument's text is complete here; an arg that carried
+                            // none records the empty string, as it always did.
                             if let Some(name) = current_arg.take() {
-                                args.push((name, String::new()));
+                                args.push((name, arg_text.trim().to_string()));
+                                arg_text.clear();
                             }
                         }
                         depth_in_action -= 1;
@@ -285,6 +298,46 @@ mod tests {
             crate::didl::parse(blob).title.as_deref(),
             Some("Cdata Title")
         );
+    }
+
+    /// quick-xml 0.38 stopped inlining entities into the text event and began emitting
+    /// each as its own `GeneralRef`, so an argument's text now arrives in fragments. A
+    /// reader that still takes the first fragment as the whole value truncates every
+    /// string at its first entity — and a URI is the argument most likely to carry one,
+    /// because every query string after the first parameter does.
+    #[test]
+    fn an_argument_is_not_truncated_at_its_first_entity() {
+        let envelope = concat!(
+            r#"<?xml version="1.0"?><s:Envelope "#,
+            r#"xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>"#,
+            r#"<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">"#,
+            "<InstanceID>0</InstanceID>",
+            "<CurrentURI>http://h/v.mp4?a=1&amp;b=2&amp;c=3</CurrentURI>",
+            "<CurrentURIMetaData>Tom &amp; Jerry &lt;x&gt; &#65;</CurrentURIMetaData>",
+            "</u:SetAVTransportURI></s:Body></s:Envelope>",
+        );
+        let a = SoapAction::parse(envelope).unwrap();
+        assert_eq!(a.arg("CurrentURI").unwrap(), "http://h/v.mp4?a=1&b=2&c=3");
+        // Interior spacing survives too: the fragments are trimmed as one value, not
+        // individually, or this would read "Tom&Jerry<x>A".
+        assert_eq!(a.arg("CurrentURIMetaData").unwrap(), "Tom & Jerry <x> A");
+    }
+
+    /// A bare `&` is malformed, but quick-xml 0.38 escalated it from "this one unescape
+    /// failed" to "this read failed" — which ends the scan and would take every argument
+    /// after it down with it, including the URI the request exists to deliver.
+    #[test]
+    fn a_bare_ampersand_costs_nothing_but_itself() {
+        let envelope = concat!(
+            r#"<?xml version="1.0"?><s:Envelope "#,
+            r#"xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>"#,
+            r#"<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">"#,
+            "<InstanceID>0</InstanceID><CurrentURIMetaData>AT&T</CurrentURIMetaData>",
+            "<CurrentURI>http://h/v.mp4</CurrentURI>",
+            "</u:SetAVTransportURI></s:Body></s:Envelope>",
+        );
+        let a = SoapAction::parse(envelope).unwrap();
+        assert_eq!(a.arg("CurrentURI").unwrap(), "http://h/v.mp4");
     }
 
     #[test]

@@ -359,6 +359,26 @@ pub fn parse_launch(xml: &str) -> Result<LaunchResponse, GameStreamError> {
     Ok(LaunchResponse { session_url })
 }
 
+/// The replacement text for one character reference or predefined general reference.
+///
+/// quick-xml 0.38 stopped inlining `&amp;` and `&#65;` into the surrounding `Event::Text`
+/// and began emitting each as its own `Event::GeneralRef`, so a text run now arrives in
+/// fragments that the reader has to stitch back together. `None` for a reference with no
+/// defined expansion, such as an undeclared `&nbsp;`.
+///
+/// `proto-dlna` carries its own copy of this: `proto-*` crates do not depend on each
+/// other, and one shared helper does not justify a substrate crate.
+fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> Option<String> {
+    match r.resolve_char_ref() {
+        Ok(Some(c)) => Some(c.to_string()),
+        Ok(None) => {
+            let name = r.decode().ok()?;
+            quick_xml::escape::resolve_predefined_entity(&name).map(str::to_owned)
+        }
+        Err(_) => None,
+    }
+}
+
 /// A flattened NVHTTP response: the root's status plus every leaf element's text, in
 /// document order. The API is shallow and element names are unique enough that a full
 /// tree buys nothing.
@@ -371,7 +391,11 @@ struct Document {
 impl Document {
     fn parse(xml: &str) -> Result<Self, GameStreamError> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
+        // GFE and Sunshine both put user-supplied app titles into this XML, and a bare `&`
+        // in one is malformed. quick-xml 0.38 began failing the *read* on that rather than
+        // only the unescape, which would turn a game called "Command & Conquer" into a
+        // whole-response parse error instead of one odd-looking title.
+        reader.config_mut().allow_dangling_amp = true;
         let mut doc = Self {
             status_code: 0,
             status_message: String::new(),
@@ -379,6 +403,10 @@ impl Document {
         };
         let mut saw_root = false;
         let mut pending: Option<String> = None;
+        // The pending element's text so far. quick-xml 0.38 emits entity references as
+        // their own events, splitting a text run into fragments, so the value is complete
+        // only at the closing tag.
+        let mut text = String::new();
 
         loop {
             match reader
@@ -392,24 +420,31 @@ impl Document {
                         doc.read_root_attrs(&e)?;
                     }
                     pending = Some(name);
+                    text.clear();
                 }
-                Event::Text(e) => {
-                    if let Some(name) = pending.take() {
-                        let text = e
-                            .unescape()
-                            .map_err(|e| GameStreamError::Xml(e.to_string()))?
-                            .to_string();
-                        doc.elements.push((name, text));
-                    }
+                Event::Text(e) if pending.is_some() => {
+                    text.push_str(
+                        &e.xml10_content()
+                            .map_err(|e| GameStreamError::Xml(e.to_string()))?,
+                    );
+                }
+                // An entity reference is its own event now. An undeclared one is malformed
+                // XML, which this parser reported rather than silently dropping.
+                Event::GeneralRef(r) if pending.is_some() => {
+                    text.push_str(&resolve_ref(&r).ok_or_else(|| {
+                        GameStreamError::Xml("unresolvable entity reference".into())
+                    })?);
                 }
                 Event::End(_) => {
-                    // An element that closed with no text still counts as present and
-                    // empty — Sunshine emits `<AppTitle/>` for an unnamed app.
+                    // The text is complete here, so this is where the element is recorded.
+                    // One that closed with no text still counts as present and empty —
+                    // Sunshine emits `<AppTitle/>` for an unnamed app.
                     if let Some(name) = pending.take() {
                         if name != "root" {
-                            doc.elements.push((name, String::new()));
+                            doc.elements.push((name, text.trim().to_string()));
                         }
                     }
+                    text.clear();
                 }
                 Event::Empty(e) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
@@ -447,7 +482,7 @@ impl Document {
         for attr in e.attributes().flatten() {
             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
             let value = attr
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|e| GameStreamError::Xml(e.to_string()))?
                 .to_string();
             match key.as_str() {
@@ -576,6 +611,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// App titles are the one field here a user names, so they are where entities show
+    /// up. quick-xml 0.38 split a text run into fragments around each reference, and
+    /// keeping only the first would list "Command & Conquer" in the chooser as "Command"
+    /// — a plausible-looking title, so nothing downstream would flag it.
+    #[test]
+    fn an_app_title_is_not_truncated_at_its_first_entity() {
+        let xml = concat!(
+            r#"<root status_code="200"><App>"#,
+            "<AppTitle>Command &amp; Conquer &lt;Remastered&gt;</AppTitle>",
+            "<ID>3</ID></App></root>",
+        );
+        let apps = parse_app_list(xml).unwrap();
+        assert_eq!(apps[0].title, "Command & Conquer <Remastered>");
+    }
+
+    /// A bare `&` in a title is malformed, and 0.38 turned it from a bad unescape into a
+    /// failed read — which would report the whole app list as malformed XML rather than
+    /// showing one odd title.
+    #[test]
+    fn a_bare_ampersand_in_a_title_does_not_fail_the_whole_list() {
+        let xml = concat!(
+            r#"<root status_code="200">"#,
+            "<App><AppTitle>Fire & Ice</AppTitle><ID>4</ID></App>",
+            "<App><AppTitle>Desktop</AppTitle><ID>5</ID></App></root>",
+        );
+        let apps = parse_app_list(xml).unwrap();
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[1].title, "Desktop");
     }
 
     #[test]

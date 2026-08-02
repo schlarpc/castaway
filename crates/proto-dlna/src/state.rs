@@ -1310,7 +1310,9 @@ mod tests {
                     }
                 }
                 Ok(Event::Text(t)) if want_name => {
-                    names.push(t.unescape().unwrap_or_default().into_owned());
+                    // Action names are alphanumeric by the UPnP grammar and these SCPDs are
+                    // our own constants, so no entity can split this text run.
+                    names.push(t.xml10_content().unwrap_or_default().into_owned());
                     want_name = false;
                 }
                 Ok(Event::End(e)) => {

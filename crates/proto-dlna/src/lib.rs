@@ -17,6 +17,7 @@ pub mod notify;
 pub mod service;
 pub mod soap;
 pub mod state;
+mod xmlref;
 
 use std::sync::{Arc, OnceLock};
 
