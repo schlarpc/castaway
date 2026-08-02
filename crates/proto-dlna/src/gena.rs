@@ -383,6 +383,19 @@ impl Subscribers {
             .collect()
     }
 
+    /// Take the next sequence number for *one* live subscription, by `SID`.
+    ///
+    /// The initial event after a SUBSCRIBE goes to exactly one subscriber, and taking it
+    /// through [`Self::prepare`] and filtering the result would advance every other
+    /// subscriber to the same service by one with nothing sent — a permanent gap in their
+    /// SEQ, which UDA 1.1 §4.2 entitles them to read as a lost event and resync on.
+    pub fn prepare_one(&mut self, sid: &str, now: Instant) -> Option<(u32, Vec<String>)> {
+        self.live
+            .iter_mut()
+            .find(|s| s.sid == sid && s.expires > now)
+            .map(|s| (s.take_seq(), s.callbacks.clone()))
+    }
+
     /// Record that a delivery worked, clearing the failure count.
     pub fn delivered(&mut self, sid: &str) {
         if let Some(sub) = self.live.iter_mut().find(|s| s.sid == sid) {
@@ -676,6 +689,43 @@ mod tests {
         // …and the other service is untouched by either.
         let rcs = subs.prepare(EventedService::RenderingControl, now);
         assert_eq!(rcs[0].1, 0);
+    }
+
+    #[test]
+    fn the_initial_event_does_not_spend_another_subscribers_sequence_number() {
+        // A second SUBSCRIBE to a service must not move the first subscriber's counter.
+        // It used to: the initial event was taken through prepare() and filtered down to
+        // the new SID, so everyone else advanced with nothing sent and their next real
+        // event arrived with a SEQ they had never been given the predecessor of — which
+        // UDA 1.1 §4.2 lets them treat as a lost event and resync on. Home Assistant
+        // stops polling once subscribed, so events being right is all it has.
+        let now = at();
+        let mut subs = Subscribers::new();
+        for sid in ["uuid:first", "uuid:second"] {
+            subs.add(
+                sid.into(),
+                EventedService::AvTransport,
+                vec!["http://h/a".into()],
+                Duration::from_secs(60),
+                now,
+            );
+        }
+
+        assert_eq!(
+            subs.prepare_one("uuid:first", now).map(|(seq, _)| seq),
+            Some(0)
+        );
+        assert_eq!(
+            subs.prepare_one("uuid:second", now).map(|(seq, _)| seq),
+            Some(0)
+        );
+
+        // The first subscriber's next event is 1 — consecutive with the 0 it was sent.
+        let batch = subs.prepare(EventedService::AvTransport, now);
+        let first = batch.iter().find(|(s, _, _)| s == "uuid:first").unwrap();
+        assert_eq!(first.1, 1, "no gap left by the newcomer's initial event");
+
+        assert_eq!(subs.prepare_one("uuid:nobody", now), None);
     }
 
     /// A phone that left the building must stop being notified, or it holds up delivery to

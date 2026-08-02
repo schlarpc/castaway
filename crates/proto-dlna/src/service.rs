@@ -399,10 +399,10 @@ async fn publish_to(st: &Arc<DlnaState>, service: EventedService, sid: &str) {
         let Ok(mut subs) = st.subscribers.lock() else {
             return;
         };
-        subs.prepare(service, Instant::now())
-            .into_iter()
-            .find(|(s, _, _)| s == sid)
-            .map(|(_, seq, cb)| (seq, cb))
+        // Not `prepare(service).find(sid)`: that takes a sequence number from every
+        // subscriber to the service and throws all but one away, leaving everybody else
+        // permanently one ahead of what they have been sent.
+        subs.prepare_one(sid, Instant::now())
     }) else {
         return;
     };
