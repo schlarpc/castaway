@@ -30,6 +30,17 @@ control, so that file is the durable record rather than a pointer to one.
 | `signatures_sha1.bin` | 900 × 256-byte SHA-1 signatures, window order. |
 | `signatures_sha256.bin` | 900 × 256-byte SHA-256 signatures, window order. |
 | `pinned_roots.pem` | Starfield Class 2 and Amazon Root CA 1 — the two roots the reference client pins for `cast.remotetogo.com`, in place of the system store. |
+| `roots/cast_root_ca.der` | `CN=Cast Root CA`, serial 2, valid to 2034-03-28. Anchors the **AirServer** chain. |
+| `roots/eureka_root_ca.der` | `CN=Eureka Root CA`, serial 1, valid to 2032-12-12. Anchors the **CKS** chain. |
+
+`roots/` is the odd one out and is not RE material: those two are the whole of
+Chromium's Cast trust store, public and static, taken verbatim from openscreen's
+`cast/common/certificate/{cast_root_ca_cert_der,eureka_root_ca_der}-inc.h`. They
+are here only so a CRL check covers the same chain the sender's does — what we
+present tops out one certificate *below* the root, and a revocation keyed on the
+anchor would otherwise be invisible to us and fatal to a Chromium sender (#123).
+`src/roots.rs` says why at length; `roots::tests` pins each one to the identity it
+anchors.
 
 ## Coverage
 

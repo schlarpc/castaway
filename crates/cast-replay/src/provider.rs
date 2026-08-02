@@ -221,6 +221,8 @@ fn pair_with_crl(credential: CastCredential, crl: Option<&CastCrl>, now: i64) ->
     let servable = crl.and_then(|crl| {
         let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
         chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
+        // What we present stops one below the root; the sender checks the anchor too.
+        let chain = crate::roots::with_anchor(&chain);
         match crl.servable_for(&chain, now) {
             Ok(Ok(servable)) => Some(servable),
             Ok(Err(crate::ServeRefusal::OutsideWindow)) => {
@@ -610,7 +612,15 @@ impl Resolver {
     /// CKS: the JSON credential cache, then the backend, then the table.
     async fn resolve_cks(&self, now_local: i64, now: i64) -> Result<CastCredential, ReplayError> {
         if let Some(path) = &self.config.cache_path {
-            match cache::load(path) {
+            // `std::fs::read` plus a JSON parse and a PEM decode — small, but filesystem
+            // work on a runtime worker all the same (ground rule 4).
+            let target = path.clone();
+            let loaded = tokio::task::spawn_blocking(move || cache::load(&target))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(ReplayError::Cache(format!("joining the cache read: {e}")))
+                });
+            match loaded {
                 Ok(Some(cached)) if cached.valid_at(now) => {
                     debug!("using the cached CKS credential");
                     return Ok(cached);
@@ -627,8 +637,15 @@ impl Resolver {
             match self.fetch(now_local).await {
                 Ok(credential) => {
                     if let Some(path) = &self.config.cache_path {
-                        if let Err(e) = cache::store(path, &credential) {
-                            warn!(error = %e, "could not cache the CKS credential");
+                        let target = path.clone();
+                        let stored = credential.clone();
+                        let written =
+                            tokio::task::spawn_blocking(move || cache::store(&target, &stored))
+                                .await;
+                        match written {
+                            Ok(Err(e)) => warn!(error = %e, "could not cache the CKS credential"),
+                            Err(e) => warn!(error = %e, "joining the cache write"),
+                            Ok(Ok(())) => {}
                         }
                     }
                     return Ok(credential);
@@ -657,7 +674,7 @@ impl Resolver {
         now_local: i64,
         now: i64,
     ) -> Result<CastCredential, ReplayError> {
-        let cached = self.airserver_db(now);
+        let cached = self.airserver_db(now).await;
         let horizon_near = cached
             .as_ref()
             .is_some_and(|db| db.covers_until() - now < REFRESH_HORIZON);
@@ -713,17 +730,32 @@ impl Resolver {
     ///
     /// Opening decrypts every window, so the result is memoised — `resolve_once` runs
     /// on a timer, but there is no reason to pay for it on every wakeup.
-    fn airserver_db(&self, _now: i64) -> Option<Arc<AirServerDb>> {
+    ///
+    /// Off the runtime, like [`Self::fetch_airserver_db`] twenty lines below, which
+    /// spawn_blocks the identical `AirServerDb::open` under a comment citing ground rule
+    /// 4. The two used to disagree. It is a SQLite open, a BLAKE2b KDF, three secretbox
+    /// opens per window and an RSA re-encode, plus a `stat` — and on the Windows box a
+    /// cold read of a 14 MB file behind a real-time scanner is the case that hurts.
+    async fn airserver_db(&self, _now: i64) -> Option<Arc<AirServerDb>> {
         if let Ok(slot) = self.airserver_cache.read() {
             if let Some(db) = slot.as_ref() {
                 return Some(Arc::clone(db));
             }
         }
-        let path = self.config.airserver_db_path.as_ref()?;
-        if !path.exists() {
-            return None;
-        }
-        match AirServerDb::open(path) {
+        let path = self.config.airserver_db_path.clone()?;
+        let opened = path.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            opened.exists().then(|| AirServerDb::open(&opened))
+        })
+        .await;
+        let found = match found {
+            Ok(found) => found?,
+            Err(e) => {
+                warn!(error = %e, "joining the AirServer database open");
+                return None;
+            }
+        };
+        match found {
             Ok(db) => {
                 let db = Arc::new(db);
                 if let Ok(mut slot) = self.airserver_cache.write() {
@@ -900,7 +932,15 @@ async fn load_crl(config: &ReplayConfig) -> Option<CastCrl> {
     let path = config.crl_cache_path.clone()?;
     let now = local_now();
 
-    let cached = match crl::read_cache(&path) {
+    let target = path.clone();
+    let read = tokio::task::spawn_blocking(move || crl::read_cache(&target))
+        .await
+        .unwrap_or_else(|e| {
+            Err(ReplayError::Cache(format!(
+                "joining the CRL cache read: {e}"
+            )))
+        });
+    let cached = match read {
         Ok(cached) => cached,
         Err(e) => {
             warn!(error = %e, "reading the cached Cast CRL failed");
@@ -935,8 +975,13 @@ async fn fetch_crl(config: &ReplayConfig) -> Option<CastCrl> {
 
     match fetched {
         Ok((raw, fresh)) => {
-            if let Err(e) = crl::write_cache(&path, &raw) {
-                warn!(error = %e, "caching the Cast CRL failed");
+            let target = path.clone();
+            let written =
+                tokio::task::spawn_blocking(move || crl::write_cache(&target, &raw)).await;
+            match written {
+                Ok(Err(e)) => warn!(error = %e, "caching the Cast CRL failed"),
+                Err(e) => warn!(error = %e, "joining the CRL cache write"),
+                Ok(Ok(())) => {}
             }
             Some(fresh)
         }
@@ -955,6 +1000,7 @@ async fn fetch_crl(config: &ReplayConfig) -> Option<CastCrl> {
 fn revoked_by(crl: &CastCrl, credential: &CastCredential) -> Option<crl::Revocation> {
     let mut chain: Vec<&[u8]> = vec![credential.device_cert_der()];
     chain.extend(credential.intermediates_der().iter().map(Vec::as_slice));
+    let chain = crate::roots::with_anchor(&chain);
     match crl.revokes(&chain) {
         Ok(found) => found,
         Err(e) => {

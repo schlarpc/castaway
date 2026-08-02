@@ -120,6 +120,7 @@ pub mod cks;
 pub mod crl;
 mod pem;
 pub mod provider;
+pub mod roots;
 pub mod template;
 pub mod window;
 
