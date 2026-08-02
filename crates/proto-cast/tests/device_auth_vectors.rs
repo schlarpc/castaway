@@ -394,6 +394,13 @@ fn airserver_vectors() -> Vec<Vector> {
 
 #[test]
 fn the_checked_in_vectors_still_describe_this_receiver() {
+    // The AirServer vectors are generated from a bundled identity that is carved at
+    // build time rather than checked in, so a build without the carve has nothing to
+    // generate them from. `nix flake check` always has it; a bare `cargo test` may not.
+    if !cast_replay::has_bundled_identity() {
+        eprintln!("skipping: this build has no carved AirServer identity");
+        return;
+    }
     let bless = std::env::var_os("CASTAWAY_BLESS_DEVICE_AUTH_VECTORS").is_some();
     let root = fixtures();
 

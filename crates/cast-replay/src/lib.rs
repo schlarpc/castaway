@@ -124,7 +124,7 @@ pub mod roots;
 pub mod template;
 pub mod window;
 
-pub use airserver::AirServerTable;
+pub use airserver::{has_bundled_identity, AirServerTable};
 pub use cks::CksTable;
 pub use crl::{CastCrl, ServableCrl, ServeRefusal};
 pub use crypto_cast_auth::{HashAlgo, NonceEcho, SigAlgo, SignedAuth};

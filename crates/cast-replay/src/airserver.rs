@@ -118,6 +118,16 @@ pub struct AirServerTable {
     identity: BundledIdentity,
 }
 
+/// Whether this build carries a bundled AirServer identity.
+///
+/// Exposed so consumers outside this crate can skip work that needs one, rather than
+/// each of them rediscovering [`ReplayError::NoIdentity`] as a panic. The `cfg` that
+/// gates this crate's own tests is not visible across a crate boundary.
+#[must_use]
+pub const fn has_bundled_identity() -> bool {
+    BUNDLED.is_some()
+}
+
 impl AirServerTable {
     /// Parse the embedded fixtures.
     ///
