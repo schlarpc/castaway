@@ -282,6 +282,15 @@ struct Health {
     /// `av_skew_ms` on purpose: it is the same quantity, and a panel with two protocols
     /// reporting sync differently is a panel nobody can compare.
     av_skew_ms: std::sync::atomic::AtomicI64,
+    /// Whether [`Health::av_skew_ms`] has ever been written.
+    ///
+    /// The atomic defaults to 0, which is indistinguishable from a measured perfect
+    /// sync — so "a skew exists" cannot be inferred from its value, and it used to be
+    /// inferred from `audio_blocks` instead. That counter moves on widget audio and on
+    /// page audio alike, and a skew is only stored when a *page* paint carrying a media
+    /// time meets a nonzero audio time, so the log asserted `av_skew_ms = 0` for the
+    /// whole life of an audio-only page and for the window before the first such paint.
+    av_skew_seen: std::sync::atomic::AtomicBool,
 }
 
 impl Health {
@@ -560,12 +569,18 @@ impl Electron {
 
     /// Lip-sync error in milliseconds: video media time minus audio media time.
     ///
-    /// `None` until both a frame and an audio block have carried a media clock, which for
-    /// a page with no media element is never — a clock page is not out of sync, it simply
-    /// has no sound to be out of sync with.
+    /// `None` until a page frame and a page audio block have both carried a media clock,
+    /// which for a page with no media element is never — a clock page is not out of sync,
+    /// it simply has no sound to be out of sync with.
+    ///
+    /// Gated on a skew having been *stored*, not on an audio block having been seen: 0 is
+    /// both the atomic's default and a real measurement, so nothing else can tell them
+    /// apart.
     #[must_use]
     pub fn av_skew_ms(&self) -> Option<i64> {
-        (self.health.audio_blocks.load(Ordering::Relaxed) > 0)
+        self.health
+            .av_skew_seen
+            .load(Ordering::Relaxed)
             .then(|| self.health.av_skew_ms.load(Ordering::Relaxed))
     }
 
@@ -719,6 +734,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                     health
                         .av_skew_ms
                         .store(video_ms - audio_ms, Ordering::Relaxed);
+                    health.av_skew_seen.store(true, Ordering::Relaxed);
                 }
             }
             trace!(
