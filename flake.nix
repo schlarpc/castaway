@@ -190,6 +190,8 @@
               "widevine-cdm"
               "widevine-cdm-windows"
               "airserver-cast-carve"
+              "libAirReceiver"
+              "airreceiver-cast-carve"
             ];
         };
       };
@@ -369,6 +371,14 @@
         nanorsSrc = moonlight-nanors-src;
       };
 
+      # SoftMedia's `libAirReceiver.so`, for the CKS identity and backend credentials.
+      # A fixed-output derivation rather than a flake input: there is no stable URL for
+      # it, so nix/airreceiver-src.nix replays a download chain and the pin is the
+      # library's own hash. See that file for why Play and APKPure do not work.
+      airreceiverSrcFor = system: import ./nix/airreceiver-src.nix {
+        inherit (pkgsFor system) lib stdenvNoCC curl unzip cacert;
+      };
+
       # AirServer's Cast credential database and the two BLAKE2b constants that open it,
       # carved out of the pinned installer so neither lives in this tree. `cast-replay`
       # takes the constants through `CASTAWAY_AIRSERVER_KEK_{PERSON,PASS}_FILE`.
@@ -452,6 +462,10 @@
           # before anything that consumes it is rebuilt: `nix build .#airserver-carve`
           # prints where the database was found and how the constants were confirmed.
           airserver-carve = airserverCarveFor system;
+
+          # The AirReceiver library the CKS carve reads, exposed so a fetch failure can
+          # be diagnosed on its own rather than inside a larger build.
+          airreceiver-src = airreceiverSrcFor system;
 
           # The linked GameStream core (D37), exposed on its own so it can be built and
           # cached independently — and so a bump can be checked before anything that
