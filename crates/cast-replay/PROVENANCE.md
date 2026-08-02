@@ -22,6 +22,48 @@ identities and all four sets of constants are recovered at build time by
 no offline Cast identity and says so. This file remains the record of how the
 recovery works, and is the only place the recovered values are written down.
 
+## Validation
+
+The six constants above are not written down here. They belong to SoftMedia and App
+Dynamic, this file is the one place they would otherwise survive in a public
+repository, and the carves do not need them: each proves its own answer.
+
+* the AirServer constants are confirmed by a **Poly1305 tag** — a wrong pair cannot
+  authenticate a secretbox, so `airserver-carve.py` either emits the right values or
+  fails;
+* the CKS identity is confirmed by verifying **all 900 windows'** receiver-auth
+  signatures against the shipped device certificate before anything is written;
+* the AirPort key is confirmed by its **modulus**.
+
+What is left here is for a human cross-check: enough to tell whether a carve on a new
+build produced the same thing as the one this file documents, without the file being
+grep-able for the values themselves.
+
+| | what | sha256 |
+|---|---|---|
+| S1 | the `sig` secret, as the 32 ASCII characters it is used as | `8e852a996b75117f76c41c59c69673410ee8f23a18de7fc3b1a8c695de843363` |
+| S2 | the `x-api-key` value, likewise | `eae79fd0e887ea1d59844bae63a7beef73d1e5758e912dc60b6ff9faa6ebf961` |
+| S3 | the response field cipher key, 16 raw bytes | `2f83f3a7b71cf17a5511e500ddad0c8297afb2ae6deacccb7ac014909b14c987` |
+| S4 | its counter block, 16 raw bytes | `d827af29149d8911eafbb151649c81992712987febd228b864209a769fb27946` |
+| S5 | the BLAKE2b personalisation, 16 ASCII bytes | `3121c9e6a028a5bed7d46ed1c6db2c140e2d2c17c8bbf43f38c113a670bb08cb` |
+| S6 | the BLAKE2b key, 64 ASCII bytes | `00bfb779275c89f863a4d2c728c6fbad7e886b342e7ed64123e85ec1b1d98b31` |
+
+S1, S2, S5 and S6 are the carve outputs verbatim, so they check with one command:
+
+```sh
+sha256sum "$(nix build --no-link --print-out-paths .#airreceiver-carve)"/cks_{sig_secret,api_key}.txt
+sha256sum "$(nix build --no-link --print-out-paths .#airserver-carve)"/kek_{person,pass}.bin
+```
+
+S3 and S4 are read out of `.rodata` rather than written to a file; `src/api.rs` carries
+them and they hash as the 16 raw bytes.
+
+One derived value is kept in the clear deliberately, in §2's live-request example:
+`sig` for `ts=1700000000` is `6f12c3bf54f1ddd603e7d0a4478c378b`. It is the output of a
+one-way function over a 128-bit secret, so it discloses nothing, and it is the single
+most useful thing in this file — it validates the *whole* derivation (secret first,
+decimal timestamp, lowercase hex) end to end. `api.rs` asserts exactly that vector.
+
 ## Source artifacts
 
 Exact inputs, with SHA-256 so a future re-derivation can confirm it is working from
@@ -91,8 +133,8 @@ protocol:
 | `+0x08` | `vector<string>` of two pinned root certificates |
 | `+0x20` | `https://cast.remotetogo.com/api/v1/cks?ts=%s&sig=%s` |
 | `+0x38` | `AirReceiver/1.0.0 CrKey/1.0` (User-Agent) |
-| `+0x50` | `***REMOVED-CKS-SIG-SECRET-PROVENANCE-S1***` — the `sig` secret |
-| `+0x68` / `+0x80` | `x-api-key` and its value `***REMOVED-CKS-API-KEY-PROVENANCE-S2***` |
+| `+0x50` | the `sig` secret — 32 ASCII hex characters ([S1](#validation)) |
+| `+0x68` / `+0x80` | `x-api-key` and its value — 32 ASCII hex characters ([S2](#validation)) |
 | `+0x140` | server clock offset, `now − time(NULL)` |
 | `+0x148` | timestamp of the last failed fetch (the 360 s backoff) |
 
@@ -102,7 +144,7 @@ Provider vtable slots: 2 = fetch (`FUN_00423f60`), 3/4 = the field cipher
 
 ```
 ts  = snprintf("%lld", time(NULL))
-sig = lowercase_hex(MD5("***REMOVED-CKS-SIG-SECRET-PROVENANCE-S1***" + ts))
+sig = lowercase_hex(MD5(<the +0x50 secret> + ts))
 url = snprintf("https://cast.remotetogo.com/api/v1/cks?ts=%s&sig=%s", ts, sig)
 ```
 
@@ -116,8 +158,8 @@ Each of the six returned values is **base64, then AES-128-CTR** under constants
 immediate in `.rodata` (`FUN_00425120`):
 
 ```
-key = 7676760d2aea6e0c2b21166f2c63de00   # ELF 0x1413b6
-iv  = 6666661d3afa7e1c3b31067f3c73ce10   # ELF 0x125820
+key = <16 raw bytes at ELF 0x1413b6>   ([S3](#validation))
+iv  = <16 raw bytes at ELF 0x125820>   ([S4](#validation))
 ```
 
 The same cipher wraps the client's own on-disk `cks2` cache record — a fixed key
@@ -161,8 +203,8 @@ Every BLOB is a libsodium `crypto_secretbox` (XSalsa20-Poly1305), laid out
 key = BLAKE2b-256(message="", key=PASS, salt=<the salt table>, person=PERSON)
     = crypto_generichash_blake2b_salt_personal
 
-PERSON = "***REMOVED: App Dynamic BLAKE2b personalisation, PROVENANCE S5***"
-PASS   = "***REMOVED: App Dynamic BLAKE2b key, PROVENANCE S6***"
+PERSON = <16 ASCII bytes>   ([S5](#validation))
+PASS   = <64 ASCII bytes>   ([S6](#validation))
 ```
 
 Both constants are plain literals in the shipped binary — in 5.7.2's `AirServer.exe`
