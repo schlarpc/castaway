@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Carve AirReceiver's CKS backend credentials out of `libAirReceiver.so`.
+"""Carve AirReceiver's CKS identity and backend credentials out of `libAirReceiver.so`.
 
-Run at build time against an operator-supplied library; nothing it produces is
-checked in. Companion to `airserver-carve.py`, and the same discipline: **no
-hardcoded offsets and no vendor strings**.
+Run at build time against the library `nix/airreceiver-src.nix` fetches; nothing it
+produces is checked in. Two separate things come out, behind two separate barriers:
+
+* **The backend credentials** — the `x-api-key` value and the `sig` secret — sit
+  behind a string obfuscator and a relocation table. Recovered with no hardcoded
+  offsets and no vendor strings; see below.
+* **The identity** — a Google-issued Cast device certificate, its intermediate, the
+  RSA peer key and template, and 900 windows of precomputed receiver-auth signatures
+  — sits inside a `dbio` container whose key is computed at runtime. Recovered by
+  emulation; see `carve_identity`.
+
+Companion to `airserver-carve.py`.
 
 ## What has to be defeated
 
@@ -305,11 +314,12 @@ def main():
 
     data = args.lib.read_bytes()
     log(f"{args.lib} ({len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()})")
+    args.out.mkdir(parents=True, exist_ok=True)
+    identity = carve_identity(args.lib, data, args.out)
     r = carve(data)
     log(f"  endpoint: {r['endpoint'].decode()}")
     log(f"  api key {len(r['api_key'])}B, sig secret {len(r['sig_secret'])}B")
 
-    args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "cks_api_key.txt").write_bytes(r["api_key"])
     (args.out / "cks_sig_secret.txt").write_bytes(r["sig_secret"])
     (args.out / "carve.json").write_text(
@@ -321,6 +331,7 @@ def main():
                 "string_key_sha256": hashlib.sha256(r["string_key"]).hexdigest(),
                 "decodable_strings": r["strings"],
                 "endpoint": r["endpoint"].decode(),
+                "identity": identity,
             },
             indent=2,
         )
@@ -328,6 +339,258 @@ def main():
     )
     log(f"  wrote {args.out}")
 
+
+
+# ============================================================== the CKS identity
+#
+# Everything below recovers the *identity* rather than the credentials: the device
+# certificate, its intermediate, the peer key and template, and the precomputed
+# receiver-auth signatures for every window. These used to be checked in under
+# `crates/cast-replay/fixtures/`, including an RSA-2048 private key and a
+# Google-issued Cast device certificate that are SoftMedia's and not ours.
+#
+# The table ships inside a `dbio` container: AES-128-CTR under a file key that is
+# itself AES-128-ECB'd under a KEK. The KEK is `H(password)` where `H` is a 128-bit
+# digest implemented as a bytecode interpreter — it is not MD5, `H("abc")` is
+# `b641c750d8ca9380f7f9136cf6d8a14b` — so it cannot be reproduced from the password
+# alone without lifting the VM. Emulating the three helpers with Unicorn sidesteps
+# that, and keeps working if a future build changes the password.
+
+import hashlib as _hashlib
+from datetime import timezone as _tz, datetime as _dt
+
+CKS_MAGIC = b"cks "
+DBIO_MAGIC = b"dbio"
+DBIO_HEADER = 0x40
+
+# The three digest helpers, the password accessor, and the global function pointer
+# they consult before doing the work themselves. ELF vaddrs (Ghidra address minus the
+# 0x100000 image base) for the library `SOURCE_SHA256` names.
+#
+# Unlike the string-obfuscation key these cannot be brute-forced — there is no cheap
+# test for "is this the right function" — so they are pinned to one build and the
+# carve asserts the library's hash before using them. `nix/airreceiver-src.nix` pins
+# the same hash, so the two travel together and a swapped library fails here with a
+# reason rather than somewhere further down with garbage.
+KEK_FNS = (0x352B4C, 0x353514, 0x352C54, 0x3531D8, 0xA8BF30)
+SOURCE_SHA256 = "71701f4fc335e14a504674454580baa8e6e4528ad0de28f1cfbc5ca34c398974"
+
+
+def recover_kek(path):
+    """`H(password)` by emulation. Returns (password, kek)."""
+    from airreceiver_armemu import Emu
+
+    pwd_fn, init, update, final, gate = KEK_FNS
+    e = Emu(str(path))
+    # The helpers consult a global function pointer before doing the work
+    # themselves; point it at `mov x0,#0 ; ret` so they always do.
+    stub = e.scratch(16)
+    e.write(stub, b"\x00\x00\x80\xd2\xc0\x03\x5f\xd6")
+    e.write(gate, struct.pack("<Q", stub))
+
+    password = e.cstr(e.call(pwd_fn))
+    ctx, out, msg = e.scratch(0x400), e.scratch(64), e.scratch(256)
+    e.write(msg, password)
+    e.call(init, ctx)
+    e.call(update, ctx, msg, len(password))
+    e.call(final, out, ctx)
+    return password, e.read(out, 16)
+
+
+def dbio_open(blob, kek):
+    """Unwrap a `dbio` container. Returns the decrypted payload, or None."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    if blob[:4] != DBIO_MAGIC or len(blob) < DBIO_HEADER:
+        return None
+    hdr = bytearray(blob[:DBIO_HEADER])
+    header_size = struct.unpack_from(">I", hdr, 0x04)[0]
+    if header_size != DBIO_HEADER:
+        return None
+    flags = hdr[0x0B]
+    sector = struct.unpack_from(">I", hdr, 0x0C)[0] * 16
+    if sector <= 0:
+        return None
+
+    d = Cipher(algorithms.AES(kek), modes.ECB()).decryptor()
+    hdr[0x10:0x30] = d.update(bytes(hdr[0x10:0x30])) + d.finalize()
+    key, nonce = bytes(hdr[0x10:0x20]), bytes(hdr[0x20:0x28])
+
+    body = blob[header_size:]
+    if flags & 1:
+        start = header_size // sector
+        c = Cipher(
+            algorithms.AES(key), modes.CTR(nonce + struct.pack(">Q", start))
+        ).encryptor()
+        body = c.update(body) + c.finalize()
+    return body
+
+
+def find_cks_store(data, kek):
+    """Every `dbio` blob, unwrapped, until one holds a `cks ` store.
+
+    Structural: the container is located by its own magic and its own header size,
+    and accepted only when the decrypted payload announces itself as a store. A wrong
+    KEK produces noise that fails that check, so this doubles as a KEK oracle.
+    """
+    off = data.find(DBIO_MAGIC)
+    while off >= 0:
+        payload = None
+        try:
+            payload = dbio_open(data[off:], kek)
+        except Exception:
+            payload = None
+        if payload and payload[:4] == CKS_MAGIC:
+            return off, payload
+        off = data.find(DBIO_MAGIC, off + 1)
+    return None, None
+
+
+class CksStore:
+    """The `cks ` table: certificates, one peer key, and per-window signatures."""
+
+    def __init__(self, payload):
+        if payload[:4] != CKS_MAGIC:
+            raise ValueError("not a 'cks ' store")
+        (
+            self.dirsize,
+            _reserved,
+            off_dev,
+            len_dev,
+            off_ica,
+            len_ica,
+            self.count,
+        ) = struct.unpack_from(">7I", payload, 4)
+        if self.count == 0:
+            raise ValueError("store declares no windows")
+        self.device_cert_pem = payload[off_dev : off_dev + len_dev]
+        self.ica_pem = payload[off_ica : off_ica + len_ica]
+
+        self.windows = []
+        for i in range(self.count):
+            o = 0x20 + i * 0x30
+            start, end = struct.unpack_from(">QQ", payload, o)
+            f = struct.unpack_from(">8I", payload, o + 16)
+
+            def blob(j, f=f):
+                return payload[f[j] : f[j] + f[j + 1]]
+
+            self.windows.append(
+                {
+                    "index": i,
+                    "start": start,
+                    "end": end,
+                    "pub": blob(0),
+                    "pri": blob(2),
+                    "sha1": blob(4),
+                    "sha256": blob(6),
+                }
+            )
+
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.primitives import serialization
+
+        w0 = self.windows[0]
+        self.peer_key = serialization.load_der_private_key(w0["pri"], None)
+        self.device_pub = _x509.load_pem_x509_certificate(
+            self.device_cert_pem
+        ).public_key()
+
+        # The peer certificate is re-issued per window: only the two UTCTime fields
+        # move, and the client re-signs the result before use. Reproducing that
+        # exactly is what makes the shipped signatures verifiable offline.
+        tmpl = bytearray(w0["pub"])
+        self._tmpl = tmpl
+        self._i_nb = tmpl.index(self._utc(w0["start"]))
+        self._i_na = tmpl.index(self._utc(w0["end"]))
+        self._tbs_off = 4
+        self._tbs_len = 4 + (tmpl[6] << 8 | tmpl[7])
+        self._tail = bytes(
+            tmpl[self._tbs_off + self._tbs_len : self._tbs_off + self._tbs_len + 20]
+        )
+
+    @staticmethod
+    def _utc(unix):
+        return _dt.fromtimestamp(unix, _tz.utc).strftime("%y%m%d%H%M%S").encode() + b"Z"
+
+    def peer_cert(self, w):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        t = bytearray(self._tmpl)
+        t[self._i_nb : self._i_nb + 13] = self._utc(w["start"])
+        t[self._i_na : self._i_na + 13] = self._utc(w["end"])
+        tbs = bytes(t[self._tbs_off : self._tbs_off + self._tbs_len])
+        sig = self.peer_key.sign(tbs, padding.PKCS1v15(), hashes.SHA256())
+        return bytes(t[: self._tbs_off]) + tbs + self._tail + sig
+
+    def verify(self, w):
+        """(sha1_ok, sha256_ok) for one window, against the shipped device cert."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        cert = self.peer_cert(w)
+        out = []
+        for sig, h in ((w["sha1"], hashes.SHA1()), (w["sha256"], hashes.SHA256())):
+            try:
+                self.device_pub.verify(sig, cert, padding.PKCS1v15(), h)
+                out.append(True)
+            except Exception:
+                out.append(False)
+        return tuple(out)
+
+
+def carve_identity(path, data, out):
+    """The CKS identity, into the fixture names `crates/cast-replay` consumes."""
+    actual = _hashlib.sha256(data).hexdigest()
+    if actual != SOURCE_SHA256:
+        raise SystemExit(
+            f"this library is {actual}, but the emulation entry points in KEK_FNS are\n"
+            f"for {SOURCE_SHA256}. Recover the five addresses for this build (see\n"
+            "PROVENANCE §1) or supply the pinned library."
+        )
+
+    password, kek = recover_kek(path)
+    log(f"  dbio password {password!r}, KEK recovered by emulation")
+
+    off, payload = find_cks_store(data, kek)
+    if payload is None:
+        raise SystemExit("no 'cks ' store unwrapped under the recovered KEK")
+    store = CksStore(payload)
+    log(f"  cks store at dbio 0x{off:x}: {store.count} windows")
+
+    # Verifying every window is the oracle: a wrong key, a wrong template offset or a
+    # mis-parsed directory all surface here rather than as a receiver that fails auth
+    # in the field. It is ~30s of RSA and worth it once per build.
+    ok1 = ok2 = 0
+    for w in store.windows:
+        a, b = store.verify(w)
+        ok1 += a
+        ok2 += b
+    if ok1 != store.count or ok2 != store.count:
+        raise SystemExit(
+            f"only {ok1}/{store.count} SHA-1 and {ok2}/{store.count} SHA-256 "
+            "signatures verify against the shipped device certificate"
+        )
+    log(f"  {ok1}/{store.count} sha1 and {ok2}/{store.count} sha256 verify")
+
+    w0 = store.windows[0]
+    (out / "device_cert.pem").write_bytes(store.device_cert_pem)
+    (out / "ica.pem").write_bytes(store.ica_pem)
+    (out / "peer_template.der").write_bytes(w0["pub"])
+    (out / "peer_key.der").write_bytes(w0["pri"])
+    (out / "signatures_sha1.bin").write_bytes(b"".join(w["sha1"] for w in store.windows))
+    (out / "signatures_sha256.bin").write_bytes(
+        b"".join(w["sha256"] for w in store.windows)
+    )
+    return {
+        "dbio_offset": off,
+        "windows": store.count,
+        "epoch_unix": w0["start"],
+        "last_end_unix": store.windows[-1]["end"],
+        "step_secs": store.windows[1]["start"] - w0["start"] if store.count > 1 else None,
+        "validity_secs": w0["end"] - w0["start"],
+    }
 
 if __name__ == "__main__":
     main()

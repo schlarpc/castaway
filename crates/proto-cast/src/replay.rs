@@ -172,6 +172,17 @@ impl DeviceAuthResponder for ReplayAuthResponder {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    /// The offline identities are carved at build time rather than checked in, so a
+    /// build without the carve has none to exercise. `nix flake check` always has
+    /// them; a bare `cargo test` may not.
+    fn skip_without_identity() -> bool {
+        if cast_replay::has_bundled_cks() {
+            return false;
+        }
+        eprintln!("skipping: this build has no carved CKS identity");
+        true
+    }
     use super::*;
     use crate::proto::HashAlgorithm;
 
@@ -198,6 +209,9 @@ mod tests {
     /// nonce back rebuilds `nonce || cert` and rejects the signature.
     #[tokio::test]
     async fn the_response_does_not_echo_the_senders_nonce() {
+        if skip_without_identity() {
+            return;
+        }
         let identity = identity().await;
         let responder = ReplayAuthResponder::new(identity.credential());
         let response = responder
@@ -213,6 +227,9 @@ mod tests {
     /// merely a well-formed one.
     #[tokio::test]
     async fn the_signature_matches_the_certificate_the_acceptor_presents() {
+        if skip_without_identity() {
+            return;
+        }
         let identity = identity().await;
         let credential = identity.credential();
         let responder = ReplayAuthResponder::new(Arc::clone(&credential));
@@ -237,6 +254,9 @@ mod tests {
     /// credential carries a signature for it.
     #[tokio::test]
     async fn an_unspecified_hash_is_answered_with_sha1() {
+        if skip_without_identity() {
+            return;
+        }
         let identity = identity().await;
         let responder = ReplayAuthResponder::new(identity.credential());
         let response = responder.respond(&challenge(None)).unwrap();
@@ -250,6 +270,9 @@ mod tests {
     /// The config is built once per window, not once per connection.
     #[tokio::test]
     async fn the_tls_config_is_memoised_within_a_window() {
+        if skip_without_identity() {
+            return;
+        }
         let identity = identity().await;
         let credential = identity.credential();
         let a = identity.config_for(&credential).unwrap();
@@ -261,6 +284,9 @@ mod tests {
     /// here would only show up as a handshake failure at runtime.
     #[tokio::test]
     async fn the_credential_forms_a_usable_tls_config() {
+        if skip_without_identity() {
+            return;
+        }
         let identity = identity().await;
         assert!(identity.for_connection().is_ok());
     }

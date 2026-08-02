@@ -1026,7 +1026,7 @@ fn revoked_by(crl: &CastCrl, credential: &CastCredential) -> Option<crl::Revocat
 fn fetch_blocking(ts: i64, timeout: Duration) -> Result<Vec<u8>, ReplayError> {
     use std::io::Read as _;
 
-    let request = api::request(ts);
+    let request = api::request(ts)?;
     let agent = ureq::builder()
         .timeout(timeout)
         .tls_config(Arc::new(pinned_tls_config()?))
@@ -1090,6 +1090,7 @@ mod tests {
 
     /// Inside the table's range, an offline provider always resolves.
     #[tokio::test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     async fn resolves_offline_from_the_table() {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
@@ -1151,6 +1152,7 @@ mod tests {
     /// can answer, so the preferred-but-exhausted identity must fall through rather
     /// than fail. This is the one case where the fallback is driven by expiry.
     #[tokio::test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     async fn an_exhausted_preferred_identity_falls_through() {
         let at = 1_814_400_000; // 2027-07-01: past AirServer, inside CKS
         let provider = ReplayProvider::resolve(ReplayConfig {
@@ -1328,6 +1330,7 @@ mod tests {
     /// dead CKS backend suppress AirServer refreshes for the whole backoff, which is
     /// exactly the coupling a second identity exists to avoid.
     #[tokio::test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     async fn the_live_sources_back_off_independently() {
         let (_dir, path) = with_database();
         let provider = ReplayProvider::resolve(ReplayConfig {
@@ -1361,6 +1364,7 @@ mod tests {
 
     /// A window roll must produce a different credential, not a stale one.
     #[tokio::test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     async fn a_window_roll_re_issues_inline() {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
@@ -1381,6 +1385,7 @@ mod tests {
 
     /// Reads on the connection path must not hit the network or the disk.
     #[tokio::test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     async fn repeated_reads_in_one_window_return_the_same_credential() {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,
@@ -1402,6 +1407,7 @@ mod tests {
 
     /// With the network off, the backoff must never gate the table.
     #[tokio::test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     async fn an_offline_provider_never_waits_on_a_backoff() {
         let provider = ReplayProvider::resolve(ReplayConfig {
             network: false,

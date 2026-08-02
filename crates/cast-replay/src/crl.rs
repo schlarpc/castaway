@@ -526,11 +526,20 @@ mod tests {
 
     /// The chain this receiver presents when replaying the CKS identity.
     fn chain() -> Vec<Vec<u8>> {
-        let device =
-            crate::pem::decode_all(include_str!("../fixtures/device_cert.pem"), "CERTIFICATE")
-                .unwrap();
-        let ica =
-            crate::pem::decode_all(include_str!("../fixtures/ica.pem"), "CERTIFICATE").unwrap();
+        let device = crate::pem::decode_all(
+            crate::cks::BUNDLED_CKS
+                .expect("carved CKS identity")
+                .device_cert_pem,
+            "CERTIFICATE",
+        )
+        .unwrap();
+        let ica = crate::pem::decode_all(
+            crate::cks::BUNDLED_CKS
+                .expect("carved CKS identity")
+                .ica_pem,
+            "CERTIFICATE",
+        )
+        .unwrap();
         let mut chain = device;
         chain.extend(ica);
         chain
@@ -595,6 +604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_crl_outside_its_window_is_withheld() {
         let chain = chain();
         let crl = CastCrl::parse(REAL_CRL).unwrap();
@@ -611,6 +621,7 @@ mod tests {
     /// The case the whole type exists for: if the CRL names us, attaching it is how a
     /// working receiver becomes a broken one.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_crl_that_revokes_our_own_public_key_is_withheld() {
         let chain = chain();
         let (_, device) = x509_parser::parse_x509_certificate(&chain[0]).unwrap();
@@ -638,6 +649,7 @@ mod tests {
     /// The other half of `CheckRevocation`: a serial range registered under the *issuer's*
     /// key hash revokes the certificate beneath it.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_serial_range_under_our_issuer_revokes_the_certificate_below_it() {
         let chain = chain();
         let (_, device) = x509_parser::parse_x509_certificate(&chain[0]).unwrap();
@@ -661,6 +673,7 @@ mod tests {
     /// A range that does not contain us must not match — otherwise the check above would
     /// pass for the wrong reason.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_serial_range_that_misses_us_does_not_revoke() {
         let chain = chain();
         let (_, device) = x509_parser::parse_x509_certificate(&chain[0]).unwrap();

@@ -12,11 +12,15 @@
 //! ```text
 //! GET https://cast.remotetogo.com/api/v1/cks?ts=<ts>&sig=<sig>
 //!     User-Agent: AirReceiver/1.0.0 CrKey/1.0
-//!     x-api-key: ***REMOVED-CKS-API-KEY-PROVENANCE-S2***
+//!     x-api-key: <API_KEY>
 //!
 //!     ts  = decimal seconds
-//!     sig = lowercase_hex(MD5(SECRET || ts))
+//!     sig = lowercase_hex(MD5(SIG_SECRET || ts))
 //! ```
+//!
+//! `API_KEY` and `SIG_SECRET` are SoftMedia's, and are not written down here — see
+//! [`CksCredentials`]. PROVENANCE §2 records their values and how they were first
+//! recovered; this crate obtains them from the build-time carve.
 //!
 //! `sig` is a bare unkeyed digest of a constant and a timestamp, and the backend
 //! does not check that the timestamp is recent — a request dated 30 days in the
@@ -53,11 +57,32 @@ pub const USER_AGENT: &str = "AirReceiver/1.0.0 CrKey/1.0";
 /// The API key header name.
 pub const API_KEY_HEADER: &str = "x-api-key";
 
-/// The API key value.
-const API_KEY: &str = "***REMOVED-CKS-API-KEY-PROVENANCE-S2***";
+/// SoftMedia's two backend constants: the `x-api-key` value, and the secret `sig` is
+/// derived from (prefixed to `ts`, not keyed over it).
+///
+/// **Not literals here.** These are service credentials belonging to someone else, so
+/// they are carved out of `libAirReceiver.so` at build time
+/// (`nix/airreceiver-carve.nix`) and reach the crate through `build.rs`. A build
+/// without them cannot talk to the CKS backend at all — [`request`] returns
+/// [`ReplayError::NoCksCredentials`] — but the offline table is unaffected, so such a
+/// build still authenticates, it just cannot refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CksCredentials {
+    /// The `x-api-key` value.
+    pub api_key: &'static str,
+    /// The constant `sig` is derived from.
+    pub sig_secret: &'static str,
+}
 
-/// The constant `sig` is derived from. Prefixed to `ts`, not keyed over it.
-const SIG_SECRET: &str = "***REMOVED-CKS-SIG-SECRET-PROVENANCE-S1***";
+include!(concat!(env!("OUT_DIR"), "/cks_credentials.rs"));
+
+impl CksCredentials {
+    /// The credentials this build was given, if any.
+    #[must_use]
+    pub const fn provisioned() -> Option<Self> {
+        CKS_CREDENTIALS
+    }
+}
 
 /// The fixed AES-128-CTR key every response field is encoded under.
 const FIELD_KEY: [u8; 16] = [
@@ -84,20 +109,35 @@ pub struct CksRequest {
 }
 
 /// Derive the request for timestamp `ts`.
-#[must_use]
-pub fn request(ts: i64) -> CksRequest {
-    CksRequest {
-        url: format!("{URL}?ts={ts}&sig={}", sig(ts)),
+///
+/// # Errors
+/// [`ReplayError::NoCksCredentials`] on a build that was not given the carved
+/// backend constants.
+pub fn request(ts: i64) -> Result<CksRequest, ReplayError> {
+    let c = CksCredentials::provisioned().ok_or(ReplayError::NoCksCredentials)?;
+    Ok(CksRequest {
+        url: format!("{URL}?ts={ts}&sig={}", sig_with(ts, c)),
         user_agent: USER_AGENT,
-        api_key: (API_KEY_HEADER, API_KEY),
-    }
+        api_key: (API_KEY_HEADER, c.api_key),
+    })
 }
 
 /// The `sig` query parameter for `ts`: `MD5(SECRET || ts)`, lowercase hex.
+///
+/// # Errors
+/// As [`request`].
+pub fn sig(ts: i64) -> Result<String, ReplayError> {
+    Ok(sig_with(
+        ts,
+        CksCredentials::provisioned().ok_or(ReplayError::NoCksCredentials)?,
+    ))
+}
+
+/// `sig` under explicit credentials, so the shape is testable without them.
 #[must_use]
-pub fn sig(ts: i64) -> String {
+pub fn sig_with(ts: i64, c: CksCredentials) -> String {
     let mut h = Md5::new();
-    h.update(SIG_SECRET.as_bytes());
+    h.update(c.sig_secret.as_bytes());
     h.update(ts.to_string().as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -233,23 +273,68 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// Both vectors are from the reference client, one of which was confirmed
-    /// against the live endpoint (HTTP 200 on the first try).
+    /// Credentials of our own, so the derivation is testable without SoftMedia's.
+    /// The expected digest is `MD5("castaway-test-secret" + "1700000000")`.
+    const TEST_CREDS: CksCredentials = CksCredentials {
+        api_key: "00112233445566778899aabbccddeeff",
+        sig_secret: "castaway-test-secret",
+    };
+
+    /// The shape of the derivation — secret first, then the decimal timestamp,
+    /// lowercase hex — which is the part that is ours to get wrong. Runs on every
+    /// build, because it does not need the carved constants.
     #[test]
+    fn sig_is_md5_of_the_secret_then_the_timestamp() {
+        let expect = {
+            let mut h = Md5::new();
+            h.update(b"castaway-test-secret");
+            h.update(b"1700000000");
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(sig_with(1_700_000_000, TEST_CREDS), expect);
+        assert_eq!(expect.len(), 32);
+        assert!(expect
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    }
+
+    /// The reference vector, confirmed against the live endpoint (HTTP 200 on the
+    /// first try). Needs the carved secret, so it only runs on a provisioned build.
+    #[test]
+    #[cfg_attr(not(cks_credentials), ignore = "needs the carved CKS credentials")]
     fn sig_matches_the_reference_derivation() {
-        assert_eq!(sig(1_700_000_000), "6f12c3bf54f1ddd603e7d0a4478c378b");
         assert_eq!(
-            request(1_700_000_000).url,
+            sig(1_700_000_000).unwrap(),
+            "6f12c3bf54f1ddd603e7d0a4478c378b"
+        );
+        assert_eq!(
+            request(1_700_000_000).unwrap().url,
             "https://cast.remotetogo.com/api/v1/cks\
              ?ts=1700000000&sig=6f12c3bf54f1ddd603e7d0a4478c378b"
         );
     }
 
     #[test]
+    #[cfg_attr(not(cks_credentials), ignore = "needs the carved CKS credentials")]
     fn the_request_carries_the_headers_the_backend_expects() {
-        let r = request(1);
+        let r = request(1).unwrap();
+        let c = CksCredentials::provisioned().unwrap();
         assert_eq!(r.user_agent, "AirReceiver/1.0.0 CrKey/1.0");
-        assert_eq!(r.api_key, ("x-api-key", "***REMOVED-CKS-API-KEY-PROVENANCE-S2***"));
+        // Compared against the carved value rather than a literal: writing the key
+        // down here would undo the point of carving it.
+        assert_eq!(r.api_key, (API_KEY_HEADER, c.api_key));
+        assert_eq!(c.api_key.len(), 32);
+    }
+
+    /// Without the carve the live path is unavailable, and says so.
+    #[test]
+    #[cfg_attr(cks_credentials, ignore = "this build has the credentials")]
+    fn an_unprovisioned_build_refuses_to_build_a_request() {
+        assert!(matches!(request(1), Err(ReplayError::NoCksCredentials)));
+        assert!(matches!(sig(1), Err(ReplayError::NoCksCredentials)));
     }
 
     fn body(sha1_len: usize) -> Vec<u8> {

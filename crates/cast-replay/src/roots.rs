@@ -84,7 +84,11 @@ mod tests {
         // The whole point: both identities top out one below the root, and which root it
         // is differs between them. Getting this wrong is silent — the chain still checks,
         // just one certificate short of what the sender checks.
-        let ica = pem_der(include_str!("../fixtures/ica.pem"));
+        let ica = pem_der(
+            crate::cks::BUNDLED_CKS
+                .expect("carved CKS identity")
+                .ica_pem,
+        );
         assert_eq!(anchor_for(&ica), Some(EUREKA_ROOT_CA), "CKS -> Eureka Root");
 
         let subroot: &[u8] = crate::airserver::BUNDLED
@@ -114,9 +118,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn with_anchor_extends_a_real_chain_by_exactly_one() {
-        let ica = pem_der(include_str!("../fixtures/ica.pem"));
-        let leaf = pem_der(include_str!("../fixtures/device_cert.pem"));
+        let ica = pem_der(
+            crate::cks::BUNDLED_CKS
+                .expect("carved CKS identity")
+                .ica_pem,
+        );
+        let leaf = pem_der(
+            crate::cks::BUNDLED_CKS
+                .expect("carved CKS identity")
+                .device_cert_pem,
+        );
         let chain: Vec<&[u8]> = vec![&leaf, &ica];
         let extended = with_anchor(&chain);
         assert_eq!(extended.len(), 3);

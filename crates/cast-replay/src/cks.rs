@@ -28,12 +28,37 @@ const WINDOW_COUNT: u32 = 900;
 /// Bytes per precomputed signature (RSA-2048).
 const SIGNATURE_LEN: usize = 256;
 
-const DEVICE_CERT_PEM: &str = include_str!("../fixtures/device_cert.pem");
-const ICA_PEM: &str = include_str!("../fixtures/ica.pem");
-const PEER_TEMPLATE_DER: &[u8] = include_bytes!("../fixtures/peer_template.der");
-const PEER_KEY_DER: &[u8] = include_bytes!("../fixtures/peer_key.der");
-const SIGNATURES_SHA1: &[u8] = include_bytes!("../fixtures/signatures_sha1.bin");
-const SIGNATURES_SHA256: &[u8] = include_bytes!("../fixtures/signatures_sha256.bin");
+/// The bundled CKS identity: SoftMedia's Google-issued device certificate, its
+/// intermediate, the RSA peer key and the certificate template re-issued per window,
+/// and 900 windows of precomputed receiver-auth signatures.
+///
+/// **Not checked in**, for the same reason as [`crate::airserver::BundledIdentity`]:
+/// it is someone else's Cast device credential, private key included. It is carved
+/// out of `libAirReceiver.so` at build time (`nix/airreceiver-carve.nix`) and reaches
+/// the crate through `build.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct BundledCks {
+    /// The Google-issued device certificate, PEM.
+    pub device_cert_pem: &'static str,
+    /// The intermediate certificate(s), PEM.
+    pub ica_pem: &'static str,
+    /// The peer certificate template, DER — re-issued per window.
+    pub peer_template_der: &'static [u8],
+    /// The RSA-2048 peer private key, PKCS#1 DER.
+    pub peer_key_der: &'static [u8],
+    /// Per-window SHA-1 receiver-auth signatures, concatenated.
+    pub signatures_sha1: &'static [u8],
+    /// Per-window SHA-256 receiver-auth signatures, concatenated.
+    pub signatures_sha256: &'static [u8],
+}
+
+include!(concat!(env!("OUT_DIR"), "/cks_identity.rs"));
+
+/// Whether this build carries a bundled CKS identity.
+#[must_use]
+pub const fn has_bundled_identity() -> bool {
+    BUNDLED_CKS.is_some()
+}
 
 /// The embedded table, parsed.
 #[derive(Debug, Clone)]
@@ -43,29 +68,34 @@ pub struct CksTable {
     peer_key_pkcs8_der: Vec<u8>,
     device_cert_der: Vec<u8>,
     ica_der: Vec<u8>,
+    identity: BundledCks,
 }
 
 impl CksTable {
     /// Parse the embedded fixtures.
     ///
     /// # Errors
-    /// [`ReplayError::Pem`], [`ReplayError::InvalidKey`] or [`ReplayError::Template`] if a
-    /// fixture does not have the shape it is supposed to. All inputs are compile-
-    /// time constants, so this either always succeeds or always fails — the tests
-    /// below are what make that a checked property rather than a hope.
+    /// [`ReplayError::NoIdentity`] on a build without the carved identity, or
+    /// [`ReplayError::Pem`], [`ReplayError::InvalidKey`] or [`ReplayError::Template`]
+    /// if a fixture does not have the shape it is supposed to. Given an identity all
+    /// inputs are compile-time constants, so this either always succeeds or always
+    /// fails — the tests below are what make that a checked property rather than a hope.
     pub fn load() -> Result<Self, ReplayError> {
-        if SIGNATURES_SHA1.len() != WINDOW_COUNT as usize * SIGNATURE_LEN
-            || SIGNATURES_SHA256.len() != WINDOW_COUNT as usize * SIGNATURE_LEN
+        let id = BUNDLED_CKS.ok_or(ReplayError::NoIdentity {
+            identity: Identity::Cks,
+        })?;
+        if id.signatures_sha1.len() != WINDOW_COUNT as usize * SIGNATURE_LEN
+            || id.signatures_sha256.len() != WINDOW_COUNT as usize * SIGNATURE_LEN
         {
             return Err(ReplayError::Table(format!(
                 "signature tables are {} and {} bytes; {WINDOW_COUNT} windows needs {}",
-                SIGNATURES_SHA1.len(),
-                SIGNATURES_SHA256.len(),
+                id.signatures_sha1.len(),
+                id.signatures_sha256.len(),
                 WINDOW_COUNT as usize * SIGNATURE_LEN
             )));
         }
 
-        let peer_key = RsaPrivateKey::from_pkcs1_der(PEER_KEY_DER)
+        let peer_key = RsaPrivateKey::from_pkcs1_der(id.peer_key_der)
             .map_err(|e| ReplayError::InvalidKey(format!("embedded peer key: {e}")))?;
         let peer_key_pkcs8_der = peer_key
             .to_pkcs8_der()
@@ -75,11 +105,12 @@ impl CksTable {
 
         let window0 = Window::new(EPOCH_UNIX, EPOCH_UNIX + WINDOW_SECS)?;
         Ok(Self {
-            template: PeerTemplate::parse(PEER_TEMPLATE_DER.to_vec(), window0)?,
+            template: PeerTemplate::parse(id.peer_template_der.to_vec(), window0)?,
             peer_key,
             peer_key_pkcs8_der,
-            device_cert_der: pem::decode_one(DEVICE_CERT_PEM, "CERTIFICATE")?,
-            ica_der: pem::decode_one(ICA_PEM, "CERTIFICATE")?,
+            device_cert_der: pem::decode_one(id.device_cert_pem, "CERTIFICATE")?,
+            ica_der: pem::decode_one(id.ica_pem, "CERTIFICATE")?,
+            identity: id,
         })
     }
 
@@ -131,8 +162,8 @@ impl CksTable {
             vec![self.ica_der.clone()],
             self.template.reissue(window, &self.peer_key)?,
             self.peer_key_pkcs8_der.clone(),
-            SIGNATURES_SHA1[at..at + SIGNATURE_LEN].to_vec(),
-            SIGNATURES_SHA256[at..at + SIGNATURE_LEN].to_vec(),
+            self.identity.signatures_sha1[at..at + SIGNATURE_LEN].to_vec(),
+            self.identity.signatures_sha256[at..at + SIGNATURE_LEN].to_vec(),
             window,
             CredentialOrigin::CksTable { index },
         )
@@ -167,6 +198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn the_table_covers_the_range_it_is_documented_to() {
         let t = table();
         assert_eq!(t.window(0).unwrap().start_unix(), 1_672_531_200); // 2023-01-01
@@ -176,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn window_lookup_agrees_with_window_bounds() {
         let t = table();
         for index in [0, 1, 652, 899] {
@@ -191,6 +224,7 @@ mod tests {
     /// windows, taken from the reference extractor. If the DER rewrite drifts by a
     /// byte these change, and every signature in the table stops verifying.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn reissued_certificates_match_the_reference_bytes() {
         let t = table();
         for (index, want) in [
@@ -223,6 +257,7 @@ mod tests {
     /// signatures verify against the shipped device certificate, over the
     /// certificate this crate re-issues. 1800 RSA verifications.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn every_shipped_signature_verifies_over_the_certificate_we_reissue() {
         let t = table();
         let key = device_key();
@@ -258,6 +293,7 @@ mod tests {
     /// provider has to re-resolve when the window rolls rather than caching one
     /// credential forever.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_signature_does_not_verify_against_a_neighbouring_window() {
         let t = table();
         let vk = VerifyingKey::<Sha256>::new(device_key());
@@ -268,6 +304,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn past_the_end_of_the_table_is_a_typed_error_not_a_wrong_credential() {
         let t = table();
         match t.credential_at(t.covers_until()) {
@@ -279,6 +316,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn the_reissued_certificate_asserts_its_windows_validity() {
         let t = table();
         let w = t.window(652).unwrap();
@@ -291,6 +329,7 @@ mod tests {
     /// Openscreen rejects a TLS certificate whose `notAfter` is more than four
     /// days out. A 2-day window clears that; a wider one would not.
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn the_window_fits_openscreens_four_day_cap() {
         let w = table().window(0).unwrap();
         assert!(w.end_unix() - w.start_unix() <= 4 * 86_400);

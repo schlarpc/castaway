@@ -74,6 +74,8 @@ fn main() {
     .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
 
     airserver_identity(&outdir);
+    cks_identity(&outdir);
+    cks_credentials(&outdir);
 }
 
 /// The AirServer identity fixtures, `include_bytes!`'d from wherever the carve put them.
@@ -125,6 +127,96 @@ fn airserver_identity(outdir: &Path) {
         format!(
             "/// The carved AirServer identity, or `None` on a build without the carve.\n\
              pub(crate) const BUNDLED: Option<BundledIdentity> = {body};\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
+}
+
+/// The CKS identity, on the same terms as the AirServer one.
+fn cks_identity(outdir: &Path) {
+    const VAR: &str = "CASTAWAY_AIRRECEIVER_CARVE";
+    println!("cargo:rerun-if-env-changed={VAR}");
+    println!("cargo:rustc-check-cfg=cfg(cks_identity)");
+
+    let body = match std::env::var_os(VAR) {
+        None => "None".to_owned(),
+        Some(dir) => {
+            println!("cargo:rustc-cfg=cks_identity");
+            let dir = PathBuf::from(dir);
+            let f = |name: &str| {
+                let p = dir.join(name);
+                assert!(p.is_file(), "{VAR} is set but {} is missing", p.display());
+                println!("cargo:rerun-if-changed={}", p.display());
+                p.display().to_string()
+            };
+            format!(
+                "Some(BundledCks {{\n    \
+                   device_cert_pem: include_str!(r\"{}\"),\n    \
+                   ica_pem: include_str!(r\"{}\"),\n    \
+                   peer_template_der: include_bytes!(r\"{}\"),\n    \
+                   peer_key_der: include_bytes!(r\"{}\"),\n    \
+                   signatures_sha1: include_bytes!(r\"{}\"),\n    \
+                   signatures_sha256: include_bytes!(r\"{}\"),\n}})",
+                f("device_cert.pem"),
+                f("ica.pem"),
+                f("peer_template.der"),
+                f("peer_key.der"),
+                f("signatures_sha1.bin"),
+                f("signatures_sha256.bin"),
+            )
+        }
+    };
+
+    let out = outdir.join("cks_identity.rs");
+    std::fs::write(
+        &out,
+        format!(
+            "/// The carved CKS identity, or `None` on a build without the carve.\n\
+             pub(crate) const BUNDLED_CKS: Option<BundledCks> = {body};\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
+}
+
+/// The CKS backend credentials, as string literals rather than file includes: they are
+/// two 32-character constants, and `include_str!` would drag their paths into the
+/// binary alongside them.
+fn cks_credentials(outdir: &Path) {
+    const VAR: &str = "CASTAWAY_AIRRECEIVER_CARVE";
+    println!("cargo:rustc-check-cfg=cfg(cks_credentials)");
+
+    let body = match std::env::var_os(VAR) {
+        None => "None".to_owned(),
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            let f = |name: &str| {
+                let p = dir.join(name);
+                let v = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()));
+                let v = v.trim().to_owned();
+                assert!(
+                    v.len() == 32 && v.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{} is not 32 hex characters",
+                    p.display()
+                );
+                println!("cargo:rerun-if-changed={}", p.display());
+                v
+            };
+            println!("cargo:rustc-cfg=cks_credentials");
+            format!(
+                "Some(CksCredentials {{ api_key: {:?}, sig_secret: {:?} }})",
+                f("cks_api_key.txt"),
+                f("cks_sig_secret.txt")
+            )
+        }
+    };
+
+    let out = outdir.join("cks_credentials.rs");
+    std::fs::write(
+        &out,
+        format!(
+            "/// The carved backend credentials, or `None` without the carve.\n\
+             pub(crate) const CKS_CREDENTIALS: Option<CksCredentials> = {body};\n"
         ),
     )
     .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));

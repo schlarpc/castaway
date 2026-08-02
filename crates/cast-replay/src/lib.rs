@@ -125,6 +125,7 @@ pub mod template;
 pub mod window;
 
 pub use airserver::{has_bundled_identity, AirServerTable};
+pub use cks::has_bundled_identity as has_bundled_cks;
 pub use cks::CksTable;
 pub use crl::{CastCrl, ServableCrl, ServeRefusal};
 pub use crypto_cast_auth::{HashAlgo, NonceEcho, SigAlgo, SignedAuth};
@@ -185,6 +186,18 @@ pub enum ReplayError {
         /// Which offline identity was asked for.
         identity: Identity,
     },
+
+    /// This build was not given the CKS backend's API credentials.
+    ///
+    /// They are SoftMedia's service credentials, carved from `libAirReceiver.so` at
+    /// build time rather than checked in. Without them the live CKS refresh is
+    /// unavailable; the offline table is not affected, so a build in this state still
+    /// authenticates and simply cannot extend its horizon.
+    #[error(
+        "this build has no CKS backend credentials, so the live refresh is \
+         unavailable; build through nix so nix/airreceiver-carve.nix can supply them"
+    )]
+    NoCksCredentials,
 
     /// A validity window could not be constructed or rendered.
     #[error("validity window: {0}")]

@@ -35,7 +35,7 @@
 # libraries winit and wgpu dlopen. The browser brings its own, because it is a separate
 # process with its own wrapper.
 { pkgs, craneLib, commonArgs, baseCargoArtifacts, depsOnlyFrom, gitRev, electron, widevineCdm, moonlightCommonC, ldacbt
-, bluetoothFirmware, airserverKekEnv }:
+, bluetoothFirmware }:
 
 let
   # Everything these features drag in: the ffmpeg/bindgen set (render + hwaccel + the
@@ -114,11 +114,6 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
   # Same gap as the Windows artifact had: the firmware directory was named only in the
   # devShell, so the kiosk that ships embedded none of it (architecture 11.3b).
   CASTAWAY_FIRMWARE_DIR = bluetoothFirmware;
-
-  # The AirServer KEK constants, carved rather than written down. On the final build for
-  # the same reason as the revision above, plus one of its own: in `commonArgs` this
-  # would drag the unfree carve into every check.
-  inherit (airserverKekEnv) CASTAWAY_AIRSERVER_KEK_PERSON_FILE CASTAWAY_AIRSERVER_KEK_PASS_FILE;
 
   # The render/browser tests want a GPU and a display; the sandbox has neither.
   doCheck = false;

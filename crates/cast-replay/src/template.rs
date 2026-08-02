@@ -182,6 +182,7 @@ mod tests {
     use crate::cks::CksTable;
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn template_layout_matches_the_shipped_certificate() {
         let table = CksTable::load().unwrap();
         let t = table.template();
@@ -194,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_truncated_template_is_rejected_rather_than_reissued() {
         let table = CksTable::load().unwrap();
         let mut der = table.template().der.clone();
@@ -203,6 +205,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(cks_identity), ignore = "needs the carved CKS identity")]
     fn a_template_signed_with_the_wrong_algorithm_is_rejected() {
         let table = CksTable::load().unwrap();
         let mut der = table.template().der.clone();

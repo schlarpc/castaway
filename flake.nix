@@ -246,7 +246,7 @@
           pkgs = pkgsFor system;
           craneLib = cranelibFor system;
         in
-        {
+        castCarveEnvFor system // {
           # Keep Cargo sources plus non-Rust assets that crates `include_str!`/`include_bytes!`
           # (SCPD/description XML in proto-dlna; fonts, blue-noise dither and the default
           # adblock filter list in pipeline; the AirPort private key in crypto-raop; the Cast
@@ -308,20 +308,29 @@
       # build with the "unknown" fallback instead; nothing shipped comes out of a check.
       gitRev = self.shortRev or self.dirtyShortRev or "unknown";
 
-      # Where `cast-replay`'s build.rs finds the two BLAKE2b constants that open an
-      # AirServer credential database — carved out of the pinned installer rather than
-      # written down (nix/airserver-carve.nix).
+      # Where `cast-replay`'s build.rs finds the carved Cast identities and the
+      # constants that open them. Both offline identities — SoftMedia's and App
+      # Dynamic's — are other companies' Google-issued device credentials, so they are
+      # carved from pinned vendor artifacts rather than checked in
+      # (nix/airserver-carve.nix, nix/airreceiver-carve.nix).
       #
-      # Set on the final package builds only, for the same reason as `gitRev` and one
-      # more: everything in `commonArgs` is inherited by every check, and the checks must
-      # not depend on unfree third-party material. They build unprovisioned, which is a
-      # supported state — `Kek::provisioned()` is `None`, the offline fixtures are keyed
-      # under a constant of our own, and the live AirServer path reports `NoKek` instead
-      # of pretending.
-      airserverKekEnvFor = system:
-        let carve = airserverCarveFor system; in {
-          CASTAWAY_AIRSERVER_KEK_PERSON_FILE = "${carve}/kek_person.bin";
-          CASTAWAY_AIRSERVER_KEK_PASS_FILE = "${carve}/kek_pass.bin";
+      # In `commonArgs`, so *every* build gets them: checks included. A build without
+      # them compiles and runs, but has no offline Cast identity at all and falls back
+      # to a self-generated development credential that real senders refuse — so a
+      # check that ran unprovisioned would be silently exercising a different receiver
+      # from the one that ships. The cost is that `nix flake check` now depends on the
+      # unfree carves; that is the honest trade, because the alternative is a green
+      # check for an artifact nobody deploys.
+      castCarveEnvFor = system:
+        let
+          airserver = airserverCarveFor system;
+          airreceiver = airreceiverCarveFor system;
+        in
+        {
+          CASTAWAY_AIRSERVER_CARVE = "${airserver}";
+          CASTAWAY_AIRSERVER_KEK_PERSON_FILE = "${airserver}/kek_person.bin";
+          CASTAWAY_AIRSERVER_KEK_PASS_FILE = "${airserver}/kek_pass.bin";
+          CASTAWAY_AIRRECEIVER_CARVE = "${airreceiver}";
         };
 
       # Build only dependencies (for caching)
@@ -379,6 +388,12 @@
         inherit (pkgsFor system) lib stdenvNoCC curl unzip cacert;
       };
 
+      # SoftMedia's CKS identity and backend credentials, out of the library above.
+      airreceiverCarveFor = system: import ./nix/airreceiver-carve.nix {
+        inherit (pkgsFor system) lib stdenvNoCC python3;
+        airreceiverSrc = airreceiverSrcFor system;
+      };
+
       # AirServer's Cast credential database and the two BLAKE2b constants that open it,
       # carved out of the pinned installer so neither lives in this tree. `cast-replay`
       # takes the constants through `CASTAWAY_AIRSERVER_KEK_{PERSON,PASS}_FILE`.
@@ -403,7 +418,6 @@
         baseCargoArtifacts = cargoArtifactsFor system;
         depsOnlyFrom = depsOnlyFromFor system;
         inherit gitRev;
-        airserverKekEnv = airserverKekEnvFor system;
         electron = electronLinuxFor system;
         widevineCdm = widevineLinuxFor system;
         bluetoothFirmware = bluetoothFirmwareFor system;
@@ -442,7 +456,7 @@
           # No renderer, no browser, nothing platform-specific: the build that proves the
           # protocol stack. It is `default` everywhere the full kiosk cannot be built (i.e.
           # Darwin), and what `checks.build` compiles so `nix flake check` stays cheap.
-          castaway-portable = craneLib.buildPackage (commonArgs // airserverKekEnvFor system // {
+          castaway-portable = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             CASTAWAY_GIT_REV = gitRev;
             # Only run tests during the check phase, not during build
@@ -466,6 +480,10 @@
           # The AirReceiver library the CKS carve reads, exposed so a fetch failure can
           # be diagnosed on its own rather than inside a larger build.
           airreceiver-src = airreceiverSrcFor system;
+
+          # Same idea as `airserver-carve`: buildable on its own so a version bump or
+          # a fetch failure is diagnosable without a full rebuild.
+          airreceiver-carve = airreceiverCarveFor system;
 
           # The linked GameStream core (D37), exposed on its own so it can be built and
           # cached independently — and so a bump can be checked before anything that
