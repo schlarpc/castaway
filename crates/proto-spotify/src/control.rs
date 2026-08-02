@@ -61,6 +61,33 @@ impl SpotifyRemote {
 /// on every change is what keeps them in step: sending only the flag that turned on
 /// would leave the other one set from a previous mode, so asking for repeat-one after
 /// repeat-all would get a device that does both and agrees with neither button.
+/// One of the two flag writes a repeat change is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepeatCall {
+    /// `repeat_context`.
+    Context(bool),
+    /// `repeat_track`.
+    Track(bool),
+}
+
+/// Both flag writes, in the order that never publishes a both-set state.
+///
+/// The flag being *cleared* goes first. A fixed order cannot do it: context-first is
+/// right for Track→Off and Context→Track, and wrong for Track→Context, where
+/// `repeat(true)` lands while the track flag is still set — and that intermediate is not
+/// internal. librespot's two handlers each touch only their own flag and `notify()` after
+/// every command, so (true, true) reaches the Spotify cluster and the phone's own UI
+/// between the two sends: [`repeat_flags`] describes it as "a device that does both and
+/// agrees with neither button", which is exactly what gets drawn.
+const fn repeat_calls(mode: RepeatMode) -> [RepeatCall; 2] {
+    let (context, track) = repeat_flags(mode);
+    if context {
+        [RepeatCall::Track(track), RepeatCall::Context(context)]
+    } else {
+        [RepeatCall::Context(context), RepeatCall::Track(track)]
+    }
+}
+
 const fn repeat_flags(mode: RepeatMode) -> (bool, bool) {
     match mode {
         RepeatMode::Context => (true, false),
@@ -104,12 +131,17 @@ impl RemoteControl for SpotifyRemote {
             ControlTxn::Previous => spirc.prev(),
             ControlTxn::Shuffle(on) => spirc.shuffle(*on),
             ControlTxn::Repeat(mode) => {
-                let (context, track) = repeat_flags(*mode);
-                // Both, always, and the context flag first so a mode change never passes
-                // through a state where both are set.
-                spirc
-                    .repeat(context)
-                    .and_then(|()| spirc.repeat_track(track))
+                let mut outcome = Ok(());
+                for call in repeat_calls(*mode) {
+                    if outcome.is_err() {
+                        break;
+                    }
+                    outcome = match call {
+                        RepeatCall::Context(on) => spirc.repeat(on),
+                        RepeatCall::Track(on) => spirc.repeat_track(on),
+                    };
+                }
+                outcome
             }
             // Unreachable via `issue`, which checks capabilities first — but this is a
             // trait method anyone can call directly, and a silent success here would look
@@ -183,6 +215,29 @@ mod tests {
         assert_eq!(repeat_flags(RepeatMode::Off), (false, false));
         assert_eq!(repeat_flags(RepeatMode::Context), (true, false));
         assert_eq!(repeat_flags(RepeatMode::Track), (false, true));
+    }
+
+    /// Every transition between every pair of modes, with the flags applied one at a
+    /// time the way librespot applies them.
+    #[test]
+    fn no_repeat_transition_passes_through_a_state_with_both_flags_set() {
+        let modes = [RepeatMode::Off, RepeatMode::Context, RepeatMode::Track];
+        for from in modes {
+            for to in modes {
+                let (mut context, mut track) = repeat_flags(from);
+                for call in repeat_calls(to) {
+                    match call {
+                        RepeatCall::Context(on) => context = on,
+                        RepeatCall::Track(on) => track = on,
+                    }
+                    assert!(
+                        !(context && track),
+                        "{from:?} -> {to:?} published both flags after {call:?}"
+                    );
+                }
+                assert_eq!((context, track), repeat_flags(to), "{from:?} -> {to:?}");
+            }
+        }
     }
 
     #[test]
