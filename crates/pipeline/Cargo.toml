@@ -275,6 +275,12 @@ required-features = ["stream"]
 name = "remote_negotiation"
 required-features = ["remote"]
 
+# The same transport, but with a real browser on the far end (#18). Needs a GPU and an
+# Electron, so `#[ignore]` and run by name — see the file's own header.
+[[test]]
+name = "remote_browser"
+required-features = ["remote", "electron"]
+
 # Regenerates the checked-in LDAC test vectors with the library's own encoder. Not part of
 # any test run — the fixtures it writes are, and they are checked in so the decode tests do
 # not need an encoder (or this feature) to have bytes to chew on.

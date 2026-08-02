@@ -54,9 +54,15 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct RemoteConfig {
     /// The UDP range ICE may bind, from `[remote.ice_ports]`.
     pub ice_ports: (u16, u16),
-    /// The address to bind candidates on. The serving interface, so the candidate a peer
-    /// receives is one it can actually route to.
-    pub bind_ip: std::net::IpAddr,
+    /// The addresses to offer candidates on, one socket each, all on the same port.
+    ///
+    /// Plural because a peer pairs a candidate of ours with one of its own, and a browser
+    /// does not offer a loopback candidate at all — it gathers its real interfaces and
+    /// nothing else. Binding only the advertised interface therefore leaves a browser *on
+    /// the panel itself* with nothing to pair against: it offers 10.x and Tailscale
+    /// addresses, we offer 127.0.0.1, and ICE reports "no candidate pairs" and stops.
+    /// Binding both is what makes the panel's own page work as well as a phone's.
+    pub bind_ips: Vec<std::net::IpAddr>,
     /// Whether a peer's input reaches the panel at all (`remote.input`).
     ///
     /// Enforced here rather than at the client, obviously, and enforced by *not queueing*
@@ -229,7 +235,13 @@ impl RemoteService {
             .with_interceptor_registry(registry)
             .with_handler(handler)
             .with_runtime(Arc::clone(&self.runtime))
-            .with_udp_addrs(vec![std::net::SocketAddr::new(self.config.bind_ip, port)])
+            .with_udp_addrs(
+                self.config
+                    .bind_ips
+                    .iter()
+                    .map(|ip| std::net::SocketAddr::new(*ip, port))
+                    .collect(),
+            )
             .build()
             .await
             .map_err(|e| PipelineError::Remote(format!("peer connection: {e}")))?;

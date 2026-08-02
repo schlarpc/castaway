@@ -317,10 +317,21 @@ fn main() -> anyhow::Result<()> {
             pipeline::remote::RemoteService::new(
                 pipeline::remote::RemoteConfig {
                     ice_ports: (config.remote.ice_ports.first, config.remote.ice_ports.last),
-                    // The serving interface, so the candidate a peer is handed is one it
-                    // can route to. A candidate on the wrong interface negotiates and
-                    // then carries nothing.
-                    bind_ip: std::net::IpAddr::V4(config.resolved_interface()),
+                    // The serving interface *and* loopback. A peer pairs one of our
+                    // candidates with one of its own, and a browser never offers a
+                    // loopback candidate — it gathers its real interfaces and stops. So
+                    // a browser open on the panel itself would have nothing to pair
+                    // against if we offered only 127.0.0.1, and nothing to pair against
+                    // if we offered only the LAN address while it sat on loopback.
+                    bind_ips: {
+                        let lan = std::net::IpAddr::V4(config.resolved_interface());
+                        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                        if lan == loopback {
+                            vec![lan]
+                        } else {
+                            vec![lan, loopback]
+                        }
+                    },
                     accept_input: config.remote.input,
                 },
                 std::sync::Arc::clone(stream_handle.stream().feed()),

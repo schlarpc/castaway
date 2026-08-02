@@ -96,7 +96,7 @@ fn service(ports: (u16, u16), accept_input: bool) -> (Arc<RemoteService>, Arc<Re
     let service = RemoteService::new(
         RemoteConfig {
             ice_ports: ports,
-            bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bind_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
             accept_input,
         },
         feed,
@@ -302,7 +302,7 @@ fn service_reusing(
     let service = RemoteService::new(
         RemoteConfig {
             ice_ports: ports,
-            bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bind_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
             accept_input: true,
         },
         Arc::new(LiveFeed::new()),
@@ -323,7 +323,7 @@ async fn connecting_starts_the_encoder() {
     let service = RemoteService::new(
         RemoteConfig {
             ice_ports: (45500, 45501),
-            bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bind_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
             accept_input: true,
         },
         feed,
