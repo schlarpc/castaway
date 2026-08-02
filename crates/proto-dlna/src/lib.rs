@@ -355,6 +355,12 @@ mod tests {
             // Will not do HEAD at all. Common, and says nothing about the resource.
             ("405 Method Not Allowed", None),
             ("501 Not Implemented", None),
+            // A signed URL whose signature covers the method, and auth we are not
+            // carrying. Both routinely coexist with a GET that works.
+            ("403 Forbidden", Some("text/html")),
+            ("401 Unauthorized", Some("text/html")),
+            // A rate limit that will have passed by the time the decoder asks.
+            ("429 Too Many Requests", Some("text/html")),
             // Having a bad minute. The decoder's own fetch retries; a probe does not.
             ("503 Service Unavailable", Some("text/html")),
             // Names no type, or the universal "here are some bytes" that plenty of real

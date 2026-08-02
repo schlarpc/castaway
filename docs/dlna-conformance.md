@@ -144,11 +144,16 @@ trees, and the enumeration behind them exists only for control points that will 
 glob (see the gmrender finding above). A renderer that refused `audio/webm` while
 advertising `audio/*` would be refusing what it had promised.
 
-**Every ambiguous answer plays the item.** A server that will not do `HEAD` (405/501), one
-that is having a bad minute (5xx), one that names no `Content-Type`, one that names
-`application/octet-stream`, and a connect that times out are all treated as "nothing
-learned". Only two answers are acted on: the server said the resource is not there (716) or
-named a type outside the advertised table (714). This is not timidity — the two errors are
+**Every ambiguous answer plays the item.** Only two answers are acted on: `404`/`410`,
+where the server says there is nothing at that URL at all (716), and a `Content-Type`
+outside the advertised table (714). Everything else is "nothing learned" — and the status
+list is deliberately short, because most refusals are about *this request* rather than
+about the resource, and routinely coexist with a `GET` that works: 405/501 is a server with
+no `HEAD` at all, 403 is a signed URL whose signature covers the method, 401 is auth we are
+not carrying, 429 is a rate limit that will have passed by the time the decoder asks, 5xx
+is a bad minute its reconnect may get through. A connect that times out is likewise left
+alone: it looks the same as a slow server, and the decoder's 30 s fetch judges it better
+than a 3 s probe. This is not timidity — the two errors are
 not symmetric. Failing to reject a bad resource costs what we had before, an asynchronous
 `ERROR_OCCURRED`. Rejecting a good one is a cast that would have played, refused, with no
 way for a guest in the room to override it.

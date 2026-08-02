@@ -22,10 +22,11 @@
 //! A probe that rejects a *good* one turns a cast that would have played into a phone
 //! saying the renderer refused it, with no way for the guest to override it. So every
 //! ambiguous answer resolves to [`Verdict::Inconclusive`] and the item plays: a server
-//! that will not do `HEAD`, one that names no type, one that names
-//! `application/octet-stream`, a timeout, a scheme with nothing to probe. Only two answers
-//! are acted on, and both are unambiguous: the server said the resource is not there, or
-//! the server said it is something we told the control point we cannot play.
+//! that will not do `HEAD`, one that refuses this request but not a `GET`, one that names
+//! no type, one that names `application/octet-stream`, a timeout, a scheme with nothing to
+//! probe. Only two answers are acted on, and both are unambiguous: `404`/`410`, where the
+//! server says there is nothing at that URL at all, and a `Content-Type` outside what we
+//! told the control point we accept.
 //!
 //! ## Why `ureq`
 //!
@@ -122,16 +123,25 @@ fn head(uri: &str) -> Verdict {
         .call()
     {
         Ok(response) => response,
-        // A status the server chose to send. This is the only branch that can refuse.
+        // A status the server chose to send.
+        //
+        // Only two of them are refused, and the list is short on purpose: this is the
+        // asymmetry from the module note applied to status codes. `404`/`410` are the
+        // server saying, unconditionally, that there is nothing at that URL — the `GET`
+        // that follows cannot succeed where the `HEAD` did not.
+        //
+        // Every other status is refused *by this request* rather than about this
+        // resource, and several of them routinely coexist with a `GET` that works:
+        // `405`/`501` is a server that does not implement `HEAD` at all, `403` is a signed
+        // URL whose signature covers the method, `401` is auth we are not carrying, `429`
+        // is a rate limit that will have passed by the time the decoder asks, `5xx` is a
+        // bad minute the decoder's own reconnect may get through. Refusing on any of those
+        // is a cast that would have played, refused.
         Err(ureq::Error::Status(code, _)) => {
-            // 405/501 is "this server does not do HEAD", which says nothing about the
-            // resource — quite common, and refusing on it would break those servers
-            // entirely. 5xx is the server having a bad day, which a retrying decoder may
-            // still get through.
-            if code == 405 || code == 501 || code >= 500 {
-                return Verdict::Inconclusive;
+            if code == 404 || code == 410 {
+                return Verdict::Missing(code);
             }
-            return Verdict::Missing(code);
+            return Verdict::Inconclusive;
         }
         // Transport failure: DNS, connect refused, TLS, timeout. Tempting to call this
         // `Missing` — it is the case the issue opens with, a URL pointing at nothing — but
