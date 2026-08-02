@@ -231,9 +231,12 @@ impl DialService {
             .route("/dial/dd.xml", get(device_description))
             .route(
                 "/dial/apps/YouTube",
-                get(app_state).post(launch).delete(stop),
+                get(app_state).post(launch).delete(stop).options(preflight),
             )
-            .route("/dial/apps/YouTube/run", axum::routing::delete(stop))
+            .route(
+                "/dial/apps/YouTube/run",
+                axum::routing::delete(stop).options(preflight),
+            )
             .with_state(self.inner.clone())
             .layer(axum::middleware::map_response(add_cors))
     }
@@ -264,6 +267,32 @@ impl DialService {
 /// `*` rather than a list of origins: they are whatever page a guest happens to have open,
 /// we have no list to check against, and there is nothing behind these routes worth
 /// guarding with one — every one of them is already reachable by anybody on the LAN.
+/// Answer the preflight a browser sends before a `DELETE`.
+///
+/// [`add_cors`] alone is not enough, and the gap was exactly the sender class its comment
+/// claims to serve. `GET` and a form-encoded `POST` are CORS *simple* requests and go
+/// straight through, so launching worked. `DELETE` — the stop operation, on both app
+/// routes — is not safelisted, so the browser preflights it with `OPTIONS`; with no route
+/// for that method axum answered 405, and a preflight must be a 2xx that names the method.
+/// A page-based sender could start the app and never stop it, leaving it "running" with
+/// its screen id published until something that is not a browser cleaned up.
+///
+/// `Allow-Headers` is not sent: nothing here reads a non-safelisted request header, and a
+/// preflight that names headers it does not want is a preflight that has to be kept in
+/// step with the ones it does.
+async fn preflight() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            ("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"),
+            // A day, so a sender that stops and restarts an app does not pay for a
+            // round trip each time.
+            ("Access-Control-Max-Age", "86400"),
+        ],
+    )
+        .into_response()
+}
+
 async fn add_cors(mut response: Response) -> Response {
     response.headers_mut().insert(
         "Access-Control-Allow-Origin",
@@ -472,6 +501,47 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn a_browser_can_preflight_the_stop_it_needs_to_send() {
+        // A page-based sender's DELETE is not a CORS simple request, so the browser
+        // preflights it. Without an OPTIONS route axum answered 405 — not a 2xx and with
+        // no Access-Control-Allow-Methods — so the DELETE was never sent and the app
+        // stayed "running" forever. Launch (GET/form POST) worked throughout, which is
+        // what made it look like CORS was handled.
+        for path in ["/dial/apps/YouTube", "/dial/apps/YouTube/run"] {
+            let (svc, _rx) = service();
+            let resp = svc
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .method("OPTIONS")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                resp.status().is_success(),
+                "{path}: a preflight must be 2xx, got {}",
+                resp.status()
+            );
+            let methods = resp
+                .headers()
+                .get("Access-Control-Allow-Methods")
+                .expect("a preflight has to name the methods it allows")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(methods.contains("DELETE"), "{path}: {methods}");
+            // …and the response layer still stamps the origin onto it.
+            assert_eq!(
+                resp.headers().get("Access-Control-Allow-Origin").unwrap(),
+                "*"
+            );
+        }
     }
 
     #[tokio::test]
