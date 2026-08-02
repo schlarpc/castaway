@@ -28,7 +28,7 @@ use crate::state::Renderer;
 type Properties = Vec<(&'static str, String)>;
 
 /// Which UPnP service a control request targets.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceKind {
     AvTransport,
     RenderingControl,
@@ -139,7 +139,7 @@ async fn handle_control(
     };
     debug!(service = ?kind, action = %action.name, "DLNA control");
 
-    if let Some(fault) = probe_uri_argument(&action).await {
+    if let Some(fault) = probe_uri_argument(kind, &action).await {
         return fault_response(&fault);
     }
 
@@ -510,7 +510,16 @@ fn xml_ok(body: String) -> Response {
 ///
 /// `None` for every action that names no URI, and for every probe that reached no
 /// conclusion — see [`crate::probe`] for why that is the overwhelming majority of them.
-async fn probe_uri_argument(action: &SoapAction) -> Option<DlnaError> {
+///
+/// Runs *after* the two checks that outrank it and would otherwise be shadowed: the
+/// service the action was posted to (a `SetAVTransportURI` sent to RenderingControl is 401
+/// `InvalidAction`, whatever the resource turns out to be) and the `InstanceID` (718). A
+/// probe that answered 714 to either would be telling the control point the wrong thing
+/// was wrong — and would have opened a socket to find it out.
+async fn probe_uri_argument(kind: ServiceKind, action: &SoapAction) -> Option<DlnaError> {
+    if kind != ServiceKind::AvTransport || action.require_instance_zero().is_err() {
+        return None;
+    }
     let uri = match action.name.as_str() {
         "SetAVTransportURI" => action.arg("CurrentURI")?,
         // An empty `NextURI` is how a control point clears what it staged (§2.4.2), and

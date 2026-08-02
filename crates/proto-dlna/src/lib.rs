@@ -304,6 +304,45 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
     }
 
+    /// The probe must not answer a question that was not the one that was wrong. A
+    /// `SetAVTransportURI` naming an instance this renderer has not got is 718 whatever the
+    /// resource turns out to be — and the probe opening a socket to find out otherwise
+    /// would be both the wrong answer and a needless request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_instance_outranks_whatever_the_resource_is() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let (svc, _rx) = service();
+        let app = svc.router();
+        let url = stub_server("200 OK", Some("text/html")).await;
+
+        let body = format!(
+            r#"<?xml version="1.0"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+            <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+            <InstanceID>1</InstanceID><CurrentURI>{url}</CurrentURI>
+            <CurrentURIMetaData></CurrentURIMetaData></u:SetAVTransportURI></s:Body></s:Envelope>"#
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(paths::AVT_CONTROL)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("<errorCode>718</errorCode>"), "{body}");
+    }
+
     /// Leniency is not a nicety here — each of these is a real server's real behaviour,
     /// and refusing on any of them turns a cast that would have played into one the phone
     /// says was rejected, with no way for a guest in the room to override it.
