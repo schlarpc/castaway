@@ -319,8 +319,10 @@ impl Nv12Converter {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Discard: the triangle covers every pixel, so clearing first
-                        // would be a full-surface write nothing ever reads.
+                        // The triangle covers every pixel, so the previous contents are
+                        // never read and a discard would do — except wgpu has no
+                        // `LoadOp::Discard` (only `StoreOp` has one). Clear is the
+                        // cheapest thing the API can express here.
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
