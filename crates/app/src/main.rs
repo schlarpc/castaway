@@ -880,36 +880,20 @@ async fn serve(
                 });
             }
             tokio::spawn(async move {
-                // At most one resolver at a time. Each launch used to spawn one with no
-                // handle, so a relaunch inside the ~60 s budget left the *old* task
-                // polling the *old* pairing code — and whichever finished last won the
-                // slot. A stale writer could overwrite the fresh screen id, or refill a
-                // slot the stop route had just cleared, which reproduces the exact D28
-                // symptom the slot exists to prevent: connected, and unable to queue.
-                let mut resolver: Option<tokio::task::JoinHandle<()>> = None;
-                while let Some(event) = dial_rx.recv().await {
-                    match &event {
-                        proto_dial::DialEvent::Launched(params) => {
-                            if let Some(task) = resolver.take() {
-                                task.abort();
-                            }
-                            if let Some(code) = params.pairing_code.clone() {
-                                resolver = Some(tokio::spawn(screen::publish_screen_id(
-                                    code,
-                                    screen.clone(),
-                                )));
-                            }
-                        }
-                        // The page is going away, so a resolver still hunting for its id
-                        // is hunting for a screen that will not exist.
-                        proto_dial::DialEvent::Stopped => {
-                            if let Some(task) = resolver.take() {
-                                task.abort();
-                            }
-                        }
-                    }
-                    on_dial(event);
-                }
+                // At most one resolver at a time, which is `pump_dial`'s whole job — see
+                // there for what a second one costs.
+                screen::pump_dial(
+                    &mut dial_rx,
+                    |params| {
+                        let code = params.pairing_code.clone()?;
+                        Some(tokio::spawn(screen::publish_screen_id(
+                            code,
+                            screen.clone(),
+                        )))
+                    },
+                    on_dial,
+                )
+                .await;
             });
         }
     }
