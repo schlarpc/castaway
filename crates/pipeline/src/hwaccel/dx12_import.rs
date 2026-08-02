@@ -121,6 +121,8 @@ impl Dx12Importer {
             height: surface.height,
             depth_or_array_layers: 1,
         };
+        // SAFETY: `resource` was just opened on this device and is live.
+        unsafe { check_extent(&resource, extent, wgpu::TextureFormat::NV12) }?;
         // SAFETY: the resource was opened on this device and is an NV12 2D texture with
         // one mip and one sample, matching the descriptor. The reference is *moved* into
         // the texture rather than cloned: with no cache there is no second owner, so
@@ -259,6 +261,8 @@ impl Dx12Importer {
         let resource = unsafe { open_shared(device, handle) }?;
 
         let extent = geometry.extent();
+        // SAFETY: `resource` was just opened on this device and is live.
+        unsafe { check_extent(&resource, extent, geometry.format) }?;
         // SAFETY: the resource was opened on this device and is a 2D texture with one mip
         // and one sample, matching the descriptor. Moved, not cloned: one reference in,
         // one release out, when wgpu drops the texture with its layer.
@@ -293,6 +297,76 @@ impl Dx12Importer {
             texture,
             _owner: owner,
         })
+    }
+}
+
+/// Check that a resource really is the size and format we are about to tell wgpu it is.
+///
+/// This is the only place in the import path where the *real* dimensions are knowable.
+/// `texture_from_raw` takes the extent on trust and does not consult the resource, so the
+/// descriptor handed to wgpu is a claim, not a reading — and everything downstream
+/// (`Texture::width()`, the compositor's own guard, the sampler's addressing) reports the
+/// claim back. Comparing those to each other can only ever agree with itself, which is
+/// what #103 was: a size guard that could not fire. `GetDesc` asks the resource.
+///
+/// A mismatch is a mis-import, not a rendering artefact to live with: a texture bound at
+/// the wrong extent samples memory outside the picture, which on a 1088-row decoder
+/// texture described as 1080 rows is the stale-frame class of bug that #102 is about at
+/// the other end of the same handle.
+///
+/// # Safety
+/// `resource` must be a live D3D12 resource.
+unsafe fn check_extent(
+    resource: &d3d12::Resource,
+    claimed: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+) -> Result<(), PipelineError> {
+    // SAFETY: `resource` is live; `GetDesc` returns by value and cannot fail.
+    let desc = unsafe { resource.GetDesc() };
+
+    if desc.Width != u64::from(claimed.width) || desc.Height != claimed.height {
+        return Err(PipelineError::GpuImport(format!(
+            "shared resource is {}×{} but was imported as {}×{}",
+            desc.Width, desc.Height, claimed.width, claimed.height
+        )));
+    }
+    // The format travels with the handle rather than being chosen here, so a producer
+    // that changed it — an NV12 pool rebuilt as P010 for a 10-bit stream, say — would
+    // otherwise be sampled through the wrong per-plane views and paint plausible garbage.
+    let accepted = dxgi_formats(format);
+    if !accepted.is_empty() && !accepted.contains(&desc.Format) {
+        return Err(PipelineError::GpuImport(format!(
+            "shared resource is DXGI format {} but was imported as {format:?}",
+            desc.Format
+        )));
+    }
+    Ok(())
+}
+
+/// Every DXGI format a `wgpu` format may legitimately arrive as, or empty for one this
+/// path does not import — which is not an error here, only a check declined.
+///
+/// A family rather than a single value because the `_TYPELESS` and `_SRGB` members of an
+/// 8-bit RGBA family differ only in how a *view* reads the same bits, and a producer
+/// picks whichever suits it: Chromium creates its shared images typeless on some paths so
+/// the same resource can be read both ways. Rejecting those would turn this guard into a
+/// new way to lose the browser layer, which is not what it is for — it is for catching a
+/// resource that is a different *thing* than we believe.
+fn dxgi_formats(format: wgpu::TextureFormat) -> &'static [winapi::shared::dxgiformat::DXGI_FORMAT] {
+    use winapi::shared::dxgiformat as fmt;
+    match format {
+        wgpu::TextureFormat::NV12 => &[fmt::DXGI_FORMAT_NV12],
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => &[
+            fmt::DXGI_FORMAT_B8G8R8A8_UNORM,
+            fmt::DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            fmt::DXGI_FORMAT_B8G8R8A8_TYPELESS,
+        ],
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => &[
+            fmt::DXGI_FORMAT_R8G8B8A8_UNORM,
+            fmt::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            fmt::DXGI_FORMAT_R8G8B8A8_TYPELESS,
+        ],
+        _ => &[],
     }
 }
 

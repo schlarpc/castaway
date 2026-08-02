@@ -1242,9 +1242,19 @@ impl WgpuCompositor {
             .ok_or_else(|| PipelineError::GpuImport("device cannot import GPU surfaces".into()))?;
         let texture = importer.import(&self.device, surface)?;
         if texture.width() != width || texture.height() != height {
-            // The frame's declared size and the surface's real size disagreeing means a
-            // resize was mishandled somewhere upstream; drawing it would sample garbage
-            // outside the picture.
+            // Two different sizes meet here and this catches the disagreement between
+            // them: `width`/`height` are the *decoded frame's* metadata, carried down the
+            // render path from `FrameImage`, while the texture's extent came from the
+            // *surface* the importer was handed. A resize mishandled between those two —
+            // a frame whose metadata was updated while its surface came from the old pool
+            // — would draw at the wrong scale.
+            //
+            // What it does *not* check is whether the imported resource is really that
+            // size, and it never could: the importer fabricates the extent it hands wgpu,
+            // so `texture.width()` reports the claim back rather than the resource. That
+            // reading is done where the raw handle is — `Dx12Importer::check_extent`
+            // against `GetDesc` — which is what #103 asked for and where it can actually
+            // be answered.
             return Err(PipelineError::GpuImport(format!(
                 "surface is {}×{} but the frame claims {width}×{height}",
                 texture.width(),
