@@ -77,6 +77,12 @@ struct KioskApp {
     drag_sample: Option<(std::time::Instant, f32)>,
     /// Where each contact was last seen, for turning a drag into a scroll.
     drag_last: std::collections::HashMap<ContactId, f32>,
+    /// The contact dragging the transport strip's scrub track, if any (#97).
+    ///
+    /// One, because there is one knob. Held so the strip gets that contact's *moves* and
+    /// only that contact's: a drag that started on the browser and happens to pass over
+    /// the strip belongs to the page underneath, and swallowing it would steal a scroll.
+    scrubbing: Option<ContactId>,
     /// Live touch contacts, for the edge swipe. Nothing else in the tree tracked these:
     /// ids were carried faithfully to the browser and then forgotten (D38).
     contacts: std::collections::HashMap<ContactId, crate::overlay::Contact>,
@@ -453,10 +459,14 @@ impl KioskApp {
     /// must still be swallowed, or it falls through to the browser underneath and scrolls
     /// a page nobody was looking at.
     fn offer_to_transport(&mut self, x: f32, y: f32, phase: crate::transport::TouchPhase) -> bool {
-        let Some(render) = self.render.as_ref() else {
+        let Some(render) = self.render.as_mut() else {
             return false;
         };
-        if !render.transport_owns(x, y) {
+        // A captured drag is exempt from the ownership test, and has to be: the finger is
+        // allowed to leave the track — people drag upwards to fine-tune — and asking
+        // whether it is still over the strip would drop the scrub mid-gesture.
+        let captured = phase == crate::transport::TouchPhase::Drag;
+        if !captured && !render.transport_owns(x, y) {
             return false;
         }
         if let Some(txn) = render.transport_action(x, y, phase) {
@@ -672,16 +682,42 @@ impl KioskApp {
             return true;
         }
 
-        let phase = match event.phase {
-            TouchPhase::Down => Some(crate::transport::TouchPhase::Press),
-            TouchPhase::Up => Some(crate::transport::TouchPhase::Release),
-            // A move is neither: the strip acts on the two ends of a contact, and
-            // swallowing moves would break a drag that started on the browser and
-            // happened to pass over the strip.
-            TouchPhase::Move | TouchPhase::Cancel => None,
-        };
+        // Which phase the strip is offered is a rule, and it lives in `transport::offer`
+        // where it can be tested (#97). What is left here is the bookkeeping: which
+        // contact owns the scrubber, and unwinding it when that contact goes away.
+        let scrubbing = self.scrubbing == Some(event.id);
+        let phase = crate::transport::offer(event.phase, scrubbing);
+        if scrubbing && event.phase == TouchPhase::Cancel {
+            self.scrubbing = None;
+            if let Some(render) = self.render.as_mut() {
+                render.clear_scrub_preview();
+            }
+        }
         if let Some(phase) = phase {
-            if self.offer_to_transport(event.x, event.y, phase) {
+            let answered = self.offer_to_transport(event.x, event.y, phase);
+            match event.phase {
+                // A press the strip answered with a preview is a scrub beginning.
+                TouchPhase::Down if answered => {
+                    if self
+                        .render
+                        .as_ref()
+                        .is_some_and(|r| r.scrub_preview().is_some())
+                    {
+                        self.scrubbing = Some(event.id);
+                    }
+                }
+                // A lift ends it whether the strip answered or not: a finger that wandered
+                // off the strip before letting go is still a finger letting go, and the
+                // strip declines to answer for a point it does not own.
+                TouchPhase::Up if scrubbing => {
+                    self.scrubbing = None;
+                    if let Some(render) = self.render.as_mut() {
+                        render.clear_scrub_preview();
+                    }
+                }
+                _ => {}
+            }
+            if answered {
                 return true;
             }
         }
@@ -1048,6 +1084,7 @@ impl KioskWiring {
             render: None,
             contacts: std::collections::HashMap::new(),
             drag_last: std::collections::HashMap::new(),
+            scrubbing: None,
             last_frame: None,
             started_drag: false,
             pointer_contact: false,
@@ -1132,6 +1169,7 @@ fn run_app(app: &mut KioskApp) -> Result<(), PipelineError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use input_touch::{InputOrigin, RemoteId};
 
@@ -1155,6 +1193,13 @@ mod tests {
             remote_input: None,
             contacts: std::collections::HashMap::new(),
             drag_last: std::collections::HashMap::new(),
+            scrubbing: None,
+            // No session holding the glass, which is what these cases are about. These two
+            // were added to `KioskApp` without ever reaching this literal, and nothing
+            // noticed: no gate has ever built this crate's tests with `kiosk` on, so the
+            // whole module below has not compiled for as long as they have existed.
+            touch_surface: None,
+            sized_surface: None,
             last_frame: None,
             started_drag: false,
             pointer_contact: false,
@@ -1178,6 +1223,166 @@ mod tests {
 
     fn up(id: ContactId, x: f32, y: f32) -> Input {
         Input::Touch(TouchEvent::new(id, TouchPhase::Up, x, y))
+    }
+
+    fn moved(id: ContactId, x: f32, y: f32) -> Input {
+        Input::Touch(TouchEvent::new(id, TouchPhase::Move, x, y))
+    }
+
+    const PANEL: (u32, u32) = (1920, 1080);
+
+    /// A router with a real strip on a real (offscreen) panel.
+    ///
+    /// `router()` above declines everything the compositor owns, which is the right shape
+    /// for the contact bookkeeping it was written for and useless for the scrub: the whole
+    /// question is what happens between a finger and a laid-out strip. `None` where there
+    /// is no GPU.
+    fn router_with_strip() -> Option<KioskApp> {
+        use castaway_core::{ControlCapabilities, NowPlaying, PlaybackState};
+        let (tx, rx) = crate::render_pipeline::render_channel(8);
+        let mut render = crate::test_gpu::render_loop(PANEL.0, PANEL.1, rx)?;
+
+        let mut track = NowPlaying::default().with_title("one");
+        track.state = PlaybackState::Playing;
+        track.position = Some(std::time::Duration::ZERO);
+        track.duration = Some(std::time::Duration::from_secs(200));
+        tx.send(crate::render_pipeline::RenderCommand::NowPlaying(Box::new(
+            crate::nowplaying_card::NowPlayingCard {
+                track,
+                source: castaway_core::SourceDescription::default(),
+                up_next: Vec::new(),
+                controls: ControlCapabilities::PLAY
+                    | ControlCapabilities::PAUSE
+                    | ControlCapabilities::SEEK,
+            },
+        )));
+        render.pump();
+
+        let mut app = router();
+        app.size = PANEL;
+        app.render = Some(render);
+        Some(app)
+    }
+
+    /// A point `fraction` along the scrub track, panel-normalized.
+    fn on_track(app: &KioskApp, fraction: f32) -> (f32, f32) {
+        let model = app
+            .render
+            .as_ref()
+            .unwrap()
+            .transport_model()
+            .expect("a strip is on screen");
+        let (ox, oy, sw, sh) = crate::transport::placement(PANEL.0, PANEL.1);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let layout = crate::transport::layout(&model, sw.round() as u32, sh.round() as u32);
+        let track = layout.track_touch.expect("a seekable track has a bar");
+        let (_, ty) = track.center();
+        (
+            (ox + track.x + track.w * fraction) / PANEL.0 as f32,
+            (oy + ty) / PANEL.1 as f32,
+        )
+    }
+
+    #[test]
+    fn a_finger_on_the_scrub_track_owns_it_until_it_lifts() {
+        let Some(mut app) = router_with_strip() else {
+            return;
+        };
+        let finger = ContactId::panel(1);
+
+        let (x, y) = on_track(&app, 0.2);
+        app.apply(down(finger, x, y));
+        assert_eq!(
+            app.scrubbing,
+            Some(finger),
+            "a press on the track begins a scrub"
+        );
+        let first = app.render.as_ref().unwrap().scrub_preview();
+        assert!(
+            first.is_some_and(|f| (f - 0.2).abs() < 0.02),
+            "and the bar goes to the finger: {first:?}"
+        );
+
+        // Sliding along it moves the preview — the moves reach the strip *because* this
+        // contact owns it, which is the half that took a third TouchPhase to express.
+        let (x, y) = on_track(&app, 0.8);
+        app.apply(moved(finger, x, y));
+        let moved_to = app.render.as_ref().unwrap().scrub_preview();
+        assert!(
+            moved_to.is_some_and(|f| (f - 0.8).abs() < 0.02),
+            "the bar must follow: {moved_to:?}"
+        );
+
+        app.apply(up(finger, x, y));
+        assert_eq!(app.scrubbing, None, "the lift ends it");
+        assert_eq!(
+            app.render.as_ref().unwrap().scrub_preview(),
+            None,
+            "and the picture goes back to being the source's"
+        );
+    }
+
+    #[test]
+    fn a_drag_that_merely_crosses_the_strip_is_left_alone() {
+        // The constraint D38 added and #97 had to keep: a contact that went down on the
+        // browser and happens to pass over the strip belongs to the page underneath.
+        // Taking its moves would steal a scroll from whatever someone was actually
+        // reading, and the theft would be invisible — the page just stops following the
+        // finger near the bottom of the screen.
+        let Some(mut app) = router_with_strip() else {
+            return;
+        };
+        let finger = ContactId::panel(2);
+
+        // Down in the middle of the panel, nowhere near the strip.
+        app.apply(down(finger, 0.5, 0.3));
+        assert_eq!(app.scrubbing, None, "nothing was scrubbed by that");
+
+        // …and now across the track.
+        let (x, y) = on_track(&app, 0.5);
+        app.apply(moved(finger, x, y));
+        assert_eq!(
+            app.scrubbing, None,
+            "a passing drag must not capture the scrubber"
+        );
+        assert_eq!(
+            app.render.as_ref().unwrap().scrub_preview(),
+            None,
+            "and must not move the bar under it"
+        );
+    }
+
+    #[test]
+    fn a_lost_contact_puts_the_bar_back_rather_than_seeking() {
+        // A remote peer that drops off Wi-Fi mid-drag. `forget_origin` routes a cancel,
+        // and a cancel is not a lift: the gesture did not finish, so the bar returns to
+        // the music and the source is asked for nothing.
+        let Some(mut app) = router_with_strip() else {
+            return;
+        };
+        let seeks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.controls = Some(Arc::new({
+            let seeks = Arc::clone(&seeks);
+            move |txn| seeks.lock().unwrap().push(txn)
+        }));
+
+        let remote = ContactId::remote(RemoteId::new(7), 0);
+        let (x, y) = on_track(&app, 0.6);
+        app.apply(down(remote, x, y));
+        assert_eq!(app.scrubbing, Some(remote));
+
+        app.forget_origin(InputOrigin::Remote(RemoteId::new(7)));
+        assert_eq!(app.scrubbing, None, "the contact is gone, so the scrub is");
+        assert_eq!(
+            app.render.as_ref().unwrap().scrub_preview(),
+            None,
+            "the bar goes back to the music"
+        );
+        assert!(
+            seeks.lock().unwrap().is_empty(),
+            "a dropped connection must not seek anywhere: {:?}",
+            seeks.lock().unwrap()
+        );
     }
 
     #[test]

@@ -874,16 +874,23 @@
           # adapter they all run, and `CASTAWAY_REQUIRE_GPU` means they cannot go back to
           # skipping without the check noticing.
           #
+          # `kiosk` rather than `render`, which is one feature wider than the drawing this
+          # is named for and is there for the input router: `kiosk.rs`'s own unit tests are
+          # the only place the panel's touch routing is reachable without glass, and they
+          # had silently stopped compiling — two fields added to `KioskApp` never reached
+          # the test literal, and no gate had ever built this crate's tests with the
+          # feature on. Exactly the rot #98 is about, one feature over.
+          #
           # Software rasterisation, so this proves the drawing and not the driver: what a
           # real Vulkan implementation does differently — the panel's DX12 path especially
           # — is still the hardware's to prove.
           render-pixels = craneLib.cargoNextest (commonArgs // {
             cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
               pname = "castaway-render-pixels";
-              cargoExtraArgs = "--package pipeline --features render";
+              cargoExtraArgs = "--package pipeline --features kiosk";
             });
             inherit (lavapipe) LD_LIBRARY_PATH WGPU_BACKEND VK_DRIVER_FILES CASTAWAY_REQUIRE_GPU;
-            cargoExtraArgs = "--package pipeline --features render";
+            cargoExtraArgs = "--package pipeline --features kiosk";
             partitions = 1;
             partitionType = "count";
           });

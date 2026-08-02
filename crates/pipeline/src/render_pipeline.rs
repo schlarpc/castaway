@@ -1413,6 +1413,12 @@ struct TransportState {
     /// The position last painted, so a repaint happens when the readout changes rather
     /// than on every frame.
     painted: Option<Duration>,
+    /// Where the finger currently dragging the scrub track is, as a fraction (#97).
+    ///
+    /// An override rather than a write into the model: the model is what the *source*
+    /// said, and a drag has not asked the source for anything yet. Cleared on the lift,
+    /// when the real seek goes out, and on a cancel, when it does not.
+    preview: Option<f32>,
 }
 
 impl TransportState {
@@ -1431,6 +1437,38 @@ impl TransportState {
             Some(total) => advanced.min(total),
             None => advanced,
         })
+    }
+
+    /// The position the strip should be showing right now.
+    ///
+    /// The finger while one is down, the clock otherwise — and the finger wins for as
+    /// long as it is there, including on a *paused* track. A drag over a pause used to
+    /// repaint not once a second but never, because the clock is the only thing that ever
+    /// asked for a repaint and a paused clock does not tick.
+    fn showing(&self) -> Option<Duration> {
+        match self.preview {
+            Some(fraction) => Some(self.model.duration?.mul_f32(fraction)),
+            // Not gated on playback being active, and it cannot be. A paused track's
+            // position is constant, so this asks for at most one repaint and then stops
+            // — but that one repaint is the one that puts the bar back where the music is
+            // when a drag over a *paused* track is cancelled. Returning nothing here left
+            // the panel showing a preview of a gesture that never happened.
+            None => self.live_position(),
+        }
+    }
+
+    /// Whether what is painted has fallen behind what should be showing.
+    ///
+    /// Two rate limits, because there are two things being drawn. A clock changes at most
+    /// once a second and the strip is a full raster, so repainting it per frame would be
+    /// waste. A bar under a finger has to keep up with the finger, so every movement
+    /// counts — that is the "frame-rate, not second-rate" #97 asks for, and it applies
+    /// only while a drag is actually in flight.
+    fn stale(&self, target: Duration) -> bool {
+        match self.preview {
+            Some(_) => self.painted != Some(target),
+            None => self.painted.map(|p| p.as_secs()) != Some(target.as_secs()),
+        }
     }
 }
 
@@ -1565,6 +1603,11 @@ impl RenderLoop {
             Some(prev) if prev.model == *model => prev.taken_at,
             _ => std::time::Instant::now(),
         };
+        // A drag survives the source republishing under it, and it has to: sources publish
+        // for reasons that have nothing to do with the finger — a position tick, a queue
+        // update — and dropping the preview on one would make the bar snap back to the
+        // music halfway through a scrub, which reads as the panel fighting the hand.
+        let preview = self.transport.as_ref().and_then(|prev| prev.preview);
 
         match self.paint_transport(model, pw, ph, placement.1, h) {
             Ok(()) => {
@@ -1574,6 +1617,7 @@ impl RenderLoop {
                     placement,
                     taken_at,
                     painted: model.position,
+                    preview,
                 });
             }
             Err(e) => error!(error = %e, "failed to draw the transport strip"),
@@ -1634,16 +1678,16 @@ impl RenderLoop {
         let Some(state) = self.transport.as_ref() else {
             return;
         };
-        if !state.model.state.is_active() {
-            return;
-        }
-        let Some(live) = state.live_position() else {
+        let Some(live) = state.showing() else {
             return;
         };
-        if state.painted.map(|p| p.as_secs()) == Some(live.as_secs()) {
+        if !state.stale(live) {
             return;
         }
 
+        // The position carries the preview rather than a separate fraction reaching the
+        // painter, so the elapsed *readout* follows the finger too. Reading 1:07 while the
+        // bar sits at a third of a three-minute track is two answers to one question.
         let mut painting = state.model.clone();
         painting.position = Some(live);
         let (_, y, w, h) = state.placement;
@@ -1690,21 +1734,67 @@ impl RenderLoop {
     /// Returns the transaction rather than the hit: the caller is the input router and
     /// has no business knowing about scrub fractions, and the mapping needs the model
     /// this loop is holding anyway.
-    #[must_use]
+    ///
+    /// A preview is *applied* here rather than returned, for the same reason: it is a
+    /// picture this loop owes the glass, not a decision the router has to relay. Takes
+    /// `&mut self` for that, and the drag's repaint lands on the next tick.
     pub fn transport_action(
-        &self,
+        &mut self,
         x: f32,
         y: f32,
         phase: crate::transport::TouchPhase,
     ) -> Option<castaway_core::ControlTxn> {
+        use crate::transport::StripTouch;
         let state = self.transport.as_ref()?;
         if self.strip_covered(x, y) {
             return None;
         }
         let (sw, sh) = self.compositor.target_size();
         let (lx, ly) = crate::transport::to_strip_local(x, y, sw, sh);
-        let hit = state.layout.hit_for(lx, ly, phase)?;
-        state.model.action(hit)
+        match state.layout.touch(lx, ly, phase)? {
+            StripTouch::Preview(fraction) => {
+                if let Some(state) = self.transport.as_mut() {
+                    state.preview = Some(fraction);
+                }
+                None
+            }
+            StripTouch::Act(hit) => {
+                // The lift commits, so the picture stops being a guess and goes back to
+                // being the source's reading — which the seek is about to move anyway.
+                self.clear_scrub_preview();
+                let state = self.transport.as_ref()?;
+                state.model.action(hit)
+            }
+        }
+    }
+
+    /// The strip's model as the source last described it, if a strip is on screen.
+    ///
+    /// For tests, which need the same layout the loop is hit-testing against — deriving
+    /// one from a model of their own would pass while the real one was wrong.
+    #[must_use]
+    pub fn transport_model(&self) -> Option<crate::transport::TransportModel> {
+        self.transport.as_ref().map(|s| s.model.clone())
+    }
+
+    /// Where the finger dragging the scrub track is, if one is.
+    ///
+    /// The input router reads it to know whether the press it just offered was taken as a
+    /// scrub, and so whether the contact's later moves belong to the strip.
+    #[must_use]
+    pub fn scrub_preview(&self) -> Option<f32> {
+        self.transport.as_ref().and_then(|s| s.preview)
+    }
+
+    /// Stop previewing, without seeking.
+    ///
+    /// For a cancel: a contact that was lost — the phone dropped off Wi-Fi mid-drag —
+    /// did not *finish* the gesture, so the bar goes back to the source's reading and
+    /// nothing is asked of the sender.
+    pub fn clear_scrub_preview(&mut self) {
+        if let Some(state) = self.transport.as_mut() {
+            state.preview = None;
+        }
     }
 
     /// Whether a panel-normalized point is over the transport strip at all.

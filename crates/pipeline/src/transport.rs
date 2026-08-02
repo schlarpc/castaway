@@ -291,12 +291,56 @@ pub struct Layout {
 pub enum TouchPhase {
     /// A finger went down, or a button was pressed.
     Press,
+    /// A finger that went down on the strip has moved (#97).
+    ///
+    /// Only ever asked for a contact the strip already captured — a drag that merely
+    /// *crosses* the strip on its way somewhere else belongs to whatever it started on.
+    /// That is why this phase is allowed to answer for an x outside the track: once a
+    /// finger owns the scrubber it keeps it, the way it does on every other scrubber a
+    /// person has used, rather than losing the bar the moment it drifts above the bar.
+    Drag,
     /// A finger lifted, or a button was released.
     Release,
 }
 
+/// What phase, if any, the strip should be offered for a contact.
+///
+/// `scrubbing` is whether *this* contact is the one already dragging the scrub track. It
+/// is the whole of the pass-through rule, and the rule is easy to get wrong in the
+/// direction that costs the most: offering every move would swallow a drag that started on
+/// the browser and happened to cross the strip, stealing a scroll from the page
+/// underneath; offering none is what left a scrub with no feedback at all (#97).
+///
+/// A cancel reaches the strip as nothing, deliberately. A contact that was lost did not
+/// *finish* the gesture — synthesising a release would seek to wherever the finger
+/// happened to be when the phone left the network — so the router unwinds the preview
+/// itself rather than routing the phase.
+#[must_use]
+pub fn offer(phase: input_touch::TouchPhase, scrubbing: bool) -> Option<TouchPhase> {
+    match (phase, scrubbing) {
+        (input_touch::TouchPhase::Down, _) => Some(TouchPhase::Press),
+        (input_touch::TouchPhase::Up, _) => Some(TouchPhase::Release),
+        (input_touch::TouchPhase::Move, true) => Some(TouchPhase::Drag),
+        (input_touch::TouchPhase::Move, false) | (input_touch::TouchPhase::Cancel, _) => None,
+    }
+}
+
+/// What a touch on the strip amounts to.
+///
+/// The two are separated because a scrub is two different things at two different moments
+/// and conflating them is the bug this exists to prevent: the *seek* happens once, on the
+/// lift, and everything before it is only a picture. A `Preview` that leaked into a
+/// transaction would seek on every move event a drag produces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StripTouch {
+    /// Run the transaction this hit maps to, now.
+    Act(TransportHit),
+    /// Draw the bar at this fraction. Nothing has been asked of the source yet.
+    Preview(f32),
+}
+
 impl Layout {
-    /// What a touch at this phase should act on, if anything.
+    /// What a touch at this phase amounts to, if anything.
     ///
     /// Buttons fire on press and the scrub track on release, and the asymmetry is the
     /// point. A button wants to feel immediate — on a wall panel, a control that waits
@@ -304,13 +348,37 @@ impl Layout {
     /// finger placed anywhere near the bar jump the track before it had moved, so the
     /// release position is the one the user actually chose, and sliding before lifting
     /// adjusts it for free.
+    ///
+    /// What sliding does *not* do, before #97, is show anything: the bar was painted from
+    /// the source's own reading, so a drag picked a target blind and you learned where you
+    /// had landed when the music moved. Press and drag on the track now answer
+    /// [`StripTouch::Preview`] — a picture, not a transaction. The seek is still, and only,
+    /// the lift.
     #[must_use]
-    pub fn hit_for(&self, x: f32, y: f32, phase: TouchPhase) -> Option<TransportHit> {
-        match (self.hit(x, y), phase) {
-            (Some(TransportHit::Press(c)), TouchPhase::Press) => Some(TransportHit::Press(c)),
-            (Some(TransportHit::Scrub(f)), TouchPhase::Release) => Some(TransportHit::Scrub(f)),
-            _ => None,
+    pub fn touch(&self, x: f32, y: f32, phase: TouchPhase) -> Option<StripTouch> {
+        match phase {
+            // A finger already on the scrubber keeps it, wherever it has wandered to.
+            TouchPhase::Drag => self.scrub_fraction_at(x).map(StripTouch::Preview),
+            TouchPhase::Press => match self.hit(x, y)? {
+                TransportHit::Press(c) => Some(StripTouch::Act(TransportHit::Press(c))),
+                TransportHit::Scrub(f) => Some(StripTouch::Preview(f)),
+            },
+            TouchPhase::Release => match self.hit(x, y)? {
+                TransportHit::Scrub(f) => Some(StripTouch::Act(TransportHit::Scrub(f))),
+                TransportHit::Press(_) => None,
+            },
         }
+    }
+
+    /// Where along the track an x lands, ignoring y entirely.
+    ///
+    /// For a drag that has already been captured: the finger is allowed to leave the
+    /// track's own rectangle — people drag upwards to fine-tune, on every scrubber ever
+    /// built — and the bar must keep following it rather than freezing at the edge.
+    #[must_use]
+    pub fn scrub_fraction_at(&self, x: f32) -> Option<f32> {
+        let touch = self.track_touch?;
+        Some(((x - touch.x) / touch.w.max(1.0)).clamp(0.0, 1.0))
     }
 
     /// What a touch at strip-local `(x, y)` landed on, ignoring phase.
@@ -323,8 +391,7 @@ impl Layout {
         }
         if let Some(touch) = self.track_touch {
             if touch.contains(x, y) {
-                let fraction = ((x - touch.x) / touch.w.max(1.0)).clamp(0.0, 1.0);
-                return Some(TransportHit::Scrub(fraction));
+                return self.scrub_fraction_at(x).map(TransportHit::Scrub);
             }
         }
         None
@@ -936,16 +1003,102 @@ mod tests {
         let m = model();
         let l = layout(&m, 1600, 240);
         let (bx, by) = l.buttons[0].1.center();
-        assert!(l.hit_for(bx, by, TouchPhase::Press).is_some());
-        assert!(l.hit_for(bx, by, TouchPhase::Release).is_none());
+        assert!(matches!(
+            l.touch(bx, by, TouchPhase::Press),
+            Some(StripTouch::Act(TransportHit::Press(_)))
+        ));
+        assert!(l.touch(bx, by, TouchPhase::Release).is_none());
 
         let track = l.track_touch.unwrap();
         let (tx, ty) = track.center();
-        assert!(l.hit_for(tx, ty, TouchPhase::Press).is_none());
+        // A press on the track shows where the finger is and asks for nothing…
         assert!(matches!(
-            l.hit_for(tx, ty, TouchPhase::Release),
-            Some(TransportHit::Scrub(_))
+            l.touch(tx, ty, TouchPhase::Press),
+            Some(StripTouch::Preview(_))
         ));
+        // …and the lift is still the only thing that seeks.
+        assert!(matches!(
+            l.touch(tx, ty, TouchPhase::Release),
+            Some(StripTouch::Act(TransportHit::Scrub(_)))
+        ));
+    }
+
+    /// The pass-through rule, which is the one that costs a scroll if it is wrong.
+    #[test]
+    fn only_a_contact_that_owns_the_scrubber_gets_its_moves() {
+        use input_touch::TouchPhase as Contact;
+        assert_eq!(offer(Contact::Move, true), Some(TouchPhase::Drag));
+        assert_eq!(
+            offer(Contact::Move, false),
+            None,
+            "a drag crossing the strip belongs to whatever it started on"
+        );
+        // The ends of a contact always reach the strip: that is how it finds out it has
+        // been touched at all, and how a press elsewhere on it still works.
+        assert_eq!(offer(Contact::Down, false), Some(TouchPhase::Press));
+        assert_eq!(offer(Contact::Up, false), Some(TouchPhase::Release));
+        assert_eq!(offer(Contact::Up, true), Some(TouchPhase::Release));
+        // A cancel is not a lift, and must never become one.
+        assert_eq!(offer(Contact::Cancel, true), None);
+        assert_eq!(offer(Contact::Cancel, false), None);
+    }
+
+    /// The drag itself: while a finger is down the bar follows it and nothing is asked of
+    /// the source. Both halves matter — a preview that produced a transaction would seek
+    /// on every move event, which on a source that re-buffers per seek is a stutter for
+    /// the length of the gesture.
+    #[test]
+    fn a_drag_previews_and_never_seeks() {
+        let l = layout(&model(), 1600, 240);
+        let track = l.track_touch.unwrap();
+        let (_, ty) = track.center();
+
+        for (at, want) in [(0.25, 0.25_f32), (0.5, 0.5), (0.9, 0.9)] {
+            let x = track.x + track.w * at;
+            match l.touch(x, ty, TouchPhase::Drag) {
+                Some(StripTouch::Preview(f)) => assert!((f - want).abs() < 0.01, "{f} vs {want}"),
+                other => panic!("a drag along the track should preview, got {other:?}"),
+            }
+        }
+    }
+
+    /// A finger that has the scrubber keeps it, however far above the bar it wanders.
+    ///
+    /// People drag upwards to fine-tune — the further from the bar, the finer the control
+    /// on some players — and every one of them would freeze the bar here if the drag were
+    /// tested for containment the way a press is.
+    #[test]
+    fn a_drag_that_leaves_the_track_still_moves_the_bar() {
+        let l = layout(&model(), 1600, 240);
+        let track = l.track_touch.unwrap();
+        let x = track.x + track.w * 0.75;
+
+        // Far above the strip, and far below it.
+        for y in [track.y - 400.0, track.y + 400.0] {
+            assert!(
+                l.hit(x, y).is_none(),
+                "the premise: this point is not on the track"
+            );
+            match l.touch(x, y, TouchPhase::Drag) {
+                Some(StripTouch::Preview(f)) => assert!((f - 0.75).abs() < 0.01, "{f}"),
+                other => panic!("a captured drag should keep previewing, got {other:?}"),
+            }
+        }
+    }
+
+    /// Past either end, a drag pins to that end rather than running off it.
+    #[test]
+    fn a_drag_past_the_ends_clamps() {
+        let l = layout(&model(), 1600, 240);
+        let track = l.track_touch.unwrap();
+        assert_eq!(
+            l.touch(track.x - 500.0, track.y, TouchPhase::Drag),
+            Some(StripTouch::Preview(0.0))
+        );
+        assert_eq!(
+            l.touch(track.x + track.w + 500.0, track.y, TouchPhase::Drag),
+            Some(StripTouch::Preview(1.0))
+        );
     }
 
     /// The panel is 3840×2160 and the strip is a rectangle somewhere near the bottom of
