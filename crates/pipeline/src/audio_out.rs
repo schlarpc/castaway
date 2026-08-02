@@ -59,6 +59,17 @@ pub trait AudioOut: Send {
 /// Two counters that always travel together: how often the callback found nothing to play,
 /// and how much it has played. Bundled because they are handed to the same thread at the
 /// same moment and neither is meaningful without knowing the run it belongs to.
+///
+/// Gated to match its constructors rather than the module: `audio_out` is behind
+/// `audio`, but the only things that build one of these are the cpal backend
+/// (`audio-out`) and the PipeWire backend (`audio-pipewire`, Linux). A build with
+/// `audio` and neither backend — which is what `--features hwaccel` and
+/// `--features render` are — decodes without ever opening a device, and would
+/// otherwise carry this as dead code.
+#[cfg(any(
+    feature = "audio-out",
+    all(feature = "audio-pipewire", target_os = "linux")
+))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StreamCounters {
     /// Callbacks that ran dry.

@@ -131,7 +131,11 @@ impl KioskApp {
     }
 
     /// Hand one contact to the session holding the glass. `false` if none is.
-    fn to_touch_surface(&mut self, event: TouchEvent) -> bool {
+    ///
+    /// Named `deliver_` rather than `to_`: it dispatches an event, it does not convert
+    /// `self` into anything, and the `to_*` prefix on a `&mut self` method reads as a
+    /// conversion to everyone including clippy.
+    fn deliver_touch(&mut self, event: TouchEvent) -> bool {
         match self.touch_surface() {
             Some(surface) => {
                 surface.touch(event.to_surface());
@@ -576,7 +580,7 @@ impl KioskApp {
                 if self.route_contact(event) {
                     return;
                 }
-                if self.to_touch_surface(event) {
+                if self.deliver_touch(event) {
                     return;
                 }
                 if let Some(sink) = self.input_sink() {
@@ -599,7 +603,7 @@ impl KioskApp {
                 // The panel's own mouse is a finger for a driven session too, or a
                 // desk-tested mirror has no input at all.
                 if self.pointer_contact
-                    && self.to_touch_surface(TouchEvent::new(
+                    && self.deliver_touch(TouchEvent::new(
                         ContactId::POINTER,
                         TouchPhase::Move,
                         x,
@@ -633,7 +637,7 @@ impl KioskApp {
                     if self.route_contact(contact) {
                         return;
                     }
-                    if self.to_touch_surface(contact) {
+                    if self.deliver_touch(contact) {
                         return;
                     }
                 }
