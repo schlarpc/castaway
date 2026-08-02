@@ -270,6 +270,10 @@ fn main() -> anyhow::Result<()> {
             .with_osd(osd.clone())
             .with_playback_ends(ends_rx);
         let remote = manager.remote_handle();
+        // Taken before `run` consumes the manager: it is the only route from a session
+        // that can be driven off the glass — a Miracast source with UIBC — to the loop
+        // that owns the glass (#125).
+        let touch_surface = manager.touch_handle();
         runtime.spawn(manager.run(event_rx));
 
         #[cfg(feature = "electron")]
@@ -503,6 +507,7 @@ fn main() -> anyhow::Result<()> {
             controls,
             shell_sink,
             remote_input: Some(remote_input),
+            touch_surface: Some(touch_surface),
         };
         #[cfg(feature = "electron")]
         pipeline::kiosk::run_with_browser(rx, wiring, browser_host)

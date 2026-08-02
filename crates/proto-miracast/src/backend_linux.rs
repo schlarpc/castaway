@@ -392,9 +392,11 @@ impl LinuxMiracastBackend {
         let ie = WfdInformationElement::sink(
             DeviceInformation::sink(DEFAULT_CONTROL_PORT, self.config.max_throughput_mbps),
             ExtendedCapability {
-                // We do implement UIBC, so claiming it here is a promise we keep. This bit
-                // is the out-of-band half of the negotiation — a source reads it before
-                // RTSP starts and decides whether asking is worthwhile.
+                // We do implement UIBC, so claiming it here is a promise we keep — the
+                // sink dials the port the source names and maps panel touch onto the
+                // stream (`uibc::UibcSurface`). This bit is the out-of-band half of the
+                // negotiation: a source reads it before RTSP starts and decides whether
+                // asking is worthwhile.
                 uibc: true,
                 ..ExtendedCapability::default()
             },

@@ -49,6 +49,9 @@ pub struct SessionManager<P: Pipeline> {
     config: SessionConfig,
     active: Option<SourceId>,
     remote: RemoteHandle,
+    /// The active source's touch surface, for a router that owns the panel. Held here as
+    /// well as pushed to the pipeline so a router that starts late can ask.
+    touch: crate::touch::TouchHandle,
     description: SourceDescription,
     /// The pipeline saying an item ended or failed. Closed unless somebody called
     /// [`SessionManager::with_playback_ends`] — see there for why it is a receiver the manager
@@ -116,6 +119,7 @@ impl<P: Pipeline> SessionManager<P> {
             config,
             active: None,
             remote: RemoteHandle::default(),
+            touch: crate::touch::TouchHandle::new(),
             description: SourceDescription::new(),
             ended,
         }
@@ -174,6 +178,14 @@ impl<P: Pipeline> SessionManager<P> {
     #[must_use]
     pub fn remote_handle(&self) -> RemoteHandle {
         self.remote.clone()
+    }
+
+    /// A handle onto the active source's touch surface, for whatever owns the panel.
+    ///
+    /// Same rule as [`Self::remote_handle`]: take it before `run` consumes `self`.
+    #[must_use]
+    pub fn touch_handle(&self) -> crate::touch::TouchHandle {
+        self.touch.clone()
     }
 
     /// Consume the event stream until it closes, arbitrating sources.
@@ -306,6 +318,15 @@ impl<P: Pipeline> SessionManager<P> {
                     Err(CoreError::NoActiveSession(source.to_string()))
                 }
             }
+            SessionEvent::TouchSurface(surface) => {
+                if self.active.as_ref() == Some(&source) {
+                    info!(%source, "session: touch surface up");
+                    self.touch.set(Some(surface));
+                    Ok(())
+                } else {
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
             SessionEvent::Control(txn) => {
                 if self.active.as_ref() == Some(&source) {
                     self.pipeline.control(txn).await
@@ -319,6 +340,10 @@ impl<P: Pipeline> SessionManager<P> {
                     info!(%source, "session: end");
                     self.active = None;
                     self.remote.set(None);
+                    // …and the glass with them. A router still pointed at a session that
+                    // ended sends touches into a closed socket at best, and at worst into
+                    // a session the person on the panel can no longer see.
+                    self.touch.set(None);
                     // Controls go with the session that published them. Leaving them on
                     // screen would offer buttons wired to a peer that has gone.
                     let _ = self.pipeline.controls(ControlCapabilities::NONE).await;
@@ -355,9 +380,10 @@ impl<P: Pipeline> SessionManager<P> {
                 }
             }
             self.pipeline.stop().await.ok();
-            // The outgoing source's control handle and description die with its session
-            // — the new source publishes its own if it has any.
+            // The outgoing source's control handle, touch surface and description die
+            // with its session — the new source publishes its own if it has any.
             self.remote.set(None);
+            self.touch.set(None);
             self.description = SourceDescription::new();
         } else if let Some(display) = &self.display {
             // Idle → active: wake the panel and select our input.

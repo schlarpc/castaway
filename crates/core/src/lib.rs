@@ -20,6 +20,7 @@ pub mod playback;
 pub mod ports;
 pub mod session;
 pub mod source;
+pub mod touch;
 pub mod types;
 pub mod volume;
 pub mod wake;
@@ -36,6 +37,7 @@ pub use playback::{PlaybackEnd, PlaybackProgress, PlaybackReport};
 pub use ports::{MediaPorts, PortRange, PortRangeError};
 pub use session::{RemoteHandle, SessionConfig, SessionManager};
 pub use source::SourceDescription;
+pub use touch::{SurfaceTouch, TouchHandle, TouchPhase, TouchSurface};
 pub use types::{
     AudioCodec, AudioFormat, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame,
     FrameImage, FrameSource, FriendlyName, GpuSurface, MediaUri, PcmFrame, PixelFormat,

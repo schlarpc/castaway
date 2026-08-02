@@ -131,6 +131,13 @@ pub enum SinkOutput {
     Send(OutgoingRequest),
     /// The stream is live: bind the media plane and start decoding.
     MediaStarted(Box<NegotiatedConfig>),
+    /// The source is listening for user input on this port: dial the UIBC back-channel.
+    ///
+    /// Separate from [`SinkOutput::MediaStarted`] because the port can arrive either with
+    /// the M4 that configures the session or in a later M14 — a source may turn UIBC on
+    /// mid-session — and because a sink that advertises the capability and then never
+    /// connects is one whose panel touch silently does nothing (#125).
+    UibcPort(u16),
     /// The stream stopped but the session survives (M9 `PAUSE`).
     MediaStopped,
     /// The session is over.
@@ -500,6 +507,10 @@ impl WfdSession {
 
         if let Some(port) = uibc_port {
             debug!(port, "source opened a UIBC channel");
+            return Ok(vec![
+                SinkOutput::Respond(self.ok(cseq)),
+                SinkOutput::UibcPort(port),
+            ]);
         }
         // wfd_route, wfd_connector_type, wfd_standby, wfd_uibc_setting: a single-output
         // sink acknowledges and carries on. Answering anything else here would end a
@@ -691,8 +702,14 @@ impl WfdSession {
                         return Ok(Vec::new());
                     }
                 };
+                // The M4 port, if the source named one there. Emitted with the media
+                // rather than at M4 time because the back-channel is dialled against a
+                // running stream — the geometry it maps touches into is this config's.
+                let uibc = config.uibc_port().map(SinkOutput::UibcPort);
                 self.state = SessionState::Playing(config.clone());
-                Ok(vec![SinkOutput::MediaStarted(config)])
+                Ok(std::iter::once(SinkOutput::MediaStarted(config))
+                    .chain(uibc)
+                    .collect())
             }
             Pending::Pause => {
                 if let SessionState::Playing(c) =

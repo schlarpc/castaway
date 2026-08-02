@@ -26,7 +26,7 @@ use castaway_core::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::MiracastError;
 use crate::media::MediaReceiver;
@@ -35,6 +35,7 @@ use crate::session::{
     NegotiatedConfig, OutgoingRequest, OutgoingResponse, SinkOutput, WfdRequest, WfdResponse,
     WfdSession,
 };
+use crate::uibc;
 
 /// The largest RTSP message we will buffer. A `wfd_display_edid` with two blocks is
 /// ~600 bytes; anything approaching this is a peer that has lost framing, and continuing
@@ -59,6 +60,13 @@ const FRAME_QUEUE: usize = 3;
 /// but each IDR collapses the bitrate, and a real capture shows a sink firing eight
 /// back-to-back and turning a lossy link into an unusable one.
 const IDR_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the UIBC back-channel gets to answer before we give up on it.
+///
+/// The source has already told us the port, so a listener that is not there is a source
+/// that changed its mind — and a dial that hangs would hold the RTSP loop, which is the
+/// one thing keeping the mirror alive.
+const UIBC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run one WFD session to completion.
 ///
@@ -85,6 +93,9 @@ pub async fn run_session(
     let mut session = WfdSession::new(caps);
     let mut media = MediaReceiver::new();
     let mut planes: Option<Planes> = None;
+    // The mode the session negotiated, kept because a UIBC port can arrive in a later
+    // M14 — after the geometry it has to map touches into is already settled.
+    let mut negotiated_mode: Option<crate::video::VideoMode> = None;
     let mut inbound = Vec::new();
     let mut datagram = vec![0u8; DATAGRAM_BUF];
     let mut last_idr = tokio::time::Instant::now()
@@ -113,7 +124,16 @@ pub async fn run_session(
                 while let Some((message, consumed)) = substrate_rtsp::parse(&inbound)? {
                     inbound.drain(..consumed);
                     let outputs = dispatch(&mut session, &message)?;
-                    if apply(&outputs, &mut control, &mut planes, &sink, &peer).await? {
+                    if apply(
+                        &outputs,
+                        &mut control,
+                        &mut planes,
+                        &mut negotiated_mode,
+                        &sink,
+                        &peer,
+                    )
+                    .await?
+                    {
                         return Ok(());
                     }
                 }
@@ -203,6 +223,7 @@ async fn apply(
     outputs: &[SinkOutput],
     control: &mut TcpStream,
     planes: &mut Option<Planes>,
+    mode: &mut Option<crate::video::VideoMode>,
     sink: &SessionSink,
     peer: &SocketAddr,
 ) -> Result<bool, MiracastError> {
@@ -211,7 +232,17 @@ async fn apply(
             SinkOutput::Respond(resp) => write_response(control, resp).await?,
             SinkOutput::Send(req) => write_request(control, req).await?,
             SinkOutput::MediaStarted(config) => {
+                *mode = Some(config.mode());
                 *planes = Some(start_media(config, sink, peer).await?);
+            }
+            SinkOutput::UibcPort(port) => {
+                // Best-effort: a back-channel that will not open costs the session its
+                // touch, not the session. The source is streaming either way, and tearing
+                // a working mirror down over an input channel would be the wrong trade.
+                match mode {
+                    Some(mode) => open_uibc(*port, *mode, sink, peer).await,
+                    None => debug!(port, "miracast: UIBC port before a mode; ignoring it"),
+                }
             }
             SinkOutput::MediaStopped => {
                 // Dropping the senders closes the pipeline's receivers, which is how a
@@ -309,6 +340,60 @@ async fn start_media(
         audio: audio_tx,
         needs_keyframe: true,
     })
+}
+
+/// Dial the source's UIBC listener and publish a touch surface for it.
+///
+/// The half of UIBC the sink owes: both the IE bit and the M3 `wfd_uibc_capability`
+/// answer are promises, and a sink that makes them and never connects is one whose panel
+/// touch silently does nothing while both peers believe the feature is negotiated (#125).
+///
+/// The source is the TCP server here, exactly as it is for RTSP. `TCP_NODELAY` because
+/// every frame is a few bytes of live input and Nagle would hold each one waiting for a
+/// companion that is a finger-movement away (§5.2).
+async fn open_uibc(
+    port: u16,
+    mode: crate::video::VideoMode,
+    sink: &SessionSink,
+    peer: &SocketAddr,
+) {
+    let target = SocketAddr::new(peer.ip(), port);
+    let stream = match tokio::time::timeout(UIBC_CONNECT_TIMEOUT, TcpStream::connect(target)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!(%target, error = %e, "miracast: could not open the UIBC back-channel; panel touch will not reach this source");
+            return;
+        }
+        Err(_) => {
+            warn!(%target, "miracast: the UIBC back-channel did not answer; panel touch will not reach this source");
+            return;
+        }
+    };
+    if let Err(e) = stream.set_nodelay(true) {
+        debug!(%target, error = %e, "miracast: no TCP_NODELAY on the UIBC channel");
+    }
+
+    let (frames, mut rx) = mpsc::channel::<Vec<u8>>(uibc::UIBC_QUEUE);
+    let surface = Arc::new(uibc::UibcSurface::new(mode, frames));
+    tokio::spawn(async move {
+        let mut stream = stream;
+        while let Some(frame) = rx.recv().await {
+            if let Err(e) = stream.write_all(&frame).await {
+                debug!(error = %e, "miracast: the UIBC channel went away");
+                return;
+            }
+        }
+    });
+
+    info!(%target, mode = %mode, "miracast: UIBC back-channel open; the panel can drive this source");
+    if sink
+        .emit(SessionEvent::TouchSurface(surface))
+        .await
+        .is_err()
+    {
+        debug!("miracast: nothing took the UIBC touch surface");
+    }
 }
 
 async fn write_response(

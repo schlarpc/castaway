@@ -24,6 +24,13 @@
 //! bug that prevents is the classic "pointer moves at half speed and only reaches the
 //! top-left quadrant".
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use castaway_core::{SurfaceTouch, TouchPhase, TouchSurface};
+use tokio::sync::mpsc;
+use tracing::debug;
+
 use crate::video::VideoMode;
 
 /// The header without a timestamp.
@@ -683,6 +690,197 @@ impl UibcFrame {
     }
 }
 
+/// How many encoded frames may wait for the socket before input is dropped.
+///
+/// Small on purpose. UIBC is a *live* input channel: a touch that has been queued behind
+/// thirty-one others is a touch the person has already given up on, and delivering it
+/// late is worse than not delivering it — the source acts on it against a screen that has
+/// moved on. Dropping the newest also keeps a down/up pair from being split by a queue
+/// that filled between them, since one full queue drops the rest of that gesture too.
+pub const UIBC_QUEUE: usize = 32;
+
+/// The panel driving a Miracast source over the negotiated back-channel.
+///
+/// This is the sink end of [`castaway_core::TouchSurface`] for WFD, and the only consumer
+/// of this module's encoder. What it owns is the translation nobody else can do: the
+/// router speaks panel-normalized coordinates and knows nothing about the stream's
+/// resolution, the source speaks source pixels and knows nothing about the panel, and
+/// [`VideoGeometry`] is what sits between them — including the part where a touch on a
+/// letterbox bar is not a point in the picture at all and must not be sent as the nearest
+/// edge.
+///
+/// Frames go out through a channel rather than a socket: this is called from the thread
+/// that owns the glass, and that thread must never wait on a network peer (ground rule
+/// 4). The actor owns the socket at the other end.
+pub struct UibcSurface {
+    mode: VideoMode,
+    /// Recomputed whenever the router says the panel changed size — see
+    /// [`TouchSurface::panel_resized`]. Starts fullscreen, which is exact whenever the
+    /// stream and the panel share an aspect ratio and wrong by the bars when they do not.
+    geometry: Mutex<VideoGeometry>,
+    frames: mpsc::Sender<Vec<u8>>,
+    contacts: Mutex<Contacts>,
+}
+
+/// The live contacts, and their UIBC ids.
+///
+/// UIBC numbers a pointer in one byte while the router's contact id is a `u64` unique
+/// across origins, so the mapping is real and has to be kept: a `TouchUp` naming an id
+/// the source never saw go down leaves the source's own tracking wrong for the rest of
+/// the session.
+#[derive(Debug)]
+struct Contacts {
+    /// Router contact id to the UIBC pointer id and its last in-picture position.
+    live: HashMap<u64, (u8, SourcePixel)>,
+    /// Which of the 256 ids are taken.
+    used: [bool; 256],
+}
+
+impl Default for Contacts {
+    fn default() -> Self {
+        Self {
+            live: HashMap::new(),
+            used: [false; 256],
+        }
+    }
+}
+
+impl Contacts {
+    fn claim(&mut self, contact: u64, at: SourcePixel) -> Option<u8> {
+        if let Some((id, last)) = self.live.get_mut(&contact) {
+            *last = at;
+            return Some(*id);
+        }
+        let id = u8::try_from(self.used.iter().position(|taken| !taken)?).ok()?;
+        self.used[usize::from(id)] = true;
+        self.live.insert(contact, (id, at));
+        Some(id)
+    }
+
+    fn release(&mut self, contact: u64) -> Option<(u8, SourcePixel)> {
+        let (id, at) = self.live.remove(&contact)?;
+        self.used[usize::from(id)] = false;
+        Some((id, at))
+    }
+
+    fn drain(&mut self) -> Vec<(u8, SourcePixel)> {
+        self.used = [false; 256];
+        self.live.drain().map(|(_, entry)| entry).collect()
+    }
+}
+
+impl UibcSurface {
+    /// A surface for `mode`, queueing frames onto `frames`.
+    #[must_use]
+    pub fn new(mode: VideoMode, frames: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            mode,
+            geometry: Mutex::new(VideoGeometry::fullscreen(mode)),
+            frames,
+            contacts: Mutex::new(Contacts::default()),
+        }
+    }
+
+    /// The geometry touches are currently mapped through.
+    #[must_use]
+    pub fn geometry(&self) -> VideoGeometry {
+        self.geometry
+            .lock()
+            .map_or_else(|_| VideoGeometry::fullscreen(self.mode), |g| *g)
+    }
+
+    /// Queue one generic input message, dropping it if the socket is behind.
+    fn send(&self, message: &GenericInput) {
+        // No timestamp: it is the low 16 bits of the RTP stamp of the frame that was on
+        // screen, and this side of the boundary has no access to it. The field is
+        // optional on the wire precisely so a sink that cannot supply it may omit it —
+        // see `UibcFrame::timestamp` for what is lost by doing so.
+        let frame = UibcFrame::generic(std::slice::from_ref(message), None).encode();
+        if self.frames.try_send(frame).is_err() {
+            debug!("miracast: UIBC back-channel is behind; dropping an input frame");
+        }
+    }
+}
+
+impl TouchSurface for UibcSurface {
+    fn touch(&self, touch: SurfaceTouch) {
+        let Ok(mut contacts) = self.contacts.lock() else {
+            return;
+        };
+        let inside = self.geometry().map_from_panel(touch.x, touch.y);
+        match touch.phase {
+            TouchPhase::Down => {
+                // A press that starts on a bar is not a press on the picture, and there is
+                // no id to allocate for it: the matching release will find nothing live
+                // and be dropped too, which is the consistent outcome.
+                let Some(at) = inside else { return };
+                let Some(id) = contacts.claim(touch.contact, at) else {
+                    debug!("miracast: more simultaneous contacts than UIBC can number");
+                    return;
+                };
+                self.send(&GenericInput::TouchDown(vec![Pointer { id, at }]));
+            }
+            TouchPhase::Move => {
+                // Only for a contact the source has seen go down, and only while it is
+                // over the picture: a finger dragged onto a bar stops reporting rather
+                // than sticking to the edge, and picks up again if it comes back.
+                let (Some(at), Some(&(id, _))) = (inside, contacts.live.get(&touch.contact)) else {
+                    return;
+                };
+                contacts.claim(touch.contact, at);
+                self.send(&GenericInput::TouchMove(vec![Pointer { id, at }]));
+            }
+            TouchPhase::Up | TouchPhase::Cancel => {
+                let Some((id, last)) = contacts.release(touch.contact) else {
+                    return;
+                };
+                // The last position *inside the picture*, not wherever the finger left
+                // from: a release off the edge would otherwise report a pixel the drag
+                // never reached, and a cancel carries no meaningful position at all.
+                self.send(&GenericInput::TouchUp(vec![Pointer {
+                    id,
+                    at: inside.unwrap_or(last),
+                }]));
+            }
+        }
+    }
+
+    fn panel_resized(&self, width: u32, height: u32) {
+        let geometry = VideoGeometry::letterboxed(self.mode, width, height);
+        if let Ok(mut slot) = self.geometry.lock() {
+            *slot = geometry;
+        }
+        debug!(
+            width,
+            height,
+            mode = %self.mode,
+            "miracast: UIBC touch mapping follows the panel"
+        );
+    }
+
+    fn cancel_all(&self) {
+        let Ok(mut contacts) = self.contacts.lock() else {
+            return;
+        };
+        let live = contacts.drain();
+        drop(contacts);
+        if live.is_empty() {
+            return;
+        }
+        // One frame with every contact in it — the shape UIBC's pointer list exists for,
+        // and one message rather than N racing each other onto the socket.
+        let pointers: Vec<Pointer> = live
+            .into_iter()
+            .map(|(id, at)| Pointer { id, at })
+            .collect();
+        debug!(
+            contacts = pointers.len(),
+            "miracast: releasing UIBC contacts; the panel is no longer ours"
+        );
+        self.send(&GenericInput::TouchUp(pointers));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -947,5 +1145,173 @@ mod tests {
     #[test]
     fn a_declared_length_below_the_header_is_refused() {
         assert!(UibcFrame::parse(&[0x00, 0x00, 0x00, 0x02]).is_none());
+    }
+
+    /// The surface's own end-to-end: a drag across the glass becomes UIBC frames in the
+    /// stream's pixel space, and a touch on a letterbox bar becomes nothing.
+    #[tokio::test]
+    async fn a_drag_on_the_glass_becomes_uibc_frames_in_source_pixels() {
+        let mode = VideoMode::new(1920, 1080, 60, false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let surface = UibcSurface::new(mode, tx);
+        // A 16:9 stream on a 16:9 panel: no bars, so the mapping is the identity scale.
+        surface.panel_resized(3840, 2160);
+
+        let at = |phase, x, y| SurfaceTouch {
+            contact: 7,
+            phase,
+            x,
+            y,
+        };
+        surface.touch(at(TouchPhase::Down, 0.5, 0.5));
+        surface.touch(at(TouchPhase::Move, 0.25, 0.75));
+        surface.touch(at(TouchPhase::Up, 0.25, 0.75));
+
+        let decode = |bytes: &[u8]| {
+            let (frame, _) = UibcFrame::parse(bytes).expect("a frame");
+            frame.generic_messages().expect("generic input")
+        };
+
+        let down = rx.try_recv().expect("a down frame");
+        assert_eq!(
+            decode(&down),
+            vec![GenericInput::TouchDown(vec![Pointer {
+                id: 0,
+                at: SourcePixel { x: 960, y: 540 },
+            }])]
+        );
+        let moved = rx.try_recv().expect("a move frame");
+        assert_eq!(
+            decode(&moved),
+            vec![GenericInput::TouchMove(vec![Pointer {
+                id: 0,
+                at: SourcePixel { x: 480, y: 809 },
+            }])]
+        );
+        let up = rx.try_recv().expect("an up frame");
+        assert_eq!(
+            decode(&up),
+            vec![GenericInput::TouchUp(vec![Pointer {
+                id: 0,
+                at: SourcePixel { x: 480, y: 809 },
+            }])]
+        );
+        assert!(rx.try_recv().is_err(), "and nothing else");
+    }
+
+    #[tokio::test]
+    async fn a_touch_on_a_letterbox_bar_is_not_a_touch_on_the_picture() {
+        // A 4:3 stream on the 16:9 panel has bars down both sides. Sending the nearest
+        // edge instead would make them behave like a sticky border.
+        let mode = VideoMode::new(640, 480, 60, false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let surface = UibcSurface::new(mode, tx);
+        surface.panel_resized(3840, 2160);
+
+        surface.touch(SurfaceTouch {
+            contact: 1,
+            phase: TouchPhase::Down,
+            x: 0.02,
+            y: 0.5,
+        });
+        assert!(rx.try_recv().is_err(), "the bar is not part of the stream");
+
+        // …and the middle of the panel still is.
+        surface.touch(SurfaceTouch {
+            contact: 2,
+            phase: TouchPhase::Down,
+            x: 0.5,
+            y: 0.5,
+        });
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn losing_the_glass_releases_every_contact_in_one_frame() {
+        // A session that never hears the `Up` believes a finger is down for the rest of
+        // its life, and the person who lifted it has no way to say otherwise.
+        let mode = VideoMode::new(1920, 1080, 60, false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let surface = UibcSurface::new(mode, tx);
+        surface.panel_resized(1920, 1080);
+
+        for contact in 0..3u64 {
+            surface.touch(SurfaceTouch {
+                contact,
+                phase: TouchPhase::Down,
+                x: 0.5,
+                y: 0.5,
+            });
+            rx.try_recv().expect("a down frame");
+        }
+        surface.cancel_all();
+
+        let (frame, _) = UibcFrame::parse(&rx.try_recv().expect("a release")).expect("a frame");
+        let messages = frame.generic_messages().expect("generic");
+        let [GenericInput::TouchUp(pointers)] = messages.as_slice() else {
+            panic!("one TouchUp naming every contact")
+        };
+        assert_eq!(pointers.len(), 3);
+        // Distinct ids, because the source tracks them and a repeat would merge fingers.
+        let mut ids: Vec<u8> = pointers.iter().map(|p| p.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        // …and a second cancel says nothing, having nothing left to say.
+        surface.cancel_all();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_id_is_reused_only_after_its_finger_lifts() {
+        let mode = VideoMode::new(1920, 1080, 60, false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let surface = UibcSurface::new(mode, tx);
+        surface.panel_resized(1920, 1080);
+        let down = |contact| SurfaceTouch {
+            contact,
+            phase: TouchPhase::Down,
+            x: 0.5,
+            y: 0.5,
+        };
+        let id_of = |bytes: &[u8]| {
+            let (frame, _) = UibcFrame::parse(bytes).expect("a frame");
+            match frame.generic_messages().expect("generic").first() {
+                Some(GenericInput::TouchDown(p) | GenericInput::TouchUp(p)) => p[0].id,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+
+        surface.touch(down(10));
+        assert_eq!(id_of(&rx.try_recv().unwrap()), 0);
+        surface.touch(down(11));
+        assert_eq!(id_of(&rx.try_recv().unwrap()), 1, "a second live finger");
+
+        surface.touch(SurfaceTouch {
+            contact: 10,
+            phase: TouchPhase::Up,
+            x: 0.5,
+            y: 0.5,
+        });
+        assert_eq!(id_of(&rx.try_recv().unwrap()), 0);
+        surface.touch(down(12));
+        assert_eq!(id_of(&rx.try_recv().unwrap()), 0, "0 is free again");
+    }
+
+    #[tokio::test]
+    async fn a_release_for_a_contact_that_never_went_down_says_nothing() {
+        // A press that started on a bar allocated no id. Its release must not invent one:
+        // an `Up` for a pointer the source never saw leaves its tracking wrong for good.
+        let mode = VideoMode::new(1920, 1080, 60, false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let surface = UibcSurface::new(mode, tx);
+        surface.panel_resized(1920, 1080);
+        surface.touch(SurfaceTouch {
+            contact: 99,
+            phase: TouchPhase::Up,
+            x: 0.5,
+            y: 0.5,
+        });
+        assert!(rx.try_recv().is_err());
     }
 }

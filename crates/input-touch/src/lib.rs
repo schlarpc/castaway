@@ -18,18 +18,12 @@ pub use wire::{RemoteCommand, WireError};
 
 use tokio::sync::mpsc;
 
-/// The phase of a touch contact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TouchPhase {
-    /// A finger touched down.
-    Down,
-    /// A tracked finger moved.
-    Move,
-    /// A finger lifted.
-    Up,
-    /// The contact was cancelled (e.g. palm rejection).
-    Cancel,
-}
+/// Where a contact is in its lifetime.
+///
+/// Defined in `castaway-core` because the route from this crate to a protocol adapter
+/// runs through it — see [`castaway_core::TouchSurface`] — and re-exported here so the
+/// name reads the same at both ends.
+pub use castaway_core::TouchPhase;
 
 /// One remote peer, for as long as it is connected.
 ///
@@ -123,6 +117,23 @@ impl ContactId {
     pub fn is_from(self, origin: InputOrigin) -> bool {
         self.origin == origin
     }
+
+    /// One number that is unique across origins, for a consumer that has no notion of
+    /// one — [`castaway_core::SurfaceTouch`], and through it a protocol adapter.
+    ///
+    /// Origin in the high bits and the device's own id in the low ones, because the raw
+    /// id is only unique *within* an origin: two peers both calling a contact 0 is the
+    /// ordinary case, and flattening to the raw id alone would merge their fingers.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        let origin = match self.origin {
+            InputOrigin::Panel => 0u64,
+            InputOrigin::PanelPointer => 1,
+            // +2 so no peer can land on either panel origin.
+            InputOrigin::Remote(peer) => peer.get().saturating_add(2),
+        };
+        (origin << 32) | self.raw as u64
+    }
 }
 
 /// A single touch contact update. Coordinates are normalized to the panel surface.
@@ -153,7 +164,23 @@ impl TouchEvent {
     /// Whether this contact ends here — the two phases after which its id is dead.
     #[must_use]
     pub fn ends_contact(&self) -> bool {
-        matches!(self.phase, TouchPhase::Up | TouchPhase::Cancel)
+        self.phase.ends_contact()
+    }
+
+    /// The same update, as the session-facing shape a [`castaway_core::TouchSurface`]
+    /// takes.
+    ///
+    /// Both are panel-normalized, so this is a rename rather than a transform: what it
+    /// drops is the `ContactId`'s origin, which is the router's business and not the
+    /// far end's.
+    #[must_use]
+    pub fn to_surface(&self) -> castaway_core::SurfaceTouch {
+        castaway_core::SurfaceTouch {
+            contact: self.id.as_u64(),
+            phase: self.phase,
+            x: self.x,
+            y: self.y,
+        }
     }
 }
 

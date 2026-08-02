@@ -99,12 +99,48 @@ struct KioskApp {
     /// wherever the loop runs, so it obeys the same wake-and-sleep discipline as every
     /// other producer rather than needing a winit user-event type of its own.
     remote_input: Option<Arc<input_touch::RemoteInputQueue>>,
+    /// The active session's touch surface — see [`KioskWiring::touch_surface`].
+    touch_surface: Option<castaway_core::TouchHandle>,
+    /// The surface [`Self::panel_size_known`] has already told the panel size to, so a
+    /// resize and a new session both reach it and nothing else does.
+    sized_surface: Option<Arc<dyn castaway_core::TouchSurface>>,
     /// The main-thread browser host (this loop is its message pump — architecture §6).
     #[cfg(feature = "electron")]
     browser: Option<crate::electron_browser::ElectronHost>,
 }
 
 impl KioskApp {
+    /// The active session's touch surface, if one currently holds the glass.
+    ///
+    /// Checked ahead of [`Self::input_sink`]: a Miracast source with UIBC up is showing
+    /// its own screen on the panel, so a finger on that picture belongs to it and not to
+    /// the browser layer underneath.
+    fn touch_surface(&mut self) -> Option<Arc<dyn castaway_core::TouchSurface>> {
+        let surface = self.touch_surface.as_ref()?.get()?;
+        // The panel's size is the router's to know, and the surface needs it to undo the
+        // compositor's letterboxing. Told on arrival and on every resize.
+        let known = self
+            .sized_surface
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, &surface));
+        if !known {
+            surface.panel_resized(self.size.0, self.size.1);
+            self.sized_surface = Some(Arc::clone(&surface));
+        }
+        Some(surface)
+    }
+
+    /// Hand one contact to the session holding the glass. `false` if none is.
+    fn to_touch_surface(&mut self, event: TouchEvent) -> bool {
+        match self.touch_surface() {
+            Some(surface) => {
+                surface.touch(event.to_surface());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The surface that currently receives input: the browser layer when present.
     /// Future interactive layers (video controls, adapter UIs) slot in here.
     fn input_sink(&mut self) -> Option<&mut dyn InputSink> {
@@ -540,6 +576,9 @@ impl KioskApp {
                 if self.route_contact(event) {
                     return;
                 }
+                if self.to_touch_surface(event) {
+                    return;
+                }
                 if let Some(sink) = self.input_sink() {
                     sink.touch(event);
                 }
@@ -549,6 +588,18 @@ impl KioskApp {
                 // finger does, or the gesture half of the panel only exists for touch.
                 if self.pointer_contact
                     && self.route_contact(TouchEvent::new(
+                        ContactId::POINTER,
+                        TouchPhase::Move,
+                        x,
+                        y,
+                    ))
+                {
+                    return;
+                }
+                // The panel's own mouse is a finger for a driven session too, or a
+                // desk-tested mirror has no input at all.
+                if self.pointer_contact
+                    && self.to_touch_surface(TouchEvent::new(
                         ContactId::POINTER,
                         TouchPhase::Move,
                         x,
@@ -578,7 +629,11 @@ impl KioskApp {
                         TouchPhase::Up
                     };
                     self.pointer_contact = down;
-                    if self.route_contact(TouchEvent::new(ContactId::POINTER, phase, x, y)) {
+                    let contact = TouchEvent::new(ContactId::POINTER, phase, x, y);
+                    if self.route_contact(contact) {
+                        return;
+                    }
+                    if self.to_touch_surface(contact) {
                         return;
                     }
                 }
@@ -855,6 +910,8 @@ impl ApplicationHandler for KioskApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.size = (size.width, size.height);
+                // Forget who has been told, so the next contact re-tells at the new size.
+                self.sized_surface = None;
                 if let Some(r) = &mut self.render {
                     r.resize(size.width, size.height);
                 }
@@ -961,6 +1018,13 @@ pub struct KioskWiring {
     pub shell_sink: Option<ShellSink>,
     /// Input queued from off the main thread by remote peers (#18).
     pub remote_input: Option<Arc<input_touch::RemoteInputQueue>>,
+    /// The active session's touch surface, if it published one.
+    ///
+    /// Taken from [`castaway_core::SessionManager::touch_handle`] before the manager is
+    /// consumed. A session that can be *driven* from the glass — a Miracast source with
+    /// UIBC negotiated — takes the panel ahead of the browser layer for the whole time it
+    /// is the active source, because the picture on screen is its picture (#125).
+    pub touch_surface: Option<castaway_core::TouchHandle>,
 }
 
 impl KioskWiring {
@@ -974,6 +1038,8 @@ impl KioskWiring {
             controls: self.controls,
             shell_sink: self.shell_sink,
             remote_input: self.remote_input,
+            touch_surface: self.touch_surface,
+            sized_surface: None,
             window: None,
             render: None,
             contacts: std::collections::HashMap::new(),

@@ -165,6 +165,14 @@ pub enum SessionEvent {
     /// L2CAP channel (AVCTP) that routinely connects *after* audio is already flowing, so
     /// folding it into [`SessionEvent::Audio`] would be a lie about the wire behaviour.
     ControlSurface(Arc<dyn RemoteControl>),
+    /// The session can be driven from the panel's glass: route touch to it.
+    ///
+    /// The mirror image of [`SessionEvent::ControlSurface`] — that one lets the receiver
+    /// drive the sender's transport, this one lets the panel drive the sender's *screen*.
+    /// Miracast negotiates UIBC for exactly this. Published when the back-channel is up,
+    /// which is after the media plane rather than with it, and dropped by the session
+    /// manager when the source stops being the active one.
+    TouchSurface(Arc<dyn crate::touch::TouchSurface>),
     /// Transport control over the active session.
     Control(ControlTxn),
     /// The source session has ended; release the pipeline and drop the source.
