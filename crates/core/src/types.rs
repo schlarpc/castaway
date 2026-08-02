@@ -117,6 +117,21 @@ impl fmt::Display for FriendlyName {
     }
 }
 
+/// What castaway calls itself to an HTTP server when fetching media.
+///
+/// The UPnP shape — `OS/version UPnP/1.0 product/version` — because a DLNA server may use
+/// it to decide what it will serve, and several are known to serve a reduced set to a
+/// client they cannot place.
+///
+/// It lives here, next to [`MediaUri`], rather than beside the fetch that sends it,
+/// because more than one crate now talks to a media server about the same resource: the
+/// decoder fetches it, and `proto-dlna` HEADs it first to decide whether to accept the
+/// item at all (#99). A server that varies its answer by client — and varying is the
+/// reason to send this at all — must be asked both questions as the same client, or the
+/// probe describes a resource that is not the one we would go on to fetch.
+pub const MEDIA_USER_AGENT: &str =
+    concat!("Linux/1.0 UPnP/1.0 castaway/", env!("CARGO_PKG_VERSION"));
+
 /// A media source URI the pipeline will fetch and decode (Cast LOAD, DLNA, HLS…).
 ///
 /// Wraps a parsed [`url::Url`] restricted to schemes the pipeline can actually open,

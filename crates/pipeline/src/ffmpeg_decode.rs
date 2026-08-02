@@ -428,10 +428,10 @@ const RECONNECT_DELAY_MAX_S: &str = "5";
 
 /// What castaway calls itself to an HTTP server.
 ///
-/// The UPnP shape — `OS/version UPnP/1.0 product/version` — because a DLNA server may use
-/// it to decide what it will serve, and several are known to serve a reduced set to a
-/// client they cannot place.
-const USER_AGENT: &str = concat!("Linux/1.0 UPnP/1.0 castaway/", env!("CARGO_PKG_VERSION"),);
+/// Moved to `castaway-core` so the DLNA HEAD probe sends the same string (#99): a server
+/// that varies what it serves by client — which is the whole reason to send this — has to
+/// be asked about the resource and then handed the resource as one client.
+use castaway_core::MEDIA_USER_AGENT as USER_AGENT;
 
 /// Open `uri` for demuxing, with the options a network fetch needs.
 ///
