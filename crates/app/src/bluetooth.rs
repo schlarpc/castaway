@@ -2,7 +2,7 @@
 //!
 //! Two things live here rather than in the protocol crates, because both are the app's
 //! job: choosing which controller to open, and persisting link keys to disk. `hci-transport`
-//! must not know where the config directory is, and `proto-bluetooth-audio` must not open
+//! must not know where the state directory is, and `proto-bluetooth-audio` must not open
 //! files at all (ground rules 2 and 3).
 
 use std::path::{Path, PathBuf};
@@ -20,7 +20,8 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 
-/// Where paired phones' link keys live, relative to the config directory.
+/// Where paired phones' link keys live, relative to the state directory — see
+/// [`Config::state_dir`] for why not the config directory.
 const LINK_KEYS_FILE: &str = "bluetooth-link-keys";
 
 /// Start the Bluetooth sink, returning the adapter task.
