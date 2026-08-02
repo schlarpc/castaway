@@ -296,6 +296,45 @@ pub fn spawn_pcm(
     std::thread::spawn(move || run_pcm(frames, output, &stop, &gain, session.as_ref()));
 }
 
+/// Answer a pending seek flush, if there is one. Returns whether anything was flushed.
+///
+/// Everything queued is from before the seek, so it is dropped — and this is the only
+/// thread that can do it, since the demuxer cannot reach into a channel it has already
+/// written to. Without it a seek plays roughly a second of wherever playback used to be
+/// before arriving where it was sent.
+///
+/// Acknowledged even when there was nothing to drop: the decode thread waits on that
+/// acknowledgement before pushing the first block of the new position, and silence would
+/// cost it the whole grace period on every seek.
+fn service_seek_flush(
+    session: Option<&PacedSession>,
+    frames: &std::sync::mpsc::Receiver<PcmFrame>,
+    output: &mut dyn AudioOut,
+    open_as: &mut Option<(u32, u16)>,
+    pace: &mut Pace,
+) -> bool {
+    let Some(seek) = session.map(|s| s.seek.as_ref()) else {
+        return false;
+    };
+    let Some(epoch) = seek.flush_wanted() else {
+        return false;
+    };
+    let mut dropped = 0usize;
+    while frames.try_recv().is_ok() {
+        dropped += 1;
+    }
+    debug!(dropped, "pcm session: discarded pre-seek audio");
+    // The device's own buffer holds the same staleness, so it is reopened on the next
+    // block rather than played out first.
+    if open_as.is_some() {
+        output.stop();
+        *open_as = None;
+    }
+    *pace = Pace::default();
+    seek.flushed(epoch);
+    true
+}
+
 /// Drive one already-decoded audio session to completion. Blocking; call it on its own
 /// thread.
 ///
@@ -317,7 +356,7 @@ pub fn run_pcm(
     let mut open_as: Option<(u32, u16)> = None;
     let mut pace = Pace::default();
 
-    loop {
+    'blocks: loop {
         // Everything queued is from before a seek, so drop it. Checked here, at the top of
         // every block, because this is the only thread that can: the demuxer cannot reach
         // into a channel it has already written to, and without this a seek plays roughly
@@ -326,23 +365,7 @@ pub fn run_pcm(
         // Acknowledged even when there was nothing to drop — the decode thread is waiting
         // on that acknowledgement before it pushes the first block of the new position,
         // and silence would cost it the whole grace period on every seek.
-        if let Some(seek) = session.map(|s| s.seek.as_ref()) {
-            if let Some(epoch) = seek.flush_wanted() {
-                let mut dropped = 0usize;
-                while frames.try_recv().is_ok() {
-                    dropped += 1;
-                }
-                debug!(dropped, "pcm session: discarded pre-seek audio");
-                // The device's own buffer holds the same staleness, so it is reopened on
-                // the next block rather than played out first.
-                if open_as.is_some() {
-                    output.stop();
-                    open_as = None;
-                }
-                pace = Pace::default();
-                seek.flushed(epoch);
-            }
-        }
+        service_seek_flush(session, &frames, output.as_mut(), &mut open_as, &mut pace);
         // `recv_timeout`, not `recv`, so `stop` is observable while nothing is arriving.
         // A session preempted while its source was *paused* has no next block to wake on,
         // so a plain `recv` parked here forever: the thread leaked and — worse — the
@@ -371,6 +394,16 @@ pub fn run_pcm(
                 info!("pcm session: preempted while paused");
                 output.stop();
                 return;
+            }
+            // Seeking *while paused* is the ordinary way people find a spot, and this is
+            // where the thread sits while they do it. Without this the flush handshake
+            // went unanswered for the whole grace period on every paused scrub — and on
+            // resume the block held below was written to the device and observed onto the
+            // media clock at its old position, so the clock jumped backwards and a
+            // second of stale audio played before the top of the loop finally flushed.
+            if service_seek_flush(session, &frames, output.as_mut(), &mut open_as, &mut pace) {
+                // The held block is pre-seek too, and dropping it is the point.
+                continue 'blocks;
             }
             std::thread::sleep(STOP_POLL);
         }
