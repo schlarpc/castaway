@@ -79,6 +79,19 @@ const NOISE_FLOOR: &[&str] = &[
     // because service registration and conflicts are worth seeing; the per-packet
     // chatter underneath it is what buries them.
     "mdns_sd=info",
+    // Per *packet*, and five lines of it: the WebRTC stack logs every write as it falls
+    // through the handler chain — srtp, datachannel, sctp, dtls, ice — so one connected
+    // remote peer (#18) at 30 fps is about 150 lines a second, before its own media
+    // traffic is counted. `info` rather than `warn` because ICE state changes and the
+    // selected candidate pair are worth seeing unasked: they are the first thing to look
+    // at when a peer connects and shows nothing.
+    "rtc=info",
+    "rtc_ice=info",
+    "rtc_dtls=info",
+    "rtc_srtp=info",
+    "rtc_sctp=info",
+    "rtc_shared=info",
+    "webrtc=info",
 ];
 
 /// Compose the noise floor with what the operator asked for.
@@ -352,6 +365,40 @@ mod tests {
         });
         assert!(logged.contains("device lost"), "{logged}");
         assert!(logged.contains("VK_ERROR_DEVICE_LOST"), "{logged}");
+    }
+
+    #[test]
+    fn the_webrtc_stack_does_not_narrate_every_packet() {
+        // One connected remote peer (#18) logs five DEBUG lines per packet as the write
+        // falls through the handler chain, so at 30 fps that is ~150 lines a second before
+        // any of its own traffic. `RUST_LOG=debug` for our own crates must not turn the
+        // panel's log into that.
+        let logged = under("debug", || {
+            // The five handlers one write actually falls through, verbatim.
+            tracing::debug!(target: "rtc::peer_connection::handler::srtp", "bypass write");
+            tracing::debug!(target: "rtc::peer_connection::handler::datachannel", "bypass write");
+            tracing::debug!(target: "rtc::peer_connection::handler::sctp", "bypass write");
+            tracing::debug!(target: "rtc::peer_connection::handler::dtls", "bypass write");
+            tracing::debug!(target: "rtc::peer_connection::handler::ice", "bypass write");
+            tracing::debug!(target: "webrtc::peer_connection::driver", "bypass write");
+            tracing::debug!(target: "rtc_srtp::session", "bypass write");
+            tracing::debug!(target: "pipeline::remote::service", "ours survives");
+        });
+        assert!(!logged.contains("bypass write"), "{logged}");
+        assert!(logged.contains("ours survives"), "{logged}");
+    }
+
+    #[test]
+    fn what_a_silent_peer_needs_is_still_logged_unasked() {
+        // The reason the floor is `info` and not `warn`: when a peer connects and shows
+        // nothing, the ICE state and the selected pair are the first things to look at,
+        // and nobody thinks to turn them on beforehand.
+        let logged = under("info", || {
+            tracing::info!(target: "rtc_ice::agent", "Setting new connection state: Connected");
+            tracing::warn!(target: "webrtc::peer_connection::driver", "Failed to send RTP");
+        });
+        assert!(logged.contains("Connected"), "{logged}");
+        assert!(logged.contains("Failed to send RTP"), "{logged}");
     }
 
     #[test]
