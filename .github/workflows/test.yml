@@ -56,7 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/nix-runner
-      - run: nix build --print-build-logs
+      - run: .github/scripts/nix-build.sh
       - uses: ./.github/actions/postmortem
         if: failure()
 
@@ -83,6 +83,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/nix-runner
-      - run: nix build --print-build-logs '.#checks.x86_64-linux.${{ matrix.check }}'
+      - run: .github/scripts/nix-build.sh '.#checks.x86_64-linux.${{ matrix.check }}'
       - uses: ./.github/actions/postmortem
         if: failure()

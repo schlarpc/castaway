@@ -40,17 +40,3 @@ runs:
     - uses: DeterminateSystems/nix-installer-action@v22
     - uses: DeterminateSystems/magic-nix-cache-action@v14
 
-    # A GitHub runner is 4 vCPU and 16 GB, and nix's `max-jobs = auto` reads only the
-    # first number: four derivations at once, each cargo build then using every core, is
-    # sixteen concurrent rustc processes on a box with 16 GB of RAM. Rust link steps are
-    # the memory-hungry part and several of this tree's are large.
-    #
-    # What that looks like when it goes wrong is worth knowing, because it names nothing:
-    # `error: Nix daemon disconnected unexpectedly (maybe it crashed?)` — no failing
-    # derivation, no build log, because the process that was going to report it is the one
-    # that died. Two jobs of two cores each keeps the peak inside the box.
-    - name: Bound build parallelism to the runner's memory
-      shell: bash
-      run: |
-        printf 'max-jobs = 2\ncores = 2\n' | sudo tee -a /etc/nix/nix.conf
-        sudo systemctl restart nix-daemon.service
