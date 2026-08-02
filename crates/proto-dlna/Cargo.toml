@@ -17,6 +17,9 @@ tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "
 axum.workspace = true
 quick-xml.workspace = true
 uuid.workspace = true
+# The `SetAVTransportURI` HEAD probe (#99). Blocking, run on `spawn_blocking` — the
+# same shape and the same crate `proto-gamestream` uses for NVHTTP.
+ureq.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util", "rt-multi-thread"] }

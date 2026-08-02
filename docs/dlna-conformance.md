@@ -131,9 +131,30 @@ Kept because both readings sounded plausible, and only the primary source settle
 
 ## What changed after this review
 
-The defects it found are closed — G66 and G68–G82, less G77's HEAD probe and the compositor
-half of G67, both recorded in GAPS with their reasons. Two things are worth carrying
-forward from *how* they closed rather than from what they were.
+The defects it found are closed — G66 and G68–G82, less the compositor half of G67, which
+is tracked as issue #98. G77's HEAD probe was the last of them to land (issue #99); the two
+things it settled are worth recording here, because both are conformance decisions rather
+than implementation details.
+
+**What the probe accepts is read out of `sink_protocol_info`, not written beside it.**
+`state::sink_accepts` parses the same advertised table, so the 714 we answer cannot claim
+something narrower than the `SinkProtocolInfo` we published. The globs at the front of that
+table therefore do most of the work — `video/*` and `audio/*` accept anything in those
+trees, and the enumeration behind them exists only for control points that will not match a
+glob (see the gmrender finding above). A renderer that refused `audio/webm` while
+advertising `audio/*` would be refusing what it had promised.
+
+**Every ambiguous answer plays the item.** A server that will not do `HEAD` (405/501), one
+that is having a bad minute (5xx), one that names no `Content-Type`, one that names
+`application/octet-stream`, and a connect that times out are all treated as "nothing
+learned". Only two answers are acted on: the server said the resource is not there (716) or
+named a type outside the advertised table (714). This is not timidity — the two errors are
+not symmetric. Failing to reject a bad resource costs what we had before, an asynchronous
+`ERROR_OCCURRED`. Rejecting a good one is a cast that would have played, refused, with no
+way for a guest in the room to override it.
+
+Two things are worth carrying forward from *how* the rest of them closed rather than from
+what they were.
 
 **The obvious-looking fix was the wrong one a third time.** G68 said "implement GENA", and
 the first correct step was the opposite: refuse. The table above is why. Getting to the real

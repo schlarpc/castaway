@@ -139,6 +139,10 @@ async fn handle_control(
     };
     debug!(service = ?kind, action = %action.name, "DLNA control");
 
+    if let Some(fault) = probe_uri_argument(&action).await {
+        return fault_response(&fault);
+    }
+
     let outcome = {
         let mut r = st.renderer.lock().await;
         // Where the pipeline says we are, handed to the state machine as an *input* so
@@ -492,6 +496,43 @@ fn xml_ok(body: String) -> Response {
         body,
     )
         .into_response()
+}
+
+/// `HEAD` the resource a URI-setting action names, and turn a conclusive answer into the
+/// fault the control point should see *now* (#99).
+///
+/// Placed here, in the async handler, rather than inside [`Renderer::av_transport`], for
+/// the reason ground rule 3 exists: the state machine is a pure function of what it is
+/// given and must not open a socket mid-transition. Returning the fault from here also
+/// means the action never reaches the state machine at all, which is the behaviour that
+/// matters — a refused URI must not become `current_uri`, or the next `Play` would start
+/// the thing we just said we would not take.
+///
+/// `None` for every action that names no URI, and for every probe that reached no
+/// conclusion — see [`crate::probe`] for why that is the overwhelming majority of them.
+async fn probe_uri_argument(action: &SoapAction) -> Option<DlnaError> {
+    let uri = match action.name.as_str() {
+        "SetAVTransportURI" => action.arg("CurrentURI")?,
+        // An empty `NextURI` is how a control point clears what it staged (§2.4.2), and
+        // there is nothing to probe about it.
+        "SetNextAVTransportURI" => action.arg("NextURI").filter(|u| !u.is_empty())?,
+        _ => return None,
+    };
+    // A URI that does not parse is the pure state machine's own 716 to give, with its own
+    // reasoning; nothing to add by racing it to the answer.
+    let parsed = castaway_core::MediaUri::parse(uri).ok()?;
+
+    match crate::probe::probe(&parsed).await {
+        crate::probe::Verdict::Playable | crate::probe::Verdict::Inconclusive => None,
+        crate::probe::Verdict::Missing(status) => {
+            info!(%uri, status, "DLNA: refusing a resource the server says is not there");
+            Some(DlnaError::ResourceNotFound(uri.to_string()))
+        }
+        crate::probe::Verdict::WrongType(content_type) => {
+            info!(%uri, %content_type, "DLNA: refusing a resource we do not advertise");
+            Some(DlnaError::IllegalMimeType(content_type))
+        }
+    }
 }
 
 fn fault_response(err: &DlnaError) -> Response {

@@ -171,6 +171,33 @@ pub(crate) const fn sink_protocol_info() -> &'static str {
     )
 }
 
+/// Does a content type fall inside what [`sink_protocol_info`] told the control point we
+/// accept?
+///
+/// Read out of that table rather than written a second time, so the answer we give a
+/// `HEAD` (#99) cannot drift from the answer we published. `mime` must already be
+/// lowercased and stripped of parameters — [`crate::probe::classify`] is the only caller
+/// and does both.
+///
+/// The globs at the front of the table do most of the work: `video/*` and `audio/*` mean
+/// anything in those two trees is accepted, and the enumeration behind them exists for
+/// control points that will not match a glob. That asymmetry is deliberate and is the
+/// whole reason this reads the table instead of the enumeration — a renderer that refused
+/// `audio/webm` while advertising `audio/*` would be refusing something it had promised.
+pub(crate) fn sink_accepts(mime: &str) -> bool {
+    sink_protocol_info().split(',').any(|entry| {
+        // `http-get:*:<mime>:*` — the MIME is the third field, and the wildcards in the
+        // others are not it.
+        let Some(advertised) = entry.split(':').nth(2) else {
+            return false;
+        };
+        match advertised.split_once("/*") {
+            Some((tree, "")) => mime.starts_with(tree) && mime[tree.len()..].starts_with('/'),
+            _ => advertised.eq_ignore_ascii_case(mime),
+        }
+    })
+}
+
 /// AVTransport actions that exist in the service template, are optional, and that this
 /// renderer does not implement — so they answer 602 rather than 401.
 ///

@@ -14,6 +14,7 @@ pub mod didl;
 pub mod error;
 pub mod gena;
 pub mod notify;
+mod probe;
 pub mod service;
 pub mod soap;
 pub mod state;
@@ -209,6 +210,127 @@ mod tests {
             msg.event,
             castaway_core::SessionEvent::Play { .. }
         ));
+    }
+
+    /// A one-shot HTTP server that answers every request with `status` and `content_type`,
+    /// and its URL. Enough to be the far end of a `HEAD`.
+    async fn stub_server(status: &'static str, content_type: Option<&'static str>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let ct = content_type
+                        .map(|ct| format!("Content-Type: {ct}\r\n"))
+                        .unwrap_or_default();
+                    let _ = sock
+                        .write_all(
+                            format!("HTTP/1.1 {status}\r\n{ct}Content-Length: 0\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/clip.mp4")
+    }
+
+    async fn set_uri(app: &axum::Router, uri: &str) -> (axum::http::StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let body = format!(
+            r#"<?xml version="1.0"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+            <u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+            <InstanceID>0</InstanceID><CurrentURI>{uri}</CurrentURI>
+            <CurrentURIMetaData></CurrentURIMetaData></u:SetAVTransportURI></s:Body></s:Envelope>"#
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(paths::AVT_CONTROL)
+                    .header(
+                        "SOAPACTION",
+                        "\"urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI\"",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The whole point of #99: the fault arrives while the control point is still
+    /// listening, instead of `ERROR_OCCURRED` arriving seconds later at a phone that has
+    /// already been shown a healthy session.
+    ///
+    /// Three shapes, and 714 is the one that had never once been produced outside its own
+    /// unit test — the code existed, was mapped, and was unreachable, because nothing ever
+    /// looked at what the resource was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resource_the_server_disowns_is_refused_at_set_time() {
+        let (svc, _rx) = service();
+        let app = svc.router();
+
+        // An HTML error page: the thing a control point most often actually hands us when
+        // the media has moved. 714.
+        let url = stub_server("200 OK", Some("text/html; charset=utf-8")).await;
+        let (status, body) = set_uri(&app, &url).await;
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("<errorCode>714</errorCode>"), "{body}");
+
+        // Gone. 716, synchronously, where before it was 200 then silence.
+        let url = stub_server("404 Not Found", Some("text/html")).await;
+        let (_, body) = set_uri(&app, &url).await;
+        assert!(body.contains("<errorCode>716</errorCode>"), "{body}");
+
+        // And the case that must keep working, which is every other cast: real media is
+        // taken, and the transport moves on to `STOPPED` ready for `Play`.
+        let url = stub_server("200 OK", Some("video/mp4")).await;
+        let (status, _) = set_uri(&app, &url).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+
+    /// Leniency is not a nicety here — each of these is a real server's real behaviour,
+    /// and refusing on any of them turns a cast that would have played into one the phone
+    /// says was rejected, with no way for a guest in the room to override it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn servers_that_answer_ambiguously_are_still_played() {
+        let (svc, _rx) = service();
+        let app = svc.router();
+
+        for (status, content_type) in [
+            // Will not do HEAD at all. Common, and says nothing about the resource.
+            ("405 Method Not Allowed", None),
+            ("501 Not Implemented", None),
+            // Having a bad minute. The decoder's own fetch retries; a probe does not.
+            ("503 Service Unavailable", Some("text/html")),
+            // Names no type, or the universal "here are some bytes" that plenty of real
+            // servers send for an mp4.
+            ("200 OK", None),
+            ("200 OK", Some("application/octet-stream")),
+        ] {
+            let url = stub_server(status, content_type).await;
+            let (code, body) = set_uri(&app, &url).await;
+            assert_eq!(
+                code,
+                axum::http::StatusCode::OK,
+                "{status} {content_type:?} was refused: {body}"
+            );
+        }
     }
 
     /// A control point that subscribes gets told things — which is the entire claim, and
