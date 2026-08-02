@@ -2,7 +2,8 @@
 //!
 //! Everything #68 decided lives here and is therefore testable: Just Works pairing with
 //! no prompt on either side, link keys persisted so a repeat guest reconnects silently,
-//! discoverable only while no session is active, and legacy PIN pairing refused outright.
+//! discoverable *while in use* rather than only when idle (#68 as amended — see
+//! [`HostConfig::discoverable`]), and legacy PIN pairing refused outright.
 //!
 //! `fn(state, event) -> (state, actions)` per ground rule 3. The actor above writes the
 //! [`HostAction::Send`]s to the transport and hands events back; nothing here opens a
@@ -273,7 +274,15 @@ impl HostController {
         self.pace(vec![HostAction::Send(Command::Reset)])
     }
 
-    /// Set discoverability directly — used to go quiet while a session is active (#68).
+    /// Set discoverability directly.
+    ///
+    /// Nothing in the adapter calls this, deliberately. #68's original policy was to go
+    /// quiet for the duration of a session, and its amendment removed exactly that: the
+    /// receiver stays findable while streaming, which is why bring-up widens the inquiry
+    /// scan to ~9% of the radio instead. Wiring this up on a session boundary would
+    /// restore the failure the amendment existed to fix — the second person in the room
+    /// cannot find the receiver while the first one is using it. It remains here as the
+    /// mechanism for an *operator*-driven quieting, which is a different decision.
     #[must_use]
     pub fn set_discoverable(&mut self, discoverable: bool) -> Vec<HostAction> {
         let scan = if discoverable {
@@ -1063,9 +1072,11 @@ mod tests {
     }
 
     #[test]
-    fn going_quiet_for_a_session_stays_connectable() {
-        // Undiscoverable, but a phone that already paired must still be able to
-        // reconnect while someone else streams — otherwise takeover never works (#68).
+    fn going_quiet_stays_connectable() {
+        // Not what a session does — #68's amendment keeps the receiver findable while it
+        // is in use, and nothing calls this on a session boundary. What it pins down is
+        // that quieting, whenever it is asked for, leaves the box *connectable*: a phone
+        // that already paired must still be able to reconnect, or takeover never works.
         let mut host = HostController::new(HostConfig::default());
         let quiet = sent(&host.set_discoverable(false));
         assert_eq!(
