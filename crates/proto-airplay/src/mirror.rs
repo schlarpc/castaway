@@ -86,6 +86,17 @@ impl MirrorCodec {
     }
 }
 
+impl From<MirrorCodec> for VideoCodec {
+    /// The pipeline's name for the same codec. Exhaustive on purpose: a third mirroring
+    /// codec must not silently keep tagging frames as one of these two.
+    fn from(codec: MirrorCodec) -> Self {
+        match codec {
+            MirrorCodec::H264 => VideoCodec::H264,
+            MirrorCodec::Hevc => VideoCodec::Hevc,
+        }
+    }
+}
+
 /// The `hvcC` marker that distinguishes an HEVC configuration record from an `avcC`.
 const HVCC_MARKER: &[u8; 4] = b"hvc1";
 
@@ -318,8 +329,15 @@ impl MirrorStream {
         self.cipher.apply_keystream(&mut data);
 
         // HEVC reads its NAL type from different bits, so the codec has to be known
-        // before an access unit can be classified. A video packet before any
-        // configuration record is a stream we cannot describe.
+        // before an access unit can be classified. Before any configuration record there
+        // is nothing to know it from, so H.264 is assumed — the baseline every sender
+        // supports, and what one falls back to. (The comment here used to claim such a
+        // packet was refused as "a stream we cannot describe". It never was.)
+        //
+        // The assumption is safe rather than merely convenient: HEVC is opt-in behind
+        // feature bit 42 and its `hvcC` record always precedes its video on a TCP channel
+        // with nothing to reorder, and a pre-config access unit cannot be decoded by
+        // anything anyway — its parameter sets arrive only with that record.
         let codec = self.codec.unwrap_or(MirrorCodec::H264);
         let keyframe = to_annex_b(&mut data, codec)?;
 
@@ -342,7 +360,11 @@ impl MirrorStream {
         let pts = self.origin.pts(header.timestamp);
 
         out.push(MirrorOutput::Frame(Box::new(EncodedFrame {
-            video_codec: Some(VideoCodec::H264),
+            // From the record the sender sent, not a constant. The decoder is opened from
+            // the first frame's tag, so tagging an HEVC stream H.264 — which this did,
+            // while logging "codec HEVC" two functions up — opens an H.264 decoder
+            // against an HEVC bitstream and decodes no picture at all.
+            video_codec: Some(codec.into()),
             audio_codec: None,
             pts,
             keyframe,
@@ -709,12 +731,33 @@ mod tests {
                 MirrorOutput::Frame(f) => Some(f),
                 _ => None,
             });
+            let frame = frame.expect("a frame");
+            assert_eq!(frame.keyframe, expect_key, "HEVC NAL type {nal_type}");
+            // …and it goes out tagged as what it is. The tag used to be the constant
+            // `H264` on every frame, however the stream had been negotiated: the decoder
+            // is opened from the first frame's tag, so an HEVC session set up cleanly,
+            // logged "codec HEVC", and then decoded no picture at all against an H.264
+            // decoder. Nothing downstream could notice, because every frame agreed.
             assert_eq!(
-                frame.expect("a frame").keyframe,
-                expect_key,
-                "HEVC NAL type {nal_type}"
+                frame.video_codec,
+                Some(VideoCodec::Hevc),
+                "an HEVC stream must not be tagged H.264"
             );
         }
+    }
+
+    #[test]
+    fn an_h264_stream_is_still_tagged_h264() {
+        let mut s = MirrorStream::new(&keys(), Arc::new(StreamOrigin::new()));
+        let plain = access_unit(1, b"not-a-keyframe");
+        let mut au = plain;
+        sender_cipher().apply_keystream(&mut au);
+        let mut buf = message(payload_type::VIDEO, 0, 0, &au);
+        let out = s.feed(&mut buf).unwrap();
+        let [MirrorOutput::Frame(f)] = out.as_slice() else {
+            panic!("expected a frame, got {out:?}")
+        };
+        assert_eq!(f.video_codec, Some(VideoCodec::H264));
     }
 
     #[test]
