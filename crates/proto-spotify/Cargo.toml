@@ -18,14 +18,14 @@ axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded = "0.7"
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 sha1.workspace = true
 hmac.workspace = true
 pbkdf2 = { version = "0.12", features = ["hmac"], default-features = false }
 aes.workspace = true
 ctr.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 rand.workspace = true
 librespot-core.workspace = true
 librespot-connect.workspace = true

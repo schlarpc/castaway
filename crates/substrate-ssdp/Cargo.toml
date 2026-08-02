@@ -12,7 +12,7 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time"] }
 axum.workspace = true
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "rt-multi-thread"] }
