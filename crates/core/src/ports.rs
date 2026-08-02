@@ -49,13 +49,15 @@ impl PortRange {
     /// # Errors
     /// [`PortRangeError`] if `first` is 0 or the bounds are backwards.
     pub const fn new(first: u16, last: u16) -> Result<Self, PortRangeError> {
+        // Order matters: a nonzero `first` with `last == 0` is a *backwards* range, and
+        // saying "cannot start at 0" about it sends the operator to edit the wrong key.
+        if first > last {
+            return Err(PortRangeError::Backwards { first, last });
+        }
         let (Some(first_nz), Some(last_nz)) = (NonZeroU16::new(first), NonZeroU16::new(last))
         else {
             return Err(PortRangeError::ZeroStart);
         };
-        if first > last {
-            return Err(PortRangeError::Backwards { first, last });
-        }
         Ok(Self {
             first: first_nz,
             last: last_nz,
@@ -148,8 +150,13 @@ mod tests {
     #[test]
     fn zero_and_backwards_are_rejected() {
         assert_eq!(PortRange::new(0, 10), Err(PortRangeError::ZeroStart));
-        // A range *ending* at 0 can only also start at 0.
         assert_eq!(PortRange::new(0, 0), Err(PortRangeError::ZeroStart));
+        // A range *ending* at 0 is backwards, not zero-started: `first` is fine and the
+        // diagnosis has to say so, or the operator edits the key that was already right.
+        assert_eq!(
+            PortRange::new(10, 0),
+            Err(PortRangeError::Backwards { first: 10, last: 0 })
+        );
         assert_eq!(
             PortRange::new(20, 10),
             Err(PortRangeError::Backwards {
