@@ -1500,11 +1500,35 @@ impl BluetoothAdapter {
             {
                 if let Ok(parsed) = avrcp::parse_element_attributes(&vendor.parameters) {
                     let changed = !parsed.now_playing.is_same_item(&link.now_playing);
-                    // GetElementAttributes carries no play state, so its default would
-                    // overwrite whatever the subscription told us. Keep ours.
-                    let state = link.now_playing.state;
+                    // A `GetElementAttributes` response describes the **track** — title,
+                    // artist, album, genre, number, duration — and nothing else on the
+                    // snapshot. Every other field belongs to the *session* and has its own
+                    // source: play state from the subscription, position from
+                    // POS_CHANGED or the poll (#162), shuffle and repeat from the player
+                    // application settings (#76), artwork from a BIP fetch that finishes
+                    // seconds later.
+                    //
+                    // This replaced the whole snapshot and handed `state` back by itself,
+                    // so everything else was silently reset to its default on *every*
+                    // metadata read — and phones re-read constantly (an iPhone sent nine
+                    // TRACK_CHANGED for three songs). Shuffle and repeat therefore went
+                    // back to `None` moments after being learned, which is precisely the
+                    // condition the transport strip refuses to draw a button under, so the
+                    // controls #76 added never appeared on the panel.
                     let previous = std::mem::replace(&mut link.now_playing, parsed.now_playing);
-                    link.now_playing.state = state;
+                    let now = &mut link.now_playing;
+                    now.state = previous.state;
+                    now.shuffle = previous.shuffle;
+                    now.repeat = previous.repeat;
+                    // These two describe the track rather than the session, so they
+                    // survive a re-read of the same one and are dropped when it really
+                    // changes: the new track's art is fetched a moment later and its
+                    // position starts again. Blanking them on every re-read was also
+                    // making already-fetched artwork disappear.
+                    if !changed {
+                        now.artwork = previous.artwork.clone();
+                        now.position = previous.position;
+                    }
                     // A sender may re-notify several times for one track as its metadata
                     // fills in — an iPhone sent nine TRACK_CHANGED for three songs — and
                     // most of those re-reads come back identical. Re-emitting them churns

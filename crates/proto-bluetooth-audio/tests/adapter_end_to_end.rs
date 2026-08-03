@@ -3501,3 +3501,104 @@ async fn a_peer_that_refuses_position_notifications_gets_polled_instead() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_metadata_read_does_not_wipe_shuffle_repeat_or_artwork() {
+    // Reported from the panel: #76 landed, the phone exposed shuffle and repeat, and no
+    // buttons appeared. The settings were being learned and then thrown away.
+    //
+    // `GetElementAttributes` describes the track. Everything else on the snapshot belongs
+    // to the session and arrives from somewhere else — and the handler replaced the whole
+    // snapshot, handing back only `state`. Phones re-read metadata constantly, so shuffle
+    // and repeat returned to `None` within moments of being learned, and the transport
+    // strip will not draw a button for a setting whose state it does not know.
+    use proto_bluetooth_audio::avrcp::pdu;
+
+    let (transport, mut rx) = connected().await;
+    let (_signaling, _media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (_frames, _) = audio_session(&mut rx).await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    // The player exposes both settings, and reports them on.
+    awaited_command(
+        &transport,
+        "the settings listing",
+        pdu::LIST_SETTING_ATTRIBUTES,
+    )
+    .await;
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::LIST_SETTING_ATTRIBUTES, &[2, 0x02, 0x03]),
+        ),
+    );
+    for _ in 0..2 {
+        awaited_command(&transport, "a value listing", pdu::LIST_SETTING_VALUES).await;
+        push_pdu(
+            &transport,
+            &L2capPdu::new(
+                avctp,
+                phone_answer(pdu::LIST_SETTING_VALUES, &[3, 0x01, 0x02, 0x03]),
+            ),
+        );
+    }
+    awaited_command(
+        &transport,
+        "the current settings",
+        pdu::GET_CURRENT_SETTINGS,
+    )
+    .await;
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            // shuffle all-tracks, repeat single-track
+            phone_answer(pdu::GET_CURRENT_SETTINGS, &[2, 0x03, 0x02, 0x02, 0x02]),
+        ),
+    );
+
+    let with_settings = eventually("shuffle and repeat on the card", || {
+        rx.try_recv().ok().and_then(|m| match m.event {
+            SessionEvent::NowPlaying(n) if n.shuffle.is_some() => Some(n),
+            _ => None,
+        })
+    })
+    .await;
+    assert_eq!(with_settings.shuffle, Some(true));
+    assert_eq!(with_settings.repeat, Some(castaway_core::RepeatMode::Track));
+
+    // Now a perfectly ordinary metadata read — the thing a phone does constantly.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            attributes_response(&[
+                (proto_bluetooth_audio::avrcp::attribute::TITLE, b"Derezzed"),
+                (
+                    proto_bluetooth_audio::avrcp::attribute::ARTIST,
+                    b"Daft Punk",
+                ),
+            ]),
+        ),
+    );
+
+    let after = eventually("the card after a metadata read", || {
+        rx.try_recv().ok().and_then(|m| match m.event {
+            SessionEvent::NowPlaying(n) if n.title.as_deref() == Some("Derezzed") => Some(n),
+            _ => None,
+        })
+    })
+    .await;
+    assert_eq!(
+        after.shuffle,
+        Some(true),
+        "the metadata response says nothing about shuffle and must not clear it"
+    );
+    assert_eq!(
+        after.repeat,
+        Some(castaway_core::RepeatMode::Track),
+        "nor about repeat"
+    );
+}
