@@ -330,6 +330,12 @@ let
     "imm32.dll"
     "iphlpapi.dll" # IP Helper — interface enumeration for mDNS/SSDP advertisement
     "kernel32.dll"
+    # Core Audio's device API, in System32 since Vista. The `audio-out` build imports
+    # exactly one symbol from it — `ActivateAudioInterfaceAsync`, minimum supported
+    # client Windows 8 — which is how cpal's WASAPI host opens the endpoint the settings
+    # screen selected. Everything else in that path arrives through COM via ole32, so this
+    # is the only WASAPI name that shows up as a link-time import at all.
+    "mmdevapi.dll"
     "ntdll.dll"
     "ole32.dll"
     "oleaut32.dll"
