@@ -397,6 +397,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_sender_attaches_to_the_running_page_without_disturbing_it() {
+        // The attach-without-launch path, which is the whole reason the screen id is
+        // published at all (#96). One phone casts; a second person opens YouTube, finds
+        // the receiver already running it, reads the screen id out of the app-info XML and
+        // joins that Lounge session directly — no `POST`, so no relaunch.
+        //
+        // Two things have to hold, and only one of them is about the XML. The id has to be
+        // there, or the second phone has no way in and the feature silently is not one.
+        // And reading it must not *do* anything: a `GET` that disturbed the session would
+        // interrupt the person already watching, which is a worse failure than not
+        // offering the attach at all.
+        let (svc, mut events) = service();
+        let slot = svc.screen_slot();
+        let app = svc.router();
+
+        let shown: Arc<Mutex<Vec<Shown>>> = Arc::default();
+        let sink = Arc::clone(&shown);
+        let resolver = slow_resolver(slot.clone(), Arc::default());
+        tokio::spawn(async move {
+            pump_dial(&mut events, resolver, move |event| {
+                let told = match event {
+                    DialEvent::Launched(params) => Shown::Page(params.leanback_url()),
+                    DialEvent::Stopped => Shown::Nothing,
+                };
+                sink.lock().unwrap().push(told);
+            })
+            .await;
+        });
+
+        assert_eq!(
+            post(&app, "pairingCode=firstcast").await,
+            StatusCode::CREATED
+        );
+        eventually("the screen id being resolved", || {
+            shown.lock().unwrap().first().cloned()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // What the second sender reads.
+        let info = app_info(&app).await;
+        assert!(
+            info.contains("running"),
+            "a second sender has to see the app running, or it launches its own: {info}"
+        );
+        assert!(
+            info.contains("screenforfirstcast"),
+            "…and the screen id it needs to attach: {info}"
+        );
+
+        // Reading it twice more is what a second and third sender actually do.
+        let again = app_info(&app).await;
+        let _third = app_info(&app).await;
+        assert_eq!(again, info, "app-info must be a read, not a transition");
+        assert_eq!(
+            *shown.lock().unwrap(),
+            vec![Shown::Page(
+                "https://www.youtube.com/tv?pairingCode=firstcast".into()
+            )],
+            "an attaching sender must not navigate or hide the page the first one is \
+             watching"
+        );
+        assert_eq!(
+            slot.get().await.map(|id| id.as_str().to_owned()),
+            Some("screenforfirstcast".into()),
+            "and the id it attached to must still be the live page's"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_stop_calls_off_the_resolver_still_hunting_for_a_screen() {
         // The other half of the same rule. A `DELETE` clears the slot; a resolver still
         // running would refill it seconds later, and the receiver would then advertise a

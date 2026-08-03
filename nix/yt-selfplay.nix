@@ -296,26 +296,51 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
 
 
   def published_screen_id(base):
-      """The screenId the receiver publishes for an already-running app.
+      """The screenId the receiver publishes for an already-running app, or None.
 
       This is the only way a sender that did not launch the app can find the screen —
       the other route to one is a pairing code, and supplying a pairing code means
       making a launch. A receiver that never publishes it strands every sender that
       arrives after the first: the app reads as `running`, the cast connects, and
-      nothing can ever be queued to it."""
+      nothing can ever be queued to it.
+
+      None covers both "nothing is running" and "running, but the receiver has not
+      resolved the id yet", because from here they look the same and the caller is
+      polling for the same answer either way."""
       status, body = http(base.rstrip("/") + "/dial/apps/YouTube")
       if status != 200:
           raise SystemExit("GET /dial/apps/YouTube -> {}".format(status))
       if "<state>running</state>" not in body:
-          raise SystemExit("--reconnect needs the app already running; launch one first")
+          return None
       match = re.search(r"<screenId>([^<]+)</screenId>", body)
-      if not match:
-          raise SystemExit(
-              "the running app publishes no <screenId>.\n"
-              "A sender arriving now has no way to attach: it did not launch this app, so it "
-              "holds no pairing code, and the app-info XML offers nothing else. This is the "
-              "connected-but-never-plays failure — the receiver has to publish its screen id.")
-      return match.group(1)
+      return match.group(1) if match else None
+
+
+  def app_is_running(base):
+      status, body = http(base.rstrip("/") + "/dial/apps/YouTube")
+      if status != 200:
+          raise SystemExit("GET /dial/apps/YouTube -> {}".format(status))
+      return "<state>running</state>" in body
+
+
+  def wait_for_published_screen(base, timeout=90):
+      """Poll until the *receiver* publishes the screen id of the page it launched.
+
+      Deliberately not the same question as `wait_for_screen`. That one asks YouTube
+      whether the page registered; this asks the receiver whether it noticed. The gap
+      between the two is the receiver's own resolver — which is exactly the thing
+      --reconnect exists to test, so it has to be waited for rather than assumed."""
+      deadline = time.monotonic() + timeout
+      while time.monotonic() < deadline:
+          screen_id = published_screen_id(base)
+          if screen_id:
+              return screen_id
+          time.sleep(2)
+      raise SystemExit(
+          "the receiver never published a <screenId> for the running app.\n"
+          "A sender arriving now has no way to attach: it did not launch this app, so it "
+          "holds no pairing code, and the app-info XML offers nothing else. This is the "
+          "connected-but-never-plays failure — the receiver has to publish its screen id.")
 
 
   def token_for_screen(screen_id):
@@ -387,7 +412,22 @@ pkgs.writers.writePython3Bin "yt-selfplay" { flakeIgnore = [ "E501" "W503" ]; } 
       if reconnect:
           # The returning phone: the app is already running, and this sender never
           # launched it. Everything hangs on the screen id the receiver publishes.
-          screen_id = published_screen_id(base)
+          #
+          # If nothing is running, be the first phone as well — launch, wait for the page
+          # to register, and then throw that pairing code away and come back through the
+          # front door. Two senders, one run, no operator. This used to demand that a
+          # human had cast by hand beforehand, which is what stopped the D28 regression
+          # from being a test anything could run (#96).
+          #
+          # The launch half deliberately keeps nothing: `wait_for_screen`'s token would
+          # work, and using it would test the path a *launching* sender takes, which is
+          # the path --reconnect exists not to take.
+          if not app_is_running(base):
+              print("nothing running; launching first, then re-attaching as a second sender")
+              pairing_code = str(uuid.uuid4())
+              dial_launch(base, pairing_code)
+              wait_for_screen(pairing_code)
+          screen_id = wait_for_published_screen(base)
           print("attaching to published screen " + screen_id)
           token = token_for_screen(screen_id)
       else:
