@@ -83,10 +83,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport = Arc::new(Recording::new(usb, &snoop_path)?);
 
+    // Link keys, kept beside the capture. Without this every run is a fresh pairing —
+    // and worse than that, the *phone* still holds the old bond, so it offers a key we
+    // answer `LinkKeyRequestNegativeReply` to and iOS quietly refuses to connect until
+    // somebody taps "Forget This Device". A bench meant to be run repeatedly against the
+    // same phone cannot afford that.
+    let keys_path = out_dir.join("link-keys.txt");
+    let link_keys = load_link_keys(&keys_path);
+    if !link_keys.is_empty() {
+        println!("remembered {} paired peer(s)", link_keys.len());
+    }
+    let writer = keys_path.clone();
     let config = BluetoothConfig {
         // The whole reason this bench exists. Off everywhere else, because it spends the
         // one risk the cover-art path has.
         probe_image_properties: true,
+        link_keys,
+        on_paired: Some(Arc::new(move |addr, key| save_link_key(&writer, addr, key))),
         ..BluetoothConfig::default()
     };
     let adapter = Arc::new(BluetoothAdapter::new(
@@ -268,6 +281,48 @@ async fn observe(
             SessionEvent::End => println!("● session ended"),
             other => println!("● {other:?}"),
         }
+    }
+}
+
+/// Read remembered link keys, tolerating a missing or half-written file.
+fn load_link_keys(path: &Path) -> Vec<(substrate_hci::BdAddr, substrate_hci::LinkKey)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (addr, key) = line.split_once(' ')?;
+            let addr = addr.trim().parse().ok()?;
+            let raw = (0..16)
+                .map(|i| u8::from_str_radix(key.get(i * 2..i * 2 + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()?;
+            Some((addr, substrate_hci::LinkKey::new(raw.try_into().ok()?)))
+        })
+        .collect()
+}
+
+/// Remember a newly paired peer, or forget one whose key was refused.
+fn save_link_key(path: &Path, addr: substrate_hci::BdAddr, key: Option<substrate_hci::LinkKey>) {
+    let mut keys = load_link_keys(path);
+    keys.retain(|(a, _)| *a != addr);
+    match key {
+        Some(key) => {
+            println!("● paired with {addr}; remembering the key");
+            keys.push((addr, key));
+        }
+        // `None` means the peer refused the key we offered — keeping it would make every
+        // future run fail the same way.
+        None => println!("● {addr} refused its stored key; forgetting it"),
+    }
+    let body: String = keys
+        .iter()
+        .map(|(a, k)| {
+            let hex: String = k.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            format!("{a} {hex}\n")
+        })
+        .collect();
+    if let Err(e) = std::fs::write(path, body) {
+        println!("  could not write {}: {e}", path.display());
     }
 }
 

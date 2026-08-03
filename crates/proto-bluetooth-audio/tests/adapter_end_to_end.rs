@@ -215,12 +215,25 @@ async fn connected() -> (Arc<ScriptedTransport>, mpsc::Receiver<SourceMessage>) 
 async fn connected_to(
     transport: Arc<ScriptedTransport>,
 ) -> (Arc<ScriptedTransport>, mpsc::Receiver<SourceMessage>) {
-    let adapter = Arc::new(BluetoothAdapter::new(
-        Arc::clone(&transport) as Arc<dyn HciTransport>,
+    connected_with(
+        transport,
         BluetoothConfig {
             decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
             ..BluetoothConfig::default()
         },
+    )
+    .await
+}
+
+/// The same again, with the config the caller wants — for the paths that only exist
+/// when a flag is on.
+async fn connected_with(
+    transport: Arc<ScriptedTransport>,
+    config: BluetoothConfig,
+) -> (Arc<ScriptedTransport>, mpsc::Receiver<SourceMessage>) {
+    let adapter = Arc::new(BluetoothAdapter::new(
+        Arc::clone(&transport) as Arc<dyn HciTransport>,
+        config,
     ));
     let (tx, rx) = mpsc::channel(64);
     let sink = SessionSink::new(SourceId::new(ProtocolKind::Bluetooth, "listener"), tx);
@@ -1587,7 +1600,17 @@ async fn cover_art_is_discovered_connected_and_fetched() {
     // channel comes up in Enhanced Retransmission Mode because GOEP 2.0 says so, OBEX
     // connects, *then* attribute 8 is asked for, and the JPEG that comes back reaches the
     // now-playing card.
-    let (transport, mut rx) = connected().await;
+    let (transport, mut rx) = connected_with(
+        transport(),
+        BluetoothConfig {
+            decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
+            // …and on past the thumbnail, into the properties listing and the larger form
+            // it may name (#75).
+            probe_image_properties: true,
+            ..BluetoothConfig::default()
+        },
+    )
+    .await;
     let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
 
     // A session, so the metadata events are actually delivered rather than dropped for a
@@ -1748,6 +1771,76 @@ async fn cover_art_is_discovered_connected_and_fetched() {
     })
     .await;
     assert_eq!(&artwork.data[..], &jpeg[..]);
+
+    // 8. With the probe on, the session then asks what other forms exist — the open half
+    //    of #75. Once per track, on the same session, a GET for a different MIME type.
+    let props_get = eventually("an obex get for the properties", || {
+        ertm_sdus(&transport, art_phone).into_iter().find(|sdu| {
+            ObexPacket::decode(sdu, 0).is_ok_and(|p| {
+                p.headers
+                    .contains(&ObexHeader::Type("x-bt/img-properties".into()))
+            })
+        })
+    })
+    .await;
+    assert!(ObexPacket::decode(&props_get, 0)
+        .unwrap()
+        .headers
+        .contains(&ObexHeader::ImageHandle("0000001".into())));
+
+    // 9. The phone lists a form larger than the linked thumbnail's fixed 200x200…
+    let listing = br#"<image-properties version="1.0" handle="0000001">
+<native encoding="JPEG" pixel="200*200" />
+<variant encoding="JPEG" pixel="600*600" />
+</image-properties>"#;
+    let props_reply = ObexPacket {
+        code: 0xA0,
+        prefix: Bytes::new(),
+        headers: vec![ObexHeader::EndOfBody(Bytes::from_static(listing))],
+    }
+    .encode();
+    push_pdu(&transport, &ertm_pdu(art_cid, 2, 1, &props_reply));
+
+    // 10. …so it is fetched, with a descriptor naming the peer's own spelling of it. A
+    //     size we invented would be refused: BIP compares these as strings.
+    let image_get = eventually("an obex get for the larger form", || {
+        ertm_sdus(&transport, art_phone).into_iter().find(|sdu| {
+            ObexPacket::decode(sdu, 0)
+                .is_ok_and(|p| p.headers.contains(&ObexHeader::Type("x-bt/img-img".into())))
+        })
+    })
+    .await;
+    let parsed = ObexPacket::decode(&image_get, 0).unwrap();
+    assert!(
+        parsed.headers.iter().any(|h| matches!(
+            h,
+            ObexHeader::ImageDescription(d)
+                if d.contains(r#"pixel="600*600""#) && d.contains(r#"encoding="JPEG""#)
+        )),
+        "the descriptor must name the listed form: {:?}",
+        parsed.headers
+    );
+    assert!(parsed
+        .headers
+        .contains(&ObexHeader::ImageHandle("0000001".into())));
+}
+
+#[tokio::test]
+async fn a_peer_offering_nothing_bigger_than_the_thumbnail_is_not_asked_twice() {
+    // The other half of the #75 gate. An iPhone's real listing tops out at 280x280 for a
+    // 200x200 native, but a peer whose largest form *is* the thumbnail should cost no
+    // second fetch at all — the upgrade exists to find a bigger picture, not to re-fetch
+    // the one we have.
+    use proto_bluetooth_audio::obex::ImageProperties;
+    let same = br#"<image-properties version="1.0" handle="1">
+<native encoding="JPEG" pixel="200*200" />
+</image-properties>"#;
+    let props = ImageProperties::parse(same).unwrap();
+    assert_eq!(
+        props.largest_decodable().map(|(_, size)| size),
+        Some((200, 200)),
+        "nothing on offer beyond what a thumbnail fetch already returns"
+    );
 }
 
 #[tokio::test]
