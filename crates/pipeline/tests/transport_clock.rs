@@ -28,10 +28,19 @@ fn card(title: &str, duration: Duration) -> NowPlayingCard {
 
 #[test]
 fn a_new_reading_re_anchors_the_clock_and_a_repeat_does_not() {
+    // Every position below is a number this test chose, not a number the host produced.
+    // It used to sleep 60 ms and assert the clock had advanced "at least 40 ms" and then
+    // re-anchored to "under 40 ms", which is a statement about the machine as much as
+    // about the code: under a full `nix flake check`, 388 tests deep against lavapipe, the
+    // re-anchored reading came back at 50.5 ms and the gate went red for a reason that had
+    // nothing to do with the change under test (#156). With the clock injected,
+    // "re-anchored" is asserted as what it actually means — the elapsed time is zero.
     let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
     let Some(mut render) = pipeline::test_gpu::render_loop(640, 360, rx) else {
         return;
     };
+    let mut render = render.with_clock(clock);
     let render = &mut render;
 
     // Track one starts at 0:00 and plays.
@@ -40,11 +49,11 @@ fn a_new_reading_re_anchors_the_clock_and_a_repeat_does_not() {
         Duration::from_secs(200),
     ))));
     render.pump();
-    std::thread::sleep(Duration::from_millis(60));
-    let elapsed = render.transport_position().unwrap();
-    assert!(
-        elapsed >= Duration::from_millis(40),
-        "the clock ticks between readings: {elapsed:?}"
+    time.advance(Duration::from_millis(60));
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_millis(60),
+        "the clock ticks between readings, at exactly the rate time passes"
     );
 
     // A republish of the *same* reading — a queue update, the device naming itself —
@@ -54,8 +63,9 @@ fn a_new_reading_re_anchors_the_clock_and_a_repeat_does_not() {
         Duration::from_secs(200),
     ))));
     render.pump();
-    assert!(
-        render.transport_position().unwrap() >= Duration::from_millis(40),
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_millis(60),
         "an identical reading keeps its anchor"
     );
 
@@ -67,10 +77,18 @@ fn a_new_reading_re_anchors_the_clock_and_a_repeat_does_not() {
         Duration::from_secs(180),
     ))));
     render.pump();
-    let fresh = render.transport_position().unwrap();
-    assert!(
-        fresh < Duration::from_millis(40),
-        "a new reading re-anchors: {fresh:?}"
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::ZERO,
+        "a new reading re-anchors"
+    );
+
+    // And it goes on running from there, rather than being pinned by the re-anchor.
+    time.advance(Duration::from_secs(5));
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_secs(5),
+        "the re-anchored clock ticks like any other"
     );
 }
 

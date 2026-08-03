@@ -1351,6 +1351,10 @@ pub struct RenderLoop {
     card_clear_due: Option<std::time::Instant>,
     /// The side the close badge was last rasterized at; `0` when it is not up.
     close_badge_side: u32,
+    /// Where this loop reads the time. Injectable so the deadlines below — the strip's
+    /// anchor, the deferred clears, the demand calculation — can be asserted against a
+    /// number a test chose rather than against how fast the host happened to be (#156).
+    clock: crate::render_clock::RenderClock,
     /// The card as last rasterized, with the surface size it was rasterized at.
     ///
     /// Position now republishes once a second (the transport strip's clock syncs on
@@ -1427,12 +1431,12 @@ impl TransportState {
     /// Only advanced while playback is actually active — a paused track whose position
     /// crept forward would be a scrubber that lies, and lies in the direction that makes
     /// a seek land somewhere the user did not ask for.
-    fn live_position(&self) -> Option<Duration> {
+    fn live_position(&self, now: std::time::Instant) -> Option<Duration> {
         let base = self.model.position?;
         if !self.model.state.is_active() {
             return Some(base);
         }
-        let advanced = base + self.taken_at.elapsed();
+        let advanced = base + now.saturating_duration_since(self.taken_at);
         Some(match self.model.duration {
             Some(total) => advanced.min(total),
             None => advanced,
@@ -1445,7 +1449,7 @@ impl TransportState {
     /// long as it is there, including on a *paused* track. A drag over a pause used to
     /// repaint not once a second but never, because the clock is the only thing that ever
     /// asked for a repaint and a paused clock does not tick.
-    fn showing(&self) -> Option<Duration> {
+    fn showing(&self, now: std::time::Instant) -> Option<Duration> {
         match self.preview {
             Some(fraction) => Some(self.model.duration?.mul_f32(fraction)),
             // Not gated on playback being active, and it cannot be. A paused track's
@@ -1453,7 +1457,7 @@ impl TransportState {
             // — but that one repaint is the one that puts the bar back where the music is
             // when a drag over a *paused* track is cancelled. Returning nothing here left
             // the panel showing a preview of a gesture that never happened.
-            None => self.live_position(),
+            None => self.live_position(now),
         }
     }
 
@@ -1493,11 +1497,21 @@ impl RenderLoop {
             video_size: None,
             card_clear_due: None,
             close_badge_side: 0,
+            clock: crate::render_clock::RenderClock::monotonic(),
             card_shown: None,
             taps: Vec::new(),
             failed_imports: 0,
             transport: None,
         }
+    }
+
+    /// Run this loop against `clock` instead of the monotonic one.
+    ///
+    /// For tests only — nothing in production installs anything but the monotonic clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: crate::render_clock::RenderClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Attach an OSD controller (consumes the core OSD channel and draws banners).
@@ -1512,8 +1526,9 @@ impl RenderLoop {
         // Passed in rather than remembered by the controller, so it tracks a window resize
         // for free and the banner is always rasterized at the panel's real pixel scale.
         let surface = self.compositor.target_size();
+        let now = self.clock.now();
         let update = match &mut self.osd {
-            Some(controller) => controller.poll(std::time::Instant::now(), surface),
+            Some(controller) => controller.poll(now, surface),
             None => return,
         };
         match update {
@@ -1601,7 +1616,7 @@ impl RenderLoop {
         // is a fresh reading, and a fresh reading re-anchors the clock.
         let taken_at = match self.transport.as_ref() {
             Some(prev) if prev.model == *model => prev.taken_at,
-            _ => std::time::Instant::now(),
+            _ => self.clock.now(),
         };
         // A drag survives the source republishing under it, and it has to: sources publish
         // for reasons that have nothing to do with the finger — a position tick, a queue
@@ -1678,7 +1693,8 @@ impl RenderLoop {
         let Some(state) = self.transport.as_ref() else {
             return;
         };
-        let Some(live) = state.showing() else {
+        let now = self.clock.now();
+        let Some(live) = state.showing(now) else {
             return;
         };
         if !state.stale(live) {
@@ -1724,9 +1740,10 @@ impl RenderLoop {
     /// long playback has run since. For tests and logs.
     #[must_use]
     pub fn transport_position(&self) -> Option<Duration> {
+        let now = self.clock.now();
         self.transport
             .as_ref()
-            .and_then(TransportState::live_position)
+            .and_then(|state| state.live_position(now))
     }
 
     /// What a touch at panel-normalized `(x, y)` means, if the strip is on screen.
@@ -2028,7 +2045,7 @@ impl RenderLoop {
     /// Used by the idle policy: an ending session returns the panel Home, but not out
     /// from under someone who is using it.
     pub fn note_touch(&mut self) {
-        self.last_touch = Some(std::time::Instant::now());
+        self.last_touch = Some(self.clock.now());
     }
 
     /// Bring the shell in front, or hand the screen back to what is playing.
@@ -2665,7 +2682,7 @@ impl RenderLoop {
         self.tick_transport();
         self.update_osd();
         self.present_and_serve_taps();
-        self.demand(std::time::Instant::now())
+        self.demand(self.clock.now())
     }
 
     /// When this loop next owes the glass a frame, from standing facts alone.
@@ -2706,7 +2723,7 @@ impl RenderLoop {
         if !state.model.state.is_active() {
             return None;
         }
-        let live = state.live_position()?;
+        let live = state.live_position(now)?;
         let to_boundary = Duration::from_secs(1)
             .saturating_sub(Duration::from_nanos(u64::from(live.subsec_nanos())));
         Some(now + to_boundary)
@@ -2763,7 +2780,7 @@ impl RenderLoop {
     /// of the frame. One readback serves everyone who said yes.
     /// Execute a scheduled layer clear whose grace has run out (see `ClearVideo`).
     fn run_due_clears(&mut self) {
-        let now = std::time::Instant::now();
+        let now = self.clock.now();
         // A due clear starts the *exit*; it does not drop the layer. Removing it here is
         // what made a card vanish rather than leave, and it is why `Phase::Leaving` exists:
         // the layer is retired by `retire_finished` once the motion has actually gone.
@@ -2883,7 +2900,7 @@ impl RenderLoop {
             self.compositor.present();
             return;
         }
-        let now = std::time::Instant::now();
+        let now = self.clock.now();
         // Ask everyone first, then read back once per *distinct* shape. Two screenshots
         // racing, or a screenshot taken while the stream is running, must not cost two
         // full-surface copies — and which taps can share one is a fact only this loop has,
@@ -3084,7 +3101,7 @@ impl RenderLoop {
             RenderCommand::ClearNowPlaying => {
                 // Deferred, like `ClearVideo` and for the same seek-shaped reason; the
                 // strip goes with the card when the grace runs out.
-                self.card_clear_due = Some(std::time::Instant::now() + CLEAR_GRACE);
+                self.card_clear_due = Some(self.clock.now() + CLEAR_GRACE);
                 false
             }
             RenderCommand::ClearVideo => {
@@ -3107,7 +3124,7 @@ impl RenderLoop {
                 // of the *next* item cancels it; a stop that really is the end of the
                 // session clears when the grace runs out, which is too brief to read as
                 // the frozen frame it would otherwise be.
-                self.video_clear_due = Some(std::time::Instant::now() + CLEAR_GRACE);
+                self.video_clear_due = Some(self.clock.now() + CLEAR_GRACE);
                 false
             }
         }

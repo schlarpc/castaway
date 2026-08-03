@@ -96,6 +96,7 @@ pub mod overlay;
 pub mod panel;
 #[cfg(feature = "render")]
 pub mod picker;
+pub mod render_clock;
 #[cfg(feature = "render")]
 pub mod render_pipeline;
 pub mod seek;
