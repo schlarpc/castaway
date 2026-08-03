@@ -204,10 +204,11 @@ async fn build(config: &Config) -> anyhow::Result<(Arc<BluetoothAdapter>, String
             // default is the output queue's own depth; there is no measurement to
             // improve on it with yet (#89).
             sink_delay: proto_bluetooth_audio::sink::DEFAULT_SINK_DELAY,
-            // A diagnostic, and one that spends the cover-art path's only real risk. It
-            // belongs to whoever is running the bench with a phone in their hand
-            // (`proto-bluetooth-audio --example phone_bench`), not to a guest at a party.
-            probe_image_properties: false,
+            // Measured and worth it (#75): a phone that offers a form larger than the
+            // fixed 200x200 thumbnail generally has real detail in it, and the extra GET
+            // rides a channel that is already open. Bounded by the airtime ceiling in
+            // `proto-bluetooth-audio`, not by what the panel could draw.
+            fetch_best_cover_art: true,
         },
     ));
 

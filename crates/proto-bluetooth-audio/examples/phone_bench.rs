@@ -95,9 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let writer = keys_path.clone();
     let config = BluetoothConfig {
-        // The whole reason this bench exists. Off everywhere else, because it spends the
-        // one risk the cover-art path has.
-        probe_image_properties: true,
+        // `fetch_best_cover_art` is the default now, so the bench inherits it rather than
+        // turning it on — which also means what it captures is what a guest would get.
         link_keys,
         on_paired: Some(Arc::new(move |addr, key| save_link_key(&writer, addr, key))),
         ..BluetoothConfig::default()

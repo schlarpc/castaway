@@ -1064,10 +1064,36 @@ impl ImageProperties {
     /// as the ceiling would answer #75's question with a number no code path could reach.
     #[must_use]
     pub fn largest_decodable(&self) -> Option<(&ImageVariant, (u16, u16))> {
+        self.largest_decodable_within(u16::MAX, u64::MAX)
+    }
+
+    /// The largest form on offer that is worth the airtime to fetch.
+    ///
+    /// The bound is not about what the panel can draw — the card's art square is over a
+    /// thousand pixels on a 4K display, so the screen is never the binding constraint.
+    /// It is about the *radio*: this is a Bluetooth link already carrying the audio the
+    /// picture belongs to, and cover art is decoration that must not cost a dropout. A
+    /// peer offering something enormous should get a thumbnail fetched instead of several
+    /// seconds of contended airtime spent on an image nobody asked to wait for.
+    ///
+    /// `max_bytes` is only checked against a size the descriptor actually states, which in
+    /// practice means a `<variant>`'s `maxsize`. A form that declares nothing is judged on
+    /// its pixels alone, because guessing a compression ratio would refuse real images.
+    #[must_use]
+    pub fn largest_decodable_within(
+        &self,
+        max_side: u16,
+        max_bytes: u64,
+    ) -> Option<(&ImageVariant, (u16, u16))> {
         self.variants
             .iter()
             .filter(|v| v.encoding.format().is_some())
+            .filter(|v| match v.size {
+                Some(ByteSize::Exact(n) | ByteSize::AtMost(n)) => n <= max_bytes,
+                None => true,
+            })
             .filter_map(|v| v.pixel.map(|p| (v, p.largest())))
+            .filter(|(_, (w, h))| *w <= max_side && *h <= max_side)
             .max_by_key(|(_, (w, h))| u32::from(*w) * u32::from(*h))
     }
 }

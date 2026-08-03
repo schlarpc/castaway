@@ -1606,7 +1606,6 @@ async fn cover_art_is_discovered_connected_and_fetched() {
             decodable: proto_bluetooth_audio::codec::ALL.to_vec(),
             // …and on past the thumbnail, into the properties listing and the larger form
             // it may name (#75).
-            probe_image_properties: true,
             ..BluetoothConfig::default()
         },
     )
@@ -1788,10 +1787,11 @@ async fn cover_art_is_discovered_connected_and_fetched() {
         .headers
         .contains(&ObexHeader::ImageHandle("0000001".into())));
 
-    // 9. The phone lists a form larger than the linked thumbnail's fixed 200x200…
+    // 9. The phone lists a form larger than the linked thumbnail's fixed 200x200, and
+    //    within the airtime ceiling…
     let listing = br#"<image-properties version="1.0" handle="0000001">
 <native encoding="JPEG" pixel="200*200" />
-<variant encoding="JPEG" pixel="600*600" />
+<variant encoding="JPEG" pixel="480*480" />
 </image-properties>"#;
     let props_reply = ObexPacket {
         code: 0xA0,
@@ -1815,7 +1815,7 @@ async fn cover_art_is_discovered_connected_and_fetched() {
         parsed.headers.iter().any(|h| matches!(
             h,
             ObexHeader::ImageDescription(d)
-                if d.contains(r#"pixel="600*600""#) && d.contains(r#"encoding="JPEG""#)
+                if d.contains(r#"pixel="480*480""#) && d.contains(r#"encoding="JPEG""#)
         )),
         "the descriptor must name the listed form: {:?}",
         parsed.headers
@@ -1823,6 +1823,47 @@ async fn cover_art_is_discovered_connected_and_fetched() {
     assert!(parsed
         .headers
         .contains(&ObexHeader::ImageHandle("0000001".into())));
+}
+
+#[tokio::test]
+async fn a_form_too_large_for_the_radio_is_declined_in_favour_of_the_thumbnail() {
+    // The ceiling is about airtime, not about the panel: this link is already carrying
+    // the audio the picture belongs to, and several seconds of contended radio spent on
+    // decoration is a dropout in the thing the decoration is for. A peer offering
+    // something enormous gets the thumbnail we already have.
+    use proto_bluetooth_audio::obex::ImageProperties;
+    let huge = br#"<image-properties version="1.0" handle="1">
+<native encoding="JPEG" pixel="200*200" />
+<variant encoding="JPEG" pixel="2048*2048" />
+</image-properties>"#;
+    let props = ImageProperties::parse(huge).unwrap();
+    assert_eq!(
+        props.largest_decodable().map(|(_, s)| s),
+        Some((2048, 2048)),
+        "the offer itself is unbounded"
+    );
+    // 512 is the adapter's ceiling; mirrored here because the constant is private.
+    assert_eq!(
+        props
+            .largest_decodable_within(512, u64::MAX)
+            .map(|(_, s)| s),
+        Some((200, 200)),
+        "so we fall back to the native, which is the thumbnail we already fetched"
+    );
+
+    // A declared `maxsize` is honoured too, when the descriptor states one.
+    let heavy = br#"<image-properties version="1.0" handle="1">
+<native encoding="JPEG" pixel="200*200" />
+<variant encoding="JPEG" pixel="480*480" maxsize="9000000" />
+</image-properties>"#;
+    let props = ImageProperties::parse(heavy).unwrap();
+    assert_eq!(
+        props
+            .largest_decodable_within(512, 1024 * 1024)
+            .map(|(_, s)| s),
+        Some((200, 200)),
+        "nine megabytes of cover art is not worth the radio"
+    );
 }
 
 #[tokio::test]

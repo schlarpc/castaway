@@ -114,18 +114,21 @@ pub struct BluetoothConfig {
     /// *video* by this much to keep lip-sync, so a number larger than the truth is as
     /// wrong as one smaller. See [`crate::sink::DEFAULT_SINK_DELAY`].
     pub sink_delay: std::time::Duration,
-    /// Ask the peer's image server what forms of the artwork it holds, once per link.
+    /// Ask the peer's image server what forms of the artwork it holds, and fetch the best
+    /// one it offers rather than settling for the linked thumbnail.
     ///
-    /// The measurement #75 turns on, and the one thing that can say whether an iPhone's
-    /// 200×200 is its ceiling or merely the one form we ask for. Nothing acts on the
-    /// answer yet — it is logged.
+    /// **On by default**, because it was measured and it is worth it (#75): an iPhone
+    /// offers a 280×280 beside the fixed 200×200 thumbnail, and that larger form is a
+    /// genuine render rather than an upscale — 2.5–3.9× the spectral detail an upscale
+    /// can contain. Nearly twice the pixels on a two-metre screen, for one extra GET on a
+    /// channel that is already open.
     ///
-    /// **Off by default, and not for tidiness.** It is an extra OBEX GET on a channel
-    /// that some peers answer protocol disagreements on by hanging up, and the observed
-    /// worst case for provoking one took the whole ACL link down with it (#74,
-    /// [`ART_STRIKES_LIMIT`]). Spending that risk on a diagnostic is a decision for
-    /// whoever is sitting in front of the bench, not a default every guest pays.
-    pub probe_image_properties: bool,
+    /// This began life gated, when it was a diagnostic that spent the cover-art path's one
+    /// real risk — an extra request on a channel some peers answer disagreements on by
+    /// hanging up (#74, [`ART_STRIKES_LIMIT`]). That risk has not vanished, but the strike
+    /// limit is what handles it, and it now buys a visible improvement rather than a log
+    /// line. The airtime it can spend is bounded by [`MAX_COVER_ART_SIDE`].
+    pub fetch_best_cover_art: bool,
 }
 
 impl std::fmt::Debug for BluetoothConfig {
@@ -137,7 +140,7 @@ impl std::fmt::Debug for BluetoothConfig {
             .field("link_keys", &self.link_keys.len())
             .field("persists_keys", &self.on_paired.is_some())
             .field("sink_delay", &self.sink_delay)
-            .field("probe_image_properties", &self.probe_image_properties)
+            .field("fetch_best_cover_art", &self.fetch_best_cover_art)
             .finish()
     }
 }
@@ -165,7 +168,7 @@ impl Default for BluetoothConfig {
             link_keys: Vec::new(),
             on_paired: None,
             sink_delay: crate::sink::DEFAULT_SINK_DELAY,
-            probe_image_properties: false,
+            fetch_best_cover_art: true,
         }
     }
 }
@@ -312,6 +315,27 @@ enum SettingsQuery {
     /// panel offers no shuffle or repeat for this link.
     Unsupported,
 }
+
+/// The largest cover art worth pulling over a link that is also carrying the audio.
+///
+/// Not a limit of the panel: the card's art square is over a thousand pixels on a 4K
+/// display, so the screen would happily take more. It is a limit on *airtime*. An iPhone's
+/// 280x280 arrives in about 43 KB and lands in well under a second beside a live A2DP
+/// stream; pixel count and bytes scale together, so 512 is roughly six times the
+/// thumbnail's pixels and still bounded, while a peer offering 2048x2048 would spend
+/// several seconds of contended radio on decoration and risk the thing it decorates.
+///
+/// It does not bind on any peer measured so far — iOS tops out at 280x280 from every app
+/// tried. It exists for the one that does not.
+const MAX_COVER_ART_SIDE: u16 = 512;
+
+/// The most a *declared* cover-art size may be before the form is skipped.
+///
+/// Only `<variant maxsize=…>` states one, and iOS states none, so this is a backstop
+/// rather than a working limit. Checked against what the descriptor claims, never against
+/// a guess: inferring bytes from pixels would refuse real images over a compression ratio
+/// we invented.
+const MAX_COVER_ART_BYTES: u64 = 1024 * 1024;
 
 /// Mid-fetch closures after which cover art is given up for the link. Two rather than
 /// one so a single coincidental teardown (a phone switching outputs mid-song) does not
@@ -1811,10 +1835,10 @@ impl BluetoothAdapter {
 
     /// Ask the image server what forms of the last-fetched artwork it holds.
     ///
-    /// Once per link and only when [`BluetoothConfig::probe_image_properties`] is on —
+    /// Once per link and only when [`BluetoothConfig::fetch_best_cover_art`] is on —
     /// this is a measurement, and it is spending the one risk the cover-art path has.
     fn probe_image_properties(&self, link: &mut Link, out: &mut Outbox) {
-        if !self.config.probe_image_properties {
+        if !self.config.fetch_best_cover_art {
             return;
         }
         let Some(handle) = link.art_handle.clone() else {
@@ -1863,7 +1887,7 @@ impl BluetoothAdapter {
         properties: &crate::obex::ImageProperties,
         out: &mut Outbox,
     ) {
-        if !self.config.probe_image_properties {
+        if !self.config.fetch_best_cover_art {
             return;
         }
         let Some(handle) = link.art_handle.clone() else {
@@ -1872,9 +1896,13 @@ impl BluetoothAdapter {
         if link.art_upgraded.as_deref() == Some(handle.as_str()) {
             return;
         }
-        // Only a form strictly larger than the linked thumbnail is worth a second fetch;
-        // BIP fixes that at 200×200, so anything at or below it is what we already have.
-        let Some((variant, (w, h))) = properties.largest_decodable() else {
+        // The best form on offer that is worth the airtime — see [`MAX_COVER_ART_SIDE`].
+        // Only one strictly larger than the linked thumbnail earns a second fetch; BIP
+        // fixes that at 200×200, so anything at or below it is what we already have.
+        let Some((variant, (w, h))) =
+            properties.largest_decodable_within(MAX_COVER_ART_SIDE, MAX_COVER_ART_BYTES)
+        else {
+            debug!("cover art: nothing on offer we can decode within the airtime budget");
             return;
         };
         if u32::from(w) * u32::from(h) <= 200 * 200 {
