@@ -3163,6 +3163,156 @@ async fn a_second_phone_that_starts_playing_takes_the_speakers_and_pauses_the_fi
     );
 }
 
+/// Bring a second phone up to `START`, taking the speakers from whoever has them.
+///
+/// Returns the index into `sent_pdus` from just before the START, so a caller can look at
+/// only what the preemption itself produced.
+async fn second_phone_takes_over(transport: &ScriptedTransport) -> usize {
+    page_us(transport, PEER2).await;
+    let (signaling2, _) = open_channel_on(transport, HANDLE2, Psm::AVDTP, 0x0060).await;
+    let discover = avdtp_on(transport, HANDLE2, signaling2, 1, Signal::Discover, &[]).await;
+    let seid2 = eventually("the last endpoint on the second link", || {
+        discover
+            .payload
+            .chunks(2)
+            .filter_map(|c| Seid::from_shifted(c[0]).ok())
+            .next_back()
+    })
+    .await;
+    let codec = sbc_at(SampleRates::HZ_48000).encode();
+    let mut set = vec![seid2.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp_on(
+        transport,
+        HANDLE2,
+        signaling2,
+        3,
+        Signal::SetConfiguration,
+        &set,
+    )
+    .await;
+    avdtp_on(
+        transport,
+        HANDLE2,
+        signaling2,
+        4,
+        Signal::Open,
+        &[seid2.shifted()],
+    )
+    .await;
+    let (_media2, _) = open_channel_on(transport, HANDLE2, Psm::AVDTP, 0x0061).await;
+
+    let before = sent_pdus(transport).len();
+    avdtp_on(
+        transport,
+        HANDLE2,
+        signaling2,
+        5,
+        Signal::Start,
+        &[seid2.shifted()],
+    )
+    .await;
+    before
+}
+
+/// Wait for an AVDTP `SUSPEND` *command* addressed to `cid`, and return it.
+async fn awaited_suspend(
+    transport: &ScriptedTransport,
+    what: &str,
+    cid: Cid,
+    from: usize,
+) -> proto_bluetooth_audio::avdtp::Message {
+    eventually(what, || {
+        sent_pdus(transport)
+            .into_iter()
+            .skip(from)
+            .filter(|pdu| pdu.cid == cid)
+            .filter_map(|pdu| proto_bluetooth_audio::avdtp::Message::decode(&pdu.payload).ok())
+            .find(|msg| {
+                msg.signal == Signal::Suspend
+                    && msg.message_type == proto_bluetooth_audio::avdtp::MessageType::Command
+            })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_preempted_phone_is_told_to_stop_sending_and_not_only_to_pause() {
+    // The AVRCP pause is what the person holding the phone sees; it is not what stops the
+    // radio. A phone that ignores the keypress went on transmitting into a session that
+    // had already been torn down — still holding its share of the piconet, still spending
+    // ACL credits against the phone that actually won — and nothing at default log level
+    // said so. The last word about it was "pausing a preempted phone" (#92).
+    let (transport, mut rx) = connected().await;
+    let (_signaling, media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (mut frames, _) = audio_session(&mut rx).await;
+    let (_, first_avctp_peer) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+    push_pdu(&transport, &L2capPdu::new(media, sbc_packet(1, 35)));
+    tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("the first phone should be playing")
+        .expect("open");
+
+    let before = second_phone_takes_over(&transport).await;
+    let (_frames2, _) = audio_session(&mut rx).await;
+
+    // Both halves, and they are not alternatives.
+    let suspend = awaited_suspend(
+        &transport,
+        "the first phone's stream being suspended",
+        Cid::new(0x0040),
+        before,
+    )
+    .await;
+    assert_eq!(
+        suspend.payload.first().copied(),
+        // `stream_up_as` configures with an INT SEID of 1, so that is the endpoint on the
+        // phone's side of this stream — the one a SUSPEND has to name. Ours would be an
+        // endpoint the phone has never heard of.
+        Some(1 << 2),
+        "a SUSPEND names the peer's endpoint, from SET_CONFIGURATION's INT SEID"
+    );
+    assert!(
+        sent_pdus(&transport)
+            .into_iter()
+            .skip(before)
+            .any(|pdu| pdu.cid == first_avctp_peer
+                && pdu.payload.windows(2).any(|w| w == [0x7C, 0x46])),
+        "the AVRCP pause is what the phone's own screen reflects, and it still goes"
+    );
+}
+
+#[tokio::test]
+async fn a_preempted_phone_with_no_control_channel_is_still_told_to_stop() {
+    // The case with no mitigation whatsoever: `pause_peer` returned before sending
+    // anything when there was no AVCTP channel, so this phone was "preempted" by being
+    // sent nothing at all. AVDTP is not optional the way AVRCP is — a streaming phone has
+    // a signaling channel by construction, because that is how the stream was negotiated.
+    let (transport, mut rx) = connected().await;
+    let (_signaling, media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (mut frames, _) = audio_session(&mut rx).await;
+    push_pdu(&transport, &L2capPdu::new(media, sbc_packet(1, 35)));
+    tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("the first phone should be playing")
+        .expect("open");
+
+    let before = second_phone_takes_over(&transport).await;
+    let (_frames2, _) = audio_session(&mut rx).await;
+
+    let suspend = awaited_suspend(
+        &transport,
+        "a phone with no AVRCP channel still being told to stop",
+        Cid::new(0x0040),
+        before,
+    )
+    .await;
+    assert_eq!(suspend.payload.first().copied(), Some(1 << 2));
+}
+
 /// Every vendor-dependent AVRCP *command* the adapter has sent, as (pdu, ctype, params).
 ///
 /// The mirror of `avrcp_responses`, and the one that matters for anything we *ask* a

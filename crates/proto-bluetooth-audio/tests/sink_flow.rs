@@ -59,6 +59,14 @@ impl Phone {
         first
     }
 
+    /// The reply, if there is one — for the paths where there must not be.
+    fn reply_opt(events: &[SinkEvent]) -> Option<&Message> {
+        events.iter().find_map(|e| match e {
+            SinkEvent::Reply(m) => Some(m),
+            _ => None,
+        })
+    }
+
     fn accepted(events: &[SinkEvent]) -> &Message {
         let reply = Self::reply(events);
         assert_eq!(
@@ -610,4 +618,156 @@ fn only_commands_are_refused() {
     // Nothing to address a refusal to.
     assert_eq!(Message::refusable_header(&[0xA0]), None);
     assert_eq!(Message::refusable_header(&[]), None);
+}
+
+/// A phone with a stream up and streaming, configured from *its* endpoint `int_seid`.
+fn streaming(int_seid: u8) -> (Phone, Seid) {
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
+    let chosen = aptx_config();
+
+    let discover = phone.send(Signal::Discover, &[]);
+    let seps = Phone::accepted(&discover).payload.clone();
+    let seid = seps
+        .chunks(2)
+        .filter_map(|c| Seid::from_shifted(c[0]).ok())
+        .find(|seid| {
+            let caps = phone.send(Signal::GetAllCapabilities, &[seid.shifted()]);
+            let payload = Phone::accepted(&caps).payload.clone();
+            proto_bluetooth_audio::avdtp::find_codec_capability(&payload)
+                .map(|c| c.audio_codec() == chosen.audio_codec())
+                .unwrap_or(false)
+        })
+        .unwrap();
+
+    // The second byte is the phone's own endpoint — the INT SEID — and it is deliberately
+    // not the same number as ours, so a test that passes could not be passing by accident.
+    let mut set = vec![seid.shifted(), int_seid << 2, 0x01, 0x00];
+    let codec = chosen.encode();
+    set.push(0x07);
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    Phone::accepted(&phone.send(Signal::SetConfiguration, &set));
+    Phone::accepted(&phone.send(Signal::Open, &[seid.shifted()]));
+    Phone::accepted(&phone.send(Signal::Start, &[seid.shifted()]));
+    assert_eq!(phone.session.state(), StreamState::Streaming);
+    (phone, seid)
+}
+
+#[test]
+fn a_preempted_stream_is_told_to_stop_and_told_at_the_right_endpoint() {
+    // Preemption used to be an AVRCP keypress and nothing else, so a phone that ignored
+    // it — or had no control channel at all — went on transmitting into a session that
+    // had already been torn down, holding its share of the piconet against the phone that
+    // actually won (#92).
+    //
+    // The endpoint is the half that was structurally missing: `SET_CONFIGURATION`'s INT
+    // SEID was skipped straight past, so there was no address to send a SUSPEND to.
+    let (mut phone, our_seid) = streaming(9);
+
+    let command = phone.session.suspend_peer().expect("a stream to suspend");
+    let SinkEvent::Command(command) = command else {
+        panic!("a suspend is a command, not a reply: {command:?}");
+    };
+    assert_eq!(command.message_type, MessageType::Command, "SNK→SRC");
+    assert_eq!(command.signal, Signal::Suspend);
+    assert_eq!(
+        command.payload[0],
+        9 << 2,
+        "a SUSPEND names the *peer's* endpoint; ours would be an endpoint it has never \
+         heard of"
+    );
+    assert_ne!(
+        command.payload[0],
+        our_seid.shifted(),
+        "the two SEIDs must not be confusable for this test to mean anything"
+    );
+
+    // Asking is not stopping. The phone is still streaming until it says otherwise, and a
+    // session that moved here would be describing our intent rather than the wire.
+    assert_eq!(phone.session.state(), StreamState::Streaming);
+    assert!(phone.session.suspend_outstanding());
+}
+
+#[test]
+fn the_stream_stops_when_the_phone_answers_the_suspend_and_not_before() {
+    let (mut phone, _) = streaming(9);
+    let SinkEvent::Command(command) = phone.session.suspend_peer().unwrap() else {
+        panic!("a suspend is a command");
+    };
+
+    // A second ask while one is outstanding is not a second command.
+    assert!(
+        phone.session.suspend_peer().is_none(),
+        "one outstanding SUSPEND at a time"
+    );
+
+    let accept = Message::accept(&command, Bytes::new());
+    let events = phone.session.handle(&accept);
+    assert!(
+        events.contains(&SinkEvent::Suspended),
+        "the accept is what suspends the stream: {events:?}"
+    );
+    assert_eq!(phone.session.state(), StreamState::Open);
+    assert!(!phone.session.suspend_outstanding());
+    assert!(
+        Phone::reply_opt(&events).is_none(),
+        "a response is not answered: {events:?}"
+    );
+}
+
+#[test]
+fn a_refused_suspend_leaves_the_stream_where_it_is_and_says_so() {
+    // The case with no lever left: the phone has been asked in both the ways this
+    // receiver has and is still transmitting. Moving our state anyway would make the two
+    // ends disagree — and the panel would look entirely healthy while the winner's audio
+    // contended with a stream nobody is listening to.
+    let (mut phone, _) = streaming(9);
+    let SinkEvent::Command(command) = phone.session.suspend_peer().unwrap() else {
+        panic!("a suspend is a command");
+    };
+
+    let reject = Message::reject(&command, error_code::BAD_STATE);
+    let events = phone.session.handle(&reject);
+    assert_eq!(
+        phone.session.state(),
+        StreamState::Streaming,
+        "a refused SUSPEND did not stop anything"
+    );
+    assert!(
+        events.contains(&SinkEvent::SuspendRefused),
+        "the log must not be the last to know: {events:?}"
+    );
+    assert!(!phone.session.suspend_outstanding());
+
+    // And it can be asked again.
+    assert!(phone.session.suspend_peer().is_some());
+}
+
+#[test]
+fn a_response_to_a_suspend_we_never_sent_is_ignored() {
+    // Transaction labels are how a response is matched to its command, and a stale or
+    // spurious one must not stop a stream that is playing.
+    let (mut phone, _) = streaming(9);
+    let stray = Message::accept(&Message::suspend(7, Seid::new(9).unwrap()), Bytes::new());
+    assert!(phone.session.handle(&stray).is_empty());
+    assert_eq!(phone.session.state(), StreamState::Streaming);
+}
+
+#[test]
+fn a_stream_that_is_not_streaming_has_nothing_to_suspend() {
+    let mut phone = Phone::new(advertised(proto_bluetooth_audio::codec::ALL));
+    assert!(
+        phone.session.suspend_peer().is_none(),
+        "nothing configured at all"
+    );
+    let seid = configure(&mut phone, &aptx_config());
+    assert!(
+        phone.session.suspend_peer().is_none(),
+        "configured but not open"
+    );
+    Phone::accepted(&phone.send(Signal::Open, &[seid.shifted()]));
+    assert!(
+        phone.session.suspend_peer().is_none(),
+        "open but not streaming"
+    );
 }

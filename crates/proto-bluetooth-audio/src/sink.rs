@@ -96,6 +96,13 @@ pub enum SinkEvent {
     Started,
     /// Audio paused but the configuration survives.
     Suspended,
+    /// A `SUSPEND` *we* sent was refused, so the peer is still transmitting.
+    ///
+    /// Distinct from silence because it is the case with no remaining lever: the phone has
+    /// been asked twice, in both the ways this receiver has, and is still holding the
+    /// piconet. Nothing here can fix that, but the log should not be the last to know
+    /// (#92).
+    SuspendRefused,
     /// The stream is finished; release the decoder.
     Closed,
 }
@@ -107,6 +114,13 @@ pub struct SinkSession {
     state: StreamState,
     /// Which of our endpoints the sender configured.
     active: Option<Seid>,
+    /// Which of *the sender's* endpoints is on the other end of that stream.
+    ///
+    /// The INT SEID from `SET_CONFIGURATION`, which used to be skipped straight past.
+    /// Every message this session sends addresses an endpoint, and a command travelling
+    /// SNK→SRC addresses the source's — so without this there is nothing to put in a
+    /// `SUSPEND` we originate, which is half of why we never sent one (#92).
+    peer_endpoint: Option<Seid>,
     configuration: Option<CodecCapability>,
     delay_reporting: bool,
     /// How long this sink holds audio before it is heard, as reported to the source.
@@ -117,6 +131,13 @@ pub struct SinkSession {
     /// Reporting category there is saying it will accept `DELAYREPORT`. A source that did
     /// not ask is not told, because a command it never negotiated is one it may reject.
     delay_reporting_configured: bool,
+    /// The label of a `SUSPEND` we have sent and not yet had answered.
+    ///
+    /// The stream stays [`StreamState::Streaming`] while this is set. That is the point of
+    /// keeping it: a command we send does not change the stream's state, the peer's answer
+    /// does — and a session that moved on its own intent would be a state machine
+    /// describing what we asked for rather than what is happening on the wire.
+    suspending: Option<u8>,
     /// The transaction label for the next command *we* send.
     ///
     /// Ours alone: AVDTP labels are chosen by whoever opens the transaction, and every
@@ -154,6 +175,8 @@ impl SinkSession {
             delay_reporting: true,
             reported_delay: SinkDelay::from_duration(DEFAULT_SINK_DELAY),
             delay_reporting_configured: false,
+            peer_endpoint: None,
+            suspending: None,
             next_transaction: 0,
         }
     }
@@ -193,9 +216,11 @@ impl SinkSession {
     #[must_use]
     pub fn handle(&mut self, msg: &Message) -> Vec<SinkEvent> {
         if msg.message_type != MessageType::Command {
-            // We are a pure responder on this channel; responses to commands we never
-            // sent are noise, not errors.
-            return Vec::new();
+            // Almost a pure responder: the two commands this session originates are
+            // `DELAYREPORT`, whose answer carries no information, and `SUSPEND`, whose
+            // answer is what actually stops the stream. Anything else is a response to a
+            // command we never sent, which is noise rather than an error.
+            return self.on_response(msg);
         }
         match msg.signal {
             Signal::Discover => self.on_discover(msg),
@@ -292,6 +317,11 @@ impl SinkSession {
         self.endpoints[index].in_use = true;
         self.state = StreamState::Configured;
         self.active = Some(seid);
+        // The second byte is the INT SEID: the sender's own endpoint for this stream. It
+        // is not needed to *answer* anything — every response carries the ACP SEID back —
+        // which is why it went unread for so long. It is needed to *ask*: see
+        // `suspend_peer`.
+        self.peer_endpoint = Seid::from_shifted(msg.payload[1]).ok();
         self.configuration = Some(capability.clone());
         // The initiator names the Delay Reporting category here when it wants
         // `DELAYREPORT` on this stream. That is the protocol's own answer to "may we send
@@ -334,6 +364,62 @@ impl SinkSession {
             seid,
             self.reported_delay,
         )))
+    }
+
+    /// Ask the peer to stop sending audio.
+    ///
+    /// The initiator half of the session, and the only one. Everything else here is driven
+    /// by a decoded peer command, which is what made preemption advisory: a phone that
+    /// lost the panel got an AVRCP `PAUSE` keypress and nothing else, so a phone with no
+    /// AVCTP channel — or one that ignores the key — went on transmitting into a session
+    /// that had already been torn down, holding its share of the piconet against the phone
+    /// that actually won (#92).
+    ///
+    /// `SUSPEND` rather than `CLOSE`: the configuration survives, so the phone can resume
+    /// with a `START` on the same stream rather than renegotiating from `DISCOVER`.
+    ///
+    /// Returns `None` — nothing to send — when there is no stream to suspend, when the
+    /// peer never told us its endpoint, or when a `SUSPEND` is already outstanding.
+    #[must_use]
+    pub fn suspend_peer(&mut self) -> Option<SinkEvent> {
+        if self.state != StreamState::Streaming || self.suspending.is_some() {
+            return None;
+        }
+        let seid = self.peer_endpoint?;
+        let transaction = self.next_transaction;
+        // Four bits on the wire, so it wraps at 16 rather than at 256.
+        self.next_transaction = (self.next_transaction + 1) % 16;
+        self.suspending = Some(transaction);
+        Some(SinkEvent::Command(Message::suspend(transaction, seid)))
+    }
+
+    /// Whether we are waiting on a peer to answer a `SUSPEND` we sent.
+    #[must_use]
+    pub const fn suspend_outstanding(&self) -> bool {
+        self.suspending.is_some()
+    }
+
+    /// A response to a command this session originated.
+    fn on_response(&mut self, msg: &Message) -> Vec<SinkEvent> {
+        if msg.signal != Signal::Suspend || self.suspending != Some(msg.transaction) {
+            return Vec::new();
+        }
+        self.suspending = None;
+        match msg.message_type {
+            // The peer has stopped. Now — and only now — the stream is `Open` again, which
+            // is exactly the transition an inbound SUSPEND would have made.
+            MessageType::ResponseAccept => {
+                if self.state != StreamState::Streaming {
+                    return Vec::new();
+                }
+                self.state = StreamState::Open;
+                vec![SinkEvent::Suspended]
+            }
+            // Refused, or the signal is not implemented. The stream is still streaming, on
+            // the wire and here, and saying otherwise is how the two ends come to disagree.
+            // Nothing about our state changes; the caller is told so it can say so.
+            _ => vec![SinkEvent::SuspendRefused],
+        }
     }
 
     /// RECONFIGURE: the sender is changing the codec block mid-session.
@@ -478,6 +564,8 @@ impl SinkSession {
         }
         self.state = StreamState::Idle;
         self.configuration = None;
+        self.peer_endpoint = None;
+        self.suspending = None;
     }
 
     /// The link dropped without a teardown handshake.

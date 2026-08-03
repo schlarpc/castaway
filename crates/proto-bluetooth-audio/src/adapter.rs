@@ -1136,16 +1136,43 @@ impl BluetoothAdapter {
     /// output died under a peer that is still streaming. Both leave the phone sending into
     /// nothing, and both need it to stop for the same reason.
     ///
-    /// AVRCP pause rather than AVDTP suspend, deliberately. Pausing the *player* is what
-    /// the person holding the phone sees and understands, and a phone that pauses stops
-    /// its own stream and sends us the suspend itself — which keeps our sink state
-    /// machine driven by what it receives, rather than diverging from a command we sent.
-    /// A phone that ignores the keypress costs nothing: the pipeline has already stopped
-    /// decoding it.
+    /// Both halves, and they are not alternatives.
+    ///
+    /// **The AVRCP pause is what the person holding the phone sees.** Pausing the *player*
+    /// is a thing the phone's own screen reflects and its own lock screen agrees with, and
+    /// a phone that pauses sends us the SUSPEND itself — which keeps the sink state
+    /// machine driven by what it receives rather than by what we asked for. That is why it
+    /// stays, and why it goes first.
+    ///
+    /// **The AVDTP suspend is what stops the radio.** The keypress was the *only* thing
+    /// sent for a long time, and it does not cover the cases this is about: a link with no
+    /// AVCTP channel got nothing whatsoever, and a phone that ignores the key went on
+    /// transmitting into a session that had already been torn down — still holding its
+    /// share of the piconet, still spending ACL credits, against the phone that actually
+    /// won. Nothing at default log level said so; the last word about it was "pausing a
+    /// preempted phone" (#92).
+    ///
+    /// SUSPEND rather than CLOSE: the configuration survives, so resuming is a START on
+    /// the same stream rather than a renegotiation from DISCOVER.
     fn pause_peer(&self, handle: ConnectionHandle, link: &mut Link, acl: &AclWriter) {
-        let Some(cid) = link.avctp else { return };
+        let paused = self.pause_player(handle, link, acl);
+        let suspended = self.suspend_stream(handle, link, acl);
+        // The one combination with no mitigation at all, and worth a word: this phone was
+        // "preempted" by sending it nothing.
+        if !paused && !suspended {
+            warn!(
+                peer = %link.peer,
+                "bluetooth: a preempted phone has neither a control channel nor a stream to \
+                 suspend; nothing asked it to stop"
+            );
+        }
+    }
+
+    /// The AVRCP passthrough. Returns whether one went out.
+    fn pause_player(&self, handle: ConnectionHandle, link: &mut Link, acl: &AclWriter) -> bool {
+        let Some(cid) = link.avctp else { return false };
         let Some(peer_cid) = link.mux.channel(cid).map(|c| c.remote_cid) else {
-            return;
+            return false;
         };
         info!(peer = %link.peer, "bluetooth: pausing a preempted phone");
         for frame in avrcp::passthrough(avrcp::operation::PAUSE) {
@@ -1154,6 +1181,37 @@ impl BluetoothAdapter {
                 handle,
                 L2capPdu::new(peer_cid, avctp_body(transaction, &frame)),
             );
+        }
+        true
+    }
+
+    /// The AVDTP SUSPEND. Returns whether one went out.
+    ///
+    /// The session stays `Streaming` until the phone answers — the transition belongs to
+    /// its response, not to our asking (see [`SinkSession::suspend_peer`]).
+    fn suspend_stream(&self, handle: ConnectionHandle, link: &mut Link, acl: &AclWriter) -> bool {
+        let Some(cid) = link.avdtp_signaling else {
+            return false;
+        };
+        let Some(SinkEvent::Command(command)) = link.sink.suspend_peer() else {
+            return false;
+        };
+        // Addressed through the multiplexer, which is the only thing that knows the
+        // identifier the *peer* uses for this channel.
+        match link.mux.send(cid, command.encode()) {
+            Ok(events) => {
+                info!(peer = %link.peer, "bluetooth: suspending a preempted phone's stream");
+                for event in events {
+                    if let L2capEvent::Send(pdu) = event {
+                        acl.send(handle, pdu);
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, peer = %link.peer, "bluetooth: could not send SUSPEND");
+                false
+            }
         }
     }
 
@@ -1290,6 +1348,16 @@ impl BluetoothAdapter {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink.emit(SessionEvent::End).await?;
                     }
+                }
+                SinkEvent::SuspendRefused => {
+                    // The end of the line for a preempted phone: it has been sent an AVRCP
+                    // pause and an AVDTP SUSPEND and is still transmitting. The winner's
+                    // stream is contending with it and the panel looks entirely healthy,
+                    // which is exactly the silence #92 is about.
+                    warn!(
+                        peer = %link.peer,
+                        "bluetooth: the phone refused SUSPEND and is still streaming"
+                    );
                 }
                 SinkEvent::Opened | SinkEvent::Suspended => {}
             }

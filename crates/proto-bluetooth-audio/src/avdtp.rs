@@ -269,6 +269,24 @@ impl Message {
         Self::command(transaction, Signal::DelayReport, payload.freeze())
     }
 
+    /// Build a `SUSPEND` command addressed to `seid`.
+    ///
+    /// The one command a sink originates that is about the *source's* stream, so `seid` is
+    /// the source's endpoint — the INT SEID it named in `SET_CONFIGURATION`, which is the
+    /// ACP SEID of this transaction. Addressing our own here would ask the phone to
+    /// suspend an endpoint it has never heard of.
+    ///
+    /// The payload is a *list* of SEIDs (AVDTP 1.3 §8.13); we only ever have one stream
+    /// with a peer, so it is a list of one.
+    #[must_use]
+    pub fn suspend(transaction: u8, seid: Seid) -> Self {
+        Self::command(
+            transaction,
+            Signal::Suspend,
+            Bytes::copy_from_slice(&[seid.shifted()]),
+        )
+    }
+
     /// Encode as a single-packet message.
     ///
     /// Fragmentation (start/continue/end packets) is deliberately not implemented on the
