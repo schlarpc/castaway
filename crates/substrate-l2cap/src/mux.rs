@@ -235,6 +235,21 @@ struct Outstanding {
     remaining: Duration,
     /// Retransmissions used so far.
     retries: u8,
+    /// What an expiry is allowed to do about it.
+    on_expiry: OnExpiry,
+}
+
+/// What to do when a response timer runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnExpiry {
+    /// Send the request again, up to `RTX_RETRIES` times, and give up after that. The
+    /// ordinary case: silence is much more likely to be a lost packet than a peer that
+    /// will never answer.
+    Resend,
+    /// Give up on the channel without resending. Set once a peer has answered `Pending`,
+    /// which is an answer: it has the request and is deciding, so the only question left
+    /// is how long we are willing to wait for it to finish.
+    GiveUp,
 }
 
 /// Bit 0 of a configuration request's flags: "more options follow in another request".
@@ -251,6 +266,16 @@ const RTX: Duration = Duration::from_secs(4);
 
 /// How many times to resend before concluding the peer is not going to answer.
 const RTX_RETRIES: u8 = 2;
+
+/// The extended response timeout (ERTX), which replaces the RTX once a peer answers with
+/// `Pending`. The spec allows 60–300 seconds and requires the switch: a peer that has said
+/// "still deciding" has answered, so the RTX has nothing left to time, and leaving it
+/// running would resend a request the peer is holding and then abandon the channel anyway.
+///
+/// At the short end of the range, for the same reason `RTX` is: the deciding peer is a
+/// device in the same room. Nothing here sends `Pending`, so this timer only ever runs
+/// against a peer that does.
+const ERTX: Duration = Duration::from_secs(60);
 
 impl Default for Multiplexer {
     fn default() -> Self {
@@ -520,6 +545,7 @@ impl Multiplexer {
                 request,
                 remaining: RTX,
                 retries: 0,
+                on_expiry: OnExpiry::Resend,
             },
         );
     }
@@ -556,7 +582,7 @@ impl Multiplexer {
             let Some(out) = self.outstanding.get_mut(&id) else {
                 continue;
             };
-            if out.retries < RTX_RETRIES {
+            if out.on_expiry == OnExpiry::Resend && out.retries < RTX_RETRIES {
                 out.retries += 1;
                 out.remaining = RTX;
                 let request = out.request.clone();
@@ -728,7 +754,7 @@ impl Multiplexer {
                 result,
                 options,
                 ..
-            } => self.on_config_response(id, source_cid, result, &options),
+            } => self.on_config_response(id, source_cid, result, &options, retired),
             Signal::DisconnectionRequest {
                 id,
                 dest_cid,
@@ -1106,6 +1132,7 @@ impl Multiplexer {
         source_cid: Cid,
         result: ConfigResult,
         options: &[ConfigOption],
+        retired: Option<Outstanding>,
     ) -> Result<Vec<L2capEvent>, L2capError> {
         let basic_mtu = self.local_mtu;
         let Some(ch) = self.channels.get_mut(&source_cid.raw()) else {
@@ -1147,6 +1174,41 @@ impl Multiplexer {
             return Ok(vec![self.request_configuration(source_cid.raw())?]);
         }
 
+        if result == ConfigResult::Pending {
+            // Not an answer, and not a refusal either: the peer has our request and is
+            // still deciding. A final response with this same identifier is still to come,
+            // so the exchange is *waited on*, not concluded — `config_id` stays armed, the
+            // outgoing direction stays unconfigured, and we emit nothing.
+            //
+            // This is also the one response whose FCS option means anything. The `Success`
+            // arm below deliberately ignores it (see the comment there, which cost a live
+            // session); Linux draws the same line from the other side, honouring a
+            // response's FCS option only when the result is `PENDING`
+            // (`l2cap_parse_conf_rsp`, `net/bluetooth/l2cap_core.c`).
+            for opt in options {
+                if let ConfigOption::Fcs(fcs) = opt {
+                    ch.parameters.fcs = *fcs;
+                }
+            }
+            // Swap the RTX for the ERTX. `handle_signal` has already retired the request's
+            // timer, as it does for every answer — but this answer does not finish the
+            // exchange, so putting the timer back is what keeps a peer that says "pending"
+            // and then goes quiet from holding the channel open forever. It goes back with
+            // the long timeout and no resend: the peer has the request, so asking again
+            // would be noise, and the only question left is how long we wait.
+            if let Some(out) = retired {
+                self.outstanding.insert(
+                    id,
+                    Outstanding {
+                        remaining: ERTX,
+                        on_expiry: OnExpiry::GiveUp,
+                        ..out
+                    },
+                );
+            }
+            return Ok(Vec::new());
+        }
+
         if result != ConfigResult::Success {
             return Ok(self.fail_configuration(source_cid));
         }
@@ -1174,7 +1236,9 @@ impl Multiplexer {
                 // `on_config_request`. Linux is explicit about the asymmetry — it sets its
                 // `CONF_RECV_NO_FCS` flag from a request unconditionally, and from a
                 // response only when the result is `PENDING`, never on success
-                // (`net/bluetooth/l2cap_core.c`).
+                // (`net/bluetooth/l2cap_core.c`). This arm is therefore about `Success`
+                // specifically, not about responses in general; the `Pending` branch above
+                // is the half that does honour it.
                 //
                 // Adopting it here cost a live session. An iPhone answered our 16-bit
                 // request with a `Success` naming No FCS; we believed it and stopped

@@ -1061,6 +1061,167 @@ fn a_success_response_naming_no_fcs_does_not_turn_the_checksum_off() {
     );
 }
 
+#[test]
+fn a_pending_response_is_waited_on_rather_than_treated_as_a_refusal() {
+    // PENDING (0x0004) means "I have your request and am still deciding": a final response
+    // with the same identifier is still to come. It used to fall into `Other(u16)` and hit
+    // the `!= Success` arm, which fails the configuration — so a peer that used it
+    // legitimately got hung up on mid-handshake.
+    //
+    // It is also the one response whose FCS option carries meaning; Linux honours a
+    // response's FCS only when the result is PENDING (`l2cap_parse_conf_rsp`).
+    use substrate_l2cap::signaling::ConfigResult;
+    use substrate_l2cap::FcsType;
+
+    let mut sink = Multiplexer::new(1024);
+    let (cid, start) = sink
+        .connect_with(cover_art_psm(), ChannelMode::EnhancedRetransmission)
+        .unwrap();
+    let peer_cid = Cid::new(0x0047);
+    let connect_id = signal_id(&start).expect("a connection request went out");
+    let out = sink
+        .handle_pdu(&L2capPdu::new(
+            Cid::SIGNALING,
+            Signal::ConnectionResponse {
+                id: connect_id,
+                dest_cid: peer_cid,
+                source_cid: cid,
+                result: substrate_l2cap::signaling::ConnectionResult::Success,
+                status: 0,
+            }
+            .encode()
+            .unwrap(),
+        ))
+        .unwrap();
+    let config_id = signal_id(&out).expect("a configuration request went out");
+
+    let out = sink
+        .handle_pdu(&L2capPdu::new(
+            Cid::SIGNALING,
+            Signal::ConfigurationResponse {
+                id: config_id,
+                source_cid: cid,
+                flags: 0,
+                result: ConfigResult::Pending,
+                options: vec![ConfigOption::Fcs(FcsType::None)],
+            }
+            .encode()
+            .unwrap(),
+        ))
+        .unwrap();
+
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, L2capEvent::ChannelClosed { .. })),
+        "PENDING is not a refusal: the channel must survive it, got {out:?}"
+    );
+    assert!(
+        out.is_empty(),
+        "there is nothing to say to a peer that is still deciding, got {out:?}"
+    );
+    assert!(
+        sink.channel(cid).is_some(),
+        "the channel must still exist while the peer decides"
+    );
+    assert_eq!(
+        sink.channel(cid).unwrap().parameters.fcs,
+        FcsType::None,
+        "PENDING is the one response whose FCS option is honoured"
+    );
+
+    // The final response settles it, and the same identifier still matches.
+    let out = sink
+        .handle_pdu(&L2capPdu::new(
+            Cid::SIGNALING,
+            Signal::ConfigurationResponse {
+                id: config_id,
+                source_cid: cid,
+                flags: 0,
+                result: ConfigResult::Success,
+                options: Vec::new(),
+            }
+            .encode()
+            .unwrap(),
+        ))
+        .unwrap();
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, L2capEvent::ChannelClosed { .. })),
+        "the final response must not fail the channel it settles, got {out:?}"
+    );
+}
+
+#[test]
+fn a_pending_response_swaps_the_response_timer_for_the_extended_one() {
+    // Without this the fix is only cosmetic: the RTX would go on running against a request
+    // the peer has explicitly said it is holding, resend it twice, and then fail the
+    // channel anyway — the same teardown, three retransmissions later.
+    use substrate_l2cap::signaling::ConfigResult;
+
+    let mut sink = Multiplexer::new(1024);
+    let (cid, start) = sink
+        .connect_with(cover_art_psm(), ChannelMode::EnhancedRetransmission)
+        .unwrap();
+    let connect_id = signal_id(&start).expect("a connection request went out");
+    let out = sink
+        .handle_pdu(&L2capPdu::new(
+            Cid::SIGNALING,
+            Signal::ConnectionResponse {
+                id: connect_id,
+                dest_cid: Cid::new(0x0049),
+                source_cid: cid,
+                result: substrate_l2cap::signaling::ConnectionResult::Success,
+                status: 0,
+            }
+            .encode()
+            .unwrap(),
+        ))
+        .unwrap();
+    let config_id = signal_id(&out).expect("a configuration request went out");
+    sink.handle_pdu(&L2capPdu::new(
+        Cid::SIGNALING,
+        Signal::ConfigurationResponse {
+            id: config_id,
+            source_cid: cid,
+            flags: 0,
+            result: ConfigResult::Pending,
+            options: Vec::new(),
+        }
+        .encode()
+        .unwrap(),
+    ))
+    .unwrap();
+
+    // Well past the RTX and its retries, comfortably inside the ERTX.
+    let mut events = Vec::new();
+    for _ in 0..30 {
+        events.extend(sink.tick(Duration::from_secs(1)));
+    }
+    assert!(
+        sink.channel(cid).is_some(),
+        "a peer that said PENDING is given the extended timeout, not the short one"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, L2capEvent::ChannelClosed { .. })),
+        "no teardown inside the ERTX, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, L2capEvent::Send(_))),
+        "and nothing resent to a peer that is holding the request, got {events:?}"
+    );
+
+    // But it is a timeout, not a licence to wait forever.
+    for _ in 0..40 {
+        events.extend(sink.tick(Duration::from_secs(1)));
+    }
+    assert!(
+        sink.channel(cid).is_none(),
+        "a peer that never follows its PENDING with an answer is still given up on"
+    );
+}
+
 /// The signalling id of the first command in `events`, for answering it.
 fn signal_id(events: &[L2capEvent]) -> Option<u8> {
     events.iter().find_map(|e| {

@@ -73,6 +73,10 @@ pub enum ConfigResult {
     Rejected,
     /// The request carried options we don't understand and that weren't hints.
     UnknownOptions,
+    /// Not an answer: the peer has our request and is still deciding. A final response
+    /// with the same identifier is still to come, and the request stays outstanding
+    /// against the longer ERTX timer until it does.
+    Pending,
     /// A result code we don't model.
     Other(u16),
 }
@@ -84,6 +88,7 @@ impl ConfigResult {
             Self::Unacceptable => 0x0001,
             Self::Rejected => 0x0002,
             Self::UnknownOptions => 0x0003,
+            Self::Pending => 0x0004,
             Self::Other(raw) => raw,
         }
     }
@@ -94,6 +99,7 @@ impl ConfigResult {
             0x0001 => Self::Unacceptable,
             0x0002 => Self::Rejected,
             0x0003 => Self::UnknownOptions,
+            0x0004 => Self::Pending,
             other => Self::Other(other),
         }
     }
