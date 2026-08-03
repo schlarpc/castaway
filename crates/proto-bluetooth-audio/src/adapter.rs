@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use castaway_core::{
-    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, NowPlaying, ProtocolKind,
-    SessionEvent, SessionSink, SourceAdapter, SourceDescription,
+    Advertisement, AudioFormat, ControlCapabilities, CoreError, EncodedFrame, FrameSource,
+    NowPlaying, ProtocolKind, SessionEvent, SessionSink, SourceAdapter, SourceDescription,
 };
 use substrate_hci::{
     BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, Reassembler,
@@ -248,9 +248,45 @@ struct Link {
     /// artwork is decoration and the observed worst case for provoking the peer again
     /// was it dropping the whole ACL link (reason 0x13).
     art_strikes: u8,
+    /// What this link's player exposes as shuffle/repeat, and with which values.
+    ///
+    /// Per link rather than per peer: AVRCP settings belong to the *player*, so the
+    /// answer changes when someone switches from Apple Music to YouTube Music on the same
+    /// phone (#76).
+    player_settings: avrcp::PlayerSettings,
+    /// How far the one-time settings interrogation has got.
+    settings_query: SettingsQuery,
+    /// What the peer's SDP record said the panel may offer, before the settings listing
+    /// widens it.
+    ///
+    /// Kept because the two answers arrive from different protocols at different times
+    /// and both narrow the same handle: without a base to add to, whichever landed second
+    /// would erase the other.
+    sdp_capabilities: ControlCapabilities,
     /// What we know about this phone: address from link-up, name from the remote-name
     /// request, codec from AVDTP configuration. Each arrives separately.
     description: SourceDescription,
+}
+
+/// How far the one-time player-application-settings interrogation has got.
+///
+/// It has to be a state machine rather than three parallel requests because of one
+/// asymmetry: a `ListPlayerApplicationSettingValues` response does not echo the attribute
+/// it is about, so the only thing that says what its value ids mean is our own memory of
+/// what we asked. Two in flight at once is two lists we cannot tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsQuery {
+    /// Not asked yet — no AVCTP channel.
+    Idle,
+    /// The 0x11 listing is in flight.
+    Attributes,
+    /// A 0x12 value listing for this attribute is in flight.
+    Values(avrcp::SettingAttribute),
+    /// Everything enumerated; the current values have been asked for.
+    Settled,
+    /// The peer refused the listing. It has no player application settings, and the
+    /// panel offers no shuffle or repeat for this link.
+    Unsupported,
 }
 
 /// Mid-fetch closures after which cover art is given up for the link. Two rather than
@@ -342,7 +378,25 @@ impl Link {
             art_sdp: None,
             art: None,
             art_strikes: 0,
+            player_settings: avrcp::PlayerSettings::default(),
+            settings_query: SettingsQuery::Idle,
+            sdp_capabilities: avrcp::capabilities_for_passthrough(),
             description: SourceDescription::new().with_address(peer.to_string()),
+        }
+    }
+
+    /// Push the union of what SDP and the settings listing allow onto the control handle.
+    ///
+    /// A union, because the two answers come from different protocols at different times
+    /// and both write the same field: SDP's `SupportedFeatures` says whether transport
+    /// and volume are worth offering, the 0x11 listing says whether shuffle and repeat
+    /// are, and whichever arrived second used to erase the other.
+    fn publish_capabilities(&self) {
+        if let Some(control) = &self.avrcp_control {
+            let caps = self.sdp_capabilities | self.player_settings.capabilities();
+            debug!(?caps, "bluetooth: panel controls for this link");
+            control.set_player_settings(self.player_settings.clone());
+            control.set_capabilities(caps);
         }
     }
 
@@ -777,6 +831,16 @@ impl BluetoothAdapter {
                         let transaction = link.next_transaction();
                         out.replies
                             .push((cid, avctp_body(transaction, &avrcp::get_play_status())));
+                        // "Which player application settings do you have?" — the one round
+                        // trip that decides whether this link gets shuffle and repeat
+                        // buttons. Asked per player, and gated on nothing: the answer is
+                        // the gate (#76).
+                        link.settings_query = SettingsQuery::Attributes;
+                        let transaction = link.next_transaction();
+                        out.replies.push((
+                            cid,
+                            avctp_body(transaction, &avrcp::list_setting_attributes()),
+                        ));
                         // …and go and find the peer's image server now, rather than when
                         // a handle turns up. This is the ordering the whole cover-art
                         // path hinges on: no BIP client, no attribute 8, no handle to
@@ -1369,6 +1433,22 @@ impl BluetoothAdapter {
                             }
                         }
                     }
+                    avrcp::event::SETTING_CHANGED => {
+                        // The only way a shuffle toggled on the phone's own screen ever
+                        // reaches the panel. INTERIM carries the value now, CHANGED every
+                        // move after it, and both land here.
+                        if let Ok(values) = avrcp::parse_setting_change(&vendor.parameters) {
+                            debug!(?values, "bluetooth: player settings changed");
+                            if avrcp::apply_settings(&mut link.now_playing, &values)
+                                && link.session_open
+                            {
+                                let link_sink = sink.with_instance(link.peer.to_string());
+                                link_sink
+                                    .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
+                                    .await?;
+                            }
+                        }
+                    }
                     avrcp::event::TRACK_CHANGED if changed => {
                         // The notification carries only a track id, so the metadata has
                         // to be asked for again — this is the request that keeps the card
@@ -1412,6 +1492,55 @@ impl BluetoothAdapter {
                     // the authority on it, and a stale GetPlayStatus answer racing a
                     // notification would flip the card back.
                     if changed && link.session_open {
+                        let link_sink = sink.with_instance(link.peer.to_string());
+                        link_sink
+                            .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
+                            .await?;
+                    }
+                }
+            }
+            avrcp::pdu::LIST_SETTING_ATTRIBUTES if frame.ctype.is_response() => {
+                if frame.ctype.is_failure() {
+                    // Plenty of players have no settings at all, and a rejection here is
+                    // how they say so. Not an error — just a link with no shuffle button.
+                    debug!("bluetooth: peer exposes no player application settings");
+                    link.settings_query = SettingsQuery::Unsupported;
+                    link.publish_capabilities();
+                } else if let Ok(attributes) = avrcp::parse_setting_attributes(&vendor.parameters) {
+                    debug!(
+                        known = ?attributes.known,
+                        unknown = ?attributes.unknown,
+                        "bluetooth: player application settings"
+                    );
+                    link.player_settings.attributes = attributes;
+                    Self::advance_settings_query(link, cid, out);
+                }
+            }
+            avrcp::pdu::LIST_SETTING_VALUES if frame.ctype.is_response() => {
+                // Only meaningful against the attribute we asked about: the response does
+                // not echo it, so `SettingsQuery::Values` is the only thing that says what
+                // these ids mean. Anything arriving outside that state is unattributable
+                // and is dropped rather than guessed at.
+                if let SettingsQuery::Values(attribute) = link.settings_query {
+                    if !frame.ctype.is_failure() {
+                        if let Ok(values) =
+                            avrcp::parse_setting_values(attribute, &vendor.parameters)
+                        {
+                            debug!(?attribute, ?values, "bluetooth: values this player takes");
+                            link.player_settings.record_values(&values);
+                        }
+                    }
+                    // Either way the interrogation moves on: a refused value listing costs
+                    // this setting its preference, not the whole feature.
+                    Self::advance_settings_query(link, cid, out);
+                }
+            }
+            avrcp::pdu::GET_CURRENT_SETTINGS
+                if frame.ctype.is_response() && !frame.ctype.is_failure() =>
+            {
+                if let Ok(values) = avrcp::parse_current_settings(&vendor.parameters) {
+                    debug!(?values, "bluetooth: current player settings");
+                    if avrcp::apply_settings(&mut link.now_playing, &values) && link.session_open {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
@@ -1593,6 +1722,66 @@ impl BluetoothAdapter {
         ));
     }
 
+    /// Ask the next question in the player-application-settings interrogation.
+    ///
+    /// Serial by necessity: a `ListPlayerApplicationSettingValues` response does not echo
+    /// the attribute it is about, so [`SettingsQuery::Values`] is the only record of what
+    /// the ids in it mean. Once every listed setting has been enumerated this reads the
+    /// current values and subscribes, which is what keeps the strip in step with the
+    /// phone's own UI (#76).
+    fn advance_settings_query(link: &mut Link, cid: Cid, out: &mut Outbox) {
+        use avrcp::SettingAttribute;
+
+        let settings = &link.player_settings;
+        let next = [
+            (SettingAttribute::Repeat, settings.repeat_values.is_empty()),
+            (
+                SettingAttribute::Shuffle,
+                settings.shuffle_values.is_empty(),
+            ),
+        ]
+        .into_iter()
+        .find(|(attribute, unasked)| *unasked && settings.attributes.contains(*attribute))
+        .map(|(attribute, _)| attribute);
+
+        if let Some(attribute) = next {
+            link.settings_query = SettingsQuery::Values(attribute);
+            let transaction = link.next_transaction();
+            out.replies.push((
+                cid,
+                avctp_body(transaction, &avrcp::list_setting_values(attribute)),
+            ));
+            return;
+        }
+
+        link.settings_query = SettingsQuery::Settled;
+        // The capability bits are publishable now whether or not anything was listed: a
+        // player with no settings has told us to offer no buttons, which is an answer.
+        link.publish_capabilities();
+        let known = link.player_settings.attributes.known.clone();
+        if known.is_empty() {
+            return;
+        }
+        let transaction = link.next_transaction();
+        out.replies.push((
+            cid,
+            avctp_body(transaction, &avrcp::get_current_settings(&known)),
+        ));
+        // …and subscribe, or the strip is a snapshot of this instant: a shuffle toggled
+        // on the phone's own screen reaches us no other way.
+        let transaction = link.next_transaction();
+        out.replies.push((
+            cid,
+            avctp_body(
+                transaction,
+                &avrcp::register_notification(
+                    avrcp::event::SETTING_CHANGED,
+                    notification_interval(avrcp::event::SETTING_CHANGED),
+                ),
+            ),
+        ));
+    }
+
     /// Bring the peer's image server up, so that attribute 8 becomes worth asking for.
     ///
     /// Two round trips the first time: the image server lives on a PSM only the peer's
@@ -1715,13 +1904,18 @@ impl BluetoothAdapter {
         // not offer a button the phone will answer `NOT IMPLEMENTED` to. Architecture
         // §11.5 always said capabilities come from this bitmask; until now they did not.
         let features = query.supported_features().ok().flatten();
-        if let Some(control) = &link.avrcp_control {
-            let caps = avrcp::capabilities_from_features(features);
-            debug!(?features, ?caps, "bluetooth: peer avrcp capabilities");
-            control.set_capabilities(caps);
-        }
         let psm = query.cover_art_psm().ok().flatten();
         link.art_sdp = None;
+        link.sdp_capabilities = avrcp::capabilities_from_features(features);
+        debug!(
+            ?features,
+            caps = ?link.sdp_capabilities,
+            "bluetooth: peer avrcp capabilities"
+        );
+        // Republished rather than stored: the settings listing may already have widened
+        // this handle, and writing the SDP answer over it would take the shuffle button
+        // back off a player that has one.
+        link.publish_capabilities();
         Self::queue_signalling(
             link.mux.disconnect(cid).unwrap_or_default(),
             &mut out.signalling,

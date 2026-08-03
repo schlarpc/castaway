@@ -983,6 +983,25 @@ impl PlayerSettings {
         caps
     }
 
+    /// Record what a `ListPlayerApplicationSettingValues` response offered.
+    ///
+    /// Values outside the setting they were asked about never arrive here: they are
+    /// dropped by [`parse_setting_values`], which reads the list against the attribute
+    /// the caller asked for.
+    pub fn record_values(&mut self, values: &[SettingValue]) {
+        for value in values {
+            match value {
+                SettingValue::Repeat(v) if !self.repeat_values.contains(v) => {
+                    self.repeat_values.push(*v);
+                }
+                SettingValue::Shuffle(v) if !self.shuffle_values.contains(v) => {
+                    self.shuffle_values.push(*v);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// The setting write a control transaction becomes, if this player can take it.
     #[must_use]
     pub fn value_for(&self, txn: &ControlTxn) -> Option<SettingValue> {

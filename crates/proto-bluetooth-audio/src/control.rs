@@ -5,7 +5,7 @@
 //! frames on the AVCTP channel, and the phone pauses.
 
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use castaway_core::{ControlCapabilities, ControlTxn, CoreError, RemoteControl};
 use tokio::sync::mpsc;
@@ -25,6 +25,13 @@ pub struct AvrcpControl {
     /// the peer's `SupportedFeatures` arrives later over SDP. Narrowing after publication
     /// is the only order the protocols allow.
     capabilities: Arc<AtomicU16>,
+    /// What the player accepts for shuffle and repeat, learned in a third stage — the
+    /// 0x11/0x12 listings, which arrive later still and only once AVRCP is up.
+    ///
+    /// Not folded into `capabilities`: the bits say *whether* a setting can be written,
+    /// this says *with which value*, and a player offering only group-repeat needs both
+    /// answers to get a working button (#76).
+    settings: Arc<RwLock<avrcp::PlayerSettings>>,
     frames: mpsc::Sender<AvcFrame>,
 }
 
@@ -37,6 +44,7 @@ impl AvrcpControl {
     pub fn new(capabilities: ControlCapabilities, frames: mpsc::Sender<AvcFrame>) -> Self {
         Self {
             capabilities: Arc::new(AtomicU16::new(capabilities.bits())),
+            settings: Arc::new(RwLock::new(avrcp::PlayerSettings::default())),
             frames,
         }
     }
@@ -56,6 +64,28 @@ impl AvrcpControl {
         self.capabilities
             .store(capabilities.bits(), Ordering::Relaxed);
     }
+
+    /// Record what the player's settings listings said, once they have arrived.
+    ///
+    /// The caller is expected to follow this with [`Self::set_capabilities`]: this decides
+    /// what a shuffle press *sends*, and that decides whether the button is offered.
+    pub fn set_player_settings(&self, settings: avrcp::PlayerSettings) {
+        // A poisoned lock means some other task panicked mid-update; the settings it left
+        // behind are still a valid snapshot, and refusing to drive the phone over it would
+        // be a worse answer than carrying on.
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = settings;
+    }
+
+    /// Queue one frame, mapping a dead channel onto a typed failure.
+    async fn send(&self, frame: AvcFrame) -> Result<(), CoreError> {
+        self.frames
+            .send(frame)
+            .await
+            .map_err(|_| CoreError::Adapter("avrcp control channel closed".into()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -65,6 +95,24 @@ impl RemoteControl for AvrcpControl {
     }
 
     async fn issue_unchecked(&self, txn: ControlTxn) -> Result<(), CoreError> {
+        // Two mechanisms, and which one a verb belongs to is not a detail. Transport is a
+        // passthrough keypress; shuffle and repeat are *player application settings*,
+        // written with a vendor-dependent command. There is no passthrough key that means
+        // "shuffle", so this is a fork rather than a fallback.
+        if matches!(txn, ControlTxn::Shuffle(_) | ControlTxn::Repeat(_)) {
+            let value = {
+                let settings = self.settings.read().unwrap_or_else(PoisonError::into_inner);
+                settings.value_for(&txn)
+            };
+            // `None` means the player never listed this setting, or listed no value that
+            // expresses the mode asked for. Refusing is the honest answer: a write the
+            // peer rejects leaves the panel showing a state the phone is not in.
+            let Some(value) = value else {
+                return Err(CoreError::UnsupportedControl(format!("{txn:?}")));
+            };
+            return self.send(avrcp::set_setting_value(&[value])).await;
+        }
+
         let Some(operation) = avrcp::operation_for(&txn) else {
             // Unreachable through `issue()`, which checks capabilities first — but a
             // direct caller must not silently get a nearest-equivalent keypress.
@@ -75,10 +123,7 @@ impl RemoteControl for AvrcpControl {
         // leaves the phone believing the key is held down; many then auto-repeat, so one
         // tap on "next" walks the entire album.
         for frame in avrcp::passthrough(operation) {
-            self.frames
-                .send(frame)
-                .await
-                .map_err(|_| CoreError::Adapter("avrcp control channel closed".into()))?;
+            self.send(frame).await?;
         }
         Ok(())
     }

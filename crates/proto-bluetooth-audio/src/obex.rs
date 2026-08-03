@@ -2,8 +2,23 @@
 //!
 //! This is the last mile of the artwork path: AVRCP hands us an image *handle*
 //! (attribute 8), and this module turns that handle into JPEG bytes over a separate
-//! L2CAP channel to the PSM found in the peer's SDP record. `obexd` has no BIP client, so
-//! this is the piece that does not exist on any OS stack.
+//! L2CAP channel to the PSM found in the peer's SDP record.
+//!
+//! **This module used to claim no OS stack has a BIP client. That was false**, and the
+//! correction is worth keeping because the false version was load-bearing in #74 and in
+//! architecture-substrate.md §11.1. BlueZ has had the whole chain since the Collabora
+//! cover-art series of August 2024: `bluetoothd` surfaces attribute 8 as the `ImgHandle`
+//! key on `org.bluez.MediaPlayer1`, and `obexd` carries a real cover-art client — the
+//! `BIP-AVRCP` driver, `org.bluez.obex.Image1`, with `Properties`, `Get` and
+//! `GetThumbnail`. Verified against bluez 5.86, which is also the oracle the parsers in
+//! here are written against.
+//!
+//! What is true, and is the actual reason to own this: it is split across two daemons
+//! with no in-tree wiring between them (`tools/mpris-proxy.c` is the reference glue),
+//! both halves are `[experimental]`, and `Image1` delivers the image as **a file on
+//! disk** via a `Transfer1` object rather than as bytes in the process that wants to draw
+//! them. None of which we could use regardless: the deploy target is one Windows binary
+//! with no `bluetoothd` and no `obexd` anywhere in it.
 //!
 //! We fetch the **linked thumbnail** rather than the full image. `x-bt/img-thm` returns a
 //! fixed 200×200 JPEG with no image descriptor to negotiate, which is both simpler and
@@ -678,57 +693,80 @@ impl Encoding {
 
 /// The `pixel` attribute of a BIP image descriptor.
 ///
-/// BIP allows three spellings and they mean genuinely different things: `200*200` is one
-/// image the peer holds, while `80*60-640*480` is a range it will *transcode* into on
-/// request. Reading the second as the first is how a listing that offers 640×480 gets
-/// recorded as offering 80×60.
+/// BIP defines exactly three spellings, and they mean genuinely different things:
+/// `200*200` is one image the peer holds, `80*60-640*480` is a range it will *transcode*
+/// into on request, and `80**-640*480` is that range with the aspect ratio pinned, so the
+/// lower bound states a width only. Reading the second as the first records a peer that
+/// offers 640×480 as one that offers 80×60.
+///
+/// Three variants for three grammatical forms, so "a fixed-ratio range with a lower-bound
+/// height" is unrepresentable rather than a `None` that every reader has to remember to
+/// check. The grammar is `obexd/client/bip-common.c::parse_pixel_range`, which is three
+/// anchored regexes — this is those regexes, and nothing looser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelSize {
     /// An exact size: `200*200`.
     Fixed {
         /// Width in pixels.
-        width: u32,
+        width: u16,
         /// Height in pixels.
-        height: u32,
+        height: u16,
     },
     /// A range the responder transcodes within: `80*60-640*480`.
     Range {
         /// Lower-bound width.
-        min_width: u32,
-        /// Lower-bound height. `None` for the `80**-640*480` spelling, which means
-        /// "whatever preserves the aspect ratio".
-        min_height: Option<u32>,
+        min_width: u16,
+        /// Lower-bound height.
+        min_height: u16,
         /// Upper-bound width.
-        max_width: u32,
+        max_width: u16,
         /// Upper-bound height.
-        max_height: u32,
+        max_height: u16,
+    },
+    /// A range that preserves the aspect ratio: `80**-640*480`.
+    ///
+    /// The lower bound names a width and *elides* the height with a second asterisk — not
+    /// an empty string, which is not legal anywhere in this grammar.
+    FixedRatioRange {
+        /// Lower-bound width.
+        min_width: u16,
+        /// Upper-bound width.
+        max_width: u16,
+        /// Upper-bound height.
+        max_height: u16,
     },
 }
 
 impl PixelSize {
     /// Parse a `pixel` attribute value.
+    ///
+    /// Strict, deliberately: no surrounding whitespace, one to five digits per number,
+    /// and an upper bound that is not below its lower one — all of which BlueZ enforces,
+    /// and none of which a value being read off as a measurement should be lenient about.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
-        let value = value.trim();
-        // The range separator is a `-` between two `w*h` pairs. Splitting on it first is
-        // what keeps `80**-640*480` — where the lower bound has an empty height — from
-        // being read as a malformed fixed size.
-        if let Some((lo, hi)) = value.split_once('-') {
-            let (min_width, min_height) = split_dimension(lo)?;
-            let (max_width, max_height) = split_dimension(hi)?;
-            return Some(Self::Range {
+        let Some((lower, upper)) = value.split_once('-') else {
+            let (width, height) = dimension(value)?;
+            return Some(Self::Fixed { width, height });
+        };
+        let (max_width, max_height) = dimension(upper)?;
+        // The fixed-ratio form is the only place a height may be absent, and `80**` is
+        // its only spelling. Testing for it before the general form is what keeps it from
+        // being read as a malformed pair.
+        if let Some(min_width) = lower.strip_suffix("**") {
+            let min_width = pixel_number(min_width)?;
+            return (max_width >= min_width).then_some(Self::FixedRatioRange {
                 min_width,
-                min_height,
                 max_width,
-                // An elided *upper* height has no defined meaning — the range needs a
-                // ceiling — so it is a parse failure rather than a guess.
-                max_height: max_height?,
+                max_height,
             });
         }
-        let (width, height) = split_dimension(value)?;
-        Some(Self::Fixed {
-            width,
-            height: height?,
+        let (min_width, min_height) = dimension(lower)?;
+        (max_width >= min_width && max_height >= min_height).then_some(Self::Range {
+            min_width,
+            min_height,
+            max_width,
+            max_height,
         })
     }
 
@@ -737,10 +775,15 @@ impl PixelSize {
     /// The question a properties listing is read to answer: a range is worth as much as
     /// its ceiling, because that is what a `GetImage` against it would return.
     #[must_use]
-    pub const fn largest(self) -> (u32, u32) {
+    pub const fn largest(self) -> (u16, u16) {
         match self {
             Self::Fixed { width, height } => (width, height),
             Self::Range {
+                max_width,
+                max_height,
+                ..
+            }
+            | Self::FixedRatioRange {
                 max_width,
                 max_height,
                 ..
@@ -749,19 +792,22 @@ impl PixelSize {
     }
 }
 
-/// Split a `w*h` pair, with the height optional.
+/// A `w*h` pair, both parts mandatory.
+fn dimension(s: &str) -> Option<(u16, u16)> {
+    let (w, h) = s.split_once('*')?;
+    Some((pixel_number(w)?, pixel_number(h)?))
+}
+
+/// One number from a `pixel` attribute: one to five digits, and nothing else.
 ///
-/// The elided height is spelled `80**` — a second `*` standing in for the number, not an
-/// empty string — so both are accepted. Reading `80**` as a malformed fixed size is what
-/// makes an aspect-preserving range vanish from a listing entirely.
-fn split_dimension(s: &str) -> Option<(u32, Option<u32>)> {
-    let (w, h) = s.trim().split_once('*')?;
-    let width = w.trim().parse().ok()?;
-    let h = h.trim();
-    if h.is_empty() || h == "*" {
-        return Some((width, None));
+/// `u16` rather than a range check after the fact, because BIP's own ceiling is 65535 —
+/// the type is the bound. The digit test is what rejects `+7`, `0x10` and a leading space,
+/// all of which `str::parse` would otherwise wave through or half-accept.
+fn pixel_number(s: &str) -> Option<u16> {
+    if s.is_empty() || s.len() > 5 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    Some((width, Some(h.parse().ok()?)))
+    s.parse().ok()
 }
 
 /// Whether a descriptor is the image the peer stores or one it will produce on request.
@@ -773,6 +819,20 @@ pub enum VariantKind {
     Variant,
 }
 
+/// The byte figure a descriptor states.
+///
+/// The two elements spell it differently and mean different things, which is easy to
+/// miss and reads as an absent size: `<native>` carries `size`, the stored object's exact
+/// length, and `<variant>` carries `maxsize`, a ceiling on what a transcode will produce
+/// (`obexd/client/bip-common.c`, `parse_attrib_native` vs `parse_attrib_variant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteSize {
+    /// `size` on a `<native>`: what the object actually weighs.
+    Exact(u64),
+    /// `maxsize` on a `<variant>`: the most a transcode of it will weigh.
+    AtMost(u64),
+}
+
 /// One form of an image the peer holds or will produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageVariant {
@@ -782,8 +842,8 @@ pub struct ImageVariant {
     pub encoding: Encoding,
     /// The size or range, when the descriptor gives one.
     pub pixel: Option<PixelSize>,
-    /// Bytes, when the descriptor states them. In practice only `<native>` does.
-    pub size: Option<u64>,
+    /// What it weighs, when the descriptor says.
+    pub size: Option<ByteSize>,
 }
 
 /// A peer's answer to `x-bt/img-properties`.
@@ -834,24 +894,34 @@ impl ImageProperties {
                     out.handle = attribute(element, b"handle");
                 }
                 name @ (b"native" | b"variant") => {
-                    let kind = if name == b"native" {
-                        VariantKind::Native
-                    } else {
-                        VariantKind::Variant
-                    };
+                    let native = name == b"native";
                     let Some(encoding) = attribute(element, b"encoding") else {
                         // A descriptor with no encoding names no image. Skipped rather
                         // than refused: the rest of the listing is still an answer.
                         continue;
                     };
+                    // `size` on a native, `maxsize` on a variant — see [`ByteSize`].
+                    // Reading only `size` drops every variant's figure silently.
+                    let size = if native {
+                        attribute(element, b"size")
+                            .and_then(|s| s.parse().ok())
+                            .map(ByteSize::Exact)
+                    } else {
+                        attribute(element, b"maxsize")
+                            .and_then(|s| s.parse().ok())
+                            .map(ByteSize::AtMost)
+                    };
                     out.variants.push(ImageVariant {
-                        kind,
+                        kind: if native {
+                            VariantKind::Native
+                        } else {
+                            VariantKind::Variant
+                        },
                         encoding: Encoding::parse(&encoding),
                         pixel: attribute(element, b"pixel")
                             .as_deref()
                             .and_then(PixelSize::parse),
-                        size: attribute(element, b"size")
-                            .and_then(|s| s.trim().parse::<u64>().ok()),
+                        size,
                     });
                 }
                 // `attachment` and anything else: not an image form.
@@ -873,12 +943,12 @@ impl ImageProperties {
     /// reporting it as the ceiling would answer #75's question with a number no code path
     /// could ever reach.
     #[must_use]
-    pub fn largest_decodable(&self) -> Option<(&ImageVariant, (u32, u32))> {
+    pub fn largest_decodable(&self) -> Option<(&ImageVariant, (u16, u16))> {
         self.variants
             .iter()
             .filter(|v| v.encoding.format().is_some())
             .filter_map(|v| v.pixel.map(|p| (v, p.largest())))
-            .max_by_key(|(_, (w, h))| u64::from(*w) * u64::from(*h))
+            .max_by_key(|(_, (w, h))| u32::from(*w) * u32::from(*h))
     }
 }
 
@@ -1327,7 +1397,7 @@ mod tests {
     /// image at all.
     const PROPERTIES_DOC: &[u8] = br#"<image-properties version="1.0" handle="1000001">
 <native encoding="JPEG" pixel="1280*1024" size="1048576"/>
-<variant encoding="JPEG" pixel="640*480"/>
+<variant encoding="JPEG" pixel="640*480" maxsize="153600"/>
 <variant encoding="JPEG" pixel="160*120"/>
 <variant encoding="GIF" pixel="80*60-640*480"/>
 <attachment content-type="text/plain" name="ABCD1234.txt" size="5120"/>
@@ -1350,40 +1420,71 @@ mod tests {
                 height: 1024
             })
         );
-        assert_eq!(native.size, Some(1_048_576));
+        // A native says `size` and means it exactly; a variant says `maxsize` and means
+        // a ceiling. Reading only `size` drops every variant's figure without a word.
+        assert_eq!(native.size, Some(ByteSize::Exact(1_048_576)));
         assert_eq!(props.variants[1].kind, VariantKind::Variant);
+        assert_eq!(props.variants[1].size, Some(ByteSize::AtMost(153_600)));
+        assert_eq!(props.variants[2].size, None, "and it is optional");
     }
 
     #[test]
-    fn a_pixel_range_is_worth_its_ceiling_not_its_floor() {
+    fn the_pixel_grammar_is_the_three_forms_bip_defines_and_no_others() {
+        // Written against `obexd/client/bip-common.c::parse_pixel_range`, which is three
+        // anchored regexes: `W*H`, `W*H-W*H`, and `W**-W*H`. An earlier version of this
+        // parser was looser in four ways, and every one of them would have quietly
+        // mis-recorded the measurement #75 is taken to answer.
+        assert_eq!(
+            PixelSize::parse("200*200").unwrap(),
+            PixelSize::Fixed {
+                width: 200,
+                height: 200
+            }
+        );
+
         // `80*60-640*480` is not an 80×60 image: it is an offer to transcode anywhere up
-        // to 640×480. Reading it as the lower bound records a peer that offers 640×480 as
-        // one that offers 80×60 — which is exactly the wrong answer to #75's question.
+        // to 640×480, so it is worth its ceiling.
         let range = PixelSize::parse("80*60-640*480").unwrap();
         assert_eq!(
             range,
             PixelSize::Range {
                 min_width: 80,
-                min_height: Some(60),
+                min_height: 60,
                 max_width: 640,
                 max_height: 480,
             }
         );
         assert_eq!(range.largest(), (640, 480));
 
-        // The aspect-preserving spelling elides the lower bound's height.
+        // The aspect-preserving form elides the lower height with a *second asterisk*,
+        // and that is its only spelling.
         assert_eq!(
             PixelSize::parse("80**-640*480").unwrap(),
-            PixelSize::Range {
+            PixelSize::FixedRatioRange {
                 min_width: 80,
-                min_height: None,
                 max_width: 640,
                 max_height: 480,
             }
         );
-        // An elided *upper* height has no meaning — a range needs a ceiling.
-        assert_eq!(PixelSize::parse("80*60-640*"), None);
-        assert_eq!(PixelSize::parse("200*200").unwrap().largest(), (200, 200));
+        assert_eq!(PixelSize::parse("80*-640*480"), None, "empty is not elided");
+        assert_eq!(PixelSize::parse("80**"), None, "and only inside a range");
+
+        // A ceiling below its floor is not a range. BlueZ rejects it; so must we, or a
+        // listing reads as offering something it does not.
+        assert_eq!(PixelSize::parse("640*480-80*60"), None);
+        assert_eq!(PixelSize::parse("80*480-640*60"), None, "either component");
+
+        // One to five digits, and 65535 is the ceiling the type now enforces.
+        assert_eq!(
+            PixelSize::parse("65535*65535").unwrap().largest(),
+            (65535, 65535)
+        );
+        assert_eq!(PixelSize::parse("123456*10"), None);
+        assert_eq!(PixelSize::parse("70000*10"), None);
+        // …and nothing but digits. `str::parse` accepts a leading `+`, and the
+        // surrounding whitespace an earlier version trimmed is not in the grammar.
+        assert_eq!(PixelSize::parse("+70*10"), None);
+        assert_eq!(PixelSize::parse(" 200*200 "), None);
         assert_eq!(PixelSize::parse("garbage"), None);
     }
 
