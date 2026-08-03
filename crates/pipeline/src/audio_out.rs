@@ -498,7 +498,7 @@ mod cpal_backend {
             };
             let host = cpal::default_host();
             host.default_output_device()
-                .and_then(|d| d.name().ok())
+                .and_then(|d| device_name(&d))
                 .is_some_and(|current| current != opened)
         }
     }
@@ -595,12 +595,26 @@ mod cpal_backend {
             .output_devices()
             .map_err(|e| PipelineError::Audio(format!("listing output devices: {e}")))?;
         Ok(devices
-            .filter_map(|d| d.name().ok())
+            .filter_map(|d| device_name(&d))
             .map(|name| OutputDeviceInfo {
                 id: name.clone(),
                 label: name,
             })
             .collect())
+    }
+
+    /// A device's name, or `None` if the host will not describe it.
+    ///
+    /// cpal 0.18 replaced `Device::name()` with a whole [`cpal::DeviceDescription`] —
+    /// manufacturer, driver, interface type and more. Every use here is the name and only
+    /// the name: it is the identity that reaches the log and that a saved selection is
+    /// matched against (#106), so it is pulled out once here rather than at four call
+    /// sites, and the description is dropped again immediately.
+    fn device_name(device: &cpal::Device) -> Option<String> {
+        device
+            .description()
+            .ok()
+            .map(|described| described.name().to_owned())
     }
 
     /// The device `selection` names, or the default.
@@ -624,7 +638,7 @@ mod cpal_backend {
                 return host
                     .output_devices()
                     .map_err(|e| format!("listing output devices: {e}"))?
-                    .find(|d| d.name().is_ok_and(|n| n == *name))
+                    .find(|d| device_name(d).is_some_and(|n| n == *name))
                     .ok_or_else(|| format!("device {name:?} is not present"));
             }
         }
@@ -632,7 +646,7 @@ mod cpal_backend {
             let found = host
                 .output_devices()
                 .map_err(|e| format!("listing output devices: {e}"))?
-                .find(|d| d.name().is_ok_and(|n| n == *name));
+                .find(|d| device_name(d).is_some_and(|n| n == *name));
             match found {
                 Some(device) => return Ok(device),
                 None => warn!(device = %name, "configured output device not found; using default"),
@@ -669,13 +683,14 @@ mod cpal_backend {
             ));
         }
 
-        let wanted_sr = cpal::SampleRate(wanted);
+        // `cpal::SampleRate` is a plain `u32` from 0.18 on, not a newtype, so these are
+        // bare hertz now. The comparisons below are the same ones.
         let supported = |sr: cpal::SampleRate| {
             ranges
                 .iter()
                 .any(|r| r.min_sample_rate() <= sr && sr <= r.max_sample_rate())
         };
-        if supported(wanted_sr) {
+        if supported(wanted) {
             return Ok(wanted);
         }
 
@@ -683,7 +698,7 @@ mod cpal_backend {
         // guaranteed to open in shared mode — so it is tried before anything cleverer.
         if let Ok(default) = device.default_output_config() {
             if supported(default.sample_rate()) {
-                return Ok(default.sample_rate().0);
+                return Ok(default.sample_rate());
             }
         }
 
@@ -691,7 +706,7 @@ mod cpal_backend {
         // ratio small and avoids inventing bandwidth that was never there.
         ranges
             .iter()
-            .map(|r| wanted.clamp(r.min_sample_rate().0, r.max_sample_rate().0))
+            .map(|r| wanted.clamp(r.min_sample_rate(), r.max_sample_rate()))
             .min_by_key(|rate| rate.abs_diff(wanted))
             .ok_or_else(|| format!("device offers no usable rate near {wanted} Hz"))
     }
@@ -718,12 +733,12 @@ mod cpal_backend {
     ) -> Result<(cpal::Stream, u32, String), String> {
         let host = cpal::default_host();
         let device = pick_device(&host, selection, strict)?;
-        let name = device.name().unwrap_or_else(|_| "<unnamed>".to_owned());
+        let name = device_name(&device).unwrap_or_else(|| "<unnamed>".to_owned());
         let opened_at = choose_rate(&device, sample_rate, channels)?;
 
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(opened_at),
+            sample_rate: opened_at,
             buffer_size: cpal::BufferSize::Default,
         };
         // Samples per frame, for turning the callback's slice length into a frame count.
@@ -733,7 +748,7 @@ mod cpal_backend {
         let mut pending: std::collections::VecDeque<f32> = std::collections::VecDeque::new();
         let stream = device
             .build_output_stream(
-                &config,
+                config,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     // Pull whatever has arrived without ever blocking: this runs on the
                     // audio thread, where waiting is a dropout.
@@ -770,7 +785,11 @@ mod cpal_backend {
                         // AUDCLNT_E_DEVICE_INVALIDATED — the endpoint was removed or
                         // reconfigured. Recoverable, and flagged rather than logged here
                         // because this runs on the audio thread.
-                        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                        //
+                        // 0.18 collapsed the per-operation error enums into one `Error`
+                        // carrying an `ErrorKind`, so this asks the kind rather than
+                        // matching a `StreamError` variant. Same condition.
+                        if err.kind() == cpal::ErrorKind::DeviceNotAvailable {
                             lost.store(true, Ordering::Relaxed);
                         }
                         warn!(error = %err, "audio output stream error");
