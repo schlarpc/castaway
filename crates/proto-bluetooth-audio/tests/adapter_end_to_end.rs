@@ -3028,3 +3028,251 @@ async fn a_second_phone_that_starts_playing_takes_the_speakers_and_pauses_the_fi
         "the pause belongs to the phone that lost the speakers, not the one that took them"
     );
 }
+
+/// Every vendor-dependent AVRCP *command* the adapter has sent, as (pdu, ctype, params).
+///
+/// The mirror of `avrcp_responses`, and the one that matters for anything we *ask* a
+/// phone rather than answer it.
+fn avrcp_commands(transport: &ScriptedTransport) -> Vec<(u8, proto_bluetooth_audio::Ctype, Bytes)> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+        .filter(|msg| msg.cr == CommandResponse::Command)
+        .filter_map(|msg| proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok())
+        .filter_map(|frame| {
+            proto_bluetooth_audio::VendorPdu::parse(&frame.operands)
+                .ok()
+                .map(|vendor| (vendor.pdu_id, frame.ctype, vendor.parameters))
+        })
+        .collect()
+}
+
+/// Wait for a vendor command with `pdu`, returning its parameters.
+async fn awaited_command(transport: &ScriptedTransport, what: &str, pdu: u8) -> Bytes {
+    eventually(what, || {
+        avrcp_commands(transport)
+            .into_iter()
+            .find(|(id, _, _)| *id == pdu)
+            .map(|(_, _, params)| params)
+    })
+    .await
+}
+
+/// A vendor-dependent AVRCP response, as a phone answers one of our commands.
+fn phone_answer(pdu: u8, params: &[u8]) -> Bytes {
+    proto_bluetooth_audio::AvctpMessage::command(
+        0,
+        proto_bluetooth_audio::avrcp::vendor_command(
+            proto_bluetooth_audio::Ctype::Stable,
+            pdu,
+            params,
+        )
+        .encode(),
+    )
+    .encode()
+}
+
+#[tokio::test]
+async fn shuffle_and_repeat_are_enumerated_before_they_are_offered() {
+    // #76: the protocol has player application settings, the core model has shuffle and
+    // repeat, and the adapter had neither — so a Bluetooth link advertised bare TRANSPORT
+    // however capable the phone was.
+    //
+    // The whole interrogation, in the order it has to happen: which settings exist, which
+    // values each takes, what they are now, and a subscription so the phone's own UI
+    // reaches the strip. The value listings are *serial* on purpose — a 0x12 response does
+    // not echo the attribute it is about, so two in flight is two lists we cannot tell
+    // apart.
+    use proto_bluetooth_audio::avrcp::{self, pdu};
+
+    let (transport, mut rx) = connected().await;
+    let (_signaling, _media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (_frames, _) = audio_session(&mut rx).await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    // 1. It asks, unprompted, as soon as AVRCP is up.
+    let request = awaited_command(
+        &transport,
+        "the settings listing",
+        pdu::LIST_SETTING_ATTRIBUTES,
+    )
+    .await;
+    assert!(
+        request.is_empty(),
+        "ListPlayerApplicationSettingAttributes takes no parameters; BlueZ rejects one that does"
+    );
+
+    // 2. The phone lists repeat, shuffle, and something we do not implement.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::LIST_SETTING_ATTRIBUTES, &[3, 0x02, 0x03, 0x7F]),
+        ),
+    );
+
+    // 3. Values for repeat first, and *only* repeat — one at a time.
+    let asked = awaited_command(
+        &transport,
+        "the repeat value listing",
+        pdu::LIST_SETTING_VALUES,
+    )
+    .await;
+    assert_eq!(&asked[..], &[0x02], "repeat, and one attribute per request");
+    assert_eq!(
+        avrcp_commands(&transport)
+            .iter()
+            .filter(|(id, _, _)| *id == pdu::LIST_SETTING_VALUES)
+            .count(),
+        1,
+        "a second listing in flight would be a list we cannot attribute"
+    );
+
+    // This player does group-repeat and not all-track repeat, which is the case the
+    // preference list exists for.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::LIST_SETTING_VALUES, &[2, 0x01, 0x04]),
+        ),
+    );
+
+    // 4. …then shuffle.
+    let asked = eventually("the shuffle value listing", || {
+        avrcp_commands(&transport)
+            .into_iter()
+            .filter(|(id, _, _)| *id == pdu::LIST_SETTING_VALUES)
+            .nth(1)
+            .map(|(_, _, params)| params)
+    })
+    .await;
+    assert_eq!(&asked[..], &[0x03]);
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::LIST_SETTING_VALUES, &[2, 0x01, 0x02]),
+        ),
+    );
+
+    // 5. Only now does it read the current values, and subscribe to changes.
+    let current = awaited_command(
+        &transport,
+        "the current settings read",
+        pdu::GET_CURRENT_SETTINGS,
+    )
+    .await;
+    assert_eq!(
+        &current[..],
+        &[2, 0x02, 0x03],
+        "both listed attributes, count first"
+    );
+    eventually("a subscription to setting changes", || {
+        avrcp_commands(&transport)
+            .into_iter()
+            .find(|(id, _, params)| {
+                *id == pdu::REGISTER_NOTIFICATION
+                    && params.first() == Some(&avrcp::event::SETTING_CHANGED)
+            })
+            .map(|_| ())
+    })
+    .await;
+
+    // 6. The answer reaches the card. Group repeat folds into Context — naming the group
+    //    needs the browsing channel, and a third repeat icon nobody can explain is worse.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::GET_CURRENT_SETTINGS, &[2, 0x03, 0x02, 0x02, 0x04]),
+        ),
+    );
+    let now = eventually("shuffle and repeat on the card", || {
+        rx.try_recv().ok().and_then(|m| match m.event {
+            SessionEvent::NowPlaying(n) if n.shuffle.is_some() => Some(n),
+            _ => None,
+        })
+    })
+    .await;
+    assert_eq!(now.shuffle, Some(true));
+    assert_eq!(now.repeat, Some(castaway_core::RepeatMode::Context));
+}
+
+#[tokio::test]
+async fn a_shuffle_press_is_a_setting_write_not_a_keypress() {
+    // There is no passthrough key that means "shuffle", so this is a fork in the control
+    // path rather than a fallback — and the value written has to be one the peer said it
+    // accepts, which for this player is group-shuffle rather than the usual all-tracks.
+    use castaway_core::ControlTxn;
+    use proto_bluetooth_audio::avrcp::pdu;
+
+    let (transport, mut rx) = connected().await;
+    let (_signaling, _media, _seid) =
+        stream_up_as(&transport, 0x0040, 0x0041, &sbc_at(SampleRates::HZ_44100)).await;
+    let (_frames, _) = audio_session(&mut rx).await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    let control = eventually("the control surface", || {
+        rx.try_recv().ok().and_then(|m| match m.event {
+            SessionEvent::ControlSurface(c) => Some(c),
+            _ => None,
+        })
+    })
+    .await;
+    // Before the listing lands the panel must not offer it: a lit button that answers
+    // REJECTED is worse than no button.
+    assert!(
+        !control.capabilities().supports(&ControlTxn::Shuffle(true)),
+        "nothing has said this player has shuffle yet"
+    );
+
+    awaited_command(
+        &transport,
+        "the settings listing",
+        pdu::LIST_SETTING_ATTRIBUTES,
+    )
+    .await;
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::LIST_SETTING_ATTRIBUTES, &[1, 0x03]),
+        ),
+    );
+    awaited_command(
+        &transport,
+        "the shuffle value listing",
+        pdu::LIST_SETTING_VALUES,
+    )
+    .await;
+    // Group shuffle only — no all-tracks value on offer.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            phone_answer(pdu::LIST_SETTING_VALUES, &[2, 0x01, 0x03]),
+        ),
+    );
+
+    eventually("shuffle becoming available", || {
+        control
+            .capabilities()
+            .supports(&ControlTxn::Shuffle(true))
+            .then_some(())
+    })
+    .await;
+    // …and repeat did not come with it. The listing is the gate, per setting.
+    assert!(!control
+        .capabilities()
+        .supports(&ControlTxn::Repeat(castaway_core::RepeatMode::Context)));
+
+    control.issue(ControlTxn::Shuffle(true)).await.unwrap();
+    let write = awaited_command(&transport, "the setting write", pdu::SET_SETTING_VALUE).await;
+    assert_eq!(
+        &write[..],
+        &[1, 0x03, 0x03],
+        "one pair: shuffle, group — the value this player actually listed"
+    );
+}
