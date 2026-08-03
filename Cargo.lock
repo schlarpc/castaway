@@ -1278,7 +1278,7 @@ dependencies = [
 name = "crypto-cast-auth"
 version = "0.1.0"
 dependencies = [
- "rand 0.8.7",
+ "rand 0.10.2",
  "rcgen",
  "rsa",
  "sha1",
@@ -4558,7 +4558,7 @@ dependencies = [
  "hex-literal",
  "moonlight-sys",
  "quick-xml 0.41.0",
- "rand 0.8.7",
+ "rand 0.10.2",
  "rcgen",
  "rsa",
  "rustls 0.23.42",
@@ -4613,7 +4613,7 @@ dependencies = [
  "num-bigint 0.5.1",
  "num-traits",
  "pbkdf2",
- "rand 0.8.7",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
