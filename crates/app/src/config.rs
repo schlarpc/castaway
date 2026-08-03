@@ -251,16 +251,19 @@ pub struct GameStream {
     /// re-pairing with every host. Must be writable and persistent, and readable only
     /// by the service user.
     pub state_dir: PathBuf,
-    /// Pair with this host at startup, using `pair_pin`. Both must be set; the PIN is
-    /// consumed once and pairing is persisted, so this is meant to be removed from the
-    /// config afterwards rather than left in place.
+    /// Pair with this host at startup, if it is not paired already.
     ///
-    /// Optional twice over: the panel can also pair on its own — pressing an unpaired
-    /// host in the Moonlight picker puts a PIN on the glass. This stays for boxes
-    /// without a touch surface, and for provisioning a panel before it is hung.
+    /// The PIN is *not* configured, and deliberately: it authenticates one handshake, so
+    /// it has no business outliving it in plaintext on disk, and a configured one is
+    /// re-sent on every restart to re-attempt a pairing that already succeeded (#78).
+    /// The receiver generates one, logs it at `info`, and holds the handshake open while
+    /// somebody types it into the host's own UI.
+    ///
+    /// Optional twice over: the panel can pair on its own — pressing an unpaired host in
+    /// the Moonlight picker puts a PIN on the glass. This stays for boxes with no touch
+    /// surface, and for provisioning a panel before it is hung. Leaving it set costs
+    /// nothing once the pairing exists; the adapter checks and stops.
     pub pair_host: Option<String>,
-    /// The PIN to type into the host's own UI during that pairing.
-    pub pair_pin: Option<String>,
     /// Start streaming from this host as soon as the receiver is up. Off unless set:
     /// a panel that launches a game at boot is a panel nobody asked.
     pub autostart_host: Option<String>,
@@ -294,7 +297,6 @@ impl Default for GameStream {
             // was simply an unwritable path that lost the pairing on every restart.
             state_dir: castaway_paths::host().state().join("gamestream"),
             pair_host: None,
-            pair_pin: None,
             autostart_host: None,
             autostart_app: None,
             width: 1920,

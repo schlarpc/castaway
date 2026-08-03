@@ -481,8 +481,10 @@ The panel as a Moonlight client. On by default, but inert until a host is paired
 is a PIN exchange someone must confirm on the *host's* side, so until then the adapter
 only browses mDNS. Pairing starts from the panel itself — pressing an unpaired host in
 the Moonlight picker shows a generated PIN and waits (three minutes, then a retry screen)
-for it to be typed into Sunshine's web UI; the `pair_host`/`pair_pin` config below is the
-headless alternative, not the only way in. The Linux kiosk build links the streaming
+for it to be typed into Sunshine's web UI; the `pair_host` config below is the headless
+alternative, not the only way in. The PIN is never configured — it authenticates one
+handshake, so the receiver generates one and logs it at `info` rather than keeping a
+plaintext credential on disk that is also re-sent on every restart (#78). The Linux kiosk build links the streaming
 core; `castaway-portable` does not (GPL, D37).
 
 ```toml
@@ -490,8 +492,7 @@ core; `castaway-portable` does not (GPL, D37).
 # the credential — persistent, mode 0600. Omit it: the default is the platform state
 # directory + /gamestream, which under the NixOS unit is this same path.
 state_dir = "/var/lib/castaway/gamestream"
-pair_host = "10.0.0.7"                        # remove after pairing succeeds once
-pair_pin  = "1234"                            # typed into *Sunshine's* web UI, not ours
+pair_host = "10.0.0.7"                        # PIN is generated and logged; safe to leave set
 autostart_host = "10.0.0.7"                   # optional; unset means nothing starts
 autostart_app  = "Desktop"                    # optional; unset takes the host's first app
 width = 1920

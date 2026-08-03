@@ -282,6 +282,13 @@ required-features = ["render"]
 name = "audio_drift"
 required-features = ["audio-out"]
 
+# How fast the media clock actually advances against the wall, on a real file. Written to
+# find #52 — the demuxer deadlocking against a clock only it could advance — and kept
+# because "plays in real time" is not a property any offline fixture can state.
+[[example]]
+name = "media_clock_rate"
+required-features = ["ffmpeg", "audio"]
+
 [[test]]
 name = "hwaccel_zero_copy"
 required-features = ["hwaccel"]

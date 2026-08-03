@@ -1377,26 +1377,13 @@ fn spawn_gamestream(
             .context("loading the GameStream client identity")?,
     );
 
-    // A half-configured pairing is an error rather than a silent no-op: someone who
-    // set one of these two meant to pair, and starting without it looks identical to
-    // success until the first session is attempted.
-    match (&gs.pair_host, &gs.pair_pin) {
-        (Some(host), Some(pin)) => {
-            command_tx
-                .try_send(proto_gamestream::GameStreamCommand::Pair {
-                    host: host.clone(),
-                    pin: pin.clone(),
-                })
-                .context("queueing the configured GameStream pairing")?;
-        }
-        (None, None) => {}
-        (Some(_), None) => anyhow::bail!(
-            "gamestream.pair_host is set but pair_pin is not; pairing needs the PIN that \
-             will be typed into the host's own UI"
-        ),
-        (None, Some(_)) => anyhow::bail!(
-            "gamestream.pair_pin is set but pair_host is not; there is no host to pair with"
-        ),
+    // The PIN is the adapter's to choose and announce, not the config file's (#78). It
+    // is also the adapter's job to notice the host is already paired, so this stays
+    // harmless when the setting is left in place after provisioning.
+    if let Some(host) = &gs.pair_host {
+        command_tx
+            .try_send(proto_gamestream::GameStreamCommand::PairAndAnnounce { host: host.clone() })
+            .context("queueing the configured GameStream pairing")?;
     }
 
     if let Some(host) = &gs.autostart_host {

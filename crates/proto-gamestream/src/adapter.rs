@@ -30,7 +30,7 @@ use crate::discovery::HostCandidate;
 use crate::error::GameStreamError;
 use crate::identity::ClientIdentity;
 use crate::nvhttp::{LaunchParams, UniqueId};
-use crate::pairing::PairedServer;
+use crate::pairing::{PairedServer, PairingPin};
 
 /// What the adapter can be asked to do. The seam a chooser would drive.
 #[derive(Debug, Clone)]
@@ -42,6 +42,19 @@ pub enum GameStreamCommand {
         host: String,
         /// The PIN the person will type on the host.
         pin: String,
+    },
+    /// Pair with a host, choosing the PIN here and announcing it.
+    ///
+    /// The provisioning form of [`GameStreamCommand::Pair`], and the reason the PIN no
+    /// longer lives in the config file (#78). A PIN authenticates one handshake, so it has
+    /// no business outliving it in plaintext on disk — and a configured one is re-sent on
+    /// every restart, re-attempting a pairing that already succeeded.
+    ///
+    /// Skipped entirely when the host is already paired, which is what stops a
+    /// `pair_host` left in the config from being a pairing attempt every boot.
+    PairAndAnnounce {
+        /// Host address or mDNS instance name.
+        host: String,
     },
     /// Start streaming an app. `app` matches an app title case-insensitively; `None`
     /// takes whatever the host lists first, which on Sunshine is the desktop.
@@ -301,6 +314,18 @@ impl GameStreamAdapter {
             client = client.with_pairing(server, https_port);
         }
         Ok(client)
+    }
+
+    /// Whether this host's pairing is already on disk.
+    ///
+    /// By resolved address, which is the key `save_pairing` uses — an mDNS instance name
+    /// and the address it resolves to are the same host, and a configured `pair_host` may
+    /// be written as either.
+    async fn is_paired(&self, host: &str) -> bool {
+        let Some((address, _)) = self.resolve(host).await else {
+            return false;
+        };
+        self.store.load_pairing(&address).is_some()
     }
 
     /// Run the pairing handshake with a host and persist the result.
@@ -597,7 +622,7 @@ impl SourceAdapter for GameStreamAdapter {
                         // `select!` arm runs to completion before the loop polls again,
                         // so awaiting it inline stopped the actor dead: no Stop for a
                         // live session, no Start, and a host list that never updated
-                        // again. Configured pair_host/pair_pin queue this at startup
+                        // again. A configured `pair_host` queues one at startup
                         // ahead of the autostart, so a PIN nobody types disabled the
                         // whole adapter. The timeout belongs to a caller with a screen
                         // to keep honest, and the shell already has one.
@@ -605,6 +630,37 @@ impl SourceAdapter for GameStreamAdapter {
                         tokio::spawn(async move {
                             if let Err(e) = adapter.pair(&host, &pin).await {
                                 warn!(%host, error = %e, "GameStream pairing failed");
+                            }
+                        });
+                    }
+                    Some(GameStreamCommand::PairAndAnnounce { host }) => {
+                        // Already paired is the ordinary case for a configured host: it
+                        // was paired once, on the first boot after provisioning, and every
+                        // boot since has had nothing to do. Saying so and stopping is what
+                        // makes leaving `pair_host` in the config harmless.
+                        if self.is_paired(&host).await {
+                            info!(%host, "GameStream: already paired; nothing to do");
+                            continue;
+                        }
+                        let pin = PairingPin::generate();
+                        // The one place a PIN is deliberately logged, and the reason this
+                        // command exists: a box being provisioned before it is hung has no
+                        // glass to read it off. It authenticates this handshake and
+                        // nothing else, it is gone when the process is, and the
+                        // alternative it replaces was the same secret sitting in a config
+                        // file indefinitely.
+                        info!(
+                            %host, %pin,
+                            "GameStream: pairing — type this PIN into the host's own UI"
+                        );
+                        let adapter = Arc::clone(&self);
+                        let announced = pin.to_string();
+                        tokio::spawn(async move {
+                            match adapter.pair(&host, &announced).await {
+                                Ok(()) => info!(%host, "GameStream: paired"),
+                                Err(e) => {
+                                    warn!(%host, error = %e, "GameStream pairing failed");
+                                }
                             }
                         });
                     }
@@ -709,6 +765,33 @@ mod tests {
         assert_eq!(loaded.server_cert_der, server.server_cert_der);
         // Per host: pairing with one must not make us look paired with another.
         assert!(store.load_pairing("10.0.0.8").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_configured_host_that_is_already_paired_is_not_paired_again() {
+        // The half of #78 that made leaving `pair_host` in the config actively harmful:
+        // the startup command re-ran the handshake on every boot, re-attempting a pairing
+        // that had already succeeded. With the PIN gone from the config the setting is
+        // meant to be safe to leave, so "already paired" has to be a thing the adapter
+        // notices rather than a thing the operator remembers.
+        let (store, _guard) = temp_store();
+        let identity = ClientIdentity::generate().unwrap();
+        let server = PairedServer {
+            server_cert_pem: identity.cert_pem().to_string(),
+            server_cert_der: identity.cert_der().to_vec(),
+        };
+        store.save_pairing("10.0.0.7", &server).unwrap();
+
+        let (_tx, rx) = mpsc::channel(1);
+        let adapter = GameStreamAdapter::new(store, SessionPreferences::default(), rx).unwrap();
+        assert!(
+            adapter.is_paired("10.0.0.7").await,
+            "a host whose pairing is on disk is paired"
+        );
+        assert!(
+            !adapter.is_paired("10.0.0.8").await,
+            "and one whose is not, is not"
+        );
     }
 
     #[test]
