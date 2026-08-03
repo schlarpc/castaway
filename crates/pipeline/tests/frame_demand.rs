@@ -128,3 +128,129 @@ fn a_playing_transport_ticks_once_a_second_not_every_frame() {
         other => panic!("a playing strip keeps time on a deadline, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The return to rest (#23).
+//
+// The lifecycle had a way home for every *press* — the pill, the edge swipe, a remote's
+// Home button, `back` walking out one step at a time — and none for the person who simply
+// walks away, which on a wall panel is how most sessions with it end. A panel left two
+// screens deep at closing time was still two screens deep the next morning.
+//
+// It belongs in this file because of *how* it is built rather than what it does: a
+// deadline read off standing facts, so the loop sleeps until it falls due instead of
+// polling, and so a gesture that moves the panel back simply stops the answer existing.
+// ---------------------------------------------------------------------------------------
+
+/// A shell with the clock in the test's hands.
+fn home_with_clock() -> (
+    pipeline::RenderTx,
+    RenderLoop,
+    pipeline::render_clock::ManualClock,
+) {
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap().with_clock(clock);
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    render.pump();
+    (tx, render, time)
+}
+
+fn a_screen() -> pipeline::shell::Screen {
+    pipeline::shell::Screen::Picker(Box::new(pipeline::picker::Picker::loading(
+        "Moonlight",
+        "…",
+    )))
+}
+
+#[test]
+fn a_panel_left_two_screens_deep_returns_home_by_itself() {
+    let (tx, mut render, time) = home_with_clock();
+    tx.send(RenderCommand::PushScreen(Box::new(a_screen())));
+    render.pump();
+    render.note_touch();
+    // A deadline rather than idle: the panel is away from rest, so it already owes the
+    // glass a return — the loop just does not have to stay awake for it.
+    assert!(
+        matches!(settle(&mut render), Demand::At(_)),
+        "an away-from-rest panel owes a return at a known time"
+    );
+    assert_eq!(render.shell_depth(), 2, "the screen is up");
+
+    // Not yet: a minute of reading a screen is not somebody having left.
+    time.advance(Duration::from_secs(60));
+    render.frame(TICK);
+    assert_eq!(
+        render.shell_depth(),
+        2,
+        "the panel closed a screen out from under someone still reading it"
+    );
+
+    // …and then they are gone.
+    time.advance(Duration::from_secs(61));
+    settle(&mut render);
+    assert_eq!(
+        render.shell_depth(),
+        1,
+        "nobody has touched the panel in two minutes; it should be back Home"
+    );
+}
+
+#[test]
+fn the_return_is_a_deadline_the_loop_can_sleep_until() {
+    // The point of doing it this way. A poll would hold the kiosk at display rate for the
+    // whole two minutes — on an idle panel, which is the state it spends most of its life
+    // in and the state #59 was about.
+    let (tx, mut render, time) = home_with_clock();
+    tx.send(RenderCommand::PushScreen(Box::new(a_screen())));
+    render.pump();
+    render.note_touch();
+
+    let Demand::At(due) = settle(&mut render) else {
+        panic!("a panel away from rest owes the glass a return, at a known time");
+    };
+    // Far enough out that this is a sleep rather than a spin, and it is the *touch* it is
+    // measured from rather than the frame.
+    assert!(
+        due.duration_since(time.now()) > Duration::from_secs(100),
+        "the deadline is only {:?} away; that is a poll, not a sleep",
+        due.duration_since(time.now())
+    );
+
+    // Touching again puts it off, because the answer is derived rather than armed.
+    time.advance(Duration::from_secs(60));
+    render.note_touch();
+    let Demand::At(again) = settle(&mut render) else {
+        panic!("still away from rest, so still owed");
+    };
+    assert!(again > due, "a touch has to push the return back");
+}
+
+#[test]
+fn a_panel_already_at_rest_is_owed_no_return() {
+    // The failure this guards is quiet and permanent: a predicate that disagreed with
+    // `rest` would wake the loop every two minutes forever, run a transition to where the
+    // panel already is, and never settle.
+    let (_tx, mut render, _time) = home_with_clock();
+    render.note_touch();
+    assert_eq!(
+        settle(&mut render),
+        Demand::Idle,
+        "a touched panel that is already Home must still let the kiosk sleep"
+    );
+
+    // And after a return has happened, it stays settled rather than repeating.
+    let (tx, mut render, time) = home_with_clock();
+    tx.send(RenderCommand::PushScreen(Box::new(a_screen())));
+    render.pump();
+    render.note_touch();
+    settle(&mut render);
+    time.advance(Duration::from_secs(121));
+    settle(&mut render);
+    assert_eq!(render.shell_depth(), 1);
+    assert_eq!(
+        settle(&mut render),
+        Demand::Idle,
+        "the return happened; nothing is owed a second time"
+    );
+}

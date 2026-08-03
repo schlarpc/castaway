@@ -412,6 +412,22 @@ impl Panel {
         before != self.focus()
     }
 
+    /// Whether the panel is somewhere a person put it, rather than at its resting
+    /// arrangement.
+    ///
+    /// The two ways to be away from rest, and they are the two [`Self::rest`] undoes: a
+    /// shell deeper than Home, and the shell holding the glass over something that is
+    /// playing. Derived rather than remembered, so nothing has to set a flag when the
+    /// panel moves — which is what makes an idle return a per-frame predicate instead of a
+    /// timer somebody has to arm and cancel.
+    ///
+    /// A panel with no shell at all is never away from rest: there are no screens to
+    /// return from, and a session there already has the glass.
+    #[must_use]
+    pub fn away_from_rest(&self) -> bool {
+        self.depth() > 1 || (self.shell_forward && self.surfaces.any_session())
+    }
+
     /// Put the panel back to its resting arrangement: Home, with the glass handed to
     /// whatever is playing. Both ends of a session ask for this.
     pub fn rest(&mut self) {
@@ -738,6 +754,60 @@ mod tests {
         ));
         // …and a surface the panel cannot end offers no badge at all.
         assert!(close_rect(Surface::Video, W, H).is_none());
+    }
+
+    #[test]
+    fn rest_is_exactly_what_away_from_rest_reports() {
+        // The predicate the idle return is built on (#23), pinned against the operation it
+        // is supposed to describe. They are separate code, and a drift between them is
+        // either a panel that returns Home every two minutes while already there — a
+        // transition animation on an unattended wall, forever — or one that never returns
+        // at all.
+        let mut p = panel();
+        assert!(
+            !p.away_from_rest(),
+            "a fresh panel is at Home with nothing up"
+        );
+
+        // Deeper than Home.
+        p.push(a_screen());
+        assert!(
+            p.away_from_rest(),
+            "two screens deep is somewhere a person put it"
+        );
+        p.rest();
+        assert!(!p.away_from_rest(), "and rest undoes it");
+
+        // The other way: the shell holding the glass over something that is playing, which
+        // is where a press of Home during a film leaves the panel.
+        p.set_surface(Surface::Video, true);
+        assert_eq!(p.focus(), Focus::Session, "a session takes the glass");
+        assert!(!p.away_from_rest(), "…and that is the resting arrangement");
+        p.go_home();
+        assert_eq!(p.focus(), Focus::Shell);
+        assert!(
+            p.away_from_rest(),
+            "the shell over a playing session is away from rest, or the film never returns"
+        );
+        p.rest();
+        assert!(!p.away_from_rest());
+        assert_eq!(
+            p.focus(),
+            Focus::Session,
+            "and the film has the glass again"
+        );
+    }
+
+    #[test]
+    fn a_panel_with_no_shell_is_never_away_from_rest() {
+        // The offscreen harness and the headless tap. There are no screens to return from,
+        // and a session there already has the glass — so an idle return would be a
+        // transition to nowhere, repeating for as long as the process ran.
+        let mut p = Panel::new();
+        assert_eq!(p.depth(), 0);
+        assert!(!p.away_from_rest());
+        p.set_surface(Surface::Video, true);
+        assert!(!p.away_from_rest());
     }
 
     #[test]

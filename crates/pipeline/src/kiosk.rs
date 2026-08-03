@@ -220,6 +220,12 @@ impl KioskApp {
             sink.cancel_all();
         }
         if let Some(render) = self.render.as_mut() {
+            // Going Home is somebody using the panel, whether the press came from the
+            // glass, the edge swipe or a remote. It has to count as one, or the idle
+            // return has no touch to date itself from: a remote pressing Home over a film
+            // leaves the shell holding the glass, which is away from rest, and the film
+            // would never come back (#23).
+            render.note_touch();
             // One call, and everything that is up follows it: a fullscreen page minimizes
             // into the widget slot, video demotes to its corner, a card to the slot. There
             // used to be a step here that reached into the browser to minimize it by hand,

@@ -27,6 +27,21 @@ use crate::wgpu_compositor::{TexelFormat, WgpuCompositor};
 /// How long after a touch the panel counts as in use, for the idle return (#27).
 const IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long the panel stays where somebody left it before returning to rest (#23).
+///
+/// The lifecycle had a way home for every *press* — the pill, the edge swipe, a remote's
+/// Home button, `Panel::back` walking out one step at a time — and none for the person who
+/// simply walks away, which on a wall panel is how most sessions with it end. Until this,
+/// a panel left two screens deep at closing time was still two screens deep the next
+/// morning, and a film someone pressed Home over never came back.
+///
+/// Two minutes rather than the twenty seconds of [`IDLE_GRACE`], because the two answer
+/// different questions. That one is "is somebody mid-interaction, so a *session* claiming
+/// the glass would be rude"; this one is "has somebody gone". Long enough to read a
+/// settings screen without it closing itself, short enough that the next person finds the
+/// panel as the panel is meant to look.
+const HOME_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// How long a requested video/card clear is held before it takes effect, so a control
 /// point that "seeks" by stopping and re-loading the item (VLC's live streams do this
 /// on every scrub) replaces the picture instead of flashing the idle screen between the
@@ -2750,9 +2765,19 @@ impl RenderLoop {
         self.tick_transition(dt);
         self.tick_motion(dt);
         self.tick_transport();
+        self.tick_home_return();
         self.update_osd();
         self.present_and_serve_taps();
         self.demand(self.clock.now())
+    }
+
+    /// Return the panel to rest if it has been left alone long enough (#23).
+    fn tick_home_return(&mut self) {
+        let now = self.clock.now();
+        if self.home_return_due(now).is_some_and(|due| now >= due) {
+            info!("shell: nobody has touched the panel for a while; returning it to rest");
+            self.rest_panel();
+        }
     }
 
     /// When this loop next owes the glass a frame, from standing facts alone.
@@ -2775,6 +2800,7 @@ impl RenderLoop {
             self.video_clear_due,
             self.card_clear_due,
             self.transport_due(now),
+            self.home_return_due(now),
             self.osd
                 .as_ref()
                 .and_then(crate::osd::OsdController::next_change),
@@ -3381,6 +3407,27 @@ impl RenderLoop {
             info!("shell: a session claimed the panel, but it was touched recently; staying put");
             return;
         }
+        self.rest_panel();
+    }
+
+    /// When the panel should put itself back to rest, if it should (#23).
+    ///
+    /// Standing facts only — where the panel is, and when it was last touched — so there
+    /// is no timer to arm and none to cancel, and a gesture that moves the panel back
+    /// simply stops the answer existing. Same discipline as everything else [`Self::demand`]
+    /// reads.
+    ///
+    /// `None` when the panel is already at rest, and when nothing has ever touched it: a
+    /// panel gets away from rest because somebody navigated it, and a session claiming the
+    /// glass is [`Self::rest_panel_if_idle`]'s business rather than this one's.
+    fn home_return_due(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
+        let last = self.last_touch?;
+        self.panel.away_from_rest().then(|| last + HOME_AFTER)
+    }
+
+    /// Put the panel back to rest, whoever asked. Animates the way a press Home does, so
+    /// an idle return and a deliberate one are one behaviour rather than two.
+    fn rest_panel(&mut self) {
         let deep = self.panel.depth() > 1;
         if deep {
             let leaving = match self.panel.current_origin() {

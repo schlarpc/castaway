@@ -1971,3 +1971,70 @@ cross-session policy is expressed yet. Device *selection* now reaches a live ses
 a test that changes it mid-session. Party mix (#72) is unblocked by this and not done by it:
 the mixer sums, but the session model, volume authority and metadata questions in that issue
 are untouched.
+
+### D53 — The panel's lifecycle, and the one transition nobody was making
+
+**2026-08-03.** #23 asked for the lifecycle of the app's screens, the transitions between
+them, and the return-to-home gesture and policy. Most of it existed and was not written
+down in one place; one part of it did not exist at all.
+
+#### The model, as it stands
+
+`panel::Panel` is the whole of "what is on the glass" (D38), derived from three standing
+facts: which screens are stacked, which surfaces exist, and whether the shell has been
+asked forward. Everything else — focus, placement, what a press means — is a function of
+those. There is no state machine to get out of step, because there is no state beyond
+those three.
+
+**Screens** are a stack with Home at the bottom. `push_from` carries the rect a screen grew
+out of, so `back` can play the entrance in reverse; `pop_screen` is one step, `go_home` is
+all the way. **Surfaces** — video, card, page, idle widget — are present or not, and where
+each one *goes* is `Placement`, derived per surface from focus and the current screen.
+
+**Transitions** are `motion`'s: springs and one choreography table, pure and unit-tested
+with no GPU (D46).
+
+**Going out** is `Panel::back`, and its ordering is the decision worth restating: leave a
+fullscreen session *before* the screen underneath it. A session is demoted, never stopped —
+pressing Home in the middle of a film is not asking for it to end — and demoted *together*,
+video to its corner and card and page to the widget slot, because the alternative left the
+pill, the PiP and the card each believing something different about who had the glass.
+
+**Rest** is the arrangement the panel returns to: Home, with the glass handed to whatever
+is playing. It is what both ends of a session ask for.
+
+#### What was missing: rest had no clock
+
+Every route home was a *press* — the pill, the edge swipe, a remote's Home button, `back`
+walking out a step at a time — and there was no route for the person who simply walks away,
+which on a wall panel is how most sessions with it end. `rest_panel_if_idle` existed and
+fired only when a *session* claimed the glass. So a panel left two screens deep at closing
+time was still two screens deep the next morning, and a film someone pressed Home over
+never came back.
+
+`HOME_AFTER` is two minutes, and it is deliberately not `IDLE_GRACE`'s twenty seconds:
+those answer different questions. `IDLE_GRACE` is "is somebody mid-interaction, so a
+session claiming the glass would be rude". This is "has somebody gone".
+
+**It is a per-frame predicate, not a timer.** `Panel::away_from_rest` is derived — deeper
+than Home, or the shell holding the glass over something playing — and `home_return_due`
+is that plus the last touch. Nothing arms it and nothing has to cancel it: a gesture that
+moves the panel back simply stops the answer existing. `demand` reads it like every other
+deadline, so the loop sleeps the two minutes rather than polling them (#59), and the
+kiosk's own Home path had to start counting as a touch or a remote's press would leave a
+panel it could never date the return from.
+
+The predicate and `rest` are separate code saying the same thing, so they are pinned
+against each other: a drift is either a transition to where the panel already is, repeating
+forever on an unattended wall, or a return that never comes.
+
+#### Not done
+
+`HOME_AFTER` is a constant rather than config; nobody has asked to tune it and a wall panel
+with a two-minute idle is not obviously a preference. The return is not *announced* — no
+banner, no fade cue — and on a panel somebody is looking at but not touching, a screen
+sliding away unprompted may want one. And nothing distinguishes "away from rest because
+somebody navigated" from "away because a remote peer did"; a phone driving the panel from
+across the room is touching it as far as this is concerned, which is right, but its
+contacts arrive through the same path and have not been checked against this policy on real
+hardware.
