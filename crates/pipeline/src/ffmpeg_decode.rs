@@ -119,6 +119,79 @@ pub struct MediaLayout {
 /// preempted session goes quiet promptly.
 pub const AUDIO_QUEUE: usize = 64;
 
+/// How many video packets may be held back waiting for their turn to be decoded.
+///
+/// This queue exists to break a deadlock, not to buffer for its own sake — see
+/// [`VIDEO_DECODE_LEAD`] for the deadlock. It holds *packets*, which is why it can be
+/// generous: a second of 1080p60 VP8 is a few hundred kilobytes, where a second of the
+/// same content decoded is half a gigabyte.
+///
+/// Four seconds at 60 fps. It should never fill on a well-interleaved file — the audio
+/// queue reaches its bound first and blocks the demuxer, which is the throttle the whole
+/// session is meant to run on — so a full one means video is running far ahead of audio
+/// in the container, and holding it is better than either dropping it or stalling on it.
+const VIDEO_PACKET_QUEUE: usize = 240;
+
+/// How far ahead of the clock a video packet is decoded.
+///
+/// The number that stops the demuxer deadlocking against itself. Video used to be decoded
+/// the instant its packet was read and then *held* — inside the demux loop — until the
+/// clock said it was due. But this thread is the only producer of the audio that drives
+/// that clock, and the clock deliberately reads `submitted - OUTPUT_LEAD`: to present a
+/// frame at `T` the demuxer must first have read audio to `T + 250ms`, which is precisely
+/// what it cannot do while it is asleep holding the frame at `T`.
+///
+/// Measured on a VP8 1080p60 + Vorbis WebM before the fix (#52): `drain_paced` slept
+/// 235–251 ms per video packet, the clock advanced 17 ms per 250 ms of wall — 0.11× — and
+/// the picture came out at 5.5 fps instead of 60. The audio queue never filled once, so
+/// the documented throttle never got to act. It was not a slow clock; it was two halves of
+/// one thread waiting for each other.
+///
+/// So a video packet now waits *as a packet*, which costs nothing to hold, and the loop
+/// goes back to reading — which is what lets audio through, which is what advances the
+/// clock, which is what makes the packet due. The lead is one frame interval's worth of
+/// slack so the decode is finished by the time the frame is wanted; the fine pacing is
+/// still `drain_paced`'s, and its wait is now bounded by this rather than by the output
+/// lead.
+const VIDEO_DECODE_LEAD: Duration = Duration::from_millis(40);
+
+/// The longest single sleep anywhere on the pacing path.
+///
+/// Sleeps are sliced so neither a preemption nor a seek is stuck behind a long hold: a
+/// *paused* session's clock never advances, so a frame waiting for its turn waits
+/// forever, and without slicing that leaks the thread and its decoder — one per paused
+/// session, in silence.
+const PACING_SLICE: Duration = Duration::from_millis(50);
+
+/// The longest a held packet waits for its turn once the container is exhausted.
+///
+/// An item whose video outlasts its audio ends with a clock that has stopped, because its
+/// master has run out. The last few frames should still be presented rather than held
+/// against a turn that will never come.
+const EOF_HOLD: Duration = Duration::from_secs(2);
+
+/// Whether `packet` is close enough to the clock to be worth decoding now.
+///
+/// `true` when there is no timestamp to judge by and when the clock has not started: the
+/// first packet of an item must go in, or a file with no audio never seeds the video
+/// master clock and nothing is ever due.
+fn packet_due(
+    packet: &ffmpeg::codec::packet::Packet,
+    time_base: ffmpeg::Rational,
+    clock: &crate::clock::MediaClock,
+) -> bool {
+    // Presentation time, not decode time. Packets are *sent* in container order either
+    // way — this only decides when — and gating on the time the picture is wanted is what
+    // keeps a reordered stream's B-frames from arriving before their turn.
+    let Some(ts) = packet.pts().or_else(|| packet.dts()) else {
+        return true;
+    };
+    let at = rescale_to_duration(ts, time_base);
+    clock
+        .wait_for(at.saturating_sub(VIDEO_DECODE_LEAD))
+        .is_none()
+}
+
 /// Decode `uri`, presenting video against `clock` and sending decoded audio to `audio`.
 ///
 /// The pacing story in one place, because it is the thing that was missing entirely:
@@ -259,6 +332,11 @@ where
         None => None,
     };
     let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
+    // Video packets read but not yet due. See `VIDEO_DECODE_LEAD` — this is the queue that
+    // keeps the demuxer reading (and so keeps audio flowing, and so keeps the clock
+    // moving) while a picture waits for its turn.
+    let mut held: std::collections::VecDeque<ffmpeg::codec::packet::Packet> =
+        std::collections::VecDeque::new();
 
     // A manual loop rather than `for … in ictx.packets()`, because a seek needs `&mut
     // ictx` and the iterator holds it for the length of the loop. Taking the iterator one
@@ -270,6 +348,10 @@ where
         }
         if let Some(control) = seek {
             if let Some(target) = control.take() {
+                // Everything held is from before the seek. Keeping it would decode the old
+                // position's pictures after the demuxer had already moved — the video half
+                // of the stale-audio problem `do_seek` step 3 is about.
+                held.clear();
                 do_seek(
                     &mut ictx,
                     video_decoder.as_mut(),
@@ -286,13 +368,18 @@ where
             }
         }
 
-        let Some((stream, packet)) = ictx.packets().next() else {
-            break;
-        };
-        let index = stream.index();
-
-        if let (Some((vi, time_base, _)), Some(decoder)) = (&video, video_decoder.as_mut()) {
-            if index == *vi {
+        // Anything held whose turn has come, before reading more. A packet is due when
+        // the clock has reached its decode timestamp less `VIDEO_DECODE_LEAD`; decode
+        // order rather than presentation order, because that is the order a decoder has
+        // to be fed and it is never later than the presentation time.
+        if let (Some((_, time_base, _)), Some(decoder)) = (&video, video_decoder.as_mut()) {
+            while held
+                .front()
+                .is_some_and(|p| packet_due(p, *time_base, clock))
+            {
+                let Some(packet) = held.pop_front() else {
+                    break;
+                };
                 decoder.send_packet(&packet).map_err(map_err)?;
                 hw.check_negotiation()?;
                 match drain_paced(
@@ -309,6 +396,27 @@ where
                     Drained::Stopped => return Ok(SessionEnd::Finished),
                     Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
                 }
+            }
+        }
+        // Nothing due and nowhere to put another. Only reachable when video runs far ahead
+        // of audio in the container — normally the audio queue's bound is what stops the
+        // demuxer, and it is the throttle this session is meant to run on.
+        if held.len() >= VIDEO_PACKET_QUEUE {
+            std::thread::sleep(PACING_SLICE);
+            continue;
+        }
+
+        let Some((stream, packet)) = ictx.packets().next() else {
+            break;
+        };
+        let index = stream.index();
+
+        if let Some((vi, _, _)) = &video {
+            if index == *vi {
+                // Held rather than decoded-and-held: a packet costs nothing to keep, and
+                // going back round the loop is what lets the audio through that this
+                // packet is waiting on.
+                held.push_back(packet);
                 continue;
             }
         }
@@ -340,8 +448,51 @@ where
         }
     }
 
-    // Flush the video decoder so the last frames of the item are not left inside it.
+    // Flush the video decoder so the last frames of the item are not left inside it —
+    // and everything still held, which is the tail of the item and is now the only place
+    // it exists.
     if let (Some(decoder), Some((_, time_base, _))) = (video_decoder.as_mut(), &video) {
+        while let Some(packet) = held.pop_front() {
+            // Still gated, and this is load-bearing rather than symmetry: for a file with
+            // no audio the gate *is* the pacing, and a tail drained as fast as it decodes
+            // plays the end of every silent item at whatever speed the CPU manages.
+            //
+            // Waiting here cannot deadlock the way waiting in the packet loop did: there
+            // is nothing left to read, so nothing is being starved. It is bounded anyway,
+            // because a clock whose master has run out — an item whose video outlasts its
+            // audio — freezes, and the last frames should still be shown.
+            let until = std::time::Instant::now() + EOF_HOLD;
+            while !packet_due(&packet, *time_base, clock) {
+                if stop() {
+                    return Ok(SessionEnd::Finished);
+                }
+                if seek.is_some_and(crate::seek::SeekControl::pending)
+                    || std::time::Instant::now() >= until
+                {
+                    break;
+                }
+                std::thread::sleep(PACING_SLICE);
+            }
+            if stop() {
+                return Ok(SessionEnd::Finished);
+            }
+            decoder.send_packet(&packet).map_err(map_err)?;
+            hw.check_negotiation()?;
+            match drain_paced(
+                decoder,
+                hw,
+                &mut scaler,
+                *time_base,
+                clock,
+                seek,
+                stop,
+                on_frame,
+            )? {
+                Drained::Continue => {}
+                Drained::Stopped => return Ok(SessionEnd::Finished),
+                Drained::Restart => return Ok(SessionEnd::RebuildInSoftware),
+            }
+        }
         decoder.send_eof().map_err(map_err)?;
         if let Drained::Restart = drain_paced(
             decoder,
@@ -1004,7 +1155,19 @@ where
         // twist: scrubbing a *paused* session is the ordinary way people find a spot, and
         // that is precisely the state where the clock never advances, so a frame waiting
         // its turn would swallow the seek until somebody pressed play.
-        const SLICE: Duration = Duration::from_millis(50);
+        // Fine pacing only, and *bounded*, which is the half of #52 the packet gate
+        // cannot do on its own. Coarse pacing is `packet_due`'s: a packet is not sent to
+        // the decoder until the clock is within `VIDEO_DECODE_LEAD` of wanting it, so by
+        // the time a frame reaches here it is at most that far early and this loop has at
+        // most that long to wait.
+        //
+        // The bound is not a nicety. This is the demux thread, and it is the only producer
+        // of the audio that advances the clock it is waiting on — an unbounded wait here
+        // is a thread waiting for itself, which is exactly what made a 60 fps cast play at
+        // two frames a second. With the bound the worst case is a frame presented up to
+        // `VIDEO_DECODE_LEAD` early, which is inside anyone's lip-sync tolerance and is
+        // not a direction that accumulates.
+        let hold_until = std::time::Instant::now() + VIDEO_DECODE_LEAD;
         loop {
             if stop() {
                 return Ok(Drained::Stopped);
@@ -1012,14 +1175,23 @@ where
             if seek_pending() {
                 return Ok(Drained::Continue);
             }
+            // A pause is the one wait that is *not* bounded, and must not be: the clock is
+            // frozen on purpose, the demuxer running ahead would be decoding a paused
+            // session, and nothing here can end it — only the source can. Sliced so the
+            // thread is still reachable by a stop or a seek, which is what stops a paused
+            // session from leaking its decoder when someone else casts.
             if clock.is_paused() {
-                std::thread::sleep(SLICE);
+                std::thread::sleep(PACING_SLICE);
                 continue;
             }
+            let Some(remaining) = hold_until.checked_duration_since(std::time::Instant::now())
+            else {
+                break;
+            };
             let Some(wait) = clock.wait_for(pts) else {
                 break;
             };
-            std::thread::sleep(wait.min(SLICE));
+            std::thread::sleep(wait.min(PACING_SLICE).min(remaining));
         }
 
         let frame = match hw.export(&mut decoded, pts) {

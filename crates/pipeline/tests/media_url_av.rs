@@ -223,6 +223,103 @@ fn a_silent_video_is_paced_by_the_wall_clock_not_the_cpu() {
     );
 }
 
+#[test]
+fn a_paced_audio_consumer_does_not_stall_the_demuxer_that_feeds_it() {
+    // #52, and the only test here that runs the *real* playback thread rather than a
+    // collector that drains instantly. That substitution is what hid this for so long: the
+    // bug is a deadlock between two halves of one thread, and a consumer with no clock in
+    // the loop cannot express it.
+    //
+    // Video used to be decoded the instant its packet was read and then held, inside the
+    // demux loop, until the media clock said it was due. But the demux thread is the only
+    // producer of the audio that drives that clock, and the clock reads
+    // `submitted - OUTPUT_LEAD`: to present a frame at T it must first read audio to
+    // T + 250 ms, which it cannot do while asleep holding the frame at T. Measured on a
+    // VP8 1080p60 + Vorbis WebM: 0.11x, and a picture at 5.5 fps instead of 60.
+    let path = tmp("paced.webm");
+    if !make(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=6:size=320x240:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=6",
+            "-c:v",
+            "libvpx",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-c:a",
+            "libvorbis",
+        ],
+        &path,
+    ) {
+        eprintln!("skipping: ffmpeg unavailable");
+        return;
+    }
+
+    let clock = Arc::new(pipeline::clock::MediaClock::new());
+    let seek = Arc::new(pipeline::seek::SeekControl::default());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = sync_channel::<castaway_core::PcmFrame>(pipeline::ffmpeg_decode::AUDIO_QUEUE);
+
+    // The real thing: `run_pcm`, paced to real time, against a null sink.
+    pipeline::audio_session::spawn_pcm(
+        rx,
+        Box::new(pipeline::audio_out::NullAudioOut::new()),
+        Arc::clone(&stop),
+        Arc::new(pipeline::audio_session::Gain::default()),
+        Some(pipeline::audio_session::PacedSession {
+            clock: Arc::clone(&clock),
+            seek: Arc::clone(&seek),
+        }),
+    );
+
+    const WATCH: Duration = Duration::from_secs(3);
+    let started = Instant::now();
+    let deadline = started + WATCH;
+    let mut frames = 0usize;
+    decode_av(
+        path.to_str().unwrap(),
+        HwPreference::SoftwareOnly,
+        &clock,
+        Some(&seek),
+        Some(tx),
+        &|| Instant::now() >= deadline,
+        |_l| {},
+        |_frame| {
+            frames += 1;
+            true
+        },
+    )
+    .unwrap();
+    let wall = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let advanced = clock.now().unwrap_or_default();
+    let rate = advanced.as_secs_f64() / wall.as_secs_f64();
+
+    // A wall-clock assertion, deliberately, because "plays in real time" is not a property
+    // that can be asserted any other way. The threshold is a *fifth* of real time against
+    // a bug that produced a ninth of it and a fix that produces all of it — four times the
+    // margin in both directions, so a loaded host cannot flip it (cf. #156).
+    assert!(
+        rate > 0.2,
+        "the media clock advanced {advanced:?} in {wall:?} — {rate:.3}x — so the demuxer is \
+         waiting on a clock only it can advance"
+    );
+    // And the picture that comes with it. 30 fps of source over three seconds is ~90
+    // frames; the deadlock produced single digits.
+    assert!(
+        frames > 30,
+        "{frames} frames in {wall:?}: the video is obeying a clock that is crawling"
+    );
+}
+
 /// Media arrives over **HTTP**, not from a file, on every path that matters: DLNA hands
 /// us a control point's URL, Cast `LOAD` hands us a CDN's, AirPlay the same. So the one
 /// thing worth proving beyond decoding is that the decoder can *fetch*.

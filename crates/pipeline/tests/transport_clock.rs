@@ -387,7 +387,7 @@ fn a_late_reading_is_absorbed_rather_than_yanking_the_bar_back() {
     };
     let mut render = render.with_clock(clock);
 
-    let mut playing = |position: Duration| {
+    let playing = |position: Duration| {
         let mut track = NowPlaying::default().with_title("one");
         track.state = PlaybackState::Playing;
         track.position = Some(position);
@@ -436,7 +436,7 @@ fn a_seek_on_the_phone_snaps_the_bar_rather_than_gliding_it() {
     };
     let mut render = render.with_clock(clock);
 
-    let mut playing = |position: Duration| {
+    let playing = |position: Duration| {
         let mut track = NowPlaying::default().with_title("one");
         track.state = PlaybackState::Playing;
         track.position = Some(position);
