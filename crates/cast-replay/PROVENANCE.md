@@ -33,7 +33,11 @@ repository, and the carves do not need them: each proves its own answer.
   fails;
 * the CKS identity is confirmed by verifying **all 900 windows'** receiver-auth
   signatures against the shipped device certificate before anything is written;
-* the AirPort key is confirmed by its **modulus**.
+* the AirPort key is confirmed by its **modulus**;
+* the CKS field cipher is confirmed only by the **digests below**, which is the weakest
+  of the four and is called out as such in `carve_field_cipher`. A digest proves a new
+  build carries the same bytes that were first read out of Ghidra; it does not prove
+  those bytes are the field cipher. The hand recovery remains the load-bearing step.
 
 What is left here is for a human cross-check: enough to tell whether a carve on a new
 build produced the same thing as the one this file documents, without the file being
@@ -48,15 +52,20 @@ grep-able for the values themselves.
 | S5 | the BLAKE2b personalisation, 16 ASCII bytes | `3121c9e6a028a5bed7d46ed1c6db2c140e2d2c17c8bbf43f38c113a670bb08cb` |
 | S6 | the BLAKE2b key, 64 ASCII bytes | `00bfb779275c89f863a4d2c728c6fbad7e886b342e7ed64123e85ec1b1d98b31` |
 
-S1, S2, S5 and S6 are the carve outputs verbatim, so they check with one command:
+All six are carve outputs verbatim, so they check with two commands:
 
 ```sh
-sha256sum "$(nix build --no-link --print-out-paths .#airreceiver-carve)"/cks_{sig_secret,api_key}.txt
+sha256sum "$(nix build --no-link --print-out-paths .#airreceiver-carve)"/cks_{sig_secret,api_key}.txt \
+          "$(nix build --no-link --print-out-paths .#airreceiver-carve)"/cks_field_{key,iv}.bin
 sha256sum "$(nix build --no-link --print-out-paths .#airserver-carve)"/kek_{person,pass}.bin
 ```
 
-S3 and S4 are read out of `.rodata` rather than written to a file; `src/api.rs` carries
-them and they hash as the 16 raw bytes.
+S3 and S4 joined the carve later than the rest. They were left in `src/api.rs` as byte
+literals when the others were removed, on the reasoning that a fixed key *and* fixed IV
+reused for every field is an encoding rather than encryption and authorises nothing —
+which is true, and is beside the point: it left this repository redistributing two of
+SoftMedia's constants and grep-able for them. They are recovered the same way as the
+rest now, and `CksCredentials` carries all four together.
 
 One derived value is kept in the clear deliberately, in §2's live-request example:
 `sig` for `ts=1700000000` is `6f12c3bf54f1ddd603e7d0a4478c378b`. It is the output of a
@@ -161,6 +170,13 @@ immediate in `.rodata` (`FUN_00425120`):
 key = <16 raw bytes at ELF 0x1413b6>   ([S3](#validation))
 iv  = <16 raw bytes at ELF 0x125820>   ([S4](#validation))
 ```
+
+Both are bare immediates with nothing nearby to anchor on, so `carve_field_cipher`
+finds them by hashing every 16-byte window of `.rodata` against the digests above
+rather than by address; the offsets here are for a human reading the binary. Two
+properties hold in 5.1.7 and are asserted rather than assumed: each occurs exactly
+once in the whole image, and `iv == key ^ 0x10` byte-wise — the latter almost
+certainly just how the pair was generated, so it corroborates and does not identify.
 
 The same cipher wraps the client's own on-disk `cks2` cache record — a fixed key
 *and* fixed IV, reused for every field of every record. `fixtures/pinned_roots.pem`

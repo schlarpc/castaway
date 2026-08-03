@@ -7,6 +7,9 @@ produces is checked in. Two separate things come out, behind two separate barrie
 * **The backend credentials** — the `x-api-key` value and the `sig` secret — sit
   behind a string obfuscator and a relocation table. Recovered with no hardcoded
   offsets and no vendor strings; see below.
+* **The response field cipher** — the AES-128-CTR key and counter block every
+  returned value is encoded under — sits in `.rodata` as two plain 16-byte
+  immediates. Located by digest rather than by address; see `carve_field_cipher`.
 * **The identity** — a Google-issued Cast device certificate, its intermediate, the
   RSA peer key and template, and 900 windows of precomputed receiver-auth signatures
   — sits inside a `dbio` container whose key is computed at runtime. Recovered by
@@ -46,6 +49,10 @@ sanity-checked against the endpoint URL before anything is emitted. There is no
 offline oracle for these two constants — unlike the AirServer carve, whose
 answer a Poly1305 tag proves — so this fails loudly on anything unexpected
 rather than guessing.
+
+The field cipher is the one part of this file that *does* have an oracle, and it is
+the weakest kind: a digest of the answer. See `carve_field_cipher` for why that is
+still worth having and what it does not prove.
 """
 import argparse
 import hashlib
@@ -249,8 +256,8 @@ def log(m):
     print(f"[airreceiver-carve] {m}", file=sys.stderr)
 
 
-def carve(data):
-    elf = Elf(data)
+def carve(data, elf=None):
+    elf = elf or Elf(data)
     key = recover_key(data)
     if key is None:
         raise SystemExit("could not recover the string-obfuscation key")
@@ -306,6 +313,83 @@ def carve(data):
     )
 
 
+# ------------------------------------------------------- the response field cipher
+
+# SHA-256 of the AES-128-CTR key and of the counter block, as the 16 raw bytes each.
+# PROVENANCE §Validation publishes both; they are what makes this carve checkable by a
+# human without the values being written anywhere.
+FIELD_KEY_SHA256 = "2f83f3a7b71cf17a5511e500ddad0c8297afb2ae6deacccb7ac014909b14c987"
+FIELD_IV_SHA256 = "d827af29149d8911eafbb151649c81992712987febd228b864209a769fb27946"
+FIELD_LEN = 16
+
+# The counter block is the key with 0x10 flipped in every byte. Almost certainly how
+# SoftMedia generated the pair rather than anything meaningful, so it is a corroborating
+# observation, not a way to find them: it is asserted after the fact and would fail the
+# build if a future library broke it, which is the point — silence there would mean the
+# assumption had rotted without anyone noticing.
+FIELD_IV_XOR = 0x10
+
+
+def carve_field_cipher(data, elf):
+    """The field cipher's key and counter block, located by digest.
+
+    These two are not strings, so neither of the techniques above reaches them: they
+    are bare 16-byte immediates that `FUN_00425120` loads directly, with nothing
+    nearby to anchor on and no in-binary structure that distinguishes them from any
+    other 16 bytes of `.rodata`.
+
+    So the anchor is their SHA-256, recorded when they were first read out of Ghidra
+    and published in PROVENANCE. Be clear about what that is worth: a digest proves
+    this build contains the same bytes that were recovered by hand, and nothing more.
+    It does not prove those bytes are the field cipher — the hand recovery is still
+    the load-bearing step, and if it was wrong, this agrees with it. That is weaker
+    than the AirServer carve, where a Poly1305 tag makes a wrong answer impossible,
+    and weaker than the identity carve, where 900 signature verifications do.
+
+    What it does buy is the thing this exists for: the constants stop being literals
+    in a public tree, and a human can still confirm a carve of a new build matches the
+    documented one with `sha256sum`. A preimage cannot be faked, so the failure mode
+    is a build that stops, not a receiver that decodes garbage.
+    """
+    if ".rodata" not in elf.sections:
+        raise SystemExit("no .rodata section; the image layout has changed")
+    _, off, size = elf.sections[".rodata"]
+    rodata = data[off : off + size]
+
+    want = {FIELD_KEY_SHA256: None, FIELD_IV_SHA256: None}
+    for i in range(len(rodata) - FIELD_LEN + 1):
+        d = hashlib.sha256(rodata[i : i + FIELD_LEN]).hexdigest()
+        if d in want and want[d] is None:
+            want[d] = off + i
+
+    missing = [d for d, v in want.items() if v is None]
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} of the 2 field-cipher constants are not in .rodata "
+            "under their published digests; the library or the digests have changed"
+        )
+
+    key_at, iv_at = want[FIELD_KEY_SHA256], want[FIELD_IV_SHA256]
+    key = data[key_at : key_at + FIELD_LEN]
+    iv = data[iv_at : iv_at + FIELD_LEN]
+
+    # Corroboration, not identification — see FIELD_IV_XOR.
+    if bytes(b ^ FIELD_IV_XOR for b in key) != iv:
+        raise SystemExit(
+            "the counter block is no longer the key with 0x10 flipped in every byte; "
+            "the pair may still be right, but the assumption recorded here is not"
+        )
+
+    # Both unique in the whole image, which is what lets "found it once" mean anything.
+    for name, pat in (("key", key), ("counter block", iv)):
+        if data.count(pat) != 1:
+            raise SystemExit(f"the field cipher {name} occurs {data.count(pat)} times, not once")
+
+    log(f"  field cipher: key at ELF {key_at:#x}, counter block at {iv_at:#x}")
+    log(f"    both unique in the image, and iv == key ^ {FIELD_IV_XOR:#04x}")
+    return {"key": key, "iv": iv, "key_at": key_at, "iv_at": iv_at}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("lib", type=Path, help="libAirReceiver.so (arm64-v8a)")
@@ -316,12 +400,17 @@ def main():
     log(f"{args.lib} ({len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()})")
     args.out.mkdir(parents=True, exist_ok=True)
     identity = carve_identity(args.lib, data, args.out)
-    r = carve(data)
+    elf = Elf(data)
+    r = carve(data, elf)
     log(f"  endpoint: {r['endpoint'].decode()}")
     log(f"  api key {len(r['api_key'])}B, sig secret {len(r['sig_secret'])}B")
 
+    cipher = carve_field_cipher(data, elf)
+
     (args.out / "cks_api_key.txt").write_bytes(r["api_key"])
     (args.out / "cks_sig_secret.txt").write_bytes(r["sig_secret"])
+    (args.out / "cks_field_key.bin").write_bytes(cipher["key"])
+    (args.out / "cks_field_iv.bin").write_bytes(cipher["iv"])
     (args.out / "carve.json").write_text(
         json.dumps(
             {
@@ -331,6 +420,12 @@ def main():
                 "string_key_sha256": hashlib.sha256(r["string_key"]).hexdigest(),
                 "decodable_strings": r["strings"],
                 "endpoint": r["endpoint"].decode(),
+                "field_cipher": {
+                    "key_at": cipher["key_at"],
+                    "iv_at": cipher["iv_at"],
+                    "key_sha256": FIELD_KEY_SHA256,
+                    "iv_sha256": FIELD_IV_SHA256,
+                },
                 "identity": identity,
             },
             indent=2,

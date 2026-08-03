@@ -178,11 +178,18 @@ fn cks_identity(outdir: &Path) {
     .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
 }
 
-/// The CKS backend credentials, as string literals rather than file includes: they are
-/// two 32-character constants, and `include_str!` would drag their paths into the
+/// The CKS backend credentials, as literals rather than file includes: they are four
+/// short constants, and `include_str!`/`include_bytes!` would drag their paths into the
 /// binary alongside them.
+///
+/// All four travel together — the two request credentials and the two halves of the
+/// response field cipher — because they are one carve and one all-or-nothing state. A
+/// build that could ask the backend for a credential but not decode the answer is not a
+/// state worth being able to represent.
 fn cks_credentials(outdir: &Path) {
     const VAR: &str = "CASTAWAY_AIRRECEIVER_CARVE";
+    /// AES-128: the key and the counter block are both exactly this long.
+    const FIELD_LEN: usize = 16;
     println!("cargo:rustc-check-cfg=cfg(cks_credentials)");
 
     let body = match std::env::var_os(VAR) {
@@ -202,11 +209,27 @@ fn cks_credentials(outdir: &Path) {
                 println!("cargo:rerun-if-changed={}", p.display());
                 v
             };
+            let block = |name: &str| {
+                let p = dir.join(name);
+                let bytes =
+                    std::fs::read(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()));
+                assert!(
+                    bytes.len() == FIELD_LEN,
+                    "{} holds {} bytes; AES-128 takes {FIELD_LEN}",
+                    p.display(),
+                    bytes.len()
+                );
+                println!("cargo:rerun-if-changed={}", p.display());
+                render(&bytes)
+            };
             println!("cargo:rustc-cfg=cks_credentials");
             format!(
-                "Some(CksCredentials {{ api_key: {:?}, sig_secret: {:?} }})",
+                "Some(CksCredentials {{ api_key: {:?}, sig_secret: {:?}, \
+                 field_key: {}, field_iv: {} }})",
                 f("cks_api_key.txt"),
-                f("cks_sig_secret.txt")
+                f("cks_sig_secret.txt"),
+                block("cks_field_key.bin"),
+                block("cks_field_iv.bin"),
             )
         }
     };

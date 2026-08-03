@@ -57,21 +57,32 @@ pub const USER_AGENT: &str = "AirReceiver/1.0.0 CrKey/1.0";
 /// The API key header name.
 pub const API_KEY_HEADER: &str = "x-api-key";
 
-/// SoftMedia's two backend constants: the `x-api-key` value, and the secret `sig` is
-/// derived from (prefixed to `ts`, not keyed over it).
+/// SoftMedia's four backend constants: the `x-api-key` value, the secret `sig` is
+/// derived from (prefixed to `ts`, not keyed over it), and the fixed AES-128-CTR key
+/// and counter block every response field is encoded under.
 ///
-/// **Not literals here.** These are service credentials belonging to someone else, so
-/// they are carved out of `libAirReceiver.so` at build time
-/// (`nix/airreceiver-carve.nix`) and reach the crate through `build.rs`. A build
-/// without them cannot talk to the CKS backend at all — [`request`] returns
-/// [`ReplayError::NoCksCredentials`] — but the offline table is unaffected, so such a
-/// build still authenticates, it just cannot refresh.
+/// **Not literals here.** These belong to someone else, so they are carved out of
+/// `libAirReceiver.so` at build time (`nix/airreceiver-carve.nix`) and reach the crate
+/// through `build.rs`. A build without them cannot talk to the CKS backend at all —
+/// [`request`] returns [`ReplayError::NoCksCredentials`] — but the offline table is
+/// unaffected, so such a build still authenticates, it just cannot refresh.
+///
+/// All four in one struct on purpose. Asking the backend and reading its answer are
+/// halves of one capability: credentials that cannot decode a response would buy
+/// nothing, and a cipher with no credentials would never see one. Keeping them
+/// together means a build has the live path or does not, with no third state for a
+/// caller to get wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CksCredentials {
     /// The `x-api-key` value.
     pub api_key: &'static str,
     /// The constant `sig` is derived from.
     pub sig_secret: &'static str,
+    /// The fixed AES-128-CTR key every response field is encoded under.
+    pub field_key: &'static [u8; 16],
+    /// The fixed counter block. Reused for every field of every response, which is
+    /// what makes this an encoding rather than encryption.
+    pub field_iv: &'static [u8; 16],
 }
 
 include!(concat!(env!("OUT_DIR"), "/cks_credentials.rs"));
@@ -83,16 +94,6 @@ impl CksCredentials {
         CKS_CREDENTIALS
     }
 }
-
-/// The fixed AES-128-CTR key every response field is encoded under.
-const FIELD_KEY: [u8; 16] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // ***REMOVED: PROVENANCE S3***
-];
-
-/// The fixed counter block. Reused for every field of every response.
-const FIELD_IV: [u8; 16] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // ***REMOVED: PROVENANCE S4***
-];
 
 type FieldCipher = ctr::Ctr128BE<aes::Aes128>;
 
@@ -178,21 +179,34 @@ pub struct CksResponse {
 /// Decode a response body.
 ///
 /// # Errors
+/// [`ReplayError::NoCksCredentials`] on a build without the carved field cipher, then
 /// [`ReplayError::Response`] if the body is not JSON, a required key is absent, a
 /// value is not base64, or a signature is not 256 bytes.
 pub fn decode_response(body: &[u8]) -> Result<CksResponse, ReplayError> {
+    decode_response_with(
+        body,
+        CksCredentials::provisioned().ok_or(ReplayError::NoCksCredentials)?,
+    )
+}
+
+/// Decode a response body under explicit credentials, so the codec is testable
+/// without SoftMedia's. Mirrors [`sig_with`].
+///
+/// # Errors
+/// As [`decode_response`], less the credential check.
+pub fn decode_response_with(body: &[u8], c: CksCredentials) -> Result<CksResponse, ReplayError> {
     let raw: RawResponse = serde_json::from_slice(body)
         .map_err(|e| ReplayError::Response(format!("body is not the expected JSON object: {e}")))?;
 
-    let peer_key = unwrap_field(&raw.pri, "pri")?;
+    let peer_key = unwrap_field(&raw.pri, "pri", c)?;
     let response = CksResponse {
-        ica: unwrap_field(&raw.ica, "ica")?,
-        device_cert: unwrap_field(&raw.cpu, "cpu")?,
-        peer_cert: unwrap_field(&raw.r#pub, "pub")?,
+        ica: unwrap_field(&raw.ica, "ica", c)?,
+        device_cert: unwrap_field(&raw.cpu, "cpu", c)?,
+        peer_cert: unwrap_field(&raw.r#pub, "pub", c)?,
         peer_key_pem: String::from_utf8(peer_key)
             .map_err(|e| ReplayError::Response(format!("pri is not text: {e}")))?,
-        sha1: unwrap_field(&raw.sha1, "sha1")?,
-        sha256: unwrap_field(&raw.sha256, "sha256")?,
+        sha1: unwrap_field(&raw.sha1, "sha1", c)?,
+        sha256: unwrap_field(&raw.sha256, "sha256", c)?,
         now: raw.now,
     };
     for (what, sig) in [("sha1", &response.sha1), ("sha256", &response.sha256)] {
@@ -251,20 +265,20 @@ impl CksResponse {
 }
 
 /// base64, then AES-128-CTR.
-fn unwrap_field(value: &str, name: &str) -> Result<Vec<u8>, ReplayError> {
+fn unwrap_field(value: &str, name: &str, c: CksCredentials) -> Result<Vec<u8>, ReplayError> {
     let mut bytes = base64::engine::general_purpose::STANDARD
         .decode(value.as_bytes())
         .map_err(|e| ReplayError::Response(format!("{name} is not base64: {e}")))?;
-    FieldCipher::new(&FIELD_KEY.into(), &FIELD_IV.into()).apply_keystream(&mut bytes);
+    FieldCipher::new(c.field_key.into(), c.field_iv.into()).apply_keystream(&mut bytes);
     Ok(bytes)
 }
 
 /// The inverse of [`unwrap_field`]. Only used to build test fixtures — the
 /// keystream is fixed, so encoding and decoding are the same operation.
 #[cfg(test)]
-fn wrap_field(plain: &[u8]) -> String {
+fn wrap_field(plain: &[u8], c: CksCredentials) -> String {
     let mut bytes = plain.to_vec();
-    FieldCipher::new(&FIELD_KEY.into(), &FIELD_IV.into()).apply_keystream(&mut bytes);
+    FieldCipher::new(c.field_key.into(), c.field_iv.into()).apply_keystream(&mut bytes);
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -273,11 +287,17 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// Credentials of our own, so the derivation is testable without SoftMedia's.
-    /// The expected digest is `MD5("castaway-test-secret" + "1700000000")`.
+    /// Credentials of our own, so the derivation and the codec are testable without
+    /// SoftMedia's. The expected digest is `MD5("castaway-test-secret" + "1700000000")`.
+    ///
+    /// The field cipher here is ours too, which is what lets the response tests run on
+    /// an unprovisioned build: what they assert is that base64-over-CTR round-trips and
+    /// that malformed bodies are rejected, and neither depends on *which* key it is.
     const TEST_CREDS: CksCredentials = CksCredentials {
         api_key: "00112233445566778899aabbccddeeff",
         sig_secret: "castaway-test-secret",
+        field_key: b"castaway-fieldk1",
+        field_iv: b"castaway-fieldiv",
     };
 
     /// The shape of the derivation — secret first, then the decimal timestamp,
@@ -337,23 +357,34 @@ mod tests {
         assert!(matches!(sig(1), Err(ReplayError::NoCksCredentials)));
     }
 
+    /// Without the carve the response codec is unavailable too, and says so — the
+    /// live path is one capability, not two.
+    #[test]
+    #[cfg_attr(cks_credentials, ignore = "this build has the credentials")]
+    fn an_unprovisioned_build_refuses_to_decode_a_response() {
+        assert!(matches!(
+            decode_response(&body(256)),
+            Err(ReplayError::NoCksCredentials)
+        ));
+    }
+
     fn body(sha1_len: usize) -> Vec<u8> {
         format!(
             r#"{{"ica":"{}","cpu":"{}","pub":"{}","pri":"{}",
                  "sha1":"{}","sha256":"{}","now":1785339945,"nb":1,"na":2}}"#,
-            wrap_field(b"ica-der"),
-            wrap_field(b"cpu-der"),
-            wrap_field(b"pub-der"),
-            wrap_field(b"-----BEGIN PRIVATE KEY-----\n"),
-            wrap_field(&vec![0xAA; sha1_len]),
-            wrap_field(&vec![0xBB; 256]),
+            wrap_field(b"ica-der", TEST_CREDS),
+            wrap_field(b"cpu-der", TEST_CREDS),
+            wrap_field(b"pub-der", TEST_CREDS),
+            wrap_field(b"-----BEGIN PRIVATE KEY-----\n", TEST_CREDS),
+            wrap_field(&vec![0xAA; sha1_len], TEST_CREDS),
+            wrap_field(&vec![0xBB; 256], TEST_CREDS),
         )
         .into_bytes()
     }
 
     #[test]
     fn decodes_every_field_through_the_fixed_keystream() {
-        let r = decode_response(&body(256)).unwrap();
+        let r = decode_response_with(&body(256), TEST_CREDS).unwrap();
         assert_eq!(r.ica, b"ica-der");
         assert_eq!(r.device_cert, b"cpu-der");
         assert_eq!(r.peer_cert, b"pub-der");
@@ -363,18 +394,41 @@ mod tests {
         assert_eq!(r.now, 1_785_339_945);
     }
 
+    /// One counter block for every field of every response, so the keystream a field
+    /// gets depends only on its length. Asserting it here means the property survives
+    /// the constants moving out of this file — a carve that returned a per-call IV
+    /// would still decode a round-trip, and would still be wrong.
+    #[test]
+    fn every_field_shares_one_keystream() {
+        let a = wrap_field(b"the same sixteen", TEST_CREDS);
+        let b = wrap_field(b"the same sixteen", TEST_CREDS);
+        assert_eq!(a, b);
+        // And a prefix relationship, which only holds if the counter starts over.
+        let long = wrap_field(b"the same sixteen bytes, then more", TEST_CREDS);
+        let short = wrap_field(b"the same sixteen", TEST_CREDS);
+        let (long, short) = (
+            base64::engine::general_purpose::STANDARD
+                .decode(long)
+                .unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(short)
+                .unwrap(),
+        );
+        assert_eq!(&long[..short.len()], &short[..]);
+    }
+
     /// Unknown keys are ignored rather than fatal: `nb`/`na` are present in live
     /// responses and the reference client does not read them, so the backend is
     /// free to add more.
     #[test]
     fn unknown_keys_do_not_break_decoding() {
-        assert!(decode_response(&body(256)).is_ok());
+        assert!(decode_response_with(&body(256), TEST_CREDS).is_ok());
     }
 
     #[test]
     fn a_truncated_signature_is_rejected() {
         assert!(matches!(
-            decode_response(&body(128)),
+            decode_response_with(&body(128), TEST_CREDS),
             Err(ReplayError::Response(_))
         ));
     }
@@ -383,7 +437,7 @@ mod tests {
     fn a_missing_key_is_rejected() {
         let body = br#"{"ica":"","cpu":"","pub":"","pri":"","sha1":""}"#;
         assert!(matches!(
-            decode_response(body),
+            decode_response_with(body, TEST_CREDS),
             Err(ReplayError::Response(_))
         ));
     }
@@ -391,7 +445,7 @@ mod tests {
     #[test]
     fn a_non_json_body_is_rejected() {
         assert!(matches!(
-            decode_response(b"<html>502 Bad Gateway</html>"),
+            decode_response_with(b"<html>502 Bad Gateway</html>", TEST_CREDS),
             Err(ReplayError::Response(_))
         ));
     }
