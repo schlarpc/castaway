@@ -6,10 +6,26 @@
 # `#[expect(clippy::disallowed_methods)]` with a reason naming its registry entry;
 # test modules allow the lint wholesale — tests bind ephemeral loopback sockets that
 # never face the LAN.
+#
+# The two `tokio` entries carry `allow-invalid = true` and the three `std`/`socket2` ones
+# do not, which is a real distinction rather than an oversight (#155). The workspace pins
+# `tokio` with `default-features = false`, so a crate that does not name the `net` feature
+# has no `tokio::net` in its dependency graph and the path cannot resolve there. Clippy
+# says so, once per compilation unit, in every such crate — `castaway-core`, `input-touch`
+# and `pipeline` today. Nothing is being missed when that happens: a crate that cannot
+# resolve `tokio::net::TcpListener` cannot call it either.
+#
+# `allow-invalid` also turns off clippy's check that the path is still real, which is the
+# reason it is not simply applied to everything. That check is not lost, it is moved:
+# `surface::tests::allow_invalid_entries_are_pinned_by_a_compile_time_reference` names both
+# functions from `castaway`, which does have `net`, so a rename fails to *build*. It also
+# asserts that these two are the only exempt entries, so exempting a third without pinning
+# it fails the test. Do not remove the flags to "restore" the typo check — that trades a
+# hard compile error for a warning, and brings the noise back.
 
 disallowed-methods = [
-  { path = "tokio::net::TcpListener::bind", reason = "unregistered listener — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
-  { path = "tokio::net::UdpSocket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
+  { path = "tokio::net::TcpListener::bind", reason = "unregistered listener — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it", allow-invalid = true },
+  { path = "tokio::net::UdpSocket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it", allow-invalid = true },
   { path = "std::net::TcpListener::bind", reason = "unregistered listener — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
   { path = "std::net::UdpSocket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },
   { path = "socket2::Socket::bind", reason = "unregistered socket — add an entry in crates/app/src/surface.rs, then #[expect] this lint at the bind site naming it" },

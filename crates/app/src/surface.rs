@@ -1151,6 +1151,62 @@ mod tests {
         assert!(parse(&["--network-surface=yaml"]).is_err());
     }
 
+    /// `clippy.toml`'s two `tokio` bind entries are exempt from clippy's own check that
+    /// the path still resolves (`allow-invalid = true`, #155). This is that check, moved
+    /// somewhere it can actually run.
+    ///
+    /// Two ways those entries can go dead, and one assertion each. A rename upstream is
+    /// caught by *naming* the functions: `castaway` depends on tokio with `net`, so the
+    /// references below stop compiling if either moves. A typo in the file is caught by
+    /// reading it back — the exempt set has to be exactly the set pinned here, so
+    /// exempting a third entry, or misspelling one of these two, fails.
+    ///
+    /// Both matter because the lint is the only thing standing between an unregistered
+    /// bind and a port the firewall never opens, and an entry that silently matches
+    /// nothing fails open.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "naming these two binds is the point — it is what makes an upstream \
+                  rename a compile error; no socket is bound here"
+    )]
+    #[test]
+    fn allow_invalid_entries_are_pinned_by_a_compile_time_reference() {
+        // Naming them *is* the test: this does not compile if the path moves.
+        let _ = tokio::net::TcpListener::bind::<std::net::SocketAddr>;
+        let _ = tokio::net::UdpSocket::bind::<std::net::SocketAddr>;
+        const PINNED: &[&str] = &[
+            "tokio::net::TcpListener::bind",
+            "tokio::net::UdpSocket::bind",
+        ];
+
+        // One entry per line, which is how the file is written and has to stay for this
+        // scan to mean anything — hence the parse failure below rather than a skip.
+        // Comments are dropped first: the header above this table discusses
+        // `allow-invalid` in prose, and prose is not an entry.
+        let exempt: Vec<&str> = include_str!("../../../clippy.toml")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| line.contains("allow-invalid = true"))
+            .map(|line| {
+                let rest = line
+                    .split_once("path = \"")
+                    .unwrap_or_else(|| panic!("clippy.toml entry has no quoted path: {line}"))
+                    .1;
+                rest.split_once('"')
+                    .unwrap_or_else(|| panic!("clippy.toml path is unterminated: {line}"))
+                    .0
+            })
+            .collect();
+
+        assert_eq!(
+            exempt, PINNED,
+            "every clippy.toml entry with `allow-invalid = true` must also be named \
+             above, so that a rename is a compile error here instead of an entry that \
+             silently matches nothing"
+        );
+    }
+
     #[test]
     fn disabling_a_protocol_closes_its_ports_in_the_resolved_view() {
         let toml = "[enable]\nairplay = false\ncast = false\n";
