@@ -163,6 +163,11 @@ async fn handle_completion<EpType: BulkOrInterrupt>(
             // Sound to clear here precisely because this endpoint carries one transfer at
             // a time: the completion we are holding was the only one in flight, so
             // nothing is pending while the CLEAR_FEATURE goes out.
+            //
+            // Awaiting this needs nusb's `tokio` feature, and needs it at *runtime*: a
+            // `MaybeFuture` awaited without it panics rather than failing to compile, so
+            // this line was a live panic on the one path that exists to keep a session
+            // alive. See the dependency's comment in Cargo.toml — do not drop that feature.
             endpoint
                 .clear_halt()
                 .await
@@ -535,5 +540,28 @@ mod tests {
             }
             Err(e) => panic!("enumeration should succeed even with no devices: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_nusb_blocking_call_can_be_awaited_from_the_runtime() {
+        // Guards a live panic, not a style preference. nusb 0.2 models its blocking
+        // syscalls as `MaybeFuture`: `.wait()` runs one synchronously, `.await` hands it
+        // to `spawn_blocking` — but only if the crate was built with its `tokio` feature.
+        // Without it, awaiting compiles fine and **panics at runtime**:
+        //
+        //   Awaiting blocking syscall without an async runtime: enable the `smol` or
+        //   `tokio` feature of nusb.
+        //
+        // The one place this transport awaits one is the endpoint stall recovery in
+        // `handle_completion`, so the panic sat on the single path that exists to keep a
+        // session alive through a stall — and a controller duly stalled mid-session and
+        // took the receiver down with it at exactly the moment it should have recovered.
+        //
+        // `list_devices` is awaited here rather than `clear_halt` because it is the same
+        // `MaybeFuture` machinery with no hardware attached, so this runs in CI.
+        let _ = nusb::list_devices()
+            .await
+            .map(std::iter::Iterator::count)
+            .unwrap_or(0);
     }
 }
