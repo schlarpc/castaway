@@ -58,3 +58,8 @@ htmlcov/
 # RE shell; a stray `__pycache__` from the latter got committed once (5638ce7).
 __pycache__/
 *.pyc
+
+# Bench output: HCI captures, fetched cover art, and pairing link keys. The keys are
+# secrets and the captures are large; the fixtures worth keeping live in
+# crates/proto-bluetooth-audio/tests/fixtures/ and are added deliberately.
+/capture/

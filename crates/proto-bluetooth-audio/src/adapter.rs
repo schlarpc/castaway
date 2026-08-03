@@ -1842,11 +1842,21 @@ impl BluetoothAdapter {
 
     /// Fetch a larger form than the thumbnail, if the peer listed one.
     ///
-    /// The open half of #75. Whether a listed 280×280 over a 200×200 native is a genuine
-    /// render or an upscale cannot be told from the listing — iOS renders artwork on
-    /// demand rather than storing it, so BIP's "native is the stored form" does not bind
-    /// it — and the only way to find out is to fetch it and compare. Under the same gate
-    /// as the listing itself, for the same reason.
+    /// **Measured, and worth doing** (#75). An iPhone lists a 280×280 variant over a
+    /// 200×200 native from every app — VLC on local files, YouTube Music, Apple Music, all
+    /// identical — and the 280 is a *genuine render*, not a resample of the 200: it
+    /// carries 2.5–3.9× the spectral energy above the 200/280 Nyquist cutoff that a
+    /// bicubic upscale can physically contain, and a bicubic upscale scores only 25–31 dB
+    /// against it where this project's own blit work calls 57 dB pixel-exact. So the
+    /// second fetch buys 1.96× the pixels with real detail in them.
+    ///
+    /// The listing alone could never have said so, which is why the code went and looked:
+    /// BIP defines `native` as the *stored* form and variants as derived from it, but iOS
+    /// stores nothing — it renders from `MPMediaItemArtwork` on demand — so the spec's
+    /// data model does not describe what the peer is doing.
+    ///
+    /// Still under the properties gate, which now needs re-weighing: it was written when
+    /// this was a diagnostic and it is now a feature.
     fn upgrade_cover_art(
         &self,
         link: &mut Link,
