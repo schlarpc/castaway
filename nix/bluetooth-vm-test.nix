@@ -157,10 +157,51 @@ pkgs.testers.runNixOSTest {
         )
         print(f"inquiry found: {out}")
 
+    # A trace of the whole run, from here on. The failure this replaces (#156) reported
+    # `l2ping: Can't connect: No route to host` nine times and nothing else, which is not
+    # enough to tell a link that never carried anything from a link that carried it to a
+    # controller in no state to answer. It is what found the cause below, and it is copied
+    # out at the end whether the test passes or not.
+    machine.succeed(
+        "systemd-run --unit=btmon --collect "
+        "${bluezWithBtvirt}/bin/btmon -w /tmp/btmon.btsnoop"
+    )
+
     with subtest("the emulated air interface carries ACL and L2CAP"):
-        machine.succeed(f"hcitool -i hci0 cc {sink_addr} || true")
+        # The scan state, asserted rather than assumed, and re-asserted on each attempt in
+        # case bluetoothd writes its own while it initialises the controllers. This was the
+        # first suspect for #156 and it is *not* the cause — measured at 0.02 s, page scan
+        # already on — but it is cheap, and having it here is what makes a later failure
+        # unambiguous about the sink being pageable.
+        machine.wait_until_succeeds(
+            "hciconfig hci1 piscan; hciconfig hci1 | grep -qw PSCAN", timeout=60
+        )
+        print(machine.succeed("hciconfig hci1"))
+
+        # The cause was the diagnostic. This subtest used to run `hcitool -i hci0 cc` for a
+        # connection l2ping neither needs nor reuses, and then retry `l2ping` blindly.
+        # l2ping makes its own connection; the stale one collided with it, and the echo
+        # requests went out over an ACL handle nothing answered. The retries only got
+        # through once the abandoned connection had timed out and gone away.
+        #
+        # Measured on an idle box, same tree, both directions: with the `cc`, 14.09 s of
+        # retries and a trace of `Echo Request` with no response; without it, 2.02 s, first
+        # attempt, request and response both. So the 60 s budget was never covering a
+        # warm-up — it was covering a self-inflicted wait, and a loaded host is exactly
+        # where that wait stretched past it.
+        #
+        # `con` is read-only and stays; it costs nothing and names the link if this fails.
         print(machine.succeed("hcitool -i hci0 con || true"))
         machine.wait_until_succeeds(f"l2ping -i hci0 -c 2 -t 5 {sink_addr}", timeout=60)
+
+        # And the trace says it was carried, rather than `l2ping` merely having exited 0 —
+        # which is the positive signal this subtest claimed and, until now, inferred. It is
+        # also what distinguishes the two failures above from each other, so a future
+        # regression arrives already diagnosed.
+        machine.succeed("systemctl stop btmon")
+        trace = machine.succeed("${bluezWithBtvirt}/bin/btmon -r /tmp/btmon.btsnoop")
+        assert "Echo Request" in trace, f"no L2CAP echo request in the trace:\n{trace[-4000:]}"
+        assert "Echo Response" in trace, f"the echo was never answered:\n{trace[-4000:]}"
 
     with subtest("the receiver claims the second controller"):
         # Same race in the other direction: bringing a controller down is an HCI command
@@ -200,5 +241,6 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed("journalctl -u castaway > /tmp/castaway.log")
     machine.copy_from_machine("/tmp/castaway.log", "")
+    machine.copy_from_machine("/tmp/btmon.btsnoop", "")
   '';
 }
