@@ -14,6 +14,8 @@
 //!
 //! This is the capture #74, #75 and #76 all asked for, and it answered all three.
 
+#![allow(clippy::unwrap_used)]
+
 use std::time::Duration;
 
 use proto_bluetooth_audio::avrcp::{
@@ -150,7 +152,7 @@ fn an_iphone_holds_its_cover_art_at_200x200() {
     assert_eq!(native.kind, VariantKind::Native);
     assert_eq!(
         native.encoding,
-        Encoding::Known(castaway_core::ImageFormat::Jpeg)
+        Encoding::Known(castaway_core::ImageFormat::Jpeg, "JPEG".to_owned())
     );
     assert_eq!(
         native.pixel,
@@ -189,4 +191,60 @@ fn the_real_document_uses_spellings_the_strict_parser_has_to_accept() {
 
     let props = ImageProperties::parse(&raw).expect("still parses");
     assert!(props.variants.iter().all(|v| v.size.is_none()));
+}
+
+#[test]
+fn the_larger_variant_can_be_asked_for_in_the_phones_own_spelling() {
+    // #75, reopened: whether the 280×280 is a genuine render or an upscale of the
+    // 200×200 native cannot be told from the listing — iOS renders artwork on demand
+    // rather than storing it, so BIP's "native means the stored form" does not bind it.
+    // The only way to find out is to fetch it, which means building a descriptor.
+    //
+    // The descriptor has to echo the responder's *own* encoding token and pixel spelling,
+    // because BIP compares them as strings. That is why the variant builds it rather than
+    // the caller: a form the peer never listed cannot be named.
+    let props = ImageProperties::parse(&fixture("iphone-image-properties.xml")).unwrap();
+    let large = &props.variants[1];
+    let descriptor = large
+        .descriptor()
+        .expect("a form with a size can be asked for");
+    assert!(descriptor.contains(r#"encoding="JPEG""#));
+    assert!(
+        descriptor.contains(r#"pixel="280*280""#),
+        "the pixel field must round-trip to the text the phone sent: {descriptor}"
+    );
+    assert!(descriptor.starts_with("<image-descriptor version=\"1.0\">"));
+
+    // And it goes on the wire as a byte-sequence header 0x71, beside the UTF-16 handle —
+    // two application-specific headers on one request with different encodings, which is
+    // the trap that cost the handle its first implementation.
+    let mut session = proto_bluetooth_audio::obex::CoverArtSession::new(0x400);
+    // Drive it to Ready the way a responder would.
+    session
+        .feed(
+            &proto_bluetooth_audio::obex::ObexPacket {
+                code: 0xA0,
+                prefix: bytes::Bytes::from_static(&[0x10, 0x00, 0x04, 0x00]),
+                headers: vec![proto_bluetooth_audio::obex::Header::ConnectionId(1)],
+            }
+            .encode(),
+        )
+        .unwrap();
+    assert!(session.fetch_image("1000001", large));
+    let request = session.next_request().expect("a GET");
+    let get = proto_bluetooth_audio::obex::ObexPacket::decode(&request, 0).unwrap();
+    assert!(get
+        .headers
+        .contains(&proto_bluetooth_audio::obex::Header::Type(
+            "x-bt/img-img".to_owned()
+        )));
+    assert!(get
+        .headers
+        .contains(&proto_bluetooth_audio::obex::Header::ImageHandle(
+            "1000001".to_owned()
+        )));
+    assert!(get.headers.iter().any(|h| matches!(
+        h,
+        proto_bluetooth_audio::obex::Header::ImageDescription(d) if d.contains("280*280")
+    )));
 }

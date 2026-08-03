@@ -265,8 +265,13 @@ struct Link {
     /// The handle of the artwork last asked for, kept so the properties probe has
     /// something to name once the thumbnail it belongs to has arrived.
     art_handle: Option<String>,
-    /// Whether this link's one properties listing has already been asked for.
-    art_probed: bool,
+    /// The handle whose properties have been asked for, so the listing is taken once per
+    /// *track* rather than once per link. Per link was enough to answer "what does this
+    /// phone hold" only if every track holds the same thing, which is the assumption #75
+    /// was reopened over.
+    art_probed: Option<String>,
+    /// The handle whose larger form has been fetched, so the upgrade is attempted once.
+    art_upgraded: Option<String>,
     /// What this link's player exposes as shuffle/repeat, and with which values.
     ///
     /// Per link rather than per peer: AVRCP settings belong to the *player*, so the
@@ -398,7 +403,8 @@ impl Link {
             art: None,
             art_strikes: 0,
             art_handle: None,
-            art_probed: false,
+            art_probed: None,
+            art_upgraded: None,
             player_settings: avrcp::PlayerSettings::default(),
             settings_query: SettingsQuery::Idle,
             sdp_capabilities: avrcp::capabilities_for_passthrough(),
@@ -1808,12 +1814,15 @@ impl BluetoothAdapter {
     /// Once per link and only when [`BluetoothConfig::probe_image_properties`] is on —
     /// this is a measurement, and it is spending the one risk the cover-art path has.
     fn probe_image_properties(&self, link: &mut Link, out: &mut Outbox) {
-        if !self.config.probe_image_properties || link.art_probed {
+        if !self.config.probe_image_properties {
             return;
         }
         let Some(handle) = link.art_handle.clone() else {
             return;
         };
+        if link.art_probed.as_deref() == Some(handle.as_str()) {
+            return;
+        }
         let Some((cid, art)) = &mut link.art else {
             return;
         };
@@ -1824,9 +1833,65 @@ impl BluetoothAdapter {
         if !session.fetch_properties(handle.clone()) {
             return;
         }
-        link.art_probed = true;
+        link.art_probed = Some(handle.clone());
         if let Some(request) = session.next_request() {
             debug!(handle, request = %hex(&request), "cover art: asking what forms exist");
+            out.replies.push((cid, request));
+        }
+    }
+
+    /// Fetch a larger form than the thumbnail, if the peer listed one.
+    ///
+    /// The open half of #75. Whether a listed 280×280 over a 200×200 native is a genuine
+    /// render or an upscale cannot be told from the listing — iOS renders artwork on
+    /// demand rather than storing it, so BIP's "native is the stored form" does not bind
+    /// it — and the only way to find out is to fetch it and compare. Under the same gate
+    /// as the listing itself, for the same reason.
+    fn upgrade_cover_art(
+        &self,
+        link: &mut Link,
+        properties: &crate::obex::ImageProperties,
+        out: &mut Outbox,
+    ) {
+        if !self.config.probe_image_properties {
+            return;
+        }
+        let Some(handle) = link.art_handle.clone() else {
+            return;
+        };
+        if link.art_upgraded.as_deref() == Some(handle.as_str()) {
+            return;
+        }
+        // Only a form strictly larger than the linked thumbnail is worth a second fetch;
+        // BIP fixes that at 200×200, so anything at or below it is what we already have.
+        let Some((variant, (w, h))) = properties.largest_decodable() else {
+            return;
+        };
+        if u32::from(w) * u32::from(h) <= 200 * 200 {
+            debug!(
+                w,
+                h, "cover art: nothing larger than the thumbnail on offer"
+            );
+            return;
+        }
+        let variant = variant.clone();
+        let Some((cid, art)) = &mut link.art else {
+            return;
+        };
+        let cid = *cid;
+        let Some(session) = art.session_mut() else {
+            return;
+        };
+        if !session.fetch_image(handle.clone(), &variant) {
+            return;
+        }
+        link.art_upgraded = Some(handle.clone());
+        if let Some(request) = session.next_request() {
+            info!(
+                handle,
+                w, h, "bluetooth: fetching the larger cover art on offer"
+            );
+            debug!(request = %hex(&request), "cover art: obex tx");
             out.replies.push((cid, request));
         }
     }
@@ -2040,6 +2105,7 @@ impl BluetoothAdapter {
                 for variant in &properties.variants {
                     debug!(?variant, "cover art: variant on offer");
                 }
+                self.upgrade_cover_art(link, &properties, out);
             }
             // OBEX is request/response all the way down: every chunk we take has to be
             // asked for.

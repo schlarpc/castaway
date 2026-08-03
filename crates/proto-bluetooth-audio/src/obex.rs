@@ -83,6 +83,14 @@ pub const TYPE_THUMBNAIL: &str = "x-bt/img-thm";
 /// 200×200 thumbnail is not a thing this project has ever been able to see.
 pub const TYPE_IMAGE_PROPERTIES: &str = "x-bt/img-properties";
 
+/// MIME type for a described-image cover-art GET.
+///
+/// Unlike the thumbnail, this one names *which* form it wants, in an
+/// [`Header::ImageDescription`] alongside it — and the form has to be one the responder
+/// listed in its properties document, so it is only askable after
+/// [`TYPE_IMAGE_PROPERTIES`] has been read (#75).
+pub const TYPE_IMAGE: &str = "x-bt/img-img";
+
 /// An OBEX header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -98,6 +106,15 @@ pub enum Header {
     ImageHandle(String),
     /// MIME type of the object requested.
     Type(String),
+    /// BIP's `Img-Description`: the XML naming which form of an image is wanted.
+    ///
+    /// A **byte sequence**, unlike [`Header::ImageHandle`] beside it, which is UTF-16.
+    /// Two application-specific headers on the same request with different encodings is
+    /// exactly the trap that cost the handle its first implementation, so the two are
+    /// separate variants rather than one with a flag (`obexd/client/bip.c`:
+    /// `g_obex_header_new_bytes(IMG_DESC_TAG, ...)` against
+    /// `g_obex_header_new_unicode(IMG_HANDLE_TAG, ...)`).
+    ImageDescription(String),
     /// A chunk of the object.
     Body(Bytes),
     /// The final chunk.
@@ -131,6 +148,8 @@ mod hi {
     /// BIP's `Img-Handle`. In the user-defined range, and a length-prefixed Unicode
     /// header like `Name` — same encoding, different identifier, different meaning.
     pub const IMAGE_HANDLE: u8 = 0x30;
+    /// BIP's `Img-Description`, also user-defined but a *byte sequence*.
+    pub const IMAGE_DESCRIPTION: u8 = 0x71;
     pub const TYPE: u8 = 0x42;
     pub const BODY: u8 = 0x48;
     pub const END_OF_BODY: u8 = 0x49;
@@ -154,6 +173,8 @@ impl Header {
             // back "not found" as though the art did not exist.
             Self::Name(s) => put_unicode(buf, hi::NAME, s),
             Self::ImageHandle(s) => put_unicode(buf, hi::IMAGE_HANDLE, s),
+            // Bytes, not UTF-16, and not null-terminated: BlueZ writes the XML raw.
+            Self::ImageDescription(s) => put_bytes(buf, hi::IMAGE_DESCRIPTION, s.as_bytes()),
             // Type, by contrast, is a *byte sequence* of null-terminated ASCII. The two
             // string headers use different encodings, which is easy to miss.
             Self::Type(s) => {
@@ -248,6 +269,9 @@ impl Header {
             out.push(match id {
                 hi::NAME => Self::Name(from_unicode(&value)),
                 hi::IMAGE_HANDLE => Self::ImageHandle(from_unicode(&value)),
+                hi::IMAGE_DESCRIPTION => {
+                    Self::ImageDescription(String::from_utf8_lossy(&value).into_owned())
+                }
                 hi::TYPE => Self::Type(
                     String::from_utf8_lossy(value.strip_suffix(&[0][..]).unwrap_or(&value))
                         .into_owned(),
@@ -384,13 +408,20 @@ enum Fetch {
     Thumbnail(String),
     /// `x-bt/img-properties`: the listing of what the peer holds (#75).
     Properties(String),
+    /// `x-bt/img-img`: a named form from that listing.
+    Image {
+        /// The image.
+        handle: String,
+        /// Which of its listed forms, as the descriptor XML that will be sent.
+        descriptor: String,
+    },
 }
 
 impl Fetch {
     /// The handle being asked about.
     fn handle(&self) -> &str {
         match self {
-            Self::Thumbnail(h) | Self::Properties(h) => h,
+            Self::Thumbnail(h) | Self::Properties(h) | Self::Image { handle: h, .. } => h,
         }
     }
 
@@ -399,6 +430,15 @@ impl Fetch {
         match self {
             Self::Thumbnail(_) => TYPE_THUMBNAIL,
             Self::Properties(_) => TYPE_IMAGE_PROPERTIES,
+            Self::Image { .. } => TYPE_IMAGE,
+        }
+    }
+
+    /// The image descriptor this fetch carries, if it names a form.
+    fn descriptor(&self) -> Option<&str> {
+        match self {
+            Self::Image { descriptor, .. } => Some(descriptor),
+            Self::Thumbnail(_) | Self::Properties(_) => None,
         }
     }
 }
@@ -477,6 +517,24 @@ impl CoverArtSession {
         self.start(Fetch::Properties(handle.into()))
     }
 
+    /// Ask for one named form of an image, from a listing the peer gave us.
+    ///
+    /// `variant` must have come from that peer's own [`ImageProperties`] — BIP requires
+    /// the descriptor to match a form the responder advertised, so this takes the parsed
+    /// variant rather than a width and height, and a size we invented cannot be requested.
+    ///
+    /// Returns `false` if the session is busy, or if the variant carries no pixel size to
+    /// name (in which case there is nothing to put in the descriptor).
+    pub fn fetch_image(&mut self, handle: impl Into<String>, variant: &ImageVariant) -> bool {
+        let Some(descriptor) = variant.descriptor() else {
+            return false;
+        };
+        self.start(Fetch::Image {
+            handle: handle.into(),
+            descriptor,
+        })
+    }
+
     /// Begin a fetch, if the session is free to take one.
     fn start(&mut self, fetch: Fetch) -> bool {
         if !self.is_ready() {
@@ -531,6 +589,9 @@ impl CoverArtSession {
                     if let Some(fetch) = &self.fetch {
                         headers.push(Header::Type(fetch.mime().to_owned()));
                         headers.push(Header::ImageHandle(fetch.handle().to_owned()));
+                        if let Some(descriptor) = fetch.descriptor() {
+                            headers.push(Header::ImageDescription(descriptor.to_owned()));
+                        }
                     }
                     self.srm = Some(Srm::Offered);
                     Some(
@@ -627,7 +688,7 @@ impl CoverArtSession {
                             // The responder does not label the encoding on a thumbnail
                             // fetch — the profile fixes it as JPEG — so sniff rather than
                             // assume, and refuse anything we cannot decode.
-                            Some(Fetch::Thumbnail(_)) | None => {
+                            Some(Fetch::Thumbnail(_) | Fetch::Image { .. }) | None => {
                                 let format =
                                     sniff_format(&data).ok_or(AudioError::BadMediaPacket(
                                         "cover art is not a format we decode",
@@ -668,8 +729,13 @@ impl CoverArtSession {
 /// parts we cannot act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Encoding {
-    /// One we can decode.
-    Known(ImageFormat),
+    /// One we can decode, beside the token exactly as the peer spelled it.
+    ///
+    /// The token is kept even though the format is known, because a `GetImage` descriptor
+    /// has to echo the responder's own spelling back at it: BIP compares encodings by
+    /// string (`obexd`, `convBIP2IM`), so re-deriving `"JPEG"` from the enum would send a
+    /// peer that wrote `"jpeg"` a form it never offered.
+    Known(ImageFormat, String),
     /// One we cannot, kept exactly as sent.
     Unknown(String),
 }
@@ -678,15 +744,26 @@ impl Encoding {
     /// Parse a BIP `encoding` token.
     #[must_use]
     pub fn parse(token: &str) -> Self {
-        ImageFormat::parse(token).map_or_else(|| Self::Unknown(token.to_owned()), Self::Known)
+        ImageFormat::parse(token).map_or_else(
+            || Self::Unknown(token.to_owned()),
+            |format| Self::Known(format, token.to_owned()),
+        )
     }
 
     /// The format, if it is one the pipeline can decode.
     #[must_use]
     pub const fn format(&self) -> Option<ImageFormat> {
         match self {
-            Self::Known(format) => Some(*format),
+            Self::Known(format, _) => Some(*format),
             Self::Unknown(_) => None,
+        }
+    }
+
+    /// The token as the peer wrote it.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        match self {
+            Self::Known(_, token) | Self::Unknown(token) => token,
         }
     }
 }
@@ -770,6 +847,29 @@ impl PixelSize {
         })
     }
 
+    /// Re-spell this size the way BIP writes it.
+    ///
+    /// Needed because a `GetImage` descriptor has to name a form the responder listed,
+    /// and it compares them as strings — so the round trip through this type has to come
+    /// back to the same text the peer sent.
+    #[must_use]
+    pub fn as_written(self) -> String {
+        match self {
+            Self::Fixed { width, height } => format!("{width}*{height}"),
+            Self::Range {
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            } => format!("{min_width}*{min_height}-{max_width}*{max_height}"),
+            Self::FixedRatioRange {
+                min_width,
+                max_width,
+                max_height,
+            } => format!("{min_width}**-{max_width}*{max_height}"),
+        }
+    }
+
     /// The largest size this descriptor can yield.
     ///
     /// The question a properties listing is read to answer: a range is worth as much as
@@ -844,6 +944,26 @@ pub struct ImageVariant {
     pub pixel: Option<PixelSize>,
     /// What it weighs, when the descriptor says.
     pub size: Option<ByteSize>,
+}
+
+impl ImageVariant {
+    /// The `Img-Description` XML that asks for exactly this form.
+    ///
+    /// Built from the variant the peer itself listed rather than from a size we chose, so
+    /// a descriptor naming a form the responder never offered cannot be constructed —
+    /// which BIP requires and which is the whole reason `GetImage` is only reachable after
+    /// a properties listing has been read.
+    ///
+    /// `None` for a descriptor with no pixel size, since there would be nothing to name.
+    /// The layout is `obexd/client/bip.c`'s, newlines included.
+    #[must_use]
+    pub fn descriptor(&self) -> Option<String> {
+        let pixel = self.pixel?.as_written();
+        Some(format!(
+            "<image-descriptor version=\"1.0\">\n<image encoding=\"{}\" pixel=\"{pixel}\"/>\n</image-descriptor>\n",
+            self.encoding.token(),
+        ))
+    }
 }
 
 /// A peer's answer to `x-bt/img-properties`.
@@ -1476,7 +1596,10 @@ mod tests {
 
         let native = &props.variants[0];
         assert_eq!(native.kind, VariantKind::Native);
-        assert_eq!(native.encoding, Encoding::Known(ImageFormat::Jpeg));
+        assert_eq!(
+            native.encoding,
+            Encoding::Known(ImageFormat::Jpeg, "JPEG".to_owned())
+        );
         assert_eq!(
             native.pixel,
             Some(PixelSize::Fixed {
@@ -1566,7 +1689,10 @@ mod tests {
         let props = ImageProperties::parse(doc).unwrap();
         let (variant, size) = props.largest_decodable().unwrap();
         assert_eq!(size, (600, 600));
-        assert_eq!(variant.encoding, Encoding::Known(ImageFormat::Jpeg));
+        assert_eq!(
+            variant.encoding,
+            Encoding::Known(ImageFormat::Jpeg, "JPEG".to_owned())
+        );
         // …and the one we cannot decode is still recorded, because a capture should say
         // what the peer claimed rather than what we understood of it.
         assert_eq!(

@@ -104,16 +104,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("bench is up. On the phone:");
     println!("  1. pair with the receiver and connect");
-    println!("  2. play a track — YouTube Music answers #76's question for that app");
-    println!("  3. let one track change happen, so a second metadata read is captured");
+    println!("  2. play a track, and let one track change happen");
+    println!("  3. try more than one app — the settings listing is per *player*, and");
+    println!("     what the image server holds may be too (#75). A local file with big");
+    println!("     embedded artwork is the sharpest test of that.");
     println!("  4. Ctrl-C here");
+    println!();
+    println!("every distinct cover image is written beside the capture, so a larger form");
+    println!("and the thumbnail can be compared rather than argued about.");
     println!();
 
     // Shared rather than returned from the task: Ctrl-C aborts the observer, and an
     // aborted `JoinHandle` yields a `JoinError`, not the tally — which would have made
     // every checklist read as though nothing happened.
     let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
-    let observer = tokio::spawn(observe(rx, Arc::clone(&seen)));
+    let observer = tokio::spawn(observe(rx, Arc::clone(&seen), out_dir.clone()));
     let run = tokio::spawn(async move { adapter.run(sink).await });
 
     tokio::select! {
@@ -193,7 +198,11 @@ impl Seen {
     }
 }
 
-async fn observe(mut rx: mpsc::Receiver<SourceMessage>, seen: Arc<std::sync::Mutex<Seen>>) {
+async fn observe(
+    mut rx: mpsc::Receiver<SourceMessage>,
+    seen: Arc<std::sync::Mutex<Seen>>,
+    out_dir: PathBuf,
+) {
     /// Update the tally without holding the lock a moment longer than the closure.
     fn note(seen: &std::sync::Mutex<Seen>, f: impl FnOnce(&mut Seen)) {
         let mut guard = match seen.lock() {
@@ -234,9 +243,17 @@ async fn observe(mut rx: mpsc::Receiver<SourceMessage>, seen: Arc<std::sync::Mut
                 }
             }
             SessionEvent::NowPlaying(now) => {
+                // Every distinct image, written out. This is what settles the open half
+                // of #75: when the peer offers a form larger than the linked thumbnail,
+                // both arrive here as separate snapshots for the same track, and the
+                // question "is the bigger one a genuine render or an upscale of the
+                // smaller" is answered by comparing the two files, not by reading a spec.
+                if let Some(art) = &now.artwork {
+                    note(&seen, |s| s.artwork = true);
+                    write_artwork(&out_dir, art);
+                }
                 note(&seen, |s| {
                     s.metadata |= now.title.is_some();
-                    s.artwork |= now.artwork.is_some();
                     s.shuffle_or_repeat |= now.shuffle.is_some() || now.repeat.is_some();
                 });
                 println!(
@@ -251,6 +268,28 @@ async fn observe(mut rx: mpsc::Receiver<SourceMessage>, seen: Arc<std::sync::Mut
             SessionEvent::End => println!("● session ended"),
             other => println!("● {other:?}"),
         }
+    }
+}
+
+/// Write one cover image out, named by its content so duplicates collapse.
+///
+/// Content-addressed rather than counted: the same track's art is re-fetched on every
+/// reconnect and after every track change back to it, and a directory of forty identical
+/// JPEGs would bury the one comparison worth making.
+fn write_artwork(dir: &Path, art: &castaway_core::Artwork) {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in art.data.iter() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    let name = format!("art-{:016x}-{}b.{:?}", hash, art.len(), art.format).to_lowercase();
+    let path = dir.join(name);
+    if path.exists() {
+        return;
+    }
+    match std::fs::write(&path, &art.data) {
+        Ok(()) => println!("  wrote {}", path.display()),
+        Err(e) => println!("  could not write {}: {e}", path.display()),
     }
 }
 
