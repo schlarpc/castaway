@@ -23,6 +23,7 @@ tracing.workspace = true
 [dev-dependencies]
 hex-literal.workspace = true
 tokio = { workspace = true, features = [
+    "signal",
     "sync",
     "rt",
     "macros",
@@ -35,11 +36,15 @@ tokio = { workspace = true, features = [
 # For the ERTM bench only: it drives the real engine against the Linux kernel's L2CAP
 # through a virtual controller, which needs a transport. Nothing in the library depends
 # on it, and the example is gated so a non-Linux build never reaches for it.
-hci-transport = { workspace = true, features = ["socket"] }
+hci-transport = { workspace = true, features = ["socket", "usb"] }
 tracing-subscriber.workspace = true
 
 [[example]]
 name = "ertm_echo"
+required-features = ["bench"]
+
+[[example]]
+name = "phone_bench"
 required-features = ["bench"]
 
 [features]

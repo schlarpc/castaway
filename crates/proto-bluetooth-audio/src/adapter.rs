@@ -114,6 +114,18 @@ pub struct BluetoothConfig {
     /// *video* by this much to keep lip-sync, so a number larger than the truth is as
     /// wrong as one smaller. See [`crate::sink::DEFAULT_SINK_DELAY`].
     pub sink_delay: std::time::Duration,
+    /// Ask the peer's image server what forms of the artwork it holds, once per link.
+    ///
+    /// The measurement #75 turns on, and the one thing that can say whether an iPhone's
+    /// 200×200 is its ceiling or merely the one form we ask for. Nothing acts on the
+    /// answer yet — it is logged.
+    ///
+    /// **Off by default, and not for tidiness.** It is an extra OBEX GET on a channel
+    /// that some peers answer protocol disagreements on by hanging up, and the observed
+    /// worst case for provoking one took the whole ACL link down with it (#74,
+    /// [`ART_STRIKES_LIMIT`]). Spending that risk on a diagnostic is a decision for
+    /// whoever is sitting in front of the bench, not a default every guest pays.
+    pub probe_image_properties: bool,
 }
 
 impl std::fmt::Debug for BluetoothConfig {
@@ -125,6 +137,7 @@ impl std::fmt::Debug for BluetoothConfig {
             .field("link_keys", &self.link_keys.len())
             .field("persists_keys", &self.on_paired.is_some())
             .field("sink_delay", &self.sink_delay)
+            .field("probe_image_properties", &self.probe_image_properties)
             .finish()
     }
 }
@@ -152,6 +165,7 @@ impl Default for BluetoothConfig {
             link_keys: Vec::new(),
             on_paired: None,
             sink_delay: crate::sink::DEFAULT_SINK_DELAY,
+            probe_image_properties: false,
         }
     }
 }
@@ -248,6 +262,11 @@ struct Link {
     /// artwork is decoration and the observed worst case for provoking the peer again
     /// was it dropping the whole ACL link (reason 0x13).
     art_strikes: u8,
+    /// The handle of the artwork last asked for, kept so the properties probe has
+    /// something to name once the thumbnail it belongs to has arrived.
+    art_handle: Option<String>,
+    /// Whether this link's one properties listing has already been asked for.
+    art_probed: bool,
     /// What this link's player exposes as shuffle/repeat, and with which values.
     ///
     /// Per link rather than per peer: AVRCP settings belong to the *player*, so the
@@ -378,6 +397,8 @@ impl Link {
             art_sdp: None,
             art: None,
             art_strikes: 0,
+            art_handle: None,
+            art_probed: false,
             player_settings: avrcp::PlayerSettings::default(),
             settings_query: SettingsQuery::Idle,
             sdp_capabilities: avrcp::capabilities_for_passthrough(),
@@ -1782,6 +1803,34 @@ impl BluetoothAdapter {
         ));
     }
 
+    /// Ask the image server what forms of the last-fetched artwork it holds.
+    ///
+    /// Once per link and only when [`BluetoothConfig::probe_image_properties`] is on —
+    /// this is a measurement, and it is spending the one risk the cover-art path has.
+    fn probe_image_properties(&self, link: &mut Link, out: &mut Outbox) {
+        if !self.config.probe_image_properties || link.art_probed {
+            return;
+        }
+        let Some(handle) = link.art_handle.clone() else {
+            return;
+        };
+        let Some((cid, art)) = &mut link.art else {
+            return;
+        };
+        let cid = *cid;
+        let Some(session) = art.session_mut() else {
+            return;
+        };
+        if !session.fetch_properties(handle.clone()) {
+            return;
+        }
+        link.art_probed = true;
+        if let Some(request) = session.next_request() {
+            debug!(handle, request = %hex(&request), "cover art: asking what forms exist");
+            out.replies.push((cid, request));
+        }
+    }
+
     /// Bring the peer's image server up, so that attribute 8 becomes worth asking for.
     ///
     /// Two round trips the first time: the image server lives on a PSM only the peer's
@@ -1842,6 +1891,9 @@ impl BluetoothAdapter {
 
     /// Ask the image server for a handle the peer just gave us.
     fn fetch_cover_art(link: &mut Link, handle: &str, out: &mut Outbox) {
+        // Remembered before the fetch rather than after: the session clears the handle
+        // when the object completes, and the properties probe runs from that completion.
+        link.art_handle = Some(handle.to_owned());
         let Some((cid, art)) = &mut link.art else {
             return;
         };
@@ -1968,6 +2020,11 @@ impl BluetoothAdapter {
                         .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
                         .await?;
                 }
+                // The session is free again, which is the only moment a second GET can go
+                // out — it refuses one while a fetch is running, deliberately. Once per
+                // link: the answer is a property of the peer's image server, not of the
+                // track (#75).
+                self.probe_image_properties(link, out);
             }
             // Nothing on the card changes from a properties listing — it says what the
             // peer *could* give us, and we still ask for the thumbnail. It is logged
