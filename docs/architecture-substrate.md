@@ -290,8 +290,28 @@ Both OS-provided routes fail the ground rules, in different places:
 | Codecs in sink role | all of them — BlueZ delegates codec choice to *our* `MediaEndpoint1` | **SBC only**, 44.1 kHz forced. aptX/LDAC are vendor codecs shipped by IHVs for the *source* role only. |
 | Stream access | yes — `MediaTransport1.Acquire()` hands us an fd of codec payloads | **no** — `AudioPlaybackConnection` is an open/close toggle; decoded PCM goes to the default render endpoint. We'd have to WASAPI-loopback the system mix. |
 | Metadata | `MediaPlayer1` gives Title/Artist/Album/Duration/Status/Position | via GSMTC, coarser |
-| Album art | **no** — `bluetoothd` never surfaces AVRCP attribute 8 and `obexd` has no BIP client | unknown; possibly free if the inbox stack fetches it |
+| Album art | yes, awkwardly — see below | unknown; possibly free if the inbox stack fetches it |
 | Reproducible test | D-Bus daemon in the loop | untestable from Linux CI |
+
+**Correction, 2026-08-02.** This table used to say album art was flatly unavailable on
+Linux — "`bluetoothd` never surfaces AVRCP attribute 8 and `obexd` has no BIP client".
+That was false, and it had been false since well before it was written. Checked against
+bluez 5.86: `bluetoothd` exposes attribute 8 as the `ImgHandle` key on
+`org.bluez.MediaPlayer1` (`doc/org.bluez.MediaPlayer.rst`), and `obexd` ships a complete
+BIP cover-art client — the `BIP-AVRCP` driver over `org.bluez.obex.Image1`, with
+`Properties`, `Get` and `GetThumbnail`. Both arrived in the Collabora cover-art series of
+August 2024, which #74 already cites and already recommends for taking captures.
+
+What is *actually* true is milder and still sufficient: the two halves live in separate
+daemons with no in-tree wiring between them (`tools/mpris-proxy.c` is the reference glue),
+both are marked `[experimental]`, and `Image1` delivers the image as a **file on disk** via
+a `Transfer1` object rather than as bytes in the process that wants to draw them. The
+decisive reason is the row below rather than this one — none of it exists on the Windows
+box we deploy to.
+
+The wrong version is recorded rather than deleted because it was load-bearing: it appeared
+here, in #74, and in `proto-bluetooth-audio/src/obex.rs`, and "no OS does this" is exactly
+the kind of claim that stops anyone checking.
 
 There is also no user-mode L2CAP on Windows at all — Winsock's `AF_BTH` is RFCOMM-only,
 and AVDTP (PSM `0x19`) / AVCTP (PSM `0x17`) are therefore unreachable without a
