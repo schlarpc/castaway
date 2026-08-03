@@ -335,3 +335,199 @@ fn the_source_publishing_under_a_drag_does_not_snatch_the_bar_back() {
         "the bar must stay under the finger, not jump to what the source just said"
     );
 }
+
+#[test]
+fn the_bar_slides_between_readings_instead_of_stepping_once_a_second() {
+    // #165: position arrives as snapshots roughly once a second, and until now the strip
+    // only repainted when the whole second rolled over — so the bar advanced in
+    // one-second hops. Fine on a phone; conspicuous on a two-metre panel.
+    //
+    // Asserted on the pixels, because the projection being *modelled* as continuous is
+    // only half of it: the event loop sleeps on `Demand`, so a bar nothing wakes for still
+    // steps whatever the model says.
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(1280, 720, rx) else {
+        return;
+    };
+    let mut render = render.with_clock(clock);
+
+    // A one-minute track on a wide panel: a fifth of a second is more than a pixel of
+    // travel, and well inside the same whole second.
+    tx.send(RenderCommand::NowPlaying(Box::new(card(
+        "one",
+        Duration::from_secs(60),
+    ))));
+    render.pump();
+    let at_zero = render.read_rgba().unwrap();
+
+    time.advance(Duration::from_millis(200));
+    render.pump();
+    assert_ne!(
+        render.read_rgba().unwrap(),
+        at_zero,
+        "the bar must move inside a second, not wait for the next one"
+    );
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_millis(200)
+    );
+}
+
+#[test]
+fn a_late_reading_is_absorbed_rather_than_yanking_the_bar_back() {
+    // Every reading a source publishes is a little stale — transport latency, plus
+    // whatever the two clocks disagree about. Snapping to each one would put a visible
+    // twitch in the bar once a second, on every source, which is worse than the stepping
+    // this replaces.
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(1280, 720, rx) else {
+        return;
+    };
+    let mut render = render.with_clock(clock);
+
+    let mut playing = |position: Duration| {
+        let mut track = NowPlaying::default().with_title("one");
+        track.state = PlaybackState::Playing;
+        track.position = Some(position);
+        track.duration = Some(Duration::from_secs(200));
+        RenderCommand::NowPlaying(Box::new(NowPlayingCard {
+            track,
+            source: castaway_core::SourceDescription::default(),
+            up_next: Vec::new(),
+            controls: ControlCapabilities::PLAY | ControlCapabilities::PAUSE,
+        }))
+    };
+
+    tx.send(playing(Duration::ZERO));
+    render.pump();
+    time.advance(Duration::from_secs(1));
+    let before = render.transport_position().unwrap();
+    assert_eq!(before, Duration::from_secs(1));
+
+    // The phone says 0.9 s when we are showing 1.0 s.
+    tx.send(playing(Duration::from_millis(900)));
+    render.pump();
+    assert_eq!(
+        render.transport_position().unwrap(),
+        before,
+        "the displayed position must not jump backwards when a stale reading lands"
+    );
+
+    // And it is converged on the source shortly after, rather than carrying the error.
+    time.advance(Duration::from_secs(2));
+    let shown = render.transport_position().unwrap().as_secs_f64();
+    assert!(
+        (shown - 2.9).abs() < 0.01,
+        "expected to have converged on the source's 2.9 s, showing {shown}"
+    );
+}
+
+#[test]
+fn a_seek_on_the_phone_snaps_the_bar_rather_than_gliding_it() {
+    // The other half of the reconciliation, and the reason a threshold exists at all:
+    // slewing to a real discontinuity would glide the bar across the track over a couple
+    // of seconds, which reads as a bug rather than as smoothing.
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(1280, 720, rx) else {
+        return;
+    };
+    let mut render = render.with_clock(clock);
+
+    let mut playing = |position: Duration| {
+        let mut track = NowPlaying::default().with_title("one");
+        track.state = PlaybackState::Playing;
+        track.position = Some(position);
+        track.duration = Some(Duration::from_secs(200));
+        RenderCommand::NowPlaying(Box::new(NowPlayingCard {
+            track,
+            source: castaway_core::SourceDescription::default(),
+            up_next: Vec::new(),
+            controls: ControlCapabilities::PLAY | ControlCapabilities::PAUSE,
+        }))
+    };
+
+    tx.send(playing(Duration::ZERO));
+    render.pump();
+    time.advance(Duration::from_secs(1));
+
+    tx.send(playing(Duration::from_secs(120)));
+    render.pump();
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_secs(120),
+        "a seek is immediate"
+    );
+}
+
+#[test]
+fn a_track_change_restarts_the_bar_rather_than_absorbing_the_old_ones_elapsed_time() {
+    // The discontinuity a projection would otherwise get wrong quietly. Both tracks start
+    // at 0:00 and the second reading is only milliseconds from where the first had got
+    // to, so it looks exactly like drift — and absorbed as drift it would leave the new
+    // song's bar showing the moment the last one had reached.
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(640, 360, rx) else {
+        return;
+    };
+    let mut render = render.with_clock(clock);
+
+    tx.send(RenderCommand::NowPlaying(Box::new(card(
+        "one",
+        Duration::from_secs(200),
+    ))));
+    render.pump();
+    time.advance(Duration::from_millis(300));
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_millis(300)
+    );
+
+    // Same duration this time, so nothing about the *model* says "different track" —
+    // only the card does.
+    tx.send(RenderCommand::NowPlaying(Box::new(card(
+        "two",
+        Duration::from_secs(200),
+    ))));
+    render.pump();
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::ZERO,
+        "a new track starts at its own beginning"
+    );
+}
+
+#[test]
+fn a_paused_bar_asks_for_no_frames_at_all() {
+    // The projection is what decides whether the loop sleeps. A paused track's position is
+    // constant, so a paused strip that kept asking for frames would spin the panel's
+    // demand-driven loop (#59) for a picture that never changes.
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(1280, 720, rx) else {
+        return;
+    };
+    let mut render = render.with_clock(clock);
+    tx.send(RenderCommand::NowPlaying(Box::new(seekable_paused(
+        Duration::from_secs(200),
+        Duration::from_secs(40),
+    ))));
+    render.pump();
+    let painted = render.read_rgba().unwrap();
+
+    time.advance(Duration::from_secs(30));
+    render.pump();
+    assert_eq!(
+        render.read_rgba().unwrap(),
+        painted,
+        "a paused bar does not move"
+    );
+    assert_eq!(
+        render.transport_position().unwrap(),
+        Duration::from_secs(40),
+        "and does not creep"
+    );
+}

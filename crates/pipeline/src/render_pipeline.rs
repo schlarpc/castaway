@@ -1412,8 +1412,12 @@ struct TransportState {
     layout: crate::transport::Layout,
     /// Where the strip sits on the surface: `(x, y, w, h)` in pixels.
     placement: (f32, f32, f32, f32),
-    /// When `model.position` was taken, so elapsed time can be added to it.
-    taken_at: std::time::Instant,
+    /// The position as it *moves*, between the readings the source publishes.
+    ///
+    /// Sources state a position roughly once a second; this is what makes the bar slide
+    /// between them instead of stepping. It also owns the reconciliation, which is the
+    /// part with the trap in it — see [`crate::projection`] (#165).
+    projection: crate::projection::Projection,
     /// The position last painted, so a repaint happens when the readout changes rather
     /// than on every frame.
     painted: Option<Duration>,
@@ -1426,21 +1430,31 @@ struct TransportState {
 }
 
 impl TransportState {
-    /// The position as of now: what the source said, plus the time since it said it.
-    ///
-    /// Only advanced while playback is actually active — a paused track whose position
-    /// crept forward would be a scrubber that lies, and lies in the direction that makes
-    /// a seek land somewhere the user did not ask for.
+    /// The position as of now: the projection, which is what the source said carried
+    /// forward and reconciled against every reading since.
     fn live_position(&self, now: std::time::Instant) -> Option<Duration> {
-        let base = self.model.position?;
-        if !self.model.state.is_active() {
-            return Some(base);
+        self.model.position?;
+        Some(self.projection.at(now))
+    }
+
+    /// How far the bar moves for one pixel of travel, in time.
+    ///
+    /// The repaint rate limit for a *playing* track, and the reason a sliding bar is not
+    /// simply "repaint every frame". A pixel is the smallest visible change, so anything
+    /// finer is a full-strip raster nobody can see; and because it scales with the item's
+    /// length, a three-minute track asks for far fewer frames than a one-minute one
+    /// without either being told a number.
+    ///
+    /// `None` when there is no scrub track drawn — a live stream, or a source that
+    /// reports no duration — in which case only the elapsed readout changes and the
+    /// second boundary is the whole rate limit.
+    fn pixel_of_travel(&self) -> Option<Duration> {
+        let total = self.model.duration?;
+        let width = f64::from(self.layout.track_touch?.w);
+        if width < 1.0 {
+            return None;
         }
-        let advanced = base + now.saturating_duration_since(self.taken_at);
-        Some(match self.model.duration {
-            Some(total) => advanced.min(total),
-            None => advanced,
-        })
+        Some(total.div_f64(width))
     }
 
     /// The position the strip should be showing right now.
@@ -1469,9 +1483,22 @@ impl TransportState {
     /// counts — that is the "frame-rate, not second-rate" #97 asks for, and it applies
     /// only while a drag is actually in flight.
     fn stale(&self, target: Duration) -> bool {
-        match self.preview {
-            Some(_) => self.painted != Some(target),
-            None => self.painted.map(|p| p.as_secs()) != Some(target.as_secs()),
+        let Some(painted) = self.painted else {
+            return true;
+        };
+        if self.preview.is_some() {
+            return painted != target;
+        }
+        // The readout, which changes on the whole second.
+        if painted.as_secs() != target.as_secs() {
+            return true;
+        }
+        // …and the bar, which moves continuously. Before this the second boundary was the
+        // only thing that asked for a repaint, so the bar advanced in one-second hops —
+        // fine on a phone, conspicuous on a two-metre panel (#165).
+        match self.pixel_of_travel() {
+            Some(pixel) => painted.abs_diff(target) >= pixel,
+            None => false,
         }
     }
 }
@@ -1592,7 +1619,19 @@ impl RenderLoop {
     /// Painting the strip is cheap next to the card — a fraction of the surface, no cover
     /// art, no text layout beyond two clock readings — which is the whole reason it is a
     /// separate layer and can be repainted every second.
-    fn set_transport(&mut self, model: &crate::transport::TransportModel, w: u32, h: u32) {
+    ///
+    /// `new_item` says the card is for a *different track*, not a fresh reading of the
+    /// same one. It is the difference between a discontinuity and a measurement, and the
+    /// projection needs to be told which it is getting: a track advancing from the phone
+    /// publishes 0:00, and absorbing that as drift would leave the new song's bar showing
+    /// the moment the last one had reached.
+    fn set_transport(
+        &mut self,
+        model: &crate::transport::TransportModel,
+        w: u32,
+        h: u32,
+        new_item: bool,
+    ) {
         if model.is_empty() {
             self.compositor.remove_layer(LayerId::Transport);
             self.transport = None;
@@ -1605,18 +1644,26 @@ impl RenderLoop {
             placement.3.round().max(1.0) as u32,
         );
 
-        // Keep the existing timestamp only when the source has repeated the *exact
-        // reading* it already gave us. The card republishes for reasons that have
-        // nothing to do with playback — a queue update, the device naming itself — and
-        // restamping on those would rewind the scrubber by however long had passed
-        // since the real reading. But matching on position alone confused "the same
-        // reading again" with "a new track that also starts at 0:00": advancing a track
-        // from the phone kept the old track's anchor, and the scrubber read 1:20 over a
-        // song at 0:00. Any field of the reading changing — state, duration, shuffle —
-        // is a fresh reading, and a fresh reading re-anchors the clock.
-        let taken_at = match self.transport.as_ref() {
-            Some(prev) if prev.model == *model => prev.taken_at,
-            _ => self.clock.now(),
+        // Only an actually-*new* reading is fed to the projection. The card republishes
+        // for reasons that have nothing to do with playback — a queue update, the device
+        // naming itself — carrying the position it last stated, and treating one of those
+        // as a measurement would rewind the scrubber by however long had passed since the
+        // real reading. But matching on position alone confused "the same reading again"
+        // with "a new track that also starts at 0:00": advancing a track from the phone
+        // kept the old track's anchor, and the scrubber read 1:20 over a song at 0:00.
+        // Any field of the reading changing — state, duration, shuffle — is a fresh
+        // reading.
+        let now = self.clock.now();
+        let running = model.state.is_active();
+        let position = model.position.unwrap_or(Duration::ZERO);
+        let projection = match self.transport.as_ref() {
+            Some(prev) if prev.model == *model && !new_item => prev.projection,
+            Some(prev) if !new_item => {
+                let mut projection = prev.projection;
+                projection.observe(position, now, running, model.duration);
+                projection
+            }
+            _ => crate::projection::Projection::new(position, now, running, model.duration),
         };
         // A drag survives the source republishing under it, and it has to: sources publish
         // for reasons that have nothing to do with the finger — a position tick, a queue
@@ -1630,7 +1677,7 @@ impl RenderLoop {
                     layout: crate::transport::layout(model, pw, ph),
                     model: model.clone(),
                     placement,
-                    taken_at,
+                    projection,
                     painted: model.position,
                     preview,
                 });
@@ -2715,18 +2762,29 @@ impl RenderLoop {
         .map_or(Demand::Idle, Demand::At)
     }
 
-    /// When the transport strip's clock next changes what it shows: the strip repaints
-    /// when the position's whole second rolls over ([`Self::tick_transport`]), so while
-    /// something is playing the next repaint is due at that boundary.
+    /// When the transport strip next changes what it shows.
+    ///
+    /// Two things move at two rates, and the earlier of them is the answer. The elapsed
+    /// *readout* changes on the whole second. The *bar* slides, and the smallest change
+    /// worth a frame is one pixel of travel — which scales with the item's length, so a
+    /// three-minute track asks for far fewer frames than a one-minute one and neither is
+    /// told a number.
+    ///
+    /// This is the half of #165 without which the projection would be invisible: the
+    /// event loop sleeps on `Demand`, so a bar that is *modelled* as sliding but only
+    /// woken for on the second still steps once a second on the glass.
     fn transport_due(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         let state = self.transport.as_ref()?;
-        if !state.model.state.is_active() {
-            return None;
-        }
         let live = state.live_position(now)?;
         let to_boundary = Duration::from_secs(1)
             .saturating_sub(Duration::from_nanos(u64::from(live.subsec_nanos())));
-        Some(now + to_boundary)
+        let bar = state
+            .pixel_of_travel()
+            .and_then(|pixel| state.projection.time_to_advance(now, pixel));
+        // A paused projection asks for nothing at all, and then neither does the readout:
+        // a clock that is not running has no boundary to cross.
+        let readout = state.projection.running().then_some(to_boundary);
+        [readout, bar].into_iter().flatten().min().map(|d| now + d)
     }
 
     /// Drain all pending commands (non-blocking) and present once. Returns the number of
@@ -3023,7 +3081,14 @@ impl RenderLoop {
                         Err(e) => error!(error = %e, "failed to render the now-playing card"),
                     }
                 }
-                self.set_transport(&card.transport(), w, h);
+                // A card that draws differently is a different track, which is the same
+                // question `same_pixels` asks and a strictly narrower one — it must not
+                // pick up a mere resize.
+                let new_item = self
+                    .card_shown
+                    .as_ref()
+                    .is_none_or(|(prev, _)| !prev.visual_eq(&card));
+                self.set_transport(&card.transport(), w, h, new_item);
                 self.card_shown = Some((card.clone(), (w, h)));
                 // A card published while someone is on the home screen arrives
                 // minimized rather than snatching the panel from under them.
