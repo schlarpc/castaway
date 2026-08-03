@@ -17,9 +17,10 @@ use tracing::info;
 pub struct NullPipeline {
     /// Stop flag for the session in progress, so a preempted one actually ends.
     active: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
-    /// Where audio goes. `None` opens the default device.
+    /// The panel's one audio output. `None` means a mixer of our own, opened lazily, so
+    /// a `NullPipeline::new()` in a test still makes a complete audio path.
     #[cfg(feature = "audio")]
-    audio_output: Option<crate::audio_out::AudioOutputFactory>,
+    mixer: std::sync::Mutex<Option<std::sync::Arc<crate::mixer::AudioMixer>>>,
 }
 
 impl NullPipeline {
@@ -29,24 +30,38 @@ impl NullPipeline {
         Self::default()
     }
 
-    /// Use `factory` for audio output instead of the default device.
+    /// Play through `mixer` rather than one of this pipeline's own.
     #[cfg(feature = "audio")]
     #[must_use]
-    pub fn with_audio_output(mut self, factory: crate::audio_out::AudioOutputFactory) -> Self {
-        self.audio_output = Some(factory);
+    pub fn with_mixer(self, mixer: std::sync::Arc<crate::mixer::AudioMixer>) -> Self {
+        if let Ok(mut slot) = self.mixer.lock() {
+            *slot = Some(mixer);
+        }
         self
     }
 
-    /// A fresh output device for one session.
+    /// A way into the mix for one session.
     #[cfg(feature = "audio")]
-    fn audio_output(&self) -> Box<dyn crate::audio_out::AudioOut> {
-        self.audio_output
-            .as_ref()
-            .map_or_else(crate::audio_session::default_output, |f| f())
+    fn audio_input(&self) -> crate::mixer::MixInput {
+        let Ok(mut slot) = self.mixer.lock() else {
+            // A poisoned lock costs this session its sound and nothing else; an unattached
+            // mixer plays out and is dropped with the input.
+            return crate::mixer::AudioMixer::new(std::sync::Arc::new(|| {
+                Box::new(crate::audio_out::NullAudioOut::new())
+            }))
+            .input();
+        };
+        slot.get_or_insert_with(|| {
+            std::sync::Arc::new(crate::mixer::AudioMixer::new(
+                crate::audio_out::output_factory(crate::audio_select::OutputSelector::default()),
+            ))
+        })
+        .input()
     }
 
-    /// End whatever session is running. Two audio sessions writing to one output device
-    /// do not mix, they fight — so a new session must retire the old one first.
+    /// End whatever session is running. The panel is single-source by policy, so a new
+    /// session retires the old one first — since #111 that is a policy rather than the
+    /// device contention it used to be.
     fn preempt(&self) {
         if let Ok(mut guard) = self.active.lock() {
             if let Some(flag) = guard.take() {
@@ -125,9 +140,8 @@ impl Pipeline for NullPipeline {
                     rx,
                     audio.format,
                     audio.config,
-                    self.audio_output(),
+                    self.audio_input(),
                     stop,
-                    std::sync::Arc::new(crate::audio_session::Gain::default()),
                     // The null pipeline has no session manager to tell, so a refused
                     // output is simply logged by the session itself.
                     None,
@@ -172,9 +186,8 @@ impl Pipeline for NullPipeline {
                     rx,
                     format,
                     config,
-                    self.audio_output(),
+                    self.audio_input(),
                     stop,
-                    std::sync::Arc::new(crate::audio_session::Gain::default()),
                     // The null pipeline has no session manager to tell, so a refused
                     // output is simply logged by the session itself.
                     None,
@@ -260,7 +273,12 @@ mod tests {
         p.stop().await.unwrap();
     }
 
-    /// An output that remembers whether anything was actually played through it.
+    /// The panel's device, remembering whether anything was actually played through it.
+    ///
+    /// Counts *audible* frames rather than every frame it is given. Since #111 it sits
+    /// under the mixer rather than under the session, and the mixer runs continuously —
+    /// it pads with silence whenever no source has anything to say — so a bare frame
+    /// count would pass this test on an empty panel.
     #[cfg(feature = "audio")]
     #[derive(Default)]
     struct Speaker {
@@ -276,8 +294,9 @@ mod tests {
             &mut self,
             block: &crate::audio_decode::PcmBlock,
         ) -> Result<(), crate::error::PipelineError> {
+            let audible = block.samples.iter().filter(|s| s.abs() > 1e-3).count() as u64;
             self.frames.fetch_add(
-                block.frame_count() as u64,
+                audible / u64::from(crate::mixer::CHANNELS),
                 std::sync::atomic::Ordering::SeqCst,
             );
             Ok(())
@@ -319,9 +338,10 @@ mod tests {
 
         let speaker = std::sync::Arc::new(Speaker::default());
         let for_factory = std::sync::Arc::clone(&speaker);
-        let pipeline = NullPipeline::new().with_audio_output(std::sync::Arc::new(move || {
-            Box::new(std::sync::Arc::clone(&for_factory))
-        }));
+        let pipeline =
+            NullPipeline::new().with_mixer(std::sync::Arc::new(crate::mixer::AudioMixer::new(
+                std::sync::Arc::new(move || Box::new(std::sync::Arc::clone(&for_factory))),
+            )));
 
         // Video is present but empty: a mirror is video by definition, and the audio has
         // to play regardless of whether any picture ever arrives.

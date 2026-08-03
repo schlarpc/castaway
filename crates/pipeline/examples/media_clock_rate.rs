@@ -19,7 +19,7 @@ use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pipeline::audio_session::{Gain, PacedSession};
+use pipeline::audio_session::PacedSession;
 use pipeline::clock::MediaClock;
 use pipeline::ffmpeg_decode::{decode_av, MediaLayout};
 use pipeline::HwPreference;
@@ -45,14 +45,17 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = sync_channel::<castaway_core::PcmFrame>(64);
 
-    // The real playback thread, paced to real time, against a null sink so this runs
-    // anywhere. `run_pcm` treats a null device exactly as a real one for timing — that is
-    // what `NullAudioOut` is for.
+    // The real playback thread, paced to real time, through a mixer over a null sink so
+    // this runs anywhere. The mixer treats a null device exactly as a real one for timing
+    // — it keeps time on the wall — which is what makes this measure the clock rather
+    // than the sound card.
+    let mixer = pipeline::mixer::AudioMixer::new(Arc::new(|| {
+        Box::new(pipeline::audio_out::NullAudioOut::new())
+    }));
     pipeline::audio_session::spawn_pcm(
         rx,
-        Box::new(pipeline::audio_out::NullAudioOut::new()),
+        mixer.input(),
         Arc::clone(&stop),
-        Arc::new(Gain::default()),
         Some(PacedSession {
             clock: Arc::clone(&clock),
             seek: Arc::clone(&seek),

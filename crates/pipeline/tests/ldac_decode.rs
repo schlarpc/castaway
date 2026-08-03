@@ -294,15 +294,36 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
     // making no noise at all.
     use pipeline::audio_out::AudioOut;
     use pipeline::error::PipelineError;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
-    /// What the output was handed, readable after `run` has consumed the sink.
+    /// What the panel's device was handed, readable after `run` has finished with it.
+    ///
+    /// Since #111 this sits under the mixer rather than under the session, so it is given
+    /// the mix format and the silence the mixer pads with — which is why what is kept is
+    /// the *span* of audible output rather than a frame total, and why the shape the
+    /// session used shows up as a duration rather than as an `opened_at`.
     #[derive(Default)]
     struct Played {
-        frames: AtomicU64,
+        heard: Mutex<Vec<f32>>,
         peak: Mutex<f32>,
         opened_at: Mutex<Option<(u32, u16)>>,
+    }
+
+    impl Played {
+        /// How long the audible part of what reached the device lasted.
+        fn played(&self) -> Duration {
+            let heard = self.heard.lock().expect("poisoned");
+            let mut hits = heard.iter().enumerate().filter(|(_, s)| s.abs() > 1e-3);
+            let Some((first, _)) = hits.next() else {
+                return Duration::ZERO;
+            };
+            let last = hits.last().map_or(first, |(i, _)| i);
+            let frames = (last - first) / usize::from(pipeline::mixer::CHANNELS);
+            Duration::from_nanos(
+                (frames as u64).saturating_mul(1_000_000_000) / u64::from(pipeline::mixer::RATE),
+            )
+        }
     }
 
     // A newtype rather than `impl AudioOut for Arc<Played>`: `Arc` is not `#[fundamental]`,
@@ -317,8 +338,10 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
         }
         fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
             self.0
-                .frames
-                .fetch_add(block.frame_count() as u64, Ordering::SeqCst);
+                .heard
+                .lock()
+                .expect("poisoned")
+                .extend_from_slice(&block.samples);
             let loudest = block.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
             let mut peak = self.0.peak.lock().expect("poisoned");
             *peak = peak.max(loudest);
@@ -337,27 +360,41 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
     drop(tx);
 
     let speaker = Arc::new(Played::default());
+    let for_factory = Arc::clone(&speaker);
+    let mixer = pipeline::mixer::AudioMixer::new(Arc::new(move || {
+        Box::new(Speaker(Arc::clone(&for_factory)))
+    }));
     pipeline::audio_session::run(
         rx,
         format(44_100, 2),
         None,
-        Box::new(Speaker(Arc::clone(&speaker))),
+        mixer.input(),
         &AtomicBool::new(false),
-        &pipeline::audio_session::Gain::default(),
         // No failure sink: this fixture drives a decode that must succeed, and a
         // callback here would have nothing to report.
         None,
     );
+    // The session returns once the mixer has *accepted* the last block; it still has to
+    // be played out, in real time.
+    std::thread::sleep(Duration::from_millis(600));
 
-    let played = speaker.frames.load(Ordering::SeqCst);
-    assert_eq!(played, 84 * 128, "the whole fixture must reach the output");
+    // 84 frames of 128 samples at 44.1 kHz is 243.8 ms, and the mix runs at 48 kHz, so
+    // the whole fixture is 243.8 ms of audio however it is resampled. A short read here
+    // is the session playing the stream at a rate the blocks did not state — which is
+    // where a wrong rate shows up now that the device no longer opens at the source's.
+    let played = speaker.played();
+    let want = Duration::from_nanos(84 * 128 * 1_000_000_000 / 44_100);
+    assert!(
+        played.abs_diff(want) < Duration::from_millis(15),
+        "played {played:?} of the fixture's {want:?}; the whole of it must reach the output"
+    );
     assert!(
         *speaker.peak.lock().expect("poisoned") > 0.05,
         "the output received silence"
     );
     assert_eq!(
         *speaker.opened_at.lock().expect("poisoned"),
-        Some((44_100, 2)),
-        "the device must be opened at the rate the blocks carry"
+        Some((pipeline::mixer::RATE, pipeline::mixer::CHANNELS)),
+        "the device is opened at the mix rate; the source's rate is resampled into it"
     );
 }

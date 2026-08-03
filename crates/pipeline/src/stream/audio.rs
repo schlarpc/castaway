@@ -1,73 +1,56 @@
 //! Tapping the panel's sound.
 //!
-//! ## There is no mixer to tap
+//! ## There is one mixer, and this is a tap on it
 //!
-//! The panel has no central audio mixer, on purpose: [`AudioOutputFactory`] hands *each
-//! session its own device*, because two sessions writing to one device fight rather than
-//! mix, and the OS is the thing that mixes. So "what the panel is playing" does not exist
-//! anywhere in this process as a single stream.
+//! Every source's audio — Cast, AirPlay, DLNA, Spotify, Bluetooth, and the browser's
+//! captured page audio — is summed by [`crate::mixer::AudioMixer`] and written to one
+//! device. [`AudioMix`] is a [`MixTap`] on that mixer, so what the stream carries is
+//! literally the samples the speakers were given, at the instant they were given them.
 //!
-//! What does exist is the factory. Every session's audio — Cast, AirPlay, DLNA, Spotify,
-//! Bluetooth, and the browser's captured page audio — is written to a `Box<dyn AudioOut>`
-//! that came from it, and the app installs exactly one. So [`tee`] wraps the factory, and
-//! every output it produces writes to the real device *and* into [`AudioMix`]. Nothing
-//! else in the audio path changes, and a session cannot be added later that misses this
-//! without also missing its own sound.
+//! It used to be a reconstruction. Until #111 there was no mixer to tap: each session held
+//! its own device and the OS did the summing, so "what the panel is playing" did not exist
+//! anywhere in this process. This module rebuilt it by wrapping the output factory, giving
+//! every session a tee, resampling each one to 48 kHz a second time, and following each
+//! with its own cursor — plus a resync threshold, a lead cap and a settle window to keep
+//! sessions that raced (a file through a null sink) from laying down hours of audio in
+//! seconds. All of that is gone. The mixer produces one stream at real-time pace, so a
+//! block is placed where it arrives because that is where it belongs.
 //!
-//! ## The mix is indexed by wall clock, not by arrival
+//! ## The mix is indexed by wall clock, not by arrival order
 //!
-//! A queue would drift. Sessions start and stop, sample rates differ, and the stream has
-//! to produce a continuous 48 kHz timeline whether or not anything is playing — a silent
-//! panel is the *normal* case, and an audio track that simply stops is one a player
-//! stalls on rather than one it treats as quiet.
+//! A queue would drift. The stream has to produce a continuous 48 kHz timeline whether or
+//! not anything is playing — a silent panel is the *normal* case, and an audio track that
+//! simply stops is one a player stalls on rather than one it treats as quiet.
 //!
 //! So the mix is a window of the shared [`Timeline`], addressed by absolute sample
-//! position. A block written at instant *t* lands at position `t - origin`; anything
-//! nobody wrote is silence because the buffer is zeroed; two sessions overlapping sum.
-//! Video slots are derived from the same origin, so the two tracks cannot drift apart no
-//! matter how long the stream runs.
+//! position. A block written at instant *t* lands at position `t - origin`; anything nobody
+//! wrote is silence because the buffer is zeroed. Video slots are derived from the same
+//! origin, so the two tracks cannot drift apart no matter how long the stream runs.
+//!
+//! That zero-fill is also why a tap does not keep the audio device open: an idle panel
+//! holds no sink, and the stream stays continuous regardless.
 //!
 //! ## What this is not
 //!
-//! It is not sample-accurate. A session's first block is placed where it was *handed to
-//! the device*, and the device plays it some tens of milliseconds later — so the stream's
-//! audio leads the panel's own speakers by roughly the output queue's depth. Relative to
-//! the stream's own video, which is captured at the moment it is composited, that is the
-//! same relationship the panel itself has, which is what matters for watching it.
-//! Sub-frame lip sync is not on offer and the readback path could not deliver it anyway.
-//!
-//! ## Sessions are followed, not sampled
-//!
-//! Each session carries a cursor — its first block's instant plus the duration of every
-//! block since — and blocks are placed at *that*, not at the instant they arrive. It
-//! matters because "the session writes in real time" is only true when something is
-//! consuming in real time: on a box with a real device the queue blocks and paces the
-//! decoder, and on one with a null sink the decoder races through a file as fast as it can
-//! read it. Placing by arrival puts a whole file's audio in the first second there.
-//!
-//! The cursor is snapped back to the clock when it diverges by more than
-//! [`RESYNC`] — a session that stalled, or a sender whose clock is not ours running for
-//! long enough to matter.
+//! It is not sample-accurate. A block is placed where it was *handed to the device*, and
+//! the device plays it some tens of milliseconds later — so the stream's audio leads the
+//! panel's own speakers by roughly the output queue's depth. Relative to the stream's own
+//! video, which is captured at the moment it is composited, that is the same relationship
+//! the panel itself has, which is what matters for watching it. Sub-frame lip sync is not
+//! on offer and the readback path could not deliver it anyway.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::timeline::Timeline;
-use crate::audio_decode::PcmBlock;
-use crate::audio_out::{AudioOut, AudioOutputFactory};
-use crate::error::PipelineError;
-use crate::resample::Resampler;
+use crate::mixer::MixTap;
 
 /// The rate the stream's audio track runs at.
 ///
-/// 48 kHz because it is what every source in this box ends up at, what AAC encoders are
-/// happiest with, and what browsers output — so the common case resamples nothing.
-pub const RATE: u32 = 48_000;
-
-/// Stereo. The panel is a display with speakers, and an HLS duplicate of it in a browser
-/// tab is not the place to carry a surround mix.
-pub const CHANNELS: u16 = 2;
+/// The mixer's rate, not a second opinion: the stream carries what the speakers were
+/// given, so a conversion here would be one nobody asked for.
+pub use crate::mixer::{CHANNELS, RATE};
 
 /// How much sound the mix will hold before it starts discarding the oldest.
 ///
@@ -75,26 +58,6 @@ pub const CHANNELS: u16 = 2;
 /// matters only if that loop dies, and then the alternative is a `Vec` that grows until
 /// the panel is killed by the OOM reaper — which is a much worse way to lose audio.
 const MAX_BUFFERED: Duration = Duration::from_secs(4);
-
-/// How far a session's cursor may fall *behind* the wall clock before it is snapped back.
-///
-/// Large enough that ordinary jitter — a decode thread descheduled, a device queue
-/// refilling in bursts — is followed rather than fought, and small enough that a stall or
-/// a genuinely different clock is corrected before anyone hears it as lip-sync error.
-///
-/// Deliberately one-sided. A cursor *ahead* of the clock is a session that has produced
-/// audio it has not played yet, which is what every source with a buffer does and is
-/// exactly right; a cursor behind it is audio being laid down where the encoder has
-/// already been, which is silently lost.
-const RESYNC: Duration = Duration::from_millis(250);
-
-/// How far ahead of the clock a session may run before its blocks are dropped.
-///
-/// A racing session — a file decoded through a null sink, which accepts every block
-/// instantly — will otherwise produce hours of audio in seconds, and the mix cannot hold
-/// it. Dropping is the honest answer for a live duplicate: this is a mirror of what the
-/// panel is playing *now*, not a player with a queue.
-const MAX_LEAD: Duration = Duration::from_secs(3);
 
 /// The panel's audio, on the stream's timeline.
 #[derive(Debug)]
@@ -255,10 +218,15 @@ impl StreamAudio {
         }
     }
 
-    /// Wrap `inner` so every session it produces is also mixed here.
+    /// The tap to register with the panel's mixer.
+    ///
+    /// Held as a trait object by the mixer, so the stream's audio arrives without this
+    /// module knowing anything about sessions — which is the whole difference from the tee
+    /// it replaced. A session cannot be added later that reaches the speakers and misses
+    /// the stream, because it does not reach the speakers except through the mixer.
     #[must_use]
-    pub fn factory(&self, inner: AudioOutputFactory) -> AudioOutputFactory {
-        tee(inner, Arc::clone(&self.mix))
+    pub fn tap(&self) -> Arc<dyn MixTap> {
+        Arc::clone(&self.mix) as Arc<dyn MixTap>
     }
 
     /// The timeline both tracks are measured against.
@@ -280,151 +248,9 @@ impl StreamAudio {
     }
 }
 
-/// Wrap an audio factory so everything it produces is also mixed into `mix`.
-///
-/// The returned factory is a drop-in for the one it wraps: same type, same behaviour on
-/// the device, and a session cannot tell the difference.
-#[must_use]
-pub fn tee(inner: AudioOutputFactory, mix: Arc<AudioMix>) -> AudioOutputFactory {
-    Arc::new(move || {
-        Box::new(TeeAudioOut {
-            inner: inner(),
-            mix: Arc::clone(&mix),
-            convert: None,
-            cursor: None,
-        })
-    })
-}
-
-/// One session's output, going two places.
-struct TeeAudioOut {
-    inner: Box<dyn AudioOut>,
-    mix: Arc<AudioMix>,
-    /// Set by `start`, which is where the session's shape is finally known. `None` means
-    /// this session's audio is not being mixed — it still plays.
-    convert: Option<Convert>,
-    /// Where this session's next block begins. `None` before its first, and reset by
-    /// `start`, so a session that restarts is followed from wherever it restarted.
-    cursor: Option<Instant>,
-}
-
-/// What it takes to get one session's blocks to [`RATE`] stereo.
-struct Convert {
-    channels: u16,
-    /// Absent when the session is already at [`RATE`].
-    resampler: Option<Resampler>,
-}
-
-impl Convert {
-    fn open(sample_rate: u32, channels: u16) -> Result<Self, PipelineError> {
-        let resampler = if sample_rate == RATE {
-            None
-        } else {
-            Some(Resampler::new(sample_rate, RATE, channels.max(1))?)
-        };
-        Ok(Self {
-            channels: channels.max(1),
-            resampler,
-        })
-    }
-
-    /// One block as interleaved [`RATE`] stereo.
-    fn stereo(&mut self, block: &PcmBlock) -> Result<Vec<f32>, PipelineError> {
-        let resampled = match self.resampler.as_mut() {
-            Some(resampler) => resampler.convert(block)?,
-            None => block.samples.clone(),
-        };
-        Ok(to_stereo(&resampled, self.channels))
-    }
-}
-
-/// Interleaved `channels`-channel audio as interleaved stereo.
-///
-/// Mono is duplicated. Anything wider than stereo keeps its first two channels, which in
-/// every standard layout are front left and front right: a proper downmix would need the
-/// layout and a set of coefficients, and what it would buy is a centre channel in a
-/// browser tab's duplicate of a wall panel.
-fn to_stereo(samples: &[f32], channels: u16) -> Vec<f32> {
-    let channels = usize::from(channels.max(1));
-    match channels {
-        2 => samples.to_vec(),
-        1 => samples.iter().flat_map(|s| [*s, *s]).collect(),
-        n => samples
-            .chunks_exact(n)
-            .flat_map(|frame| [frame[0], frame[1]])
-            .collect(),
-    }
-}
-
-/// Where a session's next block goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Place {
-    /// Here, on the wall clock.
-    At(Instant),
-    /// Nowhere: the session is running further ahead than the mix can hold.
-    Drop,
-}
-
-/// Follow a session's cursor, correcting it where it has stopped meaning anything.
-fn follow(cursor: Option<Instant>, now: Instant) -> Place {
-    let Some(cursor) = cursor else {
-        return Place::At(now);
-    };
-    if now.saturating_duration_since(cursor) > RESYNC {
-        // Behind: whatever happened, carrying on from here would write into the past.
-        return Place::At(now);
-    }
-    if cursor.saturating_duration_since(now) > MAX_LEAD {
-        return Place::Drop;
-    }
-    Place::At(cursor)
-}
-
-impl AudioOut for TeeAudioOut {
-    fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
-        self.cursor = None;
-        self.convert = match Convert::open(sample_rate, channels) {
-            Ok(convert) => Some(convert),
-            Err(e) => {
-                // The session still plays. Losing it from the stream is worth a line and
-                // is not worth failing a cast over.
-                tracing::warn!(error = %e, sample_rate, channels, "this session will not reach the output stream");
-                None
-            }
-        };
-        self.inner.start(sample_rate, channels)
-    }
-
-    fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
-        // Mixed before the device write, which may block on a full queue: the instant this
-        // block is *placed* should be as close as possible to the instant it was produced.
-        if let Some(convert) = self.convert.as_mut() {
-            match convert.stereo(block) {
-                Ok(stereo) => {
-                    if let Place::At(at) = follow(self.cursor, Instant::now()) {
-                        self.mix.add(at, &stereo);
-                        let frames = stereo.len() / usize::from(CHANNELS);
-                        self.cursor = Some(
-                            at + Duration::from_nanos(
-                                (frames as u64).saturating_mul(1_000_000_000) / u64::from(RATE),
-                            ),
-                        );
-                    }
-                }
-                Err(e) => tracing::debug!(error = %e, "a block did not reach the output stream"),
-            }
-        }
-        self.inner.write(block)
-    }
-
-    fn stop(&mut self) {
-        self.cursor = None;
-        // Deliberately no drain of the resampler's delay line into the mix. It is ~15 ms
-        // held back at the very end of a session, and flushing it would place those frames
-        // at the instant of `stop` rather than where they belong — which is worse than
-        // losing them.
-        self.convert = None;
-        self.inner.stop();
+impl MixTap for AudioMix {
+    fn mixed(&self, at: Instant, stereo: &[f32]) {
+        self.add(at, stereo);
     }
 }
 
@@ -606,90 +432,56 @@ mod tests {
     }
 
     #[test]
-    fn a_session_that_writes_faster_than_real_time_is_still_laid_out_in_real_time() {
+    fn a_source_that_writes_faster_than_real_time_is_still_laid_out_in_real_time() {
         // The failure this exists for: a box with no audio device gets a `NullAudioOut`,
         // which accepts a block instantly, so the decoder races through a file as fast as
-        // it can read it. Placing blocks by arrival puts a minute of audio into the first
-        // second — which was exactly what the first run against a real panel produced.
-        let (timeline, mix) = mix();
+        // it can read it. Placing blocks by arrival then puts a minute of audio into the
+        // first second — which was exactly what the first run against a real panel
+        // produced.
+        //
+        // This module used to defend against that itself, with a per-session cursor, a
+        // resync threshold and a lead cap, because there was nothing else that could: each
+        // session wrote to its own device and nothing in this process ran at the panel's
+        // pace. Since #111 the mixer does, so the defence is structural — a block arrives
+        // here when the speakers got it, and a source that races is blocked by the mixer
+        // long before this code sees it. What is pinned here is that end-to-end property,
+        // through the real mixer, because it is the reason the cursor could be deleted.
+        let mixer = crate::mixer::AudioMixer::new(Arc::new(|| {
+            Box::new(crate::audio_out::NullAudioOut::new())
+        }));
+        let stream = StreamAudio::new();
+        mixer.add_tap(stream.tap());
         let t0 = Instant::now();
-        timeline.anchor(t0);
-        let mix = Arc::new(mix);
-        let mut out = tee(
-            Arc::new(|| Box::new(crate::audio_out::NullAudioOut::new())),
-            Arc::clone(&mix),
-        )();
-        out.start(RATE, 2).unwrap();
-        // Ten blocks of 100 ms, written as fast as the loop goes.
+        stream.timeline().anchor(t0);
+
+        let mut input = mixer.input();
+        // A second of audio, written as fast as the loop goes.
         for _ in 0..10 {
-            out.write(&PcmBlock {
-                sample_rate: RATE,
-                channels: 2,
-                samples: vec![0.5; 4800 * 2],
-                pts: Duration::ZERO,
-            })
-            .unwrap();
+            input
+                .write(&castaway_core::PcmFrame {
+                    sample_rate: RATE,
+                    channels: CHANNELS,
+                    samples: vec![0.5; 4800 * usize::from(CHANNELS)],
+                    pts: Duration::ZERO,
+                })
+                .unwrap();
         }
+        // Let the last of it drain out of the in-flight budget.
+        std::thread::sleep(Duration::from_millis(400));
+
         // A second of audio should occupy a second of timeline. Measured over two, so the
         // answer is a proportion rather than an edge: stacked blocks would put everything
         // in a fraction of the first second and leave the rest silent.
-        let out = mix
+        let out = stream
+            .mix()
             .take(t0 + Duration::from_secs(3), 96_000, SETTLE)
             .unwrap();
         let loud = out.iter().filter(|s| s.abs() > 1e-6).count();
         let fraction = loud as f64 / out.len() as f64;
         assert!(
-            (0.45..=0.55).contains(&fraction),
+            (0.40..=0.60).contains(&fraction),
             "{:.1}% of two seconds carries audio; one second of blocks should be half",
             fraction * 100.0
         );
-    }
-
-    #[test]
-    fn a_session_that_stalls_is_snapped_back_to_the_clock() {
-        // A cursor that fell a long way behind — a session descheduled, a sender whose
-        // clock is not ours — must not keep laying audio down in the past, where the
-        // encoder has already been.
-        let now = Instant::now();
-        assert_eq!(follow(None, now), Place::At(now));
-        assert_eq!(
-            follow(Some(now - RESYNC - Duration::from_secs(1)), now),
-            Place::At(now)
-        );
-
-        // …ordinary jitter is followed rather than fought…
-        let jittered = now - Duration::from_millis(20);
-        assert_eq!(follow(Some(jittered), now), Place::At(jittered));
-
-        // …a session with a buffer runs ahead, which is what every source does…
-        let ahead = now + Duration::from_secs(1);
-        assert_eq!(follow(Some(ahead), now), Place::At(ahead));
-
-        // …and one racing through a file faster than real time is dropped rather than
-        // buffered, because a live duplicate has nowhere to keep it.
-        assert_eq!(
-            follow(Some(now + MAX_LEAD + Duration::from_secs(1)), now),
-            Place::Drop
-        );
-    }
-
-    #[test]
-    fn mono_is_heard_in_both_ears() {
-        assert_eq!(to_stereo(&[0.5, -0.5], 1), vec![0.5, 0.5, -0.5, -0.5]);
-    }
-
-    #[test]
-    fn stereo_passes_through_untouched() {
-        assert_eq!(
-            to_stereo(&[0.1, 0.2, 0.3, 0.4], 2),
-            vec![0.1, 0.2, 0.3, 0.4]
-        );
-    }
-
-    #[test]
-    fn a_wider_layout_keeps_its_front_pair() {
-        // 5.1 interleaves as L R C LFE Ls Rs, so the first two are the ones to keep.
-        let frame = [0.1, 0.2, 0.9, 0.9, 0.9, 0.9];
-        assert_eq!(to_stereo(&frame, 6), vec![0.1, 0.2]);
     }
 }

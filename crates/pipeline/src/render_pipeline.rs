@@ -498,13 +498,14 @@ pub struct RenderPipeline {
     playback: Arc<Mutex<Option<UrlPlayback>>>,
     /// Where an item that finished or failed gets reported, if anything asked to hear.
     ends: Mutex<Option<Arc<EndReport>>>,
-    /// Where audio goes. `None` opens the default device.
+    /// The panel's one audio output. `None` means a mixer of our own, opened lazily, so
+    /// a pipeline built in a test still has a complete audio path.
     ///
-    /// A factory rather than a device, because each session takes its own. It is also
-    /// the only way to observe that a session's audio *reached* an output, which is the
-    /// assertion that would have caught mirror audio being silently discarded.
+    /// A mixer rather than a per-session device since #111. It is also the only way to
+    /// observe that a session's audio *reached* an output, which is the assertion that
+    /// would have caught mirror audio being silently discarded.
     #[cfg(feature = "audio")]
-    audio_output: Mutex<Option<crate::audio_out::AudioOutputFactory>>,
+    mixer: Mutex<Option<Arc<crate::mixer::AudioMixer>>>,
     /// Called when another source takes the screen, so a browser that is covering the
     /// panel gives it back.
     ///
@@ -559,7 +560,7 @@ impl RenderPipeline {
                 ends: Mutex::new(None),
                 release_screen: Mutex::new(None),
                 #[cfg(feature = "audio")]
-                audio_output: Mutex::new(None),
+                mixer: Mutex::new(None),
                 #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
             },
@@ -569,34 +570,48 @@ impl RenderPipeline {
 
     /// The panel's one volume.
     ///
-    /// Shared rather than copied, and this is the whole point of it: everything that
-    /// writes samples to a device applies the same `Gain`, so a level set over AVRCP is
-    /// the level YouTube plays at. The browser is a second writer on a second stream and
-    /// used to reach its device without passing here at all (#86).
+    /// Shared rather than copied, and this is the whole point of it. It used to be shared
+    /// so that every one of N writers applied the same value at its own sink — the browser
+    /// was a second writer on a second stream and reached its device without passing here
+    /// at all (#86). Since #111 there is one sink and the mixer applies it there, so a
+    /// level set over AVRCP is the level YouTube plays at because there is nowhere else
+    /// for it to be applied.
     #[cfg(feature = "audio")]
     #[must_use]
     pub fn gain(&self) -> Arc<crate::audio_session::Gain> {
         Arc::clone(&self.gain)
     }
 
-    /// Use `factory` for audio output instead of the default device.
+    /// Play through `mixer` rather than one of this pipeline's own.
+    ///
+    /// The mixer carries the pipeline's [`Self::gain`], so a level set before this is
+    /// called is still the level afterwards.
     #[cfg(feature = "audio")]
     #[must_use]
-    pub fn with_audio_output(self, factory: crate::audio_out::AudioOutputFactory) -> Self {
-        if let Ok(mut slot) = self.audio_output.lock() {
-            *slot = Some(factory);
+    pub fn with_mixer(self, mixer: Arc<crate::mixer::AudioMixer>) -> Self {
+        if let Ok(mut slot) = self.mixer.lock() {
+            *slot = Some(mixer);
         }
         self
     }
 
-    /// A fresh output device for one session.
+    /// A way into the mix for one session.
     #[cfg(feature = "audio")]
-    fn audio_output(&self) -> Box<dyn crate::audio_out::AudioOut> {
-        self.audio_output
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|f| f()))
-            .unwrap_or_else(crate::audio_session::default_output)
+    fn audio_input(&self) -> crate::mixer::MixInput {
+        let Ok(mut slot) = self.mixer.lock() else {
+            // A poisoned lock costs this session its sound and nothing else.
+            return crate::mixer::AudioMixer::new(Arc::new(|| {
+                Box::new(crate::audio_out::NullAudioOut::new())
+            }))
+            .input();
+        };
+        slot.get_or_insert_with(|| {
+            Arc::new(crate::mixer::AudioMixer::with_gain(
+                crate::audio_out::output_factory(crate::audio_select::OutputSelector::default()),
+                Arc::clone(&self.gain),
+            ))
+        })
+        .input()
     }
     ///
     /// Cheap and clonable, and deliberately separate from the pipeline itself: by the
@@ -816,9 +831,8 @@ impl Pipeline for RenderPipeline {
             let (atx, arx) = std::sync::mpsc::sync_channel(crate::ffmpeg_decode::AUDIO_QUEUE);
             crate::audio_session::spawn_pcm(
                 arx,
-                self.audio_output(),
+                self.audio_input(),
                 Arc::clone(&stop),
-                Arc::clone(&self.gain),
                 Some(crate::audio_session::PacedSession {
                     clock: Arc::clone(&clock),
                     seek: Arc::clone(&seek),
@@ -924,9 +938,8 @@ impl Pipeline for RenderPipeline {
                             arx,
                             audio.format,
                             audio.config,
-                            self.audio_output(),
+                            self.audio_input(),
                             Arc::clone(&stop),
-                            Arc::clone(&self.gain),
                             // No failure report, for the same reason this path does not
                             // preempt: a mirror's audio and its picture share a stop
                             // flag, so ending the session over a refused output would
@@ -990,9 +1003,8 @@ impl Pipeline for RenderPipeline {
                         rx,
                         format,
                         config,
-                        self.audio_output(),
+                        self.audio_input(),
                         stop,
-                        Arc::clone(&self.gain),
                         failed,
                     );
                     Ok(())
@@ -1002,9 +1014,8 @@ impl Pipeline for RenderPipeline {
                 FrameSource::Pcm(rx) => {
                     crate::audio_session::spawn_pcm(
                         rx,
-                        self.audio_output(),
+                        self.audio_input(),
                         stop,
-                        Arc::clone(&self.gain),
                         // Bluetooth/Spotify PCM: the sender is the clock, there is no
                         // video to synchronise, and a seek is the phone's business — so
                         // there is no paced session to share.
@@ -4050,8 +4061,12 @@ mod card_tests {
             &mut self,
             block: &crate::audio_decode::PcmBlock,
         ) -> Result<(), crate::error::PipelineError> {
+            // Audible frames only. Since #111 this sits under the mixer rather than under
+            // the session, and the mixer runs continuously — padding with silence when
+            // nothing is playing — so a bare frame count would pass on a silent panel.
+            let audible = block.samples.iter().filter(|s| s.abs() > 1e-3).count() as u64;
             self.frames.fetch_add(
-                block.frame_count() as u64,
+                audible / u64::from(crate::mixer::CHANNELS),
                 std::sync::atomic::Ordering::SeqCst,
             );
             Ok(())
@@ -4089,8 +4104,9 @@ mod card_tests {
         let speaker = Arc::new(Speaker::default());
         let for_factory = Arc::clone(&speaker);
         let (pipeline, _rx) = RenderPipeline::new(4);
-        let pipeline =
-            pipeline.with_audio_output(Arc::new(move || Box::new(Arc::clone(&for_factory))));
+        let pipeline = pipeline.with_mixer(Arc::new(crate::mixer::AudioMixer::new(Arc::new(
+            move || Box::new(Arc::clone(&for_factory)),
+        ))));
 
         let (_vtx, vrx) = tokio::sync::mpsc::channel(1);
         pipeline

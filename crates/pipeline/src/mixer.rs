@@ -546,7 +546,15 @@ impl AudioMixer {
 
 impl Drop for AudioMixer {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Relaxed);
+        // Set under the same lock [`park`] waits on, or this races it: the mixer can check
+        // `shutdown`, find it clear, and only *then* take the lock and wait — after the
+        // notify has already gone by. The wait has a timeout, so the cost was not a hang,
+        // it was `IDLE_CLOSE` of it. Dropping the mixer happens on the way out of the
+        // process, so that is five seconds of a panel that has been told to exit.
+        {
+            let _held = self.shared.inputs.lock();
+            self.shared.shutdown.store(true, Ordering::Relaxed);
+        }
         self.shared.work.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -703,6 +711,12 @@ fn park(shared: &Arc<Shared>) {
         std::thread::sleep(IDLE_POLL);
         return;
     };
+    // Both conditions re-checked *under the lock* before waiting. Checking them outside it
+    // is the classic lost-wakeup: whoever set them could notify in the gap, and this would
+    // then wait out the whole timeout for an event that had already happened.
+    if shared.shutdown.load(Ordering::Relaxed) || !inputs.is_empty() {
+        return;
+    }
     // The guard is dropped immediately; what matters is having waited.
     drop(shared.work.wait_timeout(inputs, IDLE_CLOSE));
 }
@@ -863,6 +877,19 @@ mod tests {
         Volume::from_dbfs(0.5f32.log10() * 20.0)
     }
 
+    /// A `Shared` with no mixer thread behind it, so a test can step the retirement rule
+    /// by hand.
+    fn shared_with(inputs: Vec<Arc<InputState>>) -> Arc<Shared> {
+        Arc::new(Shared {
+            inputs: Mutex::new(inputs),
+            work: Condvar::new(),
+            taps: Mutex::new(Vec::new()),
+            gain: Arc::new(Gain::default()),
+            device_inflight: AtomicU64::new(0),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
     fn filled(samples: Vec<f32>) -> Arc<InputState> {
         Arc::new(InputState {
             ring: Mutex::new(Ring {
@@ -955,21 +982,22 @@ mod tests {
     fn a_closed_input_is_retired_only_after_what_it_left_has_played_out() {
         // Dropping a MixInput mid-block must not truncate the block: the last ~10 ms of
         // every track would go missing, on every source.
-        let device = Recorder::new();
-        let mixer = mixer_with(&device);
-        let state = {
-            let mut input = mixer.input();
-            input.write(&tone(480, 0.5)).unwrap();
-            Arc::clone(&input.state)
-        };
+        //
+        // Stepped by hand against a `Shared` with no thread behind it. Driving it through
+        // a live mixer would be a race against that mixer draining the input before the
+        // first assertion ran — which is exactly what it did.
+        let state = filled(vec![0.5; 960]);
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        // What `MixInput::drop` does.
+        state.close();
         assert!(
-            !live_inputs(&mixer.shared).is_empty(),
-            "still has audio in it"
+            !live_inputs(&shared).is_empty(),
+            "closed, but it still has audio in it"
         );
         // Drain it the way the mixer would.
         let _ = mix_pass(&[Arc::clone(&state)], 480, &Gain::default());
         assert!(
-            live_inputs(&mixer.shared).is_empty(),
+            live_inputs(&shared).is_empty(),
             "closed and drained, so it should be gone"
         );
     }

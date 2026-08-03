@@ -1639,6 +1639,14 @@ the OS mixes. D50 is what found that out, by needing the mix and having to build
 
 ### D50 — The stream's audio is tapped at the factory, not at a mixer, because there is no mixer
 
+**SUPERSEDED by D52 (2026-08-03).** There is a mixer now, and the premise below — that each
+session holding its own device is deliberate — did not survive being checked against the
+backends this project actually ships. The tee, the per-session cursor and the resync
+threshold described here are all gone; the stream's audio is a `MixTap` fed the samples the
+device was given. What still holds, and is why this entry is worth keeping, is everything
+about the *timeline*: one origin for both tracks, silence as a zeroed window, two tracks in
+one `moof`, and the AAC priming cancelled by input discard.
+
 Adding sound to the output duplicate (#101, D49) started by looking for the place the
 panel's audio exists as one stream. There is no such place, and that is deliberate:
 `AudioOutputFactory` hands **each session its own device**, because two sessions writing
@@ -1885,3 +1893,81 @@ No audio on the remote track: WebRTC wants Opus and the stream encodes AAC. No k
 `InputSink` has touch and pointer and no keys, and typing a URL or a Wi-Fi password from a
 phone is arguably the point of a remote UI; it is scoped separately. And no *phone* has
 driven a real panel: a real browser has, on a dev box, which is not the same as glass.
+
+### D52 — One mixer, and the pacing is an in-flight budget rather than a sleep
+
+**2026-08-03.** #111. `AudioOutputFactory` handed **each session its own device**, on one
+line of justification: "two sessions writing to one device fight rather than mix". That is
+true of a raw ALSA `hw:` device and of nothing else this project ships. PipeWire gives each
+stream its own node, WASAPI shared mode mixes, ALSA through `default`/`dmix` mixes. On
+every backend here the OS was already doing the job, one layer out and somewhere we could
+neither see nor steer it. **This reverses D50**, which found the absence of a mixer, wrote
+it down as deliberate, and built the stream's audio tap around it.
+
+What actually carried the old design was policy — the panel is single-source, and `stop`
+preempts — not the hazard it named. And the codebase already disagreed with itself: `Gain`
+was one shared value applied N times at N sinks, justified as "the panel has one pair of
+speakers, so it has one volume". That is the mixer argument, stated and then not taken.
+
+#### What the mixer is
+
+`AudioMixer` owns the device and a thread. Every source takes a `MixInput` and writes into
+it; the mixer sums, applies the one `Gain` once, hard-clips, writes to the device, and
+publishes the same samples to every `MixTap`. The mix is a fixed 48 kHz stereo `f32`, so
+each source resamples once on the way in and the mixer resamples at most once on the way
+out. `AudioOut` survives unchanged as the *device* abstraction and `AudioOutputFactory`
+survives as how the mixer obtains one — a better justification than the one it had.
+
+#### The pacing is the interesting part, and it is not what the issue proposed
+
+`audio_session::Pace` is gone. `MixInput::write` blocks while that input already has
+`clock::OUTPUT_LEAD` of audio in flight, and that is the whole mechanism: uniform, in one
+place, and paced by whatever the device actually consumes.
+
+"In flight" is deliberately the **sum** of what sits in the input's ring *and* what the
+mixer has queued at the device but not yet heard. Bounding the ring alone would have been
+the obvious reading and would have been wrong: `MediaClock` reads `submitted - OUTPUT_LEAD`
+to turn what a session handed over into what a listener has heard, so a session may lead
+the speakers by that and no more. A ring bounded on its own would have added the device's
+queue on top, and every media-URL cast would have played its video that much early. The
+constant is shared with `clock` rather than restated for the same reason it always was.
+
+Two mechanisms delete themselves as a consequence. `Pace`'s resync threshold existed
+because it measured submission against a start instant, so a stall accumulated a debt it
+then had to be told to forgive; a budget needs none — a source that stops writing lets its
+ring drain, and a source with an empty ring is never held. And `stream::audio`'s per-session
+cursor, resync and lead cap existed to unpick bursts from sessions that had no common pace;
+the mixer produces one stream at real-time pace, so a block is placed where it arrives
+because that is where it belongs. About 380 lines, replaced by `AudioMix: MixTap`.
+
+#### There is always a sink, and that is what fixes #55
+
+When no device will open, the sink is `NullAudioOut`. Not a special case bolted on — it is
+what *removes* the special case, because a null sink keeps time on the wall exactly as a
+real device keeps it on its crystal. A device that refuses, or vanishes when the panel
+sleeps and PipeWire takes the HDMI node with it, leaves every source draining in real time
+while the mixer retries underneath them. Sound stops and comes back; sessions do not notice.
+
+That inverts an earlier decision on purpose. A session that could not open its output used
+to end itself loudly, because the alternative was a phone streaming into a dead channel for
+46 seconds behind a now-playing card claiming to play. A session no longer holds a device,
+so it cannot be the thing that notices one refusing — and the sharp end of that failure
+cannot return, because there is no per-session device left to refuse.
+
+#### Two departures from the issue's sketch
+
+Taps do not hold the device open. The issue proposed closing after an idle period with no
+inputs *and* no taps; `stream::audio`'s window already produces silence from a zeroed
+buffer, so an idle panel holds no sink even while someone watches the stream. And the
+session entry points take a `MixInput` rather than keeping `Box<dyn AudioOut>`, so handing
+a session a device is no longer expressible.
+
+#### Not done
+
+Per-input gain exists structurally — the mixer applies gain at the output stage, so ducking
+is now a place to put code rather than a redesign — but nothing sets it, and no
+cross-session policy is expressed yet. Device *selection* now reaches a live session
+(the mixer reopens under everything at once) but is only exercised by construction, not by
+a test that changes it mid-session. Party mix (#72) is unblocked by this and not done by it:
+the mixer sums, but the session model, volume authority and metadata questions in that issue
+are untouched.

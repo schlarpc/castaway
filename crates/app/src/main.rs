@@ -199,20 +199,26 @@ fn main() -> anyhow::Result<()> {
                 .choice_for(pipeline::audio_select::active_backend())
                 .selection(),
         );
+        // The panel's one audio output (#111). It owns the device; every source — every
+        // protocol session, and the browser's captured page audio — takes a `MixInput`
+        // from it and the mixer sums them. It is also what makes the selection above
+        // reach a *live* session: the mixer reopens under everything at once, rather than
+        // each source keeping whatever device it happened to open with.
         #[cfg(feature = "audio")]
-        let audio_factory: pipeline::audio_out::AudioOutputFactory =
-            pipeline::audio_out::output_factory(audio_selector.clone());
-        // The output stream's audio (#101). The panel has no central mixer — each session
-        // takes its own device and the OS mixes — so the one place "everything the panel
-        // is playing" passes through is this factory. Teeing it here, before anything is
-        // handed a copy, is what makes a session impossible to add later that reaches the
-        // speakers and misses the stream.
+        let mixer = Arc::new(pipeline::mixer::AudioMixer::with_gain(
+            pipeline::audio_out::output_factory(audio_selector.clone()),
+            render_pipeline.gain(),
+        ));
+        // The output stream's audio (#101), as a tap on the mixer: the samples the
+        // speakers were given, not a reconstruction of them. A session cannot be added
+        // later that reaches the speakers and misses the stream, because the mixer is the
+        // only way to reach the speakers.
         #[cfg(all(feature = "audio", feature = "stream"))]
         let stream_audio = Arc::new(pipeline::stream::StreamAudio::new());
         #[cfg(all(feature = "audio", feature = "stream"))]
-        let audio_factory = stream_audio.factory(audio_factory);
+        mixer.add_tap(stream_audio.tap());
         #[cfg(feature = "audio")]
-        let render_pipeline = render_pipeline.with_audio_output(Arc::clone(&audio_factory));
+        let render_pipeline = render_pipeline.with_mixer(Arc::clone(&mixer));
         // A second handle on the render channel, for the shell: it pushes screens in
         // answer to panel presses, and the pipeline itself is about to be moved into the
         // session manager.
@@ -428,14 +434,10 @@ fn main() -> anyhow::Result<()> {
                 &app_dir,
                 StdArc::clone(&blocker),
                 // The browser's audio is captured out of the page and mixed here rather
-                // than played by the browser process, so it takes an output of its own —
-                // one per session, like every other source.
-                Some(&audio_factory),
-                // The panel's one volume, not a second one. Page audio reached the device
-                // without passing through this at all, so YouTube Lounge's `setVolume`
-                // landed on a gain the browser never consulted — a slider that did
-                // nothing, on the surface most likely to be playing (#86).
-                StdArc::clone(&browser_gain),
+                // than played by the browser process, so it joins the mix as one more
+                // source. It used to take a device of its own, which is how page audio
+                // came to bypass the panel's volume entirely (#86).
+                Some(&mixer),
                 pipeline::TV_USER_AGENT,
                 wake.clone(),
             )
@@ -447,8 +449,7 @@ fn main() -> anyhow::Result<()> {
                     program,
                     app_dir,
                     adblock: blocker,
-                    audio_out: Some(StdArc::clone(&audio_factory)),
-                    gain: browser_gain,
+                    mixer: Some(StdArc::clone(&mixer)),
                     user_agent: pipeline::TV_USER_AGENT.to_string(),
                     waker: wake.clone(),
                 },

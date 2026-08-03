@@ -792,11 +792,41 @@ pub(crate) mod tests {
         assert!(rms(&decoded) > 0.05, "SBC output is silent");
     }
 
-    /// An output that remembers how loud what it was given actually was.
+    /// The panel's device, for a test that wants to know what actually came out of it.
+    ///
+    /// It sits under a mixer rather than under a session, because since #111 a session
+    /// does not hold a device. That means it also receives the silence the mixer pads
+    /// with whenever no source has anything to say — so "how much audio played" is the
+    /// *span* between the first and last audible sample, not a running total of frames.
     #[derive(Default)]
     struct Speaker {
-        frames: std::sync::atomic::AtomicU64,
+        heard: std::sync::Mutex<Vec<f32>>,
         peak: std::sync::Mutex<f32>,
+    }
+
+    impl Speaker {
+        /// How long the audible part of what reached the device lasted.
+        fn played(&self) -> Duration {
+            let heard = self.heard.lock().expect("poisoned");
+            let audible = |(_, s): &(usize, &f32)| s.abs() > 1e-3;
+            let mut hits = heard.iter().enumerate().filter(audible);
+            let Some((first, _)) = hits.next() else {
+                return Duration::ZERO;
+            };
+            let last = hits.last().map_or(first, |(i, _)| i);
+            let frames = (last - first) / usize::from(crate::mixer::CHANNELS);
+            Duration::from_nanos(
+                (frames as u64).saturating_mul(1_000_000_000) / u64::from(crate::mixer::RATE),
+            )
+        }
+
+        /// A mixer that plays through this speaker.
+        fn mixer(self: &std::sync::Arc<Self>) -> crate::mixer::AudioMixer {
+            let device = std::sync::Arc::clone(self);
+            crate::mixer::AudioMixer::new(std::sync::Arc::new(move || {
+                Box::new(std::sync::Arc::clone(&device))
+            }))
+        }
     }
 
     impl crate::audio_out::AudioOut for std::sync::Arc<Speaker> {
@@ -804,10 +834,10 @@ pub(crate) mod tests {
             Ok(())
         }
         fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
-            self.frames.fetch_add(
-                block.frame_count() as u64,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            self.heard
+                .lock()
+                .expect("poisoned")
+                .extend_from_slice(&block.samples);
             let loudest = block.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
             if let Ok(mut peak) = self.peak.lock() {
                 *peak = peak.max(loudest);
@@ -842,23 +872,25 @@ pub(crate) mod tests {
         drop(tx);
 
         let speaker = std::sync::Arc::new(Speaker::default());
+        let mixer = speaker.mixer();
         crate::audio_session::run(
             rx,
             format(rate, 2),
             None,
-            Box::new(std::sync::Arc::clone(&speaker)),
+            mixer.input(),
             &std::sync::atomic::AtomicBool::new(false),
-            &crate::audio_session::Gain::default(),
             None,
         );
+        // The session has handed everything over; give the mixer time to play it out.
+        std::thread::sleep(Duration::from_millis(300));
 
-        let played = speaker.frames.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(played > 0, "not one sample frame reached the output");
+        let played = speaker.played();
+        assert!(played > Duration::ZERO, "not one sample reached the output");
         // A second of audio in, near enough a second of audio out — a session that
         // decoded one frame and stopped would satisfy a bare `> 0`.
         assert!(
-            played > u64::from(rate) / 2,
-            "only {played} frames of a one-second clip reached the output"
+            played > Duration::from_millis(500),
+            "only {played:?} of a one-second clip reached the output"
         );
         // …and it was *sound*, not a correctly-shaped block of zeros, which is what a
         // wrong sample format or a mis-set gain produces.
@@ -869,7 +901,8 @@ pub(crate) mod tests {
     }
 
     /// An output that will not open — what a WASAPI endpoint does when asked for a rate
-    /// it does not have.
+    /// it does not have, and what a PipeWire sink does after the panel has gone to sleep
+    /// and taken the HDMI node with it (#55).
     #[derive(Debug)]
     struct RefusingOutput;
 
@@ -886,18 +919,27 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_session_whose_output_refuses_says_so_instead_of_playing_silently() {
-        // The bug this ends, measured on the panel: a phone streaming 44.1 kHz aptX HD at
-        // a WASAPI endpoint fixed to 48 kHz. `build_output_stream` refused, the session
-        // thread returned — and nothing else was told. The adapter went on accepting
-        // media into a dead channel for another 46 seconds, logging "audio queue full"
-        // once per packet, while the now-playing card claimed to be playing throughout.
+    fn a_device_that_refuses_costs_the_sound_and_not_the_session() {
+        // This assertion is deliberately the opposite of the one it replaced, and the
+        // reversal is the point of #111.
+        //
+        // The bug that motivated the original, measured on the panel: a phone streaming
+        // 44.1 kHz aptX HD at a WASAPI endpoint fixed to 48 kHz. `build_output_stream`
+        // refused, the session thread returned — and nothing else was told. The adapter
+        // went on accepting media into a dead channel for another 46 seconds, logging
+        // "audio queue full" once per packet, while the now-playing card claimed to be
+        // playing throughout. The fix then was to end the session loudly.
+        //
+        // A session no longer holds a device, so it cannot be the thing that notices one
+        // refusing. The mixer does, falls back to a sink that still keeps time, and
+        // retries underneath every source at once — so the session runs to completion and
+        // reports no failure. That is what makes a Bluetooth session survive the display
+        // sleeping instead of dying with it (#55), and it is why the sharp end of the old
+        // failure cannot come back: there is no longer a per-session device to refuse.
         //
         // Resampling (see `crate::resample`) is what stops the refusal happening at all.
-        // This is the other half: if it ever *does* happen, somebody has to be told, or
-        // the symptom is once again silence with a healthy-looking session on top of it.
         let rate = 44_100;
-        let frames = encode(AudioCodec::Sbc, rate, &sine(rate, rate as usize));
+        let frames = encode(AudioCodec::Sbc, rate, &sine(rate, rate as usize / 4));
         if frames.is_empty() {
             eprintln!("this ffmpeg build has no SBC encoder; skipping");
             return;
@@ -909,26 +951,34 @@ pub(crate) mod tests {
         }
         drop(tx);
 
+        let mixer = crate::mixer::AudioMixer::new(std::sync::Arc::new(|| Box::new(RefusingOutput)));
         let reported: std::sync::Arc<std::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = std::sync::Arc::clone(&reported);
+        let started = std::time::Instant::now();
         crate::audio_session::run(
             rx,
             format(rate, 2),
             None,
-            Box::new(RefusingOutput),
+            mixer.input(),
             &std::sync::atomic::AtomicBool::new(false),
-            &crate::audio_session::Gain::default(),
             Some(Box::new(move |why| {
                 *sink.lock().expect("poisoned") = Some(why);
             })),
         );
 
-        let why = reported.lock().unwrap().clone();
-        let why = why.expect("a session that cannot open its output must report it");
+        assert_eq!(
+            *reported.lock().unwrap(),
+            None,
+            "a device that will not open must not tear the session down with it"
+        );
+        // And it drained in real time rather than wedging behind a sink that never
+        // consumes — a quarter-second clip, paced, with the lead it is allowed to run
+        // ahead by taken off the front.
+        let taken = started.elapsed();
         assert!(
-            why.contains("44100"),
-            "the report should name the rate that was refused, got {why:?}"
+            taken < Duration::from_secs(2),
+            "the session stalled behind a dead device: {taken:?}"
         );
     }
 
@@ -1025,7 +1075,6 @@ pub(crate) mod tests {
         // audio session and a second of audio comes out the other, with the duration the
         // input implies. A path that silently produced nothing would pass every test
         // that only checks for errors.
-        use crate::audio_out::NullAudioOut;
 
         let rate = 44_100;
         let frames = encode(AudioCodec::AptX, rate, &sine(rate, rate as usize));
@@ -1040,65 +1089,34 @@ pub(crate) mod tests {
         }
         drop(tx);
 
+        let speaker = std::sync::Arc::new(Speaker::default());
+        // The mixer stays *here*, not in the worker: dropping it stops its thread, and the
+        // last of the in-flight audio would never be played out.
+        let mixer = speaker.mixer();
+        let input = mixer.input();
         // Run on a worker thread: the session blocks, which is exactly why it gets one.
-        let handle = std::thread::spawn(move || {
-            let mut out = NullAudioOut::new();
-            // `run` takes ownership, so account through a second sink and report back.
-            let counted: BlockLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sink = CountingOut {
-                inner: std::mem::take(&mut out),
-                blocks: std::sync::Arc::clone(&counted),
-            };
+        std::thread::spawn(move || {
             let stop = std::sync::atomic::AtomicBool::new(false);
-            crate::audio_session::run(
-                rx,
-                format(44_100, 2),
-                None,
-                Box::new(sink),
-                &stop,
-                &crate::audio_session::Gain::default(),
-                None,
-            );
-            let blocks = counted.lock().unwrap().clone();
-            blocks
-        });
-        let blocks = handle.join().unwrap();
+            crate::audio_session::run(rx, format(44_100, 2), None, input, &stop, None);
+        })
+        .join()
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
 
-        assert!(!blocks.is_empty(), "the session played nothing");
-        let total: usize = blocks.iter().map(|(frames, _)| frames).sum();
-        let played = Duration::from_nanos((total as u64 * 1_000_000_000) / u64::from(rate));
-        // aptX is fixed-rate, so a second in should be about a second out. Allow slack
-        // for whatever the encoder held back at the tail.
+        let played = speaker.played();
+        // aptX is fixed-rate, so a second in should be about a second out.
+        //
+        // The window is tight on purpose, because since #111 this is also where a session
+        // inventing a rate would show up. The device runs at the mix rate whatever the
+        // source does, so a wrong rate no longer reaches it as a wrong *format* — it
+        // reaches it as the wrong *duration*: 44 100 frames declared as 48 kHz skip the
+        // resampler and play in 919 ms. That is the #70 failure, and the only thing here
+        // that can still see it.
         assert!(
-            played >= Duration::from_millis(900) && played <= Duration::from_millis(1_100),
-            "played {played:?}, expected about a second"
+            played >= Duration::from_millis(950) && played <= Duration::from_millis(1_060),
+            "played {played:?}, expected about a second — a short read here means the \
+             session played the stream at a rate the samples did not state"
         );
-        assert_eq!(blocks[0].1, (rate, 2), "format must survive the session");
-    }
-
-    /// One block as the test cares about it: how many frames, in what format.
-    type BlockLog = std::sync::Arc<std::sync::Mutex<Vec<(usize, (u32, u16))>>>;
-
-    /// A sink that records what it was handed, so the session's output can be asserted.
-    struct CountingOut {
-        inner: crate::audio_out::NullAudioOut,
-        blocks: BlockLog,
-    }
-
-    impl crate::audio_out::AudioOut for CountingOut {
-        fn start(&mut self, rate: u32, channels: u16) -> Result<(), PipelineError> {
-            self.inner.start(rate, channels)
-        }
-        fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
-            self.blocks
-                .lock()
-                .expect("poisoned")
-                .push((block.frame_count(), (block.sample_rate, block.channels)));
-            self.inner.write(block)
-        }
-        fn stop(&mut self) {
-            self.inner.stop();
-        }
     }
 
     #[test]

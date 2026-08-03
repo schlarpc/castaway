@@ -18,152 +18,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame, Volume};
+use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, PcmFrame};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio_decode::decode_audio_stream;
-use crate::audio_out::AudioOut;
-// Not test-only or headless-only any more: it is also what a *real* output falls back to
-// when the device refuses the stream, so that a missing sound card costs the sound and not
-// the picture.
-use crate::audio_out::NullAudioOut;
+use crate::mixer::MixInput;
 
-/// Output gain, shared between the thread that is playing and whoever holds the remote.
+/// The panel's one volume.
 ///
-/// This exists because a volume command had nowhere to land. AVRCP `SET_ABSOLUTE_VOLUME`
-/// was parsed, answered `Accepted`, and emitted as a `ControlTxn` that the pipeline
-/// logged and dropped — so a phone's volume rocker did nothing, and a phone that entered
-/// absolute-volume mode on the strength of our Target record stopped attenuating locally
-/// and pinned playback at full scale.
-///
-/// Applied here, at the last point before the device, rather than in each protocol: the
-/// panel has one pair of speakers, so it has one volume, and a source-side gain would
-/// leave every other source at whatever the last one set.
-///
-/// Stored as bits in an atomic so the audio thread never takes a lock — a mutex here
-/// would put the remote's contention on the path that must not stall.
-#[derive(Debug)]
-pub struct Gain {
-    level: std::sync::atomic::AtomicU32,
-    muted: AtomicBool,
-}
+/// Lives in [`crate::mixer`] now, because that is where it is applied: the argument for a
+/// single shared gain was always "the panel has one pair of speakers, so it has one
+/// volume", and until #111 that was implemented N times at N sinks. Re-exported here
+/// because a session is still how most callers reach it.
+pub use crate::mixer::Gain;
 
-impl Default for Gain {
-    fn default() -> Self {
-        Self {
-            level: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
-            muted: AtomicBool::new(false),
-        }
-    }
-}
-
-impl Gain {
-    /// Set the level.
-    ///
-    /// Takes a [`Volume`] rather than an `f32` because the number a sender sends and the
-    /// number this multiplies by are different scales that look identical (#85). The
-    /// conversion happened at whichever protocol boundary parsed the wire; by the time it
-    /// arrives here there is nothing left to interpret, and no way to hand it a slider
-    /// position by accident.
-    pub fn set(&self, level: Volume) {
-        self.level.store(
-            level.amplitude().to_bits(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    /// The current level, as the amplitude samples are multiplied by.
-    ///
-    /// Deliberately not a [`Volume`]: there is no constructor from a bare amplitude, and
-    /// there should not be one. Every sender that needs its slider told where it ended up
-    /// keeps its own authoritative copy in its own scale — Cast a position, DLNA a
-    /// percent, AirPlay a dBFS figure — so nothing has to reverse the taper to answer.
-    #[must_use]
-    pub fn level(&self) -> f32 {
-        f32::from_bits(self.level.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    /// Mute or unmute without disturbing the level.
-    pub fn set_muted(&self, muted: bool) {
-        self.muted.store(muted, Ordering::Relaxed);
-    }
-
-    /// Whether output is muted.
-    #[must_use]
-    pub fn muted(&self) -> bool {
-        self.muted.load(Ordering::Relaxed)
-    }
-
-    /// What every sample should be multiplied by right now.
-    fn factor(&self) -> f32 {
-        if self.muted() {
-            0.0
-        } else {
-            self.level()
-        }
-    }
-
-    /// Scale a block in place.
-    ///
-    /// Public because the panel has more than one thing that writes to a device: the
-    /// browser's page audio goes to its own stream and used to reach it without passing
-    /// here at all, which is the hole #86 found. Every writer applies this, at the same
-    /// point — last thing before the device.
-    pub fn apply(&self, block: &mut PcmFrame) {
-        let factor = self.factor();
-        // Unity is the overwhelmingly common case — every source that never touches the
-        // volume — and skipping it keeps the whole mechanism free when unused.
-        if (factor - 1.0).abs() < f32::EPSILON {
-            return;
-        }
-        for sample in &mut block.samples {
-            *sample *= factor;
-        }
-    }
-}
-
-/// The output a session uses when the caller expresses no preference.
-///
-/// Real device when the `audio-out` feature is on, accounting-only otherwise — so a
-/// headless CI box runs the whole path and a kiosk makes noise, from the same code.
-#[must_use]
-pub fn default_output() -> Box<dyn AudioOut> {
-    #[cfg(feature = "audio-out")]
-    {
-        Box::new(crate::audio_out::CpalAudioOut::new())
-    }
-    #[cfg(not(feature = "audio-out"))]
-    {
-        Box::new(NullAudioOut::new())
-    }
-}
-
-/// Run a decode → output session on a dedicated thread until the source ends or `stop`
-/// is set.
+/// Run a decode → mix session on a dedicated thread until the source ends or `stop` is
+/// set.
 ///
 /// The flag is not optional. A preempted session whose phone is still streaming will
-/// otherwise decode forever, and two sessions writing to one output device do not mix —
-/// they fight, and it sounds like it.
+/// otherwise decode forever. It no longer has anything to do with sharing the *device* —
+/// since #111 two sessions genuinely do mix — but the panel is still single-source by
+/// policy, and a preempted source has to be told to stop rather than left playing under
+/// the one that replaced it.
 pub fn spawn(
     frames: mpsc::Receiver<EncodedFrame>,
     format: AudioFormat,
     config: Option<bytes::Bytes>,
-    output: Box<dyn AudioOut>,
+    input: MixInput,
     stop: Arc<AtomicBool>,
-    gain: Arc<Gain>,
     failed: Option<SessionFailed>,
 ) {
     std::thread::spawn(move || {
-        run(
-            frames,
-            format,
-            config.as_deref(),
-            output,
-            &stop,
-            &gain,
-            failed,
-        );
+        run(frames, format, config.as_deref(), input, &stop, failed);
     });
 }
 
@@ -180,9 +67,8 @@ pub fn run(
     mut frames: mpsc::Receiver<EncodedFrame>,
     format: AudioFormat,
     config: Option<&[u8]>,
-    mut output: Box<dyn AudioOut>,
+    mut input: MixInput,
     stop: &AtomicBool,
-    gain: &Gain,
     failed: Option<SessionFailed>,
 ) {
     // Wait for the first frame so the codec comes from the stream itself.
@@ -196,8 +82,8 @@ pub fn run(
 
     let mut started = false;
     let mut pending = Some(first);
-    // Why the output could not be opened, if it could not. Set inside the sink closure
-    // and reported after it, because the closure cannot consume the `FnOnce`.
+    // Why the session could not play, if it could not. Set inside the sink closure and
+    // reported after it, because the closure cannot consume the `FnOnce`.
     let mut refused: Option<String> = None;
 
     let result = decode_audio_stream(
@@ -210,31 +96,11 @@ pub fn run(
             }
             pending.take().or_else(|| frames.blocking_recv())
         },
-        |mut block| {
+        |block| {
             if stop.load(Ordering::Relaxed) {
                 return false;
             }
-            gain.apply(&mut block);
             if !started {
-                if let Err(e) = output.start(block.sample_rate, block.channels) {
-                    // ERROR, not WARN: with the rate negotiated and resampled this should
-                    // now be unreachable for a mismatch, so if it fires the box genuinely
-                    // cannot play and somebody has to be told. The session used to stop
-                    // here and say nothing further — the source kept streaming into a
-                    // dead channel, the card kept saying "playing", and the only symptom
-                    // was silence.
-                    error!(
-                        error = %e,
-                        rate = block.sample_rate,
-                        channels = block.channels,
-                        "audio session: the output device refused the stream; ending the session"
-                    );
-                    refused = Some(format!(
-                        "output device refused {} Hz x {}: {e}",
-                        block.sample_rate, block.channels
-                    ));
-                    return false;
-                }
                 info!(
                     ?codec,
                     %format,
@@ -244,10 +110,23 @@ pub fn run(
                 );
                 started = true;
             }
-            match output.write(&block) {
+            // No device error can arrive here any more: the mixer owns the device, and a
+            // sink that refuses or vanishes is its problem to retry behind us (#111).
+            // What is left is a shape with no conversion to the mix format, which is a
+            // property of the samples rather than of the box, and is fatal to the
+            // session either way.
+            //
+            // The write *blocks* while this source is already `mixer::LEAD` ahead of the
+            // speakers, and that is the whole pacing mechanism for this path.
+            match input.write(&block) {
                 Ok(()) => true,
                 Err(e) => {
-                    warn!(error = %e, "audio session: output failed");
+                    warn!(error = %e, rate = block.sample_rate, channels = block.channels,
+                        "audio session: these samples cannot reach the mix");
+                    refused = Some(format!(
+                        "no conversion for {} Hz x {}: {e}",
+                        block.sample_rate, block.channels
+                    ));
                     false
                 }
             }
@@ -266,7 +145,9 @@ pub fn run(
             refused = Some(format!("{codec:?} decode failed: {e}"));
         }
     }
-    output.stop();
+    // Dropping the input is what leaves the mix; the mixer plays out whatever is still
+    // queued in it first, so the last block of a track is not truncated.
+    drop(input);
     // Tell the source. Without this the session is over here and still running there:
     // the phone keeps sending, the adapter keeps dropping into a closed channel, and the
     // now-playing card keeps claiming playback that is not happening.
@@ -293,12 +174,11 @@ pub struct PacedSession {
 /// [`spawn`], for adapters that arrive already decoded.
 pub fn spawn_pcm(
     frames: std::sync::mpsc::Receiver<PcmFrame>,
-    output: Box<dyn AudioOut>,
+    input: MixInput,
     stop: Arc<AtomicBool>,
-    gain: Arc<Gain>,
     session: Option<PacedSession>,
 ) {
-    std::thread::spawn(move || run_pcm(frames, output, &stop, &gain, session.as_ref()));
+    std::thread::spawn(move || run_pcm(frames, input, &stop, session.as_ref()));
 }
 
 /// Answer a pending seek flush, if there is one. Returns whether anything was flushed.
@@ -314,9 +194,7 @@ pub fn spawn_pcm(
 fn service_seek_flush(
     session: Option<&PacedSession>,
     frames: &std::sync::mpsc::Receiver<PcmFrame>,
-    output: &mut dyn AudioOut,
-    open_as: &mut Option<(u32, u16)>,
-    pace: &mut Pace,
+    input: &mut MixInput,
 ) -> bool {
     let Some(seek) = session.map(|s| s.seek.as_ref()) else {
         return false;
@@ -329,13 +207,10 @@ fn service_seek_flush(
         dropped += 1;
     }
     debug!(dropped, "pcm session: discarded pre-seek audio");
-    // The device's own buffer holds the same staleness, so it is reopened on the next
-    // block rather than played out first.
-    if open_as.is_some() {
-        output.stop();
-        *open_as = None;
-    }
-    *pace = Pace::default();
+    // What this session has already handed to the mixer is pre-seek too. Dropping it is
+    // now a ring clear rather than a device reopen: the device is shared, and closing it
+    // to flush one source's staleness would have interrupted every other source (#111).
+    input.flush();
     seek.flushed(epoch);
     true
 }
@@ -349,17 +224,16 @@ fn service_seek_flush(
 /// shape cannot disagree with the samples because it travels with them.
 pub fn run_pcm(
     frames: std::sync::mpsc::Receiver<PcmFrame>,
-    mut output: Box<dyn AudioOut>,
+    mut input: MixInput,
     stop: &AtomicBool,
-    gain: &Gain,
     session: Option<&PacedSession>,
 ) {
     let clock = session.map(|s| s.clock.as_ref());
-    // What the output device is currently open as, not what the first block said: a
-    // source may change rate between tracks, and writing 48 kHz samples into a device
-    // opened at 44.1 plays them at the wrong pitch rather than failing.
+    // What shape has been announced, purely so a change is worth one log line. Nothing
+    // has to be reopened for it any more: the mix has one fixed format and the input
+    // resamples into it, so a source changing rate between tracks is a new resampler
+    // rather than a device that has to be torn down and rebuilt (#111).
     let mut open_as: Option<(u32, u16)> = None;
-    let mut pace = Pace::default();
 
     'blocks: loop {
         // Everything queued is from before a seek, so drop it. Checked here, at the top of
@@ -370,13 +244,13 @@ pub fn run_pcm(
         // Acknowledged even when there was nothing to drop — the decode thread is waiting
         // on that acknowledgement before it pushes the first block of the new position,
         // and silence would cost it the whole grace period on every seek.
-        service_seek_flush(session, &frames, output.as_mut(), &mut open_as, &mut pace);
+        service_seek_flush(session, &frames, &mut input);
         // `recv_timeout`, not `recv`, so `stop` is observable while nothing is arriving.
         // A session preempted while its source was *paused* has no next block to wake on,
         // so a plain `recv` parked here forever: the thread leaked and — worse — the
         // output device stayed open, which on an exclusive-mode device means the source
         // that preempted us cannot start at all.
-        let mut block = match frames.recv_timeout(STOP_POLL) {
+        let block = match frames.recv_timeout(STOP_POLL) {
             Ok(block) => block,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::Relaxed) {
@@ -397,7 +271,10 @@ pub fn run_pcm(
         while clock.is_some_and(crate::clock::MediaClock::is_paused) {
             if stop.load(Ordering::Relaxed) {
                 info!("pcm session: preempted while paused");
-                output.stop();
+                // Dropping `input` on the way out is what leaves the mix. It matters most
+                // on exactly this path: a session preempted while *paused* has no next
+                // block to wake on, and before the mixer this was where a parked thread
+                // held an output device the source that replaced it then could not open.
                 return;
             }
             // Seeking *while paused* is the ordinary way people find a spot, and this is
@@ -406,7 +283,7 @@ pub fn run_pcm(
             // resume the block held below was written to the device and observed onto the
             // media clock at its old position, so the clock jumped backwards and a
             // second of stale audio played before the top of the loop finally flushed.
-            if service_seek_flush(session, &frames, output.as_mut(), &mut open_as, &mut pace) {
+            if service_seek_flush(session, &frames, &mut input) {
                 // The held block is pre-seek too, and dropping it is the point.
                 continue 'blocks;
             }
@@ -415,59 +292,36 @@ pub fn run_pcm(
         let shape = (block.sample_rate, block.channels);
         if open_as != Some(shape) {
             if open_as.is_some() {
-                info!(?open_as, new = ?shape, "pcm session: stream shape changed, reopening");
-                output.stop();
-            }
-            if let Err(e) = output.start(shape.0, shape.1) {
-                // Silence, not a black screen. Ending here dropped the receiver, which
-                // ended the demuxer behind it, which ended the *video* — so on a box whose
-                // sound card was absent, busy, or held in exclusive mode, a video cast
-                // produced a flash and nothing while the phone said PLAYING.
-                //
-                // A null sink keeps time exactly as the real one does, so the picture
-                // plays on, paced, with one line saying why it is quiet.
-                warn!(error = %e, rate = shape.0, channels = shape.1,
-                    "pcm session: the output refused the stream; playing on in silence");
-                output = Box::new(NullAudioOut::new());
-                if output.start(shape.0, shape.1).is_err() {
-                    // Unreachable in practice — the null sink accepts everything — but a
-                    // library crate does not get to assume that on a runtime path.
-                    break;
-                }
+                info!(?open_as, new = ?shape, "pcm session: stream shape changed");
             } else {
                 info!(rate = shape.0, channels = shape.1, "pcm session: playing");
             }
             open_as = Some(shape);
-            pace = Pace::default();
         }
-        let played = block.duration();
-        let through = block.pts + played;
-        gain.apply(&mut block);
-        if let Err(e) = output.write(&block) {
-            // Same reasoning as a refused start, one step later: a device that goes away
-            // mid-session — unplugged, or claimed by something else — must cost the sound
-            // and not the picture.
-            warn!(error = %e, "pcm session: the output failed; playing on in silence");
-            output = Box::new(NullAudioOut::new());
-            if output.start(shape.0, shape.1).is_err() || output.write(&block).is_err() {
-                break;
-            }
-        }
-        // Published *before* the pacing sleep, not after: this says how far the stream
-        // has been submitted, and the sleep that follows is precisely the mechanism that
-        // keeps submission within `LEAD` of the speaker. Publishing after would make the
-        // clock jump in whole-block steps at the moment the thread wakes.
+        let through = block.pts + block.duration();
+        // Published *before* the write, which is what blocks: this says how far the
+        // stream has been submitted, and the block that follows is precisely the
+        // mechanism keeping submission within `mixer::LEAD` of the speaker. Publishing
+        // after would make the clock jump in whole-block steps as the thread wakes.
         //
         // Only the media-URL path passes a clock; A2DP and Spotify have no video to
         // synchronise and nothing reads it.
         if let Some(clock) = clock {
             clock.observe_audio(through);
         }
-        let consumed = pace.consumed(output.as_ref(), shape.0);
-        pace.wait_for(played, consumed);
+        // Silence, not a black screen. This used to be where a device that refused or
+        // vanished ended the receiver, which ended the demuxer, which ended the *video* —
+        // so a box whose sound card was absent, busy, or held in exclusive mode showed a
+        // flash and nothing while the phone said PLAYING. There is no device here to
+        // refuse: the mixer holds it, falls back to silence that still keeps time, and
+        // retries underneath every source at once. What remains is a shape with no
+        // conversion into the mix, which no fallback can rescue.
+        if let Err(e) = input.write(&block) {
+            warn!(error = %e, rate = shape.0, channels = shape.1,
+                "pcm session: these samples cannot reach the mix; ending");
+            break;
+        }
     }
-
-    output.stop();
 }
 
 /// How often a parked PCM session looks up to see whether it has been preempted.
@@ -475,122 +329,6 @@ pub fn run_pcm(
 /// Short enough that a preempted session releases the audio device promptly, long enough
 /// that an idle one is not a busy loop.
 const STOP_POLL: Duration = Duration::from_millis(200);
-
-/// How far ahead of real time the session is allowed to run.
-///
-/// This is the buffer that absorbs a scheduling hiccup on either side. Too small and any
-/// stall is a dropout; too large and a pause takes that long to actually go quiet.
-///
-/// Shared with [`crate::clock`] rather than restated: the media clock subtracts exactly
-/// this to turn what has been submitted into what has been heard, and two copies would
-/// drift into lip sync that is quietly off by the difference.
-const LEAD: Duration = crate::clock::OUTPUT_LEAD;
-
-/// A gap this big means the stream stopped rather than merely stuttered — a pause, a
-/// buffering stall, a track that took a while to load — so the clock restarts instead of
-/// trying to make up the time in one burst.
-const RESYNC_AFTER: Duration = Duration::from_secs(1);
-
-/// Wall-clock pacing for a pull-based source.
-///
-/// A *pushed* stream needs none of this: A2DP arrives in real time because the phone is
-/// the clock, and the output drops a late block rather than stalling the link (ground
-/// rule 4). A *pulled* stream is the opposite — librespot decodes as fast as its sink
-/// accepts — so with an output that never blocks (both of ours: cpal drops when its ring
-/// is full, and the null sink accepts instantly) a track is consumed in seconds and the
-/// queue turbo-advances. Nothing else in the chain is a clock, so this is.
-///
-/// ## Which clock, and why it is not the wall
-///
-/// It used to be the wall, and that was a slow leak. The device runs on its own crystal
-/// and the wall runs on the CPU's; measured on this box's HDMI sink over forty minutes,
-/// they differ by **−16.0 ppm ± 2.2** (7σ — `examples/audio_drift.rs`, the measurement
-/// #111 stage 0 asked for). Submission paced to the wall therefore ran 16 ppm faster than
-/// consumption, the output's ring filled by one block roughly every twenty minutes, and
-/// the block was dropped — `AudioOut::write` never blocks, deliberately, so a full queue
-/// discards rather than backing up into the decoder. An audible click, three times an
-/// hour, on every long session, with a `warn!` and nothing else.
-///
-/// So the reference is what the *device* has consumed, when it can say
-/// ([`AudioOut::frames_played`]). Then the pacing loop is closed against the thing that is
-/// actually playing the samples, and the crystal's error stops accumulating anywhere —
-/// there is nothing left for it to accumulate *in*.
-///
-/// The wall is the fallback, for a sink that is not a device: the null output, and
-/// anything whose backend cannot count. It has to be, because "how fast should silence be
-/// consumed" has no other answer — but a sink with no clock also has no ring to overflow,
-/// which is why the fallback was survivable for as long as it was the only path.
-#[derive(Default)]
-struct Pace {
-    /// When the current run of audio started, and how much has been handed over since.
-    /// `None` until the first block, and reset whenever the stream stops for a while.
-    since: Option<(std::time::Instant, Duration)>,
-    /// What the device had played when this run started, if it counts.
-    ///
-    /// Subtracted from every later reading rather than assuming zero: a device is opened
-    /// once and may serve several runs, and a counter that does not restart with the run
-    /// would report the previous one's audio as this one's progress.
-    played_at_start: Option<u64>,
-}
-
-impl Pace {
-    /// Account for `played` worth of audio, then sleep off anything beyond [`LEAD`].
-    ///
-    /// `consumed` is what the device says it has played since this run began, when it can
-    /// say; see the type's docs for why that is the reference rather than wall clock.
-    fn wait_for(&mut self, played: Duration, consumed: Option<Duration>) {
-        if let Some(excess) = self.overshoot(played, consumed, std::time::Instant::now()) {
-            std::thread::sleep(excess);
-        }
-    }
-
-    /// How long the source must wait, and *why* — the decision, with no sleep in it.
-    ///
-    /// Split out so the pacing can be asserted against numbers a test chose rather than
-    /// against how fast the host is. The property that matters here is "a device running
-    /// slow slows the source down", and timing a thread to prove it is the shape #156 was
-    /// about.
-    fn overshoot(
-        &mut self,
-        played: Duration,
-        consumed: Option<Duration>,
-        now: std::time::Instant,
-    ) -> Option<Duration> {
-        let (start, submitted) = self.since.get_or_insert((now, Duration::ZERO));
-
-        // Fell far behind: the source paused or stalled. Catching up would replay the
-        // silence at speed, which is the very thing this exists to prevent.
-        //
-        // Judged on the wall even when the device is the reference, and that is not an
-        // oversight: a stalled source stops *submitting*, so the device drains, and the
-        // gap this is looking for is one in real time. Measuring it against a device that
-        // has run dry would find nothing.
-        if now.duration_since(*start) > *submitted + RESYNC_AFTER {
-            *start = now;
-            *submitted = Duration::ZERO;
-            self.played_at_start = None;
-        }
-
-        *submitted += played;
-        // The device's clock where there is one, the wall where there is not.
-        let elapsed = consumed.unwrap_or_else(|| now.duration_since(*start));
-        submitted.checked_sub(elapsed)?.checked_sub(LEAD)
-    }
-
-    /// How much the device has played since this run began, in media time.
-    ///
-    /// `None` for a sink that cannot count, and for the first block of a run — there is
-    /// nothing to measure against until a baseline is taken, and taking one *is* what
-    /// this call does.
-    fn consumed(&mut self, output: &dyn AudioOut, sample_rate: u32) -> Option<Duration> {
-        let total = output.frames_played()?;
-        let base = *self.played_at_start.get_or_insert(total);
-        let since = total.saturating_sub(base);
-        Some(Duration::from_secs_f64(
-            since as f64 / f64::from(sample_rate.max(1)),
-        ))
-    }
-}
 
 /// Which codecs this build can actually decode.
 ///
@@ -617,8 +355,81 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use castaway_core::Volume;
+
     use super::*;
+    use crate::audio_out::AudioOut;
     use crate::error::PipelineError;
+    use crate::mixer::AudioMixer;
+
+    /// A device that plays in real time and remembers what it heard.
+    ///
+    /// Sessions no longer hold devices, so this sits under a mixer rather than being
+    /// handed to a session. That is a better assertion than the call log it replaced: it
+    /// says what came out of the panel, not what one source asked for.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        start: Mutex<Option<std::time::Instant>>,
+        heard: Mutex<Vec<f32>>,
+    }
+
+    impl Recorder {
+        /// Sample frames that carried actual audio, ignoring the silence the mixer pads
+        /// with whenever no source has anything to say.
+        fn audible_frames(&self) -> usize {
+            self.heard
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.abs() > 1e-4)
+                .count()
+                / 2
+        }
+
+        fn peak(&self) -> f32 {
+            self.heard
+                .lock()
+                .unwrap()
+                .iter()
+                .fold(0.0f32, |peak, s| peak.max(s.abs()))
+        }
+    }
+
+    impl AudioOut for Arc<Recorder> {
+        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
+            *self.start.lock().unwrap() = Some(std::time::Instant::now());
+            Ok(())
+        }
+        fn write(&mut self, block: &PcmFrame) -> Result<(), PipelineError> {
+            self.heard.lock().unwrap().extend_from_slice(&block.samples);
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn frames_played(&self) -> Option<u64> {
+            let start = (*self.start.lock().unwrap())?;
+            Some(
+                u64::try_from(start.elapsed().as_nanos() * 48_000 / 1_000_000_000)
+                    .unwrap_or(u64::MAX),
+            )
+        }
+    }
+
+    /// A mixer over a recorder, plus the recorder to assert on.
+    fn rig() -> (AudioMixer, Arc<Recorder>) {
+        let device = Arc::new(Recorder::default());
+        let for_factory = Arc::clone(&device);
+        let mixer = AudioMixer::new(Arc::new(move || Box::new(Arc::clone(&for_factory))));
+        (mixer, device)
+    }
+
+    /// Let the mixer play out `handed` worth of audio.
+    ///
+    /// It drains in real time, so this has to be at least as long as the audio itself
+    /// plus the in-flight budget a source is allowed to run ahead by — a session returns
+    /// as soon as the mixer has *accepted* the last block, not when it has been heard.
+    fn settle(handed: Duration) {
+        std::thread::sleep(handed + crate::mixer::LEAD + Duration::from_millis(100));
+    }
 
     fn format() -> AudioFormat {
         AudioFormat::from_hz(44_100, 2).unwrap()
@@ -628,26 +439,33 @@ mod tests {
         Arc::new(AtomicBool::new(false))
     }
 
+    fn pcm(sample_rate: u32, channels: u16, frames: usize) -> PcmFrame {
+        pcm_at(sample_rate, channels, frames, 0.5)
+    }
+
+    fn pcm_at(sample_rate: u32, channels: u16, frames: usize, value: f32) -> PcmFrame {
+        PcmFrame {
+            sample_rate,
+            channels,
+            samples: vec![value; frames * usize::from(channels)],
+            pts: Duration::ZERO,
+        }
+    }
+
     #[test]
     fn a_session_with_no_frames_exits_instead_of_parking() {
         // The phone connected and never sent anything. The thread must not leak.
+        let (mixer, _device) = rig();
         let (tx, rx) = mpsc::channel::<EncodedFrame>(1);
         drop(tx);
-        run(
-            rx,
-            format(),
-            None,
-            Box::new(NullAudioOut::new()),
-            &running(),
-            &Gain::default(),
-            None,
-        );
+        run(rx, format(), None, mixer.input(), &running(), None);
     }
 
     #[test]
     fn a_session_that_plays_normally_reports_no_failure() {
         // The other half: the failure path must not fire for an ordinary session, or
         // every Bluetooth stream would tear itself down on the first frame.
+        let (mixer, _device) = rig();
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
         let reported = Arc::new(Mutex::new(false));
@@ -656,9 +474,8 @@ mod tests {
             rx,
             format(),
             None,
-            Box::new(NullAudioOut::new()),
+            mixer.input(),
             &running(),
-            &Gain::default(),
             Some(Box::new(move |_| *sink.lock().expect("poisoned") = true)),
         );
         assert!(
@@ -669,6 +486,7 @@ mod tests {
 
     #[test]
     fn a_frame_without_a_codec_is_refused_rather_than_guessed() {
+        let (mixer, _device) = rig();
         let (tx, rx) = mpsc::channel(1);
         tx.blocking_send(EncodedFrame {
             video_codec: None,
@@ -680,100 +498,15 @@ mod tests {
         .unwrap();
         drop(tx);
         // Guessing SBC here would decode noise; exiting is the honest answer.
-        run(
-            rx,
-            format(),
-            None,
-            Box::new(NullAudioOut::new()),
-            &running(),
-            &Gain::default(),
-            None,
-        );
-    }
-
-    /// An output that remembers what it was asked to do, so a test can assert on the
-    /// device calls rather than only on "it did not crash".
-    #[derive(Debug, Default)]
-    struct RecordingOut {
-        log: Arc<Mutex<Vec<Call>>>,
-    }
-
-    #[derive(Debug, PartialEq)]
-    enum Call {
-        Start(u32, u16),
-        Wrote(usize),
-        Stop,
-    }
-
-    impl crate::audio_out::AudioOut for RecordingOut {
-        fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
-            self.log
-                .lock()
-                .map_err(|_| PipelineError::Audio("poisoned".into()))?
-                .push(Call::Start(sample_rate, channels));
-            Ok(())
-        }
-        fn write(&mut self, block: &crate::audio_decode::PcmBlock) -> Result<(), PipelineError> {
-            self.log
-                .lock()
-                .map_err(|_| PipelineError::Audio("poisoned".into()))?
-                .push(Call::Wrote(block.frame_count()));
-            Ok(())
-        }
-        fn stop(&mut self) {
-            if let Ok(mut log) = self.log.lock() {
-                log.push(Call::Stop);
-            }
-        }
-    }
-
-    fn pcm(sample_rate: u32, channels: u16, frames: usize) -> PcmFrame {
-        PcmFrame {
-            sample_rate,
-            channels,
-            samples: vec![0.0; frames * usize::from(channels)],
-            pts: Duration::ZERO,
-        }
+        run(rx, format(), None, mixer.input(), &running(), None);
     }
 
     #[test]
     fn a_pcm_session_with_no_frames_exits_instead_of_parking() {
+        let (mixer, _device) = rig();
         let (tx, rx) = std::sync::mpsc::sync_channel::<PcmFrame>(1);
         drop(tx);
-        run_pcm(
-            rx,
-            Box::new(NullAudioOut::new()),
-            &running(),
-            &Gain::default(),
-            None,
-        );
-    }
-
-    /// Records the samples themselves, not just how many there were.
-    struct AmplitudeOut {
-        peak: Arc<Mutex<f32>>,
-    }
-    impl AudioOut for AmplitudeOut {
-        fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
-            Ok(())
-        }
-        fn write(&mut self, block: &crate::audio_decode::PcmBlock) -> Result<(), PipelineError> {
-            let loudest = block.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()));
-            if let Ok(mut peak) = self.peak.lock() {
-                *peak = peak.max(loudest);
-            }
-            Ok(())
-        }
-        fn stop(&mut self) {}
-    }
-
-    fn loud(frames: usize) -> PcmFrame {
-        PcmFrame {
-            sample_rate: 44_100,
-            channels: 2,
-            samples: vec![1.0; frames * 2],
-            pts: Duration::ZERO,
-        }
+        run_pcm(rx, mixer.input(), &running(), None);
     }
 
     #[test]
@@ -781,30 +514,28 @@ mod tests {
         // The bug: AVRCP absolute volume was parsed, answered `Accepted`, and dropped by
         // a pipeline whose `control` only logged — so the phone's rocker did nothing, and
         // a phone that had taken absolute-volume control pinned us at full scale.
-        // Positions, not amplitudes — the middle entry is the one that changed with
-        // #85: half the slider travel is -30 dB, so the peak is 0.0316 and not 0.5.
+        //
+        // Asserted at the device rather than inside the session, because since #111 the
+        // session does not apply it — the mixer does, once, to the sum. A session that
+        // silently stopped honouring the volume would still pass a test that checked the
+        // session's own output.
+        //
+        // Positions, not amplitudes — the middle entry is the one that changed with #85:
+        // half the slider travel is -30 dB, so the peak is 0.0316 and not 0.5.
         for (position, muted, expected) in
             [(1.0, false, 1.0), (0.5, false, 0.031_623), (1.0, true, 0.0)]
         {
-            let peak = Arc::new(Mutex::new(0.0f32));
+            let (mixer, device) = rig();
+            mixer.gain().set(Volume::from_position(position));
+            mixer.gain().set_muted(muted);
             let (tx, rx) = std::sync::mpsc::sync_channel(2);
-            tx.send(loud(64)).unwrap();
+            tx.send(pcm_at(48_000, 2, 64, 1.0)).unwrap();
             drop(tx);
-            let gain = Gain::default();
-            gain.set(Volume::from_position(position));
-            gain.set_muted(muted);
-            run_pcm(
-                rx,
-                Box::new(AmplitudeOut {
-                    peak: Arc::clone(&peak),
-                }),
-                &running(),
-                &gain,
-                None,
-            );
-            let got = *peak.lock().unwrap();
+            run_pcm(rx, mixer.input(), &running(), None);
+            settle(Duration::from_millis(2));
+            let got = device.peak();
             assert!(
-                (got - expected).abs() < 1e-5,
+                (got - expected).abs() < 1e-3,
                 "position {position} muted {muted}: peak {got}, want {expected}"
             );
         }
@@ -837,137 +568,96 @@ mod tests {
     }
 
     #[test]
-    fn the_gain_is_applied_by_whoever_writes_to_a_device_not_only_by_a_session() {
+    fn every_source_passes_through_the_one_volume_because_there_is_one_sink() {
         // The hole #86 found: the browser's page audio reached its own device without
         // passing through `Gain` at all, so YouTube Lounge's `setVolume` converted
         // cleanly into a `ControlTxn::Volume`, landed here, and did nothing.
         //
-        // What makes the fix hold is that `apply` is the *whole* of the volume mechanism
-        // and is now public — a second writer applies it or it does not have one, and
-        // there is no third way for a path to be quietly at full scale.
-        let gain = Gain::default();
-        gain.set(Volume::from_dbfs(-6.0));
-        let mut block = pcm(44_100, 2, 4);
-        block.samples.iter_mut().for_each(|s| *s = 1.0);
-        gain.apply(&mut block);
-        for sample in &block.samples {
-            assert!(
-                (*sample - 0.501_187).abs() < 1e-5,
-                "every sample is scaled, got {sample}"
-            );
-        }
-
-        // …and unity really is free, which is what lets this sit on the hot path of a
-        // source that never touches the volume.
-        let unity = Gain::default();
-        let mut untouched = pcm(44_100, 2, 4);
-        untouched.samples.iter_mut().for_each(|s| *s = 0.25);
-        unity.apply(&mut untouched);
-        assert!(untouched
-            .samples
-            .iter()
-            .all(|s| (*s - 0.25).abs() < f32::EPSILON));
-
-        // Mute is the same mechanism rather than a second one, or a muted panel would be
-        // muted on some paths and not others.
-        let muted = Gain::default();
-        muted.set_muted(true);
-        let mut silenced = pcm(44_100, 2, 4);
-        silenced.samples.iter_mut().for_each(|s| *s = 1.0);
-        muted.apply(&mut silenced);
-        assert!(silenced.samples.iter().all(|s| s.abs() < f32::EPSILON));
+        // What makes the fix hold now is structural rather than a convention every writer
+        // has to remember. There is one device and the mixer owns it, so "a path that
+        // reaches the speakers without passing through the gain" is not a mistake anyone
+        // can make — it is a path that does not reach the speakers.
+        let (mixer, device) = rig();
+        mixer.gain().set(Volume::from_dbfs(-6.0));
+        let mut a = mixer.input();
+        let mut b = mixer.input();
+        a.write(&pcm_at(48_000, 2, 480, 0.5)).unwrap();
+        b.write(&pcm_at(48_000, 2, 480, 0.5)).unwrap();
+        settle(Duration::from_millis(10));
+        // Two sources at 0.5 sum to 1.0, attenuated once by -6 dB.
+        let peak = device.peak();
+        assert!(
+            (peak - 0.501_187).abs() < 1e-3,
+            "the sum should be attenuated once, at the sink: got {peak}"
+        );
     }
 
     #[test]
-    fn a_pcm_session_opens_the_output_with_the_shape_the_samples_state() {
+    fn a_pcm_session_plays_at_the_rate_the_samples_state() {
         // Nothing hands this session a negotiated format, so if it ever invents one the
         // stream plays at the wrong pitch — the #70 failure, arriving by a new route.
-        let log = Arc::new(Mutex::new(Vec::new()));
+        // At the mix rate this is exact: what goes in comes out, frame for frame.
+        let (mixer, device) = rig();
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        tx.send(pcm(44_100, 2, 512)).unwrap();
-        tx.send(pcm(44_100, 2, 256)).unwrap();
+        tx.send(pcm(48_000, 2, 512)).unwrap();
+        tx.send(pcm(48_000, 2, 256)).unwrap();
         drop(tx);
-
-        run_pcm(
-            rx,
-            Box::new(RecordingOut {
-                log: Arc::clone(&log),
-            }),
-            &running(),
-            &Gain::default(),
-            None,
-        );
-
+        run_pcm(rx, mixer.input(), &running(), None);
+        settle(Duration::from_millis(16));
         assert_eq!(
-            *log.lock().unwrap(),
-            vec![
-                Call::Start(44_100, 2),
-                Call::Wrote(512),
-                Call::Wrote(256),
-                Call::Stop
-            ]
+            device.audible_frames(),
+            768,
+            "every frame the session stated should have reached the device once"
         );
     }
 
     #[test]
-    fn a_pcm_session_reopens_the_output_when_the_stream_shape_changes() {
-        // Writing 48 kHz samples into a device opened at 44.1 does not fail, it plays
-        // everything sharp — so the reopen has to be driven by the samples themselves.
-        let log = Arc::new(Mutex::new(Vec::new()));
+    fn a_stream_that_changes_shape_keeps_playing_without_reopening_anything() {
+        // This used to tear the device down and open it again, because writing 48 kHz
+        // samples into a device opened at 44.1 plays everything sharp. The mix has one
+        // fixed format now, so a source changing rate between tracks is a new resampler
+        // and nothing else — which matters because the device is *shared*: reopening it
+        // for one source's track change would have interrupted every other source (#111).
+        let (mixer, device) = rig();
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        tx.send(pcm(44_100, 2, 128)).unwrap();
-        tx.send(pcm(48_000, 2, 128)).unwrap();
+        tx.send(pcm(44_100, 2, 4410)).unwrap();
+        tx.send(pcm(48_000, 2, 4800)).unwrap();
         drop(tx);
-
-        run_pcm(
-            rx,
-            Box::new(RecordingOut {
-                log: Arc::clone(&log),
-            }),
-            &running(),
-            &Gain::default(),
-            None,
-        );
-
-        assert_eq!(
-            *log.lock().unwrap(),
-            vec![
-                Call::Start(44_100, 2),
-                Call::Wrote(128),
-                Call::Stop,
-                Call::Start(48_000, 2),
-                Call::Wrote(128),
-                Call::Stop
-            ]
+        run_pcm(rx, mixer.input(), &running(), None);
+        settle(Duration::from_millis(200));
+        // 100 ms at each rate is ~200 ms out, give or take the resampler's delay line.
+        let frames = device.audible_frames();
+        assert!(
+            (8000..=10_400).contains(&frames),
+            "both blocks should have played through: {frames} frames"
         );
     }
 
     #[test]
     fn a_pull_based_session_plays_in_real_time_rather_than_as_fast_as_it_can() {
-        // The bug this exists to prevent, seen twice on real hardware: neither output
-        // blocks — cpal drops when its ring is full, the null sink accepts instantly — so
-        // librespot decoded a whole track in seconds and the queue turbo-advanced.
+        // The bug this exists to prevent, seen twice on real hardware: no output blocked —
+        // cpal drops when its ring is full, the null sink accepts instantly — so librespot
+        // decoded a whole track in seconds and the queue turbo-advanced.
+        //
+        // The mechanism that stops it changed with #111 and the property did not. It was
+        // `Pace`, a per-session sleep against the device's counter; it is now the mixer's
+        // in-flight budget, and the session is paced simply by `write` blocking.
         //
         // Two seconds of audio in 40 ms blocks. It must take roughly two seconds minus the
-        // lead, not the microseconds a memcpy loop would.
+        // lead a source is allowed to run ahead by, not the microseconds a memcpy would.
+        let (mixer, _device) = rig();
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        let per_block = 44_100 / 25; // 40 ms
+        let per_block = 48_000 / 25; // 40 ms
         for _ in 0..50 {
-            tx.send(pcm(44_100, 2, per_block)).unwrap();
+            tx.send(pcm(48_000, 2, per_block)).unwrap();
         }
         drop(tx);
 
         let start = std::time::Instant::now();
-        run_pcm(
-            rx,
-            Box::new(NullAudioOut::new()),
-            &running(),
-            &Gain::default(),
-            None,
-        );
+        run_pcm(rx, mixer.input(), &running(), None);
         let taken = start.elapsed();
 
-        let expected = Duration::from_secs(2).saturating_sub(LEAD);
+        let expected = Duration::from_secs(2).saturating_sub(crate::mixer::LEAD);
         assert!(
             taken >= expected.mul_f32(0.8),
             "played 2s of audio in {taken:?}; it is not pacing"
@@ -977,182 +667,48 @@ mod tests {
     }
 
     #[test]
-    fn pacing_follows_the_device_that_can_say_where_it_has_got_to() {
-        // #111's measurement, as a decision rather than a stopwatch. Paced against the
-        // wall, submission runs ahead of a slow device forever and the difference is
-        // thrown away as a dropped block — measured at −16.0 ppm ± 2.2 on this box's HDMI
-        // sink (`examples/audio_drift.rs`), which is one block roughly every twenty
-        // minutes, an audible click, three times an hour, on every long session, with a
-        // `warn!` and nothing else.
-        //
-        // Every instant below is chosen, so this asserts what the pacing *decides* rather
-        // than how fast the host managed to run it (#156's lesson).
-        let t0 = std::time::Instant::now();
-        let block = Duration::from_millis(100);
-
-        // A device that has consumed nothing at all: everything past the lead has to be
-        // waited out, whatever the wall says.
-        let mut stalled = Pace::default();
-        let mut submitted = Duration::ZERO;
-        for _ in 0..10 {
-            submitted += block;
-            // The wall runs on, which under the old rule would have been enough to let
-            // the source keep going.
-            let now = t0 + submitted;
-            let wait = stalled.overshoot(block, Some(Duration::ZERO), now);
-            if submitted > LEAD {
-                assert_eq!(
-                    wait,
-                    Some(submitted - LEAD),
-                    "a device that has played nothing must hold the source at the lead"
-                );
-            } else {
-                assert_eq!(wait, None, "inside the lead there is nothing to wait for");
-            }
-        }
-
-        // A device keeping up exactly: the source is never held past the lead.
-        let mut matched = Pace::default();
-        let mut submitted = Duration::ZERO;
-        for _ in 0..10 {
-            submitted += block;
-            let wait = matched.overshoot(block, Some(submitted), t0 + submitted);
-            assert_eq!(wait, None, "a device in step slows nobody down");
-        }
-
-        // And a device running *slow* — the real case — holds the source back by exactly
-        // the accumulating difference, which is the error that used to be discarded.
-        let mut slow = Pace::default();
-        let mut submitted = Duration::ZERO;
-        for _ in 0..10 {
-            submitted += block;
-            let consumed = submitted.mul_f64(0.5);
-            let wait = slow.overshoot(block, Some(consumed), t0 + submitted);
-            let expected = (submitted - consumed).checked_sub(LEAD);
-            assert_eq!(wait, expected, "at {submitted:?} submitted");
-        }
-        assert!(
-            slow.overshoot(Duration::ZERO, Some(Duration::from_millis(500)), t0)
-                .is_some(),
-            "half a second behind is half a second the source must not run on"
-        );
-    }
-
-    #[test]
-    fn a_sink_that_cannot_count_is_paced_by_the_wall() {
-        // The fallback, and it has to exist: "how fast should silence be consumed" has no
-        // other answer. The null output takes this path, and a sink with no clock also has
-        // no ring to overflow, which is why it was survivable as the only path.
-        struct Countless;
-        impl AudioOut for Countless {
-            fn start(&mut self, _: u32, _: u16) -> Result<(), PipelineError> {
-                Ok(())
-            }
-            fn write(&mut self, _: &PcmFrame) -> Result<(), PipelineError> {
-                Ok(())
-            }
-            fn stop(&mut self) {}
-        }
-        let mut pace = Pace::default();
-        assert!(
-            pace.consumed(&Countless, 44_100).is_none(),
-            "a sink with no clock says so rather than guessing"
-        );
-
-        let t0 = std::time::Instant::now();
-        // Wall time keeping up with submission: nothing to wait for.
-        assert_eq!(
-            pace.overshoot(
-                Duration::from_millis(100),
-                None,
-                t0 + Duration::from_millis(100)
-            ),
-            None
-        );
-        // Wall time standing still while a second is submitted: held at the lead, exactly
-        // as before this change.
-        let mut still = Pace::default();
-        let mut submitted = Duration::ZERO;
-        for _ in 0..10 {
-            submitted += Duration::from_millis(100);
-            let wait = still.overshoot(Duration::from_millis(100), None, t0);
-            assert_eq!(wait, submitted.checked_sub(LEAD));
-        }
-    }
-
-    #[test]
-    fn a_devices_counter_is_measured_from_where_this_run_started() {
-        // A device is opened once and may serve several runs. A counter read as an
-        // absolute would report the previous run's audio as this one's progress, and this
-        // run would believe itself hours behind and never sleep again.
-        struct Ancient;
-        impl AudioOut for Ancient {
-            fn start(&mut self, _: u32, _: u16) -> Result<(), PipelineError> {
-                Ok(())
-            }
-            fn write(&mut self, _: &PcmFrame) -> Result<(), PipelineError> {
-                Ok(())
-            }
-            fn stop(&mut self) {}
-            fn frames_played(&self) -> Option<u64> {
-                // An hour of 44.1 kHz, from whatever it was playing before.
-                Some(44_100 * 3600)
-            }
-        }
-        let mut pace = Pace::default();
-        assert_eq!(
-            pace.consumed(&Ancient, 44_100),
-            Some(Duration::ZERO),
-            "the baseline is taken on the first read, so this run starts at zero"
-        );
-        // …and stays measured from there.
-        assert_eq!(pace.consumed(&Ancient, 44_100), Some(Duration::ZERO));
-    }
-
-    #[test]
-    fn a_stall_resyncs_the_clock_instead_of_sprinting_to_catch_up() {
+    fn a_source_that_stalls_resumes_without_replaying_the_gap_at_speed() {
         // After a pause the source resumes where it left off. Treating the silent gap as
-        // a debt to repay would replay it at speed — the same audible failure by a
-        // different route.
-        let mut pace = Pace::default();
-        pace.wait_for(Duration::from_millis(100), None);
-        // Pretend a long stall happened by rewinding the recorded start.
-        if let Some((start, _)) = pace.since.as_mut() {
-            *start -= Duration::from_secs(30);
-        }
+        // a debt to repay would replay it at speed.
+        //
+        // `Pace` needed an explicit resync threshold for this — it measured submission
+        // against a start instant, so a stall accumulated a debt it then had to be told to
+        // forgive. The budget needs none: a source that stops writing lets its ring drain,
+        // and a source with an empty ring is never held. The absence of a mechanism is the
+        // thing worth pinning, because it is what a future "improvement" would re-add.
+        let (mixer, _device) = rig();
+        let mut input = mixer.input();
+        input.write(&pcm(48_000, 2, 4800)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
         let resumed = std::time::Instant::now();
-        pace.wait_for(Duration::from_millis(100), None);
+        input.write(&pcm(48_000, 2, 480)).unwrap();
         assert!(
             resumed.elapsed() < Duration::from_millis(50),
-            "a resync must not sleep, and must not try to reclaim the stall"
+            "a source resuming after a stall was made to wait: {:?}",
+            resumed.elapsed()
         );
     }
 
     #[test]
     fn a_preempted_pcm_session_stops_without_draining_the_rest() {
-        // The second source has already taken the output device; this one must let go.
-        let log = Arc::new(Mutex::new(Vec::new()));
+        // The panel is single-source by policy, so a preempted session has to let go —
+        // and, before #111, had to let go of the *device* before the source that
+        // preempted it could start at all.
+        let (mixer, device) = rig();
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         for _ in 0..3 {
-            tx.send(pcm(44_100, 2, 64)).unwrap();
+            tx.send(pcm(48_000, 2, 64)).unwrap();
         }
         drop(tx);
         let stop = Arc::new(AtomicBool::new(true));
 
-        run_pcm(
-            rx,
-            Box::new(RecordingOut {
-                log: Arc::clone(&log),
-            }),
-            &stop,
-            &Gain::default(),
-            None,
-        );
+        run_pcm(rx, mixer.input(), &stop, None);
+        settle(Duration::from_millis(2));
 
         assert_eq!(
-            *log.lock().unwrap(),
-            vec![Call::Stop],
-            "wrote after preemption"
+            device.audible_frames(),
+            0,
+            "a preempted session wrote anyway"
         );
     }
 

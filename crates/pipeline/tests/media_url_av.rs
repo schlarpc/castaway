@@ -267,12 +267,16 @@ fn a_paced_audio_consumer_does_not_stall_the_demuxer_that_feeds_it() {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, rx) = sync_channel::<castaway_core::PcmFrame>(pipeline::ffmpeg_decode::AUDIO_QUEUE);
 
-    // The real thing: `run_pcm`, paced to real time, against a null sink.
+    // The real thing: `run_pcm`, paced to real time by the real mixer, over a null sink
+    // so this runs anywhere. The mixer keeps time on the wall when the device cannot
+    // count, so the pacing under test is the one the panel uses.
+    let mixer = pipeline::mixer::AudioMixer::new(Arc::new(|| {
+        Box::new(pipeline::audio_out::NullAudioOut::new())
+    }));
     pipeline::audio_session::spawn_pcm(
         rx,
-        Box::new(pipeline::audio_out::NullAudioOut::new()),
+        mixer.input(),
         Arc::clone(&stop),
-        Arc::new(pipeline::audio_session::Gain::default()),
         Some(pipeline::audio_session::PacedSession {
             clock: Arc::clone(&clock),
             seek: Arc::clone(&seek),

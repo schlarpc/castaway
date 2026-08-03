@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
-use pipeline::audio_out::AudioOut;
 use pipeline::compositor::{Compositor as _, Layer, LayerId, Transform};
 use pipeline::render_pipeline::{render_channel, RenderLoop};
 use pipeline::stream::audio::RATE;
@@ -80,9 +79,9 @@ fn publish(width: u32, height: u32, segments: u32) -> Option<Arc<LiveStream>> {
 
 /// The same, with the panel playing something.
 ///
-/// `sound` is handed the same factory a real session would take, so what reaches the
-/// stream reaches it the way a cast's audio does — through `AudioOut::write` — rather than
-/// through a back door the shipped path does not have.
+/// `sound` is handed the same `MixInput` a real session would take, so what reaches the
+/// stream reaches it the way a cast's audio does — through the panel's one mixer — rather
+/// than through a back door the shipped path does not have.
 fn publish_with(
     width: u32,
     height: u32,
@@ -103,14 +102,15 @@ fn publish_with(
         Some(Arc::clone(&audio)),
     )));
 
-    // A session, opened the way one really is: through the tee'd factory.
-    let mut session = sound.map(|_| {
-        let mut out = audio.factory(Arc::new(|| {
-            Box::new(pipeline::audio_out::NullAudioOut::new())
-        }))();
-        out.start(RATE, 2).unwrap();
-        out
-    });
+    // The panel's one mixer, with the stream tapping it — which is the whole path under
+    // test, since #111 made the stream a tap rather than a reconstruction. Held in scope
+    // for the loop below: dropping it would stop the mixer thread.
+    let mixer = pipeline::mixer::AudioMixer::new(Arc::new(|| {
+        Box::new(pipeline::audio_out::NullAudioOut::new())
+    }));
+    mixer.add_tap(audio.tap());
+    // A session, opened the way one really is.
+    let mut session = sound.map(|_| mixer.input());
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -119,7 +119,7 @@ fn publish_with(
         state.touch(Instant::now());
         rloop.pump();
         if let (Some(session), Some(sound)) = (session.as_mut(), sound) {
-            sound(session.as_mut());
+            sound(session);
         }
         if let StreamStatus::Failed(why) = state.status() {
             eprintln!("no encoder here, skipping: {why}");
@@ -167,7 +167,7 @@ fn playable(state: &LiveStream, segments: u32) -> tempfile::NamedTempFile {
 type Centre = (u8, u8, u8);
 
 /// A session writing into the stream, poked once per pump.
-type Session<'a> = &'a dyn Fn(&mut dyn AudioOut);
+type Session<'a> = &'a dyn Fn(&mut pipeline::mixer::MixInput);
 
 /// Decode the file: what the track claims to be, and every frame's centre pixel.
 fn decode(path: &std::path::Path) -> ((u32, u32), Vec<Centre>) {
@@ -298,7 +298,7 @@ impl Tone {
         }
     }
 
-    fn feed(&self, out: &mut dyn AudioOut) {
+    fn feed(&self, out: &mut pipeline::mixer::MixInput) {
         let now = Instant::now();
         let mut last = self.last.borrow_mut();
         let since = last.map_or(Duration::from_millis(10), |t| {

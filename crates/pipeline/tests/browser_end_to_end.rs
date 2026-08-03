@@ -56,13 +56,13 @@ const PAGE: &str =
 
 fn spec(
     adblock: Arc<AdBlocker>,
-    audio_out: Option<pipeline::audio_out::AudioOutputFactory>,
+    mixer: Option<Arc<pipeline::mixer::AudioMixer>>,
 ) -> pipeline::electron_browser::RespawnSpec {
     pipeline::electron_browser::RespawnSpec {
         program: electron_path(),
         app_dir: app_dir(),
         adblock,
-        audio_out,
+        mixer,
         user_agent: pipeline::TV_USER_AGENT.to_string(),
         waker: castaway_core::Waker::new(),
     }
@@ -259,12 +259,16 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
         return;
     };
 
-    // A counting sink stands in for the real device: what matters is that blocks reach
-    // an `AudioOut` at all, not that anything was audible in the room.
+    // A counting sink stands in for the real device, under a real mixer: the page is a
+    // source in the mix like any other since #111. It counts blocks that carry *sound*
+    // rather than every block, because the mixer runs continuously and pads with silence
+    // whenever nothing is playing — so a bare block count would pass on a silent page.
     let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let factory: pipeline::audio_out::AudioOutputFactory = {
+    let mixer = {
         let counter = Arc::clone(&counter);
-        Arc::new(move || Box::new(CountingOut(Arc::clone(&counter))))
+        Arc::new(pipeline::mixer::AudioMixer::new(Arc::new(move || {
+            Box::new(CountingOut(Arc::clone(&counter)))
+        })))
     };
 
     let blocker = Arc::new(AdBlocker::with_defaults());
@@ -272,14 +276,14 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
         &electron_path(),
         &app_dir(),
         Arc::clone(&blocker),
-        Some(&factory),
+        Some(&mixer),
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),
     )
     .expect("browser should start");
 
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
-    let mut host = ElectronHost::new(electron, spec(blocker, Some(factory)), rx);
+    let mut host = ElectronHost::new(electron, spec(blocker, Some(mixer)), rx);
     host.resize(640, 480);
     let page = format!("file://{}", audio_page().display());
     tx.send(BrowserCommand::Navigate(page)).unwrap();
@@ -299,7 +303,8 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
     host.shutdown();
 }
 
-/// An `AudioOut` that only counts. The seam a test uses to see that samples left the page.
+/// An `AudioOut` that counts the blocks that carried sound. The seam a test uses to see
+/// that samples left the page and reached the panel's one device.
 #[derive(Debug)]
 struct CountingOut(Arc<std::sync::atomic::AtomicU64>);
 
@@ -311,7 +316,7 @@ impl pipeline::audio_out::AudioOut for CountingOut {
         &mut self,
         block: &pipeline::audio_decode::PcmBlock,
     ) -> Result<(), pipeline::error::PipelineError> {
-        if !block.samples.is_empty() {
+        if block.samples.iter().any(|s| s.abs() > 1e-4) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())

@@ -179,7 +179,6 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::adblock_engine::AdBlocker;
 use crate::audio_decode::PcmBlock;
-use crate::audio_out::{AudioOut, AudioOutputFactory};
 use crate::browser::{BrowserCommand, BrowserRole, BrowserView};
 use crate::browser_proto::{
     encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, Surface, ToBrowser,
@@ -344,18 +343,18 @@ fn decode_pcm(b64: &str) -> Option<Vec<f32>> {
     )
 }
 
-/// The browser's audio output, opened on the first block that arrives.
+/// The browser's way into the panel's mix.
+///
+/// The page is a source like any other since #111 — it used to hold a device of its own,
+/// which is how page audio came to bypass the panel's volume entirely. `Gain` is
+/// documented as the last thing before the device *because* the panel has one pair of
+/// speakers, and page audio went straight past it: YouTube Lounge's `setVolume` converted
+/// cleanly into a `ControlTxn::Volume`, landed on a gain the browser never consulted, and
+/// did nothing — on the surface most likely to be playing (#86). It cannot recur, because
+/// there is no longer a second place for samples to go.
 struct BrowserAudio {
-    out: Box<dyn AudioOut>,
+    input: crate::mixer::MixInput,
     started: bool,
-    /// The panel's one volume, applied here as it is on every other path.
-    ///
-    /// Its absence was a hole with a very visible edge: `Gain` is documented as the last
-    /// thing before the device *because* the panel has one pair of speakers, and page
-    /// audio went straight past it. So YouTube Lounge's `setVolume` converted cleanly
-    /// into a `ControlTxn::Volume`, landed on a gain the browser never consulted, and did
-    /// nothing — on the surface most likely to be playing (#86).
-    gain: Arc<crate::audio_session::Gain>,
 }
 
 /// A painted frame waiting to be imported on the render thread.
@@ -415,8 +414,7 @@ impl Electron {
         program: &std::path::Path,
         app_dir: &std::path::Path,
         adblock: Arc<AdBlocker>,
-        audio_out: Option<&AudioOutputFactory>,
-        gain: Arc<crate::audio_session::Gain>,
+        mixer: Option<&Arc<crate::mixer::AudioMixer>>,
         user_agent: &str,
         waker: castaway_core::Waker,
     ) -> Result<Self, PipelineError> {
@@ -449,14 +447,12 @@ impl Electron {
         let wire = Arc::new(Mutex::new(Some(tx)));
 
         let pending: Arc<Mutex<PendingPaints>> = Arc::new(Mutex::new(PendingPaints::default()));
-        // A factory rather than a device: a respawned browser takes a *fresh* output, the
-        // same way each session does, because two writers on one device fight rather
-        // than mix.
+        // A fresh input, because a respawned browser is a new source; the mixer keeps the
+        // device across the respawn.
         let audio: Arc<Mutex<Option<BrowserAudio>>> =
-            Arc::new(Mutex::new(audio_out.map(|make| BrowserAudio {
-                out: make(),
+            Arc::new(Mutex::new(mixer.map(|mixer| BrowserAudio {
+                input: mixer.input(),
                 started: false,
-                gain: Arc::clone(&gain),
             })));
         let health = Arc::new(Health::default());
         let probes: Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>> =
@@ -866,8 +862,8 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                     // choose, and a device opened before anything plays is a device held
                     // open for a page that may never play.
                     if !sink.started {
-                        if let Err(e) = sink.out.start(sample_rate, channels) {
-                            warn!(target: "castaway::browser", error = %e, "browser audio device");
+                        if let Err(e) = sink.input.format(sample_rate, channels) {
+                            warn!(target: "castaway::browser", error = %e, "browser audio format");
                             return;
                         }
                         sink.started = true;
@@ -876,7 +872,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                             sample_rate, channels, "browser audio into the mixer"
                         );
                     }
-                    let mut block = PcmBlock {
+                    let block = PcmBlock {
                         samples,
                         channels,
                         sample_rate,
@@ -886,11 +882,9 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                         // comparison of two unrelated timelines.
                         pts: std::time::Duration::from_secs_f64(media_time.max(0.0)),
                     };
-                    // The same gain, at the same point in the path: last thing before
-                    // the device. Applied to a *copy* of the page's samples, since the
-                    // block is built here and goes nowhere else.
-                    sink.gain.apply(&mut block);
-                    if let Err(e) = sink.out.write(&block) {
+                    // No gain here any more, and that is the point: the mixer applies the
+                    // panel's one volume to the sum, so page audio cannot miss it.
+                    if let Err(e) = sink.input.write(&block) {
                         warn!(target: "castaway::browser", error = %e, "browser audio write");
                     }
                 }
@@ -1036,11 +1030,9 @@ pub struct RespawnSpec {
     pub app_dir: std::path::PathBuf,
     /// The engine that answers blocking and scriptlet queries.
     pub adblock: Arc<AdBlocker>,
-    /// Where the page's audio goes. `None` leaves the browser silent.
-    pub audio_out: Option<AudioOutputFactory>,
-    /// The panel's one volume. Applied to page audio exactly as it is to every other
-    /// path — see [`BrowserAudio::gain`] for what its absence cost.
-    pub gain: Arc<crate::audio_session::Gain>,
+    /// The panel's mixer, which the page's audio joins as one more source. `None` leaves
+    /// the browser silent. See [`BrowserAudio`] for what a device of its own cost.
+    pub mixer: Option<Arc<crate::mixer::AudioMixer>>,
     /// The user agent leanback keys off.
     pub user_agent: String,
     /// The kiosk-loop waker a respawned browser's reader thread wakes with (#59).
@@ -1366,8 +1358,7 @@ impl ElectronHost {
                 &self.respawn.program,
                 &self.respawn.app_dir,
                 Arc::clone(&self.respawn.adblock),
-                self.respawn.audio_out.as_ref(),
-                Arc::clone(&self.respawn.gain),
+                self.respawn.mixer.as_ref(),
                 &self.respawn.user_agent,
                 self.respawn.waker.clone(),
             ) {
