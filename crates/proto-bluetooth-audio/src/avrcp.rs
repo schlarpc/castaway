@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use castaway_core::{ControlCapabilities, ControlTxn, NowPlaying, PlaybackState};
+use castaway_core::{ControlCapabilities, ControlTxn, NowPlaying, PlaybackState, RepeatMode};
 
 use crate::avctp::{opcode, AvcFrame, Ctype};
 use crate::error::AudioError;
@@ -38,6 +38,14 @@ pub mod pdu {
     pub const REGISTER_NOTIFICATION: u8 = 0x31;
     /// The phone setting *our* volume.
     pub const SET_ABSOLUTE_VOLUME: u8 = 0x50;
+    /// Ask which player application settings the current player exposes.
+    pub const LIST_SETTING_ATTRIBUTES: u8 = 0x11;
+    /// Ask which values one of those settings accepts.
+    pub const LIST_SETTING_VALUES: u8 = 0x12;
+    /// Read the current value of one or more settings.
+    pub const GET_CURRENT_SETTINGS: u8 = 0x13;
+    /// Write the value of one or more settings.
+    pub const SET_SETTING_VALUE: u8 = 0x14;
 }
 
 /// Notification event identifiers.
@@ -48,6 +56,9 @@ pub mod event {
     pub const TRACK_CHANGED: u8 = 0x02;
     /// Playback position moved.
     pub const PLAYBACK_POS_CHANGED: u8 = 0x05;
+    /// A player application setting changed — shuffle or repeat, typically from the
+    /// phone's own UI rather than from us.
+    pub const SETTING_CHANGED: u8 = 0x08;
     /// The peer's volume changed.
     pub const VOLUME_CHANGED: u8 = 0x0D;
 }
@@ -624,6 +635,546 @@ pub const fn playback_state(raw: u8) -> PlaybackState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Player application settings: shuffle and repeat.
+//
+// AVRCP 1.3 §5.2, and a different mechanism from the passthrough keys above. These are
+// *state* the player carries rather than a key it can be pressed with: they are read,
+// written and subscribed to over vendor-dependent PDUs, and the panel needs all three to
+// show a shuffle button that is lit when the phone's own UI says it should be (#76).
+// ---------------------------------------------------------------------------
+
+/// A player application setting a peer may expose.
+///
+/// The four the spec defines, and only those. An id outside them is one whose values we
+/// could not enumerate and whose meaning we would be guessing at, so it never becomes a
+/// `SettingAttribute` — [`SettingAttributes::unknown`] keeps it verbatim instead, because
+/// a capture should record what the peer claimed rather than what we understood of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingAttribute {
+    /// Equalizer on or off.
+    Equalizer,
+    /// Repeat mode.
+    Repeat,
+    /// Shuffle mode.
+    Shuffle,
+    /// Scan — preview each track in turn.
+    Scan,
+}
+
+impl SettingAttribute {
+    /// The wire id.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Equalizer => 0x01,
+            Self::Repeat => 0x02,
+            Self::Shuffle => 0x03,
+            Self::Scan => 0x04,
+        }
+    }
+
+    /// Parse a wire id, or `None` for one the spec does not define.
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            0x01 => Self::Equalizer,
+            0x02 => Self::Repeat,
+            0x03 => Self::Shuffle,
+            0x04 => Self::Scan,
+            _ => return None,
+        })
+    }
+}
+
+/// The values AVRCP defines for [`SettingAttribute::Repeat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatSetting {
+    /// Play to the end and stop.
+    Off,
+    /// Repeat the current track — the mode a boolean cannot express.
+    SingleTrack,
+    /// Repeat everything.
+    AllTracks,
+    /// Repeat the current group: a folder or playlist on a browsable player.
+    Group,
+}
+
+impl RepeatSetting {
+    /// The wire id.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Off => 0x01,
+            Self::SingleTrack => 0x02,
+            Self::AllTracks => 0x03,
+            Self::Group => 0x04,
+        }
+    }
+
+    /// Parse a wire id.
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            0x01 => Self::Off,
+            0x02 => Self::SingleTrack,
+            0x03 => Self::AllTracks,
+            0x04 => Self::Group,
+            _ => return None,
+        })
+    }
+
+    /// How the panel should render it.
+    ///
+    /// `Group` folds into [`RepeatMode::Context`]: the distinction between "this playlist"
+    /// and "everything" needs the browsing channel to even name the group, and a panel
+    /// that drew a third repeat icon nobody could explain would be worse than one that
+    /// says "repeating".
+    #[must_use]
+    pub const fn mode(self) -> RepeatMode {
+        match self {
+            Self::Off => RepeatMode::Off,
+            Self::SingleTrack => RepeatMode::Track,
+            Self::AllTracks | Self::Group => RepeatMode::Context,
+        }
+    }
+
+    /// The value to write for a core repeat mode, preferring one the peer listed.
+    ///
+    /// `allowed` is what `ListPlayerApplicationSettingValues` came back with. A player
+    /// that offers `Group` but not `AllTracks` still gets a working repeat button this
+    /// way, and one that offers neither gets `None` rather than a write it will reject.
+    /// An empty `allowed` means we never asked, so the commonest value is used.
+    #[must_use]
+    pub fn for_mode(mode: RepeatMode, allowed: &[Self]) -> Option<Self> {
+        let candidates: &[Self] = match mode {
+            RepeatMode::Off => &[Self::Off],
+            RepeatMode::Track => &[Self::SingleTrack],
+            RepeatMode::Context => &[Self::AllTracks, Self::Group],
+            // `RepeatMode` is #[non_exhaustive]. A mode added upstream is refused rather
+            // than written as a nearest equivalent, for the same reason `operation_for`
+            // refuses seek.
+            _ => return None,
+        };
+        if allowed.is_empty() {
+            return candidates.first().copied();
+        }
+        candidates.iter().copied().find(|c| allowed.contains(c))
+    }
+}
+
+/// The values AVRCP defines for [`SettingAttribute::Shuffle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShuffleSetting {
+    /// In order.
+    Off,
+    /// Shuffle everything.
+    AllTracks,
+    /// Shuffle within the current group.
+    Group,
+}
+
+impl ShuffleSetting {
+    /// The wire id.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Off => 0x01,
+            Self::AllTracks => 0x02,
+            Self::Group => 0x03,
+        }
+    }
+
+    /// Parse a wire id.
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            0x01 => Self::Off,
+            0x02 => Self::AllTracks,
+            0x03 => Self::Group,
+            _ => return None,
+        })
+    }
+
+    /// Whether shuffle is on at all, in either scope.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// The value to write for a shuffle button, preferring one the peer listed.
+    ///
+    /// Never `None`: unlike repeat, both "on" spellings mean the same thing to a panel
+    /// that draws one button, so a peer exposing only `Group` is served by it.
+    #[must_use]
+    pub fn for_on(on: bool, allowed: &[Self]) -> Self {
+        if !on {
+            return Self::Off;
+        }
+        if allowed.contains(&Self::AllTracks) || allowed.is_empty() {
+            Self::AllTracks
+        } else if allowed.contains(&Self::Group) {
+            Self::Group
+        } else {
+            Self::AllTracks
+        }
+    }
+}
+
+/// The values AVRCP defines for [`SettingAttribute::Scan`].
+///
+/// Modelled for completeness of the capture — nothing in the panel drives scan, but a
+/// player that lists it should be recorded as listing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanSetting {
+    /// Off.
+    Off,
+    /// Scan everything.
+    AllTracks,
+    /// Scan within the current group.
+    Group,
+}
+
+impl ScanSetting {
+    /// The wire id.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Off => 0x01,
+            Self::AllTracks => 0x02,
+            Self::Group => 0x03,
+        }
+    }
+
+    /// Parse a wire id.
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            0x01 => Self::Off,
+            0x02 => Self::AllTracks,
+            0x03 => Self::Group,
+            _ => return None,
+        })
+    }
+}
+
+/// One setting and the value it holds.
+///
+/// The pairing is on the type: a value id means nothing without the attribute it belongs
+/// to — `0x02` is "repeat one track" under repeat and "shuffle everything" under shuffle
+/// — so this enum is what makes `Repeat(ShuffleSetting::Group)` fail to compile rather
+/// than fail on the wire (ground rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingValue {
+    /// Equalizer on or off.
+    Equalizer(bool),
+    /// Repeat mode.
+    Repeat(RepeatSetting),
+    /// Shuffle mode.
+    Shuffle(ShuffleSetting),
+    /// Scan mode.
+    Scan(ScanSetting),
+}
+
+impl SettingValue {
+    /// Which setting this is a value of.
+    #[must_use]
+    pub const fn attribute(self) -> SettingAttribute {
+        match self {
+            Self::Equalizer(_) => SettingAttribute::Equalizer,
+            Self::Repeat(_) => SettingAttribute::Repeat,
+            Self::Shuffle(_) => SettingAttribute::Shuffle,
+            Self::Scan(_) => SettingAttribute::Scan,
+        }
+    }
+
+    /// The value's wire id.
+    #[must_use]
+    pub const fn value_id(self) -> u8 {
+        match self {
+            Self::Equalizer(false) => 0x01,
+            Self::Equalizer(true) => 0x02,
+            Self::Repeat(v) => v.id(),
+            Self::Shuffle(v) => v.id(),
+            Self::Scan(v) => v.id(),
+        }
+    }
+
+    /// Parse an attribute/value pair off the wire.
+    ///
+    /// `None` for an attribute we do not model *or* a value outside the set that
+    /// attribute defines — a player that answers repeat with `0x09` has told us nothing
+    /// we can render, and inventing a mode for it is how a card ends up lying.
+    #[must_use]
+    pub const fn from_ids(attribute: u8, value: u8) -> Option<Self> {
+        Some(match SettingAttribute::from_id(attribute) {
+            Some(SettingAttribute::Equalizer) => match value {
+                0x01 => Self::Equalizer(false),
+                0x02 => Self::Equalizer(true),
+                _ => return None,
+            },
+            Some(SettingAttribute::Repeat) => match RepeatSetting::from_id(value) {
+                Some(v) => Self::Repeat(v),
+                None => return None,
+            },
+            Some(SettingAttribute::Shuffle) => match ShuffleSetting::from_id(value) {
+                Some(v) => Self::Shuffle(v),
+                None => return None,
+            },
+            Some(SettingAttribute::Scan) => match ScanSetting::from_id(value) {
+                Some(v) => Self::Scan(v),
+                None => return None,
+            },
+            None => return None,
+        })
+    }
+}
+
+/// What a `ListPlayerApplicationSettingAttributes` response said the player exposes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingAttributes {
+    /// The settings we can read and write.
+    pub known: Vec<SettingAttribute>,
+    /// Ids the spec does not define, kept exactly as sent.
+    ///
+    /// Nothing acts on these. They exist so that "the phone listed something we do not
+    /// implement" is a visible answer rather than an absence.
+    pub unknown: Vec<u8>,
+}
+
+impl SettingAttributes {
+    /// Whether the player exposes a setting.
+    #[must_use]
+    pub fn contains(&self, attribute: SettingAttribute) -> bool {
+        self.known.contains(&attribute)
+    }
+}
+
+/// What one link's player exposes, and with which values.
+///
+/// Held per link rather than per peer: AVRCP settings are a property of the *player*, so
+/// the answer changes when the person on the sofa switches from Apple Music to YouTube
+/// Music on the same phone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayerSettings {
+    /// What the 0x11 listing came back with.
+    pub attributes: SettingAttributes,
+    /// The repeat values the player accepts, if we asked.
+    pub repeat_values: Vec<RepeatSetting>,
+    /// The shuffle values the player accepts, if we asked.
+    pub shuffle_values: Vec<ShuffleSetting>,
+}
+
+impl PlayerSettings {
+    /// The controls this listing adds to whatever SDP already offered.
+    ///
+    /// The 0x11 answer is the gate, and there is no default: a player that never listed
+    /// shuffle gets no shuffle button, because the alternative is a lit control that
+    /// answers `REJECTED` (#76).
+    #[must_use]
+    pub fn capabilities(&self) -> ControlCapabilities {
+        let mut caps = ControlCapabilities::NONE;
+        if self.attributes.contains(SettingAttribute::Shuffle) {
+            caps |= ControlCapabilities::SHUFFLE;
+        }
+        if self.attributes.contains(SettingAttribute::Repeat) {
+            caps |= ControlCapabilities::REPEAT;
+        }
+        caps
+    }
+
+    /// The setting write a control transaction becomes, if this player can take it.
+    #[must_use]
+    pub fn value_for(&self, txn: &ControlTxn) -> Option<SettingValue> {
+        match txn {
+            ControlTxn::Shuffle(on) => self
+                .attributes
+                .contains(SettingAttribute::Shuffle)
+                .then(|| SettingValue::Shuffle(ShuffleSetting::for_on(*on, &self.shuffle_values))),
+            ControlTxn::Repeat(mode) => {
+                if !self.attributes.contains(SettingAttribute::Repeat) {
+                    return None;
+                }
+                RepeatSetting::for_mode(*mode, &self.repeat_values).map(SettingValue::Repeat)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Build a `ListPlayerApplicationSettingAttributes` command.
+///
+/// The one round trip that decides whether this link gets shuffle and repeat buttons at
+/// all. Cheap — an empty request — and it must be asked per player, not per peer.
+#[must_use]
+pub fn list_setting_attributes() -> AvcFrame {
+    vendor_command(Ctype::Status, pdu::LIST_SETTING_ATTRIBUTES, &[])
+}
+
+/// Build a `ListPlayerApplicationSettingValues` command for one attribute.
+#[must_use]
+pub fn list_setting_values(attribute: SettingAttribute) -> AvcFrame {
+    vendor_command(Ctype::Status, pdu::LIST_SETTING_VALUES, &[attribute.id()])
+}
+
+/// Build a `GetCurrentPlayerApplicationSettingValue` command.
+#[must_use]
+pub fn get_current_settings(attributes: &[SettingAttribute]) -> AvcFrame {
+    let mut params = BytesMut::with_capacity(1 + attributes.len());
+    params.put_u8(u8::try_from(attributes.len()).unwrap_or(u8::MAX));
+    for attribute in attributes {
+        params.put_u8(attribute.id());
+    }
+    vendor_command(Ctype::Status, pdu::GET_CURRENT_SETTINGS, &params)
+}
+
+/// Build a `SetPlayerApplicationSettingValue` command.
+///
+/// `Ctype::Control`, not `Status`: this changes the player's state, and a Target that is
+/// strict about the field answers a `Status` write with `NOT IMPLEMENTED`.
+#[must_use]
+pub fn set_setting_value(values: &[SettingValue]) -> AvcFrame {
+    let mut params = BytesMut::with_capacity(1 + values.len() * 2);
+    params.put_u8(u8::try_from(values.len()).unwrap_or(u8::MAX));
+    for value in values {
+        params.put_u8(value.attribute().id());
+        params.put_u8(value.value_id());
+    }
+    vendor_command(Ctype::Control, pdu::SET_SETTING_VALUE, &params)
+}
+
+/// Parse a `ListPlayerApplicationSettingAttributes` response.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if the list is shorter than the count it declares.
+pub fn parse_setting_attributes(params: &[u8]) -> Result<SettingAttributes, AudioError> {
+    let Some((&count, rest)) = params.split_first() else {
+        return Err(AudioError::Truncated {
+            what: "player setting attribute count",
+            need: 1,
+            have: 0,
+        });
+    };
+    let count = usize::from(count);
+    if rest.len() < count {
+        return Err(AudioError::Truncated {
+            what: "player setting attribute ids",
+            need: 1 + count,
+            have: params.len(),
+        });
+    }
+    let mut out = SettingAttributes::default();
+    for &id in &rest[..count] {
+        match SettingAttribute::from_id(id) {
+            Some(attribute) if !out.known.contains(&attribute) => out.known.push(attribute),
+            Some(_) => {}
+            None => out.unknown.push(id),
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a `ListPlayerApplicationSettingValues` response for a known attribute.
+///
+/// The attribute has to be supplied because the response does not echo it — the peer
+/// answers a bare list of value ids, and which setting they belong to is something the
+/// caller has to have remembered from its own request.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if the list is shorter than the count it declares.
+pub fn parse_setting_values(
+    attribute: SettingAttribute,
+    params: &[u8],
+) -> Result<Vec<SettingValue>, AudioError> {
+    let Some((&count, rest)) = params.split_first() else {
+        return Err(AudioError::Truncated {
+            what: "player setting value count",
+            need: 1,
+            have: 0,
+        });
+    };
+    let count = usize::from(count);
+    if rest.len() < count {
+        return Err(AudioError::Truncated {
+            what: "player setting value ids",
+            need: 1 + count,
+            have: params.len(),
+        });
+    }
+    Ok(rest[..count]
+        .iter()
+        .filter_map(|&value| SettingValue::from_ids(attribute.id(), value))
+        .collect())
+}
+
+/// Parse a `GetCurrentPlayerApplicationSettingValue` response: attribute/value pairs.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if the pairs are shorter than the count they declare.
+pub fn parse_current_settings(params: &[u8]) -> Result<Vec<SettingValue>, AudioError> {
+    let Some((&count, rest)) = params.split_first() else {
+        return Err(AudioError::Truncated {
+            what: "player setting count",
+            need: 1,
+            have: 0,
+        });
+    };
+    let count = usize::from(count);
+    if rest.len() < count * 2 {
+        return Err(AudioError::Truncated {
+            what: "player setting pairs",
+            need: 1 + count * 2,
+            have: params.len(),
+        });
+    }
+    Ok(rest[..count * 2]
+        .chunks_exact(2)
+        .filter_map(|pair| SettingValue::from_ids(pair[0], pair[1]))
+        .collect())
+}
+
+/// Parse the payload of an `EVENT_PLAYER_APPLICATION_SETTING_CHANGED` notification.
+///
+/// The same attribute/value list as [`parse_current_settings`], behind the event id every
+/// notification response carries.
+///
+/// # Errors
+/// [`AudioError::Truncated`] if the event id or the pairs are missing.
+pub fn parse_setting_change(params: &[u8]) -> Result<Vec<SettingValue>, AudioError> {
+    let Some(rest) = params.get(1..) else {
+        return Err(AudioError::Truncated {
+            what: "player setting notification",
+            need: 2,
+            have: params.len(),
+        });
+    };
+    parse_current_settings(rest)
+}
+
+/// Fold a settings list into a now-playing snapshot, reporting whether it changed.
+///
+/// Equalizer and scan are parsed and then dropped: nothing on the panel renders them, and
+/// carrying them into [`NowPlaying`] would mean inventing fields no other source fills in.
+pub fn apply_settings(now: &mut NowPlaying, values: &[SettingValue]) -> bool {
+    let mut changed = false;
+    for value in values {
+        match value {
+            SettingValue::Shuffle(v) => {
+                let on = Some(v.is_on());
+                changed |= now.shuffle != on;
+                now.shuffle = on;
+            }
+            SettingValue::Repeat(v) => {
+                let mode = Some(v.mode());
+                changed |= now.repeat != mode;
+                now.repeat = mode;
+            }
+            SettingValue::Equalizer(_) | SettingValue::Scan(_) => {}
+        }
+    }
+    changed
+}
+
 /// Volume as AVRCP carries it: seven bits, `0..=127`.
 ///
 /// A **position** on the phone's volume rocker, not an amplitude — named as such since
@@ -993,6 +1544,194 @@ mod tests {
             parse_attribute_request(&short),
             Err(AudioError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn a_setting_value_cannot_be_built_from_the_wrong_attributes_values() {
+        // The whole reason `SettingValue` pairs the two: 0x02 means "repeat one track"
+        // under repeat and "shuffle everything" under shuffle. Reading a value id without
+        // its attribute is how a card ends up claiming the wrong mode.
+        assert_eq!(
+            SettingValue::from_ids(SettingAttribute::Repeat.id(), 0x02),
+            Some(SettingValue::Repeat(RepeatSetting::SingleTrack))
+        );
+        assert_eq!(
+            SettingValue::from_ids(SettingAttribute::Shuffle.id(), 0x02),
+            Some(SettingValue::Shuffle(ShuffleSetting::AllTracks))
+        );
+        // Repeat has a 0x04; shuffle does not, and must not be given one.
+        assert_eq!(
+            SettingValue::from_ids(SettingAttribute::Repeat.id(), 0x04),
+            Some(SettingValue::Repeat(RepeatSetting::Group))
+        );
+        assert_eq!(
+            SettingValue::from_ids(SettingAttribute::Shuffle.id(), 0x04),
+            None
+        );
+        // An attribute we do not model carries no value we could act on.
+        assert_eq!(SettingValue::from_ids(0x7F, 0x01), None);
+    }
+
+    #[test]
+    fn the_attribute_listing_keeps_ids_it_does_not_understand() {
+        // The listing is a capture as much as a capability gate (#76): "the phone offered
+        // something we do not implement" has to be a visible answer, not an absence.
+        let body = [4u8, 0x02, 0x03, 0x05, 0x81];
+        let parsed = parse_setting_attributes(&body).unwrap();
+        assert_eq!(
+            parsed.known,
+            vec![SettingAttribute::Repeat, SettingAttribute::Shuffle]
+        );
+        assert_eq!(parsed.unknown, vec![0x05, 0x81]);
+        assert!(parsed.contains(SettingAttribute::Repeat));
+        assert!(!parsed.contains(SettingAttribute::Equalizer));
+    }
+
+    #[test]
+    fn a_truncated_attribute_listing_is_refused_rather_than_read_short() {
+        assert!(matches!(
+            parse_setting_attributes(&[3, 0x02]),
+            Err(AudioError::Truncated { .. })
+        ));
+        assert!(matches!(
+            parse_setting_attributes(&[]),
+            Err(AudioError::Truncated { .. })
+        ));
+        assert!(matches!(
+            parse_current_settings(&[2, 0x02, 0x01]),
+            Err(AudioError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn the_buttons_are_offered_only_for_settings_the_player_listed() {
+        // The 0x11 answer is the gate and there is no default: a lit shuffle button that
+        // answers REJECTED is worse than no button.
+        let mut settings = PlayerSettings::default();
+        assert_eq!(settings.capabilities(), ControlCapabilities::NONE);
+        assert_eq!(settings.value_for(&ControlTxn::Shuffle(true)), None);
+
+        settings.attributes.known = vec![SettingAttribute::Shuffle];
+        let caps = settings.capabilities();
+        assert!(caps.supports(&ControlTxn::Shuffle(true)));
+        assert!(
+            !caps.supports(&ControlTxn::Repeat(RepeatMode::Context)),
+            "repeat was never listed"
+        );
+        assert_eq!(
+            settings.value_for(&ControlTxn::Repeat(RepeatMode::Off)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_write_prefers_a_value_the_peer_said_it_accepts() {
+        // A player offering group-repeat but not all-track repeat still gets a working
+        // repeat button; one offering neither gets nothing rather than a rejected write.
+        let mut settings = PlayerSettings {
+            attributes: SettingAttributes {
+                known: vec![SettingAttribute::Repeat, SettingAttribute::Shuffle],
+                unknown: Vec::new(),
+            },
+            repeat_values: vec![RepeatSetting::Off, RepeatSetting::Group],
+            shuffle_values: vec![ShuffleSetting::Off, ShuffleSetting::Group],
+        };
+        assert_eq!(
+            settings.value_for(&ControlTxn::Repeat(RepeatMode::Context)),
+            Some(SettingValue::Repeat(RepeatSetting::Group))
+        );
+        assert_eq!(
+            settings.value_for(&ControlTxn::Shuffle(true)),
+            Some(SettingValue::Shuffle(ShuffleSetting::Group))
+        );
+        assert_eq!(
+            settings.value_for(&ControlTxn::Repeat(RepeatMode::Track)),
+            None,
+            "single-track repeat was not on the list"
+        );
+
+        // With nothing listed we have not asked, so the commonest value is used rather
+        // than the feature being withheld.
+        settings.repeat_values.clear();
+        settings.shuffle_values.clear();
+        assert_eq!(
+            settings.value_for(&ControlTxn::Repeat(RepeatMode::Context)),
+            Some(SettingValue::Repeat(RepeatSetting::AllTracks))
+        );
+        assert_eq!(
+            settings.value_for(&ControlTxn::Shuffle(true)),
+            Some(SettingValue::Shuffle(ShuffleSetting::AllTracks))
+        );
+    }
+
+    #[test]
+    fn a_setting_write_round_trips_through_its_vendor_frame() {
+        let frame = set_setting_value(&[
+            SettingValue::Shuffle(ShuffleSetting::AllTracks),
+            SettingValue::Repeat(RepeatSetting::SingleTrack),
+        ]);
+        // Control, not Status: this changes the player's state, and a strict Target
+        // answers a Status write with NOT IMPLEMENTED.
+        assert_eq!(frame.ctype, Ctype::Control);
+        let parsed = VendorPdu::parse(&frame.operands).unwrap();
+        assert_eq!(parsed.pdu_id, pdu::SET_SETTING_VALUE);
+        assert_eq!(&parsed.parameters[..], &[2, 0x03, 0x02, 0x02, 0x02]);
+    }
+
+    #[test]
+    fn a_setting_notification_folds_into_the_now_playing_snapshot() {
+        // Event 0x08 is what keeps the strip honest when the phone's own UI toggles
+        // shuffle — the panel never sees that press any other way.
+        let payload = [event::SETTING_CHANGED, 2, 0x03, 0x02, 0x02, 0x04];
+        let values = parse_setting_change(&payload).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                SettingValue::Shuffle(ShuffleSetting::AllTracks),
+                SettingValue::Repeat(RepeatSetting::Group),
+            ]
+        );
+
+        let mut now = NowPlaying::default();
+        assert!(apply_settings(&mut now, &values));
+        assert_eq!(now.shuffle, Some(true));
+        // Group repeat folds into Context: naming the group needs the browsing channel,
+        // and a third repeat icon nobody can explain is worse than "repeating".
+        assert_eq!(now.repeat, Some(RepeatMode::Context));
+
+        // Re-applying the same values is not a change, so the card does not churn.
+        assert!(!apply_settings(&mut now, &values));
+    }
+
+    #[test]
+    fn a_value_outside_its_attributes_range_is_dropped_not_guessed_at() {
+        // A player answering repeat with 0x09 has told us nothing renderable. Inventing a
+        // mode for it is how the card ends up lying about what the phone is doing.
+        let values = parse_current_settings(&[2, 0x02, 0x09, 0x03, 0x01]).unwrap();
+        assert_eq!(values, vec![SettingValue::Shuffle(ShuffleSetting::Off)]);
+    }
+
+    #[test]
+    fn the_values_response_is_read_against_the_attribute_that_was_asked_for() {
+        // The response does not echo the attribute, so the caller's memory of its own
+        // request is the only thing that says what these ids mean.
+        let body = [3u8, 0x01, 0x02, 0x03];
+        assert_eq!(
+            parse_setting_values(SettingAttribute::Shuffle, &body).unwrap(),
+            vec![
+                SettingValue::Shuffle(ShuffleSetting::Off),
+                SettingValue::Shuffle(ShuffleSetting::AllTracks),
+                SettingValue::Shuffle(ShuffleSetting::Group),
+            ]
+        );
+        assert_eq!(
+            parse_setting_values(SettingAttribute::Repeat, &body).unwrap(),
+            vec![
+                SettingValue::Repeat(RepeatSetting::Off),
+                SettingValue::Repeat(RepeatSetting::SingleTrack),
+                SettingValue::Repeat(RepeatSetting::AllTracks),
+            ]
+        );
     }
 
     #[test]
