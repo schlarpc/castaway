@@ -343,7 +343,7 @@ async fn pump(
                             // timeline; measuring each from whatever arrived first
                             // discards the relationship between them, and two sets of
                             // perfectly correct timestamps then land seconds apart. This
-                            // is the wiring f8e7363 introduced `StreamOrigin` for and
+                            // is the wiring bb2224a introduced `StreamOrigin` for and
                             // then only applied to the video side, which left the
                             // `AwaitingSync` handling below unreachable and its test
                             // asserting a configuration nothing built.

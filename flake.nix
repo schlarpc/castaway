@@ -839,7 +839,7 @@
           # CI compiled it, because the file is `#![cfg(feature = "render")]` and
           # `castaway`'s `default = []`, while `test`/`coverage`/`clippy` all take
           # `commonArgs` unmodified. A test CI does not compile is a test that rots, and it
-          # rots green: `506f405` had to repair this file three days after it landed,
+          # rots green: `feb1032` had to repair this file three days after it landed,
           # because a refactor deleted a method its drainers called and no gate noticed.
           #
           # Scoped to the one test target rather than the whole `render` feature's tests;

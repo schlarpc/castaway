@@ -46,7 +46,7 @@ pub(crate) fn create_instance() -> wgpu::Instance {
         // may be creating or destroying a device and mutating that same table. It
         // segfaults inside `loader_get_icd_and_device`, with no Rust frame in the stack.
         // On this tree the test suite reproduced it about once in three runs; at
-        // `01c862e`, before any of the output-stream work added more concurrent GPU tests,
+        // `f5cf889`, before any of the output-stream work added more concurrent GPU tests,
         // about once in twenty. The hazard is upstream's and predates us; what changed is
         // how often it is reached.
         //

@@ -36,8 +36,8 @@ on 2026-08-01, after the tracker and the files had already drifted apart.
 
 `G##` and `Q##` in code comments and older docs refer to those two files. The manifests that
 map every number to its outcome are issues **#104** (`GAPS.md`, the 2026-07-26 audit) and
-**#105** (`OPEN-QUESTIONS.md`); full text is at `git show a556938:docs/GAPS.md` and
-`git show a556938:docs/OPEN-QUESTIONS.md`. Do not add new `G##`/`Q##` anchors — cite the issue.
+**#105** (`OPEN-QUESTIONS.md`); full text is at `git show 3fc6b57:docs/GAPS.md` and
+`git show 3fc6b57:docs/OPEN-QUESTIONS.md`. Do not add new `G##`/`Q##` anchors — cite the issue.
 
 ## Ground rules
 

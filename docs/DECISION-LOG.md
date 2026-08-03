@@ -1729,7 +1729,7 @@ opens happen a handful of times in a process's life and none is on a per-frame p
 
 **The Vulkan loader is not safe against concurrent device create/destroy.** wgpu names each
 Vulkan object as it creates it; the loader resolves the device dispatch table on every such
-call, while another thread may be mutating it. Measured rather than assumed: at `01c862e`,
+call, while another thread may be mutating it. Measured rather than assumed: at `f5cf889`,
 before any of this work, the pipeline test binary crashed 1 run in 20; with five more
 concurrent GPU tests, 6 in 20. The hazard is upstream's and predates us — what changed is
 how often it is reached. `InstanceFlags::DEBUG` is dropped, which is what makes wgpu name
