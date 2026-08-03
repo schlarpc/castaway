@@ -30,6 +30,9 @@ pub mod pairing;
 pub mod sdp;
 pub mod session;
 pub mod transport;
+/// AirPlay *video* — the media-URL path, which is a different protocol from mirroring
+/// (#80). Pure.
+pub mod video;
 
 use castaway_core::ProtocolKind;
 
@@ -43,6 +46,7 @@ pub use mirror::{MirrorKeys, MirrorOutput, MirrorStream, StreamConnectionId};
 pub use sdp::{AlacConfig, AnnounceParams, RaopCodec, SessionKey, StreamCrypto};
 pub use session::{AirPlayResponse, AirPlaySession};
 pub use transport::{ReceiverPorts, SenderPorts};
+pub use video::{PlaybackInfo, Rate, StartPosition, VideoCommand, VideoEndpoint};
 
 /// The protocol kind for AirPlay sources.
 #[must_use]

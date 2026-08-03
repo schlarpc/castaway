@@ -201,6 +201,11 @@ impl AirPlayResponse {
         Self::status(200)
     }
 
+    /// `101 Switching Protocols`, for the `/reverse` event channel.
+    fn switching() -> Self {
+        Self::status(101)
+    }
+
     fn ok_body(content_type: &str, body: Vec<u8>) -> Self {
         Self {
             status: 200,
@@ -302,6 +307,8 @@ pub struct AirPlaySession {
     mirror_audio: Option<Box<AnnounceParams>>,
     /// A `FLUSH` the actor has not yet passed to the audio task.
     pending_flush: Option<crate::audio::FlushPoint>,
+    /// What the AirPlay *video* path reports to a polling sender (#80).
+    playback: crate::video::PlaybackInfo,
     /// This receiver's long-term pairing identity (feature bit 27).
     pairing: crate::pairing::PairingIdentity,
     /// A `/pair-verify` exchange between its two stages. `Some` only in that window:
@@ -359,6 +366,7 @@ impl AirPlaySession {
             media_key: None,
             mirror_audio: None,
             pending_flush: None,
+            playback: crate::video::PlaybackInfo::default(),
             volume: crate::control::Volume::Level(0.0),
             sender: SourceDescription::new(),
             audio_rate: None,
@@ -514,6 +522,18 @@ impl AirPlaySession {
                 AirPlayResponse::status(501)
             }
             ("POST" | "GET", "/feedback") => AirPlayResponse::ok(),
+            // AirPlay *video* — a different protocol from mirroring that arrives on the
+            // same socket, as HTTP/1.1 rather than RTSP (#80). Routed before the lenient
+            // fallback below, which is what these used to reach: a `200` that said "fine"
+            // and played nothing, on a session that had negotiated perfectly.
+            (m, p) if crate::video::VideoEndpoint::route(m, p).is_some() => {
+                // `route` just answered `Some`; the `let-else` is for the type, not for a
+                // case that can happen.
+                let Some(endpoint) = crate::video::VideoEndpoint::route(m, p) else {
+                    return Ok(AirPlayResponse::status(500));
+                };
+                self.video(endpoint, p, body)
+            }
             ("POST", "/audioMode") => AirPlayResponse::ok(),
             ("ANNOUNCE", _) => self.announce(body),
             ("SETUP", _) => self.setup(req),
@@ -680,6 +700,118 @@ impl AirPlaySession {
     /// — the reference receiver reads both blocks of *one* request — so each block is
     /// read on its own rather than inferred from how far the negotiation has got. This
     /// used to look at `streams` first and return `451` to a request carrying both.
+    /// The AirPlay video control surface (#80).
+    ///
+    /// `POST /play` hands over a URL, which is already a first-class operation here — the
+    /// same one DLNA's `SetAVTransportURI` and Cast's `LOAD` reduce to. The rest is the
+    /// transport, mapped onto the [`ControlTxn`]s every other protocol uses, and
+    /// `/playback-info` answering from what the pipeline last reported.
+    fn video(
+        &mut self,
+        endpoint: crate::video::VideoEndpoint,
+        path: &str,
+        body: &[u8],
+    ) -> AirPlayResponse {
+        use crate::video::{Rate, VideoCommand, VideoEndpoint};
+
+        // The two read-only endpoints answer from state rather than parsing anything.
+        match endpoint {
+            VideoEndpoint::PlaybackInfo => {
+                return match self.playback.to_plist() {
+                    Ok(body) => AirPlayResponse::ok_body(APPLE_PLIST_MIME, body),
+                    Err(e) => {
+                        warn!(error = %e, "could not build /playback-info");
+                        AirPlayResponse::status(500)
+                    }
+                };
+            }
+            VideoEndpoint::Reverse => {
+                // The sender opening an event channel back to itself. Answered with the
+                // protocol switch it is waiting for; nothing is pushed over it yet, and a
+                // sender that gets no events polls `/playback-info` instead, which is what
+                // it does anyway. Refusing would be worse: some senders treat a failed
+                // `/reverse` as a failed session.
+                return AirPlayResponse::switching()
+                    .header("Upgrade", "PTTH/1.0")
+                    .header("Connection", "Upgrade");
+            }
+            VideoEndpoint::Scrub if body.is_empty() && !path.contains("position=") => {
+                // A read, in the older `text/parameters` shape.
+                return AirPlayResponse::ok_body(
+                    "text/parameters",
+                    self.playback.to_scrub_body().into_bytes(),
+                );
+            }
+            _ => {}
+        }
+
+        let command = match crate::video::parse(endpoint, path, body) {
+            Ok(Some(command)) => command,
+            // Understood and asks for nothing — an `/action` this receiver has no use
+            // for, a `/rate` with no value. Distinct from a failure, and answering `200`
+            // here is honest rather than lenient.
+            Ok(None) => return AirPlayResponse::ok(),
+            Err(e) => {
+                // The lesson the rest of this file learned the hard way: a request we
+                // cannot serve must not be answered "fine". A sender told everything is
+                // well shows a spinner over nothing and says nothing about why.
+                warn!(error = %e, %path, "refusing an AirPlay video request");
+                return AirPlayResponse::status(400);
+            }
+        };
+
+        let event = match command {
+            VideoCommand::Play { source, start } => {
+                // A fraction cannot be resolved yet — the duration is the *item's*, and
+                // nothing has opened it. Seconds can, and are the form current senders
+                // use; a fraction is carried as a seek the pipeline applies once it knows.
+                let at = start.and_then(|s| s.resolve(self.playback.duration));
+                log_info!(%source, start = ?at, "AirPlay video: play");
+                self.playback = crate::video::PlaybackInfo {
+                    rate: Some(Rate::Playing),
+                    ..Default::default()
+                };
+                SessionEvent::Play { source, start: at }
+            }
+            VideoCommand::Scrub(to) => {
+                log_info!(?to, "AirPlay video: scrub");
+                self.playback.position = to;
+                SessionEvent::Control(ControlTxn::Seek(to))
+            }
+            VideoCommand::Rate(rate) => {
+                log_info!(?rate, "AirPlay video: rate");
+                self.playback.rate = Some(rate);
+                SessionEvent::Control(match rate {
+                    Rate::Playing => ControlTxn::Play,
+                    Rate::Paused => ControlTxn::Pause,
+                })
+            }
+            VideoCommand::Stop => {
+                log_info!("AirPlay video: stop");
+                self.playback = crate::video::PlaybackInfo::default();
+                SessionEvent::Control(ControlTxn::Stop)
+            }
+        };
+        let mut response = AirPlayResponse::ok();
+        response.event = Some(event);
+        response
+    }
+
+    /// Tell the session where playback has reached, so `/playback-info` can answer.
+    ///
+    /// The receiver is authoritative here and the sender draws its own scrubber from what
+    /// this reports — which is the reverse of every other AirPlay surface, where the
+    /// sender states and the receiver follows.
+    pub fn set_playback(&mut self, info: crate::video::PlaybackInfo) {
+        self.playback = info;
+    }
+
+    /// What `/playback-info` would currently answer.
+    #[must_use]
+    pub const fn playback(&self) -> crate::video::PlaybackInfo {
+        self.playback
+    }
+
     fn mirror_setup(&mut self, body: &[u8]) -> AirPlayResponse {
         let Ok(value) = plist::Value::from_reader(std::io::Cursor::new(body)) else {
             warn!("mirroring SETUP body is not a plist");
@@ -1227,6 +1359,7 @@ impl AirPlaySession {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    use std::time::Duration;
 
     /// The AirPort key is carved at build time rather than checked in, so a build
     /// without it cannot exercise the RSA paths. `nix flake check` always has it.
@@ -2265,6 +2398,171 @@ mod tests {
             .unwrap();
         assert_eq!(r.status, 200);
         assert!(r.body.is_empty());
+    }
+
+    /// The AirPlay *video* session, as iOS opens one: the same RTSP handshake as
+    /// mirroring, and then HTTP on the same socket.
+    fn video_request(
+        s: &mut AirPlaySession,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> AirPlayResponse {
+        s.handle(&AirPlayRequest::new(method, path, body)).unwrap()
+    }
+
+    fn play_body(location: &str) -> Vec<u8> {
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "Content-Location".into(),
+            plist::Value::String(location.into()),
+        );
+        let mut buf = Vec::new();
+        plist::to_writer_binary(&mut buf, &dict).unwrap();
+        buf
+    }
+
+    #[test]
+    fn a_play_becomes_the_same_event_a_dlna_or_cast_load_does() {
+        // #80's whole point: `POST /play` hands over a URL, and "play the media at this
+        // URL" already exists here. Before this it fell into the lenient `200` — answering
+        // "fine" to a session that had negotiated perfectly, and then playing nothing.
+        let mut s = session();
+        let r = video_request(
+            &mut s,
+            "POST",
+            "/play",
+            &play_body("http://10.0.0.5/v.m3u8"),
+        );
+        assert_eq!(r.status, 200);
+        match r.event {
+            Some(SessionEvent::Play { source, start }) => {
+                assert_eq!(source.url().as_str(), "http://10.0.0.5/v.m3u8");
+                assert_eq!(start, None);
+            }
+            other => panic!("a /play must produce a Play event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_transport_endpoints_become_the_control_transactions_every_protocol_uses() {
+        let mut s = session();
+        video_request(
+            &mut s,
+            "POST",
+            "/play",
+            &play_body("http://10.0.0.5/v.m3u8"),
+        );
+
+        let txn = |r: AirPlayResponse| match r.event {
+            Some(SessionEvent::Control(txn)) => txn,
+            other => panic!("expected a control transaction, got {other:?}"),
+        };
+        assert_eq!(
+            txn(video_request(&mut s, "POST", "/rate?value=0.000000", b"")),
+            ControlTxn::Pause
+        );
+        assert_eq!(
+            txn(video_request(&mut s, "POST", "/rate?value=1.000000", b"")),
+            ControlTxn::Play
+        );
+        assert_eq!(
+            txn(video_request(&mut s, "POST", "/scrub?position=42.5", b"")),
+            ControlTxn::Seek(Duration::from_millis(42_500))
+        );
+        assert_eq!(
+            txn(video_request(&mut s, "POST", "/stop", b"")),
+            ControlTxn::Stop
+        );
+    }
+
+    #[test]
+    fn playback_info_answers_from_what_the_pipeline_reported() {
+        // The one AirPlay surface where the receiver is authoritative: the sender draws
+        // its own scrubber from this, so an empty `200` is a sender that shows 0:00 over
+        // a playing film.
+        let mut s = session();
+        s.set_playback(crate::video::PlaybackInfo {
+            duration: Some(Duration::from_secs(200)),
+            position: Duration::from_secs(40),
+            rate: Some(crate::video::Rate::Playing),
+            ready: true,
+        });
+        let r = video_request(&mut s, "GET", "/playback-info", b"");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type.as_deref(), Some(APPLE_PLIST_MIME));
+        let value: plist::Value = plist::from_bytes(&r.body).unwrap();
+        let dict = value.as_dictionary().unwrap();
+        assert_eq!(
+            dict.get("position").and_then(plist::Value::as_real),
+            Some(40.0)
+        );
+        assert_eq!(
+            dict.get("duration").and_then(plist::Value::as_real),
+            Some(200.0)
+        );
+        assert_eq!(dict.get("rate").and_then(plist::Value::as_real), Some(1.0));
+    }
+
+    #[test]
+    fn a_bare_scrub_is_a_read_in_the_older_shape() {
+        let mut s = session();
+        s.set_playback(crate::video::PlaybackInfo {
+            duration: Some(Duration::from_secs(200)),
+            position: Duration::from_secs(40),
+            rate: Some(crate::video::Rate::Playing),
+            ready: true,
+        });
+        let r = video_request(&mut s, "GET", "/scrub", b"");
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            String::from_utf8(r.body).unwrap(),
+            "duration: 200\r\nposition: 40\r\n"
+        );
+        assert!(r.event.is_none(), "a read must not seek");
+    }
+
+    #[test]
+    fn reverse_gets_the_protocol_switch_it_is_waiting_for() {
+        // Nothing is pushed over the channel yet, and a sender that gets no events polls
+        // `/playback-info` — which it does anyway. Refusing would be worse: some senders
+        // treat a failed `/reverse` as a failed session.
+        let mut s = session();
+        let r = video_request(&mut s, "POST", "/reverse", b"");
+        assert_eq!(r.status, 101);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(n, v)| *n == "Upgrade" && v == "PTTH/1.0"),
+            "{:?}",
+            r.headers
+        );
+    }
+
+    #[test]
+    fn a_play_we_cannot_serve_is_refused_rather_than_answered_fine() {
+        // The failure mode this whole file is organised against, arriving on a new path:
+        // a lenient `200` tells the sender everything is well and then nothing happens,
+        // with nothing anywhere saying why.
+        let mut s = session();
+        let mut dict = plist::Dictionary::new();
+        dict.insert("Start-Position".into(), plist::Value::Real(0.5));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &dict).unwrap();
+        let r = video_request(&mut s, "POST", "/play", &body);
+        assert_eq!(r.status, 400, "a /play with no URL is not fine");
+        assert!(r.event.is_none());
+    }
+
+    #[test]
+    fn an_action_is_understood_and_ignored_rather_than_refused() {
+        // `/action` carries playlist manipulation and `unhandledURLResponse`, neither of
+        // which applies to a receiver that plays one URL at a time. Understood-and-ignored
+        // is not the same as unimplemented, and answering 200 here is honest.
+        let mut s = session();
+        let r = video_request(&mut s, "POST", "/action", b"anything");
+        assert_eq!(r.status, 200);
+        assert!(r.event.is_none());
     }
 
     #[test]

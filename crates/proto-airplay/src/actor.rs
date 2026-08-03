@@ -70,6 +70,14 @@ pub struct AirPlayReceiver {
     identity: AirPlayIdentity,
     addr: SocketAddr,
     media_ports: MediaPorts,
+    /// Where `/playback-info` gets its numbers (#80).
+    ///
+    /// The AirPlay *video* path is the one surface here where the receiver is
+    /// authoritative: the sender draws its own scrubber from what we report, which is the
+    /// reverse of everywhere else. `None` — a build with no pipeline behind it — answers
+    /// the position it last knew, which for a session that has only been told to play is
+    /// zero.
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 }
 
 impl AirPlayReceiver {
@@ -85,7 +93,18 @@ impl AirPlayReceiver {
             identity,
             addr: SocketAddr::from(([0, 0, 0, 0], AIRPLAY_PORT)),
             media_ports,
+            playback: None,
         }
+    }
+
+    /// Answer `/playback-info` and `GET /scrub` from the pipeline.
+    ///
+    /// The same handle DLNA's `GetPositionInfo` and Cast's `MEDIA_STATUS` are built on, so
+    /// all three report the same number rather than each keeping an opinion.
+    #[must_use]
+    pub fn with_playback(mut self, report: Arc<dyn castaway_core::PlaybackReport>) -> Self {
+        self.playback = Some(report);
+        self
     }
 
     /// Override the listen address (tests bind an ephemeral port).
@@ -154,6 +173,7 @@ impl AirPlayReceiver {
             peer,
             &mut audio_sockets,
             &mut mirror_listener,
+            self.playback.as_ref(),
         )
         .await
         {
@@ -209,6 +229,14 @@ enum PumpEnd {
 }
 
 /// Read requests until the peer closes, folding each through the session.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one connection's whole world: the socket, the session, the byte transform, \
+              the event sink, and the three things a SETUP may need to answer with. \
+              Bundling them into a struct would name the same fields once more and give \
+              the borrow checker a harder problem, since several are `&mut` and used \
+              independently."
+)]
 async fn pump(
     stream: &mut TcpStream,
     session: &mut AirPlaySession,
@@ -217,6 +245,7 @@ async fn pump(
     peer: SocketAddr,
     audio_sockets: &mut Option<AudioSockets>,
     mirror_listener: &mut Option<TcpListener>,
+    playback: Option<&Arc<dyn castaway_core::PlaybackReport>>,
 ) -> Result<PumpEnd, AirPlayError> {
     // The sending half of the mirror's audio channel, created with the video and filled
     // in later: a sender negotiates mirroring audio *after* its video is already
@@ -268,7 +297,7 @@ async fn pump(
             substrate_rtsp::parse(&buf).map_err(|e| AirPlayError::Connection(e.to_string()))?
         {
             buf.drain(..consumed);
-            let Some(reply) = dispatch(session, &msg, peer)? else {
+            let Some(reply) = dispatch(session, &msg, peer, playback)? else {
                 continue;
             };
             let mut bytes = substrate_rtsp::write(&reply.message)
@@ -428,6 +457,7 @@ fn dispatch(
     session: &mut AirPlaySession,
     msg: &RtspMessage,
     peer: SocketAddr,
+    playback: Option<&Arc<dyn castaway_core::PlaybackReport>>,
 ) -> Result<Option<Reply>, AirPlayError> {
     let Message::Request(req) = msg else {
         // Senders don't send us responses, and interleaved RTP arrives on its own UDP
@@ -444,6 +474,27 @@ fn dispatch(
         .headers()
         .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
         .collect();
+    // Refreshed before the request rather than on a timer: `/playback-info` and
+    // `GET /scrub` are *polled*, so the only moment their answer matters is the moment one
+    // arrives. Reading the pipeline here also means one number serves this, DLNA's
+    // `GetPositionInfo` and Cast's `MEDIA_STATUS`, rather than three opinions.
+    if let Some(report) = playback {
+        let mut info = session.playback();
+        match report.progress() {
+            Some(progress) => {
+                info.position = progress.position;
+                info.duration = progress.duration;
+                // Something is playing, which is the only evidence of readiness this side
+                // has — `progress` is `None` until the first frame or block.
+                info.ready = true;
+            }
+            // Deliberately not zeroed: a control point asking during the fetch should be
+            // told what it was told before rather than "at the start", which it would draw
+            // as a scrubber that jumped back.
+            None => info.ready = false,
+        }
+        session.set_playback(info);
+    }
     let resp = session.handle(&AirPlayRequest {
         method: &method,
         path: &path,
@@ -573,7 +624,7 @@ mod tests {
         let raw = b"GET /info RTSP/1.0\r\nCSeq: 2\r\n\r\n";
         let (msg, _) = substrate_rtsp::parse(raw).unwrap().unwrap();
         let peer = SocketAddr::from(([10, 0, 0, 9], 5000));
-        let reply = dispatch(&mut session, &msg, peer).unwrap().unwrap();
+        let reply = dispatch(&mut session, &msg, peer, None).unwrap().unwrap();
         let bytes = substrate_rtsp::write(&reply.message).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("RTSP/1.0 200"), "{text}");
@@ -588,7 +639,7 @@ mod tests {
         let raw = b"TEARDOWN rtsp://10.0.0.1:7000/1 RTSP/1.0\r\nCSeq: 9\r\n\r\n";
         let (msg, _) = substrate_rtsp::parse(raw).unwrap().unwrap();
         let peer = SocketAddr::from(([10, 0, 0, 9], 5000));
-        let reply = dispatch(&mut session, &msg, peer).unwrap().unwrap();
+        let reply = dispatch(&mut session, &msg, peer, None).unwrap().unwrap();
         assert!(matches!(reply.event, Some(SessionEvent::End)));
     }
 
@@ -600,7 +651,7 @@ mod tests {
         let raw = b"POST /pair-setup RTSP/1.0\r\nCSeq: 3\r\n\r\n";
         let (msg, _) = substrate_rtsp::parse(raw).unwrap().unwrap();
         let peer = SocketAddr::from(([10, 0, 0, 9], 5000));
-        let reply = dispatch(&mut session, &msg, peer).unwrap().unwrap();
+        let reply = dispatch(&mut session, &msg, peer, None).unwrap().unwrap();
         let bytes = substrate_rtsp::write(&reply.message).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("RTSP/1.0 200"), "{text}");
@@ -614,7 +665,7 @@ mod tests {
         let raw = b"POST /pair-setup RTSP/1.0\r\nCSeq: 3\r\nX-Apple-HKP: 4\r\n\r\n";
         let (msg, _) = substrate_rtsp::parse(raw).unwrap().unwrap();
         let peer = SocketAddr::from(([10, 0, 0, 9], 5000));
-        let reply = dispatch(&mut session, &msg, peer).unwrap().unwrap();
+        let reply = dispatch(&mut session, &msg, peer, None).unwrap().unwrap();
         let bytes = substrate_rtsp::write(&reply.message).unwrap();
         assert!(String::from_utf8_lossy(&bytes).starts_with("RTSP/1.0 501"));
     }

@@ -951,6 +951,7 @@ async fn serve(
             &mut mdns,
             event_tx.clone(),
             shutdown.clone(),
+            playback.clone(),
         ));
     }
     if config.enable.gamestream {
@@ -1501,6 +1502,7 @@ fn spawn_airplay(
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 ) -> tokio::task::JoinHandle<()> {
     let receiver = AirPlayReceiver::new(
         proto_airplay::AirPlayIdentity {
@@ -1515,6 +1517,13 @@ fn spawn_airplay(
         },
         media_ports,
     );
+    // The AirPlay *video* path polls `/playback-info` for the position it draws in its
+    // own scrubber, so it needs the same handle DLNA's `GetPositionInfo` reads (#80). A
+    // build with no media pipeline has nothing to report and says so by not offering one.
+    let receiver = match playback {
+        Some(report) => receiver.with_playback(report),
+        None => receiver,
+    };
 
     advertise_adapter(&receiver, mdns);
     // The warning that used to follow this line — "no media plane is implemented yet" —
