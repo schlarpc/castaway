@@ -939,9 +939,9 @@ impl ImageProperties {
 
     /// The largest size on offer, and the variant offering it.
     ///
-    /// Ignores encodings we cannot decode: a 2048×2048 TIFF is not a size we can use, and
-    /// reporting it as the ceiling would answer #75's question with a number no code path
-    /// could ever reach.
+    /// Ignores encodings we cannot decode: a 2048×2048 JPEG 2000 is not a size we can
+    /// use — BIP offers that encoding and nothing in this tree reads it — and reporting it
+    /// as the ceiling would answer #75's question with a number no code path could reach.
     #[must_use]
     pub fn largest_decodable(&self) -> Option<(&ImageVariant, (u16, u16))> {
         self.variants
@@ -962,13 +962,34 @@ fn attribute(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<
 }
 
 /// Identify an image by its magic bytes.
+///
+/// Sniffing rather than trusting a label, because a thumbnail fetch carries no encoding
+/// header at all — the profile fixes it as JPEG and responders vary. This covers every
+/// format [`ImageFormat`] names that *has* a magic number; TGA has none (its signature is
+/// an optional footer), so a TGA cover would have to arrive labelled to be recognised.
 #[must_use]
 pub fn sniff_format(data: &[u8]) -> Option<ImageFormat> {
+    // WebP is a RIFF container: the four-byte length between the two tags means it cannot
+    // be written as one flat slice pattern.
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return Some(ImageFormat::WebP);
+    }
     match data {
         [0xFF, 0xD8, 0xFF, ..] => Some(ImageFormat::Jpeg),
         [0x89, b'P', b'N', b'G', ..] => Some(ImageFormat::Png),
         [b'G', b'I', b'F', b'8', ..] => Some(ImageFormat::Gif),
         [b'B', b'M', ..] => Some(ImageFormat::Bmp),
+        // Both byte orders: `II` is little-endian, `MM` big.
+        [b'I', b'I', 0x2A, 0x00, ..] | [b'M', b'M', 0x00, 0x2A, ..] => Some(ImageFormat::Tiff),
+        [0x00, 0x00, 0x01, 0x00, ..] => Some(ImageFormat::Ico),
+        [b'q', b'o', b'i', b'f', ..] => Some(ImageFormat::Qoi),
+        [0x76, 0x2F, 0x31, 0x01, ..] => Some(ImageFormat::OpenExr),
+        // Radiance writes either signature.
+        _ if data.starts_with(b"#?RADIANCE") || data.starts_with(b"#?RGBE") => {
+            Some(ImageFormat::Hdr)
+        }
+        // Netpbm: `P1`..`P7` covers PBM/PGM/PPM in both ASCII and binary, plus PAM.
+        [b'P', kind, ..] if (b'1'..=b'7').contains(kind) => Some(ImageFormat::Pnm),
         _ => None,
     }
 }
@@ -1334,12 +1355,20 @@ mod tests {
     #[test]
     fn an_image_in_a_format_we_cannot_decode_is_refused() {
         // Better a text-only card than a decoder failure three layers down.
+        //
+        // JPEG 2000, because it is a real case rather than a made-up one: BIP's own
+        // encoding table offers it (`obexd`, `bip-common.c::encconv_table`) and nothing
+        // in this tree can decode it. This used to be WebP, which the pipeline now reads
+        // — so that version of the test had stopped testing anything (#87).
         let mut session = connected();
         assert!(session.fetch_thumbnail("x"));
         let err = session.feed(&reply(
             0xA0,
             &[],
-            vec![Header::EndOfBody(Bytes::from_static(b"RIFF....WEBP"))],
+            // The JP2 signature box.
+            vec![Header::EndOfBody(Bytes::from_static(&[
+                0x00, 0x00, 0x00, 0x0C, b'j', b'P', 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+            ]))],
         ));
         assert!(err.is_err());
     }
@@ -1354,6 +1383,41 @@ mod tests {
         assert_eq!(sniff_format(b"GIF89a"), Some(ImageFormat::Gif));
         assert_eq!(sniff_format(b"BM....."), Some(ImageFormat::Bmp));
         assert_eq!(sniff_format(b"not an image"), None);
+
+        // The rest of what the card can now draw. A thumbnail fetch carries no encoding
+        // header, so anything not sniffed here is refused however well the decoder would
+        // have coped (#87).
+        assert_eq!(
+            sniff_format(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some(ImageFormat::WebP)
+        );
+        assert_eq!(
+            sniff_format(b"RIFF\x24\x00\x00\x00AVI "),
+            None,
+            "not every RIFF"
+        );
+        assert_eq!(sniff_format(b"II\x2a\x00...."), Some(ImageFormat::Tiff));
+        assert_eq!(
+            sniff_format(b"MM\x00\x2a...."),
+            Some(ImageFormat::Tiff),
+            "big-endian TIFF is still TIFF"
+        );
+        assert_eq!(sniff_format(&[0, 0, 1, 0, 1, 0]), Some(ImageFormat::Ico));
+        assert_eq!(sniff_format(b"qoif...."), Some(ImageFormat::Qoi));
+        assert_eq!(
+            sniff_format(&[0x76, 0x2F, 0x31, 0x01]),
+            Some(ImageFormat::OpenExr)
+        );
+        assert_eq!(sniff_format(b"#?RADIANCE\n"), Some(ImageFormat::Hdr));
+        assert_eq!(sniff_format(b"P6\n1 1\n255\n"), Some(ImageFormat::Pnm));
+        assert_eq!(sniff_format(b"P9 nope"), None, "P8 and up are not Netpbm");
+
+        // JPEG 2000 and WBMP are on BIP's encoding table and are decodable by nothing
+        // here, so they must stay unsniffable rather than be guessed at.
+        assert_eq!(
+            sniff_format(&[0x00, 0x00, 0x00, 0x0C, b'j', b'P', 0x20, 0x20]),
+            None
+        );
     }
 
     #[test]
@@ -1490,10 +1554,12 @@ mod tests {
 
     #[test]
     fn the_largest_size_on_offer_ignores_encodings_we_cannot_decode() {
-        // Reporting a 2048×2048 TIFF as the ceiling answers "how big can the art be?"
-        // with a number no code path in this project could ever reach.
+        // Reporting a 2048×2048 JPEG 2000 as the ceiling answers "how big can the art
+        // be?" with a number no code path in this project could ever reach. JPEG 2000
+        // because BIP's encoding table offers it and nothing here decodes it — this used
+        // to say TIFF, which the pipeline now reads (#87).
         let doc = br#"<image-properties handle="7">
-<native encoding="TIFF" pixel="2048*2048"/>
+<native encoding="JPEG2000" pixel="2048*2048"/>
 <variant encoding="JPEG" pixel="600*600"/>
 <variant encoding="JPEG" pixel="200*200"/>
 </image-properties>"#;
@@ -1505,7 +1571,7 @@ mod tests {
         // what the peer claimed rather than what we understood of it.
         assert_eq!(
             props.variants[0].encoding,
-            Encoding::Unknown("TIFF".to_owned())
+            Encoding::Unknown("JPEG2000".to_owned())
         );
     }
 

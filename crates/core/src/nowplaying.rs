@@ -93,6 +93,16 @@ impl RepeatMode {
 /// A closed enum rather than a MIME string: the decoder has to match on it anyway, and
 /// parsing at the boundary means an unrecognised format is refused where it arrives
 /// instead of failing inside an image decoder three layers down (ground rule 1).
+///
+/// **The list is deliberately everything `pipeline` can decode, not a curated subset.**
+/// Cover art is whatever bytes a phone, a CDN or somebody's DLNA server chose to send, and
+/// a blank square because the sender picked WebP is a worse outcome than a few more
+/// decoders in the binary. `pipeline` has a test that fails if the two lists drift, which
+/// is how they are kept honest — they had drifted, and #87 is what that cost.
+///
+/// AVIF is the one absence, and it is a real constraint rather than a preference: the
+/// `image` crate decodes it only through dav1d, a C library, and every codec in this tree
+/// is pure Rust so that the Windows build stays a cross-build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ImageFormat {
@@ -104,14 +114,53 @@ pub enum ImageFormat {
     Gif,
     /// Windows bitmap. Permitted by BIP; rare in practice.
     Bmp,
+    /// WebP. Common from CDNs, and the likeliest of these to turn up in real use.
+    WebP,
+    /// TIFF.
+    Tiff,
+    /// Windows icon.
+    Ico,
+    /// Truevision TGA.
+    Tga,
+    /// Radiance HDR.
+    Hdr,
+    /// OpenEXR.
+    OpenExr,
+    /// Netpbm — PBM, PGM, PPM and PAM.
+    Pnm,
+    /// QOI.
+    Qoi,
 }
 
 impl ImageFormat {
+    /// Every format, so a caller can check this list against a decoder's.
+    ///
+    /// Exists because the enum is `#[non_exhaustive]`: without it, the test that keeps
+    /// this in step with `pipeline`'s decoder set could not enumerate what to check, and
+    /// a variant added here would silently go unverified.
+    pub const ALL: [Self; 12] = [
+        Self::Jpeg,
+        Self::Png,
+        Self::Gif,
+        Self::Bmp,
+        Self::WebP,
+        Self::Tiff,
+        Self::Ico,
+        Self::Tga,
+        Self::Hdr,
+        Self::OpenExr,
+        Self::Pnm,
+        Self::Qoi,
+    ];
+
     /// Parse an image format from a MIME type or a BIP `encoding` token.
     ///
     /// Accepts both spellings because the two live side by side in this stack: OBEX/BIP
     /// image descriptors carry bare tokens (`JPEG`), while everything else says
-    /// `image/jpeg`.
+    /// `image/jpeg`. The aliases are the ones that actually appear on a wire — `jpg` from
+    /// senders that spell it after the file extension, `x-targa` and `x-icon` because
+    /// those are the registered types, and the individual Netpbm spellings because a
+    /// server that has a PPM says `image/x-portable-pixmap` rather than the general form.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let token = s.rsplit('/').next().unwrap_or(s).trim();
@@ -119,12 +168,26 @@ impl ImageFormat {
             "jpeg" | "jpg" => Some(Self::Jpeg),
             "png" => Some(Self::Png),
             "gif" => Some(Self::Gif),
-            "bmp" => Some(Self::Bmp),
+            "bmp" | "x-bmp" | "x-ms-bmp" => Some(Self::Bmp),
+            "webp" => Some(Self::WebP),
+            "tiff" | "tif" => Some(Self::Tiff),
+            "ico" | "x-icon" | "vnd.microsoft.icon" => Some(Self::Ico),
+            "tga" | "targa" | "x-targa" | "x-tga" => Some(Self::Tga),
+            "hdr" | "vnd.radiance" => Some(Self::Hdr),
+            "exr" | "x-exr" => Some(Self::OpenExr),
+            "pnm" | "x-portable-anymap" | "x-portable-bitmap" | "x-portable-graymap"
+            | "x-portable-pixmap" => Some(Self::Pnm),
+            "qoi" | "x-qoi" => Some(Self::Qoi),
             _ => None,
         }
     }
 
     /// The canonical MIME type.
+    ///
+    /// These match what the `image` crate calls each format, deliberately: the test that
+    /// checks this enum against the decoder set looks the format up *by this string*, so
+    /// a spelling that disagrees is a spelling that fails the build rather than one that
+    /// quietly mislabels a picture.
     #[must_use]
     pub const fn mime(self) -> &'static str {
         match self {
@@ -132,6 +195,14 @@ impl ImageFormat {
             Self::Png => "image/png",
             Self::Gif => "image/gif",
             Self::Bmp => "image/bmp",
+            Self::WebP => "image/webp",
+            Self::Tiff => "image/tiff",
+            Self::Ico => "image/x-icon",
+            Self::Tga => "image/x-targa",
+            Self::Hdr => "image/vnd.radiance",
+            Self::OpenExr => "image/x-exr",
+            Self::Pnm => "image/x-portable-anymap",
+            Self::Qoi => "image/x-qoi",
         }
     }
 }
@@ -326,7 +397,33 @@ mod tests {
         assert_eq!(ImageFormat::parse("JPEG"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::parse("jpg"), Some(ImageFormat::Jpeg));
         assert_eq!(ImageFormat::parse("image/png"), Some(ImageFormat::Png));
-        assert_eq!(ImageFormat::parse("image/webp"), None);
+        // WebP used to be refused here, which was a gate with nothing behind it: the
+        // decoder can read it, and a CDN is more likely to send it than half the formats
+        // that were accepted (#87).
+        assert_eq!(ImageFormat::parse("image/webp"), Some(ImageFormat::WebP));
+        // The registered spellings, not just the tidy ones.
+        assert_eq!(ImageFormat::parse("image/x-icon"), Some(ImageFormat::Ico));
+        assert_eq!(
+            ImageFormat::parse("image/x-portable-pixmap"),
+            Some(ImageFormat::Pnm)
+        );
+        // …and something genuinely absent still is. AVIF decoding needs dav1d, which is C.
+        assert_eq!(ImageFormat::parse("image/avif"), None);
+        assert_eq!(ImageFormat::parse("application/pdf"), None);
+    }
+
+    #[test]
+    fn every_format_round_trips_through_its_own_mime_type() {
+        // `mime()` is what `pipeline`'s drift test looks each format up by, so a variant
+        // whose MIME type does not parse back would silently drop out of that check.
+        for format in ImageFormat::ALL {
+            assert_eq!(
+                ImageFormat::parse(format.mime()),
+                Some(format),
+                "{format:?} does not parse back from {}",
+                format.mime()
+            );
+        }
     }
 
     #[test]

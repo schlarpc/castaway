@@ -38,12 +38,35 @@ ffmpeg-next = { version = "7.1", optional = true }
 ffmpeg-sys-next = { version = "7.1", optional = true }
 ab_glyph = { version = "0.2", optional = true }
 png = { version = "0.17", optional = true }
-# Decoding cover art for the now-playing card. JPEG and PNG only — that is what AVRCP/BIP
-# and Spotify actually return, and the default feature set drags in a dozen formats plus
-# rayon. Pure Rust, so it does not complicate the Windows cross-build.
+# Decoding cover art for the now-playing card: **every decoder this crate has**, which is
+# the point rather than an oversight. Cover art is whatever bytes a phone, a CDN or some
+# DLNA server chose to send, and a panel that cannot draw a picture because the sender
+# picked WebP is a worse outcome than a slightly larger binary. `castaway_core::ImageFormat`
+# is kept in step with this list, and `nowplaying_card` has a test that fails if the two
+# drift — which they had, jpeg+png here against four formats there, so a GIF thumbnail
+# parsed as valid at the boundary and then failed to decode in exactly the place that
+# enum's docstring says cannot happen (#87).
+#
+# This is `default-formats` minus `avif`, and the omission is the one honest gate. In
+# `image` 0.25 the `avif` feature is the **encoder** (ravif); decoding AVIF needs
+# `avif-native`, which is dav1d — a C library, and the pure-Rust rule here is what keeps
+# the Windows cross-build a cross-build. So AVIF is absent from this list and from the
+# enum, and an AVIF cover is refused at the boundary rather than three layers down.
 image = { version = "0.25", default-features = false, features = [
+    "rayon",
+    "bmp",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
     "jpeg",
     "png",
+    "pnm",
+    "qoi",
+    "tga",
+    "tiff",
+    "webp",
 ], optional = true }
 # Brave's adblock engine — request-level ad/tracker blocking in the browser host, which
 # is what answered #44. Drop the default `single-thread` feature so the Engine is Arc-based

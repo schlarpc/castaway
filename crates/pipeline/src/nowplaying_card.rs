@@ -678,6 +678,52 @@ mod tests {
     }
 
     #[test]
+    fn every_format_the_boundary_accepts_is_one_this_build_can_decode() {
+        // `ImageFormat`'s docstring says it exists so an unrecognised format is refused
+        // where it arrives "instead of failing inside an image decoder three layers down".
+        // That only holds while the two lists agree, and they had not: this crate built
+        // `image` with jpeg+png while the enum accepted gif and bmp, so a GIF thumbnail
+        // parsed as valid and then failed exactly where the docstring promised it could
+        // not (#87).
+        //
+        // Exhaustive over `ImageFormat::ALL` rather than a handful of samples, and asking
+        // the decoder itself rather than reading the feature list, so a format added to
+        // core or a feature dropped from Cargo.toml fails here rather than on the wall.
+        for format in castaway_core::ImageFormat::ALL {
+            let decoder = image::ImageFormat::from_mime_type(format.mime()).unwrap_or_else(|| {
+                panic!(
+                    "{format:?}: `image` does not know the MIME type {}",
+                    format.mime()
+                )
+            });
+            assert!(
+                decoder.reading_enabled(),
+                "{format:?} parses at the boundary but this build has no decoder for it — \
+                 add its feature to `image` in pipeline/Cargo.toml, or drop the variant"
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_the_boundary_accepts_actually_decodes_bytes() {
+        // The companion to the exhaustive check above, which trusts `image`'s own view of
+        // which features are on. This one puts real bytes of a format that used to be
+        // rejected through the whole path.
+        let mut gif = b"GIF87a".to_vec();
+        gif.extend_from_slice(&[1, 0, 1, 0, 0x80, 0, 0]); // 1x1, global table of 2
+        gif.extend_from_slice(&[0, 0, 0, 0xFF, 0xFF, 0xFF]); // black, white
+        gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0]); // image descriptor
+        gif.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]); // LZW data
+        gif.push(0x3B); // trailer
+
+        let artwork =
+            castaway_core::Artwork::new(castaway_core::ImageFormat::Gif, bytes::Bytes::from(gif));
+        let cover = decode_cover(&artwork, 32).expect("a GIF cover must reach the card");
+        assert_eq!(cover.side, 32);
+        assert_eq!(cover.rgba.len(), 32 * 32 * 4);
+    }
+
+    #[test]
     fn the_card_is_the_size_it_was_asked_for() {
         let rgba = render(&card(), 640, 360).unwrap();
         assert_eq!(rgba.len(), 640 * 360 * 4);
