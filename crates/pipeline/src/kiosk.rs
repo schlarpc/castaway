@@ -19,7 +19,7 @@ use std::sync::Arc;
 use input_touch::{
     ContactId, Input, InputSink, PointerButton, PointerEvent, TouchEvent, TouchPhase,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -73,6 +73,15 @@ struct KioskApp {
     started_drag: bool,
     /// Whether the primary mouse button is down — i.e. a synthesized contact is live.
     pointer_contact: bool,
+    /// When the pointer was last actually used — moved, clicked or scrolled.
+    ///
+    /// `None` until it is, which on a wall panel with no mouse attached is forever, and
+    /// is the state in which no arrow is drawn at all (#84).
+    pointer_used: Option<std::time::Instant>,
+    /// What the window was last told about cursor visibility, so a frame that changes
+    /// nothing does not call into the window system. Starts `None` — nothing has been
+    /// said yet, so the first frame says something whichever way it goes.
+    cursor_shown: Option<bool>,
     /// The last position and time of that drag, for the velocity a flick carries.
     drag_sample: Option<(std::time::Instant, f32)>,
     /// Where each contact was last seen, for turning a drag into a scroll.
@@ -170,6 +179,35 @@ impl KioskApp {
     /// decided here — [`Self::tick_pill`] derives that from focus every frame.
     fn wake_pill(&mut self) {
         self.pill_since = Some(std::time::Instant::now());
+    }
+
+    /// Note that the pointer was used, which is what puts the cursor back on the glass.
+    fn wake_cursor(&mut self) {
+        self.pointer_used = Some(std::time::Instant::now());
+    }
+
+    /// Note that somebody touched the glass, which takes the cursor off it at once.
+    ///
+    /// Not a fade and not a timeout: a finger on the panel is a person who is not using
+    /// the mouse, and the arrow left over from whoever last did is exactly the parked
+    /// arrow this is all about.
+    fn sleep_cursor(&mut self) {
+        self.pointer_used = None;
+    }
+
+    /// Apply the cursor policy to the window. Called every frame; costs nothing when the
+    /// answer has not changed.
+    fn tick_cursor(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let used = self.pointer_used.map(|at| at.elapsed());
+        let shown = crate::cursor::shown(used, self.pointer_contact);
+        if self.cursor_shown == Some(shown) {
+            return;
+        }
+        window.set_cursor_visible(shown);
+        self.cursor_shown = Some(shown);
     }
 
     /// Go back to Home, from the pill or the gesture.
@@ -296,6 +334,16 @@ impl KioskApp {
         };
         if let Some(render) = self.render.as_ref() {
             demand = demand.merge(render.demand(now));
+        }
+        // The trap #84 names: this loop sleeps on `Demand`, so a hide deadline that is not
+        // merged here is simply slept through and the arrow stays up until something
+        // unrelated wakes the loop.
+        if let Some(until) = crate::cursor::next_change(
+            self.pointer_used
+                .map(|at| now.saturating_duration_since(at)),
+            self.pointer_contact,
+        ) {
+            demand = demand.merge(Demand::At(now + until));
         }
         #[cfg(feature = "electron")]
         if let Some(host) = self.browser.as_ref() {
@@ -556,10 +604,12 @@ impl KioskApp {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                self.wake_cursor();
                 let (x, y) = normalize(position.x, position.y, size);
                 Some(Input::Pointer(PointerEvent::Move { x, y }))
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                self.wake_cursor();
                 let button = pointer_button(*button)?;
                 let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
                 Some(Input::Pointer(PointerEvent::Button {
@@ -570,11 +620,20 @@ impl KioskApp {
                 }))
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.wake_cursor();
                 let (dx, dy) = wheel_pixels(*delta);
                 let (x, y) = normalize(self.cursor.0, self.cursor.1, size);
                 Some(Input::Pointer(PointerEvent::Wheel { x, y, dx, dy }))
             }
-            WindowEvent::Touch(touch) => Some(Input::Touch(translate_touch(touch, size))),
+            WindowEvent::Touch(touch) => {
+                // A finger on the glass is somebody not using the mouse. On Windows the
+                // panel's HID digitizer is expected to drag the native cursor along with
+                // every contact, so this is also what stops a touch *summoning* an arrow
+                // — and it is why the touch path is the one that hides rather than the
+                // pointer path being the only one that shows.
+                self.sleep_cursor();
+                Some(Input::Touch(translate_touch(touch, size)))
+            }
             _ => None,
         }
     }
@@ -829,6 +888,23 @@ fn translate_touch(touch: &winit::event::Touch, size: (u32, u32)) -> TouchEvent 
     TouchEvent::new(ContactId::panel(touch.id as u32), phase, x, y)
 }
 
+/// The panel's pointer as a winit cursor, or `None` if it cannot be built.
+///
+/// 32 px square: the size a desktop cursor is authored at, and what both X11 and Windows
+/// expect. A panel at 4K scales it in the compositor's cursor plane like any other.
+fn themed_cursor(event_loop: &ActiveEventLoop) -> Option<winit::window::Cursor> {
+    let (rgba, (hx, hy)) = crate::cursor::rasterize(CURSOR_SIDE)?;
+    let source =
+        winit::window::CustomCursor::from_rgba(rgba, CURSOR_SIDE_U16, CURSOR_SIDE_U16, hx, hy)
+            .map_err(|e| debug!(error = %e, "the themed cursor would not build"))
+            .ok()?;
+    Some(event_loop.create_custom_cursor(source).into())
+}
+
+/// The side of the cursor bitmap, in pixels.
+const CURSOR_SIDE: u32 = 32;
+const CURSOR_SIDE_U16: u16 = 32;
+
 impl ApplicationHandler for KioskApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -863,6 +939,23 @@ impl ApplicationHandler for KioskApp {
             }
         };
         let size = window.inner_size();
+        // The panel's own pointer, in place of the OS arrow — the last piece of
+        // Windows/Linux chrome that leaks through a surface otherwise entirely ours. It
+        // rides the hardware cursor path, so no frame of lag and no compositor work; and
+        // it is installed once, because whether it is *drawn* is `tick_cursor`'s and a
+        // hidden cursor costs nothing to have themed.
+        //
+        // A failure here is cosmetic — the OS arrow, hidden on the same schedule — so it
+        // is logged and stepped over rather than taken as a reason not to have a window,
+        // exactly as the icon is.
+        match themed_cursor(event_loop) {
+            Some(cursor) => window.set_cursor(cursor),
+            None => debug!("no themed cursor; the platform's own will be used"),
+        }
+        // Hidden from the first frame. Nothing has moved a mouse yet, and on a wall panel
+        // with none attached nothing ever will.
+        window.set_cursor_visible(false);
+        self.cursor_shown = Some(false);
 
         let instance = crate::wgpu_compositor::create_instance();
         let surface = match instance.create_surface(window.clone()) {
@@ -971,6 +1064,7 @@ impl ApplicationHandler for KioskApp {
                     host.pump(r);
                 }
                 self.tick_pill();
+                self.tick_cursor();
                 if let Some(render) = self.render.as_mut() {
                     let dt = self
                         .last_frame
@@ -1090,6 +1184,8 @@ impl KioskWiring {
             pointer_contact: false,
             drag_sample: None,
             pill_since: None,
+            pointer_used: None,
+            cursor_shown: None,
             pill_drawn: false,
             dirty: true,
             next_frame_at: None,
@@ -1205,6 +1301,8 @@ mod tests {
             pointer_contact: false,
             drag_sample: None,
             pill_since: None,
+            pointer_used: None,
+            cursor_shown: None,
             pill_drawn: false,
             dirty: false,
             next_frame_at: None,
@@ -1416,6 +1514,71 @@ mod tests {
         assert!(
             contact.from_edge,
             "a remote press on the reserved edge is the panel's, exactly as a finger's is"
+        );
+    }
+
+    #[test]
+    fn a_pointer_event_wakes_the_cursor_and_a_touch_puts_it_away() {
+        // The two directions of #84, at the level that decides them. A panel nobody has
+        // moved a mouse on draws no arrow; moving one draws it; and a finger on the glass
+        // takes it away again at once rather than on a timer — the person at the panel is
+        // not using the mouse, and the arrow left over from whoever last did is exactly
+        // the parked arrow this is about.
+        let mut app = router();
+        assert!(
+            app.pointer_used.is_none(),
+            "nothing has used the pointer yet"
+        );
+        assert!(!crate::cursor::shown(None, false));
+
+        app.decode_window_event(&WindowEvent::CursorMoved {
+            device_id: winit::event::DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(100.0, 100.0),
+        });
+        let used = app.pointer_used.map(|at| at.elapsed());
+        assert!(used.is_some(), "a move must wake the cursor");
+        assert!(crate::cursor::shown(used, false));
+
+        app.decode_window_event(&WindowEvent::Touch(winit::event::Touch {
+            device_id: winit::event::DeviceId::dummy(),
+            phase: winit::event::TouchPhase::Started,
+            location: winit::dpi::PhysicalPosition::new(200.0, 200.0),
+            force: None,
+            id: 0,
+        }));
+        assert!(
+            app.pointer_used.is_none(),
+            "a finger on the glass takes the arrow off it"
+        );
+        assert!(!crate::cursor::shown(None, false));
+    }
+
+    #[test]
+    fn the_cursors_hide_deadline_reaches_the_demand_calculation() {
+        // The trap the issue names: this loop sleeps on `Demand`, and `Demand::Idle`
+        // becomes `ControlFlow::Wait`. A hide deadline nothing asks a frame for is slept
+        // through, and the arrow stays up until something unrelated wakes the loop —
+        // which on an idle panel is not soon.
+        let mut app = router();
+        let now = std::time::Instant::now();
+        assert!(
+            matches!(app.demand(now), crate::demand::Demand::Idle),
+            "an untouched panel asks for nothing"
+        );
+
+        app.pointer_used = Some(now);
+        match app.demand(now) {
+            crate::demand::Demand::At(at) => {
+                assert_eq!(at, now + crate::cursor::HOLD, "the hide is what is due");
+            }
+            other => panic!("a visible cursor owes a frame at its hide time, got {other:?}"),
+        }
+
+        // …and once it has hidden, nothing is owed again.
+        app.pointer_used = Some(now - crate::cursor::HOLD);
+        assert!(
+            matches!(app.demand(now), crate::demand::Demand::Idle),
+            "a hidden cursor asks for nothing"
         );
     }
 

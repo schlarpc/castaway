@@ -53,6 +53,10 @@ pub mod adblock_engine;
 #[cfg(feature = "render")]
 pub mod attract;
 pub mod clock;
+/// Whether the pointer is drawn, and what it is drawn as (#84). Pure policy plus the
+/// artwork; the winit calls are `kiosk`'s.
+#[cfg(feature = "render")]
+pub mod cursor;
 #[cfg(feature = "electron")]
 pub mod electron_browser;
 #[cfg(feature = "ffmpeg")]

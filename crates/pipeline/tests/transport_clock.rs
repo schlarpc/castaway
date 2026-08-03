@@ -37,7 +37,7 @@ fn a_new_reading_re_anchors_the_clock_and_a_repeat_does_not() {
     // "re-anchored" is asserted as what it actually means — the elapsed time is zero.
     let (tx, rx) = pipeline::render_channel(8);
     let (clock, time) = pipeline::render_clock::RenderClock::manual();
-    let Some(mut render) = pipeline::test_gpu::render_loop(640, 360, rx) else {
+    let Some(render) = pipeline::test_gpu::render_loop(640, 360, rx) else {
         return;
     };
     let mut render = render.with_clock(clock);
