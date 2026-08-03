@@ -53,3 +53,8 @@ htmlcov/
 /castaway.toml
 
 /TODO.md
+
+# Python bytecode. `nix/*.py` are carve scripts run from the Nix build and from the
+# RE shell; a stray `__pycache__` from the latter got committed once (5638ce7).
+__pycache__/
+*.pyc
