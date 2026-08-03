@@ -144,6 +144,111 @@ fn a_stereo_stream_decodes_to_audio_that_sounds_like_what_went_in() {
     );
 }
 
+/// Decode a fixture with the wrapper directly, so the reconfiguration count is visible.
+///
+/// `decode_all` goes through `AudioDecoder`, which is the right seam for everything about
+/// the *audio* and carries nothing about how the decoder got there.
+fn decode_counting(fixture: &[u8], format: AudioFormat) -> (Vec<PcmBlock>, u64) {
+    let mut decoder = pipeline::ldac_decode::Decoder::new(format).expect("open LDAC decoder");
+    let mut blocks = Vec::new();
+    for (n, payload) in records(fixture).into_iter().enumerate() {
+        decoder
+            .decode(payload, Duration::from_millis(n as u64 * 17), |block| {
+                blocks.push(block);
+            })
+            .expect("decode");
+    }
+    let count = decoder.reconfigurations();
+    (blocks, count)
+}
+
+#[test]
+fn a_frame_that_reconfigures_the_decoder_is_kept_rather_than_counted_as_a_failure() {
+    // The sharpest edge in this wrapper, and until now the only one nothing proved it had
+    // ever been over.
+    //
+    // When a frame header disagrees with the handle's configuration, `ldacBT_decode`
+    // re-initialises itself, decodes the frame anyway, and *still returns -1* — with
+    // `LDACBT_ERR_DEC_CONFIG_UPDATED` in the error code. Believing the return code loses
+    // the first frame of every configuration change, and loses it silently.
+    //
+    // The 96 kHz fixture opened at 44.1 kHz is that case: the very first frame disagrees.
+    // `the_stream_decodes_at_its_own_rate_and_not_the_one_we_negotiated` already asserts
+    // the audio survives it — what it cannot say is whether the reconfiguration branch is
+    // what carried it, or whether the library quietly agreed all along and the branch has
+    // never run. This says which.
+    let (blocks, reconfigurations) = decode_counting(
+        include_bytes!("fixtures/ldac-96000-dual.bin"),
+        format(44_100, 2),
+    );
+    assert!(
+        reconfigurations > 0,
+        "the decoder was opened at a rate the stream does not use and reported no \
+         reconfiguration, so the branch that keeps those frames is not the one under test"
+    );
+    // Ground truth from the generator: 42 transport frames. Every one of them, including
+    // the one that carried the change.
+    assert_eq!(
+        blocks.len(),
+        42,
+        "{} of 42 frames survived a reconfiguration",
+        blocks.len()
+    );
+}
+
+#[test]
+fn an_adaptive_bitrate_stream_keeps_every_frame_the_encoder_produced() {
+    // The closest thing here to what a phone actually sends (#14). LDAC's headline feature
+    // is that it steps between 990, 660 and 330 kbps as the 2.4 GHz band gets busy — on a
+    // hackerspace wall, constantly — and every other fixture in this directory is a fixed
+    // bitrate, which no real sender is.
+    //
+    // The quality changes are the generator's, not this test's to observe: `ldac_fixtures`
+    // calls `ldacBT_set_eqmid` every eight encode calls, and the fixture is regenerable
+    // from it. Worth stating plainly, because the obvious assertion here is wrong — a
+    // bitrate step does **not** reconfigure the decoder. That was worth finding out: the
+    // frame length lives in the frame header, so a step looked like it had to disagree
+    // with the handle's configuration, and it does not. `LDACBT_ERR_DEC_CONFIG_UPDATED`
+    // is for the rate and the channel mode, which is what the test above uses.
+    //
+    // What is left is still worth pinning and is not covered anywhere else: frame lengths
+    // that change from frame to frame, decoded losslessly. A wrapper that mis-stepped
+    // `used_bytes` would resynchronise on a fixed-size stream and fall apart here.
+    let (blocks, _) = decode_counting(
+        include_bytes!("fixtures/ldac-44100-stereo-adaptive.bin"),
+        format(44_100, 2),
+    );
+
+    // Ground truth from the generator: 86 transport frames went in.
+    assert_eq!(
+        blocks.len(),
+        86,
+        "{} of 86 frames survived a stream whose frame length keeps changing",
+        blocks.len()
+    );
+    // 128 samples per channel per frame, whatever the bitrate: quality changes how many
+    // *bits* a frame takes, not how much audio it carries.
+    let samples: Vec<f32> = blocks
+        .iter()
+        .flat_map(|b| b.samples.iter().copied())
+        .collect();
+    assert_eq!(
+        samples.len(),
+        86 * 128 * 2,
+        "a frame lost some of its audio"
+    );
+    for block in &blocks {
+        assert_eq!(block.sample_rate, 44_100, "the rate never changed");
+        assert_eq!(block.channels, 2, "nor the channel count");
+    }
+    // …and it is still the tone that went in, not 86 frames of plausible-looking noise.
+    assert!(
+        rms(&samples) > 0.05,
+        "the adaptive stream decoded to silence: rms {}",
+        rms(&samples)
+    );
+}
+
 #[test]
 fn presentation_times_advance_across_the_frames_inside_one_packet() {
     // Six transport frames arrive in one A2DP packet with one RTP timestamp between them.
@@ -318,7 +423,7 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
             let Some((first, _)) = hits.next() else {
                 return Duration::ZERO;
             };
-            let last = hits.last().map_or(first, |(i, _)| i);
+            let last = hits.next_back().map_or(first, |(i, _)| i);
             let frames = (last - first) / usize::from(pipeline::mixer::CHANNELS);
             Duration::from_nanos(
                 (frames as u64).saturating_mul(1_000_000_000) / u64::from(pipeline::mixer::RATE),

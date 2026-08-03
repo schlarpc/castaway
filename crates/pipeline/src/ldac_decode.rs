@@ -93,6 +93,9 @@ pub struct Decoder {
     /// Whether a stream/negotiation disagreement has already been reported, so a mismatch
     /// costs one log line rather than one per frame.
     warned_mismatch: bool,
+    /// How many frames arrived with a header the handle disagreed with, and so
+    /// re-initialised it. See [`Decoder::reconfigurations`].
+    reconfigured: u64,
 }
 
 // The library keeps every bit of its state behind the handle — unlike moonlight-common-c,
@@ -110,6 +113,7 @@ impl std::fmt::Debug for Decoder {
         f.debug_struct("LdacDecoder")
             .field("negotiated", &self.negotiated)
             .field("stream", &self.stream_format())
+            .field("reconfigured", &self.reconfigured)
             .finish_non_exhaustive()
     }
 }
@@ -155,6 +159,7 @@ impl Decoder {
             output: Box::new([0; OUTPUT_CAPACITY]),
             negotiated: format,
             warned_mismatch: false,
+            reconfigured: 0,
         };
 
         let Ok(rate) = i32::try_from(format.sample_rate()) else {
@@ -202,6 +207,23 @@ impl Decoder {
         let rate = unsafe { sys::ldacBT_get_sampling_freq(self.handle) };
         let rate = u32::try_from(rate).ok()?;
         AudioFormat::from_hz(rate, self.negotiated.channels())
+    }
+
+    /// How many frames re-initialised the handle mid-stream.
+    ///
+    /// Exposed because the alternative is that the most interesting thing this decoder
+    /// does is invisible. `ldacBT_decode` reports a reconfiguration as *failure* — `-1`
+    /// with `LDACBT_ERR_DEC_CONFIG_UPDATED` — having already decoded the frame, so a
+    /// wrapper that believed the return code would drop the first frame of every change
+    /// and nothing would say so. This is the seam a test uses to prove a fixture actually
+    /// contains such a change, rather than asserting on a path it never took.
+    ///
+    /// Expect this to be non-zero on any real sender: LDAC's headline feature is adaptive
+    /// bitrate, the frame header carries the frame length, and so every step between
+    /// 990/660/330 kbps lands here.
+    #[must_use]
+    pub const fn reconfigurations(&self) -> u64 {
+        self.reconfigured
     }
 
     /// The library's current error code.
@@ -308,8 +330,10 @@ impl Decoder {
             return None;
         }
         if reconfigured {
+            self.reconfigured += 1;
             debug!(
                 rate = ?self.stream_format().map(AudioFormat::sample_rate),
+                count = self.reconfigured,
                 "LDAC stream changed configuration mid-flight; decoder followed it",
             );
         }

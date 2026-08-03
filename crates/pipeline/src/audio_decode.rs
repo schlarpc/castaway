@@ -813,7 +813,7 @@ pub(crate) mod tests {
             let Some((first, _)) = hits.next() else {
                 return Duration::ZERO;
             };
-            let last = hits.last().map_or(first, |(i, _)| i);
+            let last = hits.next_back().map_or(first, |(i, _)| i);
             let frames = (last - first) / usize::from(crate::mixer::CHANNELS);
             Duration::from_nanos(
                 (frames as u64).saturating_mul(1_000_000_000) / u64::from(crate::mixer::RATE),

@@ -559,6 +559,58 @@ mod tests {
     }
 
     #[test]
+    fn the_walk_holds_when_the_frame_length_changes_from_frame_to_frame() {
+        // The same cross-implementation check against the one fixture that resembles a
+        // real sender: LDAC steps between 990, 660 and 330 kbps as the band gets busy, and
+        // `ldac_fixtures` reproduces that with `ldacBT_set_eqmid` every eight encode calls
+        // (#14). Every other fixture here is a fixed bitrate, which no phone is.
+        //
+        // It matters *here* more than anywhere: the walk steps frame to frame by the
+        // 9-bit frame-length field in each header. On a fixed-bitrate stream a reader that
+        // mis-stepped would resynchronise on the next syncword and the counts would still
+        // come out right. On this one it cannot — the lengths change under it, so a wrong
+        // step lands mid-frame and stays there.
+        let packets = records(include_bytes!(
+            "../tests/fixtures/a2dp-ldac-44100-stereo-adaptive.bin"
+        ));
+        assert_eq!(packets.len(), 23, "fixture has the wrong number of packets");
+
+        let mut d = Depacketizer::new(AudioCodec::Ldac, 44_100);
+        let mut frames = 0u32;
+        // How many frames each MTU-sized payload turned out to hold. *Not* the payload
+        // size, which is constant: the encoder fills the MTU before it emits, so a quality
+        // step changes how many frames fit in those 660 bytes rather than how many bytes
+        // there are.
+        let mut per_packet = std::collections::BTreeSet::new();
+        for packet in packets {
+            let frame = d.push(packet).unwrap();
+            assert_eq!(
+                frame.data[0], 0xAA,
+                "every payload starts at a frame boundary"
+            );
+            let stream = d.ldac_stream().expect("an LDAC payload declares itself");
+            per_packet.insert(stream.frames);
+            // The configuration is what does *not* change: a bitrate step is not a
+            // reconfiguration, which is worth pinning because it looks like one.
+            assert_eq!(stream.sample_rate, ldac::SampleRate::Hz44100);
+            assert_eq!(stream.channels, ldac::ChannelConfig::Stereo);
+            frames += u32::from(stream.frames);
+        }
+        assert_eq!(
+            frames, 86,
+            "the walk must find every frame the encoder wrote"
+        );
+        // And the fixture really is variable, rather than a fixed-bitrate stream under a
+        // name that claims otherwise — which is the way this test would quietly stop
+        // testing anything.
+        assert!(
+            per_packet.len() > 1,
+            "every payload holds the same number of frames, so this fixture is not \
+             adaptive and this test is pinning nothing: {per_packet:?}"
+        );
+    }
+
+    #[test]
     fn the_rate_ldac_declares_is_read_from_the_stream_not_the_negotiation() {
         // 96 kHz dual channel, and the depacketizer told 44.1 kHz stereo. It must report
         // what the *frames* say, because that is what the decoder will follow: LDAC

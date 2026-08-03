@@ -72,6 +72,11 @@ struct Config {
     /// How much audio to encode, in PCM frames. Kept short: these are checked into the
     /// repository, and at 303 kbps a second of LDAC is 38 KB.
     frames: usize,
+    /// Switch encoder quality every this many encode calls, cycling HQ → SQ → MQ.
+    ///
+    /// `None` for a fixed-bitrate stream, which is what every other fixture here is and
+    /// what no real LDAC sender is.
+    switch_every: Option<usize>,
 }
 
 fn main() {
@@ -82,6 +87,7 @@ fn main() {
             channel_mode: ldac::LDACBT_CHANNEL_MODE_STEREO,
             name: "44100-stereo",
             frames: 11_025, // a quarter second
+            switch_every: None,
         },
         // The other half of the format space: 96 kHz puts 256 samples in a frame instead
         // of 128, and dual channel codes two channels independently. A fixture set that
@@ -92,6 +98,7 @@ fn main() {
             channel_mode: ldac::LDACBT_CHANNEL_MODE_DUAL_CHANNEL,
             name: "96000-dual",
             frames: 12_000, // an eighth of a second, and the same frame count
+            switch_every: None,
         },
         // Mono, because it is the one configuration whose block size differs — 128 samples
         // rather than 256 for a stereo frame — and therefore the one that catches a decoder
@@ -101,6 +108,25 @@ fn main() {
             channel_mode: ldac::LDACBT_CHANNEL_MODE_MONO,
             name: "44100-mono",
             frames: 11_025,
+            switch_every: None,
+        },
+        // Adaptive bitrate: the same stream, coded at a quality that keeps changing. This
+        // is the only fixture here that resembles what a phone actually sends — LDAC's
+        // headline feature is that it drops between 990, 660 and 330 kbps as the 2.4 GHz
+        // band gets busy, and on a hackerspace wall it will be doing that constantly.
+        //
+        // It matters because the frame length is *in the frame header*, so every step
+        // disagrees with the handle's configuration and re-initialises the decoder. The
+        // library reports that as failure — `-1` with `LDACBT_ERR_DEC_CONFIG_UPDATED` —
+        // having already decoded the frame, so a wrapper that believes the return code
+        // loses the first frame of every change. Nothing here had ever decoded such a
+        // stream (#14).
+        Config {
+            rate: 44_100,
+            channel_mode: ldac::LDACBT_CHANNEL_MODE_STEREO,
+            name: "44100-stereo-adaptive",
+            frames: 11_025,
+            switch_every: Some(8),
         },
     ];
 
@@ -181,8 +207,27 @@ fn encode(config: &Config) -> Vec<Packet> {
     let mut sequence: u16 = 0;
     let mut timestamp: u32 = 0;
     let mut stream = vec![0u8; ldac::LDACBT_MAX_NBYTES as usize];
+    // Cycled rather than random so the fixture is reproducible byte for byte: a generator
+    // whose output moved would make every regeneration a diff nobody could review.
+    const QUALITIES: [u32; 3] = [
+        ldac::LDACBT_EQMID_HQ,
+        ldac::LDACBT_EQMID_SQ,
+        ldac::LDACBT_EQMID_MQ,
+    ];
 
-    for block in pcm.chunks(chunk * channels) {
+    for (call, block) in pcm.chunks(chunk * channels).enumerate() {
+        if let Some(every) = config.switch_every {
+            if call > 0 && call % every == 0 {
+                let quality = QUALITIES[(call / every) % QUALITIES.len()];
+                // SAFETY: `handle` is initialised for encode and exclusively ours;
+                // `quality` is one of the three `LDACBT_EQMID_*` values the library
+                // accepts. This only changes the encoder's target bitrate.
+                let rc = unsafe {
+                    ldac::ldacBT_set_eqmid(handle, i32::try_from(quality).expect("eqmid fits"))
+                };
+                assert_eq!(rc, 0, "could not change quality for {}", config.name);
+            }
+        }
         // The library requires a full block and zero-fill for the remainder.
         let mut input = vec![0i16; chunk * channels];
         input[..block.len()].copy_from_slice(block);
