@@ -5,7 +5,7 @@ The second offline Cast receiver-auth identity. Consumed by
 
 ## Provenance
 
-Extracted from AirServer 5.7.2's bundled credential database (***REMOVED: App Dynamic BLAKE2b personalisation, PROVENANCE S5***),
+Extracted from AirServer 5.7.2's bundled credential database — App Dynamic's —
 which ships inside the installer as an encrypted SQLite file. The 2025.7.23 build
 no longer carries it as a loose file but links it into `AirServer.exe`; the copy
 carved from that binary is byte-identical to the 5.7.2 one.
