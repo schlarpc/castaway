@@ -23,6 +23,10 @@ pub mod backend_linux;
 pub mod error;
 pub mod ie;
 pub mod media;
+/// Miracast over Infrastructure — the [MS-MICE] control channel (#166). Pure.
+pub mod mice;
+/// The socket shell for [`mice`]: the 7250 listener and the hand-off to RTSP.
+pub mod mice_actor;
 pub mod p2p;
 pub mod params;
 pub mod session;
@@ -32,15 +36,19 @@ pub mod video;
 
 use castaway_core::ProtocolKind;
 
-pub use actor::{bind_rtp, connect_control, run_session, MiracastAdapter};
+pub use actor::{bind_rtp, connect_control, run_session, MiceService, MiracastAdapter};
 #[cfg(unix)]
 pub use backend_linux::{GroupSubnet, LinuxMiracastBackend, P2pConfig, WpaControl};
-pub use error::{IeError, MiracastError, ParamError};
+pub use error::{IeError, MiceError, MiracastError, ParamError};
 pub use ie::{
     DeviceInformation, DeviceType, ExtendedCapability, SessionAvailability, Subelement,
     SubelementId, WfdInformationElement,
 };
 pub use media::{MediaReceiver, MP2T_PAYLOAD_TYPE};
+pub use mice::{
+    vendor_extension, Capability, CloseReason as MiceCloseReason, MiceMessage, MiceOutput,
+    MiceSession, MiceState, SourceId as MiceSourceId,
+};
 pub use p2p::{MacAddr, WpaCommand, WpaEvent, WpaReply};
 pub use params::{
     AudioCodecs, AudioFormat, ClientRtpPorts, ConnectorType, ContentProtection, ParamBody,

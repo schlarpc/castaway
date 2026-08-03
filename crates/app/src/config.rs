@@ -339,6 +339,17 @@ pub struct Miracast {
     /// to resolve a freshly-associated peer: in WFD the sink dials the source, so the
     /// peer has no reason to send us the packet that would fill the neighbour table.
     pub group_cidr: String,
+    /// Also accept Miracast over Infrastructure — [MS-MICE], #166.
+    ///
+    /// On by default, and it costs a TCP listener and an mDNS record. Windows 10 v1703+
+    /// *prefers* this over forming a Wi-Fi Direct group, so a panel with it off makes
+    /// every Windows source do the expensive thing; and it is the one Miracast path that
+    /// works with no P2P radio at all, which on a box whose Wi-Fi card will not do Wi-Fi
+    /// Direct is the difference between Miracast and no Miracast.
+    ///
+    /// Turn it off where the LAN is not one you want screens projected across, which is
+    /// the only reason to: this path has no pairing, exactly as Wi-Fi Direct's has none.
+    pub infrastructure: bool,
 }
 
 impl Default for Miracast {
@@ -351,6 +362,7 @@ impl Default for Miracast {
             rtp_port: 1028,
             max_throughput_mbps: 200,
             group_cidr: "192.168.77.1/24".to_owned(),
+            infrastructure: true,
         }
     }
 }

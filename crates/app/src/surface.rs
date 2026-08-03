@@ -370,7 +370,25 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                 chosen_by: Provenance::Convention,
                 notes: "Advertised in M3 and echoed in SETUP; bound before M3 is \
                         sent. The RTSP control plane is outbound — the sink dials \
-                        the source's 7236, so there is no TCP listener.",
+                        the source's 7236, so there is no TCP listener for it. The \
+                        one below is MICE's, which is a different plane.",
+            },
+            Listener {
+                owner: Owner::Protocol(kind),
+                transport: Transport::Tcp,
+                port: PortSpec::Fixed(proto_miracast::mice::CONTROL_PORT),
+                bind: "0.0.0.0 (this is the ordinary LAN, not a P2P group)",
+                wire: "[MS-MICE] control channel: the source says where its RTSP \
+                       listener is, and the sink dials it",
+                security: "plaintext; Windows will not attempt MICE over a WLAN \
+                           without WPA2 link-layer security, and the DTLS and PIN \
+                           flows are neither advertised nor served",
+                gate: Gate::AnyOf(&[ProtocolKind::Miracast]),
+                provider: Provider::Process,
+                chosen_by: Provenance::Spec,
+                notes: "Fixed by [MS-MICE] §1.9 and not IANA-registered despite the \
+                        spec citing IANAPORT — 7236 is, 7250 is not. Off when \
+                        [miracast] infrastructure = false (#166).",
             },
             Listener {
                 owner: Owner::Protocol(kind),

@@ -499,6 +499,29 @@ pub async fn connect_control(peer: SocketAddr) -> Result<TcpStream, MiracastErro
 pub struct MiracastAdapter {
     backend: Arc<dyn castaway_core::MiracastBackend>,
     device_name: String,
+    /// Miracast over Infrastructure, if it is on (#166).
+    ///
+    /// `None` leaves the adapter exactly as it was: Wi-Fi Direct only, no mDNS
+    /// registration, nothing listening on 7250. `Some` adds a second way *in* rather than
+    /// a second protocol — the RTSP session either path reaches is the same one.
+    mice: Option<MiceService>,
+}
+
+/// What Miracast over Infrastructure needs beyond the P2P beacon.
+#[derive(Debug, Clone)]
+pub struct MiceService {
+    /// The GUID [MS-MICE] §3.1.3 requires in the service instance's TXT record.
+    ///
+    /// The receiver's own UUID, so a source that has seen this panel before recognises it
+    /// across restarts — which is what a container id is for.
+    pub container_id: String,
+    /// What the sink advertises it can do. Bounded by what it can actually serve: the
+    /// secured flows are refused rather than half-answered, so they are not advertised
+    /// (see [`crate::mice`]).
+    pub capability: crate::mice::Capability,
+    /// The capabilities the RTSP session negotiates with, once a source has said where to
+    /// dial it.
+    pub caps: SinkCapabilities,
 }
 
 impl MiracastAdapter {
@@ -508,7 +531,15 @@ impl MiracastAdapter {
         Self {
             backend,
             device_name,
+            mice: None,
         }
+    }
+
+    /// Also serve Miracast over Infrastructure.
+    #[must_use]
+    pub fn with_mice(mut self, mice: MiceService) -> Self {
+        self.mice = Some(mice);
+        self
     }
 }
 
@@ -519,15 +550,55 @@ impl castaway_core::SourceAdapter for MiracastAdapter {
     }
 
     fn advertisements(&self) -> Vec<castaway_core::Advertisement> {
-        // Not mDNS and not SSDP: this one is an 802.11 beacon, which the shared responders
-        // cannot carry (architecture §1e).
-        vec![castaway_core::Advertisement::WifiDirect {
+        // The beacon is 802.11 — L2, OS-specific, and not something the shared responders
+        // can carry (architecture §1e).
+        let mut out = vec![castaway_core::Advertisement::WifiDirect {
             device_name: self.device_name.clone(),
-        }]
+        }];
+        // MICE's is ordinary mDNS, and *does* go through the shared responder. That
+        // convergence is not a coincidence: [MS-MICE] §3.1.3 and WFA R2 (Miracast v2.3
+        // §4.4.1) independently landed on `_display._tcp` for the sink, so one responder
+        // serves both.
+        if let Some(mice) = &self.mice {
+            out.push(castaway_core::Advertisement::MdnsService {
+                ty: crate::mice::SERVICE_TYPE.to_string(),
+                instance: self.device_name.clone(),
+                port: crate::mice::CONTROL_PORT,
+                txt: vec![(
+                    crate::mice::CONTAINER_ID_KEY.to_string(),
+                    mice.container_id.clone(),
+                )],
+            });
+        }
+        out
     }
 
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), castaway_core::CoreError> {
-        Arc::clone(&self.backend).run(sink).await
+        let Some(mice) = self.mice.clone() else {
+            return Arc::clone(&self.backend).run(sink).await;
+        };
+        // Two ways in, one session at a time. Both are awaited together and the first to
+        // finish ends the adapter, because either finishing means the thing that owns the
+        // radio or the port has gone — carrying on with half a Miracast is a receiver that
+        // is advertised and unreachable.
+        let backend = Arc::clone(&self.backend);
+        let backend_sink = sink.clone();
+        let listener = crate::mice_actor::bind()
+            .await
+            .map_err(|e| castaway_core::CoreError::Adapter(e.to_string()))?;
+        info!(
+            port = crate::mice::CONTROL_PORT,
+            "miracast: also serving over infrastructure"
+        );
+        tokio::select! {
+            res = backend.run(backend_sink) => res,
+            res = crate::mice_actor::serve(
+                listener,
+                self.device_name.clone(),
+                mice.caps.clone(),
+                sink,
+            ) => res.map_err(|e| castaway_core::CoreError::Adapter(e.to_string())),
+        }
     }
 }
 

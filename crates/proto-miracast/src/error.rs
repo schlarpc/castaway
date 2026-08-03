@@ -126,3 +126,60 @@ pub enum IeError {
         actual: usize,
     },
 }
+
+/// What can go wrong on the Miracast-over-Infrastructure control channel ([MS-MICE]).
+///
+/// Its own enum rather than variants on [`MiracastError`]: MICE is a different protocol
+/// that happens to hand off to the same RTSP session, and folding its failures into the
+/// session's would make "the source asked for DTLS" and "the source's M4 named a format we
+/// never advertised" the same kind of thing to a caller.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MiceError {
+    /// The buffer ends inside a message or a TLV.
+    #[error("the message is truncated")]
+    Truncated,
+
+    /// A size field smaller than the header it is part of.
+    #[error("a message claims to be {0} bytes, which does not cover its own header")]
+    ShortMessage(usize),
+
+    /// A message or field too large for its length field.
+    #[error("{0} bytes will not fit the field that has to describe it")]
+    TooLong(usize),
+
+    /// A version this implementation does not speak. Only `0x01` is defined.
+    #[error("unknown MICE message version {0:#04x}")]
+    UnknownVersion(u8),
+
+    /// A command outside the six defined. Note `0x01` is `SOURCE_READY` and `0x00` is not
+    /// assigned at all.
+    #[error("unknown MICE command {0:#04x}")]
+    UnknownCommand(u8),
+
+    /// A command arrived without a TLV it cannot mean anything without.
+    #[error("the message is missing TLV {0:#04x}")]
+    MissingTlv(u8),
+
+    /// A TLV whose length is impossible for its type — or zero, which the spec forbids.
+    #[error("TLV {0:#04x} has a length of {1}, which it cannot")]
+    BadTlvLength(u8, usize),
+
+    /// A friendly name that is not valid UTF-16.
+    #[error("the friendly name is not valid UTF-16")]
+    BadFriendlyName,
+
+    /// `SinkDisplaysPin` without `UseDtlsStreamEncryption`, which the spec forbids: the
+    /// PIN exchange travels inside the encrypted TLVs, so one without the other describes
+    /// something that cannot happen.
+    #[error("security options {0:#04x} ask for a PIN with no encryption to carry it")]
+    IllegalSecurityOptions(u8),
+
+    /// A PIN response reason outside the three defined.
+    #[error("unknown PIN response reason {0:#04x}")]
+    UnknownPinReason(u8),
+
+    /// A host name containing a period, which [MS-MICE] §2.2.6.3 says "MUST NOT be used".
+    #[error("the MICE host name {0:?} is qualified; it must not contain a period")]
+    QualifiedHostName(String),
+}

@@ -4985,6 +4985,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "castaway-core",
+ "sha2",
  "substrate-rtp",
  "substrate-rtsp",
  "thiserror 2.0.19",

@@ -21,6 +21,7 @@
 | 8009 | tcp | cast | CASTv2: length-prefixed protobuf over TLS | TLS, self-signed or CKS-replayed certificate; the device-auth signature covers it (D41/D43) | enable.cast | convention |
 | 41000–41031 (`[media_ports]`) | udp | cast | mirroring RTP + RTCP (one socket per session; audio and video SSRCs demuxed on it) | AES-CTR per Cast mirroring keys | enable.cast | ours |
 | 1028 (`miracast.rtp_port`) | udp | miracast | MPEG2-TS over RTP from the source | plaintext RTP; WPA2 protects the P2P link at layer 2 | enable.miracast | convention |
+| 7250 | tcp | miracast | [MS-MICE] control channel: the source says where its RTSP listener is, and the sink dials it | plaintext; Windows will not attempt MICE over a WLAN without WPA2 link-layer security, and the DTLS and PIN flows are neither advertised nor served | enable.miracast | spec |
 | 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (#45) | plaintext | enable.miracast | spec |
 
 **Chosen by** answers "could we move this port?", in three tiers:
@@ -41,7 +42,8 @@ Notes, per listener that has one:
 - **41000–41031 (`[media_ports]`)/udp (airplay)** — binds the accepted connection's local address. Bound per sender before SETUP answers, so the Transport header only ever names ports that are already listening.
 - **41000–41031 (`[media_ports]`)/tcp (airplay)** — binds the accepted connection's local address. Answered as dataPort in the second SETUP reply.
 - **41000–41031 (`[media_ports]`)/udp (cast)** — binds the listener's address. Bound before the OFFER is answered; named as udpPort in the ANSWER.
-- **1028 (`miracast.rtp_port`)/udp (miracast)** — binds 0.0.0.0 (traffic arrives on the P2P group interface). Advertised in M3 and echoed in SETUP; bound before M3 is sent. The RTSP control plane is outbound — the sink dials the source's 7236, so there is no TCP listener.
+- **1028 (`miracast.rtp_port`)/udp (miracast)** — binds 0.0.0.0 (traffic arrives on the P2P group interface). Advertised in M3 and echoed in SETUP; bound before M3 is sent. The RTSP control plane is outbound — the sink dials the source's 7236, so there is no TCP listener for it. The one below is MICE's, which is a different plane.
+- **7250/tcp (miracast)** — binds 0.0.0.0 (this is the ordinary LAN, not a P2P group). Fixed by [MS-MICE] §1.9 and not IANA-registered despite the spec citing IANAPORT — 7236 is, 7250 is not. Off when [miracast] infrastructure = false (#166).
 - **67/udp (miracast)** — binds the P2P group interface. As group owner we must address the peer. The rule is not interface-scoped because the group interface (p2p-*-N) does not exist until the group forms.
 
 ## Multicast groups

@@ -156,6 +156,19 @@
       ],
       "owner": "miracast",
       "port": {
+        "fixed": 7250
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "[MS-MICE] control channel: the source says where its RTSP listener is, and the sink dials it"
+    },
+    {
+      "chosen_by": "spec",
+      "gate": [
+        "miracast"
+      ],
+      "owner": "miracast",
+      "port": {
         "fixed": 67
       },
       "provider": "deployment",

@@ -1446,6 +1446,11 @@ fn spawn_miracast(
             .context("building the Miracast sink capabilities")?;
         let group = proto_miracast::GroupSubnet::parse(&config.miracast.group_cidr)
             .context("parsing [miracast] group_cidr")?;
+        // The same capability table both ways in: a source that reaches us over
+        // infrastructure must negotiate the same formats and the same RTP port as one that
+        // formed a group, or the panel would behave differently depending on how it was
+        // found.
+        let mice_caps = caps.clone();
         let backend = Arc::new(proto_miracast::LinuxMiracastBackend::new(
             proto_miracast::P2pConfig {
                 control_dir: config.miracast.control_dir.clone().into(),
@@ -1457,10 +1462,18 @@ fn spawn_miracast(
             },
             caps,
         ));
-        let adapter = Arc::new(MiracastAdapter::new(
-            backend,
-            config.advertised_name(ProtocolKind::Miracast),
-        ));
+        let mut adapter =
+            MiracastAdapter::new(backend, config.advertised_name(ProtocolKind::Miracast));
+        if config.miracast.infrastructure {
+            adapter = adapter.with_mice(proto_miracast::MiceService {
+                // The receiver's own UUID: a container id is meant to identify *this
+                // panel* across restarts, which is exactly what that already is.
+                container_id: config.uuid.clone(),
+                capability: proto_miracast::Capability::insecure(),
+                caps: mice_caps,
+            });
+        }
+        let adapter = Arc::new(adapter);
         info!(
             interface = %config.miracast.interface,
             rtp_port = config.miracast.rtp_port,
