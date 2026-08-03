@@ -36,6 +36,12 @@ fn tmp(name: &str) -> std::path::PathBuf {
 struct Run {
     layout: MediaLayout,
     frames: usize,
+    /// The presentation time of the last frame that reached the callback.
+    ///
+    /// The load-independent half of "the video decoded". How *many* frames arrive is a
+    /// property of the host — `drain_paced` drops what is hopelessly late, on purpose —
+    /// but how far through the file the decode got is a property of the file (#170).
+    last_pts: Duration,
     audio_blocks: usize,
     audio_samples: usize,
     elapsed: Duration,
@@ -46,16 +52,42 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
     let (tx, rx) = sync_channel::<castaway_core::PcmFrame>(4096);
     let mut layout = MediaLayout::default();
     let mut frames = 0usize;
+    let mut last_pts = Duration::ZERO;
     let start = Instant::now();
 
-    // The audio consumer stands in for `audio_session::run_pcm`: it drains and drives the
-    // clock, but does *not* pace to real time, so the test finishes in decode time rather
-    // than in playback time. Pacing is `Pace`'s job and is tested separately.
+    // The audio consumer stands in for `audio_session::run_pcm`, and the thing it has to
+    // be faithful about is *when* it submits — not how fast it can drain.
+    //
+    // It used to drain instantly and anchor the clock on arrival, on the grounds that
+    // pacing is tested separately and this way the test finished in decode time rather
+    // than in playback time. That made the clock lie, and #170 is what it cost.
+    // `MediaClock` reads `submitted - OUTPUT_LEAD`, so two seconds of audio submitted in
+    // fifty milliseconds puts the clock 1.75 s into the media before the video decoder has
+    // produced its third frame — and `drain_paced` then drops every frame more than 400 ms
+    // behind, exactly as it should. Which thread got further first decided the frame
+    // count, so the assertion measured the host.
+    //
+    // Anchoring in the future does not fix it, and that is worth knowing before trying:
+    // `State::running_at` interpolates with `saturating_duration_since`, so an anchor
+    // ahead of now does not run backwards — the clock simply reads `submitted - LEAD` and
+    // leaps exactly as before.
+    //
+    // So this paces, which is what the real thing does: `run_pcm` submits at 1x because
+    // `MixInput::write` blocks while it is already `LEAD` ahead of the speakers (#111).
+    // Audio through media time M is therefore handed over at about `start + M - LEAD`, and
+    // the clock then reads wall-clock-since-start whatever order the threads run in. The
+    // decode takes as long as the media, which is the honest price and is what
+    // `a_silent_video_is_paced_by_the_wall_clock_not_the_cpu` already pays.
     let clock_for_audio = Arc::clone(&clock);
     let collector = std::thread::spawn(move || {
         let (mut blocks, mut samples) = (0usize, 0usize);
         while let Ok(block) = rx.recv() {
-            clock_for_audio.observe_audio(block.pts + block.duration());
+            let through = block.pts + block.duration();
+            let due = start + through.saturating_sub(pipeline::clock::OUTPUT_LEAD);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            clock_for_audio.observe_audio(through);
             blocks += 1;
             samples += block.samples.len();
         }
@@ -70,7 +102,8 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
         want_audio.then_some(tx),
         &|| false,
         |l| layout = l.clone(),
-        |_frame| {
+        |frame| {
+            last_pts = last_pts.max(frame.pts);
             frames += 1;
             true
         },
@@ -81,6 +114,7 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
     Run {
         layout,
         frames,
+        last_pts,
         audio_blocks,
         audio_samples,
         elapsed: start.elapsed(),
@@ -114,7 +148,21 @@ fn a_video_file_yields_both_pictures_and_sound() {
     }
     let r = run(&path, true);
     assert!(r.layout.has_video && r.layout.has_audio, "{:?}", r.layout);
-    assert!(r.frames >= 15, "video frames: {}", r.frames);
+    // Pictures came out, and the decode ran to the end of the file rather than being
+    // opened and abandoned.
+    //
+    // Deliberately *not* a frame count, which is what this asserted until #170 and which
+    // cannot be a guarantee: `drain_paced` drops frames that are hopelessly late, on
+    // purpose and correctly, so under load a loaded box legitimately presents fewer of
+    // them. `frames >= 15` of 20 was therefore a measurement of the host — it was seen at
+    // 11. How far *through* the file the decode got is a property of the file, and it is
+    // also the thing the assertion was reaching for.
+    assert!(r.frames > 0, "no video frames at all");
+    assert!(
+        r.last_pts >= Duration::from_millis(1_500),
+        "the decode stopped at {:?} of a two-second file",
+        r.last_pts
+    );
     assert!(r.audio_blocks > 0, "no audio was decoded at all");
     // Two seconds of 44.1/48 kHz stereo is tens of thousands of samples; anything much
     // smaller means the stream was opened and then abandoned.
@@ -213,7 +261,15 @@ fn a_silent_video_is_paced_by_the_wall_clock_not_the_cpu() {
         return;
     }
     let r = run(&path, false);
-    assert!(r.frames >= 8, "video frames: {}", r.frames);
+    // Progress, not a count, for the same reason as the A/V test above (#170): the
+    // drop-late rule means the number of frames a loaded box presents is a property of
+    // the box. This test's own claim is the `elapsed` assertion below.
+    assert!(r.frames > 0, "no video frames at all");
+    assert!(
+        r.last_pts >= Duration::from_millis(700),
+        "the decode stopped at {:?} of a one-second file",
+        r.last_pts
+    );
     // One second of media should take about a second. Generous lower bound so a loaded
     // CI box cannot fail it, but far above the ~50 ms this took with no clock at all.
     assert!(
