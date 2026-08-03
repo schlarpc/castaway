@@ -170,7 +170,7 @@ blake2b_simd = "1"
 crypto_secretbox = "0.2.0-pre.0"
 hmac = "0.12"
 hkdf = "0.12"
-rand = "0.8"
+rand = "0.10"
 
 # --- spotify ---
 # The one protocol we do NOT reimplement (DECISION-LOG D30). Spotify Connect is a cloud

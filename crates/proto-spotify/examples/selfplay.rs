@@ -334,8 +334,8 @@ async fn add_user(base: &str, info: &ReceiverInfo, stored: &Stored) -> Result<()
 }
 
 fn getrandom(buf: &mut [u8]) {
-    use rand::RngCore as _;
-    rand::thread_rng().fill_bytes(buf);
+    use rand::Rng as _;
+    rand::rng().fill_bytes(buf);
 }
 
 // ------------------------------------------------------------------- web api

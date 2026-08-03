@@ -180,7 +180,10 @@ impl CastDeviceSigner {
     /// # Errors
     /// As [`CastDeviceSigner::generate_dev`].
     pub fn generate_dev_at(now_unix: i64) -> Result<DevCredential, CastAuthError> {
-        let mut rng = rand::thread_rng();
+        // `rsa`'s own re-export, not the workspace `rand`: `RsaPrivateKey::new` takes a
+        // rand_core 0.6 `CryptoRngCore`, and the workspace is on rand 0.10 / rand_core
+        // 0.10. Reaching through the crate we are calling is what keeps the two apart.
+        let mut rng = rsa::rand_core::OsRng;
         let root_key =
             RsaPrivateKey::new(&mut rng, 2048).map_err(|e| CastAuthError::KeyGen(e.to_string()))?;
         let device_key =
@@ -390,8 +393,8 @@ mod tests {
     /// vectors could not be compared against a fresh run.
     #[test]
     fn dev_credential_is_deterministic() {
-        let root = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-        let device = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let root = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let device = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let a = CastDeviceSigner::dev_from_keys(&root, &device, 1_800_000_000).unwrap();
         let b = CastDeviceSigner::dev_from_keys(&root, &device, 1_800_000_000).unwrap();
         assert_eq!(a.root_ca_der, b.root_ca_der);

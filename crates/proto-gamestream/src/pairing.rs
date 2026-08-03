@@ -59,15 +59,19 @@ pub struct PairingSeed {
 pub struct PairingPin(u16);
 
 impl PairingPin {
-    /// A fresh PIN from the OS RNG.
+    /// A fresh PIN from a cryptographic RNG seeded by the OS.
     ///
-    /// OS randomness, not a timestamp: the PIN is the only secret gating the handshake
-    /// against everyone else on the LAN, and it is about to be shown on a wall — the
-    /// window where guessability matters is exactly the window it is being typed in.
+    /// Unguessable randomness, not a timestamp: the PIN is the only secret gating the
+    /// handshake against everyone else on the LAN, and it is about to be shown on a wall
+    /// — the window where guessability matters is exactly the window it is being typed
+    /// in. [`rand::rng`] is a CSPRNG seeded and periodically reseeded from the operating
+    /// system, which is what that argument actually asks for; rand 0.10 removed the
+    /// infallible `OsRng` this used to name, leaving only a `TryRng` that would make
+    /// generating a PIN a fallible operation for no gain in unguessability.
     #[must_use]
     pub fn generate() -> Self {
-        use rand::Rng;
-        Self(rand::rngs::OsRng.gen_range(0..=9999u16))
+        use rand::RngExt;
+        Self(rand::rng().random_range(0..=9999u16))
     }
 
     /// A PIN from a value someone already has. `None` above 9999 — a fifth digit is not

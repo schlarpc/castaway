@@ -41,7 +41,10 @@ impl ClientIdentity {
     /// # Errors
     /// [`GameStreamError::Identity`] if key generation or certificate signing fails.
     pub fn generate() -> Result<Self, GameStreamError> {
-        let mut rng = rand::rngs::OsRng;
+        // `rsa`'s own re-export, not the workspace `rand`: `RsaPrivateKey::new` takes a
+        // rand_core 0.6 `CryptoRngCore`, and the workspace is on rand 0.10 / rand_core
+        // 0.10. Reaching through the crate we are calling is what keeps the two apart.
+        let mut rng = rsa::rand_core::OsRng;
         let key = RsaPrivateKey::new(&mut rng, 2048)
             .map_err(|e| GameStreamError::Identity(e.to_string()))?;
         let key_pkcs8_pem = key

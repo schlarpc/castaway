@@ -288,9 +288,9 @@ fn fresh_uuid() -> String {
 }
 
 fn random_bytes() -> [u8; 16] {
-    use rand::RngCore;
+    use rand::Rng;
     let mut out = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut out);
+    rand::rng().fill_bytes(&mut out);
     out
 }
 

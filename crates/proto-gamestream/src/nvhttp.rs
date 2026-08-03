@@ -60,8 +60,8 @@ impl UniqueId {
     /// Generate a fresh one, Moonlight's shape: lowercase hex of 8 random bytes.
     #[must_use]
     pub fn generate() -> Self {
-        use rand::Rng;
-        Self(format!("{:x}", rand::thread_rng().gen::<u64>()))
+        use rand::RngExt;
+        Self(format!("{:x}", rand::rng().random::<u64>()))
     }
 
     /// The wire form.

@@ -8,7 +8,7 @@
 use aes::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
-use rand::RngCore;
+use rand::Rng;
 use sha1::{Digest, Sha1};
 
 use crate::error::SpotifyError;
@@ -38,7 +38,7 @@ impl DhKeys {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; 95];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self::from_private_bytes(&bytes)
     }
 
