@@ -37,6 +37,28 @@ runs:
         df -h /
         echo "::endgroup::"
 
+    # A private repo gets the 2-core / 7 GB runner; the 4-core / 16 GB one is for public
+    # repos. Seven gigabytes is not enough for this tree, and the way it fails says so only
+    # in the job annotation — "the hosted runner lost communication with the server …
+    # starves it for CPU/Memory" — while the log ends mid-build with no error in it.
+    #
+    # Swap does not make the build fast, it makes it finish. The peak is a small part of a
+    # long build, so most of this is never touched; what it buys is that the runner agent
+    # keeps its own pages when a link step wants more than the box has, instead of being
+    # starved and dropped. There is 37 GB free by this point, so the space is not scarce.
+    - name: Give the box somewhere to spill
+      shell: bash
+      run: |
+        sudo swapoff -a || true
+        sudo rm -f /swapfile
+        sudo fallocate -l 12G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile >/dev/null
+        sudo swapon /swapfile
+        # Spill sooner rather than at the cliff: the default 60 keeps anonymous pages
+        # resident until it is nearly too late, which on a box this size is the failure.
+        sudo sysctl -w vm.swappiness=60 >/dev/null
+        free -h
+
     - uses: DeterminateSystems/nix-installer-action@v22
     - uses: DeterminateSystems/magic-nix-cache-action@v14
-
