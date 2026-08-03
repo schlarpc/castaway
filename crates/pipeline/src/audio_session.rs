@@ -463,7 +463,8 @@ pub fn run_pcm(
         if let Some(clock) = clock {
             clock.observe_audio(through);
         }
-        pace.wait_for(played);
+        let consumed = pace.consumed(output.as_ref(), shape.0);
+        pace.wait_for(played, consumed);
     }
 
     output.stop();
@@ -498,32 +499,96 @@ const RESYNC_AFTER: Duration = Duration::from_secs(1);
 /// accepts — so with an output that never blocks (both of ours: cpal drops when its ring
 /// is full, and the null sink accepts instantly) a track is consumed in seconds and the
 /// queue turbo-advances. Nothing else in the chain is a clock, so this is.
+///
+/// ## Which clock, and why it is not the wall
+///
+/// It used to be the wall, and that was a slow leak. The device runs on its own crystal
+/// and the wall runs on the CPU's; measured on this box's HDMI sink over forty minutes,
+/// they differ by **−16.0 ppm ± 2.2** (7σ — `examples/audio_drift.rs`, the measurement
+/// #111 stage 0 asked for). Submission paced to the wall therefore ran 16 ppm faster than
+/// consumption, the output's ring filled by one block roughly every twenty minutes, and
+/// the block was dropped — `AudioOut::write` never blocks, deliberately, so a full queue
+/// discards rather than backing up into the decoder. An audible click, three times an
+/// hour, on every long session, with a `warn!` and nothing else.
+///
+/// So the reference is what the *device* has consumed, when it can say
+/// ([`AudioOut::frames_played`]). Then the pacing loop is closed against the thing that is
+/// actually playing the samples, and the crystal's error stops accumulating anywhere —
+/// there is nothing left for it to accumulate *in*.
+///
+/// The wall is the fallback, for a sink that is not a device: the null output, and
+/// anything whose backend cannot count. It has to be, because "how fast should silence be
+/// consumed" has no other answer — but a sink with no clock also has no ring to overflow,
+/// which is why the fallback was survivable for as long as it was the only path.
 #[derive(Default)]
 struct Pace {
     /// When the current run of audio started, and how much has been handed over since.
     /// `None` until the first block, and reset whenever the stream stops for a while.
     since: Option<(std::time::Instant, Duration)>,
+    /// What the device had played when this run started, if it counts.
+    ///
+    /// Subtracted from every later reading rather than assuming zero: a device is opened
+    /// once and may serve several runs, and a counter that does not restart with the run
+    /// would report the previous one's audio as this one's progress.
+    played_at_start: Option<u64>,
 }
 
 impl Pace {
     /// Account for `played` worth of audio, then sleep off anything beyond [`LEAD`].
-    fn wait_for(&mut self, played: Duration) {
-        let now = std::time::Instant::now();
+    ///
+    /// `consumed` is what the device says it has played since this run began, when it can
+    /// say; see the type's docs for why that is the reference rather than wall clock.
+    fn wait_for(&mut self, played: Duration, consumed: Option<Duration>) {
+        if let Some(excess) = self.overshoot(played, consumed, std::time::Instant::now()) {
+            std::thread::sleep(excess);
+        }
+    }
+
+    /// How long the source must wait, and *why* — the decision, with no sleep in it.
+    ///
+    /// Split out so the pacing can be asserted against numbers a test chose rather than
+    /// against how fast the host is. The property that matters here is "a device running
+    /// slow slows the source down", and timing a thread to prove it is the shape #156 was
+    /// about.
+    fn overshoot(
+        &mut self,
+        played: Duration,
+        consumed: Option<Duration>,
+        now: std::time::Instant,
+    ) -> Option<Duration> {
         let (start, submitted) = self.since.get_or_insert((now, Duration::ZERO));
 
         // Fell far behind: the source paused or stalled. Catching up would replay the
         // silence at speed, which is the very thing this exists to prevent.
+        //
+        // Judged on the wall even when the device is the reference, and that is not an
+        // oversight: a stalled source stops *submitting*, so the device drains, and the
+        // gap this is looking for is one in real time. Measuring it against a device that
+        // has run dry would find nothing.
         if now.duration_since(*start) > *submitted + RESYNC_AFTER {
             *start = now;
             *submitted = Duration::ZERO;
+            self.played_at_start = None;
         }
 
         *submitted += played;
-        if let Some(ahead) = submitted.checked_sub(now.duration_since(*start)) {
-            if let Some(excess) = ahead.checked_sub(LEAD) {
-                std::thread::sleep(excess);
-            }
-        }
+        // The device's clock where there is one, the wall where there is not.
+        let elapsed = consumed.unwrap_or_else(|| now.duration_since(*start));
+        submitted.checked_sub(elapsed)?.checked_sub(LEAD)
+    }
+
+    /// How much the device has played since this run began, in media time.
+    ///
+    /// `None` for a sink that cannot count, and for the first block of a run — there is
+    /// nothing to measure against until a baseline is taken, and taking one *is* what
+    /// this call does.
+    fn consumed(&mut self, output: &dyn AudioOut, sample_rate: u32) -> Option<Duration> {
+        let total = output.frames_played()?;
+        let base = *self.played_at_start.get_or_insert(total);
+        let since = total.saturating_sub(base);
+        Some(Duration::from_secs_f64(
+            since as f64 / f64::from(sample_rate.max(1)),
+        ))
     }
 }
 
@@ -912,18 +977,151 @@ mod tests {
     }
 
     #[test]
+    fn pacing_follows_the_device_that_can_say_where_it_has_got_to() {
+        // #111's measurement, as a decision rather than a stopwatch. Paced against the
+        // wall, submission runs ahead of a slow device forever and the difference is
+        // thrown away as a dropped block — measured at −16.0 ppm ± 2.2 on this box's HDMI
+        // sink (`examples/audio_drift.rs`), which is one block roughly every twenty
+        // minutes, an audible click, three times an hour, on every long session, with a
+        // `warn!` and nothing else.
+        //
+        // Every instant below is chosen, so this asserts what the pacing *decides* rather
+        // than how fast the host managed to run it (#156's lesson).
+        let t0 = std::time::Instant::now();
+        let block = Duration::from_millis(100);
+
+        // A device that has consumed nothing at all: everything past the lead has to be
+        // waited out, whatever the wall says.
+        let mut stalled = Pace::default();
+        let mut submitted = Duration::ZERO;
+        for _ in 0..10 {
+            submitted += block;
+            // The wall runs on, which under the old rule would have been enough to let
+            // the source keep going.
+            let now = t0 + submitted;
+            let wait = stalled.overshoot(block, Some(Duration::ZERO), now);
+            if submitted > LEAD {
+                assert_eq!(
+                    wait,
+                    Some(submitted - LEAD),
+                    "a device that has played nothing must hold the source at the lead"
+                );
+            } else {
+                assert_eq!(wait, None, "inside the lead there is nothing to wait for");
+            }
+        }
+
+        // A device keeping up exactly: the source is never held past the lead.
+        let mut matched = Pace::default();
+        let mut submitted = Duration::ZERO;
+        for _ in 0..10 {
+            submitted += block;
+            let wait = matched.overshoot(block, Some(submitted), t0 + submitted);
+            assert_eq!(wait, None, "a device in step slows nobody down");
+        }
+
+        // And a device running *slow* — the real case — holds the source back by exactly
+        // the accumulating difference, which is the error that used to be discarded.
+        let mut slow = Pace::default();
+        let mut submitted = Duration::ZERO;
+        for _ in 0..10 {
+            submitted += block;
+            let consumed = submitted.mul_f64(0.5);
+            let wait = slow.overshoot(block, Some(consumed), t0 + submitted);
+            let expected = (submitted - consumed).checked_sub(LEAD);
+            assert_eq!(wait, expected, "at {submitted:?} submitted");
+        }
+        assert!(
+            slow.overshoot(Duration::ZERO, Some(Duration::from_millis(500)), t0)
+                .is_some(),
+            "half a second behind is half a second the source must not run on"
+        );
+    }
+
+    #[test]
+    fn a_sink_that_cannot_count_is_paced_by_the_wall() {
+        // The fallback, and it has to exist: "how fast should silence be consumed" has no
+        // other answer. The null output takes this path, and a sink with no clock also has
+        // no ring to overflow, which is why it was survivable as the only path.
+        struct Countless;
+        impl AudioOut for Countless {
+            fn start(&mut self, _: u32, _: u16) -> Result<(), PipelineError> {
+                Ok(())
+            }
+            fn write(&mut self, _: &PcmFrame) -> Result<(), PipelineError> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+        let mut pace = Pace::default();
+        assert!(
+            pace.consumed(&Countless, 44_100).is_none(),
+            "a sink with no clock says so rather than guessing"
+        );
+
+        let t0 = std::time::Instant::now();
+        // Wall time keeping up with submission: nothing to wait for.
+        assert_eq!(
+            pace.overshoot(
+                Duration::from_millis(100),
+                None,
+                t0 + Duration::from_millis(100)
+            ),
+            None
+        );
+        // Wall time standing still while a second is submitted: held at the lead, exactly
+        // as before this change.
+        let mut still = Pace::default();
+        let mut submitted = Duration::ZERO;
+        for _ in 0..10 {
+            submitted += Duration::from_millis(100);
+            let wait = still.overshoot(Duration::from_millis(100), None, t0);
+            assert_eq!(wait, submitted.checked_sub(LEAD));
+        }
+    }
+
+    #[test]
+    fn a_devices_counter_is_measured_from_where_this_run_started() {
+        // A device is opened once and may serve several runs. A counter read as an
+        // absolute would report the previous run's audio as this one's progress, and this
+        // run would believe itself hours behind and never sleep again.
+        struct Ancient;
+        impl AudioOut for Ancient {
+            fn start(&mut self, _: u32, _: u16) -> Result<(), PipelineError> {
+                Ok(())
+            }
+            fn write(&mut self, _: &PcmFrame) -> Result<(), PipelineError> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn frames_played(&self) -> Option<u64> {
+                // An hour of 44.1 kHz, from whatever it was playing before.
+                Some(44_100 * 3600)
+            }
+        }
+        let mut pace = Pace::default();
+        assert_eq!(
+            pace.consumed(&Ancient, 44_100),
+            Some(Duration::ZERO),
+            "the baseline is taken on the first read, so this run starts at zero"
+        );
+        // …and stays measured from there.
+        assert_eq!(pace.consumed(&Ancient, 44_100), Some(Duration::ZERO));
+    }
+
+    #[test]
     fn a_stall_resyncs_the_clock_instead_of_sprinting_to_catch_up() {
         // After a pause the source resumes where it left off. Treating the silent gap as
         // a debt to repay would replay it at speed — the same audible failure by a
         // different route.
         let mut pace = Pace::default();
-        pace.wait_for(Duration::from_millis(100));
+        pace.wait_for(Duration::from_millis(100), None);
         // Pretend a long stall happened by rewinding the recorded start.
         if let Some((start, _)) = pace.since.as_mut() {
             *start -= Duration::from_secs(30);
         }
         let resumed = std::time::Instant::now();
-        pace.wait_for(Duration::from_millis(100));
+        pace.wait_for(Duration::from_millis(100), None);
         assert!(
             resumed.elapsed() < Duration::from_millis(50),
             "a resync must not sleep, and must not try to reclaim the stall"
