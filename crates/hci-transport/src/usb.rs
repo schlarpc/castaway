@@ -16,8 +16,13 @@
 //! [`substrate_hci::HciPacket::decode_body`] exists — the type comes from context here,
 //! and from a leading byte everywhere else.
 
-use nusb::transfer::{ControlOut, ControlType, Queue, Recipient, RequestBuffer, TransferError};
-use nusb::{Device, DeviceInfo, Interface};
+use std::time::Duration;
+
+use nusb::transfer::{
+    Buffer, Bulk, BulkOrInterrupt, Completion, ControlOut, ControlType, In, Interrupt, Out,
+    Recipient, TransferError,
+};
+use nusb::{Device, DeviceInfo, Endpoint, Interface, MaybeFuture};
 use substrate_hci::{HciError, HciPacket, HciTransport, PacketType};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -66,12 +71,43 @@ const _: () = {
     assert!(ACL_BUF >= ADVERTISED_L2CAP_MTU + L2CAP_HEADER + HCI_ACL_HEADER);
 };
 
+/// How long a control transfer may take before it is abandoned.
+///
+/// The control pipe is how every HCI *command* leaves this host, so a hang here is the
+/// stack going quiet with no error — the same failure the stall handling above exists to
+/// avoid. `nusb` requires the caller to name a bound; the kernel's own `btusb` uses
+/// `USB_CTRL_SET_TIMEOUT`, which is five seconds, and there is no reason to disagree with
+/// it. A controller that has not accepted a 3-byte command header in five seconds is not
+/// going to.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Round an IN transfer length up to a whole number of packets.
+///
+/// `nusb` 0.2 rejects an IN transfer whose requested length is not a nonzero multiple of
+/// the endpoint's maximum packet size — it fails the transfer with
+/// [`TransferError::InvalidArgument`] rather than short-reading. The sizes above are
+/// derived from what HCI can put on the wire, not from any endpoint's geometry, so they
+/// have to be rounded to fit. Rounding *up* is what keeps [`ACL_BUF`]'s guarantee intact:
+/// the buffer only ever grows, so it still holds the largest packet we invite.
+const fn whole_packets(len: usize, max_packet_size: usize) -> usize {
+    // A controller reporting a zero max packet size is malformed; leaving the length
+    // alone lets `submit` report it as the transfer error it is, rather than dividing by
+    // zero here.
+    if max_packet_size == 0 {
+        return len;
+    }
+    len.div_ceil(max_packet_size) * max_packet_size
+}
+
 /// A controller reached over USB.
 pub struct UsbTransport {
     interface: Interface,
     id: UsbId,
     /// Serialises reads. Two tasks polling the same endpoint would interleave packets.
     reader: Mutex<Reader>,
+    /// Serialises ACL writes. Submitting a transfer needs `&mut` on the endpoint, and
+    /// [`HciTransport::send`] only has `&self`.
+    acl_out: Mutex<Endpoint<Bulk, Out>>,
     _device: Device,
 }
 
@@ -84,8 +120,8 @@ pub struct UsbTransport {
 /// taking whichever completes is the only arrangement that works; an earlier version
 /// alternated, and hung on the first real controller it met.
 struct Reader {
-    events: Queue<RequestBuffer>,
-    acl: Queue<RequestBuffer>,
+    events: Endpoint<Interrupt, In>,
+    acl: Endpoint<Bulk, In>,
     /// Packets already read but not yet returned, so one transfer can yield several.
     queued: std::collections::VecDeque<HciPacket>,
 }
@@ -105,23 +141,33 @@ enum Read {
 /// the pipe carries on. Treating it as fatal cost a live session — the reader exited
 /// silently, and a phone spent five minutes pairing with a controller nothing was
 /// listening to.
-fn handle_completion(
-    queue: &mut Queue<RequestBuffer>,
-    completion: nusb::transfer::Completion<Vec<u8>>,
+///
+/// The completed transfer's own buffer is re-armed rather than a fresh one allocated: an
+/// IN completion leaves `requested_len` untouched, so resubmitting it asks for exactly the
+/// same rounded, whole-packet length that [`Reader::new`] worked out from the endpoint.
+/// That also keeps a zero-copy buffer zero-copy for the life of the transport.
+async fn handle_completion<EpType: BulkOrInterrupt>(
+    endpoint: &mut Endpoint<EpType, In>,
+    completion: Completion,
     what: &'static str,
-    buf_len: usize,
 ) -> Result<Read, HciError> {
-    match completion.into_result() {
-        Ok(data) => {
-            queue.submit(RequestBuffer::new(buf_len));
+    let Completion { buffer, status, .. } = completion;
+    match status {
+        Ok(()) => {
+            let data = buffer.to_vec();
+            endpoint.submit(buffer);
             Ok(Read::Data(data))
         }
         Err(TransferError::Stall) => {
             warn!(endpoint = what, "endpoint stalled; clearing and re-arming");
-            queue
+            // Sound to clear here precisely because this endpoint carries one transfer at
+            // a time: the completion we are holding was the only one in flight, so
+            // nothing is pending while the CLEAR_FEATURE goes out.
+            endpoint
                 .clear_halt()
+                .await
                 .map_err(|e| HciError::Transport(format!("{what}: clearing stall: {e}")))?;
-            queue.submit(RequestBuffer::new(buf_len));
+            endpoint.submit(buffer);
             Ok(Read::Recovered)
         }
         // Everything else really is fatal: the device is gone, or the transfer was
@@ -130,28 +176,57 @@ fn handle_completion(
     }
 }
 
+/// Clear any halt inherited from a previous owner, and arm the endpoint.
+///
+/// A process that died on a stall leaves the pipe halted, and the next claim then times
+/// out during vendor initialisation — which reads as a dead dongle needing a replug rather
+/// than as a pipe needing one control transfer.
+fn arm<EpType: BulkOrInterrupt>(
+    endpoint: &mut Endpoint<EpType, In>,
+    want: usize,
+    what: &'static str,
+) {
+    if let Err(e) = endpoint.clear_halt().wait() {
+        debug!(endpoint = what, error = %e, "no stall to clear at open");
+    }
+    let len = whole_packets(want, endpoint.max_packet_size());
+    endpoint.submit(endpoint.allocate(len));
+}
+
 impl Reader {
     /// Arm both endpoints.
-    fn new(interface: &Interface) -> Self {
-        let mut events = interface.interrupt_in_queue(EP_EVENT_IN);
-        let mut acl = interface.bulk_in_queue(EP_ACL_IN);
-        // Clear any halt inherited from a previous owner before arming. A process that
-        // died on a stall leaves the pipe halted, and the next claim then times out
-        // during vendor initialisation — which reads as a dead dongle needing a replug
-        // rather than as a pipe needing one control transfer.
-        for (queue, what) in [(&mut events, "interrupt in"), (&mut acl, "bulk in")] {
-            if let Err(e) = queue.clear_halt() {
-                debug!(endpoint = what, error = %e, "no stall to clear at open");
-            }
-        }
-        events.submit(RequestBuffer::new(EVENT_BUF));
-        acl.submit(RequestBuffer::new(ACL_BUF));
-        Self {
+    fn new(interface: &Interface, id: UsbId) -> Result<Self, TransportError> {
+        let mut events =
+            open_endpoint::<Interrupt, In>(interface, id, EP_EVENT_IN, "interrupt in")?;
+        let mut acl = open_endpoint::<Bulk, In>(interface, id, EP_ACL_IN, "bulk in")?;
+        arm(&mut events, EVENT_BUF, "interrupt in");
+        arm(&mut acl, ACL_BUF, "bulk in");
+        Ok(Self {
             events,
             acl,
             queued: std::collections::VecDeque::new(),
-        }
+        })
     }
+}
+
+/// Take exclusive use of one endpoint, saying which one when the device has not got it.
+///
+/// The addresses are fixed by the Bluetooth USB transport spec, so a device that filtered
+/// through [`is_bluetooth`] and then has no endpoint here is misdescribing itself — worth
+/// naming precisely, because it is not the failure the claim hint talks about and no
+/// amount of unbinding `btusb` will fix it.
+fn open_endpoint<EpType: nusb::transfer::EndpointType, Dir: nusb::transfer::EndpointDirection>(
+    interface: &Interface,
+    id: UsbId,
+    address: u8,
+    what: &'static str,
+) -> Result<Endpoint<EpType, Dir>, TransportError> {
+    interface
+        .endpoint::<EpType, Dir>(address)
+        .map_err(|e| TransportError::Claim {
+            id,
+            detail: format!("{what} endpoint {address:#04x}: {e}"),
+        })
 }
 
 impl std::fmt::Debug for UsbTransport {
@@ -167,7 +242,9 @@ impl std::fmt::Debug for UsbTransport {
 /// # Errors
 /// [`TransportError::Io`] if the USB device list cannot be read.
 pub fn list() -> Result<Vec<(UsbId, DeviceInfo)>, TransportError> {
-    let devices = nusb::list_devices().map_err(|e| TransportError::Io(e.to_string()))?;
+    let devices = nusb::list_devices()
+        .wait()
+        .map_err(|e| TransportError::Io(e.to_string()))?;
     Ok(devices
         .filter(is_bluetooth)
         .map(|info| (UsbId::new(info.vendor_id(), info.product_id()), info))
@@ -218,7 +295,7 @@ impl UsbTransport {
     }
 
     fn open_info(id: UsbId, info: &DeviceInfo) -> Result<Self, TransportError> {
-        let device = info.open().map_err(|e| TransportError::Claim {
+        let device = info.open().wait().map_err(|e| TransportError::Claim {
             id,
             detail: claim_hint(&e.to_string()),
         })?;
@@ -226,16 +303,19 @@ impl UsbTransport {
         // SCO pipe, which an A2DP sink never touches.
         let interface = device
             .claim_interface(0)
+            .wait()
             .map_err(|e| TransportError::Claim {
                 id,
                 detail: claim_hint(&e.to_string()),
             })?;
         info!(%id, "opened bluetooth controller over USB");
-        let reader = Reader::new(&interface);
+        let reader = Reader::new(&interface, id)?;
+        let acl_out = open_endpoint::<Bulk, Out>(&interface, id, EP_ACL_OUT, "bulk out")?;
         Ok(Self {
             interface,
             id,
             reader: Mutex::new(reader),
+            acl_out: Mutex::new(acl_out),
             _device: device,
         })
     }
@@ -300,16 +380,18 @@ impl HciTransport for UsbTransport {
                 body.push(u8::try_from(params.len()).unwrap_or(u8::MAX));
                 body.extend_from_slice(&params);
                 self.interface
-                    .control_out(ControlOut {
-                        control_type: ControlType::Class,
-                        recipient: Recipient::Interface,
-                        request: 0x00,
-                        value: 0x00,
-                        index: 0x00,
-                        data: &body,
-                    })
+                    .control_out(
+                        ControlOut {
+                            control_type: ControlType::Class,
+                            recipient: Recipient::Interface,
+                            request: 0x00,
+                            value: 0x00,
+                            index: 0x00,
+                            data: &body,
+                        },
+                        CONTROL_TIMEOUT,
+                    )
                     .await
-                    .into_result()
                     .map_err(|e| HciError::Transport(format!("control out: {e}")))?;
                 Ok(())
             }
@@ -317,8 +399,10 @@ impl HciTransport for UsbTransport {
                 let framed = HciPacket::Acl(acl).encode()?;
                 // Skip the indicator byte the encoder writes: the endpoint carries that
                 // information on USB.
-                self.interface
-                    .bulk_out(EP_ACL_OUT, framed[1..].to_vec())
+                let mut endpoint = self.acl_out.lock().await;
+                endpoint.submit(Buffer::from(&framed[1..]));
+                endpoint
+                    .next_complete()
                     .await
                     .into_result()
                     .map_err(|e| HciError::Transport(format!("bulk out: {e}")))?;
@@ -345,14 +429,14 @@ impl HciTransport for UsbTransport {
             let (kind, read) = tokio::select! {
                 completion = reader.events.next_complete() => {
                     let read = handle_completion(
-                        &mut reader.events, completion, "interrupt in", EVENT_BUF,
-                    )?;
+                        &mut reader.events, completion, "interrupt in",
+                    ).await?;
                     (PacketType::Event, read)
                 }
                 completion = reader.acl.next_complete() => {
                     let read = handle_completion(
-                        &mut reader.acl, completion, "bulk in", ACL_BUF,
-                    )?;
+                        &mut reader.acl, completion, "bulk in",
+                    ).await?;
                     (PacketType::AclData, read)
                 }
             };
@@ -395,6 +479,41 @@ mod tests {
         assert_eq!(EP_EVENT_IN, 0x81, "interrupt IN");
         assert_eq!(EP_ACL_IN, 0x82, "bulk IN");
         assert_eq!(EP_ACL_OUT, 0x02, "bulk OUT");
+    }
+
+    #[test]
+    fn in_transfer_lengths_are_whole_packets_and_never_shrink() {
+        // nusb 0.2 fails an IN transfer whose length is not a nonzero multiple of the
+        // endpoint's max packet size, so both buffers have to be rounded. Rounding the
+        // wrong way would silently give back a buffer smaller than ACL_BUF, and the
+        // build-time assertion above cannot see a runtime division — this is what
+        // stands in for it.
+        for max_packet in [16, 32, 64, 512, 1024] {
+            for want in [EVENT_BUF, ACL_BUF] {
+                let got = whole_packets(want, max_packet);
+                assert_eq!(
+                    got % max_packet,
+                    0,
+                    "{got} is not whole packets of {max_packet}"
+                );
+                assert!(got >= want, "{got} shrank below the requested {want}");
+                assert!(
+                    got < want + max_packet,
+                    "{got} rounded further than one packet past {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_exact_multiple_is_left_alone() {
+        // The common case on a high-speed bulk endpoint: ACL_BUF is already a multiple of
+        // some packet sizes, and growing it anyway would invite a larger transfer than
+        // the comment above says we ever invite.
+        assert_eq!(whole_packets(1024, 512), 1024);
+        assert_eq!(whole_packets(256, 16), 256);
+        // A controller reporting nothing must not divide by zero; submit reports it.
+        assert_eq!(whole_packets(260, 0), 260);
     }
 
     #[test]
