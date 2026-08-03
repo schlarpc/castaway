@@ -567,6 +567,18 @@ impl RenderPipeline {
         )
     }
 
+    /// The panel's one volume.
+    ///
+    /// Shared rather than copied, and this is the whole point of it: everything that
+    /// writes samples to a device applies the same `Gain`, so a level set over AVRCP is
+    /// the level YouTube plays at. The browser is a second writer on a second stream and
+    /// used to reach its device without passing here at all (#86).
+    #[cfg(feature = "audio")]
+    #[must_use]
+    pub fn gain(&self) -> Arc<crate::audio_session::Gain> {
+        Arc::clone(&self.gain)
+    }
+
     /// Use `factory` for audio output instead of the default device.
     #[cfg(feature = "audio")]
     #[must_use]

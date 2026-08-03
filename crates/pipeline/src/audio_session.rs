@@ -105,7 +105,12 @@ impl Gain {
     }
 
     /// Scale a block in place.
-    fn apply(&self, block: &mut PcmFrame) {
+    ///
+    /// Public because the panel has more than one thing that writes to a device: the
+    /// browser's page audio goes to its own stream and used to reach it without passing
+    /// here at all, which is the hole #86 found. Every writer applies this, at the same
+    /// point — last thing before the device.
+    pub fn apply(&self, block: &mut PcmFrame) {
         let factor = self.factor();
         // Unity is the overwhelmingly common case — every source that never touches the
         // volume — and skipping it keeps the whole mechanism free when unused.
@@ -764,6 +769,48 @@ mod tests {
         );
         gain.set(Volume::from_dbfs(-6.0));
         assert!((gain.level() - 0.501_187).abs() < 1e-5, "stored verbatim");
+    }
+
+    #[test]
+    fn the_gain_is_applied_by_whoever_writes_to_a_device_not_only_by_a_session() {
+        // The hole #86 found: the browser's page audio reached its own device without
+        // passing through `Gain` at all, so YouTube Lounge's `setVolume` converted
+        // cleanly into a `ControlTxn::Volume`, landed here, and did nothing.
+        //
+        // What makes the fix hold is that `apply` is the *whole* of the volume mechanism
+        // and is now public — a second writer applies it or it does not have one, and
+        // there is no third way for a path to be quietly at full scale.
+        let gain = Gain::default();
+        gain.set(Volume::from_dbfs(-6.0));
+        let mut block = pcm(44_100, 2, 4);
+        block.samples.iter_mut().for_each(|s| *s = 1.0);
+        gain.apply(&mut block);
+        for sample in &block.samples {
+            assert!(
+                (*sample - 0.501_187).abs() < 1e-5,
+                "every sample is scaled, got {sample}"
+            );
+        }
+
+        // …and unity really is free, which is what lets this sit on the hot path of a
+        // source that never touches the volume.
+        let unity = Gain::default();
+        let mut untouched = pcm(44_100, 2, 4);
+        untouched.samples.iter_mut().for_each(|s| *s = 0.25);
+        unity.apply(&mut untouched);
+        assert!(untouched
+            .samples
+            .iter()
+            .all(|s| (*s - 0.25).abs() < f32::EPSILON));
+
+        // Mute is the same mechanism rather than a second one, or a muted panel would be
+        // muted on some paths and not others.
+        let muted = Gain::default();
+        muted.set_muted(true);
+        let mut silenced = pcm(44_100, 2, 4);
+        silenced.samples.iter_mut().for_each(|s| *s = 1.0);
+        muted.apply(&mut silenced);
+        assert!(silenced.samples.iter().all(|s| s.abs() < f32::EPSILON));
     }
 
     #[test]

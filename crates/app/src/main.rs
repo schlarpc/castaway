@@ -237,6 +237,23 @@ fn main() -> anyhow::Result<()> {
         // that has to answer "how far through is this" is built inside `serve`.
         let playback: Arc<dyn castaway_core::PlaybackReport> =
             Arc::new(render_pipeline.playback_handle());
+        // Taken here for the same reason, and it has to be one handle rather than two
+        // gains: the panel has one pair of speakers, so a level set over AVRCP is the
+        // level YouTube plays at (#86).
+        #[cfg(all(feature = "electron", feature = "audio"))]
+        let browser_gain = render_pipeline.gain();
+        // The panel starts where the operator said rather than at full scale. Set once,
+        // here, because `Gain` outlives every session — a level is the panel's, not a
+        // source's (#86).
+        #[cfg(feature = "audio")]
+        {
+            let start = castaway_core::Volume::from_position(config.initial_volume);
+            render_pipeline.gain().set(start);
+            info!(
+                position = config.initial_volume,
+                "output volume starts where the config says"
+            );
+        }
 
         // DIAL launch → navigate the main-thread browser to YouTube leanback with
         // the sender's pairing params, so the phone binds to this screen; DIAL stop →
@@ -414,6 +431,11 @@ fn main() -> anyhow::Result<()> {
                 // than played by the browser process, so it takes an output of its own —
                 // one per session, like every other source.
                 Some(&audio_factory),
+                // The panel's one volume, not a second one. Page audio reached the device
+                // without passing through this at all, so YouTube Lounge's `setVolume`
+                // landed on a gain the browser never consulted — a slider that did
+                // nothing, on the surface most likely to be playing (#86).
+                StdArc::clone(&browser_gain),
                 pipeline::TV_USER_AGENT,
                 wake.clone(),
             )
@@ -426,6 +448,7 @@ fn main() -> anyhow::Result<()> {
                     app_dir,
                     adblock: blocker,
                     audio_out: Some(StdArc::clone(&audio_factory)),
+                    gain: browser_gain,
                     user_agent: pipeline::TV_USER_AGENT.to_string(),
                     waker: wake.clone(),
                 },

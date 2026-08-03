@@ -348,6 +348,14 @@ fn decode_pcm(b64: &str) -> Option<Vec<f32>> {
 struct BrowserAudio {
     out: Box<dyn AudioOut>,
     started: bool,
+    /// The panel's one volume, applied here as it is on every other path.
+    ///
+    /// Its absence was a hole with a very visible edge: `Gain` is documented as the last
+    /// thing before the device *because* the panel has one pair of speakers, and page
+    /// audio went straight past it. So YouTube Lounge's `setVolume` converted cleanly
+    /// into a `ControlTxn::Volume`, landed on a gain the browser never consulted, and did
+    /// nothing — on the surface most likely to be playing (#86).
+    gain: Arc<crate::audio_session::Gain>,
 }
 
 /// A painted frame waiting to be imported on the render thread.
@@ -408,6 +416,7 @@ impl Electron {
         app_dir: &std::path::Path,
         adblock: Arc<AdBlocker>,
         audio_out: Option<&AudioOutputFactory>,
+        gain: Arc<crate::audio_session::Gain>,
         user_agent: &str,
         waker: castaway_core::Waker,
     ) -> Result<Self, PipelineError> {
@@ -447,6 +456,7 @@ impl Electron {
             Arc::new(Mutex::new(audio_out.map(|make| BrowserAudio {
                 out: make(),
                 started: false,
+                gain: Arc::clone(&gain),
             })));
         let health = Arc::new(Health::default());
         let probes: Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>> =
@@ -866,7 +876,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                             sample_rate, channels, "browser audio into the mixer"
                         );
                     }
-                    let block = PcmBlock {
+                    let mut block = PcmBlock {
                         samples,
                         channels,
                         sample_rate,
@@ -876,6 +886,10 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                         // comparison of two unrelated timelines.
                         pts: std::time::Duration::from_secs_f64(media_time.max(0.0)),
                     };
+                    // The same gain, at the same point in the path: last thing before
+                    // the device. Applied to a *copy* of the page's samples, since the
+                    // block is built here and goes nowhere else.
+                    sink.gain.apply(&mut block);
                     if let Err(e) = sink.out.write(&block) {
                         warn!(target: "castaway::browser", error = %e, "browser audio write");
                     }
@@ -1024,6 +1038,9 @@ pub struct RespawnSpec {
     pub adblock: Arc<AdBlocker>,
     /// Where the page's audio goes. `None` leaves the browser silent.
     pub audio_out: Option<AudioOutputFactory>,
+    /// The panel's one volume. Applied to page audio exactly as it is to every other
+    /// path — see [`BrowserAudio::gain`] for what its absence cost.
+    pub gain: Arc<crate::audio_session::Gain>,
     /// The user agent leanback keys off.
     pub user_agent: String,
     /// The kiosk-loop waker a respawned browser's reader thread wakes with (#59).
@@ -1350,6 +1367,7 @@ impl ElectronHost {
                 &self.respawn.app_dir,
                 Arc::clone(&self.respawn.adblock),
                 self.respawn.audio_out.as_ref(),
+                Arc::clone(&self.respawn.gain),
                 &self.respawn.user_agent,
                 self.respawn.waker.clone(),
             ) {

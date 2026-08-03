@@ -58,6 +58,18 @@ pub struct Config {
     pub miracast: Miracast,
     /// GameStream / Sunshine client settings.
     pub gamestream: GameStream,
+    /// Where the panel's output volume starts, as a slider position in `0.0..=1.0`.
+    ///
+    /// The panel has one pair of speakers and one volume ([`pipeline::audio_session::Gain`]),
+    /// and until this existed it began every boot at full scale — a panel that comes up at
+    /// maximum in a shared room is the failure this prevents, and it applied to everything
+    /// except Spotify, which had `initial_volume` of its own (#86).
+    ///
+    /// A *position*, not an amplitude: it is the number a person would set on a slider,
+    /// and `Volume::from_position` puts the perceptual curve on it exactly as it does for
+    /// every sender's own scale.
+    #[serde(default = "default_initial_volume")]
+    pub initial_volume: f32,
     /// The remote-control web UI (#18).
     #[serde(default)]
     pub remote: Remote,
@@ -940,6 +952,15 @@ impl Default for Enable {
     }
 }
 
+/// Where the panel's volume starts.
+///
+/// Not full scale, deliberately. The same number Spotify's own `initial_volume` has
+/// always defaulted to, so the two agree: half a slider is loud enough to be obviously
+/// working and quiet enough that nobody in a shared room has to lunge for a remote.
+const fn default_initial_volume() -> f32 {
+    0.5
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -960,6 +981,7 @@ impl Default for Config {
             cast: Cast::default(),
             miracast: Miracast::default(),
             gamestream: GameStream::default(),
+            initial_volume: default_initial_volume(),
             remote: Remote::default(),
             audio: Audio::default(),
         }
