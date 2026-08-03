@@ -50,20 +50,49 @@ impl NowPlayingCard {
         !self.transport().is_empty()
     }
 
+    /// The state word this card actually draws, if any.
+    ///
+    /// `None` whenever a strip is up: the strip's play/pause glyph already says exactly
+    /// this over the same card, and the word underneath read as clutter ("playing" under
+    /// a pause button). See [`build_lines`].
+    fn drawn_state(&self) -> Option<&'static str> {
+        if self.has_transport() {
+            None
+        } else {
+            state_label(self.track.state)
+        }
+    }
+
     /// Whether this card rasterizes to the same pixels as `other`.
     ///
-    /// Position is excluded on both sides: the card draws no elapsed time — that is
-    /// the transport strip's job — so two cards differing only in position are the
-    /// same picture. This is what lets position republish once a second without
-    /// re-rasterizing a full-panel texture per tick.
+    /// Every field that does not reach the pixels is excluded, and the ones that reach
+    /// them only *sometimes* are compared as what is drawn rather than as what they are.
+    /// The card is a full-surface raster — tens of megabytes at 4K — so a field compared
+    /// here that the card never draws costs a re-raster of identical pixels, which on the
+    /// glass is a visible flash (#83).
+    ///
+    /// - **Position** the card never draws; that is the strip's job. This is what lets a
+    ///   source republish position once a second for free.
+    /// - **Shuffle and repeat** likewise: they are strip glyphs and nothing else.
+    /// - **State** the card draws only when there is no strip, so it is compared through
+    ///   [`Self::drawn_state`]. Comparing it directly is what made *pausing* flash the
+    ///   whole screen — the commonest thing anyone does to a card, on the surface most
+    ///   likely to be up.
+    ///
+    /// `has_transport` stays in the comparison, and has to: it decides the space the card
+    /// lays out against, so a card that gains or loses its strip really is a different
+    /// picture.
     #[must_use]
     pub fn visual_eq(&self, other: &Self) -> bool {
-        let flatten = |c: &Self| {
-            let mut c = c.clone();
-            c.track.position = None;
-            c
+        let key = |c: &Self| {
+            let mut flat = c.clone();
+            flat.track.position = None;
+            flat.track.state = castaway_core::PlaybackState::Stopped;
+            flat.track.shuffle = None;
+            flat.track.repeat = None;
+            (flat, c.drawn_state(), c.has_transport())
         };
-        flatten(self) == flatten(other)
+        key(self) == key(other)
     }
 }
 
@@ -548,6 +577,111 @@ mod tests {
             .into_iter()
             .map(|l| l.text)
             .collect()
+    }
+
+    /// The same card, with controls, so a transport strip is drawn under it.
+    fn card_with_strip() -> NowPlayingCard {
+        let mut c = card();
+        c.controls = ControlCapabilities::PLAY | ControlCapabilities::PAUSE;
+        c.track.state = PlaybackState::Playing;
+        c.track.duration = Some(std::time::Duration::from_secs(200));
+        c.track.position = Some(std::time::Duration::ZERO);
+        c
+    }
+
+    #[test]
+    fn pausing_a_card_that_has_a_strip_is_not_a_new_picture() {
+        // #83, and the commonest thing anyone does to a card. The card draws no state word
+        // while a strip is up — the strip's glyph says it instead — so pause and play
+        // rasterize identically. `visual_eq` compared `state` anyway, so every pause threw
+        // away a full-surface texture and uploaded the same pixels again: tens of
+        // megabytes at 4K, which on the glass is a flash of the whole screen.
+        let playing = card_with_strip();
+        let mut paused = playing.clone();
+        paused.track.state = PlaybackState::Paused;
+        assert!(playing.has_transport(), "the premise: a strip is up");
+        assert!(
+            playing.visual_eq(&paused),
+            "pause and play draw the same card when the strip draws the glyph"
+        );
+    }
+
+    #[test]
+    fn pausing_a_card_with_no_strip_is_a_new_picture() {
+        // The other half, and why the state cannot simply be masked. With no strip the
+        // card is the only thing on the panel that says whether sound should be coming
+        // out, so it prints the word — and then the word really does change.
+        let mut playing = card();
+        playing.track.state = PlaybackState::Playing;
+        let mut paused = playing.clone();
+        paused.track.state = PlaybackState::Paused;
+        assert!(!playing.has_transport(), "the premise: no strip");
+        assert!(
+            !playing.visual_eq(&paused),
+            "the card prints the word itself"
+        );
+    }
+
+    #[test]
+    fn shuffle_and_repeat_never_reach_the_card() {
+        // Strip glyphs, both of them. A phone toggling shuffle mid-track must not cost a
+        // full-panel raster.
+        let base = card_with_strip();
+        let mut shuffled = base.clone();
+        shuffled.track.shuffle = Some(true);
+        shuffled.track.repeat = Some(castaway_core::RepeatMode::Context);
+        assert!(base.visual_eq(&shuffled));
+    }
+
+    #[test]
+    fn position_never_reaches_the_card() {
+        // The original reason `visual_eq` exists: position republishes once a second.
+        let base = card_with_strip();
+        let mut later = base.clone();
+        later.track.position = Some(std::time::Duration::from_secs(97));
+        assert!(base.visual_eq(&later));
+    }
+
+    #[test]
+    fn gaining_a_strip_is_a_new_picture() {
+        // `has_transport` decides the space the card lays out against, so a card that
+        // gains or loses its strip really does rasterize differently — this is the one
+        // thing about the strip the card must keep noticing.
+        let bare = card();
+        let with_strip = card_with_strip();
+        assert_ne!(bare.has_transport(), with_strip.has_transport());
+        assert!(!bare.visual_eq(&with_strip));
+    }
+
+    #[test]
+    fn the_things_the_card_does_draw_are_still_noticed() {
+        let base = card_with_strip();
+        for (what, mutate) in [
+            (
+                "title",
+                (|c: &mut NowPlayingCard| c.track.title = Some("Other".into()))
+                    as fn(&mut NowPlayingCard),
+            ),
+            ("artist", |c: &mut NowPlayingCard| {
+                c.track.artist = Some("Someone".into())
+            }),
+            ("album", |c: &mut NowPlayingCard| {
+                c.track.album = Some("An album".into())
+            }),
+            ("queue", |c: &mut NowPlayingCard| {
+                c.up_next = vec![QueueItem::new("Next")];
+            }),
+            ("source", |c: &mut NowPlayingCard| {
+                c.source = SourceDescription::new().with_display_name("Pixel");
+            }),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(
+                !base.visual_eq(&changed),
+                "a changed {what} must re-rasterize the card"
+            );
+        }
     }
 
     #[test]
