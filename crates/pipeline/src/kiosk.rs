@@ -52,6 +52,11 @@ struct KioskApp {
     rx: Option<crate::render_pipeline::RenderRx>,
     attract: Option<AttractImage>,
     osd: Option<OsdController>,
+    /// The music visualiser's analyser (#15), installed on the render loop once the
+    /// compositor exists. Held here for the same reason the attract scene is: the loop is
+    /// not built until there is a surface to build it against.
+    #[cfg(feature = "audio")]
+    visualizer: Option<Arc<crate::visualizer::Analyzer>>,
     window: Option<Arc<Window>>,
     render: Option<RenderLoop>,
     /// External shutdown request (ctrl-c / service failure): checked whenever the loop
@@ -993,6 +998,10 @@ impl ApplicationHandler for KioskApp {
             if let Some(osd) = self.osd.take() {
                 render = render.with_osd(osd);
             }
+            #[cfg(feature = "audio")]
+            if let Some(analyzer) = self.visualizer.take() {
+                render = render.with_visualizer(analyzer);
+            }
             self.render = Some(render);
         }
         #[cfg(feature = "electron")]
@@ -1150,6 +1159,10 @@ pub struct KioskWiring {
     pub attract: Option<AttractImage>,
     /// The on-screen-display banner controller.
     pub osd: Option<OsdController>,
+    /// The music visualiser's analyser (#15). The same one attached to the mixer as a tap;
+    /// this end only reads it.
+    #[cfg(feature = "audio")]
+    pub visualizer: Option<Arc<crate::visualizer::Analyzer>>,
     /// External shutdown request (ctrl-c, or a service that failed).
     pub exit: Option<Arc<AtomicBool>>,
     /// Where a press on the transport strip goes.
@@ -1174,6 +1187,8 @@ impl KioskWiring {
             rx: Some(rx),
             attract: self.attract,
             osd: self.osd,
+            #[cfg(feature = "audio")]
+            visualizer: self.visualizer,
             exit: self.exit,
             controls: self.controls,
             shell_sink: self.shell_sink,
@@ -1288,6 +1303,8 @@ mod tests {
             rx: None,
             attract: None,
             osd: None,
+            #[cfg(feature = "audio")]
+            visualizer: None,
             window: None,
             render: None,
             controls: None,

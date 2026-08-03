@@ -219,6 +219,17 @@ fn main() -> anyhow::Result<()> {
         mixer.add_tap(stream_audio.tap());
         #[cfg(feature = "audio")]
         let render_pipeline = render_pipeline.with_mixer(Arc::clone(&mixer));
+        // The music visualiser (#15): a second tap on the same mixer the output stream
+        // taps, so the bars are drawn from the samples the speakers were given rather than
+        // from one source's idea of itself. Attached at both ends — the mixer feeds it,
+        // the render loop reads it — because those are opposite ends of the audio path and
+        // neither should have to know about the other.
+        #[cfg(all(feature = "audio", feature = "render"))]
+        let visualizer = {
+            let analyzer = Arc::new(pipeline::visualizer::Analyzer::new());
+            mixer.add_tap(Arc::clone(&analyzer) as Arc<dyn pipeline::mixer::MixTap>);
+            Some(analyzer)
+        };
         // A second handle on the render channel, for the shell: it pushes screens in
         // answer to panel presses, and the pipeline itself is about to be moved into the
         // session manager.
@@ -532,6 +543,8 @@ fn main() -> anyhow::Result<()> {
             shell_sink,
             remote_input: Some(remote_input),
             touch_surface: Some(touch_surface),
+            #[cfg(feature = "audio")]
+            visualizer,
         };
         #[cfg(feature = "electron")]
         pipeline::kiosk::run_with_browser(rx, wiring, browser_host)

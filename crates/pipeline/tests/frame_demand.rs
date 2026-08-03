@@ -254,3 +254,127 @@ fn a_panel_already_at_rest_is_owed_no_return() {
         "the return happened; nothing is owed a second time"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The music visualiser (#15).
+//
+// Here for the same reason the return to rest is: what is interesting about it from this
+// file's angle is that it asks for ~30 Hz rather than for display rate, and that it stops
+// asking the moment the music does.
+// ---------------------------------------------------------------------------------------
+
+#[cfg(feature = "audio")]
+mod visualizer {
+    use super::*;
+    use pipeline::mixer::MixTap;
+    use pipeline::render_clock::{ManualClock, RenderClock};
+    use std::sync::Arc;
+
+    /// `frames` of a 1 kHz tone as interleaved stereo at the mix rate.
+    fn tone(frames: usize) -> Vec<f32> {
+        let rate = pipeline::mixer::RATE as f32;
+        (0..frames)
+            .flat_map(|i| {
+                let v = (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / rate).sin() * 0.5;
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// A shell with a card up, an analyser attached, and the clock in the test's hands.
+    ///
+    /// The clock is not optional here. The bars are smoothed with time constants — 60 ms
+    /// to rise, 400 ms to fall — and a test loop runs thousands of frames per real
+    /// second, so on the wall clock `dt` is microseconds and nothing ever moves. This is
+    /// the trap #156 was about, arriving from the other direction.
+    fn rig() -> (RenderLoop, Arc<pipeline::visualizer::Analyzer>, ManualClock) {
+        let (tx, rx) = pipeline::render_channel(8);
+        let (clock, time) = RenderClock::manual();
+        let mut render = RenderLoop::offscreen(W, H, rx).unwrap().with_clock(clock);
+        tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+        render.pump();
+        let analyzer = Arc::new(pipeline::visualizer::Analyzer::new());
+        let mut render = render.with_visualizer(Arc::clone(&analyzer));
+        tx.send(RenderCommand::NowPlaying(Box::new(playing_card("a track"))));
+        render.pump();
+        settle(&mut render);
+        (render, analyzer, time)
+    }
+
+    /// Play `blocks` frames' worth of `audio`, one visualiser interval at a time.
+    fn play(
+        render: &mut RenderLoop,
+        analyzer: &Arc<pipeline::visualizer::Analyzer>,
+        time: &ManualClock,
+        audio: &[f32],
+        blocks: usize,
+    ) -> Demand {
+        let mut demand = Demand::Idle;
+        for _ in 0..blocks {
+            // The clock moves *before* the frame, so that when this returns `time.now()`
+            // is the instant the last frame was drawn at. Advancing afterwards would step
+            // straight over the deadline that frame just asked for, and the caller would
+            // measure it as zero.
+            time.advance(pipeline::visualizer::FRAME_INTERVAL);
+            analyzer.mixed(time.now(), audio);
+            demand = render.frame(TICK);
+        }
+        demand
+    }
+
+    #[test]
+    fn bars_reach_the_panel_while_something_is_playing() {
+        let (mut render, analyzer, time) = rig();
+
+        // Nothing has been played, so there is nothing to draw — and, importantly, no
+        // layer either: an empty upload every frame would be the cost of the feature with
+        // none of the benefit.
+        assert!(
+            !render.has_visualizer_layer(),
+            "a silent session must not put a layer up"
+        );
+
+        play(&mut render, &analyzer, &time, &tone(4_800), 20);
+        assert!(
+            render.has_visualizer_layer(),
+            "a playing session should have bars on the panel"
+        );
+    }
+
+    #[test]
+    fn the_bars_ask_for_thirty_frames_a_second_rather_than_display_rate() {
+        // The whole reason this is a deadline: an audio session is up for the length of an
+        // album, and `Demand::Frame` for that long is the most expensive thing on the box.
+        let (mut render, analyzer, time) = rig();
+        let demand = play(&mut render, &analyzer, &time, &tone(4_800), 20);
+        let Demand::At(due) = demand else {
+            panic!("moving bars should ask for a frame at a time, got {demand:?}");
+        };
+        // Measured against the clock the loop is actually reading.
+        let ahead = due.saturating_duration_since(time.now());
+        assert!(
+            ahead > Duration::from_millis(10),
+            "the bars asked for another frame in {ahead:?}; that is display rate, not 30 Hz"
+        );
+    }
+
+    #[test]
+    fn the_layer_goes_away_when_the_music_does() {
+        // A paused track is most of the time an audio session is on the panel. The layer
+        // going means the loop can sleep, which is the difference between a visualiser and
+        // a space heater.
+        let (mut render, analyzer, time) = rig();
+        play(&mut render, &analyzer, &time, &tone(4_800), 20);
+        assert!(render.has_visualizer_layer());
+
+        // The music stops. Silence still *arrives* — the mixer pads with it whenever no
+        // source has anything to say — so this is the real shape of a paused session
+        // rather than a tap that has been starved.
+        let quiet = vec![0.0f32; 9_600];
+        play(&mut render, &analyzer, &time, &quiet, 200);
+        assert!(
+            !render.has_visualizer_layer(),
+            "the bars are still up after the music stopped"
+        );
+    }
+}

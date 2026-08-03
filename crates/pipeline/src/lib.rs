@@ -80,12 +80,12 @@ pub mod keepawake;
 // answers from whether this module is here rather than from the flag itself.
 #[cfg(feature = "ldac")]
 pub mod ldac_decode;
-/// How the panel *moves* between the states [`panel`] decides: springs, and the
-/// choreography table that says which one each transition gets. Pure.
 /// The panel's one audio output: the device, the mix, and the volume (#111). Every source
 /// writes into a [`mixer::MixInput`]; the mixer sums them and owns the one device.
 #[cfg(feature = "audio")]
 pub mod mixer;
+/// How the panel *moves* between the states [`panel`] decides: springs, and the
+/// choreography table that says which one each transition gets. Pure.
 #[cfg(feature = "render")]
 pub mod motion;
 #[cfg(feature = "render")]
@@ -133,6 +133,10 @@ pub mod theme;
 pub mod transport;
 #[cfg(feature = "electron")]
 pub mod ubo_scriptlets;
+/// The music visualiser (#15): a calm row of bars fed by the mixer's tap, for the sessions
+/// that make sound and no pixels. The analysis is pure; only the drawing needs `render`.
+#[cfg(all(feature = "audio", feature = "render"))]
+pub mod visualizer;
 #[cfg(feature = "render")]
 pub mod wgpu_compositor;
 #[cfg(feature = "electron")]

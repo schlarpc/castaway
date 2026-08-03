@@ -1381,6 +1381,10 @@ pub struct RenderLoop {
     /// When the panel was last touched, so an ending session does not yank someone out
     /// of a screen they are reading (#27).
     last_touch: Option<std::time::Instant>,
+    /// The music visualiser's analyser, if one is attached (#15). `None` in a build with
+    /// no audio path, and in every test that is not about it.
+    #[cfg(feature = "audio")]
+    visualizer: Option<Arc<crate::visualizer::Analyzer>>,
     /// When a requested video-layer clear takes effect, unless a frame cancels it. The
     /// deferral exists for control points that "seek" by stopping and re-loading the
     /// item: an immediate clear bared the idle screen for the gap between the two.
@@ -1558,6 +1562,8 @@ impl RenderLoop {
             animating: false,
             mascot_base: None,
             last_touch: None,
+            #[cfg(feature = "audio")]
+            visualizer: None,
             video_clear_due: None,
             video_size: None,
             card_clear_due: None,
@@ -2123,6 +2129,94 @@ impl RenderLoop {
         };
         let (_, h) = self.compositor.target_size();
         picker.items.len() > crate::picker::layout(picker, 1, h.max(1)).visible
+    }
+
+    /// Draw the music visualiser from `analyzer` while an audio session has the panel.
+    ///
+    /// The same analyser must be attached to the mixer as a tap, which is what feeds it;
+    /// this end only reads. Separate calls because the two live at opposite ends of the
+    /// audio path and the render loop has no business knowing about the mixer.
+    #[cfg(feature = "audio")]
+    pub fn with_visualizer(mut self, analyzer: Arc<crate::visualizer::Analyzer>) -> Self {
+        self.visualizer = Some(analyzer);
+        self
+    }
+
+    /// Draw the visualiser over the now-playing card, or take it down.
+    ///
+    /// Returns when the bars next want drawing, if they are up. Deliberately a deadline
+    /// rather than "yes, keep going": they want ~30 Hz, and a panel that sat at display
+    /// rate for the length of an album would be the most expensive thing on the box
+    /// (#59, #15).
+    ///
+    /// Only while the card is *fullscreen*. Demoted into the widget slot it is a thumbnail
+    /// with a title in it, and sixteen bars across an inch of glass is noise rather than
+    /// information.
+    #[cfg(feature = "audio")]
+    fn tick_visualizer(&mut self, now: std::time::Instant) -> Option<std::time::Instant> {
+        use crate::panel::Surface;
+        let analyzer = self.visualizer.clone()?;
+        let showing = self.compositor.has_layer(LayerId::NowPlaying)
+            && !self.panel.placement(Surface::Card).is_widget();
+        if !showing {
+            self.compositor.remove_layer(LayerId::Visualizer);
+            return None;
+        }
+        let bands = analyzer.bands(now);
+        if bands.is_silent() {
+            // Nothing playing, or between two tracks. The layer goes rather than being
+            // uploaded empty every frame — and its absence is also what lets the loop go
+            // back to sleep, which for an audio session parked on a paused track is most
+            // of the time it is up.
+            self.compositor.remove_layer(LayerId::Visualizer);
+            return None;
+        }
+        let (sw, sh) = self.compositor.target_size();
+        let (sw, sh) = (sw.max(1), sh.max(1));
+        let has_transport = self.compositor.has_layer(LayerId::Transport);
+        let (x, y, w, h) = crate::visualizer::placement(sw, sh, has_transport);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (tw, th) = (w.ceil().max(1.0) as u32, h.ceil().max(1.0) as u32);
+        let rgba = match crate::visualizer::render(&bands, tw, th) {
+            Ok(rgba) => rgba,
+            Err(e) => {
+                debug!(error = %e, "visualizer: could not draw the bars");
+                return None;
+            }
+        };
+        if let Err(e) = self.compositor.upload_texture(
+            LayerId::Visualizer,
+            tw,
+            th,
+            TexelFormat::Rgba8Srgb,
+            &rgba,
+        ) {
+            debug!(error = %e, "visualizer: could not upload the bars");
+            return None;
+        }
+        self.compositor.upsert_layer(Layer {
+            id: LayerId::Visualizer,
+            opacity: 1.0,
+            transform: Transform {
+                scale_x: w / sw as f32,
+                scale_y: h / sh as f32,
+                offset_x: x / sw as f32,
+                offset_y: y / sh as f32,
+            },
+        });
+        Some(now + crate::visualizer::FRAME_INTERVAL)
+    }
+
+    /// A build with no audio path has nothing to visualise.
+    #[cfg(not(feature = "audio"))]
+    fn tick_visualizer(&mut self, _now: std::time::Instant) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Whether the visualiser's bars are currently composited. For tests and logs.
+    #[must_use]
+    pub fn has_visualizer_layer(&self) -> bool {
+        self.compositor.has_layer(LayerId::Visualizer)
     }
 
     /// Note that a finger touched the panel.
@@ -2766,9 +2860,14 @@ impl RenderLoop {
         self.tick_motion(dt);
         self.tick_transport();
         self.tick_home_return();
+        let bars_due = self.tick_visualizer(self.clock.now());
         self.update_osd();
         self.present_and_serve_taps();
-        self.demand(self.clock.now())
+        let demand = self.demand(self.clock.now());
+        match bars_due {
+            Some(at) => demand.merge(crate::demand::Demand::At(at)),
+            None => demand,
+        }
     }
 
     /// Return the panel to rest if it has been left alone long enough (#23).

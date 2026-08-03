@@ -2038,3 +2038,52 @@ somebody navigated" from "away because a remote peer did"; a phone driving the p
 across the room is touching it as far as this is concerned, which is right, but its
 contacts arrive through the same path and have not been checked against this policy on real
 hardware.
+
+### D54 — The visualiser is a tap, thirty frames a second, and deliberately boring
+
+**2026-08-03.** #15's whole brief was one line: *projectm is too overwhelming btw*. Taken
+literally, and the literal reading is what produced every decision here.
+
+**A row of soft bars, not a Milkdrop preset.** Sixteen of them across the bottom of the
+now-playing card, in the panel's accent colour, opacity rising with level so the loud bars
+carry the eye and the quiet ones stay out of the way. Bars fall four times slower than they
+rise, which is the whole difference between breathing and flickering. Below a floor they go
+to nothing rather than amplifying the noise floor between two tracks into a light show.
+
+**Fed by the mixer, which is why it is honest.** `Analyzer` is a `MixTap` (#111), so it
+sees the samples the speakers were given — after the mix, after the panel's one volume.
+Bars drawn from one source's own output would keep dancing after somebody muted the room.
+
+**The analysis is not on the audio path.** The tap copies a downmix into a ring and
+returns; the Goertzel bank runs on the render thread inside `bands`, where a frame budget
+already exists. The mixer thread paces every decoder on the box (ground rule 4), so it is
+the wrong place for ten thousand multiplies however cheap they look written down. There is
+a test that fails if the analysis ever moves into `mixed`.
+
+**Goertzel rather than an FFT.** Sixteen bands is far fewer than a 1024-point FFT gives and
+all sixteen are wanted, so a filter bank is the smaller answer — `N` multiply-adds per band
+against `N log N` plus a dependency and a scratch buffer. It is also much easier to be sure
+of: "a tone in this band lights this band and not its neighbours" is a test, and it is the
+one that caught the missing Hann window, without which a single tone lights half the
+display.
+
+**Thirty frames a second, as a deadline.** The layer asks for `Demand::At(now + 33 ms)`
+rather than `Demand::Frame`. Nothing here moves fast enough for the difference to be
+visible, and an audio session is on the panel for the length of an album — display rate for
+that long would be the most expensive thing on the box, which is the opposite of what #59
+was for. The layer is dropped entirely when the bars are silent, so a paused track lets the
+loop sleep.
+
+**Above the card, below the transport.** The card is opaque — it fills its whole surface
+with a gradient — so a layer under it is invisible. Below the strip because a control
+somebody is reaching for outranks an ornament, and it never occludes, because a layer the
+hit test cannot see through would swallow presses meant for the card.
+
+#### Not done
+
+Only while the card is fullscreen: demoted into the widget slot it is a thumbnail with a
+title in it, and sixteen bars across an inch of glass is noise. Nothing is configurable —
+not the band count, the colour, or whether it is on at all. And no real music has been
+through it: the tests drive it with synthesised tones, so what is proven is that the bank
+separates and that the bars rise, fall and go away at the right times, not that an album
+looks good.

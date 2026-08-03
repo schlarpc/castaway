@@ -243,6 +243,15 @@ pub enum LayerId {
     /// Above the attract scene, below video — a sender with pixels outranks a card about
     /// a sender without them.
     NowPlaying,
+    /// The music visualiser's bars, over the bottom of the now-playing card (#15).
+    ///
+    /// Above the card because the card is opaque — it fills its whole surface with a
+    /// gradient — so anything drawn under it is invisible. Below the transport strip,
+    /// because a control somebody is reaching for outranks an ornament.
+    ///
+    /// Never occludes: it is soft bars over transparency, and a layer this test cannot see
+    /// through would swallow presses meant for the card.
+    Visualizer,
     /// The touchable transport strip under the now-playing card. Above the card and
     /// below video, for the same reason the card is: a sender with pixels of its own
     /// outranks controls for a sender without them.
@@ -296,17 +305,18 @@ impl LayerId {
     pub const fn occludes(self) -> bool {
         !matches!(
             self,
-            Self::ShellPrev | Self::MascotOverlay | Self::CloseAffordance
+            Self::ShellPrev | Self::MascotOverlay | Self::CloseAffordance | Self::Visualizer
         )
     }
 
     /// Every layer, in paint order. The ordering test asserts against this rather than
     /// against a hand-written list, so a new variant cannot be added without placing it.
-    pub const PAINT_ORDER: [Self; 11] = [
+    pub const PAINT_ORDER: [Self; 12] = [
         Self::Attract,
         Self::ShellPrev,
         Self::BrowserWidget,
         Self::NowPlaying,
+        Self::Visualizer,
         Self::Transport,
         Self::MascotOverlay,
         Self::Video,
@@ -341,6 +351,10 @@ impl LayerId {
         match self {
             // The clock yields the moment a session has anything on the panel: an ornament
             // must not outrank the thing the panel is actually doing.
+            //
+            // `Visualizer` is deliberately absent: it is drawn over the card and never
+            // appears without it, so yielding to the card already covers it. An entry here
+            // would be a second way to say the same thing, and the two could disagree.
             Self::BrowserWidget => &[Self::NowPlaying, Self::Transport, Self::Video],
             // The mascot yields to nothing, and deliberately not to the card: she leans on
             // the *slot*, so a session demoted into it is what she is leaning on. What gets
@@ -352,6 +366,7 @@ impl LayerId {
             Self::Attract
             | Self::ShellPrev
             | Self::NowPlaying
+            | Self::Visualizer
             | Self::Transport
             | Self::Video
             | Self::BrowserFullscreen
