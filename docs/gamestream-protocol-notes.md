@@ -183,10 +183,16 @@ Sunshine's own vectors and against a scripted host over real sockets; the stream
 proven to link and answer its own queries. Everything between "the host said 200 to /launch"
 and "pixels" is unverified in this tree.
 
-**There is no chooser.** Nothing here can yet put a list of hosts on the panel and take a
-touch on it, so a session can only be started from config — which makes GameStream
-operator-configured rather than walk-up, the opposite of this project's premise. D37 records
-this as deferred, not designed.
+**There is no input path.** `moonlight-sys` binds `LiSendMouseMoveEvent`,
+`LiSendTouchEvent`, `LiSendControllerEvent` and the rest, and `stream.rs` calls none of
+them. So a session can be discovered, paired, chosen and streamed, and then not touched —
+on a touch panel, which is the whole deployment. Tracked as its own item; it is the last
+structural gap rather than a rough edge.
+
+~~**There is no chooser.**~~ Landed (D38). `app/src/shell_nav.rs` browses hosts, lists a
+host's apps, launches one, and drives pairing from the glass — pressing an unpaired host
+generates a PIN, shows it, and waits for it to be typed into the host's own UI. The PIN is
+no longer configurable at all (#78).
 
 **The GPL boundary.** moonlight-common-c is GPL-3.0 and this workspace is MIT. The `stream`
 feature that links it is off by default at the cargo level and off in `castaway-portable`.
