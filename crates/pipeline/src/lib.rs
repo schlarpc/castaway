@@ -82,6 +82,10 @@ pub mod keepawake;
 pub mod ldac_decode;
 /// How the panel *moves* between the states [`panel`] decides: springs, and the
 /// choreography table that says which one each transition gets. Pure.
+/// The panel's one audio output: the device, the mix, and the volume (#111). Every source
+/// writes into a [`mixer::MixInput`]; the mixer sums them and owns the one device.
+#[cfg(feature = "audio")]
+pub mod mixer;
 #[cfg(feature = "render")]
 pub mod motion;
 #[cfg(feature = "render")]
