@@ -38,7 +38,7 @@ exercises your *future* Linux target.
 | `.#castaway-windows` | none | toolchain canary — if it stops linking, the toolchain broke, not the media stack |
 | `.#castaway-windows-render` | `render` | DX12 compositor + kiosk, no browser; bisect render problems without the browser runtime in the way |
 | `.#castaway-windows-hwaccel` | `hwaccel` | the D3D11VA → shared-NV12 → D3D12 decode bridge. Exists as its own artifact because it is the one part of #58 Linux cannot exercise: the VA-API half has an offscreen readback test, this half has only the compiler until it reaches the Dell |
-| `.#castaway-windows-electron` | `electron` | the deploy artifact: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged |
+| `.#castaway-windows-electron` | `electron`, `audio-out` | the deploy artifact: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged, plus WASAPI output through cpal |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
 
 Every Windows artifact also carries an `archive` passthru:
@@ -125,6 +125,38 @@ a usable reference — and the derivation leaves cargo-xwin's `DONE` marker in t
 
 There is no `.cargo/config.toml` for this. Everything comes from the environment in
 `nix/windows.nix`, so there's one source of truth rather than two that drift.
+
+### One `windows-core` in the graph, not two
+
+Only the Windows target compiles the windows-rs crates, so only the Windows target can be
+broken by resolving two versions of them at once — which is a resolution the native checks
+are structurally unable to notice. It has happened once already (#169) and the shape is worth
+recognising, because the compiler's account of it reads like a tautology:
+
+```
+error[E0277]: the trait bound `IMMNotificationClient: windows_core::Interface` is not satisfied
+   --> windows-core-0.62.2/src/interface.rs:14:1     <- the bound wants this one
+   ::: windows-core-0.61.2/src/interface.rs:14:1     <- the type implements that one
+```
+
+The cause is that `#[windows::core::implement]` expands to `::windows_core::…` paths, which
+resolve against the *implementing* crate's own `windows-core` dependency — not against the one
+inside the `windows` crate the COM interfaces came from. When those two are the same version
+nothing is visible; when they differ, every interface a crate implements fails to satisfy a
+trait with its own name. cpal declares `windows` and `windows-core` as two **independent**
+ranges (`>=0.61, <=0.62` each), so cargo is free to land them in different buckets, and did.
+
+`windows` itself is held at 0.61 by sysinfo, via librespot — so `windows-core` is held at
+0.61.2 in `Cargo.lock` to match. There is no way to say that in a manifest: a direct dependency
+on `windows-core = "0.61"` does not constrain cpal, because 0.61 and 0.62 are separate
+compatibility buckets and cargo will simply activate both. So it lives in the lockfile, and the
+thing that defends it is `nix flake check` — the Windows artifacts are checks, and a
+`cargo update` that splits the two again turns them red.
+
+A full `cargo update` is *not* the hazard; it moves cpal to `windows` 0.62 + `windows-core`
+0.62 together, which is equally consistent, at the cost of a second copy of `windows` in the
+tree. The hazard is a **partial** update — `cargo update -p windows-core` on its own — which
+moves one side of a pair that nothing else ties together.
 
 ## Vendored Windows dependencies
 
