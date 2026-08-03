@@ -3410,3 +3410,94 @@ async fn a_shuffle_press_is_a_setting_write_not_a_keypress() {
         "one pair: shuffle, group — the value this player actually listed"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_refuses_position_notifications_gets_polled_instead() {
+    // #162, measured on an iPhone: it answers `NOT IMPLEMENTED` to
+    // `PLAYBACK_POS_CHANGED`. Nothing else moves a scrubber — `PLAYBACK_STATUS_CHANGED`
+    // reports play and pause, `TRACK_CHANGED` reports boundaries, and neither says where
+    // in the track we are — so on the commonest sender we have, the position froze at
+    // whatever it was when the track started and stayed there.
+    //
+    // The refusal names no event (an iPhone sends it with zero parameters), so the label
+    // we registered under is the only thing that says which subscription was turned down.
+    use proto_bluetooth_audio::avrcp::pdu;
+
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    // Find the label the position subscription went out under.
+    let label = eventually("a position-change registration", || {
+        sent_pdus(&transport).into_iter().find_map(|pdu| {
+            let msg = proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok()?;
+            let frame = proto_bluetooth_audio::AvcFrame::decode(&msg.body).ok()?;
+            let vendor = proto_bluetooth_audio::VendorPdu::parse(&frame.operands).ok()?;
+            (vendor.pdu_id == pdu::REGISTER_NOTIFICATION
+                && vendor.parameters.first()
+                    == Some(&proto_bluetooth_audio::avrcp::event::PLAYBACK_POS_CHANGED))
+            .then_some(msg.transaction)
+        })
+    })
+    .await;
+
+    let before = avrcp_commands(&transport)
+        .iter()
+        .filter(|(id, _, _)| *id == pdu::GET_PLAY_STATUS)
+        .count();
+
+    // The phone refuses it, exactly as an iPhone does: zero parameters, NOT IMPLEMENTED,
+    // under the label we asked with.
+    let refusal = proto_bluetooth_audio::AvctpMessage::command(
+        label,
+        proto_bluetooth_audio::avrcp::vendor_command(
+            proto_bluetooth_audio::Ctype::NotImplemented,
+            pdu::REGISTER_NOTIFICATION,
+            &[],
+        )
+        .encode(),
+    )
+    .encode();
+    push_pdu(&transport, &L2capPdu::new(avctp, refusal));
+
+    // …and it is told the track is playing, so there is something to follow.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                9,
+                proto_bluetooth_audio::Ctype::Changed,
+                pdu::REGISTER_NOTIFICATION,
+                &[
+                    proto_bluetooth_audio::avrcp::event::PLAYBACK_STATUS_CHANGED,
+                    0x01, // PLAYING
+                ],
+            ),
+        ),
+    );
+
+    // The first poll goes out immediately rather than a second into a track already
+    // playing, and then keeps coming.
+    let polls_after = |t: &ScriptedTransport| {
+        avrcp_commands(t)
+            .iter()
+            .filter(|(id, _, _)| *id == pdu::GET_PLAY_STATUS)
+            .count()
+    };
+    eventually("an immediate play-status poll", || {
+        (polls_after(&transport) > before).then_some(())
+    })
+    .await;
+
+    let one = polls_after(&transport);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    // Nudge the loop so the paused clock is actually observed.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(avctp, Bytes::from_static(&[0u8])),
+    );
+    eventually("the poll repeating while playing", || {
+        (polls_after(&transport) > one).then_some(())
+    })
+    .await;
+}

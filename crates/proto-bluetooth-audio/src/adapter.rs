@@ -11,9 +11,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use std::time::Duration;
+
 use castaway_core::{
     Advertisement, AudioFormat, ControlCapabilities, CoreError, EncodedFrame, FrameSource,
-    NowPlaying, ProtocolKind, SessionEvent, SessionSink, SourceAdapter, SourceDescription,
+    NowPlaying, PlaybackState, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
+    SourceDescription,
 };
 use substrate_hci::{
     BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, Reassembler,
@@ -60,6 +63,29 @@ const MAX_AVRCP_REASSEMBLY: usize = 64 * 1024;
 /// is `PLAYBACK_POS_CHANGED`. One second is the coarsest value that still reads as
 /// movement on a scrubber, and the cheapest: each report is one small AVCTP frame.
 const POSITION_INTERVAL_SECS: u32 = 1;
+
+/// How often to ask a peer that will not report position where it has got to.
+///
+/// Returns `None` when there is nothing to track, so the poll stops rather than being
+/// stopped: the cadence is a function of what is playing, not a flag toggled on
+/// transitions, and a state we do not model cannot leave a timer running.
+///
+/// Paused is deliberately still polled, just slowly. Nothing else reveals a **seek**:
+/// `PLAYBACK_STATUS_CHANGED` reports play and pause, `TRACK_CHANGED` reports boundaries,
+/// and neither says the person scrubbed — which they may well do with the phone in their
+/// hand while it is paused, and which would otherwise leave the scrubber lying until the
+/// track changed.
+const fn position_poll_interval(state: PlaybackState) -> Option<Duration> {
+    match state {
+        PlaybackState::Playing | PlaybackState::SeekingForward | PlaybackState::SeekingBackward => {
+            Some(Duration::from_secs(POSITION_INTERVAL_SECS as u64))
+        }
+        // A seek is the only thing that can move it, and nobody is watching it move.
+        PlaybackState::Paused => Some(Duration::from_secs(5)),
+        // Stopped, errored, or a state this build does not know: nothing to follow.
+        _ => None,
+    }
+}
 
 /// The `REGISTER_NOTIFICATION` interval for one event.
 ///
@@ -265,6 +291,21 @@ struct Link {
     /// artwork is decoration and the observed worst case for provoking the peer again
     /// was it dropping the whole ACL link (reason 0x13).
     art_strikes: u8,
+    /// Time left before the next `GetPlayStatus`, when this peer will not report position
+    /// on its own.
+    ///
+    /// `Some` means the peer answered `NOT_IMPLEMENTED` to `PLAYBACK_POS_CHANGED`, which
+    /// an iPhone does — so on the commonest sender we have, this is the *only* thing that
+    /// moves the scrubber between track changes (#162). `None` means the peer subscribed
+    /// happily and reports position itself, and polling it as well would be two sources
+    /// for one number.
+    position_poll: Option<Duration>,
+    /// The AVCTP label of the outstanding `PLAYBACK_POS_CHANGED` registration.
+    ///
+    /// A refusal carries no event id — an iPhone answers `NOT IMPLEMENTED` with zero
+    /// parameters — so the only thing that says *which* subscription was turned down is
+    /// our own memory of the label we sent it under.
+    pos_notify_txn: Option<u8>,
     /// The handle of the artwork last asked for, kept so the properties probe has
     /// something to name once the thumbnail it belongs to has arrived.
     art_handle: Option<String>,
@@ -426,6 +467,8 @@ impl Link {
             art_sdp: None,
             art: None,
             art_strikes: 0,
+            position_poll: None,
+            pos_notify_txn: None,
             art_handle: None,
             art_probed: None,
             art_upgraded: None,
@@ -449,6 +492,29 @@ impl Link {
             control.set_player_settings(self.player_settings.clone());
             control.set_capabilities(caps);
         }
+    }
+
+    /// How long until this link's position poll is due, if it is polling at all.
+    fn position_due(&self) -> Option<Duration> {
+        let remaining = self.position_poll?;
+        // No interval for this playback state means nothing to follow, so no deadline.
+        position_poll_interval(self.now_playing.state)?;
+        Some(remaining)
+    }
+
+    /// Advance the position poll, returning a `GetPlayStatus` when one comes due.
+    fn tick_position(&mut self, elapsed: Duration) -> Option<AvcFrame> {
+        let remaining = self.position_poll?;
+        // A state with no interval parks the timer where it is rather than disarming it:
+        // the peer still refuses to report position, and playback may resume.
+        let interval = position_poll_interval(self.now_playing.state)?;
+        let remaining = remaining.saturating_sub(elapsed);
+        if remaining > Duration::ZERO {
+            self.position_poll = Some(remaining);
+            return None;
+        }
+        self.position_poll = Some(interval);
+        Some(avrcp::get_play_status())
     }
 
     fn next_transaction(&self) -> u8 {
@@ -560,6 +626,7 @@ impl SourceAdapter for BluetoothAdapter {
             let due = links
                 .values()
                 .filter_map(|l| l.mux.next_timeout())
+                .chain(links.values().filter_map(Link::position_due))
                 .chain(host.next_timeout())
                 .min();
             let received = tokio::select! {
@@ -585,6 +652,35 @@ impl SourceAdapter for BluetoothAdapter {
             for (handle, events) in ticks {
                 let link = links.get_mut(&handle.raw());
                 self.dispatch(handle, events, link, &sink, &acl).await?;
+            }
+
+            // Peers that refuse `PLAYBACK_POS_CHANGED` are asked where they are instead.
+            // Collected before sending because addressing a PDU needs `&mut` on the same
+            // link the iteration is borrowing (#162).
+            let polls: Vec<(ConnectionHandle, Cid, Bytes)> = links
+                .iter_mut()
+                .filter_map(|(raw, link)| {
+                    let cid = link.avctp?;
+                    let frame = link.tick_position(elapsed)?;
+                    let transaction = link.next_transaction();
+                    let handle = ConnectionHandle::new(*raw).ok()?;
+                    Some((handle, cid, avctp_body(transaction, &frame)))
+                })
+                .collect();
+            for (handle, cid, body) in polls {
+                let Some(link) = links.get_mut(&handle.raw()) else {
+                    continue;
+                };
+                match link.mux.send(cid, body) {
+                    Ok(events) => {
+                        for event in events {
+                            if let L2capEvent::Send(pdu) = event {
+                                acl.send(handle, pdu);
+                            }
+                        }
+                    }
+                    Err(e) => debug!(error = %e, %cid, "position poll could not be addressed"),
+                }
             }
 
             let Some(received) = received else {
@@ -868,6 +964,11 @@ impl BluetoothAdapter {
                         ] {
                             let interval = notification_interval(event);
                             let transaction = link.next_transaction();
+                            if event == avrcp::event::PLAYBACK_POS_CHANGED {
+                                // Remembered so a refusal can be attributed: the response
+                                // to one names no event (#162).
+                                link.pos_notify_txn = Some(transaction);
+                            }
                             out.replies.push((
                                 cid,
                                 avctp_body(
@@ -1425,6 +1526,23 @@ impl BluetoothAdapter {
                     }
                 }
             }
+            // A refused subscription, which is how an iPhone answers
+            // `PLAYBACK_POS_CHANGED`. The response names no event, so the label we sent it
+            // under is the only thing that says which one was turned down — and without
+            // this the scrubber has no source of movement at all between track changes
+            // (#162). `Duration::ZERO` so the first poll goes out immediately rather than
+            // a second into a track that is already playing.
+            avrcp::pdu::REGISTER_NOTIFICATION
+                if frame.ctype.is_response()
+                    && frame.ctype.is_failure()
+                    && link.pos_notify_txn == Some(msg.transaction) =>
+            {
+                if link.position_poll.is_none() {
+                    info!("bluetooth: peer will not report position; polling play status instead");
+                }
+                link.pos_notify_txn = None;
+                link.position_poll = Some(Duration::ZERO);
+            }
             avrcp::pdu::REGISTER_NOTIFICATION
                 if matches!(frame.ctype, Ctype::Interim | Ctype::Changed) =>
             {
@@ -1434,9 +1552,17 @@ impl BluetoothAdapter {
                 // CHANGED ends the subscription — AVRCP notifications are one-shot, so a
                 // stack that does not re-register hears about exactly one track change
                 // and then goes quiet again.
+                if event == avrcp::event::PLAYBACK_POS_CHANGED && link.position_poll.is_some() {
+                    // The peer reports position after all — one number, one source.
+                    debug!("bluetooth: peer reports position; stopping the poll");
+                    link.position_poll = None;
+                }
                 let changed = frame.ctype == Ctype::Changed;
                 if changed {
                     let transaction = link.next_transaction();
+                    if event == avrcp::event::PLAYBACK_POS_CHANGED {
+                        link.pos_notify_txn = Some(transaction);
+                    }
                     // …with the same interval the first registration used. Renewing
                     // POS_CHANGED at 0 asks a Target that honours the field literally to
                     // never report position again, and the scrubber freezes after the
