@@ -58,7 +58,7 @@ base64 = { workspace = true, optional = true }
 resvg = { version = "0.45", default-features = false, optional = true }
 # A JS engine, to evaluate uBlock Origin's scriptlet modules and read their own registry
 # rather than parsing them. Cross-builds for the Windows MSVC target (checked).
-rquickjs = { version = "0.9", features = ["loader"], optional = true }
+rquickjs = { version = "0.12", features = ["loader"], optional = true }
 adblock = { version = "0.13", optional = true, default-features = false, features = [
     "embedded-domain-resolver",
     "full-regex-handling",
