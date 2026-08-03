@@ -30,7 +30,7 @@ use crate::codec::advertised;
 use crate::control::AvrcpControl;
 use crate::host::{HostAction, HostConfig, HostController};
 use crate::media::Depacketizer;
-use crate::obex::{CoverArtSession, FetchState};
+use crate::obex::{CoverArtSession, FetchState, Fetched};
 use crate::sink::{SinkEvent, SinkSession};
 use crate::{avdtp, Message};
 
@@ -1661,7 +1661,7 @@ impl BluetoothAdapter {
             debug!(handle, "cover art: the image channel is still configuring");
             return;
         };
-        if !session.fetch(handle) {
+        if !session.fetch_thumbnail(handle) {
             // Either the session is still connecting or an image is already coming. A
             // skipped-through album would otherwise queue art for tracks nobody is on.
             debug!(handle, "cover art: not ready for this one");
@@ -1765,7 +1765,7 @@ impl BluetoothAdapter {
         let next = session.next_request();
 
         match result {
-            Ok(Some(artwork)) => {
+            Ok(Some(Fetched::Artwork(artwork))) => {
                 info!(bytes = artwork.len(), "bluetooth: cover art fetched");
                 link.now_playing.artwork = Some(artwork);
                 if link.session_open {
@@ -1773,6 +1773,21 @@ impl BluetoothAdapter {
                     link_sink
                         .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
                         .await?;
+                }
+            }
+            // Nothing on the card changes from a properties listing — it says what the
+            // peer *could* give us, and we still ask for the thumbnail. It is logged
+            // because that answer is the whole of #75, and because a phone offering
+            // something larger is the only reason to implement asking for it.
+            Ok(Some(Fetched::Properties(properties))) => {
+                info!(
+                    handle = properties.handle.as_deref().unwrap_or("?"),
+                    variants = properties.variants.len(),
+                    largest = ?properties.largest_decodable().map(|(_, size)| size),
+                    "bluetooth: peer's image properties"
+                );
+                for variant in &properties.variants {
+                    debug!(?variant, "cover art: variant on offer");
                 }
             }
             // OBEX is request/response all the way down: every chunk we take has to be

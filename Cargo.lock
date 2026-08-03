@@ -4533,6 +4533,7 @@ dependencies = [
  "castaway-core",
  "hci-transport",
  "hex-literal",
+ "quick-xml 0.41.0",
  "substrate-hci",
  "substrate-l2cap",
  "substrate-rtp",

@@ -59,6 +59,15 @@ pub const COVER_ART_TARGET: [u8; 16] = [
 /// reads as a broken handle rather than a typo three layers up.
 pub const TYPE_THUMBNAIL: &str = "x-bt/img-thm";
 
+/// MIME type for the properties form of a cover-art GET.
+///
+/// Answers "what forms of this image do you hold?" with an XML listing rather than an
+/// image. It needs no image descriptor, so unlike `x-bt/img-img` it can be asked for
+/// safely by a client that advertises only the thumbnail — which is what makes it the
+/// cheap measurement #75 turns on: whether an iPhone lists anything larger than the fixed
+/// 200×200 thumbnail is not a thing this project has ever been able to see.
+pub const TYPE_IMAGE_PROPERTIES: &str = "x-bt/img-properties";
+
 /// An OBEX header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -349,11 +358,51 @@ enum Srm {
 /// strips attribute 8 from its metadata response unless a BIP client is already connected
 /// — so this has to be up before the handle is asked for, and staying up across tracks is
 /// then free (#74).
+/// What the session is currently asking the responder for.
+///
+/// The type header and what to do with the bytes both follow from this, so carrying it
+/// as one value rather than a handle plus a flag is what stops a properties document
+/// being sniffed for JPEG magic — the shape of bug the whole artwork path is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fetch {
+    /// `x-bt/img-thm`: the 200×200 linked thumbnail.
+    Thumbnail(String),
+    /// `x-bt/img-properties`: the listing of what the peer holds (#75).
+    Properties(String),
+}
+
+impl Fetch {
+    /// The handle being asked about.
+    fn handle(&self) -> &str {
+        match self {
+            Self::Thumbnail(h) | Self::Properties(h) => h,
+        }
+    }
+
+    /// The MIME type that names this form.
+    const fn mime(&self) -> &'static str {
+        match self {
+            Self::Thumbnail(_) => TYPE_THUMBNAIL,
+            Self::Properties(_) => TYPE_IMAGE_PROPERTIES,
+        }
+    }
+}
+
+/// A completed OBEX object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Fetched {
+    /// The thumbnail, in a format we know how to decode.
+    Artwork(Artwork),
+    /// What forms of the image the peer holds.
+    Properties(ImageProperties),
+}
+
 #[derive(Debug)]
 pub struct CoverArtSession {
     state: FetchState,
-    /// The handle currently being fetched. `None` between images.
-    handle: Option<String>,
+    /// What is currently being fetched. `None` between objects.
+    fetch: Option<Fetch>,
     connection_id: Option<u32>,
     body: BytesMut,
     max_packet: u16,
@@ -369,7 +418,7 @@ impl CoverArtSession {
     pub fn new(max_packet: u16) -> Self {
         Self {
             state: FetchState::Connecting,
-            handle: None,
+            fetch: None,
             connection_id: None,
             body: BytesMut::new(),
             // 0xFFFF would be legal but a responder may honour it literally and exceed
@@ -394,16 +443,31 @@ impl CoverArtSession {
         matches!(self.state, FetchState::Ready)
     }
 
-    /// Ask for the image named by an AVRCP attribute-8 handle.
+    /// Ask for the thumbnail named by an AVRCP attribute-8 handle.
     ///
     /// Returns `false` if the session is not ready — still connecting, already fetching,
     /// or dead. Refusing rather than queueing is deliberate: a skipped-through album
     /// would otherwise build a backlog of images for tracks nobody is on any more.
-    pub fn fetch(&mut self, handle: impl Into<String>) -> bool {
+    pub fn fetch_thumbnail(&mut self, handle: impl Into<String>) -> bool {
+        self.start(Fetch::Thumbnail(handle.into()))
+    }
+
+    /// Ask what forms of that image the peer actually holds.
+    ///
+    /// Same channel, same session, same refusal rule as [`Self::fetch_thumbnail`] — this
+    /// is a GET for a different MIME type, not a different conversation. Safe to ask for
+    /// from a client advertising only the linked thumbnail: unlike `x-bt/img-img` it
+    /// carries no image descriptor, so there is nothing to get wrong (#75).
+    pub fn fetch_properties(&mut self, handle: impl Into<String>) -> bool {
+        self.start(Fetch::Properties(handle.into()))
+    }
+
+    /// Begin a fetch, if the session is free to take one.
+    fn start(&mut self, fetch: Fetch) -> bool {
         if !self.is_ready() {
             return false;
         }
-        self.handle = Some(handle.into());
+        self.fetch = Some(fetch);
         self.body.clear();
         self.srm = None;
         self.state = FetchState::Fetching;
@@ -449,9 +513,9 @@ impl CoverArtSession {
                     // answered an iPhone's streamed chunks with continuation GETs and
                     // it dropped the channel — see `Srm`.
                     headers.push(Header::SingleResponseMode(SRM_ENABLE));
-                    headers.push(Header::Type(TYPE_THUMBNAIL.to_owned()));
-                    if let Some(handle) = &self.handle {
-                        headers.push(Header::ImageHandle(handle.clone()));
+                    if let Some(fetch) = &self.fetch {
+                        headers.push(Header::Type(fetch.mime().to_owned()));
+                        headers.push(Header::ImageHandle(fetch.handle().to_owned()));
                     }
                     self.srm = Some(Srm::Offered);
                     Some(
@@ -489,13 +553,13 @@ impl CoverArtSession {
         }
     }
 
-    /// Feed a response packet. Returns the artwork once an image is complete.
+    /// Feed a response packet. Returns the object once one is complete.
     ///
     /// # Errors
     /// [`AudioError::Truncated`] on a malformed packet, or
-    /// [`AudioError::BadMediaPacket`] if the responder refused. A refused *image* leaves
+    /// [`AudioError::BadMediaPacket`] if the responder refused. A refused *object* leaves
     /// the session usable — plenty of tracks have no art, and the next one may.
-    pub fn feed(&mut self, packet: &[u8]) -> Result<Option<Artwork>, AudioError> {
+    pub fn feed(&mut self, packet: &[u8]) -> Result<Option<Fetched>, AudioError> {
         // A CONNECT response carries four bytes before its headers; every other
         // response carries none.
         let prefix_len = usize::from(self.state == FetchState::Connecting) * 4;
@@ -538,26 +602,34 @@ impl CoverArtSession {
                     rsp::CONTINUE => Ok(None),
                     rsp::SUCCESS => {
                         self.state = FetchState::Ready;
-                        self.handle = None;
+                        let fetch = self.fetch.take();
                         self.srm = None;
                         let data = self.body.split().freeze();
                         if data.is_empty() {
                             return Err(AudioError::BadMediaPacket("cover art response was empty"));
                         }
-                        // The responder does not label the encoding on a thumbnail
-                        // fetch — the profile fixes it as JPEG — so sniff rather than
-                        // assume, and refuse anything we cannot decode.
-                        let format = sniff_format(&data).ok_or(AudioError::BadMediaPacket(
-                            "cover art is not a format we decode",
-                        ))?;
-                        Ok(Some(Artwork::new(format, data)))
+                        match fetch {
+                            // The responder does not label the encoding on a thumbnail
+                            // fetch — the profile fixes it as JPEG — so sniff rather than
+                            // assume, and refuse anything we cannot decode.
+                            Some(Fetch::Thumbnail(_)) | None => {
+                                let format =
+                                    sniff_format(&data).ok_or(AudioError::BadMediaPacket(
+                                        "cover art is not a format we decode",
+                                    ))?;
+                                Ok(Some(Fetched::Artwork(Artwork::new(format, data))))
+                            }
+                            Some(Fetch::Properties(_)) => {
+                                Ok(Some(Fetched::Properties(ImageProperties::parse(&data)?)))
+                            }
+                        }
                     }
                     _ => {
-                        // One image the responder would not give us. The session lives:
+                        // One object the responder would not give us. The session lives:
                         // the next track gets its own chance rather than inheriting this
                         // one's bad luck.
                         self.state = FetchState::Ready;
-                        self.handle = None;
+                        self.fetch = None;
                         self.body.clear();
                         self.srm = None;
                         Err(AudioError::BadMediaPacket("cover art fetch was refused"))
@@ -567,6 +639,256 @@ impl CoverArtSession {
             FetchState::Ready | FetchState::Failed => Ok(None),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Image properties: what the peer holds, as opposed to what it hands over.
+// ---------------------------------------------------------------------------
+
+/// An encoding token from a BIP image descriptor.
+///
+/// Two states rather than an `Option<ImageFormat>` beside a `String`, because the pair
+/// has an illegal combination — a known format with a mismatched token — and the whole
+/// point of reading a properties listing is to record what the peer said, including the
+/// parts we cannot act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Encoding {
+    /// One we can decode.
+    Known(ImageFormat),
+    /// One we cannot, kept exactly as sent.
+    Unknown(String),
+}
+
+impl Encoding {
+    /// Parse a BIP `encoding` token.
+    #[must_use]
+    pub fn parse(token: &str) -> Self {
+        ImageFormat::parse(token).map_or_else(|| Self::Unknown(token.to_owned()), Self::Known)
+    }
+
+    /// The format, if it is one the pipeline can decode.
+    #[must_use]
+    pub const fn format(&self) -> Option<ImageFormat> {
+        match self {
+            Self::Known(format) => Some(*format),
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+/// The `pixel` attribute of a BIP image descriptor.
+///
+/// BIP allows three spellings and they mean genuinely different things: `200*200` is one
+/// image the peer holds, while `80*60-640*480` is a range it will *transcode* into on
+/// request. Reading the second as the first is how a listing that offers 640×480 gets
+/// recorded as offering 80×60.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelSize {
+    /// An exact size: `200*200`.
+    Fixed {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+    },
+    /// A range the responder transcodes within: `80*60-640*480`.
+    Range {
+        /// Lower-bound width.
+        min_width: u32,
+        /// Lower-bound height. `None` for the `80**-640*480` spelling, which means
+        /// "whatever preserves the aspect ratio".
+        min_height: Option<u32>,
+        /// Upper-bound width.
+        max_width: u32,
+        /// Upper-bound height.
+        max_height: u32,
+    },
+}
+
+impl PixelSize {
+    /// Parse a `pixel` attribute value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        // The range separator is a `-` between two `w*h` pairs. Splitting on it first is
+        // what keeps `80**-640*480` — where the lower bound has an empty height — from
+        // being read as a malformed fixed size.
+        if let Some((lo, hi)) = value.split_once('-') {
+            let (min_width, min_height) = split_dimension(lo)?;
+            let (max_width, max_height) = split_dimension(hi)?;
+            return Some(Self::Range {
+                min_width,
+                min_height,
+                max_width,
+                // An elided *upper* height has no defined meaning — the range needs a
+                // ceiling — so it is a parse failure rather than a guess.
+                max_height: max_height?,
+            });
+        }
+        let (width, height) = split_dimension(value)?;
+        Some(Self::Fixed {
+            width,
+            height: height?,
+        })
+    }
+
+    /// The largest size this descriptor can yield.
+    ///
+    /// The question a properties listing is read to answer: a range is worth as much as
+    /// its ceiling, because that is what a `GetImage` against it would return.
+    #[must_use]
+    pub const fn largest(self) -> (u32, u32) {
+        match self {
+            Self::Fixed { width, height } => (width, height),
+            Self::Range {
+                max_width,
+                max_height,
+                ..
+            } => (max_width, max_height),
+        }
+    }
+}
+
+/// Split a `w*h` pair, with the height optional.
+///
+/// The elided height is spelled `80**` — a second `*` standing in for the number, not an
+/// empty string — so both are accepted. Reading `80**` as a malformed fixed size is what
+/// makes an aspect-preserving range vanish from a listing entirely.
+fn split_dimension(s: &str) -> Option<(u32, Option<u32>)> {
+    let (w, h) = s.trim().split_once('*')?;
+    let width = w.trim().parse().ok()?;
+    let h = h.trim();
+    if h.is_empty() || h == "*" {
+        return Some((width, None));
+    }
+    Some((width, Some(h.parse().ok()?)))
+}
+
+/// Whether a descriptor is the image the peer stores or one it will produce on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantKind {
+    /// `<native>` — the form the peer actually holds.
+    Native,
+    /// `<variant>` — a form it will transcode to.
+    Variant,
+}
+
+/// One form of an image the peer holds or will produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageVariant {
+    /// Stored, or transcoded on request.
+    pub kind: VariantKind,
+    /// The encoding.
+    pub encoding: Encoding,
+    /// The size or range, when the descriptor gives one.
+    pub pixel: Option<PixelSize>,
+    /// Bytes, when the descriptor states them. In practice only `<native>` does.
+    pub size: Option<u64>,
+}
+
+/// A peer's answer to `x-bt/img-properties`.
+///
+/// The measurement #75 asks for: whether an iPhone's cover art is genuinely 200×200 —
+/// in which case the fetch side is already optimal and the issue closes — or whether it
+/// holds something larger that we have simply never asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageProperties {
+    /// The handle the listing is for, as the responder echoed it.
+    pub handle: Option<String>,
+    /// Every form offered, in document order.
+    pub variants: Vec<ImageVariant>,
+}
+
+impl ImageProperties {
+    /// Parse a BIP image-properties document.
+    ///
+    /// # Errors
+    /// [`AudioError::BadImageProperties`] if the XML is malformed or carries no
+    /// `image-properties` root.
+    pub fn parse(xml: &[u8]) -> Result<Self, AudioError> {
+        use quick_xml::events::Event;
+
+        let text =
+            std::str::from_utf8(xml).map_err(|e| AudioError::BadImageProperties(e.to_string()))?;
+        let mut reader = quick_xml::Reader::from_str(text);
+        // Same reasoning as the NVHTTP parser: a bare `&` somewhere in a filename should
+        // cost us that attribute, not the whole listing.
+        reader.config_mut().allow_dangling_amp = true;
+
+        let mut out = Self::default();
+        let mut saw_root = false;
+        loop {
+            let event = reader
+                .read_event()
+                .map_err(|e| AudioError::BadImageProperties(e.to_string()))?;
+            // `native` and `variant` are conventionally self-closing but need not be, so
+            // both start-forms are read the same way.
+            let element = match &event {
+                Event::Start(e) | Event::Empty(e) => e,
+                Event::Eof => break,
+                _ => continue,
+            };
+            match element.name().as_ref() {
+                b"image-properties" => {
+                    saw_root = true;
+                    out.handle = attribute(element, b"handle");
+                }
+                name @ (b"native" | b"variant") => {
+                    let kind = if name == b"native" {
+                        VariantKind::Native
+                    } else {
+                        VariantKind::Variant
+                    };
+                    let Some(encoding) = attribute(element, b"encoding") else {
+                        // A descriptor with no encoding names no image. Skipped rather
+                        // than refused: the rest of the listing is still an answer.
+                        continue;
+                    };
+                    out.variants.push(ImageVariant {
+                        kind,
+                        encoding: Encoding::parse(&encoding),
+                        pixel: attribute(element, b"pixel")
+                            .as_deref()
+                            .and_then(PixelSize::parse),
+                        size: attribute(element, b"size")
+                            .and_then(|s| s.trim().parse::<u64>().ok()),
+                    });
+                }
+                // `attachment` and anything else: not an image form.
+                _ => {}
+            }
+        }
+
+        if !saw_root {
+            return Err(AudioError::BadImageProperties(
+                "no image-properties element".into(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The largest size on offer, and the variant offering it.
+    ///
+    /// Ignores encodings we cannot decode: a 2048×2048 TIFF is not a size we can use, and
+    /// reporting it as the ceiling would answer #75's question with a number no code path
+    /// could ever reach.
+    #[must_use]
+    pub fn largest_decodable(&self) -> Option<(&ImageVariant, (u32, u32))> {
+        self.variants
+            .iter()
+            .filter(|v| v.encoding.format().is_some())
+            .filter_map(|v| v.pixel.map(|p| (v, p.largest())))
+            .max_by_key(|(_, (w, h))| u64::from(*w) * u64::from(*h))
+    }
+}
+
+/// Read one attribute off an element, as a string.
+fn attribute(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+    element
+        .attributes()
+        .flatten()
+        .find(|a| a.key.as_ref() == key)
+        .map(|a| String::from_utf8_lossy(&a.value).trim().to_owned())
 }
 
 /// Identify an image by its magic bytes.
@@ -652,13 +974,16 @@ mod tests {
     /// Drive a session against a scripted responder, returning the artwork.
     fn run(handle: &str, replies: Vec<Bytes>) -> Result<Option<Artwork>, AudioError> {
         let mut session = connected();
-        assert!(session.fetch(handle));
+        assert!(session.fetch_thumbnail(handle));
         let mut art = None;
         for reply in replies {
             assert!(session.next_request().is_some(), "session stopped early");
             art = session.feed(&reply)?;
         }
-        Ok(art)
+        Ok(art.map(|fetched| match fetched {
+            Fetched::Artwork(artwork) => artwork,
+            other => panic!("a thumbnail fetch produced {other:?}"),
+        }))
     }
 
     #[test]
@@ -681,7 +1006,7 @@ mod tests {
         // reads back perfectly — and the responder, which matches on Img-Handle and
         // ignores Name, answers a GET that named no image at all.
         let mut session = connected();
-        assert!(session.fetch("0000001"));
+        assert!(session.fetch_thumbnail("0000001"));
         let get = ObexPacket::decode(&session.next_request().unwrap(), 0).unwrap();
         assert!(
             get.headers.contains(&Header::ImageHandle("0000001".into())),
@@ -759,7 +1084,7 @@ mod tests {
         // Repeating the handle/Type on continuation GETs makes some responders restart
         // the transfer, which never terminates.
         let mut client = connected();
-        assert!(client.fetch("0000001"));
+        assert!(client.fetch_thumbnail("0000001"));
 
         let first = ObexPacket::decode(&client.next_request().unwrap(), 0).unwrap();
         assert!(first.headers.contains(&Header::ConnectionId(7)));
@@ -792,7 +1117,7 @@ mod tests {
         // mandatory (§4.6) and every reference client asks. Not offering it left us in
         // a conversation the responder wasn't having — see the streaming test below.
         let mut client = connected();
-        assert!(client.fetch("0000001"));
+        assert!(client.fetch_thumbnail("0000001"));
         let first = ObexPacket::decode(&client.next_request().unwrap(), 0).unwrap();
         assert!(
             first
@@ -811,7 +1136,7 @@ mod tests {
         // it, reason 0x13). Under an SRM grant the client must go quiet and consume.
         let image = jpeg(900);
         let mut client = connected();
-        assert!(client.fetch("0000001"));
+        assert!(client.fetch_thumbnail("0000001"));
         assert!(client.next_request().is_some(), "the one and only GET");
 
         // First response grants SRM and starts the stream.
@@ -849,7 +1174,7 @@ mod tests {
             ))
             .unwrap()
             .expect("artwork");
-        assert_eq!(&art.data[..], &image[..]);
+        assert!(matches!(art, Fetched::Artwork(a) if a.data[..] == image[..]));
         assert!(
             client.is_ready(),
             "and the session is good for the next one"
@@ -861,7 +1186,7 @@ mod tests {
         // Backward compatible by construction: no SRM echo in the first response means
         // request/response, exactly as before the offer existed.
         let mut client = connected();
-        assert!(client.fetch("0000001"));
+        assert!(client.fetch_thumbnail("0000001"));
         assert!(client.next_request().is_some());
         client
             .feed(&reply(
@@ -887,7 +1212,10 @@ mod tests {
         assert!(session.feed(&reply(0xC3, &[0, 0, 0, 0], vec![])).is_err());
         assert_eq!(session.state(), FetchState::Failed);
         assert!(session.next_request().is_none(), "a dead session stops");
-        assert!(!session.fetch("0000001"), "and takes no more requests");
+        assert!(
+            !session.fetch_thumbnail("0000001"),
+            "and takes no more requests"
+        );
     }
 
     #[test]
@@ -896,10 +1224,10 @@ mod tests {
         // track — tearing the session down would cost every track after it as well, and
         // rebuilding it takes an SDP query and a channel.
         let mut session = connected();
-        assert!(session.fetch("deadbeef"));
+        assert!(session.fetch_thumbnail("deadbeef"));
         assert!(session.feed(&reply(0xC4, &[], vec![])).is_err());
         assert!(session.is_ready(), "the next track deserves its own chance");
-        assert!(session.fetch("0000002"));
+        assert!(session.fetch_thumbnail("0000002"));
     }
 
     #[test]
@@ -910,7 +1238,7 @@ mod tests {
         // window in which handles stop arriving.
         let mut session = connected();
         for handle in ["0000001", "0000002"] {
-            assert!(session.fetch(handle));
+            assert!(session.fetch_thumbnail(handle));
             let art = session
                 .feed(&reply(
                     0xA0,
@@ -919,7 +1247,7 @@ mod tests {
                 ))
                 .unwrap()
                 .expect("artwork");
-            assert_eq!(art.format, ImageFormat::Jpeg);
+            assert!(matches!(art, Fetched::Artwork(a) if a.format == ImageFormat::Jpeg));
             assert!(session.is_ready());
         }
     }
@@ -929,15 +1257,15 @@ mod tests {
         // A skipped-through album would otherwise build a backlog of images for tracks
         // nobody is on any more.
         let mut session = connected();
-        assert!(session.fetch("0000001"));
-        assert!(!session.fetch("0000002"));
+        assert!(session.fetch_thumbnail("0000001"));
+        assert!(!session.fetch_thumbnail("0000002"));
     }
 
     #[test]
     fn an_image_in_a_format_we_cannot_decode_is_refused() {
         // Better a text-only card than a decoder failure three layers down.
         let mut session = connected();
-        assert!(session.fetch("x"));
+        assert!(session.fetch_thumbnail("x"));
         let err = session.feed(&reply(
             0xA0,
             &[],
@@ -976,7 +1304,7 @@ mod tests {
         //   30 0013 …0000       Img-Handle (0x30, not Name 0x01), UTF-16 **big-endian**
         //                       and null-terminated
         let mut session = connected();
-        assert!(session.fetch("1000002"));
+        assert!(session.fetch_thumbnail("1000002"));
         let request = session.next_request().expect("the get");
         let actual: String = request.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
@@ -992,6 +1320,153 @@ mod tests {
             .concat(),
             "the thumbnail GET changed shape; a responder is entitled to notice"
         );
+    }
+
+    /// The BIP specification's own example listing, which is also the shape every
+    /// responder's is: a `native` form, some `variant`s, and an attachment that is not an
+    /// image at all.
+    const PROPERTIES_DOC: &[u8] = br#"<image-properties version="1.0" handle="1000001">
+<native encoding="JPEG" pixel="1280*1024" size="1048576"/>
+<variant encoding="JPEG" pixel="640*480"/>
+<variant encoding="JPEG" pixel="160*120"/>
+<variant encoding="GIF" pixel="80*60-640*480"/>
+<attachment content-type="text/plain" name="ABCD1234.txt" size="5120"/>
+</image-properties>"#;
+
+    #[test]
+    fn a_properties_listing_says_what_the_peer_holds() {
+        let props = ImageProperties::parse(PROPERTIES_DOC).unwrap();
+        assert_eq!(props.handle.as_deref(), Some("1000001"));
+        // Four image forms. The attachment is not one — it is a text file riding along.
+        assert_eq!(props.variants.len(), 4);
+
+        let native = &props.variants[0];
+        assert_eq!(native.kind, VariantKind::Native);
+        assert_eq!(native.encoding, Encoding::Known(ImageFormat::Jpeg));
+        assert_eq!(
+            native.pixel,
+            Some(PixelSize::Fixed {
+                width: 1280,
+                height: 1024
+            })
+        );
+        assert_eq!(native.size, Some(1_048_576));
+        assert_eq!(props.variants[1].kind, VariantKind::Variant);
+    }
+
+    #[test]
+    fn a_pixel_range_is_worth_its_ceiling_not_its_floor() {
+        // `80*60-640*480` is not an 80×60 image: it is an offer to transcode anywhere up
+        // to 640×480. Reading it as the lower bound records a peer that offers 640×480 as
+        // one that offers 80×60 — which is exactly the wrong answer to #75's question.
+        let range = PixelSize::parse("80*60-640*480").unwrap();
+        assert_eq!(
+            range,
+            PixelSize::Range {
+                min_width: 80,
+                min_height: Some(60),
+                max_width: 640,
+                max_height: 480,
+            }
+        );
+        assert_eq!(range.largest(), (640, 480));
+
+        // The aspect-preserving spelling elides the lower bound's height.
+        assert_eq!(
+            PixelSize::parse("80**-640*480").unwrap(),
+            PixelSize::Range {
+                min_width: 80,
+                min_height: None,
+                max_width: 640,
+                max_height: 480,
+            }
+        );
+        // An elided *upper* height has no meaning — a range needs a ceiling.
+        assert_eq!(PixelSize::parse("80*60-640*"), None);
+        assert_eq!(PixelSize::parse("200*200").unwrap().largest(), (200, 200));
+        assert_eq!(PixelSize::parse("garbage"), None);
+    }
+
+    #[test]
+    fn the_largest_size_on_offer_ignores_encodings_we_cannot_decode() {
+        // Reporting a 2048×2048 TIFF as the ceiling answers "how big can the art be?"
+        // with a number no code path in this project could ever reach.
+        let doc = br#"<image-properties handle="7">
+<native encoding="TIFF" pixel="2048*2048"/>
+<variant encoding="JPEG" pixel="600*600"/>
+<variant encoding="JPEG" pixel="200*200"/>
+</image-properties>"#;
+        let props = ImageProperties::parse(doc).unwrap();
+        let (variant, size) = props.largest_decodable().unwrap();
+        assert_eq!(size, (600, 600));
+        assert_eq!(variant.encoding, Encoding::Known(ImageFormat::Jpeg));
+        // …and the one we cannot decode is still recorded, because a capture should say
+        // what the peer claimed rather than what we understood of it.
+        assert_eq!(
+            props.variants[0].encoding,
+            Encoding::Unknown("TIFF".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_properties_fetch_asks_for_a_different_type_on_the_same_session() {
+        // Same channel, same connection id, same refusal rule — only the Type header
+        // differs. It carries no image descriptor, which is what makes it safe to ask
+        // for from a client that advertises only the linked thumbnail.
+        let mut session = connected();
+        assert!(session.fetch_properties("1000001"));
+        let get = ObexPacket::decode(&session.next_request().unwrap(), 0).unwrap();
+        assert!(get
+            .headers
+            .contains(&Header::Type(TYPE_IMAGE_PROPERTIES.to_owned())));
+        assert!(get
+            .headers
+            .contains(&Header::ImageHandle("1000001".to_owned())));
+        assert!(get.headers.contains(&Header::ConnectionId(7)));
+    }
+
+    #[test]
+    fn a_properties_body_is_parsed_as_xml_rather_than_sniffed_for_jpeg() {
+        // The bug this fetch kind exists to make unrepresentable: a properties document
+        // fed through `sniff_format` is "not a format we decode", which reads as a peer
+        // with no artwork rather than as an answer.
+        let mut session = connected();
+        assert!(session.fetch_properties("1000001"));
+        let _ = session.next_request();
+        let fetched = session
+            .feed(&reply(
+                0xA0,
+                &[],
+                vec![Header::EndOfBody(Bytes::from_static(PROPERTIES_DOC))],
+            ))
+            .unwrap()
+            .expect("a listing");
+        let Fetched::Properties(props) = fetched else {
+            panic!("a properties fetch produced artwork");
+        };
+        assert_eq!(props.variants.len(), 4);
+        assert!(session.is_ready(), "and the session is free again");
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_properties_document_is_a_typed_failure() {
+        assert!(matches!(
+            ImageProperties::parse(b"<html>nope</html>"),
+            Err(AudioError::BadImageProperties(_))
+        ));
+        // A refused listing must not take the session down with it: the next track still
+        // deserves its thumbnail.
+        let mut session = connected();
+        assert!(session.fetch_properties("1000001"));
+        let _ = session.next_request();
+        assert!(session
+            .feed(&reply(
+                0xA0,
+                &[],
+                vec![Header::EndOfBody(Bytes::from_static(b"<html/>"))]
+            ))
+            .is_err());
+        assert!(session.is_ready());
     }
 
     #[test]

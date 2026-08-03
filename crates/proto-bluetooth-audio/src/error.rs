@@ -62,4 +62,11 @@ pub enum AudioError {
     /// A media packet could not be depacketized.
     #[error("bad media packet: {0}")]
     BadMediaPacket(&'static str),
+
+    /// The peer's BIP image-properties document could not be read.
+    ///
+    /// Owned rather than `&'static str` because the useful part is what the parser
+    /// choked on, which is only known at runtime.
+    #[error("malformed image properties: {0}")]
+    BadImageProperties(String),
 }

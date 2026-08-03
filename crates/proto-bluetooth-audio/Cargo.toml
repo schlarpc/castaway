@@ -17,6 +17,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 bytes.workspace = true
+quick-xml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
