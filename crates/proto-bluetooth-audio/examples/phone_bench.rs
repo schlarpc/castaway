@@ -145,6 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct Seen {
     connected: bool,
     audio: bool,
+    /// Encoded frames actually consumed. Zero beside `audio: true` means the session was
+    /// torn down as soon as it opened, which is what dropping the receiver looks like.
+    frames: u64,
     metadata: bool,
     artwork: bool,
     shuffle_or_repeat: bool,
@@ -158,6 +161,10 @@ impl Seen {
         };
         line(self.connected, "a phone connected");
         line(self.audio, "audio arrived (the sink negotiated a codec)");
+        line(
+            self.frames > 0,
+            &format!("…and was consumed ({} frames)", self.frames),
+        );
         line(self.metadata, "AVRCP metadata reached the card");
         line(
             self.artwork,
@@ -177,28 +184,61 @@ impl Seen {
             println!("no artwork: check the log for how far the chain got — the SDP query,");
             println!("the image PSM, the ERTM configure, then OBEX CONNECT.");
         }
+        if self.audio && self.frames == 0 {
+            println!();
+            println!("audio opened and delivered nothing, so the session was torn down at");
+            println!("its first packet and every later card update was discarded. The three");
+            println!("lines above are then meaningless — read the btsnoop, not this list.");
+        }
     }
 }
 
 async fn observe(mut rx: mpsc::Receiver<SourceMessage>, seen: Arc<std::sync::Mutex<Seen>>) {
-    while let Some(msg) = rx.recv().await {
-        let mut seen = match seen.lock() {
+    /// Update the tally without holding the lock a moment longer than the closure.
+    fn note(seen: &std::sync::Mutex<Seen>, f: impl FnOnce(&mut Seen)) {
+        let mut guard = match seen.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        f(&mut guard);
+    }
+
+    while let Some(msg) = rx.recv().await {
         match msg.event {
-            SessionEvent::SourceInfo(ref description) => {
-                seen.connected = true;
+            SessionEvent::SourceInfo(description) => {
+                note(&seen, |s| s.connected = true);
                 println!("● connected: {description:?}");
             }
-            SessionEvent::Audio { ref format, .. } => {
-                seen.audio = true;
+            // The frame receiver has to be *taken and kept*, not matched past. Dropping it
+            // is not inert: the adapter sees `TrySendError::Closed` on the next media
+            // packet, tears the session down and clears `session_open` — after which every
+            // NowPlaying and every fetched cover is discarded before it is emitted. The
+            // first run of this bench did exactly that, and reported three questions
+            // unanswered that the capture shows the phone had answered perfectly.
+            SessionEvent::Audio { source, format, .. } => {
+                note(&seen, |s| s.audio = true);
                 println!("● audio: {format:?}");
+                if let castaway_core::FrameSource::Encoded(mut frames) = source {
+                    let tally = Arc::clone(&seen);
+                    tokio::spawn(async move {
+                        // Drained rather than merely held. A receiver nobody reads fills
+                        // up, and a full queue is a different failure that would read as a
+                        // radio problem.
+                        let mut count = 0u64;
+                        while frames.recv().await.is_some() {
+                            count += 1;
+                        }
+                        note(&tally, |s| s.frames = count);
+                        println!("● audio stream ended after {count} frames");
+                    });
+                }
             }
-            SessionEvent::NowPlaying(ref now) => {
-                seen.metadata |= now.title.is_some();
-                seen.artwork |= now.artwork.is_some();
-                seen.shuffle_or_repeat |= now.shuffle.is_some() || now.repeat.is_some();
+            SessionEvent::NowPlaying(now) => {
+                note(&seen, |s| {
+                    s.metadata |= now.title.is_some();
+                    s.artwork |= now.artwork.is_some();
+                    s.shuffle_or_repeat |= now.shuffle.is_some() || now.repeat.is_some();
+                });
                 println!(
                     "● now playing: {:?} — {:?} | art {} | shuffle {:?} repeat {:?}",
                     now.title.as_deref().unwrap_or("?"),
@@ -209,7 +249,7 @@ async fn observe(mut rx: mpsc::Receiver<SourceMessage>, seen: Arc<std::sync::Mut
                 );
             }
             SessionEvent::End => println!("● session ended"),
-            ref other => println!("● {other:?}"),
+            other => println!("● {other:?}"),
         }
     }
 }

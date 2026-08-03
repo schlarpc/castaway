@@ -1,0 +1,4 @@
+<image-properties version="1.0" handle="1000001">
+<native encoding="JPEG" pixel="200*200" />
+<variant encoding="JPEG" pixel="280*280" />
+</image-properties>
