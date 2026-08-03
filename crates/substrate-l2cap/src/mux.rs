@@ -1166,7 +1166,24 @@ impl Multiplexer {
                     }
                     ch.parameters.max_transmit = config.max_transmit.max(1);
                 }
-                ConfigOption::Fcs(fcs) => ch.parameters.fcs = *fcs,
+                // **Not** the FCS. A `Success` response carrying "No FCS" does not turn
+                // the frame check sequence off, however much it looks like agreement.
+                //
+                // The option is decided by *requests*: FCS is omitted only when a peer
+                // asks for its omission in a Configuration Request, which is the branch in
+                // `on_config_request`. Linux is explicit about the asymmetry — it sets its
+                // `CONF_RECV_NO_FCS` flag from a request unconditionally, and from a
+                // response only when the result is `PENDING`, never on success
+                // (`net/bluetooth/l2cap_core.c`).
+                //
+                // Adopting it here cost a live session. An iPhone answered our 16-bit
+                // request with a `Success` naming No FCS; we believed it and stopped
+                // appending the checksum, while the phone went on expecting one. Every
+                // frame after that failed its check at the far end, the cover-art channel
+                // went silent mid-session, and nothing in the log said why — the exchange
+                // simply stopped. The session that worked, minutes earlier on the same
+                // phone, had negotiated 16-bit on both sides and moved 108 KB.
+                ConfigOption::Fcs(_) => {}
                 _ => {}
             }
         }

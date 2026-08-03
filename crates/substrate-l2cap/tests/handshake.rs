@@ -1004,3 +1004,77 @@ fn a_channel_that_never_finishes_configuring_is_still_given_up_on() {
         "a configuration nobody answers must still fail the channel"
     );
 }
+
+#[test]
+fn a_success_response_naming_no_fcs_does_not_turn_the_checksum_off() {
+    // Reconstructed from a live capture (2026-08-02, iPhone, cover-art channel). We asked
+    // for a 16-bit FCS; the phone answered `Success` carrying "No FCS"; we believed it and
+    // stopped appending the checksum while the phone went on expecting one. Every frame
+    // after that failed its check at the far end and the channel went silent mid-session,
+    // with nothing in the log to say why. Minutes earlier the same phone had negotiated
+    // 16-bit on both sides and moved 108 KB over the same code.
+    //
+    // The rule is asymmetric and easy to get backwards: FCS is dropped only when a peer
+    // asks for that in a Configuration *Request*. Linux sets its `CONF_RECV_NO_FCS` from a
+    // request unconditionally, and from a response only when the result is `PENDING` —
+    // never on success (`net/bluetooth/l2cap_core.c`). `FcsType::None`'s own docstring has
+    // always said "only legal when *both* ends ask for it"; the response path did not
+    // honour it.
+    use substrate_l2cap::signaling::ConfigResult;
+    use substrate_l2cap::FcsType;
+
+    let mut sink = Multiplexer::new(1024);
+    let (cid, start) = sink
+        .connect_with(cover_art_psm(), ChannelMode::EnhancedRetransmission)
+        .unwrap();
+
+    // The peer accepts the channel.
+    let peer_cid = Cid::new(0x0045);
+    let connect_id = signal_id(&start).expect("a connection request went out");
+    let accept = Signal::ConnectionResponse {
+        id: connect_id,
+        dest_cid: peer_cid,
+        source_cid: cid,
+        result: substrate_l2cap::signaling::ConnectionResult::Success,
+        status: 0,
+    };
+    let out = sink
+        .handle_pdu(&L2capPdu::new(Cid::SIGNALING, accept.encode().unwrap()))
+        .unwrap();
+
+    // …and answers our configuration request the way the phone did: Success, No FCS.
+    let config_id = signal_id(&out).expect("a configuration request went out");
+    let refusal = Signal::ConfigurationResponse {
+        id: config_id,
+        source_cid: cid,
+        flags: 0,
+        result: ConfigResult::Success,
+        options: vec![ConfigOption::Fcs(FcsType::None)],
+    };
+    sink.handle_pdu(&L2capPdu::new(Cid::SIGNALING, refusal.encode().unwrap()))
+        .unwrap();
+
+    assert_eq!(
+        sink.channel(cid).unwrap().parameters.fcs,
+        FcsType::Crc16,
+        "a Success response must not disable the FCS — only a peer's own Request may"
+    );
+}
+
+/// The signalling id of the first command in `events`, for answering it.
+fn signal_id(events: &[L2capEvent]) -> Option<u8> {
+    events.iter().find_map(|e| {
+        let L2capEvent::Send(pdu) = e else {
+            return None;
+        };
+        Signal::decode_all(&pdu.payload)
+            .ok()?
+            .into_iter()
+            .find_map(|s| match s {
+                Signal::ConnectionRequest { id, .. } | Signal::ConfigurationRequest { id, .. } => {
+                    Some(id)
+                }
+                _ => None,
+            })
+    })
+}
