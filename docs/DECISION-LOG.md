@@ -2087,3 +2087,127 @@ not the band count, the colour, or whether it is on at all. And no real music ha
 through it: the tests drive it with synthesised tones, so what is proven is that the bank
 separates and that the bars rise, fall and go away at the right times, not that an album
 looks good.
+
+### D54 — Matter Casting: link the Matter core, own the LAN, and be the certificate authority
+
+**2026-08-03.** #19 asked for a Matter cast receiver interface, with Amazon Video named as
+the likely test subject. Three things had to be decided before any of it could be written:
+what to build against, what a "receiver" even is in this protocol, and what to do about the
+fact that the panel ends up running a certificate authority.
+
+#### The roles are inverted, and that is the whole shape of the work
+
+Every other protocol in this tree has the panel waiting to be found and then spoken to.
+Matter Casting has the panel waiting to be found and then *doing the commissioning*: the
+Casting Video Player is the **commissioner**, the phone is the **commissionee**, and the
+phone only becomes able to say "play this" after it has been issued an operational
+certificate by the panel.
+
+So a receiver here is not one stack but two halves that meet in the middle. The panel runs
+PASE and CASE as the *initiator*, mints node operational certificates, and then serves the
+interaction model *back* to the node it just created. That is why the network surface shows
+both roles on one UDP socket, and why the crate has a commissioning worker at all.
+
+#### Link `rs-matter`, and say what it cost
+
+Ground rule 9 says reimplement, and its own logic applies: the peer is a device speaking a
+frozen public spec. It was overridden on volume, which makes this the third exception after
+Spotify (D30) and the GameStream streaming core (D37) — and the cheapest of the three.
+
+Matter core is TLV, the message layer, MRP, SPAKE2+ for PASE, sigma1/2/3 for CASE, the
+interaction model, the data model, and Matter's own certificate format, before a single
+casting command arrives. That is comfortably the largest protocol in this repository and
+none of it is the interesting part of #19.
+
+`rs-matter` 0.2 is Apache-2.0, pure Rust with no C anywhere in it, and maintained by
+project-chip — the organisation that also writes the specification. It has the commissioner
+role (`onboard::Commissioner`), both ends of PASE and CASE, and an interaction-model client
+as well as a server. Its build-time codegen emits **every** cluster in the CSA 1.5.1 IDL, so
+`ContentLauncher` and `MediaPlayback` arrive as typed requests and typestate response
+builders rather than as a second reverse-engineering project.
+
+Against moonlight-common-c this is a mild dependency: no GPL, no C toolchain, no link-time
+environment variable, no off-by-default feature. It is not free. Three things came with it:
+
+- **A thread.** `rs-matter` is `no_std`-shaped — `NoopRawMutex`, a `!Sync` random handle,
+  one task on one core. That is what lets it run on a microcontroller and it makes the
+  future `!Send`, which `SourceAdapter::run` requires. Matter therefore gets a thread and a
+  current-thread runtime of its own, bridged back by one channel carrying one result.
+- **A link-time trap.** `embassy-time` has no clock and no timer queue unless something in
+  the graph selects them, and neither absence is a compile error — the symptom is
+  `_embassy_time_now` undefined at link. Both are named in `[workspace.dependencies]` with
+  a comment saying so.
+- **A reproducibility hole.** Its `build.rs` stamps the host wall clock into a constant.
+  `RS_MATTER_BUILD_MATTER_SECS = "0"` is set in `commonArgs`; nothing here validates a
+  certificate against a clock, because the fabric's own certificates are issued forever.
+
+The D30 conditions hold. The dependency is an idiomatic Rust crate, and the entire local
+surface is still ours: the `_matterd._udp` advertisement goes on the project's one mDNS
+responder, the sockets are tokio's through `rs-matter`'s own transport traits (its `os`
+feature is off), and User Directed Commissioning — which `rs-matter` does not implement at
+all — is written here from `connectedhomeip`'s wire behaviour, byte for byte, with a
+hand-written fixture.
+
+#### The panel keeps its root key, and that is the honest trade
+
+The panel is the fabric's administrator, so it is a CA. `rs-matter`'s own commissioning
+example generates a root, signs an intermediate with it, and discards the root key on the
+reasoning that production keeps it in an HSM. There is no HSM here and no second machine:
+a root key the panel cannot use is a root it cannot issue against after the first restart,
+which means every phone re-pairs on every reboot.
+
+So the root key stays on disk, mode 0600, and NOCs are signed with it directly — a mode
+`rs-matter` supports explicitly. What that costs, stated plainly: anyone who can read the
+panel's state directory can mint an identity on this fabric. The exposure is the same as
+the panel's other stored credentials and it is bounded by what the fabric can do, which is
+drive one screen.
+
+Everything else is rebuilt from that key at boot. The one thing that genuinely has to
+survive is the *list of phones* — a device commissioned yesterday must still be allowed to
+speak today — so that is a tab-separated file a person can read to answer "who can drive
+this screen?", with the device-supplied fields flattened so a name containing a tab cannot
+forge a record. Commissioned clients get `Operate`, never `Administer`: nothing in Matter
+Casting asks for more, and `Administer` would let any paired phone evict every other one.
+
+#### The passcode is ours to generate, because the panel has no keyboard
+
+Matter Casting has two ways to agree a passcode. In the first the client displays one and
+the user types it into the TV. In the second — `commissionerPasscode`, the flow Amazon's
+senders use — the player generates it, shows it on its own screen, and the user types it
+into the phone.
+
+Only the second fits a device whose entire input surface is a person looking at it, so the
+first is declined in the spec's own vocabulary rather than by silence (D32). Three smaller
+decisions follow from taking the passcode seriously as something a person reads off a wall:
+
+- **A missing app is reported before any passcode appears.** A user who types eight digits
+  and then learns the app is not hosted has been made to do work for nothing.
+- **The prompt stays up after the phone says the passcode is typed**, because someone who
+  mistyped needs to re-read it; it comes down when commissioning finishes.
+- **The window is three minutes**, not the spec's fifteen. The secret is a number readable
+  from the sofa, and every extra minute is another minute it is readable by someone who
+  was not invited.
+
+The retransmit behaviour is where the wire test earned its keep. The reference client sends
+five copies of every message 100 ms apart, and nothing in them distinguishes a retransmit
+from a second attempt — so the first implementation generated five passcodes, changing the
+number four times while somebody read it and invalidating the one they had begun typing.
+A declaration that is already pending now gets the number it already got, and the window is
+measured from when it first went up rather than from the last copy.
+
+#### What this actually plays, which is less than the issue hoped
+
+Matter carries no media. `LaunchURL` is a sentence, and the app it names is expected to
+fetch its own bytes — which means an open receiver is only as useful as the content apps it
+can honestly host. The panel ships one: itself, taking a URL and playing it. Nothing here
+claims to be Prime Video, because a content app that accepted the cast and then had nothing
+to play would be answering "yes" to a question it cannot honour, and because the client's
+vendor authorisation is checked against a device attestation certificate this panel does not
+verify.
+
+So the answer to "Amazon Video is the test subject I think?" is: not yet, and not without
+certification. What works is the whole control plane — commissioning a real Casting Client,
+serving the media clusters over CASE, and turning `LaunchURL` into playback or a browser
+page. What does not is being trusted by a certified sender. That distance is a CSA
+certification and a real device attestation certificate, not more code, and it is tracked
+rather than papered over.

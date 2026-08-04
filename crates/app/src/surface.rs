@@ -241,8 +241,9 @@ fn shared_listeners() -> Vec<Listener> {
             chosen_by: Provenance::Spec,
             notes: "Advertises only enabled protocols, restricted to the serving \
                     interface. GameStream's host browser runs a second daemon — a \
-                    second 5353 socket — when enabled. Contends with Avahi/Bonjour \
-                    for answers (#43); the NixOS module warns when Avahi is on.",
+                    second 5353 socket — when enabled, and Matter's commissionable-node \
+                    browse a third. Contends with Avahi/Bonjour for answers (#43); the \
+                    NixOS module warns when Avahi is on.",
         },
         Listener {
             owner: Owner::Ssdp,
@@ -512,6 +513,21 @@ fn adverts() -> Vec<Advert> {
             record: proto_gamestream::NVSTREAM_SERVICE_TYPE,
             points_at: "never advertised — the receiver browses for hosts",
             gate: ProtocolKind::GameStream,
+        },
+        Advert {
+            medium: "mDNS",
+            record: proto_matter::discovery::COMMISSIONER_SERVICE,
+            points_at: "UDP 5550 — the commissioner, not the node: the panel's \
+                        operational identity exists only on a fabric it created, and the \
+                        phone learns that address while being commissioned",
+            gate: ProtocolKind::MatterCast,
+        },
+        Advert {
+            medium: "mDNS (browse only)",
+            record: proto_matter::discovery::COMMISSIONABLE_SERVICE,
+            points_at: "never advertised — the panel browses for the phone it was asked \
+                        to commission",
+            gate: ProtocolKind::MatterCast,
         },
         Advert {
             medium: "SSDP",

@@ -11,6 +11,12 @@ description = "Matter Casting receiver: the Casting Video Player role — UDC, t
 castaway-core.workspace = true
 substrate-mdns.workspace = true
 rs-matter.workspace = true
+# Not used directly — depended on so their `std` features are unified into rs-matter's
+# graph. `embassy-time` has no time driver without one, and the MRP retransmit timer
+# then fails to *link* rather than to compile: `_embassy_time_now` undefined.
+embassy-time.workspace = true
+critical-section.workspace = true
+embassy-time-queue-utils.workspace = true
 # rs-matter's own RNG trait bound; the `Dataver`s and the handler chain take one.
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror.workspace = true

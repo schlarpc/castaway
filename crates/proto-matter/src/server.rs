@@ -203,20 +203,34 @@ impl UdcState {
                     };
                 }
 
-                let passcode = generate_passcode(rand);
-                let device_name = id
-                    .device_name
-                    .clone()
-                    .unwrap_or_else(|| "a device".to_string());
+                // A declaration that is already pending gets the number it already got.
+                // The client sends five copies of every message and there is nothing in
+                // them to tell a retransmit from a second attempt, so generating a fresh
+                // passcode per datagram would change the number on the screen four times
+                // while somebody was reading it — and invalidate the one they had already
+                // started typing. The issue time is not refreshed either: the window
+                // starts when the passcode was first shown, not at the last retransmit.
+                let (passcode, device_name) = match self.pending.get(&id.instance_name) {
+                    Some(pending) => (pending.passcode, pending.device_name.clone()),
+                    None => {
+                        let passcode = generate_passcode(rand);
+                        let device_name = id
+                            .device_name
+                            .clone()
+                            .unwrap_or_else(|| "a device".to_string());
 
-                self.pending.insert(
-                    id.instance_name.clone(),
-                    Pending {
-                        passcode,
-                        device_name: device_name.clone(),
-                        issued: now,
-                    },
-                );
+                        self.pending.insert(
+                            id.instance_name.clone(),
+                            Pending {
+                                passcode,
+                                device_name: device_name.clone(),
+                                issued: now,
+                            },
+                        );
+
+                        (passcode, device_name)
+                    }
+                };
 
                 Decision {
                     reply: CommissionerDeclaration {
@@ -308,6 +322,17 @@ impl UdcServer {
             catalogue,
             prompts,
             requests,
+        })
+    }
+
+    /// The address actually bound. Ephemeral in tests; 5550 in the panel.
+    ///
+    /// # Errors
+    /// [`MatterError::Io`] if the socket cannot report it.
+    pub fn local_addr(&self) -> Result<SocketAddr, MatterError> {
+        self.socket.local_addr().map_err(|source| MatterError::Io {
+            context: "reading the user-directed-commissioning socket address",
+            source,
         })
     }
 
@@ -609,15 +634,54 @@ mod tests {
         );
     }
 
-    /// The client sends five copies of every message. Two prompts for one phone would be
-    /// two different numbers, and the second would invalidate the one being typed.
+    /// The client sends five copies of every message and nothing in them distinguishes a
+    /// retransmit from a second attempt. A fresh passcode per datagram would change the
+    /// number four times while somebody was reading it.
     #[test]
-    fn a_retransmit_replaces_rather_than_accumulates() {
+    fn a_retransmit_shows_the_same_number() {
         let mut state = UdcState::new();
-        for _ in 0..5 {
-            decide(&mut state, &declaration(), Instant::now());
-        }
+        let shown: Vec<_> = (0..5)
+            .map(
+                |_| match decide(&mut state, &declaration(), Instant::now()).prompt {
+                    Some(Prompt::Passcode { passcode, .. }) => passcode,
+                    other => panic!("expected a passcode prompt, got {other:?}"),
+                },
+            )
+            .collect();
+
         assert_eq!(state.pending(), 1);
+        assert_eq!(shown.len(), 5);
+        assert!(
+            shown.windows(2).all(|w| w[0] == w[1]),
+            "the number changed under the user: {shown:?}"
+        );
+    }
+
+    /// And the window is measured from when it first went up, not from the last
+    /// retransmit — otherwise a client that re-declares every minute holds a passcode on
+    /// the screen forever.
+    #[test]
+    fn a_retransmit_does_not_extend_the_window() {
+        let mut state = UdcState::new();
+        let start = Instant::now();
+        decide(&mut state, &declaration(), start);
+        decide(
+            &mut state,
+            &declaration(),
+            start + PASSCODE_LIFETIME - Duration::from_secs(1),
+        );
+
+        let mut ready = declaration();
+        ready.commissioner_passcode_ready = true;
+        let decision = decide(
+            &mut state,
+            &ready,
+            start + PASSCODE_LIFETIME + Duration::from_secs(1),
+        );
+        assert!(
+            decision.commission.is_none(),
+            "the window should have closed"
+        );
     }
 
     #[test]

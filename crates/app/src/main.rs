@@ -310,6 +310,10 @@ fn main() -> anyhow::Result<()> {
         let touch_surface = manager.touch_handle();
         runtime.spawn(manager.run(event_rx));
 
+        // Cloned before the DIAL closure takes ownership: Matter's launches go to the
+        // same browser.
+        #[cfg(feature = "electron")]
+        let nav_tx_matter = nav_tx.clone();
         #[cfg(feature = "electron")]
         let on_dial = {
             let dial_wake = wake.clone();
@@ -330,6 +334,26 @@ fn main() -> anyhow::Result<()> {
         };
         #[cfg(feature = "electron")]
         let on_dial = Some(on_dial);
+
+        // Matter's browser launches ride the same navigation channel DIAL's do — one
+        // browser, one place that drives it — but arrive as a stream rather than a
+        // callback, because they cross the thread `rs-matter` runs on.
+        #[cfg(feature = "electron")]
+        let browser_launch_tx = {
+            let (tx, mut rx) = mpsc::unbounded_channel::<proto_matter::BrowserLaunch>();
+            let nav = nav_tx_matter;
+            let matter_wake = wake.clone();
+            runtime.spawn(async move {
+                while let Some(launch) = rx.recv().await {
+                    info!(url = %launch.url, "Matter launch: navigating kiosk browser");
+                    let _ = nav.send(pipeline::BrowserCommand::Navigate(launch.url));
+                    matter_wake.wake();
+                }
+            });
+            Some(tx)
+        };
+        #[cfg(not(feature = "electron"))]
+        let browser_launch_tx: Option<mpsc::UnboundedSender<proto_matter::BrowserLaunch>> = None;
         // Rendering but browser-less: there is a screen, and still nothing to put YouTube
         // on it with.
         #[cfg(not(feature = "electron"))]
@@ -405,7 +429,10 @@ fn main() -> anyhow::Result<()> {
                 serve_tx,
                 serve_shutdown,
                 serve_osd,
-                on_dial,
+                Launchers {
+                    dial: on_dial,
+                    browser: browser_launch_tx,
+                },
                 handles,
                 abandoned_rx,
             )
@@ -589,7 +616,12 @@ fn main() -> anyhow::Result<()> {
             event_tx,
             shutdown,
             osd,
-            on_dial,
+            // Headless: nothing to open a page with, so a Matter content app pointed at
+            // the browser is dropped rather than accepted and abandoned.
+            Launchers {
+                dial: on_dial,
+                browser: None,
+            },
             PipelineHandles::default(),
             abandoned_rx,
         ))?;
@@ -718,6 +750,21 @@ struct ShellChannels {
     settings: settings::Catalog,
 }
 
+/// The two ways something that is not a media URL gets opened, and the one place that
+/// knows whether either exists.
+///
+/// A struct rather than two parameters because they are one fact: this build has a
+/// browser, or it does not. Both are `None` together in a headless build, and a
+/// `spawn_*` that finds its own field empty declines the capability up front rather than
+/// accepting a launch it would have to abandon.
+struct Launchers<D> {
+    /// DIAL launch/stop, as a callback — it arrives on the runtime that owns the browser.
+    dial: Option<D>,
+    /// Matter content-app launches, as a stream — they cross the thread `rs-matter` runs
+    /// on, so they cannot be a borrowed callback.
+    browser: Option<mpsc::UnboundedSender<proto_matter::BrowserLaunch>>,
+}
+
 /// Stand up the shared HTTP host, SSDP responder, and mDNS responder for the enabled
 /// protocols, and run until `shutdown` is signalled. `osd` is cloned to each adapter so
 /// they can surface their own status on the overlay; DIAL launch/stop events are handed
@@ -728,11 +775,15 @@ async fn serve(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
     osd: castaway_core::OsdSink,
-    on_dial: Option<impl Fn(proto_dial::DialEvent) + Send + 'static>,
+    launchers: Launchers<impl Fn(proto_dial::DialEvent) + Send + 'static>,
     handles: PipelineHandles,
     // Signalled when the kiosk browser has given up on the launched page.
     mut abandoned: mpsc::UnboundedReceiver<()>,
 ) -> anyhow::Result<()> {
+    let Launchers {
+        dial: on_dial,
+        browser: browser_launches,
+    } = launchers;
     let PipelineHandles {
         screenshot,
         stream,
@@ -1011,6 +1062,26 @@ async fn serve(
             }
         }
     }
+    if config.enable.matter {
+        // The other inverted protocol, and inverted a different way from GameStream: the
+        // panel is discovered normally, but it is the *commissioner* — a phone joins a
+        // fabric this box administers before it can say anything. An unwritable state
+        // directory is logged and skipped like the rest, because a receiver that can
+        // still do AirPlay should not refuse to start over it.
+        match spawn_matter(
+            &config,
+            &mut mdns,
+            event_tx.clone(),
+            shutdown.clone(),
+            osd.clone(),
+            browser_launches,
+        ) {
+            Ok(handle) => adapter_handles.push(handle),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "Matter Casting unavailable; continuing without it");
+            }
+        }
+    }
     if config.enable.miracast {
         // Miracast has no IP discovery to register: it advertises itself in an 802.11
         // beacon, which neither the mDNS nor the SSDP responder can carry (architecture
@@ -1173,6 +1244,7 @@ fn landing_page(config: &Config) -> String {
         (config.enable.bluetooth, "Bluetooth audio"),
         (config.enable.miracast, "Miracast"),
         (config.enable.gamestream, "GameStream (Moonlight client)"),
+        (config.enable.matter, "Matter Casting"),
     ] {
         if on {
             services.push_str(&format!("<li>{label}</li>\n"));
@@ -1582,6 +1654,92 @@ fn spawn_airplay(
     })
 }
 
+/// Build the Matter Casting receiver and hand it its mDNS record.
+fn spawn_matter(
+    config: &Config,
+    mdns: &mut MdnsResponder,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+    osd: castaway_core::OsdSink,
+    browser_launches: Option<mpsc::UnboundedSender<proto_matter::BrowserLaunch>>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    use proto_matter::{ContentApp, LaunchTarget, MatterAdapter, MatterConfig};
+
+    let apps = config
+        .matter
+        .apps
+        .iter()
+        .filter_map(|app| {
+            let launch = match app.surface {
+                crate::config::MatterSurface::MediaUrl => LaunchTarget::MediaUrl,
+                crate::config::MatterSurface::Browser => {
+                    // A browser app on a build with no browser is an app that would accept
+                    // a cast and then have nowhere to put it. Dropped here rather than at
+                    // launch time, so the phone is told "no such app" up front.
+                    if browser_launches.is_none() {
+                        warn!(
+                            app = %app.name,
+                            "Matter: skipping a browser content app in a build with no browser"
+                        );
+                        return None;
+                    }
+                    LaunchTarget::Browser {
+                        search: app.search.clone(),
+                    }
+                }
+            };
+
+            Some(ContentApp {
+                // Overwritten by the catalogue: an endpoint is a position in the node's
+                // tree, not something config gets to pick.
+                endpoint: 0,
+                vendor_id: app.vendor_id,
+                product_id: app.product_id,
+                vendor_name: app.vendor_name.clone(),
+                name: app.name.clone(),
+                application_id: app.application_id.clone(),
+                catalog_vendor_id: app.catalog_vendor_id,
+                launch,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let adapter = MatterAdapter::new(MatterConfig {
+        friendly_name: config.advertised_name(ProtocolKind::MatterCast),
+        host: MDNS_HOST.to_string(),
+        state_dir: config.matter.state_dir.clone(),
+        vendor_id: config.matter.vendor_id,
+        product_id: config.matter.product_id,
+        catalogue: proto_matter::Catalogue::new(apps),
+        bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    })
+    .with_osd(osd);
+
+    let adapter = match browser_launches {
+        Some(launches) => adapter.with_browser(launches),
+        None => adapter,
+    };
+
+    advertise_adapter(&adapter, mdns);
+    info!("enabled: Matter Casting (commissioner on 5550, node on 5540)");
+
+    let sink = SessionSink::new(
+        SourceId::new(ProtocolKind::MatterCast, "listener"),
+        event_tx,
+    );
+    let adapter = Arc::new(adapter);
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            res = adapter.run(sink) => {
+                if let Err(e) = res {
+                    warn!(error = %e, "Matter adapter exited");
+                }
+            }
+            () = shutdown.notified() => info!("Matter listeners stopping"),
+        }
+    }))
+}
+
 fn spotify_device_id(config: &Config) -> String {
     config.uuid.replace('-', "")
 }
@@ -1776,6 +1934,23 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
             "Project a Windows desktop with no cable.",
             vec!["Press Win+K".into(), "Pick this screen".into()],
             ProtocolKind::Miracast,
+        ));
+    }
+    if config.enable.matter {
+        // The one tile whose second step is on the *panel*: every other protocol here is
+        // "pick this screen and you are done", and this one puts a number on the glass
+        // that has to be carried back to the phone.
+        tiles.push(service(
+            "matter",
+            "Matter",
+            TileGlyph::MatterCast,
+            [0xf6, 0x9b, 0x21, 0xff],
+            "Cast from an app that speaks Matter.",
+            vec![
+                "Tap cast in the app".into(),
+                "Type the code shown here".into(),
+            ],
+            ProtocolKind::MatterCast,
         ));
     }
     if config.enable.gamestream {

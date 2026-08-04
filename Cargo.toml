@@ -188,6 +188,10 @@ rand = "0.10"
 rs-matter = { version = "0.2", default-features = false, features = ["std", "rustcrypto", "log"] }
 embassy-time = { version = "0.5", features = ["std"] }
 critical-section = { version = "1.1", features = ["std"] }
+# The timer queue behind `embassy-time`. Without it the default is the one the embassy
+# *executor* provides, which this project does not run — and the symptom is a link error
+# (`__embassy_time_queue_item_from_waker`), not a compile error.
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"] }
 
 # --- spotify ---
 # The one protocol we do NOT reimplement (DECISION-LOG D30). Spotify Connect is a cloud

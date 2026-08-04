@@ -58,6 +58,9 @@ pub struct Config {
     pub miracast: Miracast,
     /// GameStream / Sunshine client settings.
     pub gamestream: GameStream,
+    /// Matter Casting settings.
+    #[serde(default)]
+    pub matter: Matter,
     /// Where the panel's output volume starts, as a slider position in `0.0..=1.0`.
     ///
     /// The panel has one pair of speakers and one volume ([`pipeline::audio_session::Gain`]),
@@ -81,6 +84,89 @@ pub struct Config {
     /// settings screen persists the picked output device here.
     #[serde(default)]
     pub audio: Audio,
+}
+
+/// Matter Casting (the Casting Video Player role).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct Matter {
+    /// Where the fabric this panel administers lives — its root key, and the list of
+    /// phones it has commissioned. Losing it un-pairs every phone.
+    pub state_dir: PathBuf,
+    /// The CSA vendor id the panel claims. `0xFFF1` is the test range, which is what an
+    /// uncertified receiver is entitled to and what this is.
+    pub vendor_id: u16,
+    /// The product id within that vendor.
+    pub product_id: u16,
+    /// The content apps this panel hosts. A Casting Client picks an endpoint by matching
+    /// its own app against these, so they are the address a cast is sent to — not a
+    /// label. An empty list still leaves the player endpoint, which takes a bare URL.
+    pub apps: Vec<MatterApp>,
+}
+
+impl Default for Matter {
+    fn default() -> Self {
+        Self {
+            state_dir: castaway_paths::host().state().join("matter"),
+            // The same test vendor and product `rs-matter`'s own fixtures use. Claiming a
+            // real vendor's id would be a lie a certified sender is entitled to act on.
+            vendor_id: 0xFFF1,
+            product_id: 0x8001,
+            // One app, and it is the panel itself: it accepts a URL and plays it, which
+            // is what makes `LaunchURL` work out of the box. Nothing here claims to be
+            // Prime Video or Netflix — a panel that advertised a content app it cannot
+            // play would be answering "yes" to a cast it is about to drop.
+            apps: vec![MatterApp {
+                name: "castaway".into(),
+                vendor_name: "castaway".into(),
+                vendor_id: 0xFFF1,
+                product_id: 0x8001,
+                application_id: "castaway".into(),
+                catalog_vendor_id: 0,
+                surface: MatterSurface::MediaUrl,
+                search: None,
+            }],
+        }
+    }
+}
+
+/// One content app a Casting Client can aim at.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MatterApp {
+    /// The app's name, as a phone shows it.
+    pub name: String,
+    /// The vendor's name.
+    #[serde(default)]
+    pub vendor_name: String,
+    /// The vendor id a client matches against.
+    pub vendor_id: u16,
+    /// The product id within that vendor.
+    #[serde(default)]
+    pub product_id: u16,
+    /// The app's id in its catalog — a package name, usually.
+    #[serde(default)]
+    pub application_id: String,
+    /// Which catalog that id is read against. 0 means the vendor's own.
+    #[serde(default)]
+    pub catalog_vendor_id: u16,
+    /// Which half of the panel opens a launch into this app.
+    #[serde(default)]
+    pub surface: MatterSurface,
+    /// A search URL template with `{query}` in it, for `LaunchContent`. Browser apps
+    /// without one decline a search rather than opening their home page.
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// Where a launched URL goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatterSurface {
+    /// The media pipeline fetches and decodes it.
+    #[default]
+    MediaUrl,
+    /// The browser opens it as a page. Needs an `electron` build.
+    Browser,
 }
 
 /// Audio output settings.
@@ -987,6 +1073,7 @@ impl Default for Config {
             cast: Cast::default(),
             miracast: Miracast::default(),
             gamestream: GameStream::default(),
+            matter: Matter::default(),
             initial_volume: default_initial_volume(),
             remote: Remote::default(),
             audio: Audio::default(),

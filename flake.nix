@@ -248,6 +248,14 @@
           craneLib = cranelibFor system;
         in
         castCarveEnvFor system // {
+          # `rs-matter`'s build.rs stamps the host wall clock into a constant, which is
+          # its seed for "last known good UTC time" on a device with no real-time clock.
+          # Left alone that makes every build of this tree a different derivation output.
+          # Pinning it to the Matter epoch is safe here because nothing this project does
+          # with Matter validates a certificate against a clock — the fabric's own
+          # certificates are issued `VALID_FOREVER` (crates/proto-matter/src/fabric.rs).
+          RS_MATTER_BUILD_MATTER_SECS = "0";
+
           # Keep Cargo sources plus non-Rust assets that crates `include_str!`/`include_bytes!`
           # (SCPD/description XML in proto-dlna; fonts, blue-noise dither and the default
           # adblock filter list in pipeline; the AirPort private key in crypto-raop; the Cast
