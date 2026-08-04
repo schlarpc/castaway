@@ -611,14 +611,17 @@ impl RenderPipeline {
     }
 
     /// A way into the mix for one session.
+    ///
+    /// `backpressure` is the caller's to state: it is whether this source can be told to
+    /// wait, and only the caller knows. See [`crate::mixer::Backpressure`].
     #[cfg(feature = "audio")]
-    fn audio_input(&self) -> crate::mixer::MixInput {
+    fn audio_input(&self, backpressure: crate::mixer::Backpressure) -> crate::mixer::MixInput {
         let Ok(mut slot) = self.mixer.lock() else {
             // A poisoned lock costs this session its sound and nothing else.
             return crate::mixer::AudioMixer::new(Arc::new(|| {
                 Box::new(crate::audio_out::NullAudioOut::new())
             }))
-            .input();
+            .input(backpressure);
         };
         slot.get_or_insert_with(|| {
             Arc::new(crate::mixer::AudioMixer::with_gain(
@@ -626,7 +629,7 @@ impl RenderPipeline {
                 Arc::clone(&self.gain),
             ))
         })
-        .input()
+        .input(backpressure)
     }
     ///
     /// Cheap and clonable, and deliberately separate from the pipeline itself: by the
@@ -846,7 +849,9 @@ impl Pipeline for RenderPipeline {
             let (atx, arx) = std::sync::mpsc::sync_channel(crate::ffmpeg_decode::AUDIO_QUEUE);
             crate::audio_session::spawn_pcm(
                 arx,
-                self.audio_input(),
+                // We are the player here: the demuxer is reading a file or an HTTP body
+                // and not reading is the flow control, so parking it is correct.
+                self.audio_input(crate::mixer::Backpressure::Pull),
                 Arc::clone(&stop),
                 Some(crate::audio_session::PacedSession {
                     clock: Arc::clone(&clock),
@@ -953,7 +958,7 @@ impl Pipeline for RenderPipeline {
                             arx,
                             audio.format,
                             audio.config,
-                            self.audio_input(),
+                            self.audio_input(crate::mixer::Backpressure::Live),
                             Arc::clone(&stop),
                             // No failure report, for the same reason this path does not
                             // preempt: a mirror's audio and its picture share a stop
@@ -1018,7 +1023,7 @@ impl Pipeline for RenderPipeline {
                         rx,
                         format,
                         config,
-                        self.audio_input(),
+                        self.audio_input(crate::mixer::Backpressure::Live),
                         stop,
                         failed,
                     );
@@ -1029,7 +1034,7 @@ impl Pipeline for RenderPipeline {
                 FrameSource::Pcm(rx) => {
                     crate::audio_session::spawn_pcm(
                         rx,
-                        self.audio_input(),
+                        self.audio_input(crate::mixer::Backpressure::Live),
                         stop,
                         // Bluetooth/Spotify PCM: the sender is the clock, there is no
                         // video to synchronise, and a seek is the phone's business — so

@@ -22,9 +22,14 @@
 //!
 //! ## The in-flight budget is the pacing, and it is the clock's invariant
 //!
-//! There is no separate pacing step any more. [`MixInput::write`] **blocks** while this
-//! input already has [`LEAD`] of audio in flight, and that is what paces the decode thread
-//! behind it — uniformly, instead of per-backend and by accident.
+//! There is no separate pacing step any more. [`MixInput::write`] holds a source to [`LEAD`]
+//! of audio in flight, and that is what paces the decode thread behind it — uniformly,
+//! instead of per-backend and by accident.
+//!
+//! *How* it holds it depends on the source, and [`Backpressure`] is that choice. Parking
+//! the writer is flow control only if something upstream will wait; against a phone it is
+//! not flow control at all, it just moves the loss into the protocol's own queue, where it
+//! costs whole encoded packets and seconds of latency instead of a click.
 //!
 //! "In flight" is deliberately the *sum* of what is sitting in this input's ring and what
 //! the mixer has queued at the device but not yet heard:
@@ -230,7 +235,39 @@ pub trait MixTap: Send + Sync {
 /// Created per session from [`AudioMixer::input`], and removed from the mix when dropped.
 /// Replaces the `Box<dyn AudioOut>` a session used to own: a session no longer has a
 /// device, and cannot be handed one by mistake.
+/// What a source does when the mix has no room for it.
+///
+/// Not a tuning knob — it is the answer to "can anything upstream be told to wait", and
+/// only one of the two answers is available for any given source. Getting it wrong is not
+/// a slow path, it is lost audio in the worst available place, so it is stated at the call
+/// site rather than defaulted.
+///
+/// The distinction was already written down in this codebase before it was enforced:
+/// `audio_session::PacedSession` is present exactly when *we* are the player and absent
+/// exactly when "the sender is the clock".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backpressure {
+    /// Park until there is room.
+    ///
+    /// Correct only when something upstream will wait: a file or an HTTP body we are
+    /// pulling from, where not reading is the flow control and the bytes stay put.
+    Pull,
+    /// Take the newest audio and let the oldest go.
+    ///
+    /// The only honest answer for a sender that is its own clock — a phone on A2DP or
+    /// AirPlay, Spotify, a browser page. Nothing here can slow it down, so audio in excess
+    /// of [`LEAD`] is going to be lost whatever this returns; all this decides is *where*.
+    /// Shedding it here costs a click. Refusing it pushes the loss up into the protocol's
+    /// own queue, where the unit is an encoded packet — a decoder desync rather than a gap
+    /// — and where a queue that fills once never drains again, because it can only drain
+    /// at real time. That queue is seconds deep, so it also becomes a permanent latency
+    /// floor. See #111 and the regression it caused.
+    Live,
+}
+
 pub struct MixInput {
+    /// What to do when this input is already [`LEAD`] ahead.
+    backpressure: Backpressure,
     state: Arc<InputState>,
     shared: Arc<Shared>,
     /// Rebuilt whenever the source's shape changes. `None` until the first
@@ -238,8 +275,13 @@ pub struct MixInput {
     convert: Option<Convert>,
     /// What `convert` was built for, so an unchanged shape costs nothing.
     shape: Option<(u32, u16)>,
-    /// Blocks abandoned at [`WRITE_DEADLINE`]. Reported once, on drop.
+    /// Blocks abandoned at [`WRITE_DEADLINE`], which only a [`Backpressure::Pull`] input
+    /// can do. Reported once, on drop.
     dropped: u64,
+    /// Frames shed to keep a [`Backpressure::Live`] source inside its budget. Counted
+    /// separately from `dropped` because they are not the same event: this one is the
+    /// design working, and it is only alarming in bulk.
+    shed: u64,
 }
 
 /// The shared half of an input: what the mixer pulls from.
@@ -369,7 +411,10 @@ impl MixInput {
         Ok(())
     }
 
-    /// Park until this input's share of [`LEAD`] has room, then append.
+    /// Make room for `stereo` inside this input's share of [`LEAD`], then append.
+    ///
+    /// How the room is made is [`Backpressure`]'s whole subject: a pull source parks until
+    /// the mixer has drained, a live one sheds its oldest audio and carries on.
     fn enqueue(&mut self, stereo: &[f32]) {
         let budget = frames_in(LEAD);
         let deadline = Instant::now() + WRITE_DEADLINE;
@@ -380,6 +425,24 @@ impl MixInput {
             let queued = ring.samples.len() as u64 / u64::from(CHANNELS);
             let inflight = queued + self.shared.device_inflight.load(Ordering::Relaxed);
             if inflight < budget || ring.closed {
+                break;
+            }
+            if self.backpressure == Backpressure::Live {
+                // Keep the newest and let the oldest go, so the room this source has is
+                // spent on the audio nearest to now. Dropping the *front* rather than
+                // refusing the block is what bounds the latency: refusing leaves the stale
+                // audio in place and the source's own queue absorbs the difference, which
+                // is exactly the failure this enum exists to prevent.
+                let incoming = stereo.len() as u64 / u64::from(CHANNELS);
+                let room =
+                    budget.saturating_sub(self.shared.device_inflight.load(Ordering::Relaxed));
+                let keep = room.saturating_sub(incoming) * u64::from(CHANNELS);
+                let keep = usize::try_from(keep).unwrap_or(usize::MAX);
+                if ring.samples.len() > keep {
+                    let shed = ring.samples.len() - keep;
+                    ring.samples.drain(..shed);
+                    self.shed += shed as u64 / u64::from(CHANNELS);
+                }
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -433,6 +496,15 @@ impl Drop for MixInput {
             warn!(
                 blocks = self.dropped,
                 "mixer: an input gave up on blocks the mixer never drained"
+            );
+        }
+        if self.shed > 0 {
+            // At INFO because a live source shedding a little is the design working. In
+            // bulk it says the source is outrunning the panel's clock, which is worth
+            // being able to see without turning on debug logging.
+            info!(
+                frames = self.shed,
+                "mixer: a live source ran ahead of the speakers and its oldest audio was shed"
             );
         }
         self.state.close();
@@ -511,8 +583,11 @@ impl AudioMixer {
     }
 
     /// A way in for one source.
+    ///
+    /// `backpressure` has to be stated because there is no answer that is safe for both
+    /// kinds of source — see [`Backpressure`].
     #[must_use]
-    pub fn input(&self) -> MixInput {
+    pub fn input(&self, backpressure: Backpressure) -> MixInput {
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
@@ -522,11 +597,13 @@ impl AudioMixer {
         }
         self.shared.work.notify_all();
         MixInput {
+            backpressure,
             state,
             shared: Arc::clone(&self.shared),
             convert: None,
             shape: None,
             dropped: 0,
+            shed: 0,
         }
     }
 
@@ -1006,8 +1083,8 @@ mod tests {
     fn what_two_live_sources_write_reaches_the_device_summed() {
         let device = Recorder::new();
         let mixer = mixer_with(&device);
-        let mut a = mixer.input();
-        let mut b = mixer.input();
+        let mut a = mixer.input(Backpressure::Pull);
+        let mut b = mixer.input(Backpressure::Pull);
         for _ in 0..10 {
             a.write(&tone(480, 0.25)).unwrap();
             b.write(&tone(480, 0.5)).unwrap();
@@ -1029,7 +1106,7 @@ mod tests {
         // against a mix of the wall clock and the device's; now it is the ring, once.
         let device = Recorder::new();
         let mixer = mixer_with(&device);
-        let mut input = mixer.input();
+        let mut input = mixer.input(Backpressure::Pull);
         let start = Instant::now();
         // 1 s in 50 ms blocks.
         for _ in 0..20 {
@@ -1077,7 +1154,7 @@ mod tests {
 
         let device = Recorder::new();
         let mixer = mixer_with(&device);
-        let mut input = mixer.input();
+        let mut input = mixer.input(Backpressure::Pull);
         input.format(SOURCE_RATE, CHANNELS).unwrap();
         let block = PcmBlock {
             sample_rate: SOURCE_RATE,
@@ -1126,6 +1203,43 @@ mod tests {
         );
     }
 
+    /// A live source is never made to wait, however far ahead it runs.
+    ///
+    /// This is the property the two real-time-drain tests could not check, and the reason
+    /// they both passed while a phone was losing a fifth of its audio: their producer was a
+    /// loop calling `write`, so it was *flow-controlled by the thing under test* and could
+    /// never get ahead. A phone is not. It fires packets on its own clock into a queue we
+    /// do not own, so the only question that matters is whether this call returns.
+    ///
+    /// Five seconds of audio offered as fast as a thread can produce it, which is what a
+    /// sender running ahead looks like from here. Under [`Backpressure::Pull`] that takes
+    /// five seconds, by the test above. Under [`Backpressure::Live`] it must not: every
+    /// millisecond spent parked here is a millisecond the source's own queue spends filling,
+    /// and that queue is seconds deep and newest-drops.
+    #[test]
+    fn a_live_source_is_never_made_to_wait() {
+        let device = Recorder::new();
+        let mixer = mixer_with(&device);
+        let mut input = mixer.input(Backpressure::Live);
+        let start = Instant::now();
+        // 100 blocks of 50 ms: five seconds of audio, twenty times the budget.
+        for _ in 0..100 {
+            input.write(&tone(2400, 0.5)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a live source was parked for {elapsed:?} offering five seconds of audio;              its own queue fills for exactly that long, and it newest-drops"
+        );
+        // Not "discarded everything": the newest audio still has to reach the speakers.
+        std::thread::sleep(Duration::from_millis(200));
+        let peak = device.peak();
+        assert!(
+            (peak - 0.5).abs() < 1e-3,
+            "the live source shed its backlog but should still be audible: peak {peak}"
+        );
+    }
+
     #[test]
     fn a_box_with_no_device_still_drains_its_sources_in_real_time() {
         // #55's shape: the sink goes away and the session must carry on rather than wedge.
@@ -1141,7 +1255,7 @@ mod tests {
             fn stop(&mut self) {}
         }
         let mixer = AudioMixer::new(Arc::new(|| Box::new(Refuses)));
-        let mut input = mixer.input();
+        let mut input = mixer.input(Backpressure::Pull);
         let start = Instant::now();
         for _ in 0..10 {
             input.write(&tone(2400, 0.5)).unwrap();
@@ -1170,7 +1284,7 @@ mod tests {
         let mixer = mixer_with(&device);
         let tap = Arc::new(Collect::default());
         mixer.add_tap(Arc::clone(&tap) as Arc<dyn MixTap>);
-        let mut input = mixer.input();
+        let mut input = mixer.input(Backpressure::Pull);
         for _ in 0..8 {
             input.write(&tone(480, 0.5)).unwrap();
         }
@@ -1189,7 +1303,7 @@ mod tests {
     fn a_source_at_another_rate_is_resampled_on_the_way_in() {
         let device = Recorder::new();
         let mixer = mixer_with(&device);
-        let mut input = mixer.input();
+        let mut input = mixer.input(Backpressure::Pull);
         input
             .write(&PcmBlock {
                 sample_rate: 44_100,
@@ -1220,7 +1334,7 @@ mod tests {
     fn a_flush_drops_what_was_queued_before_a_seek() {
         let device = Recorder::new();
         let mixer = mixer_with(&device);
-        let mut input = mixer.input();
+        let mut input = mixer.input(Backpressure::Pull);
         input.write(&tone(4800, 0.5)).unwrap();
         input.flush();
         assert_eq!(

@@ -37,7 +37,7 @@ const AMPLITUDE: f32 = 1e-4;
 fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
     let selector = OutputSelector::new(OutputSelection::SystemDefault);
     let mixer = AudioMixer::new(output_factory(selector));
-    let mut input = mixer.input();
+    let mut input = mixer.input(pipeline::mixer::Backpressure::Pull);
     input.format(SOURCE_RATE, CHANNELS).unwrap();
     let block = PcmBlock {
         sample_rate: SOURCE_RATE,

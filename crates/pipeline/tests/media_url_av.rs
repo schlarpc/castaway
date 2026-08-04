@@ -331,7 +331,7 @@ fn a_paced_audio_consumer_does_not_stall_the_demuxer_that_feeds_it() {
     }));
     pipeline::audio_session::spawn_pcm(
         rx,
-        mixer.input(),
+        mixer.input(pipeline::mixer::Backpressure::Pull),
         Arc::clone(&stop),
         Some(pipeline::audio_session::PacedSession {
             clock: Arc::clone(&clock),

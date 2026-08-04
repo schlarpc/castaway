@@ -49,14 +49,14 @@ impl NullPipeline {
             return crate::mixer::AudioMixer::new(std::sync::Arc::new(|| {
                 Box::new(crate::audio_out::NullAudioOut::new())
             }))
-            .input();
+            .input(crate::mixer::Backpressure::Pull);
         };
         slot.get_or_insert_with(|| {
             std::sync::Arc::new(crate::mixer::AudioMixer::new(
                 crate::audio_out::output_factory(crate::audio_select::OutputSelector::default()),
             ))
         })
-        .input()
+        .input(crate::mixer::Backpressure::Pull)
     }
 
     /// End whatever session is running. The panel is single-source by policy, so a new

@@ -54,7 +54,7 @@ fn main() {
     }));
     pipeline::audio_session::spawn_pcm(
         rx,
-        mixer.input(),
+        mixer.input(pipeline::mixer::Backpressure::Pull),
         Arc::clone(&stop),
         Some(PacedSession {
             clock: Arc::clone(&clock),

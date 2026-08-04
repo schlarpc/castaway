@@ -451,7 +451,7 @@ impl Electron {
         // device across the respawn.
         let audio: Arc<Mutex<Option<BrowserAudio>>> =
             Arc::new(Mutex::new(mixer.map(|mixer| BrowserAudio {
-                input: mixer.input(),
+                input: mixer.input(crate::mixer::Backpressure::Live),
                 started: false,
             })));
         let health = Arc::new(Health::default());

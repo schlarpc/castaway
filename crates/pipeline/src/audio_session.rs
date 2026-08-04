@@ -458,7 +458,14 @@ mod tests {
         let (mixer, _device) = rig();
         let (tx, rx) = mpsc::channel::<EncodedFrame>(1);
         drop(tx);
-        run(rx, format(), None, mixer.input(), &running(), None);
+        run(
+            rx,
+            format(),
+            None,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &running(),
+            None,
+        );
     }
 
     #[test]
@@ -474,7 +481,7 @@ mod tests {
             rx,
             format(),
             None,
-            mixer.input(),
+            mixer.input(crate::mixer::Backpressure::Pull),
             &running(),
             Some(Box::new(move |_| *sink.lock().expect("poisoned") = true)),
         );
@@ -498,7 +505,14 @@ mod tests {
         .unwrap();
         drop(tx);
         // Guessing SBC here would decode noise; exiting is the honest answer.
-        run(rx, format(), None, mixer.input(), &running(), None);
+        run(
+            rx,
+            format(),
+            None,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &running(),
+            None,
+        );
     }
 
     #[test]
@@ -506,7 +520,12 @@ mod tests {
         let (mixer, _device) = rig();
         let (tx, rx) = std::sync::mpsc::sync_channel::<PcmFrame>(1);
         drop(tx);
-        run_pcm(rx, mixer.input(), &running(), None);
+        run_pcm(
+            rx,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &running(),
+            None,
+        );
     }
 
     #[test]
@@ -531,7 +550,12 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::sync_channel(2);
             tx.send(pcm_at(48_000, 2, 64, 1.0)).unwrap();
             drop(tx);
-            run_pcm(rx, mixer.input(), &running(), None);
+            run_pcm(
+                rx,
+                mixer.input(crate::mixer::Backpressure::Pull),
+                &running(),
+                None,
+            );
             settle(Duration::from_millis(2));
             let got = device.peak();
             assert!(
@@ -579,8 +603,8 @@ mod tests {
         // can make — it is a path that does not reach the speakers.
         let (mixer, device) = rig();
         mixer.gain().set(Volume::from_dbfs(-6.0));
-        let mut a = mixer.input();
-        let mut b = mixer.input();
+        let mut a = mixer.input(crate::mixer::Backpressure::Pull);
+        let mut b = mixer.input(crate::mixer::Backpressure::Pull);
         a.write(&pcm_at(48_000, 2, 480, 0.5)).unwrap();
         b.write(&pcm_at(48_000, 2, 480, 0.5)).unwrap();
         settle(Duration::from_millis(10));
@@ -602,7 +626,12 @@ mod tests {
         tx.send(pcm(48_000, 2, 512)).unwrap();
         tx.send(pcm(48_000, 2, 256)).unwrap();
         drop(tx);
-        run_pcm(rx, mixer.input(), &running(), None);
+        run_pcm(
+            rx,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &running(),
+            None,
+        );
         settle(Duration::from_millis(16));
         assert_eq!(
             device.audible_frames(),
@@ -623,7 +652,12 @@ mod tests {
         tx.send(pcm(44_100, 2, 4410)).unwrap();
         tx.send(pcm(48_000, 2, 4800)).unwrap();
         drop(tx);
-        run_pcm(rx, mixer.input(), &running(), None);
+        run_pcm(
+            rx,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &running(),
+            None,
+        );
         settle(Duration::from_millis(200));
         // 100 ms at each rate is ~200 ms out, give or take the resampler's delay line.
         let frames = device.audible_frames();
@@ -654,7 +688,12 @@ mod tests {
         drop(tx);
 
         let start = std::time::Instant::now();
-        run_pcm(rx, mixer.input(), &running(), None);
+        run_pcm(
+            rx,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &running(),
+            None,
+        );
         let taken = start.elapsed();
 
         let expected = Duration::from_secs(2).saturating_sub(crate::mixer::LEAD);
@@ -677,7 +716,7 @@ mod tests {
         // and a source with an empty ring is never held. The absence of a mechanism is the
         // thing worth pinning, because it is what a future "improvement" would re-add.
         let (mixer, _device) = rig();
-        let mut input = mixer.input();
+        let mut input = mixer.input(crate::mixer::Backpressure::Pull);
         input.write(&pcm(48_000, 2, 4800)).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let resumed = std::time::Instant::now();
@@ -702,7 +741,12 @@ mod tests {
         drop(tx);
         let stop = Arc::new(AtomicBool::new(true));
 
-        run_pcm(rx, mixer.input(), &stop, None);
+        run_pcm(
+            rx,
+            mixer.input(crate::mixer::Backpressure::Pull),
+            &stop,
+            None,
+        );
         settle(Duration::from_millis(2));
 
         assert_eq!(

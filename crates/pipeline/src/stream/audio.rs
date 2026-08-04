@@ -454,7 +454,7 @@ mod tests {
         let t0 = Instant::now();
         stream.timeline().anchor(t0);
 
-        let mut input = mixer.input();
+        let mut input = mixer.input(crate::mixer::Backpressure::Pull);
         // A second of audio, written as fast as the loop goes.
         for _ in 0..10 {
             input

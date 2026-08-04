@@ -110,7 +110,7 @@ fn publish_with(
     }));
     mixer.add_tap(audio.tap());
     // A session, opened the way one really is.
-    let mut session = sound.map(|_| mixer.input());
+    let mut session = sound.map(|_| mixer.input(pipeline::mixer::Backpressure::Pull));
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {

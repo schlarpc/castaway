@@ -473,7 +473,7 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
         rx,
         format(44_100, 2),
         None,
-        mixer.input(),
+        mixer.input(pipeline::mixer::Backpressure::Pull),
         &AtomicBool::new(false),
         // No failure sink: this fixture drives a decode that must succeed, and a
         // callback here would have nothing to report.

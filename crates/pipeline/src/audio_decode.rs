@@ -877,7 +877,7 @@ pub(crate) mod tests {
             rx,
             format(rate, 2),
             None,
-            mixer.input(),
+            mixer.input(crate::mixer::Backpressure::Pull),
             &std::sync::atomic::AtomicBool::new(false),
             None,
         );
@@ -960,7 +960,7 @@ pub(crate) mod tests {
             rx,
             format(rate, 2),
             None,
-            mixer.input(),
+            mixer.input(crate::mixer::Backpressure::Pull),
             &std::sync::atomic::AtomicBool::new(false),
             Some(Box::new(move |why| {
                 *sink.lock().expect("poisoned") = Some(why);
@@ -1093,7 +1093,7 @@ pub(crate) mod tests {
         // The mixer stays *here*, not in the worker: dropping it stops its thread, and the
         // last of the in-flight audio would never be played out.
         let mixer = speaker.mixer();
-        let input = mixer.input();
+        let input = mixer.input(crate::mixer::Backpressure::Pull);
         // Run on a worker thread: the session blocks, which is exactly why it gets one.
         std::thread::spawn(move || {
             let stop = std::sync::atomic::AtomicBool::new(false);
