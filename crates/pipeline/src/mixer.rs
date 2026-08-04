@@ -524,6 +524,9 @@ impl MixInput {
         }
         ring.fed = true;
         ring.samples.extend(stereo.iter().copied());
+        self.shared
+            .written
+            .fetch_add(stereo.len() as u64 / u64::from(CHANNELS), Ordering::Relaxed);
     }
 
     /// Throw away everything queued but not yet mixed.
@@ -600,6 +603,19 @@ struct Shared {
     /// `starved_pct=0.0`. Silence is silence; where it came from is a label, not a reason
     /// to leave it out of the total.
     priming: AtomicU64,
+    /// Frames the writers handed in. The term whose absence made every figure here a
+    /// subtraction, and every subtraction rested on an assumption that turned out false.
+    ///
+    /// With this, two identities hold and can be checked against each other rather than
+    /// believed:
+    ///
+    /// ```text
+    /// written  == drained + shed + (what is still sitting in the rings)
+    /// emitted  == drained + starved + priming
+    /// ```
+    written: AtomicU64,
+    /// Frames the mixer actually took out of the rings.
+    drained: AtomicU64,
     /// Frames shed from a [`Backpressure::Live`] input that had run ahead.
     ///
     /// Also on `MixInput` for the teardown line, and here as well because a counter that
@@ -656,6 +672,8 @@ impl AudioMixer {
             starved: AtomicU64::new(0),
             priming: AtomicU64::new(0),
             shed: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -843,8 +861,11 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
             &inputs,
             want,
             &shared.gain,
-            Some(&shared.starved),
-            Some(&shared.priming),
+            Some(&MixCounters {
+                starved: &shared.starved,
+                priming: &shared.priming,
+                drained: &shared.drained,
+            }),
         );
         publish(shared, now, &mixed);
 
@@ -920,12 +941,18 @@ fn open(device: &AudioOutputFactory) -> Option<Sink> {
 }
 
 /// Pull `frames` from every input, sum them, and apply the panel's volume.
+/// Where a pass reports what it did. Absent in unit tests that only assert on samples.
+struct MixCounters<'a> {
+    starved: &'a AtomicU64,
+    priming: &'a AtomicU64,
+    drained: &'a AtomicU64,
+}
+
 fn mix_pass(
     inputs: &[Arc<InputState>],
     frames: usize,
     gain: &Gain,
-    starved: Option<&AtomicU64>,
-    priming: Option<&AtomicU64>,
+    counters: Option<&MixCounters<'_>>,
 ) -> Vec<f32> {
     let wanted = frames * usize::from(CHANNELS);
     let mut mixed = vec![0.0f32; wanted];
@@ -944,8 +971,8 @@ fn mix_pass(
         // for more would truncate the last moment of every session.
         if input.backpressure == Backpressure::Live && !ring.closed && !ring.primed {
             if (ring.samples.len() / usize::from(CHANNELS)) < frames_in(PREBUFFER) as usize {
-                if let Some(priming) = priming {
-                    priming.fetch_add(frames as u64, Ordering::Relaxed);
+                if let Some(c) = counters {
+                    c.priming.fetch_add(frames as u64, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -966,11 +993,13 @@ fn mix_pass(
         // What this input could not supply, which the loop above has just written as
         // zeroes. Counted here because this is the only place that knows the difference
         // between "quiet" and "had nothing to give".
-        if let Some(starved) = starved {
+        if let Some(c) = counters {
             let short = (wanted - take) / usize::from(CHANNELS);
             if short > 0 {
-                starved.fetch_add(short as u64, Ordering::Relaxed);
+                c.starved.fetch_add(short as u64, Ordering::Relaxed);
             }
+            c.drained
+                .fetch_add((take / usize::from(CHANNELS)) as u64, Ordering::Relaxed);
         }
         drop(ring);
         input.room.notify_all();
@@ -1000,10 +1029,20 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Instant, inputs: usize)
     let starved = shared.starved.swap(0, Ordering::Relaxed);
     let priming = shared.priming.swap(0, Ordering::Relaxed);
     let shed = shared.shed.swap(0, Ordering::Relaxed);
-    if starved == 0 && priming == 0 && shed == 0 {
+    let written = shared.written.swap(0, Ordering::Relaxed);
+    let drained = shared.drained.swap(0, Ordering::Relaxed);
+    if starved == 0 && priming == 0 && shed == 0 && written == 0 {
         return;
     }
     let expected = window.as_secs_f64() * f64::from(RATE);
+    #[allow(clippy::cast_precision_loss)]
+    let pct = |n: u64| {
+        if expected > 0.0 {
+            n as f64 / expected * 100.0
+        } else {
+            0.0
+        }
+    };
     #[allow(clippy::cast_precision_loss)]
     let share = if expected > 0.0 {
         starved as f64 / expected * 100.0
@@ -1022,6 +1061,10 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Instant, inputs: usize)
         priming_frames = priming,
         priming_pct = format!("{priming_share:.1}"),
         shed_frames = shed,
+        written_frames = written,
+        written_pct = format!("{:.1}", pct(written)),
+        drained_frames = drained,
+        drained_pct = format!("{:.1}", pct(drained)),
         inputs,
         "mixer: audio the speakers did not get"
     );
@@ -1139,6 +1182,8 @@ mod tests {
             starved: AtomicU64::new(0),
             priming: AtomicU64::new(0),
             shed: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
         })
     }
 
@@ -1192,7 +1237,7 @@ mod tests {
         // device and the OS did this — invisibly, and with no way to express a policy.
         let a = filled(vec![0.25; 8]);
         let b = filled(vec![0.5; 8]);
-        let mixed = mix_pass(&[a, b], 4, &Gain::default(), None, None);
+        let mixed = mix_pass(&[a, b], 4, &Gain::default(), None);
         assert_eq!(mixed, vec![0.75; 8]);
     }
 
@@ -1201,7 +1246,7 @@ mod tests {
         // Not a shortfall to correct: an input that has not produced yet *is* silence,
         // and stretching what it did produce would change its pitch.
         let short = filled(vec![1.0; 4]);
-        let mixed = mix_pass(&[short], 4, &Gain::default(), None, None);
+        let mixed = mix_pass(&[short], 4, &Gain::default(), None);
         assert_eq!(mixed, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
@@ -1211,7 +1256,7 @@ mod tests {
         // out-of-range f32 is anything from a clamp to a wrap depending on the backend.
         let a = filled(vec![0.8; 4]);
         let b = filled(vec![0.8; 4]);
-        let mixed = mix_pass(&[a, b], 2, &Gain::default(), None, None);
+        let mixed = mix_pass(&[a, b], 2, &Gain::default(), None);
         assert_eq!(mixed, vec![1.0; 4]);
     }
 
@@ -1224,7 +1269,7 @@ mod tests {
         gain.set(half_scale());
         let a = filled(vec![0.25; 4]);
         let b = filled(vec![0.25; 4]);
-        let mixed = mix_pass(&[a, b], 2, &gain, None, None);
+        let mixed = mix_pass(&[a, b], 2, &gain, None);
         for sample in mixed {
             assert!((sample - 0.25).abs() < 1e-4, "{sample}");
         }
@@ -1235,7 +1280,7 @@ mod tests {
         let gain = Gain::default();
         gain.set(Volume::from_dbfs(0.75f32.log10() * 20.0));
         gain.set_muted(true);
-        let mixed = mix_pass(&[filled(vec![1.0; 4])], 2, &gain, None, None);
+        let mixed = mix_pass(&[filled(vec![1.0; 4])], 2, &gain, None);
         assert_eq!(mixed, vec![0.0; 4]);
         assert!(
             (gain.level() - 0.75).abs() < 1e-4,
@@ -1260,7 +1305,7 @@ mod tests {
             "closed, but it still has audio in it"
         );
         // Drain it the way the mixer would.
-        let _ = mix_pass(&[Arc::clone(&state)], 480, &Gain::default(), None, None);
+        let _ = mix_pass(&[Arc::clone(&state)], 480, &Gain::default(), None);
         assert!(
             live_inputs(&shared).is_empty(),
             "closed and drained, so it should be gone"
@@ -1410,10 +1455,63 @@ mod tests {
     /// contributes silence, because the alternative is stretching what it did produce and
     /// changing its pitch. What was missing is that it left no trace: no counter, no
     /// warning, so an input running dry for minutes read exactly like one playing.
+    /// The identity the report is worth reading for: what the writer gave equals what the
+    /// mixer took plus what was thrown away plus what is still sitting in the ring.
+    ///
+    /// This test exists because its absence is the methodological fault behind a day of
+    /// wrong answers on #175. Every quantity that mattered was *derived* by subtracting
+    /// counters, each subtraction carried an assumption about a term nobody measured, and
+    /// each assumption was eventually false. Measure the terms; do not infer them.
+    #[test]
+    fn what_was_written_is_what_was_drained_plus_what_is_left() {
+        let starved = AtomicU64::new(0);
+        let priming = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        // No mixer thread: this asserts an identity, so a second drainer racing the
+        // arithmetic would make it assert nothing.
+        let state = Arc::new(InputState {
+            ring: Mutex::new(Ring::default()),
+            room: Condvar::new(),
+            backpressure: Backpressure::Pull,
+        });
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = MixInput {
+            backpressure: Backpressure::Pull,
+            state: Arc::clone(&state),
+            shared: Arc::clone(&shared),
+            convert: None,
+            shape: None,
+            dropped: 0,
+            shed: 0,
+        };
+        for _ in 0..4 {
+            input.write(&tone(480, 0.5)).unwrap();
+        }
+        let written = shared.written.load(Ordering::Relaxed);
+        assert_eq!(written, 4 * 480, "the writer's own count, not a deduction");
+
+        let counters = MixCounters {
+            starved: &starved,
+            priming: &priming,
+            drained: &drained,
+        };
+        let _ = mix_pass(&[Arc::clone(&state)], 500, &shared.gain, Some(&counters));
+        let took = drained.load(Ordering::Relaxed);
+        let left = state.ring.lock().unwrap().samples.len() as u64 / u64::from(CHANNELS);
+        let shed = shared.shed.load(Ordering::Relaxed);
+        assert_eq!(
+            written,
+            took + shed + left,
+            "written={written} took={took} shed={shed} left={left}"
+        );
+    }
+
     /// A live input banks a reserve before it is drawn on, and is not called starved for it.
     #[test]
     fn a_live_input_primes_before_it_is_mixed() {
         let starved = AtomicU64::new(0);
+        let priming = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
@@ -1425,8 +1523,11 @@ mod tests {
             &[Arc::clone(&state)],
             240,
             &Gain::default(),
-            Some(&starved),
-            None,
+            Some(&MixCounters {
+                starved: &starved,
+                priming: &priming,
+                drained: &drained,
+            }),
         );
         assert_eq!(
             mixed,
@@ -1447,8 +1548,11 @@ mod tests {
             &[Arc::clone(&state)],
             240,
             &Gain::default(),
-            Some(&starved),
-            None,
+            Some(&MixCounters {
+                starved: &starved,
+                priming: &priming,
+                drained: &drained,
+            }),
         );
         assert_eq!(mixed, vec![1.0; 480], "primed, so the reserve is drawn on");
         assert!(state.ring.lock().unwrap().primed);
@@ -1461,6 +1565,8 @@ mod tests {
     #[test]
     fn a_primed_input_covers_the_gap_between_two_packets() {
         let starved = AtomicU64::new(0);
+        let priming = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
@@ -1473,8 +1579,11 @@ mod tests {
             &[Arc::clone(&state)],
             1,
             &Gain::default(),
-            Some(&starved),
-            None,
+            Some(&MixCounters {
+                starved: &starved,
+                priming: &priming,
+                drained: &drained,
+            }),
         );
         // Now three passes with nothing arriving at all, as happens between packets.
         for _ in 0..3 {
@@ -1482,8 +1591,11 @@ mod tests {
                 &[Arc::clone(&state)],
                 240,
                 &Gain::default(),
-                Some(&starved),
-                None,
+                Some(&MixCounters {
+                    starved: &starved,
+                    priming: &priming,
+                    drained: &drained,
+                }),
             );
             assert!(
                 mixed.iter().all(|s| (*s - 1.0).abs() < 1e-6),
@@ -1509,6 +1621,7 @@ mod tests {
     fn priming_is_counted_and_happens_once() {
         let starved = AtomicU64::new(0);
         let priming = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
@@ -1520,8 +1633,11 @@ mod tests {
             &[Arc::clone(&state)],
             240,
             &Gain::default(),
-            Some(&starved),
-            Some(&priming),
+            Some(&MixCounters {
+                starved: &starved,
+                priming: &priming,
+                drained: &drained,
+            }),
         );
         assert_eq!(mixed, vec![0.0; 480]);
         assert_eq!(
@@ -1543,8 +1659,11 @@ mod tests {
                 &[Arc::clone(&state)],
                 240,
                 &Gain::default(),
-                Some(&starved),
-                Some(&priming),
+                Some(&MixCounters {
+                    starved: &starved,
+                    priming: &priming,
+                    drained: &drained,
+                }),
             );
         }
         let priming_before = priming.load(Ordering::Relaxed);
@@ -1556,8 +1675,11 @@ mod tests {
             &[Arc::clone(&state)],
             4,
             &Gain::default(),
-            Some(&starved),
-            Some(&priming),
+            Some(&MixCounters {
+                starved: &starved,
+                priming: &priming,
+                drained: &drained,
+            }),
         );
         assert_eq!(
             mixed,
@@ -1582,20 +1704,25 @@ mod tests {
         });
         feed(&state, vec![1.0; 8]);
         state.ring.lock().unwrap().closed = true;
-        let mixed = mix_pass(&[state], 4, &Gain::default(), None, None);
+        let mixed = mix_pass(&[state], 4, &Gain::default(), None);
         assert_eq!(mixed, vec![1.0; 8], "the tail has to reach the speakers");
     }
 
     #[test]
     fn an_input_that_runs_dry_is_counted_and_not_only_padded() {
         let starved = AtomicU64::new(0);
+        let priming = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
         // Two frames offered against a four-frame pass.
         let mixed = mix_pass(
             &[filled(vec![1.0; 4])],
             4,
             &Gain::default(),
-            Some(&starved),
-            None,
+            Some(&MixCounters {
+                starved: &starved,
+                priming: &priming,
+                drained: &drained,
+            }),
         );
         assert_eq!(mixed, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(
