@@ -1419,6 +1419,17 @@ pub struct RenderLoop {
     failed_imports: u32,
     /// The transport strip currently on screen, if any.
     transport: Option<TransportState>,
+    /// When the visualiser last got its look at the glass, whatever it decided to draw.
+    ///
+    /// The anchor [`Self::visualizer_due`] schedules the next wake from. It has to be a
+    /// recorded instant and not `now + FRAME_INTERVAL` at the asking: `demand()` is
+    /// recomputed every time the event loop's timer fires, so a deadline phrased
+    /// relative to *the recomputation* recedes by one interval per wake and never
+    /// arrives — the loop woke at the bars' cadence and never owed a redraw, which read
+    /// as bars at a few frames a second and a scrubber that only stepped when something
+    /// unrelated woke the glass (#15).
+    #[cfg(feature = "audio")]
+    bars_ticked: Option<std::time::Instant>,
     /// The decoded size of the video currently on the glass.
     ///
     /// Kept because placement happens in [`Self::apply_motion`], which runs on motion
@@ -1578,6 +1589,8 @@ impl RenderLoop {
             taps: Vec::new(),
             failed_imports: 0,
             transport: None,
+            #[cfg(feature = "audio")]
+            bars_ticked: None,
         }
     }
 
@@ -2167,6 +2180,10 @@ impl RenderLoop {
             self.compositor.remove_layer(LayerId::Visualizer);
             return None;
         }
+        // The wake anchor, stamped whether or not anything gets drawn below: a silent
+        // reading is still the bars having had their look, and the next one is owed a
+        // whole interval later — not immediately, and not never.
+        self.bars_ticked = Some(now);
         let bands = analyzer.bands(now);
         if bands.is_silent() {
             // Nothing playing, or between two tracks. The layer goes rather than being
@@ -2918,16 +2935,25 @@ impl RenderLoop {
 
     /// When the bars next want a frame.
     ///
-    /// Derived from whether *audio is arriving*, which the mixer's tap keeps answering
-    /// whether or not this loop wakes — never from the last set of bars this loop drew.
-    /// That was the bug: `tick_visualizer` returning `None` on a silent reading removed the
-    /// only reason the loop had to wake for the bars, so nothing re-read them and they
-    /// stayed gone until unrelated business happened to wake it. Measured at about two
-    /// frames a second on a session that was playing perfectly well.
+    /// *Whether* they want one is derived from audio arriving, which the mixer's tap
+    /// keeps answering whether or not this loop wakes — never from the last set of bars
+    /// this loop drew. That was the first latch: `tick_visualizer` returning `None` on a
+    /// silent reading removed the only reason the loop had to wake for the bars, so
+    /// nothing re-read them. Measured at about two frames a second on a session that was
+    /// playing perfectly well.
     ///
-    /// Structural rather than stateful, for the same reason `home_return_due` is: nothing
-    /// arms this and nothing cancels it. Audio stops arriving and the answer stops
-    /// existing, which is what lets an idle panel sleep (#59).
+    /// *When* is anchored to [`Self::bars_ticked`], and that anchoring is the second
+    /// latch's fix: the first version answered `now + FRAME_INTERVAL`, which reads as a
+    /// cadence and is actually a horizon — `demand()` is recomputed each time the event
+    /// loop's timer fires, so the deadline receded by one interval per wake and `at <=
+    /// now` never came true. The loop woke thirty times a second and never once owed a
+    /// redraw; the bars moved only when something unrelated dirtied the glass, and the
+    /// scrubber's between-seconds interpolation never stepped at all. Same symptom as
+    /// the first latch, one mechanism further out.
+    ///
+    /// Structural rather than stateful, for the same reason `home_return_due` is:
+    /// nothing arms this and nothing cancels it. Audio stops arriving and the answer
+    /// stops existing, which is what lets an idle panel sleep (#59).
     #[cfg(all(feature = "audio", feature = "render"))]
     fn visualizer_due(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         use crate::panel::Surface;
@@ -2937,9 +2963,12 @@ impl RenderLoop {
         {
             return None;
         }
-        analyzer
-            .is_sounding(now)
-            .then(|| now + crate::visualizer::FRAME_INTERVAL)
+        // Never fed and never ticked: the first frame is owed now, not an interval from
+        // now — a session's first bars should not wait out a cadence that has not begun.
+        let due = self
+            .bars_ticked
+            .map_or(now, |at| at + crate::visualizer::FRAME_INTERVAL);
+        analyzer.is_sounding(now).then_some(due)
     }
 
     #[cfg(not(all(feature = "audio", feature = "render")))]
@@ -3962,6 +3991,83 @@ mod tests {
             pipe.card().up_next.len(),
             1,
             "unrelated track ate the queue"
+        );
+    }
+
+    /// The wake the bars ask for must *arrive*.
+    ///
+    /// b9411ea put the visualiser into `demand()`, which fixed the first latch — the
+    /// loop now knows the bars want frames while audio arrives. But it phrased the
+    /// deadline as `now + FRAME_INTERVAL`, and `demand()` is recomputed every time the
+    /// event loop's timer fires: a deadline relative to the recomputation recedes by one
+    /// interval per wake and `at <= now` never comes true. The loop woke at the bars'
+    /// cadence and never once owed a redraw — bars at a few frames a second, and a
+    /// scrubber whose between-seconds interpolation never stepped, exactly the symptom
+    /// the first fix claimed to remove (#15).
+    ///
+    /// So this asserts the promise the way winit redeems it: ask `demand`, sleep to the
+    /// instant it named, ask again *without a frame in between*. The second answer must
+    /// not be later than the first.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn the_visualizers_deadline_arrives_rather_than_receding() {
+        use crate::mixer::MixTap;
+
+        let (pipe, rx) = RenderPipeline::new(4);
+        let rloop = match RenderLoop::offscreen(64, 48, rx) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: no GPU ({e})");
+                return;
+            }
+        };
+        let analyzer = std::sync::Arc::new(crate::visualizer::Analyzer::new());
+        let mut rloop = rloop.with_visualizer(std::sync::Arc::clone(&analyzer));
+
+        // A playing card, which arrives fullscreen on a fresh panel: the surface the
+        // bars draw over, and half of what `visualizer_due` gates on.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            pipe.now_playing(
+                castaway_core::NowPlaying::new(castaway_core::PlaybackState::Playing)
+                    .with_title("Derezzed"),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Let the card's arrival animation settle; a loop mid-transition demands
+        // continuous frames and the question here is about the scheduled kind.
+        for _ in 0..200 {
+            if !matches!(
+                rloop.frame(Duration::from_millis(16)),
+                crate::demand::Demand::Frame
+            ) {
+                break;
+            }
+        }
+
+        // Audible samples at the tap — the standing fact that makes the bars due at all.
+        analyzer.mixed(std::time::Instant::now(), &vec![0.5f32; 4096]);
+
+        let now = std::time::Instant::now();
+        let first = match rloop.demand(now) {
+            crate::demand::Demand::At(at) => at,
+            other => panic!("a sounding card should schedule a wake, got {other:?}"),
+        };
+        // The timer fires and the loop re-asks at the promised instant, with no frame in
+        // between — which is exactly what winit's WaitUntil wake is.
+        let again = match rloop.demand(first) {
+            crate::demand::Demand::At(at) => at,
+            other => panic!("the re-ask should still schedule a wake, got {other:?}"),
+        };
+        assert!(
+            again <= first,
+            "the bars' deadline receded from {first:?} to {again:?}: the loop wakes at \
+             the bars' cadence forever and never owes a redraw"
         );
     }
 
