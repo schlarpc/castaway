@@ -529,6 +529,24 @@
                 "$out/bin/gs-probe"
             '';
           });
+
+          # The stand-in Casting Client (#171): declare over UDC, become a commissionable
+          # node with the passcode the panel chose, get commissioned, then cast back over
+          # the CASE session that commissioning left open. Its real job is the
+          # `matter-vm` check; pointed at a panel by hand with `--matter-port` it also
+          # runs beside one on a single host, which is the quickest way to find out why a
+          # phone will not pair.
+          matter-peer = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+            pname = "matter-peer";
+            cargoExtraArgs = "-p proto-matter --example matter-peer";
+            doCheck = false;
+            postInstall = ''
+              install -Dm755 \
+                "$(find target -name matter-peer -type f -perm -u+x | head -1)" \
+                "$out/bin/matter-peer"
+            '';
+          });
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux (
           let
             windows = windowsFor system;
@@ -783,6 +801,13 @@
           # dialling out over it — the whole surface #45 said only hardware could touch,
           # minus the driver's own quirks (§7.6), which remain the hardware's to prove.
           miracast-vm = import ./nix/miracast-vm-test.nix { inherit pkgs self; };
+
+          # Matter commissioning end to end between two hosts (#171). The half of
+          # `proto-matter` a socket test cannot reach: the `_matterc._udp` browse, PASE,
+          # AddNOC, CASE, and the client invoking `LaunchURL` back over the session
+          # commissioning left open. Two nodes specifically because `rs-matter`'s own
+          # commissioning test skips mDNS, so discovery has coverage nowhere else.
+          matter-vm = import ./nix/matter-vm-test.nix { inherit pkgs self; };
 
           # A complete A2DP session with no radio: btvirt's linked virtual controllers,
           # BlueZ as an independent A2DP source on one, our receiver on the other. The
