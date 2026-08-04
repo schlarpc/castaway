@@ -27,6 +27,10 @@ async-trait.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time", "net"] }
 tempfile.workspace = true
+# For `examples/matter-peer.rs`, the scripted Casting Client the VM test drives. Its
+# `tracing-log` default feature is what makes `rs-matter`'s own `log` records visible,
+# which is most of what you have to read when commissioning fails.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
