@@ -320,9 +320,10 @@ struct InputState {
 struct Ring {
     /// Whether this input has banked [`PREBUFFER`] and is being drawn on.
     ///
-    /// False until it first fills, and false again if it ever runs dry — a source that has
-    /// fallen behind has to rebuild its reserve, because resuming on empty just returns to
-    /// emitting a hole between every packet.
+    /// Set once and never cleared. Re-priming on an empty ring was tried and is much worse
+    /// than the problem: a live source hits empty routinely, so rebuilding the reserve each
+    /// time replaces a sub-millisecond hole with a [`PREBUFFER`]-long one. A momentary
+    /// empty ring is ordinary starvation — counted, and small.
     primed: bool,
     /// Interleaved [`CHANNELS`]-channel [`RATE`] audio waiting to be mixed.
     samples: VecDeque<f32>,
@@ -559,6 +560,13 @@ struct Shared {
     /// logs from one playing perfectly — no counter, no warning, and a third of the audio
     /// replaced by holes. See #175.
     starved: AtomicU64,
+    /// Frames of silence emitted while a live input was still banking its reserve.
+    ///
+    /// Counted apart from `starved` because the cause is different — this one is a source
+    /// starting up — but counted, because exempting it is how a prebuffer bug hid behind
+    /// `starved_pct=0.0`. Silence is silence; where it came from is a label, not a reason
+    /// to leave it out of the total.
+    priming: AtomicU64,
     /// Frames shed from a [`Backpressure::Live`] input that had run ahead.
     ///
     /// Also on `MixInput` for the teardown line, and here as well because a counter that
@@ -613,6 +621,7 @@ impl AudioMixer {
             device_inflight: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             starved: AtomicU64::new(0),
+            priming: AtomicU64::new(0),
             shed: AtomicU64::new(0),
         });
         let thread = {
@@ -797,7 +806,13 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
             continue;
         }
 
-        let mixed = mix_pass(&inputs, want, &shared.gain, Some(&shared.starved));
+        let mixed = mix_pass(
+            &inputs,
+            want,
+            &shared.gain,
+            Some(&shared.starved),
+            Some(&shared.priming),
+        );
         publish(shared, now, &mixed);
 
         if let Err(e) = sink.out.write(&block_of(&mixed)) {
@@ -877,6 +892,7 @@ fn mix_pass(
     frames: usize,
     gain: &Gain,
     starved: Option<&AtomicU64>,
+    priming: Option<&AtomicU64>,
 ) -> Vec<f32> {
     let wanted = frames * usize::from(CHANNELS);
     let mut mixed = vec![0.0f32; wanted];
@@ -890,6 +906,9 @@ fn mix_pass(
         // waiting for more would truncate the last moment of every session.
         if input.backpressure == Backpressure::Live && !ring.closed && !ring.primed {
             if (ring.samples.len() / usize::from(CHANNELS)) < frames_in(PREBUFFER) as usize {
+                if let Some(priming) = priming {
+                    priming.fetch_add(frames as u64, Ordering::Relaxed);
+                }
                 continue;
             }
             ring.primed = true;
@@ -914,11 +933,6 @@ fn mix_pass(
             if short > 0 {
                 starved.fetch_add(short as u64, Ordering::Relaxed);
             }
-        }
-        // Ran dry despite the reserve. Rebuild it rather than carrying on empty, which is
-        // the state this whole mechanism exists to leave.
-        if ring.primed && ring.samples.is_empty() && !ring.closed {
-            ring.primed = false;
         }
         drop(ring);
         input.room.notify_all();
@@ -946,8 +960,9 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Instant, inputs: usize)
     }
     *last = now;
     let starved = shared.starved.swap(0, Ordering::Relaxed);
+    let priming = shared.priming.swap(0, Ordering::Relaxed);
     let shed = shared.shed.swap(0, Ordering::Relaxed);
-    if starved == 0 && shed == 0 {
+    if starved == 0 && priming == 0 && shed == 0 {
         return;
     }
     let expected = window.as_secs_f64() * f64::from(RATE);
@@ -957,9 +972,17 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Instant, inputs: usize)
     } else {
         0.0
     };
+    #[allow(clippy::cast_precision_loss)]
+    let priming_share = if expected > 0.0 {
+        priming as f64 / expected * 100.0
+    } else {
+        0.0
+    };
     info!(
         starved_frames = starved,
         starved_pct = format!("{share:.1}"),
+        priming_frames = priming,
+        priming_pct = format!("{priming_share:.1}"),
         shed_frames = shed,
         inputs,
         "mixer: audio the speakers did not get"
@@ -1076,6 +1099,7 @@ mod tests {
             device_inflight: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             starved: AtomicU64::new(0),
+            priming: AtomicU64::new(0),
             shed: AtomicU64::new(0),
         })
     }
@@ -1121,7 +1145,7 @@ mod tests {
         // device and the OS did this — invisibly, and with no way to express a policy.
         let a = filled(vec![0.25; 8]);
         let b = filled(vec![0.5; 8]);
-        let mixed = mix_pass(&[a, b], 4, &Gain::default(), None);
+        let mixed = mix_pass(&[a, b], 4, &Gain::default(), None, None);
         assert_eq!(mixed, vec![0.75; 8]);
     }
 
@@ -1130,7 +1154,7 @@ mod tests {
         // Not a shortfall to correct: an input that has not produced yet *is* silence,
         // and stretching what it did produce would change its pitch.
         let short = filled(vec![1.0; 4]);
-        let mixed = mix_pass(&[short], 4, &Gain::default(), None);
+        let mixed = mix_pass(&[short], 4, &Gain::default(), None, None);
         assert_eq!(mixed, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
@@ -1140,7 +1164,7 @@ mod tests {
         // out-of-range f32 is anything from a clamp to a wrap depending on the backend.
         let a = filled(vec![0.8; 4]);
         let b = filled(vec![0.8; 4]);
-        let mixed = mix_pass(&[a, b], 2, &Gain::default(), None);
+        let mixed = mix_pass(&[a, b], 2, &Gain::default(), None, None);
         assert_eq!(mixed, vec![1.0; 4]);
     }
 
@@ -1153,7 +1177,7 @@ mod tests {
         gain.set(half_scale());
         let a = filled(vec![0.25; 4]);
         let b = filled(vec![0.25; 4]);
-        let mixed = mix_pass(&[a, b], 2, &gain, None);
+        let mixed = mix_pass(&[a, b], 2, &gain, None, None);
         for sample in mixed {
             assert!((sample - 0.25).abs() < 1e-4, "{sample}");
         }
@@ -1164,7 +1188,7 @@ mod tests {
         let gain = Gain::default();
         gain.set(Volume::from_dbfs(0.75f32.log10() * 20.0));
         gain.set_muted(true);
-        let mixed = mix_pass(&[filled(vec![1.0; 4])], 2, &gain, None);
+        let mixed = mix_pass(&[filled(vec![1.0; 4])], 2, &gain, None, None);
         assert_eq!(mixed, vec![0.0; 4]);
         assert!(
             (gain.level() - 0.75).abs() < 1e-4,
@@ -1189,7 +1213,7 @@ mod tests {
             "closed, but it still has audio in it"
         );
         // Drain it the way the mixer would.
-        let _ = mix_pass(&[Arc::clone(&state)], 480, &Gain::default(), None);
+        let _ = mix_pass(&[Arc::clone(&state)], 480, &Gain::default(), None, None);
         assert!(
             live_inputs(&shared).is_empty(),
             "closed and drained, so it should be gone"
@@ -1350,7 +1374,13 @@ mod tests {
         });
         // One packet's worth, far short of the reserve.
         state.ring.lock().unwrap().samples.extend(vec![1.0; 800]);
-        let mixed = mix_pass(&[Arc::clone(&state)], 240, &Gain::default(), Some(&starved));
+        let mixed = mix_pass(
+            &[Arc::clone(&state)],
+            240,
+            &Gain::default(),
+            Some(&starved),
+            None,
+        );
         assert_eq!(
             mixed,
             vec![0.0; 480],
@@ -1366,7 +1396,13 @@ mod tests {
         // Past the reserve, it plays.
         let banked = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
         state.ring.lock().unwrap().samples.extend(vec![1.0; banked]);
-        let mixed = mix_pass(&[Arc::clone(&state)], 240, &Gain::default(), Some(&starved));
+        let mixed = mix_pass(
+            &[Arc::clone(&state)],
+            240,
+            &Gain::default(),
+            Some(&starved),
+            None,
+        );
         assert_eq!(mixed, vec![1.0; 480], "primed, so the reserve is drawn on");
         assert!(state.ring.lock().unwrap().primed);
     }
@@ -1391,10 +1427,22 @@ mod tests {
             .samples
             .extend(vec![1.0; reserve]);
         // Prime.
-        let _ = mix_pass(&[Arc::clone(&state)], 1, &Gain::default(), Some(&starved));
+        let _ = mix_pass(
+            &[Arc::clone(&state)],
+            1,
+            &Gain::default(),
+            Some(&starved),
+            None,
+        );
         // Now three passes with nothing arriving at all, as happens between packets.
         for _ in 0..3 {
-            let mixed = mix_pass(&[Arc::clone(&state)], 240, &Gain::default(), Some(&starved));
+            let mixed = mix_pass(
+                &[Arc::clone(&state)],
+                240,
+                &Gain::default(),
+                Some(&starved),
+                None,
+            );
             assert!(
                 mixed.iter().all(|s| (*s - 1.0).abs() < 1e-6),
                 "the reserve has to cover a gap between packets: {mixed:?}"
@@ -1404,6 +1452,84 @@ mod tests {
             starved.load(Ordering::Relaxed),
             0,
             "nothing was invented; it came out of the bank"
+        );
+    }
+
+    /// Priming is silence and is counted as such, and an input primes exactly once.
+    ///
+    /// Both halves are corrections of the first attempt at this, and both were the reason
+    /// it made things worse rather than better. Re-priming on an empty ring sounds prudent
+    /// and is not: a live source hits empty routinely, so it replaced a sub-millisecond
+    /// hole with a [`PREBUFFER`]-long one, over and over. And exempting priming from the
+    /// counters meant all of that silence reported as `starved_pct=0.0` — the one number
+    /// that existed to catch it could not see it.
+    #[test]
+    fn priming_is_counted_and_happens_once() {
+        let starved = AtomicU64::new(0);
+        let priming = AtomicU64::new(0);
+        let state = Arc::new(InputState {
+            ring: Mutex::new(Ring::default()),
+            room: Condvar::new(),
+            backpressure: Backpressure::Live,
+        });
+        // A pass while it is still filling: silence, and said so.
+        let mixed = mix_pass(
+            &[Arc::clone(&state)],
+            240,
+            &Gain::default(),
+            Some(&starved),
+            Some(&priming),
+        );
+        assert_eq!(mixed, vec![0.0; 480]);
+        assert_eq!(
+            priming.load(Ordering::Relaxed),
+            240,
+            "silence has to be counted"
+        );
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            0,
+            "and attributed to the right cause"
+        );
+
+        // Bank the reserve and play it all out, so the ring ends empty.
+        let reserve = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
+        state
+            .ring
+            .lock()
+            .unwrap()
+            .samples
+            .extend(vec![1.0; reserve]);
+        while !state.ring.lock().unwrap().samples.is_empty() {
+            let _ = mix_pass(
+                &[Arc::clone(&state)],
+                240,
+                &Gain::default(),
+                Some(&starved),
+                Some(&priming),
+            );
+        }
+        let priming_before = priming.load(Ordering::Relaxed);
+
+        // Dry, and one packet arrives. It must play immediately rather than starting a
+        // fresh 60 ms of silence.
+        state.ring.lock().unwrap().samples.extend(vec![1.0; 8]);
+        let mixed = mix_pass(
+            &[Arc::clone(&state)],
+            4,
+            &Gain::default(),
+            Some(&starved),
+            Some(&priming),
+        );
+        assert_eq!(
+            mixed,
+            vec![1.0; 8],
+            "a primed input does not re-prime when it runs dry"
+        );
+        assert_eq!(
+            priming.load(Ordering::Relaxed),
+            priming_before,
+            "and nothing further is charged to priming"
         );
     }
 
@@ -1421,7 +1547,7 @@ mod tests {
             ring.samples.extend(vec![1.0; 8]);
             ring.closed = true;
         }
-        let mixed = mix_pass(&[state], 4, &Gain::default(), None);
+        let mixed = mix_pass(&[state], 4, &Gain::default(), None, None);
         assert_eq!(mixed, vec![1.0; 8], "the tail has to reach the speakers");
     }
 
@@ -1429,7 +1555,13 @@ mod tests {
     fn an_input_that_runs_dry_is_counted_and_not_only_padded() {
         let starved = AtomicU64::new(0);
         // Two frames offered against a four-frame pass.
-        let mixed = mix_pass(&[filled(vec![1.0; 4])], 4, &Gain::default(), Some(&starved));
+        let mixed = mix_pass(
+            &[filled(vec![1.0; 4])],
+            4,
+            &Gain::default(),
+            Some(&starved),
+            None,
+        );
         assert_eq!(mixed, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(
             starved.load(Ordering::Relaxed),
