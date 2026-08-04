@@ -179,6 +179,7 @@ fn enable_flag(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Spotify => "spotify",
         ProtocolKind::Bluetooth => "bluetooth",
         ProtocolKind::GameStream => "gamestream",
+        ProtocolKind::MatterCast => "matter",
     }
 }
 
@@ -193,6 +194,7 @@ fn flag_value(kind: ProtocolKind, enable: &Enable) -> bool {
         ProtocolKind::Spotify => enable.spotify,
         ProtocolKind::Bluetooth => enable.bluetooth,
         ProtocolKind::GameStream => enable.gamestream,
+        ProtocolKind::MatterCast => enable.matter,
     }
 }
 
@@ -421,6 +423,42 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
         // socket noted on the mDNS entry; the media plane dials out (moonlight ports,
         // outbound table).
         ProtocolKind::GameStream => vec![],
+        ProtocolKind::MatterCast => vec![
+            Listener {
+                owner: Owner::Protocol(kind),
+                transport: Transport::Udp,
+                port: PortSpec::Fixed(proto_matter::UDC_PORT),
+                bind: "0.0.0.0",
+                wire: "User Directed Commissioning: a phone's IdentificationDeclaration, \
+                       answered with a CommissionerDeclaration to the port it names",
+                security: "plaintext and unauthenticated by construction — UDC runs \
+                           before any session exists, and what protects it is that the \
+                           passcode it leads to is on the panel's own screen",
+                gate: Gate::AnyOf(&[ProtocolKind::MatterCast]),
+                provider: Provider::Process,
+                chosen_by: Provenance::Spec,
+                notes: "Five identical datagrams arrive per request, 100 ms apart, \
+                        because the message has no acknowledgement. The reply goes to \
+                        the cdPort the client names, which is this same number by \
+                        default but is the client's to choose.",
+            },
+            Listener {
+                owner: Owner::Protocol(kind),
+                transport: Transport::Udp,
+                port: PortSpec::Fixed(proto_matter::MATTER_PORT),
+                bind: "0.0.0.0",
+                wire: "the Matter operational node: PASE and CASE, then the interaction \
+                       model carrying ContentLauncher / MediaPlayback / ApplicationBasic",
+                security: "AES-CCM under a CASE session; the fabric's root of trust is \
+                           a certificate authority this panel generates and keeps",
+                gate: Gate::AnyOf(&[ProtocolKind::MatterCast]),
+                provider: Provider::Process,
+                chosen_by: Provenance::Spec,
+                notes: "Both roles run on this one socket, which is what Matter Casting \
+                        being inverted costs: the panel commissions the phone over it, \
+                        and then serves the phone's cluster invokes back over it.",
+            },
+        ],
     }
 }
 

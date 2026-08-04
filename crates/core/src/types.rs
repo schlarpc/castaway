@@ -35,6 +35,9 @@ pub enum ProtocolKind {
     /// GameStream / Sunshine client (Moonlight role) — the one protocol where the
     /// panel dials out to a host instead of being discovered by a sender.
     GameStream,
+    /// Matter Casting — the Casting Video Player role. The one protocol where the panel
+    /// is the *commissioner*: a phone joins a fabric we administer before it can speak.
+    MatterCast,
 }
 
 impl ProtocolKind {
@@ -43,7 +46,7 @@ impl ProtocolKind {
     /// Adding a variant fails the exhaustive matches over this enum first (the
     /// registry's among them, `crates/app/src/surface.rs`); update this list in the
     /// same change — `all_lists_every_variant` below holds you to the count.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AirPlay,
         Self::Cast,
         Self::Miracast,
@@ -52,6 +55,7 @@ impl ProtocolKind {
         Self::Spotify,
         Self::Bluetooth,
         Self::GameStream,
+        Self::MatterCast,
     ];
 
     /// A short, stable, lowercase identifier used in logs and source ids.
@@ -68,6 +72,9 @@ impl ProtocolKind {
             ProtocolKind::Spotify => "spotify",
             ProtocolKind::Bluetooth => "bluetooth",
             ProtocolKind::GameStream => "gamestream",
+            // "matter", not "matter-cast": the panel speaks one Matter role and the
+            // shorter word is what a person reads in a picker.
+            ProtocolKind::MatterCast => "matter",
         }
     }
 }
@@ -604,12 +611,13 @@ mod tests {
             | ProtocolKind::YouTubeLounge
             | ProtocolKind::Spotify
             | ProtocolKind::Bluetooth
-            | ProtocolKind::GameStream => (),
+            | ProtocolKind::GameStream
+            | ProtocolKind::MatterCast => (),
         };
         for kind in ProtocolKind::ALL {
             noted(kind);
         }
-        assert_eq!(ProtocolKind::ALL.len(), 8);
+        assert_eq!(ProtocolKind::ALL.len(), 9);
         // No duplicates: every slug appears once.
         let mut slugs: Vec<_> = ProtocolKind::ALL.iter().map(|k| k.slug()).collect();
         slugs.sort_unstable();

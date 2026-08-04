@@ -935,6 +935,11 @@ pub struct Enable {
     /// §7.5). Fine with Ethernet upstream; turn it off if the radio is the uplink.
     /// A radio that can't do P2P group-owner logs and skips.
     pub miracast: bool,
+    /// Matter Casting (the Casting Video Player role): UDC on 5550, and the operational
+    /// node on 5540. Costs two idle UDP sockets and an mDNS record until a phone asks to
+    /// be commissioned, so it stays on — but note that a phone commissioned here joins a
+    /// fabric this panel administers, and stays on it across restarts.
+    pub matter: bool,
 }
 
 impl Default for Enable {
@@ -948,6 +953,7 @@ impl Default for Enable {
             bluetooth: true,
             gamestream: true,
             miracast: true,
+            matter: true,
         }
     }
 }

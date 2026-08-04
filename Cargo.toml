@@ -26,6 +26,7 @@ members = [
     "crates/proto-airplay",
     "crates/proto-dial",
     "crates/proto-miracast",
+    "crates/proto-matter",
     "crates/moonlight-sys",
     "crates/ldac-sys",
     "crates/proto-gamestream",
@@ -71,6 +72,7 @@ proto-cast = { path = "crates/proto-cast" }
 proto-airplay = { path = "crates/proto-airplay" }
 proto-dial = { path = "crates/proto-dial" }
 proto-miracast = { path = "crates/proto-miracast" }
+proto-matter = { path = "crates/proto-matter" }
 moonlight-sys = { path = "crates/moonlight-sys" }
 ldac-sys = { path = "crates/ldac-sys" }
 proto-gamestream = { path = "crates/proto-gamestream" }
@@ -171,6 +173,21 @@ crypto_secretbox = "0.2.0-pre.0"
 hmac = "0.12"
 hkdf = "0.12"
 rand = "0.10"
+
+# --- matter ---
+# The Matter core, linked rather than reimplemented (DECISION-LOG D54): TLV, MRP,
+# PASE/CASE both ways round, the interaction model, and the certificate handling, plus
+# every cluster in the CSA 1.5.1 IDL generated at build time — the media clusters among
+# them. Apache-2.0, pure Rust, and maintained by project-chip, who also write the spec.
+#
+# Default features less `os`: that one exists to hand the crate a smol reactor, its own
+# UDP sockets and its own mDNS responder, and this project has exactly one of each
+# already (D26/D45). `embassy-time` and `critical-section` are named directly because
+# `os` is where they would otherwise have picked up their `std` implementations, and
+# without those the MRP retransmit timer has no clock.
+rs-matter = { version = "0.2", default-features = false, features = ["std", "rustcrypto", "log"] }
+embassy-time = { version = "0.5", features = ["std"] }
+critical-section = { version = "1.1", features = ["std"] }
 
 # --- spotify ---
 # The one protocol we do NOT reimplement (DECISION-LOG D30). Spotify Connect is a cloud

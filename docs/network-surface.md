@@ -23,6 +23,8 @@
 | 1028 (`miracast.rtp_port`) | udp | miracast | MPEG2-TS over RTP from the source | plaintext RTP; WPA2 protects the P2P link at layer 2 | enable.miracast | convention |
 | 7250 | tcp | miracast | [MS-MICE] control channel: the source says where its RTSP listener is, and the sink dials it | plaintext; Windows will not attempt MICE over a WLAN without WPA2 link-layer security, and the DTLS and PIN flows are neither advertised nor served | enable.miracast | spec |
 | 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (#45) | plaintext | enable.miracast | spec |
+| 5550 | udp | matter | User Directed Commissioning: a phone's IdentificationDeclaration, answered with a CommissionerDeclaration to the port it names | plaintext and unauthenticated by construction — UDC runs before any session exists, and what protects it is that the passcode it leads to is on the panel's own screen | enable.matter | spec |
+| 5540 | udp | matter | the Matter operational node: PASE and CASE, then the interaction model carrying ContentLauncher / MediaPlayback / ApplicationBasic | AES-CCM under a CASE session; the fabric's root of trust is a certificate authority this panel generates and keeps | enable.matter | spec |
 
 **Chosen by** answers "could we move this port?", in three tiers:
 
@@ -45,6 +47,8 @@ Notes, per listener that has one:
 - **1028 (`miracast.rtp_port`)/udp (miracast)** — binds 0.0.0.0 (traffic arrives on the P2P group interface). Advertised in M3 and echoed in SETUP; bound before M3 is sent. The RTSP control plane is outbound — the sink dials the source's 7236, so there is no TCP listener for it. The one below is MICE's, which is a different plane.
 - **7250/tcp (miracast)** — binds 0.0.0.0 (this is the ordinary LAN, not a P2P group). Fixed by [MS-MICE] §1.9 and not IANA-registered despite the spec citing IANAPORT — 7236 is, 7250 is not. Off when [miracast] infrastructure = false (#166).
 - **67/udp (miracast)** — binds the P2P group interface. As group owner we must address the peer. The rule is not interface-scoped because the group interface (p2p-*-N) does not exist until the group forms.
+- **5550/udp (matter)** — binds 0.0.0.0. Five identical datagrams arrive per request, 100 ms apart, because the message has no acknowledgement. The reply goes to the cdPort the client names, which is this same number by default but is the client's to choose.
+- **5540/udp (matter)** — binds 0.0.0.0. Both roles run on this one socket, which is what Matter Casting being inverted costs: the panel commissions the phone over it, and then serves the phone's cluster invokes back over it.
 
 ## Multicast groups
 

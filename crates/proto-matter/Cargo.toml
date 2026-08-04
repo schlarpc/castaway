@@ -1,0 +1,23 @@
+[package]
+name = "proto-matter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Matter Casting receiver: the Casting Video Player role — UDC, the fabric we administer, and the media clusters a Casting Client invokes."
+
+[dependencies]
+castaway-core.workspace = true
+substrate-mdns.workspace = true
+rs-matter.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros", "net", "time"] }
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time", "net"] }
+
+[lints]
+workspace = true
