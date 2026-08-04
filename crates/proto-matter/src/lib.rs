@@ -27,12 +27,17 @@
 //! - [`adapter`] — the actor, the sockets, and the mDNS records, on our one responder.
 #![forbid(unsafe_code)]
 
+pub mod adapter;
+pub mod discovery;
 pub mod error;
 pub mod fabric;
+pub mod net;
 pub mod node;
 pub mod player;
+pub mod server;
 pub mod udc;
 
+pub use adapter::{BrowserLaunch, MatterAdapter, MatterConfig};
 pub use error::{MatterError, UdcError};
 pub use player::{CastCommand, Catalogue, ContentApp, LaunchTarget, PlayerState, Surface};
 
