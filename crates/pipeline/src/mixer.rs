@@ -1046,6 +1046,86 @@ mod tests {
         );
     }
 
+    /// A source that needs resampling is drained at *its own* rate, in real time.
+    ///
+    /// The test above establishes the pacing at [`RATE`], where no conversion happens. This
+    /// is the same property one layer out, and it is the one a phone exercises: A2DP is
+    /// 44.1 kHz, so every block goes through [`Convert`] before it reaches the ring, and
+    /// the contract is that the input still accepts 44 100 frames per second of wall clock.
+    ///
+    /// Why it has to hold rather than merely being nice: [`MixInput::write`] parks until
+    /// this source is under [`LEAD`] ahead of the speakers, which is flow control for a
+    /// file and a fiction for a radio. A phone cannot be slowed down, so whatever this
+    /// declines to accept is dropped further up — at the A2DP queue, where the unit of loss
+    /// is an encoded packet and the sound of it is corruption rather than a gap. A deficit
+    /// here does not show up as "slightly behind"; it shows up as an upstream queue that
+    /// fills once and then never drains, which is both a permanent drop rate and a
+    /// permanent latency floor of however deep that queue is.
+    ///
+    /// Measured two ways, because they fail differently and neither alone is convincing:
+    /// what the input accepted per second of wall clock, and how much of what reached the
+    /// device carried audio rather than the silence the mixer pads a starved input with.
+    #[test]
+    fn a_source_that_needs_resampling_is_drained_in_real_time() {
+        const SOURCE_RATE: u32 = 44_100;
+        /// One AAC frame, which is what an A2DP packet carries.
+        const BLOCK: usize = 1024;
+        /// Long enough to fill the budget and open the device, so what follows is steady
+        /// state rather than the ring filling.
+        const WARMUP: Duration = Duration::from_millis(1000);
+        const WINDOW: Duration = Duration::from_millis(2000);
+
+        let device = Recorder::new();
+        let mixer = mixer_with(&device);
+        let mut input = mixer.input();
+        input.format(SOURCE_RATE, CHANNELS).unwrap();
+        let block = PcmBlock {
+            sample_rate: SOURCE_RATE,
+            channels: CHANNELS,
+            samples: vec![0.5; BLOCK * usize::from(CHANNELS)],
+            pts: Duration::ZERO,
+        };
+
+        let warm_until = Instant::now() + WARMUP;
+        while Instant::now() < warm_until {
+            input.write(&block).unwrap();
+        }
+
+        let from = device.heard.lock().unwrap().len();
+        let started = Instant::now();
+        let mut accepted = 0u64;
+        while started.elapsed() < WINDOW {
+            input.write(&block).unwrap();
+            accepted += BLOCK as u64;
+        }
+        let elapsed = started.elapsed();
+        let heard = device.heard.lock().unwrap()[from..].to_vec();
+
+        let rate = accepted as f64 / elapsed.as_secs_f64();
+        let frames = heard.chunks_exact(usize::from(CHANNELS));
+        let total = frames.len();
+        let audible = frames.filter(|f| f.iter().any(|s| *s != 0.0)).count();
+        let carried = audible as f64 / total as f64;
+        println!(
+            "accepted {rate:.0} frames/s of {SOURCE_RATE} ({:.1}%); \
+             {audible}/{total} device frames carried audio ({:.1}%)",
+            rate / f64::from(SOURCE_RATE) * 100.0,
+            carried * 100.0,
+        );
+
+        assert!(
+            rate > f64::from(SOURCE_RATE) * 0.97,
+            "the input accepted {rate:.0} frames/s of a {SOURCE_RATE} Hz source; \
+             a live sender's queue fills at the difference and never drains again"
+        );
+        assert!(
+            carried > 0.97,
+            "only {:.1}% of what reached the device carried audio; \
+             the mixer is padding a starved input with silence",
+            carried * 100.0
+        );
+    }
+
     #[test]
     fn a_box_with_no_device_still_drains_its_sources_in_real_time() {
         // #55's shape: the sink goes away and the session must carry on rather than wedge.
