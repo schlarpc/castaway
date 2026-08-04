@@ -182,6 +182,11 @@ struct Ring {
     /// normalisation. Reset by [`Analyzer::bands`] so it describes *recent* audio rather
     /// than the loudest moment of the session.
     peak: f32,
+    /// When audio above [`SILENCE`] last arrived, from the mixer's clock.
+    ///
+    /// Kept here rather than derived from the bars because this side keeps being written
+    /// whether or not anything reads it — see [`Analyzer::is_sounding`].
+    last_sound: Option<Instant>,
 }
 
 impl Ring {
@@ -232,6 +237,7 @@ impl Analyzer {
                 samples: Box::new([0.0; WINDOW]),
                 head: 0,
                 peak: 0.0,
+                last_sound: None,
             }),
             state: Mutex::new(Smoothed {
                 bands: Bands::SILENT,
@@ -292,15 +298,48 @@ impl Analyzer {
     }
 }
 
+/// How long after the last audible sample the bars are still worth waking for.
+///
+/// The gap between two tracks, roughly. Long enough that a track change does not put the
+/// loop to sleep and strand the bars, short enough that a session parked on a paused track
+/// stops costing 30 frames a second (#59).
+const LINGER: Duration = Duration::from_secs(1);
+
+impl Analyzer {
+    /// Whether audio has been heard recently enough that the bars should be drawn.
+    ///
+    /// Answered from the *mixer's* side of the tap, which is the whole point: it keeps
+    /// being updated whether or not the render loop wakes. Deciding this from the last
+    /// [`Analyzer::bands`] reading instead is self-latching — one silent reading removes the
+    /// only reason the loop had to wake for the bars, so nothing re-reads them and they
+    /// stay gone until something unrelated happens to wake it. That measured at about two
+    /// frames a second.
+    #[must_use]
+    pub fn is_sounding(&self, now: Instant) -> bool {
+        let Ok(ring) = self.ring.lock() else {
+            return false;
+        };
+        ring.last_sound
+            .is_some_and(|at| now.saturating_duration_since(at) < LINGER)
+    }
+}
+
 impl MixTap for Analyzer {
-    fn mixed(&self, _at: Instant, stereo: &[f32]) {
+    fn mixed(&self, at: Instant, stereo: &[f32]) {
         let Ok(mut ring) = self.ring.lock() else {
             return;
         };
         // A copy and nothing else. See the module docs: this is the mixer thread, and the
-        // decode threads behind it stall on how long it takes.
+        // decode threads behind it stall on how long it takes. The one extra comparison
+        // per frame is what lets the loop know the bars are worth waking for.
+        let mut loudest = 0.0f32;
         for frame in stereo.chunks_exact(usize::from(crate::mixer::CHANNELS)) {
-            ring.push((frame[0] + frame[1]) * 0.5);
+            let mono = (frame[0] + frame[1]) * 0.5;
+            loudest = loudest.max(mono.abs());
+            ring.push(mono);
+        }
+        if loudest > SILENCE {
+            ring.last_sound = Some(at);
         }
     }
 }
@@ -384,6 +423,52 @@ fn fade(colour: Rgba, alpha: f32) -> Rgba {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let a = (f32::from(colour[3]) * alpha.clamp(0.0, 1.0)).round() as u8;
     [colour[0], colour[1], colour[2], a]
+}
+
+#[cfg(test)]
+mod wake_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::mixer::MixTap;
+
+    fn stereo(value: f32, frames: usize) -> Vec<f32> {
+        vec![value; frames * usize::from(crate::mixer::CHANNELS)]
+    }
+
+    /// Audible samples make the bars worth waking for, and the answer comes from the tap.
+    ///
+    /// The regression this exists for is self-latching, so it cannot be written against
+    /// the bars: deciding "should the loop wake" from the last `bands` reading meant one
+    /// silent reading removed the only reason to wake, and nothing re-read it. This asserts
+    /// the answer against the *mixer's* side, which keeps being written either way.
+    #[test]
+    fn audible_audio_is_what_asks_for_a_frame() {
+        let a = Analyzer::new();
+        let t0 = Instant::now();
+        assert!(!a.is_sounding(t0), "nothing has arrived yet");
+
+        a.mixed(t0, &stereo(0.5, 256));
+        assert!(a.is_sounding(t0), "audio arrived, so the bars want frames");
+
+        // Reading the bars must not change the answer — that coupling is the bug.
+        let _ = a.bands(t0);
+        assert!(
+            a.is_sounding(t0),
+            "asking for the bars cannot stop them being asked for"
+        );
+
+        // And it lapses on its own once the audio stops, so an idle panel sleeps (#59).
+        assert!(!a.is_sounding(t0 + LINGER + Duration::from_millis(1)));
+    }
+
+    /// Silence arriving is not audio arriving.
+    #[test]
+    fn a_stream_of_silence_does_not_hold_the_loop_awake() {
+        let a = Analyzer::new();
+        let t0 = Instant::now();
+        a.mixed(t0, &stereo(0.0, 256));
+        assert!(!a.is_sounding(t0));
+    }
 }
 
 #[cfg(test)]

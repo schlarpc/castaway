@@ -2904,6 +2904,7 @@ impl RenderLoop {
             self.video_clear_due,
             self.card_clear_due,
             self.transport_due(now),
+            self.visualizer_due(now),
             self.home_return_due(now),
             self.osd
                 .as_ref()
@@ -2913,6 +2914,37 @@ impl RenderLoop {
         .flatten()
         .min()
         .map_or(Demand::Idle, Demand::At)
+    }
+
+    /// When the bars next want a frame.
+    ///
+    /// Derived from whether *audio is arriving*, which the mixer's tap keeps answering
+    /// whether or not this loop wakes — never from the last set of bars this loop drew.
+    /// That was the bug: `tick_visualizer` returning `None` on a silent reading removed the
+    /// only reason the loop had to wake for the bars, so nothing re-read them and they
+    /// stayed gone until unrelated business happened to wake it. Measured at about two
+    /// frames a second on a session that was playing perfectly well.
+    ///
+    /// Structural rather than stateful, for the same reason `home_return_due` is: nothing
+    /// arms this and nothing cancels it. Audio stops arriving and the answer stops
+    /// existing, which is what lets an idle panel sleep (#59).
+    #[cfg(all(feature = "audio", feature = "render"))]
+    fn visualizer_due(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        use crate::panel::Surface;
+        let analyzer = self.visualizer.as_ref()?;
+        if !self.compositor.has_layer(LayerId::NowPlaying)
+            || self.panel.placement(Surface::Card).is_widget()
+        {
+            return None;
+        }
+        analyzer
+            .is_sounding(now)
+            .then(|| now + crate::visualizer::FRAME_INTERVAL)
+    }
+
+    #[cfg(not(all(feature = "audio", feature = "render")))]
+    fn visualizer_due(&self, _now: std::time::Instant) -> Option<std::time::Instant> {
+        None
     }
 
     /// When the transport strip next changes what it shows.
