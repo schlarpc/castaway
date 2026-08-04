@@ -117,6 +117,21 @@ const IDLE_CLOSE: Duration = Duration::from_secs(5);
 /// How often the mixer retries a device it could not open, or that failed.
 const REOPEN_AFTER: Duration = Duration::from_secs(1);
 
+/// How much a live input banks before the mixer starts drawing on it.
+///
+/// The jitter buffer this path did not have (#175). A source arriving in ordinary,
+/// well-behaved packets — 8 ms of ALAC, 23 ms of AAC — still delivers in lumps, while the
+/// mixer tops the device up whenever it has room, several times per packet. Without a
+/// reserve every pass falling between two packets finds the ring empty and emits silence,
+/// so the output is real audio and holes interleaved at sub-millisecond granularity. That
+/// measured at ~100% of the output on a session the protocol said was arriving perfectly.
+///
+/// Bigger than the largest packet any live source sends, and small beside [`LEAD`]: this is
+/// spent out of the same budget, and #111 deliberately spent that budget on letting a source
+/// run *ahead*. Only [`Backpressure::Live`] inputs prime — a pull source is kept full by the
+/// writer parking, so it has no jitter to absorb and priming it would only add latency.
+const PREBUFFER: Duration = Duration::from_millis(60);
+
 /// How often the mixer says what the speakers did not get.
 ///
 /// Matches the AirPlay diagnostics cadence deliberately, so the two lines can be read
@@ -296,10 +311,19 @@ struct InputState {
     ring: Mutex<Ring>,
     /// Signalled by the mixer after it drains, and by [`InputState::close`].
     room: Condvar,
+    /// Whether this source can be told to wait, which is also what decides whether it
+    /// primes. The mixer thread needs it and only sees this half of the input.
+    backpressure: Backpressure,
 }
 
 #[derive(Debug, Default)]
 struct Ring {
+    /// Whether this input has banked [`PREBUFFER`] and is being drawn on.
+    ///
+    /// False until it first fills, and false again if it ever runs dry — a source that has
+    /// fallen behind has to rebuild its reserve, because resuming on empty just returns to
+    /// emitting a hole between every packet.
+    primed: bool,
     /// Interleaved [`CHANNELS`]-channel [`RATE`] audio waiting to be mixed.
     samples: VecDeque<f32>,
     /// The [`MixInput`] is gone. The mixer plays out what is left, then retires this.
@@ -613,6 +637,7 @@ impl AudioMixer {
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
+            backpressure,
         });
         if let Ok(mut inputs) = self.shared.inputs.lock() {
             inputs.push(Arc::clone(&state));
@@ -859,6 +884,16 @@ fn mix_pass(
         let Ok(mut ring) = input.ring.lock() else {
             continue;
         };
+        // Still filling its reserve, so it contributes silence and says nothing about it:
+        // this is the buffer working, not the starvation the counter exists to show. A
+        // closed input never primes — what is left in it is all there will ever be, and
+        // waiting for more would truncate the last moment of every session.
+        if input.backpressure == Backpressure::Live && !ring.closed && !ring.primed {
+            if (ring.samples.len() / usize::from(CHANNELS)) < frames_in(PREBUFFER) as usize {
+                continue;
+            }
+            ring.primed = true;
+        }
         // Rounded down to a whole frame: taking an odd number of samples would swap this
         // input's channels for the rest of the session, which is the kind of fault that
         // sounds like "something is subtly wrong with the stereo" and never gets found.
@@ -879,6 +914,11 @@ fn mix_pass(
             if short > 0 {
                 starved.fetch_add(short as u64, Ordering::Relaxed);
             }
+        }
+        // Ran dry despite the reserve. Rebuild it rather than carrying on empty, which is
+        // the state this whole mechanism exists to leave.
+        if ring.primed && ring.samples.is_empty() && !ring.closed {
+            ring.primed = false;
         }
         drop(ring);
         input.room.notify_all();
@@ -1043,10 +1083,14 @@ mod tests {
     fn filled(samples: Vec<f32>) -> Arc<InputState> {
         Arc::new(InputState {
             ring: Mutex::new(Ring {
+                // Already playing: every existing test means "an input with audio in it",
+                // and priming is a separate property with its own tests below.
+                primed: true,
                 samples: samples.into(),
                 closed: false,
             }),
             room: Condvar::new(),
+            backpressure: Backpressure::Pull,
         })
     }
 
@@ -1295,6 +1339,92 @@ mod tests {
     /// contributes silence, because the alternative is stretching what it did produce and
     /// changing its pitch. What was missing is that it left no trace: no counter, no
     /// warning, so an input running dry for minutes read exactly like one playing.
+    /// A live input banks a reserve before it is drawn on, and is not called starved for it.
+    #[test]
+    fn a_live_input_primes_before_it_is_mixed() {
+        let starved = AtomicU64::new(0);
+        let state = Arc::new(InputState {
+            ring: Mutex::new(Ring::default()),
+            room: Condvar::new(),
+            backpressure: Backpressure::Live,
+        });
+        // One packet's worth, far short of the reserve.
+        state.ring.lock().unwrap().samples.extend(vec![1.0; 800]);
+        let mixed = mix_pass(&[Arc::clone(&state)], 240, &Gain::default(), Some(&starved));
+        assert_eq!(
+            mixed,
+            vec![0.0; 480],
+            "still filling, so it contributes nothing"
+        );
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            0,
+            "priming is the buffer working, not the fault the counter reports"
+        );
+        assert!(!state.ring.lock().unwrap().primed);
+
+        // Past the reserve, it plays.
+        let banked = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
+        state.ring.lock().unwrap().samples.extend(vec![1.0; banked]);
+        let mixed = mix_pass(&[Arc::clone(&state)], 240, &Gain::default(), Some(&starved));
+        assert_eq!(mixed, vec![1.0; 480], "primed, so the reserve is drawn on");
+        assert!(state.ring.lock().unwrap().primed);
+    }
+
+    /// The reserve is what a source arriving in packets needs, and the point of the whole
+    /// mechanism: a pass falling between two packets draws on the bank instead of punching
+    /// a hole. Without priming this same sequence is silence in every gap — which measured
+    /// at ~100% of the output on a real session (#175).
+    #[test]
+    fn a_primed_input_covers_the_gap_between_two_packets() {
+        let starved = AtomicU64::new(0);
+        let state = Arc::new(InputState {
+            ring: Mutex::new(Ring::default()),
+            room: Condvar::new(),
+            backpressure: Backpressure::Live,
+        });
+        let reserve = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
+        state
+            .ring
+            .lock()
+            .unwrap()
+            .samples
+            .extend(vec![1.0; reserve]);
+        // Prime.
+        let _ = mix_pass(&[Arc::clone(&state)], 1, &Gain::default(), Some(&starved));
+        // Now three passes with nothing arriving at all, as happens between packets.
+        for _ in 0..3 {
+            let mixed = mix_pass(&[Arc::clone(&state)], 240, &Gain::default(), Some(&starved));
+            assert!(
+                mixed.iter().all(|s| (*s - 1.0).abs() < 1e-6),
+                "the reserve has to cover a gap between packets: {mixed:?}"
+            );
+        }
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            0,
+            "nothing was invented; it came out of the bank"
+        );
+    }
+
+    /// An input that closes plays out what it has rather than waiting for a reserve that
+    /// is never coming — otherwise the last moment of every session is truncated.
+    #[test]
+    fn a_closing_input_plays_out_without_priming() {
+        let state = Arc::new(InputState {
+            ring: Mutex::new(Ring::default()),
+            room: Condvar::new(),
+            backpressure: Backpressure::Live,
+        });
+        {
+            let mut ring = state.ring.lock().unwrap();
+            ring.samples.extend(vec![1.0; 8]);
+            ring.closed = true;
+        }
+        let mixed = mix_pass(&[state], 4, &Gain::default(), None);
+        assert_eq!(mixed, vec![1.0; 8], "the tail has to reach the speakers");
+    }
+
     #[test]
     fn an_input_that_runs_dry_is_counted_and_not_only_padded() {
         let starved = AtomicU64::new(0);
