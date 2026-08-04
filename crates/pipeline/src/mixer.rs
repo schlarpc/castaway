@@ -44,6 +44,63 @@
 //! speakers by [`LEAD`] and no more. Bounding only the ring would have added the device's
 //! own queue on top, and every media-URL cast would have played its video that much early.
 //!
+//! Three budgets live near each other here and belong to three different owners — mixing
+//! them up cost most of a day on #175. [`LEAD`] is the *media clock's* invariant, enforced
+//! where a paced writer parks. [`LIVE_BUDGET`] is a *jitter and burst allowance* for a
+//! sender that is its own clock and answers to no media clock at all. [`DEVICE_LEAD`] and
+//! [`DEVICE_FLOOR`] are the *sound card's*: how much the mixer keeps between itself and
+//! the device callback.
+//!
+//! ## Silence is invented in exactly one place
+//!
+//! The drain loop cannot ask for more than the scarcest input has. A pass either takes
+//! what every contributing input can actually supply ([`Pass::Take`]), or — only when the
+//! device is within [`DEVICE_FLOOR`] of running dry — emits a backstop pass that pads the
+//! shortfall ([`Pass::Backstop`]). That is the whole policy, and it is the load-bearing
+//! change of #175.
+//!
+//! The first drain loop did the opposite: it topped the device up to [`DEVICE_LEAD`]
+//! whenever it had room, several passes per arriving packet, padding every input that
+//! could not fill the pass. Against a source that delivers in packets — 8 ms of ALAC,
+//! 23 ms of AAC — that *invented silence ahead of the deadline*, interleaving holes into a
+//! stream that was arriving perfectly (#174's baseline defect). Two mechanisms were then
+//! stacked on top to pay for it (a prebuffer, prime-once) and each changed the shape of
+//! the failure rather than removing it, because eager padding was still underneath. Here
+//! the defect is unrepresentable: a `Take` pass has no silence in it *by construction*,
+//! and every frame of invented silence is a `Backstop` pass defending the floor — counted,
+//! and attributed.
+//!
+//! A shortfall in a backstop pass is padded at the *front* of the pass, not the back. The
+//! difference is what it does to the stream: front padding pushes this input's audio later
+//! — adding latency, once — where back padding would cut a hole into it. A source that
+//! starts slow therefore *defers* rather than stutters. That is not hypothetical: every
+//! AirPlay sender measured on #175 delivered ~20–45% of real time for its first five
+//! seconds and exactly real time after, with `sender_latency_frames=77175` declaring that
+//! it intends the receiver to sit 1.75 s behind. Front padding banks precisely the deficit
+//! the ramp creates, which is the buffer the sender expected us to hold. (Reading the
+//! declared figure and reclaiming the latency deliberately is the timing-model work, not
+//! this.)
+//!
+//! ## What silence means: [`Supply`]
+//!
+//! The old loop had one `if` and one counter where there were four different states, and
+//! that conflation produced most of #175's wrong diagnoses — a browser input that had
+//! played a page once and gone quiet read as a source starving at 100%, sustained, for
+//! every minute of every session after it (measured twice, in two runs, before it was
+//! recognised). Each pass now classifies every input, and the classification is an enum
+//! the compiler makes this module handle:
+//!
+//! - [`Supply::Surface`] — never fed. A surface that *might* make a sound; the browser
+//!   holds one for the life of the panel. Owes no explanation, gets no counter.
+//! - [`Supply::Flowing`] — fed, and either has audio or went empty so recently it is
+//!   between packets. What it has constrains the pass; a shortfall against it is real
+//!   starvation.
+//! - [`Supply::Quiescent`] — fed once, empty, and nothing has arrived for
+//!   [`STALE_AFTER`]. A paused phone, a page that stopped playing. Genuinely silent:
+//!   contributes silence, constrains nothing, and is counted as `idle`, not `starved`.
+//! - [`Supply::Tail`] — closed. What is in it is all there will ever be; it plays out at
+//!   device pace and the end of it is the end of a session, not a fault.
+//!
 //! ## The device is the mixer's problem, not a session's
 //!
 //! A session cannot see a device error, because it no longer holds a device. When the sink
@@ -90,12 +147,21 @@ pub const CHANNELS: u16 = 2;
 /// drift into lip sync quietly off by the difference.
 pub const LEAD: Duration = crate::clock::OUTPUT_LEAD;
 
-/// How much audio the mixer keeps queued at the device.
+/// The most audio the mixer keeps queued at the device.
 ///
 /// The rest of [`LEAD`] lives in the inputs' rings. Big enough that an ordinary scheduling
 /// hiccup on the mixer thread does not reach the device callback as a dropout, small
 /// enough to leave most of the budget where backpressure can act on it.
 const DEVICE_LEAD: Duration = Duration::from_millis(100);
+
+/// The least audio the mixer lets the device hold while anything might play.
+///
+/// This is the deadline, and defending it is the *only* thing that may put silence into
+/// the mix: a [`Pass::Backstop`] runs when the device's queue decays to here and nothing
+/// supply-driven has topped it up. Between the floor and [`DEVICE_LEAD`] is the slack a
+/// late packet spends silently — a delivery gap shorter than the difference never reaches
+/// the speakers at all.
+const DEVICE_FLOOR: Duration = Duration::from_millis(50);
 
 /// The most audio one mixer pass will produce.
 ///
@@ -104,7 +170,7 @@ const DEVICE_LEAD: Duration = Duration::from_millis(100);
 /// which a newly arrived input starts being heard.
 const QUANTUM: Duration = Duration::from_millis(10);
 
-/// How long the mixer sleeps when the device is full enough and there is nothing to do.
+/// How long the mixer sleeps when there is nothing to take and no floor to defend.
 const IDLE_POLL: Duration = Duration::from_millis(5);
 
 /// How long the device stays open with no inputs.
@@ -138,20 +204,18 @@ const REOPEN_AFTER: Duration = Duration::from_secs(1);
 /// timing-model work (`clock_samples=0`), not this.
 const LIVE_BUDGET: Duration = Duration::from_secs(2);
 
-/// How much a live input banks before the mixer starts drawing on it.
+/// How long an empty input is still treated as between packets.
 ///
-/// The jitter buffer this path did not have (#175). A source arriving in ordinary,
-/// well-behaved packets — 8 ms of ALAC, 23 ms of AAC — still delivers in lumps, while the
-/// mixer tops the device up whenever it has room, several times per packet. Without a
-/// reserve every pass falling between two packets finds the ring empty and emits silence,
-/// so the output is real audio and holes interleaved at sub-millisecond granularity. That
-/// measured at ~100% of the output on a session the protocol said was arriving perfectly.
+/// The line between [`Supply::Flowing`] and [`Supply::Quiescent`], and it has to be a
+/// timescale because nothing else distinguishes them: a phone that paused and a phone
+/// whose next packet is 8 ms out look identical at the instant the ring is empty. Longer
+/// than any inter-packet gap a live source produces (23 ms for A2DP AAC, less for
+/// everything else) plus the delivery jitter on top; short enough that one source pausing
+/// does not hold the whole mix at the floor for long.
 ///
-/// Bigger than the largest packet any live source sends, and small beside [`LEAD`]: this is
-/// spent out of the same budget, and #111 deliberately spent that budget on letting a source
-/// run *ahead*. Only [`Backpressure::Live`] inputs prime — a pull source is kept full by the
-/// writer parking, so it has no jitter to absorb and priming it would only add latency.
-const PREBUFFER: Duration = Duration::from_millis(60);
+/// Structural rather than stateful, like `is_sounding`: nothing arms it and nothing
+/// cancels it — the answer falls out of a timestamp the writer was setting anyway.
+const STALE_AFTER: Duration = Duration::from_millis(250);
 
 /// How often the mixer says what the speakers did not get.
 ///
@@ -272,11 +336,6 @@ pub trait MixTap: Send + Sync {
     fn mixed(&self, at: Instant, stereo: &[f32]);
 }
 
-/// One source's way into the mix.
-///
-/// Created per session from [`AudioMixer::input`], and removed from the mix when dropped.
-/// Replaces the `Box<dyn AudioOut>` a session used to own: a session no longer has a
-/// device, and cannot be handed one by mistake.
 /// What a source does when the mix has no room for it.
 ///
 /// Not a tuning knob — it is the answer to "can anything upstream be told to wait", and
@@ -287,6 +346,10 @@ pub trait MixTap: Send + Sync {
 /// The distinction was already written down in this codebase before it was enforced:
 /// `audio_session::PacedSession` is present exactly when *we* are the player and absent
 /// exactly when "the sender is the clock".
+///
+/// Read in exactly one place — [`MixInput::enqueue`], the write-side boundary. The drain
+/// side never consults it: how an input is mixed falls out of [`Supply`], which both kinds
+/// of source share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backpressure {
     /// Park until there is room.
@@ -298,17 +361,22 @@ pub enum Backpressure {
     ///
     /// The only honest answer for a sender that is its own clock — a phone on A2DP or
     /// AirPlay, Spotify, a browser page. Nothing here can slow it down, so audio in excess
-    /// of [`LEAD`] is going to be lost whatever this returns; all this decides is *where*.
-    /// Shedding it here costs a click. Refusing it pushes the loss up into the protocol's
-    /// own queue, where the unit is an encoded packet — a decoder desync rather than a gap
-    /// — and where a queue that fills once never drains again, because it can only drain
-    /// at real time. That queue is seconds deep, so it also becomes a permanent latency
-    /// floor. See #111 and the regression it caused.
+    /// of its budget is going to be lost whatever this returns; all this decides is
+    /// *where*. Shedding it here costs a click. Refusing it pushes the loss up into the
+    /// protocol's own queue, where the unit is an encoded packet — a decoder desync rather
+    /// than a gap — and where a queue that fills once never drains again, because it can
+    /// only drain at real time. That queue is seconds deep, so it also becomes a permanent
+    /// latency floor. See #111 and the regression it caused.
     Live,
 }
 
+/// One source's way into the mix.
+///
+/// Created per session from [`AudioMixer::input`], and removed from the mix when dropped.
+/// Replaces the `Box<dyn AudioOut>` a session used to own: a session no longer has a
+/// device, and cannot be handed one by mistake.
 pub struct MixInput {
-    /// What to do when this input is already [`LEAD`] ahead.
+    /// What to do when this input is already at its budget.
     backpressure: Backpressure,
     state: Arc<InputState>,
     shared: Arc<Shared>,
@@ -332,32 +400,64 @@ struct InputState {
     ring: Mutex<Ring>,
     /// Signalled by the mixer after it drains, and by [`InputState::close`].
     room: Condvar,
-    /// Whether this source can be told to wait, which is also what decides whether it
-    /// primes. The mixer thread needs it and only sees this half of the input.
-    backpressure: Backpressure,
 }
 
 #[derive(Debug, Default)]
 struct Ring {
-    /// Whether anything has ever been written here.
+    /// When something last arrived, and whether anything ever has.
     ///
-    /// A `Live` input is created when a surface that *might* make a sound appears — the
-    /// browser holds one for the whole life of the panel — so an input that has never been
-    /// written to is silent by nature, not starved. Counting those made the phantom read
-    /// as ~100% of every figure this module reports, which is most of a day's wrong
-    /// diagnoses.
-    fed: bool,
-    /// Whether this input has banked [`PREBUFFER`] and is being drawn on.
-    ///
-    /// Set once and never cleared. Re-priming on an empty ring was tried and is much worse
-    /// than the problem: a live source hits empty routinely, so rebuilding the reserve each
-    /// time replaces a sub-millisecond hole with a [`PREBUFFER`]-long one. A momentary
-    /// empty ring is ordinary starvation — counted, and small.
-    primed: bool,
+    /// Both questions matter and they are one field: `None` is [`Supply::Surface`] — a
+    /// browser that has never made a sound — and a stale `Some` on an empty ring is
+    /// [`Supply::Quiescent`] — a page that made one and stopped. Conflating those two
+    /// with a starving source is, in two different ways, most of #175's wrong readings.
+    last_fed: Option<Instant>,
     /// Interleaved [`CHANNELS`]-channel [`RATE`] audio waiting to be mixed.
     samples: VecDeque<f32>,
     /// The [`MixInput`] is gone. The mixer plays out what is left, then retires this.
     closed: bool,
+}
+
+/// What one input can put into a pass, decided fresh each pass.
+///
+/// The enum the old code kept as two booleans and an `if`, which is how a permanently
+/// quiet input spent a day reading as a starving one. Every pass classifies every input
+/// and the `match` is exhaustive: a new kind of silence has to say what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Supply {
+    /// Never fed. A surface that might make a sound, not a source failing to.
+    Surface,
+    /// Fed, and live in the ordinary sense: has audio, or went empty recently enough
+    /// that the next packet is presumed in flight. What it has bounds the pass.
+    Flowing {
+        /// Whole frames available right now. Zero between packets.
+        frames: u64,
+    },
+    /// Fed once, empty, and quiet past [`STALE_AFTER`]: paused, muted, or done sending.
+    /// Genuinely silent — mixed as silence, constraining nothing, starving nothing.
+    Quiescent,
+    /// Closed. What remains is all there will ever be, and the end of it is the end of a
+    /// session rather than a shortfall.
+    Tail {
+        /// Whole frames left to play out.
+        frames: u64,
+    },
+}
+
+impl Ring {
+    /// Classify this ring, now.
+    fn supply(&self, now: Instant) -> Supply {
+        let frames = self.samples.len() as u64 / u64::from(CHANNELS);
+        if self.closed {
+            return Supply::Tail { frames };
+        }
+        match self.last_fed {
+            None => Supply::Surface,
+            Some(at) if frames == 0 && now.saturating_duration_since(at) >= STALE_AFTER => {
+                Supply::Quiescent
+            }
+            Some(_) => Supply::Flowing { frames },
+        }
+    }
 }
 
 impl InputState {
@@ -452,9 +552,10 @@ impl MixInput {
 
     /// Hand over samples.
     ///
-    /// **Blocks while this input already has [`LEAD`] of audio in flight.** That is the
-    /// backpressure that paces the decoder behind it; see the module docs for why the
-    /// budget spans the device's queue as well as this input's ring.
+    /// **Blocks while this input already has [`LEAD`] of audio in flight** — for a
+    /// [`Backpressure::Pull`] source. That is the backpressure that paces the decoder
+    /// behind it; see the module docs for why the budget spans the device's queue as well
+    /// as this input's ring. A [`Backpressure::Live`] source is never made to wait.
     ///
     /// # Errors
     /// [`PipelineError`] if the block's shape has no resampler to [`RATE`].
@@ -471,10 +572,11 @@ impl MixInput {
         Ok(())
     }
 
-    /// Make room for `stereo` inside this input's share of [`LEAD`], then append.
+    /// Make room for `stereo` inside this input's budget, then append.
     ///
     /// How the room is made is [`Backpressure`]'s whole subject: a pull source parks until
-    /// the mixer has drained, a live one sheds its oldest audio and carries on.
+    /// the mixer has drained, a live one sheds its oldest audio and carries on. This is
+    /// the one place the enum is read.
     fn enqueue(&mut self, stereo: &[f32]) {
         let budget = match self.backpressure {
             Backpressure::Pull => frames_in(LEAD),
@@ -522,7 +624,7 @@ impl MixInput {
             };
             ring = next;
         }
-        ring.fed = true;
+        ring.last_fed = Some(Instant::now());
         ring.samples.extend(stereo.iter().copied());
         self.shared
             .written
@@ -589,38 +691,42 @@ struct Shared {
     /// Signalled when an input appears or disappears, so an idle mixer wakes.
     work: Condvar,
     taps: Mutex<Vec<Arc<dyn MixTap>>>,
-    /// Frames the mixer emitted as silence because an input's ring was short.
+    /// Frames of silence a backstop pass padded a [`Supply::Flowing`] input with.
     ///
-    /// The one number this module was missing. A starved input is *padded*, not dropped or
-    /// refused, so until this existed an input running dry was indistinguishable in the
-    /// logs from one playing perfectly — no counter, no warning, and a third of the audio
-    /// replaced by holes. See #175.
+    /// The one defect counter. Structurally zero while every source keeps up, because a
+    /// [`Pass::Take`] cannot pad: every frame counted here was invented at the floor,
+    /// against an input that was mid-stream and had nothing to give.
     starved: AtomicU64,
-    /// Frames of silence emitted while a live input was still banking its reserve.
+    /// Frames a [`Supply::Quiescent`] input sat out, plus a closed input's runout past
+    /// its tail.
     ///
-    /// Counted apart from `starved` because the cause is different — this one is a source
-    /// starting up — but counted, because exempting it is how a prebuffer bug hid behind
-    /// `starved_pct=0.0`. Silence is silence; where it came from is a label, not a reason
-    /// to leave it out of the total.
-    priming: AtomicU64,
+    /// Benign silence, counted so the emitted identity closes rather than because it is
+    /// alarming. This is where the browser's gone-quiet input lands — the state that,
+    /// counted as starvation, dominated every #175 reading for a day.
+    idle: AtomicU64,
     /// Frames the writers handed in. The term whose absence made every figure here a
     /// subtraction, and every subtraction rested on an assumption that turned out false.
-    ///
-    /// With this, two identities hold and can be checked against each other rather than
-    /// believed:
-    ///
-    /// ```text
-    /// written  == drained + shed + (what is still sitting in the rings)
-    /// emitted  == drained + starved + priming
-    /// ```
     written: AtomicU64,
-    /// Frames the mixer actually took out of the rings.
+    /// Frames the mixer actually took out of the rings, summed across inputs.
     drained: AtomicU64,
     /// Frames shed from a [`Backpressure::Live`] input that had run ahead.
     ///
     /// Also on `MixInput` for the teardown line, and here as well because a counter that
     /// only reports when a session *ends* is no use while one is going wrong.
     shed: AtomicU64,
+    /// Frames the mixer emitted to the device, of any kind.
+    ///
+    /// The output-side clock check. Against one fed input two identities hold and can be
+    /// read straight off the report:
+    ///
+    /// ```text
+    /// written  == drained + shed + (what is still in the rings)
+    /// emitted  == drained + starved + idle
+    /// ```
+    ///
+    /// `emitted` far from 100% of real time is the device's clock misbehaving — the one
+    /// remaining way this module can be wrong that no input-side counter would show.
+    emitted: AtomicU64,
     gain: Arc<Gain>,
     /// Frames the mixer has written to the device but the device has not played.
     ///
@@ -670,10 +776,11 @@ impl AudioMixer {
             device_inflight: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             starved: AtomicU64::new(0),
-            priming: AtomicU64::new(0),
+            idle: AtomicU64::new(0),
             shed: AtomicU64::new(0),
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
+            emitted: AtomicU64::new(0),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -697,7 +804,6 @@ impl AudioMixer {
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
-            backpressure,
         });
         if let Ok(mut inputs) = self.shared.inputs.lock() {
             inputs.push(Arc::clone(&state));
@@ -746,14 +852,137 @@ impl Drop for AudioMixer {
     }
 }
 
-/// How much the mixer owes the device: the gap between where it wants to be and where it
-/// has submitted to, in frames.
+/// What one iteration of the drain loop should do.
 ///
-/// Pure, and split out for the same reason `audio_session::Pace::overshoot` was: the
-/// property that matters — "a device running slow slows the mixer down" — is about
-/// numbers, and timing a thread to prove it is a flaky test.
-fn owed(target: u64, submitted: u64, max: u64) -> usize {
-    usize::try_from(target.saturating_sub(submitted).min(max)).unwrap_or(0)
+/// Decided by [`plan`], which is pure: the whole drain policy is a function from what the
+/// inputs have and where the device's queue sits, to one of three actions — so the policy
+/// is tested as arithmetic, not by timing threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Nothing to take, no floor to defend. Sleep briefly.
+    Sleep,
+    /// Take exactly this many frames, which every constraining input has. No silence is
+    /// in a `Take` by construction — that is the point of the whole design.
+    Take {
+        /// Whole frames, at most a quantum.
+        frames: u64,
+    },
+    /// The device is at the floor: emit a quantum, padding at the front whatever any
+    /// input cannot supply. The only pass that invents silence.
+    Backstop,
+}
+
+/// Decide the next pass.
+///
+/// A pass may take the *least* any [`Supply::Flowing`] or [`Supply::Tail`] input can
+/// supply — never more, so a `Take` cannot pad — bounded by the device's headroom and the
+/// quantum. When that is nothing and the device would decay through [`DEVICE_FLOOR`],
+/// a backstop runs instead; otherwise the loop sleeps and lets the queue carry the gap.
+fn plan(supplies: &[Supply], inflight: u64) -> Pass {
+    let constraint = supplies
+        .iter()
+        .filter_map(|s| match s {
+            Supply::Flowing { frames } | Supply::Tail { frames } => Some(*frames),
+            Supply::Surface | Supply::Quiescent => None,
+        })
+        .min();
+    let headroom = frames_in(DEVICE_LEAD).saturating_sub(inflight);
+    let frames = constraint
+        .unwrap_or(0)
+        .min(headroom)
+        .min(frames_in(QUANTUM));
+    if frames > 0 {
+        return Pass::Take { frames };
+    }
+    if inflight <= frames_in(DEVICE_FLOOR) {
+        return Pass::Backstop;
+    }
+    Pass::Sleep
+}
+
+/// Where a pass reports what it did. Absent in unit tests that only assert on samples.
+struct MixCounters<'a> {
+    starved: &'a AtomicU64,
+    idle: &'a AtomicU64,
+    drained: &'a AtomicU64,
+}
+
+/// Execute a pass: pull up to `frames` from every input, sum, and apply the panel's
+/// volume.
+///
+/// Each input is classified again under its own lock — the plan's snapshot may be a
+/// moment old — and contributes what it has, up to `frames`. A shortfall is padded at the
+/// *front* of this input's contribution, so a source that is behind is deferred rather
+/// than perforated; against a [`Pass::Take`] the shortfall is structurally zero, because
+/// the plan never asks for more than the scarcest input had.
+fn mix_pass(
+    inputs: &[Arc<InputState>],
+    frames: u64,
+    now: Instant,
+    gain: &Gain,
+    counters: Option<&MixCounters<'_>>,
+) -> Vec<f32> {
+    let channels = usize::from(CHANNELS);
+    let wanted = usize::try_from(frames).unwrap_or(usize::MAX) * channels;
+    let mut mixed = vec![0.0f32; wanted];
+    for input in inputs {
+        let Ok(mut ring) = input.ring.lock() else {
+            continue;
+        };
+        let supply = ring.supply(now);
+        let available = match supply {
+            // A surface owes no explanation and gets no counter.
+            Supply::Surface => continue,
+            // Genuinely silent: it contributes silence because it has nothing to say,
+            // not because the mixer outran it.
+            Supply::Quiescent => {
+                if let Some(c) = counters {
+                    c.idle.fetch_add(frames, Ordering::Relaxed);
+                }
+                continue;
+            }
+            Supply::Flowing { frames } | Supply::Tail { frames } => frames,
+        };
+        // Whole frames only: taking an odd number of samples would swap this input's
+        // channels for the rest of the session, which is the kind of fault that sounds
+        // like "something is subtly wrong with the stereo" and never gets found.
+        let take = available.min(frames);
+        let take_samples = usize::try_from(take).unwrap_or(usize::MAX) * channels;
+        // The shortfall leads and the audio trails: deferral, not a hole.
+        let offset = wanted - take_samples;
+        for slot in mixed[offset..].iter_mut() {
+            if let Some(sample) = ring.samples.pop_front() {
+                *slot += sample;
+            }
+        }
+        if let Some(c) = counters {
+            c.drained.fetch_add(take, Ordering::Relaxed);
+            let short = frames - take;
+            if short > 0 {
+                match supply {
+                    // Mid-stream and had nothing to give: the defect counter.
+                    Supply::Flowing { .. } => {
+                        c.starved.fetch_add(short, Ordering::Relaxed);
+                    }
+                    // Running out past the end of a session is the session ending.
+                    Supply::Tail { .. } => {
+                        c.idle.fetch_add(short, Ordering::Relaxed);
+                    }
+                    Supply::Surface | Supply::Quiescent => {}
+                }
+            }
+        }
+        drop(ring);
+        input.room.notify_all();
+    }
+    gain.apply(&mut mixed);
+    // Summing can leave the unit range even at unity gain — two sources at once, which is
+    // the case this mixer exists to make possible. Hard-clipped rather than left to the
+    // backend, where an out-of-range `f32` is anything from a clamp to a wrap.
+    for sample in &mut mixed {
+        *sample = sample.clamp(-1.0, 1.0);
+    }
+    mixed
 }
 
 /// Where the mix is going, and what has been given to it.
@@ -764,6 +993,8 @@ fn owed(target: u64, submitted: u64, max: u64) -> usize {
 /// keeps time exactly as a real device does, so the inputs keep draining in real time and
 /// nothing behind them stalls. It is also what keeps a Bluetooth session alive across a
 /// panel that went to sleep and took the HDMI sink with it (#55).
+///
+/// [`NullAudioOut`]: crate::audio_out::NullAudioOut
 struct Sink {
     out: Box<dyn AudioOut>,
     /// Whether `out` is a real device. False for the silence above, which is what says
@@ -804,6 +1035,11 @@ impl Sink {
             .unwrap_or_else(|| frames_in(now.saturating_duration_since(self.started)))
     }
 
+    /// Frames the mixer believes are queued at this sink.
+    fn inflight(&self, now: Instant) -> u64 {
+        self.submitted.saturating_sub(self.played(now))
+    }
+
     fn close(&mut self) {
         self.out.stop();
     }
@@ -819,11 +1055,22 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
     // sound card must not spend the whole session looking for one.
     let mut retry_at: Option<Instant> = None;
     let mut last_report = Instant::now();
+    // The device's own dry-callback count at the last report, so the report can carry the
+    // delta. This is the far side of `emitted`: silence the *device* inserted because the
+    // mixer was late, which no counter on the mix side can see.
+    let mut last_underruns = 0u64;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let inputs = live_inputs(shared);
         let now = Instant::now();
-        report(shared, now, &mut last_report, inputs.len());
+        report(
+            shared,
+            now,
+            &mut last_report,
+            inputs.len(),
+            &sink,
+            &mut last_underruns,
+        );
 
         if inputs.is_empty() {
             shared.device_inflight.store(0, Ordering::Relaxed);
@@ -850,23 +1097,40 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
             }
         }
 
-        let target = sink.played(now) + frames_in(DEVICE_LEAD);
-        let want = owed(target, sink.submitted, frames_in(QUANTUM));
-        if want == 0 {
-            std::thread::sleep(IDLE_POLL);
-            continue;
-        }
+        let inflight = sink.inflight(now);
+        shared.device_inflight.store(inflight, Ordering::Relaxed);
+
+        let supplies: Vec<Supply> = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .ring
+                    .lock()
+                    .map_or(Supply::Quiescent, |ring| ring.supply(now))
+            })
+            .collect();
+
+        let frames = match plan(&supplies, inflight) {
+            Pass::Sleep => {
+                std::thread::sleep(IDLE_POLL);
+                continue;
+            }
+            Pass::Take { frames } => frames,
+            Pass::Backstop => frames_in(QUANTUM),
+        };
 
         let mixed = mix_pass(
             &inputs,
-            want,
+            frames,
+            now,
             &shared.gain,
             Some(&MixCounters {
                 starved: &shared.starved,
-                priming: &shared.priming,
+                idle: &shared.idle,
                 drained: &shared.drained,
             }),
         );
+        shared.emitted.fetch_add(frames, Ordering::Relaxed);
         publish(shared, now, &mixed);
 
         if let Err(e) = sink.out.write(&block_of(&mixed)) {
@@ -874,12 +1138,12 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
             sink = Sink::silent();
             retry_at = Some(now + REOPEN_AFTER);
         } else {
-            sink.submitted += want as u64;
+            sink.submitted += frames;
         }
         // Republished every pass, because it is half of every writer's budget: a device
         // that stops draining has to show up as a full budget, or the sources ahead of it
         // would carry on producing into a ring nobody empties.
-        let inflight = sink.submitted.saturating_sub(sink.played(Instant::now()));
+        let inflight = sink.inflight(Instant::now());
         shared.device_inflight.store(inflight, Ordering::Relaxed);
     }
 
@@ -940,131 +1204,60 @@ fn open(device: &AudioOutputFactory) -> Option<Sink> {
     }
 }
 
-/// Pull `frames` from every input, sum them, and apply the panel's volume.
-/// Where a pass reports what it did. Absent in unit tests that only assert on samples.
-struct MixCounters<'a> {
-    starved: &'a AtomicU64,
-    priming: &'a AtomicU64,
-    drained: &'a AtomicU64,
-}
-
-fn mix_pass(
-    inputs: &[Arc<InputState>],
-    frames: usize,
-    gain: &Gain,
-    counters: Option<&MixCounters<'_>>,
-) -> Vec<f32> {
-    let wanted = frames * usize::from(CHANNELS);
-    let mut mixed = vec![0.0f32; wanted];
-    for input in inputs {
-        let Ok(mut ring) = input.ring.lock() else {
-            continue;
-        };
-        // Nothing has ever been written here, so it is a surface that might make a sound
-        // rather than a source that is failing to: it owes no explanation and gets no
-        // counter. The browser holds one of these for the life of the panel.
-        if input.backpressure == Backpressure::Live && !ring.fed {
-            continue;
-        }
-        // Still filling its reserve. Silence, and counted as silence — see `priming`. A
-        // closed input never primes: what is in it is all there will ever be, and waiting
-        // for more would truncate the last moment of every session.
-        if input.backpressure == Backpressure::Live && !ring.closed && !ring.primed {
-            if (ring.samples.len() / usize::from(CHANNELS)) < frames_in(PREBUFFER) as usize {
-                if let Some(c) = counters {
-                    c.priming.fetch_add(frames as u64, Ordering::Relaxed);
-                }
-                continue;
-            }
-            ring.primed = true;
-        }
-        // Rounded down to a whole frame: taking an odd number of samples would swap this
-        // input's channels for the rest of the session, which is the kind of fault that
-        // sounds like "something is subtly wrong with the stereo" and never gets found.
-        let channels = usize::from(CHANNELS);
-        let take = wanted.min(ring.samples.len()) / channels * channels;
-        for slot in mixed.iter_mut().take(take) {
-            // An input shorter than the pass contributes silence for the rest, which is
-            // what an input that has not produced yet *is*.
-            if let Some(sample) = ring.samples.pop_front() {
-                *slot += sample;
-            }
-        }
-        // What this input could not supply, which the loop above has just written as
-        // zeroes. Counted here because this is the only place that knows the difference
-        // between "quiet" and "had nothing to give".
-        if let Some(c) = counters {
-            let short = (wanted - take) / usize::from(CHANNELS);
-            if short > 0 {
-                c.starved.fetch_add(short as u64, Ordering::Relaxed);
-            }
-            c.drained
-                .fetch_add((take / usize::from(CHANNELS)) as u64, Ordering::Relaxed);
-        }
-        drop(ring);
-        input.room.notify_all();
-    }
-    gain.apply(&mut mixed);
-    // Summing can leave the unit range even at unity gain — two sources at once, which is
-    // the case this mixer exists to make possible. Hard-clipped rather than left to the
-    // backend, where an out-of-range `f32` is anything from a clamp to a wrap.
-    for sample in &mut mixed {
-        *sample = sample.clamp(-1.0, 1.0);
-    }
-    mixed
-}
-
 /// Say what the speakers did not get, if anything, at most every [`REPORT_EVERY`].
 ///
 /// Silence and shedding are both *normal* in small amounts — a source starting, a track
-/// changing — so this reports a rate rather than a total and stays quiet at zero. What it
-/// exists to make visible is the sustained case, where the figure is a share of the output
-/// that simply was not there.
-fn report(shared: &Arc<Shared>, now: Instant, last: &mut Instant, inputs: usize) {
+/// changing — so this reports rates against real time and stays quiet when nothing moved.
+/// The figures are sums across inputs; against the usual one active source the two
+/// identities on [`Shared::emitted`] read straight off the line.
+fn report(
+    shared: &Arc<Shared>,
+    now: Instant,
+    last: &mut Instant,
+    inputs: usize,
+    sink: &Sink,
+    last_underruns: &mut u64,
+) {
     let window = now.saturating_duration_since(*last);
     if window < REPORT_EVERY {
         return;
     }
     *last = now;
     let starved = shared.starved.swap(0, Ordering::Relaxed);
-    let priming = shared.priming.swap(0, Ordering::Relaxed);
+    let idle = shared.idle.swap(0, Ordering::Relaxed);
     let shed = shared.shed.swap(0, Ordering::Relaxed);
     let written = shared.written.swap(0, Ordering::Relaxed);
     let drained = shared.drained.swap(0, Ordering::Relaxed);
-    if starved == 0 && priming == 0 && shed == 0 && written == 0 {
+    let emitted = shared.emitted.swap(0, Ordering::Relaxed);
+    let underruns = sink.out.underruns().unwrap_or(0);
+    let dry = underruns.saturating_sub(*last_underruns);
+    *last_underruns = underruns;
+    // Idle and emitted alone do not wake the log: a panel holding a quiet page is not an
+    // event. Anything a session did — or failed to get — is.
+    if starved == 0 && shed == 0 && written == 0 && drained == 0 {
         return;
     }
     let expected = window.as_secs_f64() * f64::from(RATE);
     #[allow(clippy::cast_precision_loss)]
     let pct = |n: u64| {
         if expected > 0.0 {
-            n as f64 / expected * 100.0
+            format!("{:.1}", n as f64 / expected * 100.0)
         } else {
-            0.0
+            "0.0".to_owned()
         }
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let share = if expected > 0.0 {
-        starved as f64 / expected * 100.0
-    } else {
-        0.0
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let priming_share = if expected > 0.0 {
-        priming as f64 / expected * 100.0
-    } else {
-        0.0
     };
     info!(
         starved_frames = starved,
-        starved_pct = format!("{share:.1}"),
-        priming_frames = priming,
-        priming_pct = format!("{priming_share:.1}"),
+        starved_pct = pct(starved),
+        idle_frames = idle,
         shed_frames = shed,
         written_frames = written,
-        written_pct = format!("{:.1}", pct(written)),
+        written_pct = pct(written),
         drained_frames = drained,
-        drained_pct = format!("{:.1}", pct(drained)),
+        drained_pct = pct(drained),
+        emitted_frames = emitted,
+        emitted_pct = pct(emitted),
+        device_dry = dry,
         inputs,
         "mixer: audio the speakers did not get"
     );
@@ -1180,46 +1373,190 @@ mod tests {
             device_inflight: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             starved: AtomicU64::new(0),
-            priming: AtomicU64::new(0),
+            idle: AtomicU64::new(0),
             shed: AtomicU64::new(0),
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
+            emitted: AtomicU64::new(0),
         })
     }
 
-    /// Put audio into a live input the way [`MixInput::write`] does — `fed` included, since
-    /// that is what tells the mixer this input is a source rather than a silent surface.
-    fn feed(state: &Arc<InputState>, samples: Vec<f32>) {
-        let mut ring = state.ring.lock().unwrap();
-        ring.fed = true;
-        ring.samples.extend(samples);
-    }
-
-    fn filled(samples: Vec<f32>) -> Arc<InputState> {
+    fn state_with(ring: Ring) -> Arc<InputState> {
         Arc::new(InputState {
-            ring: Mutex::new(Ring {
-                // Already playing: every existing test means "an input with audio in it",
-                // and priming is a separate property with its own tests below.
-                primed: true,
-                fed: true,
-                samples: samples.into(),
-                closed: false,
-            }),
+            ring: Mutex::new(ring),
             room: Condvar::new(),
-            backpressure: Backpressure::Pull,
         })
+    }
+
+    /// An input mid-stream with audio banked, which is what every summing test means.
+    fn filled(samples: Vec<f32>) -> Arc<InputState> {
+        state_with(Ring {
+            last_fed: Some(Instant::now()),
+            samples: samples.into(),
+            closed: false,
+        })
+    }
+
+    fn counters<'a>(
+        starved: &'a AtomicU64,
+        idle: &'a AtomicU64,
+        drained: &'a AtomicU64,
+    ) -> MixCounters<'a> {
+        MixCounters {
+            starved,
+            idle,
+            drained,
+        }
+    }
+
+    // ---- classification -----------------------------------------------------------
+
+    #[test]
+    fn an_input_is_what_its_ring_says_it_is() {
+        let now = Instant::now();
+        // Never fed: a surface, wherever the clock stands.
+        assert_eq!(Ring::default().supply(now), Supply::Surface);
+        // Fed and holding audio: flowing, however old the last write is.
+        let stale = now - STALE_AFTER * 4;
+        let holding = Ring {
+            last_fed: Some(stale),
+            samples: vec![0.5; 8].into(),
+            closed: false,
+        };
+        assert_eq!(holding.supply(now), Supply::Flowing { frames: 4 });
+        // Fed, empty, but fresh: between packets, still flowing — with nothing to give.
+        let between = Ring {
+            last_fed: Some(now),
+            samples: VecDeque::new(),
+            closed: false,
+        };
+        assert_eq!(between.supply(now), Supply::Flowing { frames: 0 });
+        // Fed, empty, and quiet past the line: gone quiet, not starving.
+        let quiet = Ring {
+            last_fed: Some(stale),
+            samples: VecDeque::new(),
+            closed: false,
+        };
+        assert_eq!(quiet.supply(now), Supply::Quiescent);
+        // Closed: a tail, whatever else is true.
+        let tail = Ring {
+            last_fed: Some(stale),
+            samples: vec![0.5; 4].into(),
+            closed: true,
+        };
+        assert_eq!(tail.supply(now), Supply::Tail { frames: 2 });
+    }
+
+    // ---- the plan ----------------------------------------------------------------
+
+    #[test]
+    fn a_pass_never_asks_for_more_than_the_scarcest_input_has() {
+        let comfortable = frames_in(DEVICE_FLOOR) + 100;
+        // The least-supplied flowing input bounds the take.
+        assert_eq!(
+            plan(
+                &[
+                    Supply::Flowing { frames: 100 },
+                    Supply::Flowing { frames: 700 }
+                ],
+                comfortable
+            ),
+            Pass::Take { frames: 100 }
+        );
+        // A tail bounds it the same way: its remainder is played out, not overdrawn.
+        assert_eq!(
+            plan(
+                &[Supply::Tail { frames: 3 }, Supply::Flowing { frames: 700 }],
+                comfortable
+            ),
+            Pass::Take { frames: 3 }
+        );
+        // An input between packets supplies nothing, so nothing is taken — the device's
+        // queue carries the gap. This is the line the old loop crossed: it would have
+        // emitted anyway and padded, which is #174's baseline defect.
+        assert_eq!(
+            plan(
+                &[
+                    Supply::Flowing { frames: 0 },
+                    Supply::Flowing { frames: 700 }
+                ],
+                comfortable
+            ),
+            Pass::Sleep
+        );
     }
 
     #[test]
-    fn the_mixer_owes_the_gap_between_where_it_wants_to_be_and_where_it_is() {
-        // Nothing submitted, a full lead wanted: produce the lead, capped by the quantum.
-        assert_eq!(owed(1000, 0, 480), 480);
-        // Caught up: nothing owed, which is what makes the thread sleep instead of spin.
-        assert_eq!(owed(1000, 1000, 480), 0);
-        // Ahead of the target — a device that ran slower than the mixer expected. Not a
-        // negative debt, and not a panic.
-        assert_eq!(owed(1000, 1200, 480), 0);
-        assert_eq!(owed(1100, 1000, 480), 100);
+    fn surfaces_and_quiet_inputs_constrain_nothing() {
+        let comfortable = frames_in(DEVICE_FLOOR) + 100;
+        // A never-fed surface alongside a playing source must not hold the mix at the
+        // floor — this is the browser's input during every session.
+        assert_eq!(
+            plan(
+                &[Supply::Surface, Supply::Flowing { frames: 700 }],
+                comfortable
+            ),
+            Pass::Take {
+                frames: frames_in(QUANTUM)
+            }
+        );
+        // Likewise one that played once and went quiet.
+        assert_eq!(
+            plan(
+                &[Supply::Quiescent, Supply::Flowing { frames: 700 }],
+                comfortable
+            ),
+            Pass::Take {
+                frames: frames_in(QUANTUM)
+            }
+        );
+        // Alone, they supply nothing; above the floor there is nothing to do.
+        assert_eq!(plan(&[Supply::Surface], comfortable), Pass::Sleep);
+    }
+
+    #[test]
+    fn silence_is_invented_only_at_the_floor() {
+        // Above the floor with nothing to take: wait for audio rather than invent quiet.
+        assert_eq!(
+            plan(
+                &[Supply::Flowing { frames: 0 }],
+                frames_in(DEVICE_FLOOR) + 1
+            ),
+            Pass::Sleep
+        );
+        // At the floor the device must be fed, whatever the inputs have.
+        assert_eq!(
+            plan(&[Supply::Flowing { frames: 0 }], frames_in(DEVICE_FLOOR)),
+            Pass::Backstop
+        );
+        // Even with no inputs able to speak at all: an open device is kept fed.
+        assert_eq!(plan(&[Supply::Surface], 0), Pass::Backstop);
+        assert_eq!(plan(&[], 0), Pass::Backstop);
+    }
+
+    #[test]
+    fn the_device_ceiling_caps_the_take() {
+        // A full device takes nothing, however much is banked; that is what lets the
+        // write-side budget mean anything.
+        let full = frames_in(DEVICE_LEAD);
+        assert_eq!(plan(&[Supply::Flowing { frames: 9600 }], full), Pass::Sleep);
+        // Just below it, the take is the headroom, not the bank and not the quantum.
+        assert_eq!(
+            plan(&[Supply::Flowing { frames: 9600 }], full - 7),
+            Pass::Take { frames: 7 }
+        );
+    }
+
+    // ---- executing a pass --------------------------------------------------------
+
+    #[test]
+    fn two_sources_are_summed_rather_than_one_replacing_the_other() {
+        // The whole point of the change: before this, two sessions each held their own
+        // device and the OS did this — invisibly, and with no way to express a policy.
+        let a = filled(vec![0.25; 8]);
+        let b = filled(vec![0.5; 8]);
+        let mixed = mix_pass(&[a, b], 4, Instant::now(), &Gain::default(), None);
+        assert_eq!(mixed, vec![0.75; 8]);
     }
 
     #[test]
@@ -1232,31 +1569,12 @@ mod tests {
     }
 
     #[test]
-    fn two_sources_are_summed_rather_than_one_replacing_the_other() {
-        // The whole point of the change: before this, two sessions each held their own
-        // device and the OS did this — invisibly, and with no way to express a policy.
-        let a = filled(vec![0.25; 8]);
-        let b = filled(vec![0.5; 8]);
-        let mixed = mix_pass(&[a, b], 4, &Gain::default(), None);
-        assert_eq!(mixed, vec![0.75; 8]);
-    }
-
-    #[test]
-    fn an_input_shorter_than_the_pass_contributes_silence_for_the_rest() {
-        // Not a shortfall to correct: an input that has not produced yet *is* silence,
-        // and stretching what it did produce would change its pitch.
-        let short = filled(vec![1.0; 4]);
-        let mixed = mix_pass(&[short], 4, &Gain::default(), None);
-        assert_eq!(mixed, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
     fn a_sum_that_leaves_the_unit_range_is_clipped_here_rather_than_in_the_backend() {
         // Two loud sources at once is exactly the case this mixer makes possible, and an
         // out-of-range f32 is anything from a clamp to a wrap depending on the backend.
         let a = filled(vec![0.8; 4]);
         let b = filled(vec![0.8; 4]);
-        let mixed = mix_pass(&[a, b], 2, &Gain::default(), None);
+        let mixed = mix_pass(&[a, b], 2, Instant::now(), &Gain::default(), None);
         assert_eq!(mixed, vec![1.0; 4]);
     }
 
@@ -1269,7 +1587,7 @@ mod tests {
         gain.set(half_scale());
         let a = filled(vec![0.25; 4]);
         let b = filled(vec![0.25; 4]);
-        let mixed = mix_pass(&[a, b], 2, &gain, None);
+        let mixed = mix_pass(&[a, b], 2, Instant::now(), &gain, None);
         for sample in mixed {
             assert!((sample - 0.25).abs() < 1e-4, "{sample}");
         }
@@ -1280,12 +1598,102 @@ mod tests {
         let gain = Gain::default();
         gain.set(Volume::from_dbfs(0.75f32.log10() * 20.0));
         gain.set_muted(true);
-        let mixed = mix_pass(&[filled(vec![1.0; 4])], 2, &gain, None);
+        let mixed = mix_pass(&[filled(vec![1.0; 4])], 2, Instant::now(), &gain, None);
         assert_eq!(mixed, vec![0.0; 4]);
         assert!(
             (gain.level() - 0.75).abs() < 1e-4,
             "the level survives a mute"
         );
+    }
+
+    #[test]
+    fn a_shortfall_is_padded_in_front_so_a_late_source_defers_rather_than_stutters() {
+        // A backstop pass against an input with less than the pass: the silence leads and
+        // the audio trails, so the stream is pushed later — latency, once — instead of a
+        // hole being cut into it. Every AirPlay sender measured on #175 under-delivers
+        // for its first seconds while intending the receiver to bank a lead; this is what
+        // turns that ramp into the bank it intended.
+        let starved = AtomicU64::new(0);
+        let idle = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        let short = filled(vec![1.0; 4]);
+        let mixed = mix_pass(
+            &[short],
+            4,
+            Instant::now(),
+            &Gain::default(),
+            Some(&counters(&starved, &idle, &drained)),
+        );
+        assert_eq!(mixed, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            2,
+            "half the pass was invented and has to say so"
+        );
+        assert_eq!(drained.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn an_input_that_went_quiet_is_idle_not_starved() {
+        // The reading that dominated #175: the browser's input plays a page once, goes
+        // quiet, and every counter after that is ~100% "starved" for as long as the panel
+        // runs — two runs measured it before it was recognised. A quiet input is not a
+        // starving one, and the defect counter must not say it is.
+        let starved = AtomicU64::new(0);
+        let idle = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        let quiet = state_with(Ring {
+            last_fed: Some(Instant::now() - STALE_AFTER * 4),
+            samples: VecDeque::new(),
+            closed: false,
+        });
+        let playing = filled(vec![0.5; 960]);
+        let mixed = mix_pass(
+            &[quiet, playing],
+            480,
+            Instant::now(),
+            &Gain::default(),
+            Some(&counters(&starved, &idle, &drained)),
+        );
+        assert_eq!(mixed, vec![0.5; 960], "the playing source is untouched");
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            0,
+            "a source with nothing to say is not being starved of anything"
+        );
+        assert_eq!(idle.load(Ordering::Relaxed), 480, "counted, as idle");
+        assert_eq!(drained.load(Ordering::Relaxed), 480);
+    }
+
+    #[test]
+    fn a_tails_runout_is_the_end_of_a_session_not_a_fault() {
+        let starved = AtomicU64::new(0);
+        let idle = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        let state = state_with(Ring {
+            last_fed: Some(Instant::now()),
+            samples: vec![1.0; 8].into(),
+            closed: true,
+        });
+        let mixed = mix_pass(
+            &[state],
+            8,
+            Instant::now(),
+            &Gain::default(),
+            Some(&counters(&starved, &idle, &drained)),
+        );
+        // The tail plays out — at the end of the pass, deferred like any shortfall.
+        assert_eq!(
+            &mixed[8..],
+            vec![1.0; 8],
+            "the last moment reaches the speakers"
+        );
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            0,
+            "running out past the end is not starvation"
+        );
+        assert_eq!(idle.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -1305,12 +1713,70 @@ mod tests {
             "closed, but it still has audio in it"
         );
         // Drain it the way the mixer would.
-        let _ = mix_pass(&[Arc::clone(&state)], 480, &Gain::default(), None);
+        let _ = mix_pass(
+            &[Arc::clone(&state)],
+            480,
+            Instant::now(),
+            &Gain::default(),
+            None,
+        );
         assert!(
             live_inputs(&shared).is_empty(),
             "closed and drained, so it should be gone"
         );
     }
+
+    // ---- the identities ----------------------------------------------------------
+
+    /// What the writer gave equals what the mixer took plus what was thrown away plus
+    /// what is still sitting in the ring.
+    ///
+    /// This test exists because its absence is the methodological fault behind a day of
+    /// wrong answers on #175. Every quantity that mattered was *derived* by subtracting
+    /// counters, each subtraction carried an assumption about a term nobody measured, and
+    /// each assumption was eventually false. Measure the terms; do not infer them.
+    #[test]
+    fn what_was_written_is_what_was_drained_plus_what_is_left() {
+        let starved = AtomicU64::new(0);
+        let idle = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        // No mixer thread: this asserts an identity, so a second drainer racing the
+        // arithmetic would make it assert nothing.
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = MixInput {
+            backpressure: Backpressure::Pull,
+            state: Arc::clone(&state),
+            shared: Arc::clone(&shared),
+            convert: None,
+            shape: None,
+            dropped: 0,
+            shed: 0,
+        };
+        for _ in 0..4 {
+            input.write(&tone(480, 0.5)).unwrap();
+        }
+        let written = shared.written.load(Ordering::Relaxed);
+        assert_eq!(written, 4 * 480, "the writer's own count, not a deduction");
+
+        let _ = mix_pass(
+            &[Arc::clone(&state)],
+            500,
+            Instant::now(),
+            &shared.gain,
+            Some(&counters(&starved, &idle, &drained)),
+        );
+        let took = drained.load(Ordering::Relaxed);
+        let left = state.ring.lock().unwrap().samples.len() as u64 / u64::from(CHANNELS);
+        let shed = shared.shed.load(Ordering::Relaxed);
+        assert_eq!(
+            written,
+            took + shed + left,
+            "written={written} took={took} shed={shed} left={left}"
+        );
+    }
+
+    // ---- the whole machine, against real-time devices -----------------------------
 
     #[test]
     fn what_two_live_sources_write_reaches_the_device_summed() {
@@ -1436,299 +1902,164 @@ mod tests {
         );
     }
 
-    /// A live source is never made to wait, however far ahead it runs.
+    /// A producer on its own clock, delivering in packets — the shape every previous test
+    /// here lacked, and the reason four of them measured 100% while a phone lost audio.
     ///
-    /// This is the property the two real-time-drain tests could not check, and the reason
-    /// they both passed while a phone was losing a fifth of its audio: their producer was a
-    /// loop calling `write`, so it was *flow-controlled by the thing under test* and could
-    /// never get ahead. A phone is not. It fires packets on its own clock into a queue we
-    /// do not own, so the only question that matters is whether this call returns.
-    ///
-    /// Five seconds of audio offered as fast as a thread can produce it, which is what a
-    /// sender running ahead looks like from here. Under [`Backpressure::Pull`] that takes
-    /// five seconds, by the test above. Under [`Backpressure::Live`] it must not: every
-    /// millisecond spent parked here is a millisecond the source's own queue spends filling,
-    /// and that queue is seconds deep and newest-drops.
-    /// A starved input is counted, not only padded.
-    ///
-    /// The padding itself is right and is asserted above — an input that has not produced
-    /// contributes silence, because the alternative is stretching what it did produce and
-    /// changing its pitch. What was missing is that it left no trace: no counter, no
-    /// warning, so an input running dry for minutes read exactly like one playing.
-    /// The identity the report is worth reading for: what the writer gave equals what the
-    /// mixer took plus what was thrown away plus what is still sitting in the ring.
-    ///
-    /// This test exists because its absence is the methodological fault behind a day of
-    /// wrong answers on #175. Every quantity that mattered was *derived* by subtracting
-    /// counters, each subtraction carried an assumption about a term nobody measured, and
-    /// each assumption was eventually false. Measure the terms; do not infer them.
+    /// A `while { write() }` producer is flow-controlled by the thing under test: it can
+    /// never get ahead of the mixer and never fall behind it, so it exercises the average
+    /// rate and nothing else. A phone does neither favour. It fires one packet's worth of
+    /// audio on its own deadline schedule — 352 frames of 44.1 kHz every ~8 ms is AirPlay's
+    /// ALAC cadence — and the mixer's passes fall where they fall between those packets.
+    /// The defect this exists to catch is the mixer padding those gaps with silence:
+    /// output that is real audio and holes interleaved, which no average-rate measurement
+    /// can distinguish from perfect playback (#175).
     #[test]
-    fn what_was_written_is_what_was_drained_plus_what_is_left() {
-        let starved = AtomicU64::new(0);
-        let priming = AtomicU64::new(0);
-        let drained = AtomicU64::new(0);
-        // No mixer thread: this asserts an identity, so a second drainer racing the
-        // arithmetic would make it assert nothing.
-        let state = Arc::new(InputState {
-            ring: Mutex::new(Ring::default()),
-            room: Condvar::new(),
-            backpressure: Backpressure::Pull,
-        });
-        let shared = shared_with(vec![Arc::clone(&state)]);
-        let mut input = MixInput {
-            backpressure: Backpressure::Pull,
-            state: Arc::clone(&state),
-            shared: Arc::clone(&shared),
-            convert: None,
-            shape: None,
-            dropped: 0,
-            shed: 0,
+    fn a_packet_source_on_its_own_clock_is_heard_without_holes() {
+        const SOURCE_RATE: u32 = 44_100;
+        /// One ALAC packet, as AirPlay sends it.
+        const PACKET: usize = 352;
+        /// Long enough to open the device and settle into steady state.
+        const WARMUP: Duration = Duration::from_millis(1000);
+        const WINDOW: Duration = Duration::from_millis(3000);
+
+        let device = Recorder::new();
+        let mixer = mixer_with(&device);
+        let mut input = mixer.input(Backpressure::Live);
+        input.format(SOURCE_RATE, CHANNELS).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let block = PcmBlock {
+                    sample_rate: SOURCE_RATE,
+                    channels: CHANNELS,
+                    samples: vec![0.5; PACKET * usize::from(CHANNELS)],
+                    pts: Duration::ZERO,
+                };
+                let period =
+                    Duration::from_nanos(1_000_000_000u64 * PACKET as u64 / u64::from(SOURCE_RATE));
+                let mut sent = 0u64;
+                let started = Instant::now();
+                let mut next = started;
+                while !stop.load(Ordering::Relaxed) {
+                    input.write(&block).unwrap();
+                    sent += 1;
+                    next += period;
+                    if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                (sent, started.elapsed())
+            })
         };
-        for _ in 0..4 {
-            input.write(&tone(480, 0.5)).unwrap();
-        }
-        let written = shared.written.load(Ordering::Relaxed);
-        assert_eq!(written, 4 * 480, "the writer's own count, not a deduction");
 
-        let counters = MixCounters {
-            starved: &starved,
-            priming: &priming,
-            drained: &drained,
-        };
-        let _ = mix_pass(&[Arc::clone(&state)], 500, &shared.gain, Some(&counters));
-        let took = drained.load(Ordering::Relaxed);
-        let left = state.ring.lock().unwrap().samples.len() as u64 / u64::from(CHANNELS);
-        let shed = shared.shed.load(Ordering::Relaxed);
-        assert_eq!(
-            written,
-            took + shed + left,
-            "written={written} took={took} shed={shed} left={left}"
+        std::thread::sleep(WARMUP);
+        let from = device.heard.lock().unwrap().len();
+        std::thread::sleep(WINDOW);
+        let heard = device.heard.lock().unwrap()[from..].to_vec();
+        stop.store(true, Ordering::Relaxed);
+        let (sent, producing) = producer.join().unwrap();
+
+        // The harness's own honesty first: a producer that was parked could not keep its
+        // schedule, and everything below would then measure the parking, not the mixing.
+        let offered = sent as f64 * PACKET as f64 / producing.as_secs_f64();
+        assert!(
+            offered > f64::from(SOURCE_RATE) * 0.97,
+            "the producer only kept {offered:.0} frames/s of its {SOURCE_RATE} Hz schedule; \
+             it was made to wait, so the measurement below means nothing"
+        );
+
+        let frames = heard.chunks_exact(usize::from(CHANNELS));
+        let total = frames.len();
+        let audible = frames.filter(|f| f.iter().any(|s| *s != 0.0)).count();
+        #[allow(clippy::cast_precision_loss)]
+        let carried = audible as f64 / total as f64;
+        println!(
+            "{audible}/{total} device frames carried audio ({:.1}%)",
+            carried * 100.0
+        );
+        assert!(
+            carried > 0.97,
+            "only {:.1}% of the output carried audio against a source arriving in packets \
+             at exactly real time; the rest is silence the mixer padded into the gaps \
+             between packets",
+            carried * 100.0
         );
     }
 
-    /// A live input banks a reserve before it is drawn on, and is not called starved for it.
-    #[test]
-    fn a_live_input_primes_before_it_is_mixed() {
-        let starved = AtomicU64::new(0);
-        let priming = AtomicU64::new(0);
-        let drained = AtomicU64::new(0);
-        let state = Arc::new(InputState {
-            ring: Mutex::new(Ring::default()),
-            room: Condvar::new(),
-            backpressure: Backpressure::Live,
-        });
-        // One packet's worth, far short of the reserve.
-        feed(&state, vec![1.0; 800]);
-        let mixed = mix_pass(
-            &[Arc::clone(&state)],
-            240,
-            &Gain::default(),
-            Some(&MixCounters {
-                starved: &starved,
-                priming: &priming,
-                drained: &drained,
-            }),
-        );
-        assert_eq!(
-            mixed,
-            vec![0.0; 480],
-            "still filling, so it contributes nothing"
-        );
-        assert_eq!(
-            starved.load(Ordering::Relaxed),
-            0,
-            "priming is the buffer working, not the fault the counter reports"
-        );
-        assert!(!state.ring.lock().unwrap().primed);
-
-        // Past the reserve, it plays.
-        let banked = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
-        feed(&state, vec![1.0; banked]);
-        let mixed = mix_pass(
-            &[Arc::clone(&state)],
-            240,
-            &Gain::default(),
-            Some(&MixCounters {
-                starved: &starved,
-                priming: &priming,
-                drained: &drained,
-            }),
-        );
-        assert_eq!(mixed, vec![1.0; 480], "primed, so the reserve is drawn on");
-        assert!(state.ring.lock().unwrap().primed);
-    }
-
-    /// The reserve is what a source arriving in packets needs, and the point of the whole
-    /// mechanism: a pass falling between two packets draws on the bank instead of punching
-    /// a hole. Without priming this same sequence is silence in every gap — which measured
-    /// at ~100% of the output on a real session (#175).
-    #[test]
-    fn a_primed_input_covers_the_gap_between_two_packets() {
-        let starved = AtomicU64::new(0);
-        let priming = AtomicU64::new(0);
-        let drained = AtomicU64::new(0);
-        let state = Arc::new(InputState {
-            ring: Mutex::new(Ring::default()),
-            room: Condvar::new(),
-            backpressure: Backpressure::Live,
-        });
-        let reserve = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
-        feed(&state, vec![1.0; reserve]);
-        // Prime.
-        let _ = mix_pass(
-            &[Arc::clone(&state)],
-            1,
-            &Gain::default(),
-            Some(&MixCounters {
-                starved: &starved,
-                priming: &priming,
-                drained: &drained,
-            }),
-        );
-        // Now three passes with nothing arriving at all, as happens between packets.
-        for _ in 0..3 {
-            let mixed = mix_pass(
-                &[Arc::clone(&state)],
-                240,
-                &Gain::default(),
-                Some(&MixCounters {
-                    starved: &starved,
-                    priming: &priming,
-                    drained: &drained,
-                }),
-            );
-            assert!(
-                mixed.iter().all(|s| (*s - 1.0).abs() < 1e-6),
-                "the reserve has to cover a gap between packets: {mixed:?}"
-            );
-        }
-        assert_eq!(
-            starved.load(Ordering::Relaxed),
-            0,
-            "nothing was invented; it came out of the bank"
-        );
-    }
-
-    /// Priming is silence and is counted as such, and an input primes exactly once.
+    /// A sender that starts slow is deferred, not perforated.
     ///
-    /// Both halves are corrections of the first attempt at this, and both were the reason
-    /// it made things worse rather than better. Re-priming on an empty ring sounds prudent
-    /// and is not: a live source hits empty routinely, so it replaced a sub-millisecond
-    /// hole with a [`PREBUFFER`]-long one, over and over. And exempting priming from the
-    /// counters meant all of that silence reported as `starved_pct=0.0` — the one number
-    /// that existed to catch it could not see it.
+    /// Every AirPlay sender measured on #175 delivered ~20–45% of real time for its first
+    /// five seconds and exactly real time after — four sessions, same shape — while
+    /// declaring `sender_latency_frames=77175`: it *intends* the receiver to run 1.75 s
+    /// behind, and the ramp is how the gap opens. A drain that pads eagerly plays that
+    /// ramp as audio riddled with holes. Front-padded backstops instead convert the ramp
+    /// deficit into deferral once, so the steady state that follows is continuous.
     #[test]
-    fn priming_is_counted_and_happens_once() {
-        let starved = AtomicU64::new(0);
-        let priming = AtomicU64::new(0);
-        let drained = AtomicU64::new(0);
-        let state = Arc::new(InputState {
-            ring: Mutex::new(Ring::default()),
-            room: Condvar::new(),
-            backpressure: Backpressure::Live,
-        });
-        // One packet in — fed, but far short of the reserve. That is priming.
-        feed(&state, vec![1.0; 800]);
-        let mixed = mix_pass(
-            &[Arc::clone(&state)],
-            240,
-            &Gain::default(),
-            Some(&MixCounters {
-                starved: &starved,
-                priming: &priming,
-                drained: &drained,
-            }),
-        );
-        assert_eq!(mixed, vec![0.0; 480]);
-        assert_eq!(
-            priming.load(Ordering::Relaxed),
-            240,
-            "silence has to be counted"
-        );
-        assert_eq!(
-            starved.load(Ordering::Relaxed),
-            0,
-            "and attributed to the right cause"
-        );
+    fn a_sender_that_ramps_up_is_deferred_not_riddled() {
+        const SOURCE_RATE: u32 = 44_100;
+        const PACKET: usize = 352;
+        /// The ramp: packets at a third of real time.
+        const RAMP: Duration = Duration::from_millis(1500);
+        const WINDOW: Duration = Duration::from_millis(3000);
 
-        // Bank the reserve and play it all out, so the ring ends empty.
-        let reserve = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
-        feed(&state, vec![1.0; reserve]);
-        while !state.ring.lock().unwrap().samples.is_empty() {
-            let _ = mix_pass(
-                &[Arc::clone(&state)],
-                240,
-                &Gain::default(),
-                Some(&MixCounters {
-                    starved: &starved,
-                    priming: &priming,
-                    drained: &drained,
-                }),
-            );
-        }
-        let priming_before = priming.load(Ordering::Relaxed);
+        let device = Recorder::new();
+        let mixer = mixer_with(&device);
+        let mut input = mixer.input(Backpressure::Live);
+        input.format(SOURCE_RATE, CHANNELS).unwrap();
 
-        // Dry, and one packet arrives. It must play immediately rather than starting a
-        // fresh 60 ms of silence.
-        feed(&state, vec![1.0; 8]);
-        let mixed = mix_pass(
-            &[Arc::clone(&state)],
-            4,
-            &Gain::default(),
-            Some(&MixCounters {
-                starved: &starved,
-                priming: &priming,
-                drained: &drained,
-            }),
-        );
-        assert_eq!(
-            mixed,
-            vec![1.0; 8],
-            "a primed input does not re-prime when it runs dry"
-        );
-        assert_eq!(
-            priming.load(Ordering::Relaxed),
-            priming_before,
-            "and nothing further is charged to priming"
-        );
-    }
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let block = PcmBlock {
+                    sample_rate: SOURCE_RATE,
+                    channels: CHANNELS,
+                    samples: vec![0.5; PACKET * usize::from(CHANNELS)],
+                    pts: Duration::ZERO,
+                };
+                let period =
+                    Duration::from_nanos(1_000_000_000u64 * PACKET as u64 / u64::from(SOURCE_RATE));
+                let started = Instant::now();
+                let mut next = started;
+                while !stop.load(Ordering::Relaxed) {
+                    input.write(&block).unwrap();
+                    // A third of real time during the ramp, real time after.
+                    next += if started.elapsed() < RAMP {
+                        period * 3
+                    } else {
+                        period
+                    };
+                    if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+            })
+        };
 
-    /// An input that closes plays out what it has rather than waiting for a reserve that
-    /// is never coming — otherwise the last moment of every session is truncated.
-    #[test]
-    fn a_closing_input_plays_out_without_priming() {
-        let state = Arc::new(InputState {
-            ring: Mutex::new(Ring::default()),
-            room: Condvar::new(),
-            backpressure: Backpressure::Live,
-        });
-        feed(&state, vec![1.0; 8]);
-        state.ring.lock().unwrap().closed = true;
-        let mixed = mix_pass(&[state], 4, &Gain::default(), None);
-        assert_eq!(mixed, vec![1.0; 8], "the tail has to reach the speakers");
-    }
+        // Let the ramp finish, then measure the steady state that follows it.
+        std::thread::sleep(RAMP + Duration::from_millis(500));
+        let from = device.heard.lock().unwrap().len();
+        std::thread::sleep(WINDOW);
+        let heard = device.heard.lock().unwrap()[from..].to_vec();
+        stop.store(true, Ordering::Relaxed);
+        producer.join().unwrap();
 
-    #[test]
-    fn an_input_that_runs_dry_is_counted_and_not_only_padded() {
-        let starved = AtomicU64::new(0);
-        let priming = AtomicU64::new(0);
-        let drained = AtomicU64::new(0);
-        // Two frames offered against a four-frame pass.
-        let mixed = mix_pass(
-            &[filled(vec![1.0; 4])],
-            4,
-            &Gain::default(),
-            Some(&MixCounters {
-                starved: &starved,
-                priming: &priming,
-                drained: &drained,
-            }),
+        let frames = heard.chunks_exact(usize::from(CHANNELS));
+        let total = frames.len();
+        let audible = frames.filter(|f| f.iter().any(|s| *s != 0.0)).count();
+        #[allow(clippy::cast_precision_loss)]
+        let carried = audible as f64 / total as f64;
+        println!(
+            "post-ramp: {audible}/{total} device frames carried audio ({:.1}%)",
+            carried * 100.0
         );
-        assert_eq!(mixed, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(
-            starved.load(Ordering::Relaxed),
-            2,
-            "half the pass was invented and has to say so"
+        assert!(
+            carried > 0.97,
+            "only {:.1}% of the post-ramp output carried audio; the ramp's deficit should \
+             have become deferral, not recurring holes",
+            carried * 100.0
         );
     }
 
@@ -1738,14 +2069,15 @@ mod tests {
         let mixer = mixer_with(&device);
         let mut input = mixer.input(Backpressure::Live);
         let start = Instant::now();
-        // 100 blocks of 50 ms: five seconds of audio, twenty times the budget.
+        // 100 blocks of 50 ms: five seconds of audio, more than twice the budget.
         for _ in 0..100 {
             input.write(&tone(2400, 0.5)).unwrap();
         }
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(500),
-            "a live source was parked for {elapsed:?} offering five seconds of audio;              its own queue fills for exactly that long, and it newest-drops"
+            "a live source was parked for {elapsed:?} offering five seconds of audio; \
+             its own queue fills for exactly that long, and it newest-drops"
         );
         // Not "discarded everything": the newest audio still has to reach the speakers.
         std::thread::sleep(Duration::from_millis(200));
@@ -1828,16 +2160,16 @@ mod tests {
                 pts: Duration::ZERO,
             })
             .unwrap();
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(400));
         let heard = device.heard();
         assert!(
             !heard.is_empty(),
             "a 44.1 kHz mono source produced nothing at the device"
         );
         // Counted over the *audible* part, not over everything the device was given: the
-        // mixer produces a continuous stream and pads with silence whenever the inputs
-        // have nothing, which is the property the tap depends on. 100 ms in at 44.1 kHz
-        // mono is ~100 ms out at 48 kHz stereo, give or take the resampler's delay line.
+        // mixer emits silence when it must keep the device fed with nothing banked, which
+        // is what an idle panel is. 100 ms in at 44.1 kHz mono is ~100 ms out at 48 kHz
+        // stereo, give or take the resampler's delay line.
         let audible = heard.iter().filter(|s| s.abs() > 0.01).count();
         let frames = audible / usize::from(CHANNELS);
         assert!(
