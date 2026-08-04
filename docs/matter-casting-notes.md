@@ -249,10 +249,45 @@ client does not. Tracked, not papered over.
 
 ## 6. Where the risk is
 
-**Nothing has driven this from a real phone.** The wire tests script a Casting Client over
-a real socket and prove the UDC exchange byte for byte; the commissioning half — PASE,
-`AddNOC`, CASE — has never run against a peer. `rs-matter`'s own commissioning integration
-test exercises that code path, but against `rs-matter`, which is agreement with ourselves.
+**Commissioning has run against a peer; nothing has driven it from a real phone.** Those
+are different claims and the gap between them is where the risk now sits.
+
+What runs: `nix build .#checks.x86_64-linux.matter-vm` puts the panel on one VM and
+`crates/proto-matter/examples/matter-peer` — a scripted Casting Client — on another, and
+walks the whole flow with nobody in the room. Declare over UDC, the panel picks a passcode
+and shows it, the harness reads it off the journal and types it onto the phone, then
+`_matterc._udp` browse → PASE → `ArmFailSafe` → `AddNOC` → CASE →
+`CommissioningComplete`, and finally the phone opening an exchange *back* and invoking
+`LaunchURL`, asserted through to `session: play`. So our CA, our NOC generator wiring, the
+fabric we install, the ACLs we seed and the endpoint tree are all on a path that executes.
+
+The Matter *core* is `rs-matter` on both sides of that test, which is agreement with
+ourselves and proves nothing about TLV, MRP, PASE or CASE. That is the D54 bargain and it
+is the same shape as GameStream's: the reference implementation's correctness is not what
+we are testing.
+
+One thing the two-node arrangement bought outright: **`await_commissionable` had
+integration coverage nowhere**, ours or upstream's. `rs-matter`'s own commissioning test
+skips mDNS *entirely* — its comment says device and controller share the host's `:5353`,
+whose multicast loopback is unreliable, so discovery is "covered by unit tests instead".
+Two hosts on a test LAN is the first time that browse met an advertiser.
+
+What is still untested is a *real* phone: an implementation that has never seen our code,
+whose UDC retransmit timing, TXT-key expectations and instance-name casing are its own.
+`instance_matches` is case-insensitive on a guess about that, not a measurement.
+
+**The panel's operational record is not advertised, and the cast rides session reuse.**
+`advertisements()` publishes `_matterd._udp` only — the comment there says the phone
+"learns the address during commissioning rather than by browsing", and the VM test
+confirms that holds: the `LaunchURL` goes out over the CASE session `complete_via_case`
+established, on the first attempt.
+
+It stops holding when that session is gone — an idle timeout, a panel restart, a phone
+that sleeps overnight. `rs-matter`'s `Transport::initiate` reuses a live session and
+otherwise resolves `<compressed-fabric-id>-<node-id>._matter._tcp`, which this panel does
+not publish, so a returning phone has nothing to resolve. `matter-vm` casts seconds after
+commissioning and therefore takes the reuse branch every time, which is exactly why the
+harness passing does not close this. Issue **#173**.
 
 **Attestation runs the *other* way, and the first draft of this section said otherwise.**
 Worth stating precisely, because the inversion catches this too. During commissioning it
