@@ -813,7 +813,9 @@ mod tests {
         0x24, 0x06, 0x21, // Context tag 8 (cdPort), u16 = 5550.
         0x25, 0x08, 0xAE, 0x15, // Context tag 9 (targetAppList), a TLV list.
         0x37, 0x09, // Context tag 10 (targetApp), a structure.
-        0x35, 0x0A, // Context tag 11 (app vendorId), u16 = 4996 — Amazon.
+        0x35, 0x0A, // Context tag 11 (app vendorId), u16 = 4996. An illustrative value, not a
+        // looked-up one: CSA vendor ids live in the distributed compliance ledger and
+        // only the test range (0xFFF1-4) is safe to assert from memory.
         0x25, 0x0B, 0x84, 0x13, // Context tag 12 (app productId), u8 = 1.
         0x24, 0x0C, 0x01, // End of the targetApp structure.
         0x18, // End of the targetAppList list.

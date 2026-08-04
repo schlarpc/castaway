@@ -254,16 +254,34 @@ a real socket and prove the UDC exchange byte for byte; the commissioning half �
 `AddNOC`, CASE — has never run against a peer. `rs-matter`'s own commissioning integration
 test exercises that code path, but against `rs-matter`, which is agreement with ourselves.
 
-**A certified sender will not talk to this panel.** Prime Video and the rest check the
-receiver's device attestation certificate chain, and the panel presents a test-vendor
-identity (`0xFFF1`) with no CSA certification behind it. That distance is a certification
-and a real DAC, not more code.
+**Attestation runs the *other* way, and the first draft of this section said otherwise.**
+Worth stating precisely, because the inversion catches this too. During commissioning it
+is the **client** that presents a Device Attestation Certificate and the **player** that
+checks it — the player never presents one, and CASE afterwards authenticates with node
+operational certificates chained to the fabric root the client was just given. So there is
+no "receiver attestation chain" for a sender to validate, and nothing cryptographic on the
+panel's side is what stands between it and a commercial sender.
 
-**We do not verify the client's attestation either.** `allow_test_attestation: true`, and
-the comment in `commission_one` says why: `rs-matter` has no DCL fetch, and what it would
-prove — that the phone is a certified Matter device — is not the question the panel is
-asking. The question is whether the person holding it is in the room, and the answer to
-that is the passcode on the screen.
+We do not verify the client's, either: `allow_test_attestation: true`, and the comment in
+`commission_one` says why — `rs-matter` has no DCL fetch, and what verification would prove
+(that the phone is a certified Matter device) is not the question the panel is asking. The
+question is whether the person holding it is in the room, and the passcode on the screen
+answers that.
+
+**What actually stands between this panel and a commercial sender is softer, and worse.**
+A client picks an endpoint by matching `ApplicationBasic` — a vendor id, a product id, an
+application id in some catalog. Those are numbers in config. Claiming Amazon's would be a
+config edit, and it would be a lie the panel cannot make good on: the cast would be
+accepted and then nothing would play, because the content app on the other side has to be
+the real thing, with its own DRM stack and its own entitlement. Matter carries no media, so
+there is no version of this where the protocol supplies what the app does not. That is a
+ceiling, not a gap.
+
+The vendor id itself is a registry entry — the CSA allocates them, `0xFFF1`–`0xFFF4` are the
+test range, and the authoritative list is the CSA's distributed compliance ledger. The
+SDK's own `CHIPVendorIdentifiers.hpp` names only a handful (Apple `0x1349`, Google `0x6006`,
+the test range); every value in this repository's fixtures outside the test range should be
+read as illustrative unless it cites the DCL.
 
 **Content apps are the ceiling.** Matter gives the panel "app X, play title Y". Mainstream
 apps will not run here — they need their own DRM stack and their own business arrangement —
