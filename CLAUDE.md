@@ -18,6 +18,7 @@ The design docs are the spec — read them before touching a subsystem:
   correct and must not be "fixed", where real control points diverge from the spec, and
   what the citations are worth. Read before changing `proto-dlna`.
 - **docs/miracast-protocol-notes.md** — the WFD/Miracast protocol record `proto-miracast` is built from: the information element, the `wfd-kv` grammar, the M1–M16 exchange, MPEG2-TS-over-RTP, UIBC, and what real Windows and Android senders actually do. Read before changing `proto-miracast`; §7 is the platform reality and is where the project's remaining risk lives.
+- **docs/matter-casting-notes.md** — the Matter Casting record `proto-matter` is built from: the inverted roles (the panel is the *commissioner*), the UDC wire format `rs-matter` does not implement, the passcode flow, and the endpoint tree. Read before changing `proto-matter`; §6 is where its remaining risk lives.
 - **docs/gamestream-protocol-notes.md** — the GameStream/Moonlight record. The one *inverted* protocol (we are the client) and the one that is half-linked rather than reimplemented: NVHTTP + pairing are ours, the streaming core is moonlight-common-c (D37). Read before changing `proto-gamestream`; §6 is where its remaining risk lives.
 - **docs/cross-build.md** — Linux→Windows cross-build (`cargo-xwin`-modelled MSVC toolchain), the vendored Electron/ffmpeg/Widevine blobs, and the testing matrix.
 
@@ -112,8 +113,8 @@ These are binding engineering constraints for this project. They override genera
    the *local* surface — discovery, advertisement, anything sharing our single HTTP host
    or mDNS responder — still has to be ours.
 
-   **Carve-out — the GameStream streaming core (D37).** The second and, for now, last
-   exception, and a different one: the peer *is* a device speaking a stable spec, so the
+   **Carve-out — the GameStream streaming core (D37).** The second exception, and a
+   different one: the peer *is* a device speaking a stable spec, so the
    rule's own logic says reimplement. It was overridden deliberately on volume and shape
    — the streaming half is ~15k lines of C whose correctness is FEC recovery under real
    loss and A/V pacing under real jitter. The split holds the line where it matters: the
@@ -121,6 +122,16 @@ These are binding engineering constraints for this project. They override genera
    against the reference implementation's own vectors; only the post-`/launch` media
    plane is linked, behind an off-by-default feature, and it is GPL against this MIT
    tree. Do not read this as a general licence to link — read D37 for what it cost.
+
+   **Carve-out — the Matter core (D54).** The third, on the same reasoning as D37 and at a
+   fraction of the price. Matter core — TLV, MRP, PASE, CASE, the interaction model, the
+   certificate format — is the largest protocol in this tree and none of it is the
+   interesting part of a casting receiver. `rs-matter` is Apache-2.0, pure Rust with no C,
+   and maintained by the organisation that writes the spec; its build-time codegen even
+   emits the media clusters from the CSA IDL. The D30 conditions hold: idiomatic Rust
+   crate, and the entire local surface is still ours — User Directed Commissioning (which
+   `rs-matter` does not implement), the `_matterd._udp` record on our one mDNS responder,
+   the sockets, the endpoint tree, and the cluster handlers.
 
    Everything else here is still reimplemented.
 
