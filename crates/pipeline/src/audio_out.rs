@@ -52,6 +52,16 @@ pub trait AudioOut: Send {
     fn frames_played(&self) -> Option<u64> {
         None
     }
+
+    /// How many times the device callback ran dry, if this backend can say.
+    ///
+    /// The far side of everything the mixer counts: silence inserted *by the device*
+    /// because a write arrived late, which no counter on the mix side can see. Both real
+    /// backends were already counting this and nothing in production read it — the one
+    /// term of #175's audit that had no way into a log line.
+    fn underruns(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// What a live output stream reports about itself, shared with the thread that owns it.
@@ -506,6 +516,10 @@ mod cpal_backend {
     impl AudioOut for CpalAudioOut {
         fn frames_played(&self) -> Option<u64> {
             Some(self.played.load(Ordering::Relaxed))
+        }
+
+        fn underruns(&self) -> Option<u64> {
+            Some(self.underruns.load(Ordering::Relaxed))
         }
 
         fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {

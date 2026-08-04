@@ -266,6 +266,10 @@ impl AudioOut for PipeWireAudioOut {
         Some(self.played.load(Ordering::Relaxed))
     }
 
+    fn underruns(&self) -> Option<u64> {
+        Some(self.underruns.load(Ordering::Relaxed))
+    }
+
     fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
         // A sink that errored or was unlinked. As on the cpal side this no longer ends
         // the session: live audio is dropped while there is nowhere to put it, and
