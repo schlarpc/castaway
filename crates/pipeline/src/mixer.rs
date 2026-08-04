@@ -117,6 +117,27 @@ const IDLE_CLOSE: Duration = Duration::from_secs(5);
 /// How often the mixer retries a device it could not open, or that failed.
 const REOPEN_AFTER: Duration = Duration::from_secs(1);
 
+/// How much audio a live input may hold.
+///
+/// [`LEAD`] does not apply to these and never should have. It is the *media clock's*
+/// invariant — `MediaClock` reports `submitted - OUTPUT_LEAD`, so a paced source may run
+/// exactly that far ahead of the speakers and no further, or a cast plays its video early.
+/// A live source has no media clock: `spawn_pcm`'s own comment says "the sender is the
+/// clock, there is no video to synchronise". Capping it at `LEAD` applied a lip-sync
+/// constraint to sources with no lips, and cost the audio instead.
+///
+/// What it has to hold is the sender's burst. A phone does not hand over one packet every
+/// 8 ms in a tidy line; it sends ahead, in lumps, and declares how far ahead it intends to
+/// run — `sender_latency_frames=77175` is 1.75 s of it. A ring holding 150 ms against that
+/// alternately overflows and runs dry, which is `starved=42%` and `shed=41%` in the same
+/// five seconds.
+///
+/// Two seconds, so the declared burst fits. The cost is latency *only if the sender
+/// actually runs that far ahead*, since this is a ceiling and not a target — the ring
+/// drains at real time and sits at whatever the sender banks. Reclaiming that is the
+/// timing-model work (`clock_samples=0`), not this.
+const LIVE_BUDGET: Duration = Duration::from_secs(2);
+
 /// How much a live input banks before the mixer starts drawing on it.
 ///
 /// The jitter buffer this path did not have (#175). A source arriving in ordinary,
@@ -318,6 +339,14 @@ struct InputState {
 
 #[derive(Debug, Default)]
 struct Ring {
+    /// Whether anything has ever been written here.
+    ///
+    /// A `Live` input is created when a surface that *might* make a sound appears — the
+    /// browser holds one for the whole life of the panel — so an input that has never been
+    /// written to is silent by nature, not starved. Counting those made the phantom read
+    /// as ~100% of every figure this module reports, which is most of a day's wrong
+    /// diagnoses.
+    fed: bool,
     /// Whether this input has banked [`PREBUFFER`] and is being drawn on.
     ///
     /// Set once and never cleared. Re-priming on an empty ring was tried and is much worse
@@ -447,7 +476,10 @@ impl MixInput {
     /// How the room is made is [`Backpressure`]'s whole subject: a pull source parks until
     /// the mixer has drained, a live one sheds its oldest audio and carries on.
     fn enqueue(&mut self, stereo: &[f32]) {
-        let budget = frames_in(LEAD);
+        let budget = match self.backpressure {
+            Backpressure::Pull => frames_in(LEAD),
+            Backpressure::Live => frames_in(LIVE_BUDGET),
+        };
         let deadline = Instant::now() + WRITE_DEADLINE;
         let Ok(mut ring) = self.state.ring.lock() else {
             return;
@@ -490,6 +522,7 @@ impl MixInput {
             };
             ring = next;
         }
+        ring.fed = true;
         ring.samples.extend(stereo.iter().copied());
     }
 
@@ -900,10 +933,15 @@ fn mix_pass(
         let Ok(mut ring) = input.ring.lock() else {
             continue;
         };
-        // Still filling its reserve, so it contributes silence and says nothing about it:
-        // this is the buffer working, not the starvation the counter exists to show. A
-        // closed input never primes — what is left in it is all there will ever be, and
-        // waiting for more would truncate the last moment of every session.
+        // Nothing has ever been written here, so it is a surface that might make a sound
+        // rather than a source that is failing to: it owes no explanation and gets no
+        // counter. The browser holds one of these for the life of the panel.
+        if input.backpressure == Backpressure::Live && !ring.fed {
+            continue;
+        }
+        // Still filling its reserve. Silence, and counted as silence — see `priming`. A
+        // closed input never primes: what is in it is all there will ever be, and waiting
+        // for more would truncate the last moment of every session.
         if input.backpressure == Backpressure::Live && !ring.closed && !ring.primed {
             if (ring.samples.len() / usize::from(CHANNELS)) < frames_in(PREBUFFER) as usize {
                 if let Some(priming) = priming {
@@ -1104,12 +1142,21 @@ mod tests {
         })
     }
 
+    /// Put audio into a live input the way [`MixInput::write`] does — `fed` included, since
+    /// that is what tells the mixer this input is a source rather than a silent surface.
+    fn feed(state: &Arc<InputState>, samples: Vec<f32>) {
+        let mut ring = state.ring.lock().unwrap();
+        ring.fed = true;
+        ring.samples.extend(samples);
+    }
+
     fn filled(samples: Vec<f32>) -> Arc<InputState> {
         Arc::new(InputState {
             ring: Mutex::new(Ring {
                 // Already playing: every existing test means "an input with audio in it",
                 // and priming is a separate property with its own tests below.
                 primed: true,
+                fed: true,
                 samples: samples.into(),
                 closed: false,
             }),
@@ -1373,7 +1420,7 @@ mod tests {
             backpressure: Backpressure::Live,
         });
         // One packet's worth, far short of the reserve.
-        state.ring.lock().unwrap().samples.extend(vec![1.0; 800]);
+        feed(&state, vec![1.0; 800]);
         let mixed = mix_pass(
             &[Arc::clone(&state)],
             240,
@@ -1395,7 +1442,7 @@ mod tests {
 
         // Past the reserve, it plays.
         let banked = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
-        state.ring.lock().unwrap().samples.extend(vec![1.0; banked]);
+        feed(&state, vec![1.0; banked]);
         let mixed = mix_pass(
             &[Arc::clone(&state)],
             240,
@@ -1420,12 +1467,7 @@ mod tests {
             backpressure: Backpressure::Live,
         });
         let reserve = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
-        state
-            .ring
-            .lock()
-            .unwrap()
-            .samples
-            .extend(vec![1.0; reserve]);
+        feed(&state, vec![1.0; reserve]);
         // Prime.
         let _ = mix_pass(
             &[Arc::clone(&state)],
@@ -1472,7 +1514,8 @@ mod tests {
             room: Condvar::new(),
             backpressure: Backpressure::Live,
         });
-        // A pass while it is still filling: silence, and said so.
+        // One packet in — fed, but far short of the reserve. That is priming.
+        feed(&state, vec![1.0; 800]);
         let mixed = mix_pass(
             &[Arc::clone(&state)],
             240,
@@ -1494,12 +1537,7 @@ mod tests {
 
         // Bank the reserve and play it all out, so the ring ends empty.
         let reserve = frames_in(PREBUFFER) as usize * usize::from(CHANNELS);
-        state
-            .ring
-            .lock()
-            .unwrap()
-            .samples
-            .extend(vec![1.0; reserve]);
+        feed(&state, vec![1.0; reserve]);
         while !state.ring.lock().unwrap().samples.is_empty() {
             let _ = mix_pass(
                 &[Arc::clone(&state)],
@@ -1513,7 +1551,7 @@ mod tests {
 
         // Dry, and one packet arrives. It must play immediately rather than starting a
         // fresh 60 ms of silence.
-        state.ring.lock().unwrap().samples.extend(vec![1.0; 8]);
+        feed(&state, vec![1.0; 8]);
         let mixed = mix_pass(
             &[Arc::clone(&state)],
             4,
@@ -1542,11 +1580,8 @@ mod tests {
             room: Condvar::new(),
             backpressure: Backpressure::Live,
         });
-        {
-            let mut ring = state.ring.lock().unwrap();
-            ring.samples.extend(vec![1.0; 8]);
-            ring.closed = true;
-        }
+        feed(&state, vec![1.0; 8]);
+        state.ring.lock().unwrap().closed = true;
         let mixed = mix_pass(&[state], 4, &Gain::default(), None, None);
         assert_eq!(mixed, vec![1.0; 8], "the tail has to reach the speakers");
     }
