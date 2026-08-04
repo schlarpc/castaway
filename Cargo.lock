@@ -5461,8 +5461,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "castaway-core",
+ "rand_core 0.6.4",
  "rs-matter",
  "substrate-mdns",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

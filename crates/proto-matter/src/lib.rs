@@ -28,9 +28,13 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod fabric;
+pub mod node;
+pub mod player;
 pub mod udc;
 
 pub use error::{MatterError, UdcError};
+pub use player::{CastCommand, Catalogue, ContentApp, LaunchTarget, PlayerState, Surface};
 
 /// The Matter operational UDP port (`rs_matter::MATTER_PORT`), re-exported so the
 /// network-surface registry names one constant rather than reaching past this crate.

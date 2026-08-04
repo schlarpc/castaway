@@ -11,6 +11,8 @@ description = "Matter Casting receiver: the Casting Video Player role — UDC, t
 castaway-core.workspace = true
 substrate-mdns.workspace = true
 rs-matter.workspace = true
+# rs-matter's own RNG trait bound; the `Dataver`s and the handler chain take one.
+rand_core = "0.6"
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "net", "time"] }
@@ -18,6 +20,7 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time", "net"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true
