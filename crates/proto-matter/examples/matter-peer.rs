@@ -367,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The transport keeps running underneath this select: a wrong *passcode* is
             // only refused after the panel has actually tried PASE against us, which needs
             // us answering.
-            let cd = udc.reply_within(REFUSAL_TIMEOUT).await?;
+            let cd = udc.await_refusal(REFUSAL_TIMEOUT).await?;
             println!(
                 "matter-peer: the panel refused with {:?} ({})",
                 cd.error_code, cd.error_code as u16
@@ -605,6 +605,34 @@ impl UdcSocket {
 
     async fn reply(&self) -> Result<CommissionerDeclaration, Box<dyn std::error::Error>> {
         self.reply_within(CD_TIMEOUT).await
+    }
+
+    /// Read declarations until one carries an error code, or `within` elapses.
+    ///
+    /// Not `reply_within`: the panel answers the `commissionerPasscodeReady` declaration
+    /// immediately with "understood, going now" — `CdError::None` — and the outcome
+    /// arrives a minute later on the same socket. Taking the first datagram as the answer
+    /// reads the acknowledgement as the verdict, which is what a real client would do
+    /// wrong too.
+    async fn await_refusal(
+        &self,
+        within: Duration,
+    ) -> Result<CommissionerDeclaration, Box<dyn std::error::Error>> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err("the panel never said why commissioning stopped".into());
+            }
+            let cd = self.reply_within(left).await?;
+            if cd.error_code != CdError::None {
+                return Ok(cd);
+            }
+            tracing::debug!(
+                ?cd,
+                "matter-peer: an all-clear; still waiting for the outcome"
+            );
+        }
     }
 
     async fn reply_within(
