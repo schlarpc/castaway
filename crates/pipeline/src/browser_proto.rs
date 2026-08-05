@@ -335,6 +335,22 @@ pub enum ToBrowser {
         /// Whether to cancel the request.
         block: bool,
     },
+    /// Install, or withdraw, the Cast receiver platform shim (#16).
+    ///
+    /// Sent before a hosted Cast application is navigated to and withdrawn when it
+    /// stops. Withdrawal matters as much as installation: a page that is not a Cast
+    /// application must not find a platform sitting there, or a stale tab could drive
+    /// the last application's session.
+    CastPlatform {
+        /// `None` withdraws the shim.
+        ///
+        /// `Some(port)` is the loopback port the receiver platform listens on, which the
+        /// page's SDK is handed through `queryPlatformValue("port-for-web-server")`. It
+        /// travels rather than being defaulted so the page and the server cannot
+        /// disagree — the SDK's own fallback is a hardcoded 8008, and a page that dials
+        /// the wrong port fails silently.
+        port: Option<u16>,
+    },
     /// The scriptlets for a page, answering [`FromBrowser::ScriptletQuery`].
     ScriptletSource {
         /// The query being answered.

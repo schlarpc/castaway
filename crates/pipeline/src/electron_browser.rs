@@ -1160,6 +1160,9 @@ impl ElectronHost {
         }
         while let Ok(cmd) = self.commands.try_recv() {
             match cmd {
+                BrowserCommand::CastPlatform(port) => {
+                    self.send(&ToBrowser::CastPlatform { port });
+                }
                 BrowserCommand::Navigate(url) => self.show_page(render, &url),
                 BrowserCommand::Hide => self.hide_page(render),
             }

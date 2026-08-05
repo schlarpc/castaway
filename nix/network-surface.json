@@ -116,6 +116,19 @@
       "wire": "CASTv2: length-prefixed protobuf over TLS"
     },
     {
+      "chosen_by": "spec",
+      "gate": [
+        "cast"
+      ],
+      "owner": "cast",
+      "port": {
+        "fixed": 8008
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "the Cast receiver platform: a WebSocket on /v2/ipc carrying {namespace, senderId, data} frames to a hosted application's page"
+    },
+    {
       "chosen_by": "ours",
       "gate": [
         "cast"

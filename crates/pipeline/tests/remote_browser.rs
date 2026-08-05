@@ -316,7 +316,10 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
         program: electron_path(),
         app_dir: app_dir(),
         adblock: blocker,
-        audio_out: None,
+        // Renamed to `mixer` when #111 made the panel have one output rather than a
+        // device per session; this test was not built with `--features electron` and so
+        // did not fail when it stopped compiling.
+        mixer: None,
         user_agent: pipeline::TV_USER_AGENT.to_string(),
         waker: castaway_core::Waker::new(),
     };

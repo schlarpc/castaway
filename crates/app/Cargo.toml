@@ -21,6 +21,7 @@ proto-dlna.workspace = true
 proto-cast.workspace = true
 crypto-cast-auth.workspace = true
 cast-replay.workspace = true
+cast-registry.workspace = true
 proto-spotify.workspace = true
 proto-bluetooth-audio.workspace = true
 hci-transport.workspace = true

@@ -30,6 +30,55 @@ const path = require('path');
 // to the sound card. See audio-tap.js for why this cannot be done from the host side.
 const AUDIO_TAP = fs.readFileSync(path.join(__dirname, 'audio-tap.js'), 'utf8');
 
+// The Cast receiver platform shim (#16).
+//
+// A hosted Cast application is a page that loads Google's receiver SDK, and the SDK looks
+// for the *device* underneath it at `cast.__platform__` — NOT `window.__platform__`. Both
+// generations capture the `cast` namespace object first and read the shim out of it:
+//
+//   v2:  var n = this||self; var q = n.cast || {};    ... q.__platform__
+//   CAF: _.u.cast = _.u.cast || {}; cast = _.u.cast;  ... cast.__platform__
+//
+// On `window` it is simply never found, and the SDK falls back to its own hardcoded 8008
+// with no complaint — which on a receiver whose platform is on another port is a page
+// that dials nothing and an application that never starts, with nothing said anywhere.
+//
+// Two things are load-bearing here:
+//
+//   `port-for-web-server` is where the SDK dials. Handed over rather than left to the
+//   default so the page and the server cannot disagree; both come from one value in
+//   `proto-cast::platform_actor`.
+//
+//   `canDisplayType` is what the page asks before choosing a rendition, and its absence
+//   is not neutral. The SDK's own guard is `if (!cc()) return true` — with no shim it
+//   answers *yes to everything*, so the page concludes the panel does HEVC, Dolby Vision
+//   and Atmos and picks a stream accordingly. What that looks like in the room is a
+//   receiver that connects and then shows nothing. So the shim answers from the browser
+//   itself, which is the only thing that actually knows.
+const CAST_PLATFORM = (config) => `
+(() => {
+  window.cast = window.cast || {};
+  window.cast.__platform__ = {
+    queryPlatformValue: (key) => (${JSON.stringify(config.values)})[key],
+    // MediaSource is the same question the SDK is asking, asked of the engine that
+    // would have to play it. \`isTypeSupported\` is stricter than <video> canPlayType
+    // and is what an adaptive receiver actually uses.
+    canDisplayType: (mime) => {
+      try {
+        return Boolean(window.MediaSource && window.MediaSource.isTypeSupported(mime));
+      } catch (e) {
+        return false;
+      }
+    },
+  };
+})();
+`;
+
+// What the receiver told us about itself, for the shim above. Empty until the Rust side
+// says otherwise, and the shim is then simply not installed: a page that is not a Cast
+// application must not find a platform, or a stale tab could drive one.
+let castPlatform = null;
+
 // ---------------------------------------------------------------------------
 // Fail loudly on stderr, never in a dialog. A modal on a wall-mounted panel is a
 // receiver that has stopped, with nobody there to dismiss the reason.
@@ -466,7 +515,7 @@ async function applyScriptlets(w, source) {
     }
     const res = await withDeadline(
       contents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
-        source: `${AUDIO_TAP}\n${source || ''}`,
+        source: `${castPlatform ? CAST_PLATFORM(castPlatform) : ''}\n${AUDIO_TAP}\n${source || ''}`,
         runImmediately: true,
       }),
       'addScriptToEvaluateOnNewDocument'
@@ -745,6 +794,21 @@ function handle(msg) {
     case 'adblock-verdict': {
       const finish = pendingBlock.get(msg.id);
       if (finish) finish(Boolean(msg.block));
+      return;
+    }
+    case 'cast-platform': {
+      // Installed before a hosted Cast application is navigated to, withdrawn when it
+      // stops. The shim is baked into the document-start blob, so it takes effect on the
+      // *next* navigation, which is the one the receiver is about to perform.
+      castPlatform = msg.port
+        ? { values: { 'port-for-web-server': String(msg.port) } }
+        : null;
+      log('info', castPlatform
+        ? `cast platform shim armed for port ${msg.port}`
+        : 'cast platform shim withdrawn');
+      // Nothing is re-armed here. The blob is rebuilt per navigation (scriptlets are
+      // domain-scoped, so `applyScriptlets` runs on every one), and the receiver's next
+      // move after arming this is the navigation to the application itself.
       return;
     }
     case 'scriptlet-source': {

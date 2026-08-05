@@ -484,6 +484,13 @@ impl PlaybackReport for PlaybackHandle {
     }
 }
 
+/// What puts a hosted page on the panel: the browser channel, as a closure.
+///
+/// A closure rather than a handle held by the pipeline because the channel belongs to the
+/// main thread and this type is shared across the runtime — the same shape
+/// [`RenderPipeline::set_screen_release`] uses for the other direction.
+pub type PageHost = Arc<dyn Fn(castaway_core::HostedPage) + Send + Sync>;
+
 /// The tokio-side pipeline handle. Implements [`Pipeline`]; owns decode threads and the
 /// sender half of the render channel.
 pub struct RenderPipeline {
@@ -528,6 +535,8 @@ pub struct RenderPipeline {
     /// the `electron` feature and the pipeline should not: the pipeline's concern is "somebody
     /// else is casting now", and what that means for a browser is the app's business.
     release_screen: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// How to put a hosted page on the panel, when this build has a browser.
+    host_page: Mutex<Option<PageHost>>,
     /// Output gain, shared with whichever audio session is live.
     ///
     /// Owned by the pipeline rather than by a session because it has to outlive them:
@@ -574,6 +583,7 @@ impl RenderPipeline {
                 playback: Arc::new(Mutex::new(None)),
                 ends: Mutex::new(None),
                 release_screen: Mutex::new(None),
+                host_page: Mutex::new(None),
                 #[cfg(feature = "audio")]
                 mixer: Mutex::new(None),
                 #[cfg(feature = "audio")]
@@ -719,6 +729,18 @@ impl RenderPipeline {
     pub const fn with_hw_preference(mut self, preference: HwPreference) -> Self {
         self.hw = preference;
         self
+    }
+
+    /// Register how to put a page on the panel.
+    ///
+    /// The counterpart of [`Self::set_screen_release`]: that one hands the panel back,
+    /// this one takes it. Both are closures over the browser channel rather than a
+    /// handle held here, because the channel is the main thread's and this type is
+    /// shared across the runtime.
+    pub fn set_page_host(&self, host: PageHost) {
+        if let Ok(mut held) = self.host_page.lock() {
+            *held = Some(host);
+        }
     }
 
     /// Register what to do when another source takes the screen.
@@ -911,6 +933,27 @@ impl Pipeline for RenderPipeline {
                 report.report(ticket, end);
             }
         });
+        Ok(())
+    }
+
+    async fn host_page(&self, page: castaway_core::HostedPage) -> Result<(), CoreError> {
+        let host = self.host_page.lock().ok().and_then(|held| held.clone());
+        let Some(host) = host else {
+            return Err(CoreError::Pipeline(format!(
+                "this build has no browser to host {} in",
+                page.url
+            )));
+        };
+        // The panel is claimed and whatever was decoding is preempted, exactly as a
+        // starting URL or mirror session would — a hosted application is a session, and
+        // the audio of the thing it replaced must not go on playing underneath it.
+        //
+        // `release_screen` is deliberately *not* called: that hands the panel back from
+        // the browser, and the browser is what is about to take it.
+        self.claim_panel();
+        self.preempt();
+        info!(url = %page.url, title = %page.title, "render pipeline: HOST PAGE");
+        host(page);
         Ok(())
     }
 

@@ -74,6 +74,13 @@ pub enum BrowserCommand {
     /// Give the panel back: return to the idle widget if one is configured, else close
     /// the browser and drop its compositor layer (e.g. DIAL stop).
     Hide,
+    /// Arm, or withdraw, the Cast receiver platform shim before a navigation (#16).
+    ///
+    /// Separate from [`BrowserCommand::Navigate`] rather than a field on it because the
+    /// two have different lifetimes: the shim is withdrawn when the application stops,
+    /// which is not a navigation at all, and leaving it armed would let a page that is
+    /// not a Cast application find a platform to drive.
+    CastPlatform(Option<u16>),
 }
 
 #[cfg(feature = "render")]

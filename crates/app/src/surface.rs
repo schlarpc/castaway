@@ -344,6 +344,26 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
             },
             Listener {
                 owner: Owner::Protocol(kind),
+                transport: Transport::Tcp,
+                port: PortSpec::Fixed(proto_cast::platform::DEFAULT_PLATFORM_PORT),
+                bind: "127.0.0.1",
+                wire: "the Cast receiver platform: a WebSocket on /v2/ipc carrying \
+                       {namespace, senderId, data} frames to a hosted application's page",
+                security: "none, and it does not need any — the peer is our own browser \
+                           process on this host and nothing else can reach the socket",
+                gate: Gate::AnyOf(&[ProtocolKind::Cast]),
+                provider: Provider::Process,
+                chosen_by: Provenance::Spec,
+                notes: "Loopback, unlike every other entry here, and deliberately: this \
+                        is the *inside* of the receiver. Anything that could open it \
+                        could impersonate the device to the application — set its \
+                        volume, claim a sender connected, feed it messages as though \
+                        they came from a phone. 8008 is the receiver SDK's own default \
+                        and a real Chromecast's port; the browser is told the actual \
+                        one, so the two cannot disagree (#16).",
+            },
+            Listener {
+                owner: Owner::Protocol(kind),
                 transport: Transport::Udp,
                 port: PortSpec::MediaRange,
                 bind: "the listener's address",

@@ -293,6 +293,19 @@ fn main() -> anyhow::Result<()> {
             }));
         }
 
+        // A hosted Cast application taking the panel (#16). The same channel DIAL's
+        // launch uses, reached through the session manager rather than around it — which
+        // is what makes a hosted page preempt whatever was playing instead of covering it.
+        #[cfg(feature = "electron")]
+        {
+            let host_tx = nav_tx.clone();
+            let host_wake = wake.clone();
+            render_pipeline.set_page_host(Arc::new(move |page: castaway_core::HostedPage| {
+                let _ = host_tx.send(pipeline::BrowserCommand::Navigate(page.url));
+                host_wake.wake();
+            }));
+        }
+
         // The decode thread noticing that a URL finished, or could not be fetched at all,
         // is the only party that knows — and until this channel existed it logged and
         // exited, leaving a DLNA control point reading PLAYING / OK for the rest of the
@@ -312,9 +325,11 @@ fn main() -> anyhow::Result<()> {
         runtime.spawn(manager.run(event_rx));
 
         // Cloned before the DIAL closure takes ownership: Matter's launches go to the
-        // same browser.
+        // same browser, and so does the Cast platform shim.
         #[cfg(feature = "electron")]
         let nav_tx_matter = nav_tx.clone();
+        #[cfg(feature = "electron")]
+        let nav_tx_cast = nav_tx.clone();
         #[cfg(feature = "electron")]
         let on_dial = {
             let dial_wake = wake.clone();
@@ -418,6 +433,15 @@ fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "remote"))]
             remote: None,
             playback: Some(playback),
+            #[cfg(feature = "electron")]
+            cast_platform_shim: Some({
+                let tx = nav_tx_cast;
+                let shim_wake = wake.clone();
+                Arc::new(move |port| {
+                    let _ = tx.send(pipeline::BrowserCommand::CastPlatform(port));
+                    shim_wake.wake();
+                })
+            }),
             shell: Some(ShellChannels {
                 events: shell_event_rx,
                 render: render_tx.clone(),
@@ -736,6 +760,15 @@ struct PipelineHandles {
     /// where there is no panel to press.
     #[cfg(feature = "render")]
     shell: Option<ShellChannels>,
+    /// How to tell the browser where the Cast receiver platform is (#16).
+    ///
+    /// The port is only known once the platform has bound, and the browser has to be
+    /// told before anything navigates to a receiver page — the SDK's own fallback is a
+    /// hardcoded 8008, and a page pointed at the wrong port never dials at all. `None`
+    /// withdraws the shim, so a page that is not a Cast application cannot find one.
+    /// Absent in a build with no browser, where there is nothing to arm.
+    #[cfg(feature = "electron")]
+    cast_platform_shim: Option<Arc<dyn Fn(Option<u16>) + Send + Sync>>,
 }
 
 /// The shell's two ends, as seen from the service side.
@@ -792,6 +825,8 @@ async fn serve(
         playback,
         #[cfg(feature = "render")]
         shell,
+        #[cfg(feature = "electron")]
+        cast_platform_shim,
     } = handles;
     let (iface, iface_source) = config.resolved_interface_with_source();
     info!(
@@ -987,10 +1022,41 @@ async fn serve(
         }
     }
 
+    let mut adapter_handles = Vec::new();
+    // The receiver platform a hosted Cast application's page talks to (#16). Loopback
+    // only, and started before the adapter that needs it because the port has to be known
+    // in order to be handed to the browser — the SDK's own fallback is a hardcoded 8008,
+    // and a page pointed at the wrong port fails silently.
+    //
+    // A failure here costs app hosting and nothing else: media-URL casting and mirroring
+    // do not use it, so the receiver comes up without it rather than not at all.
+    #[cfg_attr(not(feature = "electron"), allow(unused_mut, unused_assignments))]
+    let mut cast_platform: Option<proto_cast::PlatformHost> = None;
+    #[cfg(feature = "electron")]
+    if config.enable.cast {
+        match proto_cast::PlatformServer::new(proto_cast::DeviceCapabilities::default())
+            .bind()
+            .await
+        {
+            Ok((host, task)) => {
+                let port = host.port();
+                // The browser is told the port the moment it exists, so the shim is in
+                // place before anything navigates to a receiver page.
+                if let Some(arm) = &cast_platform_shim {
+                    arm(Some(port));
+                }
+                adapter_handles.push(tokio::spawn(task));
+                cast_platform = Some(host);
+            }
+            Err(e) => {
+                warn!(error = %e, "no Cast receiver platform; hosted applications are unavailable");
+            }
+        }
+    }
+
     // Cast is the first protocol whose adapter owns a real listener, so it advertises
     // itself: what goes in the TXT record comes from the same object that answers the
     // port, and the two can't drift.
-    let mut adapter_handles = Vec::new();
     // Kept so the panel's shell can ask what has been discovered and ask for a launch.
     // Unread in a build with no panel, which is honest rather than dead: the adapter
     // still runs, there is just nothing to press.
@@ -1024,6 +1090,7 @@ async fn serve(
             event_tx.clone(),
             shutdown.clone(),
             playback.clone(),
+            cast_platform.clone(),
         )
         .await
         {
@@ -1292,6 +1359,7 @@ async fn spawn_cast(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+    app_hosting: Option<proto_cast::PlatformHost>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     // Three ways to be a Cast device, in descending order of how much they are ours.
     // A provisioned credential is the operator's own hardware identity and wins; a CKS
@@ -1371,9 +1439,22 @@ async fn spawn_cast(
         Some(report) => receiver.with_playback(report),
         None => receiver,
     };
+    // Hosting somebody else's receiver page (#16). Both halves or neither: the registry
+    // says which page an app id names, the platform is what that page talks to.
+    let hosting = app_hosting.is_some();
+    let receiver = match app_hosting {
+        Some(platform) => {
+            receiver.with_app_hosting(Arc::new(cast_registry::Registry::new()), platform)
+        }
+        None => receiver,
+    };
 
     advertise_adapter(&receiver, mdns);
-    info!("enabled: Google Cast (CASTv2 media-URL LOAD)");
+    if hosting {
+        info!("enabled: Google Cast (CASTv2 media-URL LOAD, mirroring, and hosted applications)");
+    } else {
+        info!("enabled: Google Cast (CASTv2 media-URL LOAD)");
+    }
 
     // The listener adapter's own tag; each accepted sender is retagged with its peer.
     let sink = SessionSink::new(SourceId::new(ProtocolKind::Cast, "listener"), event_tx);

@@ -31,7 +31,6 @@ use std::time::Duration;
 use castaway_core::{EncodedFrame, FrameImage, VideoCodec};
 use pipeline::compositor::{Compositor as _, Layer, LayerId, Transform};
 use pipeline::hwaccel::{import_capability, HwPreference, SurfaceImport};
-use pipeline::wgpu_compositor::WgpuCompositor;
 
 /// The picture the fixture is filled with. Chosen away from the greys and primaries that
 /// a broken conversion tends to land on by accident, and away from the clipping ends of
