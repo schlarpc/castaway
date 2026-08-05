@@ -680,9 +680,13 @@ mod tests {
         }
     }
 
-    /// A scripted WFD *source*: it accepts the sink's connection and walks M1→M7, then
-    /// sends one RTP datagram of transport stream. Everything a real source does over a
-    /// socket, with none of the radio.
+    /// A scripted WFD *source*: it accepts the sink's connection and walks M1→M7.
+    ///
+    /// **Control plane only.** This used to claim it "sends one RTP datagram of transport
+    /// stream"; it does not and never did, so nothing in this file has ever put a TS
+    /// packet through `MediaReceiver`. The media plane's coverage is `media.rs` and
+    /// `ts.rs` against fixtures, and `miracast-vm` over a real emulated radio — where the
+    /// source deliberately sends an IDR first, so the sink never needs M13 either (#192).
     ///
     /// Returns its own end of the control connection rather than dropping it, so a caller
     /// can choose between the two endings that matter: drop it and the sink sees FIN, or
