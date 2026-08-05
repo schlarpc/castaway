@@ -17,6 +17,13 @@ pub mod ns {
     pub const DEVICE_AUTH: &str = "urn:x-cast:com.google.cast.tp.deviceauth";
     /// Media control (`LOAD`/`PLAY`/`PAUSE`/`SEEK`/`STOP`).
     pub const MEDIA: &str = "urn:x-cast:com.google.cast.media";
+    /// Device description (`GET_DEVICE_INFO`).
+    ///
+    /// Where a sender's *device prober* asks a discovered receiver to describe itself.
+    /// Leaving it unanswered is what kept this panel out of the iOS Cast picker: the
+    /// prober connects, authenticates, asks, gets nothing, and discards the device —
+    /// visibly to nobody, since from the phone it looks like the device is not there.
+    pub const DISCOVERY: &str = "urn:x-cast:com.google.cast.receiver.discovery";
 }
 
 /// The Default Media Receiver application id — the app senders launch to LOAD media
@@ -525,6 +532,88 @@ pub fn media_status(
         "status": [status],
     })
     .to_string()
+}
+
+/// The device capability bitmask a receiver reports in `GET_DEVICE_INFO`.
+///
+/// `6149` is openscreen's `kDefaultDeviceCapabilities`
+/// (`cast/common/channel/message_util.h:55`) — the value its own receiver reports, and
+/// the one this is taken from rather than derived. Deliberately *not* the mDNS `ca=5`:
+/// they are different fields with different vocabularies, and the temptation to make one
+/// out of the other is how a receiver ends up describing itself two ways.
+pub const DEFAULT_DEVICE_CAPABILITIES: u32 = 6149;
+
+/// Build the answer to `GET_DEVICE_INFO`.
+///
+/// Note the reply carries `type`, not `responseType`, and repeats the request's own type
+/// — which is unlike every other response in this protocol. openscreen's own protocol
+/// notes call it out: *"The response unexpectedly uses the same message `type` and is not
+/// a `responseType`."* A sender matching on `responseType` here would never see it, which
+/// is exactly the sort of detail that makes a receiver invisible rather than broken.
+///
+/// Shape and keys from `cast/receiver/application_agent.cc:444` (`PopulateDeviceInfo`).
+/// Where that file and the prose table in `cast/protocol/streaming_session_protocol.md`
+/// disagree — the table says `capabilities`, the code emits `deviceCapabilities` — the
+/// code wins, because the code is what a sender was tested against.
+#[must_use]
+pub fn device_info(request_id: i64, device: &DeviceInfo) -> String {
+    serde_json::json!({
+        "type": "GET_DEVICE_INFO",
+        "requestId": request_id,
+        "deviceId": device.device_id,
+        "friendlyName": device.friendly_name,
+        "deviceModel": device.model,
+        "deviceCapabilities": DEFAULT_DEVICE_CAPABILITIES,
+        "controlNotifications": 1,
+    })
+    .to_string()
+}
+
+/// Build the `INVALID_REQUEST` a receiver answers an unrecognised discovery message with.
+///
+/// openscreen answers rather than ignores (`ApplicationAgent::HandleInvalidCommand`), and
+/// so do we: a prober that is answered "I did not understand that" knows the device is
+/// alive, where one that is answered nothing cannot tell us from a device that is gone.
+#[must_use]
+pub fn invalid_request(request_id: Option<i64>) -> String {
+    serde_json::json!({
+        "responseType": "INVALID_REQUEST",
+        "requestId": request_id.unwrap_or(0),
+        "reason": "INVALID_COMMAND",
+    })
+    .to_string()
+}
+
+/// How this receiver describes itself to a sender's device prober.
+///
+/// The same three values the `_googlecast._tcp` TXT record carries (`id`, `fn`, `md`),
+/// and that is the point rather than a coincidence: a sender correlates the record it
+/// discovered with the device that answered, and a receiver that gives two different
+/// names for itself is a receiver a prober may decline. [`crate::CastReceiver`] builds
+/// both from one value so they cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// The stable device id — the same string the TXT record's `id` carries.
+    pub device_id: String,
+    /// The name shown in the picker; the TXT record's `fn`.
+    pub friendly_name: String,
+    /// The model; the TXT record's `md`.
+    pub model: String,
+}
+
+impl Default for DeviceInfo {
+    /// A description that is honest about knowing nothing.
+    ///
+    /// Only reachable in a session nobody gave an identity to, which on a real receiver
+    /// cannot happen — [`crate::CastReceiver`] sets one per connection. It exists so the
+    /// pure session has no unwrap and no panic on a path a test can reach.
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            friendly_name: String::new(),
+            model: "castaway".to_owned(),
+        }
+    }
 }
 
 /// A running application's identity, echoed in `RECEIVER_STATUS`.

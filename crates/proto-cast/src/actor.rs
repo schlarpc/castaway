@@ -503,6 +503,21 @@ impl CastReceiver {
         self
     }
 
+    /// How this receiver describes itself, in the two places it has to.
+    ///
+    /// One value feeding both the `_googlecast._tcp` TXT record and the `GET_DEVICE_INFO`
+    /// answer, because a sender correlates them: the prober asks the device that answered
+    /// to confirm the record it discovered, and a receiver giving two different names for
+    /// itself is one a prober may decline. Sharing the value is what stops that being a
+    /// thing anyone has to remember.
+    fn device_info(&self) -> crate::messages::DeviceInfo {
+        crate::messages::DeviceInfo {
+            device_id: self.device_id.clone(),
+            friendly_name: self.friendly_name.clone(),
+            model: "castaway".to_owned(),
+        }
+    }
+
     /// The port senders should be pointed at (as advertised over mDNS).
     #[must_use]
     pub fn port(&self) -> u16 {
@@ -536,7 +551,7 @@ impl CastReceiver {
         };
         info!(%peer, "CASTv2 sender connected");
 
-        let mut session = CastSession::new(auth);
+        let mut session = CastSession::new(auth).with_device(self.device_info());
 
         // Bind the RTP socket up front. The ANSWER has to name a port, and the only way
         // to name one we are certain of is to already hold it. A failure here costs
@@ -887,14 +902,15 @@ impl SourceAdapter for CastReceiver {
     }
 
     fn advertisements(&self) -> Vec<Advertisement> {
+        let device = self.device_info();
         vec![Advertisement::MdnsService {
             ty: CAST_SERVICE_TYPE.to_string(),
             instance: self.friendly_name.clone(),
             port: self.port(),
             txt: vec![
-                ("id".to_string(), self.device_id.clone()),
-                ("md".to_string(), "castaway".to_string()),
-                ("fn".to_string(), self.friendly_name.clone()),
+                ("id".to_string(), device.device_id.clone()),
+                ("md".to_string(), device.model.clone()),
+                ("fn".to_string(), device.friendly_name.clone()),
                 // Capability bitmask and protocol version, as senders expect them:
                 // 5 = video out + audio out, "05" = the CASTv2 generation we speak.
                 ("ca".to_string(), "5".to_string()),
@@ -1079,6 +1095,38 @@ mod tests {
                     assert!(
                         txt.iter().any(|(k, _)| k == key),
                         "the {key} TXT key is required; without it the record is dropped"
+                    );
+                }
+            }
+            other => panic!("expected an mDNS advertisement, got {other:?}"),
+        }
+    }
+
+    /// The record a sender discovers and the answer its prober gets must describe the
+    /// same device. They are produced from one value precisely so this cannot drift, and
+    /// this is what holds that: a receiver that advertises one name and confirms another
+    /// is one a prober may decline, with nothing on either side saying why.
+    #[test]
+    fn the_advertised_record_and_the_probed_answer_describe_one_device() {
+        let receiver = CastReceiver::new(
+            SocketAddr::from(([0, 0, 0, 0], 8009)),
+            "Lab TV",
+            "0f8c2e10",
+            CastIdentity::Unauthenticated(identity()),
+            MediaPorts::Ephemeral,
+        )
+        .unwrap();
+        let device = receiver.device_info();
+        match &receiver.advertisements()[0] {
+            Advertisement::MdnsService { txt, .. } => {
+                for (key, value) in [
+                    ("id", &device.device_id),
+                    ("fn", &device.friendly_name),
+                    ("md", &device.model),
+                ] {
+                    assert!(
+                        txt.contains(&(key.to_string(), value.clone())),
+                        "the TXT {key} and GET_DEVICE_INFO disagree: {txt:?} vs {device:?}"
                     );
                 }
             }

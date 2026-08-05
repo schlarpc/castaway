@@ -179,12 +179,19 @@ mod tests {
         );
     }
 
-    /// The app id that sent us here: Plex's picker was empty because we declined this.
+    /// Plex, under both of the app ids it has. `A1EB4E9D` is the one an iPhone actually
+    /// asks about — captured from a real device prober on 2026-08-05 — and `9AC194DC` is
+    /// the one the registry also still serves. A receiver that knew only the second would
+    /// answer the wrong question for every current Plex install.
     #[test]
-    fn plex_resolves_to_a_page() {
-        let surface = parse(&fixture("9AC194DC")).unwrap();
-        assert_eq!(surface.page_url(), Some("https://app.plex.tv/cast"));
-        assert_eq!(surface.display_name(), Some("Plex"));
+    fn both_of_plexs_app_ids_resolve_to_a_page() {
+        let current = parse(&fixture("A1EB4E9D")).unwrap();
+        assert_eq!(current.page_url(), Some("https://chromecast.plex.tv/"));
+        assert_eq!(current.display_name(), Some("Plex"));
+
+        let older = parse(&fixture("9AC194DC")).unwrap();
+        assert_eq!(older.page_url(), Some("https://app.plex.tv/cast"));
+        assert_eq!(older.display_name(), Some("Plex"));
     }
 
     #[test]

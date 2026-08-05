@@ -145,6 +145,8 @@ async fn the_whole_fixture_set_resolves_over_a_real_socket() {
         ("CC1AD845", "gstatic.com/cast/sdk/default_receiver"),
         ("233637DE", "youtube.com/tv?castv=2.0"),
         ("9AC194DC", "app.plex.tv/cast"),
+        // The app id a real iPhone's prober asks about.
+        ("A1EB4E9D", "chromecast.plex.tv"),
         ("CA5E8412", "netflix.com"),
         ("4F8B3483", "storage.googleapis.com/cast-reference-receiver"),
         ("B3419EF5", "default_receiver"),

@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 
 use crate::error::CastError;
 use crate::messages::{
-    self, ns, App, AppAvailabilityRequest, Envelope, LaunchRefusal, LaunchRequest, LoadRequest,
-    RunningApp, SetVolumeRequest,
+    self, ns, App, AppAvailabilityRequest, DeviceInfo, Envelope, LaunchRefusal, LaunchRequest,
+    LoadRequest, RunningApp, SetVolumeRequest,
 };
 use crate::proto::{
     auth_error, AuthError, AuthResponse, CastMessage, DeviceAuthMessage, PayloadType,
@@ -130,6 +130,8 @@ pub struct CastSession {
     mirror_port: Option<u16>,
     /// What is known about app ids this receiver does not serve natively.
     catalogue: messages::AppCatalogue,
+    /// How this receiver describes itself to a sender's device prober.
+    device: DeviceInfo,
 }
 
 impl CastSession {
@@ -149,7 +151,19 @@ impl CastSession {
             auth,
             mirror_port: None,
             catalogue: messages::AppCatalogue::default(),
+            device: DeviceInfo::default(),
         }
+    }
+
+    /// Describe this receiver to senders that ask (`GET_DEVICE_INFO`).
+    ///
+    /// Not optional in practice: a sender's device prober asks every discovered receiver
+    /// to identify itself, and one that does not answer is dropped from the picker
+    /// without a word. `CastReceiver` sets this from the same values it advertises.
+    #[must_use]
+    pub fn with_device(mut self, device: DeviceInfo) -> Self {
+        self.device = device;
+        self
     }
 
     /// Record what the receiver currently knows about app ids.
@@ -294,6 +308,7 @@ impl CastSession {
             ns::HEARTBEAT => Ok(self.handle_heartbeat(msg)),
             ns::RECEIVER => self.handle_receiver(msg),
             ns::MEDIA => self.handle_media(msg),
+            ns::DISCOVERY => Ok(self.handle_discovery(msg)),
             crate::mirror::WEBRTC_NS => self.handle_webrtc(msg),
             other => {
                 debug!(namespace = %other, "ignoring message on unknown namespace");
@@ -484,6 +499,39 @@ impl CastSession {
                 Ok(Reaction::default())
             }
         }
+    }
+
+    /// Answer a sender's device prober.
+    ///
+    /// The whole of why this matters: the prober is what decides whether a discovered
+    /// receiver is *real*. Until this existed the panel answered its challenge, answered
+    /// app availability, and then went unlisted anyway — because the one question whose
+    /// silence is fatal was the one falling through to "unknown namespace".
+    fn handle_discovery(&self, msg: &CastMessage) -> Reaction {
+        let env = msg
+            .payload_utf8
+            .as_deref()
+            .and_then(|p| Envelope::parse(p).ok());
+        let Some(env) = env else {
+            return Reaction::default();
+        };
+        let json = if env.r#type == "GET_DEVICE_INFO" {
+            debug!(
+                device_id = %self.device.device_id,
+                name = %self.device.friendly_name,
+                "describing this receiver to a sender's device prober"
+            );
+            messages::device_info(env.request_id.unwrap_or(0), &self.device)
+        } else {
+            debug!(kind = %env.r#type, "an unrecognised discovery message");
+            messages::invalid_request(env.request_id)
+        };
+        Reaction::reply(vec![CastMessage::json(
+            &msg.destination_id,
+            &msg.source_id,
+            ns::DISCOVERY,
+            json,
+        )])
     }
 
     fn handle_media(&mut self, msg: &CastMessage) -> Result<Reaction, CastError> {
@@ -806,6 +854,62 @@ mod tests {
 
     fn receiver_request(json: &str) -> CastMessage {
         recv_msg(ns::RECEIVER, "sender-0", "receiver-0", json)
+    }
+
+    /// The exchange that decides whether this receiver appears in a picker at all.
+    ///
+    /// Captured from an iPhone on 2026-08-05: `com.google.cast.DeviceProber` connects,
+    /// authenticates, and asks the device to identify itself. Before this was answered
+    /// the panel was discovered, connected to, probed, and then silently dropped — from
+    /// the phone, indistinguishable from a receiver that is not switched on.
+    #[test]
+    fn a_device_prober_is_told_what_this_receiver_is() {
+        let mut s = session().with_device(DeviceInfo {
+            device_id: "0e8c2e10caaa4b0f8f0e1d2c3b4a5968".into(),
+            friendly_name: "dma.space/screen".into(),
+            model: "castaway".into(),
+        });
+        let probe = recv_msg(
+            ns::DISCOVERY,
+            "6E7FF50E-9AF4-453E-9430-00C9A4E490B8",
+            "receiver-0",
+            r#"{"type":"GET_DEVICE_INFO","requestId":1}"#,
+        );
+        let r = s.handle(&probe).unwrap();
+        let reply = &r.outgoing[0];
+        assert_eq!(reply.namespace, ns::DISCOVERY);
+        assert_eq!(reply.destination_id, "6E7FF50E-9AF4-453E-9430-00C9A4E490B8");
+
+        let body = payload(reply);
+        // `type`, not `responseType`, and it repeats the request's own type — unlike
+        // every other response in this protocol. A sender matching on `responseType`
+        // would never see this one.
+        assert_eq!(body["type"], "GET_DEVICE_INFO");
+        assert!(body.get("responseType").is_none(), "{body}");
+        assert_eq!(body["requestId"], 1);
+        assert_eq!(body["deviceId"], "0e8c2e10caaa4b0f8f0e1d2c3b4a5968");
+        assert_eq!(body["friendlyName"], "dma.space/screen");
+        assert_eq!(body["deviceModel"], "castaway");
+        // openscreen's own `kDefaultDeviceCapabilities`, not the mDNS `ca`.
+        assert_eq!(body["deviceCapabilities"], 6149);
+        assert_eq!(body["controlNotifications"], 1);
+    }
+
+    /// A prober that is answered "I did not understand that" knows the device is alive;
+    /// one that is answered nothing cannot tell us from a device that has gone.
+    #[test]
+    fn an_unrecognised_discovery_message_is_answered_rather_than_ignored() {
+        let mut s = session();
+        let odd = recv_msg(
+            ns::DISCOVERY,
+            "prober",
+            "receiver-0",
+            r#"{"type":"GET_SOMETHING_ELSE","requestId":9}"#,
+        );
+        let body = payload(&s.handle(&odd).unwrap().outgoing[0]);
+        assert_eq!(body["responseType"], "INVALID_REQUEST");
+        assert_eq!(body["requestId"], 9);
+        assert_eq!(body["reason"], "INVALID_COMMAND");
     }
 
     /// A session on a receiver that can host applications, with `app_id` already known
