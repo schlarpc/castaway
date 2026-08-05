@@ -44,7 +44,8 @@ name = "vhci"
 required-features = ["socket"]
 
 [features]
-default = ["usb"]
+# Both transports (D55). `socket` is Linux-only; `windows.nix` names its own set.
+default = ["usb", "socket"]
 # The USB backend. Works on both platforms; the only one Windows can use.
 usb = ["dep:nusb", "dep:futures"]
 # The Linux raw-HCI socket. A convenience for working on the layers above: it hands over

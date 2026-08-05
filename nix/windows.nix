@@ -253,14 +253,18 @@ let
   depsOnlyFrom = import ./deps-only-from.nix { inherit craneLib lib; };
   crossBaseArtifacts = craneLib.buildDepsOnly (crossArgs // {
     pname = "castaway-windows";
-    cargoExtraArgs = "--package castaway";
+    cargoExtraArgs = "--package castaway --no-default-features";
   });
 
   # Cargo refuses `--features` at the root of a virtual workspace, so every feature-
   # selecting build has to name the package too.
   mkCastaway = { pname, features ? [ ], withFfmpeg ? false, withBrowser ? false }:
     let
-      cargoExtraArgs = "--package castaway"
+      # `--no-default-features` because the default set is now everything (D55), and two
+      # of its entries are Linux-only: `audio-pipewire`, whose dependency table does not
+      # cross, and `bluetooth-socket`, which is the kernel HCI socket. Windows names what
+      # it wants instead of subtracting.
+      cargoExtraArgs = "--package castaway --no-default-features"
         + lib.optionalString (features != [ ])
         " --features ${lib.concatStringsSep "," features}";
       args = crossArgs // { inherit cargoExtraArgs; };
@@ -414,29 +418,16 @@ in
 rec {
   inherit sysroot crossEnv target toolchainBins;
 
-  # No optional features: the portable protocol core only. This is the canary — if it
-  # stops linking, the toolchain broke, not the render/browser stack.
-  castaway = mkCastaway { pname = "castaway-windows"; };
-
-  # DX12 compositor + winit kiosk, no browser. Useful on its own for bisecting a render
-  # problem without the browser runtime's hundreds of MB in the way.
-  castaway-render = mkCastaway {
-    pname = "castaway-windows-render";
-    features = [ "render" ];
-    withFfmpeg = true;
-  };
-
-  # Same, plus the D3D11VA → shared-NV12-texture → D3D12 decode bridge. It exists as its
-  # own artifact because it is the *only* part of #58 that Linux cannot exercise: the
-  # VA-API half is proven by an offscreen readback test on the dev box, but the Windows
-  # half has no substitute for the Dell. Building it here at least keeps the winapi/d3d12
-  # interop compiling, so it does not rot silently between visits to the panel.
-  castaway-hwaccel = mkCastaway {
-    pname = "castaway-windows-hwaccel";
-    features = [ "hwaccel" ];
-    withFfmpeg = true;
-  };
-
+  # The deploy artifact, and now the only one (D55).
+  #
+  # There used to be four: a bare canary, `render`, `hwaccel`, and this. Three of them
+  # were subsets — `electron` implies `render` and `hwaccel` — so they were bisecting aids
+  # that cost three cross-compiles per CI run to tell you which layer broke, which the
+  # full build's log says anyway. The canary's job (toolchain vs stack) is the same
+  # question one link error answers. #58's D3D11VA → shared-NV12 → D3D12 bridge still
+  # compiles here, because `electron` pulls `hwaccel` in; that was the one variant with a
+  # reason of its own, and it is preserved by implication rather than by a second artifact.
+  #
   # The full deploy artifact: render + the offscreen Electron browser (YouTube leanback
   # via DIAL), and a real PCM device. `audio-out` is WASAPI here (cpal reaches it
   # through the OS, no extra DLLs), which is also what makes the settings screen's
@@ -449,11 +440,8 @@ rec {
     withBrowser = true;
   };
 
-  # One check per artifact — the staging differs between them, so each needs its own.
+  # One artifact, one check.
   checks = {
-    castaway-windows-dll-closure = mkBundleCheck castaway;
-    castaway-windows-render-dll-closure = mkBundleCheck castaway-render;
-    castaway-windows-hwaccel-dll-closure = mkBundleCheck castaway-hwaccel;
     castaway-windows-electron-dll-closure = mkBundleCheck castaway-electron;
   };
 

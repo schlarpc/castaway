@@ -3,6 +3,15 @@
 A point-in-time audit of what the automated tests actually prove, per protocol and per mode,
 against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a7`.
 
+> **Acted on, same day.** The audit's own top findings are fixed, so the numbers below have
+> moved. **§3.1 (140 tests compiled by no check) and §3.2 (a broken build configuration) are
+> closed by D55**: every feature is on by default now, `castaway-portable` is a test fixture
+> rather than a product, 23 checks became 15, and `cargo nextest run` went from 1784 tests to
+> 2243. §3.3's ffmpeg and GPU tripwires are in. The per-protocol matrices in §4 are unchanged
+> and still accurate — what a test *asserts* did not change, only whether it runs.
+>
+> Sections are marked **[CLOSED]** where that applies. The rest is the standing record.
+
 This is a **record**, not a backlog. Where it names a gap, the gap belongs in an issue —
 several already are, and those are cited. Nothing here should become a parallel tracker;
 see the note in CLAUDE.md about `GAPS.md`.
@@ -55,8 +64,9 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 
 ### The 23 checks
 
-`nix flake check` runs **all 23** checks. There is no opt-in tier inside `checks` — nothing
-is gated behind an env var or a separate invocation.
+`nix flake check` runs **all 15** checks (23 before D55 collapsed the per-feature ones).
+There is no opt-in tier inside `checks` — nothing is gated behind an env var or a separate
+invocation.
 
 CI (`.github/workflows/test.yml`) is a fan-out of exactly these: a `discover` job runs
 `nix eval` over `checks.x86_64-linux` and emits the attribute names as a job matrix, so a
@@ -70,7 +80,7 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 
 | Check | Scope / features | Tier | Cost |
 |---|---|---|---|
-| `build` | `castaway-portable`, default features, `doCheck=false` | — | 71m |
+| `build` | the shipped artifact (`packages.default` — the Linux kiosk since D55) | — | ~70m |
 | `test` | bare `cargo nextest run`, workspace, **default features** | T0/T1 | 81m |
 | `coverage` | `cargoLlvmCov`, default features | — | 68m |
 | `clippy` | `--all-targets --deny warnings`, default features | — | 68m |
@@ -103,12 +113,14 @@ Two structural notes on the attrset:
 
 `docs/STATUS.md` claims 1404 tests. Measured at `37db8a7`:
 
-| Configuration | Tests |
-|---|---|
-| `cargo nextest list --workspace` (default — what `test`/`coverage` run) | **1835** |
-| `--all-features` | **2303** |
-| Distinct tests executed by *some* CI check | **2163** |
-| **Executed by no CI check** | **140** |
+| Configuration | Before D55 | After D55 |
+|---|---|---|
+| `cargo nextest run` (default features) | 1835 listed / 1784 run | **2243 run** |
+| Executed by *some* CI check | 2163 | **2243** |
+| **Executed by no CI check** | **140** | **0** |
+
+The remaining 63 skipped are the `#[ignore]`d hardware/network tests in §3.3 — tracked in
+#183, and a deliberate skip rather than an invisible one.
 
 ---
 
@@ -117,7 +129,7 @@ Two structural notes on the attrset:
 These are the patterns. They matter more than any individual gap because each one produces
 gaps faster than they can be closed by hand.
 
-### 3.1 Feature-gate rot is endemic, not fixed — 140 tests never run
+### 3.1 Feature-gate rot is endemic, not fixed — 140 tests never run  **[CLOSED — D55]**
 
 Issue **#98** ("a test CI does not compile is a test that rots, and it rots green") is
 **closed**, having fixed exactly two feature sets: `render` for one app test target
@@ -156,7 +168,7 @@ Three of these are load-bearing beyond their count:
 *never advertise a Bluetooth codec this build cannot decode*. Their own comment calls that
 "the one nothing was checking". Nothing is still checking it.
 
-### 3.2 A feature combination on `main` does not compile
+### 3.2 A feature combination on `main` does not compile  **[CLOSED — #180]**
 
 ```
 $ cargo check -p pipeline --features ffmpeg
@@ -173,7 +185,7 @@ precisely the bug. Every `ffmpeg`-without-`audio` combination is broken: `ffmpeg
 
 Verified failing at `37db8a7`. This is §3.1's mechanism one combination over.
 
-### 3.3 Tests that pass by skipping
+### 3.3 Tests that pass by skipping  **[mostly closed — #182]**
 
 A skip reports `ok`. `CASTAWAY_REQUIRE_GPU` exists to convert one class of skip into a
 failure and works where it is applied (`render-pixels`, `media-plane`) — but it is not
@@ -723,33 +735,21 @@ Comments were added to **#14**, **#17**, **#21**, **#40**, **#41**, **#48**, **#
 
 ---
 
-## 6. Proposed checks
+## 6. Proposed checks  **[superseded by D55]**
 
-Concrete additions, in rough order of value per hour:
+This section proposed three new checks (`stream-plane`, `remote-plane`, `browser-plane`) plus
+widening two more, to reach the feature sets the default build could not. D55 removed the
+premise: there is no feature set the default build cannot reach, so `checks.test` covers all
+of it and five checks went away instead of three arriving.
 
-```nix
-# 1. Closes ~24 tests incl. the only reference-parse of our fMP4 and the only A/V-sync number.
-stream-plane   = "-p pipeline --features stream"        # + lavapipe, ffmpeg_7 in nativeBuildInputs,
-                                                        #   StreamStatus::Failed made fatal under a CI flag
-# 2. Closes 17 WebRTC tests.
-remote-plane   = "-p pipeline --features remote"
-# 3. Closes 20 (browser host, adblock, scriptlets) — reuse cast-app-hosting's Electron recipe.
-browser-plane  = "-p pipeline --features electron"      # + CASTAWAY_ELECTRON
-# 4. Closes links_moonlight.rs and compiles/lints stream.rs at all. GPL-encumbered: see §4.8.
-gamestream     = "-p proto-gamestream --features stream" # + MOONLIGHT_COMMON_C_LIB_DIR
-# 5. Closes the 3 tests enforcing #14's advertise-⊆-decodable invariant.
-audio          += "--package castaway"                   # and add ffmpeg_7 to nativeBuildInputs (§3.3)
-# 6. Closes media_url_av.rs (10) — the most-used path in the product.
-render-pixels  = "-p pipeline --features kiosk,ffmpeg"   # + ffmpeg_7 in nativeBuildInputs
-# 7. Closes the visualizer (14).
-audio          = "-p pipeline --features audio,ldac,render"
-```
+What is left, and is *not* a feature question:
 
-Plus, as VM work rather than feature work: an A2DP session in `bluetooth-vm`; a real
-`cliraop` AirPlay session in `integration-vm`; a streaming `gs-probe` against a
-software-encoding Sunshine; a MICE subtest in `miracast-vm` (the listener is already
-running there); and a `chip`-controller peer for `matter-vm`.
-
-And two nightly (not per-commit) jobs, because their peers are third-party clouds:
-`yt-selfplay` both modes against an `electron` build, and `spotify-selfplay` once the
-one-time OAuth visit is done.
+- **VM work.** An A2DP session in `bluetooth-vm` (#186); a real `cliraop` AirPlay session in
+  `integration-vm` (#188); a streaming `gs-probe` against a software-encoding Sunshine
+  (#190); a MICE subtest in `miracast-vm`, where the listener already runs (#194); a
+  `chip`-controller peer for `matter-vm` (#196); a `gupnp-tools` control point (#202); a
+  headless-chromium Cast sender (#184).
+- **Two nightly jobs**, because their peers are third-party clouds: `yt-selfplay` both modes
+  against a browser build, and `spotify-selfplay` once the one-time OAuth visit is done.
+- **A dummy audio sink in a VM**, so `mixer_real_device.rs` stops being `#[ignore]`d and the
+  mixer's guarantees stop resting on a wall-clock-derived fake (#204).

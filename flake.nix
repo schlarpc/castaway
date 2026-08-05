@@ -301,7 +301,25 @@
               # as child processes, and without them those tests skip rather than fail —
               # which is how the receiver-SDK tests came to pass in the sandbox without
               # ever opening a browser (#16).
-              || (pkgs.lib.hasInfix "/browser-host/" path);
+              || (pkgs.lib.hasInfix "/browser-host/" path)
+              # nextest's own configuration, which `filterCargoSources` does not keep.
+              # It declares which tests may not share a runner (`.config/nextest.toml`):
+              # the mixer's and the output stream's assertions are about *rate*, and a
+              # measurement starved of a core reads as a failure. Without it the file is
+              # simply absent in the sandbox and every one of them runs against the full
+              # parallel load — the same fails-open shape the fixture rule above was
+              # written for, found the same way (D55).
+              #
+              # The directory needs its own clause because `cleanSourceWith` runs the
+              # filter over directories too and never descends into a rejected one.
+              #
+              # Worth knowing if this ever looks like it is not working: in a flake `./.`
+              # is the *git* source, so a file that is not tracked is not there at all and
+              # no filter clause can reach it. Adding this rule while the file was still
+              # untracked produced a byte-identical derivation, which reads exactly like
+              # the filter being wrong. `git add` first, then look at the drv hash.
+              || (type == "directory" && pkgs.lib.hasSuffix "/.config" path)
+              || (pkgs.lib.hasSuffix "/.config/nextest.toml" path);
             name = "source";
           };
           strictDeps = true;
@@ -356,9 +374,17 @@
         };
 
       # Build only dependencies (for caching)
+      # The one dependency tree, built at the default feature set — which is now everything
+      # (D55), so there is a single tree rather than the five near-identical ones the
+      # per-feature checks used to need.
+      #
+      # Not folded into `commonArgs`: `nix/windows.nix` builds its `crossArgs` by appending
+      # to `commonArgs`, so Linux `buildInputs` there would end up as inputs to a
+      # cross-compile. `commonArgs` stays the platform-neutral base; this is where the
+      # native deps land.
       cargoArtifactsFor = system:
         let craneLib = cranelibFor system;
-        in craneLib.buildDepsOnly (commonArgsFor system);
+        in craneLib.buildDepsOnly (fullArgsFor system // darwinMinimal system);
 
       # `buildDepsOnly`, but extending the base artifacts above rather than starting
       # empty — see nix/deps-only-from.nix. The feature-set trees (kiosk, audio,
@@ -442,6 +468,51 @@
         src = external-libldac-src;
       };
 
+      # What the default feature set needs to *link*, on Linux (D55).
+      #
+      # Since every feature is on by default, this is no longer "the extras one check
+      # wants" — it is the ordinary build environment, and `test`/`clippy`/`coverage`/
+      # `build` all take it. That is the whole point of the inversion: the configuration
+      # CI compiles is the configuration that ships, so there is no feature set left for a
+      # test to rot behind.
+      #
+      # Linux only. The Windows cross-build names its own set in nix/windows.nix, and
+      # Darwin has neither pipewire nor a working libldacBT here, so its checks build with
+      # `--no-default-features` — see `darwinMinimal` below. Darwin is not a deploy target;
+      # it gets a compile signal, not a coverage claim.
+      fullArgsFor = system:
+        let
+          pkgs = pkgsFor system;
+          commonArgs = commonArgsFor system;
+        in
+        commonArgs // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          nativeBuildInputs = (commonArgs.nativeBuildInputs or [ ]) ++ [
+            pkgs.pkg-config
+            # On `PATH`, not just linked: `strictDeps` means `buildInputs` binaries are not
+            # reachable, and the decode tests shell out to make their clips. That gap is
+            # what made `checks.audio` skip them and report ok (#182).
+            pkgs.ffmpeg_7
+          ];
+          buildInputs = (commonArgs.buildInputs or [ ]) ++ [
+            pkgs.ffmpeg_7
+            pkgs.alsa-lib
+            pkgs.pipewire
+            (ldacbtFor system)
+          ];
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+          MOONLIGHT_COMMON_C_LIB_DIR =
+            "${moonlightCommonCFor system}/lib:${pkgs.openssl.out}/lib";
+          LDACBT_LIB_DIR = "${ldacbtFor system}/lib";
+          CASTAWAY_FIRMWARE_DIR = "${bluetoothFirmwareFor system}";
+        };
+
+      # Darwin cannot build the default set, so its checks opt out of it entirely.
+      darwinMinimal = system:
+        (pkgsFor system).lib.optionalAttrs (pkgsFor system).stdenv.isDarwin {
+          cargoExtraArgs = "--no-default-features";
+        };
+
       # The full kiosk build — renderer, browser, audio, Bluetooth. `packages.default` on
       # Linux, so it is what `nix run .` gives you.
       linuxKioskFor = system: import ./nix/linux-kiosk.nix {
@@ -486,11 +557,19 @@
           cargoArtifacts = cargoArtifactsFor system;
         in
         {
-          # No renderer, no browser, nothing platform-specific: the build that proves the
-          # protocol stack. It is `default` everywhere the full kiosk cannot be built (i.e.
-          # Darwin), and what `checks.build` compiles so `nix flake check` stays cheap.
+          # No renderer, no browser, nothing platform-specific.
+          #
+          # This is no longer a *product* (D55) — it is the fixture the VM tests boot, and
+          # the fallback `default` on Darwin. The VM tests want it because they assert on
+          # the null pipeline's log lines (`null pipeline: PLAY …`), which is how a
+          # protocol test says "the event crossed into the media plane" without needing a
+          # GPU in a VM. That is a real need and it is why the build survives; it is not a
+          # configuration anybody deploys, and `checks.build` no longer pretends otherwise.
+          #
+          # `--no-default-features` explicitly, because the default is now everything.
           castaway-portable = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
+            cargoExtraArgs = "--package castaway --no-default-features";
             CASTAWAY_GIT_REV = gitRev;
             # Only run tests during the check phase, not during build
             doCheck = false;
@@ -628,12 +707,10 @@
                 '';
               };
 
-            # The Windows deploy artifacts, cross-compiled from Linux. `-electron` is the one
-            # that ships; `-render` drops the browser, and the bare build is the toolchain
-            # canary — if it stops linking, the toolchain broke, not the media stack.
-            castaway-windows = windows.castaway;
-            castaway-windows-render = windows.castaway-render;
-            castaway-windows-hwaccel = windows.castaway-hwaccel;
+            # The Windows deploy artifact, cross-compiled from Linux. One now rather than
+            # four (D55): the other three were subsets of this one — `electron` implies
+            # `render` and `hwaccel` — kept around to bisect which layer broke, which is a
+            # question the failing build's own log answers.
             castaway-windows-electron = windows.castaway-electron;
 
             # The MSVC CRT + Windows SDK sysroot they build against. Exposed on its own so
@@ -664,6 +741,11 @@
           commonArgs = commonArgsFor system;
           cargoArtifacts = cargoArtifactsFor system;
           depsOnlyFrom = depsOnlyFromFor system;
+
+          # The ordinary build environment now that every feature is on (D55): the native
+          # deps the default set links, plus `--no-default-features` on Darwin, which
+          # cannot build it.
+          fullArgs = fullArgsFor system // darwinMinimal system;
 
           # What the `hwaccel` feature needs on top of a default build: ffmpeg's headers
           # for `ffmpeg-sys-next` (7.x, matching the crate — nixpkgs defaults to 8.x) and
@@ -751,17 +833,20 @@
           };
         in
         {
-          # Build the crate as part of checks. Deliberately the *portable* build and not
-          # `default`: on Linux `default` is now the kiosk, and pulling Electron, ffmpeg
-          # and a second dependency tree into `nix flake check` would cost far more than it
-          # proves. The feature sets that build adds are covered by `audio`/`hwaccel`
-          # below; what is left uncovered is the `electron` build, and that is a
-          # deploy-time concern.
-          build = self.packages.${system}.castaway-portable;
+          # Build the artifact that ships (D55).
+          #
+          # This used to be `castaway-portable`, on the reasoning that pulling Electron and
+          # ffmpeg into `nix flake check` cost more than it proved. What it actually bought
+          # was a gate on a build nobody deploys, while the one that does deploy set
+          # `doCheck = false` and was not a check at all.
+          build = self.packages.${system}.default;
 
-          # Run clippy
-          clippy = craneLib.cargoClippy (commonArgs // {
+          # Clippy over every target, at the default feature set — which is now everything,
+          # so `media-plane-clippy` and `hwaccel-clippy` are subsumed and gone.
+          clippy = craneLib.cargoClippy (fullArgs // {
             inherit cargoArtifacts;
+            # `cargoExtraArgs` rides along from `fullArgs` (crane passes both), so this only
+            # adds what clippy itself needs.
             cargoClippyExtraArgs = "--all-targets -- --deny warnings";
           });
 
@@ -770,16 +855,23 @@
             src = commonArgs.src;
           };
 
-          # Run tests
-          test = craneLib.cargoNextest (commonArgs // {
+          # Every test in the workspace, with every feature on, in a sandbox that can
+          # actually run them: lavapipe supplies an adapter and ffmpeg is on `PATH`, and
+          # both tripwires are set so a test that cannot get either fails rather than
+          # skipping. This one check replaces `audio`, `render-pixels`, `media-plane` and
+          # their two clippy siblings — they existed to reach feature sets the default
+          # build could not, and there is no such set any more (D55).
+          test = craneLib.cargoNextest (fullArgs // lavapipe // {
             inherit cargoArtifacts;
+            CASTAWAY_REQUIRE_FFMPEG = "1";
             partitions = 1;
             partitionType = "count";
           });
 
           # Run tests with coverage
-          coverage = craneLib.cargoLlvmCov (commonArgs // {
+          coverage = craneLib.cargoLlvmCov (fullArgs // lavapipe // {
             inherit cargoArtifacts;
+            CASTAWAY_REQUIRE_FFMPEG = "1";
           });
 
           # Prove the checked-in Cast RTP fixtures still match what openscreen's own
@@ -842,32 +934,6 @@
             });
           };
 
-          # Compile-check the Linux hardware-decode backend (VA-API → DMA-BUF → Vulkan).
-          #
-          # Only clippy, not the tests: the sandbox has no render node, so the zero-copy
-          # readback test would skip and prove nothing. What this *does* catch is the
-          # backend rotting behind its feature flag — raw libav and `wgpu-hal` are exactly
-          # the kind of unsafe FFI that stops compiling when a dependency moves, and the
-          # default build never touches it. Running the real thing needs the dev box's GPU.
-          # The audio path must keep compiling *and* keep passing its round-trip tests:
-          # this is the one feature whose failure is silent, since a receiver with no
-          # decoder still pairs and still streams — it just plays nothing. The decode
-          # tests assert on the decoded audio's level, so a path that produces silence
-          # fails here rather than in the room.
-          audio = craneLib.cargoNextest (commonArgs // {
-            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
-              pname = "castaway-audio";
-              inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS LDACBT_LIB_DIR;
-              cargoExtraArgs = audioArgs.cargoExtraArgs;
-            });
-            inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS LDACBT_LIB_DIR;
-            # This build has ffmpeg and its codecs, so a test that cannot make a clip or
-            # open an encoder is a broken check rather than an honest skip. Without this
-            # the decode tests skipped and reported `ok` (#182) — in the one check whose
-            # entire purpose is that a missing decoder fails silently.
-            CASTAWAY_REQUIRE_FFMPEG = "1";
-            cargoExtraArgs = "--package pipeline --features audio,ldac";
-          });
 
           # The bindings for a library that ships no headers, regenerated and diffed.
           # Nothing at build time can catch a wrong FFI signature here, so this is the only
@@ -878,79 +944,8 @@
             ldacbt = ldacbtFor system;
           };
 
-          hwaccel-clippy = craneLib.cargoClippy (commonArgs // {
-            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
-              pname = "castaway-hwaccel";
-              inherit (hwaccelArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-              cargoExtraArgs = hwaccelArgs.cargoExtraArgs;
-            });
-            inherit (hwaccelArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-            cargoClippyExtraArgs = "${hwaccelArgs.cargoExtraArgs} --all-targets -- --deny warnings";
-          });
 
-          # The DLNA media plane, end to end, in CI (#98).
-          #
-          # `crates/app/tests/dlna_media_plane.rs` drives a real SOAP envelope into the
-          # real router, through the real session manager, into a `RenderPipeline` fetching
-          # a real HTTP URL with a real demuxer. It has worked for a while — but nothing in
-          # CI compiled it, because the file is `#![cfg(feature = "render")]` and
-          # `castaway`'s `default = []`, while `test`/`coverage`/`clippy` all take
-          # `commonArgs` unmodified. A test CI does not compile is a test that rots, and it
-          # rots green: `feb1032` had to repair this file three days after it landed,
-          # because a refactor deleted a method its drainers called and no gate noticed.
-          #
-          # Scoped to the one test target rather than the whole `render` feature's tests;
-          # the rest of that set is `render-pixels`' job, below.
-          #
-          # It now runs on `lavapipe`, which is what lets the cast be asserted in pixels
-          # rather than in channel traffic: the frames go through a real compositor and the
-          # test reads the panel back. What is still *not* proven, stated so the green tick
-          # is not read as more than it is: only video is claimed — the drainer counts
-          # `RenderCommand::Video` and `ClearVideo`, so "a cast that produced sound" is
-          # asserted only at the `pipeline` layer.
-          media-plane = craneLib.cargoNextest (commonArgs // {
-            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
-              pname = "castaway-media-plane";
-              inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-              cargoExtraArgs = mediaPlaneArgs.cargoExtraArgs;
-            });
-            inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-            inherit (lavapipe) LD_LIBRARY_PATH WGPU_BACKEND VK_DRIVER_FILES CASTAWAY_REQUIRE_GPU;
-            cargoExtraArgs = "${mediaPlaneArgs.cargoExtraArgs} --test dlna_media_plane";
-            partitions = 1;
-            partitionType = "count";
-          });
 
-          # Everything that draws, drawn — the rest of #98's second remainder.
-          #
-          # `pipeline`'s render tests are the ones that open a compositor, push commands
-          # through it and read the surface back: the transport clock, the shell's
-          # navigation and screens, picture-in-picture, the widget slot, the transitions.
-          # Twenty-four of them skipped for want of an adapter, and a skip reports `ok`, so
-          # nothing here had ever executed under any gate. With lavapipe supplying the
-          # adapter they all run, and `CASTAWAY_REQUIRE_GPU` means they cannot go back to
-          # skipping without the check noticing.
-          #
-          # `kiosk` rather than `render`, which is one feature wider than the drawing this
-          # is named for and is there for the input router: `kiosk.rs`'s own unit tests are
-          # the only place the panel's touch routing is reachable without glass, and they
-          # had silently stopped compiling — two fields added to `KioskApp` never reached
-          # the test literal, and no gate had ever built this crate's tests with the
-          # feature on. Exactly the rot #98 is about, one feature over.
-          #
-          # Software rasterisation, so this proves the drawing and not the driver: what a
-          # real Vulkan implementation does differently — the panel's DX12 path especially
-          # — is still the hardware's to prove.
-          render-pixels = craneLib.cargoNextest (commonArgs // {
-            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
-              pname = "castaway-render-pixels";
-              cargoExtraArgs = "--package pipeline --features kiosk";
-            });
-            inherit (lavapipe) LD_LIBRARY_PATH WGPU_BACKEND VK_DRIVER_FILES CASTAWAY_REQUIRE_GPU;
-            cargoExtraArgs = "--package pipeline --features kiosk";
-            partitions = 1;
-            partitionType = "count";
-          });
 
           # The Cast app-hosting path against Google's own receiver SDK, and a hosted
           # application playing real media (#16).
@@ -988,22 +983,6 @@
             partitionType = "count";
           });
 
-          # Compile everything the `render` feature reaches, warnings denied.
-          #
-          # The other half of the same gap: `clippy` runs on default features, so the whole
-          # render tree — the kiosk, the compositor, every test cfg'd behind it — was
-          # invisible to the lint gate as well as to the test gate. This is what catches a
-          # `render`-only test that no longer builds, which is how `ldac_decode.rs` sat
-          # broken under `--all-features` without anything noticing.
-          media-plane-clippy = craneLib.cargoClippy (commonArgs // {
-            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
-              pname = "castaway-media-plane";
-              inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-              cargoExtraArgs = mediaPlaneArgs.cargoExtraArgs;
-            });
-            inherit (mediaPlaneArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS;
-            cargoClippyExtraArgs = "${mediaPlaneArgs.cargoExtraArgs} --all-targets -- --deny warnings";
-          });
         }
         # Cross-build the Windows artifacts and verify each one's DLL closure. The Windows
         # binaries can't be executed on the builder, so a static check of what the loader

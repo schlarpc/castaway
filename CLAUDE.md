@@ -77,6 +77,15 @@ These are binding engineering constraints for this project. They override genera
    crate. The `FrameSource::{Encoded,Decoded}` split and `MiracastBackend` trait exist precisely for
    this — keep that discipline everywhere.
 
+   **Cargo features are mechanism, not policy (D55).** Every feature is on by default; the
+   default set is what ships and what `cargo test` builds. Do not add a feature to make
+   something optional — a feature that is off is code nothing compiles and tests nothing, and
+   that cost 140 uncompiled tests and a build broken on `main` before it was noticed. If a
+   capability should be switchable, switch it **at runtime** (`[enable]` in castaway.toml, the
+   codec table, DIAL's launch-target check) where it can be tested. The only admissible reason
+   for a new compile-time gate is a platform that genuinely cannot build the code, and that is
+   `cfg(target_os)` first.
+
 6. **Test without a human in the loop; use Nix to make it reproducible.** Two tiers:
    - *Pure-protocol tests* run the sans-I/O cores against captured/golden byte fixtures
      (pcap transcripts, `bplist`/SDP/`wfd-kv` bodies, RTSP exchanges) — fast, deterministic, no network.

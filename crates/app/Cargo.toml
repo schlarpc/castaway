@@ -77,7 +77,29 @@ tower = { version = "0.5", features = ["util"] }
 embed-resource = "3"
 
 [features]
-default = []
+# Everything the Linux kiosk ships, because that is the artifact and it should be the
+# thing `cargo test` builds (D55). `windows.nix` passes `--no-default-features` and names
+# its own set; `audio-pipewire` is the only entry that is genuinely Linux-only.
+#
+# `gamestream` is in here, which makes a default build GPL-3.0-bound via
+# moonlight-common-c (D37). That was previously the one gate with a safety argument
+# behind it, and it was dropped deliberately: this tree is n=1 and private, nothing is
+# redistributed, and an untested streaming path was the larger risk. If a binary ever
+# does get handed to somebody, that is the moment to care — the source stays MIT either
+# way, and only the linked artifact is affected.
+default = [
+    "render",
+    "stream",
+    "remote",
+    "hwaccel",
+    "audio",
+    "audio-out",
+    "audio-pipewire",
+    "bluetooth-socket",
+    "ldac",
+    "electron",
+    "gamestream",
+]
 # Real render output: swap NullPipeline → RenderPipeline (ffmpeg decode + wgpu compositor)
 # and run the winit fullscreen kiosk on the main thread. Native deps required (see flake).
 # Also brings the output duplicate (#101): anything that can draw can stream what it

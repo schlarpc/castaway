@@ -1,0 +1,46 @@
+# Tests that measure real time cannot share a runner with two thousand that do not.
+#
+# #156 closed after two wall-clock assertions made `nix flake check` non-deterministic
+# under load, and the fix there was to stop asserting on wall time where the property
+# could be expressed some other way. These are the residue: the mixer's whole contract is
+# *rate* — a source drains in real time, a live sender is never parked, a ramp is deferred
+# rather than perforated — and there is no way to state that without a clock.
+#
+# Turning every feature on (D55) took the default run from 1784 tests to 2243, and three
+# of them started failing in CI-shaped parallelism while passing alone. That is the
+# measurement being starved of a core, not a regression: a drain that should take 3 s
+# takes 3.4 s when it is one of sixteen things on eight cores, and the assertion is a
+# ±10% band around real time.
+#
+# So they get the runner to themselves. It costs about twenty seconds of wall clock on a
+# full run, which is the correct price: the alternative is either widening the bands until
+# they stop meaning anything, or a gate that goes red for reasons unrelated to the change
+# under test — and #156 records what that does to a team's willingness to believe it.
+#
+# `threads-required = "num-test-threads"` is exclusivity, not just serialisation within a
+# group: nothing else runs while one of these does.
+
+[[profile.default.overrides]]
+filter = 'package(pipeline) and test(/^mixer::tests::/)'
+threads-required = "num-test-threads"
+
+# Same shape, one layer up: the transport clock re-anchors against `Instant::now()`, and
+# `a_new_reading_re_anchors_the_clock_and_a_repeat_does_not` is the assertion that missed
+# its 40 ms budget by 10 ms in #156 while 388 tests ran beside it on lavapipe.
+[[profile.default.overrides]]
+filter = 'package(pipeline) and binary(transport_clock)'
+threads-required = "num-test-threads"
+
+# The audio device drain tests in `audio_session`, for the same reason: they assert that a
+# session hands the sink samples at the rate the sink consumes them.
+[[profile.default.overrides]]
+filter = 'package(pipeline) and test(/^audio_session::tests::.*real_time/)'
+threads-required = "num-test-threads"
+
+# NOT `output_stream`, and the reason is worth recording because it looked like one of
+# these and is not. `sound_lands_where_on_the_timeline_it_was_played` also fails in the
+# sandbox while passing on the dev box, so exclusivity was the obvious guess — and it made
+# no difference at all: the miss went from 135 ms to 212 ms on the exclusive run. It is a
+# real defect that depends on which H.264 encoder opens (#208), not a starved measurement.
+# The three above were confirmed by the opposite result: they pass with the runner to
+# themselves.

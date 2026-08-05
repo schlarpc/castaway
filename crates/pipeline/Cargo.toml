@@ -171,7 +171,35 @@ name = "electron_osr"
 required-features = ["hwaccel"]
 
 [features]
-default = []
+# Everything, because a feature that is off is a feature nothing tests (D55).
+#
+# These were opt-in so `castaway-portable` could be built without wgpu, ffmpeg, Electron
+# and the rest. That build is gone, and with it the only reason: the fine-grained graph
+# was buying exactly one artifact while costing 140 tests that no CI check compiled, a
+# `--features ffmpeg` build that was broken on `main` for an unknown time (#180), and the
+# standing inversion where `cargo test` exercised the configuration we did *not* ship.
+#
+# Nothing here is a user-facing choice. What a receiver does or does not do is a *runtime*
+# decision — `[enable]` in castaway.toml, the codec table, DIAL's launch-target check —
+# and runtime decisions are the ones that can be tested. The feature names stay because
+# 235 `cfg` sites read them and because the Windows cross-build genuinely cannot take
+# `audio-pipewire`; they are mechanism now, not policy.
+#
+# Linux-buildable set. `windows.nix` passes `--no-default-features` and names its own.
+default = [
+    "render",
+    "kiosk",
+    "ffmpeg",
+    "libav-sys",
+    "stream",
+    "remote",
+    "audio",
+    "audio-out",
+    "audio-pipewire",
+    "ldac",
+    "hwaccel",
+    "electron",
+]
 # `render` = the wgpu Compositor backend (feature can't be named `wgpu` — that's a dep).
 # `kiosk`  = winit fullscreen output driving the compositor.
 # `ffmpeg` = libav decode. `electron` (below) = the offscreen browser.

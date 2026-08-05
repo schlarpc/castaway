@@ -2217,3 +2217,101 @@ serving the media clusters over CASE, and turning `LaunchURL` into playback or a
 page. What does not is being trusted by a certified sender. That distance is a CSA
 certification and a real device attestation certificate, not more code, and it is tracked
 rather than papered over.
+
+### D55 — Every feature on by default, because a feature that is off is a feature nothing tests
+
+An audit of what the tests actually assert (`docs/test-matrix.md`, 2026-08-05) found 140
+tests that no `nix flake check` derivation compiled, a `--features ffmpeg` build that had
+been broken on `main` for an unknown length of time (#180), and `checks.audio` reporting
+green while skipping every test it existed to run (#182). Those look like three bugs. They
+are one, and it is structural.
+
+The workspace had 24 features across seven crates and 235 `cfg(feature = …)` sites. Sorted
+by why they existed, only one had an argument behind it that survived contact:
+
+- **Licence.** `gamestream` links moonlight-common-c, which is GPL-3.0 against this MIT
+  tree (D37). Off-by-default *was* the safety property.
+- **Platform.** `audio-pipewire`, `bluetooth-socket`, `usb`/`socket`, `evdev`/`winuser`.
+  Real, but this is `cfg(target_os)` wearing a feature costume, and the flake was already
+  choosing per platform.
+- **Build weight.** `render`, `ffmpeg`, `electron`, `hwaccel`, `stream`, `remote` — 215 of
+  the 235 sites. The whole justification was `castaway-portable`.
+- **Mechanism, not choice.** `libav-sys`, `kiosk`, `audio`, and the app's `stream`/`remote`
+  are internal plumbing; three of them say "Internal:" in their own comments.
+
+So a graph with a nominal 2^12 combinations was buying exactly one artifact. The tell is
+that at the app level there was effectively one switch: `electron` implies `render` and
+`hwaccel`, `render` implies `pipeline/{kiosk,ffmpeg,stream,remote}` plus `audio`. The Linux
+kiosk built everything, `castaway-portable` built nothing, and the only points in between
+were three Windows artifacts that existed to bisect which layer broke.
+
+#### The inversion that made it expensive
+
+`checks.test`, `clippy` and `coverage` all ran default features — which was
+`castaway-portable`, the configuration that is **not** deployed. The configuration that
+does deploy set `doCheck = false` and was not a check at all. We tested the thing we did not
+ship and shipped the thing we did not test, and every check that touched real functionality
+— `audio`, `render-pixels`, `media-plane`, and their two clippy siblings — was a fragment
+bolted on to reach past the default. No two fragments overlapped, which is why
+`media_url_av.rs` (10 tests on the URL path *every* protocol casts through) needed
+`ffmpeg`+`render` and fell through the gap between `render-pixels` (`kiosk`, no ffmpeg) and
+`audio` (ffmpeg, no render).
+
+#### What was decided
+
+`default` is every feature the platform can build. `castaway-portable` builds with
+`--no-default-features` and stops being a product: it survives only as the fixture the VM
+tests boot, because they assert on the null pipeline's log lines, which is how a protocol
+test says "the event reached the media plane" without a GPU in a VM. Windows names its own
+set for the two entries that genuinely do not cross.
+
+The licence gate went too, and that one was a real decision rather than a cleanup. A default
+build now links GPL-3.0 code. The argument for keeping it: it is the only feature whose
+default carried a safety property. The argument against, which won: this tree is n=1 and
+private, nothing is redistributed, the source stays MIT either way, and an untested
+streaming path — 15k lines of linked C whose two hardest properties are FEC recovery under
+loss and A/V pacing under jitter — was the larger risk by a distance. If a binary is ever
+handed to somebody, that is the moment to care, and the gate can come back for that build
+alone.
+
+Result: 23 checks became 15, five near-identical dependency trees became one, and
+`cargo nextest run` went from 1784 tests to 2243.
+
+#### What it cost, honestly
+
+Three mixer tests started failing. They pass alone and fail in a full run, because they
+assert on *rate* — a source drains in real time, a live sender is never parked, a ramp is
+deferred rather than perforated — and there is no way to state that without a clock. Going
+from 1784 to 2243 tests starved the measurement of a core. That is #156 arriving again, and
+the fix is `.config/nextest.toml`: those tests get the runner to themselves. It costs about
+twenty seconds on a full run, against the alternatives of widening the bands until they
+stop meaning anything, or a gate that goes red for reasons unrelated to the change.
+
+Getting that config into the sandbox took two wrong turns worth writing down, because both
+present as "the filter is broken". `craneLib.filterCargoSources` does not keep `.config/`,
+and `cleanSourceWith` runs the filter over directories and never descends into a rejected
+one — so the file needs a clause and its directory needs another. Neither mattered at first,
+because in a flake `./.` is the *git* source: while the file was untracked it was not there
+at all and no filter clause could reach it. The derivation hash does not move, which reads
+exactly like a filter bug. `git add`, then look at the hash.
+
+And one test found a **real defect rather than a flaky one**, which is the return on the
+whole change. `output_stream.rs` is `required-features = ["stream"]` and had therefore never
+run in CI; the first time it did,
+`sound_lands_where_on_the_timeline_it_was_played` failed. It passes on the dev box's
+hardware encoder and fails in the sandbox on libx264, by 135 ms and then 212 ms — so the
+`/stream/*` duplicate's A/V alignment depends on which encoder the box happens to have, and
+a panel that falls back to software gets audio a fifth of a second out. That is #208. Note
+the first diagnosis was wrong: exclusivity was applied on the theory that this was another
+starved measurement, and the miss got *larger*, which is what ruled it out. The test is
+`#[ignore]`d against #208 so the gate can be green — a named exception, not the silent kind,
+and exactly the debt #183 exists to keep visible.
+
+Darwin cannot build the default set, so its checks pass `--no-default-features`. Darwin is
+not a deploy target; it gets a compile signal, not a coverage claim, and that is now stated
+rather than implied.
+
+The 235 `cfg` sites remain. They are mechanism now — the Windows cross-build still needs
+two of them — but most are permanently true and could come out incrementally. That is
+tidying, not correctness, and it is deliberately not being done in the same change as the
+thing that makes the tests run.

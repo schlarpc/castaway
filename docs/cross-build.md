@@ -35,11 +35,15 @@ exercises your *future* Linux target.
 
 | Output | Features | What it's for |
 |---|---|---|
-| `.#castaway-windows` | none | toolchain canary — if it stops linking, the toolchain broke, not the media stack |
-| `.#castaway-windows-render` | `render` | DX12 compositor + kiosk, no browser; bisect render problems without the browser runtime in the way |
-| `.#castaway-windows-hwaccel` | `hwaccel` | the D3D11VA → shared-NV12 → D3D12 decode bridge. Exists as its own artifact because it is the one part of #58 Linux cannot exercise: the VA-API half has an offscreen readback test, this half has only the compiler until it reaches the Dell |
-| `.#castaway-windows-electron` | `electron`, `audio-out` | the deploy artifact: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged, plus WASAPI output through cpal |
+| `.#castaway-windows-electron` | `--no-default-features --features electron,audio-out` | the deploy artifact, and since D55 the only one: render + hwaccel + the Electron browser subprocess, with the ECS distribution, our host app, and the Widevine CDM staged, plus WASAPI output through cpal |
 | `.#msvc-sysroot` | — | the MSVC CRT + Windows SDK sysroot, built and cached independently |
+
+There were four artifacts until D55: a bare canary, `render`, `hwaccel`, and the deploy build.
+Three were subsets — `electron` implies `render` and `hwaccel` — so they cost three
+cross-compiles per CI run to answer "which layer broke", which the failing build's own log
+answers. #58's D3D11VA → shared-NV12 → D3D12 bridge still compiles here, by implication rather
+than as a second artifact. Windows names its features explicitly because the default set is now
+everything, and two entries (`audio-pipewire`, `bluetooth-socket`) are Linux-only.
 
 Every Windows artifact also carries an `archive` passthru:
 `nix build .#castaway-windows-electron.archive` yields
@@ -63,7 +67,7 @@ export CASTAWAY_WINDOWS_HOST=user@panel
 nix run .#windows-firewall            # once per box; --close takes it down again
 nix run .#deploy-windows              # build → wipe → copy → verify → launch → stream the log
 nix run .#deploy-windows -- --force   # re-copy even if the box already has these bits
-nix run .#deploy-windows -- --no-launch castaway-windows-render
+nix run .#deploy-windows -- --no-launch castaway-windows-electron
 ```
 
 `deploy-windows` is built around the assumption that **a stale tree that looks deployed is the

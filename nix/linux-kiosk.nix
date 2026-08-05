@@ -42,7 +42,9 @@ let
   # audio decoders) and ALSA for the PCM device.
   kioskArgs = {
     pname = "castaway";
-    cargoExtraArgs = "--package castaway --features electron,audio-out,audio-pipewire,bluetooth-socket,gamestream,ldac";
+    # No `--features`: the default set *is* this list now (D55). Naming it here as well
+    # would be two lists that have to agree, which is the drift this change exists to end.
+    cargoExtraArgs = "--package castaway";
 
     nativeBuildInputs = [
       pkgs.pkg-config

@@ -40,6 +40,10 @@ tracing-subscriber.workspace = true
 # The streaming session itself — links moonlight-common-c via moonlight-sys, so it
 # needs MOONLIGHT_COMMON_C_LIB_DIR at link time (the devShell and Nix builds set it).
 # Discovery, pairing, and the NVHTTP client are pure Rust and always compile.
+# On by default (D55): this is the only thing that links moonlight-common-c, and while it
+# was opt-in `tests/links_moonlight.rs` was compiled by no check — so nothing proved the
+# archive linked or the symbols resolved.
+default = ["stream"]
 stream = ["dep:moonlight-sys"]
 
 [lints]

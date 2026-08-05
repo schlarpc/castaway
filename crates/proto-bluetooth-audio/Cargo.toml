@@ -48,7 +48,9 @@ name = "phone_bench"
 required-features = ["bench"]
 
 [features]
-default = []
+# `ldac` on by default (D55). `bench` stays opt-in: it is not a build variant, it is a
+# set of examples that want a real dongle and `sudo`.
+default = ["ldac"]
 # Build the benches that need a controller. Off by default: they are Linux-only and
 # exist to be run by hand against `btvirt`, not by CI.
 bench = []
