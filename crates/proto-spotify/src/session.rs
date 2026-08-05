@@ -1858,6 +1858,186 @@ mod tests {
         assert_eq!(volume_to_spotify(2.0), u16::MAX);
     }
 
+    /// An `AudioItem` the way the metadata layer hands one over, minus the parts the
+    /// card does not read.
+    ///
+    /// The issue's own point, and it holds: this needs no `Session`. Every field is
+    /// public and the two that are not trivially constructible — `track_id` and
+    /// `availability` — take a parsed URI and a `Result<(), _>` (#199).
+    fn audio_item(name: &str, duration_ms: u32, unique_fields: UniqueFields) -> AudioItem {
+        AudioItem {
+            track_id: librespot_core::SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC")
+                .expect("a real Spotify track URI"),
+            uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_owned(),
+            files: librespot_metadata::audio::AudioFiles::default(),
+            name: name.to_owned(),
+            covers: Vec::new(),
+            language: Vec::new(),
+            duration_ms,
+            is_explicit: false,
+            availability: Ok(()),
+            alternatives: None,
+            unique_fields,
+        }
+    }
+
+    fn artist(name: &str) -> librespot_metadata::artist::ArtistWithRole {
+        librespot_metadata::artist::ArtistWithRole {
+            id: librespot_core::SpotifyUri::from_uri("spotify:artist:4tZwfgrHOc3mvqYlEYSvVi")
+                .expect("a real Spotify artist URI"),
+            name: name.to_owned(),
+            role: librespot_metadata::artist::ArtistRole::ARTIST_ROLE_MAIN_ARTIST,
+        }
+    }
+
+    /// The three shapes a Spotify item comes in, folded onto the card.
+    ///
+    /// `apply_track` had no test. It is the whole of what a person reads while music is
+    /// playing, and every branch of it encodes a decision that is wrong in a specific,
+    /// silent way if reversed (#199).
+    #[test]
+    fn every_kind_of_item_folds_onto_the_card_the_way_it_should_read() {
+        // A track. Several artists is the common case rather than the exception, and a
+        // card showing only the first is wrong for most of a playlist.
+        let mut card = NowPlaying::default();
+        apply_track(
+            &mut card,
+            &audio_item(
+                "Windowlicker",
+                366_000,
+                UniqueFields::Track {
+                    artists: librespot_metadata::artist::ArtistsWithRole(vec![
+                        artist("Aphex Twin"),
+                        artist("AFX"),
+                    ]),
+                    album: "Windowlicker".to_owned(),
+                    album_artists: Vec::new(),
+                    popularity: 50,
+                    number: 1,
+                    disc_number: 1,
+                },
+            ),
+        );
+        assert_eq!(card.title.as_deref(), Some("Windowlicker"));
+        assert_eq!(card.artist.as_deref(), Some("Aphex Twin, AFX"));
+        assert_eq!(card.album.as_deref(), Some("Windowlicker"));
+        assert_eq!(card.duration, Some(Duration::from_secs(366)));
+        assert_eq!(card.track, Some((1, None)));
+        // A new track starts at zero, not wherever the last one got to — the position
+        // ticks that blank the card are what this field's history is about.
+        assert_eq!(card.position, Some(Duration::ZERO));
+        // Artwork is a URL at this point, not bytes. Leaving it absent rather than
+        // holding the text hostage to a download is the decision in #50, and the failure
+        // it prevents is a card that appears a second late for every track.
+        assert!(card.artwork.is_none());
+
+        // `number == 0` means "not known", not "track zero". A card that printed `0` for
+        // every single would look like a bug in the metadata rather than an absence.
+        let mut card = NowPlaying::default();
+        apply_track(
+            &mut card,
+            &audio_item(
+                "Untitled",
+                1000,
+                UniqueFields::Track {
+                    artists: librespot_metadata::artist::ArtistsWithRole(vec![artist("Someone")]),
+                    album: "Album".to_owned(),
+                    album_artists: Vec::new(),
+                    popularity: 0,
+                    number: 0,
+                    disc_number: 1,
+                },
+            ),
+        );
+        assert_eq!(card.track, None);
+
+        // A podcast has no artist and no album. The show name is the closest honest
+        // mapping, and it is what a listener would call the thing playing.
+        let mut card = NowPlaying::default();
+        apply_track(
+            &mut card,
+            &audio_item(
+                "Episode 12",
+                3_600_000,
+                UniqueFields::Episode {
+                    description: "…".to_owned(),
+                    publish_time: librespot_core::date::Date::from_timestamp_ms(0).unwrap(),
+                    show_name: "A Podcast".to_owned(),
+                },
+            ),
+        );
+        assert_eq!(card.title.as_deref(), Some("Episode 12"));
+        assert_eq!(card.artist.as_deref(), Some("A Podcast"));
+        assert_eq!(card.album, None);
+        assert_eq!(card.track, None);
+
+        // A local file the user synced. librespot cannot split the artist string safely,
+        // so it goes through exactly as the file's metadata had it — including the case
+        // where the file had none at all.
+        let mut card = NowPlaying::default();
+        apply_track(
+            &mut card,
+            &audio_item(
+                "A File",
+                1000,
+                UniqueFields::Local {
+                    artists: Some("Some; Body".to_owned()),
+                    album: None,
+                    album_artists: None,
+                    number: Some(0),
+                    disc_number: None,
+                    path: std::path::PathBuf::from("/music/a.mp3"),
+                },
+            ),
+        );
+        assert_eq!(card.artist.as_deref(), Some("Some; Body"));
+        assert_eq!(card.album, None);
+        // …and `0` means unknown here too, which is a separate code path from the track
+        // branch above and was equally untested.
+        assert_eq!(card.track, None);
+    }
+
+    /// The cover art chosen is the biggest one offered.
+    ///
+    /// Spotify sends several sizes and the card scales down, so picking the smallest
+    /// gives a visibly soft image on a 4K panel — and picking "the first" gives whichever
+    /// order the metadata happened to arrive in.
+    #[test]
+    fn the_cover_chosen_is_the_largest_one_offered() {
+        use librespot_metadata::audio::item::CoverImage;
+        use librespot_metadata::image::ImageSize;
+
+        let cover = |url: &str, width: i32| CoverImage {
+            url: url.to_owned(),
+            size: ImageSize::DEFAULT,
+            width,
+            height: width,
+        };
+
+        let mut item = audio_item(
+            "x",
+            1000,
+            UniqueFields::Episode {
+                description: String::new(),
+                publish_time: librespot_core::date::Date::from_timestamp_ms(0).unwrap(),
+                show_name: "s".to_owned(),
+            },
+        );
+        assert_eq!(best_cover(&item), None, "no covers is not a panic");
+
+        // Deliberately not in size order: "the largest" and "the last" must not be the
+        // same answer, or the test would pass on a `.last()`.
+        item.covers = vec![
+            cover("https://i.scdn.co/small", 64),
+            cover("https://i.scdn.co/large", 640),
+            cover("https://i.scdn.co/medium", 300),
+        ];
+        assert_eq!(
+            best_cover(&item).as_deref(),
+            Some("https://i.scdn.co/large")
+        );
+    }
+
     #[test]
     fn a_premium_refusal_is_explained_rather_than_dumped() {
         // The single most likely reason a pairing "just does nothing".
