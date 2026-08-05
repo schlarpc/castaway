@@ -329,7 +329,13 @@ let
     print("<- availability {}".format(availability))
     assert availability["CC1AD845"] == "APP_AVAILABLE", availability
     assert availability["0F5096E8"] == "APP_AVAILABLE", availability
-    # Somebody else's web receiver. We cannot host it and must not claim otherwise.
+    # Somebody else's web receiver. This build has no browser — `castaway-portable` is
+    # `default = []`, so no `electron` — and a receiver that cannot host a page must say
+    # so rather than accept a launch it will not serve. On a build that *can* host one
+    # the answer is the opposite and deliberately so (#16): an unresolved app id is
+    # offered, because declining makes the device vanish from the picker with nothing
+    # said anywhere. Both answers are correct; which one is right depends on the build,
+    # and this VM pins the browser-less half.
     assert availability["CA5E8412"] == "APP_UNAVAILABLE", availability
 
     # And the same honesty on launch. Answering RECEIVER_STATUS here is the G56 failure:
