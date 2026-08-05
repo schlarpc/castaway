@@ -764,3 +764,185 @@ pub fn handlers<'a>(
             target_navigator,
         )
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::player::{ContentApp, LaunchTarget, FIRST_CONTENT_APP_ENDPOINT};
+
+    fn app(name: &str) -> ContentApp {
+        ContentApp {
+            // Overwritten by `Catalogue::new`, which is the point of the assertion below.
+            endpoint: 0,
+            vendor_id: 0xFFF1,
+            product_id: 0x8001,
+            vendor_name: "castaway".into(),
+            name: name.into(),
+            application_id: format!("com.example.{name}"),
+            catalog_vendor_id: 0,
+            launch: LaunchTarget::Browser { search: None },
+        }
+    }
+
+    fn cluster_ids(endpoint: &Endpoint<'static>) -> Vec<u32> {
+        endpoint.clusters.iter().map(|c| c.id).collect()
+    }
+
+    /// The endpoint tree a client reads, which nothing had ever constructed in a test.
+    ///
+    /// `NodeTree` is the whole of what a commissioned phone discovers about this panel:
+    /// the root, the Casting Video Player, and one Content App per thing the panel can
+    /// open. A client picks an endpoint by walking the Descriptor, so a tree with the
+    /// wrong device type or a missing cluster is a client that finds nothing to cast to
+    /// and says nothing about why (#196).
+    #[test]
+    fn the_tree_is_a_root_a_player_and_one_endpoint_per_content_app() {
+        let catalogue = Catalogue::new([app("alpha"), app("beta")]);
+        let tree = NodeTree::new(&catalogue);
+        let node = tree.node();
+        let endpoints: Vec<&Endpoint<'static>> = node.endpoints.iter().collect();
+
+        assert_eq!(endpoints.len(), 4, "root, player, and one per app");
+
+        // Endpoint 0 is `rs-matter`'s root, and ours must stay off it: the system handler
+        // answers for it, and a Descriptor there listing our clusters is a client told the
+        // root can launch content.
+        assert_eq!(endpoints[0].id, 0);
+        let root_clusters = cluster_ids(endpoints[0]);
+        for ours in [
+            <ContentLauncherHandler as content_launcher::ClusterHandler>::CLUSTER.id,
+            <MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER.id,
+            <TargetNavigatorHandler as target_navigator::ClusterHandler>::CLUSTER.id,
+            <ApplicationBasicHandler as application_basic::ClusterHandler>::CLUSTER.id,
+        ] {
+            assert!(
+                !root_clusters.contains(&ours),
+                "cluster {ours:#x} is on the root endpoint"
+            );
+        }
+
+        // The player: the endpoint a client casts to when it has no app in mind. All
+        // three of its clusters are load-bearing — no ContentLauncher and there is
+        // nothing to launch with, no MediaPlayback and the transport buttons do nothing,
+        // no TargetNavigator and the content apps are invisible.
+        assert_eq!(endpoints[1].id, PLAYER_ENDPOINT);
+        let player = cluster_ids(endpoints[1]);
+        for required in [
+            <DescHandler as desc::ClusterHandler>::CLUSTER.id,
+            <ContentLauncherHandler as content_launcher::ClusterHandler>::CLUSTER.id,
+            <MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER.id,
+            <TargetNavigatorHandler as target_navigator::ClusterHandler>::CLUSTER.id,
+        ] {
+            assert!(
+                player.contains(&required),
+                "player is missing {required:#x}"
+            );
+        }
+        assert!(
+            endpoints[1]
+                .device_types
+                .iter()
+                .any(|d| d.dtype == DEV_TYPE_CASTING_VIDEO_PLAYER.dtype),
+            "the player must say it is a Casting Video Player, which is what a client \
+             matches on before it will cast at all"
+        );
+
+        // One endpoint per app, numbered from `FIRST_CONTENT_APP_ENDPOINT` upward and in
+        // catalogue order — the identity `TargetNavigator`'s one-based identifiers assume.
+        for (i, app) in catalogue.apps().iter().enumerate() {
+            let ep = endpoints[2 + i];
+            assert_eq!(ep.id, app.endpoint);
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = FIRST_CONTENT_APP_ENDPOINT + i as u16;
+            assert_eq!(ep.id, expected, "content apps are dense from the first");
+            assert!(
+                ep.device_types
+                    .iter()
+                    .any(|d| d.dtype == DEV_TYPE_CONTENT_APP.dtype),
+                "a content app that does not say so is one a TargetApp match skips"
+            );
+            let clusters = cluster_ids(ep);
+            assert!(
+                clusters.contains(
+                    &<ApplicationBasicHandler as application_basic::ClusterHandler>::CLUSTER.id
+                ),
+                "ApplicationBasic is how a client learns who this endpoint claims to be"
+            );
+            assert!(clusters.contains(
+                &<ContentLauncherHandler as content_launcher::ClusterHandler>::CLUSTER.id
+            ));
+            // …and *not* MediaPlayback: the transport is the player's, and a second one
+            // per app would give a client two places to send Play and no rule for which.
+            assert!(
+                !clusters.contains(
+                    &<MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER.id
+                ),
+                "the transport belongs to the player endpoint, not to each app"
+            );
+        }
+    }
+
+    /// An empty catalogue is still a node a client can talk to.
+    ///
+    /// The honest default for this panel is no content apps at all — Matter carries no
+    /// media, and an app that accepted a cast it cannot play would be lying — so this is
+    /// the shipped shape rather than a degenerate one.
+    #[test]
+    fn a_panel_with_no_content_apps_still_offers_a_player() {
+        let tree = NodeTree::new(&Catalogue::new([]));
+        let node = tree.node();
+        let endpoints: Vec<&Endpoint<'static>> = node.endpoints.iter().collect();
+        assert_eq!(endpoints.len(), 2, "root and player");
+        assert_eq!(endpoints[1].id, PLAYER_ENDPOINT);
+    }
+
+    /// The one-based target identifier a client sends maps onto an endpoint, and the
+    /// reserved zero maps onto nothing.
+    ///
+    /// `TargetNavigator`'s identifiers are one-based and dense; endpoints are neither.
+    /// The mapping is four lines and was untested, and both ends of it are a way for a
+    /// `NavigateTarget` to select the wrong app silently — an off-by-one here launches
+    /// the neighbour of the thing the user picked (#196).
+    #[test]
+    fn target_identifiers_are_one_based_and_zero_is_reserved() {
+        let catalogue = Catalogue::new([app("alpha"), app("beta"), app("gamma")]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(CastingContext {
+            catalogue: catalogue.clone(),
+            state: Arc::new(PlayerState::new()),
+            commands: tx,
+        });
+        let nav = TargetNavigatorHandler::new(Arc::clone(&ctx), Dataver::new(1));
+
+        // 1 is the first app, not the second and not the player.
+        assert_eq!(
+            nav.endpoint_for_target(1),
+            Some(FIRST_CONTENT_APP_ENDPOINT),
+            "target 1 must be the first content app"
+        );
+        assert_eq!(
+            nav.endpoint_for_target(3),
+            Some(FIRST_CONTENT_APP_ENDPOINT + 2)
+        );
+
+        // 0 is the spec's "no target" and must not index anything — a `checked_sub` that
+        // became a `- 1` would wrap to 255 and miss, but a `saturating_sub` would select
+        // the *first* app, which is the dangerous one.
+        assert_eq!(
+            nav.endpoint_for_target(0),
+            None,
+            "0 is reserved; it must not select the first app"
+        );
+
+        // Past the end is `TargetNotFound`, not the last app.
+        assert_eq!(nav.endpoint_for_target(4), None);
+        assert_eq!(nav.endpoint_for_target(u8::MAX), None);
+    }
+
+    #[test]
+    fn a_duration_longer_than_any_media_saturates_rather_than_wrapping() {
+        assert_eq!(millis(std::time::Duration::from_millis(1500)), 1500);
+        assert_eq!(millis(std::time::Duration::MAX), u64::MAX);
+    }
+}
