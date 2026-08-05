@@ -2230,6 +2230,111 @@ mod tests {
         );
     }
 
+    /// …and when the device comes *back*, sound comes back with it.
+    ///
+    /// The only device-vanish test in the tree used a factory that refuses forever, so it
+    /// proved the session survives and nothing at all about recovery. The `REOPEN_AFTER` /
+    /// `retry_at` loop — which is the fix for the panel sleeping and taking the HDMI sink
+    /// with it (#55) — had no test where the device fails and *then* succeeds, and D52
+    /// admits mid-session device selection is "only exercised by construction" (#204).
+    ///
+    /// Three separate things go wrong if the loop is wrong, and this fails on each:
+    /// never retrying (silence forever), retrying every pass (a box with no sound card
+    /// spends the session looking for one — caught by the attempt count), and letting the
+    /// retry stall the sources (caught by `dropped` and by the elapsed time).
+    #[test]
+    fn a_device_that_comes_back_is_reopened_and_heard() {
+        /// Refuses until `opens_at`, then hands over the recorder.
+        struct ComesBack {
+            opens_at: Instant,
+            attempts: Arc<AtomicU64>,
+            recorder: Arc<Recorder>,
+            open: bool,
+        }
+
+        impl AudioOut for ComesBack {
+            fn start(&mut self, rate: u32, channels: u16) -> Result<(), PipelineError> {
+                self.attempts.fetch_add(1, Ordering::Relaxed);
+                if Instant::now() < self.opens_at {
+                    return Err(PipelineError::Audio("the panel is asleep".into()));
+                }
+                self.open = true;
+                Arc::clone(&self.recorder).start(rate, channels)
+            }
+
+            fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
+                if !self.open {
+                    return Err(PipelineError::Audio("the panel is asleep".into()));
+                }
+                Arc::clone(&self.recorder).write(block)
+            }
+
+            fn stop(&mut self) {}
+
+            fn frames_played(&self) -> Option<u64> {
+                self.open
+                    .then(|| Arc::clone(&self.recorder).frames_played())?
+            }
+        }
+
+        // Asleep for two whole retry intervals, so the loop has to come back more than
+        // once — a single retry would pass a shorter outage by luck.
+        let outage = REOPEN_AFTER * 2;
+        let opens_at = Instant::now() + outage;
+        let attempts = Arc::new(AtomicU64::new(0));
+        let recorder = Recorder::new();
+
+        let mixer = AudioMixer::new(Arc::new({
+            let (attempts, recorder) = (Arc::clone(&attempts), Arc::clone(&recorder));
+            move || {
+                Box::new(ComesBack {
+                    opens_at,
+                    attempts: Arc::clone(&attempts),
+                    recorder: Arc::clone(&recorder),
+                    open: false,
+                })
+            }
+        }));
+
+        // A source writing throughout, across the outage and out the other side. Pull, so
+        // the mixer paces it — which is the case where a stalled reopen would show up as
+        // the writer blocking rather than as silence.
+        let mut input = mixer.input(Backpressure::Pull);
+        let started = Instant::now();
+        let deadline = opens_at + REOPEN_AFTER + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            input.write(&tone(240, 0.5)).unwrap();
+        }
+
+        assert!(
+            recorder.peak() > 0.4,
+            "the device came back and nothing was heard (peak {})",
+            recorder.peak()
+        );
+
+        // Nothing was dropped *throughout* — the outage is not allowed to cost the source
+        // its audio, only its audibility.
+        assert_eq!(
+            input.dropped, 0,
+            "a source was made to wait on a device that was not there"
+        );
+
+        // And the retries were paced. Without `retry_at` this loop spins on `open()` as
+        // fast as it can pass, which on a box with no sound card is a core burnt for the
+        // life of the session. A couple per `REOPEN_AFTER` is the shape; dozens is not.
+        let tried = attempts.load(Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let budget =
+            (started.elapsed().as_secs_f64() / REOPEN_AFTER.as_secs_f64()).ceil() as u64 + 2;
+        assert!(
+            tried <= budget,
+            "opened the device {tried} times in {:?}; REOPEN_AFTER is {REOPEN_AFTER:?}, so \
+             at most {budget} were paced",
+            started.elapsed()
+        );
+        assert!(tried >= 2, "the device was never retried after it refused");
+    }
+
     #[test]
     fn a_tap_is_given_exactly_what_the_device_was_given() {
         #[derive(Default)]

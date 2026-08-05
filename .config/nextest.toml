@@ -44,3 +44,18 @@ threads-required = "num-test-threads"
 # real defect that depends on which H.264 encoder opens (#208), not a starved measurement.
 # The three above were confirmed by the opposite result: they pass with the runner to
 # themselves.
+
+# `stream::audio`'s pacing assertion, added after it failed once in a full-crate run and
+# passed alone — which is the file's own criterion for the distinction above, and the
+# opposite result to `output_stream`'s. It asserts that a source writing faster than real
+# time is still *laid out* at real time, so it measures wall clock for the same
+# unavoidable reason the mixer's do.
+#
+# It was not in this list because it had not been seen to fail. What made it visible was a
+# new mixer test (#204) that holds the runner for three and a half seconds — so the
+# marginal cost of one more real-time test is a second measurement that was already
+# passing by margin rather than by construction. Naming it is cheaper than discovering it
+# again from a red CI run on somebody else's change.
+[[profile.default.overrides]]
+filter = 'package(pipeline) and test(/^stream::audio::tests::.*real_time/)'
+threads-required = "num-test-threads"
