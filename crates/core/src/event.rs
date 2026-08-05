@@ -173,6 +173,19 @@ pub enum SessionEvent {
     /// which is after the media plane rather than with it, and dropped by the session
     /// manager when the source stops being the active one.
     TouchSurface(Arc<dyn crate::touch::TouchSurface>),
+    /// Host a web page and give it the panel: a *hosted application*, where the pixels
+    /// are somebody else's page and the protocol above them is their own.
+    ///
+    /// The third shape of session, beside a URL we decode ([`SessionEvent::Play`]) and
+    /// frames we composite ([`SessionEvent::Mirror`]). A Cast application is the first
+    /// (#16): `proto-cast` resolves the launched app id to a receiver page, and what
+    /// runs in it is a vendor's JavaScript talking to its own cloud — nothing in this
+    /// tree parses any of it.
+    ///
+    /// It travels as a session event rather than straight to a launcher so that taking
+    /// the panel goes through the session manager, which is what preempts whatever was
+    /// playing. DIAL's launch does go straight to one, and D28 is the bug that cost.
+    HostPage(crate::pipeline::HostedPage),
     /// Transport control over the active session.
     Control(ControlTxn),
     /// The source session has ended; release the pipeline and drop the source.

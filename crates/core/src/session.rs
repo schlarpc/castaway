@@ -327,6 +327,11 @@ impl<P: Pipeline> SessionManager<P> {
                     Err(CoreError::NoActiveSession(source.to_string()))
                 }
             }
+            SessionEvent::HostPage(page) => {
+                self.begin_session(&source).await?;
+                info!(%source, url = %page.url, title = %page.title, "session: hosting a page");
+                self.pipeline.host_page(page).await
+            }
             SessionEvent::Control(txn) => {
                 if self.active.as_ref() == Some(&source) {
                     self.pipeline.control(txn).await

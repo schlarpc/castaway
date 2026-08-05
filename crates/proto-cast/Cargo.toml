@@ -13,6 +13,8 @@ crypto-cast-auth.workspace = true
 # The replay-based device credential. `CksIdentity` is where the TLS certificate and
 # the precomputed signature are drawn from one value rather than chosen separately.
 cast-replay.workspace = true
+# Resolving a launched `appId` to the receiver page that serves it (#16).
+cast-registry.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true

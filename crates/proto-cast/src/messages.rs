@@ -52,17 +52,78 @@ pub enum App {
     DefaultMedia,
     /// A Cast Streaming receiver: the sender mirrors to us over RTP.
     Streaming,
-    /// Somebody else's web receiver — Netflix, Spotify, YouTube's own Cast app. Hosting
-    /// these means running the vendor's receiver page and speaking the Cast receiver
-    /// SDK's platform protocol to it — see issue #16 — and
-    /// is not built.
+    /// Somebody else's web receiver — YouTube, Plex, Netflix. Hosted by loading the
+    /// vendor's page in the browser and speaking the platform protocol to it
+    /// (`crate::platform`), with the vendor's own protocol staying in the vendor's JS.
+    Page,
+    /// Not something this receiver can run: a native application that is not one of the
+    /// mirroring ids, or an id the registry does not have.
     Unhostable,
 }
 
-impl App {
-    /// Classify an `appId` from the wire.
+/// What the receiver currently knows about app ids it does not serve natively.
+///
+/// Pushed in by the actor before a fold rather than looked up during one, for the same
+/// reason playback position is (see [`crate::session::CastSession::observe_progress`]):
+/// resolving an app id is a network lookup, and a pure state machine that could make one
+/// would put a third party in the path of every `GET_APP_AVAILABILITY` and make every
+/// status test depend on the internet.
+#[derive(Debug, Clone, Default)]
+pub struct AppCatalogue {
+    hosting: bool,
+    known: std::collections::HashMap<String, bool>,
+}
+
+impl AppCatalogue {
+    /// A catalogue for a receiver that can host pages, or one that cannot.
+    ///
+    /// `false` is a real configuration and not a degraded one: a build with no browser
+    /// (`--no-default-features`) genuinely cannot host an application, and must say so
+    /// rather than accept launches it will not serve.
     #[must_use]
-    pub fn classify(app_id: &str) -> Self {
+    pub fn new(hosting: bool) -> Self {
+        Self {
+            hosting,
+            known: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record that `app_id` is, or is not, a web receiver.
+    pub fn record(&mut self, app_id: &str, is_page: bool) {
+        self.known.insert(app_id.to_ascii_uppercase(), is_page);
+    }
+
+    /// Whether a page could be hosted at all.
+    #[must_use]
+    pub const fn hosting(&self) -> bool {
+        self.hosting
+    }
+
+    fn is_page(&self, app_id: &str) -> Option<bool> {
+        self.known.get(&app_id.to_ascii_uppercase()).copied()
+    }
+}
+
+impl App {
+    /// Classify an `appId` from the wire against what the receiver knows.
+    ///
+    /// The interesting case is an id that has never been resolved, and it is answered
+    /// **optimistically** — as a page — whenever hosting is possible at all. That is a
+    /// deliberate asymmetry between two failures:
+    ///
+    /// - saying unavailable for an app we could have hosted makes the device *vanish
+    ///   from the picker*. Nothing is shown, nothing is logged on the sender, and there
+    ///   is no way for the person holding the phone to tell it apart from a network
+    ///   fault. This is the failure Plex hit, and it is what #16 is about.
+    /// - saying available for an app that turns out not to exist costs a launch that
+    ///   fails with `NOT_FOUND` — the sender's own error, in its own words, in front of
+    ///   somebody who just pressed a button.
+    ///
+    /// The second is recoverable and the first is invisible, so the guess goes that way.
+    /// It is also usually right: an unknown eight-hex-digit id belongs to a web receiver
+    /// far more often than to anything else, and one lookup makes it exact for good.
+    #[must_use]
+    pub fn classify(app_id: &str, catalogue: &AppCatalogue) -> Self {
         if app_id.eq_ignore_ascii_case(DEFAULT_MEDIA_RECEIVER_APP_ID) {
             Self::DefaultMedia
         } else if STREAMING_APP_IDS
@@ -70,8 +131,13 @@ impl App {
             .any(|id| app_id.eq_ignore_ascii_case(id))
         {
             Self::Streaming
-        } else {
+        } else if !catalogue.hosting {
             Self::Unhostable
+        } else {
+            match catalogue.is_page(app_id) {
+                Some(true) | None => Self::Page,
+                Some(false) => Self::Unhostable,
+            }
         }
     }
 }
@@ -280,6 +346,29 @@ pub fn launch_error(request_id: i64, refusal: LaunchRefusal) -> String {
     .to_string()
 }
 
+/// The `namespaces` array for a running application.
+///
+/// Transport namespaces are always present — `CONNECTION` and `HEARTBEAT` are how a
+/// sender reaches the session at all, and they stay ours even while somebody else's page
+/// owns the media plane. Everything else comes from the application when there is one,
+/// and defaults to the media namespace we serve ourselves when there is not.
+fn namespaces(app: &RunningApp) -> serde_json::Value {
+    let mut names: Vec<&str> = vec![ns::CONNECTION, ns::HEARTBEAT];
+    if app.namespaces.is_empty() {
+        names.push(ns::MEDIA);
+    } else {
+        names.extend(app.namespaces.iter().map(String::as_str));
+    }
+    names.sort_unstable();
+    names.dedup();
+    serde_json::Value::Array(
+        names
+            .into_iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect(),
+    )
+}
+
 /// Build a `RECEIVER_STATUS` payload. `app` is `Some` when an application is running.
 #[must_use]
 pub fn receiver_status(
@@ -296,11 +385,7 @@ pub fn receiver_status(
             "transportId": a.transport_id,
             "statusText": a.status_text,
             "isIdleScreen": false,
-            "namespaces": [
-                {"name": ns::MEDIA},
-                {"name": ns::CONNECTION},
-                {"name": ns::HEARTBEAT},
-            ],
+            "namespaces": namespaces(a),
         }]),
         None => serde_json::json!([]),
     };
@@ -445,6 +530,14 @@ pub fn media_status(
 /// A running application's identity, echoed in `RECEIVER_STATUS`.
 #[derive(Debug, Clone)]
 pub struct RunningApp {
+    /// The namespaces a *hosted* application declared, or empty when we are serving the
+    /// session ourselves.
+    ///
+    /// `RECEIVER_STATUS` reports this list and a sender reads it to decide what it may
+    /// send — so a receiver that reported its own namespaces while somebody else's app
+    /// was running would tell every sender the wrong thing, and the messages it invited
+    /// would arrive on a namespace nothing is listening to.
+    pub namespaces: Vec<String>,
     /// The launched app id.
     pub app_id: String,
     /// Human-readable app name.
@@ -489,10 +582,36 @@ mod tests {
             transport_id: "transport-1".into(),
             status_text: "Ready".into(),
             controller: "sender-0".into(),
+            namespaces: Vec::new(),
         };
         let s = receiver_status(1, Some(&app), 1.0, false);
         assert!(s.contains("\"transportId\":\"transport-1\""));
         assert!(s.contains(ns::MEDIA));
+    }
+
+    /// While somebody else's application is running, the namespaces a sender is told
+    /// about are *its* namespaces. Reporting ours would invite every sender to send on a
+    /// namespace nothing is listening to.
+    #[test]
+    fn a_hosted_application_reports_its_own_namespaces() {
+        let app = RunningApp {
+            app_id: "233637DE".into(),
+            display_name: "YouTube".into(),
+            session_id: "sess-2".into(),
+            transport_id: "transport-2".into(),
+            status_text: "YouTube".into(),
+            controller: "sender-0".into(),
+            namespaces: vec!["urn:x-cast:com.google.youtube.mdx".into(), ns::MEDIA.into()],
+        };
+        let status = receiver_status(1, Some(&app), 1.0, false);
+        assert!(
+            status.contains("urn:x-cast:com.google.youtube.mdx"),
+            "{status}"
+        );
+        // Transport stays ours whatever the application declared: `CONNECTION` and
+        // `HEARTBEAT` are how a sender reaches the session at all.
+        assert!(status.contains(ns::CONNECTION), "{status}");
+        assert!(status.contains(ns::HEARTBEAT), "{status}");
     }
 
     #[test]

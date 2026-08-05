@@ -97,6 +97,16 @@ impl Registry {
         }
     }
 
+    /// Every resolution held, as `(app_id, is_a_page)`.
+    ///
+    /// Exists for callers on a message path, which must not make a lookup: this is the
+    /// whole of what is knowable for free, and it is small — a panel resolves a handful
+    /// of applications in its life.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(String, bool)> {
+        self.memory.lock().map(|c| c.snapshot()).unwrap_or_default()
+    }
+
     /// What is known about `app_id` without a lookup.
     #[must_use]
     pub fn cached(&self, app_id: &str) -> Option<AppSurface> {

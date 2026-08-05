@@ -51,9 +51,17 @@ fn browser_env() -> Result<(String, String, String), String> {
         .map_err(|_| "CASTAWAY_ELECTRON is unset; run inside `nix develop`".to_owned())?;
     let sdk = std::env::var("CASTAWAY_CAST_RECEIVER_SDK")
         .map_err(|_| "CASTAWAY_CAST_RECEIVER_SDK is unset; run inside `nix develop`".to_owned())?;
-    let probe = std::env::var("CASTAWAY_BROWSER_APP")
-        .map_err(|_| "CASTAWAY_BROWSER_APP is unset; run inside `nix develop`".to_owned())?;
-    Ok((electron, sdk, format!("{probe}/cast-platform-probe.js")))
+    // Resolved from the source tree, deliberately *not* from `CASTAWAY_BROWSER_APP`.
+    // That variable points at the browser host the receiver runs, which under Nix is a
+    // store copy of the flake source — so in a shell that has not been re-entered since
+    // the last edit it is a stale snapshot, and the test would measure a probe nobody
+    // has changed. A test has to exercise the tree it is part of.
+    let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../browser-host/cast-platform-probe.js");
+    let probe = probe
+        .canonicalize()
+        .map_err(|e| format!("no probe at {}: {e}", probe.display()))?;
+    Ok((electron, sdk, probe.display().to_string()))
 }
 
 fn app(app_id: &str, name: &str) -> AppIdentity {

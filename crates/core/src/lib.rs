@@ -32,7 +32,7 @@ pub use error::CoreError;
 pub use event::{Advertisement, ControlTxn, MirrorAudio, SessionEvent};
 pub use nowplaying::{Artwork, ImageFormat, NowPlaying, PlaybackState, QueueItem, RepeatMode};
 pub use osd::{osd_channel, OsdCommand, OsdMessage, OsdReceiver, OsdSink};
-pub use pipeline::Pipeline;
+pub use pipeline::{HostedPage, Pipeline};
 pub use playback::{PlaybackEnd, PlaybackProgress, PlaybackReport};
 pub use ports::{MediaPorts, PortRange, PortRangeError};
 pub use session::{RemoteHandle, SessionConfig, SessionManager};

@@ -109,6 +109,18 @@ impl Cache {
         true
     }
 
+    /// Every resolution held, as `(app_id, is_a_page)`.
+    ///
+    /// For building a caller's own index in one pass. Ordered, because the underlying
+    /// map is — a snapshot that shuffled would make a diff of two of them unreadable.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(String, bool)> {
+        self.entries
+            .iter()
+            .map(|(id, surface)| (id.clone(), matches!(surface, StoredSurface::Web { .. })))
+            .collect()
+    }
+
     /// How many resolutions are held.
     #[must_use]
     pub fn len(&self) -> usize {

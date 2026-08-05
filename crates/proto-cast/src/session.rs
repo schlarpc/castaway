@@ -43,6 +43,47 @@ pub struct Reaction {
     /// can't emit [`SessionEvent::Mirror`] itself (that needs an I/O-fed frame channel),
     /// so it surfaces the config and the actor wires the RTP receiver + `FrameSource`.
     pub start_mirror: Option<crate::mirror::MirrorConfig>,
+    /// A `LAUNCH` this session has accepted in principle and cannot finish on its own.
+    ///
+    /// Hosting an application needs a registry lookup and a browser, both of which are
+    /// I/O — so the fold stops here and the actor finishes it, coming back through
+    /// [`CastSession::page_hosted`] or [`CastSession::page_refused`]. The sender is
+    /// deliberately left waiting in the meantime: a `RECEIVER_STATUS` sent before the
+    /// page exists is the "connected phone, black panel" failure #16 opens with.
+    pub launch_page: Option<PendingLaunch>,
+    /// Messages a hosted application owns, for the actor to hand to the page.
+    pub to_page: Vec<PageMessage>,
+}
+
+/// A `LAUNCH` waiting on a lookup and a browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLaunch {
+    /// The app id to resolve.
+    pub app_id: String,
+    /// The request to answer once it is resolved.
+    pub request_id: i64,
+    /// The sender waiting on it, which becomes the session's controller.
+    pub sender: String,
+    /// The session id, minted here rather than when the page comes up.
+    ///
+    /// It has to exist *before* the platform is told about the application, because the
+    /// page is handed it in `ready` and echoes it to the vendor's own cloud — so a
+    /// session id invented later would be a second one, and `RECEIVER_STATUS` and the
+    /// page would disagree about which session this is.
+    pub session_id: String,
+    /// The virtual-connection id media messages address once the app is running.
+    pub transport_id: String,
+}
+
+/// A sender's message on a namespace a hosted application declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageMessage {
+    /// The namespace it arrived on.
+    pub namespace: String,
+    /// Which sender sent it.
+    pub sender: String,
+    /// The payload, untouched.
+    pub data: String,
 }
 
 impl Reaction {
@@ -50,8 +91,7 @@ impl Reaction {
     fn reply(outgoing: Vec<CastMessage>) -> Self {
         Self {
             outgoing,
-            events: Vec::new(),
-            start_mirror: None,
+            ..Self::default()
         }
     }
 
@@ -60,7 +100,7 @@ impl Reaction {
         Self {
             outgoing,
             events: vec![event],
-            start_mirror: None,
+            ..Self::default()
         }
     }
 }
@@ -88,6 +128,8 @@ pub struct CastSession {
     auth: Option<Box<dyn DeviceAuthResponder>>,
     /// UDP port the actor pre-bound for mirroring RTP, if mirroring is enabled.
     mirror_port: Option<u16>,
+    /// What is known about app ids this receiver does not serve natively.
+    catalogue: messages::AppCatalogue,
 }
 
 impl CastSession {
@@ -106,7 +148,36 @@ impl CastSession {
             id_counter: 0,
             auth,
             mirror_port: None,
+            catalogue: messages::AppCatalogue::default(),
         }
+    }
+
+    /// Record what the receiver currently knows about app ids.
+    ///
+    /// Pushed in by the actor before each fold, exactly as
+    /// [`CastSession::observe_progress`] pushes playback position: it is the answer to a
+    /// network lookup, and a pure fold must not be able to make one.
+    pub fn observe_catalogue(&mut self, catalogue: messages::AppCatalogue) {
+        self.catalogue = catalogue;
+    }
+
+    /// Whether a hosted application currently owns `namespace`.
+    fn hosted_owns(&self, namespace: &str) -> bool {
+        // Transport is never the application's, whatever it declared. `CONNECTION` and
+        // `HEARTBEAT` are how a sender reaches the session at all and `DEVICE_AUTH` is
+        // how it trusts the device; an application that claimed one of them and was
+        // given it would be able to end sessions it does not own, or answer a challenge
+        // it cannot sign. The SDK already refuses to let a page open a bus on the system
+        // namespace; this is the same rule applied from our side, where it is enforceable.
+        if matches!(
+            namespace,
+            ns::CONNECTION | ns::HEARTBEAT | ns::DEVICE_AUTH | ns::RECEIVER
+        ) {
+            return false;
+        }
+        self.app
+            .as_ref()
+            .is_some_and(|app| app.namespaces.iter().any(|n| n == namespace))
     }
 
     /// Record where the pipeline says playback has reached.
@@ -197,6 +268,26 @@ impl CastSession {
     /// # Errors
     /// [`CastError`] on undecodable payloads.
     pub fn handle(&mut self, msg: &CastMessage) -> Result<Reaction, CastError> {
+        // A hosted application owns the namespaces it declared, and that includes the
+        // media namespace: with YouTube up, YouTube answers `LOAD`, not us. Answering
+        // alongside it would put two receivers on one session — two `MEDIA_STATUS`
+        // replies to one request, from two players that disagree.
+        if self.hosted_owns(&msg.namespace) {
+            let Some(data) = msg.payload_utf8.as_deref() else {
+                // The application layer is JSON. A binary payload on an app namespace
+                // is not something a receiver page can be handed.
+                debug!(namespace = %msg.namespace, "dropping a binary payload bound for a hosted app");
+                return Ok(Reaction::default());
+            };
+            return Ok(Reaction {
+                to_page: vec![PageMessage {
+                    namespace: msg.namespace.clone(),
+                    sender: msg.source_id.clone(),
+                    data: data.to_owned(),
+                }],
+                ..Reaction::default()
+            });
+        }
         match msg.namespace.as_str() {
             ns::DEVICE_AUTH => self.handle_device_auth(msg),
             ns::CONNECTION => Ok(self.handle_connection(msg)),
@@ -304,7 +395,7 @@ impl CastSession {
                     .app_ids
                     .into_iter()
                     .map(|id| {
-                        let can = self.can_host(App::classify(&id));
+                        let can = self.can_host(App::classify(&id, &self.catalogue));
                         (id, can)
                     })
                     .collect();
@@ -318,7 +409,26 @@ impl CastSession {
             }
             "LAUNCH" => {
                 let req: LaunchRequest = messages::parse_message(payload)?;
-                let app = App::classify(&req.app_id);
+                let app = App::classify(&req.app_id, &self.catalogue);
+                if app == App::Page {
+                    self.id_counter += 1;
+                    let n = self.id_counter;
+                    // Accepted in principle and not answerable here: resolving the id is
+                    // a lookup and hosting it needs a browser. The actor finishes it and
+                    // comes back through `page_hosted`/`page_refused`; the sender waits,
+                    // which is correct — a status claiming the app is running before its
+                    // page exists is the failure this whole path is for.
+                    return Ok(Reaction {
+                        launch_page: Some(PendingLaunch {
+                            app_id: req.app_id,
+                            request_id: req.request_id,
+                            sender,
+                            session_id: format!("sess-{n}"),
+                            transport_id: format!("transport-{n}"),
+                        }),
+                        ..Reaction::default()
+                    });
+                }
                 if let Some(refusal) = self.refusal_for(app) {
                     // Saying "running" to a launch we cannot serve is the worst answer
                     // available: the sender opens a connection to a transport id that
@@ -479,6 +589,7 @@ impl CastSession {
             )],
             events: Vec::new(),
             start_mirror: Some(config),
+            ..Reaction::default()
         })
     }
 
@@ -498,8 +609,93 @@ impl CastSession {
             App::DefaultMedia => None,
             App::Streaming if self.mirror_port.is_some() => None,
             App::Streaming => Some(LaunchRefusal::SystemError),
+            // Hosting is decided by the actor, which is the only party that can resolve
+            // the id and open a browser. Reaching here means the caller asked whether we
+            // *could*, which for a page is yes whenever hosting exists at all — the
+            // narrowing happens when the lookup comes back.
+            App::Page => None,
             App::Unhostable => Some(LaunchRefusal::NotFound),
         }
+    }
+
+    /// The page for `pending` is up: record the session and answer the waiting sender.
+    ///
+    /// `namespaces` is what the application itself declared over the platform channel,
+    /// and it becomes what `RECEIVER_STATUS` reports — a sender reads that list to
+    /// decide what it may send.
+    pub fn page_hosted(
+        &mut self,
+        pending: &PendingLaunch,
+        display_name: &str,
+        namespaces: Vec<String>,
+    ) -> Vec<CastMessage> {
+        self.app = Some(RunningApp {
+            app_id: pending.app_id.clone(),
+            display_name: display_name.to_owned(),
+            session_id: pending.session_id.clone(),
+            transport_id: pending.transport_id.clone(),
+            status_text: display_name.to_owned(),
+            controller: pending.sender.clone(),
+            namespaces,
+        });
+        // The media plane is the application's now, so whatever we were reporting about
+        // our own is no longer this session's truth.
+        self.player_state = None;
+        self.position = None;
+        self.reply_receiver_status(&pending.sender, pending.request_id)
+            .outgoing
+    }
+
+    /// The page for `pending` could not be hosted: tell the sender in its own vocabulary.
+    #[must_use]
+    pub fn page_refused(
+        &self,
+        pending: &PendingLaunch,
+        refusal: LaunchRefusal,
+    ) -> Vec<CastMessage> {
+        warn!(
+            app_id = %pending.app_id,
+            reason = refusal.reason(),
+            "declining a LAUNCH the browser could not host"
+        );
+        vec![CastMessage::json(
+            &self.receiver_id,
+            &pending.sender,
+            ns::RECEIVER,
+            messages::launch_error(pending.request_id, refusal),
+        )]
+    }
+
+    /// The device volume and mute, as the session currently believes them.
+    ///
+    /// A hosted application draws its own slider from this, so it has to be the level
+    /// senders are told about rather than a fresh 1.0 — an app that comes up claiming
+    /// full volume on a panel at a quarter is a control that lies before it is touched.
+    #[must_use]
+    pub const fn output_volume(&self) -> (f32, bool) {
+        (self.volume, self.muted)
+    }
+
+    /// The session id a hosted page should be told, if one is running.
+    ///
+    /// The page echoes it to the vendor's own cloud, so it has to be the same string
+    /// `RECEIVER_STATUS` reports rather than a second one invented for the platform.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.app.as_ref().map(|a| a.session_id.as_str())
+    }
+
+    /// An application's message for a sender, addressed from the running session.
+    ///
+    /// `*` is a broadcast — how a receiver tells every sender on the connection about a
+    /// status change it did not ask for.
+    #[must_use]
+    pub fn from_page(&self, namespace: &str, sender: &str, data: &str) -> CastMessage {
+        let source = self
+            .app
+            .as_ref()
+            .map_or(self.receiver_id.as_str(), |a| a.transport_id.as_str());
+        CastMessage::json(source, sender, namespace, data.to_owned())
     }
 
     fn launch(&mut self, req: &LaunchRequest, controller: &str) {
@@ -512,6 +708,9 @@ impl CastSession {
             transport_id: format!("transport-{n}"),
             status_text: "Ready To Cast".to_string(),
             controller: controller.to_string(),
+            // Serving the session ourselves: the media namespace is ours, and
+            // `namespaces` reports it because this list is empty.
+            namespaces: Vec::new(),
         });
     }
 
@@ -607,6 +806,222 @@ mod tests {
 
     fn receiver_request(json: &str) -> CastMessage {
         recv_msg(ns::RECEIVER, "sender-0", "receiver-0", json)
+    }
+
+    /// A session on a receiver that can host applications, with `app_id` already known
+    /// to be a page — the state after one registry lookup.
+    fn hosting_session(app_id: &str) -> CastSession {
+        let mut catalogue = messages::AppCatalogue::new(true);
+        catalogue.record(app_id, true);
+        let mut s = session();
+        s.observe_catalogue(catalogue);
+        s
+    }
+
+    /// Launch `app_id` and take the receiver all the way to hosting its page.
+    fn launched(app_id: &str, namespaces: &[&str]) -> CastSession {
+        let mut s = hosting_session(app_id);
+        let r = s
+            .handle(&receiver_request(&format!(
+                r#"{{"requestId":1,"type":"LAUNCH","appId":"{app_id}"}}"#
+            )))
+            .unwrap();
+        let pending = r.launch_page.expect("a page launch");
+        s.page_hosted(
+            &pending,
+            "The App",
+            namespaces.iter().map(|n| (*n).to_string()).collect(),
+        );
+        s
+    }
+
+    /// The sender is left waiting on purpose. Resolving the id is a lookup and hosting
+    /// it needs a browser, and a `RECEIVER_STATUS` sent before the page exists is
+    /// exactly the "connected phone, black panel" failure #16 opens with.
+    #[test]
+    fn launching_a_page_defers_instead_of_answering() {
+        let mut s = hosting_session("233637DE");
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":9,"type":"LAUNCH","appId":"233637DE"}"#,
+            ))
+            .unwrap();
+        assert!(
+            r.outgoing.is_empty(),
+            "nothing may be claimed before the page exists: {:?}",
+            r.outgoing
+        );
+        assert_eq!(
+            r.launch_page,
+            Some(PendingLaunch {
+                app_id: "233637DE".into(),
+                request_id: 9,
+                sender: "sender-0".into(),
+                session_id: "sess-1".into(),
+                transport_id: "transport-1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_hosted_page_is_reported_to_the_sender_that_launched_it() {
+        let mut s = hosting_session("9AC194DC");
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":4,"type":"LAUNCH","appId":"9AC194DC"}"#,
+            ))
+            .unwrap();
+        let pending = r.launch_page.unwrap();
+        let out = s.page_hosted(&pending, "Plex", vec![ns::MEDIA.to_string()]);
+        let status = payload(&out[0]);
+        assert_eq!(status["type"], "RECEIVER_STATUS");
+        assert_eq!(status["requestId"], 4);
+        let app = &status["status"]["applications"][0];
+        assert_eq!(app["appId"], "9AC194DC");
+        assert_eq!(app["displayName"], "Plex");
+        assert_eq!(s.session_id(), Some(app["sessionId"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn a_page_that_cannot_be_hosted_is_declined_in_the_senders_vocabulary() {
+        let mut s = hosting_session("DEADBEEF");
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":5,"type":"LAUNCH","appId":"DEADBEEF"}"#,
+            ))
+            .unwrap();
+        let pending = r.launch_page.unwrap();
+        let out = s.page_refused(&pending, LaunchRefusal::NotFound);
+        let error = payload(&out[0]);
+        assert_eq!(error["type"], "LAUNCH_ERROR");
+        assert_eq!(error["reason"], "NOT_FOUND");
+        assert_eq!(error["requestId"], 5);
+    }
+
+    /// The media namespace changing hands is the point of hosting an app: with YouTube
+    /// up, YouTube answers `LOAD`. Answering alongside it would put two receivers on one
+    /// session, replying twice to one request from two players that disagree.
+    #[test]
+    fn a_hosted_app_takes_the_media_namespace_off_us() {
+        let mut s = launched("233637DE", &[ns::MEDIA]);
+        let load = recv_msg(
+            ns::MEDIA,
+            "sender-0",
+            "transport-1",
+            r#"{"requestId":7,"type":"LOAD","media":{"contentId":"http://x/v.mp4"}}"#,
+        );
+        let r = s.handle(&load).unwrap();
+        assert!(
+            r.outgoing.is_empty() && r.events.is_empty(),
+            "we must not answer for the application: {r:?}"
+        );
+        assert_eq!(r.to_page.len(), 1);
+        assert_eq!(r.to_page[0].namespace, ns::MEDIA);
+        assert_eq!(r.to_page[0].sender, "sender-0");
+        assert!(r.to_page[0].data.contains("v.mp4"));
+    }
+
+    /// With no application running, the media namespace is ours again — the same `LOAD`
+    /// plays through our own pipeline.
+    #[test]
+    fn the_media_namespace_comes_back_when_no_app_is_hosted() {
+        let mut s = session();
+        let load = recv_msg(
+            ns::MEDIA,
+            "sender-0",
+            "receiver-0",
+            r#"{"requestId":7,"type":"LOAD","media":{"contentId":"http://x/v.mp4"}}"#,
+        );
+        let r = s.handle(&load).unwrap();
+        assert!(r.to_page.is_empty());
+        assert!(matches!(r.events[0], SessionEvent::Play { .. }));
+    }
+
+    /// Transport is never the application's, whatever it declared. An app given
+    /// `CONNECTION` could end sessions it does not own; given `DEVICE_AUTH` it would be
+    /// handed a challenge it cannot sign, and the sender would walk away.
+    #[test]
+    fn an_application_cannot_claim_the_transport_namespaces() {
+        let mut s = launched(
+            "233637DE",
+            &[ns::MEDIA, ns::CONNECTION, ns::HEARTBEAT, ns::DEVICE_AUTH],
+        );
+        let ping = recv_msg(
+            ns::HEARTBEAT,
+            "sender-0",
+            "receiver-0",
+            r#"{"type":"PING"}"#,
+        );
+        let r = s.handle(&ping).unwrap();
+        assert!(r.to_page.is_empty(), "heartbeat must stay ours");
+        assert_eq!(payload(&r.outgoing[0])["type"], "PONG");
+
+        let close = recv_msg(ns::CONNECTION, "other", "receiver-0", r#"{"type":"CLOSE"}"#);
+        assert!(s.handle(&close).unwrap().to_page.is_empty());
+    }
+
+    /// The Plex failure, as a test. An app id nobody has resolved yet is answered
+    /// available whenever hosting is possible — because the alternative makes the device
+    /// vanish from the picker with nothing said anywhere.
+    #[test]
+    fn an_unresolved_app_id_is_offered_when_a_browser_can_host_it() {
+        let mut s = session();
+        s.observe_catalogue(messages::AppCatalogue::new(true));
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":1,"type":"GET_APP_AVAILABILITY","appId":["9AC194DC"]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["availability"]["9AC194DC"],
+            "APP_AVAILABLE"
+        );
+    }
+
+    #[test]
+    fn a_receiver_with_no_browser_says_so_rather_than_accepting_a_launch_it_cannot_serve() {
+        let mut s = session();
+        s.observe_catalogue(messages::AppCatalogue::new(false));
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":1,"type":"GET_APP_AVAILABILITY","appId":["9AC194DC"]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["availability"]["9AC194DC"],
+            "APP_UNAVAILABLE"
+        );
+    }
+
+    /// A native app id that is not one of the mirroring ones stays unhostable even with
+    /// a browser: the registry said it has no page, and a page is the only thing the
+    /// browser can host.
+    #[test]
+    fn a_known_native_app_is_not_offered_to_a_browser() {
+        let mut catalogue = messages::AppCatalogue::new(true);
+        catalogue.record("AAAAAAAA", false);
+        let mut s = session();
+        s.observe_catalogue(catalogue);
+        let r = s
+            .handle(&receiver_request(
+                r#"{"requestId":1,"type":"GET_APP_AVAILABILITY","appId":["AAAAAAAA"]}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            payload(&r.outgoing[0])["availability"]["AAAAAAAA"],
+            "APP_UNAVAILABLE"
+        );
+    }
+
+    /// An application's answer goes back out addressed from the session's transport id,
+    /// which is what the sender opened its virtual connection to.
+    #[test]
+    fn an_applications_answer_is_addressed_from_the_session() {
+        let s = launched("233637DE", &[ns::MEDIA]);
+        let out = s.from_page(ns::MEDIA, "sender-0", r#"{"type":"MEDIA_STATUS"}"#);
+        assert_eq!(out.destination_id, "sender-0");
+        assert_eq!(out.namespace, ns::MEDIA);
+        assert!(out.source_id.starts_with("transport-"));
     }
 
     /// A sender asks what this device can run *before* offering it in a picker. Leaving
@@ -711,13 +1126,26 @@ mod tests {
     /// no reason anybody in the room could work out.
     #[test]
     fn every_streaming_app_id_is_recognised() {
+        // With hosting on, so the streaming ids are being told apart from pages rather
+        // than merely from a receiver that cannot host anything.
+        let catalogue = messages::AppCatalogue::new(true);
         for id in [
             "0F5096E8", "85CDB22F", "674A0243", "8E6C866D", "96084372", "BFD92C23",
         ] {
-            assert_eq!(App::classify(id), App::Streaming, "{id} not recognised");
+            assert_eq!(
+                App::classify(id, &catalogue),
+                App::Streaming,
+                "{id} not recognised"
+            );
         }
-        assert_eq!(App::classify("CC1AD845"), App::DefaultMedia);
-        assert_eq!(App::classify("233637DE"), App::Unhostable); // YouTube's own receiver
+        assert_eq!(App::classify("CC1AD845", &catalogue), App::DefaultMedia);
+        // YouTube's own receiver is a page now, which is the whole of #16.
+        assert_eq!(App::classify("233637DE", &catalogue), App::Page);
+        // …and on a build with no browser it is honestly unhostable again.
+        assert_eq!(
+            App::classify("233637DE", &messages::AppCatalogue::new(false)),
+            App::Unhostable
+        );
     }
 
     /// Chrome's cast dialog has a volume slider. Unhandled, it moved and nothing happened

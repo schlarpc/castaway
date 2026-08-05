@@ -5408,6 +5408,7 @@ dependencies = [
  "axum",
  "base64 0.23.0",
  "bytes",
+ "cast-registry",
  "cast-replay",
  "castaway-core",
  "crypto-cast-auth",

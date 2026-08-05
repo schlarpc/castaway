@@ -105,4 +105,40 @@ pub trait Pipeline: Send + Sync {
     /// # Errors
     /// [`CoreError::Pipeline`] on teardown failure.
     async fn stop(&self) -> Result<(), CoreError>;
+
+    /// Put a page on the panel and give it the session.
+    ///
+    /// The third way a source can fill the screen, beside a URL we decode
+    /// ([`Pipeline::play`]) and frames we composite ([`Pipeline::mirror`]): a *hosted
+    /// application*, where the pixels are a web page and the protocol above it is the
+    /// vendor's own. Cast app hosting is the first caller (#16); DIAL's YouTube launch
+    /// is the same shape and predates it.
+    ///
+    /// Routed through here rather than through a launcher the adapter holds directly,
+    /// because taking the panel is what a session *is*: this is the seam where the
+    /// manager preempts whatever was playing. The bug that argues for it is already in
+    /// this tree — DIAL's launcher goes around the manager, and for a long time that
+    /// meant a later cast decoded underneath an opaque leanback page (D28).
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if there is no browser to host it in. The default is
+    /// exactly that: a pipeline without one is a real configuration (`--no-default-
+    /// features`, the null pipeline, every test double), and it must answer honestly
+    /// rather than be forced to pretend it has a browser.
+    async fn host_page(&self, page: HostedPage) -> Result<(), CoreError> {
+        Err(CoreError::Pipeline(format!(
+            "this pipeline has no browser to host {} in",
+            page.url
+        )))
+    }
+}
+
+/// A page a source has asked the panel to host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedPage {
+    /// Where the page lives.
+    pub url: String,
+    /// What to call it on screen while it loads. The registry's name for a Cast
+    /// application, so the panel says "YouTube" rather than an eight-digit id.
+    pub title: String,
 }

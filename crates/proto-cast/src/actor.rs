@@ -308,6 +308,20 @@ impl CastIdentity {
     }
 }
 
+/// The next event from a hosted application, or pending forever when none is hosted.
+///
+/// A helper rather than an inline arm because `tokio::select!` needs a future either way,
+/// and "there is no application" has to be *quiet* rather than a branch that resolves
+/// instantly and spins the loop.
+async fn recv_from_page(
+    slot: &mut Option<tokio::sync::mpsc::Receiver<crate::platform_actor::HostEvent>>,
+) -> Option<crate::platform_actor::HostEvent> {
+    match slot.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// `SystemTime` in the shape rcgen wants.
 fn offset_date_time(at: SystemTime) -> Result<OffsetDateTime, CastError> {
     let secs = at
@@ -332,6 +346,13 @@ pub struct CastReceiver {
     /// for "unknown", so the honest thing available is the value a sender sees for the
     /// length of a fetch anyway.
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+    /// The receiver platform a hosted application's page talks to, when this build has a
+    /// browser to host one in (#16). `None` is a real configuration and not a degraded
+    /// one: without it every third-party app id is honestly declined rather than
+    /// accepted and then left on a blank panel.
+    platform: Option<crate::platform_actor::PlatformHost>,
+    /// Where an `appId` is resolved to a receiver page.
+    registry: Option<Arc<cast_registry::Registry>>,
 }
 
 impl CastReceiver {
@@ -358,7 +379,116 @@ impl CastReceiver {
             identity,
             media_ports,
             playback: None,
+            platform: None,
+            registry: None,
         })
+    }
+
+    /// Let this receiver host third-party Cast applications (#16).
+    ///
+    /// Both halves or neither: the registry says which page an app id names and the
+    /// platform is what that page talks to, and one without the other is a receiver that
+    /// either knows a URL it cannot open or opens a page that finds nobody home. Taking
+    /// them in one call is what makes the half-configured state unrepresentable.
+    #[must_use]
+    pub fn with_app_hosting(
+        mut self,
+        registry: Arc<cast_registry::Registry>,
+        platform: crate::platform_actor::PlatformHost,
+    ) -> Self {
+        self.registry = Some(registry);
+        self.platform = Some(platform);
+        self
+    }
+
+    /// What this receiver currently knows about app ids, for the session to fold with.
+    ///
+    /// Built from the registry's *cache* only — this is called on the message path and
+    /// must not make a lookup (ground rule 3/4). An id nobody has resolved yet is simply
+    /// absent, which `App::classify` reads as "offer it and find out".
+    fn catalogue(&self) -> crate::messages::AppCatalogue {
+        let mut catalogue = crate::messages::AppCatalogue::new(self.platform.is_some());
+        if let Some(registry) = &self.registry {
+            for (app_id, is_page) in registry.snapshot() {
+                catalogue.record(&app_id, is_page);
+            }
+        }
+        catalogue
+    }
+
+    /// Finish a deferred `LAUNCH`: resolve the app id, and if it names a page, put it on
+    /// the panel and start the platform the page will dial back into.
+    ///
+    /// Returns the messages to write. A refusal is a message too — the sender is waiting,
+    /// and silence is the failure this whole path exists to stop.
+    async fn begin_hosting(
+        &self,
+        pending: &crate::session::PendingLaunch,
+        session: &mut CastSession,
+        sink: &SessionSink,
+        host_events: &mut Option<tokio::sync::mpsc::Receiver<crate::platform_actor::HostEvent>>,
+    ) -> Vec<crate::proto::CastMessage> {
+        let (Some(registry), Some(platform)) = (&self.registry, &self.platform) else {
+            // `App::classify` only produces `Page` when hosting exists, so this is
+            // unreachable by construction; declining is still the right answer to have.
+            return session.page_refused(pending, crate::messages::LaunchRefusal::NotFound);
+        };
+
+        let surface = match registry.resolve(&pending.app_id).await {
+            Ok(surface) => surface,
+            Err(e) => {
+                warn!(app_id = %pending.app_id, error = %e, "could not resolve the launched application");
+                return session.page_refused(pending, crate::messages::LaunchRefusal::NotFound);
+            }
+        };
+        let Some(url) = surface.page_url() else {
+            // A native application the registry knows about but that is not one of the
+            // mirroring ids we terminate ourselves. Nothing here can run it.
+            info!(
+                app_id = %pending.app_id,
+                name = surface.display_name().unwrap_or("?"),
+                "the launched application is native, not a page; declining"
+            );
+            return session.page_refused(pending, crate::messages::LaunchRefusal::NotFound);
+        };
+        let name = surface.display_name().unwrap_or(&pending.app_id).to_owned();
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+        let identity = crate::platform::AppIdentity {
+            application_id: pending.app_id.clone(),
+            application_name: name.clone(),
+            session_id: pending.session_id.clone(),
+            launching_sender_id: pending.sender.clone(),
+            icon_url: None,
+        };
+        if let Err(e) = platform
+            .start(identity, session.output_volume(), events_tx)
+            .await
+        {
+            warn!(error = %e, "the receiver platform would not take the application");
+            return session.page_refused(pending, crate::messages::LaunchRefusal::SystemError);
+        }
+        // The sender that launched it is already connected — it is the one waiting on
+        // this reply — so the platform is told before the page arrives, and replays it.
+        platform.sender_connected(&pending.sender, "").await;
+        *host_events = Some(events_rx);
+
+        info!(app_id = %pending.app_id, %name, %url, "hosting a Cast application");
+        if sink
+            .emit(SessionEvent::HostPage(castaway_core::HostedPage {
+                url: url.to_owned(),
+                title: name,
+            }))
+            .await
+            .is_err()
+        {
+            platform.stop().await;
+            *host_events = None;
+            return session.page_refused(pending, crate::messages::LaunchRefusal::SystemError);
+        }
+        // Nothing is written to the sender yet: it learns the app is running when the
+        // page says it is (`HostEvent::Ready`), not when we decided to load one.
+        Vec::new()
     }
 
     /// Let this receiver ask the pipeline where playback has reached.
@@ -437,6 +567,10 @@ impl CastReceiver {
         let remote = Arc::new(CastRemote::new(to_actor, sink.clone()));
 
         let mut mirror_task: Option<JoinHandle<()>> = None;
+        // Set while this connection is hosting an application: the platform's side of
+        // the conversation, which is a third source the pump has to select on.
+        let mut host_events: Option<tokio::sync::mpsc::Receiver<crate::platform_actor::HostEvent>> =
+            None;
         if let Err(e) = self
             .pump(
                 &mut tls,
@@ -447,6 +581,7 @@ impl CastReceiver {
                 &mut mirror_task,
                 from_receiver,
                 &remote,
+                &mut host_events,
             )
             .await
         {
@@ -456,6 +591,14 @@ impl CastReceiver {
         // RTP loop goes with it, whatever the pipeline still holds.
         if let Some(task) = mirror_task {
             task.abort();
+        }
+        // The application belonged to this connection too. A page left running would go
+        // on holding the panel for a sender that has gone, which is D28's bug wearing a
+        // different hat.
+        if host_events.is_some() {
+            if let Some(platform) = &self.platform {
+                platform.stop().await;
+            }
         }
         // A dropped connection is a finished session, however it ended: tell the manager
         // so the pipeline doesn't hold the screen for a sender that walked away.
@@ -476,9 +619,13 @@ impl CastReceiver {
         mirror_task: &mut Option<JoinHandle<()>>,
         mut from_receiver: tokio::sync::mpsc::Receiver<FromReceiver>,
         remote: &Arc<CastRemote>,
+        host_events: &mut Option<tokio::sync::mpsc::Receiver<crate::platform_actor::HostEvent>>,
     ) -> Result<(), CastError> {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
+        // The `LAUNCH` whose page has not come up yet. One at a time: there is one panel
+        // and one browser, so a second launch replaces the first.
+        let mut pending_launch: Option<crate::session::PendingLaunch> = None;
         loop {
             // Two sources, one owner. The session is folded from here and nowhere else, so
             // an unsolicited status and a reply to a sender cannot interleave halfway
@@ -486,6 +633,15 @@ impl CastReceiver {
             // to be careful about and this does not.
             let n = tokio::select! {
                 read = tls.read(&mut chunk) => read.map_err(|e| CastError::Io(e.to_string()))?,
+                // The hosted application, when there is one. `recv_from_page` returns
+                // pending forever when there is not, so this arm simply never fires.
+                event = recv_from_page(host_events) => {
+                    let outgoing = self
+                        .from_hosted_app(event, &mut pending_launch, session, sink, host_events)
+                        .await?;
+                    Self::write_all(tls, &outgoing).await?;
+                    continue;
+                }
                 Some(request) = from_receiver.recv() => {
                     let outgoing = match request {
                         FromReceiver::Ended(end) => {
@@ -526,8 +682,35 @@ impl CastReceiver {
                 // a pure fold — the same shape `proto-dlna` uses, and what keeps every
                 // status test free of a live decoder.
                 session.observe_progress(self.playback.as_ref().and_then(|p| p.progress()));
+                // What is known about app ids, pushed in for the same reason as the
+                // position: resolving one is a lookup, and the fold must not make one.
+                session.observe_catalogue(self.catalogue());
                 let reaction = session.handle(&msg)?;
                 Self::write_all(tls, &reaction.outgoing).await?;
+
+                // A message the running application owns. Straight across, unread.
+                if let Some(platform) = &self.platform {
+                    for message in &reaction.to_page {
+                        platform
+                            .to_page(&message.namespace, &message.sender, &message.data)
+                            .await;
+                    }
+                }
+
+                // A `LAUNCH` the session accepted and could not finish: resolve it, put
+                // the page on the panel, and start the platform it will dial back into.
+                if let Some(pending) = reaction.launch_page {
+                    let outgoing = self
+                        .begin_hosting(&pending, session, sink, host_events)
+                        .await;
+                    if outgoing.is_empty() {
+                        pending_launch = Some(pending);
+                    } else {
+                        // Refused, and already answered.
+                        pending_launch = None;
+                    }
+                    Self::write_all(tls, &outgoing).await?;
+                }
                 for event in with_control_surface(reaction.events, remote) {
                     let ended = matches!(event, SessionEvent::End);
                     sink.emit(event)
@@ -594,6 +777,87 @@ impl CastReceiver {
                         .await
                         .map_err(|e| CastError::Io(e.to_string()))?;
                 }
+            }
+        }
+    }
+
+    /// Fold one event from the hosted application into messages for its senders.
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "this converts an event *from* the hosted application into messages; \
+                  it is not a constructor"
+    )]
+    async fn from_hosted_app(
+        &self,
+        event: Option<crate::platform_actor::HostEvent>,
+        pending_launch: &mut Option<crate::session::PendingLaunch>,
+        session: &mut CastSession,
+        sink: &SessionSink,
+        host_events: &mut Option<tokio::sync::mpsc::Receiver<crate::platform_actor::HostEvent>>,
+    ) -> Result<Vec<crate::proto::CastMessage>, CastError> {
+        use crate::platform_actor::HostEvent;
+
+        let Some(event) = event else {
+            // The platform's channel closed. Nothing is hosted any more.
+            *host_events = None;
+            return Ok(Vec::new());
+        };
+        match event {
+            HostEvent::Ready(ready) => {
+                let Some(pending) = pending_launch.take() else {
+                    debug!("a page came up with no launch waiting on it");
+                    return Ok(Vec::new());
+                };
+                info!(
+                    app_id = %pending.app_id,
+                    namespaces = ready.active_namespaces.len(),
+                    "the hosted application is up; answering the sender that launched it"
+                );
+                Ok(session.page_hosted(
+                    &pending,
+                    ready.status_text.as_deref().unwrap_or("Ready To Cast"),
+                    ready.active_namespaces.clone(),
+                ))
+            }
+            HostEvent::ToSender {
+                namespace,
+                sender_id,
+                data,
+            } => Ok(vec![session.from_page(&namespace, &sender_id, &data)]),
+            HostEvent::Platform(crate::platform::PlatformEvent::SetVolume(level)) => {
+                let txn =
+                    castaway_core::ControlTxn::Volume(castaway_core::Volume::from_position(level));
+                let _ = sink.emit(SessionEvent::Control(txn)).await;
+                Ok(
+                    session.apply_local_control(&castaway_core::ControlTxn::Volume(
+                        castaway_core::Volume::from_position(level),
+                    )),
+                )
+            }
+            HostEvent::Platform(crate::platform::PlatformEvent::SetMuted(muted)) => {
+                let txn = castaway_core::ControlTxn::Mute(muted);
+                let _ = sink.emit(SessionEvent::Control(txn)).await;
+                Ok(session.apply_local_control(&castaway_core::ControlTxn::Mute(muted)))
+            }
+            HostEvent::PageGone => {
+                // The page's socket closed. Whatever the browser is showing, the
+                // application is gone, and a sender left believing otherwise would sit
+                // on a session that answers nothing.
+                warn!("the hosted application's page went away; ending the session");
+                *host_events = None;
+                *pending_launch = None;
+                if let Some(platform) = &self.platform {
+                    platform.stop().await;
+                }
+                let _ = sink.emit(SessionEvent::End).await;
+                Ok(Vec::new())
+            }
+            HostEvent::Platform(other) => {
+                debug!(
+                    ?other,
+                    "a platform request with nothing behind it on this panel"
+                );
+                Ok(Vec::new())
             }
         }
     }
