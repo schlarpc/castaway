@@ -115,6 +115,109 @@ mod tests {
         assert!(json.contains("\"accountReq\":\"PREMIUM\""));
     }
 
+    /// Every field `getInfo` emits, by name and by value.
+    ///
+    /// `getInfo` is the first thing a Spotify client asks of a Connect device, and its
+    /// response decides whether the device is usable. Four of the twenty fields were
+    /// asserted anywhere; the rest were emitted on faith (#200). The failure shape is the
+    /// one AirPlay's `et`/`cn` assertions exist to catch: a client that wants a field we
+    /// omit, or rejects a value we invented, shows the device in the picker and then does
+    /// nothing — indistinguishable from a network problem from the sofa.
+    ///
+    /// **What this is and is not.** It is a pin, not a validation: nothing here has been
+    /// checked against a real client, and no fixture of one exists. So a wrong *value*
+    /// still ships — what this stops is a wrong value changing by accident, and it makes
+    /// the field set legible in one place so the capture, when somebody takes it, has
+    /// something to be diffed against. That capture is the actual close for #200 and is a
+    /// LAN capture rather than a cloud one.
+    #[test]
+    fn get_info_emits_the_field_set_a_client_reads() {
+        let keys = DhKeys::from_private_bytes(&[5u8; 95]);
+        let info = DeviceInfo {
+            remote_name: "Hackerspace TV".into(),
+            device_id: "0f8c2e1000004000800000000c057200".into(),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&get_info(&info, &keys, "alice")).unwrap();
+
+        // The handshake's own fields. `status: 101` is Spotify's "OK" for this endpoint —
+        // not 200, and not a string — and `spotifyError: 0` beside it is what a client
+        // checks before reading anything else.
+        assert_eq!(parsed["status"], 101);
+        assert_eq!(parsed["statusString"], "OK");
+        assert_eq!(parsed["spotifyError"], 0);
+
+        // Identity. `deviceID` is the value the blob decryption is keyed to, so it has to
+        // be the one the session runner uses — `SpotifyService` passes its own through to
+        // `ConnectSettings`, and this is the advertised half of that.
+        assert_eq!(parsed["deviceID"], "0f8c2e1000004000800000000c057200");
+        assert_eq!(parsed["remoteName"], "Hackerspace TV");
+        assert_eq!(parsed["deviceType"], "SPEAKER");
+
+        // The protocol version a client negotiates against. librespot's own devices send
+        // this; a different string here is the kind of thing a client silently declines.
+        assert_eq!(parsed["version"], "2.7.1");
+
+        // Authentication shape. `PREMIUM` says a free account cannot use this device,
+        // which is true of Connect; `activeUser` is who is on it now, and an empty string
+        // means nobody rather than a missing field.
+        assert_eq!(parsed["accountReq"], "PREMIUM");
+        assert_eq!(parsed["activeUser"], "alice");
+        assert_eq!(parsed["tokenType"], "default");
+        assert_eq!(parsed["scope"], "streaming");
+
+        // Fields whose *presence* is what matters and whose values are deliberately
+        // empty: we are not a group, we have no client id of our own, and we are not a
+        // catalogued product. Omitting them is what breaks a client that reads by name.
+        assert_eq!(parsed["groupStatus"], "NONE");
+        assert_eq!(parsed["clientID"], "");
+        assert_eq!(parsed["productID"], 0);
+        assert_eq!(parsed["availability"], "");
+
+        // The key the whole pairing is built on: our DH public key, base64, 96 bytes.
+        let public_key = parsed["publicKey"].as_str().expect("a publicKey string");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(public_key)
+            .expect("publicKey must be base64 a client can decode");
+        assert_eq!(
+            decoded,
+            keys.public_key(),
+            "the advertised key must be the one `addUser` will derive the shared secret \
+             from, or every blob fails to decrypt with nothing that looks like a cause"
+        );
+
+        // …and nothing else. A field added without a decision is a field a client may
+        // read, so this list is the decision. Update it deliberately.
+        let object = parsed.as_object().expect("getInfo is a JSON object");
+        let mut names: Vec<&str> = object.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "accountReq",
+                "activeUser",
+                "availability",
+                "brandDisplayName",
+                "clientID",
+                "deviceID",
+                "deviceType",
+                "groupStatus",
+                "libraryVersion",
+                "modelDisplayName",
+                "productID",
+                "publicKey",
+                "remoteName",
+                "resolverVersion",
+                "scope",
+                "spotifyError",
+                "status",
+                "statusString",
+                "tokenType",
+                "version",
+            ]
+        );
+    }
+
     #[test]
     fn add_user_decrypts_blob_from_a_peer() {
         let b64 = base64::engine::general_purpose::STANDARD;

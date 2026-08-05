@@ -2187,6 +2187,54 @@ mod tests {
         assert!(uuid::Uuid::parse_str(&dial).is_ok(), "must be a real uuid");
     }
 
+    /// Spotify's device id is the panel's UUID with the dashes taken out, and it is the
+    /// value the whole blob decryption is keyed to.
+    ///
+    /// `spotify_device_id` — one `replace` — had no test at all. `tests/pairing.rs`
+    /// proves `getInfo`'s id and the blob's id agree *within* `proto-spotify`; nothing
+    /// proved the id the session runner uses is the one this crate advertised, and the
+    /// crate's own docs say a mismatch "fails login with nothing that looks like a
+    /// cause" (#200).
+    ///
+    /// The other half of that identity is inside `proto-spotify`: `SpotifyService::new`
+    /// stores this string once and `with_playback` hands the *same* field to
+    /// `ConnectSettings`, so there is one value and not two. This end asserts what goes
+    /// in, and that it is stable across restarts — a generated-at-startup id would pair
+    /// once and then fail every reconnect.
+    #[test]
+    fn the_spotify_device_id_is_the_panels_uuid_and_survives_a_restart() {
+        let config = crate::config::Config {
+            uuid: "0f8c1e2a-1111-4000-8000-00000000abcd".to_owned(),
+            ..Default::default()
+        };
+        let id = super::spotify_device_id(&config);
+
+        assert_eq!(id, "0f8c1e2a11114000800000000000abcd");
+        assert!(
+            !id.contains('-'),
+            "Spotify's device id is hex with no separators; a dash here is a login that \
+             fails with nothing that looks like a cause"
+        );
+        assert_eq!(
+            id.len(),
+            32,
+            "a UUID is 32 hex digits once the dashes are gone"
+        );
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Derived from the config, which is file-backed — so the same box advertises the
+        // same id after a reboot, and a phone that paired yesterday still recognises it.
+        assert_eq!(id, super::spotify_device_id(&config));
+
+        // And it is *this* panel's, not a constant: two boxes on one LAN that shared an id
+        // would each decrypt the other's blob.
+        let other = crate::config::Config {
+            uuid: "0f8c1e2a-1111-4000-8000-00000000abce".to_owned(),
+            ..Default::default()
+        };
+        assert_ne!(id, super::spotify_device_id(&other));
+    }
+
     #[test]
     fn a_malformed_configured_uuid_still_yields_stable_distinct_ones() {
         // The config is hand-edited. A typo should degrade to "still works, still
