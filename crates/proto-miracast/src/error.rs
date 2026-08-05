@@ -47,6 +47,21 @@ pub enum MiracastError {
     #[error("no common audio format with the source")]
     NoCommonAudioFormat,
 
+    /// The source's M4 turned on HDCP, which this sink answered `none` to in M3.
+    ///
+    /// Its own category for the same reason as [`Self::UnadvertisedFormat`], and the
+    /// opposite conclusion. That one is a conforming source doing something surprising and
+    /// is survivable; this one is a source that read our `wfd_content_protection: none`
+    /// and set HDCP anyway, and there is nothing to survive: the stream would arrive
+    /// encrypted under a key exchange we never ran, and the decoder would be handed
+    /// ciphertext. Refusing says why. Proceeding is an unexplained black screen, which is
+    /// the one outcome nobody can act on (#195).
+    ///
+    /// Not expected in the field — notes §6.6 records Windows, AOSP and both open-source
+    /// sinks all leaving HDCP off when the sink says `none`.
+    #[error("the source set {0} after this sink answered wfd_content_protection: none")]
+    ContentProtectionRefused(String),
+
     /// The connection is over: a socket error, or a byte stream that will not frame.
     /// Rendered rather than wrapped — nothing downstream recovers differently per cause.
     #[error("connection failed: {0}")]

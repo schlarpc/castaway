@@ -61,6 +61,27 @@ const FRAME_QUEUE: usize = 3;
 /// back-to-back and turning a lossy link into an unusable one.
 const IDR_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The session timeout to use before the source has named one, and if it names none.
+///
+/// RFC 2326 §12.37's default, which is also what the WFD spec and intel/wds use. AOSP
+/// sends 30; a real Samsung sink sends 60. Never hard-coded past this point — the source's
+/// own `Session:` value is what drives the watchdog once M6 has been answered.
+const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How much longer than the negotiated timeout a silent source gets.
+///
+/// The notes are emphatic about this and it is the whole reason the constant exists rather
+/// than the raw timeout: *"A sink should honour whatever the source put in `Session:` and
+/// should not itself time the session out aggressively — several sources send M16 late"*,
+/// and *"a sink that never receives M16 should not tear down on that basis alone; Windows
+/// in some configurations relies on RTP flow rather than M16"* (§2.3).
+///
+/// So this is not a keep-alive deadline. It is a **liveness** deadline: three whole
+/// timeout periods with nothing at all arriving — no keep-alive, no RTSP, and no RTP —
+/// which is a peer that is gone rather than one that is late. At AOSP's 30 s that is 90 s
+/// before the panel's single-source slot is handed back (#195).
+const IDLE_GRACE: u32 = 3;
+
 /// How long the UIBC back-channel gets to answer before we give up on it.
 ///
 /// The source has already told us the port, so a listener that is not there is a source
@@ -102,10 +123,38 @@ pub async fn run_session(
         .checked_sub(IDR_MIN_INTERVAL)
         .unwrap_or_else(tokio::time::Instant::now);
     let mut read_buf = vec![0u8; 8192];
+    // Anything at all from the source, on either socket. Not a keep-alive clock — see
+    // `IDLE_GRACE` for why the two are different things.
+    let mut last_heard = tokio::time::Instant::now();
 
     info!(%peer, "WFD session opened");
     loop {
+        // Re-read every pass: the timeout is unknown until the source's M6 response
+        // carries `Session: <id>;timeout=<n>`, and it is the source's number rather than
+        // ours. Before that, and if it names none, RFC 2326's default.
+        let idle_deadline = last_heard
+            + session
+                .session_timeout_secs()
+                .map_or(DEFAULT_SESSION_TIMEOUT, |secs| {
+                    Duration::from_secs(u64::from(secs))
+                })
+                * IDLE_GRACE;
+
         tokio::select! {
+            // A source that dies without sending FIN — a phone that walks out of range, a
+            // laptop that sleeps — otherwise holds this session, the panel's single-source
+            // slot and the RTP socket until someone restarts the process (#195).
+            () = tokio::time::sleep_until(idle_deadline) => {
+                warn!(
+                    %peer,
+                    timeout_secs = session.session_timeout_secs().unwrap_or(
+                        DEFAULT_SESSION_TIMEOUT.as_secs().try_into().unwrap_or(u32::MAX)
+                    ),
+                    "the source has said nothing for {IDLE_GRACE} session timeouts; \
+                     giving the slot back"
+                );
+                break;
+            }
             // Reading bytes is all that happens in the branch; the parse is below.
             read = control.read(&mut read_buf) => {
                 let n = read.map_err(|e| MiracastError::Connection(e.to_string()))?;
@@ -113,6 +162,7 @@ pub async fn run_session(
                     debug!(%peer, "source closed the control connection");
                     break;
                 }
+                last_heard = tokio::time::Instant::now();
                 inbound.extend_from_slice(&read_buf[..n]);
                 if inbound.len() > MAX_RTSP_MESSAGE {
                     return Err(MiracastError::Connection(
@@ -140,6 +190,7 @@ pub async fn run_session(
             }
             received = rtp.recv(&mut datagram) => {
                 let n = received.map_err(|e| MiracastError::Connection(e.to_string()))?;
+                last_heard = tokio::time::Instant::now();
                 let frames = media.push_datagram(Bytes::copy_from_slice(&datagram[..n]));
                 if let Some(planes) = &mut planes {
                     for frame in frames {
@@ -632,10 +683,19 @@ mod tests {
     /// A scripted WFD *source*: it accepts the sink's connection and walks M1→M7, then
     /// sends one RTP datagram of transport stream. Everything a real source does over a
     /// socket, with none of the radio.
+    ///
+    /// Returns its own end of the control connection rather than dropping it, so a caller
+    /// can choose between the two endings that matter: drop it and the sink sees FIN, or
+    /// hold it and the sink sees a peer that is connected and saying nothing.
+    ///
+    /// `session_timeout` is what goes in the `Session:` header of the SETUP response —
+    /// the source's number, which is the one the sink's watchdog has to honour rather than
+    /// a value of its own (notes §2.3).
     async fn scripted_source(
         listener: tokio::net::TcpListener,
         rtp_port: u16,
-    ) -> Result<(), std::io::Error> {
+        session_timeout: u32,
+    ) -> Result<TcpStream, std::io::Error> {
         let (mut stream, _) = listener.accept().await?;
         let mut buf = vec![0u8; 8192];
         let mut seen = String::new();
@@ -656,7 +716,7 @@ mod tests {
         while !seen.contains("RTSP/1.0 200") || !seen.contains("OPTIONS") {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
-                return Ok(());
+                return Ok(stream);
             }
             seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
@@ -687,7 +747,7 @@ mod tests {
         while !seen.contains("wfd_client_rtp_ports:") {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
-                return Ok(());
+                return Ok(stream);
             }
             seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
@@ -717,7 +777,7 @@ mod tests {
         while !seen.contains("SETUP") {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
-                return Ok(());
+                return Ok(stream);
             }
             seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
@@ -727,9 +787,10 @@ mod tests {
         );
         send(
             &mut stream,
-            "RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 4242;timeout=30\r\n\
-             Transport: RTP/AVP/UDP;unicast;client_port=1028;server_port=19000\r\n\r\n"
-                .to_owned(),
+            format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: 4242;timeout={session_timeout}\r\n\
+                 Transport: RTP/AVP/UDP;unicast;client_port=1028;server_port=19000\r\n\r\n"
+            ),
         )
         .await?;
 
@@ -737,7 +798,7 @@ mod tests {
         while !seen.contains("PLAY") {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
-                return Ok(());
+                return Ok(stream);
             }
             seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
@@ -746,7 +807,7 @@ mod tests {
             "RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: 4242\r\n\r\n".to_owned(),
         )
         .await?;
-        Ok(())
+        Ok(stream)
     }
 
     #[tokio::test]
@@ -756,7 +817,7 @@ mod tests {
         let rtp = bind_rtp(0).await.unwrap();
         let rtp_port = rtp.local_addr().unwrap().port();
 
-        let source = tokio::spawn(scripted_source(listener, rtp_port));
+        let source = tokio::spawn(scripted_source(listener, rtp_port, 30));
 
         let (tx, mut rx) = mpsc::channel::<SourceMessage>(8);
         let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "test"), tx);
@@ -778,6 +839,66 @@ mod tests {
         source.await.unwrap().unwrap();
         // Dropping the source's socket ends the session cleanly rather than by error.
         session.abort();
+    }
+
+    /// A source that stops talking without saying goodbye gives the slot back.
+    ///
+    /// The `Session:` header's `;timeout=` was parsed and then discarded, and nothing in
+    /// `run_session` timed out a silent peer — so a phone that walked out of range or a
+    /// laptop that slept held the session, the panel's single-source slot and the RTP
+    /// socket indefinitely, and recovery was a restart (#195).
+    ///
+    /// The distinction this is careful about: it is a *liveness* deadline, not a
+    /// keep-alive one. The notes are emphatic that a sink must not time out on a missing
+    /// M16 alone — several sources send them late, and Windows in some configurations
+    /// relies on RTP flow instead — so the clock resets on anything at all from the
+    /// source, on either socket, and only fires after `IDLE_GRACE` whole timeout periods.
+    ///
+    /// Driven by a source that says `timeout=1`, which keeps the test to three seconds and
+    /// asserts the thing worth asserting: the watchdog runs on the **source's** number.
+    /// A hard-coded 30 or 60 would sit here for a minute and a half and pass.
+    #[tokio::test]
+    async fn a_source_that_goes_silent_without_a_teardown_gives_the_slot_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = listener.local_addr().unwrap();
+        let rtp = bind_rtp(0).await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+
+        let source = tokio::spawn(scripted_source(listener, rtp_port, 1));
+
+        let (tx, mut rx) = mpsc::channel::<SourceMessage>(8);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "test"), tx);
+        let control = connect_control(source_addr).await.unwrap();
+        let session = tokio::spawn(run_session(control, rtp, caps(rtp_port), sink));
+
+        while let Some(message) = rx.recv().await {
+            if matches!(message.event, SessionEvent::Mirror { .. }) {
+                break;
+            }
+        }
+
+        // Held, not dropped: the socket stays open and nothing more is written to it. A
+        // dropped socket is a FIN, which the loop already handled — the case that had no
+        // handling is the peer that is still connected and gone.
+        let _still_connected = source.await.unwrap().unwrap();
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), session)
+            .await
+            .expect("the session is still holding the panel's slot")
+            .unwrap();
+        assert!(
+            outcome.is_ok(),
+            "an idle peer is a session that ended, not one that failed: {outcome:?}"
+        );
+
+        // …and it waited. A watchdog that fired immediately would satisfy the assertion
+        // above and would end a session every time a source paused between messages.
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(1),
+            "gave up after {waited:?}, which is inside a single session timeout"
+        );
     }
 
     #[tokio::test]

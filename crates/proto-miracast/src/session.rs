@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 
 use crate::error::MiracastError;
 use crate::params::{
-    render_body, AudioCodecEntry, ClientRtpPorts, ParamBody, ParamName, PresentationUrls,
-    SinkCapabilities, TriggerMethod,
+    render_body, AudioCodecEntry, ClientRtpPorts, ContentProtection, ParamBody, ParamName,
+    PresentationUrls, SinkCapabilities, TriggerMethod,
 };
 use crate::video::{NegotiatedVideo, Profile, ResolutionTable, VideoFormats, VideoMode};
 
@@ -531,6 +531,25 @@ impl WfdSession {
             state: self.state.name(),
         })?;
 
+        // Before anything is negotiated: a session under HDCP is one this sink cannot
+        // decode a single frame of, so there is no point settling a video format for it.
+        //
+        // We answer `wfd_content_protection: none` in M3 and every real source leaves it
+        // off (notes §6.6 — Windows' own sink says `none` too). A source that sets it
+        // anyway has either ignored the answer or is running a stack that assumes HDCP;
+        // either way the RTP would arrive encrypted under a key exchange that never
+        // happened, and handing that to the decoder produces noise or a black screen with
+        // a green journal. The parameter used to be parsed and then dropped on the floor,
+        // which is the one option that gives no one anything to act on (#195).
+        if let Some(value) = m4.value(&ParamName::ContentProtection) {
+            match ContentProtection::parse(value)? {
+                ContentProtection::None => {}
+                cp @ (ContentProtection::Hdcp2_0(_) | ContentProtection::Hdcp2_1(_)) => {
+                    return Err(MiracastError::ContentProtectionRefused(cp.to_string()));
+                }
+            }
+        }
+
         let chosen = VideoFormats::parse(m4.value(&ParamName::VideoFormats).unwrap_or("none"))?;
         let codec = chosen
             .codecs
@@ -813,7 +832,7 @@ fn parse_uibc_port(value: &str) -> Option<u16> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::params::{AudioCodecs, ConnectorType, ContentProtection, RtpProfile};
+    use crate::params::{AudioCodecs, ConnectorType, RtpProfile};
 
     fn caps() -> SinkCapabilities {
         SinkCapabilities {
@@ -1260,6 +1279,74 @@ mod tests {
         s.on_request(&request("SET_PARAMETER", CONTROL_URI, &h, &body))
             .unwrap();
         assert_eq!(s.config().unwrap().uibc_port(), Some(7239));
+    }
+
+    /// A source that turns HDCP on after being told `none` is refused, with a reason.
+    ///
+    /// The parameter was parsed and then dropped: `ContentProtection` renders and parses
+    /// correctly and `negotiate()` never looked at it. So the session would have gone on
+    /// to settle a video format, bind the media plane, and hand the decoder a stream
+    /// encrypted under a key exchange that never happened — noise or a black screen, with
+    /// a green journal and nothing anyone could act on (#195).
+    ///
+    /// Not a case any real source produces: notes §6.6 records Windows' own sink, AOSP and
+    /// both open-source sinks all leaving HDCP off against a sink that says `none`. It is
+    /// the defensive half of that finding, and the alternative — proceed and log — is the
+    /// one option that produces the unexplained black screen.
+    #[test]
+    fn a_source_that_insists_on_hdcp_is_refused_rather_than_ignored() {
+        for (value, expected) in [
+            ("HDCP2.1 port=1189", "HDCP2.1 port=1189"),
+            // Prohibited for new devices by v2.3 and parsed anyway, because a source that
+            // sends it still means to encrypt.
+            ("HDCP2.0 port=53002", "HDCP2.0 port=53002"),
+        ] {
+            let mut s = WfdSession::new(caps());
+            let h = headers(&[("CSeq", "1")]);
+            s.on_request(&request("OPTIONS", "*", &h, b"")).unwrap();
+
+            let mut body = M4_BODY.to_vec();
+            body.extend_from_slice(format!("wfd_content_protection: {value}\r\n").as_bytes());
+            let h = headers(&[("CSeq", "2")]);
+            let err = s
+                .on_request(&request("SET_PARAMETER", CONTROL_URI, &h, &body))
+                .expect_err("HDCP was accepted");
+
+            match &err {
+                MiracastError::ContentProtectionRefused(what) => assert_eq!(what, expected),
+                other => panic!("refused for the wrong reason: {other}"),
+            }
+            // The reason has to name the thing, because the person reading it is looking
+            // at a panel that did not mirror.
+            assert!(err.to_string().contains(expected), "{err}");
+            // And nothing was negotiated: no config means no media plane, which is the
+            // invariant `NegotiatedConfig`'s private fields exist to hold.
+            assert!(s.config().is_none());
+        }
+    }
+
+    /// …and the value we and every real source actually send goes through untouched.
+    ///
+    /// The other half of the assertion above: a check that refused `none` too would fail
+    /// every session in the field rather than the one that cannot work.
+    #[test]
+    fn content_protection_none_is_what_a_session_proceeds_on() {
+        let mut s = WfdSession::new(caps());
+        let h = headers(&[("CSeq", "1")]);
+        s.on_request(&request("OPTIONS", "*", &h, b"")).unwrap();
+
+        let mut body = M4_BODY.to_vec();
+        body.extend_from_slice(b"wfd_content_protection: none\r\n");
+        let h = headers(&[("CSeq", "2")]);
+        let out = s
+            .on_request(&request("SET_PARAMETER", CONTROL_URI, &h, &body))
+            .unwrap();
+        assert_eq!(only_response(&out).status, 200);
+        assert!(s.config().is_some());
+
+        // As does an M4 that omits it entirely, which is what the §2.5 Windows transcript
+        // does — the parameter is optional in M4 and its absence means `none`.
+        assert!(handshake().config().is_some());
     }
 
     #[test]

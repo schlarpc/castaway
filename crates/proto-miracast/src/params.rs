@@ -971,6 +971,61 @@ mod tests {
         );
     }
 
+    /// Every `microsoft_*` name Windows is known to ask about gets an answer.
+    ///
+    /// The handler matches the whole `microsoft_` prefix, so this cannot fail on a name
+    /// basis — which is exactly why it is worth pinning the list. Notes §7.2: *"Answering
+    /// `none` to each is sufficient to get a session. Answer them; do not ignore them."*
+    /// A future narrowing of that arm to an explicit allow-list is the change this
+    /// catches, and the symptom of getting it wrong is a Windows session that degrades or
+    /// does not start, with nothing in either log saying which parameter did it.
+    ///
+    /// The eleven are the M3 extension set from the Windows 11 interop report
+    /// (miraclecast#471); `two_of_them` was all that was asserted before (#195).
+    #[test]
+    fn every_microsoft_parameter_windows_asks_about_is_answered() {
+        const WINDOWS_M3: &[&str] = &[
+            "microsoft_cursor",
+            "microsoft_rtcp_capability",
+            "microsoft_latency_management_capability",
+            "microsoft_format_change_capability",
+            "microsoft_diagnostics_capability",
+            "microsoft_video_formats",
+            "microsoft_max_bitrate",
+            "microsoft_multiscreen_projection",
+            "microsoft_audio_mute",
+            "microsoft_color_space_conversion",
+            "wfd_idr_request_capability",
+        ];
+
+        let request: Vec<u8> = WINDOWS_M3
+            .iter()
+            .flat_map(|n| format!("{n}\r\n").into_bytes())
+            .collect();
+        let requested = ParamBody::parse(&request).unwrap().requested_names();
+        let body = caps().respond_to(&requested);
+        let text = String::from_utf8(body).unwrap();
+
+        for name in WINDOWS_M3 {
+            assert!(
+                text.contains(&format!("{name}: ")),
+                "{name} was asked for and not answered:\n{text}"
+            );
+        }
+        // Ten `none`s and one real answer: `wfd_idr_request_capability` is the one in this
+        // set the sink actually implements, and answering `none` to it would give up M13 —
+        // the only loss-recovery primitive WFD has, and the entire reason for the
+        // hand-rolled demuxer (D35). The value is `1`, not a word: AOSP reads it as an
+        // integer.
+        assert!(text.contains("wfd_idr_request_capability: 1"), "{text}");
+        assert_eq!(
+            text.matches(": none").count(),
+            WINDOWS_M3.len() - 1,
+            "every microsoft_* extension is answered `none`, which is their documented \
+             'not supported' value:\n{text}"
+        );
+    }
+
     #[test]
     fn every_line_of_a_rendered_body_ends_with_crlf() {
         // AOSP's parser scans for \r\n explicitly, so a body without a final one loses
