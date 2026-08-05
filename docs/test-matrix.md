@@ -3,14 +3,37 @@
 A point-in-time audit of what the automated tests actually prove, per protocol and per mode,
 against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a7`.
 
-> **Acted on, same day.** The audit's own top findings are fixed, so the numbers below have
-> moved. **§3.1 (140 tests compiled by no check) and §3.2 (a broken build configuration) are
-> closed by D55**: every feature is on by default now, `castaway-portable` is a test fixture
-> rather than a product, 23 checks became 15, and `cargo nextest run` went from 1784 tests to
-> 2243. §3.3's ffmpeg and GPU tripwires are in. The per-protocol matrices in §4 are unchanged
-> and still accurate — what a test *asserts* did not change, only whether it runs.
+> **Acted on, same day, and then acted on further.** The audit's own top findings are fixed,
+> so the numbers below have moved. **§3.1 (140 tests compiled by no check) and §3.2 (a broken
+> build configuration) are closed by D55**: every feature is on by default now,
+> `castaway-portable` is a test fixture rather than a product, 23 checks became 15, and
+> `cargo nextest run` went from 1784 tests to 2243. §3.3's silent skips are all four closed.
 >
 > Sections are marked **[CLOSED]** where that applies. The rest is the standing record.
+>
+> **What has closed since, and where the evidence is.** Listed here rather than edited into
+> §4, because §4 is a record of what the tests proved *at the audit* and rewriting it in
+> place would destroy the thing it is for. Read §4 as the baseline and this as the diff.
+>
+> | Was | Now | Issue |
+> |---|---|---|
+> | DLNA's six "do not fix" rows had no test | `proto-dlna/tests/conformance.rs`, each test quoting its citation, each verified by mutating the thing it guards. Plus the hostile-friendly-name round trip (the bug that shipped) and GENA's two invariants in the real-socket subscriber test | #201 |
+> | `moonlight-sys` had no ABI drift guard | `checks.moonlight-bindings`, regenerating from the pinned `Limelight.h` and diffing. The generated file's own layout assertions are self-referential and cannot see upstream drift | #191 |
+> | `PinnedServerCert` was never asked to reject anything | three cases, including a truncated presentation | #191 |
+> | Matter's passcode stayed on the glass forever | a deadline in `UdcServer::run`, tested at T0, over a real socket with paused time against the shipped 180 s, and in `matter-vm` through the OSD | #197 |
+> | `CdError` 1–10 had no producer | three stages produce three codes, derived from a typed `CommissionStage`; the other six are documented as having no producer *and why*. `matter-peer --wrong-passcode` / `--wrong-instance` assert the specific code in `matter-vm` | #198 |
+> | Miracast had no idle watchdog and ignored HDCP | a liveness deadline on the source's own `Session:` timeout, and an M4 offering HDCP refused with a typed reason | #195 |
+> | `DeviceInformation::busy()` had no caller | re-advertised either side of every session, including the error path | #194 |
+> | AAC had no decode coverage at all; the rest were RMS windows | per-channel cross-correlation against a two-channel sweep for SBC/aptX/aptX HD/AAC and LDAC, plus the real iPhone capture through the real depacketiser into the real decoder — the seam that nothing joined | #187 |
+> | Darwin checks could not evaluate | `systems` is `[ "x86_64-linux" ]`; aarch64-linux turned out to be broken too (D57) | #207 |
+> | `getInfo`'s field set and `spotify_device_id` were unasserted | both pinned, with the test saying plainly that a pin is not a validation | #200 (partial) |
+> | `apply_track` / `best_cover` untested | every branch, mutation-checked | #199 (partial) |
+>
+> Two entries above are **partial and the issues stay open**: #199's `pump_events` and
+> `run()` are the bulk of it, and #200 still wants the one LAN capture that would turn a pin
+> into a validation. #194 keeps its first bullet — the MICE vendor extension turns out to be
+> D-Bus-only in wpa_supplicant 2.11, which is recorded on the issue and changes what option 2
+> on #206 costs.
 
 This is a **record**, not a backlog. Where it names a gap, the gap belongs in an issue —
 several already are, and those are cited. Nothing here should become a parallel tracker;
@@ -204,7 +227,7 @@ precisely the bug. Every `ffmpeg`-without-`audio` combination is broken: `ffmpeg
 
 Verified failing at `37db8a7`. This is §3.1's mechanism one combination over.
 
-### 3.3 Tests that pass by skipping  **[mostly closed — #182]**
+### 3.3 Tests that pass by skipping  **[CLOSED — #182]**
 
 A skip reports `ok`. `CASTAWAY_REQUIRE_GPU` exists to convert one class of skip into a
 failure and works where it is applied (`render-pixels`, `media-plane`) — but it is not
@@ -734,11 +757,11 @@ there as a comment rather than duplicated.
 | 17 | **Mixer real-time guarantees rest on a wall-clock-derived fake**; #174/#175/#177 all live here | dummy PipeWire sink in a VM so `mixer_real_device.rs` runs | **#204** |
 | 18 | **#55's recovery half untested** — the failing-then-succeeding device | a 30-line test | comment on **#55** |
 | 19 | **No whole-frame render comparison anywhere** | golden PNGs, mean abs error ≤2/255, diff on failure | **#203** |
-| 20 | **Silent skips**: `audio`'s ffmpeg CLI, the untripwired pixel tests, `output_stream`'s skip-pass | `nativeBuildInputs`; route through `test_gpu`; a `CASTAWAY_REQUIRE_FFMPEG` tripwire | **#182** |
-| 21 | **DLNA's six "do not fix" conformance rows have no test** | a `conformance.rs` quoting the citations; ~40 lines | **#201** |
+| 20 | **Silent skips**: `audio`'s ffmpeg CLI, the untripwired pixel tests, `output_stream`'s skip-pass | `nativeBuildInputs`; route through `test_gpu`; a `CASTAWAY_REQUIRE_FFMPEG` tripwire | **#182 — closed** |
+| 21 | **DLNA's six "do not fix" conformance rows have no test** | a `conformance.rs` quoting the citations; ~40 lines | **#201 — closed** |
 | 22 | **No DLNA/DIAL third-party control point** anywhere | `gupnp-tools` in the sender VM; ~30 lines of Nix | **#202** |
-| 23 | **GameStream mutual-TLS verifier has no negative test** — the only boundary protecting a paired session | ten lines | **#191** |
-| 24 | **moonlight-sys ABI guard documented but absent** (`moonlight-bindings` check does not exist) | port `nix/ldac-bindings.nix` | **#191** |
+| 23 | **GameStream mutual-TLS verifier has no negative test** — the only boundary protecting a paired session | ten lines | **#191 — closed** |
+| 24 | **moonlight-sys ABI guard documented but absent** (`moonlight-bindings` check does not exist) | port `nix/ldac-bindings.nix` | **#191 — closed** |
 | 25 | **`#[ignore]`d tests run nowhere, ever** (5 files) | decide per file: make runnable, or state the hardware gate in notes | **#183** |
 
 Filed alongside these, from findings that were not test gaps but code gaps the audit tripped
