@@ -793,10 +793,43 @@ mod tests {
         };
         let bare_px = probe(&render(&bare, w, h).unwrap());
         let playing_px = probe(&render(&playing, w, h).unwrap());
-        assert_ne!(
-            bare_px, playing_px,
-            "the art panel should be absent without a track and present with one"
-        );
+
+        // `assert_ne!` was all this used to say, and a difference is not a drawing:
+        // "draws the wrong thing, in the right place, at the right size" passed (#203).
+        // So both sides are named.
+        //
+        // **Literals, not `Palette::default()`.** Reading the expected colour from the
+        // palette makes the assertion move with the thing it is checking — swapping
+        // `art_bg`'s channels then passes, which is the same self-referential trap as a
+        // generated layout assertion. These are the palette's values, pinned on purpose:
+        // if the design changes, this fails and somebody decides, which is the point.
+        const ART_BG: [u8; 3] = [0x11, 0x1a, 0x30];
+        // The background gradient halfway down: `bg_top` 0d/14/28 → `bg_bottom` 03/05/0b.
+        const BG_MID: [u8; 3] = [0x08, 0x0d, 0x1a];
+
+        let near = |got: [u8; 3], want: [u8; 3], what: &str| {
+            for (c, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    g.abs_diff(*w) <= 2,
+                    "{what}: channel {c} is {g}, expected about {w} (got {got:?}, \
+                     want {want:?})"
+                );
+            }
+        };
+
+        // With a track, the probe lands inside the art panel's flat interior.
+        near(playing_px, ART_BG, "the art panel's interior");
+
+        // Without one, the same coordinate is the card's own background gradient — not
+        // the panel drawn in a different colour, and not black.
+        near(bare_px, BG_MID, "the background where the panel is not");
+
+        // …and the two constants above really are what the card is built from, so a
+        // palette change fails here rather than silently redefining what is asserted.
+        let pal = Palette::default();
+        assert_eq!([pal.art_bg[0], pal.art_bg[1], pal.art_bg[2]], ART_BG);
+        let (bg, _) = background_span(0.5, 0.5);
+        assert_eq!([bg[0], bg[1], bg[2]], BG_MID);
     }
 
     #[test]
