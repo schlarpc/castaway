@@ -223,6 +223,86 @@ pkgs.testers.runNixOSTest {
         # The display string survived the round trip into the now-playing surface.
         assert "${castTitle}" in journal, journal
 
+    with subtest("a phone that mistypes the passcode is told so, not left guessing"):
+        # `commission_loop`'s `Err` arm logged, put a banner on the panel, and sent the
+        # client nothing — so all ten of the spec's commissioning error codes had no
+        # producer anywhere in the tree. In the room: somebody misreads a digit across
+        # it, and their phone gets silence rather than "wrong code". The phone's UI then
+        # has to guess, and what it usually guesses is a timeout (#198).
+        #
+        # PASE, not discovery: the peer advertises correctly and is found, and the panel
+        # runs the handshake against a verifier built from a number one digit out.
+        phone.succeed(
+            f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+            f"--instance 00112233445566BB --name 'a phone that mistypes' "
+            f"--matter-port 5541 --discriminator 3841 --wrong-passcode "
+            f"--passcode-file /tmp/wrong.txt > /tmp/wrong.log 2>&1 &"
+        )
+        phone.wait_until_succeeds(
+            "grep -q 'passcode dialog is up' /tmp/wrong.log", timeout=60
+        )
+        shown = panel.succeed(
+            "journalctl -u castaway --no-pager "
+            "| grep 'a phone that mistypes wants to cast' "
+            "| grep -oE '[0-9]{4}-[0-9]{4}' | tail -1"
+        ).strip()
+        assert re.fullmatch(r"[0-9]{4}-[0-9]{4}", shown), f"no passcode on screen: {shown!r}"
+        phone.succeed(f"echo {shown} > /tmp/wrong.txt")
+
+        try:
+            phone.wait_until_succeeds(
+                "grep -q 'the panel refused with' /tmp/wrong.log", timeout=180
+            )
+        except Exception:
+            print(phone.succeed("cat /tmp/wrong.log || true"))
+            print(panel.succeed("journalctl -u castaway --no-pager | tail -80 || true"))
+            raise
+
+        wrong_log = phone.succeed("cat /tmp/wrong.log")
+        # Code 2, `PaseConnectionFailed`. Not 3 (`PaseAuthFailed`), and deliberately so:
+        # rs-matter 0.2 does not distinguish a wrong passcode from an unreachable peer at
+        # this boundary, so emitting 3 would be a guess. The reasoning, and the other five
+        # codes with no producer, are on `CommissionStage::cd_error`.
+        assert "PaseConnectionFailed (2)" in wrong_log, wrong_log
+        panel.succeed(
+            "journalctl -u castaway --no-pager "
+            "| grep -q 'telling the client why commissioning stopped'"
+        )
+
+    with subtest("a phone the panel cannot find is told that, and not something else"):
+        # The other stage, isolated: everything is correct except the label the peer
+        # advertises under, so the panel's browse waits out its full 60 s on a node that
+        # is right there. The distinction matters to the client — a discovery failure is
+        # worth retrying, a PASE failure is worth re-reading the number for.
+        phone.succeed(
+            f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+            f"--instance 00112233445566CC --name 'a phone in disguise' "
+            f"--matter-port 5542 --discriminator 3842 --wrong-instance "
+            f"--passcode-file /tmp/disguise.txt > /tmp/disguise.log 2>&1 &"
+        )
+        phone.wait_until_succeeds(
+            "grep -q 'passcode dialog is up' /tmp/disguise.log", timeout=60
+        )
+        shown = panel.succeed(
+            "journalctl -u castaway --no-pager "
+            "| grep 'a phone in disguise wants to cast' "
+            "| grep -oE '[0-9]{4}-[0-9]{4}' | tail -1"
+        ).strip()
+        assert re.fullmatch(r"[0-9]{4}-[0-9]{4}", shown), f"no passcode on screen: {shown!r}"
+        phone.succeed(f"echo {shown} > /tmp/disguise.txt")
+
+        try:
+            phone.wait_until_succeeds(
+                "grep -q 'the panel refused with' /tmp/disguise.log", timeout=200
+            )
+        except Exception:
+            print(phone.succeed("cat /tmp/disguise.log || true"))
+            print(panel.succeed("journalctl -u castaway --no-pager | tail -80 || true"))
+            raise
+
+        disguise_log = phone.succeed("cat /tmp/disguise.log")
+        assert "CommissionableDiscoveryFailed (1)" in disguise_log, disguise_log
+
     with subtest("a passcode nobody types comes off the glass on its own"):
         # The other end of the flow, and the one that used to have no end at all: a phone
         # declares, the panel puts an eight-digit commissioning passcode on a wall-mounted

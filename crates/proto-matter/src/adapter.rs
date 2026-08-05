@@ -50,6 +50,7 @@ use crate::player::{
     CastCommand, Catalogue, PlaybackState, PlayerSnapshot, PlayerState, Surface, Transport,
 };
 use crate::server::{CommissionRequest, Prompt, UdcServer};
+use crate::udc::{CommissionStage, CommissionerDeclaration};
 
 /// How long the panel waits for a phone to appear as a commissionable node after it says
 /// the passcode is typed. Generous: this is a wait on a person walking back to the sofa,
@@ -275,6 +276,7 @@ impl MatterAdapter {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
 
         let ctx = Arc::new(CastingContext {
             catalogue: self.config.catalogue.clone(),
@@ -305,6 +307,7 @@ impl MatterAdapter {
             self.config.catalogue.clone(),
             prompt_tx,
             request_tx,
+            outcome_rx,
         )
         .await?;
 
@@ -324,14 +327,14 @@ impl MatterAdapter {
         let im = dm.run();
         let answers = responder.run::<4, 4>();
         let udc = udc.run(&mut rand);
-        let commissioning = self.commission_loop(
-            &matter,
-            &crypto,
-            &mut ca,
+        let cx = Commissioning {
+            matter: &matter,
+            crypto: &crypto,
             fab_idx,
-            &responder_mdns,
-            request_rx,
-        );
+            mdns: &responder_mdns,
+            outcomes: &outcome_tx,
+        };
+        let commissioning = self.commission_loop(&cx, &mut ca, request_rx);
         let commands = self.pump_commands(command_rx, &sink);
         let prompts = self.pump_prompts(prompt_rx);
 
@@ -352,11 +355,8 @@ impl MatterAdapter {
     /// Take one phone at a time from "the passcode is typed" to "on the fabric".
     async fn commission_loop<C: rs_matter::crypto::Crypto>(
         &self,
-        matter: &Matter<'_>,
-        crypto: &C,
+        cx: &Commissioning<'_, '_, C>,
         ca: &mut CastingCa,
-        fab_idx: NonZeroU8,
-        mdns: &MdnsResponder,
         mut requests: mpsc::UnboundedReceiver<CommissionRequest>,
     ) -> Result<(), MatterError> {
         while let Some(request) = requests.recv().await {
@@ -367,17 +367,14 @@ impl MatterAdapter {
                 "matter: commissioning a casting client"
             );
 
-            match self
-                .commission_one(matter, crypto, ca, fab_idx, mdns, &request)
-                .await
-            {
+            match self.commission_one(cx, ca, &request).await {
                 Ok(node_id) => {
                     ca.remember(CommissionedClient {
                         node_id,
                         instance: request.instance.to_string(),
                         name: request.device_name.clone(),
                     })?;
-                    seed_acls(matter, fab_idx, ca.clients())?;
+                    seed_acls(cx.matter, cx.fab_idx, ca.clients())?;
                     self.show(OsdMessage::banner(
                         format!("{} can now cast", request.device_name),
                         Duration::from_secs(5),
@@ -396,6 +393,27 @@ impl MatterAdapter {
                         format!("could not pair {}", request.device_name),
                         Duration::from_secs(5),
                     ));
+
+                    // …and tell the phone, which is otherwise left with silence and a UI
+                    // that has to guess — and what it usually guesses is a timeout. The
+                    // code is derived from the typed stage rather than from the message,
+                    // so a new step in the flow is a compile error rather than a
+                    // plausible wrong code (#198).
+                    if let (Some(to), Some(error_code)) =
+                        (request.reply_to, e.commissioner_declaration_error())
+                    {
+                        tracing::info!(
+                            %to, ?error_code,
+                            "matter: telling the client why commissioning stopped"
+                        );
+                        let _ = cx.outcomes.send(crate::server::Outcome {
+                            to,
+                            declaration: CommissionerDeclaration {
+                                error_code,
+                                ..CommissionerDeclaration::default()
+                            },
+                        });
+                    }
                 }
             }
 
@@ -407,16 +425,16 @@ impl MatterAdapter {
 
     async fn commission_one<C: rs_matter::crypto::Crypto>(
         &self,
-        matter: &Matter<'_>,
-        crypto: &C,
+        cx: &Commissioning<'_, '_, C>,
         ca: &CastingCa,
-        fab_idx: NonZeroU8,
-        mdns: &MdnsResponder,
         request: &CommissionRequest,
     ) -> Result<u64, MatterError> {
-        let found =
-            crate::discovery::await_commissionable(mdns, &request.instance, COMMISSIONABLE_TIMEOUT)
-                .await?;
+        let found = crate::discovery::await_commissionable(
+            cx.mdns,
+            &request.instance,
+            COMMISSIONABLE_TIMEOUT,
+        )
+        .await?;
 
         // A returning phone keeps the node id it already has, so its access-control entry
         // and any binding it cached stay valid.
@@ -430,9 +448,9 @@ impl MatterAdapter {
 
         let mut scratch = crate::fabric::commissioner_scratch();
         let mut commissioner = rs_matter::onboard::Commissioner::new(
-            matter,
-            crypto,
-            fab_idx,
+            cx.matter,
+            cx.crypto,
+            cx.fab_idx,
             &mut generator,
             &mut scratch,
         );
@@ -460,6 +478,7 @@ impl MatterAdapter {
             .map_err(|e| MatterError::CommissioningFailed {
                 instance: request.instance.to_string(),
                 addr: found.addr,
+                stage: CommissionStage::Pase,
                 reason: e.to_string(),
             })?;
 
@@ -469,6 +488,7 @@ impl MatterAdapter {
             .map_err(|e| MatterError::CommissioningFailed {
                 instance: request.instance.to_string(),
                 addr: found.addr,
+                stage: CommissionStage::Case,
                 reason: format!("completing over CASE: {e}"),
             })?;
 
@@ -607,6 +627,23 @@ impl MatterAdapter {
             osd.clear();
         }
     }
+}
+
+/// The apparatus a commissioning attempt runs against.
+///
+/// Grouped because all five are fixed for the adapter's whole life and travelled together
+/// through both functions below — the only things that vary per attempt are the client and
+/// the CA the result is written into, which stay as arguments because one of them is
+/// `&mut`.
+struct Commissioning<'a, 'm, C> {
+    matter: &'a Matter<'m>,
+    crypto: &'a C,
+    fab_idx: NonZeroU8,
+    /// Its own browse handle: the app's shared responder is built for advertising, and
+    /// this is the one place in the crate that needs to *look* for something.
+    mdns: &'a MdnsResponder,
+    /// Where to say how it went, so the client is not left guessing (#198).
+    outcomes: &'a crate::server::OutcomeSender,
 }
 
 /// Install the panel's own identity on its fabric.

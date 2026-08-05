@@ -91,17 +91,23 @@ struct Harness {
     client: Client,
     prompts: mpsc::UnboundedReceiver<Prompt>,
     requests: mpsc::UnboundedReceiver<CommissionRequest>,
+    /// The commissioning worker's end: what the panel tells a client once an attempt it
+    /// already answered has finished. There is no worker in this harness, so tests drive
+    /// it directly.
+    outcomes: proto_matter::server::OutcomeSender,
 }
 
 async fn harness(catalogue: Catalogue) -> Harness {
     let (prompt_tx, prompts) = mpsc::unbounded_channel();
     let (request_tx, requests) = mpsc::unbounded_channel();
+    let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
 
     let server = UdcServer::bind(
         "127.0.0.1:0".parse().unwrap(),
         catalogue,
         prompt_tx,
         request_tx,
+        outcome_rx,
     )
     .await
     .unwrap();
@@ -116,6 +122,7 @@ async fn harness(catalogue: Catalogue) -> Harness {
         client: Client::new(addr).await,
         prompts,
         requests,
+        outcomes: outcome_tx,
     }
 }
 
@@ -166,6 +173,82 @@ async fn a_passcode_round_trip() {
             .split_at(4)
             .pipe(|(a, b)| format!("{a}-{b}"))
     );
+}
+
+/// A commissioning request carries where to send the answer, and the answer arrives.
+///
+/// The failure this closes is that `commission_loop`'s `Err` arm logged, put a banner on
+/// the panel, and sent the client **nothing** — so all ten of the spec's commissioning
+/// error codes had no producer anywhere in the tree. In the room that is: somebody
+/// mistypes the passcode, and their phone gets silence rather than "wrong code, try
+/// again". The phone's UI then has to guess, and what it usually guesses is a timeout
+/// (#198).
+///
+/// There is no commissioning worker in this harness — that needs a Matter node, and lives
+/// in `matter-vm` — so the outcome is pushed onto the same channel the worker uses. What
+/// this proves is the half a worker cannot: that the request carries a usable return
+/// address, and that a declaration sent minutes after the exchange still reaches the
+/// client's `cdPort` from the socket it has been talking to.
+#[tokio::test]
+async fn a_client_is_told_how_commissioning_went() {
+    let mut h = harness(catalogue()).await;
+    let id = h.client.declaration();
+
+    h.client.send(&id).await;
+    let _ = h.client.reply().await;
+    let _ = h.prompts.recv().await;
+
+    let mut ready = id;
+    ready.commissioner_passcode_ready = true;
+    h.client.send(&ready).await;
+    let request = h.requests.recv().await.expect("a commissioning request");
+    // The immediate answer to `commissionerPasscodeReady`: "understood, going now". Drained
+    // so the assertion below is on the *outcome* and not on this.
+    assert_eq!(h.client.reply().await.error_code, CdError::None);
+
+    // The `cdPort` the client named, at the address it sent from — not the source port,
+    // which is the same distinction `the_reply_goes_to_the_declared_port` makes for the
+    // immediate reply and which is easier to get wrong here, minutes later.
+    let to = request.reply_to.expect("nowhere to send the outcome");
+    assert_eq!(to.port(), h.client.port());
+
+    // What the worker sends when `await_commissionable` times out: the client advertised
+    // nothing we could find.
+    h.outcomes
+        .send(proto_matter::server::Outcome {
+            to,
+            declaration: CommissionerDeclaration {
+                error_code: CdError::CommissionableDiscoveryFailed,
+                ..CommissionerDeclaration::default()
+            },
+        })
+        .unwrap();
+
+    let told = h.client.reply().await;
+    assert_eq!(told.error_code, CdError::CommissionableDiscoveryFailed);
+}
+
+/// A client that names no `cdPort` is not one we can tell anything, and asking is how the
+/// caller finds that out rather than by a send to port 0.
+#[tokio::test]
+async fn a_client_with_no_reply_port_has_no_return_address() {
+    let mut h = harness(catalogue()).await;
+    let mut id = h.client.declaration();
+    id.cd_port = None;
+    // `cdUponPasscodeDialog` asks for a reply there is no port for. The panel still shows
+    // the passcode — a client can be commissioned without ever reading a CD — so the
+    // request is real and only the return address is missing.
+    id.cd_upon_passcode_dialog = false;
+
+    h.client.send(&id).await;
+    let _ = h.prompts.recv().await;
+
+    let mut ready = id;
+    ready.commissioner_passcode_ready = true;
+    h.client.send(&ready).await;
+
+    let request = h.requests.recv().await.expect("a commissioning request");
+    assert_eq!(request.reply_to, None);
 }
 
 /// The reference client sends five copies of every message, 100 ms apart, because there

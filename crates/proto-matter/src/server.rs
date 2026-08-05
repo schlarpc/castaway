@@ -84,6 +84,27 @@ pub struct CommissionRequest {
     pub device_name: String,
     /// Where its UDC message came from, for the log.
     pub source: SocketAddr,
+    /// Where to send the *outcome*, once there is one — the client's `cdPort` at the
+    /// address the declaration came from, or `None` if it named no port.
+    ///
+    /// Carried on the request because the attempt outlives the datagram that started it
+    /// by up to a minute, and by then the socket half has long since answered and moved
+    /// on (#198).
+    pub reply_to: Option<SocketAddr>,
+}
+
+/// A `CommissionerDeclaration` to send after the fact.
+///
+/// The outcome of a commissioning attempt is decided long after the datagram that asked
+/// for it was answered, and the socket belongs to [`UdcServer`]. So the worker says what
+/// to send and to whom, and the socket loop sends it — rather than opening a second socket
+/// and replying to the client from a source port it never spoke to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// The client's `cdPort`, at the address its declaration came from.
+    pub to: SocketAddr,
+    /// What to tell it.
+    pub declaration: CommissionerDeclaration,
 }
 
 /// One phone's in-flight passcode.
@@ -159,6 +180,9 @@ impl UdcState {
                         passcode: pending.passcode,
                         device_name: pending.device_name,
                         source,
+                        reply_to: id
+                            .reply_port()
+                            .map(|port| SocketAddr::new(source.ip(), port)),
                     }),
                 },
                 // A phone claiming a passcode we never issued — a retransmit after the
@@ -304,6 +328,7 @@ pub struct UdcServer {
     catalogue: Catalogue,
     prompts: mpsc::UnboundedSender<Prompt>,
     requests: mpsc::UnboundedSender<CommissionRequest>,
+    outcomes: mpsc::UnboundedReceiver<Outcome>,
 }
 
 impl UdcServer {
@@ -322,6 +347,7 @@ impl UdcServer {
         catalogue: Catalogue,
         prompts: mpsc::UnboundedSender<Prompt>,
         requests: mpsc::UnboundedSender<CommissionRequest>,
+        outcomes: mpsc::UnboundedReceiver<Outcome>,
     ) -> Result<Self, MatterError> {
         let socket = UdpSocket::bind(addr)
             .await
@@ -336,6 +362,7 @@ impl UdcServer {
             catalogue,
             prompts,
             requests,
+            outcomes,
         })
     }
 
@@ -386,6 +413,26 @@ impl UdcServer {
                     if self.state.expire(tokio::time::Instant::now()) {
                         tracing::info!("matter: a displayed passcode expired; clearing the prompt");
                         let _ = self.prompts.send(Prompt::Clear);
+                    }
+                }
+
+                // A commissioning attempt finished — usually badly, because the good case
+                // is announced by the panel appearing on the client's fabric. The
+                // declaration goes out from *this* socket rather than a fresh one, so the
+                // client sees the answer arrive from the port it has been talking to.
+                Some(outcome) = self.outcomes.recv() => {
+                    match outcome.declaration.encode() {
+                        Ok(datagram) => {
+                            if let Err(e) = self.socket.send_to(&datagram, outcome.to).await {
+                                tracing::warn!(
+                                    to = %outcome.to, error = %e,
+                                    "matter: could not tell a client how commissioning went"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "matter: could not encode a UDC outcome");
+                        }
                     }
                 }
 
@@ -461,6 +508,9 @@ pub type PromptSender = mpsc::UnboundedSender<Prompt>;
 
 /// Likewise for commissioning requests.
 pub type RequestSender = mpsc::UnboundedSender<CommissionRequest>;
+
+/// And for telling a client how its commissioning went.
+pub type OutcomeSender = mpsc::UnboundedSender<Outcome>;
 
 #[cfg(test)]
 mod tests {
@@ -728,11 +778,13 @@ mod tests {
     async fn a_phone_that_walks_away_does_not_leave_its_passcode_on_the_wall() {
         let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel();
         let (requests_tx, _requests_rx) = mpsc::unbounded_channel();
+        let (_outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
         let server = UdcServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             catalogue(),
             prompts_tx,
             requests_tx,
+            outcomes_rx,
         )
         .await
         .unwrap();

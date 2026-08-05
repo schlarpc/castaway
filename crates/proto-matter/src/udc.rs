@@ -483,6 +483,59 @@ pub enum CdError {
     UnexpectedCommissionerPasscodeReady = 18,
 }
 
+/// How far a commissioning attempt got before it stopped.
+///
+/// The panel knows this precisely — it is which call returned the error — and it is the
+/// only thing needed to decide what the phone is told. Modelled as a type rather than
+/// derived from an error string so that adding a step to the flow is a compile error at
+/// [`CommissionStage::cd_error`] rather than a phone that gets a plausible wrong code.
+///
+/// Deliberately coarser than [`CdError`]: the codes we do not emit and why are recorded
+/// on [`CommissionStage::cd_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommissionStage {
+    /// Browsing `_matterc._udp` for the instance the client declared.
+    Discovery,
+    /// PASE, and everything carried over it: ArmFailSafe, the CSR, AddNOC.
+    Pase,
+    /// CASE, and `CommissioningComplete` over it.
+    Case,
+}
+
+impl CommissionStage {
+    /// The code the client is told when the attempt stops here.
+    ///
+    /// Exhaustive on purpose: a new stage has to decide what the phone hears, and the
+    /// compiler is what asks.
+    ///
+    /// Six of the spec's ten failure codes have **no producer here, and should not**:
+    ///
+    /// - `PaseAuthFailed` (3) — the honest one to want, and `rs-matter` 0.2 does not
+    ///   distinguish it. A wrong passcode surfaces from `Exchange::initiate_pase` as the
+    ///   same generic error as an unreachable peer, so emitting 3 would be a guess. A
+    ///   client reading 2 retries the whole flow, which is the right behaviour for both.
+    /// - `DacValidationFailed` (4) — the panel sets `allow_test_attestation` and
+    ///   `verify_device_attestation` therefore cannot fail (D54; the reasoning is in
+    ///   `adapter.rs::commission_one`). Emitting it would describe a check we do not run.
+    /// - `AlreadyOnFabric` (5) — a returning client keeps its node id and is
+    ///   re-commissioned deliberately, so this is not an error path here.
+    /// - `OperationalDiscoveryFailed` (6) — the panel never resolves the client
+    ///   operationally; it reuses the CASE session from commissioning.
+    /// - `CaseAuthFailed` (8) — as (3), one level up.
+    /// - `ConfigurationFailed` (9) / `BindingConfigurationFailed` (10) — the panel writes
+    ///   no post-commissioning configuration and no bindings to the client.
+    ///
+    /// If any of those becomes producible, it becomes a stage.
+    #[must_use]
+    pub const fn cd_error(self) -> CdError {
+        match self {
+            Self::Discovery => CdError::CommissionableDiscoveryFailed,
+            Self::Pase => CdError::PaseConnectionFailed,
+            Self::Case => CdError::CaseConnectionFailed,
+        }
+    }
+}
+
 impl CdError {
     /// Parse a wire value.
     ///

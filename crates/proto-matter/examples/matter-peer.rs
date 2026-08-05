@@ -74,6 +74,13 @@ const PASSCODE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to wait to be commissioned once the passcode is in and we are advertising.
 const COMMISSION_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long to wait for the panel to say *why* it gave up.
+///
+/// Longer than every other wait here, because it is the sum of the panel's own:
+/// `COMMISSIONABLE_TIMEOUT` is 60 s on its side, and a wrong passcode fails PASE only
+/// after the exchange's own retransmits.
+const REFUSAL_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// How long to keep retrying the `LaunchURL` invoke.
 ///
 /// Not a network timeout: `AddNOC` lands the fabric *before* CASE and
@@ -108,13 +115,42 @@ struct Args {
     /// `PASSCODE_LIFETIME` exists for and the one the panel used to leave on the glass
     /// indefinitely (#197).
     declare_only: bool,
+    /// Type a number that is not the one on the screen.
+    ///
+    /// The panel's PASE then fails against a verifier built from the wrong secret, which
+    /// is the single most likely way commissioning goes wrong in a room — somebody
+    /// misreads a digit across it.
+    wrong_passcode: bool,
+    /// Advertise under a label the panel was never told to look for.
+    ///
+    /// Everything else is correct, so this isolates the browse: the panel waits out its
+    /// full `COMMISSIONABLE_TIMEOUT` on a node that is sitting right there under a
+    /// different name.
+    wrong_instance: bool,
+}
+
+impl Args {
+    /// Whether this run expects to be refused rather than commissioned.
+    const fn expects_refusal(&self) -> bool {
+        self.wrong_passcode || self.wrong_instance
+    }
+
+    /// The label to advertise under, which is the declared one unless we are deliberately
+    /// hiding.
+    fn advertised_instance(&self) -> String {
+        if self.wrong_instance {
+            "FFFFFFFFFFFFFFFF".to_string()
+        } else {
+            self.instance.as_str().to_string()
+        }
+    }
 }
 
 fn usage() -> String {
     "usage: matter-peer --player <ip> --passcode-file <path> [--bind <ip>] \
      [--instance <hex16>] [--name <str>] [--url <str>] [--display-string <str>] \
      [--endpoint <n>] [--app-vendor <n>] [--app-product <n>] [--discriminator <n>] \
-     [--matter-port <n>] [--declare-only]"
+     [--matter-port <n>] [--declare-only] [--wrong-passcode] [--wrong-instance]"
         .into()
 }
 
@@ -136,6 +172,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut discriminator = 3840_u16;
     let mut matter_port = MATTER_PORT;
     let mut declare_only = false;
+    let mut wrong_passcode = false;
+    let mut wrong_instance = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -154,6 +192,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--discriminator" => discriminator = value()?.parse()?,
             "--matter-port" => matter_port = value()?.parse()?,
             "--declare-only" => declare_only = true,
+            "--wrong-passcode" => wrong_passcode = true,
+            "--wrong-instance" => wrong_instance = true,
             other => return Err(format!("unknown argument {other:?}\n{}", usage()).into()),
         }
     }
@@ -172,6 +212,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         discriminator,
         matter_port,
         declare_only,
+        wrong_passcode,
+        wrong_instance,
     })
 }
 
@@ -229,7 +271,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---- Phase 2: play the person ---------------------------------------------------
 
     let passcode = await_passcode(&args.passcode_file).await?;
-    println!("matter-peer: typed the passcode");
+    let passcode = if args.wrong_passcode {
+        // One digit out, which is what a misread across a room produces. `- 1` rather
+        // than `+ 1` so the result stays inside the spec's range at the top end, and
+        // guarded at the bottom because passcode 0 is forbidden.
+        let wrong = if passcode <= 1 { 2 } else { passcode - 1 };
+        println!("matter-peer: typed {wrong} instead of {passcode}, on purpose");
+        wrong
+    } else {
+        println!("matter-peer: typed the passcode");
+        passcode
+    };
 
     // ---- Phase 3: become a commissionable node --------------------------------------
 
@@ -306,6 +358,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ready.commissioner_passcode_ready = true;
         udc.send(&ready).await?;
         println!("matter-peer: told the panel the passcode is in");
+
+        if args.expects_refusal() {
+            // The other half of #198: a commissioning attempt that fails used to tell the
+            // client nothing at all, so a phone whose user mistyped got silence and its UI
+            // had to guess — and what it usually guesses is a timeout.
+            //
+            // The transport keeps running underneath this select: a wrong *passcode* is
+            // only refused after the panel has actually tried PASE against us, which needs
+            // us answering.
+            let cd = udc.reply_within(REFUSAL_TIMEOUT).await?;
+            println!(
+                "matter-peer: the panel refused with {:?} ({})",
+                cd.error_code, cd.error_code as u16
+            );
+            return Ok(());
+        }
 
         run_script(&matter, &crypto, &args).await
     };
@@ -443,7 +511,7 @@ fn commissionable_service(args: &Args) -> MdnsService {
     let host = hostname();
     MdnsService::new(
         proto_matter::discovery::COMMISSIONABLE_SERVICE,
-        args.instance.as_str(),
+        args.advertised_instance(),
         &host,
         args.matter_port,
     )
@@ -536,8 +604,15 @@ impl UdcSocket {
     }
 
     async fn reply(&self) -> Result<CommissionerDeclaration, Box<dyn std::error::Error>> {
+        self.reply_within(CD_TIMEOUT).await
+    }
+
+    async fn reply_within(
+        &self,
+        within: Duration,
+    ) -> Result<CommissionerDeclaration, Box<dyn std::error::Error>> {
         let mut buf = [0u8; 1024];
-        let (len, _) = tokio::time::timeout(CD_TIMEOUT, self.socket.recv_from(&mut buf))
+        let (len, _) = tokio::time::timeout(within, self.socket.recv_from(&mut buf))
             .await
             .map_err(|_| "the panel never answered the declaration")??;
         Ok(CommissionerDeclaration::decode(&buf[..len])?)

@@ -39,12 +39,16 @@ pub enum MatterError {
     },
 
     /// Commissioning ran but did not complete.
-    #[error("commissioning {instance} at {addr} failed: {reason}")]
+    #[error("commissioning {instance} at {addr} failed during {stage:?}: {reason}")]
     CommissioningFailed {
         /// The client's declared instance name.
         instance: String,
         /// Where we tried to reach it.
         addr: SocketAddr,
+        /// How far it got. Typed rather than folded into `reason`, because it is what
+        /// decides the `CommissionerDeclaration` the client is told (#198) — and a code
+        /// picked by sniffing a message string is a code that goes wrong silently.
+        stage: crate::udc::CommissionStage,
         /// What went wrong.
         reason: String,
     },
@@ -52,6 +56,28 @@ pub enum MatterError {
     /// The session channel to the app closed.
     #[error(transparent)]
     Session(#[from] castaway_core::CoreError),
+}
+
+impl MatterError {
+    /// The `CommissionerDeclaration` error code a waiting client should be told, if this
+    /// is a failure a client is in fact waiting on.
+    ///
+    /// `None` for the failures that are the panel's own — a dead socket, a broken session
+    /// channel — because there is nobody on the far end of those with a screen saying
+    /// "connecting". A client that mistypes its passcode, on the other hand, gets silence
+    /// today and its UI has to guess; what it usually guesses is a timeout (#198).
+    #[must_use]
+    pub const fn commissioner_declaration_error(&self) -> Option<crate::udc::CdError> {
+        match self {
+            Self::CommissioneeNotFound { .. } => {
+                Some(crate::udc::CommissionStage::Discovery.cd_error())
+            }
+            Self::CommissioningFailed { stage, .. } => Some(stage.cd_error()),
+            Self::Udc(_) | Self::Core(_) | Self::Io { .. } | Self::Mdns(_) | Self::Session(_) => {
+                None
+            }
+        }
+    }
 }
 
 /// Failures parsing or building a User Directed Commissioning datagram.
