@@ -487,6 +487,104 @@ mod tests {
         assert!(changed.contains("&lt;TransportState val=&quot;STOPPED&quot;/&gt;"));
         assert!(changed.contains("v.mp4"));
 
+        // Position and duration stay *out* of `LastChange` (AVT §2.3.1 excludes position;
+        // duration follows it because both are read from the pipeline per request rather
+        // than stored). Asserted here rather than against `avt_last_change` directly,
+        // because what matters is what leaves the process: either one in the document
+        // makes the change-diff below differ on every poll, which is one event per second
+        // per subscriber for a number nobody asked to be pushed.
+        for pushed in [&initial, &changed] {
+            for excluded in [
+                "RelTime",
+                "AbsTime",
+                "CurrentMediaDuration",
+                "CurrentTrackDuration",
+                "RelCount",
+                "AbsCount",
+            ] {
+                assert!(
+                    !pushed.contains(excluded),
+                    "{excluded} is in LastChange; it is read per request, so every poll \
+                     becomes an event"
+                );
+            }
+        }
+
+        // Publish on a *diff*. The doc names the case: "a control point polling
+        // `GetTransportInfo` twice a second must not produce two events." Home Assistant
+        // is the one that makes this load-bearing — once `is_subscribed` is true it
+        // disables its polling fallback entirely, so an event storm is not merely waste,
+        // it is the only channel the entity has.
+        //
+        // Ten polls of each read-only action, changing nothing.
+        for _ in 0..10 {
+            for (path, service, act) in [
+                (paths::AVT_CONTROL, "AVTransport", "GetTransportInfo"),
+                (paths::AVT_CONTROL, "AVTransport", "GetPositionInfo"),
+                (paths::RC_CONTROL, "RenderingControl", "GetVolume"),
+            ] {
+                let body = format!(
+                    r#"<?xml version="1.0"?>
+                    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+                    <u:{act} xmlns:u="urn:schemas-upnp-org:service:{service}:1">
+                    <InstanceID>0</InstanceID><Channel>Master</Channel>
+                    </u:{act}></s:Body></s:Envelope>"#
+                );
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{act} failed");
+            }
+        }
+
+        // Nothing changed, so nothing was published. A short window rather than an
+        // immediate `try_recv`: the send is spawned off the request, so a racing
+        // implementation would otherwise pass here by being slow.
+        if let Ok(pushed) = tokio::time::timeout(Duration::from_millis(500), events_rx.recv()).await
+        {
+            panic!(
+                "thirty reads that changed nothing produced an event:\n{}",
+                pushed.unwrap_or_default()
+            );
+        }
+
+        // …and a real change still gets through, so the silence above is a diff working
+        // and not a publisher that has stopped. Staging a next URI rather than a transport
+        // action, because it is a change to a variable that is genuinely in `LastChange`
+        // and depends on no state transition being legal from here.
+        let set_next = r#"<?xml version="1.0"?>
+        <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+        <u:SetNextAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+        <InstanceID>0</InstanceID><NextURI>http://10.0.0.9/next.mp4</NextURI>
+        </u:SetNextAVTransportURI></s:Body></s:Envelope>"#;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(paths::AVT_CONTROL)
+                    .body(Body::from(set_next))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let staged = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+            .await
+            .expect("a state change after the polls reached no subscriber")
+            .unwrap();
+        assert!(
+            staged.contains("SEQ: 2\r\n"),
+            "the polls must not consume a SEQ"
+        );
+        assert!(staged.contains("next.mp4"));
+
         // …and unsubscribing stops it. A control point that has gone away and a control
         // point that said so are different, and only the second should be instant.
         let gone = app
