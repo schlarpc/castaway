@@ -2,6 +2,21 @@
 //! network, so it is a `cargo test -- --ignored` check rather than part of `nix flake
 //! check`, for the same reason `yt-selfplay` is a `nix run`.
 //!
+//! ## The decision, and when it gets revisited (#183)
+//!
+//! **Stays `#[ignore]`d, and belongs in a nightly job rather than in `nix flake check`.**
+//! A gate that fails because somebody else's CDN is down is a gate people learn to ignore,
+//! and what this watches for moves on its own schedule rather than on ours — the useful
+//! cadence is a clock, not a commit.
+//!
+//! The distinction from `mixer_real_device.rs` is worth stating: that one is `#[ignore]`d
+//! for a dependency we could supply and have not, this one for a dependency that is
+//! somebody else's and always will be. Only the first is a gap.
+//!
+//! Revisit: when there is a nightly job at all. It would carry this, `live_backend.rs`,
+//! `yt-selfplay` and a future `spotify-selfplay` — four things with the same shape and no
+//! home, which is the argument for building one.
+//!
 //! What it protects is the failure that has no symptom: uBlock Origin's rules are mostly
 //! *cosmetic*, and a scriptlet bundle that stops parsing turns every one of them into a
 //! no-op while the receiver still looks fine and still blocks network-level ads. That has

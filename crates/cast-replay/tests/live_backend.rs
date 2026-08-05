@@ -1,5 +1,12 @@
 //! Confirms the network path against the real CKS backend.
 //!
+//! ## The decision, and when it gets revisited (#183)
+//!
+//! **Stays `#[ignore]`d, nightly.** Same call and the same reasoning as
+//! `pipeline/tests/filter_subscriptions.rs`: the dependency is somebody else's uptime, so
+//! a red gate here would say nothing about the change that turned it red. Revisit when a
+//! nightly job exists to carry it.
+//!
 //! `#[ignore]`d: it needs an uplink, it talks to a third party's endpoint, and it
 //! fails when that endpoint goes away — which is a fact about the world, not a
 //! regression in this tree. The offline path is covered unconditionally by the

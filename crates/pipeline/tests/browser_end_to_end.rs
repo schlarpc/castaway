@@ -17,6 +17,25 @@
 //! 5. Touch reaches the page, so the CDP route is real rather than merely written.
 //! 6. The browser is gone when the host is dropped.
 //!
+//!
+//! ## The decision, and when it gets revisited (#183)
+//!
+//! **This should run in CI and the recipe already exists.** `checks.cast-app-hosting`
+//! supplies a real Electron *and* a GPU (lavapipe, with `CASTAWAY_REQUIRE_GPU` set), which
+//! is the entire dependency list — so what stands between this file and a check is a
+//! `cargoExtraArgs` naming it and `--run-ignored all`, not a new harness.
+//!
+//! Two things to get right when it lands, and both are why it is not a one-liner. The
+//! check runs `-p proto-cast`; this is `pipeline`, so it is either a second check or a
+//! widened one, and widening means the Electron and the GPU are on the path of tests that
+//! do not need them. And `--run-ignored all` in the same invocation would also pick up any
+//! other `#[ignore]`d test in the crate — `mixer_real_device.rs` is `#[ignore]`d for a
+//! dependency this check does *not* supply — so the filter has to name binaries rather
+//! than lean on the flag.
+//!
+//! Revisit: next time anyone touches `checks.cast-app-hosting`. STATUS.md calls the
+//! sibling `remote_browser.rs` "the test that matters" and records that it found three
+//! bugs a fixture could not, which is the argument for paying the wiring cost.
 //! Needs a GPU and an Electron, so it is `#[ignore]` by default and run by name:
 //!
 //! ```sh

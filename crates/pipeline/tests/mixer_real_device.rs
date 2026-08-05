@@ -6,8 +6,25 @@
 //! same measurement with that assumption removed, which is the only difference between the
 //! two and therefore the whole point of having both.
 //!
-//! Hardware, so `#[ignore]` per ground rule 6: it needs a session bus, a running PipeWire
-//! and a sink to open. Run it with `--run-ignored all`.
+//! Hardware today, so `#[ignore]` per ground rule 6: it needs a session bus, a running
+//! PipeWire and a sink to open. Run it with `--run-ignored all`.
+//!
+//! ## The decision, and when it gets revisited (#183)
+//!
+//! **This should run in CI, and does not need hardware to.** That is the one call among
+//! the five `#[ignore]`d files that goes against the file's own header: a nixosTest with a
+//! dummy PipeWire or ALSA sink gives a device whose clock is not derived from ours, which
+//! is the entire property under test. `bluetooth-vm` already boots a `services.pipewire`
+//! block for a `tester` user, so the recipe is nearly written.
+//!
+//! Until that exists this is the only thing in the tree that removes the
+//! correct-by-construction assumption underneath **every** mixer pacing test, and it runs
+//! nowhere — which is why #204 treats it as the headline rather than as a nice-to-have,
+//! and why the three live regressions in that blind spot (#174, #175, #177) were all found
+//! by a person listening to the panel.
+//!
+//! Revisit: when #204's nixosTest lands. Then the `#[ignore]` comes off and this file is
+//! the check.
 //!
 //! The tone is at -80 dBFS. It has to be non-zero to prove samples are flowing, and it has
 //! to be inaudible because the panel this runs on is usually playing something.
