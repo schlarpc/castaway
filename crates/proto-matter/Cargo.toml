@@ -25,7 +25,10 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "net", "time"] }
 async-trait.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time", "net"] }
+# `test-util` for `start_paused`: the passcode window is 180 s and the test that proves it
+# comes off the screen on its own asserts against the constant the panel ships with, not
+# against a shortened one (#197).
+tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time", "net", "test-util"] }
 tempfile.workspace = true
 # For `examples/matter-peer.rs`, the scripted Casting Client the VM test drives. Its
 # `tracing-log` default feature is what makes `rs-matter`'s own `log` records visible,

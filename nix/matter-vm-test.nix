@@ -222,5 +222,50 @@ pkgs.testers.runNixOSTest {
         assert re.search(r"null pipeline: PLAY.*${castUrl}", journal), journal
         # The display string survived the round trip into the now-playing surface.
         assert "${castTitle}" in journal, journal
+
+    with subtest("a passcode nobody types comes off the glass on its own"):
+        # The other end of the flow, and the one that used to have no end at all: a phone
+        # declares, the panel puts an eight-digit commissioning passcode on a wall-mounted
+        # screen, and the phone walks away. `expire` ran only on the way past the *next*
+        # inbound datagram, and a phone that walked away sends no more datagrams — so the
+        # number stayed up indefinitely while the state machine considered it dead and
+        # would have refused it (#197).
+        #
+        # `server.rs` proves the timer arms and emits `Prompt::Clear` over a real socket
+        # with paused time. What only this can prove is the link past it: `pump_prompts`
+        # turning that `Clear` into a takedown of the sticky OSD message, on the real
+        # panel, through the module.
+        #
+        # A fresh instance name, so this is a new phone rather than a retransmit of the
+        # one already commissioned.
+        phone.succeed(
+            f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+            f"--instance 00112233445566AA --name 'a phone that leaves' "
+            f"--declare-only --passcode-file /dev/null > /tmp/leaver.log 2>&1"
+        )
+        phone.succeed("grep -q 'matter-peer: declared and leaving' /tmp/leaver.log")
+
+        panel.wait_until_succeeds(
+            "journalctl -u castaway --no-pager "
+            "| grep -q 'a phone that leaves wants to cast — enter'",
+            timeout=60,
+        )
+        # Nothing else happens on the wire from here. The panel is on its own.
+        panel.wait_until_succeeds(
+            "journalctl -u castaway --no-pager | grep -q 'a displayed passcode expired'",
+            # PASSCODE_LIFETIME is 180 s and is deliberately not shortened for the test:
+            # what is being asserted is the constant the panel ships with.
+            timeout=260,
+        )
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        # …and the OSD, not just the log. The number lives on the overlay and nowhere
+        # else, so a `Clear` that never reached it leaves the passcode exactly where it
+        # was — which is the failure, unchanged.
+        #
+        # Read from *after* the expiry line rather than anywhere in the journal: the
+        # commissioning flow above also clears the OSD when it finishes, and an assertion
+        # that matched that one would pass with this path removed entirely.
+        after_expiry = journal.split("a displayed passcode expired", 1)[1]
+        assert "OSD clear" in after_expiry, after_expiry
   '';
 }

@@ -101,13 +101,20 @@ struct Args {
     /// `_matterc._udp` record names, and a client that is not on the well-known port is
     /// the case worth being able to reproduce by hand.
     matter_port: u16,
+    /// Declare, report what came back, and exit — without ever typing a passcode.
+    ///
+    /// The phone that walks away. Everything after phase 1 is skipped, so the panel is
+    /// left holding a passcode nothing will ever redeem, which is the case
+    /// `PASSCODE_LIFETIME` exists for and the one the panel used to leave on the glass
+    /// indefinitely (#197).
+    declare_only: bool,
 }
 
 fn usage() -> String {
     "usage: matter-peer --player <ip> --passcode-file <path> [--bind <ip>] \
      [--instance <hex16>] [--name <str>] [--url <str>] [--display-string <str>] \
      [--endpoint <n>] [--app-vendor <n>] [--app-product <n>] [--discriminator <n>] \
-     [--matter-port <n>]"
+     [--matter-port <n>] [--declare-only]"
         .into()
 }
 
@@ -128,6 +135,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut app_product_id = 0x8001_u16;
     let mut discriminator = 3840_u16;
     let mut matter_port = MATTER_PORT;
+    let mut declare_only = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -145,6 +153,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--app-product" => app_product_id = value()?.parse()?,
             "--discriminator" => discriminator = value()?.parse()?,
             "--matter-port" => matter_port = value()?.parse()?,
+            "--declare-only" => declare_only = true,
             other => return Err(format!("unknown argument {other:?}\n{}", usage()).into()),
         }
     }
@@ -162,6 +171,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         app_product_id,
         discriminator,
         matter_port,
+        declare_only,
     })
 }
 
@@ -207,6 +217,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "matter-peer: passcode dialog is up, {} digits",
         cd.passcode_length
     );
+
+    if args.declare_only {
+        // The sentinel for the walk-away case. Nothing here redeems the passcode, so the
+        // panel is now the only party with a reason to act, and what it has to do is take
+        // the number off its screen on its own.
+        println!("matter-peer: declared and leaving");
+        return Ok(());
+    }
 
     // ---- Phase 2: play the person ---------------------------------------------------
 

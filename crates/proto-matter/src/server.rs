@@ -259,6 +259,20 @@ impl UdcState {
         self.pending.len() != before
     }
 
+    /// When the next passcode falls out of its window, or `None` if none is outstanding.
+    ///
+    /// This is what makes expiry an *event* rather than something noticed the next time a
+    /// datagram happens to arrive. A phone that sends one declaration and walks away sends
+    /// no more datagrams by definition, which is exactly the case where the number is left
+    /// on a wall-mounted panel with nobody watching.
+    #[must_use]
+    pub fn next_expiry(&self) -> Option<tokio::time::Instant> {
+        self.pending
+            .values()
+            .map(|p| p.issued + PASSCODE_LIFETIME)
+            .min()
+    }
+
     /// How many passcodes are outstanding.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -338,6 +352,14 @@ impl UdcServer {
 
     /// Run until the socket dies.
     ///
+    /// Two things wake this loop: a datagram, and a passcode reaching the end of
+    /// [`PASSCODE_LIFETIME`]. The second is not an optimisation. Expiry used to be checked
+    /// only on the way past a *new* datagram, so a phone that sent one declaration and
+    /// walked away left an eight-digit commissioning passcode on a wall-mounted panel
+    /// indefinitely — while the state machine considered it dead and would refuse it. That
+    /// defeats the reasoning [`PASSCODE_LIFETIME`] exists for, which is that every extra
+    /// minute is another minute the number is readable from the sofa (#197).
+    ///
     /// # Errors
     /// [`MatterError::Io`] if the socket fails; a malformed datagram is logged and
     /// dropped, because anything at all can arrive on an unauthenticated UDP port.
@@ -348,24 +370,42 @@ impl UdcServer {
         let mut buf = [0u8; 1024];
 
         loop {
-            let (len, source) =
-                self.socket
-                    .recv_from(&mut buf)
-                    .await
-                    .map_err(|source| MatterError::Io {
+            // The deadline of the *earliest* outstanding passcode, so the loop sleeps
+            // exactly as long as it has to rather than ticking. With nothing pending there
+            // is no deadline and this branch never completes — a timer that fired with
+            // nothing to expire would send a `Clear` over a prompt somebody else put up.
+            let next_expiry = self.state.next_expiry();
+
+            tokio::select! {
+                () = async {
+                    match next_expiry {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if self.state.expire(tokio::time::Instant::now()) {
+                        tracing::info!("matter: a displayed passcode expired; clearing the prompt");
+                        let _ = self.prompts.send(Prompt::Clear);
+                    }
+                }
+
+                received = self.socket.recv_from(&mut buf) => {
+                    let (len, source) = received.map_err(|source| MatterError::Io {
                         context: "reading a user-directed-commissioning datagram",
                         source,
                     })?;
 
-            match IdentificationDeclaration::decode(&buf[..len]) {
-                Ok(id) => self.dispatch(&id, source, rand).await,
-                Err(UdcError::WrongProtocol { .. }) => {
-                    // Something else on 5550. Not worth a warning: this port is
-                    // unauthenticated and the internet scans it.
-                    tracing::debug!(%source, "matter: a non-UDC datagram on the UDC port");
-                }
-                Err(e) => {
-                    tracing::warn!(%source, error = %e, "matter: undecodable UDC datagram");
+                    match IdentificationDeclaration::decode(&buf[..len]) {
+                        Ok(id) => self.dispatch(&id, source, rand).await,
+                        Err(UdcError::WrongProtocol { .. }) => {
+                            // Something else on 5550. Not worth a warning: this port is
+                            // unauthenticated and the internet scans it.
+                            tracing::debug!(%source, "matter: a non-UDC datagram on the UDC port");
+                        }
+                        Err(e) => {
+                            tracing::warn!(%source, error = %e, "matter: undecodable UDC datagram");
+                        }
+                    }
                 }
             }
         }
@@ -425,6 +465,9 @@ pub type RequestSender = mpsc::UnboundedSender<CommissionRequest>;
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    // The scripted phone binds an ephemeral loopback socket; the registry in
+    // `crates/app/src/surface.rs` governs the ports the panel actually listens on.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::player::{ContentApp, LaunchTarget};
     use crate::udc::TargetApp;
@@ -631,6 +674,102 @@ mod tests {
         assert_eq!(
             decision.reply.error_code,
             CdError::UnexpectedCommissionerPasscodeReady
+        );
+    }
+
+    /// …and the loop that has to *notice* it expired knows when to wake up.
+    ///
+    /// `a_passcode_expires` proves the state machine refuses a stale passcode, which was
+    /// never the missing half — the missing half was that nothing took the number off the
+    /// screen, because `expire` ran only on the way past the next inbound datagram and a
+    /// phone that walked away sends no more datagrams (#197).
+    #[test]
+    fn the_earliest_passcode_is_the_one_the_loop_waits_for() {
+        let mut state = UdcState::new();
+        assert_eq!(
+            state.next_expiry(),
+            None,
+            "with nothing pending there is no deadline, so the loop must not arm a timer \
+             that would clear a prompt somebody else put up"
+        );
+
+        let first = Instant::now();
+        decide(&mut state, &declaration(), first);
+        assert_eq!(state.next_expiry(), Some(first + PASSCODE_LIFETIME));
+
+        // A second phone, later. The deadline stays the *earlier* one, so the loop wakes
+        // for whichever number comes off the screen first.
+        let second = first + Duration::from_secs(30);
+        let mut other = declaration();
+        other.instance_name = InstanceName::new("0011223344556677").unwrap();
+        decide(&mut state, &other, second);
+        assert_eq!(state.pending(), 2);
+        assert_eq!(state.next_expiry(), Some(first + PASSCODE_LIFETIME));
+
+        // Past the first deadline: it goes, the second remains, and the deadline moves to
+        // it rather than to `None`.
+        assert!(state.expire(first + PASSCODE_LIFETIME + Duration::from_millis(1)));
+        assert_eq!(state.pending(), 1);
+        assert_eq!(state.next_expiry(), Some(second + PASSCODE_LIFETIME));
+
+        assert!(state.expire(second + PASSCODE_LIFETIME + Duration::from_millis(1)));
+        assert_eq!(state.next_expiry(), None);
+    }
+
+    /// The whole thing over a real socket: a phone declares once and then goes away, and
+    /// the number leaves the screen on its own.
+    ///
+    /// Paused time rather than a shortened lifetime, so what is asserted is the constant
+    /// the panel actually ships with. The elapsed-virtual-time check is the second half of
+    /// the assertion and the more important one: a `Clear` sent immediately would satisfy
+    /// "the prompt goes away" and would take the passcode down while the user was still
+    /// typing it.
+    #[tokio::test(start_paused = true)]
+    async fn a_phone_that_walks_away_does_not_leave_its_passcode_on_the_wall() {
+        let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel();
+        let (requests_tx, _requests_rx) = mpsc::unbounded_channel();
+        let server = UdcServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            catalogue(),
+            prompts_tx,
+            requests_tx,
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = server.run(&mut Counter(41)).await;
+        });
+
+        // One declaration, and then nothing — the phone is gone.
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        phone
+            .send_to(&declaration().encode().unwrap(), addr)
+            .await
+            .unwrap();
+
+        let shown = prompts_rx.recv().await.unwrap();
+        let Prompt::Passcode { passcode, .. } = &shown else {
+            panic!("expected a passcode prompt, got {shown:?}");
+        };
+        assert_eq!(passcode.len(), 9);
+        let issued_at = Instant::now();
+
+        // Under `start_paused` the runtime advances its clock to the *earliest* pending
+        // deadline whenever it has nothing else to run. So if the loop armed an expiry
+        // timer, that one is earlier than this bound and fires first; if it did not, the
+        // clock jumps straight to the bound and this fails rather than hanging, which is
+        // what it did before the fix.
+        let cleared = tokio::time::timeout(PASSCODE_LIFETIME * 2, prompts_rx.recv())
+            .await
+            .expect("the passcode is still on the screen twice its lifetime later")
+            .unwrap();
+        assert_eq!(cleared, Prompt::Clear);
+        assert!(
+            Instant::now().duration_since(issued_at) >= PASSCODE_LIFETIME,
+            "the prompt came down after {:?}, inside the window somebody is reading it in",
+            Instant::now().duration_since(issued_at)
         );
     }
 
