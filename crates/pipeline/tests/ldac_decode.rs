@@ -80,6 +80,68 @@ fn format(rate: u32, channels: u16) -> AudioFormat {
     AudioFormat::from_hz(rate, channels).expect("a sane format")
 }
 
+/// The signal the fixtures were made from: 440 Hz at three quarters of full scale.
+///
+/// Reproduced rather than checked in beside the bitstream, because `examples/ldac_fixtures.rs`
+/// is what generates both and this is that file's `sine()` — if the two ever disagree the
+/// correlation below is what says so.
+fn reference_sine(rate: u32, frames: usize) -> Vec<f32> {
+    (0..frames)
+        .map(|n| {
+            #[allow(clippy::cast_precision_loss)]
+            let t = n as f32 / rate as f32;
+            (t * 440.0 * std::f32::consts::TAU).sin() * (24_000.0 / 32_768.0)
+        })
+        .collect()
+}
+
+/// Split interleaved stereo into its two channels.
+fn channels(interleaved: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    (
+        interleaved.iter().step_by(2).copied().collect(),
+        interleaved.iter().skip(1).step_by(2).copied().collect(),
+    )
+}
+
+/// Normalised cross-correlation at zero lag: same shape at any scale is 1.0.
+fn correlation(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y) = (f64::from(a[i]), f64::from(b[i]));
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    }
+}
+
+/// The best correlation over lags in `0..=max_lag`, and the lag that achieved it. The
+/// codec's own latency is not what is under test; that some single alignment explains the
+/// whole signal is.
+fn best_alignment(reference: &[f32], decoded: &[f32], max_lag: usize) -> (f32, usize) {
+    let mut best = (0.0f32, 0usize);
+    for lag in 0..=max_lag {
+        if lag >= decoded.len() {
+            break;
+        }
+        let score = correlation(reference, &decoded[lag..]);
+        if score > best.0 {
+            best = (score, lag);
+        }
+    }
+    best
+}
+
 #[test]
 fn ldac_is_decodable_when_the_feature_that_binds_the_library_is_on() {
     // The inverse of the test in `audio_decode` that asserts LDAC is *not* claimed on a
@@ -122,6 +184,20 @@ fn a_stereo_stream_decodes_to_audio_that_sounds_like_what_went_in() {
     assert!(
         EXPECTED_RMS.contains(&level),
         "decoded level {level} is not what a 440 Hz sine should produce"
+    );
+
+    // …and it is the *same waveform*, not merely one at the same level. An RMS window
+    // passes for a phase inversion, a time-reversed decode, and a decode that dropped
+    // every other frame while producing the right total count — none of which this does
+    // (#187). The reference is reproducible rather than captured: the fixture generator
+    // encodes exactly this signal, and `examples/ldac_fixtures.rs` is where it is written.
+    let reference = reference_sine(44_100, samples.len() / 2);
+    let (left, _) = channels(&samples);
+    let (score, lag) = best_alignment(&reference, &left, 44_100 / 100);
+    assert!(
+        score >= 0.98,
+        "the decoded left channel correlates {score:.4} with the 440 Hz sine that was \
+         encoded (best lag {lag}). LDAC at MQ is lossy; it is not a different waveform"
     );
 
     // Both channels, evenly. A mono sine was encoded to both, so an imbalance means the

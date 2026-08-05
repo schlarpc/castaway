@@ -615,6 +615,27 @@ pub(crate) mod tests {
                 let n = bytes.len().min(dst.len());
                 dst[..n].copy_from_slice(&bytes[..n]);
             }
+            // What ffmpeg's native AAC encoder takes. Full scale is ±1.0 rather than
+            // ±32767, so this is the one conversion here that is a divide and not a shift
+            // — encoding an i16's raw value as a float would clip every sample to the
+            // rails and produce a square wave that still decodes.
+            ffmpeg::format::Sample::F32(Type::Planar) => {
+                for ch in 0..channels {
+                    let plane = frame.plane_mut::<f32>(ch);
+                    for (i, slot) in plane.iter_mut().take(frames).enumerate() {
+                        *slot = f32::from(interleaved[i * channels + ch]) / 32768.0;
+                    }
+                }
+            }
+            ffmpeg::format::Sample::F32(Type::Packed) => {
+                let bytes: Vec<u8> = interleaved
+                    .iter()
+                    .flat_map(|s| (f32::from(*s) / 32768.0).to_ne_bytes())
+                    .collect();
+                let dst = frame.data_mut(0);
+                let n = bytes.len().min(dst.len());
+                dst[..n].copy_from_slice(&bytes[..n]);
+            }
             other => panic!("test helper cannot fill {other:?}"),
         }
     }
@@ -695,6 +716,233 @@ pub(crate) mod tests {
         #[allow(clippy::cast_precision_loss)]
         let n = samples.len() as f32;
         (samples.iter().map(|s| s * s).sum::<f32>() / n).sqrt()
+    }
+
+    /// A multi-tone sweep: what the fidelity tests below send.
+    ///
+    /// Four tones rather than one sine, because a single sine is the one signal that
+    /// survives almost every way a codec path can be wrong. A decode that dropped every
+    /// other block, ran at half rate, or reversed time still produces a 440 Hz tone at the
+    /// right level — and RMS, which is what these tests used to assert, cannot see any of
+    /// it. Spread across the band so a filterbank that lost a subband shows up, and with a
+    /// short silent lead-in so "best lag" is a question with an answer.
+    pub(crate) fn sweep(rate: u32, seconds: f32) -> Vec<i16> {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation
+        )]
+        let frames = (rate as f32 * seconds) as usize;
+        let mut out = Vec::with_capacity(frames * 2);
+        for n in 0..frames {
+            #[allow(clippy::cast_precision_loss)]
+            let t = n as f32 / rate as f32;
+            // Silent for the first 50 ms. Lag has to be measurable, and a signal that
+            // starts at full amplitude in sample zero gives every alignment the same score
+            // over its steady-state region.
+            let envelope = if t < 0.05 { 0.0 } else { 1.0 };
+            let s: f32 = [220.0f32, 1000.0, 3500.0, 7000.0]
+                .iter()
+                .map(|f| (t * f * std::f32::consts::TAU).sin())
+                .sum::<f32>()
+                / 4.0;
+            // Left and right differ, deliberately: identical channels make a swap and a
+            // mono collapse invisible, and both are real failures — a planar frame read
+            // through a packed accessor produces exactly the second.
+            #[allow(clippy::cast_possible_truncation)]
+            let left = (s * envelope * 11_000.0) as i16;
+            #[allow(clippy::cast_possible_truncation)]
+            let right = ((t * 660.0 * std::f32::consts::TAU).sin() * envelope * 11_000.0) as i16;
+            out.push(left);
+            out.push(right);
+        }
+        out
+    }
+
+    /// Normalised cross-correlation of two signals at zero lag, in `[-1, 1]`.
+    ///
+    /// 1.0 is "the same shape at any scale", 0.0 is unrelated, −1.0 is inverted. Scale
+    /// invariance is the point: a codec is allowed to change the level a little and is not
+    /// allowed to change the waveform.
+    fn correlation(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        if n == 0 {
+            return 0.0;
+        }
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            let (x, y) = (f64::from(a[i]), f64::from(b[i]));
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (dot / (na.sqrt() * nb.sqrt())) as f32
+        }
+    }
+
+    /// The best correlation over lags in `0..=max_lag`, and the lag that achieved it.
+    ///
+    /// A lag search rather than a fixed offset because every codec here has its own
+    /// latency — SBC's filterbank, aptX's four-sample block, AAC's 1024-sample window plus
+    /// encoder priming — and none of them is the thing under test. What *is* under test is
+    /// that some single alignment explains the whole signal.
+    fn best_alignment(reference: &[f32], decoded: &[f32], max_lag: usize) -> (f32, usize) {
+        let mut best = (0.0f32, 0usize);
+        for lag in 0..=max_lag {
+            if lag >= decoded.len() {
+                break;
+            }
+            let score = correlation(reference, &decoded[lag..]);
+            if score > best.0 {
+                best = (score, lag);
+            }
+        }
+        best
+    }
+
+    /// Split interleaved stereo into its two channels.
+    fn channels(interleaved: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        (
+            interleaved.iter().step_by(2).copied().collect(),
+            interleaved.iter().skip(1).step_by(2).copied().collect(),
+        )
+    }
+
+    /// Decode every frame and flush, collecting the PCM and what the decoder said it was.
+    fn decode_all(
+        codec: AudioCodec,
+        rate: u32,
+        frames: &[EncodedFrame],
+        config: Option<&[u8]>,
+    ) -> (Vec<f32>, Option<(u32, u16)>) {
+        let mut decoded = Vec::new();
+        let mut reported = None;
+        let mut decoder = AudioDecoder::new(codec, format(rate, 2), config).unwrap();
+        for frame in frames {
+            decoder
+                .decode(frame, |b| {
+                    reported = Some((b.sample_rate, b.channels));
+                    decoded.extend_from_slice(&b.samples);
+                })
+                .unwrap();
+        }
+        // Flushing is not optional: libav decoders hold frames back, and a session that
+        // never flushes loses whatever was still in the pipeline when the phone stopped.
+        decoder
+            .flush(|b| decoded.extend_from_slice(&b.samples))
+            .unwrap();
+        (decoded, reported)
+    }
+
+    /// Every codec the panel advertises decodes to the waveform that went in.
+    ///
+    /// This is the assertion the per-codec tests were reaching for and could not make.
+    /// `rms(&decoded) > 0.05` passes for a channel swap, a phase inversion, a wrong sample
+    /// rate at the right level, a time-reversed decode, and a decode that dropped every
+    /// other block — all of which are silence-or-noise in the room and green here. LDAC's
+    /// `EXPECTED_RMS = 0.35..0.65` is the same shape with tighter bounds; aptX's per-channel
+    /// balance check was the only one that could see a mono collapse (#187).
+    ///
+    /// Normalised cross-correlation at the best lag instead, **per channel**, which is what
+    /// makes a swap and a collapse visible: the two channels carry different tones, so a
+    /// decode that put the left signal in both ears scores badly on the right.
+    ///
+    /// One caveat stated plainly, because it bounds what this proves: the input is our own
+    /// encoder's output, so a misunderstanding shared between our encode and decode
+    /// configuration is still invisible. The fix for that is a capture from a real phone,
+    /// which for AAC exists and is used by `aac_from_a_real_iphone_decodes_to_audio`.
+    #[test]
+    fn every_advertised_codec_decodes_to_the_waveform_that_went_in() {
+        // 0.98 rather than 0.99: SBC at its default bitpool is genuinely lossy in a way
+        // that shows here, and the threshold has to be one the *worst* honest codec
+        // clears. Everything this is meant to catch scores far below either number —
+        // a channel swap on this signal is ~0.0, an inversion is −1.0, and half-rate is
+        // ~0.1. Measured on the dev box: SBC 0.985/0.990, aptX 0.999/0.999,
+        // aptX HD 0.9999/0.9999, AAC 0.996/0.997.
+        const FLOOR: f32 = 0.98;
+        // 20 ms of slack for codec latency, which is generous: the longest here is AAC's
+        // 1024-sample window at 44.1 kHz, about 23 ms — so the search window is 40 ms and
+        // the assertion is that the best lag is inside 20 ms of *something*, not that it
+        // is zero.
+        let rate = 44_100;
+        let max_lag_frames = rate as usize * 40 / 1000;
+
+        let pcm = sweep(rate, 1.0);
+        let (ref_l, ref_r) = channels(
+            &pcm.iter()
+                .map(|s| f32::from(*s) / 32768.0)
+                .collect::<Vec<_>>(),
+        );
+
+        for codec in [
+            AudioCodec::Sbc,
+            AudioCodec::AptX,
+            AudioCodec::AptXHd,
+            // The one with no decode coverage at all before this, and the one every
+            // iPhone picks. It sat 4th in `advertised()` and was offered whenever ffmpeg
+            // reported it, so an ffmpeg build without the AAC decoder gave every iPhone in
+            // the room a connected session and silence.
+            AudioCodec::Aac,
+        ] {
+            let frames = encode(codec, rate, &pcm);
+            if !crate::test_media::available(&format!("a {codec:?} encoder"), !frames.is_empty()) {
+                continue;
+            }
+
+            let (decoded, reported) = decode_all(codec, rate, &frames, None);
+            assert!(!decoded.is_empty(), "{codec:?} produced no audio");
+            assert_eq!(
+                reported,
+                Some((rate, 2)),
+                "{codec:?}: rate and channels must survive the round trip"
+            );
+
+            let (got_l, got_r) = channels(&decoded);
+            let (score_l, lag_l) = best_alignment(&ref_l, &got_l, max_lag_frames);
+            let (score_r, lag_r) = best_alignment(&ref_r, &got_r, max_lag_frames);
+
+            assert!(
+                score_l >= FLOOR,
+                "{codec:?} left channel correlates {score_l:.4} with what was sent \
+                 (at lag {lag_l}); anything below {FLOOR} is a different waveform, not a \
+                 lossy one"
+            );
+            assert!(
+                score_r >= FLOOR,
+                "{codec:?} right channel correlates {score_r:.4} with what was sent \
+                 (at lag {lag_r}); the two channels carry different tones, so this is what \
+                 fails on a swap or a mono collapse"
+            );
+            // The same alignment for both, within a millisecond. Channels that need
+            // different lags is a decoder that has desynchronised them, which is audible
+            // as a smeared image long before it is audible as an error.
+            let skew = lag_l.abs_diff(lag_r);
+            assert!(
+                skew < rate as usize / 1000,
+                "{codec:?}: the channels align at different lags ({lag_l} vs {lag_r})"
+            );
+        }
+    }
+
+    /// #14's invariant, for the codec it was most likely to be wrong about.
+    ///
+    /// `the_codecs_we_advertise_are_the_codecs_we_can_decode` iterated `[Sbc, AptX,
+    /// AptXHd]`. AAC was absent — no RMS test, no level test, not even a `can_decode`
+    /// assertion — while sitting 4th in `advertised()` and offered whenever ffmpeg reports
+    /// it. That is the exact failure #14 exists to prevent, for the most common sender
+    /// there is (#187).
+    #[test]
+    fn aac_is_decodable_because_it_is_what_every_iphone_picks() {
+        assert!(
+            can_decode(AudioCodec::Aac),
+            "AAC is advertised to every phone that asks; a build that cannot decode it \
+             gives every iPhone in the room a connected session and silence"
+        );
     }
 
     #[test]
@@ -1060,7 +1308,12 @@ pub(crate) mod tests {
     fn the_codecs_we_advertise_are_the_codecs_we_can_decode() {
         // The invariant #14 turns on. If this fails, some phone will negotiate a codec
         // that produces silence.
-        for codec in [AudioCodec::Sbc, AudioCodec::AptX, AudioCodec::AptXHd] {
+        for codec in [
+            AudioCodec::Sbc,
+            AudioCodec::AptX,
+            AudioCodec::AptXHd,
+            AudioCodec::Aac,
+        ] {
             assert!(can_decode(codec), "{codec:?} must be decodable");
         }
     }
