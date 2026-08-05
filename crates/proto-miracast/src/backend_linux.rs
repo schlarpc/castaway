@@ -362,6 +362,35 @@ impl LinuxMiracastBackend {
         Self { config, caps }
     }
 
+    /// Write the WFD information element into the daemon's beacons and probe responses.
+    ///
+    /// Called at bring-up and then **again either side of every session**, which is the
+    /// point: the IE used to be installed once and never updated, so the availability bit
+    /// said "free" for the whole life of the process. A second source therefore saw an
+    /// available sink in its picker, joined a busy one, and got nothing — while the panel
+    /// is single-source by policy and by construction (`serve_peer` is awaited inline, so
+    /// the event loop is not even reading while a session runs). The bit exists precisely
+    /// to keep that phone out of the queue (#194).
+    ///
+    /// # Errors
+    /// [`MiracastError::Backend`] if any subelement is refused.
+    async fn advertise(
+        &self,
+        control: &WpaControl,
+        availability: Availability,
+    ) -> Result<(), MiracastError> {
+        let ie = advertisement(self.config.max_throughput_mbps, availability);
+        for subelement in &ie.subelements {
+            control
+                .require(WpaCommand::WfdSubelemSet {
+                    id: subelement.id.wire(),
+                    hex: WfdInformationElement::subelem_set_hex(subelement),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Install the advertisement and bring up an autonomous group.
     ///
     /// # Errors
@@ -389,26 +418,7 @@ impl LinuxMiracastBackend {
             })
             .await?;
 
-        let ie = WfdInformationElement::sink(
-            DeviceInformation::sink(DEFAULT_CONTROL_PORT, self.config.max_throughput_mbps),
-            ExtendedCapability {
-                // We do implement UIBC, so claiming it here is a promise we keep — the
-                // sink dials the port the source names and maps panel touch onto the
-                // stream (`uibc::UibcSurface`). This bit is the out-of-band half of the
-                // negotiation: a source reads it before RTSP starts and decides whether
-                // asking is worthwhile.
-                uibc: true,
-                ..ExtendedCapability::default()
-            },
-        );
-        for subelement in &ie.subelements {
-            control
-                .require(WpaCommand::WfdSubelemSet {
-                    id: subelement.id.wire(),
-                    hex: WfdInformationElement::subelem_set_hex(subelement),
-                })
-                .await?;
-        }
+        self.advertise(control, Availability::Free).await?;
 
         control
             .require(WpaCommand::P2pGroupAdd {
@@ -462,6 +472,44 @@ async fn connect_p2p_management(
         }
         Err(_) => WpaControl::connect(control_dir, interface).await,
     }
+}
+
+/// The WFD information element this sink advertises, at a given availability.
+///
+/// Pure, and separate from the socket call that installs it, so what goes on the air is
+/// testable without a radio (rule 3).
+fn advertisement(max_throughput_mbps: u16, availability: Availability) -> WfdInformationElement {
+    let device = DeviceInformation::sink(DEFAULT_CONTROL_PORT, max_throughput_mbps);
+    WfdInformationElement::sink(
+        match availability {
+            Availability::Free => device,
+            Availability::Busy => device.busy(),
+        },
+        ExtendedCapability {
+            // We do implement UIBC, so claiming it here is a promise we keep — the sink
+            // dials the port the source names and maps panel touch onto the stream
+            // (`uibc::UibcSurface`). This bit is the out-of-band half of the negotiation:
+            // a source reads it before RTSP starts and decides whether asking is
+            // worthwhile.
+            uibc: true,
+            ..ExtendedCapability::default()
+        },
+    )
+}
+
+/// What the beacon says about whether somebody is already casting.
+///
+/// A type rather than a `bool` because the two calls that use it are three lines apart and
+/// would read identically at the call site (rule 1) — and getting them the wrong way round
+/// advertises a free sink for the duration of a session and a busy one forever after,
+/// which is the same symptom as the bug it fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Availability {
+    /// Nobody is casting; join.
+    Free,
+    /// A session is running. `DeviceInformation::busy` withdraws the sink from every
+    /// picker in the room for its duration.
+    Busy,
 }
 
 /// How long two `AP-STA-CONNECTED` events for the same peer are treated as one.
@@ -562,7 +610,24 @@ impl castaway_core::MiracastBackend for LinuxMiracastBackend {
                     }
                     last_station = Some((peer, tokio::time::Instant::now()));
                     let iface = g.iface.clone();
-                    if let Err(e) = self.serve_peer(&iface, peer, &sink).await {
+
+                    // Out of every picker in the room for the duration. Not fatal if it
+                    // fails: a beacon that still says "free" is a second phone that joins
+                    // and waits, which is worse than this session not happening at all.
+                    if let Err(e) = self.advertise(&control, Availability::Busy).await {
+                        warn!(error = %e, "could not withdraw the sink while it is busy");
+                    }
+
+                    let outcome = self.serve_peer(&iface, peer, &sink).await;
+
+                    // …and back, whichever way the session ended. This has to run on the
+                    // error path too: a sink that fails one session and stays advertised
+                    // as busy is one nobody can cast to again until the process restarts.
+                    if let Err(e) = self.advertise(&control, Availability::Free).await {
+                        warn!(error = %e, "could not re-advertise the sink as available");
+                    }
+
+                    if let Err(e) = outcome {
                         // One failed session is not a reason to tear the group down; the
                         // next person who walks up should still get a picture.
                         warn!(%peer, error = %e, "the WFD session ended in error");
@@ -702,6 +767,67 @@ mod tests {
         "IP address       HW type     Flags       HW address            Mask     Device\n\
         192.168.49.15    0x1         0x2         02:aa:bb:cc:dd:ee     *        p2p-wlan0-0\n\
         10.0.0.1         0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n";
+
+    /// Busy and free differ in the availability bits and in nothing else.
+    ///
+    /// `DeviceInformation::busy()` was implemented, unit-tested, and had **no caller**:
+    /// the IE went in once at bring-up and was never updated, so the bit said "free" for
+    /// the whole life of the process. A second source saw an available sink in its
+    /// picker, joined a busy one, and got nothing — while the panel is single-source both
+    /// by policy and by construction, since `serve_peer` is awaited inline and the event
+    /// loop is not even reading while a session runs (#194).
+    ///
+    /// v2.3 §4.5 makes the bit a hard gate: a source *shall not* connect to a device
+    /// advertising `0b00`. So this is the mechanism, and the assertion that matters is
+    /// that flipping it changes *only* it — a busy advertisement that also dropped the
+    /// control port or the UIBC bit would take the sink out of the picker and out of the
+    /// protocol.
+    #[test]
+    fn a_session_withdraws_the_sink_and_finishing_puts_it_back() {
+        let free = advertisement(200, Availability::Free);
+        let busy = advertisement(200, Availability::Busy);
+
+        assert_eq!(
+            free.subelements.len(),
+            busy.subelements.len(),
+            "the same subelements either way; only one value inside one of them moves"
+        );
+
+        let mut differing = Vec::new();
+        for (f, b) in free.subelements.iter().zip(busy.subelements.iter()) {
+            assert_eq!(
+                f.id, b.id,
+                "subelement order must not depend on availability"
+            );
+            if f.body != b.body {
+                differing.push(f.id);
+            }
+        }
+        assert_eq!(
+            differing.len(),
+            1,
+            "exactly one subelement should change, got {differing:?}"
+        );
+
+        let device_of = |ie: &WfdInformationElement| {
+            let body = ie
+                .subelements
+                .iter()
+                .find(|s| s.id == crate::ie::SubelementId::DeviceInformation)
+                .expect("a sink advertises device information")
+                .body
+                .clone();
+            DeviceInformation::parse(&body).expect("our own body must parse")
+        };
+
+        let (f, b) = (device_of(&free), device_of(&busy));
+        assert_eq!(f.availability, crate::ie::SessionAvailability::Available);
+        assert_eq!(b.availability, crate::ie::SessionAvailability::NotAvailable);
+        // Everything a source needs in order to come back later survives being busy.
+        assert_eq!(b.device_type, f.device_type);
+        assert_eq!(b.control_port, DEFAULT_CONTROL_PORT);
+        assert_eq!(b.max_throughput_mbps, 200);
+    }
 
     #[test]
     fn a_peers_address_is_found_by_mac_and_interface() {
