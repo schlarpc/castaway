@@ -4,7 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-    systems.url = "github:nix-systems/default";
 
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -142,7 +141,6 @@
   outputs =
     { self
     , nixpkgs
-    , systems
     , rust-overlay
     , crane
     , nix-direnv
@@ -159,7 +157,29 @@
     , ...
     }:
     let
-      eachSystem = nixpkgs.lib.genAttrs (import systems);
+      # One system, and it is the one that gets built (#207).
+      #
+      # This was `nix-systems/default` — x86_64-linux, aarch64-linux, and the two Darwins.
+      # Under the current nixpkgs pin **every Darwin check was unbuildable**: the
+      # `commonArgs` Darwin branch referenced `darwin.apple_sdk.frameworks.Security`, a
+      # removed compatibility stub, so forcing any `checks.aarch64-darwin.*` threw.
+      # Nobody saw it because CI evaluates and builds only x86_64-linux.
+      #
+      # Forcing every attribute on the remaining systems found the same shape one over:
+      # `checks.aarch64-linux.cast-app-hosting` cannot evaluate either, because the
+      # vendored Electron (`nix/electron-linux.nix`) is `platforms = [ "x86_64-linux" ]`
+      # by construction — as are the Widevine CDM and the MSVC sysroot the Windows
+      # cross-build needs. So aarch64-linux was exactly as aspirational as Darwin, and the
+      # issue's own reasoning applies to it verbatim: the deploy target is Windows
+      # (cross-built from here, and that check is in this list), development is x86_64
+      # Linux, and a platform nothing builds is not a supported platform — it is an
+      # unproven claim in a `flake.nix`, which is the same shape as every other finding in
+      # `docs/test-matrix.md`.
+      #
+      # Adding a system back is a real piece of work — the vendored blobs are the hard
+      # part — and doing it means fixing what breaks, which is a truthful claim then
+      # rather than a hopeful one now.
+      eachSystem = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
 
       # Helper to get pkgs for a system with rust-overlay applied
       pkgsFor = system: import nixpkgs {
@@ -326,9 +346,6 @@
 
           buildInputs = [
             # Add additional build inputs here
-          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.libiconv
-            pkgs.darwin.apple_sdk.frameworks.Security
           ];
 
           nativeBuildInputs = [
@@ -384,7 +401,7 @@
       # native deps land.
       cargoArtifactsFor = system:
         let craneLib = cranelibFor system;
-        in craneLib.buildDepsOnly (fullArgsFor system // darwinMinimal system);
+        in craneLib.buildDepsOnly (fullArgsFor system);
 
       # `buildDepsOnly`, but extending the base artifacts above rather than starting
       # empty — see nix/deps-only-from.nix. The feature-set trees (kiosk, audio,
@@ -476,15 +493,18 @@
       # CI compiles is the configuration that ships, so there is no feature set left for a
       # test to rot behind.
       #
-      # Linux only. The Windows cross-build names its own set in nix/windows.nix, and
-      # Darwin has neither pipewire nor a working libldacBT here, so its checks build with
-      # `--no-default-features` — see `darwinMinimal` below. Darwin is not a deploy target;
-      # it gets a compile signal, not a coverage claim.
+      # Linux only in the sense that the Windows cross-build names its own set in
+      # nix/windows.nix. There is no third case: Darwin left `systems` in #207.
       fullArgsFor = system:
         let
           pkgs = pkgsFor system;
           commonArgs = commonArgsFor system;
         in
+        # The `isLinux` guards here and below are always true since #207 took Darwin out
+        # of `systems`. They stay because each one says *why* its contents are
+        # Linux-shaped — nixosTest needs a Linux kernel, the Windows cross-build is
+        # cross-built from Linux, pipewire and libldacBT are Linux libraries — and that is
+        # a real distinction between the attributes they wrap and the ones they do not.
         commonArgs // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nativeBuildInputs = (commonArgs.nativeBuildInputs or [ ]) ++ [
             pkgs.pkg-config
@@ -505,12 +525,6 @@
             "${moonlightCommonCFor system}/lib:${pkgs.openssl.out}/lib";
           LDACBT_LIB_DIR = "${ldacbtFor system}/lib";
           CASTAWAY_FIRMWARE_DIR = "${bluetoothFirmwareFor system}";
-        };
-
-      # Darwin cannot build the default set, so its checks opt out of it entirely.
-      darwinMinimal = system:
-        (pkgsFor system).lib.optionalAttrs (pkgsFor system).stdenv.isDarwin {
-          cargoExtraArgs = "--no-default-features";
         };
 
       # The full kiosk build — renderer, browser, audio, Bluetooth. `packages.default` on
@@ -749,9 +763,8 @@
           depsOnlyFrom = depsOnlyFromFor system;
 
           # The ordinary build environment now that every feature is on (D55): the native
-          # deps the default set links, plus `--no-default-features` on Darwin, which
-          # cannot build it.
-          fullArgs = fullArgsFor system // darwinMinimal system;
+          # deps the default set links.
+          fullArgs = fullArgsFor system;
 
           # What the `hwaccel` feature needs on top of a default build: ffmpeg's headers
           # for `ffmpeg-sys-next` (7.x, matching the crate — nixpkgs defaults to 8.x) and
@@ -894,22 +907,28 @@
           # the line of C++ that says so" into an executed result — including which of
           # the sender's many checks we already pass, so a provisioned credential has
           # exactly one case left to flip.
-          # The GameStream client against a real Sunshine — the only test here that
-          # runs the *reference implementation* as the peer rather than a script of
-          # ours (D37). Pairing is hands-free because `sunshine -0` takes the PIN on
-          # stdin instead of its web UI.
-          gamestream-vm = import ./nix/gamestream-vm-test.nix {
-            inherit pkgs self;
-          };
-
           openscreen-device-auth = import ./nix/openscreen-device-auth.nix {
             inherit pkgs;
             openscreenSrc = openscreen-src;
           };
         }
         # Tier-2: whole adapters driven by scripted senders from a second VM over a real
-        # LAN (ground rule 6). Linux-only — nixosTest needs KVM and a NixOS guest.
+        # LAN (ground rule 6). nixosTest needs KVM and a NixOS guest.
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # The GameStream client against a real Sunshine — the only test here that
+          # runs the *reference implementation* as the peer rather than a script of
+          # ours (D37). Pairing is hands-free because `sunshine -0` takes the PIN on
+          # stdin instead of its web UI.
+          #
+          # It was defined in the all-systems block above, between the comment for
+          # `openscreen-device-auth` and the attribute that comment describes, so
+          # `checks.aarch64-darwin.gamestream-vm` would have tried a nixosTest on Darwin.
+          # Latent, because CI only ever built x86_64-linux — and moot since #207, but a
+          # nixosTest belongs in the nixosTest block regardless.
+          gamestream-vm = import ./nix/gamestream-vm-test.nix {
+            inherit pkgs self;
+          };
+
           integration-vm = import ./nix/vm-test.nix { inherit pkgs self; };
 
           # The Miracast radio path end to end on mac80211_hwsim: real mac80211 radios,

@@ -2045,7 +2045,14 @@ across the room is touching it as far as this is concerned, which is right, but 
 contacts arrive through the same path and have not been checked against this policy on real
 hardware.
 
-### D54 — The visualiser is a tap, thirty frames a second, and deliberately boring
+### D56 — The visualiser is a tap, thirty frames a second, and deliberately boring
+
+> **Out of order on purpose.** This was written as D54 and so was the Matter entry below
+> it, on the same day. Every citation in the tree — CLAUDE.md's carve-out list,
+> `proto-matter`, `matter-casting-notes.md`, `matter-vm-test.nix`, STATUS.md — means the
+> Matter one, so that keeps the number and this one moved to the first free slot rather
+> than to a number in sequence, which would have renumbered everything after it. Found
+> while closing #207.
 
 **2026-08-03.** #15's whole brief was one line: *projectm is too overwhelming btw*. Taken
 literally, and the literal reading is what produced every decision here.
@@ -2315,3 +2322,53 @@ The 235 `cfg` sites remain. They are mechanism now — the Windows cross-build s
 two of them — but most are permanently true and could come out incrementally. That is
 tidying, not correctness, and it is deliberately not being done in the same change as the
 thing that makes the tests run.
+
+---
+
+### D57 — One system in `systems`, because three of the four had never been built
+
+**2026-08-05.** `nix eval .#checks.aarch64-darwin.test.drvPath` failed, and had been
+failing for as long as the current nixpkgs pin had been in place: `commonArgs`' Darwin
+branch referenced `pkgs.darwin.apple_sdk.frameworks.Security`, which nixpkgs removed as a
+legacy compatibility stub. So **every Darwin check was unbuildable** — not slow, not
+untested, unbuildable — and `nix flake check` on a Mac would have failed on the first
+attribute it forced.
+
+Nobody saw it because `.github/workflows/test.yml` evaluates and builds only
+`checks.x86_64-linux`. The four Darwin systems in `systems` were aspirational. Note that
+the attrset itself still *evaluated*: `builtins.attrNames` returned eight names quite
+happily, and only forcing one threw — so a `--no-build`-style guard would not have caught
+it either. What catches it is what CI already does, forcing every check to a `drvPath`.
+
+The obvious fix is to drop the `apple_sdk` reference and see what happens. That was
+rejected. Even repaired, no Darwin check would ever run — CI has no macOS runner and is not
+getting one — so the flake would go on claiming a platform whose evidence was that it
+parsed. That is the same shape as every other finding in the 2026-08-05 test-matrix audit,
+and the audit's own conclusion applies: a platform nothing builds is not a supported
+platform.
+
+Then forcing every attribute on the systems that were left found the same thing one system
+over. **`checks.aarch64-linux.cast-app-hosting` cannot evaluate**, because the vendored
+Electron in `nix/electron-linux.nix` is `platforms = [ "x86_64-linux" ]` — as are the
+Widevine CDM and the MSVC sysroot the Windows cross-build needs. Those are not oversights;
+they are prebuilt binaries for one architecture, which is what `docs/cross-build.md` is
+about. aarch64-linux was therefore exactly as aspirational as Darwin.
+
+So `systems` is now the literal `[ "x86_64-linux" ]` and the `systems` flake input is gone.
+The deploy target is Windows, cross-built from here, and that check is in the list. Adding
+a system back is real work — the vendored blobs are the hard part — and doing that work
+means fixing what breaks, which makes the claim true at the point it is made rather than
+years earlier.
+
+**What this does not change.** `pkgs.stdenv.isLinux` guards are now always true and stay,
+because each says *why* its contents are Linux-shaped: nixosTest needs a Linux kernel, the
+Windows cross-build is cross-built from Linux, pipewire and libldacBT are Linux libraries.
+That is a real distinction between the attributes they wrap and the ones they do not, and
+it is the structure to restore a system into.
+
+**Two things fell out of the same pass.** `gamestream-vm` was defined in the all-systems
+block above the `optionalAttrs isLinux` guard — so `checks.aarch64-darwin.gamestream-vm`
+would have tried a nixosTest on Darwin — and it had been inserted between the comment for
+`openscreen-device-auth` and the attribute that comment describes. Both moot once Darwin
+is gone; both fixed anyway, because a nixosTest belongs in the nixosTest block and a
+comment belongs above the thing it explains.

@@ -65,7 +65,8 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 ### The 16 checks
 
 `nix flake check` runs **all 16** checks (23 before D55 collapsed the per-feature
-ones; `moonlight-bindings` was added after, closing half of #191).
+ones; `moonlight-bindings` was added after, closing half of #191), on the one system
+this flake now claims — see the structural note below.
 There is no opt-in tier inside `checks` — nothing is gated behind an env var or a separate
 invocation.
 
@@ -108,13 +109,24 @@ build the shipped configuration. What each of them *asserted* is unchanged and s
 `CASTAWAY_REQUIRE_FFMPEG`, and `media-plane`'s `dlna_media_plane` target are all inside
 `test` now.
 
-Two structural notes on the attrset:
+Both structural notes this section used to carry are **closed by #207**, and the second
+one is why the first stopped mattering:
 
-- **`gamestream-vm` is in the wrong block** — defined in the all-systems attrset (flake.nix:797)
-  above the `optionalAttrs isLinux` guard at :807, so `checks.aarch64-darwin.gamestream-vm`
-  would try a nixosTest on Darwin. Latent only, because CI builds `x86_64-linux`.
-- **An orphaned comment** — flake.nix:786-795 documents `openscreen-device-auth`, but
-  `gamestream-vm` was inserted between the comment and the attribute it describes.
+- `gamestream-vm` sat in the all-systems attrset above the `optionalAttrs isLinux` guard,
+  so `checks.aarch64-darwin.gamestream-vm` would have tried a nixosTest on Darwin — and
+  the comment for `openscreen-device-auth` had `gamestream-vm` inserted between it and the
+  attribute it describes. Both fixed; the nixosTest is in the nixosTest block.
+- **`systems` is now `[ "x86_64-linux" ]`.** It was `nix-systems/default`, and every
+  Darwin check was *unbuildable* under the current nixpkgs pin. Forcing every attribute on
+  the rest found the same shape one system over: `checks.aarch64-linux.cast-app-hosting`
+  cannot evaluate either, because the vendored Electron is `platforms = [ "x86_64-linux" ]`
+  by construction, as are the Widevine CDM and the MSVC sysroot. So three of the four
+  systems in that list were claims nothing had ever built.
+
+The gate that makes this stay closed already existed and simply had nothing to cover the
+other systems: CI's `discover` job forces every check to a `drvPath`, which runs all of its
+evaluation. With one system, every check attribute is also a matrix job, so an attribute
+that throws on force fails a named job rather than nothing at all.
 
 ### Test count
 
