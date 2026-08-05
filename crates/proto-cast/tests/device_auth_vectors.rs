@@ -398,7 +398,16 @@ fn the_checked_in_vectors_still_describe_this_receiver() {
     // build time rather than checked in, so a build without the carve has nothing to
     // generate them from. `nix flake check` always has it; a bare `cargo test` may not.
     if !cast_replay::has_bundled_identity() {
-        eprintln!("skipping: this build has no carved AirServer identity");
+        // Loud, and in the shape `receiver_sdk.rs` uses, because this file is what keeps
+        // the vectors `checks.openscreen-device-auth` judges honest — and it generates
+        // *and* compares them, so with no identity it does neither. CI is safe (the carve
+        // is in `commonArgs`); a developer's bare `cargo nextest run` is what this is for.
+        // The browser-host incident fixed in `a0ca9a7` was exactly this shape (#182).
+        eprintln!(
+            "\n*** NOT RUN: this build has no carved AirServer identity, so the vectors\n\
+             *** were neither generated nor compared. Nothing here has been checked.\n\
+             ***   nix develop -c cargo nextest run -p proto-cast -E 'binary(device_auth_vectors)'\n"
+        );
         return;
     }
     let bless = std::env::var_os("CASTAWAY_BLESS_DEVICE_AUTH_VECTORS").is_some();

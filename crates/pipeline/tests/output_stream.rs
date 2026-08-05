@@ -11,9 +11,12 @@
 //! take. A `trun` pointing four bytes past its `mdat` produces segments of exactly the
 //! right size that decode to nothing, and only a demuxer notices.
 //!
-//! Needs a GPU adapter and an H.264 encoder. Where either is missing the test says so and
-//! passes — CI has neither, and a hardware requirement is not something to smuggle in
-//! (ground rule 6).
+//! Needs a GPU adapter and an H.264 encoder. Where either is honestly missing these skip
+//! and say so — a hardware requirement is not something to smuggle in (ground rule 6) —
+//! but both skips go through the tripwires, so a build that *promised* an adapter
+//! (`CASTAWAY_REQUIRE_GPU`) or ffmpeg (`CASTAWAY_REQUIRE_FFMPEG`) and then could not
+//! supply one fails instead. That is not hypothetical: this file skip-passed by design
+//! until #182, so even once a check compiled it, it could have asserted nothing.
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -41,7 +44,10 @@ const MAGENTA_YUV: (u8, u8, u8) = (78, 214, 230);
 
 /// A compositor showing one solid colour, or `None` where there is no GPU.
 fn panel(width: u32, height: u32) -> Option<WgpuCompositor> {
-    let mut compositor = WgpuCompositor::new_offscreen(width, height).ok()?;
+    // Through the tripwire, not `.ok()?`: `checks.test` supplies lavapipe and sets
+    // `CASTAWAY_REQUIRE_GPU`, and a `?` here would let an ICD path that stopped resolving
+    // turn every assertion in this file back into a green nothing.
+    let mut compositor = pipeline::test_gpu::compositor(width, height)?;
     let pixels: Vec<u8> = std::iter::repeat_n(MAGENTA, (width * height) as usize)
         .flatten()
         .collect();
@@ -72,7 +78,8 @@ fn config() -> StreamConfig {
 
 /// Drive a render loop with a stream tap attached until `segments` have been published.
 ///
-/// Returns `None` when there is no GPU or no encoder, which is a skip and not a failure.
+/// Returns `None` when there is honestly no GPU and no encoder. Both are tripwired, so
+/// under a build that promised either, this is a failure rather than a skip (#182).
 fn publish(width: u32, height: u32, segments: u32) -> Option<Arc<LiveStream>> {
     publish_with(width, height, segments, None).map(|(state, _)| state)
 }
@@ -122,7 +129,13 @@ fn publish_with(
             sound(session);
         }
         if let StreamStatus::Failed(why) = state.status() {
-            eprintln!("no encoder here, skipping: {why}");
+            // An H.264 encoder is an ffmpeg capability, so it gets ffmpeg's tripwire: with
+            // `CASTAWAY_REQUIRE_FFMPEG` set the build has said it has one, and "there is no
+            // encoder" is then a build that lost a codec rather than a developer's box.
+            let _: Option<()> = pipeline::test_media::resolve(
+                &format!("opening an H.264 encoder for the output stream ({why})"),
+                None,
+            );
             return None;
         }
         if state.segment(segments).is_some() {
