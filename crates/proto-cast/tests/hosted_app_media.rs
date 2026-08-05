@@ -11,9 +11,9 @@
 //! somebody else's uptime — and the *shape* is identical, because the registry response
 //! is the captured one and the page loads the pinned SDK exactly as youtube.com/tv does.
 //!
-//! Needs `CASTAWAY_ELECTRON`, `CASTAWAY_CAST_RECEIVER_SDK` and `ffmpeg`, all of which the
-//! dev shell provides. Fails rather than skips when they are missing, for the reason in
-//! `receiver_sdk.rs`: a browser test that skips itself never runs.
+//! Needs `CASTAWAY_ELECTRON`, `CASTAWAY_CAST_RECEIVER_SDK` and `ffmpeg`, which the dev
+//! shell provides and the `cast-app-hosting` flake check supplies. With no browser at all
+//! it skips — audibly, on stderr, for the reason in `receiver_sdk.rs`.
 
 #![allow(clippy::unwrap_used)]
 // A test's own fixture server is not part of the receiver's network surface.
@@ -263,14 +263,11 @@ struct Report {
     media: Option<serde_json::Value>,
 }
 
-fn env(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
-        panic!(
-            "{name} is unset; run inside `nix develop`. This test measures whether a \
-                hosted Cast application actually plays, and skipping it silently would \
-                leave that unmeasured."
-        )
-    })
+/// The browser environment, or a reason there is none.
+fn browser_env() -> Option<(String, PathBuf)> {
+    let electron = std::env::var("CASTAWAY_ELECTRON").ok()?;
+    let sdk = std::env::var("CASTAWAY_CAST_RECEIVER_SDK").ok()?;
+    Some((electron, PathBuf::from(sdk)))
 }
 
 /// The whole path: a sender's `LAUNCH` resolves through the registry, the page comes up
@@ -278,8 +275,18 @@ fn env(name: &str) -> String {
 /// plays — with the application's own `MEDIA_STATUS` coming back out to the sender.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hosted_application_plays_real_media_and_answers_the_sender() {
-    let electron = env("CASTAWAY_ELECTRON");
-    let sdk = PathBuf::from(env("CASTAWAY_CAST_RECEIVER_SDK"));
+    let Some((electron, sdk)) = browser_env() else {
+        // Loud, and on stderr: a green run that never opened a browser must not read
+        // like a green run that did.
+        eprintln!(
+            "\n*** NOT RUN: the hosted-application media test needs a browser \
+             (CASTAWAY_ELECTRON / CASTAWAY_CAST_RECEIVER_SDK).\n\
+             *** Whether a hosted Cast application actually plays has not been measured. \
+             Run it with\n\
+             ***   nix develop -c cargo nextest run -p proto-cast -E 'binary(hosted_app_media)'\n"
+        );
+        return;
+    };
     let origin = Origin::start(sdk, media_file());
 
     // The receiver's own registry, pointed at this test's endpoint. Everything else
@@ -348,10 +355,30 @@ async fn a_hosted_application_plays_real_media_and_answers_the_sender() {
 
     // The browser, pointed at the page the registry named and at the platform port.
     let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../browser-host/cast-page-probe.js")
-        .canonicalize()
-        .expect("the page probe");
+        .join("../../browser-host/cast-page-probe.js");
+    // A panic rather than a skip, for the reason in `receiver_sdk.rs`: a configured
+    // browser with no probe is a broken environment, and skipping it is how a green run
+    // comes to mean nothing.
+    let probe = probe.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "CASTAWAY_ELECTRON is set but there is no probe at {}: {e}",
+            probe.display()
+        )
+    });
     let child = tokio::process::Command::new(&electron)
+        // Chromium's setuid/namespace sandbox cannot start inside the Nix build sandbox
+        // (`zygote_host_impl_linux.cc: Check failed: Invalid argument`). Dropping it is
+        // safe here and only here: the renderer's whole world is a local fixture server
+        // and a pinned script, and the alternative is a test that cannot run in CI.
+        .arg("--no-sandbox")
+        // No GPU and no compositor in the build sandbox; the page is rasterised on the
+        // CPU, which is all an offscreen probe needs.
+        .arg("--disable-gpu")
+        .arg("--disable-dev-shm-usage")
+        // No display server either. Ozone's headless platform is what lets Chromium
+        // initialise without one; without it Electron exits at `aura/env.cc: The
+        // platform failed to initialize`.
+        .arg("--ozone-platform=headless")
         .arg(&probe)
         .arg("--port")
         .arg(host.port().to_string())

@@ -289,7 +289,19 @@
               # them at runtime and fail on drift, which is what keeps the firewall
               # JSON in lock-step with the registry — so the sandbox must see them.
               || (pkgs.lib.hasSuffix "docs/network-surface.md" path)
-              || (pkgs.lib.hasSuffix "nix/network-surface.json" path);
+              || (pkgs.lib.hasSuffix "nix/network-surface.json" path)
+              # Everything under a `tests/fixtures` directory, whatever its extension.
+              # By path rather than by suffix on purpose: the per-extension list above
+              # fails *open* — a fixture whose type is not listed simply is not there,
+              # and a test that reads it does not fail, it reads nothing. The captured
+              # Cast registry responses (`.json`) were exactly that, and the rule that
+              # would have caught them is "a fixture is a fixture".
+              || (pkgs.lib.hasInfix "/tests/fixtures/" path)
+              # The Electron host and its probes. Not Cargo sources, but tests drive them
+              # as child processes, and without them those tests skip rather than fail —
+              # which is how the receiver-SDK tests came to pass in the sandbox without
+              # ever opening a browser (#16).
+              || (pkgs.lib.hasInfix "/browser-host/" path);
             name = "source";
           };
           strictDeps = true;
@@ -924,6 +936,42 @@
             });
             inherit (lavapipe) LD_LIBRARY_PATH WGPU_BACKEND VK_DRIVER_FILES CASTAWAY_REQUIRE_GPU;
             cargoExtraArgs = "--package pipeline --features kiosk";
+            partitions = 1;
+            partitionType = "count";
+          });
+
+          # The Cast app-hosting path against Google's own receiver SDK, and a hosted
+          # application playing real media (#16).
+          #
+          # A separate check because it needs a browser, which the ordinary `test`
+          # derivation has no reason to carry. Without it those two test binaries skip —
+          # audibly, on stderr, but they skip — and the only thing in the tree that can
+          # say whether the platform protocol is actually right would never run in CI.
+          #
+          # The SDK bundles are fetched by hash, never at test time, so this measures our
+          # implementation against a fixed oracle rather than against Google's uptime.
+          cast-app-hosting = craneLib.cargoNextest (commonArgs // {
+            cargoArtifacts = depsOnlyFrom cargoArtifacts (commonArgs // {
+              pname = "castaway-cast-app-hosting";
+              cargoExtraArgs = "--package proto-cast";
+            });
+            cargoExtraArgs = "--package proto-cast";
+            cargoNextestExtraArgs = "-E 'binary(receiver_sdk) + binary(hosted_app_media)'";
+            nativeBuildInputs = (commonArgs.nativeBuildInputs or [ ]) ++ [ pkgs.ffmpeg ];
+            CASTAWAY_ELECTRON = "${electronLinuxFor system}/bin/electron";
+            CASTAWAY_CAST_RECEIVER_SDK = import ./nix/cast-receiver-sdk.nix { inherit pkgs; };
+            # Electron rasterises offscreen; the same software GPU the pixel tests use.
+            inherit (lavapipe) LD_LIBRARY_PATH VK_DRIVER_FILES;
+            # Chromium wants somewhere to put its user-data directory and its runtime
+            # sockets. With neither it exits before `app.whenReady()` and prints nothing
+            # at all, which reads as "the probe produced no report".
+            preCheck = ''
+              export HOME="$TMPDIR/home"
+              export XDG_RUNTIME_DIR="$TMPDIR/xdg"
+              export XDG_CACHE_HOME="$TMPDIR/cache"
+              export XDG_CONFIG_HOME="$TMPDIR/config"
+              mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+            '';
             partitions = 1;
             partitionType = "count";
           });

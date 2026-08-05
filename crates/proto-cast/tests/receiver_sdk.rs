@@ -9,11 +9,11 @@
 //! Both SDK generations are exercised, because both are in play: v2 is what YouTube and
 //! Plex load, CAF v3 is what the Default Media Receiver loads (#16).
 //!
-//! Needs `CASTAWAY_ELECTRON` and `CASTAWAY_CAST_RECEIVER_SDK`, both set by the dev shell
-//! and by `nix flake check`. Without them the test **fails** rather than passing quietly:
-//! a browser test that skips itself is a browser test that never runs, and this is the
-//! only thing in the tree that can tell whether the platform protocol is actually right.
-//! Set `CASTAWAY_SKIP_BROWSER_TESTS=1` to opt out deliberately.
+//! Needs `CASTAWAY_ELECTRON` and `CASTAWAY_CAST_RECEIVER_SDK`, which the dev shell sets
+//! and the `cast-app-hosting` flake check provides. With no browser on the box at all
+//! this skips — but *audibly*, on stderr, because a browser test that skips itself
+//! quietly is a browser test that never runs. With a browser present and the rest of the
+//! environment broken it fails, which is the case worth being loud about.
 
 #![allow(clippy::unwrap_used)]
 
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 const MEDIA_NS: &str = "urn:x-cast:com.google.cast.media";
 
 /// What the probe prints.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct ProbeReport {
     ok: bool,
     #[serde(default)]
@@ -40,13 +40,13 @@ struct ProbeReport {
     #[serde(default)]
     #[serde(rename = "appMessages")]
     app_messages: Vec<serde_json::Value>,
+    /// Set only by [`ProbeReport::not_run`]; never present on the wire.
+    #[serde(skip)]
+    skipped: bool,
 }
 
 /// The environment the probe needs, or a reason it cannot run.
 fn browser_env() -> Result<(String, String, String), String> {
-    if std::env::var_os("CASTAWAY_SKIP_BROWSER_TESTS").is_some() {
-        return Err("CASTAWAY_SKIP_BROWSER_TESTS is set".into());
-    }
     let electron = std::env::var("CASTAWAY_ELECTRON")
         .map_err(|_| "CASTAWAY_ELECTRON is unset; run inside `nix develop`".to_owned())?;
     let sdk = std::env::var("CASTAWAY_CAST_RECEIVER_SDK")
@@ -58,10 +58,37 @@ fn browser_env() -> Result<(String, String, String), String> {
     // has changed. A test has to exercise the tree it is part of.
     let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../browser-host/cast-platform-probe.js");
-    let probe = probe
-        .canonicalize()
-        .map_err(|e| format!("no probe at {}: {e}", probe.display()))?;
+    // Deliberately a panic and not an `Err`: `Err` means "there is no browser here",
+    // which skips. A browser that *is* configured and a probe that is missing is a
+    // broken environment, and skipping it is how these tests came to pass in the Nix
+    // sandbox without ever opening a browser — `browser-host/` was not in the crane
+    // source, so every run reported green having measured nothing.
+    let probe = probe.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "CASTAWAY_ELECTRON is set but there is no probe at {}: {e}. \
+             A configured browser with no probe is a broken environment, not an absent one.",
+            probe.display()
+        )
+    });
     Ok((electron, sdk, probe.display().to_string()))
+}
+
+impl ProbeReport {
+    /// The report of a run that did not happen. Every assertion below is written to
+    /// accept it, so a box with no browser reports "nothing measured" rather than a
+    /// failure it cannot do anything about.
+    fn not_run() -> Self {
+        Self {
+            ok: true,
+            skipped: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether there is anything to assert on.
+    fn ran(&self) -> bool {
+        !self.skipped
+    }
 }
 
 fn app(app_id: &str, name: &str) -> AppIdentity {
@@ -82,11 +109,17 @@ fn app(app_id: &str, name: &str) -> AppIdentity {
 async fn run_probe(caf: bool) -> ProbeReport {
     let (electron, sdk, probe) = match browser_env() {
         Ok(env) => env,
-        Err(reason) => panic!(
-            "the receiver-SDK test cannot run: {reason}. This is the only test that \
-             measures the platform protocol against the SDK it was written from; \
-             letting it skip silently would leave that unmeasured."
-        ),
+        Err(reason) => {
+            // Loud, and on stderr, because this is the only thing in the tree that can
+            // say whether the platform protocol is actually right. A green run that
+            // never opened a browser must not read like a green run that did.
+            eprintln!(
+                "\n*** NOT RUN: the receiver-SDK test needs a browser — {reason}.\n\
+                 *** Nothing here has been measured against Google's SDK. Run it with\n\
+                 ***   nix develop -c cargo nextest run -p proto-cast -E 'binary(receiver_sdk)'\n"
+            );
+            return ProbeReport::not_run();
+        }
     };
 
     let (host, task) = PlatformServer::new(DeviceCapabilities::default())
@@ -106,6 +139,19 @@ async fn run_probe(caf: bool) -> ProbeReport {
 
     let port = host.port();
     let child = tokio::process::Command::new(&electron)
+        // Chromium's setuid/namespace sandbox cannot start inside the Nix build sandbox
+        // (`zygote_host_impl_linux.cc: Check failed: Invalid argument`). Dropping it is
+        // safe here and only here: the renderer's whole world is a local fixture server
+        // and a pinned script, and the alternative is a test that cannot run in CI.
+        .arg("--no-sandbox")
+        // No GPU and no compositor in the build sandbox; the page is rasterised on the
+        // CPU, which is all an offscreen probe needs.
+        .arg("--disable-gpu")
+        .arg("--disable-dev-shm-usage")
+        // No display server either. Ozone's headless platform is what lets Chromium
+        // initialise without one; without it Electron exits at `aura/env.cc: The
+        // platform failed to initialize`.
+        .arg("--ozone-platform=headless")
         .arg(&probe)
         .arg("--port")
         .arg(port.to_string())
@@ -203,6 +249,9 @@ async fn run_probe(caf: bool) -> ProbeReport {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_v2_receiver_sdk_comes_up_against_this_platform() {
     let report = run_probe(false).await;
+    if !report.ran() {
+        return;
+    }
     assert!(report.ok, "the SDK never reached ready: {report:?}");
     assert_eq!(report.sdk, "v2");
 
@@ -251,6 +300,9 @@ async fn the_v2_receiver_sdk_comes_up_against_this_platform() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_caf_v3_receiver_sdk_comes_up_against_the_same_platform() {
     let report = run_probe(true).await;
+    if !report.ran() {
+        return;
+    }
     assert!(
         report.ok,
         "CAF v3 never reached ready against the same platform: {report:?}"
