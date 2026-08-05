@@ -254,20 +254,21 @@ fn main() -> anyhow::Result<()> {
         // that has to answer "how far through is this" is built inside `serve`.
         let playback: Arc<dyn castaway_core::PlaybackReport> =
             Arc::new(render_pipeline.playback_handle());
-        // Taken here for the same reason, and it has to be one handle rather than two
-        // gains: the panel has one pair of speakers, so a level set over AVRCP is the
-        // level YouTube plays at (#86).
-        #[cfg(all(feature = "electron", feature = "audio"))]
-        let browser_gain = render_pipeline.gain();
-        // The panel starts where the operator said rather than at full scale. Set once,
-        // here, because `Gain` outlives every session — a level is the panel's, not a
-        // source's (#86).
+        // The panel starts where the operator said. Set once, here, because `Gain`
+        // outlives every session — a level is the panel's, not a source's (#86). The
+        // browser no longer needs a handle of its own: it writes into the mixer, and the
+        // mixer applies this to the sum (#111).
+        //
+        // Both numbers, because they are the two that are 30 dB apart in the middle and
+        // look alike written down (#85). A log with only the position cannot tell you the
+        // panel came up inaudible, which is exactly what it did not tell anyone (#178).
         #[cfg(feature = "audio")]
         {
             let start = castaway_core::Volume::from_position(config.initial_volume);
             render_pipeline.gain().set(start);
             info!(
                 position = config.initial_volume,
+                amplitude = start.amplitude(),
                 "output volume starts where the config says"
             );
         }

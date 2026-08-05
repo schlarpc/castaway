@@ -64,13 +64,13 @@ pub struct Config {
     /// Where the panel's output volume starts, as a slider position in `0.0..=1.0`.
     ///
     /// The panel has one pair of speakers and one volume ([`pipeline::audio_session::Gain`]),
-    /// and until this existed it began every boot at full scale — a panel that comes up at
-    /// maximum in a shared room is the failure this prevents, and it applied to everything
-    /// except Spotify, which had `initial_volume` of its own (#86).
+    /// and this is where that volume stands before any sender has said otherwise (#86).
     ///
     /// A *position*, not an amplitude: it is the number a person would set on a slider,
     /// and `Volume::from_position` puts the perceptual curve on it exactly as it does for
-    /// every sender's own scale.
+    /// every sender's own scale. Which is the trap worth stating here, because the two
+    /// scales look alike and are 30 dB apart in the middle: `0.5` is not half as loud, it
+    /// is −30 dBFS. See [`default_initial_volume`] for why the default is what it is.
     #[serde(default = "default_initial_volume")]
     pub initial_volume: f32,
     /// The remote-control web UI (#18).
@@ -1046,11 +1046,25 @@ impl Default for Enable {
 
 /// Where the panel's volume starts.
 ///
-/// Not full scale, deliberately. The same number Spotify's own `initial_volume` has
-/// always defaulted to, so the two agree: half a slider is loud enough to be obviously
-/// working and quiet enough that nobody in a shared room has to lunge for a remote.
+/// Full scale, and the reasoning that first said otherwise was inverted (#178).
+///
+/// Half a slider looks moderate and is not: the taper is 60 dB, so position 0.5 is
+/// −30 dBFS, and page audio — which joined `Gain` in the same week this default did —
+/// became inaudible. Nothing on the panel can undo that. The settings screen has one
+/// entry and it is the output device; the transport strip has no level; the remote UI
+/// (#18) has none. Until #168 puts a control on the glass, the only thing that can raise
+/// this receiver's volume is a sender that sends one.
+///
+/// So the two failures are not symmetric. Booting loud is obvious, and every sender that
+/// cares corrects it within seconds over its own protocol. Booting quiet is silent,
+/// indistinguishable from a broken receiver, and unrecoverable from the room the panel is
+/// in. This is the one that degrades safely.
+///
+/// Spotify's own `initial_volume` stays at 0.5 and is a different question — it applies
+/// per session, in librespot's `SoftMixer`, to a source that always arrives with a phone
+/// holding its slider.
 const fn default_initial_volume() -> f32 {
-    0.5
+    1.0
 }
 
 impl Default for Config {
