@@ -101,6 +101,19 @@
 //! - [`Supply::Tail`] — closed. What is in it is all there will ever be; it plays out at
 //!   device pace and the end of it is the end of a session, not a fault.
 //!
+//! ## What a frame count cannot say
+//!
+//! Every counter above is a number of frames, and a frame of silence weighs exactly what a
+//! frame of music does. A mix delivered at real time, drained without starvation and
+//! consumed by a device that never ran dry reads *identically* whether the samples in it
+//! are a song or zeros — which is how a page audible only at −30 dBFS spent a session
+//! looking like a mixer fault (#178).
+//!
+//! So the report also carries the loudest sample the device was given and the factor the
+//! volume applied to reach it. Signal that arrived and was then attenuated to nothing is a
+//! different fault from signal that never arrived, they are told apart by one subtraction
+//! in dB, and no count of frames distinguishes them at all.
+//!
 //! ## The device is the mixer's problem, not a session's
 //!
 //! A session cannot see a device error, because it no longer holds a device. When the sink
@@ -727,6 +740,16 @@ struct Shared {
     /// `emitted` far from 100% of real time is the device's clock misbehaving — the one
     /// remaining way this module can be wrong that no input-side counter would show.
     emitted: AtomicU64,
+    /// The loudest sample the device was given since the last report.
+    ///
+    /// Measured *after* [`Gain`], because the question it answers is what the speakers
+    /// got rather than what the mix held. Read against [`Gain::factor`] on the same line:
+    /// a peak far below the mix's own level says the volume ate it, and a peak of nothing
+    /// at all says no source ever had anything to attenuate.
+    ///
+    /// Held as `f32` bits under `fetch_max`, which is exact for non-negative floats —
+    /// IEEE-754 orders them identically to their bit patterns read as `u32`.
+    peak: AtomicU32,
     gain: Arc<Gain>,
     /// Frames the mixer has written to the device but the device has not played.
     ///
@@ -781,6 +804,7 @@ impl AudioMixer {
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
+            peak: AtomicU32::new(0),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -905,6 +929,7 @@ struct MixCounters<'a> {
     starved: &'a AtomicU64,
     idle: &'a AtomicU64,
     drained: &'a AtomicU64,
+    peak: &'a AtomicU32,
 }
 
 /// Execute a pass: pull up to `frames` from every input, sum, and apply the panel's
@@ -981,6 +1006,12 @@ fn mix_pass(
     // backend, where an out-of-range `f32` is anything from a clamp to a wrap.
     for sample in &mut mixed {
         *sample = sample.clamp(-1.0, 1.0);
+    }
+    // Last, so what is measured is exactly the samples the device is about to be handed —
+    // a peak taken before the gain would report the mix's ambition rather than its result.
+    if let Some(c) = counters {
+        let peak = mixed.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        c.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
     }
     mixed
 }
@@ -1128,6 +1159,7 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
                 starved: &shared.starved,
                 idle: &shared.idle,
                 drained: &shared.drained,
+                peak: &shared.peak,
             }),
         );
         shared.emitted.fetch_add(frames, Ordering::Relaxed);
@@ -1229,6 +1261,9 @@ fn report(
     let written = shared.written.swap(0, Ordering::Relaxed);
     let drained = shared.drained.swap(0, Ordering::Relaxed);
     let emitted = shared.emitted.swap(0, Ordering::Relaxed);
+    // Swapped with the rest, above the early return: a peak carried into the next window
+    // would report a sound that stopped as one still playing.
+    let peak = f32::from_bits(shared.peak.swap(0, Ordering::Relaxed));
     let underruns = sink.out.underruns().unwrap_or(0);
     let dry = underruns.saturating_sub(*last_underruns);
     *last_underruns = underruns;
@@ -1259,8 +1294,23 @@ fn report(
         emitted_pct = pct(emitted),
         device_dry = dry,
         inputs,
+        peak_dbfs = dbfs(peak),
+        amplitude = shared.gain.factor(),
         "mixer: audio the speakers did not get"
     );
+}
+
+/// A measured sample peak as dBFS, for a log line.
+///
+/// Not [`castaway_core::Volume`]: that type has no constructor from a bare amplitude and
+/// should not gain one (#85). This is a measurement of what samples *were*, not a level
+/// anyone set, and the two must not become interchangeable.
+fn dbfs(peak: f32) -> String {
+    if peak > 0.0 {
+        format!("{:.1}", peak.log10() * 20.0)
+    } else {
+        "-inf".to_owned()
+    }
 }
 
 /// Hand the mix to every tap.
@@ -1378,6 +1428,7 @@ mod tests {
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
+            peak: AtomicU32::new(0),
         })
     }
 
@@ -1401,12 +1452,19 @@ mod tests {
         starved: &'a AtomicU64,
         idle: &'a AtomicU64,
         drained: &'a AtomicU64,
+        peak: &'a AtomicU32,
     ) -> MixCounters<'a> {
         MixCounters {
             starved,
             idle,
             drained,
+            peak,
         }
+    }
+
+    /// What [`mix_pass`] recorded, as an amplitude.
+    fn measured(peak: &AtomicU32) -> f32 {
+        f32::from_bits(peak.load(Ordering::Relaxed))
     }
 
     // ---- classification -----------------------------------------------------------
@@ -1616,13 +1674,14 @@ mod tests {
         let starved = AtomicU64::new(0);
         let idle = AtomicU64::new(0);
         let drained = AtomicU64::new(0);
+        let peak = AtomicU32::new(0);
         let short = filled(vec![1.0; 4]);
         let mixed = mix_pass(
             &[short],
             4,
             Instant::now(),
             &Gain::default(),
-            Some(&counters(&starved, &idle, &drained)),
+            Some(&counters(&starved, &idle, &drained, &peak)),
         );
         assert_eq!(mixed, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
         assert_eq!(
@@ -1642,6 +1701,7 @@ mod tests {
         let starved = AtomicU64::new(0);
         let idle = AtomicU64::new(0);
         let drained = AtomicU64::new(0);
+        let peak = AtomicU32::new(0);
         let quiet = state_with(Ring {
             last_fed: Some(Instant::now() - STALE_AFTER * 4),
             samples: VecDeque::new(),
@@ -1653,7 +1713,7 @@ mod tests {
             480,
             Instant::now(),
             &Gain::default(),
-            Some(&counters(&starved, &idle, &drained)),
+            Some(&counters(&starved, &idle, &drained, &peak)),
         );
         assert_eq!(mixed, vec![0.5; 960], "the playing source is untouched");
         assert_eq!(
@@ -1670,6 +1730,7 @@ mod tests {
         let starved = AtomicU64::new(0);
         let idle = AtomicU64::new(0);
         let drained = AtomicU64::new(0);
+        let peak = AtomicU32::new(0);
         let state = state_with(Ring {
             last_fed: Some(Instant::now()),
             samples: vec![1.0; 8].into(),
@@ -1680,7 +1741,7 @@ mod tests {
             8,
             Instant::now(),
             &Gain::default(),
-            Some(&counters(&starved, &idle, &drained)),
+            Some(&counters(&starved, &idle, &drained, &peak)),
         );
         // The tail plays out — at the end of the pass, deferred like any shortfall.
         assert_eq!(
@@ -1740,6 +1801,7 @@ mod tests {
         let starved = AtomicU64::new(0);
         let idle = AtomicU64::new(0);
         let drained = AtomicU64::new(0);
+        let peak = AtomicU32::new(0);
         // No mixer thread: this asserts an identity, so a second drainer racing the
         // arithmetic would make it assert nothing.
         let state = state_with(Ring::default());
@@ -1764,7 +1826,7 @@ mod tests {
             500,
             Instant::now(),
             &shared.gain,
-            Some(&counters(&starved, &idle, &drained)),
+            Some(&counters(&starved, &idle, &drained, &peak)),
         );
         let took = drained.load(Ordering::Relaxed);
         let left = state.ring.lock().unwrap().samples.len() as u64 / u64::from(CHANNELS);
@@ -1774,6 +1836,55 @@ mod tests {
             took + shed + left,
             "written={written} took={took} shed={shed} left={left}"
         );
+    }
+
+    /// The measurement no frame count can make (#178).
+    ///
+    /// Perfect flow — every frame written, drained and emitted at real time, nothing
+    /// starved and nothing shed — is what a page attenuated to −30 dBFS looks like *and*
+    /// what a page handing over digital silence looks like. They were the same log line
+    /// for a session. Separating them is this counter's whole job, which is why it is
+    /// taken after the gain and why "quiet" and "nothing" must not read alike.
+    #[test]
+    fn the_report_says_whether_the_speakers_got_signal_or_only_frames() {
+        /// One pass over one full input, answering with the peak it recorded.
+        fn pass(gain: &Gain, samples: Vec<f32>) -> f32 {
+            let (starved, idle) = (AtomicU64::new(0), AtomicU64::new(0));
+            let (drained, peak) = (AtomicU64::new(0), AtomicU32::new(0));
+            let frames = samples.len() as u64 / u64::from(CHANNELS);
+            let _ = mix_pass(
+                &[filled(samples)],
+                frames,
+                Instant::now(),
+                gain,
+                Some(&counters(&starved, &idle, &drained, &peak)),
+            );
+            measured(&peak)
+        }
+
+        let unity = Gain::default();
+        assert_eq!(pass(&unity, vec![1.0; 8]), 1.0);
+        assert_eq!(dbfs(pass(&unity, vec![1.0; 8])), "0.0", "full scale");
+
+        // Digital silence at full volume: the source has nothing, and the line has to be
+        // able to say so rather than looking like a healthy 100% of real time.
+        assert_eq!(pass(&unity, vec![0.0; 8]), 0.0);
+        assert_eq!(dbfs(pass(&unity, vec![0.0; 8])), "-inf", "nothing at all");
+
+        // The #178 reading, exactly: full-scale audio arriving, half a slider of a 60 dB
+        // taper applied to it, and a mix that measures 30 dB down.
+        let half = Gain::default();
+        half.set(Volume::from_position(0.5));
+        assert_eq!(
+            dbfs(pass(&half, vec![1.0; 8])),
+            "-30.0",
+            "signal that arrived and was attenuated is not signal that never arrived"
+        );
+
+        // Mute is the same mechanism, so it reads as the same measurement.
+        let muted = Gain::default();
+        muted.set_muted(true);
+        assert_eq!(dbfs(pass(&muted, vec![1.0; 8])), "-inf");
     }
 
     // ---- the whole machine, against real-time devices -----------------------------
