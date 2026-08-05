@@ -62,9 +62,10 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 
 ## 2. The harness
 
-### The 23 checks
+### The 16 checks
 
-`nix flake check` runs **all 15** checks (23 before D55 collapsed the per-feature ones).
+`nix flake check` runs **all 16** checks (23 before D55 collapsed the per-feature
+ones; `moonlight-bindings` was added after, closing half of #191).
 There is no opt-in tier inside `checks` — nothing is gated behind an env var or a separate
 invocation.
 
@@ -93,13 +94,19 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `matter-vm` | 2-node; panel from **the real NixOS module**; peer is our own `matter-peer` | T2 | 74m |
 | `gamestream-vm` | 2-node; peer is **real nixpkgs `sunshine`**; neither node runs castaway or the module | **T3** | 71m |
 | `bluetooth-vm` | 1 node, `hci_vhci` + btvirt; peer is **real BlueZ**; receiver launched ad-hoc, **not** via the module | T2 | 75m |
-| `audio` | `-p pipeline --features audio,ldac` | T0 signal | 58m |
-| `render-pixels` | `-p pipeline --features kiosk`, lavapipe, `CASTAWAY_REQUIRE_GPU=1` | T1 pixels | 74m |
-| `media-plane` | `--package castaway --features render --test dlna_media_plane`, lavapipe | T1 pixels | 83m |
-| `media-plane-clippy` | clippy only, `--features render --all-targets` | — | 82m |
-| `hwaccel-clippy` | **clippy only**, `--features hwaccel` | — | 60m |
 | `ldac-bindings` | regenerate `ldac-sys/src/bindings.rs` with bindgen and `diff -u` | T3 | 3m |
-| `castaway-windows-{,render-,hwaccel-,electron-}dll-closure` | cross-build + static import-table closure (×4) | T2 | 51–70m |
+| `moonlight-bindings` | the same for `moonlight-sys/src/bindings.rs` against the pinned `Limelight.h` | T3 | <1m |
+| `castaway-windows-electron-dll-closure` | cross-build + static import-table closure | T2 | 51–70m |
+
+**Gone in D55**, and worth knowing where their coverage went, because the names appear
+throughout the per-protocol matrices below: `audio`, `render-pixels`, `media-plane`,
+`media-plane-clippy`, `hwaccel-clippy` and three of the four Windows closures were each a
+fragment bolted on to reach past a default feature set that is no longer a subset of
+anything. They collapsed into `test`, `clippy` and the single Windows closure, which now
+build the shipped configuration. What each of them *asserted* is unchanged and still runs
+— `render-pixels`' lavapipe adapter and `CASTAWAY_REQUIRE_GPU`, `audio`'s ffmpeg CLI and
+`CASTAWAY_REQUIRE_FFMPEG`, and `media-plane`'s `dlna_media_plane` target are all inside
+`test` now.
 
 Two structural notes on the attrset:
 

@@ -9,14 +9,15 @@
 //! `src/bindings.rs` is **pregenerated and checked in**, pinned to the same revision the
 //! Nix derivation builds (`nix/moonlight-common-c.nix`).
 //!
-//! **There is no drift guard.** This comment used to claim a `moonlight-bindings` flake
-//! check regenerates the file and fails on any diff — no such check exists (`ldac-bindings`
-//! is the only bindings check in the tree). The compile-time size/offset assertions inside
-//! the generated file are *self-referential*: bindgen produced both the struct and the
-//! assertion from the same header, so they catch a hand-edit or a target-ABI change and
-//! never upstream header drift. A revision bump that changes `STREAM_CONFIGURATION`'s
-//! layout would land silently and corrupt a live session's parameters. Porting
-//! `nix/ldac-bindings.nix` is the fix; tracked in its own issue.
+//! The drift guard is `checks.moonlight-bindings` (`nix/moonlight-bindings.nix`), which
+//! regenerates this file from the pinned header and fails on any diff. It exists because
+//! the compile-time size/offset assertions *inside* the generated file are
+//! **self-referential**: bindgen produced both the struct and the assertion from the same
+//! header, so they catch a hand-edit or a target-ABI change and can never catch upstream
+//! drift — a revision bump that moved a field inside `STREAM_CONFIGURATION` changes
+//! neither of them, only the library the struct is passed to. That failure is not a
+//! compile error and not a link error; it is a live session reading its parameters from
+//! the wrong offsets (#191).
 //!
 //! Everything here is `unsafe extern "C"`; the safe boundary is
 //! `proto_gamestream::stream`, which is the only permitted consumer (rule 8: FFI surface

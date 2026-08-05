@@ -217,11 +217,14 @@ impl PipeWireAudioOut {
         let lost = Arc::clone(&self.lost);
         lost.store(false, Ordering::Relaxed);
 
+        let request = StreamRequest {
+            selection,
+            sample_rate,
+            channels,
+        };
         std::thread::spawn(move || {
             run_stream(
-                &selection,
-                sample_rate,
-                channels,
+                &request,
                 samples_rx,
                 quit_rx,
                 &ready_tx,
@@ -307,19 +310,27 @@ impl AudioOut for PipeWireAudioOut {
     }
 }
 
+/// Which sink, at what shape. One value rather than three loose arguments because the
+/// three are only ever passed together, and because a `(u32, u16)` pair passed positionally
+/// through two call layers is a sample rate and a channel count that can be swapped without
+/// the compiler minding.
+struct StreamRequest {
+    selection: OutputSelection,
+    sample_rate: u32,
+    channels: u16,
+}
+
 /// Own the main loop and the stream for one session, on this thread, until told to
 /// quit. The other half of [`PipeWireAudioOut::start`].
 fn run_stream(
-    selection: &OutputSelection,
-    sample_rate: u32,
-    channels: u16,
+    request: &StreamRequest,
     samples: Receiver<Vec<f32>>,
     quit: pipewire::channel::Receiver<()>,
     ready: &SyncSender<Result<(), String>>,
     counters: &crate::audio_out::StreamCounters,
     lost: &Arc<AtomicBool>,
 ) {
-    match open_stream(selection, sample_rate, channels, samples, counters, lost) {
+    match open_stream(request, samples, counters, lost) {
         Ok((mainloop, _stream, _listener)) => {
             // `stop()` reaches this thread through the channel; quitting the loop ends
             // this scope, and everything the stream owns unwinds with it. Attached
@@ -353,9 +364,7 @@ struct StreamData {
 /// thread — none of these types are `Send`, which is exactly why the thread owns them.
 #[allow(clippy::type_complexity)]
 fn open_stream(
-    selection: &OutputSelection,
-    sample_rate: u32,
-    channels: u16,
+    request: &StreamRequest,
     samples: Receiver<Vec<f32>>,
     counters: &crate::audio_out::StreamCounters,
     lost: &Arc<AtomicBool>,
@@ -367,6 +376,12 @@ fn open_stream(
     ),
     String,
 > {
+    let &StreamRequest {
+        ref selection,
+        sample_rate,
+        channels,
+    } = request;
+
     pipewire::init();
     let mainloop =
         pipewire::main_loop::MainLoop::new(None).map_err(|e| format!("pipewire main loop: {e}"))?;

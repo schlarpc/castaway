@@ -954,6 +954,19 @@
             ldacbt = ldacbtFor system;
           };
 
+          # The same guard for the other linked C library, and against a different
+          # failure. moonlight-common-c *does* ship a header, and the generated file
+          # carries bindgen's layout assertions — but bindgen wrote both the struct and
+          # the assertion from the same header, so they are self-referential and cannot
+          # see upstream drift. A revision bump that moved a field inside
+          # `STREAM_CONFIGURATION` would compile, link, and hand a live session its
+          # parameters from the wrong offsets (#191).
+          moonlight-bindings = import ./nix/moonlight-bindings.nix {
+            inherit pkgs;
+            rustToolchain = rustToolchainFor system;
+            moonlightCommonC = moonlightCommonCFor system;
+          };
+
 
 
 
