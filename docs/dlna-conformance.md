@@ -117,6 +117,41 @@ still never been observed on a real Windows box.
   that MIME. So G80's enumeration should grow only as the decoder does. A `video/*` glob
   has *no defined obligation set*, which is why no certified device publishes one.
 
+## Divergences we choose, and why
+
+Distinct from the section above: those are places the spec and reality disagree, these are
+places **we** disagree with the spec on purpose. An unrecorded divergence is the thing this
+document exists to prevent, so each is written down with its cost.
+
+### `MX` is parsed and discarded — we reply immediately
+
+UDA 1.0 §1.2.3 asks a device to wait a random `0..MX` seconds before answering `M-SEARCH`,
+so that a search on a LAN full of devices does not produce a simultaneous reply storm that
+overruns the searcher's receive buffer. We parse `MX` (`SsdpRequest::Search { mx, .. }`)
+and answer straight away.
+
+**Why.** The storm is a property of the *population*, not of any one device. It is a
+hundred UPnP devices answering one probe; this panel is one responder on a hackerspace LAN,
+and the datagram it would be colliding with is its own. Spreading our single reply over up
+to five seconds buys nothing and costs the thing that actually matters here — a control
+point that lists devices as they answer shows this one late, or times out its own window
+first. `SsdpResponse::search_ok` is also sent per matching target, so a `MediaRenderer`
+answers a `ssdp:all` search several times; delaying each independently would smear one
+device's arrival across the whole window.
+
+**What it would cost to comply**, if the panel ever ships somewhere dense: a random delay
+per reply and a test on the distribution rather than on the delay, because a test that
+asserts "slept at least once" passes on a constant. The responder is single-tasked
+(`run`'s `select!` owns the socket), so the delay has to be a scheduled send rather than a
+sleep in the handler — a sleep there stops the ticker and every other search for its
+duration, which is a worse failure than the one being fixed.
+
+**Not observed to matter.** No control point in the compatibility list is known to depend
+on it, and the failure it prevents has never been seen here. That is a reason to record the
+divergence rather than to close the question.
+
+---
+
 ## Claims the review made and then withdrew
 
 Kept because both readings sounded plausible, and only the primary source settled them.
