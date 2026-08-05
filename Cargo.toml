@@ -18,6 +18,7 @@ members = [
     "crates/proto-spotify",
     "crates/crypto-cast-auth",
     "crates/cast-replay",
+    "crates/cast-registry",
     "crates/substrate-rtp",
     "crates/substrate-rtsp",
     "crates/crypto-fairplay",
@@ -64,6 +65,7 @@ hci-transport = { path = "crates/hci-transport" }
 substrate-rtp = { path = "crates/substrate-rtp" }
 crypto-cast-auth = { path = "crates/crypto-cast-auth" }
 cast-replay = { path = "crates/cast-replay" }
+cast-registry = { path = "crates/cast-registry" }
 crypto-fairplay = { path = "crates/crypto-fairplay" }
 crypto-raop = { path = "crates/crypto-raop" }
 crypto-playfair = { path = "crates/crypto-playfair" }

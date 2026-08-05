@@ -1,0 +1,29 @@
+[package]
+name = "cast-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Cast application registry: resolving an appId to the receiver page that serves it, with the disk cache an unattended panel needs."
+
+[dependencies]
+castaway-paths.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+# The lookup: blocking, driven from `spawn_blocking`, exactly as `cast-replay`
+# fetches its credential. One dependency, one shape, one thing to audit.
+ureq.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

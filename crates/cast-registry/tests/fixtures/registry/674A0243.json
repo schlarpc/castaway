@@ -1,0 +1,2 @@
+)]}'
+{"resolution_height":0,"external":true,"native_app":true,"android_package":"com.google.android.apps.mediashell","whitelisting":{"trusted_cast_app":true},"uses_ipc":true,"display_name":"Screen Mirroring","app_id":"674A0243","command_line":"/bin/logwrapper /chrome/v2mirroring --vmodule=*media/cast/*=1,*=0 ${POST_DATA}"}

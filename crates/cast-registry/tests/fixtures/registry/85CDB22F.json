@@ -1,0 +1,2 @@
+)]}'
+{"resolution_height":0,"external":true,"native_app":true,"whitelisting":{"trusted_cast_app":true},"uses_ipc":true,"display_name":"Chrome Audio Mirroring","app_id":"85CDB22F","command_line":"/bin/logwrapper /chrome/v2mirroring --vmodule=*media/cast/*=1,*=0 ${POST_DATA}"}
