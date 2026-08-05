@@ -325,8 +325,7 @@ mod tests {
             rate,
             &crate::audio_decode::tests::sine(rate, 44_100),
         );
-        if frames.is_empty() {
-            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+        if !crate::test_media::available("an SBC encoder", !frames.is_empty()) {
             return;
         }
 

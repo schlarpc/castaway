@@ -2019,14 +2019,17 @@ mod tests {
     use super::*;
 
     /// Skip GPU tests gracefully if no adapter is available in this environment.
+    /// Open an offscreen compositor, or leave — honouring `CASTAWAY_REQUIRE_GPU`.
+    ///
+    /// This used to skip on its own, without consulting the tripwire, which made these
+    /// five the *least* protected tests in the crate rather than the most: they are the
+    /// only ones that assert exact RGBA at named coordinates, and an ICD path that stopped
+    /// resolving would have turned every one of them green having drawn nothing (#182).
     macro_rules! compositor_or_skip {
         ($w:expr, $h:expr) => {
-            match WgpuCompositor::new_offscreen($w, $h) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("skipping GPU test: {e}");
-                    return;
-                }
+            match crate::test_gpu::compositor($w, $h) {
+                Some(c) => c,
+                None => return,
             }
         };
     }

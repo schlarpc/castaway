@@ -677,9 +677,15 @@
           # session of silence (#14) — and its tests are the only ones that decode LDAC at
           # all, so leaving them out of `nix flake check` would mean the endpoint's
           # correctness rested on somebody remembering to pass a feature flag.
+          # `pkgs.ffmpeg_7` is in *both* lists, for the reason spelled out at `mediaPlaneArgs`
+          # below: `buildInputs` gets the libraries, `nativeBuildInputs` gets the **binary**
+          # on `PATH`. `commonArgs` sets `strictDeps = true`, so without the second entry the
+          # decode tests that shell out to make a clip take their skip branch and report
+          # `ok` — which is what they did until 2026-08-05 (#182). That silently covered the
+          # one feature this check exists to protect against failing silently.
           audioArgs = {
             cargoExtraArgs = "--package castaway --features audio-out,ldac";
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.ffmpeg_7 ];
             buildInputs = [ pkgs.ffmpeg_7 pkgs.alsa-lib (ldacbtFor system) ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
@@ -855,6 +861,11 @@
               cargoExtraArgs = audioArgs.cargoExtraArgs;
             });
             inherit (audioArgs) nativeBuildInputs buildInputs LIBCLANG_PATH BINDGEN_EXTRA_CLANG_ARGS LDACBT_LIB_DIR;
+            # This build has ffmpeg and its codecs, so a test that cannot make a clip or
+            # open an encoder is a broken check rather than an honest skip. Without this
+            # the decode tests skipped and reported `ok` (#182) — in the one check whose
+            # entire purpose is that a missing decoder fails silently.
+            CASTAWAY_REQUIRE_FFMPEG = "1";
             cargoExtraArgs = "--package pipeline --features audio,ldac";
           });
 

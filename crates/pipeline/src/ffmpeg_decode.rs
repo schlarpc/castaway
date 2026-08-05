@@ -655,9 +655,11 @@ fn tag(ictx: &ffmpeg::format::context::Input, key: &str) -> Option<String> {
 
 /// A stream timestamp in its own time base, as a [`Duration`].
 ///
-/// Only the audio half needs it — video timestamps go through [`frame_pts`] — so it is
-/// gated with the audio half rather than left as dead code in a video-only build.
-#[cfg(feature = "audio")]
+/// This was once `#[cfg(feature = "audio")]`, on the reasoning that only the audio half
+/// needs it. It does not: the video pacing path calls it too, so an `ffmpeg`-without-`audio`
+/// build did not compile at all. No check built that combination, so it went unnoticed
+/// (#180) — the cfg is gone rather than widened, because four lines of arithmetic are not
+/// worth a feature gate.
 fn rescale_to_duration(pts: i64, time_base: ffmpeg::Rational) -> Duration {
     let seconds = f64::from(time_base) * pts as f64;
     Duration::from_secs_f64(seconds.max(0.0))
@@ -1317,13 +1319,12 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .ok()?;
-        status.success().then_some(path)
+        crate::test_media::resolve("a test clip", status.success().then_some(path))
     }
 
     #[test]
     fn decodes_testsrc_to_rgba_frames() {
         let Some(path) = make_test_clip("decodes-to-rgba") else {
-            eprintln!("skipping: ffmpeg CLI not available to make a test clip");
             return;
         };
         let mut frames = 0usize;
@@ -1365,7 +1366,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .ok()?;
-        status.success().then_some(path)
+        crate::test_media::resolve("a raw H.264 test stream", status.success().then_some(path))
     }
 
     /// Split that elementary stream into the per-frame units an adapter would hand us.
@@ -1403,7 +1404,6 @@ mod tests {
     #[test]
     fn stream_decode_turns_pushed_frames_into_rgba() {
         let Some(path) = make_test_stream("stream-decode") else {
-            eprintln!("skipping: ffmpeg CLI not available to make a test stream");
             return;
         };
         let mut input = encoded_frames(&path).into_iter();

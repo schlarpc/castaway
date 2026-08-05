@@ -124,6 +124,8 @@ pub mod tap;
 /// be one" (#98). In the library because the tests that use it live in two crates.
 #[cfg(feature = "render")]
 pub mod test_gpu;
+/// The same, for ffmpeg (#182). Ungated: the checks that need it do not turn on `render`.
+pub mod test_media;
 #[cfg(feature = "render")]
 pub mod text;
 // Not gated behind `render`, unlike every other drawing module: `ThemeChoice` is a field

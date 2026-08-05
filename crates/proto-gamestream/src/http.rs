@@ -185,3 +185,60 @@ impl ServerCertVerifier for PinnedServerCert {
             .supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// The pinned verifier's *negative* branch, which nothing else exercises (#191).
+    ///
+    /// `checks.gamestream-vm` proves the positive case against real Sunshine, and only
+    /// ever presents the certificate we paired with — so a refactor that inverted this
+    /// comparison, or short-circuited it to `Ok`, would pass every check in the tree while
+    /// removing the entire security boundary of a paired session. Byte equality is the
+    /// whole check by design, which makes it exactly the kind of thing that looks
+    /// redundant to a later reader.
+    fn verifier(expected: &[u8]) -> PinnedServerCert {
+        PinnedServerCert {
+            expected: expected.to_vec(),
+        }
+    }
+
+    fn verify(v: &PinnedServerCert, presented: &[u8]) -> Result<ServerCertVerified, rustls::Error> {
+        v.verify_server_cert(
+            &CertificateDer::from(presented.to_vec()),
+            &[],
+            &ServerName::try_from("192.0.2.1").unwrap(),
+            &[],
+            UnixTime::now(),
+        )
+    }
+
+    #[test]
+    fn the_certificate_pairing_pinned_is_accepted() {
+        let pinned = b"the host certificate we stored at pairing";
+        assert!(verify(&verifier(pinned), pinned).is_ok());
+    }
+
+    #[test]
+    fn any_other_certificate_is_refused() {
+        let pinned = b"the host certificate we stored at pairing";
+        let err = verify(&verifier(pinned), b"somebody else's certificate")
+            .expect_err("a substituted certificate must not verify");
+        assert!(
+            format!("{err}").contains("does not match the one pairing pinned"),
+            "the error should name why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_of_the_pinned_certificate_is_not_close_enough() {
+        // Guards against a comparison that ever becomes `starts_with` or a length-limited
+        // memcmp: a truncated presentation is a different certificate, not a partial match.
+        let pinned = b"the host certificate we stored at pairing";
+        assert!(verify(&verifier(pinned), &pinned[..pinned.len() - 1]).is_err());
+        assert!(verify(&verifier(pinned), b"").is_err());
+    }
+}

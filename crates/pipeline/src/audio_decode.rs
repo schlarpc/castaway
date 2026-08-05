@@ -706,8 +706,7 @@ pub(crate) mod tests {
         let rate = 44_100;
         let pcm = sine(rate, 44_100);
         let frames = encode(AudioCodec::AptX, rate, &pcm);
-        if frames.is_empty() {
-            eprintln!("this ffmpeg build has no aptX encoder; skipping");
+        if !crate::test_media::available("an aptX encoder", !frames.is_empty()) {
             return;
         }
 
@@ -770,8 +769,7 @@ pub(crate) mod tests {
         let rate = 44_100;
         let pcm = sine(rate, 44_100);
         let frames = encode(AudioCodec::Sbc, rate, &pcm);
-        if frames.is_empty() {
-            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+        if !crate::test_media::available("an SBC encoder", !frames.is_empty()) {
             return;
         }
         let mut decoded = Vec::new();
@@ -860,8 +858,7 @@ pub(crate) mod tests {
         // required to support, so this runs on any build that can decode anything.
         let rate = 44_100;
         let frames = encode(AudioCodec::Sbc, rate, &sine(rate, 44_100));
-        if frames.is_empty() {
-            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+        if !crate::test_media::available("an SBC encoder", !frames.is_empty()) {
             return;
         }
 
@@ -940,8 +937,7 @@ pub(crate) mod tests {
         // Resampling (see `crate::resample`) is what stops the refusal happening at all.
         let rate = 44_100;
         let frames = encode(AudioCodec::Sbc, rate, &sine(rate, rate as usize / 4));
-        if frames.is_empty() {
-            eprintln!("this ffmpeg build has no SBC encoder; skipping");
+        if !crate::test_media::available("an SBC encoder", !frames.is_empty()) {
             return;
         }
 
@@ -1078,8 +1074,7 @@ pub(crate) mod tests {
 
         let rate = 44_100;
         let frames = encode(AudioCodec::AptX, rate, &sine(rate, rate as usize));
-        if frames.is_empty() {
-            eprintln!("this ffmpeg build has no aptX encoder; skipping");
+        if !crate::test_media::available("an aptX encoder", !frames.is_empty()) {
             return;
         }
 

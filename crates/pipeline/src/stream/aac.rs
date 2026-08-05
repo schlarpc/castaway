@@ -388,13 +388,16 @@ mod tests {
     use super::*;
 
     fn encoder() -> Option<AacEncoder> {
-        match AacEncoder::open(RATE, 128_000) {
-            Ok(e) => Some(e),
-            Err(e) => {
-                eprintln!("no AAC encoder here, skipping: {e}");
-                None
-            }
-        }
+        crate::test_media::resolve(
+            "an AAC encoder",
+            match AacEncoder::open(RATE, 128_000) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("AAC encoder open failed: {e}");
+                    None
+                }
+            },
+        )
     }
 
     /// A frame of a 440 Hz tone, so the encoder has something other than silence to chew

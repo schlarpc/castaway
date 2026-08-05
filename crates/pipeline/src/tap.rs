@@ -261,8 +261,7 @@ mod integration {
     /// A screenshot of a real composited frame, through the whole seam.
     #[test]
     fn a_tap_captures_what_was_actually_composited() {
-        let Ok(mut compositor) = WgpuCompositor::new_offscreen(64, 32) else {
-            eprintln!("no GPU adapter here; skipping");
+        let Some(mut compositor) = crate::test_gpu::compositor(64, 32) else {
             return;
         };
         // A solid magenta layer, so the captured pixels are unmistakable and a channel
@@ -289,7 +288,27 @@ mod integration {
             .try_recv()
             .expect("the tap should have been served")
             .expect("png encoding should succeed");
-        assert_eq!(&png[1..4], b"PNG");
+
+        // Decode it. Asserting the signature bytes — which is all this did until
+        // 2026-08-05 (#203) — cannot fail on any of the ways this actually breaks: a
+        // channel swap, a black surface, a readback of the wrong texture, or a row-stride
+        // slip all encode into a perfectly well-formed PNG. The comment above about a
+        // channel swap being "obvious" was only true if somebody looked at the file.
+        let decoded = image::load_from_memory(&png)
+            .expect("the bytes we hand a browser must decode as an image")
+            .to_rgba8();
+        assert_eq!(
+            decoded.dimensions(),
+            (64, 32),
+            "the screenshot must be the size of the surface"
+        );
+        for (x, y) in [(0, 0), (63, 31), (32, 16)] {
+            assert_eq!(
+                decoded.get_pixel(x, y).0,
+                [0xff, 0x00, 0xff, 0xff],
+                "composited magenta must survive the readback and the encode at ({x}, {y})"
+            );
+        }
 
         // …and a second pump must not read back again: the tap retired itself.
         rloop.pump();
