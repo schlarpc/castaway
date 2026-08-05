@@ -678,35 +678,48 @@ assertions is mostly wiring.
 
 ## 5. Consolidated gap ranking
 
-Ranked by expected cost of the failure it hides, weighted by how cheaply it closes.
+Ranked by expected cost of the failure it hides, weighted by how cheaply it closes. Every row
+was filed on 2026-08-05; where an open issue already covered the gap, the finding was added
+there as a comment rather than duplicated.
 
 | # | Gap | Cheapest close | Issue |
 |---|---|---|---|
-| 1 | **`-p pipeline --features ffmpeg` does not compile on `main`** | move `rescale_to_duration` out of the `audio` cfg | file |
-| 2 | **140 tests never compiled by any check**, incl. the whole stream/HLS, WebRTC, hwaccel, adblock and `media_url_av` sets | 3 new checks: `stream-plane`, `remote-plane`, `browser-plane`; widen `audio` to `+render`; add `ffmpeg` to `render-pixels` | #98 recurring — file |
-| 3 | **No automated test uses a real Cast sender** — both defects that reached users were found by hand | nixosTest with headless chromium over CDP; the recipe exists | file |
-| 4 | **`bluetooth-vm` does not test A2DP** despite its name and comments | `bluetoothctl pair/connect` + `paplay` + btmon assertions + cross-correlate decoded PCM | file |
-| 5 | **AirPlay media never crosses a LAN in CI** | package `cliraop` into the sender node; `airplay-research.md` §6.1 specifies it | file |
-| 6 | **GameStream: nothing between `/launch` and pixels has ever run**, incl. FEC and A/V pacing — D37's stated reasons for linking | virtual display on the Sunshine host + a streaming `gs-probe` + netem | **untracked** since #33 closed — file |
-| 7 | **No signal-level assertion in any VM test**; the two that exist are cargo-tier | per-codec cross-correlation; per-frame luma for Miracast; decode AirPlay payloads | file |
-| 8 | **AAC has no decode test** — the codec every iPhone picks, advertised 4th | extend `audio_decode.rs`'s codec list; the fixture already exists | #14-adjacent |
-| 9 | **AirPlay timing is dead code in the field** — mirroring sessions never probe | a T1 test binding the declared `timing_port` | **#176** |
-| 10 | **`av_skew_ms` has no asserted bound at any tier**, and reads 17 hours | assert a bound in the existing mirroring T1 test | **#79** |
-| 11 | **Spotify `pump_events` and `run()` — ~375 lines, zero tests**, both local and closable | scripted `PlayerEvent` vectors; injectable starter + `tokio::time::pause()` | file |
-| 12 | **Miracast M13 has never fired** — WFD's only loss recovery, and D35's justification | induce loss in the hwsim medium | **#17**-adjacent |
-| 13 | **Miracast UIBC socket half untested** — exactly #125's shape, fixed with no regression test | scripted source offering a UIBC port | #125 reopen |
-| 14 | **MICE vendor extension not wired**, so Windows falls back to the P2P path MICE exists to escape | install the WSC extension; assert it in the probe response | **#166** empty body — reopen |
-| 15 | **Matter: endpoint tree + every cluster but one unexecuted**; `node.rs` has zero tests | extend `matter-peer`; then a `home-assistant-chip-core` peer for real T3 | **#172**-adjacent |
-| 16 | **`control-display` is vacuous over a wrong-shaped encoder** | correct the frame shape first, then a TCP fake panel on 4661 | **#21** |
-| 17 | **Mixer real-time guarantees rest on a wall-clock-derived fake**; #174/#175/#177 all live here | dummy PipeWire sink in a VM so `mixer_real_device.rs` runs | #174/#175/#177 |
-| 18 | **#55's recovery half untested** — the failing-then-succeeding device | a 30-line test | **#55** |
-| 19 | **No whole-frame render comparison anywhere** | golden PNGs, mean abs error ≤2/255, diff on failure | file |
-| 20 | **Silent skips**: `audio`'s ffmpeg CLI, the untripwired pixel tests, `output_stream`'s skip-pass | `nativeBuildInputs`; route through `test_gpu`; a `CASTAWAY_REQUIRE_FFMPEG` tripwire | file |
-| 21 | **DLNA's six "do not fix" conformance rows have no test** | a `conformance.rs` quoting the citations; ~40 lines | file |
-| 22 | **No DLNA/DIAL third-party control point** anywhere | `gupnp-tools` in the sender VM; ~30 lines of Nix | file |
-| 23 | **GameStream mutual-TLS verifier has no negative test** — the only boundary protecting a paired session | ten lines | file |
-| 24 | **moonlight-sys ABI guard documented but absent** (`moonlight-bindings` check does not exist) | port `nix/ldac-bindings.nix` | file |
-| 25 | **`#[ignore]`d tests run nowhere, ever** (5 files) | decide per file: make runnable, or state the hardware gate in notes | file |
+| 1 | **`-p pipeline --features ffmpeg` does not compile on `main`** | move `rescale_to_duration` out of the `audio` cfg | **#180** |
+| 2 | **140 tests never compiled by any check**, incl. the whole stream/HLS, WebRTC, hwaccel, adblock and `media_url_av` sets | 3 new checks: `stream-plane`, `remote-plane`, `browser-plane`; widen `audio` to `+render`; add `ffmpeg` to `render-pixels` | **#181** (#98 recurring) |
+| 3 | **No automated test uses a real Cast sender** — both defects that reached users were found by hand | nixosTest with headless chromium over CDP; the recipe exists | **#184** |
+| 4 | **`bluetooth-vm` does not test A2DP** despite its name and comments | `bluetoothctl pair/connect` + `paplay` + btmon assertions + cross-correlate decoded PCM | **#186** |
+| 5 | **AirPlay media never crosses a LAN in CI** | package `cliraop` into the sender node; `airplay-research.md` §6.1 specifies it | **#188** |
+| 6 | **GameStream: nothing between `/launch` and pixels has ever run**, incl. FEC and A/V pacing — D37's stated reasons for linking | virtual display on the Sunshine host + a streaming `gs-probe` + netem | **#190** (was untracked since #33 closed) |
+| 7 | **No signal-level assertion in any VM test**; the two that exist are cargo-tier | per-codec cross-correlation; per-frame luma for Miracast; decode AirPlay payloads | folded into #186, #189, #190, #192 |
+| 8 | **AAC has no decode test** — the codec every iPhone picks, advertised 4th | extend `audio_decode.rs`'s codec list; the fixture already exists | **#187** (+ comment on #14) |
+| 9 | **AirPlay timing is dead code in the field** — mirroring sessions never probe | a T1 test binding the declared `timing_port` | comment on **#176** |
+| 10 | **`av_skew_ms` has no asserted bound at any tier**, and reads 17 hours | assert a bound in the existing mirroring T1 test | comment on **#79** |
+| 11 | **Spotify `pump_events` and `run()` — ~375 lines, zero tests**, both local and closable | scripted `PlayerEvent` vectors; injectable starter + `tokio::time::pause()` | **#199** |
+| 12 | **Miracast M13 has never fired** — WFD's only loss recovery, and D35's justification | induce loss in the hwsim medium | **#192** |
+| 13 | **Miracast UIBC socket half untested** — exactly #125's shape, fixed with no regression test | scripted source offering a UIBC port | **#193** |
+| 14 | **MICE vendor extension not wired**, so Windows falls back to the P2P path MICE exists to escape | install the WSC extension; assert it in the probe response | **#194** (#166 closed empty) |
+| 15 | **Matter: endpoint tree + every cluster but one unexecuted**; `node.rs` has zero tests | extend `matter-peer`; then a `home-assistant-chip-core` peer for real T3 | **#196** (+ comment on #172) |
+| 16 | **`control-display` is vacuous over a wrong-shaped encoder** | correct the frame shape first, then a TCP fake panel on 4661 | comment on **#21** |
+| 17 | **Mixer real-time guarantees rest on a wall-clock-derived fake**; #174/#175/#177 all live here | dummy PipeWire sink in a VM so `mixer_real_device.rs` runs | **#204** |
+| 18 | **#55's recovery half untested** — the failing-then-succeeding device | a 30-line test | comment on **#55** |
+| 19 | **No whole-frame render comparison anywhere** | golden PNGs, mean abs error ≤2/255, diff on failure | **#203** |
+| 20 | **Silent skips**: `audio`'s ffmpeg CLI, the untripwired pixel tests, `output_stream`'s skip-pass | `nativeBuildInputs`; route through `test_gpu`; a `CASTAWAY_REQUIRE_FFMPEG` tripwire | **#182** |
+| 21 | **DLNA's six "do not fix" conformance rows have no test** | a `conformance.rs` quoting the citations; ~40 lines | **#201** |
+| 22 | **No DLNA/DIAL third-party control point** anywhere | `gupnp-tools` in the sender VM; ~30 lines of Nix | **#202** |
+| 23 | **GameStream mutual-TLS verifier has no negative test** — the only boundary protecting a paired session | ten lines | **#191** |
+| 24 | **moonlight-sys ABI guard documented but absent** (`moonlight-bindings` check does not exist) | port `nix/ldac-bindings.nix` | **#191** |
+| 25 | **`#[ignore]`d tests run nowhere, ever** (5 files) | decide per file: make runnable, or state the hardware gate in notes | **#183** |
+
+Filed alongside these, from findings that were not test gaps but code gaps the audit tripped
+over: **#185** (Cast mirroring audio untested, RTCP differential one-directional),
+**#189** (nothing decodes AirPlay media), **#195** (Miracast has no idle-session watchdog, and
+a source offering HDCP is ignored), **#197** (the Matter passcode prompt is never taken down
+on expiry), **#198** (a failed Matter commissioning sends no `CommissionerDeclaration`),
+**#200** (Spotify `getInfo`'s field set never validated), **#205** (the idle-CPU and A/V-sync
+numbers are prose, not gates), **#206** (the deploy target has no proven Miracast path).
+
+Comments were added to **#14**, **#17**, **#21**, **#40**, **#41**, **#48**, **#49**, **#55**,
+**#58**, **#65**, **#79**, **#87**, **#172** and **#176** rather than filing duplicates.
 
 ---
 
