@@ -209,8 +209,11 @@ pkgs.testers.runNixOSTest {
         assert "LauncherResponse status=Success" in peer_log, peer_log
 
         journal = panel.succeed("journalctl -u castaway --no-pager")
-        # It landed on the content-app endpoint rather than the bare player, which is
-        # what a client's TargetApp match is *for*.
+        # NOTE (2026-08-05): this used to claim the invoke "landed on the content-app
+        # endpoint rather than the bare player". It did not — `app=1` is PLAYER_ENDPOINT,
+        # content apps start at 6, and `matter-peer` defaults to `--endpoint 1` with
+        # nothing here overriding it. **No Content App endpoint is invoked anywhere**, and
+        # a client's TargetApp match is therefore untested. See `docs/test-matrix.md` §4.7.
         assert re.search(r"matter: launching.*app=1", journal), journal
         assert "${castUrl}" in journal, journal
         # And it became a session, which is the only claim that matters to anyone

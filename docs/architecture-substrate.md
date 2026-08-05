@@ -262,9 +262,18 @@ Priorities are set by the **actual crowd** (NixOS/Rust/Windows programmers + som
 5. **`crypto-cast-auth` + `proto-cast` mirroring** — the *workhorse* for this crowd (Chrome/Edge "Cast desktop" from Linux **and** Windows, LAN-based, no Wi-Fi Direct). Carve one gen-1 cert.
 6. `substrate-rtsp`/`substrate-rtp` + `proto-airplay` audio → mirroring (+ `crypto-fairplay`). Mac contingent.
 7. `proto-dial` + YouTube Lounge (+ the browser — now the Electron subprocess, D36).
-8. **`proto-miracast` `backend-windows`** — promoted to core (Win+K + Linux GNOME Network Displays senders). *Cheap on Windows* (thin `MiracastReceiver` OS-call), so it's not the yak it is on Linux. Needs Ethernet-upstream (§7.5).
+8. **`proto-miracast` `backend-linux`** — what actually shipped, and the reverse of the order
+   planned here. The Linux backend forms a real autonomous P2P group in CI against
+   `mac80211_hwsim` (`checks.miracast-vm`); MICE landed alongside it (#166, D35).
 9. `control-display` (RS-232 primary / DDC) + `input-touch` (USB HID touch → browser/compositor).
-10. *Later:* `proto-miracast` `backend-linux` when/if the box migrates (the one crate the move touches).
+   **Still unbuilt as of 2026-08-05**: `control-display`'s encoder carries placeholder opcodes
+   and is the wrong frame shape (#21), and `input-touch`'s `evdev`/`winuser` features are
+   empty feature lists with no code — all touch arrives via winit.
+10. *Later:* `proto-miracast` `backend-windows`. The plan below assumed this was the cheap
+    one (a thin `MiracastReceiver` OS-call) and Linux the yak; it turned out inverted.
+    `WFDStartDisplaySink` is dead, `MiracastReceiver` is UWP-only, and `WiFiDirectAdvertisement`
+    is unspiked — so the deploy target has *no* proven Miracast path, and `app/src/main.rs`
+    refuses on non-Linux (§7.7, #17).
 
 ## 10. Cross-build (dev Linux → target Windows)
 

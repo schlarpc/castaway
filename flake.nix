@@ -821,10 +821,11 @@
           # commissioning test skips mDNS, so discovery has coverage nowhere else.
           matter-vm = import ./nix/matter-vm-test.nix { inherit pkgs self; };
 
-          # A complete A2DP session with no radio: btvirt's linked virtual controllers,
-          # BlueZ as an independent A2DP source on one, our receiver on the other. The
-          # sender side is then an implementation that has never seen our code, which is
-          # categorically better evidence than our source talking to our sink.
+          # The Bluetooth stack up to discovery, with no radio: btvirt's linked virtual
+          # controllers, BlueZ on one, our receiver on the other. BlueZ finds us by
+          # inquiry — but it does not pair, connect, or stream, so nothing above L2CAP is
+          # covered here despite the derivation's name. See the note at the top of
+          # nix/bluetooth-vm-test.nix and `docs/test-matrix.md` §4.3.
           bluetooth-vm = import ./nix/bluetooth-vm-test.nix {
             inherit pkgs;
             castaway = craneLib.buildPackage (commonArgs // {

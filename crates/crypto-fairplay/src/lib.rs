@@ -17,17 +17,20 @@
 //! it is exactly `4 × 142`, those four replies, and they are byte-identical across
 //! UxPlay, shairport-sync, pyatv, airplay2-receiver and RPiPlay.
 //!
-//! **The derivation is the part that is missing.** Turning the 72-byte `ekey` from the
-//! RTSP `SETUP` plist into the 16-byte AES key needs the OmgHax table set (~99 KiB) and
-//! about 1200 lines of algorithm. That is [`FairPlaySession::decrypt_ekey`], and it is
-//! the only thing here that returns [`FairPlayError::KeyDerivationUnavailable`].
-//! Notably it does *not* need a live capture to validate: airplay2-receiver publishes
-//! 20 complete `(key message, ekey, expected key)` vectors. What it needs is a decision
-//! about transcribing GPL'd, Apple-derived constants into an MIT crate —
-//! `docs/airplay-research.md` §5.3 lays that out.
+//! **The derivation lives in `crypto-playfair`, not here** (#39, closed). Turning the
+//! 72-byte `ekey` from the RTSP `SETUP` plist into the 16-byte AES key needs the OmgHax
+//! table set (~99 KiB) and about 1200 lines of algorithm, and the licence decision
+//! `docs/airplay-research.md` §5.3 lays out went the way of a separate crate: the material
+//! is GPL where this workspace is MIT. `crypto_playfair::decrypt_key` is what production
+//! calls (`proto-airplay/src/session.rs`), and it is settled against airplay2-receiver's
+//! 20 published `(key message, ekey, expected key)` vectors across all four modes.
 //!
-//! None of this blocks AirPlay 1 audio, which is the current target: that key arrives
-//! RSA-wrapped in the `ANNOUNCE` SDP and never touches FairPlay.
+//! [`FairPlaySession::decrypt_ekey`] here is therefore a **stub on a dead path**, kept so
+//! the boundary is explicit rather than absent; it is the only thing in this crate that
+//! returns [`FairPlayError::KeyDerivationUnavailable`].
+//!
+//! None of this blocks AirPlay 1 audio: that key arrives RSA-wrapped in the `ANNOUNCE` SDP
+//! and never touches FairPlay.
 //!
 //! This is also distinct from **FairPlay Streaming** (content DRM) — a wall we don't touch.
 #![forbid(unsafe_code)]

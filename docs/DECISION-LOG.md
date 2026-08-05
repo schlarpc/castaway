@@ -604,10 +604,16 @@ Four decisions inside it, each of which had a plausible alternative:
   `NegotiatedVideo::sink_can_decode` is a question the M4 handler asks rather than an
   assumption it makes.
 
-What is deferred with eyes open: Miracast-over-Infrastructure (MS-MICE) is documented and
-unbuilt — it removes the P2P *data* path but not the beacon, so it does not rescue us from
-the driver question, and it is only worth building once a group forms. See #45 and
-#17 for what has to be true before either can be promised on the deploy target.
+What was deferred with eyes open, and has since been built: Miracast-over-Infrastructure
+(MS-MICE) — it removes the P2P *data* path but not the beacon, so it does not rescue us from
+the driver question, and it was only worth building once a group formed. It landed in
+`786a706` (#166): the control protocol, the `_display._tcp` registration, the 7250 listener
+and the `SOURCE_READY` hand-off. The reasoning above is why the **beacon** half still
+matters — and that half is the one piece that did *not* land. `mice::vendor_extension()`
+reproduces [MS-MICE] §4's hexdump byte for byte and has no non-test caller, so nothing
+installs the WSC vendor extension into our beacons. Per §3.1.3 a source that does not see it
+"MUST fall back to using standard Miracast", i.e. straight back into the driver question
+MICE exists to escape. See #45 and #17 for the radio, and `docs/test-matrix.md` §4.6.
 
 ### D36 — The browser runtime: Electron over CEF, gated on one spike
 The browser stopped being an implementation detail the moment G56 became intent. Hosting

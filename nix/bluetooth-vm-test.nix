@@ -1,4 +1,14 @@
-# A complete A2DP session with no radio, no dongle, and no hardware of any kind.
+# The Bluetooth stack up to *discovery*, with no radio, no dongle, and no hardware.
+#
+# NOTE (2026-08-05): this file used to open "a complete A2DP session". It does not run one.
+# What the testScript actually asserts is: btvirt creates a linked pair, the two controllers
+# inquire each other, the emulated air carries L2CAP echo, our receiver claims hci1, brings
+# it up, becomes discoverable, and BlueZ finds it by inquiry. There is no `bluetoothctl
+# pair`, no AVDTP discover/get_caps/set_config, no stream start, no media packet, and no
+# audio — and the `services.pipewire`/`tester` block below is configured and used by nothing.
+# The A2DP intent described further down is the design this file was built *for*; closing
+# the gap is tracked in its own issue. Everything above L2CAP is therefore still validated
+# only by our own code talking to our own code. See `docs/test-matrix.md` §4.3.
 #
 # The kernel's `hci_vhci` plus BlueZ's `btvirt` emulator give a pair of *linked* virtual
 # controllers — two `hciN` devices on `Bus: Virtual` that inquire, page and carry L2CAP
@@ -6,16 +16,17 @@
 # Verified on the dev box before this was written: `l2ping` across the pair reports 0%
 # loss and `btmon` shows real L2CAP exchanges.
 #
-# That makes the test worth having possible: **BlueZ drives one controller as an ordinary
-# A2DP source, and our receiver owns the other.** The sender side is then an independent
+# That makes the *intended* test possible: BlueZ drives one controller as an ordinary A2DP
+# source, and our receiver owns the other. The sender side would then be an independent
 # implementation that has never seen our code — categorically better evidence than our
-# source code talking to our sink code, which is all the in-process tests can offer.
+# source code talking to our sink code, which is all the in-process tests can offer. Today
+# BlueZ only inquires; it never pairs, connects, or streams (see the note at the top).
 #
-# Two properties make this *harsher* than real hardware, which is the point. A virtual
+# Two properties would make this *harsher* than real hardware, which is the point. A virtual
 # controller reports an ACL MTU of 192 with a **single** buffer, against 1021x4 on a real
-# AX200. Every SDP record and AVDTP capability response therefore fragments, and transmit
-# flow control has no slack whatsoever — both paths run on every test rather than only
-# under load.
+# AX200. Every SDP record and AVDTP capability response would therefore fragment, and
+# transmit flow control has no slack whatsoever. As written, the only traffic is inquiry and
+# two echo packets, so neither path is actually exercised here.
 { pkgs, castaway }:
 
 let
