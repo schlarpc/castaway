@@ -611,7 +611,13 @@
           gs-probe = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
             pname = "gs-probe";
-            cargoExtraArgs = "-p proto-gamestream --example gs-probe";
+            # `--no-default-features` since D55: `proto-gamestream`'s default is now
+            # `stream`, which links moonlight-common-c and would need
+            # `MOONLIGHT_COMMON_C_LIB_DIR` here. This prober only pairs and reads NVHTTP,
+            # so it does not want the streaming core — and keeping it out is also what
+            # keeps `nix run .#gs-probe` MIT-clean, which is the half of D37's licence
+            # separation still worth having now the app itself links it.
+            cargoExtraArgs = "-p proto-gamestream --example gs-probe --no-default-features";
             doCheck = false;
             # The example is not installed by crane's default install phase.
             postInstall = ''
@@ -929,7 +935,11 @@
             castaway = craneLib.buildPackage (commonArgs // {
               inherit cargoArtifacts;
               pname = "castaway-bluetooth";
-              cargoExtraArgs = "--package castaway --features bluetooth-socket";
+              # Lean plus the one transport this test needs. Without
+              # `--no-default-features` D55's default would pull the whole kiosk —
+              # ffmpeg, wgpu, Electron — into a headless VM, on `commonArgs` that does not
+              # carry those native deps.
+              cargoExtraArgs = "--package castaway --no-default-features --features bluetooth-socket";
               doCheck = false;
             });
           };
