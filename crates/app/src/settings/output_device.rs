@@ -184,11 +184,18 @@ mod tests {
 
     #[test]
     fn a_failed_save_still_applies_and_says_both_halves() {
-        // Point the store somewhere unwritable: the config the NixOS module generates
+        // Point the store somewhere it cannot write: the config the NixOS module generates
         // lives in the read-only store, and that must not make the setting inert.
-        let dir = std::env::temp_dir().join(format!("castaway-outdev-ro-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = ConfigStore::new(dir.join("nope").join("castaway.toml"));
+        //
+        // A *file* standing where the directory should be, rather than the missing
+        // directory this used to use. A missing directory is no longer a failure — the
+        // store creates it, which is #179 — and it was never the case this test meant;
+        // a chmod'd directory would be, but only when the tests do not run as root.
+        let blocker =
+            std::env::temp_dir().join(format!("castaway-outdev-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, "a file, so nothing can be created beneath it").unwrap();
+        let store = ConfigStore::new(blocker.join("castaway.toml"));
         let selector = OutputSelector::default();
         let setting =
             OutputDeviceSetting::for_backend(selector.clone(), store, OutputBackendKind::PipeWire);
@@ -196,6 +203,7 @@ mod tests {
         let applied = setting.apply("device:sink").unwrap();
         assert!(matches!(applied, Applied::NotSaved(_)), "{applied:?}");
         assert_eq!(selector.get(), OutputSelection::Device("sink".into()));
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]

@@ -63,8 +63,8 @@ impl ConfigStore {
     }
 
     /// The store over the same file [`crate::config::Config::load_at`] loaded — the
-    /// one resolved [`ConfigLocation`] both share. The file not existing yet is fine:
-    /// the first saved setting creates it.
+    /// one resolved [`ConfigLocation`] both share. Neither the file nor the directory
+    /// holding it needs to exist yet: the first saved setting creates both.
     #[must_use]
     pub fn at(location: &ConfigLocation) -> Self {
         Self::new(location.path())
@@ -138,11 +138,24 @@ impl ConfigStore {
 
     /// Write via a sibling temp file and rename, so the file is always either the old
     /// config or the new one, never a torn half.
+    ///
+    /// The directory is created first. On the deploy box it does not exist — the platform
+    /// config location (`%LOCALAPPDATA%\castaway\config`) is somewhere nothing else in the
+    /// app writes, so the very first saved setting is also what has to make the directory.
+    /// Without this the temp write fails with "the system cannot find the path" and *every*
+    /// setting changed at the panel reverts on the next restart (#179).
     fn write_atomically(&self, contents: &str) -> Result<(), StoreError> {
         let write_err = |source| StoreError::Write {
             path: self.path.clone(),
             source,
         };
+        if let Some(dir) = self.path.parent() {
+            // An empty parent is a bare filename in the working directory, which needs no
+            // creating; `create_dir_all` is fine with a directory that already exists.
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(write_err)?;
+            }
+        }
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -254,6 +267,40 @@ pipewire = \"alsa_output.usb-old.analog-stereo\"
             parsed.audio.output.pipewire,
             crate::config::OutputChoice::Default
         );
+    }
+
+    /// The panel's own case, and the one every fixture above misses by living in a
+    /// directory that already exists: the platform config location is somewhere nothing
+    /// else in the app writes, so the first saved setting has to make the directory as
+    /// well as the file. Before this, the temp write failed with "the system cannot find
+    /// the path" and the setting was applied at runtime and gone on the next start (#179).
+    #[test]
+    fn the_first_saved_setting_creates_the_directory_as_well_as_the_file() {
+        let root =
+            std::env::temp_dir().join(format!("castaway-store-{}-nodir", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _guard = DirCleanup(root.clone());
+        // Two levels deep, because the real path is `…\castaway\config\castaway.toml` and
+        // neither component need exist.
+        let store = ConfigStore::new(root.join("castaway").join("config").join("castaway.toml"));
+
+        store
+            .set(&["audio", "output", "windows"], "Speakers")
+            .unwrap();
+
+        let parsed: crate::config::Config =
+            toml::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(
+            parsed.audio.output.windows,
+            crate::config::OutputChoice::Device("Speakers".into())
+        );
+    }
+
+    struct DirCleanup(PathBuf);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
