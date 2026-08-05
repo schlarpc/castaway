@@ -106,6 +106,30 @@ impl Responder {
     /// [`SsdpError::Io`] if the socket can't be created/bound.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), SsdpError> {
         let sock = bind_multicast(self.config.interface)?;
+        self.run_on(sock, shutdown).await
+    }
+
+    /// The same loop, on a socket the caller has already bound and joined.
+    ///
+    /// Exists so the announcement behaviour can be observed. [`bind_multicast`] sets
+    /// `IP_MULTICAST_LOOP` off — correct on the panel, and it means no socket on this host
+    /// can see our `NOTIFY`s, so a test that binds a listener beside the responder watches
+    /// silence and cannot tell it from a responder that built its messages and never sent
+    /// them. That is exactly the gap (#202): `alive_messages` and `byebye_messages` are
+    /// tested as string sets, and until now nothing had executed the ticker or the
+    /// shutdown branch, or seen a datagram leave.
+    ///
+    /// What this does *not* cover, and cannot: the socket options themselves — the group
+    /// join, `IP_MULTICAST_IF` on a multi-homed box, TTL 4. Those are `bind_multicast`'s
+    /// and are a real LAN's to check.
+    ///
+    /// # Errors
+    /// [`SsdpError::Io`] if the socket fails.
+    pub async fn run_on(
+        self,
+        sock: UdpSocket,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), SsdpError> {
         let multicast: SocketAddr = SocketAddrV4::new(SSDP_MULTICAST_ADDR, SSDP_PORT).into();
         let mut buf = vec![0u8; 2048];
         let mut ticker = tokio::time::interval(self.config.notify_interval());
@@ -298,5 +322,134 @@ mod tests {
         let raw = socket2::SockRef::from(&sock);
         assert_eq!(raw.multicast_if_v4().unwrap(), Ipv4Addr::LOCALHOST);
         assert_eq!(raw.multicast_ttl_v4().unwrap(), 4);
+    }
+
+    /// Bind a socket on the loopback interface, joined to the SSDP group.
+    ///
+    /// `loop_back` is the whole reason this is here rather than [`bind_multicast`]: the
+    /// production socket sets `IP_MULTICAST_LOOP` **off**, which is right on the panel and
+    /// means nothing on this host can observe our announcements. The listener needs the
+    /// join; the responder needs loopback on so the listener sees anything at all.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test socket on the loopback interface; the registry governs the \
+                  panel's binds"
+    )]
+    fn test_socket(loop_back: bool) -> std::io::Result<UdpSocket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket
+            .bind(&SocketAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT)).into())?;
+        socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::LOCALHOST)?;
+        socket.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+        socket.set_multicast_loop_v4(loop_back)?;
+        socket.set_nonblocking(true)?;
+        UdpSocket::from_std(socket.into())
+    }
+
+    /// The announcements actually leave the socket, repeatedly, and stop with a byebye.
+    ///
+    /// `alive_messages` and `byebye_messages` were tested as string sets, and nothing had
+    /// ever executed `run`'s ticker or its shutdown branch — so a responder that built
+    /// every message correctly and sent none of them, or that announced once at startup
+    /// and then went quiet, passed every gate in the tree. The symptom in the room is a
+    /// device that appears, works, and vanishes from every picker one `max-age` later
+    /// (#202).
+    ///
+    /// `max_age = 4` makes the interval two seconds, so two bursts fit in a test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn announcements_reach_the_wire_and_stop_with_a_byebye() {
+        let Ok(listener) = test_socket(false) else {
+            eprintln!("skipping: multicast unavailable here");
+            return;
+        };
+        let Ok(sender) = test_socket(true) else {
+            eprintln!("skipping: multicast unavailable here");
+            return;
+        };
+
+        let responder = Responder::new(ResponderConfig {
+            max_age: 4,
+            ..cfg()
+        })
+        .advertise(
+            SsdpDevice {
+                uuid: "uuid:abcd".into(),
+                device_type: "urn:schemas-upnp-org:device:MediaRenderer:1".into(),
+                services: vec!["urn:schemas-upnp-org:service:AVTransport:1".into()],
+            },
+            "/dlna/description.xml",
+        );
+        let targets = 4; // root + uuid + device type + one service
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            let _ = responder
+                .run_on(sender, async {
+                    let _ = stop_rx.await;
+                })
+                .await;
+        });
+
+        // Collect for long enough that a once-at-startup announcer is distinguishable
+        // from one that keeps its promise: two intervals plus the burst gaps.
+        let mut alive = 0usize;
+        let mut buf = vec![0u8; 2048];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5) + NOTIFY_REPEAT_GAP * 4;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.recv_from(&mut buf))
+                    .await
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]);
+            if text.starts_with("NOTIFY") && text.contains("ssdp:alive") {
+                alive += 1;
+            }
+        }
+
+        // Two bursts, each repeating at least twice, one message per target.
+        //
+        // The floor is a literal `2` and **not** `NOTIFY_REPEATS`, which is the mistake
+        // this originally made: an expectation computed from the constant moves with it,
+        // so dropping the repeats to 1 passed. The exact value is pinned next door by
+        // `one_alive_round_covers_every_target_and_the_burst_repeats_it`; what this
+        // asserts is the property that survives a change to it: announcements keep
+        // arriving, in bursts, after startup.
+        const MIN_REPEATS: usize = 2;
+        let due = targets * MIN_REPEATS * 2;
+        assert!(
+            alive >= due,
+            "saw {alive} alive NOTIFYs; at least {due} were due over two intervals. A \
+             responder that announces once at startup and never again is a device that \
+             vanishes from every picker one max-age later"
+        );
+
+        // …and shutting down says goodbye, once per target, promptly. Without this a
+        // control point holds a stale entry for the whole cache lifetime and offers the
+        // user a device that is not there.
+        let _ = stop_tx.send(());
+        let mut byebye = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && byebye < targets {
+            let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(300), listener.recv_from(&mut buf))
+                    .await
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]);
+            if text.starts_with("NOTIFY") && text.contains("ssdp:byebye") {
+                byebye += 1;
+            }
+        }
+        assert_eq!(
+            byebye, targets,
+            "every advertised target must be withdrawn, not just the root device"
+        );
+
+        running.await.unwrap();
     }
 }
