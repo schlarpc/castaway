@@ -19,6 +19,8 @@ pub mod error;
 pub mod framing;
 pub mod messages;
 pub mod mirror;
+pub mod platform;
+pub mod platform_actor;
 pub mod proto;
 pub mod receiver;
 pub mod replay;
@@ -33,6 +35,10 @@ pub use control::CastRemote;
 pub use error::CastError;
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
 pub use mirror::{Codec, MediaKind, MirrorConfig, StreamConfig};
+pub use platform::{
+    AppIdentity, DeviceCapabilities, DisconnectReason, IpcFrame, PlatformEvent, PlatformSession,
+};
+pub use platform_actor::{HostEvent, PlatformHost, PlatformServer};
 pub use proto::CastMessage;
 pub use receiver::{CastRtpReceiver, Consume, Delivered, Received};
 pub use replay::{ReplayAuthResponder, ReplayIdentity};

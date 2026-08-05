@@ -23,6 +23,10 @@ aes.workspace = true
 ctr.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time", "sync"] }
+# The receiver-platform WebSocket a hosted application's SDK dials. axum is already the
+# HTTP surface for five protocols here; `ws` is the one feature it needs beyond default.
+axum = { workspace = true, features = ["ws"] }
+futures.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
@@ -30,6 +34,9 @@ time.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
+tokio-tungstenite.workspace = true
+# The receiver-SDK test drives Electron as a child process and reads its report.
+tokio = { workspace = true, features = ["process", "rt-multi-thread"] }
 x509-parser.workspace = true
 rsa.workspace = true
 base64.workspace = true

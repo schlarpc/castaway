@@ -90,6 +90,8 @@ tokio-util = "0.7"
 tokio-stream = "0.1"
 async-trait = "0.1"
 futures = "0.3"
+# A WebSocket *client*, for tests that dial the receiver platform the way a page does.
+tokio-tungstenite = "0.28"
 
 # --- cli ---
 # `env` so `--config` and `$CASTAWAY_CONFIG` are one code path with one precedence rule.

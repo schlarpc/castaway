@@ -958,6 +958,7 @@
           # The same ECS distribution the Linux kiosk package stages; a devShell that
           # disagreed with the package would be a trap.
           electron = electronLinuxFor system;
+          castReceiverSdk = import ./nix/cast-receiver-sdk.nix { inherit pkgs; };
         in
         {
           default = pkgs.mkShell {
@@ -1047,6 +1048,10 @@
             # Point the receiver at the ECS runtime and our Electron host app.
             CASTAWAY_ELECTRON = "${electron}/bin/electron";
             CASTAWAY_BROWSER_APP = toString ./browser-host;
+            # The pinned receiver SDKs the platform tests run against (#16). Set here
+            # rather than fetched by the test, so the test never touches the network and
+            # a bundle that moved fails a hash instead of changing a result.
+            CASTAWAY_CAST_RECEIVER_SDK = castReceiverSdk;
             # Let winit/wgpu dlopen Vulkan/Wayland/X11.
             # libGL is needed because Electron's bundled libGLESv2.so links libGL.so.1;
             # without it the browser's GPU process dies and wgpu's GL-backend probe SIGSEGVs.
