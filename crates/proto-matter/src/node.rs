@@ -246,6 +246,40 @@ impl MediaPlaybackHandler {
         }
 
         self.ctx.send(CastCommand::Transport(transport))?;
+        // And move the projection this cluster reads *here*, in the transaction the client
+        // is waiting on, rather than where the command is eventually consumed. Two reasons,
+        // and the second is the one that made this a defect rather than a race:
+        //
+        // - `CastCommand` goes out on a channel the adapter drains on another task, so a
+        //   phone that presses pause and reads `CurrentState` back can otherwise see the
+        //   two out of order.
+        // - Nothing moved this projection at all except a launch and the end of a session.
+        //   So a paused phone was told it was still playing, and `NotActive` above was
+        //   unreachable for the whole life of a session: nothing could put the state back
+        //   to `NotPlaying` (#196).
+        //
+        // The pipeline is the real authority and nothing feeds its state back here yet; a
+        // command the panel has just accepted is the best evidence this projection has.
+        // The position-changing verbs deliberately leave the state alone — seeking while
+        // paused does not start playback.
+        match transport {
+            Transport::Play => self.ctx.state.update(|s| s.state = PlaybackState::Playing),
+            Transport::Pause => self.ctx.state.update(|s| s.state = PlaybackState::Paused),
+            Transport::Stop => self.ctx.state.update(|s| {
+                // Not a whole `PlayerSnapshot::default()`: stopping releases the media and
+                // not the client's idea of which app it was in, and a `CurrentTarget` that
+                // reset itself on stop reads to a phone as the app having closed.
+                s.state = PlaybackState::NotPlaying;
+                s.position = std::time::Duration::ZERO;
+                s.duration = None;
+            }),
+            Transport::StartOver
+            | Transport::Previous
+            | Transport::Next
+            | Transport::Seek(_)
+            | Transport::SkipForward(_)
+            | Transport::SkipBackward(_) => {}
+        }
         response
             .status(media_playback::StatusEnum::Success)?
             .data(None)?

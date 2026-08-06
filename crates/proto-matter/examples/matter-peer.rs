@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use proto_matter::fabric::CastingCa;
+use proto_matter::player::PLAYER_ENDPOINT;
 use proto_matter::udc::{
     CdError, CommissionerDeclaration, IdentificationDeclaration, InstanceName, TargetApp,
 };
@@ -127,6 +128,39 @@ struct Args {
     /// full `COMMISSIONABLE_TIMEOUT` on a node that is sitting right there under a
     /// different name.
     wrong_instance: bool,
+    /// What to do to the panel once commissioned, past the `LaunchURL` (#196).
+    ///
+    /// Every one of these is a cluster handler that no test had ever executed: they need
+    /// a `ReadContext` or an `InvokeContext`, which in `rs-matter` means a real
+    /// transaction, which means a peer. This is the peer, so it may as well drive them.
+    probes: Probes,
+}
+
+/// The post-commissioning probes, all off by default.
+///
+/// Off so the runs that exist keep proving what they proved — the commissioning path is
+/// what those assert, and a probe that failed would fail them for an unrelated reason.
+#[derive(Debug, Default)]
+struct Probes {
+    /// Read the Descriptor on the root, the player and the app endpoint.
+    descriptor: bool,
+    /// Read all seven `ApplicationBasic` attributes on the app endpoint.
+    app_basic: bool,
+    /// Invoke these `MediaPlayback` commands, in order, on the player endpoint.
+    transport: Vec<String>,
+    /// Read `TargetList` and `CurrentTarget`, then `NavigateTarget` to this identifier.
+    navigate: Option<u8>,
+    /// `LaunchContent` this query at the app endpoint.
+    launch_content: Option<String>,
+    /// Read the Access Control cluster's `ACL` attribute, which needs Administer.
+    ///
+    /// The panel seeds a commissioned client with `Operate` and says in a comment why not
+    /// `Administer` — "handing out Administer because it is simpler would let any
+    /// commissioned phone evict every other one". Nothing tested it, so a regression to
+    /// `ADMINISTER` passed every check in the repo. This is the read that has to fail.
+    read_acl: bool,
+    /// Which endpoint the app-level probes address. The panel's first content app.
+    app_endpoint: u16,
 }
 
 impl Args {
@@ -150,7 +184,9 @@ fn usage() -> String {
     "usage: matter-peer --player <ip> --passcode-file <path> [--bind <ip>] \
      [--instance <hex16>] [--name <str>] [--url <str>] [--display-string <str>] \
      [--endpoint <n>] [--app-vendor <n>] [--app-product <n>] [--discriminator <n>] \
-     [--matter-port <n>] [--declare-only] [--wrong-passcode] [--wrong-instance]"
+     [--matter-port <n>] [--declare-only] [--wrong-passcode] [--wrong-instance] \
+     [--read-descriptor] [--app-basic] [--read-acl] [--app-endpoint <n>] \
+     [--transport <verb>[,<verb>…]] [--navigate <n>] [--launch-content <query>]"
         .into()
 }
 
@@ -174,6 +210,12 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut declare_only = false;
     let mut wrong_passcode = false;
     let mut wrong_instance = false;
+    // `FIRST_CONTENT_APP_ENDPOINT`: the panel packs content apps densely from 6, and the
+    // default catalogue has exactly one.
+    let mut probes = Probes {
+        app_endpoint: 6,
+        ..Probes::default()
+    };
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -194,6 +236,17 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--declare-only" => declare_only = true,
             "--wrong-passcode" => wrong_passcode = true,
             "--wrong-instance" => wrong_instance = true,
+            "--read-descriptor" => probes.descriptor = true,
+            "--app-basic" => probes.app_basic = true,
+            "--read-acl" => probes.read_acl = true,
+            "--app-endpoint" => probes.app_endpoint = value()?.parse()?,
+            // Comma-separated so one run can drive the transport through a sequence, which
+            // is the only way `NotActive` and `Success` are both reachable in one session.
+            "--transport" => probes
+                .transport
+                .extend(value()?.split(',').map(str::to_owned)),
+            "--navigate" => probes.navigate = Some(value()?.parse()?),
+            "--launch-content" => probes.launch_content = Some(value()?),
             other => return Err(format!("unknown argument {other:?}\n{}", usage()).into()),
         }
     }
@@ -214,6 +267,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         declare_only,
         wrong_passcode,
         wrong_instance,
+        probes,
     })
 }
 
@@ -421,7 +475,7 @@ async fn run_script<C: rs_matter::crypto::Crypto>(
         match launch_url(matter, crypto, fab_idx, player_node_id, args).await {
             Ok(()) => {
                 println!("matter-peer: LaunchURL accepted on attempt {attempt}");
-                return Ok(());
+                return run_probes(matter, crypto, fab_idx, player_node_id, args).await;
             }
             Err(e) if tokio::time::Instant::now() < deadline => {
                 // Expected for the first attempt or two: `AddNOC` commits the fabric
@@ -436,6 +490,289 @@ async fn run_script<C: rs_matter::crypto::Crypto>(
             }
         }
     }
+}
+
+/// Drive whichever cluster handlers this run was asked to drive (#196).
+///
+/// Every probe is one IM transaction and therefore one exchange, because a cluster's
+/// client view consumes the exchange it was entered from. Each prints a line the VM test
+/// asserts on rather than returning a structure: what is under test is what the *panel*
+/// answered, and the shortest honest way to carry that out of a `no_std`-shaped API is to
+/// print it.
+async fn run_probes<C: rs_matter::crypto::Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    fab_idx: core::num::NonZeroU8,
+    player: u64,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rs_matter::dm::clusters::decl::access_control::AccessControlClient as _;
+    use rs_matter::dm::clusters::decl::application_basic::ApplicationBasicClient as _;
+    use rs_matter::dm::clusters::decl::content_launcher::{self, ContentLauncherClient as _};
+    use rs_matter::dm::clusters::decl::descriptor::DescriptorClient as _;
+    use rs_matter::dm::clusters::decl::media_playback::MediaPlaybackClient as _;
+    use rs_matter::dm::clusters::decl::target_navigator::TargetNavigatorClient as _;
+
+    let probes = &args.probes;
+    let app = probes.app_endpoint;
+
+    if probes.descriptor {
+        // The root, the player and one content app: the whole of what a commissioned
+        // phone discovers about this panel, read by a client rather than asserted against
+        // our own constructor. `NodeTree` had no coverage of any kind until `4cd7373`,
+        // and none of it went through the interaction model.
+        for endpoint in [0, PLAYER_ENDPOINT, app] {
+            let parts = Exchange::initiate(matter, crypto, fab_idx, player)
+                .await?
+                .descriptor()
+                .parts_list_read_with(endpoint, |v| {
+                    v.map(|list| {
+                        list.iter()
+                            .filter_map(Result::ok)
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await??;
+            let servers = Exchange::initiate(matter, crypto, fab_idx, player)
+                .await?
+                .descriptor()
+                .server_list_read_with(endpoint, |v| {
+                    v.map(|list| {
+                        list.iter()
+                            .filter_map(Result::ok)
+                            .map(|c| format!("{c:#06x}"))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await??;
+            let types = Exchange::initiate(matter, crypto, fab_idx, player)
+                .await?
+                .descriptor()
+                .device_type_list_read_with(endpoint, |v| {
+                    v.map(|list| {
+                        list.iter()
+                            .filter_map(Result::ok)
+                            .filter_map(|d| d.device_type().ok())
+                            .map(|t| format!("{t:#010x}"))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await??;
+            println!(
+                "matter-peer: descriptor endpoint={endpoint} \
+                 device_types={types:?} servers={servers:?} parts={parts:?}"
+            );
+        }
+    }
+
+    if probes.app_basic {
+        // All seven, on the endpoint the app actually occupies. Each one comes out of the
+        // catalogue entry rather than out of a constant, so reading them is what says the
+        // endpoint a client picked is the app it thought it picked.
+        let read = Exchange::initiate(matter, crypto, fab_idx, player).await?;
+        let vendor_name = read
+            .application_basic()
+            .vendor_name_read_with(app, |v| v.map(ToString::to_string))
+            .await??;
+        let vendor_id = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .vendor_id_read(app)
+            .await?;
+        let product_id = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .product_id_read(app)
+            .await?;
+        let name = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .application_name_read_with(app, |v| v.map(ToString::to_string))
+            .await??;
+        let version = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .application_version_read_with(app, |v| v.map(ToString::to_string))
+            .await??;
+        let application = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .application_read_with(app, |v| {
+                v.map(|s| {
+                    format!(
+                        "catalog={} app_id={}",
+                        s.catalog_vendor_id().unwrap_or_default(),
+                        s.application_id()
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    )
+                })
+            })
+            .await??;
+        let status = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .status_read(app)
+            .await?;
+        let allowed = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_basic()
+            .allowed_vendor_list_read_with(app, |v| v.map(|list| list.iter().count()))
+            .await??;
+        println!(
+            "matter-peer: application_basic endpoint={app} vendor_name={vendor_name:?} \
+             vendor_id={vendor_id:#06x} product_id={product_id:#06x} name={name:?} \
+             version={version:?} application=({application}) status={status:?} \
+             allowed_vendors={allowed}"
+        );
+    }
+
+    for verb in &probes.transport {
+        // One exchange per verb, and the *response status* is the whole point: `NotActive`
+        // when nothing is loaded and `Success` when something is, which is the guard
+        // `MediaPlaybackHandler::drive` exists for and which nothing had run.
+        let view = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback();
+        let handle = match verb.as_str() {
+            "play" => view.play(PLAYER_ENDPOINT).await?,
+            "pause" => view.pause(PLAYER_ENDPOINT).await?,
+            "stop" => view.stop(PLAYER_ENDPOINT).await?,
+            "start-over" => view.start_over(PLAYER_ENDPOINT).await?,
+            "previous" => view.previous(PLAYER_ENDPOINT).await?,
+            "next" => view.next(PLAYER_ENDPOINT).await?,
+            other => return Err(format!("unknown transport verb {other:?}").into()),
+        };
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: media_playback {verb} status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+
+        let state = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .current_state_read(PLAYER_ENDPOINT)
+            .await?;
+        println!("matter-peer: media_playback current_state={state:?}");
+    }
+
+    if let Some(target) = probes.navigate {
+        let targets = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .target_navigator()
+            .target_list_read_with(PLAYER_ENDPOINT, |v| {
+                v.map(|list| {
+                    list.iter()
+                        .filter_map(Result::ok)
+                        .map(|t| {
+                            format!(
+                                "{}:{}",
+                                t.identifier().unwrap_or_default(),
+                                t.name().map(ToString::to_string).unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await??;
+        let current = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .target_navigator()
+            .current_target_read(PLAYER_ENDPOINT)
+            .await?;
+        println!("matter-peer: target_navigator targets={targets:?} current={current}");
+
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .target_navigator()
+            .navigate_target(PLAYER_ENDPOINT, |builder| {
+                builder.target(target)?.data(None)?.end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: navigate_target target={target} status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+
+        // And read it back. `SelectTarget` logs nothing on the panel and changes nothing
+        // a session can see — the only place it is observable is the next read of this
+        // attribute, which is also the only place a phone would look.
+        let after = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .target_navigator()
+            .current_target_read(PLAYER_ENDPOINT)
+            .await?;
+        println!("matter-peer: target_navigator current after navigate={after}");
+    }
+
+    if let Some(query) = &probes.launch_content {
+        // One parameter, which the panel joins into a query string. `LaunchContent`'s
+        // `{query}` template resolution is T0-tested; the *handler* that gets to it — the
+        // `parameterList` walk and the refusal a non-searchable app deserves — is not.
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .content_launcher()
+            .launch_content(app, |builder| {
+                builder
+                    .search()?
+                    .parameter_list()?
+                    .push()?
+                    .r#type(content_launcher::ParameterEnum::Any)?
+                    .value(query.as_str())?
+                    .external_id_list()?
+                    .none()
+                    .end()?
+                    .end()?
+                    .end()?
+                    .auto_play(true)?
+                    .data(None)?
+                    // Absent, not defaulted: a client casting a search has no opinion
+                    // about audio tracks, and none about reusing a context it never had.
+                    .playback_preferences()?
+                    .none()
+                    .use_current_context(None)?
+                    .end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: launch_content query={query:?} endpoint={app} status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+    }
+
+    if probes.read_acl {
+        // The one probe whose *failure* is the pass. Reading the Access Control cluster's
+        // ACL needs Administer, and the panel seeded this client with Operate — so a
+        // success here means any commissioned phone can rewrite the access list and evict
+        // every other one. The status is printed either way; the VM decides.
+        let outcome = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .access_control()
+            .acl_read_with(0, |v| match v {
+                Ok(list) => format!("readable, {} entries", list.iter().count()),
+                Err(e) => format!("refused: {e}"),
+            })
+            .await;
+        match outcome {
+            Ok(report) => println!("matter-peer: access_control acl {report}"),
+            Err(e) => println!("matter-peer: access_control acl refused: {e}"),
+        }
+    }
+
+    Ok(())
 }
 
 /// Open CASE back to the panel and invoke `ContentLauncher::LaunchURL`.
