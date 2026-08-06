@@ -19,6 +19,10 @@ pub mod audio_decode;
 pub mod audio_out;
 #[cfg(all(feature = "audio-pipewire", target_os = "linux"))]
 pub mod audio_pw;
+/// A copy of everything the panel played, on disk, so a test can correlate it against
+/// what was sent (#186). A tap on the mixer, so recording does not silence the speakers.
+#[cfg(feature = "audio")]
+pub mod audio_record;
 // Not gated behind `audio`, for the same reason `theme` is not behind `render`: the
 // output-device selection is config-file surface, and config parses in every build.
 pub mod audio_select;

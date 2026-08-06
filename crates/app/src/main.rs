@@ -209,6 +209,10 @@ fn main() -> anyhow::Result<()> {
             pipeline::audio_out::output_factory(audio_selector.clone()),
             render_pipeline.gain(),
         ));
+        // A copy of the mix on disk, if the config asked for one. A tap rather than an
+        // output, so the speakers keep working while it records (#186).
+        #[cfg(feature = "audio")]
+        record_the_mix(&config, &mixer);
         // The output stream's audio (#101), as a tap on the mixer: the samples the
         // speakers were given, not a reconstruction of them. A session cannot be added
         // later that reaches the speakers and misses the stream, because the mixer is the
@@ -616,9 +620,29 @@ fn main() -> anyhow::Result<()> {
     {
         use pipeline::NullPipeline;
         let display: Box<dyn DisplayControl> = Box::new(NullDisplay);
-        let manager =
-            SessionManager::new(NullPipeline::new(), Some(display), SessionConfig::default())
-                .with_osd(osd.clone());
+        // The headless build makes sound too — an A2DP sink is audio with a card for a
+        // screen — so it gets the same audio path the kiosk does: one mixer, opening the
+        // device the config names, with the recording tap on it if one was asked for.
+        // Before this it built its mixer internally against `OutputSelector::default()`,
+        // which meant `[audio.output]` parsed and did nothing here.
+        #[cfg(feature = "audio")]
+        let media_pipeline = {
+            let mixer = Arc::new(pipeline::mixer::AudioMixer::new(
+                pipeline::audio_out::output_factory(pipeline::audio_select::OutputSelector::new(
+                    config
+                        .audio
+                        .output
+                        .choice_for(pipeline::audio_select::active_backend())
+                        .selection(),
+                )),
+            ));
+            record_the_mix(&config, &mixer);
+            NullPipeline::new().with_mixer(mixer)
+        };
+        #[cfg(not(feature = "audio"))]
+        let media_pipeline = NullPipeline::new();
+        let manager = SessionManager::new(media_pipeline, Some(display), SessionConfig::default())
+            .with_osd(osd.clone());
         let remote = manager.remote_handle();
         runtime.spawn(manager.run(event_rx));
         // Headless: no renderer, so drain the OSD channel to the log.
@@ -672,6 +696,24 @@ fn main() -> anyhow::Result<()> {
 fn device_uuid(base: &str, protocol: &str) -> String {
     let namespace = uuid::Uuid::parse_str(base).unwrap_or(uuid::Uuid::NAMESPACE_URL);
     uuid::Uuid::new_v5(&namespace, protocol.as_bytes()).to_string()
+}
+
+/// Attach the recording tap to `mixer`, if `[audio] record` names a path.
+///
+/// Nothing is returned: the mixer holds the tap for as long as it holds the device, which
+/// is the whole run. A failure is a warning rather than a fatal error — the recording is a
+/// diagnostic, and a panel that refused to boot because a debug path was unwritable would
+/// be the worse outcome by a distance. The warning names the path, so the reason is one
+/// line away from the absent file.
+#[cfg(feature = "audio")]
+fn record_the_mix(config: &Config, mixer: &Arc<pipeline::mixer::AudioMixer>) {
+    let Some(path) = &config.audio.record else {
+        return;
+    };
+    match pipeline::audio_record::MixRecorder::create(path) {
+        Ok(recorder) => mixer.add_tap(recorder),
+        Err(e) => warn!(error = %e, path = %path.display(), "not recording the mix"),
+    }
 }
 
 /// ctrl-c triggers the same shutdown as a kiosk window close: stop the services and

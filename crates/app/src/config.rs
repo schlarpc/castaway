@@ -175,6 +175,20 @@ pub enum MatterSurface {
 pub struct Audio {
     /// Which output device to play through.
     pub output: AudioOutput,
+    /// Also write everything the panel plays to this file, as a 16-bit WAV
+    /// ([`pipeline::audio_record::MixRecorder`]).
+    ///
+    /// A *recording*, not a device: sound still comes out of the speakers, and what lands
+    /// here is exactly what they were given — post-mix, post-volume. Off unless a path is
+    /// named, because a receiver on a wall would otherwise fill its disk with a session
+    /// nobody asked to keep.
+    ///
+    /// It exists to make signal-level assertions possible from outside the process:
+    /// `bluetooth-vm` correlates this file against the waveform it told a real A2DP source
+    /// to send, which is the only way to tell audio that *arrived* from audio that arrived
+    /// right (#186). It is just as useful by hand — point it at `/tmp/mix.wav`, play
+    /// something, and open the file.
+    pub record: Option<PathBuf>,
 }
 
 /// Which output device each backend should use.
@@ -212,9 +226,10 @@ impl AudioOutput {
 
     /// This build's choice — the one behind [`Self::key_for`] of the active backend.
     ///
-    /// Read where the selector is seeded (the render build) and in tests; the headless
-    /// build parses the section without acting on it, like `theme`.
-    #[cfg_attr(not(feature = "render"), allow(dead_code))]
+    /// Read wherever the selector is seeded, which is both builds: the headless one used
+    /// to parse this section and ignore it, so `--features audio-out` on a box with two
+    /// sound cards played through whichever one ALSA called default and offered no way to
+    /// say otherwise.
     #[must_use]
     pub fn choice_for(&self, backend: pipeline::audio_select::OutputBackendKind) -> &OutputChoice {
         use pipeline::audio_select::OutputBackendKind as B;
