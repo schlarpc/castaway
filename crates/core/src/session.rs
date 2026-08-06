@@ -756,6 +756,73 @@ mod tests {
         );
     }
 
+    /// A touch surface goes up, comes down when the source withdraws it, and does not
+    /// come down at somebody else's request.
+    ///
+    /// The revoke is its own event rather than a session end because the source keeps
+    /// streaming — a Miracast source sending `wfd_uibc_setting: disable` is closing an
+    /// input channel, not a session (#193). Without it the surface lives until the
+    /// session does, which is the wrong lifetime: the panel goes on delivering touch to a
+    /// source that has said it is not listening.
+    #[tokio::test]
+    async fn a_withdrawn_touch_surface_comes_down_without_ending_the_session() {
+        struct Surface;
+        impl crate::touch::TouchSurface for Surface {
+            fn touch(&self, _touch: crate::touch::SurfaceTouch) {}
+            fn cancel_all(&self) {}
+        }
+
+        let counts = Arc::new(Counts::default());
+        let mut mgr =
+            SessionManager::new(FakePipeline(counts.clone()), None, SessionConfig::default());
+        let a = SourceId::new(ProtocolKind::Miracast, "a");
+        mgr.handle(audio_msg(&a)).await.unwrap();
+        assert!(
+            mgr.touch_handle().get().is_none(),
+            "nothing before UIBC opens"
+        );
+
+        mgr.handle(SourceMessage {
+            source: a.clone(),
+            event: SessionEvent::TouchSurface(Arc::new(Surface)),
+        })
+        .await
+        .unwrap();
+        assert!(
+            mgr.touch_handle().get().is_some(),
+            "the surface is routable"
+        );
+
+        // A *different* source cannot take it down. Otherwise a backgrounded session
+        // could blind the active one's glass, which is the same class of hijack
+        // `metadata_from_a_backgrounded_source_cannot_hijack_the_card` guards.
+        let b = SourceId::new(ProtocolKind::Miracast, "b");
+        assert!(mgr
+            .handle(SourceMessage {
+                source: b,
+                event: SessionEvent::TouchSurfaceRevoked,
+            })
+            .await
+            .is_err());
+        assert!(
+            mgr.touch_handle().get().is_some(),
+            "a source that is not active must not clear the active one's surface"
+        );
+
+        // The source that put it up takes it down, and the session survives.
+        mgr.handle(SourceMessage {
+            source: a,
+            event: SessionEvent::TouchSurfaceRevoked,
+        })
+        .await
+        .unwrap();
+        assert!(mgr.touch_handle().get().is_none(), "withdrawn");
+        assert!(
+            mgr.active().is_some(),
+            "an input channel closed, not a session"
+        );
+    }
+
     #[tokio::test]
     async fn preemption_drops_the_previous_sources_control_surface() {
         let counts = Arc::new(Counts::default());
