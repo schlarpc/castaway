@@ -29,6 +29,9 @@ pub struct MediaReceiver {
     demux: TsDemux,
     /// Datagrams discarded for not being MP2T-in-RTP.
     foreign: u64,
+    /// Datagrams the reorder buffer refused: a duplicate, or one that turned up after its
+    /// place in the sequence had already gone past.
+    late: u64,
 }
 
 impl MediaReceiver {
@@ -39,6 +42,7 @@ impl MediaReceiver {
             reorder: ReorderBuffer::new(REORDER_DEPTH),
             demux: TsDemux::new(),
             foreign: 0,
+            late: 0,
         }
     }
 
@@ -56,6 +60,7 @@ impl MediaReceiver {
         // where re-feeding bytes it has already seen would break the continuity counter
         // and cost a whole access unit.
         if !self.reorder.push(packet) {
+            self.late = self.late.saturating_add(1);
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -76,6 +81,21 @@ impl MediaReceiver {
     #[must_use]
     pub fn foreign_datagrams(&self) -> u64 {
         self.foreign
+    }
+
+    /// How many datagrams never arrived, as counted by the holes they left.
+    ///
+    /// The link's own number, before any of it is interpreted: reordering that resolves
+    /// itself does not appear here, so a nonzero value is loss and nothing else.
+    #[must_use]
+    pub fn lost_datagrams(&self) -> u64 {
+        self.reorder.skipped()
+    }
+
+    /// How many datagrams were refused as duplicates or as too late to be of use.
+    #[must_use]
+    pub const fn late_datagrams(&self) -> u64 {
+        self.late
     }
 
     /// The demuxer, for the session-level diagnostics that report what the PMT declared.
@@ -139,6 +159,88 @@ mod tests {
         rx.push_datagram(rtp(1, MP2T_PAYLOAD_TYPE, &null_ts()));
         assert_eq!(rx.demux().resync_count(), 0);
         assert_eq!(rx.foreign_datagrams(), 0);
+    }
+
+    #[test]
+    fn a_datagram_that_never_arrives_is_counted_as_lost_once_the_buffer_gives_up() {
+        // Below the reorder depth the hole is still open, and calling it a loss then
+        // would make every reordered pair look like damage. Past the depth it is real,
+        // and the session layer has to act on it (#192).
+        let mut rx = MediaReceiver::new();
+        let depth = u16::try_from(REORDER_DEPTH).unwrap();
+        // 0 and 1 are delivered; 2 never arrives.
+        for seq in [0, 1] {
+            rx.push_datagram(rtp(seq, MP2T_PAYLOAD_TYPE, &null_ts()));
+        }
+        for seq in 3..3 + depth {
+            rx.push_datagram(rtp(seq, MP2T_PAYLOAD_TYPE, &null_ts()));
+        }
+        assert_eq!(rx.lost_datagrams(), 0, "seq 2 could still turn up");
+        rx.push_datagram(rtp(3 + depth, MP2T_PAYLOAD_TYPE, &null_ts()));
+        assert_eq!(rx.lost_datagrams(), 1);
+        // And one that turns up after its place has gone past is neither loss nor damage:
+        // the hole it would have filled has already been counted.
+        rx.push_datagram(rtp(2, MP2T_PAYLOAD_TYPE, &null_ts()));
+        assert_eq!(rx.late_datagrams(), 1);
+        assert_eq!(rx.lost_datagrams(), 1);
+    }
+
+    #[test]
+    fn two_lost_datagrams_become_two_video_gaps_and_nothing_else() {
+        // The chain `miracast-vm` asserts across a radio, at the tier where the numbers
+        // can be reasoned about: one datagram per access unit — which is what the sink
+        // sees from a source sending small frames — with two of them withheld.
+        //
+        // Every step in between is a place the count could be wrong. The reorder buffer
+        // holds each hole open for its depth and then gives up on it *once*; the demuxer
+        // sees the continuity counter jump *once* per hole; and the session layer turns
+        // each of those into one IDR request. Two withheld datagrams have to come out the
+        // far end as two, or the sink either asks for keyframes it does not need or fails
+        // to ask for one it does (#192).
+        use crate::ts::tests as ts;
+
+        let mut rx = MediaReceiver::new();
+        let mut tables = ts::ts_packet(crate::ts::PAT_PID, true, 0, &ts::pat(ts::PMT_PID));
+        tables.extend_from_slice(&ts::ts_packet(
+            ts::PMT_PID,
+            true,
+            0,
+            &ts::pmt(&[(ts::VIDEO_PID, 0x1B)]),
+        ));
+        rx.push_datagram(rtp(0, MP2T_PAYLOAD_TYPE, &tables));
+
+        // Far enough apart that each hole crosses the reorder depth on its own, which is
+        // the same spacing the VM's schedule uses and for the same reason.
+        let withheld = [5u16, 16];
+        let mut frames = 0;
+        for n in 0..40u16 {
+            let pes = ts::pes(
+                0xE0,
+                Some(90_000 + u64::from(n) * 3_600),
+                &ts::non_idr_access_unit(),
+                false,
+            );
+            let packet = ts::packetize(ts::VIDEO_PID, (n % 16) as u8, &pes);
+            // The sequence number and the continuity counter advance either way: the
+            // source produced the packet, and it is the air that lost it.
+            if !withheld.contains(&n) {
+                frames += rx
+                    .push_datagram(rtp(n + 1, MP2T_PAYLOAD_TYPE, &packet))
+                    .len();
+            }
+        }
+        assert_eq!(rx.lost_datagrams(), 2);
+        assert_eq!(rx.demux().video_gap_count(), 2);
+        assert_eq!(rx.late_datagrams(), 0);
+        assert_eq!(rx.foreign_datagrams(), 0);
+        assert_eq!(rx.demux().resync_count(), 0, "no datagram was ever torn");
+        // And the picture survives: an unbounded PES completes at the next one's start,
+        // so 38 arrivals can yield at most 37 frames, and each hole costs the access unit
+        // it swallowed plus the one it left half-trusted.
+        assert!(
+            frames >= 33,
+            "only {frames} access units survived two losses"
+        );
     }
 
     #[test]

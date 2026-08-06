@@ -313,6 +313,13 @@ pub struct TsDemux {
     partial: BytesMut,
     /// Packets whose sync byte was not where it should have been, since the last resync.
     resyncs: u64,
+    /// Continuity-counter gaps on a stream carrying *video*.
+    ///
+    /// Kept apart from `resyncs` because it means something the layer above can act on
+    /// and `resyncs` does not: bytes of the coded video are missing, so every frame
+    /// decoded from here until the next IDR references data nobody has. That is what
+    /// M13 exists for, and it is the trigger the sink had no way to notice (#192).
+    video_gaps: u64,
 }
 
 impl TsDemux {
@@ -328,6 +335,16 @@ impl TsDemux {
     #[must_use]
     pub fn resync_count(&self) -> u64 {
         self.resyncs
+    }
+
+    /// How many times the coded video has been found to be missing bytes.
+    ///
+    /// Every increase is a reference frame the decoder will not have, so the picture is
+    /// wrong from here until an IDR arrives — which, against an AOSP source's
+    /// fifteen-second IDR interval, is the whole reason `wfd_idr_request` exists (D35).
+    #[must_use]
+    pub fn video_gap_count(&self) -> u64 {
+        self.video_gaps
     }
 
     /// The stream types the PMT declared, for logging what a session actually negotiated.
@@ -512,8 +529,13 @@ impl TsDemux {
             expected.is_some_and(|e| e != header.continuity_counter) && !header.discontinuity
         };
         if lost {
+            let mut video = false;
             if let Some(state) = self.streams.get_mut(&header.pid) {
                 state.damaged = true;
+                video = state.stream_type.video_codec().is_some();
+            }
+            if video {
+                self.video_gaps = self.video_gaps.saturating_add(1);
             }
         }
 
@@ -952,6 +974,36 @@ pub(crate) mod tests {
             "the next, intact access unit still arrives"
         );
         assert!(flushed[0].keyframe);
+        // And the gap is *reported*, once. Dropping the access unit keeps the picture
+        // clean; it does nothing about the fact that everything after it references a
+        // frame nobody has, and only the session layer can fix that — with an M13. It
+        // could not do so while this number did not exist (#192).
+        assert_eq!(demux.video_gap_count(), 1);
+        assert_eq!(
+            demux.resync_count(),
+            0,
+            "nothing lost its sync byte; a resync and a lost packet are different failures"
+        );
+    }
+
+    #[test]
+    fn a_gap_on_an_audio_stream_is_not_a_video_gap() {
+        // The counter drives `wfd_idr_request`, which asks for a *video* keyframe. A lost
+        // audio packet costs a few milliseconds of sound and nothing else, and answering
+        // it with an IDR would spend the source's rate limit on the wrong plane.
+        let mut demux = TsDemux::new();
+        demux.push(&ts_packet(PAT_PID, true, 0, &pat(PMT_PID)));
+        demux.push(&ts_packet(
+            PMT_PID,
+            true,
+            0,
+            &pmt(&[(VIDEO_PID, 0x1B), (AUDIO_PID, 0x0F)]),
+        ));
+        let bytes = pes(0xC0, Some(90_000), &vec![0x77u8; 400], true);
+        let packets = packetize(AUDIO_PID, 0, &bytes);
+        demux.push(&packets[..TS_PACKET_LEN]);
+        demux.push(&packets[TS_PACKET_LEN * 2..]);
+        assert_eq!(demux.video_gap_count(), 0);
     }
 
     #[test]

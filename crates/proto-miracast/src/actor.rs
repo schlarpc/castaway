@@ -122,6 +122,7 @@ pub async fn run_session(
     let mut last_idr = tokio::time::Instant::now()
         .checked_sub(IDR_MIN_INTERVAL)
         .unwrap_or_else(tokio::time::Instant::now);
+    let mut idr_requests: u64 = 0;
     let mut read_buf = vec![0u8; 8192];
     // Anything at all from the source, on either socket. Not a keep-alive clock — see
     // `IDLE_GRACE` for why the two are different things.
@@ -191,10 +192,20 @@ pub async fn run_session(
             received = rtp.recv(&mut datagram) => {
                 let n = received.map_err(|e| MiracastError::Connection(e.to_string()))?;
                 last_heard = tokio::time::Instant::now();
+                let gaps_before = media.demux().video_gap_count();
                 let frames = media.push_datagram(Bytes::copy_from_slice(&datagram[..n]));
+                let lost_video = media.demux().video_gap_count() != gaps_before;
                 if let Some(planes) = &mut planes {
                     for frame in frames {
                         planes.deliver(frame);
+                    }
+                    // Bytes of the coded video went missing, so every frame from here
+                    // references data nobody has: the access unit the gap broke was
+                    // dropped, and the ones after it decode into a picture that is wrong
+                    // and stays wrong. Only an IDR repairs that, and against an AOSP
+                    // source's fifteen-second interval, only one we ask for (D35, #192).
+                    if lost_video {
+                        planes.needs_keyframe = true;
                     }
                     // A frame arriving with no keyframe yet means we joined mid-GOP, and
                     // AOSP's fifteen-second IDR interval makes waiting a very long stare
@@ -206,7 +217,8 @@ pub async fn run_session(
                         // loop that is using them.
                         if let Some(SinkOutput::Send(request)) = session.request_idr() {
                             last_idr = tokio::time::Instant::now();
-                            debug!("asking the source for an IDR");
+                            idr_requests = idr_requests.saturating_add(1);
+                            debug!(idr_requests, "asking the source for an IDR");
                             write_request(&mut control, &request).await?;
                         }
                     }
@@ -219,6 +231,20 @@ pub async fn run_session(
             planes.deliver(frame);
         }
     }
+    // What the link actually did, once, at the end. Every one of these numbers existed
+    // and none of them was ever said out loud, so a mirror that looked bad in the field
+    // left nothing behind to tell a lossy radio from a slow decoder from a source sending
+    // to the wrong port — three problems with three different owners (#192).
+    info!(
+        %peer,
+        lost = media.lost_datagrams(),
+        late = media.late_datagrams(),
+        foreign = media.foreign_datagrams(),
+        resyncs = media.demux().resync_count(),
+        video_gaps = media.demux().video_gap_count(),
+        idr_requests,
+        "miracast: media plane closed"
+    );
     let _ = sink.emit(SessionEvent::End).await;
     Ok(())
 }
@@ -690,6 +716,21 @@ mod tests {
         }
     }
 
+    /// One RTP datagram of MPEG2-TS: the MP2T payload type, a sequence number, and bytes.
+    ///
+    /// The sequence number is the parameter it needs to be. A constant one — which is what
+    /// this used to build — makes every datagram after the first *late* to the sink's
+    /// reorder buffer, so nothing reaches the demuxer and the media tests below are
+    /// asserting on the datagram rather than on its contents (#192).
+    fn rtp_datagram(seq: u16, payload: &[u8]) -> Vec<u8> {
+        let mut datagram = Vec::with_capacity(12 + payload.len());
+        datagram.extend_from_slice(&[0x80, 33]);
+        datagram.extend_from_slice(&seq.to_be_bytes());
+        datagram.extend_from_slice(&[0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
+        datagram.extend_from_slice(payload);
+        datagram
+    }
+
     /// A scripted WFD *source*: it accepts the sink's connection and walks M1→M7.
     ///
     /// **Control plane only.** This used to claim it "sends one RTP datagram of transport
@@ -1085,10 +1126,16 @@ mod tests {
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = std::net::SocketAddr::from(([127, 0, 0, 1], rtp_port));
         let mut cc = 0u8;
-        let send_ts = |bytes: &[u8]| {
-            let mut datagram = Vec::with_capacity(12 + bytes.len());
-            datagram.extend_from_slice(&[0x80, 33, 0, 1, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
-            datagram.extend_from_slice(bytes);
+        // A real sequence number per datagram. It used to be the constant 1, and the
+        // sink's reorder buffer calls anything at or behind where it has already emitted
+        // *late* — so from the second datagram on, every one of them was dropped before
+        // it reached the demuxer, and this test was asserting that the first datagram
+        // triggers an M13 rather than that a P-frame does. Found while writing the loss
+        // test below (#192).
+        let mut next_seq = 0u16;
+        let mut send_ts = |bytes: &[u8]| {
+            let datagram = rtp_datagram(next_seq, bytes);
+            next_seq = next_seq.wrapping_add(1);
             datagram
         };
         let psi = {
@@ -1166,6 +1213,154 @@ mod tests {
             "asked {} more times inside one IDR_MIN_INTERVAL; the rate limiter is what \
              stands between a lossy link and an unusable one",
             after - before
+        );
+
+        session.abort();
+    }
+
+    /// Read whatever the source has been sent, for up to `window`.
+    async fn drain_control(control: &mut TcpStream, into: &mut String, window: Duration) {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut buf = vec![0u8; 8192];
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(100), control.read(&mut buf)).await
+            else {
+                continue;
+            };
+            if n == 0 {
+                break;
+            }
+            into.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    /// A gap in the middle of a *running* stream asks for an IDR again.
+    ///
+    /// The other half of D35's justification, and the half the sink could not do at all.
+    /// `needs_keyframe` was set once when a mirror started and cleared by the first
+    /// keyframe, and nothing ever set it again — so a source that answered the join-time
+    /// M13 and then dropped a reference left the panel showing a picture that was wrong
+    /// and stayed wrong until the encoder's own next IDR. On AOSP that is fifteen seconds,
+    /// which is the exact failure `wfd_idr_request` exists to prevent (#192).
+    ///
+    /// The loss is real rather than simulated: a datagram is withheld, the reorder buffer
+    /// holds the hole open for its depth and then gives up on it, and the demuxer finds
+    /// the continuity counter has jumped. Every link in that chain has to work for the
+    /// request to go out, which is the point — a counter the session layer cannot see is
+    /// what the sink was missing, not a decision it was getting wrong.
+    #[tokio::test]
+    async fn a_gap_in_a_running_stream_asks_for_an_idr_again() {
+        use crate::ts::tests as ts_fixtures;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = listener.local_addr().unwrap();
+        let rtp = bind_rtp(0).await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+
+        let source = tokio::spawn(scripted_source(listener, rtp_port, 30));
+
+        let (tx, mut rx) = mpsc::channel::<SourceMessage>(8);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "test"), tx);
+        let control = connect_control(source_addr).await.unwrap();
+        let session = tokio::spawn(run_session(control, rtp, caps(rtp_port), sink));
+
+        while let Some(message) = rx.recv().await {
+            if matches!(message.event, SessionEvent::Mirror { .. }) {
+                break;
+            }
+        }
+        let mut control = source.await.unwrap().unwrap();
+
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = std::net::SocketAddr::from(([127, 0, 0, 1], rtp_port));
+        let mut seq = 0u16;
+        let mut cc = 0u8;
+        let mut pts = 90_000u64;
+
+        let mut psi = ts_fixtures::ts_packet(
+            crate::ts::PAT_PID,
+            true,
+            0,
+            &ts_fixtures::pat(ts_fixtures::PMT_PID),
+        );
+        psi.extend_from_slice(&ts_fixtures::ts_packet(
+            ts_fixtures::PMT_PID,
+            true,
+            0,
+            &ts_fixtures::pmt(&[(ts_fixtures::VIDEO_PID, 0x1B)]),
+        ));
+        sender
+            .send_to(&rtp_datagram(seq, &psi), target)
+            .await
+            .unwrap();
+        seq = seq.wrapping_add(1);
+
+        // One access unit per datagram, which is what a source sending small frames
+        // produces and what makes a withheld datagram exactly one lost access unit.
+        let send_au = |seq: u16, cc: u8, pts: u64, keyframe: bool| {
+            let au = if keyframe {
+                ts_fixtures::idr_access_unit()
+            } else {
+                ts_fixtures::non_idr_access_unit()
+            };
+            let pes = ts_fixtures::pes(0xE0, Some(pts), &au, false);
+            rtp_datagram(
+                seq,
+                &ts_fixtures::packetize(ts_fixtures::VIDEO_PID, cc, &pes),
+            )
+        };
+
+        // A keyframe and two P-frames: an unbounded PES completes only when the next one
+        // starts, so this is what it takes to get the keyframe *delivered* and the
+        // join-time request satisfied.
+        for keyframe in [true, false, false] {
+            let datagram = send_au(seq, cc, pts, keyframe);
+            sender.send_to(&datagram, target).await.unwrap();
+            seq = seq.wrapping_add(1);
+            cc = cc.wrapping_add(1) & 0x0F;
+            pts += 3_000;
+        }
+
+        let mut seen = String::new();
+        drain_control(&mut control, &mut seen, Duration::from_millis(400)).await;
+        let before = seen.matches("wfd_idr_request").count();
+        assert_eq!(
+            before, 1,
+            "the join-time request is the one this test starts from:\n{seen}"
+        );
+
+        // Past the limiter, so what follows is attributable to the loss and not to a
+        // request that was merely overdue.
+        tokio::time::sleep(IDR_MIN_INTERVAL + Duration::from_millis(200)).await;
+        drain_control(&mut control, &mut seen, Duration::from_millis(200)).await;
+        assert_eq!(
+            seen.matches("wfd_idr_request").count(),
+            before,
+            "silence costs nothing: the sink has a keyframe and no reason to ask:\n{seen}"
+        );
+
+        // Now lose one, and keep sending. The reorder buffer waits out its depth before
+        // it will admit the datagram is gone, so the ones after it are what turn a hole
+        // into a loss.
+        seq = seq.wrapping_add(1);
+        cc = cc.wrapping_add(1) & 0x0F;
+        pts += 3_000;
+        for _ in 0..12 {
+            let datagram = send_au(seq, cc, pts, false);
+            sender.send_to(&datagram, target).await.unwrap();
+            seq = seq.wrapping_add(1);
+            cc = cc.wrapping_add(1) & 0x0F;
+            pts += 3_000;
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        drain_control(&mut control, &mut seen, Duration::from_secs(2)).await;
+        let after = seen.matches("wfd_idr_request").count();
+        assert!(
+            after > before,
+            "a reference frame was lost and the sink never asked for a new one; on an \
+             AOSP source that is fifteen seconds of a frozen, wrong picture:\n{seen}"
         );
 
         session.abort();
