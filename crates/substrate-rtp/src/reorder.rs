@@ -15,6 +15,12 @@ pub struct ReorderBuffer {
     /// lowers the baseline (start-of-stream reordering); after it, earlier = late.
     started: bool,
     buf: BTreeMap<u16, RtpPacket>,
+    /// Packets never delivered because the buffer stopped waiting for them.
+    ///
+    /// The one number that says a live stream is being damaged rather than merely
+    /// jittery: reordering costs nothing and shows up here as zero, while a real loss
+    /// leaves a hole the layer above has to repair (for Miracast, with an M13 — #192).
+    skipped: u64,
 }
 
 impl ReorderBuffer {
@@ -26,7 +32,14 @@ impl ReorderBuffer {
             next: None,
             started: false,
             buf: BTreeMap::new(),
+            skipped: 0,
         }
+    }
+
+    /// How many packets the buffer gave up on rather than waiting for.
+    #[must_use]
+    pub const fn skipped(&self) -> u64 {
+        self.skipped
     }
 
     /// Number of buffered (not-yet-popped) packets.
@@ -77,30 +90,43 @@ impl ReorderBuffer {
         }
     }
 
-    /// If over depth, skip the gap: advance `next` to the earliest buffered sequence so
-    /// [`Self::pop`] can proceed. This is the "drop late frames" policy for live media.
+    /// If a hole has held delivery up for more than `max_depth` packets, give up on it:
+    /// advance `next` to the earliest buffered sequence so [`Self::pop`] can proceed.
+    /// This is the "drop late frames" policy for live media.
+    ///
+    /// The depth bounds *how long a gap is waited on*, not how much a caller may leave
+    /// undrained — a caller is expected to [`Self::pop`] until it returns `None` after
+    /// every push, which every caller does. It used to bound both, and the second job
+    /// cost real packets: on giving up on a hole it went on to discard the packet that
+    /// had just become deliverable, so one lost datagram was always reported and felt as
+    /// two. For MPEG2-TS that is an extra continuity-counter gap, an extra access unit
+    /// dropped, and — since #192 — an extra IDR asked of the source (`skipped()` is what
+    /// made it visible).
     fn enforce_depth(&mut self) {
         while self.buf.len() > self.max_depth {
             let Some(next) = self.next else { return };
+            // Nothing is stuck: the packet we are waiting for is right here, so the
+            // backlog is a burst the caller has not drained yet, not a hole.
+            if self.buf.contains_key(&next) {
+                return;
+            }
             // Earliest buffered = smallest forward distance from `next`.
-            if let Some((&earliest, _)) = self
+            let Some((&earliest, _)) = self
                 .buf
                 .iter()
                 .min_by_key(|(&seq, _)| seq.wrapping_sub(next))
-            {
-                self.next = Some(earliest);
-                // Drop anything now strictly older than the new `next`.
-                let cutoff = earliest;
-                self.buf.retain(|&seq, _| !serial_lt(seq, cutoff));
-            }
-            // Emit by popping happens via pop(); here we just moved `next` forward, but
-            // if buffer is still over depth (all contiguous), drop the oldest.
-            if self.buf.len() > self.max_depth {
-                if let Some(next2) = self.next {
-                    self.buf.remove(&next2);
-                    self.next = Some(next2.wrapping_add(1));
-                }
-            }
+            else {
+                return;
+            };
+            // Everything between where we were and where we are going is gone. Counted in
+            // packets rather than in events, because "one gap" is what a stall looks like
+            // and "forty packets" is what it costs.
+            self.skipped = self
+                .skipped
+                .saturating_add(u64::from(earliest.wrapping_sub(next)));
+            self.next = Some(earliest);
+            // Drop anything now strictly older than the new `next`.
+            self.buf.retain(|&seq, _| !serial_lt(seq, earliest));
         }
     }
 }
@@ -158,16 +184,47 @@ mod tests {
     #[test]
     fn skips_gap_on_overflow() {
         let mut b = ReorderBuffer::new(3);
-        // seq 0 never arrives; 1,2,3,4 do — buffer overflows depth 3 and must skip 0.
-        for s in [1u16, 2, 3, 4] {
+        // 0 has to be *delivered* first, or there is no gap here to skip: the very first
+        // push sets the baseline, so "seq 0 never arrives, 1 2 3 4 do" — which is what
+        // this test used to do — is a stream that starts at 1 and loses nothing. It
+        // passed anyway, on `first >= 1`, which is true of every packet it could have
+        // returned. Nothing has ever exercised this path.
+        b.push(pkt(0));
+        assert_eq!(b.pop().unwrap().header.sequence, 0);
+
+        // Now 1 is genuinely missing. Within the depth, it is still worth waiting for.
+        for s in [2u16, 3, 4] {
             b.push(pkt(s));
         }
-        // First pop should not stall on the missing 0.
-        let first = b.pop().unwrap().header.sequence;
-        assert!(
-            first >= 1,
-            "must have skipped the missing seq 0, got {first}"
-        );
+        assert!(b.pop().is_none(), "2 cannot be delivered before 1");
+        assert_eq!(b.skipped(), 0);
+
+        // Past it, it is not: latency beats freshness, so the gap is skipped.
+        b.push(pkt(5));
+        let mut got = Vec::new();
+        while let Some(p) = b.pop() {
+            got.push(p.header.sequence);
+        }
+        // Exactly the packets that arrived — giving up on the hole used to take 2 with
+        // it, so one loss cost two packets and the second was self-inflicted.
+        assert_eq!(got, vec![2, 3, 4, 5]);
+        // And it says so. Reordering that resolves itself and a loss that never will are
+        // indistinguishable from the outside otherwise — one is free and the other
+        // corrupts every frame until the next keyframe (#192).
+        assert_eq!(b.skipped(), 1, "the missing packet is counted, once");
+    }
+
+    #[test]
+    fn reordering_that_resolves_itself_is_not_counted_as_loss() {
+        let mut b = ReorderBuffer::new(8);
+        for s in [2u16, 0, 1, 3] {
+            b.push(pkt(s));
+        }
+        while b.pop().is_some() {}
+        assert_eq!(b.skipped(), 0);
+        // Nor is a duplicate, or one that turns up after its place has gone past.
+        assert!(!b.push(pkt(1)));
+        assert_eq!(b.skipped(), 0);
     }
 
     #[test]
