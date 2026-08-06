@@ -2,7 +2,7 @@
 
 Snapshot for our next sync. Companion to DECISION-LOG.md (why) and the issue tracker
 (what needs you; `docs/OPEN-QUESTIONS.md` was migrated there and deleted — see #105).
-Everything below builds with `cargo build`, passes `cargo nextest run` (**2243 tests** as of
+Everything below builds with `cargo build`, passes `cargo nextest run` (**2274 tests** as of
 2026-08-05 — every feature is on by default since D55), passes `cargo clippy --all-targets -- -D warnings`,
 `nix build` produces a running binary, and `nix flake check` passes — which includes the VM
 tests (integration, miracast, bluetooth, gamestream, matter), the openscreen differential
