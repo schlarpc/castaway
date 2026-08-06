@@ -33,7 +33,7 @@ pub const TS_PACKET_LEN: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
 
 /// The PID carrying the Program Association Table. Fixed by the spec.
-const PAT_PID: Pid = Pid(0x0000);
+pub(crate) const PAT_PID: Pid = Pid(0x0000);
 
 /// The elementary stream clock: 90 kHz, for both PTS and the PCR base.
 const PTS_HZ: u64 = 90_000;
@@ -694,13 +694,13 @@ fn annex_b_has_idr(data: &[u8], codec: VideoCodec) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
     /// Build a TS packet with the given payload, padding with an adaptation field the way
     /// a real muxer does (stuffing bytes, not trailing 0xFF in the payload).
-    fn ts_packet(pid: Pid, pusi: bool, cc: u8, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn ts_packet(pid: Pid, pusi: bool, cc: u8, payload: &[u8]) -> Vec<u8> {
         assert!(payload.len() <= 184);
         let mut pkt = vec![0u8; TS_PACKET_LEN];
         pkt[0] = SYNC_BYTE;
@@ -727,7 +727,7 @@ mod tests {
         pkt
     }
 
-    fn pat(pmt_pid: Pid) -> Vec<u8> {
+    pub(crate) fn pat(pmt_pid: Pid) -> Vec<u8> {
         let mut section = vec![0x00u8]; // table_id
         let body = {
             let mut b = vec![0x00, 0x01, 0xC1, 0x00, 0x00]; // tsid, version, section, last
@@ -744,7 +744,7 @@ mod tests {
         payload
     }
 
-    fn pmt(streams: &[(Pid, u8)]) -> Vec<u8> {
+    pub(crate) fn pmt(streams: &[(Pid, u8)]) -> Vec<u8> {
         let mut body = vec![0x00, 0x01, 0xC1, 0x00, 0x00]; // program, version, section, last
         body.extend_from_slice(&[0xE1, 0x00]); // PCR PID 0x100
         body.extend_from_slice(&[0xF0, 0x00]); // program_info_length 0
@@ -776,7 +776,7 @@ mod tests {
         ]
     }
 
-    fn pes(stream_id: u8, pts: Option<u64>, payload: &[u8], bounded: bool) -> Vec<u8> {
+    pub(crate) fn pes(stream_id: u8, pts: Option<u64>, payload: &[u8], bounded: bool) -> Vec<u8> {
         let mut header = Vec::new();
         let optional = pts.map(|p| timestamp_bytes(p, 0b0010));
         let opt_len = optional.map_or(0usize, |o| o.len());
@@ -798,7 +798,7 @@ mod tests {
     }
 
     /// Split a PES across as many TS packets as it needs.
-    fn packetize(pid: Pid, cc_start: u8, pes_bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn packetize(pid: Pid, cc_start: u8, pes_bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut cc = cc_start;
         for (i, chunk) in pes_bytes.chunks(184).enumerate() {
@@ -811,11 +811,11 @@ mod tests {
     /// One frame at 30 fps: 3000 ticks of the 90 kHz clock, to the nanosecond.
     const THIRTY_FPS_FRAME: Duration = Duration::from_nanos(33_333_333);
 
-    const VIDEO_PID: Pid = Pid(0x1011);
+    pub(crate) const VIDEO_PID: Pid = Pid(0x1011);
     const AUDIO_PID: Pid = Pid(0x1100);
-    const PMT_PID: Pid = Pid(0x0100);
+    pub(crate) const PMT_PID: Pid = Pid(0x0100);
 
-    fn idr_access_unit() -> Vec<u8> {
+    pub(crate) fn idr_access_unit() -> Vec<u8> {
         // SPS, then an IDR slice — the shape of every keyframe a WFD source sends.
         let mut au = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E];
         au.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x68, 0xCE]);
@@ -823,7 +823,7 @@ mod tests {
         au
     }
 
-    fn non_idr_access_unit() -> Vec<u8> {
+    pub(crate) fn non_idr_access_unit() -> Vec<u8> {
         vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x12]
     }
 

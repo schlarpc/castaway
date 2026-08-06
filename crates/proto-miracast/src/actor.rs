@@ -1041,6 +1041,136 @@ mod tests {
         scripted_source_inner(listener, rtp_port, 30, Some(uibc_port)).await
     }
 
+    /// Joining mid-GOP asks the source for an IDR, and does not ask again for a second.
+    ///
+    /// `wfd_idr_request` is WFD's only loss-recovery primitive and the entire
+    /// justification for hand-rolling the MPEG2-TS demuxer instead of using ffmpeg's
+    /// `rtp_mpegts` (D35): AOSP's encoder puts IDRs *fifteen seconds* apart, so without
+    /// M13 a single lost reference is a fifteen-second frozen screen.
+    ///
+    /// Two tests covered the message *shape*. **The trigger had never fired at any
+    /// tier** — `needs_keyframe` and the `IDR_MIN_INTERVAL` rate limiter were executed by
+    /// nothing, and `miracast-vm`'s source deliberately sends an IDR first so the sink
+    /// never needs one (#192). It turned out this file could not have tested it either:
+    /// the scripted source sent no RTP at all despite a comment saying it did (`c9a5b89`).
+    ///
+    /// Both halves are asserted, and the limiter is the one that matters in the field: a
+    /// real capture shows a sink firing eight M13s back to back and turning a lossy link
+    /// into an unusable one, because each IDR collapses the bitrate.
+    #[tokio::test]
+    async fn joining_mid_gop_asks_for_an_idr_and_then_stops_asking() {
+        use crate::ts::tests as ts_fixtures;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = listener.local_addr().unwrap();
+        let rtp = bind_rtp(0).await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+
+        let source = tokio::spawn(scripted_source(listener, rtp_port, 30));
+
+        let (tx, mut rx) = mpsc::channel::<SourceMessage>(8);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "test"), tx);
+        let control = connect_control(source_addr).await.unwrap();
+        let session = tokio::spawn(run_session(control, rtp, caps(rtp_port), sink));
+
+        while let Some(message) = rx.recv().await {
+            if matches!(message.event, SessionEvent::Mirror { .. }) {
+                break;
+            }
+        }
+        let mut control = source.await.unwrap().unwrap();
+
+        // A stream that starts on a *P-frame*: the source was already encoding when we
+        // joined, which is the ordinary case for a sink walking up to a running cast.
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = std::net::SocketAddr::from(([127, 0, 0, 1], rtp_port));
+        let mut cc = 0u8;
+        let send_ts = |bytes: &[u8]| {
+            let mut datagram = Vec::with_capacity(12 + bytes.len());
+            datagram.extend_from_slice(&[0x80, 33, 0, 1, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
+            datagram.extend_from_slice(bytes);
+            datagram
+        };
+        let psi = {
+            let mut v = ts_fixtures::ts_packet(
+                crate::ts::PAT_PID,
+                true,
+                0,
+                &ts_fixtures::pat(ts_fixtures::PMT_PID),
+            );
+            v.extend_from_slice(&ts_fixtures::ts_packet(
+                ts_fixtures::PMT_PID,
+                true,
+                0,
+                &ts_fixtures::pmt(&[(ts_fixtures::VIDEO_PID, 0x1B)]),
+            ));
+            v
+        };
+        sender.send_to(&send_ts(&psi), target).await.unwrap();
+
+        // Several P-frames. An unbounded PES ends only when the next one starts, so it
+        // takes two to get one frame out of the demuxer.
+        for pts in [90_000u64, 93_000, 96_000, 99_000] {
+            let pes = ts_fixtures::pes(0xE0, Some(pts), &ts_fixtures::non_idr_access_unit(), false);
+            let packets = ts_fixtures::packetize(ts_fixtures::VIDEO_PID, cc, &pes);
+            cc = cc.wrapping_add(u8::try_from(packets.len() / 188).unwrap_or(1)) & 0x0F;
+            sender.send_to(&send_ts(&packets), target).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The sink must ask. Read the source's socket for an M13 — a bare
+        // `wfd_idr_request` in a SET_PARAMETER, which is what AOSP substring-matches on.
+        let mut seen = String::new();
+        let mut buf = vec![0u8; 8192];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && !seen.contains("wfd_idr_request") {
+            let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(300), control.read(&mut buf)).await
+            else {
+                continue;
+            };
+            if n == 0 {
+                break;
+            }
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(
+            seen.contains("wfd_idr_request"),
+            "the sink joined mid-GOP and never asked for a keyframe; without M13 that is \
+             a fifteen-second stare at a frozen screen on AOSP:\n{seen}"
+        );
+
+        // …and stops asking. Keep feeding P-frames for well under `IDR_MIN_INTERVAL` and
+        // count: a sink that asks per frame turns a lossy link into an unusable one,
+        // because every IDR collapses the bitrate.
+        let before = seen.matches("wfd_idr_request").count();
+        for pts in [102_000u64, 105_000, 108_000, 111_000, 114_000] {
+            let pes = ts_fixtures::pes(0xE0, Some(pts), &ts_fixtures::non_idr_access_unit(), false);
+            let packets = ts_fixtures::packetize(ts_fixtures::VIDEO_PID, cc, &pes);
+            cc = cc.wrapping_add(u8::try_from(packets.len() / 188).unwrap_or(1)) & 0x0F;
+            sender.send_to(&send_ts(&packets), target).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(200), control.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let after = seen.matches("wfd_idr_request").count();
+        assert_eq!(
+            after,
+            before,
+            "asked {} more times inside one IDR_MIN_INTERVAL; the rate limiter is what \
+             stands between a lossy link and an unusable one",
+            after - before
+        );
+
+        session.abort();
+    }
+
     #[tokio::test]
     async fn binding_a_taken_port_fails_before_anything_is_advertised() {
         // The port in M3 is a promise; discovering it is taken afterwards means a source
