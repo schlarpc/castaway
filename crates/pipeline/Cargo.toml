@@ -153,6 +153,10 @@ d3d12 = { version = "22", optional = true }
 
 [dev-dependencies]
 base64.workspace = true
+# Decoding the blessed PNGs in `tests/golden_scenes.rs`. The crate itself only *encodes*
+# (`attract::to_png`), and a golden-image test has to read one back (#203). Same crate the
+# card already decodes cover art with, so this adds nothing to the build.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # The output-stream round trip writes its segments somewhere libavformat can open them.
 tempfile.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
