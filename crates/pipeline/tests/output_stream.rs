@@ -76,12 +76,38 @@ fn config() -> StreamConfig {
     }
 }
 
+/// A stream that has published what was asked of it, with the loop that produced it
+/// **still attached**.
+///
+/// The render loop is held rather than dropped, and that is the whole reason this type
+/// exists. Dropping it drops the [`StreamTap`]; `StreamTap::drop` clears the job sender;
+/// the encode thread's `recv` then fails and the tail of `encode_loop` flushes, publishes
+/// the last segment and calls `LiveStream::stopped`, which moves the status
+/// `Live | Starting → Idle`. That thread is spawned and never joined, so all of it happens
+/// *after* the harness returns — and a test reading `status()` afterwards was racing its
+/// own teardown. `published a segment but is not live` is what winning that race looks
+/// like, and the two tests that read the status are the only two that have ever shown it
+/// (#208).
+struct Published {
+    state: Arc<LiveStream>,
+    /// Never read. Held so the tap outlives the assertions; see the type's docs.
+    _render: RenderLoop,
+}
+
+impl std::ops::Deref for Published {
+    type Target = LiveStream;
+
+    fn deref(&self) -> &LiveStream {
+        &self.state
+    }
+}
+
 /// Drive a render loop with a stream tap attached until `segments` have been published.
 ///
 /// Returns `None` when there is honestly no GPU and no encoder. Both are tripwired, so
 /// under a build that promised either, this is a failure rather than a skip (#182).
-fn publish(width: u32, height: u32, segments: u32) -> Option<Arc<LiveStream>> {
-    publish_with(width, height, segments, None).map(|(state, _)| state)
+fn publish(width: u32, height: u32, segments: u32) -> Option<Published> {
+    publish_with(width, height, segments, None)
 }
 
 /// The same, with the panel playing something.
@@ -94,7 +120,7 @@ fn publish_with(
     height: u32,
     segments: u32,
     sound: Option<Session<'_>>,
-) -> Option<(Arc<LiveStream>, Arc<StreamAudio>)> {
+) -> Option<Published> {
     let compositor = panel(width, height)?;
     let config = config();
     let state = Arc::new(LiveStream::new(&config));
@@ -139,7 +165,10 @@ fn publish_with(
             return None;
         }
         if state.segment(segments).is_some() {
-            return Some((state, audio));
+            return Some(Published {
+                state,
+                _render: rloop,
+            });
         }
         // Faster than the panel would present, so the cadence is what paces the stream
         // rather than this loop.
@@ -440,12 +469,42 @@ fn the_stream_says_which_encoder_it_got() {
 }
 
 #[test]
+fn letting_the_tap_go_takes_the_stream_live_status_with_it() {
+    // The mechanism [`Published`] exists to keep out of the other tests' way, asserted
+    // head-on so it is a documented property rather than a footnote in a struct (#208).
+    //
+    // It is also a real requirement: `/stream/*` answers from this status, and a panel
+    // that kept saying `Live` after its tap went away would offer a playlist whose next
+    // segment nobody is producing.
+    let Some(published) = publish(320, 176, 1) else {
+        return;
+    };
+    assert!(matches!(published.status(), StreamStatus::Live { .. }));
+
+    let state = Arc::clone(&published.state);
+    drop(published);
+
+    // The encode thread is spawned and never joined, so waiting for it is the only honest
+    // way to observe the end of it — which is exactly why a test that read the status
+    // straight after the harness returned was racing.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && matches!(state.status(), StreamStatus::Live { .. }) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !matches!(state.status(), StreamStatus::Live { .. }),
+        "a tap that has gone should stop the stream, not leave it advertising itself: {:?}",
+        state.status()
+    );
+}
+
+#[test]
 fn sound_played_on_the_panel_comes_back_in_the_stream() {
     // Through the shipped path: a session takes an output from the tee'd factory and
     // writes to it exactly as a cast does. If the tee, the resampler, the mix, the AAC
     // encoder, the `esds` or the second `traf` is wrong, this is silence.
     let tone = Tone::after(Duration::ZERO);
-    let Some((state, _audio)) = publish_with(320, 176, 2, Some(&|out| tone.feed(out))) else {
+    let Some(state) = publish_with(320, 176, 2, Some(&|out| tone.feed(out))) else {
         return;
     };
     let file = playable(&state, 2);
@@ -463,7 +522,7 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
 fn a_silent_panel_still_carries_a_continuous_audio_track() {
     // The normal case, and the one that breaks players: a track that stops when nothing
     // is playing is one a browser stalls on. Silence has to be *produced*.
-    let Some((state, _audio)) = publish_with(320, 176, 2, None) else {
+    let Some(state) = publish_with(320, 176, 2, None) else {
         return;
     };
     let file = playable(&state, 2);
@@ -482,7 +541,7 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
     // audio running *ahead*, which would mean it was being placed by arrival rather than
     // by the clock, and would compound into real drift.
     let segments = 4;
-    let Some((state, _audio)) = publish_with(320, 176, segments, None) else {
+    let Some(state) = publish_with(320, 176, segments, None) else {
         return;
     };
     let file = playable(&state, segments);
@@ -525,8 +584,7 @@ fn sound_lands_where_on_the_timeline_it_was_played() {
     let quiet = Duration::from_millis(250);
     let tone = Tone::after(quiet);
     let segments = 4;
-    let Some((state, _audio)) = publish_with(320, 176, segments, Some(&|out| tone.feed(out)))
-    else {
+    let Some(state) = publish_with(320, 176, segments, Some(&|out| tone.feed(out))) else {
         return;
     };
     let file = playable(&state, segments);
@@ -546,7 +604,7 @@ fn sound_lands_where_on_the_timeline_it_was_played() {
 fn the_stream_says_it_has_both_tracks() {
     // What an MSE `SourceBuffer` is opened with. One track missing from the codec string
     // and the browser refuses the whole stream.
-    let Some((state, _audio)) = publish_with(320, 176, 1, None) else {
+    let Some(state) = publish_with(320, 176, 1, None) else {
         return;
     };
     let StreamStatus::Live { codec, encoder, .. } = state.status() else {
