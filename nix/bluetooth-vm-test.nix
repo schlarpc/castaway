@@ -10,8 +10,10 @@
 #
 # What that peer now does, in order: browses our SDP records with `sdptool`, pairs over
 # SSP, enumerates our stream endpoints and decodes every capability record with `avinfo`,
-# refuses to be given a codec an endpoint does not offer, and configures, opens and starts
-# a stream with `avtest`. Four of those had never happened here.
+# refuses to be given a codec an endpoint does not offer, configures, opens and starts a
+# stream with `avtest`, and finally plays a real six-second waveform through bluetoothd's
+# own A2DP source with PipeWire behind it — which we decode, mix, record, and correlate
+# against what was sent.
 #
 # Two properties make this *harsher* than real hardware, which is the point. A virtual
 # controller reports an ACL MTU of 192 with a **single** buffer, against 1021x4 on a real
@@ -24,13 +26,13 @@
 # (so pairing falls back to legacy PIN, which this receiver refuses by design), and
 # `avtest` configures the first endpoint it finds rather than a matching one.
 #
-# **Still not covered, and it is the audio.** No media packet is sent and nothing is
-# decoded, so the `services.pipewire`/`tester` block below remains configured and unused.
-# That wants bluetoothd's own A2DP source with a PipeWire endpoint behind it — which now
-# has a fair chance of working, because a *trusted* device makes bluetoothd connect
-# profiles on its own (this test can already see it driving AVRCP), and a receiver that
-# writes decoded PCM somewhere a test can cross-correlate it. See `docs/test-matrix.md`
-# §4.3 and #186.
+# **The audio is the last subtest and it is the point.** Everything above it establishes a
+# session; only that one asks whether anything came out. The claim it makes is stronger
+# than a counter can make: the recording is what the mixer handed the output device, the
+# reference is what a source that has never seen our code was told to play, and a
+# normalised cross-correlation per channel says they are the same waveform. A channel
+# swap, a mono collapse, a half-rate decode or a phase inversion each fail it, and each
+# one satisfies "blocks were accepted". See `docs/test-matrix.md` §4.3 and #186.
 { pkgs, castaway }:
 
 let
@@ -38,12 +40,32 @@ let
   bluezWithBtvirt = pkgs.bluez.overrideAttrs (old: {
     pname = "bluez-btvirt";
     configureFlags = (old.configureFlags or [ ]) ++ [ "--enable-testing" ];
+    # Every controller btvirt can emulate is hardcoded to a 192-byte ACL MTU with a
+    # single transmit buffer — `emulator/btdev.c`, one assignment, no option and no
+    # variation by controller type. The MTU is a feature here and stays (it is what
+    # fragments every SDP browse), but a single outstanding packet means a completion
+    # round trip through a userspace emulator per 192 bytes, and that ceiling is far
+    # below what A2DP needs: measured at roughly a seventh of real time, which is not a
+    # link any audio can cross.
+    #
+    # So the two become settable, defaulting to exactly what they were. Nothing changes
+    # for a caller that sets neither, which is every subtest but the audio one.
+    postPatch = (old.postPatch or "") + ''
+      substituteInPlace emulator/btdev.c \
+        --replace-fail 'btdev->acl_mtu = 192;' \
+          'btdev->acl_mtu = getenv("BTVIRT_ACL_MTU") ? atoi(getenv("BTVIRT_ACL_MTU")) : 192;' \
+        --replace-fail 'btdev->acl_max_pkt = 1;' \
+          'btdev->acl_max_pkt = getenv("BTVIRT_ACL_MAX_PKT") ? atoi(getenv("BTVIRT_ACL_MAX_PKT")) : 1;'
+    '';
     postInstall = (old.postInstall or "") + ''
       install -Dm755 emulator/btvirt $out/bin/btvirt
     '';
   });
 
-  config = pkgs.writeText "castaway.toml" ''
+  # The three receivers this test starts are the same panel differing by two lines, so the
+  # body is shared: a change to `[enable]` that reached one of them and not the others
+  # would make two subtests disagree about what is under test for no visible reason.
+  configFor = name: extra: pkgs.writeText "castaway-${name}.toml" ''
     friendly_name = "castaway vm"
     uuid = "0f8c2e10-castaway-0001-00000000vmbt"
     http_port = 8080
@@ -64,7 +86,10 @@ let
     # hci1 is btvirt's second controller; BlueZ keeps hci0 and plays the source.
     transport = "socket:1"
     state_dir = "/var/lib/castaway"
+    ${extra}
   '';
+
+  config = configFor "full" "";
 
   # The same receiver, advertising only the mandatory codec.
   #
@@ -77,26 +102,26 @@ let
   # `codecs` exists for exactly this, and says so: a source takes the first endpoint it
   # supports, so the only way to exercise a *particular* codec is to stop offering the
   # ones it would otherwise prefer.
-  sbcConfig = pkgs.writeText "castaway-sbc.toml" ''
-    friendly_name = "castaway vm"
-    uuid = "0f8c2e10-castaway-0001-00000000vmbt"
-    http_port = 8080
+  sbcConfig = configFor "sbc" ''codecs = ["sbc"]'';
 
-    [enable]
-    dlna = false
-    spotify = false
-    dial = false
-    cast = false
-    airplay = false
-    gamestream = false
-    miracast = false
-    bluetooth = true
-
-    [bluetooth]
-    transport = "socket:1"
-    state_dir = "/var/lib/castaway"
+  # Where the recording lands, and the receiver that makes one.
+  #
+  # Still SBC-only, for a different reason than `sbcConfig`'s: PipeWire would negotiate
+  # the best codec both ends offer, which makes the codec under test a property of what
+  # nixpkgs happened to build `libfreeaptx` against. The fidelity floor asserted below is
+  # a number for *one* codec, and SBC is the one every A2DP source has.
+  recordPath = "/var/lib/castaway/mix.wav";
+  recordConfig = configFor "record" ''
     codecs = ["sbc"]
+
+    [audio]
+    record = "${recordPath}"
   '';
+
+  # The waveform the source sends and the analysis that says it survived. numpy for the
+  # FFT the correlation is built on — a lag loop over a recording this long is minutes.
+  signal = ./bluetooth-a2dp-signal.py;
+  python = pkgs.python3.withPackages (ps: [ ps.numpy ]);
 in
 pkgs.testers.runNixOSTest {
   name = "castaway-bluetooth-a2dp";
@@ -111,7 +136,10 @@ pkgs.testers.runNixOSTest {
     environment.systemPackages = [
       bluezWithBtvirt
       castaway
-      pkgs.python3
+      python
+      # `pactl` and `paplay`. The *clients* only — `services.pipewire.pulse` is the
+      # server, and these are what a person would reach for to play something at it.
+      pkgs.pulseaudio
     ];
 
     # A real audio graph, so the source side is PipeWire doing what it does for a
@@ -122,13 +150,35 @@ pkgs.testers.runNixOSTest {
       alsa.enable = true;
       pulse.enable = true;
       wireplumber.enable = true;
+      # WirePlumber gates its bluez monitor on logind seat activity — Bluetooth audio is
+      # meant to follow whoever is physically at the machine, so a session that is not
+      # *active on a seat* gets no bluez device at all. A VM has no seat and nobody is
+      # logged in at one, so the monitor loaded, sat there, and bluetoothd refused the
+      # profile with `a2dp-sink profile connect failed: Protocol not available` — which
+      # names our sink and means "there is no local source endpoint to connect it to".
+      #
+      # Turning the gate off rather than manufacturing a seat: what is under test is the
+      # A2DP path, and an autologin on tty1 to satisfy a policy about who is at the
+      # keyboard would be a second moving part for no coverage.
+      wireplumber.extraConfig."10-bluez-without-a-seat" = {
+        "wireplumber.profiles".main."monitor.bluez.seat-monitoring" = "disabled";
+      };
     };
     users.users.tester = {
       isNormalUser = true;
       extraGroups = [ "audio" "wheel" ];
     };
+    # The bluez monitor says nothing at default verbosity — not that it loaded, not that
+    # it failed to. When the A2DP source endpoint is missing the only symptom is
+    # bluetoothd refusing the profile several steps later, so this test would rather pay
+    # for a noisy journal than diagnose that from the far end again.
+    systemd.user.services.wireplumber.environment.WIREPLUMBER_DEBUG = "5";
 
-    virtualisation.memorySize = 2048;
+    # 2 GB ran everything up to the audio; the correlation is what wanted more. Its search
+    # window is the whole recording, so the FFT is sized to the next power of two above
+    # it — a minute of 48 kHz stereo is a 4 M-point transform in float64, and numpy holds
+    # several of those at once.
+    virtualisation.memorySize = 4096;
     # btvirt emulates the air interface in userspace, so it and the kernel's HCI layer
     # are two runnable things: on the single vCPU a nixosTest defaults to, a loaded host
     # can starve one long enough for an HCI command to hit its 2s timeout. A second core
@@ -357,22 +407,36 @@ pkgs.testers.runNixOSTest {
         for handle in ["0x10000", "0x10001", "0x10002"]:
             assert handle in records, records
 
-    with subtest("BlueZ pairs with the receiver over Secure Simple Pairing"):
-        # Everything past SDP is behind authentication: BlueZ opens its AVDTP sockets at
-        # security MEDIUM, so the link is authenticated before a byte of AVDTP flows.
-        #
-        # And the emulator decides *which* pairing happens. `btdev.c`'s `use_ssp()` is
+    def pair_with_receiver(unit):
+        """Pair and trust, from BlueZ's side, against the receiver running as `unit`.
+
+        Called twice: once as its own subtest, and again after the controllers are
+        swapped for the audio one, because a new controller is a new adapter and
+        bluetoothd's record of what this device is goes with the old one.
+        """
+        # The emulator decides *which* pairing happens. `btdev.c`'s `use_ssp()` is
         # `!auth_enable && both simple_pairing_mode`, so if either controller has SSP off
         # the link falls back to legacy PIN — which this receiver refuses by design
         # (`host.rs`: a panel with no keypad cannot be asked for a number), and the
         # result was BlueZ retrying forever: 54 `link up` / `link down` cycles with
         # `No agent available for request type 0` beside each one. That is the emulator's
-        # default, not ours; our side sets SSP in its bring-up sequence.
+        # default, not ours; our side sets SSP in its bring-up sequence. It is a
+        # *controller* setting, so a fresh controller needs it said again.
         print(machine.succeed("hciconfig hci0 sspmode"))
         machine.succeed("hciconfig hci0 sspmode 1")
         print(machine.succeed("hciconfig hci0 sspmode"))
 
         drop_stale_links()
+        # bluetoothd will not pair with a device it has no object for, and after a
+        # `remove` — or on an adapter that has only just appeared — there is none: `pair`
+        # answers `Device 00:AA:01:01:00:01 not available` and exits 0 having done
+        # nothing. A scan is how a phone acquires one, and it is a no-op on the call
+        # where the device is already known.
+        machine.wait_until_succeeds(
+            f"bluetoothctl --timeout 15 scan on >/dev/null 2>&1; "
+            f"bluetoothctl devices | grep -q {sink_addr}",
+            timeout=120,
+        )
         # `NoInputNoOutput` on both ends is the just-works case, which is what a panel and
         # a phone actually negotiate: no number to compare, no keypad on either side.
         status, out = machine.execute(
@@ -382,7 +446,7 @@ pkgs.testers.runNixOSTest {
         # Our side's own account of it, which is the one that matters: the link key
         # arrived and was stored, so the next connection skips pairing entirely.
         machine.wait_until_succeeds(
-            "journalctl -u castaway | grep -q 'bluetooth: paired'", timeout=60
+            f"journalctl -u {unit} | grep -q 'bluetooth: paired'", timeout=60
         )
         assert status == 0, f"bluetoothctl pair exited {status}:\n{out}"
 
@@ -392,6 +456,11 @@ pkgs.testers.runNixOSTest {
         # needs one again to authorise each profile. A phone marks a speaker trusted
         # when the person taps "pair"; this is that tap.
         machine.succeed(f"bluetoothctl --timeout 5 trust {sink_addr}")
+
+    with subtest("BlueZ pairs with the receiver over Secure Simple Pairing"):
+        # Everything past SDP is behind authentication: BlueZ opens its AVDTP sockets at
+        # security MEDIUM, so the link is authenticated before a byte of AVDTP flows.
+        pair_with_receiver("castaway")
 
     with subtest("BlueZ's own AVDTP client discovers the endpoint and reads its codecs"):
         # `avinfo` is the other end of `avdtp.rs`: DISCOVER, then GET_CAPABILITIES on what
@@ -489,10 +558,237 @@ pkgs.testers.runNixOSTest {
             "'bluetooth: (link up|stream configured|sbc bitpool)'"
         ))
 
+    with subtest("a real A2DP source plays audio and the waveform survives the path"):
+        # The assertion this whole file was built toward, and the one no other test in the
+        # tree makes: not that a session was established, not that blocks were counted, but
+        # that the samples that reached the speakers are the samples that were sent.
+        #
+        # The source is bluetoothd's own A2DP with PipeWire's media endpoint behind it —
+        # the same two programs that drive a real headset, neither of which has seen our
+        # code. `avtest` above proved our responder agrees to SET_CONFIGURATION/OPEN/START;
+        # it does not prove a single media packet decodes to anything.
+        machine.succeed("systemctl stop castaway-sbc")
+        machine.wait_until_succeeds("hciconfig hci1 down", timeout=60)
+
+        # A different pair of controllers for this subtest, and the only place in this
+        # file that asks for one.
+        #
+        # Every subtest above wants the 192-byte single-buffer geometry: it is what makes
+        # every SDP browse fragment, which is the only thing that has ever exercised the
+        # continuation path. Audio wants the opposite. A single outstanding 192-byte
+        # packet means a completion round trip through a userspace emulator per 192
+        # bytes, and that link carries SBC at about a seventh of real time — measured,
+        # along with 23% at sixteen buffers, so this is not a margin that a bigger number
+        # closes. A source plays in real time regardless, so what arrives is a fraction of
+        # what was sent and the receiver is being asked to reconstruct audio from an
+        # eighth of it.
+        #
+        # 1021:8 is an ordinary laptop controller (an Intel AX200 is 1021:4). Restarting
+        # rather than choosing one geometry for the whole file is what keeps both
+        # properties, and the bond survives it because btvirt derives each controller's
+        # address from its index, so the same two addresses come back.
+        machine.succeed("pkill -f 'bin/btvirt'")
+        machine.wait_until_succeeds("! hciconfig | grep -q hci1", timeout=60)
+        machine.succeed(
+            "BTVIRT_ACL_MTU=1021 BTVIRT_ACL_MAX_PKT=8 "
+            "${bluezWithBtvirt}/bin/btvirt -l2 >>/tmp/btvirt.log 2>&1 &"
+        )
+        machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=60)
+        bring_up("hci0")
+        roomy = machine.succeed("hciconfig hci0")
+        assert "ACL MTU: 1021:8" in roomy, f"the geometry did not take:\n{roomy}"
+        # The same addresses, or the bond from the pairing subtest is gone and everything
+        # below fails for a reason that has nothing to do with audio.
+        assert address_of("hci1") == sink_addr, (
+            f"the controllers came back as {address_of('hci1')}, not {sink_addr}"
+        )
+
+        # Both sides forget the bond, not one. BlueZ's went with the adapter that learned
+        # it; a receiver still holding a key for a peer that has none would answer the
+        # authentication instead of pairing again, and there would be no
+        # `bluetooth: paired` to wait for. Read at startup, so it happens before the
+        # process does.
+        machine.succeed("rm -f /var/lib/castaway/bluetooth-link-keys")
+        machine.succeed(
+            "systemd-run --unit=castaway-rec --setenv=RUST_LOG=info "
+            "--setenv=CASTAWAY_CONFIG=${recordConfig} ${castaway}/bin/castaway"
+        )
+        # Both, and in this order: a receiver that came up without its recorder would fail
+        # this subtest at the analysis, several minutes later, saying only that the file
+        # was missing.
+        machine.wait_until_succeeds(
+            "journalctl -u castaway-rec | grep -q 'recording the mix'", timeout=60
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u castaway-rec | grep -q 'bluetooth: discoverable'", timeout=60
+        )
+
+        # The bond does not survive the swap, whatever the addresses say. bluetoothd
+        # keeps what it knows about a device — the link key *and* the service UUIDs it
+        # learned while pairing — under the adapter that learned it, and the adapter that
+        # learned it is gone. What is left answers `Connect()` with
+        # `org.bluez.Error.Failed br-connection-unknown`: it has a device with no
+        # profiles on it and nothing to connect. So it is forgotten deliberately and
+        # paired again, which is a handful of seconds and leaves no ambiguity.
+        machine.execute(f"bluetoothctl --timeout 5 remove {sink_addr}")
+        pair_with_receiver("castaway-rec")
+
+        # bluetoothd's idea of powered, which is not `hciconfig`'s. `powerOnBoot = false`
+        # leaves `AutoEnable=false` in its config, so it is entitled to settle an adapter
+        # to off — and it does so at every index event, which the receiver generates each
+        # time it claims or releases hci1. Everything before this goes over raw HCI or an
+        # L2CAP socket and does not care; a *profile* connection is the first thing routed
+        # through bluetoothd, and without this it answers
+        # `org.bluez.Error.NotReady br-connection-adapter-not-powered`.
+        #
+        # And it happens *here*, before the audio graph starts, for a second reason that
+        # cost its own run: wireplumber registers its `org.bluez.MediaEndpoint1` per
+        # adapter as it enumerates them at startup, and an adapter that was unpowered when
+        # it looked gets no endpoint. bluetoothd then has nothing to offer for the source
+        # role and refuses the connection with `a2dp-sink profile connect failed:
+        # Protocol not available` — which reads like our sink's fault and is not.
+        machine.wait_until_succeeds(
+            "bluetoothctl --timeout 5 power on >/dev/null 2>&1; "
+            "bluetoothctl --timeout 5 show | grep -q 'Powered: yes'",
+            timeout=60,
+        )
+        print(machine.succeed("bluetoothctl --timeout 5 show"))
+
+        # PipeWire is a *user* service and a VM test has nobody logged in, so it has to be
+        # asked for explicitly. Lingering rather than a login shell: `su` gives a session
+        # whose runtime dir is torn down when it exits, which would take the audio graph
+        # with it between two `machine.succeed` calls.
+        machine.succeed("loginctl enable-linger tester")
+        uid = machine.succeed("id -u tester").strip()
+
+        def as_tester(cmd, **kw):
+            return machine.succeed(
+                f"su tester -c 'export XDG_RUNTIME_DIR=/run/user/{uid}; {cmd}'", **kw
+            )
+
+        # Started head-on rather than waited for. PipeWire is socket-activated, so
+        # `is-active pipewire.service` reports `inactive` until something connects — which
+        # is not the same as "not running", and waiting for it to flip is a 90 s timeout
+        # against a graph that was ready the whole time.
+        #
+        # wireplumber by name, and not just pipewire: it is what registers the media
+        # endpoint the paragraph above is about.
+        #
+        # How many such registrations bluetoothd has already logged, so the wait below is
+        # for *this* wireplumber's rather than for one a previous one left in the journal.
+        registered = "journalctl -u bluetooth --no-pager | grep -c A2DPSource/sbc || true"
+        before = int(machine.succeed(registered).strip() or 0)
+        machine.wait_until_succeeds(
+            "systemctl --user --machine=tester@.host start "
+            "pipewire.service wireplumber.service",
+            timeout=120,
+        )
+        # A client reaching the graph, rather than a unit's own opinion of itself:
+        # `pactl` is what plays the audio below, over the socket it will use.
+        machine.wait_until_succeeds(
+            f"su tester -c 'export XDG_RUNTIME_DIR=/run/user/{uid}; pactl info'",
+            timeout=60,
+        )
+        # And then the thing that actually gates the connection. `pactl info` answering
+        # says PipeWire is up; it says nothing about the bluez monitor, which registers
+        # its endpoints seconds later and over D-Bus. Connecting in that window fails with
+        # `a2dp-sink profile connect failed: Protocol not available` — measured at eight
+        # seconds early, which is wide enough that it is not a race worth losing again.
+        machine.wait_until_succeeds(
+            f"test $({registered}) -gt {before}", timeout=120
+        )
+
+        drop_stale_links()
+        # A profile connection this time, not a bare ACL: the device is paired and trusted
+        # above, so this is the same thing tapping a speaker in a phone's settings does.
+        status, out = machine.execute(
+            f"timeout 60 bluetoothctl --timeout 30 connect {sink_addr} 2>&1"
+        )
+        print(out)
+        # The node is the real signal — `bluetoothctl connect` returns on the *link*, and
+        # the profile follows it by however long bluetoothd and wireplumber take to agree.
+        try:
+            machine.wait_until_succeeds(
+                f"su tester -c 'export XDG_RUNTIME_DIR=/run/user/{uid}; "
+                f"pactl list short sinks' | grep -q bluez_output",
+                timeout=90,
+            )
+        except Exception:
+            # `execute` throughout, deliberately: this runs only when the subtest has
+            # already failed, and a diagnostic that raises would replace the failure with
+            # its own. wireplumber's journal is read by its user-unit field rather than
+            # `--user`, which from root would look at root's own session.
+            for name, cmd in [
+                ("bluetoothd", "journalctl -u bluetooth --no-pager | tail -60"),
+                ("wireplumber/bluez",
+                 "journalctl _SYSTEMD_USER_UNIT=wireplumber.service --no-pager "
+                 "| grep -iE 'bluez|bluetooth|dbus' | tail -80"),
+                ("castaway", "journalctl -u castaway-rec --no-pager | tail -40"),
+                ("adapter", "bluetoothctl --timeout 5 show"),
+                ("graph",
+                 f"su tester -c 'export XDG_RUNTIME_DIR=/run/user/{uid}; wpctl status'"),
+            ]:
+                print(f"--- {name} ---\n{machine.execute(cmd)[1]}")
+            raise Exception(
+                f"no bluez_output sink appeared; bluetoothctl connect exited {status}:\n{out}"
+            )
+        sinks = as_tester("pactl list short sinks")
+        print(sinks)
+        sink_name = [line.split("\t")[1] for line in sinks.splitlines() if "bluez_output" in line][0]
+        print(f"playing into {sink_name}")
+
+        # The reference, generated rather than checked in: it is 1.1 MB of samples fully
+        # described by six constants, and a binary in the tree would be a fixture nobody
+        # could regenerate without this script anyway.
+        machine.succeed("${python}/bin/python3 ${signal} make /tmp/ref.wav")
+        machine.succeed("chmod 644 /tmp/ref.wav")
+        # `paplay` blocks until the file has been handed over. The generous timeout is the
+        # emulated air: 192-byte ACL packets with a single transmit buffer is roughly two
+        # orders of magnitude less headroom than the controller in a laptop, and a source
+        # that has to wait for a completed-packet event per fragment plays a six-second
+        # file in rather more than six seconds.
+        as_tester(f"paplay -d {sink_name} /tmp/ref.wav", timeout=300)
+        # The tail: `paplay` returns when PipeWire has the samples, not when the far end
+        # has decoded them, and the last second of the chirp is inside that gap.
+        machine.sleep(5)
+
+        print(machine.succeed(
+            "journalctl -u castaway-rec | grep -E "
+            "'bluetooth: (link up|stream configured|stream started|sbc bitpool)|mixer:' | tail -30"
+        ))
+        # Stopped before it is read, so the recording holds this session and nothing after
+        # it. The file is valid at every instant by construction — the RIFF lengths are
+        # patched per batch — so this is tidiness rather than a finalisation step.
+        machine.succeed("systemctl stop castaway-rec")
+
+        # And the analysis. Every window of audio in the recording has to be a window of
+        # the reference — located in it, on both channels at one instant, scoring better
+        # there than the opposite channel does, and in order.
+        #
+        # 0.9 is the per-window floor and 0.6 the share of windows that must clear it.
+        # Both ends of that gap are measured rather than chosen: this link scores 80%,
+        # and recordings built to be wrong — channels swapped, collapsed to mono, either
+        # or both inverted, resampled wrongly, decoded at half rate, replaced with noise
+        # — score between 0% and 15%. The 20 points of headroom below 80% are for the
+        # splices, which are a property of a loaded host and vary from run to run.
+        status, report = machine.execute(
+            "${python}/bin/python3 ${signal} check /tmp/ref.wav ${recordPath} 0.9 0.6"
+        )
+        print(report)
+        if status != 0:
+            print(machine.succeed("journalctl -u castaway-rec | tail -60"))
+            raise Exception(f"the audio did not survive the path:\n{report}")
+
     machine.succeed(
-        "journalctl -u castaway -u castaway-sbc > /tmp/castaway.log"
+        "journalctl -u castaway -u castaway-sbc -u castaway-rec > /tmp/castaway.log"
     )
     machine.copy_from_machine("/tmp/castaway.log", "")
     machine.copy_from_machine("/tmp/btmon.btsnoop", "")
+    # The recording itself, so a failed correlation can be listened to rather than
+    # reasoned about. `execute`, because a subtest that failed before the receiver ever
+    # made one must not lose its own error to a missing file here.
+    machine.execute("cp ${recordPath} /tmp/mix.wav")
+    if machine.execute("test -f /tmp/mix.wav")[0] == 0:
+        machine.copy_from_machine("/tmp/mix.wav", "")
   '';
 }

@@ -955,9 +955,10 @@
           # A2DP up to a started stream, with no radio: btvirt's linked virtual
           # controllers, BlueZ on one, our receiver on the other. BlueZ browses our SDP
           # records, pairs over SSP, reads our endpoints and their codecs, and configures,
-          # opens and starts a stream — all with its own tools. What is still missing is
-          # the audio itself: no media packet is sent and nothing is decoded (#186). See
-          # the note at the top of nix/bluetooth-vm-test.nix and `docs/test-matrix.md` §4.3.
+          # opens and starts a stream — all with its own tools. It then plays a real
+          # waveform through bluetoothd's A2DP source, and the PCM we recorded is
+          # correlated against what was sent (#186). See the note at the top of
+          # nix/bluetooth-vm-test.nix and `docs/test-matrix.md` §4.3.
           bluetooth-vm = import ./nix/bluetooth-vm-test.nix {
             inherit pkgs;
             castaway = craneLib.buildPackage (fullArgs // {
