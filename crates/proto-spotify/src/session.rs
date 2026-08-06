@@ -281,9 +281,28 @@ impl std::fmt::Debug for LiveSession {
     }
 }
 
-impl LiveSession {
+/// What the runner needs of a session it is holding.
+///
+/// Three questions, and [`run`] asks nothing else: has it ended, did the user end it, and
+/// stop it. Naming them makes the reconnect loop — the only thing between a Wi-Fi blip and
+/// a panel that has silently left every picker — drivable without an access point, which
+/// it was not (#199).
+#[async_trait::async_trait]
+trait SessionLifetime: Send {
     /// Resolves when this session is no longer live.
-    ///
+    async fn ended(&mut self);
+
+    /// Whether the user ended this session deliberately.
+    fn was_hung_up(&self) -> bool;
+
+    /// Stop the session and release the account.
+    fn shutdown(self)
+    where
+        Self: Sized;
+}
+
+#[async_trait::async_trait]
+impl SessionLifetime for LiveSession {
     /// `spirc_task` is the one worth watching: `SpircTask::run` loops
     /// `while !self.session.is_invalid() && !self.shutdown` and then simply *returns*, so
     /// its completion is the only signal that the device has left the picker. Nothing
@@ -292,12 +311,10 @@ impl LiveSession {
         let _ = (&mut self.spirc_task).await;
     }
 
-    /// Whether the user ended this session deliberately.
     fn was_hung_up(&self) -> bool {
         self.hung_up.load(Ordering::SeqCst)
     }
 
-    /// Stop the session and release the account.
     fn shutdown(self) {
         // Ask politely first: this pauses playback and tells the cloud we are no longer
         // the active device, so the user's phone stops showing castaway as playing.
@@ -308,6 +325,46 @@ impl LiveSession {
         self.events_task.abort();
         self.queue_task.abort();
         self.reattach_task.abort();
+    }
+}
+
+/// How the runner brings a session up.
+///
+/// The seam [`run`] is tested through. Everything the loop decides — how long to wait,
+/// when a budget resets, when to stop trying, whether a pairing beats a retry timer — is
+/// decided from *outcomes*, so a starter that hands back scripted outcomes exercises all
+/// of it in milliseconds of paused time (#199).
+#[async_trait::async_trait]
+trait SessionStarter: Send + Sync + 'static {
+    /// What a successful start hands back.
+    type Session: SessionLifetime;
+
+    /// Bring one session up.
+    ///
+    /// # Errors
+    /// Whatever the login failed with; the runner treats every error the same way.
+    async fn start(
+        &self,
+        settings: &ConnectSettings,
+        user: PairedUser,
+        sink: &SessionSink,
+    ) -> Result<Self::Session, SpotifyError>;
+}
+
+/// The real one: log in to Spotify.
+struct Librespot;
+
+#[async_trait::async_trait]
+impl SessionStarter for Librespot {
+    type Session = LiveSession;
+
+    async fn start(
+        &self,
+        settings: &ConnectSettings,
+        user: PairedUser,
+        sink: &SessionSink,
+    ) -> Result<LiveSession, SpotifyError> {
+        start(settings, user, sink).await
     }
 }
 
@@ -326,7 +383,7 @@ pub fn spawn(
     // Depth 1: pairings are human-paced, and if two arrive at once only the later one
     // matters — but it must not be dropped, so this is a send, not a try_send.
     let (tx, rx) = mpsc::channel(1);
-    tokio::spawn(run(settings, sink, osd, rx, active));
+    tokio::spawn(run(settings, sink, osd, rx, active, Librespot));
     ConnectHandle { tx }
 }
 
@@ -363,21 +420,27 @@ const RECONNECT_ATTEMPTS: u32 = 8;
 /// A dropped session and a deliberate hang-up look identical from here — both end
 /// `spirc_task` — so `LiveSession::hung_up` carries the distinction back from the event
 /// pump, which is the only place the difference is visible.
-async fn run(
+async fn run<S: SessionStarter>(
     settings: ConnectSettings,
     sink: SessionSink,
     osd: Option<OsdSink>,
     mut rx: mpsc::Receiver<PairedUser>,
     active: ActiveUser,
+    starter: S,
 ) {
-    let mut current: Option<LiveSession> = None;
+    let mut current: Option<S::Session> = None;
     /// Credentials worth reconnecting with, and how many times we have tried.
     struct Standing {
         user: PairedUser,
         attempts: u32,
         backoff: Duration,
         /// When the session these credentials belong to last came up.
-        up_since: Option<std::time::Instant>,
+        ///
+        /// A `tokio::time::Instant` rather than a `std` one so that it moves with the
+        /// runtime's clock: everything else the loop measures is a `tokio` sleep, and a
+        /// mixture of the two cannot be reasoned about under `tokio::time::pause()` — the
+        /// budget reset below would be the one rule in here with no test.
+        up_since: Option<tokio::time::Instant>,
     }
     let mut standing: Option<Standing> = None;
 
@@ -476,7 +539,7 @@ async fn run(
 
         let user_name = user.user_name.clone();
         let retained = user.clone();
-        match start(&settings, user, &sink).await {
+        match starter.start(&settings, user, &sink).await {
             Ok(live) => {
                 info!(user = %user_name, resuming, "spotify: connect session up");
                 // Only greet a genuinely new arrival. A banner on every reconnect would
@@ -502,7 +565,7 @@ async fn run(
                     user: retained,
                     attempts,
                     backoff,
-                    up_since: Some(std::time::Instant::now()),
+                    up_since: Some(tokio::time::Instant::now()),
                 });
             }
             Err(e) => {
@@ -2611,6 +2674,444 @@ mod tests {
             .await
             .expect("the pump should notice and stop")
             .expect("without panicking");
+    }
+
+    // ---- the reconnect loop: `run` ----------------------------------------------------
+    //
+    // librespot 0.8 does not re-establish the AP session after a keepalive timeout, which
+    // is the whole reason this loop exists: it is the only thing between a Wi-Fi blip and
+    // a panel that has silently left every phone's picker until somebody reboots it. None
+    // of its rules had a test (#199). All of these run in paused time, so the 366 seconds
+    // the give-up path takes cost nothing.
+
+    /// One scripted answer to a login attempt.
+    #[derive(Debug, Clone, Copy)]
+    enum Attempt {
+        /// The login fails — an unreachable AP, a stale blob, a non-Premium account. The
+        /// runner cannot tell those apart from one attempt, which is why it retries.
+        Fails,
+        /// A session comes up and stays up until the runner takes it down.
+        Lives,
+        /// A session comes up and then ends on its own, deliberately or otherwise.
+        Ends { after: Duration, hung_up: bool },
+    }
+
+    /// A session the test decides the fate of.
+    struct FakeSession {
+        ends_at: Option<tokio::time::Instant>,
+        hung_up: bool,
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionLifetime for FakeSession {
+        async fn ended(&mut self) {
+            // A deadline rather than a duration: `run` re-arms this on every turn of its
+            // select, and a sleep that restarted each time would be a session that never
+            // ends however long the test waits.
+            match self.ends_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        }
+
+        fn was_hung_up(&self) -> bool {
+            self.hung_up
+        }
+
+        fn shutdown(self) {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Logins that go however the test says, and remember when they were asked for.
+    struct ScriptedStarter {
+        script: std::sync::Mutex<std::collections::VecDeque<Attempt>>,
+        /// What the script does once it runs out — every test needs a steady state.
+        tail: Attempt,
+        attempts: std::sync::Mutex<Vec<(String, tokio::time::Instant)>>,
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedStarter {
+        fn new(script: &[Attempt], tail: Attempt) -> Arc<Self> {
+            Arc::new(Self {
+                script: std::sync::Mutex::new(script.iter().copied().collect()),
+                tail,
+                attempts: std::sync::Mutex::new(Vec::new()),
+                shutdowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        }
+
+        /// Who was asked for, in order.
+        fn users(&self) -> Vec<String> {
+            self.attempts
+                .lock()
+                .expect("test lock")
+                .iter()
+                .map(|(who, _)| who.clone())
+                .collect()
+        }
+
+        /// How long the runner waited between one attempt and the next.
+        fn gaps(&self) -> Vec<Duration> {
+            let held = self.attempts.lock().expect("test lock");
+            held.windows(2).map(|w| w[1].1 - w[0].1).collect()
+        }
+
+        fn shutdowns(&self) -> usize {
+            self.shutdowns.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStarter for Arc<ScriptedStarter> {
+        type Session = FakeSession;
+
+        async fn start(
+            &self,
+            _settings: &ConnectSettings,
+            user: PairedUser,
+            _sink: &SessionSink,
+        ) -> Result<FakeSession, SpotifyError> {
+            self.attempts
+                .lock()
+                .expect("test lock")
+                .push((user.user_name.clone(), tokio::time::Instant::now()));
+            let next = self
+                .script
+                .lock()
+                .expect("test lock")
+                .pop_front()
+                .unwrap_or(self.tail);
+            match next {
+                Attempt::Fails => Err(SpotifyError::Login("scripted refusal".to_owned())),
+                Attempt::Lives => Ok(FakeSession {
+                    ends_at: None,
+                    hung_up: false,
+                    shutdowns: Arc::clone(&self.shutdowns),
+                }),
+                Attempt::Ends { after, hung_up } => Ok(FakeSession {
+                    ends_at: Some(tokio::time::Instant::now() + after),
+                    hung_up,
+                    shutdowns: Arc::clone(&self.shutdowns),
+                }),
+            }
+        }
+    }
+
+    /// The runner, running, with the wires a test drives it by.
+    struct Runner {
+        pairings: mpsc::Sender<PairedUser>,
+        events: mpsc::Receiver<castaway_core::SourceMessage>,
+        osd: castaway_core::OsdReceiver,
+        active: ActiveUser,
+        starter: Arc<ScriptedStarter>,
+        task: JoinHandle<()>,
+    }
+
+    impl Runner {
+        fn start(starter: Arc<ScriptedStarter>) -> Self {
+            let (pairings, rx) = mpsc::channel(1);
+            let (tx, events) = mpsc::channel(64);
+            let sink = SessionSink::new(SourceId::new(ProtocolKind::Spotify, "test"), tx);
+            let (osd_sink, osd) = castaway_core::osd_channel();
+            let active = ActiveUser::default();
+            let task = tokio::spawn(run(
+                settings(),
+                sink,
+                Some(osd_sink),
+                rx,
+                active.clone(),
+                Arc::clone(&starter),
+            ));
+            Self {
+                pairings,
+                events,
+                osd,
+                active,
+                starter,
+                task,
+            }
+        }
+
+        /// A pairing arriving from the zeroconf endpoint, which claims the device on the
+        /// way past exactly as the real endpoint does.
+        async fn pair(&self, who: &str) {
+            self.active.claim(who).await;
+            self.pairings
+                .send(PairedUser {
+                    user_name: who.to_owned(),
+                    blob: vec![0u8; 32],
+                })
+                .await
+                .expect("the runner is running");
+        }
+
+        /// Wait until the runner has made `n` login attempts.
+        ///
+        /// Time is paused, so this advances the clock by exactly whatever the runner is
+        /// sleeping on and not one tick more.
+        async fn until_attempts(&self, n: usize) {
+            while self.starter.attempts.lock().expect("test lock").len() < n {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        /// Everything the OSD was told to show.
+        fn banners(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Some(command) = self.osd.try_recv() {
+                if let castaway_core::OsdCommand::Show(message) = command {
+                    out.push(message.text);
+                }
+            }
+            out
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_login_that_keeps_failing_backs_off_and_then_gives_the_device_back() {
+        // The rate-limiting rule and the give-up rule, which are the same code path. A
+        // login attempt every two seconds for an afternoon is how an account gets
+        // rate-limited; retrying to the horizon is worse than stopping and letting the
+        // person re-pair, which takes them four seconds.
+        let starter = ScriptedStarter::new(&[], Attempt::Fails);
+        let mut runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+
+        // The runner says so on the way out. This is the only signal the panel gets.
+        let event = runner
+            .events
+            .recv()
+            .await
+            .expect("the runner should give up");
+        assert!(
+            matches!(event.event, SessionEvent::End),
+            "{:?}",
+            event.event
+        );
+
+        assert_eq!(
+            starter.users().len(),
+            (RECONNECT_ATTEMPTS + 1) as usize,
+            "one initial attempt and {RECONNECT_ATTEMPTS} retries"
+        );
+        // Doubling from two seconds, capped, and the cap is what stops it becoming an
+        // hourly poll on a blob that will never work again.
+        assert_eq!(
+            starter.gaps(),
+            [2, 4, 8, 16, 32, 64, 120, 120].map(Duration::from_secs)
+        );
+        // And the device stops claiming to be logged in as somebody it cannot log in as —
+        // `getInfo` is exactly what a phone reads back to decide whether this device is
+        // theirs.
+        assert_eq!(runner.active.get().await, "");
+        let banners = runner.banners();
+        assert!(
+            banners.iter().any(|b| b.contains("pair again")),
+            "the room should be told what to do: {banners:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_comes_up_and_dies_forever_also_stops_being_retried() {
+        // The *other* give-up, on the other branch: here every login succeeds and every
+        // session dies seconds later, so the counter is driven by the session-ended arm
+        // rather than by a login failure. It has to end the same way — the panel must not
+        // be left with a now-playing card and transport buttons wired to a `Spirc` that
+        // has been aborted, and nothing else tears a Spotify session down.
+        let starter = ScriptedStarter::new(
+            &[],
+            Attempt::Ends {
+                after: Duration::from_secs(1),
+                hung_up: false,
+            },
+        );
+        let mut runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+
+        let event = runner
+            .events
+            .recv()
+            .await
+            .expect("the runner should give up");
+        assert!(
+            matches!(event.event, SessionEvent::End),
+            "{:?}",
+            event.event
+        );
+        assert_eq!(starter.users().len(), (RECONNECT_ATTEMPTS + 1) as usize);
+        assert_eq!(runner.active.get().await, "");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_stayed_up_gets_a_fresh_budget() {
+        // Otherwise an evening's worth of blips inherits a backoff from hours earlier, and
+        // the first reconnect after a healthy two-hour session waits two minutes.
+        let starter = ScriptedStarter::new(
+            &[
+                Attempt::Fails,
+                Attempt::Fails,
+                Attempt::Ends {
+                    after: HEALTHY_SESSION + Duration::from_secs(10),
+                    hung_up: false,
+                },
+            ],
+            Attempt::Lives,
+        );
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(4).await;
+
+        let gaps = starter.gaps();
+        assert_eq!(gaps[0], Duration::from_secs(2));
+        assert_eq!(gaps[1], Duration::from_secs(4), "the backoff had grown");
+        // The session that came up third stayed up past `HEALTHY_SESSION`, so whatever
+        // killed it is a new problem rather than the continuation of an old one: the next
+        // attempt is at the *minimum* interval, not the eight seconds it had reached.
+        assert_eq!(
+            gaps[2],
+            HEALTHY_SESSION + Duration::from_secs(10) + RECONNECT_MIN
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_dies_at_once_keeps_the_budget_it_had() {
+        // The other half, and the one that matters more: a login that succeeds and then
+        // dies ten seconds later is a failing session, not a working one. Resetting on
+        // *connect* would loop it forever at the minimum interval.
+        let starter = ScriptedStarter::new(
+            &[
+                Attempt::Fails,
+                Attempt::Fails,
+                Attempt::Ends {
+                    after: Duration::from_secs(10),
+                    hung_up: false,
+                },
+            ],
+            Attempt::Lives,
+        );
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(4).await;
+
+        // Two failures took the backoff to eight seconds, and the short-lived session in
+        // between does not hand it back.
+        assert_eq!(
+            starter.gaps()[2],
+            Duration::from_secs(10) + Duration::from_secs(8)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_user_who_disconnects_is_not_dragged_back_onto_the_panel() {
+        // Reconnecting here would drag somebody onto a device they just left, which on a
+        // shared panel is worse than useless: the next person's phone finds it occupied.
+        let starter = ScriptedStarter::new(
+            &[Attempt::Ends {
+                after: Duration::from_secs(5),
+                hung_up: true,
+            }],
+            Attempt::Lives,
+        );
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(1).await;
+
+        // Long enough that every backoff in the table would have fired several times.
+        tokio::time::sleep(RECONNECT_MAX * 8).await;
+        assert_eq!(starter.users(), ["alice"], "it must not come back");
+        assert_eq!(runner.active.get().await, "", "and the device is free");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn somebody_standing_at_the_panel_beats_a_retry_timer() {
+        let starter = ScriptedStarter::new(&[Attempt::Fails], Attempt::Lives);
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(1).await;
+
+        // Half a second into a two-second backoff, someone else pairs.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        runner.pair("bob").await;
+        runner.until_attempts(2).await;
+
+        assert_eq!(starter.users(), ["alice", "bob"]);
+        assert!(
+            starter.gaps()[0] < RECONNECT_MIN,
+            "the pairing should not have waited out alice's backoff: {:?}",
+            starter.gaps()[0]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_pairing_retires_the_session_that_was_live() {
+        // Two Connect sessions on one device id fight over the same registration, and the
+        // account that loses is whichever the cloud saw last — which is not necessarily
+        // the person standing in front of the panel.
+        let starter = ScriptedStarter::new(&[], Attempt::Lives);
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(1).await;
+        assert_eq!(starter.shutdowns(), 0);
+
+        runner.pair("bob").await;
+        runner.until_attempts(2).await;
+        assert_eq!(
+            starter.shutdowns(),
+            1,
+            "alice's session should be retired before bob's starts"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_room_is_greeted_once_rather_than_on_every_reconnect() {
+        // A banner on every reconnect turns a flaky uplink into a strobe light on a
+        // two-metre screen.
+        let starter = ScriptedStarter::new(
+            &[
+                Attempt::Ends {
+                    after: Duration::from_secs(5),
+                    hung_up: false,
+                },
+                Attempt::Lives,
+            ],
+            Attempt::Lives,
+        );
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(2).await;
+
+        let greetings: Vec<String> = runner
+            .banners()
+            .into_iter()
+            .filter(|b| b.contains("connected"))
+            .collect();
+        assert_eq!(greetings, ["Spotify: alice connected"], "greeted once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_runner_takes_its_session_with_it_when_the_endpoint_goes() {
+        // The panel shutting down, or the zeroconf endpoint dropping its handle. A session
+        // left running would keep the account registered to a device that no longer exists
+        // and hold the audio path with it.
+        let starter = ScriptedStarter::new(&[], Attempt::Lives);
+        let runner = Runner::start(Arc::clone(&starter));
+        runner.pair("alice").await;
+        runner.until_attempts(1).await;
+
+        let Runner {
+            pairings,
+            starter,
+            task,
+            ..
+        } = runner;
+        drop(pairings);
+        task.await.expect("the runner should stop cleanly");
+        assert_eq!(starter.shutdowns(), 1);
     }
 
     #[test]

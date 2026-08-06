@@ -40,7 +40,10 @@ bytes.workspace = true
 
 [dev-dependencies]
 hex-literal.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` for `start_paused`: the reconnect loop's give-up path takes 366 seconds of
+# backoff, and the test asserts against the intervals the panel ships with rather than
+# against shortened ones (#199).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # For the `selfplay` harness only — the scripted controller talks to Spotify's Web API.
 # `rustls-tls-webpki-roots` for the same reason the runtime crates use it: no OpenSSL.
