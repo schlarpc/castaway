@@ -34,11 +34,12 @@ against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a
 > | ALAC was proven to *open*, never to decode | a lossless round trip at 0.999 correlation, using the encoder's own magic cookie — a hand-built one with the wrong `frame_length` produces no audio, which is the #189 failure exactly | #189 (partial) |
 > | the M13 IDR request had never fired at any tier | a T1 test joining mid-GOP: the sink asks, and then stops asking inside one `IDR_MIN_INTERVAL`. Both halves mutation-verified | #192 (partial) |
 > | the UIBC back-channel's socket half had no test — #125 fixed without a regression test | a scripted source offering a port, the sink dialling it, and a touch arriving in the *source's* pixel space; removing the dial reproduces #125. Plus `wfd_uibc_setting: disable`, which used to be acknowledged and ignored | #193 |
+> | `pump_events` and `run()` — ~375 lines, no tests, both local | the fold behind `CoverSource` and the reconnect loop behind `SessionStarter`/`SessionLifetime`, so scripted events and scripted login outcomes drive both. Each of the fold's four documented past regressions is asserted; the loop's backoff, both give-up paths, the healthy-session reset and the deliberate hang-up are asserted in paused time against the shipped constants. Plus the volume arm that did not exist, and the strip join in `app` | #199 |
 > | the mixer's device-vanish test never let the device come back | a factory that refuses for two retry intervals and then opens, asserting sound returns, nothing was dropped, and the retries were paced | #204 (partial) |
 >
-> Two entries above are **partial and the issues stay open**: #199's `pump_events` and
-> `run()` are the bulk of it, and #200 still wants the one LAN capture that would turn a pin
-> into a validation. #194 keeps its first bullet — the MICE vendor extension turns out to be
+> Of the entries above, **#200 stays open**: it still wants the one LAN capture that would
+> turn a pin into a validation. #199 closed with the row above — the two functions that were
+> the bulk of it were, as the issue said, entirely local. #194 keeps its first bullet — the MICE vendor extension turns out to be
 > D-Bus-only in wpa_supplicant 2.11, which is recorded on the issue and changes what option 2
 > on #206 costs.
 
