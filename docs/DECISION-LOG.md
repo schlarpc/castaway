@@ -832,7 +832,10 @@ glass. The second is not proven reachable and wants a test before a fix.
 
 **Deferred with eyes open.** The font stays DejaVu. dma.space uses Inter, and switching
 moves every glyph on every existing surface and invalidates the golden-image tests — that
-belongs to the theming work, not smuggled in with the shell. Brand assets are vendored at
+belongs to the theming work, not smuggled in with the shell. (Written when there were no
+such tests, which #203 pointed out. There are eight now, in
+`crates/pipeline/tests/golden_scenes.rs`, and the sentence is true rather than aspirational:
+a font change fails them and re-blessing is the deliberate act that follows.) Brand assets are vendored at
 `crates/pipeline/assets/brand/` with provenance recorded; they were ripped from the live
 site rather than handed over as a kit, and the gold in the palette is authored in oklch
 outside sRGB, so the hex we render is duller than intended.
