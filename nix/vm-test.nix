@@ -166,6 +166,128 @@ let
         sys.exit(1)
     print(match.group(1))
   '';
+
+  # A control point *we did not write* (#202).
+  #
+  # Everything else on this node is ours: `dlna-ctl` builds the SOAP by hand, so it can
+  # only ever find the disagreements we already thought of, and it never reads the SCPDs at
+  # all — a service description that contradicted the actions we answer would pass every
+  # test in this repository. DLNA has the largest conformance surface in the project, an
+  # entire document of recorded divergences, and until now no third-party peer at any tier.
+  #
+  # This is `async-upnp-client`'s `DmrDevice`, which is **the DLNA renderer profile Home
+  # Assistant drives its `dlna_dmr` integration with** — so what it exercises is not a
+  # generic UPnP library but the specific control point most likely to meet this panel in
+  # the room it is going in. Rule 9 permits it: reference implementations are banned at
+  # runtime, not as Nix-pinned oracles in CI.
+  #
+  # It asserts nothing itself. It prints `key: value` lines and the test script decides,
+  # so a failure lands in the test log as the value that was wrong rather than as a
+  # traceback inside somebody else's library.
+  dmrProbe = pkgs.writers.writePython3Bin "dmr-probe"
+    {
+      flakeIgnore = [ "E501" ];
+      libraries = [ pkgs.python3Packages.async-upnp-client ];
+    } ''
+    import asyncio
+    import sys
+
+    from async_upnp_client.aiohttp import AiohttpNotifyServer, AiohttpRequester
+    from async_upnp_client.client_factory import UpnpFactory
+    from async_upnp_client.profiles.dlna import DmrDevice
+    from async_upnp_client.search import async_search
+
+    local = sys.argv[1]
+    media = sys.argv[2]
+
+
+    async def discover():
+        """Find the renderer the way a control point does, over SSDP."""
+        found = []
+
+        async def on_response(headers):
+            found.append(headers)
+
+        await async_search(
+            on_response,
+            timeout=8,
+            search_target="urn:schemas-upnp-org:device:MediaRenderer:1",
+            source=(local, 0),
+        )
+        if not found:
+            print("no MediaRenderer answered the search", file=sys.stderr)
+            sys.exit(1)
+        return found[0]
+
+
+    async def main():
+        headers = await discover()
+        location = headers["location"]
+        print("discovered:", location)
+        print("usn:", headers["usn"])
+
+        device = await UpnpFactory(AiohttpRequester()).async_create_device(location)
+        print("friendly_name:", device.friendly_name)
+        print("model_name:", device.model_name)
+        print("udn:", device.udn)
+        print("services:", " ".join(sorted(
+            s.service_type.split(":")[-2] for s in device.services.values()
+        )))
+
+        # A callback server on the LAN address, so the receiver's NOTIFYs have somewhere
+        # real to go. This is the half `substrate-ssdp`'s own tests cannot reach: our
+        # event XML parsed by somebody else's subscriber.
+        server = AiohttpNotifyServer(device.requester, source=(local, 0))
+        await server.async_start_server()
+        dmr = DmrDevice(device, event_handler=server.event_handler)
+        events = []
+        dmr.on_event = lambda service, variables: events.append(
+            service.service_id.split(":")[-1]
+        )
+        await dmr.async_subscribe_services(auto_resubscribe=False)
+
+        # Derived from the SCPDs we serve, not from anything this script assumes: a
+        # missing action or a mistyped argument turns a capability off here.
+        print("caps:", " ".join(name for name, present in [
+            ("play", dmr.has_play),
+            ("pause", dmr.has_pause),
+            ("stop", dmr.has_stop),
+            ("seek", dmr.has_seek_rel_time),
+            ("volume", dmr.has_volume_level),
+            ("mute", dmr.has_volume_mute),
+        ] if present))
+
+        await dmr.async_set_transport_uri(media, "Windowlicker", None)
+        await dmr.async_play()
+        await dmr.async_update()
+        print("after-play:", dmr.transport_state)
+        print("title:", dmr.media_title)
+
+        await dmr.async_pause()
+        await dmr.async_update()
+        print("after-pause:", dmr.transport_state)
+
+        await dmr.async_set_volume_level(0.5)
+        await dmr.async_update()
+        print("volume:", dmr.volume_level)
+
+        await dmr.async_stop()
+        await dmr.async_update()
+        print("after-stop:", dmr.transport_state)
+
+        # The initial ConnectionManager event carries the sink list, so read it once the
+        # subscriptions have had a moment rather than straight after subscribing.
+        await asyncio.sleep(2)
+        print("sink:", " ".join(sorted(dmr.sink_protocol_info)))
+        print("events:", " ".join(sorted(set(events))))
+
+        await dmr.async_unsubscribe_services()
+        await server.async_stop_server()
+
+
+    asyncio.run(main())
+  '';
+
   # A scripted CASTv2 sender: TLS to :8009, then length-prefixed protobuf CastMessages.
   #
   # The protobuf is hand-rolled rather than generated. CastMessage is seven scalar
@@ -526,7 +648,7 @@ pkgs.testers.runNixOSTest {
         enable = true;
         openFirewall = false;
       };
-      environment.systemPackages = [ pkgs.curl ssdpSearch dlnaCtl castSender airplaySender ];
+      environment.systemPackages = [ pkgs.curl ssdpSearch dlnaCtl dmrProbe castSender airplaySender ];
     };
   };
 
@@ -611,6 +733,68 @@ pkgs.testers.runNixOSTest {
         )
         receiver.succeed("journalctl -u castaway --no-pager | grep -q 'null pipeline: CONTROLS'")
         sender.succeed(f"dlna-ctl {base} stop")
+
+    with subtest("a control point we did not write drives the whole renderer"):
+        # #202: every other peer in this file is a script from this repository, so it can
+        # only find the disagreements we already thought of. This one is Home Assistant's
+        # `dlna_dmr` profile (`async-upnp-client`'s `DmrDevice`), and it starts from an
+        # SSDP search rather than from a URL we hand it.
+        report = dict(
+            line.split(": ", 1)
+            for line in sender.succeed(
+                f"dmr-probe {lan} http://example.invalid/third-party.mp4"
+            ).strip().splitlines()
+            if ": " in line
+        )
+
+        # Discovery and description. The LOCATION it found has to be the one we advertise
+        # on the LAN, not a loopback address the control point cannot fetch.
+        assert kiosk in report["discovered"], report
+        # The name a third party actually reads off this device carries the protocol
+        # suffix, the same rule `getInfo` and the AirPlay records are asserted against
+        # here: one box appears in four pickers at once and each surface says which one
+        # it is. Nothing had ever checked that from outside for DLNA.
+        assert report["friendly_name"] == "${friendlyName}#dlna", report
+        assert report["udn"] == "uuid:0f8c2e10-0000-4000-8000-0000000c0571", report
+        # The USN a control point keys its device table on. `device_uuid` exists to keep
+        # DIAL from colliding with the DLNA root here (#202's fourth item), and this is
+        # the composed form seen from the other end.
+        assert report["usn"] == (
+            "uuid:0f8c2e10-0000-4000-8000-0000000c0571"
+            "::urn:schemas-upnp-org:device:MediaRenderer:1"
+        ), report
+        assert report["services"] == "AVTransport ConnectionManager RenderingControl", report
+
+        # Capabilities, derived from the SCPDs *it* fetched and parsed. Nothing else in
+        # this repository reads those documents back: a service description that
+        # contradicted the actions we answer would pass every other test here.
+        assert report["caps"] == "play pause stop seek volume mute", report
+
+        # The transport, driven through somebody else's SOAP.
+        assert report["after-play"] == "TransportState.PLAYING", report
+        assert report["after-pause"] == "TransportState.PAUSED_PLAYBACK", report
+        assert report["after-stop"] == "TransportState.STOPPED", report
+        # The title it reads back is the one it set, which means our DIDL-Lite round trip
+        # survives a parser that is not ours.
+        assert report["title"] == "Windowlicker", report
+        assert report["volume"] == "0.5", report
+
+        # GENA, from the other end. `substrate-ssdp` watches its own NOTIFYs leave the
+        # socket; this is our event XML arriving at a subscriber we did not write, for all
+        # three services.
+        assert report["events"] == "AVTransport ConnectionManager RenderingControl", report
+
+        # And the same sink list `dlna-ctl` reads by hand, this time parsed out of the
+        # ConnectionManager event by the library.
+        assert "http-get:*:video/*:*" in report["sink"], report
+        assert "http-get:*:audio/*:*" in report["sink"], report
+        assert "image/" not in report["sink"], report
+
+        # As everywhere else here: the SOAP answering is not the point, the event crossing
+        # the stack is.
+        receiver.succeed(
+            "journalctl -u castaway --no-pager | grep -q 'third-party.mp4'"
+        )
 
     with subtest("the sink advertises only what this receiver can render"):
         # A control point reads GetProtocolInfo to decide what it may send. image/* was

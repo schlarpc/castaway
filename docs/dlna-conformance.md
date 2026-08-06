@@ -208,6 +208,40 @@ It had been hiding as a slow `cargo test --workspace` through two verification g
 GAPS G83, and its lesson is the one this file exists for: the failure mode was silence, and
 silence is indistinguishable from working.
 
+## What a control point we did not write now proves
+
+Everything above was read out of specifications and reference sources; everything testing
+it was a script from this repository, which can only find the disagreements somebody here
+already thought of. Since #202 the `integration-vm` sender node also runs
+**`async-upnp-client`'s `DmrDevice`** — the DLNA renderer profile **Home Assistant** drives
+its `dlna_dmr` integration with — against the receiver over the test LAN, starting from an
+SSDP search rather than from a URL the test hands it.
+
+What that adds, in order of how likely each was to be silently wrong:
+
+- **Our SCPDs are read back by somebody else's parser.** Nothing here had ever done that.
+  The profile derives its capability flags from the service descriptions we serve, so a
+  service description contradicting the actions we answer — an argument named differently,
+  a missing `<action>`, a state variable of the wrong type — turns a capability off rather
+  than passing unnoticed. All six it looks for (`play`, `pause`, `stop`, `seek`, `volume`,
+  `mute`) come back on.
+- **Our GENA events are parsed by a subscriber we did not write**, for all three services.
+  `substrate-ssdp` watches its own `NOTIFY`s leave the socket; this is the other end.
+- **The DIDL-Lite round trip survives a foreign parser**: the title the profile set is the
+  title it reads back.
+- **The name and USN a third party actually sees** — `castaway-vm#dlna` and
+  `uuid:…::urn:schemas-upnp-org:device:MediaRenderer:1` — which is where a DIAL/DLNA root
+  collision would show up.
+- **The sink table is the one this file argues about**, parsed out of the ConnectionManager
+  event rather than out of our own `GetProtocolInfo` reply.
+
+**What it does not prove.** It is *one* control point, and a permissive-by-construction one:
+it was written against many renderers, so it works around what it can. The rows in "Where
+real control points and the spec disagree" are about clients that do *not* work around
+things — Windows' MediaRenderer stack, Kodi, BubbleUPnP, Symfonium — and those remain
+unproven, as does the Windows row this file marks "Needs a real Windows box". A green
+`integration-vm` says Home Assistant can drive this panel. It does not say VLC can.
+
 ## What the citations are worth
 
 Read directly, and quotable: UPnP AV Architecture, AVTransport:1/:2/:3, RenderingControl,
