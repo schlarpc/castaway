@@ -923,6 +923,17 @@ impl Ertm {
             // second additionally asks for the missing one, but only once.
             if !self.rejected && distance(self.expected_tx_seq, tx_seq) < SEQ_MODULO / 2 {
                 self.rejected = true;
+                // The only recovery decision this engine makes, and until #210 it was
+                // invisible: a REJ and a duplicate that we merely re-acknowledge produce
+                // the same silence from here, and only one of them means frames are being
+                // lost. Not the hot path the checksum drop above is — the `rejected` guard
+                // means at most one of these per gap, however wide the gap.
+                debug!(
+                    cid = %self.params.local_cid,
+                    expected = self.expected_tx_seq,
+                    got = tx_seq,
+                    "ertm: a frame is missing; rejecting so the peer resends from here"
+                );
                 out.frames
                     .push(self.supervisory(Supervisory::Reject, false, false));
             } else {

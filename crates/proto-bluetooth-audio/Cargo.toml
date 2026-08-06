@@ -33,27 +33,24 @@ tokio = { workspace = true, features = [
     # waits five real seconds for it is a test nobody runs.
     "test-util",
 ] }
-# For the ERTM bench only: it drives the real engine against the Linux kernel's L2CAP
-# through a virtual controller, which needs a transport. Nothing in the library depends
-# on it, and the example is gated so a non-Linux build never reaches for it.
+# For the two examples only: they drive the real stack against a controller, which needs
+# a transport. Nothing in the library depends on it. `socket` is a no-op off Linux (the
+# module is `cfg(target_os = "linux")`), and `ertm_echo` says so for itself.
 hci-transport = { workspace = true, features = ["socket", "usb"] }
 tracing-subscriber.workspace = true
 
-[[example]]
-name = "ertm_echo"
-required-features = ["bench"]
-
-[[example]]
-name = "phone_bench"
-required-features = ["bench"]
-
 [features]
-# `ldac` on by default (D55). `bench` stays opt-in: it is not a build variant, it is a
-# set of examples that want a real dongle and `sudo`.
+# `ldac` on by default (D55) — and as of #210 there is nothing else here.
+#
+# There used to be a `bench` feature holding these two examples back, on the reasoning
+# that they want a dongle and `sudo` and CI does not have either. What it actually did
+# was keep ~600 lines out of `clippy --all-targets` and out of every build: `ertm_echo`
+# is the *only* thing in this tree that has ever put our ERTM engine in front of a
+# foreign L2CAP, and it was one bit-rotted line away from not compiling at any time. That
+# is exactly the shape D55 was written about. Wanting hardware is a reason not to *run*
+# something in CI; it was never a reason not to compile it — and `checks.bluetooth-vm`
+# now runs `ertm_echo` anyway, against `btvirt`, with no hardware at all (#210).
 default = ["ldac"]
-# Build the benches that need a controller. Off by default: they are Linux-only and
-# exist to be run by hand against `btvirt`, not by CI.
-bench = []
 # Advertise the LDAC endpoint. Still gated, because advertising a codec we cannot decode
 # is worse than omitting it: the sender picks it and the session is silence (#14). What
 # changed is that there is now something to gate — `pipeline/ldac` links Sony's own
