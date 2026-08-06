@@ -952,21 +952,31 @@
           # commissioning test skips mDNS, so discovery has coverage nowhere else.
           matter-vm = import ./nix/matter-vm-test.nix { inherit pkgs self; };
 
-          # The Bluetooth stack up to discovery, with no radio: btvirt's linked virtual
-          # controllers, BlueZ on one, our receiver on the other. BlueZ finds us by
-          # inquiry — but it does not pair, connect, or stream, so nothing above L2CAP is
-          # covered here despite the derivation's name. See the note at the top of
-          # nix/bluetooth-vm-test.nix and `docs/test-matrix.md` §4.3.
+          # A2DP up to a started stream, with no radio: btvirt's linked virtual
+          # controllers, BlueZ on one, our receiver on the other. BlueZ browses our SDP
+          # records, pairs over SSP, reads our endpoints and their codecs, and configures,
+          # opens and starts a stream — all with its own tools. What is still missing is
+          # the audio itself: no media packet is sent and nothing is decoded (#186). See
+          # the note at the top of nix/bluetooth-vm-test.nix and `docs/test-matrix.md` §4.3.
           bluetooth-vm = import ./nix/bluetooth-vm-test.nix {
             inherit pkgs;
-            castaway = craneLib.buildPackage (commonArgs // {
+            castaway = craneLib.buildPackage (fullArgs // {
               inherit cargoArtifacts;
               pname = "castaway-bluetooth";
-              # Lean plus the one transport this test needs. Without
-              # `--no-default-features` D55's default would pull the whole kiosk —
-              # ffmpeg, wgpu, Electron — into a headless VM, on `commonArgs` that does not
-              # carry those native deps.
-              cargoExtraArgs = "--package castaway --no-default-features --features bluetooth-socket";
+              # Lean plus the two things this test needs. Without
+              # `--no-default-features` D55's default would pull the whole kiosk — wgpu,
+              # Electron, a browser — into a headless VM.
+              #
+              # `audio` is not optional here, and leaving it out is what kept this test at
+              # discovery: the endpoints a sink advertises are *derived* from what the
+              # build can decode (`app::bluetooth::decodable`), so a build without
+              # decoders answers AVDTP DISCOVER with an empty list. Measured, in the trace
+              # this test now takes: a two-byte `Discover Response Accept` and BlueZ
+              # disconnecting immediately, having been told this device has no endpoints.
+              # That is `fullArgs` rather than `commonArgs`, for the ffmpeg the decoders
+              # link against.
+              cargoExtraArgs =
+                "--package castaway --no-default-features --features bluetooth-socket,audio";
               doCheck = false;
             });
           };

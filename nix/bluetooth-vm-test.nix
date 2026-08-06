@@ -1,32 +1,36 @@
-# The Bluetooth stack up to *discovery*, with no radio, no dongle, and no hardware.
-#
-# NOTE (2026-08-05): this file used to open "a complete A2DP session". It does not run one.
-# What the testScript actually asserts is: btvirt creates a linked pair, the two controllers
-# inquire each other, the emulated air carries L2CAP echo, our receiver claims hci1, brings
-# it up, becomes discoverable, and BlueZ finds it by inquiry. There is no `bluetoothctl
-# pair`, no AVDTP discover/get_caps/set_config, no stream start, no media packet, and no
-# audio — and the `services.pipewire`/`tester` block below is configured and used by nothing.
-# The A2DP intent described further down is the design this file was built *for*; closing
-# the gap is tracked in its own issue. Everything above L2CAP is therefore still validated
-# only by our own code talking to our own code. See `docs/test-matrix.md` §4.3.
+# A2DP up to a started stream, driven by BlueZ, with no radio and no hardware.
 #
 # The kernel's `hci_vhci` plus BlueZ's `btvirt` emulator give a pair of *linked* virtual
 # controllers — two `hciN` devices on `Bus: Virtual` that inquire, page and carry L2CAP
 # between each other over an emulated air interface, and that need no firmware at all.
-# Verified on the dev box before this was written: `l2ping` across the pair reports 0%
-# loss and `btmon` shows real L2CAP exchanges.
+# BlueZ drives one as an ordinary source; our receiver owns the other. Everything on the
+# far side is an implementation that has never seen our code, which is categorically
+# better evidence than our source code talking to our sink code — all the in-process
+# tests can offer (#186).
 #
-# That makes the *intended* test possible: BlueZ drives one controller as an ordinary A2DP
-# source, and our receiver owns the other. The sender side would then be an independent
-# implementation that has never seen our code — categorically better evidence than our
-# source code talking to our sink code, which is all the in-process tests can offer. Today
-# BlueZ only inquires; it never pairs, connects, or streams (see the note at the top).
+# What that peer now does, in order: browses our SDP records with `sdptool`, pairs over
+# SSP, enumerates our stream endpoints and decodes every capability record with `avinfo`,
+# refuses to be given a codec an endpoint does not offer, and configures, opens and starts
+# a stream with `avtest`. Four of those had never happened here.
 #
-# Two properties would make this *harsher* than real hardware, which is the point. A virtual
+# Two properties make this *harsher* than real hardware, which is the point. A virtual
 # controller reports an ACL MTU of 192 with a **single** buffer, against 1021x4 on a real
-# AX200. Every SDP record and AVDTP capability response would therefore fragment, and
-# transmit flow control has no slack whatsoever. As written, the only traffic is inquiry and
-# two echo packets, so neither path is actually exercised here.
+# AX200. So every SDP browse response fragments — a browse returns all three records at
+# once and the largest is 335 bytes — and transmit flow control has no slack whatsoever.
+#
+# Three things the emulator gets wrong for us, each found the hard way and each worked
+# around at its subtest rather than here: a controller reset leaves BlueZ holding a stale
+# ACL handle it will reuse forever, SSP is *off* by default on the BlueZ-side controller
+# (so pairing falls back to legacy PIN, which this receiver refuses by design), and
+# `avtest` configures the first endpoint it finds rather than a matching one.
+#
+# **Still not covered, and it is the audio.** No media packet is sent and nothing is
+# decoded, so the `services.pipewire`/`tester` block below remains configured and unused.
+# That wants bluetoothd's own A2DP source with a PipeWire endpoint behind it — which now
+# has a fair chance of working, because a *trusted* device makes bluetoothd connect
+# profiles on its own (this test can already see it driving AVRCP), and a receiver that
+# writes decoded PCM somewhere a test can cross-correlate it. See `docs/test-matrix.md`
+# §4.3 and #186.
 { pkgs, castaway }:
 
 let
@@ -60,6 +64,38 @@ let
     # hci1 is btvirt's second controller; BlueZ keeps hci0 and plays the source.
     transport = "socket:1"
     state_dir = "/var/lib/castaway"
+  '';
+
+  # The same receiver, advertising only the mandatory codec.
+  #
+  # `avtest` is BlueZ's AVDTP tester rather than its A2DP source: it configures the
+  # *first* endpoint it discovers with whichever codec it was built to send, and does not
+  # look for a matching one. Against the full table that is an SBC configuration aimed at
+  # our aptX HD endpoint, which we refuse with `UNSUPPORTED_CONFIGURATION` — correctly,
+  # and the refusal is asserted below on the full table before this narrowing.
+  #
+  # `codecs` exists for exactly this, and says so: a source takes the first endpoint it
+  # supports, so the only way to exercise a *particular* codec is to stop offering the
+  # ones it would otherwise prefer.
+  sbcConfig = pkgs.writeText "castaway-sbc.toml" ''
+    friendly_name = "castaway vm"
+    uuid = "0f8c2e10-castaway-0001-00000000vmbt"
+    http_port = 8080
+
+    [enable]
+    dlna = false
+    spotify = false
+    dial = false
+    cast = false
+    airplay = false
+    gamestream = false
+    miracast = false
+    bluetooth = true
+
+    [bluetooth]
+    transport = "socket:1"
+    state_dir = "/var/lib/castaway"
+    codecs = ["sbc"]
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -250,7 +286,212 @@ pkgs.testers.runNixOSTest {
         # was — sending 0x240414 as a u32 rather than three bytes.
         print(f"inquiry found the receiver: {out.strip()}")
 
-    machine.succeed("journalctl -u castaway > /tmp/castaway.log")
+    def drop_stale_links():
+        """Make BlueZ page afresh instead of reusing a handle to a controller that reset.
+
+        The same trap the `l2ping` comment above records, arriving from the other side.
+        `l2ping` left an ACL up; our receiver then claimed hci1 and reset it, so the link
+        is gone at the far end while BlueZ's kernel still holds a handle for it. Every
+        client after that — `sdptool`, `avinfo`, `avtest` — opens an L2CAP socket, the
+        kernel reuses that handle rather than paging, and the request goes out over a
+        connection nothing is listening on. Measured: `sdptool browse` sat there until its
+        30 s timeout with the receiver reporting `RX bytes:0 acl:0`, i.e. not one byte
+        ever reached it.
+        """
+        # `bluetoothctl` first, and only once there is something to tell: after pairing,
+        # bluetoothd knows this address is an audio sink and reconnects it the moment the
+        # link drops, so `hcitool dc` alone races its own reconnect and the link is never
+        # observed down. That cost a cycle — a 30 s wait that never came true.
+        machine.execute(f"bluetoothctl --timeout 5 disconnect {sink_addr} 2>&1")
+        machine.execute(f"hcitool -i hci0 dc {sink_addr} 2>&1")
+        machine.wait_until_succeeds(
+            f"! hcitool -i hci0 con | grep -q '{sink_addr}'", timeout=60
+        )
+
+    with subtest("BlueZ's own SDP client reads the records we serve"):
+        drop_stale_links()
+        # `substrate-sdp/src/server.rs` had no inline tests and no third-party client had
+        # ever parsed what it serves — the only such parse on record was a manual bench
+        # run (#74, #186). `sdptool browse` is BlueZ's, and it is the harsher of the two
+        # ways to ask: a browse is a `ServiceSearchAttribute` for the public browse group
+        # that returns *every* record at once, which over this controller's 192-byte MTU
+        # cannot fit in one response. So this also exercises the continuation path the
+        # file's header claims and nothing had run — `chunk`'s offset token, and a client
+        # that is not ours reassembling from it.
+        # Traced and time-boxed rather than retried. `sdptool` blocks on its own SDP
+        # connect, so a `wait_until_succeeds` around it waits out the *client's* timeout
+        # several times over and then reports nothing about why — which is how the first
+        # attempt at this subtest spent minutes saying only "waiting for success".
+        machine.succeed(
+            "systemd-run --unit=btmon-sdp --collect "
+            "${bluezWithBtvirt}/bin/btmon -w /tmp/sdp.btsnoop"
+        )
+        status, records = machine.execute(
+            f"timeout 30 sdptool -i hci0 browse {sink_addr} 2>&1"
+        )
+        machine.succeed("systemctl stop btmon-sdp")
+        print(records)
+        if status != 0:
+            trace = machine.succeed("${bluezWithBtvirt}/bin/btmon -r /tmp/sdp.btsnoop")
+            print(machine.succeed("journalctl -u castaway | tail -40"))
+            raise Exception(
+                f"sdptool browse exited {status}:\n{records}\n\n{trace[-8000:]}"
+            )
+        # The A2DP half. `Audio Sink` is the class a source searches for before it will
+        # offer anything, and PSM 25 is where it then connects AVDTP.
+        assert "Audio Sink" in records, records
+        assert "PSM: 25" in records, records
+        # Both AVRCP roles, in `sdptool`'s own spelling. The controller record is the one
+        # that gets us metadata at all — a sink publishing only Target gets none — and a
+        # browse that returned one of the three records would be caught here rather than
+        # by a phone showing no track title.
+        assert '"AV Remote Controller" (0x110f)' in records, records
+        assert '"AV Remote Target" (0x110c)' in records, records
+        assert "PSM: 23" in records, records
+        # The generic A/V Remote Control class beside the role-specific one: a peer that
+        # searches for 0x110E, which is what the profile says to search for, finds nothing
+        # in a record listing only 0x110F.
+        assert '"AV Remote" (0x110e)' in records, records
+        # All three, and their handles, so a record silently dropped from the server's
+        # list is a failure rather than a shorter browse nobody reads.
+        for handle in ["0x10000", "0x10001", "0x10002"]:
+            assert handle in records, records
+
+    with subtest("BlueZ pairs with the receiver over Secure Simple Pairing"):
+        # Everything past SDP is behind authentication: BlueZ opens its AVDTP sockets at
+        # security MEDIUM, so the link is authenticated before a byte of AVDTP flows.
+        #
+        # And the emulator decides *which* pairing happens. `btdev.c`'s `use_ssp()` is
+        # `!auth_enable && both simple_pairing_mode`, so if either controller has SSP off
+        # the link falls back to legacy PIN — which this receiver refuses by design
+        # (`host.rs`: a panel with no keypad cannot be asked for a number), and the
+        # result was BlueZ retrying forever: 54 `link up` / `link down` cycles with
+        # `No agent available for request type 0` beside each one. That is the emulator's
+        # default, not ours; our side sets SSP in its bring-up sequence.
+        print(machine.succeed("hciconfig hci0 sspmode"))
+        machine.succeed("hciconfig hci0 sspmode 1")
+        print(machine.succeed("hciconfig hci0 sspmode"))
+
+        drop_stale_links()
+        # `NoInputNoOutput` on both ends is the just-works case, which is what a panel and
+        # a phone actually negotiate: no number to compare, no keypad on either side.
+        status, out = machine.execute(
+            f"timeout 40 bluetoothctl --agent NoInputNoOutput pair {sink_addr} 2>&1"
+        )
+        print(out)
+        # Our side's own account of it, which is the one that matters: the link key
+        # arrived and was stored, so the next connection skips pairing entirely.
+        machine.wait_until_succeeds(
+            "journalctl -u castaway | grep -q 'bluetooth: paired'", timeout=60
+        )
+        assert status == 0, f"bluetoothctl pair exited {status}:\n{out}"
+
+        # Trust it, or every later service connection is refused with
+        # `security block` and `Authentication attempt without agent` in the log: the
+        # agent that paired exits with the command, and an *untrusted* paired device
+        # needs one again to authorise each profile. A phone marks a speaker trusted
+        # when the person taps "pair"; this is that tap.
+        machine.succeed(f"bluetoothctl --timeout 5 trust {sink_addr}")
+
+    with subtest("BlueZ's own AVDTP client discovers the endpoint and reads its codecs"):
+        # `avinfo` is the other end of `avdtp.rs`: DISCOVER, then GET_CAPABILITIES on what
+        # comes back, decoded by BlueZ's parser rather than by ours. A capability response
+        # with a wrong length byte, a codec element in the wrong order, or a service
+        # category we invented would be read here by something with no reason to be
+        # forgiving — and `adapter_end_to_end.rs`, which is our state machine against our
+        # own scripted bytes, would still be green.
+        machine.succeed(
+            "systemd-run --unit=btmon-avdtp --collect "
+            "${bluezWithBtvirt}/bin/btmon -w /tmp/avdtp.btsnoop"
+        )
+        status, info = machine.execute(f"timeout 30 avinfo -i hci0 {sink_addr} 2>&1")
+        machine.succeed("systemctl stop btmon-avdtp")
+        print(info)
+        if status != 0 or "Audio Sink" not in info:
+            trace = machine.succeed("${bluezWithBtvirt}/bin/btmon -r /tmp/avdtp.btsnoop")
+            print(machine.succeed("journalctl -u castaway | tail -30"))
+            raise Exception(f"avinfo exited {status}:\n{info}\n\n{trace[-9000:]}")
+        # SBC is mandatory for every A2DP sink and is what a source falls back to; if the
+        # only thing it could read were our optional codecs, a phone would have nothing to
+        # negotiate with.
+        assert "SBC" in info, info
+
+    with subtest("a configuration naming a codec the endpoint does not offer is refused"):
+        # `avtest` configures the *first* endpoint it discovers, whatever codec it is
+        # sending — so against the full table it aims an SBC configuration at our aptX HD
+        # endpoint. Refusing that is the correct answer and worth pinning: a sink that
+        # accepted it would go on to decode aptX HD frames as SBC, which is noise at full
+        # scale on a PA rather than an error anybody can act on.
+        machine.succeed(
+            f"avtest --device hci0 --send start --preconf --wait 1 {sink_addr} "
+            "> /tmp/avtest-mismatch.log 2>&1 || true"
+        )
+        mismatch = machine.succeed("cat /tmp/avtest-mismatch.log")
+        print(mismatch)
+        # AVDTP message type 3 is a reject, and 0x29 is UNSUPPORTED_CONFIGURATION. The
+        # 0x31 (BAD_STATE) that follows on OPEN and START is the other half of the same
+        # answer: nothing was configured, so there is nothing to open or start.
+        assert "MT 3 SI 3" in mismatch, mismatch
+        assert "29" in mismatch, mismatch
+
+    with subtest("an implementation that is not ours configures and starts a stream"):
+        # The step every previous version of this file stopped short of. Restarted with a
+        # single-codec table so `avtest`'s naive endpoint choice lands on an endpoint that
+        # accepts what it is sending — see `sbcConfig` above for why that is the shipped
+        # mechanism rather than a fudge.
+        machine.succeed("systemctl stop castaway")
+        machine.wait_until_succeeds("hciconfig hci1 down", timeout=60)
+        machine.succeed(
+            "systemd-run --unit=castaway-sbc --setenv=RUST_LOG=info "
+            "--setenv=CASTAWAY_CONFIG=${sbcConfig} ${castaway}/bin/castaway"
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u castaway-sbc | grep -q 'bluetooth: discoverable'", timeout=60
+        )
+        drop_stale_links()
+
+        machine.succeed(
+            "systemd-run --unit=btmon2 --collect "
+            "${bluezWithBtvirt}/bin/btmon -w /tmp/avdtp.btsnoop"
+        )
+        # `systemd-run` returns when the unit *starts*, not when btmon has its socket
+        # open, and the difference is enough to lose the first exchange — a trace that
+        # began at `Start` with no `Discover` before it cost a cycle here.
+        machine.wait_until_succeeds("test -s /tmp/avdtp.btsnoop", timeout=30)
+        machine.succeed(
+            f"avtest --device hci0 --send start --preconf --wait 3 {sink_addr} "
+            "> /tmp/avtest.log 2>&1 || true"
+        )
+        avtest_log = machine.succeed("cat /tmp/avtest.log")
+        print(avtest_log)
+        machine.succeed("systemctl stop btmon2")
+
+        # What the *other end* saw, in its own words. `MT 2` is an AVDTP response-accept
+        # and `MT 3` a reject, so this is BlueZ reporting that our responder agreed to
+        # each step: SI 3 SET_CONFIGURATION, SI 6 OPEN, SI 7 START.
+        #
+        # Read from `avtest`'s log rather than from the trace because btmon can only
+        # decode a channel whose connection it observed, and it cannot be started early
+        # enough here without also capturing the previous subtest's teardown — a trace
+        # that shows the bytes and calls them raw ACL proves nothing this can rely on.
+        for step in ["MT 2 SI 3", "MT 2 SI 6", "MT 2 SI 7"]:
+            assert step in avtest_log, f"AVDTP {step} was not accepted:\n{avtest_log}"
+
+        # Our side of the same event. `stream configured` carries the codec and the format
+        # it resolved to, which is the thing a wrong capability response gets wrong
+        # silently — a sink that agreed to 44.1 kHz mono when the source asked for 48 kHz
+        # stereo plays, and plays wrong.
+        machine.wait_until_succeeds(
+            "journalctl -u castaway-sbc | grep -q 'bluetooth: stream configured'", timeout=60
+        )
+        print(machine.succeed(
+            "journalctl -u castaway-sbc | grep -E "
+            "'bluetooth: (link up|stream configured|sbc bitpool)'"
+        ))
+
+    machine.succeed(
+        "journalctl -u castaway -u castaway-sbc > /tmp/castaway.log"
+    )
     machine.copy_from_machine("/tmp/castaway.log", "")
     machine.copy_from_machine("/tmp/btmon.btsnoop", "")
   '';
