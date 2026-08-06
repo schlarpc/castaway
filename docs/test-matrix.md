@@ -31,6 +31,7 @@ against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a
 > | five `#[ignore]`d files with no recorded decision | a call at each file, and they are three different calls — one is a gap, two are a nightly job that does not exist, two are wiring `cast-app-hosting` already has | #183 |
 > | `node.rs` had zero tests | the endpoint tree and the one-based target mapping, mutation-checked. Every cluster *handler* is still unexecuted | #196 (partial) |
 > | SSDP `NOTIFY` never seen on a wire | a listener joined to the group watches two alive bursts and a byebye leave the socket; `MX`'s divergence is written down rather than left implicit | #202 (partial) |
+> | ALAC was proven to *open*, never to decode | a lossless round trip at 0.999 correlation, using the encoder's own magic cookie — a hand-built one with the wrong `frame_length` produces no audio, which is the #189 failure exactly | #189 (partial) |
 > | the UIBC back-channel's socket half had no test — #125 fixed without a regression test | a scripted source offering a port, the sink dialling it, and a touch arriving in the *source's* pixel space; removing the dial reproduces #125. Plus `wfd_uibc_setting: disable`, which used to be acknowledged and ignored | #193 |
 > | the mixer's device-vanish test never let the device come back | a factory that refuses for two retry intervals and then opens, asserting sound returns, nothing was dropped, and the retries were paced | #204 (partial) |
 >
