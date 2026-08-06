@@ -327,6 +327,17 @@ impl<P: Pipeline> SessionManager<P> {
                     Err(CoreError::NoActiveSession(source.to_string()))
                 }
             }
+            SessionEvent::TouchSurfaceRevoked => {
+                if self.active.as_ref() == Some(&source) {
+                    info!(%source, "session: touch surface withdrawn");
+                    self.touch.set(None);
+                    Ok(())
+                } else {
+                    // A source that is not active has no surface installed to withdraw,
+                    // and saying so is better than clearing the *active* source's.
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
             SessionEvent::HostPage(page) => {
                 self.begin_session(&source).await?;
                 info!(%source, url = %page.url, title = %page.title, "session: hosting a page");

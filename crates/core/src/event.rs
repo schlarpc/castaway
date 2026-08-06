@@ -173,6 +173,14 @@ pub enum SessionEvent {
     /// which is after the media plane rather than with it, and dropped by the session
     /// manager when the source stops being the active one.
     TouchSurface(Arc<dyn crate::touch::TouchSurface>),
+    /// The session can no longer be driven from the glass: stop routing touch to it.
+    ///
+    /// Not the same as the session ending, which is why it is its own event: a Miracast
+    /// source may send `wfd_uibc_setting: disable` mid-session and keep streaming, and a
+    /// panel that goes on delivering touches to a source that has said stop is one whose
+    /// glass drives something invisible. Without this the surface published above stays
+    /// live until the *session* goes, which is the wrong lifetime (#193).
+    TouchSurfaceRevoked,
     /// Host a web page and give it the panel: a *hosted application*, where the pixels
     /// are somebody else's page and the protocol above them is their own.
     ///

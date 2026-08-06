@@ -295,6 +295,16 @@ async fn apply(
                     None => debug!(port, "miracast: UIBC port before a mode; ignoring it"),
                 }
             }
+            SinkOutput::UibcRevoked => {
+                // The source is still streaming; only the input channel closed. Telling
+                // the session manager is what stops the glass driving something that has
+                // said it is not listening — the writer task ends on its own when the
+                // surface is dropped and its channel closes.
+                info!(%peer, "miracast: the source turned UIBC off; taking the touch surface down");
+                if sink.emit(SessionEvent::TouchSurfaceRevoked).await.is_err() {
+                    debug!("miracast: nothing was holding the UIBC touch surface");
+                }
+            }
             SinkOutput::MediaStopped => {
                 // Dropping the senders closes the pipeline's receivers, which is how a
                 // pause reaches the far end. The session and its negotiation survive.
@@ -700,6 +710,16 @@ mod tests {
         rtp_port: u16,
         session_timeout: u32,
     ) -> Result<TcpStream, std::io::Error> {
+        scripted_source_inner(listener, rtp_port, session_timeout, None).await
+    }
+
+    /// The body, with an optional `wfd_uibc_capability` port in M4.
+    async fn scripted_source_inner(
+        listener: tokio::net::TcpListener,
+        rtp_port: u16,
+        session_timeout: u32,
+        uibc_port: Option<u16>,
+    ) -> Result<TcpStream, std::io::Error> {
         let (mut stream, _) = listener.accept().await?;
         let mut buf = vec![0u8; 8192];
         let mut seen = String::new();
@@ -762,9 +782,16 @@ mod tests {
 
         // M4 and M5 in one segment — which real sources do, and which is the framing
         // hazard a recv()-per-message loop fails on.
-        let m4 = "wfd_video_formats: 00 00 03 10 00000100 00000000 00000000 00 0000 0000 00 \
-                  none none\r\nwfd_audio_codecs: AAC 00000001 00\r\n\
-                  wfd_presentation_URL: rtsp://127.0.0.1/wfd1.0/streamid=0 none\r\n";
+        let m4 = format!(
+            "wfd_video_formats: 00 00 03 10 00000100 00000000 00000000 00 0000 0000 00 \
+             none none\r\nwfd_audio_codecs: AAC 00000001 00\r\n\
+             wfd_presentation_URL: rtsp://127.0.0.1/wfd1.0/streamid=0 none\r\n{}",
+            uibc_port.map_or_else(String::new, |port| format!(
+                "wfd_uibc_capability: input_category_list=GENERIC;\
+                 generic_cap_list=SingleTouch;hidc_cap_list=none;port={port}\r\n"
+            ))
+        );
+        let m4 = m4.as_str();
         let m5 = "wfd_trigger_method: SETUP\r\n";
         let coalesced = format!(
             "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: 3\r\n\
@@ -903,6 +930,115 @@ mod tests {
             waited >= Duration::from_secs(1),
             "gave up after {waited:?}, which is inside a single session timeout"
         );
+    }
+
+    /// The source advertises a UIBC port, we dial it, and panel touch comes out the far
+    /// side as source pixels.
+    ///
+    /// #125 was "UIBC is negotiated end to end, the sink never connects the back-channel,
+    /// panel touch silently does nothing", and the fix landed with **no regression test**.
+    /// The encoder below it has 22 excellent tests — the spec's own worked touch-down
+    /// bytes, lazycast's mouse descriptor, multi-touch `5n+1` arithmetic, odd-length HIDC
+    /// padding, a coordinate type that cannot carry panel pixels — and that is precisely
+    /// why the bug survived: the encoder was never the problem, and everything that was
+    /// tested kept passing while touch did nothing (#193).
+    ///
+    /// So this asserts the half that was missing and nothing the encoder already covers:
+    /// the dial happens, a `TouchSurface` is published, and what arrives on the socket is
+    /// in the **source's** pixel space — which is where the letterbox mapping can be
+    /// silently wrong, because a panel-space coordinate is a perfectly well-formed frame
+    /// that puts the finger somewhere else.
+    #[tokio::test]
+    async fn a_source_that_offers_uibc_gets_the_panels_touches() {
+        // The source's back-channel listener, bound before M4 so the port it advertises is
+        // one it is already listening on.
+        let uibc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uibc_port = uibc.local_addr().unwrap().port();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = listener.local_addr().unwrap();
+        let rtp = bind_rtp(0).await.unwrap();
+        let rtp_port = rtp.local_addr().unwrap().port();
+
+        let source = tokio::spawn(scripted_source_with_uibc(listener, rtp_port, uibc_port));
+
+        let (tx, mut rx) = mpsc::channel::<SourceMessage>(8);
+        let sink = SessionSink::new(SourceId::new(ProtocolKind::Miracast, "test"), tx);
+        let control = connect_control(source_addr).await.unwrap();
+        let session = tokio::spawn(run_session(control, rtp, caps(rtp_port), sink));
+
+        // The sink must dial *us*. A session that negotiates UIBC and never connects is
+        // exactly #125, and it looks identical from every other vantage point.
+        let accepted = tokio::time::timeout(Duration::from_secs(5), uibc.accept())
+            .await
+            .expect("the sink never dialled the UIBC port the source advertised")
+            .unwrap();
+        let (mut back_channel, _) = accepted;
+
+        // …and publish a surface for the panel to drive.
+        let mut surface = None;
+        while let Some(message) = rx.recv().await {
+            if let SessionEvent::TouchSurface(s) = message.event {
+                surface = Some(s);
+                break;
+            }
+        }
+        let surface = surface.expect("the session never published a touch surface");
+
+        // A press at the middle of the glass. The negotiated mode is 1280x720 (the M4
+        // below picks it), and the source's space is that — not the panel's.
+        surface.touch(castaway_core::SurfaceTouch {
+            contact: 1,
+            phase: castaway_core::TouchPhase::Down,
+            x: 0.5,
+            y: 0.5,
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), back_channel.read(&mut buf))
+            .await
+            .expect("no UIBC frame arrived within five seconds")
+            .unwrap();
+        assert!(n > 0, "the back-channel closed instead of carrying a frame");
+
+        let (frame, _) = uibc::UibcFrame::parse(&buf[..n]).expect("a whole UIBC frame");
+        let messages = frame
+            .generic_messages()
+            .expect("touch rides the generic category");
+        let [uibc::GenericInput::TouchDown(pointers)] = messages.as_slice() else {
+            panic!("expected one touch-down, got {messages:?}");
+        };
+        let [pointer] = pointers.as_slice() else {
+            panic!("one finger went down, so one pointer: {pointers:?}");
+        };
+
+        // The assertion that matters, and the only one the encoder's own tests cannot
+        // make: the coordinate is in the *source's* space. A panel-space 0.5 would come
+        // through as some other number entirely, and both are well-formed frames.
+        //
+        // The M4 above sets CEA bit 8, which is 1920x1080p30 — so the middle of the glass
+        // is (960, 540) and *not* 0.5 of anything. Written as a literal rather than read
+        // back off the surface, because an expectation taken from the thing under test is
+        // not an expectation. (It is also what this test got wrong first time, which is
+        // the argument for the literal: a wrong constant fails loudly, a derived one
+        // agrees with whatever happened.)
+        assert_eq!(
+            (u32::from(pointer.at.x()), u32::from(pointer.at.y())),
+            (1920 / 2, 1080 / 2),
+            "the middle of the glass must land in the middle of the source's picture"
+        );
+
+        session.abort();
+        let _ = source.await;
+    }
+
+    /// [`scripted_source`], plus a `wfd_uibc_capability` naming `uibc_port` in M4.
+    async fn scripted_source_with_uibc(
+        listener: tokio::net::TcpListener,
+        rtp_port: u16,
+        uibc_port: u16,
+    ) -> Result<TcpStream, std::io::Error> {
+        scripted_source_inner(listener, rtp_port, 30, Some(uibc_port)).await
     }
 
     #[tokio::test]

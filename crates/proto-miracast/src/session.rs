@@ -138,6 +138,13 @@ pub enum SinkOutput {
     /// mid-session — and because a sink that advertises the capability and then never
     /// connects is one whose panel touch silently does nothing (#125).
     UibcPort(u16),
+    /// The source turned UIBC off mid-session: take the touch surface down.
+    ///
+    /// `wfd_uibc_setting: disable` used to fall through to the generic mid-session
+    /// acknowledgement, so the sink answered `200 OK` and went on delivering panel touch
+    /// to a source that had said stop (#193). The session keeps streaming either way —
+    /// this is an input channel closing, not a session ending.
+    UibcRevoked,
     /// The stream stopped but the session survives (M9 `PAUSE`).
     MediaStopped,
     /// The session is over.
@@ -510,6 +517,19 @@ impl WfdSession {
             return Ok(vec![
                 SinkOutput::Respond(self.ok(cseq)),
                 SinkOutput::UibcPort(port),
+            ]);
+        }
+
+        // M15, the off switch. Checked *after* the capability above, because a body
+        // carrying both is a source enabling a new port rather than closing the old one.
+        if parsed
+            .value(&ParamName::UibcSetting)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("disable"))
+        {
+            debug!("source disabled UIBC");
+            return Ok(vec![
+                SinkOutput::Respond(self.ok(cseq)),
+                SinkOutput::UibcRevoked,
             ]);
         }
         // wfd_route, wfd_connector_type, wfd_standby, wfd_uibc_setting: a single-output
@@ -1359,7 +1379,6 @@ mod tests {
             &b"wfd_route: secondary\r\n"[..],
             &b"wfd_connector_type: 05\r\n"[..],
             &b"wfd_standby\r\n"[..],
-            &b"wfd_uibc_setting: disable\r\n"[..],
         ] {
             let h = headers(&[("CSeq", "20")]);
             let out = s
@@ -1367,7 +1386,75 @@ mod tests {
                 .unwrap();
             assert_eq!(only_response(&out).status, 200);
             assert!(matches!(s.state(), SessionState::Playing(_)));
+            assert_eq!(
+                out.len(),
+                1,
+                "a parameter that changes nothing must produce nothing but the ack: {out:?}"
+            );
         }
+    }
+
+    /// `wfd_uibc_setting: disable` takes the touch surface down.
+    ///
+    /// It used to be in the list above — acknowledged with a 200 and otherwise ignored —
+    /// so a source that turned UIBC off mid-session kept receiving panel touch, and the
+    /// glass went on driving something that had said it was not listening. The session
+    /// itself survives, which is why this is its own output rather than an end (#193).
+    #[test]
+    fn a_source_that_turns_uibc_off_gets_the_surface_taken_down() {
+        let mut s = handshake();
+        let h = headers(&[("CSeq", "20")]);
+        let out = s
+            .on_request(&request(
+                "SET_PARAMETER",
+                CONTROL_URI,
+                &h,
+                b"wfd_uibc_setting: disable\r\n",
+            ))
+            .unwrap();
+
+        assert_eq!(only_response(&out).status, 200, "still a well-formed ack");
+        assert!(
+            out.contains(&SinkOutput::UibcRevoked),
+            "disable must revoke the surface, not merely be acknowledged: {out:?}"
+        );
+        assert!(
+            matches!(s.state(), SessionState::Playing(_)),
+            "the source is still streaming; only the input channel closed"
+        );
+
+        // `enable` is not a revoke, and it is not a port either — the port arrives in the
+        // capability, so this is a source saying "yes" to something already agreed.
+        let h = headers(&[("CSeq", "21")]);
+        let out = s
+            .on_request(&request(
+                "SET_PARAMETER",
+                CONTROL_URI,
+                &h,
+                b"wfd_uibc_setting: enable\r\n",
+            ))
+            .unwrap();
+        assert!(
+            !out.contains(&SinkOutput::UibcRevoked),
+            "enable is not disable: {out:?}"
+        );
+
+        // A body carrying both a capability *and* a setting is a source opening a new
+        // channel, not closing one. The port wins, and revoking here would take down the
+        // surface the same message just asked for.
+        let h = headers(&[("CSeq", "22")]);
+        let out = s
+            .on_request(&request(
+                "SET_PARAMETER",
+                CONTROL_URI,
+                &h,
+                b"wfd_uibc_capability: input_category_list=GENERIC;\
+                  generic_cap_list=SingleTouch;hidc_cap_list=none;port=7239\r\n\
+                  wfd_uibc_setting: disable\r\n",
+            ))
+            .unwrap();
+        assert!(out.contains(&SinkOutput::UibcPort(7239)), "{out:?}");
+        assert!(!out.contains(&SinkOutput::UibcRevoked), "{out:?}");
     }
 
     #[test]
