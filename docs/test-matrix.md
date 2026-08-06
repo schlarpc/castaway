@@ -28,6 +28,10 @@ against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a
 > | Darwin checks could not evaluate | `systems` is `[ "x86_64-linux" ]`; aarch64-linux turned out to be broken too (D57) | #207 |
 > | `getInfo`'s field set and `spotify_device_id` were unasserted | both pinned, with the test saying plainly that a pin is not a validation | #200 (partial) |
 > | `apply_track` / `best_cover` untested | every branch, mutation-checked | #199 (partial) |
+> | five `#[ignore]`d files with no recorded decision | a call at each file, and they are three different calls — one is a gap, two are a nightly job that does not exist, two are wiring `cast-app-hosting` already has | #183 |
+> | `node.rs` had zero tests | the endpoint tree and the one-based target mapping, mutation-checked. Every cluster *handler* is still unexecuted | #196 (partial) |
+> | SSDP `NOTIFY` never seen on a wire | a listener joined to the group watches two alive bursts and a byebye leave the socket; `MX`'s divergence is written down rather than left implicit | #202 (partial) |
+> | the mixer's device-vanish test never let the device come back | a factory that refuses for two retry intervals and then opens, asserting sound returns, nothing was dropped, and the retries were paced | #204 (partial) |
 >
 > Two entries above are **partial and the issues stay open**: #199's `pump_events` and
 > `run()` are the bulk of it, and #200 still wants the one LAN capture that would turn a pin
