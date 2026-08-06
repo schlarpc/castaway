@@ -98,6 +98,76 @@ const fn repeat_flags(mode: RepeatMode) -> (bool, bool) {
     }
 }
 
+/// One call on librespot's `Spirc`, chosen before any of it is made.
+///
+/// The dispatch used to be a `match` that called straight through, so the decisions in it
+/// — chiefly that "stop" hangs up rather than pausing — were only observable by holding a
+/// live `Spirc`, which no test can build (#199). Choosing the call first makes the choice
+/// a value, and the applying half below has nothing left to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpircCall {
+    Play,
+    Pause,
+    /// Give up being the active device, pausing on the way out.
+    ///
+    /// This is `Stop`, and it is deliberately not `pause()`: "stop" on the panel should
+    /// hand the account back to whatever the user picks next, not leave castaway holding
+    /// a paused session nobody in the room can see. The `bool` is librespot's
+    /// `pause` argument — leaving it false would hand the account back with the audio
+    /// still running here.
+    Disconnect {
+        pause: bool,
+    },
+    SetPosition(u32),
+    SetVolume(u16),
+    Next,
+    Previous,
+    Shuffle(bool),
+}
+
+/// What one transaction becomes on the wire, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallPlan {
+    /// One call, which is every verb but repeat.
+    One(SpircCall),
+    /// Repeat is two flag writes; see [`repeat_calls`] for why both, and why in that order.
+    Repeat([RepeatCall; 2]),
+}
+
+/// Decide what a transaction does, without doing any of it.
+///
+/// # Errors
+/// [`CoreError::UnsupportedControl`] for a verb Connect has no honest implementation of.
+fn plan(txn: &ControlTxn) -> Result<CallPlan, CoreError> {
+    let one = |call| Ok(CallPlan::One(call));
+    match txn {
+        ControlTxn::Play => one(SpircCall::Play),
+        ControlTxn::Pause => one(SpircCall::Pause),
+        ControlTxn::Stop => one(SpircCall::Disconnect { pause: true }),
+        ControlTxn::Seek(position) => one(SpircCall::SetPosition(
+            u32::try_from(position.as_millis()).unwrap_or(u32::MAX),
+        )),
+        // Spotify's 16-bit volume is a slider position like everyone else's — it is what
+        // the phone's own control shows — so it takes the position back out rather than
+        // the amplitude (#85). librespot owns the taper on its side.
+        ControlTxn::Volume(level) => one(SpircCall::SetVolume(volume_to_spotify(level.position()))),
+        ControlTxn::Next => one(SpircCall::Next),
+        ControlTxn::Previous => one(SpircCall::Previous),
+        ControlTxn::Shuffle(on) => one(SpircCall::Shuffle(*on)),
+        ControlTxn::Repeat(mode) => Ok(CallPlan::Repeat(repeat_calls(*mode))),
+        // Unreachable via `issue`, which checks capabilities first — but this is a trait
+        // method anyone can call directly, and a silent success here would look like a
+        // queue that was accepted and then ignored.
+        //
+        // The wildcard is forced: `ControlTxn` is `#[non_exhaustive]`, so a downstream
+        // crate cannot match it closed. Refusing by default is the safe direction — a verb
+        // added later arrives here as "unsupported" rather than as a silent no-op.
+        ControlTxn::Mute(_) | ControlTxn::SetQueue { .. } | _ => {
+            Err(CoreError::UnsupportedControl(format!("{txn:?}")))
+        }
+    }
+}
+
 impl fmt::Debug for SpotifyRemote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `Spirc` is an opaque command sender with nothing worth printing.
@@ -113,26 +183,21 @@ impl RemoteControl for SpotifyRemote {
 
     async fn issue_unchecked(&self, txn: ControlTxn) -> Result<(), CoreError> {
         let spirc = &self.spirc;
-        let result = match &txn {
-            ControlTxn::Play => spirc.play(),
-            ControlTxn::Pause => spirc.pause(),
-            // Give up being the active device rather than merely pausing: "stop" on the
-            // panel should hand the account back to whatever the user picks next, not
-            // leave castaway holding a paused session nobody can see.
-            ControlTxn::Stop => spirc.disconnect(true),
-            ControlTxn::Seek(position) => {
-                spirc.set_position_ms(u32::try_from(position.as_millis()).unwrap_or(u32::MAX))
-            }
-            // Spotify's 16-bit volume is a slider position like everyone else's — it is
-            // what the phone's own control shows — so it takes the position back out
-            // rather than the amplitude (#85). librespot owns the taper on its side.
-            ControlTxn::Volume(level) => spirc.set_volume(volume_to_spotify(level.position())),
-            ControlTxn::Next => spirc.next(),
-            ControlTxn::Previous => spirc.prev(),
-            ControlTxn::Shuffle(on) => spirc.shuffle(*on),
-            ControlTxn::Repeat(mode) => {
+        let apply = |call| match call {
+            SpircCall::Play => spirc.play(),
+            SpircCall::Pause => spirc.pause(),
+            SpircCall::Disconnect { pause } => spirc.disconnect(pause),
+            SpircCall::SetPosition(ms) => spirc.set_position_ms(ms),
+            SpircCall::SetVolume(raw) => spirc.set_volume(raw),
+            SpircCall::Next => spirc.next(),
+            SpircCall::Previous => spirc.prev(),
+            SpircCall::Shuffle(on) => spirc.shuffle(on),
+        };
+        let result = match plan(&txn)? {
+            CallPlan::One(call) => apply(call),
+            CallPlan::Repeat(calls) => {
                 let mut outcome = Ok(());
-                for call in repeat_calls(*mode) {
+                for call in calls {
                     if outcome.is_err() {
                         break;
                     }
@@ -143,16 +208,6 @@ impl RemoteControl for SpotifyRemote {
                 }
                 outcome
             }
-            // Unreachable via `issue`, which checks capabilities first — but this is a
-            // trait method anyone can call directly, and a silent success here would look
-            // like a queue that was accepted and then ignored.
-            //
-            // The wildcard is forced: `ControlTxn` is `#[non_exhaustive]`, so a downstream
-            // crate cannot match it closed. Refusing by default is the safe direction — a
-            // verb added later arrives here as "unsupported" rather than as a silent no-op.
-            ControlTxn::Mute(_) | ControlTxn::SetQueue { .. } | _ => {
-                return Err(CoreError::UnsupportedControl(format!("{txn:?}")));
-            }
         };
 
         result.map_err(|e| {
@@ -160,6 +215,17 @@ impl RemoteControl for SpotifyRemote {
             CoreError::Adapter(format!("spotify control {txn:?} failed: {e}"))
         })
     }
+}
+
+/// Read Spotify's 16-bit volume back as a slider position.
+///
+/// The inverse of [`volume_to_spotify`], and it exists because the phone is authoritative:
+/// a finger on the phone's slider reaches us as a `VolumeChanged` player event, and the
+/// panel has to follow it rather than keep playing at whatever the last local level was
+/// (#199). Same reading in both directions — Spotify's number is a slider position, not an
+/// amplitude, so [`castaway_core::Volume::from_position`] owns the taper (#85).
+pub(crate) fn volume_from_spotify(raw: u16) -> castaway_core::Volume {
+    castaway_core::Volume::from_position(f32::from(raw) / f32::from(u16::MAX))
 }
 
 /// Map a `0.0..=1.0` level onto Spotify's 16-bit volume scale.
@@ -238,6 +304,106 @@ mod tests {
                 assert_eq!((context, track), repeat_flags(to), "{from:?} -> {to:?}");
             }
         }
+    }
+
+    /// What each verb actually does to the Connect session.
+    ///
+    /// Every line here was previously observable only by holding a live `Spirc`, which
+    /// means it was observable only by a person with a phone (#199).
+    #[test]
+    fn every_advertised_verb_maps_to_the_call_it_says_it_does() {
+        use std::time::Duration;
+
+        let one = |txn: &ControlTxn| match plan(txn) {
+            Ok(CallPlan::One(call)) => call,
+            other => panic!("{txn:?} should be one call, got {other:?}"),
+        };
+        assert_eq!(one(&ControlTxn::Play), SpircCall::Play);
+        assert_eq!(one(&ControlTxn::Pause), SpircCall::Pause);
+        assert_eq!(one(&ControlTxn::Next), SpircCall::Next);
+        assert_eq!(one(&ControlTxn::Previous), SpircCall::Previous);
+        assert_eq!(one(&ControlTxn::Shuffle(true)), SpircCall::Shuffle(true));
+        assert_eq!(
+            one(&ControlTxn::Seek(Duration::from_millis(4200))),
+            SpircCall::SetPosition(4200)
+        );
+    }
+
+    /// Stop hangs up; it does not pause.
+    ///
+    /// The surprising one, and deliberate: leaving castaway holding a paused session
+    /// means the account stays on a device nobody in the room can see, and the next
+    /// person's phone finds it occupied. `pause: true` matters as much as the disconnect
+    /// — hanging up while still feeding the mixer would give the room audio from a device
+    /// that has just told the cloud it is gone.
+    #[test]
+    fn stop_gives_the_account_back_rather_than_pausing() {
+        assert_eq!(
+            plan(&ControlTxn::Stop).unwrap(),
+            CallPlan::One(SpircCall::Disconnect { pause: true })
+        );
+    }
+
+    /// A seek past what Spotify's 32-bit millisecond field can hold saturates.
+    ///
+    /// Not reachable from the strip, which scrubs within a duration — but `ControlTxn`
+    /// carries a `Duration`, and a wrapping cast would turn "seek to the end of a very
+    /// long podcast" into "seek to somewhere near the beginning".
+    #[test]
+    fn a_seek_beyond_the_wire_format_saturates_rather_than_wrapping() {
+        let huge = std::time::Duration::from_millis(u64::from(u32::MAX) + 5000);
+        assert_eq!(
+            plan(&ControlTxn::Seek(huge)).unwrap(),
+            CallPlan::One(SpircCall::SetPosition(u32::MAX))
+        );
+    }
+
+    #[test]
+    fn a_verb_with_no_honest_implementation_is_refused_rather_than_swallowed() {
+        // Reachable: `issue` checks capabilities, but `issue_unchecked` is a trait method
+        // anyone can call. A silent `Ok` here is a queue that was accepted and ignored.
+        for txn in [
+            ControlTxn::Mute(true),
+            ControlTxn::SetQueue {
+                items: Vec::new(),
+                start_index: 0,
+            },
+        ] {
+            assert!(
+                matches!(plan(&txn), Err(CoreError::UnsupportedControl(_))),
+                "{txn:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeat_change_plans_both_flag_writes() {
+        assert_eq!(
+            plan(&ControlTxn::Repeat(RepeatMode::Track)).unwrap(),
+            CallPlan::Repeat([RepeatCall::Context(false), RepeatCall::Track(true)])
+        );
+    }
+
+    /// The phone's slider and the panel's are the same scale, read the same way.
+    ///
+    /// Both directions in one test because the failure that matters is asymmetry: a
+    /// finger on the phone reaching us through a different curve than the one we send back
+    /// makes the two sliders disagree, and each correction moves the other.
+    #[test]
+    fn a_volume_survives_the_round_trip_through_spotifys_scale() {
+        for position in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let sent = volume_to_spotify(position);
+            let back = volume_from_spotify(sent);
+            assert!(
+                (back.position() - position).abs() < 0.001,
+                "{position} came back as {}",
+                back.position()
+            );
+        }
+        // The ends are exact, because the ends are what a listener notices: a "silent"
+        // that is not silent, or a "full" that is a decibel down.
+        assert_eq!(volume_from_spotify(0), castaway_core::Volume::SILENT);
+        assert_eq!(volume_from_spotify(u16::MAX), castaway_core::Volume::FULL);
     }
 
     #[test]

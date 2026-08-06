@@ -723,7 +723,7 @@ async fn start(
     let events_task = tokio::spawn(pump_events(
         events,
         sink.clone(),
-        session.clone(),
+        Arc::new(SessionCovers(session.clone())),
         Arc::clone(&hung_up),
         Arc::clone(&presentation),
     ));
@@ -791,7 +791,7 @@ async fn serve_reattach(
 async fn pump_events(
     mut events: mpsc::UnboundedReceiver<PlayerEvent>,
     sink: SessionSink,
-    session: Session,
+    covers: Arc<dyn CoverSource>,
     hung_up: Arc<AtomicBool>,
     presentation: Arc<Presentation>,
 ) {
@@ -830,10 +830,10 @@ async fn pump_events(
                 apply_track(&mut snapshot, &audio_item);
                 current_uri = Some(audio_item.uri.clone());
                 if let Some(url) = best_cover(&audio_item) {
-                    let (session, art_tx, uri) =
-                        (session.clone(), art_tx.clone(), audio_item.uri.clone());
+                    let (covers, art_tx, uri) =
+                        (Arc::clone(&covers), art_tx.clone(), audio_item.uri.clone());
                     tokio::spawn(async move {
-                        if let Some(art) = fetch_cover(&session, &url).await {
+                        if let Some(art) = covers.fetch(&url).await {
                             let _ = art_tx.send((uri, art)).await;
                         }
                     });
@@ -923,6 +923,31 @@ async fn pump_events(
                             return;
                         }
                     }
+                }
+                false
+            }
+            PlayerEvent::VolumeChanged { volume } => {
+                // The phone is authoritative, exactly as for AVRCP's absolute volume
+                // (#69): a finger on the phone's slider — or another device on the
+                // account moving it — has to move the room's volume, or the two controls
+                // disagree and the panel plays at whatever the last local level was.
+                //
+                // This arm did not exist, so every volume change made from the phone
+                // reached librespot's soft mixer, which we do not read: it scales a stream
+                // we never take PCM from (`PcmSink` sits before it), so the level moved on
+                // the phone and nothing at all happened in the room (#199).
+                //
+                // A `Control` rather than a field on the card, because volume is a
+                // property of the *output*, not of the track — and the session manager
+                // already routes it to the mixer for every other source of this shape.
+                if sink
+                    .emit(SessionEvent::Control(castaway_core::ControlTxn::Volume(
+                        crate::control::volume_from_spotify(volume),
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
                 false
             }
@@ -1265,6 +1290,31 @@ fn best_cover(item: &AudioItem) -> Option<String> {
         .iter()
         .max_by_key(|c| c.width)
         .map(|c| c.url.clone())
+}
+
+/// Where the fold gets cover art.
+///
+/// The one thing in [`pump_events`] that needs the network, and therefore the one thing
+/// that used to force a live `Session` through the whole fold — which meant the ~175
+/// lines carrying four documented past regressions could not be driven by a test at all
+/// (#199). Everything else in there is `PlayerEvent`s in, [`SessionEvent`]s out.
+///
+/// Deliberately not `Result`: a missing cover is cosmetic, the card already draws an
+/// empty panel for it, and nothing here is worth failing a session over.
+#[async_trait::async_trait]
+trait CoverSource: Send + Sync + 'static {
+    /// Fetch the image at `url`, or `None` if it cannot be had.
+    async fn fetch(&self, url: &str) -> Option<castaway_core::Artwork>;
+}
+
+/// The live one: librespot's own HTTP client, which is already authenticated and pooled.
+struct SessionCovers(Session);
+
+#[async_trait::async_trait]
+impl CoverSource for SessionCovers {
+    async fn fetch(&self, url: &str) -> Option<castaway_core::Artwork> {
+        fetch_cover(&self.0, url).await
+    }
 }
 
 /// Fetch cover bytes over librespot's HTTP client.
@@ -2036,6 +2086,531 @@ mod tests {
             best_cover(&item).as_deref(),
             Some("https://i.scdn.co/large")
         );
+    }
+
+    // ---- the fold: `pump_events` ------------------------------------------------------
+    //
+    // Every phone-side transport action the room takes lands in that one function, and it
+    // had no test of any kind (#199). The four regressions it carries in its own comments
+    // — position ticks blanking the card, `SessionDisconnected` falling through the
+    // wildcard, artwork pasted onto a successor track, `PositionChanged` re-anchoring the
+    // scrubber — are each asserted below, because each of them shipped once already.
+
+    /// A track item with a URI of the test's choosing, so two of them can be told apart.
+    fn track(uri: &str, name: &str) -> AudioItem {
+        let mut item = audio_item(
+            name,
+            240_000,
+            UniqueFields::Track {
+                artists: librespot_metadata::artist::ArtistsWithRole(vec![artist("Someone")]),
+                album: "An Album".to_owned(),
+                album_artists: Vec::new(),
+                popularity: 0,
+                number: 1,
+                disc_number: 1,
+            },
+        );
+        item.track_id = librespot_core::SpotifyUri::from_uri(uri).expect("a real track URI");
+        item.uri = uri.to_owned();
+        item
+    }
+
+    /// Two real-shaped track URIs, distinct, so "the art belongs to the track we left" is
+    /// a question with an answer.
+    const FIRST: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
+    const SECOND: &str = "spotify:track:1301WleyT98MSxVHPZCA6M";
+
+    fn cover(url: &str, width: i32) -> librespot_metadata::audio::item::CoverImage {
+        librespot_metadata::audio::item::CoverImage {
+            url: url.to_owned(),
+            size: librespot_metadata::image::ImageSize::DEFAULT,
+            width,
+            height: width,
+        }
+    }
+
+    /// Cover art delivered on the test's schedule.
+    ///
+    /// The gate is the point: artwork is fetched off the fold's own task, so "the art for
+    /// the track we just skipped past arrives now" is only reachable if the test decides
+    /// when now is.
+    struct ScriptedCovers {
+        asked: std::sync::Mutex<Vec<String>>,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl ScriptedCovers {
+        /// Art the test releases by hand.
+        fn gated() -> Arc<Self> {
+            Arc::new(Self {
+                asked: std::sync::Mutex::new(Vec::new()),
+                gate: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        /// Art that lands as soon as it is asked for.
+        fn eager() -> Arc<Self> {
+            let covers = Self::gated();
+            covers.release();
+            covers
+        }
+
+        fn release(&self) {
+            self.gate.add_permits(1);
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("test lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CoverSource for ScriptedCovers {
+        async fn fetch(&self, url: &str) -> Option<castaway_core::Artwork> {
+            self.asked.lock().expect("test lock").push(url.to_owned());
+            self.gate.acquire().await.expect("gate stays open").forget();
+            Some(castaway_core::Artwork::new(
+                castaway_core::ImageFormat::Jpeg,
+                bytes::Bytes::from_static(b"\xff\xd8\xffthese are not really jpeg bytes"),
+            ))
+        }
+    }
+
+    /// The fold, running, with the wires the test drives it by.
+    struct Pump {
+        events: mpsc::UnboundedSender<PlayerEvent>,
+        rx: mpsc::Receiver<castaway_core::SourceMessage>,
+        covers: Arc<ScriptedCovers>,
+        hung_up: Arc<AtomicBool>,
+        presentation: Arc<Presentation>,
+        task: JoinHandle<()>,
+    }
+
+    impl Pump {
+        fn start(covers: Arc<ScriptedCovers>) -> Self {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(64);
+            let sink = SessionSink::new(SourceId::new(ProtocolKind::Spotify, "test"), tx);
+            let hung_up = Arc::new(AtomicBool::new(false));
+            let presentation = Arc::new(presentation());
+            let task = tokio::spawn(pump_events(
+                event_rx,
+                sink,
+                Arc::clone(&covers) as Arc<dyn CoverSource>,
+                Arc::clone(&hung_up),
+                Arc::clone(&presentation),
+            ));
+            Self {
+                events: event_tx,
+                rx,
+                covers,
+                hung_up,
+                presentation,
+                task,
+            }
+        }
+
+        fn send(&self, event: PlayerEvent) {
+            self.events.send(event).expect("the pump is running");
+        }
+
+        /// The next event the fold published, or `None` if it published nothing.
+        ///
+        /// Bounded rather than blocking, because half of these tests are about an event
+        /// *not* being published.
+        async fn next(&mut self) -> Option<SessionEvent> {
+            tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .map(|msg| msg.event)
+        }
+
+        /// The next card the fold published. Panics if it published something else, which
+        /// is the point — an unexpected event in between is a fact worth failing on.
+        async fn next_card(&mut self) -> NowPlaying {
+            match self.next().await {
+                Some(SessionEvent::NowPlaying(card)) => card,
+                other => panic!("expected a card, got {other:?}"),
+            }
+        }
+
+        /// Close the event channel and collect everything the fold published on its way
+        /// out — the deterministic form, with no timeouts in it.
+        async fn finish(self) -> Vec<SessionEvent> {
+            let Self {
+                events,
+                mut rx,
+                task,
+                ..
+            } = self;
+            drop(events);
+            task.await.expect("the pump should not panic");
+            let mut out = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                out.push(msg.event);
+            }
+            out
+        }
+    }
+
+    fn playing(position_ms: u32) -> PlayerEvent {
+        PlayerEvent::Playing {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+            position_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_position_tick_keeps_the_text_it_was_not_told_about() {
+        // Regression, documented on the function itself: `NowPlaying` is a full snapshot
+        // re-emitted on every change, and librespot reports the track and the position in
+        // separate events — so a fold that forgot the track blanked the card once a second.
+        let pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(track(FIRST, "Windowlicker")),
+        });
+        pump.send(PlayerEvent::PositionChanged {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+            position_ms: 61_000,
+        });
+
+        let cards: Vec<NowPlaying> = pump
+            .finish()
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::NowPlaying(card) => Some(card),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 2, "a tick is published, not swallowed");
+        assert_eq!(cards[1].title.as_deref(), Some("Windowlicker"));
+        assert_eq!(cards[1].position, Some(Duration::from_secs(61)));
+    }
+
+    #[tokio::test]
+    async fn a_position_tick_is_published_because_the_scrubber_re_anchors_on_it() {
+        // The other half of the same arm, and the reason it returns `true`: the transport
+        // strip's clock free-runs between published positions, so a tick that is folded in
+        // and *not* emitted leaves the scrubber running on the OS clock from the opening
+        // zero — and carrying that anchor across a track change, since zero equals zero.
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::PositionChanged {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+            position_ms: 5000,
+        });
+        assert_eq!(
+            pump.next_card().await.position,
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[tokio::test]
+    async fn play_and_pause_carry_the_position_they_happened_at() {
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(playing(1000));
+        let card = pump.next_card().await;
+        assert_eq!(card.state, PlaybackState::Playing);
+        assert_eq!(card.position, Some(Duration::from_secs(1)));
+
+        pump.send(PlayerEvent::Paused {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+            position_ms: 2000,
+        });
+        let card = pump.next_card().await;
+        assert_eq!(card.state, PlaybackState::Paused);
+        assert_eq!(card.position, Some(Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn cover_art_arriving_late_is_folded_into_the_track_it_belongs_to() {
+        let mut pump = Pump::start(ScriptedCovers::gated());
+        let mut item = track(FIRST, "Windowlicker");
+        item.covers = vec![
+            cover("https://i.scdn.co/small", 64),
+            cover("https://i.scdn.co/large", 640),
+        ];
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(item),
+        });
+
+        // The text goes up first and does not wait for the download (#50).
+        let card = pump.next_card().await;
+        assert_eq!(card.title.as_deref(), Some("Windowlicker"));
+        assert!(card.artwork.is_none());
+
+        pump.covers.release();
+        let card = pump.next_card().await;
+        assert_eq!(card.title.as_deref(), Some("Windowlicker"));
+        assert!(card.artwork.is_some(), "the art should have landed");
+        // …and the session remembers it, so a reopen does not re-fetch the same image.
+        let held = Presentation::read(&pump.presentation.now_playing)
+            .flatten()
+            .expect("the fold records every snapshot");
+        assert!(held.artwork.is_some());
+        // The largest offered, not the first (`best_cover`), asked for exactly once.
+        assert_eq!(
+            pump.covers.asked(),
+            vec!["https://i.scdn.co/large".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cover_art_for_a_track_we_have_left_is_dropped_rather_than_pasted_on() {
+        // A documented past regression: skip quickly and the previous track's art landed
+        // on the next track's card, so the wall showed one song's title over another's
+        // sleeve. The fetch is off-task by design, so this is a race the fold has to win
+        // by remembering which URI it is currently on.
+        let mut pump = Pump::start(ScriptedCovers::gated());
+        let mut first = track(FIRST, "Windowlicker");
+        first.covers = vec![cover("https://i.scdn.co/first", 640)];
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(first),
+        });
+        assert_eq!(
+            pump.next_card().await.title.as_deref(),
+            Some("Windowlicker")
+        );
+
+        // Skip on. The art for the first track is still in flight.
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(track(SECOND, "Come to Daddy")),
+        });
+        assert_eq!(
+            pump.next_card().await.title.as_deref(),
+            Some("Come to Daddy")
+        );
+
+        // Release the art with the event channel empty, so the fold has nothing else it
+        // could be choosing to do: whatever happens next is its answer to the late art.
+        // Dropping it is silent, so silence is the assertion — and it is a real one,
+        // because folding it in republishes the card.
+        pump.covers.release();
+        assert!(
+            pump.next().await.is_none(),
+            "art for a track we have left should be dropped, not published"
+        );
+
+        // …and the card the room is looking at is still the one without a sleeve, which
+        // catches the other half: folded in silently and shown on the next tick.
+        pump.send(playing(3000));
+        let card = pump.next_card().await;
+        assert_eq!(card.title.as_deref(), Some("Come to Daddy"));
+        assert!(
+            card.artwork.is_none(),
+            "the first track's sleeve must not reach the second track's card"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_disconnecting_ends_the_session_rather_than_falling_through() {
+        // A documented past regression, and the expensive one: `SessionDisconnected` fell
+        // into the wildcard arm, so the session manager was never told. `active` stayed
+        // Spotify, the pipeline was never stopped, the card never cleared, and the PCM
+        // thread kept the audio device — the panel sat on a stale card until somebody cast
+        // over it.
+        let pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(track(FIRST, "Windowlicker")),
+        });
+        pump.send(PlayerEvent::SessionDisconnected {
+            connection_id: "c".to_owned(),
+            user_name: "alice".to_owned(),
+        });
+        let hung_up = Arc::clone(&pump.hung_up);
+
+        let events = pump.finish().await;
+        assert!(
+            matches!(events.last(), Some(SessionEvent::End)),
+            "the session must end: {events:?}"
+        );
+        // …and the runner has to be able to tell this from a session that died, or it
+        // reconnects the user onto a device they just walked away from.
+        assert!(hung_up.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_phone_names_itself_and_the_session_keeps_the_name() {
+        // `user_name` is a canonical Spotify id — for any account made since about 2015,
+        // 25 random characters, rendered at 28px on a 65-inch screen. This event is the
+        // only place the phone says what it is called.
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::SessionClientChanged {
+            client_id: "id".to_owned(),
+            client_name: String::new(),
+            client_brand_name: "Google".to_owned(),
+            client_model_name: "Pixel 8".to_owned(),
+        });
+        let Some(SessionEvent::SourceInfo(info)) = pump.next().await else {
+            panic!("the phone naming itself should reach the panel");
+        };
+        // The first non-empty of the three, so an empty `client_name` does not win.
+        assert!(info.to_string().contains("Google"), "{info}");
+        // Merged into the session's own description, not merely emitted, so a reopen says
+        // it again rather than falling back to the account id.
+        let held = Presentation::read(&pump.presentation.description).expect("a description");
+        assert!(held.to_string().contains("Google"), "{held}");
+    }
+
+    #[tokio::test]
+    async fn the_phone_moving_the_volume_moves_the_room() {
+        // The functional gap #199 names: there was no volume arm at all, so a finger on
+        // the phone's slider changed librespot's soft mixer — which sits *after* the PCM
+        // we take — and nothing in the room got louder or quieter.
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::VolumeChanged { volume: u16::MAX });
+        let Some(SessionEvent::Control(castaway_core::ControlTxn::Volume(level))) =
+            pump.next().await
+        else {
+            panic!("a volume change on the phone should reach the mixer");
+        };
+        assert_eq!(level, castaway_core::Volume::FULL);
+
+        pump.send(PlayerEvent::VolumeChanged { volume: 0 });
+        let Some(SessionEvent::Control(castaway_core::ControlTxn::Volume(level))) =
+            pump.next().await
+        else {
+            panic!("…in both directions");
+        };
+        assert_eq!(level, castaway_core::Volume::SILENT);
+    }
+
+    #[tokio::test]
+    async fn volume_is_not_mistaken_for_a_track_change() {
+        // It publishes a `Control`, and it must not also publish a card: the volume is a
+        // property of the output rather than of the track, and a card republished on every
+        // slider movement is a full-screen raster per volume step.
+        let pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::VolumeChanged { volume: 30_000 });
+        let events = pump.finish().await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::NowPlaying(_))),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_clears_the_card_including_the_art() {
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(track(FIRST, "Windowlicker")),
+        });
+        assert!(pump.next_card().await.has_text());
+        pump.send(PlayerEvent::Stopped {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+        });
+        let card = pump.next_card().await;
+        assert_eq!(card.state, PlaybackState::Stopped);
+        assert!(
+            !card.has_text(),
+            "a stopped session should not leave a track on the wall: {card:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_track_says_so_instead_of_sitting_there() {
+        // Region-locked or pulled from the catalogue. Spirc skips on, but the card would
+        // otherwise sit on a track that is never going to play.
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::Unavailable {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+        });
+        assert_eq!(pump.next_card().await.state, PlaybackState::Error);
+    }
+
+    #[tokio::test]
+    async fn shuffle_and_repeat_reach_the_strip_the_way_the_buttons_read() {
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::ShuffleChanged { shuffle: true });
+        assert_eq!(pump.next_card().await.shuffle, Some(true));
+
+        // Spotify keeps two independent flags where `RepeatMode` is one answer, and both
+        // set is a real state the cloud publishes. Track wins, because the current song
+        // forever is what the listener will actually hear.
+        pump.send(PlayerEvent::RepeatChanged {
+            context: true,
+            track: true,
+        });
+        assert_eq!(pump.next_card().await.repeat, Some(RepeatMode::Track));
+
+        pump.send(PlayerEvent::RepeatChanged {
+            context: true,
+            track: false,
+        });
+        assert_eq!(pump.next_card().await.repeat, Some(RepeatMode::Context));
+
+        pump.send(PlayerEvent::RepeatChanged {
+            context: false,
+            track: false,
+        });
+        assert_eq!(pump.next_card().await.repeat, Some(RepeatMode::Off));
+    }
+
+    #[tokio::test]
+    async fn a_seek_someone_made_is_published_but_does_not_disturb_the_text() {
+        let mut pump = Pump::start(ScriptedCovers::eager());
+        pump.send(PlayerEvent::TrackChanged {
+            audio_item: Box::new(track(FIRST, "Windowlicker")),
+        });
+        assert_eq!(pump.next_card().await.position, Some(Duration::ZERO));
+        pump.send(PlayerEvent::Seeked {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI"),
+            position_ms: 120_000,
+        });
+        let card = pump.next_card().await;
+        assert_eq!(card.position, Some(Duration::from_secs(120)));
+        assert_eq!(card.title.as_deref(), Some("Windowlicker"));
+    }
+
+    #[tokio::test]
+    async fn spircs_internal_chatter_does_not_repaint_the_wall() {
+        // Most of `PlayerEvent` is spirc talking to itself: preload timing, request ids,
+        // end-of-track. Publishing a card for each would repaint a 4K screen several times
+        // per track for nothing.
+        let pump = Pump::start(ScriptedCovers::eager());
+        let id = librespot_core::SpotifyUri::from_uri(FIRST).expect("a real track URI");
+        pump.send(PlayerEvent::PlayRequestIdChanged { play_request_id: 2 });
+        pump.send(PlayerEvent::TimeToPreloadNextTrack {
+            play_request_id: 2,
+            track_id: id.clone(),
+        });
+        pump.send(PlayerEvent::EndOfTrack {
+            play_request_id: 2,
+            track_id: id.clone(),
+        });
+        pump.send(PlayerEvent::Preloading { track_id: id });
+        pump.send(PlayerEvent::AutoPlayChanged { auto_play: true });
+        assert!(pump.finish().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_fold_stops_when_the_session_manager_goes_away() {
+        // Not a leak in theory: the pump outlives its sink whenever the panel shuts down,
+        // and a task looping on a closed channel would hold the whole session alive.
+        let pump = Pump::start(ScriptedCovers::eager());
+        let Pump {
+            events, rx, task, ..
+        } = pump;
+        drop(rx);
+        events
+            .send(PlayerEvent::TrackChanged {
+                audio_item: Box::new(track(FIRST, "Windowlicker")),
+            })
+            .expect("the pump is running");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the pump should notice and stop")
+            .expect("without panicking");
     }
 
     #[test]
