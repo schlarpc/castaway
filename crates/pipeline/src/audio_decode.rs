@@ -646,17 +646,33 @@ pub(crate) mod tests {
     /// Returns an empty vec if this build has no encoder for the codec, so the tests
     /// skip rather than fail on an ffmpeg compiled without it.
     pub(crate) fn encode(codec: AudioCodec, rate: u32, pcm: &[i16]) -> Vec<EncodedFrame> {
+        encode_with_config(codec, rate, pcm).0
+    }
+
+    /// The same, and the encoder's own extradata beside it.
+    ///
+    /// ALAC cannot be decoded without it — libavcodec's `alac_decode_init` refuses to
+    /// open on fewer than 36 bytes — and a *hand-built* cookie is not enough either: the
+    /// `frame_length` field has to be the one the encoder actually packed, and a cookie
+    /// that gets it wrong decodes to silence or static rather than to an error. In the
+    /// real path this comes off the sender's SDP (`a=fmtp:96 352 0 16 40 10 14 2 255 …`),
+    /// which is the same information from the other side of the wire.
+    pub(crate) fn encode_with_config(
+        codec: AudioCodec,
+        rate: u32,
+        pcm: &[i16],
+    ) -> (Vec<EncodedFrame>, Vec<u8>) {
         ensure_init();
         let id = codec_id(codec).unwrap();
         let Some(found) = ffmpeg::encoder::find(id) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let Ok(audio_codec) = found.audio() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         // Ask the encoder what it accepts instead of assuming s16.
         let Some(format) = audio_codec.formats().and_then(|mut f| f.next()) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
 
         let mut context = ffmpeg::codec::context::Context::new_with_codec(found);
@@ -669,7 +685,21 @@ pub(crate) mod tests {
             ffmpeg_sys_next::av_channel_layout_default(std::ptr::addr_of_mut!((*raw).ch_layout), 2);
         }
         let Ok(mut encoder) = context.encoder().audio().and_then(|e| e.open_as(found)) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
+        };
+
+        // The magic cookie the encoder wrote when it opened. SAFETY: `encoder` is open and
+        // exclusively owned, so `extradata` is either null or a valid buffer of
+        // `extradata_size` bytes for as long as this borrow lasts.
+        let config = unsafe {
+            let raw = encoder.as_ptr();
+            let (ptr, len) = ((*raw).extradata, (*raw).extradata_size);
+            match usize::try_from(len) {
+                Ok(len) if !ptr.is_null() && len > 0 => {
+                    std::slice::from_raw_parts(ptr, len).to_vec()
+                }
+                _ => Vec::new(),
+            }
         };
 
         // A frame_size of 0 means "any size"; pick something sane so the loop terminates.
@@ -705,7 +735,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        frames
+        (frames, config)
     }
 
     /// Root-mean-square of a signal, as a rough loudness measure.
@@ -1258,6 +1288,63 @@ pub(crate) mod tests {
             AudioDecoder::new(AudioCodec::Alac, format(44_100, 2), None).is_err(),
             "ALAC without extradata must fail loudly at open, not silently later"
         );
+    }
+
+    /// ALAC decodes to the waveform that went in, not merely opens.
+    ///
+    /// `alac_opens_with_its_magic_cookie_and_not_without_it` proves libavcodec *opens* a
+    /// decoder given our 36 bytes. It does not prove a frame decodes, and AirPlay's audio
+    /// path had nothing that did: `raop_session.rs` is the strongest test in that
+    /// subsystem — real sockets, a real FairPlay vector, a genuine AES-CTR keystream
+    /// assertion — and the "ALAC" payload it carries is the ASCII string
+    /// `an ALAC frame..` (#189).
+    ///
+    /// So the machinery is proven and the media is not: a correct magic cookie with a
+    /// wrong `frame_length` decodes to static, and the field symptom is static with a
+    /// green journal.
+    #[test]
+    fn alac_decodes_to_the_waveform_that_went_in() {
+        let rate = 44_100;
+        let pcm = sweep(rate, 1.0);
+        let (frames, cookie) = encode_with_config(AudioCodec::Alac, rate, &pcm);
+        if !crate::test_media::available("an ALAC encoder", !frames.is_empty()) {
+            return;
+        }
+        assert!(
+            cookie.len() >= 36,
+            "an ALAC encoder that writes no magic cookie leaves a decoder nothing to \
+             open with; got {} bytes",
+            cookie.len()
+        );
+
+        // The cookie describes the stream it is handed, and `frame_length` is the field a
+        // hand-built one gets wrong: ffmpeg's encoder packs 4096 samples per frame and
+        // AirPlay's RAOP uses 352. A decoder told the wrong number reads the next frame's
+        // bits as this one's residuals, which is audible as static and is not an error —
+        // which is why this takes the encoder's own cookie rather than reconstructing one.
+        let (decoded, reported) = decode_all(AudioCodec::Alac, rate, &frames, Some(&cookie));
+
+        assert!(!decoded.is_empty(), "ALAC produced no audio");
+        assert_eq!(reported, Some((rate, 2)));
+
+        let (ref_l, ref_r) = channels(
+            &pcm.iter()
+                .map(|s| f32::from(*s) / 32768.0)
+                .collect::<Vec<_>>(),
+        );
+        let (got_l, got_r) = channels(&decoded);
+        let max_lag = rate as usize * 40 / 1000;
+
+        // ALAC is *lossless*, so the bar is higher than the lossy codecs' 0.98 — anything
+        // short of near-unity here is a framing error rather than a codec being a codec.
+        for (name, reference, got) in [("left", &ref_l, &got_l), ("right", &ref_r, &got_r)] {
+            let (score, lag) = best_alignment(reference, got, max_lag);
+            assert!(
+                score >= 0.999,
+                "ALAC {name} correlates {score:.5} at lag {lag}; it is lossless, so this \
+                 is a framing error and not a quality one"
+            );
+        }
     }
 
     #[test]
