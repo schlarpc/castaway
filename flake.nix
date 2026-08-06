@@ -885,6 +885,14 @@
             CASTAWAY_REQUIRE_FFMPEG = "1";
             partitions = 1;
             partitionType = "count";
+            # Report every failure rather than stopping at the second. The default costs
+            # nothing when the check is green and hides siblings when it is not — and this
+            # tree has at least two independent *intermittent* failure sources whose
+            # treatments are opposite (#208): one is a starved measurement, fixed by runner
+            # exclusivity, and one is a product defect that exclusivity would hide. Telling
+            # them apart needs a run that names all of them, and a failing run that stopped
+            # early was the missing evidence every time.
+            cargoNextestExtraArgs = "--no-fail-fast";
           });
 
           # Run tests with coverage
