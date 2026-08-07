@@ -25,7 +25,8 @@ bytes.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# --- real render backends (optional; default off, DECISION-LOG D4) ---
+# --- real render backends (optional deps, in the default feature set since D55;
+# windows.nix opts out and names its own. DECISION-LOG D4) ---
 wgpu = { version = "22", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
@@ -246,9 +247,10 @@ audio-out = ["audio", "dep:cpal"]
 # ALSA host (see `audio_select::active_backend`); on Windows it is inert, so a shared
 # feature list cross-builds cleanly.
 audio-pipewire = ["audio", "dep:pipewire"]
-# The LDAC decoder, over FFI to Sony's own `libldacBT` (#14). Off by default because it
+# The LDAC decoder, over FFI to Sony's own `libldacBT` (#14). Its own feature because it
 # is the one decoder that is not already in the ffmpeg the rest of `audio` links: a build
-# without `ldacbt` available would fail to link rather than fail to decode. Implies
+# without `ldacbt` available would fail to link rather than fail to decode. In the default
+# set since D55; a build without the library opts out by naming its features. Implies
 # `audio` because the PCM it produces goes through the same session and output path.
 #
 # The feature no longer merely reserves a slot. `can_decode` asks whether a decoder

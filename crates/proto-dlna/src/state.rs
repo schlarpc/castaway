@@ -1020,7 +1020,7 @@ mod tests {
         assert!(sink.contains("audio/*"));
         assert!(
             !sink.contains("image/"),
-            "nothing renders a still, so nothing should ask us to (G62)"
+            "nothing renders a still, so nothing should ask us to (G65, manifest in #104)"
         );
     }
 

@@ -107,8 +107,9 @@
     # cannot do; nix/moonlight-common-c.nix grafts them in.
     #
     # Note the licence asymmetry: moonlight-common-c is GPL-3.0 while this workspace is
-    # MIT, so the `stream` feature that links it is opt-in and off in the portable
-    # build. See D37.
+    # MIT. The `stream` feature that links it is on by default (D55), so the default
+    # artifact is GPL-bound; the builds that must stay MIT-clean (`castaway-portable`,
+    # `gs-probe`) opt *out* via `--no-default-features`. See D37.
     moonlight-common-c-src = {
       url = "github:moonlight-stream/moonlight-common-c/e41355ea01670fd4c830b384009d31dd0339a705";
       flake = false;
@@ -664,10 +665,11 @@
             windowsDeploy = import ./nix/deploy-windows.nix { inherit pkgs; };
           in
           {
-            # On Linux the default is the real receiver: every optional feature except
-            # `ldac` (see nix/linux-kiosk.nix for why that one stays off). `nix run .`
-            # should hand you something that can actually display a cast, not a build that
-            # discovers, accepts, and then has nowhere to put the picture.
+            # On Linux the default is the real receiver: every optional feature, `ldac`
+            # included (nix/linux-kiosk.nix keeps the story of why that one was once the
+            # exception). `nix run .` should hand you something that can actually display a
+            # cast, not a build that discovers, accepts, and then has nowhere to put the
+            # picture.
             default = linuxKioskFor system;
 
             # The browser runtime the port targets (D36). Exposed on its own so it can be

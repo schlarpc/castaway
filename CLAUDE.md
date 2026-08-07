@@ -177,13 +177,15 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 
 ## Architecture
 
-Built from the [rust-flake](https://github.com/schlarpc/rust-flake) template. The repo is still
-single-crate template scaffolding; the **target** structure is the Cargo workspace in
-architecture-substrate.md §2 (see ground rule 2). Migrate to the workspace before adding real
-subsystems.
+Built from the [rust-flake](https://github.com/schlarpc/rust-flake) template. The repo **is**
+the Cargo workspace from architecture-substrate.md §2 (see ground rule 2): 32 crates under
+`crates/`, listed explicitly in the root manifest because crane's dependency-only build does
+not expand globs — a new crate goes into that `members` list by hand. `docs/STATUS.md` is the
+current per-crate record of what is real and what is not.
 
-- **src/main.rs** — application entry point (template scaffolding; becomes the `app` crate)
-- **Cargo.toml** — package manifest; lints configured under `[lints.rust]` and `[lints.clippy]`
+- **crates/app/** — application entry point and wiring; the one `anyhow` crate
+- **Cargo.toml** — virtual workspace manifest; shared lints under `[workspace.lints.rust]`
+  and `[workspace.lints.clippy]`, inherited by each crate via `[lints] workspace = true`
 - **flake.nix** — Nix build (Crane), dev shell, and CI checks
 - **rust-toolchain.toml** — single source of truth for the Rust version; Nix reads it via
   `rust-bin.fromRustupToolchainFile`, so builds stay reproducible. Bump `channel` to upgrade.
