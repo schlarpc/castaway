@@ -135,12 +135,12 @@ async fn handle_control(
 ) -> Response {
     let action = match SoapAction::parse(body) {
         Ok(a) => a,
-        Err(e) => return fault_response(&e),
+        Err(e) => return fault_response(None, &e),
     };
     debug!(service = ?kind, action = %action.name, "DLNA control");
 
     if let Some(fault) = probe_uri_argument(kind, &action).await {
-        return fault_response(&fault);
+        return fault_response(Some(&action.name), &fault);
     }
 
     let outcome = {
@@ -192,7 +192,7 @@ async fn handle_control(
             let xml = soap::action_response(kind.service_type(), &action.name, &out.out_args);
             xml_ok(xml)
         }
-        Err(e) => fault_response(&e),
+        Err(e) => fault_response(Some(&action.name), &e),
     }
 }
 
@@ -544,7 +544,15 @@ async fn probe_uri_argument(kind: ServiceKind, action: &SoapAction) -> Option<Dl
     }
 }
 
-fn fault_response(err: &DlnaError) -> Response {
+fn fault_response(action: Option<&str>, err: &DlnaError) -> Response {
+    // The control point's user sees this failure; the panel's operator must too, or the
+    // only forensics for "it won't play" live on the phone that walked out of the room.
+    warn!(
+        action = action.unwrap_or("<unparsed>"),
+        error = %err,
+        code = err.upnp_code(),
+        "DLNA: control action refused"
+    );
     let xml = soap::fault(err.upnp_code(), &err.to_string());
     (
         StatusCode::INTERNAL_SERVER_ERROR,
