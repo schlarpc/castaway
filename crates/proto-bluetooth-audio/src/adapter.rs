@@ -24,7 +24,7 @@ use substrate_hci::{
 use substrate_l2cap::{ChannelMode, Cid, L2capEvent, L2capPdu, Multiplexer, Psm};
 use substrate_sdp::{a2dp_sink, avrcp_controller, avrcp_target, SdpServer};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::acl::AclWriter;
 use crate::avctp::{opcode, AvcFrame, AvctpMessage, CommandResponse, Ctype};
@@ -710,7 +710,13 @@ impl SourceAdapter for BluetoothAdapter {
                             continue;
                         }
                     };
-                    debug!(?event, "hci event");
+                    // Last-resort visibility only: every event that matters has its own
+                    // structured line in the arms below, and completion credits arrive
+                    // once per ACL packet during streaming — at `debug` they bury the
+                    // lines a live chase is actually after (#215).
+                    if !matches!(event, Event::NumberOfCompletedPackets(_)) {
+                        trace!(?event, "hci event");
+                    }
                     for action in host.on_event(&event) {
                         match &action {
                             HostAction::Ready {
