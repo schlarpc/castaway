@@ -26,14 +26,22 @@
 # (so pairing falls back to legacy PIN, which this receiver refuses by design), and
 # `avtest` configures the first endpoint it finds rather than a matching one.
 #
-# **The audio is the last subtest and it is the point.** Everything above it establishes a
+# **A2DP is not the whole file.** The last four subtests drop a layer and change the
+# question: `ertm-echo` takes the same controller and answers on a PSM of its own, so
+# BlueZ's `l2test` — the Linux kernel's L2CAP — drives `substrate-l2cap`'s Enhanced
+# Retransmission engine directly. Segmentation, a rejected gap, a bad checksum and a
+# starved transmit window, all marked by an implementation that has never seen ours. That
+# differential existed before (#210) and needed `sudo`, a feature flag and a hand-started
+# emulator, which is the same as not existing.
+#
+# **The audio is the last A2DP subtest and it is the point.** Everything above it establishes a
 # session; only that one asks whether anything came out. The claim it makes is stronger
 # than a counter can make: the recording is what the mixer handed the output device, the
 # reference is what a source that has never seen our code was told to play, and a
 # normalised cross-correlation per channel says they are the same waveform. A channel
 # swap, a mono collapse, a half-rate decode or a phase inversion each fail it, and each
 # one satisfies "blocks were accepted". See `docs/test-matrix.md` §4.3 and #186.
-{ pkgs, castaway }:
+{ pkgs, castaway, ertmEcho }:
 
 let
   # btvirt lives behind `--enable-testing` and nixpkgs does not install it.
@@ -136,6 +144,7 @@ pkgs.testers.runNixOSTest {
     environment.systemPackages = [
       bluezWithBtvirt
       castaway
+      ertmEcho
       python
       # `pactl` and `paplay`. The *clients* only — `services.pipewire.pulse` is the
       # server, and these are what a person would reach for to play something at it.
@@ -230,6 +239,21 @@ pkgs.testers.runNixOSTest {
         # `up` returning 0 is not the same as the controller being usable; wait for the
         # kernel to actually report it running before anything is asked of it.
         machine.wait_until_succeeds(f"hciconfig {dev} | grep -q 'UP RUNNING'", timeout=120)
+
+    def restart_btvirt(env=""):
+        """Bring the linked pair back, optionally at a different ACL geometry.
+
+        Two subtests below want a geometry that is not the one everything else runs at,
+        and `btdev.c` reads both numbers from the environment at start-up (see the
+        `overrideAttrs` at the top), so changing one means a new pair of controllers.
+        The addresses survive it — btvirt derives them from the hci index — which is what
+        makes a bond and a link key outlive the swap, or fail to in a way worth asserting.
+        """
+        machine.succeed("pkill -f 'bin/btvirt'")
+        machine.wait_until_succeeds("! hciconfig | grep -q hci1", timeout=60)
+        machine.succeed(f"{env} ${bluezWithBtvirt}/bin/btvirt -l2 >>/tmp/btvirt.log 2>&1 &")
+        machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=60)
+        bring_up("hci0")
 
     with subtest("the two controllers can see each other"):
         # Best-effort settle: give bluetoothd a chance to finish claiming the controllers
@@ -587,14 +611,7 @@ pkgs.testers.runNixOSTest {
         # rather than choosing one geometry for the whole file is what keeps both
         # properties, and the bond survives it because btvirt derives each controller's
         # address from its index, so the same two addresses come back.
-        machine.succeed("pkill -f 'bin/btvirt'")
-        machine.wait_until_succeeds("! hciconfig | grep -q hci1", timeout=60)
-        machine.succeed(
-            "BTVIRT_ACL_MTU=1021 BTVIRT_ACL_MAX_PKT=8 "
-            "${bluezWithBtvirt}/bin/btvirt -l2 >>/tmp/btvirt.log 2>&1 &"
-        )
-        machine.wait_until_succeeds("hciconfig | grep -q hci1", timeout=60)
-        bring_up("hci0")
+        restart_btvirt("BTVIRT_ACL_MTU=1021 BTVIRT_ACL_MAX_PKT=8")
         roomy = machine.succeed("hciconfig hci0")
         assert "ACL MTU: 1021:8" in roomy, f"the geometry did not take:\n{roomy}"
         # The same addresses, or the bond from the pairing subtest is gone and everything
@@ -779,8 +796,196 @@ pkgs.testers.runNixOSTest {
             print(machine.succeed("journalctl -u castaway-rec | tail -60"))
             raise Exception(f"the audio did not survive the path:\n{report}")
 
+    # ------------------------------------------------------------------------------
+    # ERTM against the kernel's own L2CAP (#210).
+    #
+    # A layer below everything above, and a different peer. `substrate-l2cap`'s Enhanced
+    # Retransmission engine has ~48 in-memory tests and in every one of them the peer is
+    # our own multiplexer, which cannot catch a *shared* misreading of the spec — the two
+    # real defects it has had (#143, #144) were found by reading the Core spec, not by a
+    # test. The one differential that has ever run against a foreign implementation is
+    # `examples/ertm_echo.rs` against BlueZ's `l2test`, and until now it needed `sudo`, a
+    # feature flag and a hand-started btvirt, so it ran when somebody remembered.
+    #
+    # The receiver is not involved: `ertm-echo` claims the same controller and answers on
+    # a PSM of its own, so nothing that fails here can be a profile's opinion. It runs
+    # last because it wants btvirt's *own* geometry back — a 192-byte ACL MTU with one
+    # outstanding packet is where windowing and retransmission are actually squeezed, and
+    # it is the geometry that found #163.
+    ERTM_PSM = 4101
+
+    # bluetoothd still holds a paired, trusted audio sink at this address and reconnects
+    # its profiles whenever the link comes back. That device is about to become an echo
+    # server on an unrelated PSM, so the reconnect can only fail, repeatedly, in the
+    # middle of the measurements below.
+    machine.execute(f"bluetoothctl --timeout 5 remove {sink_addr}")
+    restart_btvirt()
+    lean = machine.succeed("hciconfig hci0")
+    assert "ACL MTU: 192:1" in lean, f"the geometry did not come back:\n{lean}"
+    # A new adapter is one bluetoothd has settled to off, because `powerOnBoot = false`
+    # leaves `AutoEnable=false` — the same trap the audio subtest documents, and the same
+    # fix. `hciconfig up` is the kernel's idea of powered and this is bluetoothd's; an
+    # L2CAP connect goes out over the second one.
+    machine.wait_until_succeeds(
+        "bluetoothctl --timeout 5 power on >/dev/null 2>&1; "
+        "bluetoothctl --timeout 5 show | grep -q 'Powered: yes'",
+        timeout=60,
+    )
+    # And SSP, for the same reason `pair_with_receiver` says it: it is a *controller*
+    # setting, and these controllers are new. bluetoothd authenticates the link the moment
+    # `l2test` connects — before a byte of L2CAP — and with SSP off on this side
+    # `btdev.c`'s `use_ssp()` sends the pair down the legacy PIN path, which this receiver
+    # refuses by design (a panel with no keypad cannot be asked for a number). The symptom
+    # is not a pairing failure: it is `l2test` reporting `Can't connect: Invalid exchange`
+    # with no L2CAP on the wire at all, and it cost a full run to read off a trace.
+    machine.succeed("hciconfig hci0 sspmode 1")
+    print(machine.succeed("hciconfig hci0 sspmode"))
+
+    def run_ertm(name, echo_flags, l2test_flags, seconds):
+        """One scenario: our echo server on hci1, the kernel's ERTM on hci0.
+
+        A unit name per scenario rather than one unit restarted: `journalctl -u` reads
+        the whole journal, so a shared name would hand each scenario the previous ones'
+        injections and poll counts.
+        """
+        unit = f"ertm-{name}"
+        machine.wait_until_succeeds("hciconfig hci1 down", timeout=60)
+        machine.succeed(
+            f"systemd-run --unit={unit} --setenv=RUST_LOG=info,substrate_l2cap=debug "
+            f"${ertmEcho}/bin/ertm-echo 1 {ERTM_PSM} {echo_flags}"
+        )
+        machine.wait_until_succeeds(
+            f"journalctl -u {unit} | grep -q 'discoverable at'", timeout=60
+        )
+        drop_stale_links()
+        machine.succeed(
+            f"systemd-run --unit=btmon-{unit} --collect "
+            f"${bluezWithBtvirt}/bin/btmon -w /tmp/{unit}.btsnoop"
+        )
+        machine.wait_until_succeeds(f"test -s /tmp/{unit}.btsnoop", timeout=30)
+        # `-I 2048` is not decoration. `l2test` defaults its *receive* MTU to 672 while
+        # happily sending 800-byte SDUs, and our mux refuses to send an SDU larger than
+        # the MTU the peer agreed to receive — correctly. Without this the session
+        # establishes, every SDU arrives and reassembles, and not one echo goes back:
+        # `could not echo: l2cap payload too long: 800 bytes (max 672)`, four times.
+        # `docs/architecture-substrate.md` claimed the echoes reached l2test's application
+        # intact; measured on the bench at `2026-08-06`, they did not, and had not.
+        #
+        # `l2test -y` sends and then dumps forever, so the timeout is how the run ends in
+        # every scenario but the last — where the whole point is that it ends sooner.
+        status, _ = machine.execute(
+            f"timeout {seconds} l2test {l2test_flags} -I 2048 -P {ERTM_PSM} -X ertm "
+            f"-i hci0 {sink_addr} > /tmp/{unit}.log 2>&1"
+        )
+        machine.succeed(f"systemctl stop btmon-{unit}")
+        peer = machine.succeed(f"cat /tmp/{unit}.log")
+        machine.execute(f"systemctl stop {unit}")
+        ours = machine.succeed(f"journalctl -u {unit} --no-pager")
+        print(f"--- l2test, {name} (exit {status}) ---\n{peer}")
+        print(f"--- ertm-echo, {name} ---\n{ours}")
+        if "channel" not in ours:
+            trace = machine.succeed(f"${bluezWithBtvirt}/bin/btmon -r /tmp/{unit}.btsnoop")
+            print(machine.succeed("hciconfig -a hci0"))
+            print(machine.execute("bluetoothctl --timeout 5 show")[1])
+            raise Exception(
+                f"no channel ever opened in the {name} scenario.\n"
+                f"l2test said:\n{peer}\n\nand the air carried:\n{trace[-9000:]}"
+            )
+        return status, peer, ours
+
+    def echoes(peer):
+        """Which of `l2test`'s 800-byte SDUs came back, by the sequence number in each.
+
+        `do_send` puts a little-endian counter in the first four bytes and the frame
+        length in the next two, and `dump_mode` hexdumps whatever it reads. So this reads
+        the *kernel's* account of what it got back, byte for byte, rather than a count of
+        anything either side chose to log.
+        """
+        return {
+            seq for seq in range(8)
+            if f"{seq:02x} 00 00 00 20 03" in peer
+        }
+
+    def negotiated_mps(ours):
+        import re
+        found = re.search(r"open in EnhancedRetransmission \(mps (\d+)", ours)
+        if not found:
+            raise Exception(f"the channel never opened in enhanced retransmission mode:\n{ours}")
+        return int(found.group(1))
+
+    with subtest("the kernel's own L2CAP configures and drives our ERTM engine"):
+        status, peer, ours = run_ertm("clean", "", "-y -N 4 -b 800", 60)
+        # Mode 3 is ERTM, and this is the kernel reporting what it ended up in — the one
+        # number our own logs cannot be trusted for, since a mode we merely *believe* we
+        # negotiated is exactly the failure this whole subtest exists to catch.
+        assert "mode 3," in peer, f"the kernel did not end up in ERTM:\n{peer}"
+        # Segmentation is on the hook rather than assumed. An 800-byte SDU has to cross
+        # this link in several frames, and the reassembly of those frames is ours.
+        mps = negotiated_mps(ours)
+        assert mps < 800, (
+            f"the kernel offered an MPS of {mps}, so nothing was segmented and this "
+            f"scenario proves less than it claims"
+        )
+        assert echoes(peer) == {0, 1, 2, 3}, (
+            f"the kernel got back {sorted(echoes(peer))} of the four SDUs it sent:\n{peer}"
+        )
+
+    with subtest("a frame that never arrives is rejected, and the kernel resends it"):
+        # The first of the three things no peer but ours has ever put on our wire. The
+        # third I-frame is lost between the socket and the engine — after the kernel has
+        # sent it and before we have any record of it, which is the only place a loss is
+        # indistinguishable from one the air caused.
+        status, peer, ours = run_ertm("reject", "--drop-inbound-i-frame 3", "-y -N 4 -b 800", 60)
+        assert "injected: dropped inbound i-frame #3" in ours, ours
+        assert "a frame is missing; rejecting so the peer resends from here" in ours, ours
+        # And then the part that is not ours to claim: the kernel acted on that REJ, and
+        # every SDU still arrived complete and in order. A REJ naming the wrong sequence
+        # number leaves a hole here or duplicates a segment into the next SDU.
+        assert echoes(peer) == {0, 1, 2, 3}, (
+            f"loss was not recovered: {sorted(echoes(peer))} came back:\n{peer}"
+        )
+
+    with subtest("a frame whose checksum does not match is dropped, not delivered"):
+        # The second. The FCS is CRC16 over the basic L2CAP header *and* the frame, which
+        # is the detail that makes a wrong implementation connect perfectly and transfer
+        # nothing — so the interesting assertion is that we notice at all.
+        status, peer, ours = run_ertm("fcs", "--corrupt-inbound-fcs 3", "-y -N 4 -b 800", 60)
+        assert "injected: flipped a checksum bit on inbound i-frame #3" in ours, ours
+        assert "dropping a frame whose checksum does not match" in ours, ours
+        # A frame silently accepted with a bad checksum would also produce four SDUs here
+        # — with one segment of garbage in the middle — so the line above is what
+        # separates the two, and this is what says recovery followed it.
+        assert echoes(peer) == {0, 1, 2, 3}, (
+            f"a corrupted frame was not recovered from: {sorted(echoes(peer))}:\n{peer}"
+        )
+
+    with subtest("a peer that stops acknowledging costs the channel its allowance"):
+        # The third, and the only one whose correct outcome is a dead channel. Every
+        # acknowledgement the kernel sends is dropped, so our transmit side polls, waits
+        # out the monitor timeout, polls again, and after `max_transmit` attempts declares
+        # the channel dead and tells the peer. One SDU rather than four so that no later
+        # I-frame can carry a piggybacked acknowledgement past the injection.
+        #
+        # 90 s because the arithmetic is the kernel's numbers, not ours: one 2 s
+        # retransmission timeout and then three 12 s monitor timeouts.
+        status, peer, ours = run_ertm("starved", "--drop-inbound-acks", "-y -N 1 -b 800", 90)
+        assert echoes(peer) == {0}, f"the one SDU did not come back at all:\n{peer}"
+        polls = ours.count("nothing acknowledged within the retransmission timeout")
+        assert polls == 3, (
+            f"expected max_transmit (3) polls before giving up, saw {polls}:\n{ours}"
+        )
+        assert "closed after its retransmission allowance ran out" in ours, ours
+        # The independent half. `l2test -y` dumps until the channel goes away, so an exit
+        # before the timeout is the *kernel* reporting that we tore it down — a channel we
+        # abandoned without telling the peer would leave it sitting here for all 90 s.
+        assert status != 124, (
+            "l2test ran to its timeout, so the peer never saw the channel close:\n"
+            f"{peer}"
+        )
+
     machine.succeed(
-        "journalctl -u castaway -u castaway-sbc -u castaway-rec > /tmp/castaway.log"
+        "journalctl -u castaway -u castaway-sbc -u castaway-rec "
+        "-u ertm-clean -u ertm-reject -u ertm-fcs -u ertm-starved > /tmp/castaway.log"
     )
     machine.copy_from_machine("/tmp/castaway.log", "")
     machine.copy_from_machine("/tmp/btmon.btsnoop", "")

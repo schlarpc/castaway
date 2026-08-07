@@ -957,7 +957,9 @@
           # records, pairs over SSP, reads our endpoints and their codecs, and configures,
           # opens and starts a stream — all with its own tools. It then plays a real
           # waveform through bluetoothd's A2DP source, and the PCM we recorded is
-          # correlated against what was sent (#186). See the note at the top of
+          # correlated against what was sent (#186). Then, a layer down, BlueZ's `l2test`
+          # drives our Enhanced Retransmission engine — segmentation, a rejected gap, a
+          # bad checksum and a starved window (#210). See the note at the top of
           # nix/bluetooth-vm-test.nix and `docs/test-matrix.md` §4.3.
           bluetooth-vm = import ./nix/bluetooth-vm-test.nix {
             inherit pkgs;
@@ -979,6 +981,24 @@
               cargoExtraArgs =
                 "--package castaway --no-default-features --features bluetooth-socket,audio";
               doCheck = false;
+            });
+            # The ERTM differential (#210). Not the receiver: it claims the same
+            # controller and answers on a PSM of its own, because what is under test is
+            # `substrate-l2cap`'s retransmission engine against the Linux kernel's, and
+            # putting that behind AVDTP would only add a profile's opinions to it.
+            #
+            # `commonArgs` rather than `fullArgs`: nothing in `proto-bluetooth-audio`
+            # links ffmpeg, and this example reaches no further than the HCI socket.
+            ertmEcho = craneLib.buildPackage (commonArgs // {
+              inherit cargoArtifacts;
+              pname = "ertm-echo";
+              cargoExtraArgs = "-p proto-bluetooth-audio --example ertm_echo";
+              doCheck = false;
+              postInstall = ''
+                install -Dm755 \
+                  "$(find target -name ertm_echo -type f -perm -u+x | head -1)" \
+                  "$out/bin/ertm-echo"
+              '';
             });
           };
 

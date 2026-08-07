@@ -841,13 +841,26 @@ misreading of the spec. Same idea as the openscreen fixtures in #54, applied to 
 ```sh
 sudo btvirt -l2 &
 sudo hciconfig hci2 down
-sudo cargo run -p proto-bluetooth-audio --features bench --example ertm_echo -- 2 4101
-l2test -y -P 4101 -X ertm -N 3 -b 800 -i hci1 00:AA:01:01:00:02
+sudo cargo run -p proto-bluetooth-audio --example ertm_echo -- 2 4101
+l2test -y -P 4101 -X ertm -N 4 -b 800 -I 2048 -i hci1 00:AA:01:01:00:02
 ```
 
-Confirmed 2026-07-26: `l2test` reports `mode 3`, three 800-byte SDUs arrive segmented and
-reassemble, and the echoes go back segmented (the kernel's MPS was 180) and reach its
-application intact.
+**Since #210 this is a check rather than a bench**: `checks.bluetooth-vm` builds the example
+and runs four scenarios of it against `l2test` on every CI run — the clean exchange, a
+dropped I-frame recovered by REJ, a checksum that does not match, and a peer whose
+acknowledgements never arrive. The `--features bench` flag it used to need is gone with the
+feature (D55); the invocation above is what to run by hand to watch one under `btmon`.
+
+Confirmed 2026-07-26 and again on 2026-08-06: `l2test` reports `mode 3`, 800-byte SDUs
+arrive segmented (the kernel's MPS was 180) and reassemble, and the echoes go back
+segmented and reach its application intact.
+
+**`-I 2048` is load-bearing, and the 2026-07-26 note above was wrong without it.** `l2test`
+defaults its *receive* MTU to 672 while sending whatever `-b` says, so with `-b 800` our mux
+refuses every echo — `l2cap payload too long: 800 bytes (max 672)`, which is the correct
+answer to a peer that agreed to receive 672. Measured on the bench 2026-08-06: the session
+establishes, all four SDUs arrive and reassemble, and not one echo goes back. The original
+run recorded the echoes as intact; they were not, and nothing had looked since.
 
 ### Testing the whole flow with no radio: `btvirt` + `vhci`
 
