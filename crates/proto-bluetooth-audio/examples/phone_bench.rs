@@ -19,9 +19,9 @@
 //! ls /sys/bus/usb/drivers/btusb/
 //! echo 3-10:1.0 | sudo tee /sys/bus/usb/drivers/btusb/unbind
 //!
-//! sudo -E cargo run -p proto-bluetooth-audio --features bench --example phone_bench
+//! sudo -E cargo run -p proto-bluetooth-audio --example phone_bench
 //! # …or name a different controller and output directory:
-//! sudo -E cargo run -p proto-bluetooth-audio --features bench --example phone_bench \
+//! sudo -E cargo run -p proto-bluetooth-audio --example phone_bench \
 //!     -- 2357:0604 ./capture
 //! ```
 //!
