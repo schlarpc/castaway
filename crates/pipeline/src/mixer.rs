@@ -697,6 +697,76 @@ impl Drop for MixInput {
 }
 
 /// State shared between the mixer thread, its inputs and its taps.
+/// What the mixer has done since it started, in frames, as one consistent-enough read.
+///
+/// Every field is a running total for the life of the [`AudioMixer`]; the log line
+/// [`report`] writes every [`REPORT_EVERY`] is a *window* over these, differenced with
+/// [`MixerCounters::since`]. Totals rather than a per-window reset because a counter that
+/// the reporter consumes is a counter nothing else can ever read, and the three live
+/// defects these were added for (#174, #175, #177) all needed a test to read them.
+///
+/// The fields are not sampled under one lock, so a snapshot taken mid-pass can catch
+/// `drained` incremented and `emitted` not yet. That is frames of skew on figures whose
+/// subject is seconds, and paying a lock on the drain loop's hot path to remove it would
+/// be the wrong trade — but it does mean the two identities below hold to within a pass,
+/// not exactly:
+///
+/// ```text
+/// written  == drained + shed + (what is still in the rings)
+/// emitted  == drained + starved + idle
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MixerCounters {
+    /// Frames of silence a backstop pass invented for an input that was mid-stream and
+    /// had nothing to give. The one defect counter: structurally zero while every source
+    /// keeps up.
+    pub starved: u64,
+    /// Frames an input with nothing to say sat out, plus a closed input's runout past its
+    /// tail. Benign, and counted so the emitted identity closes.
+    pub idle: u64,
+    /// Frames the writers handed in.
+    pub written: u64,
+    /// Frames the mixer took out of the rings, summed across inputs.
+    pub drained: u64,
+    /// Frames dropped from a [`Backpressure::Live`] input that had run ahead of its
+    /// budget.
+    pub shed: u64,
+    /// Frames the mixer emitted to the device, of any kind. Far from real time, this is
+    /// the device's clock misbehaving — the one way this module can be wrong that no
+    /// input-side counter would show.
+    pub emitted: u64,
+}
+
+impl MixerCounters {
+    /// What happened between `earlier` and this reading.
+    ///
+    /// Saturating, so a snapshot racing an increment reads as no progress rather than as
+    /// most of a `u64`.
+    #[must_use]
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            starved: self.starved.saturating_sub(earlier.starved),
+            idle: self.idle.saturating_sub(earlier.idle),
+            written: self.written.saturating_sub(earlier.written),
+            drained: self.drained.saturating_sub(earlier.drained),
+            shed: self.shed.saturating_sub(earlier.shed),
+            emitted: self.emitted.saturating_sub(earlier.emitted),
+        }
+    }
+
+    /// The share of what the device was given that the mixer made up, as a fraction.
+    ///
+    /// `None` when nothing was emitted at all, which is a mixer that has not run rather
+    /// than one that starved: there is no denominator and the caller must not read zero
+    /// as health. This is the quantity #175 is about, and the one an assertion on a
+    /// *duration* could only infer.
+    #[must_use]
+    pub fn invented(&self) -> Option<f64> {
+        #[allow(clippy::cast_precision_loss)]
+        (self.emitted > 0).then(|| self.starved as f64 / self.emitted as f64)
+    }
+}
+
 struct Shared {
     /// Live inputs. The mixer retires an entry once its [`MixInput`] is gone and its ring
     /// has played out.
@@ -704,41 +774,18 @@ struct Shared {
     /// Signalled when an input appears or disappears, so an idle mixer wakes.
     work: Condvar,
     taps: Mutex<Vec<Arc<dyn MixTap>>>,
-    /// Frames of silence a backstop pass padded a [`Supply::Flowing`] input with.
+    /// Running totals for the life of the mixer, read out as [`MixerCounters`]. What each
+    /// one means is documented on that type, which is the public face of these; what is
+    /// worth knowing *here* is that nothing resets them. See [`Reported`].
     ///
-    /// The one defect counter. Structurally zero while every source keeps up, because a
-    /// [`Pass::Take`] cannot pad: every frame counted here was invented at the floor,
-    /// against an input that was mid-stream and had nothing to give.
+    /// `shed` is also kept per-[`MixInput`] for the teardown line, and here as well
+    /// because a counter that only reports when a session *ends* is no use while one is
+    /// going wrong.
     starved: AtomicU64,
-    /// Frames a [`Supply::Quiescent`] input sat out, plus a closed input's runout past
-    /// its tail.
-    ///
-    /// Benign silence, counted so the emitted identity closes rather than because it is
-    /// alarming. This is where the browser's gone-quiet input lands — the state that,
-    /// counted as starvation, dominated every #175 reading for a day.
     idle: AtomicU64,
-    /// Frames the writers handed in. The term whose absence made every figure here a
-    /// subtraction, and every subtraction rested on an assumption that turned out false.
     written: AtomicU64,
-    /// Frames the mixer actually took out of the rings, summed across inputs.
     drained: AtomicU64,
-    /// Frames shed from a [`Backpressure::Live`] input that had run ahead.
-    ///
-    /// Also on `MixInput` for the teardown line, and here as well because a counter that
-    /// only reports when a session *ends* is no use while one is going wrong.
     shed: AtomicU64,
-    /// Frames the mixer emitted to the device, of any kind.
-    ///
-    /// The output-side clock check. Against one fed input two identities hold and can be
-    /// read straight off the report:
-    ///
-    /// ```text
-    /// written  == drained + shed + (what is still in the rings)
-    /// emitted  == drained + starved + idle
-    /// ```
-    ///
-    /// `emitted` far from 100% of real time is the device's clock misbehaving — the one
-    /// remaining way this module can be wrong that no input-side counter would show.
     emitted: AtomicU64,
     /// The loudest sample the device was given since the last report.
     ///
@@ -758,6 +805,20 @@ struct Shared {
     /// synchronisation point.
     device_inflight: AtomicU64,
     shutdown: AtomicBool,
+}
+
+impl Shared {
+    /// One reading of every total. See [`MixerCounters`] for what "one reading" is worth.
+    fn counters(&self) -> MixerCounters {
+        MixerCounters {
+            starved: self.starved.load(Ordering::Relaxed),
+            idle: self.idle.load(Ordering::Relaxed),
+            written: self.written.load(Ordering::Relaxed),
+            drained: self.drained.load(Ordering::Relaxed),
+            shed: self.shed.load(Ordering::Relaxed),
+            emitted: self.emitted.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// The panel's one audio output.
@@ -855,6 +916,17 @@ impl AudioMixer {
     #[must_use]
     pub fn gain(&self) -> Arc<Gain> {
         Arc::clone(&self.shared.gain)
+    }
+
+    /// What this mixer has done since it started.
+    ///
+    /// Totals, not a window: difference two readings with [`MixerCounters::since`] to get
+    /// a rate. Reading these does not disturb the log line — that is the whole reason
+    /// they are totals, and #175's counters existing only inside an `info!` is what a
+    /// test could not assert on.
+    #[must_use]
+    pub fn counters(&self) -> MixerCounters {
+        self.shared.counters()
     }
 }
 
@@ -1085,23 +1157,16 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
     // When a real device may next be tried, after a failure or a refusal. A box with no
     // sound card must not spend the whole session looking for one.
     let mut retry_at: Option<Instant> = None;
-    let mut last_report = Instant::now();
-    // The device's own dry-callback count at the last report, so the report can carry the
-    // delta. This is the far side of `emitted`: silence the *device* inserted because the
-    // mixer was late, which no counter on the mix side can see.
-    let mut last_underruns = 0u64;
+    let mut last_report = Reported {
+        at: Instant::now(),
+        counters: MixerCounters::default(),
+        underruns: 0,
+    };
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let inputs = live_inputs(shared);
         let now = Instant::now();
-        report(
-            shared,
-            now,
-            &mut last_report,
-            inputs.len(),
-            &sink,
-            &mut last_underruns,
-        );
+        report(shared, now, &mut last_report, inputs.len(), &sink);
 
         if inputs.is_empty() {
             shared.device_inflight.store(0, Ordering::Relaxed);
@@ -1236,37 +1301,57 @@ fn open(device: &AudioOutputFactory) -> Option<Sink> {
     }
 }
 
+/// What the last report read, so the next one can carry a window without resetting
+/// anything.
+///
+/// The counters on [`Shared`] are running totals for the life of the mixer. They used to
+/// be `swap`ped to zero here, which made the log the only thing that could ever read them
+/// — a test asserting on invented silence would have been racing the reporter for the
+/// figure, and whichever won would have taken it from the other. The device's underrun
+/// count was already kept this way, because it comes from the backend and could not be
+/// reset; every counter now works the way that one did.
+struct Reported {
+    at: Instant,
+    counters: MixerCounters,
+    /// The device's own dry-callback count. This is the far side of
+    /// [`Shared::emitted`]: silence the *device* inserted because the mixer was late,
+    /// which no counter on the mix side can see.
+    underruns: u64,
+}
+
 /// Say what the speakers did not get, if anything, at most every [`REPORT_EVERY`].
 ///
 /// Silence and shedding are both *normal* in small amounts — a source starting, a track
 /// changing — so this reports rates against real time and stays quiet when nothing moved.
 /// The figures are sums across inputs; against the usual one active source the two
 /// identities on [`Shared::emitted`] read straight off the line.
-fn report(
-    shared: &Arc<Shared>,
-    now: Instant,
-    last: &mut Instant,
-    inputs: usize,
-    sink: &Sink,
-    last_underruns: &mut u64,
-) {
-    let window = now.saturating_duration_since(*last);
+fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize, sink: &Sink) {
+    let window = now.saturating_duration_since(last.at);
     if window < REPORT_EVERY {
         return;
     }
-    *last = now;
-    let starved = shared.starved.swap(0, Ordering::Relaxed);
-    let idle = shared.idle.swap(0, Ordering::Relaxed);
-    let shed = shared.shed.swap(0, Ordering::Relaxed);
-    let written = shared.written.swap(0, Ordering::Relaxed);
-    let drained = shared.drained.swap(0, Ordering::Relaxed);
-    let emitted = shared.emitted.swap(0, Ordering::Relaxed);
-    // Swapped with the rest, above the early return: a peak carried into the next window
-    // would report a sound that stopped as one still playing.
-    let peak = f32::from_bits(shared.peak.swap(0, Ordering::Relaxed));
+    let totals = shared.counters();
+    let MixerCounters {
+        starved,
+        idle,
+        shed,
+        written,
+        drained,
+        emitted,
+    } = totals.since(&last.counters);
+    // Read before the early return, or a window the log skipped would fold its figures
+    // into the next one and report a rate that never happened.
     let underruns = sink.out.underruns().unwrap_or(0);
-    let dry = underruns.saturating_sub(*last_underruns);
-    *last_underruns = underruns;
+    let dry = underruns.saturating_sub(last.underruns);
+    // The peak is still taken rather than differenced: it is a maximum over the window,
+    // not a total, and one carried into the next window would report a sound that stopped
+    // as one still playing.
+    let peak = f32::from_bits(shared.peak.swap(0, Ordering::Relaxed));
+    *last = Reported {
+        at: now,
+        counters: totals,
+        underruns,
+    };
     // Idle and emitted alone do not wake the log: a panel holding a quiet page is not an
     // event. Anything a session did — or failed to get — is.
     if starved == 0 && shed == 0 && written == 0 && drained == 0 {
@@ -1885,6 +1970,60 @@ mod tests {
         let muted = Gain::default();
         muted.set_muted(true);
         assert_eq!(dbfs(pass(&muted, vec![1.0; 8])), "-inf");
+    }
+
+    #[test]
+    fn the_report_reads_the_counters_rather_than_taking_them() {
+        // #204. Every figure on the report used to be `swap`ped to zero as it was read,
+        // which made the five-second log line the only thing in the process that could
+        // ever see one: a test asserting on invented silence would have been racing the
+        // reporter for the number, and whichever won would have taken it from the other.
+        // That is why #175's counters landed and #204 still had nothing to assert on.
+        let shared = shared_with(vec![]);
+        shared.written.store(1000, Ordering::Relaxed);
+        shared.drained.store(990, Ordering::Relaxed);
+        shared.starved.store(10, Ordering::Relaxed);
+        shared.emitted.store(1000, Ordering::Relaxed);
+
+        let start = Instant::now();
+        let mut last = Reported {
+            at: start,
+            counters: MixerCounters::default(),
+            underruns: 0,
+        };
+        report(&shared, start + REPORT_EVERY, &mut last, 1, &Sink::silent());
+
+        let after = shared.counters();
+        assert_eq!(
+            after.written, 1000,
+            "the reporter consumed the total it printed"
+        );
+        assert_eq!(
+            last.counters, after,
+            "a window moves its own floor, and nothing else"
+        );
+
+        // A second window therefore carries what happened *in* it, not the life of the
+        // mixer — which is the property the swap was there to get, kept without the cost.
+        shared.written.fetch_add(500, Ordering::Relaxed);
+        shared.emitted.fetch_add(500, Ordering::Relaxed);
+        let later = shared.counters();
+        let window = later.since(&last.counters);
+        assert_eq!(window.written, 500, "the window is a difference");
+        assert_eq!(window.starved, 0, "and nothing starved in it");
+
+        // And the quantity #175 is about is now a fraction anyone can read, rather than
+        // something inferred from how long a fixture took to play.
+        let invented = later.invented().expect("something was emitted");
+        assert!(
+            (invented - 10.0 / 1500.0).abs() < 1e-9,
+            "invented silence read as {invented} of everything the device was given"
+        );
+        assert_eq!(
+            MixerCounters::default().invented(),
+            None,
+            "a mixer that never emitted has not starved; it has not run"
+        );
     }
 
     // ---- the whole machine, against real-time devices -----------------------------
