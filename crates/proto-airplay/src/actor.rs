@@ -1091,12 +1091,17 @@ async fn run_mirroring(
     diagnostics: Arc<SessionDiagnostics>,
     sink: SessionSink,
 ) {
-    let Ok((mut stream, from)) = listener.accept().await else {
-        warn!(%peer, "no mirroring data connection arrived");
-        // A session announced but never connected is still a session that is over; leaving
-        // it open would hold the panel for a picture that is never coming.
-        let _ = sink.emit(SessionEvent::End).await;
-        return;
+    let (mut stream, from) = match listener.accept().await {
+        Ok(conn) => conn,
+        // Reachable only on a local socket fault — a sender that never dials leaves the
+        // accept pending instead, so the error itself is the one fact worth keeping.
+        Err(e) => {
+            warn!(%peer, error = %e, "mirroring data accept failed");
+            // A session announced but never connected is still a session that is over;
+            // leaving it open would hold the panel for a picture that is never coming.
+            let _ = sink.emit(SessionEvent::End).await;
+            return;
+        }
     };
     info!(%from, "AirPlay mirroring data channel connected");
 
@@ -1108,7 +1113,10 @@ async fn run_mirroring(
             r = stream.read(&mut chunk) => match r {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(e) => { debug!(error = %e, "mirroring read failed"); break }
+                // At `warn` deliberately: this fault blanks the panel mid-mirror, and it
+                // is what distinguishes a network death from the sender pressing stop —
+                // the "ended" line below is the same for both.
+                Err(e) => { warn!(error = %e, "mirroring read failed; ending the session"); break }
             },
             () = frames.closed() => {
                 debug!("mirroring consumer went away");
