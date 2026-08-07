@@ -30,6 +30,13 @@
 //! That zero-fill is also why a tap does not keep the audio device open: an idle panel
 //! holds no sink, and the stream stays continuous regardless.
 //!
+//! When the video gives up on a long stall — [`super::cadence::Cadence`] rebasing the
+//! shared timeline — a span of wall time is deleted, and the sound played in that span is
+//! deleted with it ([`Window::reconcile`]). The sound before it stays under the frames
+//! the video papered over; the sound after it lands against the new clock with no seam.
+//! What a rebase costs the audio track is counted, not silent: [`AudioMix::rebase_discarded`]
+//! and [`AudioMix::clipped`].
+//!
 //! ## What this is not
 //!
 //! It is not sample-accurate. A block is placed where it was *handed to the device*, and
@@ -69,10 +76,60 @@ pub struct AudioMix {
 #[derive(Debug)]
 struct Window {
     /// Absolute frame position of the first frame in `samples`.
+    ///
+    /// Two quantities that agree by construction: the count of frames handed to the
+    /// encoder — the track position sound taken next will land at — and the timeline
+    /// label of the window's front. A rebase is the one event that could split them,
+    /// which is what [`Self::reconcile`] is for; `base` itself never moves backwards,
+    /// because the frames it counts cannot be unsent.
     base: u64,
+    /// The timeline's rebase total this window last saw. When a fresh [`Reading`]
+    /// disagrees, a rebase has deleted a span of wall time since the last touch, and
+    /// whatever is held past the new present was played inside it.
+    reconciled: Duration,
     /// Interleaved stereo at [`RATE`]. Zeroed regions are silence, which is the whole
     /// trick: nothing has to write silence for silence to be what comes out.
     samples: VecDeque<f32>,
+    /// Frames rebases have deleted, along with the span of timeline they were played in.
+    rebase_discarded: u64,
+    /// Frames clipped off the front of arriving blocks because their positions were
+    /// already taken — blocks later than `settle`, and the catch-up after a rebase that
+    /// deleted time the encoder had already been fed (#208).
+    clipped: u64,
+}
+
+impl Window {
+    /// Catch up with a rebase: the timeline deleted a span of wall time ending at the
+    /// present, so the sound played in that span — everything held past `at`, the
+    /// present under the new clock — goes with it, exactly as its video slots did.
+    ///
+    /// What is *kept* keeps its place twice over: sound before the cut sits under the
+    /// slots the video papered over, and blocks arriving after the rebase land against
+    /// the new clock right where the cut left off. `base` does not move — the track the
+    /// encoder is building stays contiguous, and the label and the count still agree.
+    /// The exception is a rebase that deletes time already taken (`base` past `at`,
+    /// possible only when the encoder kept draining through the stall): those frames
+    /// cannot be unsent, so arriving sound is clipped by [`AudioMix::add`] until the
+    /// clock reaches the count again — sync is kept, the loss is bounded by the overrun
+    /// rather than by the rebase, and `clipped` says what it cost.
+    fn reconcile(&mut self, at: u64, rebased: Duration) {
+        if rebased == self.reconciled {
+            return;
+        }
+        self.reconciled = rebased;
+        let keep = usize::try_from(at.saturating_sub(self.base))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(usize::from(CHANNELS));
+        if self.samples.len() > keep {
+            let dropped = (self.samples.len() - keep) / usize::from(CHANNELS);
+            self.rebase_discarded += dropped as u64;
+            self.samples.truncate(keep);
+            tracing::debug!(
+                frames = dropped,
+                "a rebase deleted the span this sound was played in"
+            );
+        }
+    }
 }
 
 impl AudioMix {
@@ -83,7 +140,10 @@ impl AudioMix {
             timeline,
             inner: Mutex::new(Window {
                 base: 0,
+                reconciled: Duration::ZERO,
                 samples: VecDeque::new(),
+                rebase_discarded: 0,
+                clipped: 0,
             }),
         }
     }
@@ -99,18 +159,22 @@ impl AudioMix {
     /// the first composited frame has nowhere on the timeline to go, and placing it at
     /// position zero would put sound under a picture that had not been drawn.
     pub fn add(&self, now: Instant, stereo: &[f32]) {
-        let Some(elapsed) = self.timeline.elapsed(now) else {
+        let Some(reading) = self.timeline.read(now) else {
             return;
         };
-        let at = Self::frames_at(elapsed);
+        let at = Self::frames_at(reading.elapsed);
         let Ok(mut window) = self.inner.lock() else {
             return;
         };
+        window.reconcile(at, reading.rebased);
         // Part of this block belongs to sample positions the encoder has already taken.
         // That part is gone; the rest still lands where it should, so a late block loses
         // its head rather than shifting everything after it.
         let skip_frames = window.base.saturating_sub(at);
         let channels = usize::from(CHANNELS);
+        if skip_frames > 0 {
+            window.clipped += skip_frames.min((stereo.len() / channels) as u64);
+        }
         let Some(tail) = stereo.get(
             usize::try_from(skip_frames)
                 .unwrap_or(usize::MAX)
@@ -153,9 +217,12 @@ impl AudioMix {
     /// it is the one knob trading the stream's audio latency against how much of a slow
     /// session's block gets clipped off its front.
     pub fn take(&self, now: Instant, frames: usize, settle: Duration) -> Option<Vec<f32>> {
-        let elapsed = self.timeline.elapsed(now)?.checked_sub(settle)?;
-        let settled = Self::frames_at(elapsed);
+        let reading = self.timeline.read(now)?;
+        let settled = Self::frames_at(reading.elapsed.checked_sub(settle)?);
         let mut window = self.inner.lock().ok()?;
+        // Reconciling cuts at the present, `settle` ahead of anything taken here, so a
+        // rebase never truncates sound this call was about to hand out.
+        window.reconcile(Self::frames_at(reading.elapsed), reading.rebased);
         if window.base + frames as u64 > settled {
             return None;
         }
@@ -177,14 +244,37 @@ impl AudioMix {
         self.inner.lock().map_or(0, |w| w.base)
     }
 
+    /// Frames of held sound that rebases have deleted, along with the span of timeline
+    /// they were played in. A running total for the life of the mix.
+    ///
+    /// This is video's `resynced` warning as audio sees it — the deliberate cost of a
+    /// rebase, where [`Self::clipped`] is a loss. Left uncounted, it spent months being
+    /// read as an encoder fault (#208, #175).
+    #[must_use]
+    pub fn rebase_discarded(&self) -> u64 {
+        self.inner.lock().map_or(0, |w| w.rebase_discarded)
+    }
+
+    /// Frames clipped off the front of arriving blocks because their positions were
+    /// already taken. A running total for the life of the mix.
+    ///
+    /// Nonzero means sound was lost: a session delivering later than `settle`, or a
+    /// rebase deleting time the encoder had already been fed.
+    #[must_use]
+    pub fn clipped(&self) -> u64 {
+        self.inner.lock().map_or(0, |w| w.clipped)
+    }
+
     /// Throw away everything held and go back to position zero.
     ///
     /// Paired with [`Timeline::reset`] when a stream restarts: what is in the window
     /// belongs to the old origin, and keeping it would put the previous run's last second
-    /// of sound at the start of the new one.
+    /// of sound at the start of the new one — which is also why the reconciled rebase
+    /// total starts over, while the loss counters keep counting across presentations.
     pub fn clear(&self) {
         if let Ok(mut window) = self.inner.lock() {
             window.base = 0;
+            window.reconciled = Duration::ZERO;
             window.samples.clear();
         }
     }
@@ -429,6 +519,112 @@ mod tests {
             mix.position() > 0,
             "the window moved on rather than stalling"
         );
+    }
+
+    #[test]
+    fn a_rebase_deletes_the_stalls_own_sound_and_nothing_after_it() {
+        // #208/#175, the shared root cause. The cadence gives up on a long stall by
+        // rebasing the shared timeline; the window's stored position did not move, so it
+        // was left in the future of the clock that addressed it — every block arriving
+        // next was discarded whole and the encoder was refused until the wall clock
+        // caught up. A hole the length of the rebase, landing on whatever played *after*
+        // the stall: the lip-sync shift when it clipped a tone, the peak-of-0 track when
+        // it swallowed one. The sound a rebase may delete is the stall's own — the same
+        // span the video deleted — and nothing else.
+        //
+        // Every 100 ms block carries its index as a constant sample value. Blocks are
+        // written at disjoint instants, so nothing sums, and the value read back says
+        // which block a track position landed in — a marker `add`'s summation cannot
+        // forge, which is what makes asserting exact positions sound here.
+        let (timeline, mix) = mix();
+        let t0 = Instant::now();
+        timeline.anchor(t0);
+        let block = Duration::from_millis(100);
+        // A session plays continuously through the stall: wall 0 s..2.0 s.
+        for i in 0..20u16 {
+            mix.add(t0 + block * u32::from(i), &tone(4800, f32::from(i) + 1.0));
+        }
+        // The encoder keeps pace until the pump stalls at 0.5 s: emitted through 0.4 s.
+        mix.take(t0 + block * 5, 4800 * 4, SETTLE)
+            .expect("settled well before the stall");
+        assert_eq!(mix.position(), 19_200);
+        // At 2.0 s the pump comes back. The video papers half a second of duplicates and
+        // rebases away the other whole second, exactly as `Cadence::take` would.
+        timeline.rebase(Duration::from_secs(1));
+        // The session plays on: wall 2.0 s..2.5 s, which the new clock calls 1.0 s..1.5 s.
+        for i in 0..5u16 {
+            mix.add(
+                t0 + Duration::from_secs(2) + block * u32::from(i),
+                &tone(4800, f32::from(i) + 21.0),
+            );
+        }
+        // Everything settled comes out in one go: track frames 19 200..72 000.
+        let out = mix
+            .take(t0 + Duration::from_millis(2600), 52_800, SETTLE)
+            .expect("a rebase must not make the mix refuse the encoder");
+        let frame = |n: usize| out[n * 2];
+        // The session never stopped playing, so nowhere in the track is silence.
+        assert!(out.iter().all(|s| *s != 0.0), "no invented silence");
+        // The papered half second and the sound leading into the stall keep their place:
+        // wall 0.4 s..1.0 s under the duplicated frames.
+        assert!((frame(0) - 5.0).abs() < 1e-6, "track 19 200 is wall 0.4 s");
+        assert!((frame(28_799) - 10.0).abs() < 1e-6, "up to wall 1.0 s");
+        // The deleted second — wall 1.0 s..2.0 s, played mid-stall — is gone whole, and
+        // counted rather than mistaken for an encoder fault.
+        assert_eq!(mix.rebase_discarded(), 48_000);
+        // What played after the stall lands exactly where the rebased clock says, with
+        // no seam: wall 2.0 s is the new clock's 1.0 s, track frame 48 000.
+        assert!((frame(28_800) - 21.0).abs() < 1e-6, "wall 2.0 s, in sync");
+        assert!((frame(43_200) - 24.0).abs() < 1e-6, "wall 2.3 s, mid-span");
+        assert!((frame(52_799) - 25.0).abs() < 1e-6, "wall 2.5 s");
+        // The encoder never ran into the deleted span, so nothing arriving was clipped.
+        assert_eq!(mix.clipped(), 0);
+    }
+
+    #[test]
+    fn a_rebase_past_what_was_already_encoded_costs_the_overrun_and_no_more() {
+        // The other topology, from #208's measured trace: under load the encoder kept
+        // draining right through the stall, so its count is already inside the span the
+        // rebase deletes. Those frames cannot be unsent. Sync wins over content — the
+        // same length of *arriving* sound is clipped, and counted, instead of the track
+        // drifting by the rebase for the rest of the run. The loss is bounded by the
+        // overrun; before this it was the whole rebase, plus a refusal as long again.
+        let (timeline, mix) = mix();
+        let t0 = Instant::now();
+        timeline.anchor(t0);
+        let block = Duration::from_millis(100);
+        // Wall 0 s..1.0 s, playing continuously.
+        for i in 0..10u16 {
+            mix.add(t0 + block * u32::from(i), &tone(4800, f32::from(i) + 1.0));
+        }
+        // The encoder is right at the settle edge when the rebase lands: taken to 0.9 s.
+        mix.take(t0 + Duration::from_secs(1), 43_200, SETTLE)
+            .expect("settled");
+        assert_eq!(mix.position(), 43_200);
+        // The rebase deletes wall 0.5 s..1.0 s — the encoder is 0.4 s inside it.
+        timeline.rebase(Duration::from_millis(500));
+        // The session plays on: wall 1.0 s..1.6 s, new clock 0.5 s..1.1 s.
+        for i in 0..6u16 {
+            mix.add(
+                t0 + Duration::from_secs(1) + block * u32::from(i),
+                &tone(4800, f32::from(i) + 21.0),
+            );
+        }
+        // What was held at the rebase — wall 0.9 s..1.0 s — was inside the deleted span:
+        // gone, and counted.
+        assert_eq!(mix.rebase_discarded(), 4_800);
+        // Arriving blocks lose their heads only up to the encoder's count: 0.4 s, the
+        // overrun exactly, not the 0.5 s of the rebase.
+        assert_eq!(mix.clipped(), 19_200);
+        // And the track resumes in sync at the settle edge, not after a refusal the
+        // length of the rebase: wall 1.4 s..1.6 s is the new clock's 0.9 s..1.1 s, which
+        // is track frames 43 200..52 800 — no gap, no drift.
+        let out = mix
+            .take(t0 + Duration::from_millis(1700), 9_600, SETTLE)
+            .expect("resumes as soon as sound has settled");
+        assert!(out.iter().all(|s| *s != 0.0), "no invented silence");
+        assert!((out[0] - 25.0).abs() < 1e-6, "wall 1.4 s");
+        assert!((out[(9_600 - 1) * 2] - 26.0).abs() < 1e-6, "wall 1.6 s");
     }
 
     #[test]

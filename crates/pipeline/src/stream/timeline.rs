@@ -22,7 +22,29 @@ use std::time::{Duration, Instant};
 /// would owe that wait in duplicated frames and silence before the stream had a picture.
 #[derive(Debug, Default)]
 pub struct Timeline {
-    origin: Mutex<Option<Instant>>,
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    origin: Option<Instant>,
+    /// Wall time rebases have discarded since the origin was anchored.
+    rebased: Duration,
+}
+
+/// One consistent view of the timeline, taken under a single lock.
+///
+/// `elapsed` alone is not enough for a reader that *stores* a position between reads: a
+/// rebase moves every derived position and leaves a stored one behind, in the future of
+/// the clock that now addresses it (#208). `rebased` is the running total that lets such
+/// a reader notice — and it has to come out of the same lock as `elapsed`, or a rebase
+/// landing between the two reads hands back a pair that never coexisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    /// How far past the origin the instant is.
+    pub elapsed: Duration,
+    /// The total wall time rebases have discarded since the origin was anchored.
+    pub rebased: Duration,
 }
 
 impl Timeline {
@@ -37,10 +59,10 @@ impl Timeline {
     /// The first caller gets zero, which is the definition of the origin rather than a
     /// special case.
     pub fn anchor(&self, now: Instant) -> Duration {
-        let Ok(mut origin) = self.origin.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             return Duration::ZERO;
         };
-        now.saturating_duration_since(*origin.get_or_insert(now))
+        now.saturating_duration_since(*state.origin.get_or_insert(now))
     }
 
     /// How far past the origin `now` is, or `None` while nothing has anchored it.
@@ -50,8 +72,17 @@ impl Timeline {
     /// putting it at position zero would place a second of sound under a picture that had
     /// not been drawn yet.
     pub fn elapsed(&self, now: Instant) -> Option<Duration> {
-        let origin = (*self.origin.lock().ok()?)?;
-        Some(now.saturating_duration_since(origin))
+        Some(self.read(now)?.elapsed)
+    }
+
+    /// As [`Self::elapsed`], with the rebase total alongside — see [`Reading`].
+    pub fn read(&self, now: Instant) -> Option<Reading> {
+        let state = self.state.lock().ok()?;
+        let origin = state.origin?;
+        Some(Reading {
+            elapsed: now.saturating_duration_since(origin),
+            rebased: state.rebased,
+        })
     }
 
     /// Discard `by` of wall-clock time: everything measured from here jumps forward.
@@ -59,9 +90,11 @@ impl Timeline {
     /// What a rebase *is*. The stream's own timeline stays contiguous — which is what a
     /// player reconstructs — and only its agreement with the wall clock is given up.
     pub fn rebase(&self, by: Duration) {
-        if let Ok(mut origin) = self.origin.lock() {
-            if let Some(at) = origin.as_mut() {
+        if let Ok(mut guard) = self.state.lock() {
+            let state = &mut *guard;
+            if let Some(at) = state.origin.as_mut() {
                 *at += by;
+                state.rebased += by;
             }
         }
     }
@@ -69,17 +102,18 @@ impl Timeline {
     /// Forget the origin, so the next [`Self::anchor`] establishes a new one.
     ///
     /// A stream that retired and started again is a new presentation with a new init
-    /// segment and a segment counter back at one, so its timeline starts again too.
+    /// segment and a segment counter back at one, so its timeline starts again too — the
+    /// rebase total included, since it counts from the origin it belonged to.
     pub fn reset(&self) {
-        if let Ok(mut origin) = self.origin.lock() {
-            *origin = None;
+        if let Ok(mut state) = self.state.lock() {
+            *state = State::default();
         }
     }
 
     /// Whether anything has anchored it yet.
     #[must_use]
     pub fn anchored(&self) -> bool {
-        self.origin.lock().is_ok_and(|o| o.is_some())
+        self.state.lock().is_ok_and(|s| s.origin.is_some())
     }
 }
 
@@ -127,6 +161,35 @@ mod tests {
         assert_eq!(t.elapsed(now), Some(Duration::from_secs(10)));
         t.rebase(Duration::from_secs(8));
         assert_eq!(t.elapsed(now), Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_reading_carries_the_rebase_total_so_stored_positions_can_tell() {
+        // `elapsed` moves with a rebase; a position *stored* between reads does not, and
+        // the audio mix stores one (#208). The running total is how it notices, and it
+        // comes out of the same lock as `elapsed` so the pair always coexisted.
+        let t = Timeline::new();
+        let t0 = Instant::now();
+        assert!(t.read(t0).is_none(), "a passenger's read does not anchor");
+        t.anchor(t0);
+        let now = t0 + Duration::from_secs(10);
+        let r = t.read(now).expect("anchored");
+        assert_eq!(r.elapsed, Duration::from_secs(10));
+        assert_eq!(r.rebased, Duration::ZERO);
+        t.rebase(Duration::from_secs(8));
+        let r = t.read(now).expect("anchored");
+        assert_eq!(r.elapsed, Duration::from_secs(2));
+        assert_eq!(r.rebased, Duration::from_secs(8));
+        // A running total, not the last rebase: two gaps must not read as one.
+        t.rebase(Duration::from_secs(1));
+        assert_eq!(
+            t.read(now).expect("anchored").rebased,
+            Duration::from_secs(9)
+        );
+        // A reset is a new presentation; the total belongs to the origin it counted from.
+        t.reset();
+        t.anchor(now);
+        assert_eq!(t.read(now).expect("anchored").rebased, Duration::ZERO);
     }
 
     #[test]
