@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use pipeline::audio_decode::PcmBlock;
 use pipeline::audio_out::output_factory;
 use pipeline::audio_select::{OutputSelection, OutputSelector};
-use pipeline::mixer::{AudioMixer, MixTap, CHANNELS, RATE};
+use pipeline::mixer::{AudioMixer, MixTap, MixerCounters, CHANNELS, RATE};
 
 /// A2DP's rate, and the one that needs conversion to the mix rate.
 const SOURCE_RATE: u32 = 44_100;
@@ -70,6 +70,7 @@ fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
         input.write(&block).unwrap();
     }
 
+    let before = mixer.counters();
     let started = Instant::now();
     let mut accepted = 0u64;
     while started.elapsed() < WINDOW {
@@ -77,11 +78,12 @@ fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
         accepted += BLOCK as u64;
     }
     let elapsed = started.elapsed();
+    let window = mixer.counters().since(&before);
 
     let rate = accepted as f64 / elapsed.as_secs_f64();
     let share = rate / f64::from(SOURCE_RATE);
     println!(
-        "accepted {rate:.0} frames/s of {SOURCE_RATE} ({:.1}%)",
+        "accepted {rate:.0} frames/s of {SOURCE_RATE} ({:.1}%); {window:?}",
         share * 100.0
     );
     assert!(
@@ -90,6 +92,53 @@ fn a_44_1k_source_is_drained_in_real_time_by_a_real_device() {
          a live sender cannot be slowed down, so its queue fills at the difference and \
          then never drains again — a permanent drop rate and a permanent latency floor",
         share * 100.0
+    );
+    invented_is_negligible(&window);
+    emission_is_real_time(&window, elapsed);
+}
+
+/// The share of the device's frames the mixer made up, asserted rather than inferred.
+///
+/// A saturating source cannot legitimately starve the mixer: it always has more, so every
+/// frame counted here was invented at the floor against an input that was mid-stream and
+/// had nothing to give. #175 is what that looks like at a third, and the reason this is a
+/// *proportion* and not a duration is that the two tests which caught it first
+/// (`ldac_decode`, `output_stream`) could only assert on how long a fixture took to play
+/// — so they failed when the run was unlucky enough to push the span past a fixed band,
+/// rather than in proportion to the defect.
+fn invented_is_negligible(window: &MixerCounters) {
+    let invented = window
+        .invented()
+        .expect("the mixer emitted nothing at all over the window");
+    assert!(
+        invented < 0.01,
+        "{:.1}% of what the device was given was silence the mixer invented \
+         ({} of {} frames); the source never ran out, so this is the mixer failing to \
+         take what was there rather than a gap in the audio",
+        invented * 100.0,
+        window.starved,
+        window.emitted,
+    );
+}
+
+/// Did the mixer emit at real time *against the device's own counter*?
+///
+/// This is the term every in-crate pacing test holds correct by construction, and the
+/// whole reason this file exists: `mixer::tests`' `Recorder` derives `frames_played` from
+/// the wall clock, so a device whose clock ran fast or slow could not fail one of them.
+///
+/// The band is ±5% rather than #204's proposed 1% because this now runs in a VM on a
+/// shared CI box. A device clock wrong enough to matter is wrong by much more than that —
+/// the #175 reading was a third — and a band that goes red under load is a band that
+/// stops being believed (#156).
+fn emission_is_real_time(window: &MixerCounters, elapsed: Duration) {
+    #[allow(clippy::cast_precision_loss)]
+    let emission = window.emitted as f64 / elapsed.as_secs_f64() / f64::from(RATE);
+    assert!(
+        (0.95..=1.05).contains(&emission),
+        "the mixer emitted at {:.1}% of real time against the device's own counter; \
+         that counter and the wall disagree, which every input-side figure would miss",
+        emission * 100.0
     );
 }
 
@@ -148,10 +197,12 @@ fn a_packet_source_on_its_own_clock_survives_a_real_device() {
 
     std::thread::sleep(WARMUP);
     let from = tap.0.lock().unwrap().len();
+    let before = mixer.counters();
     let started = Instant::now();
     std::thread::sleep(WINDOW);
     let elapsed = started.elapsed();
     let heard = tap.0.lock().unwrap()[from..].to_vec();
+    let window = mixer.counters().since(&before);
     stop.store(true, Ordering::Relaxed);
     producer.join().unwrap();
 
@@ -161,7 +212,8 @@ fn a_packet_source_on_its_own_clock_survives_a_real_device() {
     let carried = audible as f64 / total as f64;
     let emission = total as f64 / elapsed.as_secs_f64() / f64::from(RATE);
     println!(
-        "{audible}/{total} device frames carried audio ({:.1}%); emission at {:.1}% of real time",
+        "{audible}/{total} device frames carried audio ({:.1}%); \
+         emission at {:.1}% of real time; {window:?}",
         carried * 100.0,
         emission * 100.0
     );
@@ -177,5 +229,20 @@ fn a_packet_source_on_its_own_clock_survives_a_real_device() {
         "the mixer emitted at {:.1}% of real time against the device's own counter; \
          that counter and the wall disagree, which every input-side figure would miss",
         emission * 100.0
+    );
+
+    // The same two properties from the mixer's own books rather than the tap's. They are
+    // worth having twice because they fail differently: the tap can only see zeros, and
+    // zeros the *source* sent look identical to zeros the mixer made up. These name
+    // which it was.
+    invented_is_negligible(&window);
+    emission_is_real_time(&window, elapsed);
+    assert_eq!(
+        window.shed, 0,
+        "the mixer shed {} frames from a source delivering at exactly real time; \
+         `Backpressure::Live` sheds when a sender runs past its budget, so a sender that \
+         is not running ahead being shed means the drain is below real time — which is \
+         #177's signature, from the other side",
+        window.shed
     );
 }

@@ -715,6 +715,11 @@ impl Drop for MixInput {
 /// written  == drained + shed + (what is still in the rings)
 /// emitted  == drained + starved + idle
 /// ```
+///
+/// Both are statements about *totals*, and neither survives [`MixerCounters::since`]: a
+/// window that opens with a backlog in the rings drains more than was written into it,
+/// which is ordinary and is what a warm-up produces. Read a window for rates, and the
+/// totals for the identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MixerCounters {
     /// Frames of silence a backstop pass invented for an input that was mid-stream and
