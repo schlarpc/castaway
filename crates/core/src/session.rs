@@ -200,7 +200,16 @@ impl<P: Pipeline> SessionManager<P> {
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
                     if let Err(e) = self.handle(msg).await {
-                        warn!(error = %e, "session manager dropped an event");
+                        match e {
+                            // A backgrounded source that keeps talking is refused by
+                            // design (the not-the-active-source arms in `handle`), and
+                            // every preemption produces a burst of these — they must not
+                            // wear the severity a real pipeline failure wears.
+                            CoreError::NoActiveSession(source) => {
+                                debug!(%source, "session manager ignored an event from a backgrounded source");
+                            }
+                            e => warn!(error = %e, "session manager dropped an event"),
+                        }
                     }
                 }
                 // A dropped sender makes this `None` forever, which disables the branch
@@ -211,7 +220,9 @@ impl<P: Pipeline> SessionManager<P> {
             }
         }
         // Stream closed: best-effort teardown.
-        let _ = self.pipeline.stop().await;
+        if let Err(e) = self.pipeline.stop().await {
+            debug!(error = %e, "session: shutdown stop failed");
+        }
     }
 
     /// The pipeline finished, or failed to play, whatever the active source handed it.
@@ -395,7 +406,12 @@ impl<P: Pipeline> SessionManager<P> {
                     debug!(%prev, error = %e, "session: preempted source would not pause");
                 }
             }
-            self.pipeline.stop().await.ok();
+            if let Err(e) = self.pipeline.stop().await {
+                // The takeover proceeds regardless — but a pipeline that would not stop
+                // is how the loser's audio bleeds into the winner's session, so it must
+                // not happen silently.
+                warn!(%prev, %source, error = %e, "session: preempted pipeline did not stop");
+            }
             // The outgoing source's control handle, touch surface and description die
             // with its session — the new source publishes its own if it has any.
             self.remote.set(None);
