@@ -6,25 +6,24 @@
 //! same measurement with that assumption removed, which is the only difference between the
 //! two and therefore the whole point of having both.
 //!
-//! Hardware today, so `#[ignore]` per ground rule 6: it needs a session bus, a running
-//! PipeWire and a sink to open. Run it with `--run-ignored all`.
+//! ## Where this runs (#204)
 //!
-//! ## The decision, and when it gets revisited (#183)
+//! `checks.mixer-vm` — a nixosTest that boots `snd-dummy`, a kernel sound card whose
+//! period wakeups come from an hrtimer, and runs this file with `--include-ignored`. See
+//! `nix/mixer-vm-test.nix` for what a dummy card does and does not buy. It also runs
+//! against whatever this box has: `cargo nextest run -p pipeline --run-ignored all -E
+//! 'binary(mixer_real_device)'`.
 //!
-//! **This should run in CI, and does not need hardware to.** That is the one call among
-//! the five `#[ignore]`d files that goes against the file's own header: a nixosTest with a
-//! dummy PipeWire or ALSA sink gives a device whose clock is not derived from ours, which
-//! is the entire property under test. `bluetooth-vm` already boots a `services.pipewire`
-//! block for a `tester` user, so the recipe is nearly written.
+//! **The `#[ignore]` stays, and that is deliberate.** It was written as "hardware today"
+//! and the header used to say it would come off when the VM landed. It must not:
+//! `checks.test` builds in a sandbox with no session bus, no PipeWire and no card, so
+//! without the attribute these two would be a pair of tests that can only fail there. The
+//! attribute is what lets one file be dark in one check and the whole subject of another.
 //!
-//! Until that exists this is the only thing in the tree that removes the
-//! correct-by-construction assumption underneath **every** mixer pacing test, and it runs
-//! nowhere — which is why #204 treats it as the headline rather than as a nice-to-have,
-//! and why the three live regressions in that blind spot (#174, #175, #177) were all found
-//! by a person listening to the panel.
-//!
-//! Revisit: when #204's nixosTest lands. Then the `#[ignore]` comes off and this file is
-//! the check.
+//! Why #204 treats this as its headline rather than a nice-to-have: it is the only thing
+//! in the tree that removes the correct-by-construction assumption underneath **every**
+//! mixer pacing test, and the three live regressions in that blind spot (#174, #175,
+//! #177) were all found by a person listening to the panel.
 //!
 //! The tone is at -80 dBFS. It has to be non-zero to prove samples are flowing, and it has
 //! to be inaudible because the panel this runs on is usually playing something.
@@ -127,10 +126,21 @@ fn invented_is_negligible(window: &MixerCounters) {
 /// whole reason this file exists: `mixer::tests`' `Recorder` derives `frames_played` from
 /// the wall clock, so a device whose clock ran fast or slow could not fail one of them.
 ///
-/// The band is ±5% rather than #204's proposed 1% because this now runs in a VM on a
-/// shared CI box. A device clock wrong enough to matter is wrong by much more than that —
-/// the #175 reading was a third — and a band that goes red under load is a band that
-/// stops being believed (#156).
+/// The band is ±5% rather than #204's proposed 1% for two reasons, and the second is the
+/// one worth knowing. The first is that this runs in a VM on a shared CI box, and a band
+/// that goes red under load is a band that stops being believed (#156).
+///
+/// The second is that the measurement has a **systematic offset of about +2.4%**, and it
+/// is not drift. `emitted` is sampled at two instants that fall wherever they fall inside
+/// a pass, and the mixer runs [`DEVICE_LEAD`](pipeline::mixer) ahead of the speakers — so
+/// a three-second window catches roughly one lead's worth of frames the device has been
+/// given but has not played. Measured at 102.4% on the dev box's real card and 102.4% in
+/// the VM's `snd-dummy`, which is what says it is the window and not either clock: two
+/// devices with nothing in common read the same figure to a tenth of a percent.
+///
+/// So the effective band is about −7%/+2.6%, and the check is still sharp in the
+/// direction that matters. A device counter running slow throttles emission
+/// proportionally — the #175 reading was a third — and nothing near that survives here.
 fn emission_is_real_time(window: &MixerCounters, elapsed: Duration) {
     #[allow(clippy::cast_precision_loss)]
     let emission = window.emitted as f64 / elapsed.as_secs_f64() / f64::from(RATE);

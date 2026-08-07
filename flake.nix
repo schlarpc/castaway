@@ -1002,6 +1002,32 @@
             });
           };
 
+          # The mixer against a sound card whose clock is not ours (#204). See the note at
+          # the top of nix/mixer-vm-test.nix for why a dummy card is enough, and
+          # `docs/test-matrix.md` §4.10.
+          mixer-vm = import ./nix/mixer-vm-test.nix {
+            inherit pkgs;
+            mixerTest = craneLib.buildPackage (fullArgs // {
+              inherit cargoArtifacts;
+              pname = "mixer-real-device";
+              # The test binary, not a package: `--test <name>` selects it the way
+              # `--example` selects `ertm-echo` above, and the same `find` installs it,
+              # because crane installs what cargo calls a binary and this is not one.
+              #
+              # `--no-default-features` and the two features the file's own `cfg` names.
+              # D55's default would pull wgpu, Electron and a browser into a headless VM
+              # to run two audio tests.
+              cargoExtraArgs =
+                "-p pipeline --test mixer_real_device "
+                + "--no-default-features --features audio,audio-pipewire";
+              doCheck = false;
+              postInstall = ''
+                install -Dm755 \
+                  "$(find target -name 'mixer_real_device-*' -type f -perm -u+x | head -1)" \
+                  "$out/bin/mixer-real-device"
+              '';
+            });
+          };
 
           # The bindings for a library that ships no headers, regenerated and diffed.
           # Nothing at build time can catch a wrong FFI signature here, so this is the only

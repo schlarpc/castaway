@@ -114,10 +114,11 @@ invocation.
 CI (`.github/workflows/test.yml`) is a fan-out of exactly these: a `discover` job runs
 `nix eval` over `checks.x86_64-linux` and emits the attribute names as a job matrix, so a
 check added to `flake.nix` becomes a CI job automatically and the two cannot drift. One
-runner per check, `fail-fast: false`, on every push and PR. **The five VM tests do run in
+runner per check, `fail-fast: false`, on every push and PR. **The VM tests do run in
 CI on KVM on GitHub-hosted runners** — verified against run `30967773951` (2026-08-05,
 green): `integration-vm` 75m, `bluetooth-vm` 75m, `matter-vm` 74m, `gamestream-vm` 71m,
-`miracast-vm` 57m. Total ~2h21m.
+`miracast-vm` 57m. Total ~2h21m. `mixer-vm` (#204) postdates that run and has no CI
+figure yet; its VM script is 28 s, so it is a cargo build and little else.
 
 So the question is never "did CI run it". It is **"is there a check for it"**.
 
@@ -136,6 +137,7 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `matter-vm` | 2-node; panel from **the real NixOS module**; peer is our own `matter-peer` | T2 | 74m |
 | `gamestream-vm` | 2-node; peer is **real nixpkgs `sunshine`**; neither node runs castaway or the module | **T3** | 71m |
 | `bluetooth-vm` | 1 node, `hci_vhci` + btvirt; peer is **real BlueZ**; receiver launched ad-hoc, **not** via the module | T2 | 75m |
+| `mixer-vm` | 1 node, `snd-dummy` + PipeWire; runs `mixer_real_device.rs` `--include-ignored` against a device clock that is the kernel's, not ours (#204) | T2 | 28s + build |
 | `ldac-bindings` | regenerate `ldac-sys/src/bindings.rs` with bindgen and `diff -u` | T3 | 3m |
 | `moonlight-bindings` | the same for `moonlight-sys/src/bindings.rs` against the pinned `Limelight.h` | T3 | <1m |
 | `castaway-windows-electron-dll-closure` | cross-build + static import-table closure | T2 | 51–70m |
@@ -207,7 +209,6 @@ Test files that **no check compiles**:
 | `crates/pipeline/tests/browser_end_to_end.rs` | `electron` (+`#[ignore]`) | 5 |
 | `crates/proto-gamestream/tests/links_moonlight.rs` | `stream` | 4 |
 | `crates/pipeline/tests/hwaccel_zero_copy.rs` | `hwaccel` | 3 |
-| `crates/pipeline/tests/mixer_real_device.rs` | `audio-pipewire` (+`#[ignore]`) | 2 |
 | `crates/pipeline/tests/remote_browser.rs` | `remote`+`electron` (+`#[ignore]`) | 1 |
 | `crates/pipeline/tests/filter_subscriptions.rs` | `electron` (+`#[ignore]`) | 1 |
 | `crates/pipeline` lib units | `stream`(24), `hwaccel`(19), `visualizer`(11), `remote`(8), `render_pipeline`(6), `filterlists`(6), `ubo_scriptlets`(4), `adblock_engine`(3) | 81 |
@@ -270,8 +271,10 @@ applied everywhere, and there is no equivalent for ffmpeg.
   safe (the carve is in `commonArgs`); a developer's bare `cargo nextest run` reports green
   having compared nothing.
 
-Five `#[ignore]`d files run nowhere, ever: `browser_end_to_end.rs`, `remote_browser.rs`,
-`filter_subscriptions.rs`, `mixer_real_device.rs`, `cast-replay/tests/live_backend.rs`.
+Four `#[ignore]`d files run nowhere, ever: `browser_end_to_end.rs`, `remote_browser.rs`,
+`filter_subscriptions.rs`, `cast-replay/tests/live_backend.rs`. `mixer_real_device.rs` was
+the fifth until `checks.mixer-vm` (#204); it keeps its `#[ignore]` because `checks.test`
+has no sound card, and the VM passes `--include-ignored`.
 
 ### 3.4 Fixes shipped with no regression test
 
@@ -451,7 +454,7 @@ media plane has never crossed a real LAN in CI.
 | AVRCP metadata / settings | T0+T1\*+real capture | `avrcp.rs` (29); `iphone_capture.rs` vs real iPhone bytes | one phone, one app, one moment |
 | AVRCP transport / absolute volume | T0+T1\* | `avrcp.rs`, `adapter_end_to_end.rs:2695` | no independent controller ever receives one |
 | Cover art (BIP/OBEX over ERTM) | T0+T1\* | `obex.rs` (23) | **never fetched from a real image server**; **#87** is a live field bug (art renders for some VLC-Android tracks, not others) with no reproducing test |
-| Output to a real sound card | T0+**T4** | `mixer_real_device.rs` `#[ignore]`d | never runs. `bluetooth-vm` records the mix through `[audio] record`, which is the samples the device was handed but not the device. **#55** (panel sleep removes the HDMI sink) has no test |
+| Output to a real sound card | T0+**T2** | `mixer_real_device.rs` (2), in `checks.mixer-vm` | runs on `snd-dummy`, so the device clock is the kernel's rather than ours (#204). Not a real card: no analogue output, and no hardware misbehaviour — **#55** (panel sleep removes the HDMI sink) still has no test |
 
 \* **T1\*** = the whole async adapter driven end to end in one process against
 `ScriptedTransport` — real state machines, real wire bytes, no socket and no independent
@@ -717,10 +720,10 @@ The shared destination every protocol feeds. Measured test counts: `-p pipeline`
 | Transport strip layout / hit test / capabilities / scrub | **T0, strong** | `transport::tests` (20), `projection::tests` (13) | best-covered surface in the crate; runs by default |
 | Now-playing card | T0 + weak raster | `nowplaying_card::tests` (21) | only pixel check is `assert_ne!` (§3.5) |
 | **Mixer summation & gain** | **T0 signal** | `mixer::tests` (26) — sample-exact `0.25+0.5 → 0.75`, clipping, mute, `tapped == heard` | genuinely signal-level; the strongest audio coverage in the tree |
-| Mixer pacing / `OUTPUT_LEAD` | T0 wall-clock | `mixer::tests` (5) | asserted against a fake whose `frames_played` is **wall-clock derived — correct by construction**. #174/#175/#177 are all live regressions here, found by a human listening |
+| Mixer pacing / `OUTPUT_LEAD` | T0 wall-clock **+ T2** | `mixer::tests` (5); `mixer_real_device.rs` (2) in `checks.mixer-vm` | the in-crate five are asserted against a fake whose `frames_played` is **wall-clock derived — correct by construction**; #204's VM is what removes that term. #174/#175/#177 were all found by a human listening, and the VM asserts on the counters that name them |
 | Device-vanish retry (#55) | T0, **half** | `a_box_with_no_device_still_drains_its_sources_in_real_time` | the factory refuses *forever*; **the recovery half has no test**, and #55 asks for exactly that |
 | LDAC / aptX / SBC / ALAC decode | **T0 signal** | `ldac_decode.rs` (11), `audio_decode.rs` (10) | see §4.3 for the per-codec weaknesses |
-| Real audio device | **T4** | `mixer_real_device.rs` `#[ignore]`d | never runs |
+| Real audio device | **T2** | `mixer_real_device.rs` (2), `checks.mixer-vm` | `snd-dummy` in a VM: an independent clock, no analogue output. `starved`, `shed` and emission rate are all asserted (#204) |
 | cpal / ALSA / WASAPI backend | **NONE in CI** | — | `audio-out` is **not even compiled** by `nix flake check` on Linux; only the Windows DLL-closure check touches it |
 | `/screenshot.png` | T1, content untested | `tap::tests` (4) | asserts three bytes (§3.5) |
 | fMP4/HLS boxing | **T0, runs by default** | `fmp4`(16), `hls`(8), `cadence`(7), `timeline`(5), `feed`(8) | self-consistency against the test module's own naive `find_box`. **`hls.rs` never calls `push_audio`** |
@@ -773,7 +776,7 @@ there as a comment rather than duplicated.
 | 14 | **MICE vendor extension not wired**, so Windows falls back to the P2P path MICE exists to escape | install the WSC extension; assert it in the probe response | **#194** (#166 closed empty) |
 | 15 | **Matter: endpoint tree + every cluster but one unexecuted**; `node.rs` has zero tests | extend `matter-peer`; then a `home-assistant-chip-core` peer for real T3 | **#196** (+ comment on #172) |
 | 16 | **`control-display` is vacuous over a wrong-shaped encoder** | correct the frame shape first, then a TCP fake panel on 4661 | comment on **#21** |
-| 17 | **Mixer real-time guarantees rest on a wall-clock-derived fake**; #174/#175/#177 all live here | dummy PipeWire sink in a VM so `mixer_real_device.rs` runs | **#204** |
+| 17 | **Mixer real-time guarantees rest on a wall-clock-derived fake**; #174/#175/#177 all live here | dummy PipeWire sink in a VM so `mixer_real_device.rs` runs | **#204 — closed** |
 | 18 | **#55's recovery half untested** — the failing-then-succeeding device | a 30-line test | comment on **#55** |
 | 19 | **No whole-frame render comparison anywhere** | golden PNGs, mean abs error ≤2/255, diff on failure | **#203** |
 | 20 | **Silent skips**: `audio`'s ffmpeg CLI, the untripwired pixel tests, `output_stream`'s skip-pass | `nativeBuildInputs`; route through `test_gpu`; a `CASTAWAY_REQUIRE_FFMPEG` tripwire | **#182 — closed** |
@@ -812,5 +815,5 @@ What is left, and is *not* a feature question:
   headless-chromium Cast sender (#184).
 - **Two nightly jobs**, because their peers are third-party clouds: `yt-selfplay` both modes
   against a browser build, and `spotify-selfplay` once the one-time OAuth visit is done.
-- **A dummy audio sink in a VM**, so `mixer_real_device.rs` stops being `#[ignore]`d and the
-  mixer's guarantees stop resting on a wall-clock-derived fake (#204).
+- ~~**A dummy audio sink in a VM**, so the mixer's guarantees stop resting on a
+  wall-clock-derived fake (#204).~~ Landed as `checks.mixer-vm`.
