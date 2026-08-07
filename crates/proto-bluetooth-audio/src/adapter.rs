@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use castaway_core::{
     Advertisement, AudioFormat, ControlCapabilities, CoreError, EncodedFrame, FrameSource,
-    NowPlaying, PlaybackState, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
-    SourceDescription,
+    LossySend, LossySender, NowPlaying, PlaybackState, ProtocolKind, SessionEvent, SessionSink,
+    SourceAdapter, SourceDescription,
 };
 use substrate_hci::{
     BdAddr, ConnectionHandle, Event, HciPacket, HciTransport, LinkKey, Reassembler,
@@ -233,7 +233,7 @@ struct Link {
     /// What AVDTP negotiated, held from SET_CONFIGURATION until START. aptX carries no
     /// in-band rate, so this is the decoder's only source of it (#70).
     audio_format: Option<AudioFormat>,
-    audio_tx: Option<mpsc::Sender<EncodedFrame>>,
+    audio_tx: Option<LossySender<EncodedFrame>>,
     /// Whether a `SessionEvent::Audio` has already been emitted for this link.
     session_open: bool,
     /// Last SBC bitpool we reported, so a change is logged and a steady stream is not.
@@ -1305,7 +1305,7 @@ impl BluetoothAdapter {
                     };
                     if !link.session_open {
                         let (tx, rx) = mpsc::channel(AUDIO_QUEUE_DEPTH);
-                        link.audio_tx = Some(tx);
+                        link.audio_tx = Some(LossySender::new(tx));
                         link.session_open = true;
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
@@ -1417,21 +1417,23 @@ impl BluetoothAdapter {
                     );
                 }
                 link.reported_gaps = gaps;
-                // `try_send` rather than `send`: blocking here would stall the whole
-                // adapter, including the signaling channel, so a phone could not even
-                // pause. A full queue means decode is behind, which is worth saying.
+                // A lossy sender rather than a blocking one: blocking here would stall
+                // the whole adapter, including the signaling channel, so a phone could
+                // not even pause. A full queue means decode is behind, which is worth
+                // saying.
                 //
                 // Full and Closed are told apart deliberately. They used to collapse into
                 // one `is_err()`, and the difference is the difference between a hiccup
                 // and a dead session: when the decode side went away, *every* subsequent
                 // packet logged "audio queue full" — thousands of lines blaming
-                // backpressure for a channel with no receiver at all.
-                match tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
+                // backpressure for a channel with no receiver at all. The `LossySend`
+                // enum now makes that collapse uncompilable (#221).
+                match tx.send(frame) {
+                    LossySend::Sent => {}
+                    LossySend::Dropped => {
                         warn!("audio queue full; dropping a frame");
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    LossySend::Closed => {
                         // The consumer is gone and is not coming back, so stop pretending
                         // there is a session. Logged once, because the whole point is to
                         // stop repeating a per-packet message.

@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use castaway_core::{
-    AudioFormat, EncodedFrame, FrameSource, MirrorAudio, SessionEvent, SessionSink,
-    SourceDescription,
+    AudioFormat, DropCounter, EncodedFrame, FrameSource, LossySend, LossySender, MirrorAudio,
+    SessionEvent, SessionSink, SourceDescription,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -123,7 +123,10 @@ pub async fn run_session(
         .checked_sub(IDR_MIN_INTERVAL)
         .unwrap_or_else(tokio::time::Instant::now);
     let mut idr_requests: u64 = 0;
-    let mut dropped: u64 = 0;
+    // Session-scoped, shared into every `Planes` rebuild: the planes are torn down and
+    // remade on every pause and resume, and a total kept in them would restart
+    // mid-session — the number nobody could explain would be the one in the log (#192).
+    let dropped = DropCounter::new();
     let mut read_buf = vec![0u8; 8192];
     // Anything at all from the source, on either socket. Not a keep-alive clock — see
     // `IDLE_GRACE` for why the two are different things.
@@ -183,6 +186,7 @@ pub async fn run_session(
                         &mut negotiated_mode,
                         &sink,
                         &peer,
+                        &dropped,
                     )
                     .await?
                     {
@@ -191,7 +195,7 @@ pub async fn run_session(
                         // has to be said here as well as at the bottom — and this is the
                         // path a well-behaved session actually takes, so a report only at
                         // the bottom would be one that almost never printed.
-                        report_media(&peer, &media, idr_requests, dropped);
+                        report_media(&peer, &media, idr_requests, dropped.get());
                         return Ok(());
                     }
                 }
@@ -204,9 +208,7 @@ pub async fn run_session(
                 let lost_video = media.demux().video_gap_count() != gaps_before;
                 if let Some(planes) = &mut planes {
                     for frame in frames {
-                        if planes.deliver(frame) {
-                            dropped = dropped.saturating_add(1);
-                        }
+                        planes.deliver(frame);
                     }
                     // Bytes of the coded video went missing, so every frame from here
                     // references data nobody has: the access unit the gap broke was
@@ -237,12 +239,10 @@ pub async fn run_session(
     }
     if let Some(planes) = &mut planes {
         for frame in media.flush() {
-            if planes.deliver(frame) {
-                dropped = dropped.saturating_add(1);
-            }
+            planes.deliver(frame);
         }
     }
-    report_media(&peer, &media, idr_requests, dropped);
+    report_media(&peer, &media, idr_requests, dropped.get());
     let _ = sink.emit(SessionEvent::End).await;
     Ok(())
 }
@@ -324,6 +324,7 @@ async fn apply(
     mode: &mut Option<crate::video::VideoMode>,
     sink: &SessionSink,
     peer: &SocketAddr,
+    dropped: &DropCounter,
 ) -> Result<bool, MiracastError> {
     for output in outputs {
         match output {
@@ -331,7 +332,7 @@ async fn apply(
             SinkOutput::Send(req) => write_request(control, req).await?,
             SinkOutput::MediaStarted(config) => {
                 *mode = Some(config.mode());
-                *planes = Some(start_media(config, sink, peer).await?);
+                *planes = Some(start_media(config, sink, peer, dropped.clone()).await?);
             }
             SinkOutput::UibcPort(port) => {
                 // Best-effort: a back-channel that will not open costs the session its
@@ -369,37 +370,41 @@ async fn apply(
 
 /// The two frame channels of a running mirror.
 struct Planes {
-    video: mpsc::Sender<EncodedFrame>,
-    audio: Option<mpsc::Sender<EncodedFrame>>,
+    video: LossySender<EncodedFrame>,
+    audio: Option<LossySender<EncodedFrame>>,
     /// Set until a keyframe has been seen; drives the IDR request.
     needs_keyframe: bool,
 }
 
 impl Planes {
-    /// Hand a frame to the pipeline. Returns whether it was dropped instead.
+    /// Hand a frame to the pipeline, dropping it if the pipeline is behind.
     ///
-    /// The caller counts, rather than this: `Planes` is rebuilt on every pause and
-    /// resume, so a total kept here would restart mid-session and the number nobody could
-    /// explain would be the one in the log (#192).
-    fn deliver(&mut self, frame: EncodedFrame) -> bool {
+    /// The senders count drops into the session's [`DropCounter`], not a total of their
+    /// own: `Planes` is rebuilt on every pause and resume, so a total kept here would
+    /// restart mid-session and the number nobody could explain would be the one in the
+    /// log (#192).
+    fn deliver(&mut self, frame: EncodedFrame) {
+        // Lossy senders and not `send`: a full queue means the decoder is behind, and for
+        // a live mirror the right answer is to drop the frame rather than to stall the
+        // socket and accumulate latency (ground rule 4).
         if frame.video_codec.is_some() {
             if frame.keyframe {
                 self.needs_keyframe = false;
             }
-            // `try_send` and not `send`: a full queue means the decoder is behind, and for
-            // a live mirror the right answer is to drop the frame rather than to stall the
-            // socket and accumulate latency (ground rule 4).
-            if self.video.try_send(frame).is_err() {
-                debug!("dropped a video frame; the pipeline is behind");
-                return true;
+            match self.video.send(frame) {
+                LossySend::Sent => {}
+                LossySend::Dropped => debug!("dropped a video frame; the pipeline is behind"),
+                // Not a drop: the pipeline let go of its receiver, which `MediaStopped`
+                // or `Ended` will explain; the counter stays honest about backpressure.
+                LossySend::Closed => debug!("the video pipeline is gone"),
             }
         } else if let Some(audio) = &self.audio {
-            if audio.try_send(frame).is_err() {
-                debug!("dropped an audio frame");
-                return true;
+            match audio.send(frame) {
+                LossySend::Sent => {}
+                LossySend::Dropped => debug!("dropped an audio frame"),
+                LossySend::Closed => debug!("the audio pipeline is gone"),
             }
         }
-        false
     }
 }
 
@@ -407,6 +412,7 @@ async fn start_media(
     config: &NegotiatedConfig,
     sink: &SessionSink,
     peer: &SocketAddr,
+    dropped: DropCounter,
 ) -> Result<Planes, MiracastError> {
     let (video_tx, video_rx) = mpsc::channel(FRAME_QUEUE);
     let mode = config.mode();
@@ -452,8 +458,8 @@ async fn start_media(
     .await
     .map_err(|e| MiracastError::Connection(e.to_string()))?;
     Ok(Planes {
-        video: video_tx,
-        audio: audio_tx,
+        video: LossySender::with_counter(video_tx, dropped.clone()),
+        audio: audio_tx.map(|tx| LossySender::with_counter(tx, dropped)),
         needs_keyframe: true,
     })
 }
@@ -1266,8 +1272,9 @@ mod tests {
 
     /// A pipeline that cannot keep up loses frames, not latency.
     ///
-    /// Ground rule 4 in one function. `deliver` uses `try_send`, so a full queue drops the
-    /// frame instead of awaiting a decoder that is behind — the alternative is a socket
+    /// Ground rule 4 in one function. `deliver` sends through a `LossySender`, so a full
+    /// queue drops the frame instead of awaiting a decoder that is behind — the
+    /// alternative is a socket
     /// that stalls, a receive buffer that fills, and a mirror whose lag grows without
     /// bound and never recovers.
     ///
@@ -1278,8 +1285,9 @@ mod tests {
     #[tokio::test]
     async fn a_pipeline_that_cannot_keep_up_loses_frames_rather_than_latency() {
         let (video, _held) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE);
+        let drops = DropCounter::new();
         let mut planes = Planes {
-            video,
+            video: LossySender::with_counter(video, drops.clone()),
             audio: None,
             needs_keyframe: true,
         };
@@ -1294,13 +1302,15 @@ mod tests {
 
         // The queue's worth goes in. `_held` is the receiver, alive and never read.
         for _ in 0..FRAME_QUEUE {
-            assert!(!planes.deliver(frame()), "the queue had room");
+            planes.deliver(frame());
         }
+        assert_eq!(drops.get(), 0, "the queue had room");
         // And then every one is dropped — immediately, rather than after a wait. This
-        // whole test would hang on a `send`, which is the point of it.
+        // whole test would hang on a blocking send, which is the point of it.
         for _ in 0..8 {
-            assert!(planes.deliver(frame()), "a full queue must cost the frame");
+            planes.deliver(frame());
         }
+        assert_eq!(drops.get(), 8, "a full queue must cost the frame");
     }
 
     /// A keyframe that is dropped for a full queue still clears `needs_keyframe`.
@@ -1313,8 +1323,9 @@ mod tests {
     #[tokio::test]
     async fn a_keyframe_lost_to_a_full_queue_is_not_asked_for_again() {
         let (video, _held) = mpsc::channel::<EncodedFrame>(1);
+        let drops = DropCounter::new();
         let mut planes = Planes {
-            video,
+            video: LossySender::with_counter(video, drops.clone()),
             audio: None,
             needs_keyframe: true,
         };
@@ -1325,8 +1336,10 @@ mod tests {
             keyframe: true,
             data: Bytes::from_static(b"idr"),
         };
-        assert!(!planes.deliver(keyframe()));
-        assert!(planes.deliver(keyframe()), "the queue is full now");
+        planes.deliver(keyframe());
+        assert_eq!(drops.get(), 0);
+        planes.deliver(keyframe());
+        assert_eq!(drops.get(), 1, "the queue is full now");
         assert!(!planes.needs_keyframe);
     }
 

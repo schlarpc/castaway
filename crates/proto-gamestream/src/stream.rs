@@ -29,7 +29,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use castaway_core::{AudioCodec, AudioFormat, EncodedFrame, FrameSource, MirrorAudio, VideoCodec};
+use castaway_core::{
+    AudioCodec, AudioFormat, EncodedFrame, FrameSource, LossySend, LossySender, MirrorAudio,
+    VideoCodec,
+};
 use moonlight_sys as sys;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -105,7 +108,7 @@ impl StreamSession {
         let (video_tx, video_rx) = mpsc::channel(VIDEO_QUEUE);
         let (audio_tx, audio_rx) = mpsc::channel(AUDIO_QUEUE);
         let sinks = Sinks {
-            video: video_tx,
+            video: LossySender::new(video_tx),
             audio: audio_tx,
             audio_pts: Mutex::new(Duration::ZERO),
             codec: Mutex::new(VideoCodec::H264),
@@ -191,7 +194,9 @@ fn fallback_format() -> AudioFormat {
 /// The channels the C callbacks push into. One per process, because several callbacks
 /// take no context pointer.
 struct Sinks {
-    video: mpsc::Sender<EncodedFrame>,
+    video: LossySender<EncodedFrame>,
+    /// Deliberately *not* lossy, unlike video: the callback thread blocks instead (see
+    /// `audio_sample` for why that is the right trade there).
     audio: mpsc::Sender<EncodedFrame>,
     audio_pts: Mutex<Duration>,
     codec: Mutex<VideoCodec>,
@@ -419,17 +424,18 @@ extern "C" fn video_submit(unit: *mut sys::DECODE_UNIT) -> c_int {
         data: bytes::Bytes::from(data),
     };
 
-    let sent = with_sinks(|sinks| sinks.video.try_send(frame));
+    let sent = with_sinks(|sinks| sinks.video.send(frame));
     match sent {
         // Dropping is the correct answer for a live mirror: the renderer is behind and
         // the next frame is worth more than this one (ground rule 4). The decoder is
         // not asked for an IDR, because the *stream* is fine — we are.
-        Some(Err(mpsc::error::TrySendError::Full(_))) => {
+        Some(LossySend::Dropped) => {
             debug!("dropped a GameStream video frame; renderer is behind");
             sys::DR_OK
         }
-        Some(Err(mpsc::error::TrySendError::Closed(_))) | None => sys::DR_OK,
-        Some(Ok(())) => sys::DR_OK,
+        // A gone consumer ends the session through `connection_terminated`, not here.
+        Some(LossySend::Closed) | None => sys::DR_OK,
+        Some(LossySend::Sent) => sys::DR_OK,
     }
 }
 

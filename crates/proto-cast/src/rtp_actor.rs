@@ -19,10 +19,9 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use castaway_core::{AudioCodec, EncodedFrame, FrameSource, VideoCodec};
+use castaway_core::{AudioCodec, EncodedFrame, FrameSource, LossySend, LossySender, VideoCodec};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -359,7 +358,7 @@ impl HeardSenderReport {
 struct Stream {
     config: StreamConfig,
     receiver: CastRtpReceiver,
-    frames: mpsc::Sender<EncodedFrame>,
+    frames: LossySender<EncodedFrame>,
     video_codec: Option<VideoCodec>,
     audio_codec: Option<AudioCodec>,
     /// When the frame we owe the decoder was first known to be overdue, or `None` if
@@ -383,7 +382,7 @@ impl Stream {
         let stream = Self {
             receiver: CastRtpReceiver::new(config.sender_ssrc, config.receiver_ssrc),
             config: config.clone(),
-            frames: tx,
+            frames: LossySender::new(tx),
             video_codec,
             audio_codec,
             stalled_since: None,
@@ -446,15 +445,15 @@ impl Stream {
                 keyframe: header.dependency == Dependency::KeyFrame,
                 data: Bytes::from(payload),
             };
-            match self.frames.try_send(frame) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
+            match self.frames.send(frame) {
+                LossySend::Sent => {}
+                LossySend::Dropped => {
                     debug!(
                         ssrc = self.config.sender_ssrc,
                         "pipeline is behind; dropping a frame"
                     );
                 }
-                Err(TrySendError::Closed(_)) => return false,
+                LossySend::Closed => return false,
             }
         }
     }

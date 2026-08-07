@@ -19,8 +19,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use castaway_core::{
-    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, MediaPorts, ProtocolKind,
-    SessionEvent, SessionSink, SourceAdapter,
+    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, LossySend, LossySender,
+    MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
 };
 use substrate_rtsp::rtsp_types::headers::{HeaderName, CONTENT_TYPE, CSEQ, SERVER};
 use substrate_rtsp::rtsp_types::{Message, Response, StatusCode, Version};
@@ -250,7 +250,7 @@ async fn pump(
     // The sending half of the mirror's audio channel, created with the video and filled
     // in later: a sender negotiates mirroring audio *after* its video is already
     // flowing, so the channel has to exist before there is anything to put in it.
-    let mut mirror_audio_tx: Option<mpsc::Sender<EncodedFrame>> = None;
+    let mut mirror_audio_tx: Option<LossySender<EncodedFrame>> = None;
     // Shared by the mirror's two planes so they present on one timeline.
     let mirror_origin = Arc::new(StreamOrigin::new());
     // Counters every task in this session writes to, and a reporter reads. See
@@ -766,7 +766,7 @@ async fn bind_tcp_media(host: IpAddr, media_ports: MediaPorts) -> std::io::Resul
 async fn run_audio(
     sockets: AudioSockets,
     mut stream: AudioStream,
-    frames: mpsc::Sender<EncodedFrame>,
+    frames: LossySender<EncodedFrame>,
     peer_ip: IpAddr,
     sender_ports: Option<SenderPorts>,
     mut flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
@@ -864,9 +864,20 @@ async fn run_audio(
                 // Latency beats freshness: a full channel means the decoder is behind,
                 // and waiting here would stall sync and timing handling too.
                 diagnostics.audio_frame(frame.pts);
-                if frames.try_send(frame).is_err() {
-                    diagnostics.audio_drop();
-                    debug!("AirPlay audio buffer full; dropping a packet");
+                match frames.send(frame) {
+                    LossySend::Sent => {}
+                    LossySend::Dropped => {
+                        diagnostics.audio_drop();
+                        debug!("AirPlay audio buffer full; dropping a packet");
+                    }
+                    // Not a drop — the consumer is gone, which is what the `closed()`
+                    // branch above watches for; a race can land it here first. This
+                    // used to be one `is_err()`, which read a dead consumer as
+                    // backpressure and counted it as such (#221).
+                    LossySend::Closed => {
+                        debug!("AirPlay audio consumer went away; stopping the receive loop");
+                        return;
+                    }
                 }
             }
             Ok(AudioOutput::Sync(sync)) => {
@@ -966,6 +977,7 @@ async fn start_negotiated_audio(
     // Bounded: a full channel means the decoder is behind, and the receive loop drops
     // rather than stalling the sockets that carry sync and timing.
     let (tx, rx) = mpsc::channel(512);
+    let tx = LossySender::new(tx);
     let stream = AudioStream::new(params);
     info!(%peer, %link, "AirPlay audio starting");
     if sink
@@ -1025,7 +1037,7 @@ async fn start_mirroring(
     sink: &SessionSink,
     peer: SocketAddr,
     description: castaway_core::SourceDescription,
-) -> Option<mpsc::Sender<EncodedFrame>> {
+) -> Option<LossySender<EncodedFrame>> {
     let (tx, rx) = mpsc::channel(8);
     // The audio channel is created now even though nothing will feed it until a later
     // SETUP — if one ever comes. A mirror with no audio simply leaves it silent, which
@@ -1058,12 +1070,12 @@ async fn start_mirroring(
         listener,
         keys,
         origin,
-        tx,
+        LossySender::new(tx),
         peer,
         diagnostics,
         sink.clone(),
     ));
-    Some(audio_tx)
+    Some(LossySender::new(audio_tx))
 }
 
 /// Accept the sender's data connection and feed frames until it ends, then end the session.
@@ -1086,7 +1098,7 @@ async fn run_mirroring(
     listener: TcpListener,
     keys: MirrorKeys,
     origin: Arc<StreamOrigin>,
-    frames: mpsc::Sender<EncodedFrame>,
+    frames: LossySender<EncodedFrame>,
     peer: SocketAddr,
     diagnostics: Arc<SessionDiagnostics>,
     sink: SessionSink,
@@ -1108,7 +1120,7 @@ async fn run_mirroring(
     let mut mirror = MirrorStream::new(&keys, origin);
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
     let mut chunk = vec![0u8; 1 << 16];
-    loop {
+    'session: loop {
         let n = tokio::select! {
             r = stream.read(&mut chunk) => match r {
                 Ok(0) => break,
@@ -1141,9 +1153,19 @@ async fn run_mirroring(
                     // Drop late rather than stall: latency beats freshness, and this is
                     // safe *here* because the frame has already been decrypted — the
                     // keystream has moved on regardless of whether we keep the bytes.
-                    if frames.try_send(*frame).is_err() {
-                        diagnostics.video_drop();
-                        debug!("mirroring buffer full; dropping a frame");
+                    match frames.send(*frame) {
+                        LossySend::Sent => {}
+                        LossySend::Dropped => {
+                            diagnostics.video_drop();
+                            debug!("mirroring buffer full; dropping a frame");
+                        }
+                        // Not a drop: the consumer is gone, which ends the session —
+                        // the same exit the `closed()` branch above takes when it wins
+                        // the race instead (#221).
+                        LossySend::Closed => {
+                            debug!("mirroring consumer went away");
+                            break 'session;
+                        }
                     }
                 }
                 MirrorOutput::Geometry(g) => {
