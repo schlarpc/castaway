@@ -398,8 +398,9 @@ pub struct MixInput {
     convert: Option<Convert>,
     /// What `convert` was built for, so an unchanged shape costs nothing.
     shape: Option<(u32, u16)>,
-    /// Blocks abandoned at [`WRITE_DEADLINE`], which only a [`Backpressure::Pull`] input
-    /// can do. Reported once, on drop.
+    /// Frames abandoned at [`WRITE_DEADLINE`], which only a [`Backpressure::Pull`] input
+    /// can do. Kept here for the teardown line; mirrored into [`Shared`] as it happens,
+    /// because a wedged mixer is a mid-session condition (#218).
     dropped: u64,
     /// Frames shed to keep a [`Backpressure::Live`] source inside its budget. Counted
     /// separately from `dropped` because they are not the same event: this one is the
@@ -629,7 +630,9 @@ impl MixInput {
             if remaining.is_zero() {
                 // The mixer is not draining. Losing this block keeps the caller's loop
                 // alive to notice it has been told to stop.
-                self.dropped += 1;
+                let frames = stereo.len() as u64 / u64::from(CHANNELS);
+                self.dropped += frames;
+                self.shared.dropped.fetch_add(frames, Ordering::Relaxed);
                 return;
             }
             let Ok((next, _)) = self.state.room.wait_timeout(ring, remaining) else {
@@ -678,8 +681,9 @@ impl Drop for MixInput {
     fn drop(&mut self) {
         if self.dropped > 0 {
             warn!(
-                blocks = self.dropped,
-                "mixer: an input gave up on blocks the mixer never drained"
+                frames = self.dropped,
+                shape = ?self.shape,
+                "mixer: an input gave up on audio the mixer never drained"
             );
         }
         if self.shed > 0 {
@@ -716,6 +720,9 @@ impl Drop for MixInput {
 /// emitted  == drained + starved + idle
 /// ```
 ///
+/// `dropped` sits outside both identities on purpose: an abandoned block was never
+/// handed in, so it appears in neither `written` nor anything downstream of it.
+///
 /// Both are statements about *totals*, and neither survives [`MixerCounters::since`]: a
 /// window that opens with a backlog in the rings drains more than was written into it,
 /// which is ordinary and is what a warm-up produces. Read a window for rates, and the
@@ -736,6 +743,11 @@ pub struct MixerCounters {
     /// Frames dropped from a [`Backpressure::Live`] input that had run ahead of its
     /// budget.
     pub shed: u64,
+    /// Frames a [`Backpressure::Pull`] input abandoned at [`WRITE_DEADLINE`] because the
+    /// mixer never drained. The other defect counter: like `starved`, structurally zero
+    /// while the mixer is healthy — and a nonzero reading is worse, because the audio was
+    /// real and a session is losing it *now* (#218).
+    pub dropped: u64,
     /// Frames the mixer emitted to the device, of any kind. Far from real time, this is
     /// the device's clock misbehaving — the one way this module can be wrong that no
     /// input-side counter would show.
@@ -755,6 +767,7 @@ impl MixerCounters {
             written: self.written.saturating_sub(earlier.written),
             drained: self.drained.saturating_sub(earlier.drained),
             shed: self.shed.saturating_sub(earlier.shed),
+            dropped: self.dropped.saturating_sub(earlier.dropped),
             emitted: self.emitted.saturating_sub(earlier.emitted),
         }
     }
@@ -783,14 +796,15 @@ struct Shared {
     /// one means is documented on that type, which is the public face of these; what is
     /// worth knowing *here* is that nothing resets them. See [`Reported`].
     ///
-    /// `shed` is also kept per-[`MixInput`] for the teardown line, and here as well
-    /// because a counter that only reports when a session *ends* is no use while one is
-    /// going wrong.
+    /// `shed` and `dropped` are also kept per-[`MixInput`] for the teardown lines, and
+    /// here as well because a counter that only reports when a session *ends* is no use
+    /// while one is going wrong.
     starved: AtomicU64,
     idle: AtomicU64,
     written: AtomicU64,
     drained: AtomicU64,
     shed: AtomicU64,
+    dropped: AtomicU64,
     emitted: AtomicU64,
     /// The loudest sample the device was given since the last report.
     ///
@@ -821,6 +835,7 @@ impl Shared {
             written: self.written.load(Ordering::Relaxed),
             drained: self.drained.load(Ordering::Relaxed),
             shed: self.shed.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
             emitted: self.emitted.load(Ordering::Relaxed),
         }
     }
@@ -867,6 +882,7 @@ impl AudioMixer {
             starved: AtomicU64::new(0),
             idle: AtomicU64::new(0),
             shed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
@@ -1340,6 +1356,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         starved,
         idle,
         shed,
+        dropped,
         written,
         drained,
         emitted,
@@ -1359,7 +1376,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
     };
     // Idle and emitted alone do not wake the log: a panel holding a quiet page is not an
     // event. Anything a session did — or failed to get — is.
-    if starved == 0 && shed == 0 && written == 0 && drained == 0 {
+    if starved == 0 && shed == 0 && dropped == 0 && written == 0 && drained == 0 {
         return;
     }
     let expected = window.as_secs_f64() * f64::from(RATE);
@@ -1376,6 +1393,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         starved_pct = pct(starved),
         idle_frames = idle,
         shed_frames = shed,
+        dropped_frames = dropped,
         written_frames = written,
         written_pct = pct(written),
         drained_frames = drained,
@@ -1386,7 +1404,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         inputs,
         peak_dbfs = dbfs(peak),
         amplitude = shared.gain.factor(),
-        "mixer: audio the speakers did not get"
+        "mixer: what the speakers got, and what they did not"
     );
 }
 
@@ -1515,6 +1533,7 @@ mod tests {
             starved: AtomicU64::new(0),
             idle: AtomicU64::new(0),
             shed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
@@ -1925,6 +1944,41 @@ mod tests {
             written,
             took + shed + left,
             "written={written} took={took} shed={shed} left={left}"
+        );
+    }
+
+    /// A wedged mixer's abandoned audio is visible *while the session is going wrong*,
+    /// not only in the teardown line (#218).
+    ///
+    /// Slow by construction: the write has to sit out the whole [`WRITE_DEADLINE`]
+    /// before it is allowed to give up. That wait is the thing under test.
+    #[test]
+    fn abandoned_blocks_are_counted_where_a_live_test_can_read_them() {
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        // A device claiming the whole budget is already in flight, and no mixer thread
+        // to drain anything: the write can never make room and must abandon.
+        shared.device_inflight.store(u64::MAX, Ordering::Relaxed);
+        let mut input = MixInput {
+            backpressure: Backpressure::Pull,
+            state: Arc::clone(&state),
+            shared: Arc::clone(&shared),
+            convert: None,
+            shape: None,
+            dropped: 0,
+            shed: 0,
+        };
+        input.write(&tone(480, 0.5)).unwrap();
+        assert_eq!(input.dropped, 480, "the teardown line's count, in frames");
+        assert_eq!(
+            shared.counters().dropped,
+            480,
+            "the published counter agrees while the input is still alive"
+        );
+        assert_eq!(
+            shared.counters().written,
+            0,
+            "an abandoned block was never handed in, so it is outside `written`"
         );
     }
 
