@@ -10,11 +10,13 @@
 //! [`responder`] actor is the thin I/O shell around them.
 #![forbid(unsafe_code)]
 
+pub mod description;
 pub mod device;
 pub mod error;
 pub mod message;
 pub mod responder;
 
+pub use description::{xml_escape, DeviceDescription};
 pub use device::{SsdpDevice, Target};
 pub use error::SsdpError;
 pub use message::{SearchTarget, SsdpRequest, SsdpResponse};

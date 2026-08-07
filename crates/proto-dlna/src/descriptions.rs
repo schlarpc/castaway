@@ -43,22 +43,15 @@ pub mod service_types {
 
 /// Render the root device description XML for a renderer named `friendly_name` with
 /// device `uuid` (bare, without the `uuid:` prefix).
+///
+/// The skeleton and the escaping come from [`substrate_ssdp::DeviceDescription`] — the
+/// builder escapes the free-text fields, which is what keeps a panel named `Bar & Grill`
+/// from producing XML no control point will parse (the history is on the builder and in
+/// #222). Only the DLNA-specific tail is written here.
 #[must_use]
 pub fn device_description(friendly_name: &str, uuid: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
-  <specVersion><major>1</major><minor>0</minor></specVersion>
-  <device>
-    <deviceType>{dev_type}</deviceType>
-    <friendlyName>{name}</friendlyName>
-    <manufacturer>castaway</manufacturer>
-    <manufacturerURL>https://github.com/schlarpc/castaway</manufacturerURL>
-    <modelDescription>Universal cast receiver</modelDescription>
-    <modelName>castaway</modelName>
-    <modelNumber>0.1</modelNumber>
-    <UDN>uuid:{uuid}</UDN>
-    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC>
+    let services = format!(
+        r#"    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC>
     <serviceList>
       <service>
         <serviceType>{avt_type}</serviceType>
@@ -81,18 +74,7 @@ pub fn device_description(friendly_name: &str, uuid: &str) -> String {
         <controlURL>{cm_control}</controlURL>
         <eventSubURL>{cm_event}</eventSubURL>
       </service>
-    </serviceList>
-  </device>
-</root>"#,
-        dev_type = service_types::MEDIA_RENDERER,
-        // Escaped, not interpolated raw. A panel named `Bar & Grill` otherwise produced
-        // XML that is not well-formed, so every control point's parser rejected the
-        // description — the device answered M-SEARCH, served its LOCATION with a 200, and
-        // appeared in no picker anywhere, logging nothing. The VM test could not catch it
-        // either, because it asserts the LOCATION returns 200 and never that the body
-        // parses.
-        name = crate::soap::xml_escape(friendly_name),
-        uuid = crate::soap::xml_escape(uuid),
+    </serviceList>"#,
         avt_type = service_types::AVTRANSPORT,
         rc_type = service_types::RENDERING_CONTROL,
         cm_type = service_types::CONNECTION_MANAGER,
@@ -105,7 +87,17 @@ pub fn device_description(friendly_name: &str, uuid: &str) -> String {
         avt_event = paths::AVT_EVENT,
         rc_event = paths::RC_EVENT,
         cm_event = paths::CM_EVENT,
-    )
+    );
+    substrate_ssdp::DeviceDescription {
+        device_type: service_types::MEDIA_RENDERER.to_owned(),
+        friendly_name: friendly_name.to_owned(),
+        udn: format!("uuid:{uuid}"),
+        manufacturer_url: Some("https://github.com/schlarpc/castaway".to_owned()),
+        model_description: Some("Universal cast receiver".to_owned()),
+        model_number: Some("0.1".to_owned()),
+        extra_device_xml: services,
+    }
+    .render()
 }
 
 /// The AVTransport SCPD (action list for the subset we implement).

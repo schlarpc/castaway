@@ -226,25 +226,11 @@ fn local_name(qname: &[u8]) -> String {
     }
 }
 
-/// Minimal XML text escaping for response bodies.
-/// Escape text for inclusion in an XML document.
-///
-/// Used by the SOAP responses here and by the device description, which was interpolating
-/// a user-supplied friendly name raw.
-pub(crate) fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
+// The shared escape, re-exported for this crate's other XML writers (GENA property
+// sets, and historically the device description). It lived here as a private copy until
+// #222 moved it to the substrate — DIAL carried an identical one, and the two crates
+// fixed the same raw-friendly-name bug independently, three days apart.
+pub(crate) use substrate_ssdp::xml_escape;
 
 #[cfg(test)]
 mod tests {

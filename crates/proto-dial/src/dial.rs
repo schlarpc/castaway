@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use castaway_core::OsdSink;
-use substrate_ssdp::SsdpDevice;
+use substrate_ssdp::{xml_escape, SsdpDevice};
 
 use crate::error::DialError;
 use tokio::sync::{mpsc, Mutex};
@@ -306,26 +306,21 @@ async fn add_cors(mut response: Response) -> Response {
 }
 
 async fn device_description(State(st): State<Arc<DialInner>>) -> Response {
-    let name = xml_escape(&st.friendly_name);
     // `<UDN>` is not optional and its absence is not forgiving. UPnP mandates it, and
     // Chromium's DIAL device-description parser treats an empty unique-id as a parse
     // failure and drops the device outright — so we were invisible to a whole family of
     // senders while `curl` and `yt-selfplay`, neither of which reads it, both passed.
     // Android senders use it to tie the SSDP `USN` back to the description they fetched.
-    let udn = xml_escape(&format!("uuid:{}", st.uuid));
-    let xml = format!(
-        r#"<?xml version="1.0"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
-  <specVersion><major>1</major><minor>0</minor></specVersion>
-  <device>
-    <deviceType>urn:schemas-upnp-org:device:tvdevice:1</deviceType>
-    <friendlyName>{name}</friendlyName>
-    <manufacturer>castaway</manufacturer>
-    <modelName>castaway</modelName>
-    <UDN>{udn}</UDN>
-  </device>
-</root>"#
-    );
+    let xml = substrate_ssdp::DeviceDescription {
+        device_type: "urn:schemas-upnp-org:device:tvdevice:1".to_owned(),
+        friendly_name: st.friendly_name.clone(),
+        udn: format!("uuid:{}", st.uuid),
+        manufacturer_url: None,
+        model_description: None,
+        model_number: None,
+        extra_device_xml: String::new(),
+    }
+    .render();
     // DIAL: the description response MUST carry Application-URL pointing at the app base.
     let app_url = format!("{}/dial/apps/", st.base_url.trim_end_matches('/'));
     (
@@ -412,21 +407,6 @@ async fn stop(State(st): State<Arc<DialInner>>) -> Response {
     info!("DIAL stopped YouTube");
     let _ = st.events.send(DialEvent::Stopped).await;
     StatusCode::OK.into_response()
-}
-
-/// Escape the five XML-special characters for element text (the friendly name is
-/// operator-configured free text).
-fn xml_escape(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '&' => "&amp;".to_string(),
-            '<' => "&lt;".to_string(),
-            '>' => "&gt;".to_string(),
-            '"' => "&quot;".to_string(),
-            '\'' => "&apos;".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
 }
 
 /// Extract a field from an `application/x-www-form-urlencoded` body (no external dep for
