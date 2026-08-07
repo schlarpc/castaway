@@ -47,10 +47,10 @@
 //! on offer and the readback path could not deliver it anyway.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use super::timeline::Timeline;
+use super::timeline::{Reading, Timeline};
 use crate::mixer::MixTap;
 
 /// The rate the stream's audio track runs at.
@@ -70,6 +70,10 @@ const MAX_BUFFERED: Duration = Duration::from_secs(4);
 #[derive(Debug)]
 pub struct AudioMix {
     timeline: Arc<Timeline>,
+    /// Locked directly only by the clock-free accessors — the counters, [`Self::position`]
+    /// and [`Self::clear`]. Anything holding a [`Reading`] goes through [`Self::window`],
+    /// which is what keeps a stored position from being addressed by a clock it has not
+    /// caught up with.
     inner: Mutex<Window>,
 }
 
@@ -153,6 +157,26 @@ impl AudioMix {
         u64::try_from(elapsed.as_nanos() * u128::from(RATE) / 1_000_000_000).unwrap_or(u64::MAX)
     }
 
+    /// The window, already caught up with `reading`, and the present in frames.
+    ///
+    /// The one door for any access that addresses the window by timeline position. #208
+    /// was an accessor doing exactly that with stored state a rebase had left behind, and
+    /// an accessor that *remembered to reconcile first* would only be the same bug waiting
+    /// on the next author — so the door reconciles, rather than handing the guard and the
+    /// obligation separately. An accessor built the obvious way — take a [`Reading`], ask
+    /// for the window — cannot see pre-rebase state; recreating #208 now requires locking
+    /// `inner` directly *and* computing positions on the side, which no longer has a
+    /// shorter spelling than the correct thing.
+    ///
+    /// The cut lands at the present, which is at least `settle` ahead of anything
+    /// [`Self::take`] hands out — a rebase never truncates sound a take was about to.
+    fn window(&self, reading: Reading) -> Option<(MutexGuard<'_, Window>, u64)> {
+        let at = Self::frames_at(reading.elapsed);
+        let mut window = self.inner.lock().ok()?;
+        window.reconcile(at, reading.rebased);
+        Some((window, at))
+    }
+
     /// Add interleaved stereo, taken to start playing at `now`.
     ///
     /// Silently does nothing before the timeline is anchored: audio that arrives ahead of
@@ -162,11 +186,9 @@ impl AudioMix {
         let Some(reading) = self.timeline.read(now) else {
             return;
         };
-        let at = Self::frames_at(reading.elapsed);
-        let Ok(mut window) = self.inner.lock() else {
+        let Some((mut window, at)) = self.window(reading) else {
             return;
         };
-        window.reconcile(at, reading.rebased);
         // Part of this block belongs to sample positions the encoder has already taken.
         // That part is gone; the rest still lands where it should, so a late block loses
         // its head rather than shifting everything after it.
@@ -219,10 +241,7 @@ impl AudioMix {
     pub fn take(&self, now: Instant, frames: usize, settle: Duration) -> Option<Vec<f32>> {
         let reading = self.timeline.read(now)?;
         let settled = Self::frames_at(reading.elapsed.checked_sub(settle)?);
-        let mut window = self.inner.lock().ok()?;
-        // Reconciling cuts at the present, `settle` ahead of anything taken here, so a
-        // rebase never truncates sound this call was about to hand out.
-        window.reconcile(Self::frames_at(reading.elapsed), reading.rebased);
+        let (mut window, _at) = self.window(reading)?;
         if window.base + frames as u64 > settled {
             return None;
         }
