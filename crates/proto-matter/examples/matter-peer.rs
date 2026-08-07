@@ -615,11 +615,21 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
             .application_basic()
             .status_read(app)
             .await?;
+        // `AllowedVendorList` is the one attribute here a commissioned client is *not*
+        // entitled to read: the spec gives it Administer, because it is the list a content
+        // app would refuse a casting client by. So a refusal is the expected answer for a
+        // client holding `Operate`, and it is better evidence for that grant than
+        // `--read-acl` — this one is a media cluster a phone actually touches. Reported
+        // rather than propagated: the whole point is that it does not succeed.
         let allowed = Exchange::initiate(matter, crypto, fab_idx, player)
             .await?
             .application_basic()
-            .allowed_vendor_list_read_with(app, |v| v.map(|list| list.iter().count()))
-            .await??;
+            .allowed_vendor_list_read_with(app, |v| match v {
+                Ok(list) => format!("{} entries", list.iter().count()),
+                Err(e) => format!("refused: {e}"),
+            })
+            .await
+            .unwrap_or_else(|e| format!("refused: {e}"));
         println!(
             "matter-peer: application_basic endpoint={app} vendor_name={vendor_name:?} \
              vendor_id={vendor_id:#06x} product_id={product_id:#06x} name={name:?} \

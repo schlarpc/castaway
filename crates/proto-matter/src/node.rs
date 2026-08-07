@@ -680,6 +680,11 @@ impl target_navigator::ClusterHandler for TargetNavigatorHandler {
         };
 
         self.ctx.send(CastCommand::SelectTarget(endpoint))?;
+        // Synchronously, for the reason `MediaPlaybackHandler::drive` gives: the command
+        // crosses a channel another task drains, and `CurrentTarget` is the *only* place
+        // a selection is observable — so a client that navigates and then reads back
+        // could otherwise be told it is still on the target it just left.
+        self.ctx.state.update(|s| s.app = Some(endpoint));
         response
             .status(target_navigator::StatusEnum::Success)?
             .data(None)?

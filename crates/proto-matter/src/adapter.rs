@@ -569,8 +569,12 @@ impl MatterAdapter {
 
                 CastCommand::SelectTarget(endpoint) => {
                     // Selecting a target is not playing anything — it says which app a
-                    // subsequent launch belongs to.
-                    self.state.update(|s| s.app = Some(endpoint));
+                    // subsequent launch belongs to. The projection moved in the handler,
+                    // synchronously with the invoke the client was waiting on (#196), so
+                    // what is left here is the record: this is the one cast command that
+                    // changes nothing about playback, and without a line it would happen
+                    // entirely invisibly.
+                    tracing::info!(app = endpoint, "matter: a client selected a content app");
                 }
 
                 CastCommand::End => {

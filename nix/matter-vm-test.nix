@@ -79,6 +79,33 @@ pkgs.testers.runNixOSTest {
             miracast = false;
             matter = true;
           };
+          # Two content apps, not the default one (#196). `TargetNavigator`'s identifiers
+          # are one-based and dense while endpoints start at 6, so with a single app every
+          # off-by-one in that mapping still lands on the right place. Two is the smallest
+          # catalogue where target 2 and endpoint 7 are different numbers, and it is what
+          # a `NavigateTarget` below actually distinguishes.
+          #
+          # Both `media-url`: a `browser` app is dropped at startup on a build with no
+          # browser, and `castaway-portable` is one, so a browser app here would be an
+          # endpoint that silently is not there.
+          matter.apps = [
+            {
+              name = "castaway";
+              vendor_name = "castaway";
+              vendor_id = 65521; # 0xFFF1, the test range
+              product_id = 32769; # 0x8001
+              application_id = "castaway";
+              surface = "media-url";
+            }
+            {
+              name = "castaway two";
+              vendor_name = "castaway";
+              vendor_id = 65521;
+              product_id = 32770; # 0x8002
+              application_id = "castaway.two";
+              surface = "media-url";
+            }
+          ];
         };
       };
 
@@ -100,6 +127,16 @@ pkgs.testers.runNixOSTest {
 
   testScript = { nodes, ... }: ''
     import re
+
+    def one(pattern, text):
+        """`re.search` that says what it was looking for when it finds nothing.
+
+        Also what the driver's type checker wants: a bare `re.search(...).group(1)` is
+        `None.group` on the failing path, and it refuses the script rather than the run.
+        """
+        found = re.search(pattern, text)
+        assert found, f"nothing matched {pattern!r} in:\n{text}"
+        return found
 
     panel_ip = "${nodes.panel.networking.primaryIPAddress}"
     phone_ip = "${nodes.phone.networking.primaryIPAddress}"
@@ -135,7 +172,16 @@ pkgs.testers.runNixOSTest {
         phone.succeed(
             f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
             f"--passcode-file /tmp/passcode.txt --url '${castUrl}' "
-            f"--display-string '${castTitle}' > /tmp/peer.log 2>&1 &"
+            f"--display-string '${castTitle}' "
+            # Everything past the LaunchURL (#196). One commissioning, then every cluster
+            # handler this node serves, driven through a real interaction model by a
+            # client. `--transport play,pause` in that order because the panel is playing
+            # by then — the LaunchURL above is what put it there — so `drive`'s
+            # `NotActive` guard and its success path are both on the same run.
+            f"--read-descriptor --app-basic --app-endpoint 7 "
+            f"--transport play,pause,stop,play --navigate 2 "
+            f"--launch-content 'a search nobody can serve' --read-acl "
+            f"> /tmp/peer.log 2>&1 &"
         )
         phone.wait_until_succeeds(
             "grep -q 'passcode dialog is up' /tmp/peer.log", timeout=60
@@ -222,6 +268,125 @@ pkgs.testers.runNixOSTest {
         assert re.search(r"null pipeline: PLAY.*${castUrl}", journal), journal
         # The display string survived the round trip into the now-playing surface.
         assert "${castTitle}" in journal, journal
+
+    with subtest("a client reads the endpoint tree the panel actually serves"):
+        # `node.rs` had zero tests until `4cd7373`, and what it grew then was a
+        # constructor asserting against itself. This is the same tree read *by a client*,
+        # through the interaction model, which is the only form a phone ever sees (#196).
+        descriptors = dict(
+            re.findall(r"descriptor endpoint=(\d+) (.*)", peer_log)
+        )
+        print(descriptors)
+        assert set(descriptors) == {"0", "1", "7"}, descriptors
+
+        # Our clusters stay off the root. A Descriptor on endpoint 0 listing ContentLauncher
+        # is a client being told the root can launch content, and `AppCluster` exists to
+        # keep that from happening.
+        assert "0x050a" not in descriptors["0"], descriptors["0"]
+        # …and the root lists the rest of the tree, which is how a client finds any of it.
+        parts = one(r"parts=\[(.*)\]", descriptors["0"]).group(1)
+        assert parts.split(", ") == ['"1"', '"6"', '"7"'], parts
+
+        # The player: the casting video-player device type a client matches on before it
+        # will cast at all, and all four of its clusters.
+        assert "0x00000023" in descriptors["1"], descriptors["1"]
+        for cluster in ["0x001d", "0x050a", "0x0506", "0x0505"]:
+            assert cluster in descriptors["1"], (cluster, descriptors["1"])
+        # A content app: the content-app device type, ApplicationBasic and ContentLauncher —
+        # and **not** MediaPlayback, which would give a client two places to send Play and
+        # no rule for which.
+        assert "0x00000024" in descriptors["7"], descriptors["7"]
+        assert "0x050d" in descriptors["7"], descriptors["7"]
+        assert "0x050a" in descriptors["7"], descriptors["7"]
+        assert "0x0506" not in descriptors["7"], descriptors["7"]
+
+    with subtest("the content app answers for itself, on the endpoint it occupies"):
+        # `ApplicationBasicHandler`'s seven attributes, none of which had ever been read.
+        # Every one comes out of the catalogue entry rather than a constant, so reading
+        # them is what says the endpoint a client picked is the app it thought it picked —
+        # endpoint 7 is the *second* app, and answering with the first one's name would be
+        # a client casting into the wrong place with no way to tell.
+        app = one(r"application_basic endpoint=7 (.*)", peer_log).group(1)
+        print(app)
+        assert 'name="castaway two"' in app, app
+        assert 'vendor_name="castaway"' in app, app
+        assert "vendor_id=0xfff1" in app, app
+        assert "product_id=0x8002" in app, app
+        assert "app_id=castaway.two" in app, app
+        # Not playing *this* app's media, so `Stopped` — the LaunchURL above went to the
+        # player endpoint, and this attribute is what distinguishes the two.
+        assert "status=Stopped" in app, app
+        # And the one attribute a commissioned phone may *not* read. The spec gives
+        # `AllowedVendorList` Administer privilege — it is the list a content app would
+        # refuse a casting client by — and this client holds `Operate`, so `rs-matter`'s
+        # access control answers `UnsupportedAccess` before our handler is reached. That is
+        # the ACL grant asserted on a cluster a phone actually touches, which is stronger
+        # evidence than the Access Control read below. (Our handler returns an empty list
+        # when it *is* reached, and says why: a non-empty one is an access-control claim
+        # backed by attestation this panel does not verify.)
+        assert "allowed_vendors=refused" in app, app
+
+    with subtest("the transport works, and stops working when there is nothing to drive"):
+        # `MediaPlaybackHandler::drive` and its `NotActive` guard: no Play, Pause or Stop
+        # invoke had ever run at any tier. The sequence is what makes the guard reachable —
+        # `stop` is the only thing that can put the panel back to `NotPlaying`, and the
+        # `play` after it is the one that has to be refused.
+        verbs = re.findall(r"media_playback (\w[\w-]*) status=(\w+)", peer_log)
+        states = re.findall(r"media_playback current_state=(\w+)", peer_log)
+        print(verbs, states)
+        assert verbs == [
+            ("play", "Success"),
+            ("pause", "Success"),
+            ("stop", "Success"),
+            ("play", "NotActive"),
+        ], verbs
+        # And the state a phone would read back after each one. A transport command the
+        # panel accepted and then denied having accepted is what a paused phone showing
+        # "playing" looks like.
+        assert states == ["Playing", "Paused", "NotPlaying", "NotPlaying"], states
+
+    with subtest("a client can list the panel's apps and select one"):
+        nav = one(r"target_navigator targets=(.*) current=(\d+)", peer_log)
+        targets, current = nav.group(1), nav.group(2)
+        print(targets, current)
+        # One-based and dense, in catalogue order, against endpoints that start at 6.
+        assert '"1:castaway"' in targets, targets
+        assert '"2:castaway two"' in targets, targets
+        # The launch went to the player endpoint, which no content app owns — and 0 is the
+        # spec's reserved "no target", which is the honest answer rather than target 1.
+        assert current == "0", current
+        assert "navigate_target target=2 status=Success" in peer_log, peer_log
+        # Target 2 is endpoint 7, and `endpoint_for_target` is four lines with two ways to
+        # be silently wrong — `saturating_sub` in place of `checked_sub` selects the first
+        # app for the reserved target 0, which launches something rather than nothing. The
+        # only place the selection is observable is the next read of this attribute, which
+        # is also the only place a phone would look.
+        assert "current after navigate=2" in peer_log, peer_log
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert "matter: a client selected a content app" in journal, journal
+
+    with subtest("a search a media-URL app cannot serve is refused, not faked"):
+        # `handle_launch_content`'s `parameterList` walk, and the refusal underneath it.
+        # A media-URL app has no notion of "find me something called X" — the alternative
+        # to saying so is opening a home page and calling it a result.
+        # `AuthFailed`, not something more descriptive, because the cluster's whole
+        # vocabulary is Success / URLNotAvailable / AuthFailed / {Text,Audio}TrackNotAvailable
+        # — `NotAllowed` and `NoAppFound` both land on it, which is lossy and is the
+        # spec's doing rather than ours. The panel's own log is where the reason survives.
+        assert re.search(
+            r"launch_content query=.*endpoint=7 status=AuthFailed", peer_log
+        ), peer_log
+        assert "matter: declining a LaunchContent" in journal, journal
+
+    with subtest("a commissioned phone gets Operate, and cannot rewrite the access list"):
+        # `seed_acls` grants `Operate` with a comment saying why not `Administer`:
+        # "handing out Administer because it is simpler would let any commissioned phone
+        # evict every other one". Nothing tested it, so a regression to `ADMINISTER`
+        # passed every check in the repo — and the phone that noticed would be the second
+        # one, when the first one removed its fabric.
+        acl = one(r"access_control acl (.*)", peer_log).group(1)
+        print(acl)
+        assert "refused" in acl, f"an Operate client read the ACL: {acl}"
 
     with subtest("a phone that mistypes the passcode is told so, not left guessing"):
         # `commission_loop`'s `Err` arm logged, put a banner on the panel, and sent the
