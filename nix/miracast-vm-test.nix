@@ -39,13 +39,15 @@ let
     esac
   '';
 
-  # A scripted WFD *source*: accepts the sink's connection, walks M1→M7, streams a few
-  # real MPEG2-TS-over-RTP datagrams at the negotiated port, then triggers TEARDOWN so
-  # the clean-shutdown path is what gets exercised. A second, independent reading of the
+  # A scripted WFD *source*: accepts the sink's connection, walks M1→M7, streams real
+  # MPEG2-TS-over-RTP at the negotiated port — mid-GOP, with datagrams dropped on a
+  # schedule, answering the sink's M13s with keyframes — then triggers TEARDOWN so the
+  # clean-shutdown path is what gets exercised. A second, independent reading of the
   # wire formats — TS packetisation included — so the assertions mirror what real
   # sources send, not what our sink implementation happens to accept.
   # W503: as in vm-test.nix — operators lead their continuation lines here.
   wfdSource = pkgs.writers.writePython3Bin "wfd-source" { flakeIgnore = [ "E501" "W503" ]; } ''
+    import select
     import socket
     import struct
     import time
@@ -87,6 +89,33 @@ let
             buffered.extend(chunk)
 
 
+    def take_messages():
+        """Split whole RTSP messages out of the buffer, advancing the same high-water mark.
+
+        `phase` is a substring search, which is all the negotiation needs; the media
+        phase needs the CSeq of each request so it can answer it, so it needs framing.
+        Both move `mark`, so the two can be interleaved — and they are: the media loop
+        runs between M7 and the TEARDOWN phase.
+        """
+        global mark
+        out = []
+        while True:
+            blob = bytes(buffered[mark:])
+            head_end = blob.find(b"\r\n\r\n")
+            if head_end < 0:
+                return out
+            head = blob[:head_end].decode("utf-8", "replace")
+            length = 0
+            for line in head.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    length = int(line.split(":", 1)[1].strip() or 0)
+            total = head_end + 4 + length
+            if len(blob) < total:
+                return out
+            out.append(blob[:total].decode("utf-8", "replace"))
+            mark += total
+
+
     # M1, with the Server: header a real Windows source sends. The sink must answer it
     # *and* open its own M2 OPTIONS — both arrive together.
     send("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nRequire: org.wfa.wfd1.0\r\nServer: MSMiracastSource/10.0\r\n\r\n")
@@ -122,10 +151,24 @@ let
 
     # --- The media plane: hand-rolled MPEG2-TS over RTP, sent to the port the sink
     # promised in M3, across the group interface. PAT, PMT (H.264 on PID 0x1011), and
-    # three access units as unbounded PES packets — the first carries SPS/PPS/IDR so
-    # the very first completed frame is a keyframe and the sink never needs M13. An
-    # unbounded PES only completes at the next payload-unit start, so three sent means
-    # two delivered; the third is still pending when TEARDOWN lands, and that is fine.
+    # a run of access units as unbounded PES packets.
+    #
+    # Two things the sink has to survive here, neither of which this source used to send
+    # (#192):
+    #
+    # 1. **A mid-GOP join.** The stream opens on P-frames and stays that way until the
+    #    sink asks for a keyframe. This source used to send an IDR first, with a comment
+    #    saying it did so "so the sink never needs M13" — which meant WFD's only loss
+    #    recovery primitive, and the entire justification for hand-rolling this demuxer
+    #    rather than using ffmpeg's rtp_mpegts (D35), had never fired at any tier.
+    # 2. **Loss.** The hwsim medium is lossless, jitter-free and instantaneous, so the
+    #    reorder buffer, the continuity-counter resync and the drop-late-frames policy
+    #    had never absorbed anything either. Datagrams are dropped on a schedule rather
+    #    than with `tc`/netem, because a schedule can drop a *specific* datagram — which
+    #    is what makes a continuity gap assertable rather than merely probable.
+    #
+    # An unbounded PES only completes at the next payload-unit start, so the last access
+    # unit sent is still pending when TEARDOWN lands. That is fine and expected.
 
 
     def ts_packet(pid, cc, payload):
@@ -181,15 +224,122 @@ let
         rtp.sendto(header + b"".join(packets), (sink, 1028))
 
 
+    # 25 fps: slow enough that a VM keeps up, fast enough that the sink's reorder depth
+    # (8 packets) is crossed in well under half a second, so a dropped datagram becomes a
+    # *known* loss inside one frame interval of the schedule rather than at teardown.
+    FRAME_INTERVAL = 0.04
+
+    seq = 0
+    cc = 0
+    pts = 90000
+    sent = 0
+    dropped = []
+    idr_requests = []
+    owed_idr = False
+    started = 0.0
+
+
+    def pump_control():
+        """Answer whatever the sink says, without blocking, and note any M13.
+
+        The only request it makes during playback is `wfd_idr_request`, and it makes it
+        because it cannot decode what it is being sent — so a source that answered 200 OK
+        and did not then send a keyframe would be agreeing to help and not helping.
+        """
+        global owed_idr
+        while select.select([conn], [], [], 0)[0]:
+            chunk = conn.recv(65536)
+            if not chunk:
+                raise SystemExit("sink closed the control connection mid-stream")
+            buffered.extend(chunk)
+        for message in take_messages():
+            if message.startswith("RTSP/1.0"):
+                continue  # a response to something we sent
+            cseq = ""
+            for line in message.split("\r\n"):
+                if line.lower().startswith("cseq:"):
+                    cseq = line.split(":", 1)[1].strip()
+            if "wfd_idr_request" in message:
+                idr_requests.append(time.monotonic() - started)
+                owed_idr = True
+                print("m13 #{} at {:.3f}s".format(len(idr_requests), idr_requests[-1]), flush=True)
+            send("RTSP/1.0 200 OK\r\nCSeq: {}\r\n\r\n".format(cseq))
+
+
+    def send_au(payload, drop=False):
+        """One access unit: one PES, one TS packet, one RTP datagram.
+
+        The RTP sequence number and the continuity counter advance whether or not the
+        datagram goes out, which is the whole trick — the source produced it, the air
+        lost it, and what the sink sees is a hole in one and a jump in the other.
+        """
+        global seq, cc, pts, sent
+        packet = ts_packet(VIDEO_PID, cc, pes(pts, payload))
+        if drop:
+            dropped.append(seq)
+            print("dropping datagram seq={}".format(seq), flush=True)
+        else:
+            rtp_send(seq, pts, [packet])
+            sent += 1
+        seq += 1
+        cc = (cc + 1) & 0x0F
+        pts += 3600
+
+
+    def run(seconds, drop_at=()):
+        """Send access units for `seconds`, dropping the ones whose index is in `drop_at`.
+
+        A keyframe goes out in place of the next P-frame whenever the sink has asked for
+        one. That is the source's entire half of M13, and it is what makes "decoding
+        recovers" observable rather than assumed.
+        """
+        global owed_idr
+        n = 0
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            pump_control()
+            # The schedule wins ties. An owed keyframe waits a frame rather than taking a
+            # scheduled drop's slot, because a drop that happened to land on the frame the
+            # sink had just asked for would silently make this a one-loss test — and the
+            # only symptom would be a count at the very end that no longer added up.
+            drop = n in drop_at
+            if owed_idr and not drop:
+                send_au(keyframe)
+                owed_idr = False
+            else:
+                send_au(delta, drop=drop)
+            n += 1
+            time.sleep(FRAME_INTERVAL)
+
+
     # The sink wires its media plane while handling our PLAY response; a datagram that
     # outruns that TCP segment is silently pre-session.
     time.sleep(0.5)
-    rtp_send(0, 90000, [ts_packet(0, 0, pat), ts_packet(PMT_PID, 0, pmt),
-                        ts_packet(VIDEO_PID, 0, pes(90000, keyframe))])
-    rtp_send(1, 91500, [ts_packet(VIDEO_PID, 1, pes(91500, delta))])
-    rtp_send(2, 93000, [ts_packet(VIDEO_PID, 2, pes(93000, delta))])
-    print("rtp media sent", flush=True)
-    time.sleep(1)
+    started = time.monotonic()
+    # The program tables get their own datagram, so nothing below can drop them.
+    rtp_send(seq, pts, [ts_packet(0, 0, pat), ts_packet(PMT_PID, 0, pmt)])
+    seq += 1
+
+    # Mid-GOP. The sink has no keyframe and cannot get one by waiting, so it must ask.
+    # Long enough that the limiter window from that first M13 has expired before the
+    # first loss, or the two triggers would be indistinguishable.
+    run(1.6)
+    # Loss, twice, deliberately close together. The first is answered; the second lands
+    # inside the limiter's window, which is the half that matters in the field — a real
+    # capture shows a sink firing eight M13s back to back and turning a lossy link into
+    # an unusable one. Eleven frames apart so each hole crosses the reorder depth on its own.
+    run(2.4, drop_at=(5, 16))
+    # And recovery: frames keep flowing, and the sink stops asking.
+    run(1.2)
+    print("rtp media sent: {} datagrams, dropped {}".format(sent, len(dropped)), flush=True)
+    print("idr requests: {}".format(["{:.3f}".format(t) for t in idr_requests]), flush=True)
+    gaps = [b - a for a, b in zip(idr_requests, idr_requests[1:])]
+    print("idr gaps: {}".format(["{:.3f}".format(g) for g in gaps]), flush=True)
+    # Reported rather than asserted here, deliberately: an assertion in this process
+    # exits it before the TEARDOWN below, which would take the clean-shutdown subtest
+    # down with it and make one failure look like two. The numbers are the source's; the
+    # judgement is the test script's.
+    assert len(dropped) == 2, "this schedule's own bookkeeping is wrong: {}".format(dropped)
 
     # Source-triggered teardown: the sink must come back with its own TEARDOWN rather
     # than just dropping the socket.
@@ -234,6 +384,18 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import re
+
+    def one(pattern, text):
+        """`re.search` that says what it was looking for when it finds nothing.
+
+        Also what the driver's type checker wants: a bare `re.search(...).group(1)` is
+        `None.group` on the failing path, and it refuses the script rather than the run.
+        """
+        found = re.search(pattern, text)
+        assert found, f"nothing matched {pattern!r} in:\n{text}"
+        return found
+
     # The sender's P2P management lives on wlan1's control socket; commands only touch
     # the socket, so they need no namespace.
     wcli = "wpa_cli -p /run/wpa_supplicant-sender -i wlan1"
@@ -337,11 +499,93 @@ pkgs.testers.runNixOSTest {
         # The source hand-rolled PAT/PMT/PES and sent them over the group interface;
         # the count is logged when teardown closes the plane. Zero here is exactly the
         # §7.2 failure — a sink that advertised a port it was not really reachable on —
-        # so the assertion is a nonzero count, keyframe first.
+        # so the assertion is a nonzero count.
         machine.wait_until_succeeds(
             "journalctl -u castaway --no-pager "
             "| grep -E -q 'encoded video source ended frames=[1-9]'",
             timeout=30,
+        )
+
+    with subtest("the sink asks for an IDR, and keeps asking no faster than once a second"):
+        # WFD's only loss-recovery primitive, and until #192 it had never fired at any
+        # tier — this source used to send a keyframe first precisely so that it would not
+        # have to. Now the stream opens mid-GOP and loses two datagrams on a schedule, so
+        # the sink has to ask twice for two different reasons: once because it has no
+        # keyframe at all, and once because the coded video it does have is missing bytes.
+        #
+        # The rate limiter is asserted by the *source*, from the arrival times of the
+        # requests it received, because that is where the number matters: a sink that
+        # asks on every damaged frame turns a lossy link into an unusable one, and both
+        # halves of that are invisible from inside the sink.
+        source_log = machine.succeed("cat /tmp/wfd-source.log")
+        print(source_log)
+        assert "m13 #2" in source_log, (
+            f"the sink asked for an IDR at most once:\n{source_log}"
+        )
+        # `IDR_MIN_INTERVAL` is one second, and this is that number on a real wire. The
+        # T1 test (#192, `45cbae2`) pins it against a clock the test controls; here it is
+        # the source's own arrival times, over a radio, with two independent triggers
+        # landing inside one window.
+        gaps = [
+            float(g)
+            for g in re.findall(r"[\d.]+", one(r"idr gaps: \[(.*)\]", source_log).group(1))
+        ]
+        assert gaps, f"only one M13 ever arrived, so the limiter proves nothing:\n{source_log}"
+        assert min(gaps) >= 0.95, (
+            f"two M13s {min(gaps):.3f}s apart; the limiter is what keeps a lossy link "
+            f"usable, and a sink without one sends eight in a row"
+        )
+        # Our own side of the same events, so a request the source imagined is caught.
+        asked = int(machine.succeed(
+            "journalctl -u castaway --no-pager | grep -c 'asking the source for an IDR'"
+        ).strip())
+        received = source_log.count("m13 #")
+        assert asked == received, (
+            f"the sink logged {asked} IDR requests and the source received {received}"
+        )
+
+    with subtest("the loss the source injected is the loss the sink reports"):
+        # The media plane's counters, said out loud once at teardown. Every one of these
+        # existed before #192 and none of them was ever logged, so a bad mirror in the
+        # field left nothing behind to tell a lossy radio from a slow decoder from a
+        # source sending to the wrong port.
+        closed = machine.wait_until_succeeds(
+            "journalctl -u castaway --no-pager | grep -m1 'miracast: media plane closed'",
+            timeout=30,
+        )
+        print(closed)
+        # Exactly the two datagrams the source withheld, found by the holes they left —
+        # and *only* those, on a medium with no loss of its own. `foreign` and `late`
+        # stay zero for the same reason, and a nonzero one of those would mean something
+        # other than this source is reaching our media port.
+        assert "lost=2" in closed, closed
+        assert "late=0" in closed, closed
+        assert "foreign=0" in closed, closed
+        # Each hole reaching the demuxer as a continuity-counter jump on the video PID:
+        # this is the signal the IDR request is derived from, and asserting the two
+        # numbers together is what says the chain from a missing datagram to an M13 is
+        # whole rather than two coincidences.
+        assert "video_gaps=2" in closed, closed
+
+    with subtest("the mirror recovers rather than freezing until the next natural IDR"):
+        # What the loss would cost without M13: an AOSP source puts IDRs fifteen seconds
+        # apart, so a single lost reference is a fifteen-second frozen screen. Here the
+        # source answers each request with a keyframe, and the assertion is that frames
+        # kept arriving after the last one — the count is a large fraction of what was
+        # sent, rather than the handful that would arrive if the plane had stalled.
+        sent = int(one(r"rtp media sent: (\d+) datagrams", source_log).group(1))
+        delivered = int(one(
+            r"encoded video source ended frames=(\d+)",
+            machine.succeed(
+                "journalctl -u castaway --no-pager | grep -m1 'encoded video source ended'"
+            ),
+        ).group(1))
+        print(f"{delivered} frames delivered of {sent} datagrams sent")
+        # Not equality: the two datagrams dropped cost the access units they carried *and*
+        # the ones the gaps broke, an unbounded PES only completes at the next one's
+        # start, and the tables' datagram carries no frame at all.
+        assert delivered >= sent * 0.8, (
+            f"only {delivered} of {sent} access units survived; the plane stalled"
         )
 
     with subtest("the triggered teardown ended the session cleanly"):

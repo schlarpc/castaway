@@ -185,6 +185,12 @@ pub async fn run_session(
                     )
                     .await?
                     {
+                        // The clean ending: the source triggered a TEARDOWN and we
+                        // answered it. It returns from inside the loop, so the summary
+                        // has to be said here as well as at the bottom — and this is the
+                        // path a well-behaved session actually takes, so a report only at
+                        // the bottom would be one that almost never printed.
+                        report_media(&peer, &media, idr_requests);
                         return Ok(());
                     }
                 }
@@ -231,10 +237,18 @@ pub async fn run_session(
             planes.deliver(frame);
         }
     }
-    // What the link actually did, once, at the end. Every one of these numbers existed
-    // and none of them was ever said out loud, so a mirror that looked bad in the field
-    // left nothing behind to tell a lossy radio from a slow decoder from a source sending
-    // to the wrong port — three problems with three different owners (#192).
+    report_media(&peer, &media, idr_requests);
+    let _ = sink.emit(SessionEvent::End).await;
+    Ok(())
+}
+
+/// What the link actually did, once, at the end.
+///
+/// Every one of these numbers existed and none of them was ever said out loud, so a mirror
+/// that looked bad in the field left nothing behind to tell a lossy radio from a slow
+/// decoder from a source sending to the wrong port — three problems with three different
+/// owners (#192).
+fn report_media(peer: &SocketAddr, media: &MediaReceiver, idr_requests: u64) {
     info!(
         %peer,
         lost = media.lost_datagrams(),
@@ -245,8 +259,6 @@ pub async fn run_session(
         idr_requests,
         "miracast: media plane closed"
     );
-    let _ = sink.emit(SessionEvent::End).await;
-    Ok(())
 }
 
 /// Turn a parsed RTSP message into session outputs.
