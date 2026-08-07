@@ -123,6 +123,7 @@ pub async fn run_session(
         .checked_sub(IDR_MIN_INTERVAL)
         .unwrap_or_else(tokio::time::Instant::now);
     let mut idr_requests: u64 = 0;
+    let mut dropped: u64 = 0;
     let mut read_buf = vec![0u8; 8192];
     // Anything at all from the source, on either socket. Not a keep-alive clock — see
     // `IDLE_GRACE` for why the two are different things.
@@ -190,7 +191,7 @@ pub async fn run_session(
                         // has to be said here as well as at the bottom — and this is the
                         // path a well-behaved session actually takes, so a report only at
                         // the bottom would be one that almost never printed.
-                        report_media(&peer, &media, idr_requests);
+                        report_media(&peer, &media, idr_requests, dropped);
                         return Ok(());
                     }
                 }
@@ -203,7 +204,9 @@ pub async fn run_session(
                 let lost_video = media.demux().video_gap_count() != gaps_before;
                 if let Some(planes) = &mut planes {
                     for frame in frames {
-                        planes.deliver(frame);
+                        if planes.deliver(frame) {
+                            dropped = dropped.saturating_add(1);
+                        }
                     }
                     // Bytes of the coded video went missing, so every frame from here
                     // references data nobody has: the access unit the gap broke was
@@ -234,10 +237,12 @@ pub async fn run_session(
     }
     if let Some(planes) = &mut planes {
         for frame in media.flush() {
-            planes.deliver(frame);
+            if planes.deliver(frame) {
+                dropped = dropped.saturating_add(1);
+            }
         }
     }
-    report_media(&peer, &media, idr_requests);
+    report_media(&peer, &media, idr_requests, dropped);
     let _ = sink.emit(SessionEvent::End).await;
     Ok(())
 }
@@ -248,7 +253,7 @@ pub async fn run_session(
 /// that looked bad in the field left nothing behind to tell a lossy radio from a slow
 /// decoder from a source sending to the wrong port — three problems with three different
 /// owners (#192).
-fn report_media(peer: &SocketAddr, media: &MediaReceiver, idr_requests: u64) {
+fn report_media(peer: &SocketAddr, media: &MediaReceiver, idr_requests: u64, dropped: u64) {
     info!(
         %peer,
         lost = media.lost_datagrams(),
@@ -257,6 +262,10 @@ fn report_media(peer: &SocketAddr, media: &MediaReceiver, idr_requests: u64) {
         resyncs = media.demux().resync_count(),
         video_gaps = media.demux().video_gap_count(),
         idr_requests,
+        // Frames the *pipeline* could not take, which is a different problem from the four
+        // above and has a different owner: those are the radio, this is the decoder. A
+        // mirror that stutters with `lost=0 dropped=900` is a machine that cannot keep up.
+        dropped,
         "miracast: media plane closed"
     );
 }
@@ -367,7 +376,12 @@ struct Planes {
 }
 
 impl Planes {
-    fn deliver(&mut self, frame: EncodedFrame) {
+    /// Hand a frame to the pipeline. Returns whether it was dropped instead.
+    ///
+    /// The caller counts, rather than this: `Planes` is rebuilt on every pause and
+    /// resume, so a total kept here would restart mid-session and the number nobody could
+    /// explain would be the one in the log (#192).
+    fn deliver(&mut self, frame: EncodedFrame) -> bool {
         if frame.video_codec.is_some() {
             if frame.keyframe {
                 self.needs_keyframe = false;
@@ -377,12 +391,15 @@ impl Planes {
             // socket and accumulate latency (ground rule 4).
             if self.video.try_send(frame).is_err() {
                 debug!("dropped a video frame; the pipeline is behind");
+                return true;
             }
         } else if let Some(audio) = &self.audio {
             if audio.try_send(frame).is_err() {
                 debug!("dropped an audio frame");
+                return true;
             }
         }
+        false
     }
 }
 
@@ -1245,6 +1262,72 @@ mod tests {
             }
             into.push_str(&String::from_utf8_lossy(&buf[..n]));
         }
+    }
+
+    /// A pipeline that cannot keep up loses frames, not latency.
+    ///
+    /// Ground rule 4 in one function. `deliver` uses `try_send`, so a full queue drops the
+    /// frame instead of awaiting a decoder that is behind — the alternative is a socket
+    /// that stalls, a receive buffer that fills, and a mirror whose lag grows without
+    /// bound and never recovers.
+    ///
+    /// Nothing had ever filled that queue. The VM's medium is lossless *and* its pipeline
+    /// is the null one, which drains a channel as fast as anything can push into it, so
+    /// the `try_send` there always succeeds (#192). Here the receiver is simply held and
+    /// never read, which is what a decoder falling behind looks like from this side.
+    #[tokio::test]
+    async fn a_pipeline_that_cannot_keep_up_loses_frames_rather_than_latency() {
+        let (video, _held) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE);
+        let mut planes = Planes {
+            video,
+            audio: None,
+            needs_keyframe: true,
+        };
+
+        let frame = || EncodedFrame {
+            video_codec: Some(castaway_core::VideoCodec::H264),
+            audio_codec: None,
+            pts: Duration::ZERO,
+            keyframe: false,
+            data: Bytes::from_static(b"nal"),
+        };
+
+        // The queue's worth goes in. `_held` is the receiver, alive and never read.
+        for _ in 0..FRAME_QUEUE {
+            assert!(!planes.deliver(frame()), "the queue had room");
+        }
+        // And then every one is dropped — immediately, rather than after a wait. This
+        // whole test would hang on a `send`, which is the point of it.
+        for _ in 0..8 {
+            assert!(planes.deliver(frame()), "a full queue must cost the frame");
+        }
+    }
+
+    /// A keyframe that is dropped for a full queue still clears `needs_keyframe`.
+    ///
+    /// Deliberate, and worth pinning because the opposite is defensible: the frame never
+    /// reached a decoder, so arguably the sink still needs one. But the source *sent* it,
+    /// and asking again would spend an M13 on a queue depth rather than on a loss — on a
+    /// panel whose decoder is behind, that is an IDR every second forever, each one a
+    /// bitrate spike that makes the queue worse.
+    #[tokio::test]
+    async fn a_keyframe_lost_to_a_full_queue_is_not_asked_for_again() {
+        let (video, _held) = mpsc::channel::<EncodedFrame>(1);
+        let mut planes = Planes {
+            video,
+            audio: None,
+            needs_keyframe: true,
+        };
+        let keyframe = || EncodedFrame {
+            video_codec: Some(castaway_core::VideoCodec::H264),
+            audio_codec: None,
+            pts: Duration::ZERO,
+            keyframe: true,
+            data: Bytes::from_static(b"idr"),
+        };
+        assert!(!planes.deliver(keyframe()));
+        assert!(planes.deliver(keyframe()), "the queue is full now");
+        assert!(!planes.needs_keyframe);
     }
 
     /// A gap in the middle of a *running* stream asks for an IDR again.

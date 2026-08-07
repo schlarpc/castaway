@@ -561,6 +561,24 @@ pkgs.testers.runNixOSTest {
         assert "lost=2" in closed, closed
         assert "late=0" in closed, closed
         assert "foreign=0" in closed, closed
+        # And what was lost at the *other* end. `dropped` counts frames the pipeline could
+        # not take, which is a different problem with a different owner: the four numbers
+        # above are the radio, this one is the decoder.
+        #
+        # It is **not zero**, and that is the finding. This was expected to be zero by
+        # construction — the null pipeline drains a channel about as fast as anything can
+        # push into it — and it measured 8 of 128 on the first run that counted. The
+        # queue is three frames deep and the drain is a task that has to be *scheduled*,
+        # so a VM at 25 fps loses a handful to nothing worse than the host being busy.
+        # That is ground rule 4 working: a dropped frame is cheaper than latency that
+        # never comes back. What would be wrong is a large share of them.
+        sent = int(one(r"rtp media sent: (\d+) datagrams", source_log).group(1))
+        dropped = int(one(r"dropped=(\d+)", closed).group(1))
+        print(f"the pipeline refused {dropped} of {sent}")
+        assert dropped * 4 < sent, (
+            f"the pipeline refused {dropped} of {sent} frames; at that share it is not "
+            f"a busy moment, it is a consumer that cannot keep up at all"
+        )
         # Each hole reaching the demuxer as a continuity-counter jump on the video PID:
         # this is the signal the IDR request is derived from, and asserting the two
         # numbers together is what says the chain from a missing datagram to an M13 is
@@ -573,19 +591,24 @@ pkgs.testers.runNixOSTest {
         # source answers each request with a keyframe, and the assertion is that frames
         # kept arriving after the last one — the count is a large fraction of what was
         # sent, rather than the handful that would arrive if the plane had stalled.
-        sent = int(one(r"rtp media sent: (\d+) datagrams", source_log).group(1))
         delivered = int(one(
             r"encoded video source ended frames=(\d+)",
             machine.succeed(
                 "journalctl -u castaway --no-pager | grep -m1 'encoded video source ended'"
             ),
         ).group(1))
-        print(f"{delivered} frames delivered of {sent} datagrams sent")
-        # Not equality: the two datagrams dropped cost the access units they carried *and*
-        # the ones the gaps broke, an unbounded PES only completes at the next one's
-        # start, and the tables' datagram carries no frame at all.
-        assert delivered >= sent * 0.8, (
-            f"only {delivered} of {sent} access units survived; the plane stalled"
+        print(f"{delivered} frames delivered, {dropped} refused, of {sent} datagrams sent")
+        # The accounting first, which is the assertion that does not move with the host:
+        # every access unit sent either reached the pipeline or was refused by it, bar the
+        # ones the two losses cost — each hole swallows the unit it broke *and* leaves the
+        # one before it half-trusted — plus the last, still pending when TEARDOWN lands,
+        # and the tables' datagram, which carries no frame at all.
+        assert delivered + dropped >= sent * 0.9, (
+            f"{delivered} delivered + {dropped} refused does not account for {sent} sent"
+        )
+        # And then that it is still a mirror rather than a slideshow.
+        assert delivered >= sent * 0.6, (
+            f"only {delivered} of {sent} access units were played; the plane stalled"
         )
 
     with subtest("the triggered teardown ended the session cleanly"):
