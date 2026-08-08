@@ -2836,11 +2836,13 @@ async fn the_volume_slider_on_the_phone_moves_the_panel_and_is_echoed_back() {
 #[tokio::test]
 async fn a_notification_the_phone_registers_on_us_is_answered_rather_than_left_hanging() {
     // We register notifications *on* phones all the time; a phone registering one on us
-    // reaches a handler that only models the response direction, falls through to the
-    // catch-all, and gets `NOT IMPLEMENTED`. That is very likely the right answer — we are
-    // not a Target with a playlist — but nothing said so, so nobody would notice it
-    // becoming the wrong one. What must never happen is silence: AVCTP has no "ignored",
-    // so a stack that gets none waits out its transaction timeout and some abort the link.
+    // used to reach a handler that only modelled the response direction, fall through to
+    // the catch-all, and get `NOT IMPLEMENTED` — for every event, including the one we
+    // advertise (#211). The command arm exists now, and this pins its refusing half:
+    // PLAYBACK_STATUS_CHANGED is not in SUPPORTED_EVENTS — we are not a Target with a
+    // playlist — so the answer stays NOT IMPLEMENTED. What must never happen is silence:
+    // AVCTP has no "ignored", so a stack that gets none waits out its transaction timeout
+    // and some abort the link.
     let (transport, _rx) = connected().await;
     let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
 
@@ -2873,6 +2875,150 @@ async fn a_notification_the_phone_registers_on_us_is_answered_rather_than_left_h
         answer.1,
         proto_bluetooth_audio::Ctype::NotImplemented,
         "we are not a Target with events to report, and saying nothing is not an option"
+    );
+}
+
+/// Every `REGISTER_NOTIFICATION` response the adapter has sent, keeping the AVCTP label —
+/// which is the substance here: the CHANGED half of a notification answers the
+/// *registration's* transaction, not whatever command moved the value.
+fn notification_responses(
+    transport: &ScriptedTransport,
+) -> Vec<(u8, proto_bluetooth_audio::Ctype, Bytes)> {
+    sent_pdus(transport)
+        .into_iter()
+        .filter_map(|pdu| proto_bluetooth_audio::AvctpMessage::decode(&pdu.payload).ok())
+        .filter(|msg| msg.cr == CommandResponse::Response)
+        .filter_map(|msg| {
+            proto_bluetooth_audio::AvcFrame::decode(&msg.body)
+                .ok()
+                .map(|frame| (msg.transaction, frame))
+        })
+        .filter_map(|(transaction, frame)| {
+            proto_bluetooth_audio::VendorPdu::parse(&frame.operands)
+                .ok()
+                .filter(|vendor| {
+                    vendor.pdu_id == proto_bluetooth_audio::avrcp::pdu::REGISTER_NOTIFICATION
+                })
+                .map(|vendor| (transaction, frame.ctype, vendor.parameters))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn registering_the_advertised_volume_event_gets_interim_now_and_changed_on_the_move() {
+    // The mirror image of the refusal above, and the half #211 found missing:
+    // GET_CAPABILITIES advertises exactly one event, VOLUME_CHANGED, and the registration
+    // a phone sends on the strength of that answer was falling through to the same
+    // NOT IMPLEMENTED. A controller is entitled to read that as "absolute volume
+    // unsupported" and never offer it — the volume-rocker-does-nothing failure. The
+    // contract has three legs: INTERIM with the current value at registration, CHANGED
+    // under the *registration's* label when the level moves, and nothing further until
+    // the peer re-arms — AVRCP notifications are one-shot.
+    use proto_bluetooth_audio::avrcp::{event, pdu};
+    let (transport, _rx) = connected().await;
+    let (avctp, _) = open_channel(&transport, Psm::AVCTP, 0x0050).await;
+
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                5,
+                proto_bluetooth_audio::Ctype::Notify,
+                pdu::REGISTER_NOTIFICATION,
+                &[event::VOLUME_CHANGED, 0, 0, 0, 0],
+            ),
+        ),
+    );
+    let interim = eventually("the INTERIM answering the registration", || {
+        notification_responses(&transport)
+            .into_iter()
+            .find(|(_, ctype, _)| *ctype == proto_bluetooth_audio::Ctype::Interim)
+    })
+    .await;
+    assert_eq!(
+        interim.0, 5,
+        "the INTERIM must ride the registration's label"
+    );
+    assert_eq!(
+        interim.2.as_ref(),
+        &[event::VOLUME_CHANGED, 0x7F],
+        "the current level: nothing has moved it, and the pipeline's gain starts at full"
+    );
+
+    // The phone turns its slider down. The acceptance is also the event the registration
+    // asked to hear about, so both go out — and the CHANGED answers transaction 5, not 6.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                6,
+                proto_bluetooth_audio::Ctype::Control,
+                pdu::SET_ABSOLUTE_VOLUME,
+                &[0x40],
+            ),
+        ),
+    );
+    let changed = eventually("the CHANGED completing the notification", || {
+        notification_responses(&transport)
+            .into_iter()
+            .find(|(_, ctype, _)| *ctype == proto_bluetooth_audio::Ctype::Changed)
+    })
+    .await;
+    assert_eq!(
+        changed.0, 5,
+        "CHANGED answers the registration, not the command that moved the volume"
+    );
+    assert_eq!(changed.2.as_ref(), &[event::VOLUME_CHANGED, 0x40]);
+
+    // A second move with no registration outstanding, then a re-registration. Processing
+    // is in arrival order, so once the second INTERIM is visible, any CHANGED the second
+    // move wrongly produced would be visible too.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                7,
+                proto_bluetooth_audio::Ctype::Control,
+                pdu::SET_ABSOLUTE_VOLUME,
+                &[0x20],
+            ),
+        ),
+    );
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            avctp,
+            avrcp_command(
+                8,
+                proto_bluetooth_audio::Ctype::Notify,
+                pdu::REGISTER_NOTIFICATION,
+                &[event::VOLUME_CHANGED, 0, 0, 0, 0],
+            ),
+        ),
+    );
+    let rearmed = eventually("the INTERIM answering the re-registration", || {
+        notification_responses(&transport)
+            .into_iter()
+            .find(|(transaction, ctype, _)| {
+                *transaction == 8 && *ctype == proto_bluetooth_audio::Ctype::Interim
+            })
+    })
+    .await;
+    assert_eq!(
+        rearmed.2.as_ref(),
+        &[event::VOLUME_CHANGED, 0x20],
+        "the INTERIM reports the tracked level, not a constant"
+    );
+    let fired = notification_responses(&transport)
+        .into_iter()
+        .filter(|(_, ctype, _)| *ctype == proto_bluetooth_audio::Ctype::Changed)
+        .count();
+    assert_eq!(
+        fired, 1,
+        "a notification is one-shot: the move at 0x20 had no registration to answer"
     );
 }
 

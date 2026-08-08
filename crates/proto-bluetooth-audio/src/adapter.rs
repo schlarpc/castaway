@@ -334,6 +334,19 @@ struct Link {
     /// parameters — so the only thing that says *which* subscription was turned down is
     /// our own memory of the label we sent it under.
     pos_notify_txn: Option<u8>,
+    /// The label of the peer's outstanding `VOLUME_CHANGED` registration *on us* (#211).
+    ///
+    /// This is the other direction from every other notification here: the phone is the
+    /// controller and we are the Target, because GET_CAPABILITIES advertises exactly this
+    /// event. AVRCP notifications are one-shot, so the label is consumed by the CHANGED
+    /// it eventually carries; a peer that wants to keep hearing re-registers.
+    volume_notify_txn: Option<u8>,
+    /// The absolute volume this Target would report, 0..=0x7F.
+    ///
+    /// Starts at the ceiling because that is what the pipeline's gain does until a sender
+    /// says otherwise; from then on it follows `SET_ABSOLUTE_VOLUME`, and #168's panel
+    /// control will be one more writer when it exists.
+    volume: u8,
     /// The handle of the artwork last asked for, kept so the properties probe has
     /// something to name once the thumbnail it belongs to has arrived.
     art_handle: Option<String>,
@@ -494,6 +507,8 @@ impl Link {
             art_strikes: 0,
             position_poll: None,
             pos_notify_txn: None,
+            volume_notify_txn: None,
+            volume: 0x7F,
             art_handle: None,
             art_probed: None,
             art_upgraded: None,
@@ -1699,6 +1714,42 @@ impl BluetoothAdapter {
                     }
                 }
             }
+            // Inbound *command*: the phone subscribing to an event on us. We advertise
+            // exactly one — VOLUME_CHANGED — and AVRCP 1.6 §6.13 obliges a Target that
+            // lists an event in GetCapabilities to answer its registration with INTERIM
+            // plus the current value. A phone that hears NOT IMPLEMENTED instead is
+            // entitled to conclude absolute volume is unsupported, and that is the
+            // "volume rocker does nothing" failure, of our own making (#211).
+            //
+            // Guarded on the AV/C ctype rather than the AVCTP direction bit, like the
+            // rest of this match: a registration is the only NOTIFY-ctype frame on this
+            // PDU, while the INTERIM/CHANGED answering *our* registrations carry
+            // response ctypes — and stacks are looser with the AVCTP bit than with the
+            // ctype, which is why the arms below already discriminate this way.
+            avrcp::pdu::REGISTER_NOTIFICATION if frame.ctype == Ctype::Notify => {
+                match vendor.parameters.first().copied() {
+                    Some(event) if avrcp::SUPPORTED_EVENTS.contains(&event) => {
+                        // The advertised list is only VOLUME_CHANGED, so the current
+                        // value is always the volume. Remember the label: the CHANGED
+                        // that completes this notification travels under it, however
+                        // long from now the level next moves.
+                        link.volume_notify_txn = Some(msg.transaction);
+                        let response = avrcp::volume_changed_response(Ctype::Interim, link.volume);
+                        out.replies.push((cid, avctp_response(&msg, &response)));
+                    }
+                    _ => {
+                        // An event we never advertised. Refusing is right; refusing
+                        // *audibly* is mandatory — silence costs the peer a transaction
+                        // timeout, and some stacks abort the link over it.
+                        let response = avrcp::vendor_command(
+                            Ctype::NotImplemented,
+                            avrcp::pdu::REGISTER_NOTIFICATION,
+                            &[],
+                        );
+                        out.replies.push((cid, avctp_response(&msg, &response)));
+                    }
+                }
+            }
             // A refused subscription, which is how an iPhone answers
             // `PLAYBACK_POS_CHANGED`. The response names no event, so the label we sent it
             // under is the only thing that says which one was turned down — and without
@@ -1902,6 +1953,7 @@ impl BluetoothAdapter {
             avrcp::pdu::SET_ABSOLUTE_VOLUME if is_command || frame.ctype == Ctype::Accepted => {
                 // #69: the phone is authoritative. Accept and mirror it.
                 if let Some(&raw) = vendor.parameters.first() {
+                    let raw = raw & 0x7F;
                     let position = avrcp::volume_to_position(raw);
                     if link.audio.is_open() {
                         let link_sink = sink.with_instance(link.peer.to_string());
@@ -1915,9 +1967,23 @@ impl BluetoothAdapter {
                     let response = avrcp::vendor_command(
                         Ctype::Accepted,
                         avrcp::pdu::SET_ABSOLUTE_VOLUME,
-                        &[raw & 0x7F],
+                        &[raw],
                     );
                     out.replies.push((cid, avctp_response(&msg, &response)));
+                    // A moved level completes the outstanding VOLUME_CHANGED
+                    // registration, under the label it arrived on — one-shot, so the
+                    // label is spent and the peer re-registers if it wants the next
+                    // move too. Today the only mover is this very command; a panel
+                    // volume control (#168) becomes a second writer through the same
+                    // gate.
+                    if link.volume != raw {
+                        link.volume = raw;
+                        if let Some(transaction) = link.volume_notify_txn.take() {
+                            let changed = avrcp::volume_changed_response(Ctype::Changed, raw);
+                            out.replies
+                                .push((cid, avctp_notification(transaction, &changed)));
+                        }
+                    }
                 }
             }
             other if is_command => {
@@ -2527,6 +2593,21 @@ fn avctp_body(transaction: u8, frame: &AvcFrame) -> Bytes {
 /// and the original still times out.
 fn avctp_response(command: &AvctpMessage, frame: &AvcFrame) -> Bytes {
     AvctpMessage::response(command, frame.encode()).encode()
+}
+
+/// Wrap an AV/C frame as a *deferred* response: the CHANGED half of a notification.
+///
+/// It answers a command whose message is long gone — all that survives of the
+/// registration is the label we stored — so it is built from the label directly rather
+/// than from an [`AvctpMessage`] we no longer hold.
+fn avctp_notification(transaction: u8, frame: &AvcFrame) -> Bytes {
+    AvctpMessage {
+        transaction,
+        cr: CommandResponse::Response,
+        pid: crate::avctp::PID_AVRCP,
+        body: frame.encode(),
+    }
+    .encode()
 }
 
 /// `NOT IMPLEMENTED`, echoing the opcode and operands the peer sent.

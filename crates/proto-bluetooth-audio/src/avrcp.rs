@@ -512,6 +512,20 @@ pub fn register_notification(event_id: u8, interval_secs: u32) -> AvcFrame {
     vendor_command(Ctype::Notify, pdu::REGISTER_NOTIFICATION, &params)
 }
 
+/// Build our half of a `VOLUME_CHANGED` notification: the INTERIM that answers a
+/// registration, or the CHANGED that fires it later.
+///
+/// The value rides in the low seven bits — 0x7F is the ceiling AVRCP defines — and the
+/// top bit is reserved, so it is masked rather than trusted.
+#[must_use]
+pub fn volume_changed_response(ctype: Ctype, volume: u8) -> AvcFrame {
+    vendor_command(
+        ctype,
+        pdu::REGISTER_NOTIFICATION,
+        &[event::VOLUME_CHANGED, volume & 0x7F],
+    )
+}
+
 /// Build a `GetPlayStatus` command.
 #[must_use]
 pub fn get_play_status() -> AvcFrame {
