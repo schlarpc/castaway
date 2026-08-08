@@ -107,12 +107,32 @@ impl Published {
     fn sound_diagnostics(&self) -> String {
         let mix = self.audio.mix();
         format!(
-            "{:?}, clipped={} rebase_discarded={} position={}",
+            "{:?}, invented={} clipped={} rebase_discarded={} position={} held={}",
             self.mixer.counters(),
+            mix.invented(),
             mix.clipped(),
             mix.rebase_discarded(),
             mix.position(),
+            mix.held(),
         )
+    }
+
+    /// Fail unless the harness's own source kept the mixer fed.
+    ///
+    /// The premise every audio assertion below rests on, checked separately so a box that
+    /// could not schedule a thread writing 480 samples every 10 ms says *that* rather than
+    /// reporting a sync defect. `starved` is the discriminator: it counts a pass that
+    /// found a live input empty, so it separates "the source did not produce" from "the
+    /// mix mislaid what it produced" — the two diagnoses #208 spent a week between.
+    fn assert_the_source_kept_up(&self) {
+        let counters = self.mixer.counters();
+        let starved = counters.starved as f64 / f64::from(RATE);
+        assert!(
+            starved < 0.05,
+            "the harness source was descheduled for {starved:.3}s, so this box cannot \
+             measure sync — not a defect in the stream. {}",
+            self.sound_diagnostics()
+        );
     }
 }
 
@@ -124,25 +144,29 @@ impl std::ops::Deref for Published {
     }
 }
 
+/// What the panel is doing while the stream records it.
+#[derive(Default, Clone, Copy)]
+struct Scenario {
+    /// A session playing a tone, after this much silence. It takes the same `MixInput` a
+    /// real session would, so what reaches the stream reaches it the way a cast's audio
+    /// does — through the panel's one mixer — rather than through a back door the shipped
+    /// path does not have.
+    sound: Option<Duration>,
+    /// Hold the render thread still once, mid-run, for this long — a compositor that lost
+    /// its GPU to software rasterisation, which is what the CI sandbox is.
+    stall: Option<Duration>,
+}
+
 /// Drive a render loop with a stream tap attached until `segments` have been published.
 ///
 /// Returns `None` when there is honestly no GPU and no encoder. Both are tripwired, so
 /// under a build that promised either, this is a failure rather than a skip (#182).
 fn publish(width: u32, height: u32, segments: u32) -> Option<Published> {
-    publish_with(width, height, segments, None)
+    publish_with(width, height, segments, Scenario::default())
 }
 
-/// The same, with the panel playing something.
-///
-/// `sound` is handed the same `MixInput` a real session would take, so what reaches the
-/// stream reaches it the way a cast's audio does — through the panel's one mixer — rather
-/// than through a back door the shipped path does not have.
-fn publish_with(
-    width: u32,
-    height: u32,
-    segments: u32,
-    sound: Option<Session<'_>>,
-) -> Option<Published> {
+/// The same, with the panel doing something.
+fn publish_with(width: u32, height: u32, segments: u32, scenario: Scenario) -> Option<Published> {
     let compositor = panel(width, height)?;
     let config = config();
     let state = Arc::new(LiveStream::new(&config));
@@ -164,38 +188,65 @@ fn publish_with(
         Box::new(pipeline::audio_out::NullAudioOut::new())
     }));
     mixer.add_tap(audio.tap());
-    // A session, opened the way one really is.
-    let mut session = sound.map(|_| mixer.input(pipeline::mixer::Backpressure::Pull));
 
-    // Wait for the mixer's first pass before starting the clock. On the panel the mixer
-    // is started at boot and is warm long before a stream tap exists; this harness spawns
-    // it fresh, and under CI-shaped load its first pass can land hundreds of milliseconds
-    // out. A mix pass places sound at the instant it *runs*, so everything written before
-    // it would land that late on the timeline — past the ~250 ms of audio track two
-    // segments carry, which decodes as a peak of 0 with every loss counter rightly zero,
-    // because nothing was lost. Feeding silence until a pass has drained it is how the
-    // test waits for the premise the shipped path gets for free (#208).
-    // One block, not a loop of them: silence stacked here would sit in the ring ahead of
-    // the tone and delay its placement by exactly the depth it stacked.
-    if let Some(session) = session.as_mut() {
-        session
-            .write(&pipeline::audio_decode::PcmBlock {
-                sample_rate: RATE,
-                channels: 2,
-                samples: vec![0.0; 960],
-                pts: Duration::ZERO,
-            })
-            .expect("stereo at the mixer's own rate needs no resampler");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while mixer.counters().drained == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "the mixer never ran a pass: {:?}",
-                mixer.counters()
+    // Boot the mixer before the session, because the panel's is. There the browser holds
+    // an input from startup, so by the time a cast opens one the device queue is already
+    // full and the mixer is pacing to it. A mixer whose sink has *just* opened is a
+    // different machine: an empty queue is a whole `DEVICE_LEAD` of headroom, which `plan`
+    // takes in back-to-back passes, and a live session's ring is drained faster than real
+    // time for as long as that lasts — 60 ms of `starved` in this harness, which is 60 ms
+    // of silence in front of the tone.
+    //
+    // An input nobody ever writes to is exactly that boot condition and needs no new code
+    // path: it is `Supply::Surface`, so it opens the device, constrains no pass and is
+    // counted nowhere, and the mixer free-runs silence into the queue until it is full.
+    let _warm = mixer.input(pipeline::mixer::Backpressure::Pull);
+    // A device lead and a half of emitted frames: past that the queue is full and every
+    // further pass is paced by the sink rather than by the headroom.
+    let warm_enough = frames_at(Duration::from_millis(150));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mixer.counters().emitted < warm_enough {
+        assert!(
+            Instant::now() < deadline,
+            "the mixer never warmed up: {:?}",
+            mixer.counters()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // Pump until the timeline has an origin, and only then let the session start.
+    //
+    // The origin is the first composited frame, and audio that arrives before it is
+    // dropped rather than stacked at position zero (`AudioMix::add`). So a source whose
+    // sample zero predates the anchor loses exactly that much of its head, and everything
+    // it plays afterwards arrives *early* by the same amount — the placement defect with
+    // the opposite sign. It is not hypothetical: on a box contended down to four cores the
+    // first pump costs 140 ms of cold wgpu pipeline, and one run in six put the tone at
+    // 0.110 s instead of 0.250 s. Ordering these makes the source's sample zero and the
+    // timeline's origin the same instant by construction, rather than by being quick.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !audio.timeline().anchored() {
+        assert!(
+            Instant::now() < deadline,
+            "the render loop never composited a frame; status {:?}",
+            state.status()
+        );
+        state.touch(Instant::now());
+        rloop.pump();
+        if let StreamStatus::Failed(why) = state.status() {
+            let _: Option<()> = pipeline::test_media::resolve(
+                &format!("opening an H.264 encoder for the output stream ({why})"),
+                None,
             );
-            std::thread::sleep(Duration::from_millis(2));
+            return None;
         }
     }
+    let source = scenario
+        .sound
+        .map(|quiet_for| Source::tone(mixer.input(pipeline::mixer::Backpressure::Pull), quiet_for));
+
+    let loop_began = Instant::now();
+    let mut stalled = false;
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -203,8 +254,13 @@ fn publish_with(
         // is asking over HTTP.
         state.touch(Instant::now());
         rloop.pump();
-        if let (Some(session), Some(sound)) = (session.as_mut(), sound) {
-            sound(session);
+        if let Some(stall) = scenario.stall {
+            // Once, and far enough in that the tone's own silence is still running: a
+            // stall straddling the moment sound starts is the one that used to move it.
+            if !stalled && loop_began.elapsed() >= Duration::from_millis(150) {
+                stalled = true;
+                std::thread::sleep(stall);
+            }
         }
         if let StreamStatus::Failed(why) = state.status() {
             // An H.264 encoder is an ffmpeg capability, so it gets ffmpeg's tripwire: with
@@ -217,8 +273,9 @@ fn publish_with(
             return None;
         }
         if state.segment(segments).is_some() {
-            // The session's input is dropped here; the mixer itself rides along so the
-            // assertions can read its counters.
+            // The source is dropped here, which stops and joins its thread; the mixer
+            // rides along so the assertions can read its counters.
+            drop(source);
             return Some(Published {
                 state,
                 _render: rloop,
@@ -263,9 +320,6 @@ fn playable(state: &LiveStream, segments: u32) -> tempfile::NamedTempFile {
 
 /// One decoded frame's centre pixel, in the decoder's own planar Y'CbCr.
 type Centre = (u8, u8, u8);
-
-/// A session writing into the stream, poked once per pump.
-type Session<'a> = &'a dyn Fn(&mut pipeline::mixer::MixInput);
 
 /// Decode the file: what the track claims to be, and every frame's centre pixel.
 fn decode(path: &std::path::Path) -> ((u32, u32), Vec<Centre>) {
@@ -375,58 +429,99 @@ fn decode_audio(path: &std::path::Path) -> Option<Sound> {
 /// Paced against the wall clock rather than per call, because the mix places a block where
 /// the clock says it belongs — so a source that produced faster than real time would stack
 /// its blocks on the same positions and simply get louder.
-struct Tone {
-    /// Set on the first block written, not at construction: the timeline is anchored by
-    /// the first composited frame, and between building this and that there is a GPU
-    /// device to open. Starting the clock here puts the source and the timeline within a
-    /// frame of each other, which is what the placement test is measuring against.
-    started: std::cell::RefCell<Option<Instant>>,
-    quiet_for: Duration,
-    last: std::cell::RefCell<Option<Instant>>,
-    phase: std::cell::Cell<u64>,
+/// How often the source wakes. A decoder hands over about a packet's worth at a time.
+const SOURCE_TICK: Duration = Duration::from_millis(10);
+
+/// How many frames of [`RATE`] audio fit in `elapsed`.
+fn frames_at(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos() * u128::from(RATE) / 1_000_000_000).unwrap_or(0)
 }
 
-impl Tone {
-    fn after(quiet_for: Duration) -> Self {
+/// A session playing into the panel's mixer, the way an adapter is one: on a thread of its
+/// own, with its position counted in samples.
+///
+/// Both halves of that are load-bearing, and neither used to hold (#208). This was a
+/// closure called from inside `pump()`, so the "session" stopped producing whenever the
+/// render thread did — and the render thread is the expensive one, compositing under
+/// lavapipe while libx264 takes the rest of the box. Ground rule 4 says a source is an
+/// actor on its own clock precisely so that cannot happen; no shipped adapter is driven
+/// this way (the browser's audio comes off `browser-reader`, sessions off their decoders).
+///
+/// Injecting the stall proved it end to end before this changed: a render thread held
+/// still for 100/200/300 ms moved the tone 74/109/207 ms late, bracketing the 135 ms and
+/// 212 ms measured in the sandbox. The stall is a scenario now
+/// (`a_stalled_render_thread_does_not_move_the_sound`), so what it used to measure by
+/// accident it now measures on purpose.
+struct Source {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Source {
+    /// Play `quiet_for` of silence, then a 440 Hz tone, until dropped.
+    fn tone(mut input: pipeline::mixer::MixInput, quiet_for: Duration) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = std::thread::Builder::new()
+            .name("harness-source".into())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    let quiet = frames_at(quiet_for);
+                    let began = Instant::now();
+                    let mut written: u64 = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // What this source owes by now, against a fixed schedule rather
+                        // than against the last wake. A thread that was slept on then
+                        // delivers the audio it missed instead of shortening it, and the
+                        // boundary between silence and tone stays at sample `quiet`
+                        // however the scheduler behaved — a wall-clock `loud` flag moved
+                        // it, which is half of why the old source was fragile.
+                        let owed = frames_at(began.elapsed()).saturating_sub(written);
+                        if owed == 0 {
+                            std::thread::sleep(SOURCE_TICK);
+                            continue;
+                        }
+                        let samples: Vec<f32> = (0..owed)
+                            .flat_map(|i| {
+                                let n = written + i;
+                                if n < quiet {
+                                    return [0.0, 0.0];
+                                }
+                                let t = (n - quiet) as f32 / RATE as f32;
+                                let s = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+                                [s, s]
+                            })
+                            .collect();
+                        written += owed;
+                        if input
+                            .write(&pipeline::audio_decode::PcmBlock {
+                                sample_rate: RATE,
+                                channels: 2,
+                                samples,
+                                pts: Duration::ZERO,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        std::thread::sleep(SOURCE_TICK);
+                    }
+                }
+            })
+            .expect("a thread for the harness source");
         Self {
-            started: std::cell::RefCell::new(None),
-            quiet_for,
-            last: std::cell::RefCell::new(None),
-            phase: std::cell::Cell::new(0),
+            stop,
+            thread: Some(thread),
         }
     }
+}
 
-    fn feed(&self, out: &mut pipeline::mixer::MixInput) {
-        let now = Instant::now();
-        let mut last = self.last.borrow_mut();
-        let since = last.map_or(Duration::from_millis(10), |t| {
-            now.saturating_duration_since(t)
-        });
-        if since < Duration::from_millis(10) {
-            return;
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
-        *last = Some(now);
-        let frames = usize::try_from(since.as_millis() * u128::from(RATE) / 1000).unwrap_or(0);
-        let phase = self.phase.get();
-        self.phase.set(phase + frames as u64);
-        let started = *self.started.borrow_mut().get_or_insert(now);
-        let loud = now.saturating_duration_since(started) >= self.quiet_for;
-        let samples: Vec<f32> = (0..frames)
-            .flat_map(|i| {
-                if !loud {
-                    return [0.0, 0.0];
-                }
-                let t = (phase + i as u64) as f32 / RATE as f32;
-                let s = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
-                [s, s]
-            })
-            .collect();
-        let _ = out.write(&pipeline::audio_decode::PcmBlock {
-            sample_rate: RATE,
-            channels: 2,
-            samples,
-            pts: Duration::ZERO,
-        });
     }
 }
 
@@ -559,8 +654,15 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     // Through the shipped path: a session takes an output from the tee'd factory and
     // writes to it exactly as a cast does. If the tee, the resampler, the mix, the AAC
     // encoder, the `esds` or the second `traf` is wrong, this is silence.
-    let tone = Tone::after(Duration::ZERO);
-    let Some(state) = publish_with(320, 176, 2, Some(&|out| tone.feed(out))) else {
+    let Some(state) = publish_with(
+        320,
+        176,
+        2,
+        Scenario {
+            sound: Some(Duration::ZERO),
+            ..Scenario::default()
+        },
+    ) else {
         return;
     };
     let file = playable(&state, 2);
@@ -579,7 +681,7 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
 fn a_silent_panel_still_carries_a_continuous_audio_track() {
     // The normal case, and the one that breaks players: a track that stops when nothing
     // is playing is one a browser stalls on. Silence has to be *produced*.
-    let Some(state) = publish_with(320, 176, 2, None) else {
+    let Some(state) = publish_with(320, 176, 2, Scenario::default()) else {
         return;
     };
     let file = playable(&state, 2);
@@ -598,7 +700,7 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
     // audio running *ahead*, which would mean it was being placed by arrival rather than
     // by the clock, and would compound into real drift.
     let segments = 4;
-    let Some(state) = publish_with(320, 176, segments, None) else {
+    let Some(state) = publish_with(320, 176, segments, Scenario::default()) else {
         return;
     };
     let file = playable(&state, segments);
@@ -616,52 +718,76 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
     );
 }
 
-/// **`#[ignore]`d against #208, which this test found the first time it ever ran.**
-///
-/// The file is `required-features = ["stream"]` and no `nix flake check` derivation
-/// enabled `stream` until D55, so this assertion had never executed anywhere but a
-/// developer's box. On the dev box's hardware encoder it passes. In the CI sandbox, where
-/// the encoder probe falls back to libx264, the tone lands 135–212 ms late against a
-/// ±60 ms bound — so the duplicate's A/V alignment depends on which encoder opened, which
-/// is a real defect in `/stream/*` and not a flaky test.
-///
-/// Exclusivity was tried first (`.config/nextest.toml`) on the theory that this was a
-/// starved real-time measurement like the mixer's. It is not: with the runner to itself
-/// the miss got *larger*. Removing the guess rather than leaving it in place.
-///
-/// This is a deliberate, named exception so `checks.test` can be green while #208 is
-/// open. It is the same debt #183 is about, and it should be short-lived.
+/// How long the panel is quiet before the tone, in the two placement tests.
+const QUIET: Duration = Duration::from_millis(250);
+
+/// Where the tone came back in the decoded track, or `None` where there is no GPU.
+fn tone_onset(scenario: Scenario) -> Option<f64> {
+    let segments = 4;
+    let state = publish_with(320, 176, segments, scenario)?;
+    state.assert_the_source_kept_up();
+    let file = playable(&state, segments);
+    let sound = decode_audio(file.path()).unwrap();
+    let onset = sound.onset.unwrap_or_else(|| {
+        panic!(
+            "no tone anywhere in the track. {}",
+            state.sound_diagnostics()
+        )
+    });
+    let at = onset as f64 / f64::from(RATE);
+    eprintln!("onset {at:.3}s; {}", state.sound_diagnostics());
+    assert!(
+        (at - QUIET.as_secs_f64()).abs() < 0.06,
+        "the tone starts {at:.3}s in; it was played at {:.3}s. {}",
+        QUIET.as_secs_f64(),
+        state.sound_diagnostics()
+    );
+    Some(at)
+}
+
 #[test]
-#[ignore = "#208: audio lands late when a software H.264 encoder opens"]
 fn sound_lands_where_on_the_timeline_it_was_played() {
     // The sync assertion. The session is silent for a quarter of a second and then plays,
     // and the tone has to show up a quarter of a second into the decoded audio — not at
     // the start, which is where it would land if the mix placed blocks by arrival, and not
     // shifted by the encoder's priming delay, which is what `initial_padding` cancels.
-    let quiet = Duration::from_millis(250);
-    let tone = Tone::after(quiet);
-    let segments = 4;
-    let Some(state) = publish_with(320, 176, segments, Some(&|out| tone.feed(out))) else {
-        return;
-    };
-    let file = playable(&state, segments);
-    let sound = decode_audio(file.path()).unwrap();
-    let onset = sound
-        .onset
-        .expect("the tone should be somewhere in the track");
-    let at = onset as f64 / f64::from(RATE);
-    assert!(
-        (at - quiet.as_secs_f64()).abs() < 0.06,
-        "the tone starts {at:.3}s in; it was played at {:.3}s",
-        quiet.as_secs_f64()
-    );
+    //
+    // `#[ignore]`d against #208 for as long as it took to find out which of three
+    // candidate defects it was measuring. It was the harness: a "session" driven from
+    // inside the render loop (see [`Source`]), which under lavapipe and libx264 stops
+    // producing for a fifth of a second at a time. The stream's own defect was real and
+    // is fixed too — a burst of mixer passes summed onto one instant — but it was never
+    // what this assertion caught, and the sandbox's dependence on the *encoder* was the
+    // render thread losing its cores to it, not the audio path consulting it.
+    tone_onset(Scenario {
+        sound: Some(QUIET),
+        ..Scenario::default()
+    });
+}
+
+#[test]
+fn a_stalled_render_thread_does_not_move_the_sound() {
+    // The same assertion with the failure injected: the render thread held still for
+    // 300 ms straddling the moment the tone starts. Before the source became an actor of
+    // its own this moved the onset 207 ms — 100/200/300 ms of stall bought 74/109/207 ms
+    // of miss, which brackets the 135 ms and 212 ms the sandbox produced by accident.
+    //
+    // Kept because it is the only thing here that fails if a "session" is ever wired back
+    // onto the render thread, and because the panel really does stall: a browser paint
+    // and a compositor pass share that thread with everything else `RenderLoop` does.
+    // Sound the panel plays during a stall is sound it played, and it belongs where the
+    // clock says.
+    tone_onset(Scenario {
+        sound: Some(QUIET),
+        stall: Some(Duration::from_millis(300)),
+    });
 }
 
 #[test]
 fn the_stream_says_it_has_both_tracks() {
     // What an MSE `SourceBuffer` is opened with. One track missing from the codec string
     // and the browser refuses the whole stream.
-    let Some(state) = publish_with(320, 176, 1, None) else {
+    let Some(state) = publish_with(320, 176, 1, Scenario::default()) else {
         return;
     };
     let StreamStatus::Live { codec, encoder, .. } = state.status() else {
