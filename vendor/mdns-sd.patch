@@ -1,0 +1,124 @@
+--- a/src/service_info.rs
++++ b/src/service_info.rs
+@@ -98,6 +98,18 @@
+     /// <https://datatracker.ietf.org/doc/html/rfc6763#section-7.1>
+     sub_domain: Option<String>, // <subservice>._sub.<service>.<domain>
+ 
++    /// Every subtype this instance is published under, fully qualified, including
++    /// `sub_domain` when that is set.
++    ///
++    /// RFC 6763 section 7.1 puts no limit on how many subtypes one instance may carry,
++    /// and a service that runs several applications genuinely has several: a Cast
++    /// receiver publishes one per application id so a sender browsing for a particular
++    /// application finds it while browsing, before it connects to anything.
++    ///
++    /// `sub_domain` is kept as the first of these so every existing accessor keeps its
++    /// meaning; this is the whole set, and it is what answering and announcing iterate.
++    sub_domains: Vec<String>,
++
+     fullname: String, // <instance>.<service>.<domain>
+     server: String,   // fully qualified name for service host
+     addresses: HashSet<IpAddr>,
+@@ -178,6 +190,7 @@
+         let fullname = format!("{escaped_name}.{ty_domain}");
+         let ty_domain = ty_domain.to_string();
+         let sub_domain = sub_domain.map(str::to_string);
++        let sub_domains = sub_domain.iter().cloned().collect::<Vec<_>>();
+         let server = normalize_hostname(host_name.to_string());
+         let addresses = ip.as_ip_addrs()?;
+         let txt_properties = properties.into_txt_properties();
+@@ -214,6 +227,7 @@
+         let this = Self {
+             ty_domain,
+             sub_domain,
++            sub_domains,
+             fullname,
+             server,
+             addresses,
+@@ -294,9 +308,41 @@
+         &self.sub_domain
+     }
+ 
+-    /// Returns whether the service type or subtype matches the given name.
++    /// Returns every subtype this instance is published under, fully qualified.
++    ///
++    /// For example: `["_printer._sub._http._tcp.local."]`.
++    #[inline]
++    pub fn get_subtypes(&self) -> &[String] {
++        &self.sub_domains
++    }
++
++    /// Publish this instance under an additional subtype, fully qualified
++    /// (`_printer._sub._http._tcp.local.`).
++    ///
++    /// The first subtype added — whether here or through the type string given to
++    /// [`ServiceInfo::new`] — is also the one [`ServiceInfo::get_subtype`] reports.
++    pub fn add_subtype(&mut self, subtype: String) {
++        if self.sub_domains.iter().any(|existing| *existing == subtype) {
++            return;
++        }
++        if self.sub_domain.is_none() {
++            self.sub_domain = Some(subtype.clone());
++        }
++        self.sub_domains.push(subtype);
++    }
++
++    /// Builder form of [`ServiceInfo::add_subtype`].
++    #[must_use]
++    pub fn with_subtypes(mut self, subtypes: &[String]) -> Self {
++        for subtype in subtypes {
++            self.add_subtype(subtype.clone());
++        }
++        self
++    }
++
++    /// Returns whether the service type or any of its subtypes matches the given name.
+     pub(crate) fn matches_type_or_subtype(&self, name: &str) -> bool {
+-        name == self.get_type() || self.get_subtype().as_ref().is_some_and(|v| v == name)
++        name == self.get_type() || self.sub_domains.iter().any(|v| v == name)
+     }
+ 
+     /// Returns a reference of the service fullname.
+@@ -459,7 +505,10 @@
+     }
+ 
+     pub(crate) fn _set_subtype(&mut self, subtype: String) {
+-        self.sub_domain = Some(subtype);
++        self.sub_domain = Some(subtype.clone());
++        if !self.sub_domains.iter().any(|existing| *existing == subtype) {
++            self.sub_domains.push(subtype);
++        }
+     }
+ 
+     /// host_ttl is for SRV and address records
+--- a/src/dns_parser.rs
++++ b/src/dns_parser.rs
+@@ -1932,7 +1932,7 @@
+             return;
+         }
+ 
+-        if let Some(sub) = service.get_subtype() {
++        for sub in service.get_subtypes() {
+             trace!("Adding subdomain {}", sub);
+             self.add_additional_answer(DnsPointer::new(
+                 sub,
+--- a/src/service_daemon.rs
++++ b/src/service_daemon.rs
+@@ -2363,7 +2363,7 @@
+             0,
+         );
+ 
+-        if let Some(sub) = info.get_subtype() {
++        for sub in info.get_subtypes() {
+             trace!("Adding subdomain {}", sub);
+             out.add_answer_at_time(
+                 DnsPointer::new(
+@@ -4734,7 +4734,7 @@
+         0,
+     );
+ 
+-    if let Some(sub) = info.get_subtype() {
++    for sub in info.get_subtypes() {
+         trace!("Adding subdomain {}", sub);
+         out.add_answer_at_time(
+             DnsPointer::new(

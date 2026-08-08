@@ -332,6 +332,13 @@
               # The Windows resource script and the .exe icon it embeds (app/build.rs).
               || (pkgs.lib.hasSuffix ".rc" path)
               || (pkgs.lib.hasSuffix ".ico" path)
+              # The patched third-party crates under `vendor/` (see vendor/README.md).
+              # `[patch.crates-io]` points Cargo at them by path, so they are build
+              # inputs exactly like a workspace member: without this the sandbox fails
+              # at `cargo metadata` with "failed to read vendor/<crate>/Cargo.toml",
+              # which is at least loud. By path rather than by suffix because a crate is
+              # whatever files it ships — licences, a README, a build script.
+              || (pkgs.lib.hasInfix "/vendor/" path)
               # Everything under a fixtures/ directory, wholesale: ground rule 9 lands
               # reverse engineering as checked-in fixtures, and several are files no
               # suffix rule can name — proto-cast's extensionless `expect`/`time`

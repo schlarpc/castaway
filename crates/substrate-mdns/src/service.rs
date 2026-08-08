@@ -243,7 +243,16 @@ impl MdnsService {
     /// # Errors
     /// [`MdnsError`] on a bad type or if `ServiceInfo` construction fails.
     pub fn to_service_info(&self) -> Result<ServiceInfo, MdnsError> {
-        self.to_service_info_for(None)
+        let info = self.to_service_info_for(None)?;
+        // Every sub-type on the one instance. `with_subtypes` is the patched crate's
+        // (#227); upstream holds a single `Option<String>` and would keep only the last
+        // of several registrations, silently.
+        let qualified = self
+            .subtypes
+            .iter()
+            .map(|subtype| self.qualified_subtype(subtype))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(info.with_subtypes(&qualified))
     }
 
     /// The `ServiceInfo` for this instance, optionally registered under one sub-type.

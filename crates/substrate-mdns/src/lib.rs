@@ -86,38 +86,23 @@ impl MdnsResponder {
                 "instance name is not encodable as one DNS label; advertising a repaired name"
             );
         }
+        // One registration carrying every sub-type, not one registration per sub-type.
+        // The difference is not style: `mdns-sd`'s registry is keyed by a fullname that
+        // does not include the sub-type, so N registrations of one instance silently
+        // collapse to the last — which is what #227 is, and why the patched crate takes
+        // them all at once instead.
         let info = service.to_service_info()?;
         let fullname = info.get_fullname().to_string();
         self.daemon
             .register(info)
             .map_err(|e| MdnsError::Register(e.to_string()))?;
-        info!(service = %service.service_type, instance = %service.instance, "mDNS advertised");
+        info!(
+            service = %service.service_type,
+            instance = %service.instance,
+            subtypes = service.subtypes.len(),
+            "mDNS advertised"
+        );
         self.registered.push(fullname);
-
-        // Then the same instance again, once per sub-type, because `mdns-sd` carries a
-        // single `sub_domain` per `ServiceInfo`. `my_services` is keyed by *fullname*,
-        // which does not include the sub-type — so how many of these survive alongside
-        // each other is the library's business and not something to assume. Whatever it
-        // does, publishing the base type has already succeeded above, so a sub-type that
-        // does not take costs discovery-time filtering and not the device.
-        for subtype in &service.subtypes {
-            match service.to_service_info_for(Some(subtype)) {
-                Ok(info) => {
-                    if let Err(e) = self.daemon.register(info) {
-                        warn!(
-                            service = %service.service_type,
-                            %subtype,
-                            error = %e,
-                            "could not advertise a sub-type; senders filtering on it will \
-                             not see this device"
-                        );
-                    } else {
-                        debug!(service = %service.service_type, %subtype, "mDNS sub-type advertised");
-                    }
-                }
-                Err(e) => warn!(%subtype, error = %e, "malformed mDNS sub-type"),
-            }
-        }
         Ok(())
     }
 

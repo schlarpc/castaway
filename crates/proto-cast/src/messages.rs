@@ -74,19 +74,15 @@ const STREAMING_APP_IDS: [&str; 6] = [
 /// looking for those still find us the slower way, by connecting and asking
 /// `GET_APP_AVAILABILITY`.
 ///
-/// **Order matters, for a reason that is a bug in something else.** `mdns-sd` keys its
-/// registry by fullname, which does not include the sub-type, so registering one
-/// instance under several sub-types silently keeps only the last — measured on the wire
-/// (#227). Until that is fixed, the most valuable id goes last so the one sub-type that
-/// survives is the one a phone's mirroring picker filters on.
+/// Order carries no meaning: every one of these is published, and a sender finds us by
+/// whichever it browses for. That is worth stating because it was briefly false — the
+/// list was ordered so the mirroring id came last, because the mDNS crate served only
+/// the last sub-type registered and silently dropped the rest (#227). The fix belongs
+/// in the responder, not in an ordering here that nothing could enforce.
 #[must_use]
 pub fn native_app_ids() -> Vec<&'static str> {
     std::iter::once(DEFAULT_MEDIA_RECEIVER_APP_ID)
         .chain(STREAMING_APP_IDS)
-        // Android mirroring, audio + video: what the system cast picker asks for on a
-        // device with a screen, and therefore the one to keep if only one survives.
-        .filter(|id| *id != "674A0243")
-        .chain(std::iter::once("674A0243"))
         .collect()
 }
 

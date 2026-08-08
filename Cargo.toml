@@ -258,3 +258,20 @@ panic = "abort"
 [profile.test]
 opt-level = 0
 debug = true
+
+# `mdns-sd`, plus the one capability it does not have: several DNS-SD sub-types on one
+# service instance (#227). Upstream's `ServiceInfo` holds a single `Option<String>` and
+# its registry is keyed by a fullname with the sub-type stripped, so registering an
+# instance under N sub-types silently keeps only the last — every `register()` returning
+# Ok while six of seven records never reach the wire. That is fatal here: Play Services
+# matches a discovered device to its filter criteria out of the sub-types in the mDNS
+# answer alone, so each unserved one is a picker this panel is invisible to (#226).
+#
+# The patch is additive and backwards-compatible — `sub_domains: Vec<String>` beside the
+# existing `sub_domain`, which stays the first of them, so every existing accessor keeps
+# its meaning — and is kept as `vendor/mdns-sd.patch` so an upstream bump is re-apply
+# rather than re-derive. Nobody has reported this upstream (the closest is
+# keepsimple1/mdns-sd#145, the browse half of the same root cause), so it is offered
+# rather than owned: the fork exists to be deleted.
+[patch.crates-io]
+mdns-sd = { path = "vendor/mdns-sd" }
