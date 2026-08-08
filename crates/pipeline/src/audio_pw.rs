@@ -266,7 +266,11 @@ impl AudioOut for PipeWireAudioOut {
     }
 
     fn frames_played(&self) -> Option<u64> {
-        Some(self.played.load(Ordering::Relaxed))
+        // Only while a stream is actually consuming — see the cpal side for why a
+        // counter that has stopped must not be reported as a device that is keeping up.
+        self.samples
+            .is_some()
+            .then(|| self.played.load(Ordering::Relaxed))
     }
 
     fn underruns(&self) -> Option<u64> {
@@ -274,17 +278,22 @@ impl AudioOut for PipeWireAudioOut {
     }
 
     fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
-        // A sink that errored or was unlinked. As on the cpal side this no longer ends
-        // the session: live audio is dropped while there is nowhere to put it, and
-        // playback resumes when the sink returns.
+        // A sink that errored or was unlinked. As on the cpal side this does not end the
+        // session — the mixer answers an `Err` by swapping in a silent sink that keeps
+        // pacing and retrying — but it must not be reported as delivery, which wedged the
+        // mixer and the backend against each other (#55, #218; see `audio_out.rs`).
         if self.lost.swap(false, Ordering::Relaxed) {
             self.release();
         }
         if self.samples.is_none() && !self.recover() {
-            return Ok(());
+            return Err(PipelineError::Audio(
+                "the pipewire sink has gone away".into(),
+            ));
         }
         let Some(tx) = self.samples.as_ref() else {
-            return Ok(());
+            return Err(PipelineError::Audio(
+                "the pipewire sink has gone away".into(),
+            ));
         };
         match tx.try_send(block.samples.clone()) {
             Ok(()) => Ok(()),

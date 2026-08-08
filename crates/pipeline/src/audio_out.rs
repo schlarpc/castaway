@@ -515,7 +515,16 @@ mod cpal_backend {
 
     impl AudioOut for CpalAudioOut {
         fn frames_played(&self) -> Option<u64> {
-            Some(self.played.load(Ordering::Relaxed))
+            // Only while a stream is actually consuming. `played` is an `Arc` the device
+            // callback drives and it survives a `release()`, so answering with it after
+            // the endpoint went away reports a counter that has stopped as a device that
+            // has stopped *needing* — and the mixer, whose `inflight` is
+            // `submitted - played`, reads a queue that is permanently full. `None` is the
+            // documented "this sink cannot count", which is what the wall-clock fallback
+            // is for.
+            self.samples
+                .is_some()
+                .then(|| self.played.load(Ordering::Relaxed))
         }
 
         fn underruns(&self) -> Option<u64> {
@@ -532,22 +541,36 @@ mod cpal_backend {
 
         fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
             // An endpoint that went away, or a default that moved out from under us.
-            // Neither ends the session any more: live audio is dropped while the output
-            // is unavailable, which is the same trade the rest of the pipeline makes
-            // (latency beats freshness), and playback resumes when it returns.
+            // Neither ends the *session* — that was the point of not erroring here, and
+            // it is still right — but saying `Ok` for audio that went nowhere is not how
+            // to achieve it, and since #111 it is not needed: the only caller is the
+            // mixer, which answers an `Err` by swapping in a silent sink that keeps
+            // pacing on the wall and retrying every `REOPEN_AFTER`. Sessions carry on
+            // either way.
+            //
+            // Saying `Ok` instead deadlocked the two of them. The mixer counted the
+            // binned frames as submitted against a `played` that had stopped, so
+            // `inflight` pinned above `DEVICE_LEAD`, `plan` returned `Sleep` forever, and
+            // `write` — the only place `recover()` is reached from — was never called
+            // again. The panel stayed silent, with `Pull` sources parking for the full
+            // write deadline per block, until every session ended (#55, #218).
             if self.lost.swap(false, Ordering::Relaxed) {
                 self.invalidations += 1;
                 self.release();
             }
             if self.samples.is_none() {
                 if !self.recover() {
-                    return Ok(());
+                    return Err(PipelineError::Audio(
+                        "the output endpoint has gone away".into(),
+                    ));
                 }
             } else if self.default_moved() {
                 info!("audio output: the system default moved; following it");
                 self.last_attempt = None;
                 if !self.recover() {
-                    return Ok(());
+                    return Err(PipelineError::Audio(
+                        "the system default output moved and the new one will not open".into(),
+                    ));
                 }
             }
 
