@@ -196,6 +196,21 @@ const IDLE_CLOSE: Duration = Duration::from_secs(5);
 /// How often the mixer retries a device it could not open, or that failed.
 const REOPEN_AFTER: Duration = Duration::from_secs(1);
 
+/// How long a sink may consume nothing at all before it is treated as gone.
+///
+/// Bounded on both sides, and both bounds matter. Above: five times [`DEVICE_LEAD`], the
+/// most the device is ever holding, so a counter that has not moved in this long is not a
+/// busy device whatever it reports. Below: comfortably inside [`WRITE_DEADLINE`], because
+/// the loop is not draining while it waits this out — set to `2s` first, and a `Pull`
+/// writer lost exactly one block to the deadline before the watchdog fired.
+///
+/// What it guards against is permanent and what it costs when wrong is one reopen. A
+/// backend that stops draining without saying so is otherwise indistinguishable from a
+/// full queue, and the mixer answers a full queue by sleeping — so the two compose into a
+/// deadlock that outlives every session
+/// (`a_backend_that_bins_audio_without_saying_so_does_not_wedge_the_mixer`).
+const SINK_STALL: Duration = Duration::from_millis(500);
+
 /// How many refusals in a row are still treated as an outage rather than as a verdict.
 ///
 /// The cases worth being impatient about are transient — a panel waking from DPMS (#55), a
@@ -1178,6 +1193,14 @@ struct Sink {
     submitted: u64,
     /// When it was opened, for a sink that cannot count.
     started: Instant,
+    /// The last time [`Self::played`] was seen to advance, and what it read.
+    ///
+    /// The mixer's whole pacing rests on `played` moving. Nothing else in the loop can
+    /// tell a device that is *briefly full* from one that has stopped forever, because
+    /// both look like `inflight` at the lead — and the second one is a deadlock:
+    /// [`plan`] returns [`Pass::Sleep`], so nothing is written, so `inflight` never
+    /// falls, so it sleeps again. See [`SINK_STALL`].
+    progress: (Instant, u64),
 }
 
 impl Sink {
@@ -1189,12 +1212,34 @@ impl Sink {
         if out.start(RATE, CHANNELS).is_err() {
             warn!("mixer: even the null sink refused the mix");
         }
+        let started = Instant::now();
         Self {
             out,
             real: false,
             submitted: 0,
-            started: Instant::now(),
+            started,
+            progress: (started, 0),
         }
+    }
+
+    /// Whether this sink has stopped consuming altogether.
+    ///
+    /// A liveness check, not a health metric, and the only thing in the loop that can
+    /// break the deadlock described on [`Self::progress`]. The device is handed at most
+    /// [`DEVICE_LEAD`] at a time and is meant to consume it in real time, so a counter
+    /// that has not moved in [`SINK_STALL`] — twenty times the lead — is not a busy
+    /// device whatever it reports. Owed frames are required as well, so a sink nobody is
+    /// writing to is never accused.
+    ///
+    /// A sink that cannot count reads the wall instead ([`Self::played`]) and therefore
+    /// always advances, which is right: the wall is never the thing that stopped.
+    fn stalled(&mut self, now: Instant) -> bool {
+        let played = self.played(now);
+        if played > self.progress.1 {
+            self.progress = (now, played);
+            return false;
+        }
+        self.submitted > played && now.saturating_duration_since(self.progress.0) >= SINK_STALL
     }
 
     /// Frames this sink has played: by its own clock where it has one, by the wall where
@@ -1268,6 +1313,20 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
             }
         }
 
+        // Before anything is decided from `inflight`, ask whether the number still means
+        // what the rest of the loop assumes. A sink that has stopped consuming is dropped
+        // for the silent one, which paces on the wall — the same answer as a failed
+        // write, reached without needing the backend to admit anything.
+        if sink.stalled(now) {
+            warn!(
+                submitted = sink.submitted,
+                "mixer: the output device stopped taking audio; carrying on in silence"
+            );
+            sink.close();
+            sink = Sink::silent();
+            retry_at = Some(now + REOPEN_AFTER);
+            continue;
+        }
         let inflight = sink.inflight(now);
         shared.device_inflight.store(inflight, Ordering::Relaxed);
 
@@ -1364,11 +1423,13 @@ fn open(device: &AudioOutputFactory) -> Result<Sink, PipelineError> {
         channels = CHANNELS,
         "mixer: output device open"
     );
+    let started = Instant::now();
     Ok(Sink {
         out,
         real: true,
         submitted: 0,
-        started: Instant::now(),
+        started,
+        progress: (started, 0),
     })
 }
 
@@ -2440,18 +2501,31 @@ mod tests {
                     Duration::from_nanos(1_000_000_000u64 * PACKET as u64 / u64::from(SOURCE_RATE));
                 let started = Instant::now();
                 let mut next = started;
+                // Packets before the ramp ends, and packets after, counted separately: the
+                // whole point is that they are offered at different rates, so one average
+                // over both would prove nothing about either.
+                let ramp_packets = RAMP.as_nanos() / (period * 3).as_nanos();
+                let (mut sent, mut steady) = (0u64, 0u64);
+                let mut steady_from = None;
                 while !stop.load(Ordering::Relaxed) {
                     input.write(&block).unwrap();
-                    // A third of real time during the ramp, real time after.
-                    next += if started.elapsed() < RAMP {
+                    sent += 1;
+                    // A third of real time during the ramp, real time after. Counted, not
+                    // clocked: `started.elapsed()` here would move the ramp's boundary
+                    // under a descheduled thread, so the deficit the test sets up would
+                    // vary run to run and the steady state would start somewhere else.
+                    next += if u128::from(sent) <= ramp_packets {
                         period * 3
                     } else {
+                        steady_from.get_or_insert_with(Instant::now);
+                        steady += 1;
                         period
                     };
                     if let Some(wait) = next.checked_duration_since(Instant::now()) {
                         std::thread::sleep(wait);
                     }
                 }
+                (steady, steady_from.map(|at| at.elapsed()))
             })
         };
 
@@ -2461,7 +2535,20 @@ mod tests {
         std::thread::sleep(WINDOW);
         let heard = device.heard.lock().unwrap()[from..].to_vec();
         stop.store(true, Ordering::Relaxed);
-        producer.join().unwrap();
+        let (steady, producing) = producer.join().unwrap();
+
+        // The harness's own honesty first, as in the test above — and here it is the
+        // *post-ramp* rate that matters, because that is the span being measured. A
+        // producer parked after the ramp leaves real holes, which the mixer pads
+        // correctly, and the assertion below would report them as the ramp's deficit
+        // never having been deferred (#208).
+        let producing = producing.expect("the ramp should have ended well inside the window");
+        let offered = steady as f64 * PACKET as f64 / producing.as_secs_f64();
+        assert!(
+            offered > f64::from(SOURCE_RATE) * 0.97,
+            "after the ramp the producer only kept {offered:.0} frames/s of its \
+             {SOURCE_RATE} Hz schedule; it was parked, so the measurement below is of that"
+        );
 
         let frames = heard.chunks_exact(usize::from(CHANNELS));
         let total = frames.len();
@@ -2533,6 +2620,111 @@ mod tests {
         assert_eq!(
             input.dropped, 0,
             "nothing should have hit the write deadline"
+        );
+    }
+
+    /// The panel goes to sleep and takes the sink with it — modelled the way the
+    /// *backends* behave rather than the way the trait says they do.
+    ///
+    /// [`AudioOut::write`]'s contract is "`Err` if the device has gone away", and #55's
+    /// whole mechanism hangs off it: swap in a silent sink, keep pacing on a monotonic
+    /// timer so every source carries on draining, retry every [`REOPEN_AFTER`]. Both real
+    /// backends returned `Ok(())` instead — they bin the audio and recover internally —
+    /// and their `played` counter is an `Arc` the device callback drives, so on loss it
+    /// froze rather than going `None`.
+    ///
+    /// Composed, those two were a mutual stall that neither side could see. `inflight`
+    /// is `submitted - played`, so a frozen `played` pins it above [`DEVICE_LEAD`];
+    /// [`plan`] then returns [`Pass::Sleep`] forever; [`mix_pass`] — the only caller of
+    /// `room.notify_all` — never runs again, so every [`Backpressure::Pull`] writer parks
+    /// for the full [`WRITE_DEADLINE`] per block and drops it. And the backends' own
+    /// recovery lives *inside* `write`, which the mixer has by then stopped calling. The
+    /// panel stayed silent until every session ended and stayed ended for
+    /// [`IDLE_CLOSE`].
+    ///
+    /// The two tests either side of this one pass against fakes that return `Err` and
+    /// `None`. That is exactly why this went unseen for so long: they model the contract,
+    /// and nothing modelled the implementations. This fake is written to the observed
+    /// behaviour on purpose, so it stays honest if the backends drift back.
+    #[test]
+    fn a_backend_that_bins_audio_without_saying_so_does_not_wedge_the_mixer() {
+        struct SleepsWithoutSaying {
+            lost: Arc<AtomicBool>,
+            started: Instant,
+            /// Where the device callback stopped counting.
+            frozen: Arc<Mutex<Option<u64>>>,
+        }
+
+        impl AudioOut for SleepsWithoutSaying {
+            fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
+                Ok(())
+            }
+
+            fn frames_played(&self) -> Option<u64> {
+                let live = frames_in(self.started.elapsed());
+                if !self.lost.load(Ordering::Relaxed) {
+                    return Some(live);
+                }
+                // The callback stopped; the counter it drives stopped with it, and the
+                // backend goes on answering with the last value it had.
+                let mut frozen = self
+                    .frozen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Some(*frozen.get_or_insert(live))
+            }
+
+            fn write(&mut self, _block: &PcmBlock) -> Result<(), PipelineError> {
+                // The whole finding, in one line: audio the device never got, reported
+                // as delivered.
+                Ok(())
+            }
+
+            fn stop(&mut self) {}
+        }
+
+        let lost = Arc::new(AtomicBool::new(false));
+        let frozen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let mixer = AudioMixer::new(Arc::new({
+            let lost = Arc::clone(&lost);
+            let frozen = Arc::clone(&frozen);
+            move || {
+                Box::new(SleepsWithoutSaying {
+                    lost: Arc::clone(&lost),
+                    started: Instant::now(),
+                    frozen: Arc::clone(&frozen),
+                }) as Box<dyn AudioOut>
+            }
+        }));
+
+        // Settle into steady state with the device present, so `inflight` is sitting at
+        // the lead when the panel sleeps — which is where a real session would be.
+        let mut input = mixer.input(Backpressure::Pull);
+        for _ in 0..20 {
+            input.write(&tone(480, 0.5)).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+
+        lost.store(true, Ordering::Relaxed);
+
+        // A session that keeps playing must keep draining in real time. A second of
+        // audio: the `LEAD` budget absorbs a quarter of it and the mixer has to take the
+        // rest, so a mixer that has stopped draining shows up here and nowhere else.
+        let start = Instant::now();
+        for _ in 0..100 {
+            input.write(&tone(480, 0.5)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(
+            input.dropped, 0,
+            "the source hit the write deadline {} times over; the mixer stopped draining \
+             when the device stopped counting",
+            input.dropped
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "a second of audio took {elapsed:?} to hand over with the device asleep; \
+             sources must carry on at real time behind a sink that has gone"
         );
     }
 
