@@ -14,21 +14,37 @@
 //! with its own cursor — plus a resync threshold, a lead cap and a settle window to keep
 //! sessions that raced (a file through a null sink) from laying down hours of audio in
 //! seconds. All of that is gone. The mixer produces one stream at real-time pace, so a
-//! block is placed where it arrives because that is where it belongs.
+//! block belongs after the one before it and nothing here has to work out where.
 //!
-//! ## The mix is indexed by wall clock, not by arrival order
+//! ## The mixer lays the samples out; the clock only says how long the track must be
 //!
-//! A queue would drift. The stream has to produce a continuous 48 kHz timeline whether or
-//! not anything is playing — a silent panel is the *normal* case, and an audio track that
-//! simply stops is one a player stalls on rather than one it treats as quiet.
+//! The stream has to produce a continuous 48 kHz timeline whether or not anything is
+//! playing — a silent panel is the *normal* case, and an audio track that simply stops is
+//! one a player stalls on rather than one it treats as quiet. So the two questions this
+//! module answers are kept apart, because conflating them is #208:
 //!
-//! So the mix is a window of the shared [`Timeline`], addressed by absolute sample
-//! position. A block written at instant *t* lands at position `t - origin`; anything nobody
-//! wrote is silence because the buffer is zeroed. Video slots are derived from the same
-//! origin, so the two tracks cannot drift apart no matter how long the stream runs.
+//! - **Where does a block go?** After the last one. The mixer is this mix's only writer
+//!   and its passes abut ([`MixTap`]), so the answer needs no clock at all and the write
+//!   is an append. It used to be an indexed sum against `t - origin`, which addressed one
+//!   stream as though it were several: a burst of passes sharing an instant — what a
+//!   freshly opened sink produces every single time — was summed on top of itself, and
+//!   everything but the first quantum of it was destroyed. Nothing counted that, because
+//!   nothing was dropped.
+//! - **How long must the track be?** As long as the video, which is what the shared
+//!   [`Timeline`] is for. That is asked in [`AudioMix::take`], on the way out, and where
+//!   the mixer has not produced enough the shortfall is filled with silence and counted
+//!   ([`AudioMix::invented`]).
 //!
-//! That zero-fill is also why a tap does not keep the audio device open: an idle panel
-//! holds no sink, and the stream stays continuous regardless.
+//! The clock still bounds the write in one direction: audio whose position the reader has
+//! already passed cannot be un-emitted, so it is clipped rather than allowed to shift
+//! everything after it ([`AudioMix::clipped`]). In steady state neither correction fires —
+//! the mixer paces to the device queue, so its stream runs `DEVICE_LEAD` *ahead* of the
+//! wall clock and that lead is the hysteresis.
+//!
+//! Video slots are derived from the same origin, so the two tracks cannot drift apart no
+//! matter how long the stream runs. The fill in `take` is also why a tap does not keep the
+//! audio device open: an idle panel holds no sink, the mixer parks, and the stream stays
+//! continuous regardless.
 //!
 //! When the video gives up on a long stall — [`super::cadence::Cadence`] rebasing the
 //! shared timeline — a span of wall time is deleted, and the sound played in that span is
@@ -45,6 +61,8 @@
 //! video, which is captured at the moment it is composited, that is the same relationship
 //! the panel itself has, which is what matters for watching it. Sub-frame lip sync is not
 //! on offer and the readback path could not deliver it anyway.
+//!
+//! [`MixTap`]: crate::mixer::MixTap
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -91,15 +109,24 @@ struct Window {
     /// disagrees, a rebase has deleted a span of wall time since the last touch, and
     /// whatever is held past the new present was played inside it.
     reconciled: Duration,
-    /// Interleaved stereo at [`RATE`]. Zeroed regions are silence, which is the whole
-    /// trick: nothing has to write silence for silence to be what comes out.
+    /// Interleaved stereo at [`RATE`], in the order the mixer produced it. Contiguous by
+    /// construction: appended at one end, drained at the other, never indexed.
     samples: VecDeque<f32>,
     /// Frames rebases have deleted, along with the span of timeline they were played in.
     rebase_discarded: u64,
-    /// Frames clipped off the front of arriving blocks because their positions were
-    /// already taken — blocks later than `settle`, and the catch-up after a rebase that
-    /// deleted time the encoder had already been fed (#208).
+    /// Frames clipped off the front of arriving blocks because the reader had already
+    /// passed their positions — the catch-up after a rebase that deleted time the encoder
+    /// had been fed, or a mixer that fell far enough behind for `take` to fill for it.
     clipped: u64,
+    /// Frames of silence the *track* needed and nothing played: the mixer produced less
+    /// than the timeline says has elapsed, so [`AudioMix::take`] filled for it.
+    ///
+    /// #175 at this boundary. Sustained nonzero means the mixer thread is not keeping up
+    /// or is parked while the stream is live, and it is now the difference between "the
+    /// panel was quiet" and "no one produced" — which an aggregate `starved` on the mixer
+    /// cannot express, because it counts a source failing an input, not the mix failing
+    /// the track.
+    invented: u64,
 }
 
 impl Window {
@@ -148,6 +175,7 @@ impl AudioMix {
                 samples: VecDeque::new(),
                 rebase_discarded: 0,
                 clipped: 0,
+                invented: 0,
             }),
         }
     }
@@ -177,7 +205,7 @@ impl AudioMix {
         Some((window, at))
     }
 
-    /// Add interleaved stereo, taken to start playing at `now`.
+    /// Append the mixer's next block of interleaved stereo, which it ran at `now`.
     ///
     /// Silently does nothing before the timeline is anchored: audio that arrives ahead of
     /// the first composited frame has nowhere on the timeline to go, and placing it at
@@ -189,55 +217,51 @@ impl AudioMix {
         let Some((mut window, at)) = self.window(reading) else {
             return;
         };
-        // Part of this block belongs to sample positions the encoder has already taken.
-        // That part is gone; the rest still lands where it should, so a late block loses
-        // its head rather than shifting everything after it.
-        let skip_frames = window.base.saturating_sub(at);
         let channels = usize::from(CHANNELS);
-        if skip_frames > 0 {
-            window.clipped += skip_frames.min((stereo.len() / channels) as u64);
+        // Part of this block belongs to positions the reader has already handed to the
+        // encoder — a rebase that deleted time already encoded, or a stall long enough
+        // that `take` filled the span in. Those frames cannot be un-emitted, so sync wins
+        // over content: the block loses its head rather than shifting everything after it.
+        //
+        // Against `base` and not against the end of the window, because everything still
+        // *held* is this same stream and belongs after what precedes it. That distinction
+        // is the whole fix: measuring the overlap against the window's end instead turns
+        // a burst of passes — one stream, arriving fast — into a stream summed onto
+        // itself (#208).
+        let skip = usize::try_from(window.base.saturating_sub(at)).unwrap_or(usize::MAX);
+        if skip > 0 {
+            window.clipped += (skip as u64).min((stereo.len() / channels) as u64);
         }
-        let Some(tail) = stereo.get(
-            usize::try_from(skip_frames)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(channels)..,
-        ) else {
+        let Some(tail) = stereo.get(skip.saturating_mul(channels)..) else {
             return;
         };
-        let start = usize::try_from(at.saturating_add(skip_frames) - window.base).unwrap_or(0);
-        let needed = (start + tail.len() / channels) * channels;
-        if window.samples.len() < needed {
-            window.samples.resize(needed, 0.0);
-        }
-        // Summed, not replaced: two sessions overlapping is rare but real — a Spotify
-        // stream that has not stopped when a cast starts — and the last writer winning
-        // would silence one of them at random.
-        for (i, sample) in tail.iter().enumerate() {
-            if let Some(slot) = window.samples.get_mut(start * channels + i) {
-                *slot += *sample;
-            }
-        }
+        // And then it simply follows the last block. No index, so no way to express two
+        // blocks landing on top of each other.
+        window.samples.extend(tail.iter().copied());
         // `base` counts frames and `samples` holds interleaved ones, so the trim has to
         // drop a whole frame at a time. Popping one sample per `base += 1` advanced the
         // label at twice the rate for stereo: what was still in the window came back
         // relabelled half a trim late, and once pinned at cap the base outran the wall
-        // clock — heads of live blocks lost to `skip_frames`, and `take` refusing until
-        // the clock caught up. It lasted until the next `restart()`.
+        // clock — heads of live blocks lost to `skip`, and `take` refusing until the clock
+        // caught up. It lasted until the next `restart()`.
         let cap = usize::try_from(Self::frames_at(MAX_BUFFERED)).unwrap_or(usize::MAX) * channels;
         while window.samples.len() > cap {
             for _ in 0..channels {
                 window.samples.pop_front();
             }
             window.base += 1;
+            window.clipped += 1;
         }
     }
 
     /// Take `frames` frames from the front, if they are far enough in the past to be
     /// settled.
     ///
-    /// `settle` is how long a block gets to arrive late and still land in the right place;
-    /// it is the one knob trading the stream's audio latency against how much of a slow
-    /// session's block gets clipped off its front.
+    /// `settle` is how far behind the wall clock the reader stays, so that ordinary
+    /// jitter in the mixer's pace is absorbed rather than filled in. Filling is a ratchet:
+    /// silence handed to the encoder cannot be taken back, so the audio it stands in for
+    /// arrives to find its place gone (`clipped`). The knob trades the stream's audio
+    /// latency against how much of a stalled mixer's output is lost that way.
     pub fn take(&self, now: Instant, frames: usize, settle: Duration) -> Option<Vec<f32>> {
         let reading = self.timeline.read(now)?;
         let settled = Self::frames_at(reading.elapsed.checked_sub(settle)?);
@@ -247,8 +271,12 @@ impl AudioMix {
         }
         let channels = usize::from(CHANNELS);
         let wanted = frames * channels;
-        // Short means nothing wrote that far, which is silence rather than a shortfall.
+        // The track has to be as long as the video whatever the mixer managed, so a
+        // shortfall is filled here — and *only* here, which is what keeps the write side
+        // free of the clock. Nothing produced this sound, so it is counted rather than
+        // left to look like a quiet panel (#175).
         if window.samples.len() < wanted {
+            window.invented += ((wanted - window.samples.len()) / channels) as u64;
             window.samples.resize(wanted, 0.0);
         }
         let out: Vec<f32> = window.samples.drain(..wanted).collect();
@@ -274,14 +302,37 @@ impl AudioMix {
         self.inner.lock().map_or(0, |w| w.rebase_discarded)
     }
 
-    /// Frames clipped off the front of arriving blocks because their positions were
-    /// already taken. A running total for the life of the mix.
+    /// Frames clipped off the front of arriving blocks because the reader had already
+    /// passed their positions. A running total for the life of the mix.
     ///
-    /// Nonzero means sound was lost: a session delivering later than `settle`, or a
-    /// rebase deleting time the encoder had already been fed.
+    /// Nonzero means sound was lost: a rebase deleting time the encoder had already been
+    /// fed, or a mixer stalled long enough that [`Self::take`] filled the span in first.
     #[must_use]
     pub fn clipped(&self) -> u64 {
         self.inner.lock().map_or(0, |w| w.clipped)
+    }
+
+    /// Frames of silence [`Self::take`] filled in because the mixer had not produced that
+    /// far. A running total for the life of the mix.
+    ///
+    /// The counter #175 asked for, at the boundary where the answer exists. `starved` on
+    /// the mixer says a *source* failed to feed an input; this says the *mix* failed to
+    /// fill the track, which is the number that decides whether audio arriving late is
+    /// the panel's fault or the stream's. Zero on a quiet panel: silence nobody played is
+    /// still silence the mixer produced, and it arrives here as samples.
+    #[must_use]
+    pub fn invented(&self) -> u64 {
+        self.inner.lock().map_or(0, |w| w.invented)
+    }
+
+    /// Frames held but not yet taken: how far the mixer's stream is running ahead of the
+    /// encoder. For diagnostics — a standing value well past `settle` is a device whose
+    /// clock is faster than nominal, which shows up nowhere else.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.inner
+            .lock()
+            .map_or(0, |w| w.samples.len() as u64 / u64::from(CHANNELS))
     }
 
     /// Throw away everything held and go back to position zero.
@@ -434,13 +485,17 @@ mod tests {
     }
 
     #[test]
-    fn a_block_lands_where_the_clock_says_it_was_played() {
-        // Not where it happened to arrive in a queue. This is the whole difference between
-        // a mix that stays in step with the video and one that drifts.
+    fn a_block_lands_where_the_mixer_played_it() {
+        // The mixer is one writer producing one continuous stream, so a quiet panel is
+        // not "nothing written" — it is silence, delivered as samples like anything else.
+        // What has to hold is that the tone occupies the tenth 10 ms of the track because
+        // it was the tenth 10 ms the mixer produced.
         let (timeline, mix) = mix();
         let t0 = Instant::now();
         timeline.anchor(t0);
-        // 100 ms in: frame 4800.
+        for i in 0..10u32 {
+            mix.add(t0 + Duration::from_millis(10) * i, &tone(480, 0.0));
+        }
         mix.add(t0 + Duration::from_millis(100), &tone(480, 0.5));
 
         let now = t0 + Duration::from_secs(1);
@@ -448,24 +503,84 @@ mod tests {
         assert!(first.iter().all(|s| *s == 0.0), "nothing before 100 ms");
         let second = mix.take(now, 480, SETTLE).unwrap();
         assert!(second.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+        // Nothing was written past the tone, so the track is filled out — and said so.
         let third = mix.take(now, 480, SETTLE).unwrap();
         assert!(third.iter().all(|s| *s == 0.0), "silence after it again");
+        assert_eq!(mix.invented(), 480, "the fill is counted, not silent");
     }
 
     #[test]
-    fn two_sessions_overlapping_are_summed() {
-        // Rare but real: a Spotify stream that has not stopped when a cast starts. The
-        // last writer winning would silence one of them at random.
+    fn a_burst_of_passes_is_one_stream_and_not_several() {
+        // #208, in the shape that actually reaches the panel. A freshly opened sink has
+        // an empty queue, so the mixer runs passes back to back until it is full — a
+        // whole `DEVICE_LEAD` of audio inside one wall millisecond, measured at 60 ms
+        // inside 100 µs, and it happens at the head of *every* presentation.
+        //
+        // Placing those blocks by the instant the pass ran summed them on top of each
+        // other: six passes into one quantum, fifty of the sixty milliseconds destroyed,
+        // and every loss counter rightly zero because nothing was dropped. Each pass
+        // carries its index here, so a summed track cannot be mistaken for an ordered one.
         let (timeline, mix) = mix();
         let t0 = Instant::now();
         timeline.anchor(t0);
-        mix.add(t0, &tone(480, 0.25));
-        mix.add(t0, &tone(480, 0.5));
-        let out = mix.take(t0 + Duration::from_secs(1), 480, SETTLE).unwrap();
+        for i in 0..6u16 {
+            // A hundred microseconds apart: five frames of clock for 480 of audio.
+            mix.add(
+                t0 + Duration::from_micros(100) * u32::from(i),
+                &tone(480, f32::from(i) + 1.0),
+            );
+        }
+        let out = mix.take(t0 + Duration::from_secs(1), 2880, SETTLE).unwrap();
+        for i in 0..6usize {
+            let got = out[i * 480 * 2];
+            let want = i as f32 + 1.0;
+            assert!(
+                (got - want).abs() < 1e-6,
+                "pass {i} should own its own 10 ms; found {got} where {want} belongs"
+            );
+        }
+        assert_eq!(mix.clipped(), 0, "a burst is early, not late");
+        assert_eq!(mix.invented(), 0, "and nothing had to be filled in");
+    }
+
+    #[test]
+    fn what_two_sessions_playing_at_once_sound_like_is_the_mixers_business() {
+        // This used to be asserted here, by writing two blocks at one instant and
+        // expecting their sum. That was the tee's world: before #111 every session had
+        // its own device and this module reconstructed the panel's output, so it really
+        // did have several writers. It has had exactly one since — `mix_pass` sums the
+        // sessions and hands over the result — and keeping the summation on this side is
+        // what let a burst of passes be read as overlapping sources (#208).
+        let mixer = crate::mixer::AudioMixer::new(Arc::new(|| {
+            Box::new(crate::audio_out::NullAudioOut::new())
+        }));
+        let stream = StreamAudio::new();
+        mixer.add_tap(stream.tap());
+        let t0 = Instant::now();
+        stream.timeline().anchor(t0);
+
+        let block = |value: f32| castaway_core::PcmFrame {
+            sample_rate: RATE,
+            channels: CHANNELS,
+            samples: vec![value; 4800 * usize::from(CHANNELS)],
+            pts: Duration::ZERO,
+        };
+        let mut spotify = mixer.input(crate::mixer::Backpressure::Pull);
+        let mut cast = mixer.input(crate::mixer::Backpressure::Pull);
+        for _ in 0..4 {
+            spotify.write(&block(0.25)).unwrap();
+            cast.write(&block(0.5)).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        let out = stream
+            .mix()
+            .take(t0 + Duration::from_secs(2), 4800, SETTLE)
+            .unwrap();
+        let loudest = out.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
         assert!(
-            out.iter().all(|s| (*s - 0.75).abs() < 1e-6),
-            "{:?}",
-            &out[..4]
+            (loudest - 0.75).abs() < 1e-6,
+            "the panel plays both at once: peak {loudest}"
         );
     }
 
