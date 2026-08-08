@@ -5,7 +5,9 @@ Snapshot for our next sync. Companion to DECISION-LOG.md (why) and the issue tra
 Everything below builds with `cargo build`, passes `cargo nextest run` (**2274 tests** as of
 2026-08-05 — every feature is on by default since D55), passes `cargo clippy --all-targets -- -D warnings`,
 `nix build` produces a running binary, and `nix flake check` passes — which includes the VM
-tests (integration, miracast, bluetooth, gamestream, matter), the openscreen differential
+tests (integration, miracast, bluetooth, gamestream, matter), the Android-emulator
+Bluetooth differential (`android-bt`, #225 — a real phone stack pairs, registers volume,
+streams aptX HD, and the waveform is correlated per channel), the openscreen differential
 checks, and the Windows cross-build DLL-closure check.
 
 **What a green check does and does not mean is recorded in `docs/test-matrix.md`** — a
