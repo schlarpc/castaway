@@ -4,6 +4,7 @@
 use serde::Deserialize;
 
 use crate::error::CastError;
+use crate::ids::{AppId, SenderId, SessionId, TransportId};
 
 /// The CASTv2 protocol namespaces we handle.
 pub mod ns {
@@ -130,7 +131,7 @@ impl App {
     /// It is also usually right: an unknown eight-hex-digit id belongs to a web receiver
     /// far more often than to anything else, and one lookup makes it exact for good.
     #[must_use]
-    pub fn classify(app_id: &str, catalogue: &AppCatalogue) -> Self {
+    pub fn classify(app_id: &AppId, catalogue: &AppCatalogue) -> Self {
         if app_id.eq_ignore_ascii_case(DEFAULT_MEDIA_RECEIVER_APP_ID) {
             Self::DefaultMedia
         } else if STREAMING_APP_IDS
@@ -141,7 +142,7 @@ impl App {
         } else if !catalogue.hosting {
             Self::Unhostable
         } else {
-            match catalogue.is_page(app_id) {
+            match catalogue.is_page(app_id.as_str()) {
                 Some(true) | None => Self::Page,
                 Some(false) => Self::Unhostable,
             }
@@ -211,7 +212,7 @@ pub struct LaunchRequest {
     pub request_id: i64,
     /// The app id the sender wants launched.
     #[serde(rename = "appId")]
-    pub app_id: String,
+    pub app_id: AppId,
 }
 
 /// A `GET_APP_AVAILABILITY` request on the receiver namespace.
@@ -225,7 +226,7 @@ pub struct AppAvailabilityRequest {
     pub request_id: i64,
     /// The app ids the sender is asking about.
     #[serde(rename = "appId")]
-    pub app_ids: Vec<String>,
+    pub app_ids: Vec<AppId>,
 }
 
 /// A `SET_VOLUME` request on the receiver namespace.
@@ -322,7 +323,7 @@ pub fn pong() -> String {
 /// and would not recognise it under the wrong key. Shape taken from openscreen's
 /// `ApplicationAgent::HandleGetAppAvailability`.
 #[must_use]
-pub fn app_availability(request_id: i64, availability: &[(String, bool)]) -> String {
+pub fn app_availability(request_id: i64, availability: &[(AppId, bool)]) -> String {
     let map: serde_json::Map<String, serde_json::Value> = availability
         .iter()
         .map(|(id, available)| {
@@ -331,7 +332,10 @@ pub fn app_availability(request_id: i64, availability: &[(String, bool)]) -> Str
             } else {
                 "APP_UNAVAILABLE"
             };
-            (id.clone(), serde_json::Value::String(value.to_string()))
+            (
+                id.as_str().to_owned(),
+                serde_json::Value::String(value.to_string()),
+            )
         })
         .collect();
     serde_json::json!({
@@ -628,18 +632,18 @@ pub struct RunningApp {
     /// would arrive on a namespace nothing is listening to.
     pub namespaces: Vec<String>,
     /// The launched app id.
-    pub app_id: String,
+    pub app_id: AppId,
     /// Human-readable app name.
     pub display_name: String,
     /// The session id we assigned.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// The transport (virtual-connection) id media messages address.
-    pub transport_id: String,
+    pub transport_id: TransportId,
     /// Status line text.
     pub status_text: String,
     /// The sender that launched the app — the one whose departure ends the session.
     /// Any sender may STOP; only this one's CLOSE means "the session's owner left".
-    pub controller: String,
+    pub controller: SenderId,
 }
 
 #[cfg(test)]

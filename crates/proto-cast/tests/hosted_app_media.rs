@@ -308,7 +308,7 @@ async fn a_hosted_application_plays_real_media_and_answers_the_sender() {
     session.observe_catalogue(catalogue.clone());
 
     assert_eq!(
-        App::classify(APP_ID, &catalogue),
+        App::classify(&APP_ID.into(), &catalogue),
         App::Page,
         "a resolved web receiver must classify as a page"
     );
@@ -329,7 +329,10 @@ async fn a_hosted_application_plays_real_media_and_answers_the_sender() {
     );
 
     // What the actor does with it: resolve, then host.
-    let surface = registry.resolve(&pending.app_id).await.expect("resolve");
+    let surface = registry
+        .resolve(pending.app_id.as_str())
+        .await
+        .expect("resolve");
     let url = surface
         .page_url()
         .expect("the registry entry names a page")
@@ -416,7 +419,7 @@ async fn a_hosted_application_plays_real_media_and_answers_the_sender() {
                         // sender is folded into a relay rather than into our own player.
                         let load = CastMessage::json(
                             "sender-0",
-                            &pending.transport_id,
+                            pending.transport_id.as_str(),
                             MEDIA_NS,
                             format!(
                                 r#"{{"requestId":8,"type":"LOAD","media":{{"contentId":"{media_url}","contentType":"video/mp4","streamType":"BUFFERED"}}}}"#

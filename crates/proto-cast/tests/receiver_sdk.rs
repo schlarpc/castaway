@@ -93,10 +93,10 @@ impl ProbeReport {
 
 fn app(app_id: &str, name: &str) -> AppIdentity {
     AppIdentity {
-        application_id: app_id.to_owned(),
+        application_id: app_id.into(),
         application_name: name.to_owned(),
-        session_id: "sess-probe".to_owned(),
-        launching_sender_id: "sender-probe".to_owned(),
+        session_id: "sess-probe".into(),
+        launching_sender_id: "sender-probe".into(),
         icon_url: None,
     }
 }
@@ -135,7 +135,8 @@ async fn run_probe(caf: bool) -> ProbeReport {
         .unwrap();
     // A sender that connected before the page loaded — the launching sender's own case,
     // and the one the platform has to replay rather than drop.
-    host.sender_connected("sender-probe", "probe/1.0").await;
+    host.sender_connected(&"sender-probe".into(), "probe/1.0")
+        .await;
 
     let port = host.port();
     let child = tokio::process::Command::new(&electron)
@@ -188,7 +189,7 @@ async fn run_probe(caf: bool) -> ProbeReport {
                             "the SDK did not declare the namespace the probe opened: {:?}",
                             ready.active_namespaces
                         );
-                        host.to_page(MEDIA_NS, "sender-probe", r#"{"type":"PROBE_PING"}"#)
+                        host.to_page(MEDIA_NS, &"sender-probe".into(), r#"{"type":"PROBE_PING"}"#)
                             .await;
                     }
                     Ok(Some(HostEvent::ToSender { data, .. })) => {

@@ -8,6 +8,7 @@ use prost::Message as _;
 use tracing::{debug, warn};
 
 use crate::error::CastError;
+use crate::ids::{AppId, SenderId, SessionId, TransportId};
 use crate::messages::{
     self, ns, App, AppAvailabilityRequest, DeviceInfo, Envelope, LaunchRefusal, LaunchRequest,
     LoadRequest, RunningApp, SetVolumeRequest,
@@ -59,20 +60,20 @@ pub struct Reaction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingLaunch {
     /// The app id to resolve.
-    pub app_id: String,
+    pub app_id: AppId,
     /// The request to answer once it is resolved.
     pub request_id: i64,
     /// The sender waiting on it, which becomes the session's controller.
-    pub sender: String,
+    pub sender: SenderId,
     /// The session id, minted here rather than when the page comes up.
     ///
     /// It has to exist *before* the platform is told about the application, because the
     /// page is handed it in `ready` and echoes it to the vendor's own cloud — so a
     /// session id invented later would be a second one, and `RECEIVER_STATUS` and the
     /// page would disagree about which session this is.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// The virtual-connection id media messages address once the app is running.
-    pub transport_id: String,
+    pub transport_id: TransportId,
 }
 
 /// A sender's message on a namespace a hosted application declared.
@@ -81,7 +82,7 @@ pub struct PageMessage {
     /// The namespace it arrived on.
     pub namespace: String,
     /// Which sender sent it.
-    pub sender: String,
+    pub sender: SenderId,
     /// The payload, untouched.
     pub data: String,
 }
@@ -296,7 +297,7 @@ impl CastSession {
             return Ok(Reaction {
                 to_page: vec![PageMessage {
                     namespace: msg.namespace.clone(),
-                    sender: msg.source_id.clone(),
+                    sender: SenderId::new(msg.source_id.clone()),
                     data: data.to_owned(),
                 }],
                 ..Reaction::default()
@@ -368,7 +369,7 @@ impl CastSession {
             && self
                 .app
                 .as_ref()
-                .is_some_and(|app| app.controller == msg.source_id)
+                .is_some_and(|app| app.controller.as_str() == msg.source_id)
         {
             self.app = None;
             self.player_state = None;
@@ -401,12 +402,12 @@ impl CastSession {
             .as_deref()
             .ok_or_else(|| CastError::Json("receiver message without payload".into()))?;
         let env = Envelope::parse(payload)?;
-        let sender = msg.source_id.clone();
+        let sender = SenderId::new(msg.source_id.clone());
         match env.r#type.as_str() {
             "GET_STATUS" => Ok(self.reply_receiver_status(&sender, env.request_id.unwrap_or(0))),
             "GET_APP_AVAILABILITY" => {
                 let req: AppAvailabilityRequest = messages::parse_message(payload)?;
-                let answers: Vec<(String, bool)> = req
+                let answers: Vec<(AppId, bool)> = req
                     .app_ids
                     .into_iter()
                     .map(|id| {
@@ -417,7 +418,7 @@ impl CastSession {
                 debug!(?answers, "answering app availability");
                 Ok(Reaction::reply(vec![CastMessage::json(
                     &self.receiver_id,
-                    &sender,
+                    sender.as_str(),
                     ns::RECEIVER,
                     messages::app_availability(req.request_id, &answers),
                 )]))
@@ -438,8 +439,8 @@ impl CastSession {
                             app_id: req.app_id,
                             request_id: req.request_id,
                             sender,
-                            session_id: format!("sess-{n}"),
-                            transport_id: format!("transport-{n}"),
+                            session_id: SessionId::new(format!("sess-{n}")),
+                            transport_id: TransportId::new(format!("transport-{n}")),
                         }),
                         ..Reaction::default()
                     });
@@ -456,7 +457,7 @@ impl CastSession {
                     );
                     return Ok(Reaction::reply(vec![CastMessage::json(
                         &self.receiver_id,
-                        &sender,
+                        sender.as_str(),
                         ns::RECEIVER,
                         messages::launch_error(req.request_id, refusal),
                     )]));
@@ -708,7 +709,7 @@ impl CastSession {
         );
         vec![CastMessage::json(
             &self.receiver_id,
-            &pending.sender,
+            pending.sender.as_str(),
             ns::RECEIVER,
             messages::launch_error(pending.request_id, refusal),
         )]
@@ -729,8 +730,8 @@ impl CastSession {
     /// The page echoes it to the vendor's own cloud, so it has to be the same string
     /// `RECEIVER_STATUS` reports rather than a second one invented for the platform.
     #[must_use]
-    pub fn session_id(&self) -> Option<&str> {
-        self.app.as_ref().map(|a| a.session_id.as_str())
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.app.as_ref().map(|a| &a.session_id)
     }
 
     /// An application's message for a sender, addressed from the running session.
@@ -738,36 +739,36 @@ impl CastSession {
     /// `*` is a broadcast — how a receiver tells every sender on the connection about a
     /// status change it did not ask for.
     #[must_use]
-    pub fn from_page(&self, namespace: &str, sender: &str, data: &str) -> CastMessage {
+    pub fn from_page(&self, namespace: &str, sender: &SenderId, data: &str) -> CastMessage {
         let source = self
             .app
             .as_ref()
             .map_or(self.receiver_id.as_str(), |a| a.transport_id.as_str());
-        CastMessage::json(source, sender, namespace, data.to_owned())
+        CastMessage::json(source, sender.as_str(), namespace, data.to_owned())
     }
 
-    fn launch(&mut self, req: &LaunchRequest, controller: &str) {
+    fn launch(&mut self, req: &LaunchRequest, controller: &SenderId) {
         self.id_counter += 1;
         let n = self.id_counter;
         self.app = Some(RunningApp {
             app_id: req.app_id.clone(),
             display_name: "castaway".to_string(),
-            session_id: format!("sess-{n}"),
-            transport_id: format!("transport-{n}"),
+            session_id: SessionId::new(format!("sess-{n}")),
+            transport_id: TransportId::new(format!("transport-{n}")),
             status_text: "Ready To Cast".to_string(),
-            controller: controller.to_string(),
+            controller: controller.clone(),
             // Serving the session ourselves: the media namespace is ours, and
             // `namespaces` reports it because this list is empty.
             namespaces: Vec::new(),
         });
     }
 
-    fn reply_receiver_status(&self, sender: &str, request_id: i64) -> Reaction {
+    fn reply_receiver_status(&self, sender: &SenderId, request_id: i64) -> Reaction {
         let json =
             messages::receiver_status(request_id, self.app.as_ref(), self.volume, self.muted);
         Reaction::reply(vec![CastMessage::json(
             &self.receiver_id,
-            sender,
+            sender.as_str(),
             ns::RECEIVER,
             json,
         )])
@@ -983,7 +984,10 @@ mod tests {
         let app = &status["status"]["applications"][0];
         assert_eq!(app["appId"], "9AC194DC");
         assert_eq!(app["displayName"], "Plex");
-        assert_eq!(s.session_id(), Some(app["sessionId"].as_str().unwrap()));
+        assert_eq!(
+            s.session_id().map(SessionId::as_str),
+            Some(app["sessionId"].as_str().unwrap())
+        );
     }
 
     #[test]
@@ -1021,7 +1025,7 @@ mod tests {
         );
         assert_eq!(r.to_page.len(), 1);
         assert_eq!(r.to_page[0].namespace, ns::MEDIA);
-        assert_eq!(r.to_page[0].sender, "sender-0");
+        assert_eq!(r.to_page[0].sender.as_str(), "sender-0");
         assert!(r.to_page[0].data.contains("v.mp4"));
     }
 
@@ -1122,7 +1126,7 @@ mod tests {
     #[test]
     fn an_applications_answer_is_addressed_from_the_session() {
         let s = launched("233637DE", &[ns::MEDIA]);
-        let out = s.from_page(ns::MEDIA, "sender-0", r#"{"type":"MEDIA_STATUS"}"#);
+        let out = s.from_page(ns::MEDIA, &"sender-0".into(), r#"{"type":"MEDIA_STATUS"}"#);
         assert_eq!(out.destination_id, "sender-0");
         assert_eq!(out.namespace, ns::MEDIA);
         assert!(out.source_id.starts_with("transport-"));
@@ -1222,7 +1226,7 @@ mod tests {
             ))
             .unwrap();
         assert!(payload_is_type(&r.outgoing[0], "RECEIVER_STATUS"));
-        assert_eq!(s.app.as_ref().unwrap().app_id, "0F5096E8");
+        assert_eq!(s.app.as_ref().unwrap().app_id.as_str(), "0F5096E8");
     }
 
     /// The Android and iOS streaming ids are the same feature as the desktop pair. A
@@ -1237,17 +1241,20 @@ mod tests {
             "0F5096E8", "85CDB22F", "674A0243", "8E6C866D", "96084372", "BFD92C23",
         ] {
             assert_eq!(
-                App::classify(id, &catalogue),
+                App::classify(&id.into(), &catalogue),
                 App::Streaming,
                 "{id} not recognised"
             );
         }
-        assert_eq!(App::classify("CC1AD845", &catalogue), App::DefaultMedia);
+        assert_eq!(
+            App::classify(&"CC1AD845".into(), &catalogue),
+            App::DefaultMedia
+        );
         // YouTube's own receiver is a page now, which is the whole of #16.
-        assert_eq!(App::classify("233637DE", &catalogue), App::Page);
+        assert_eq!(App::classify(&"233637DE".into(), &catalogue), App::Page);
         // …and on a build with no browser it is honestly unhostable again.
         assert_eq!(
-            App::classify("233637DE", &messages::AppCatalogue::new(false)),
+            App::classify(&"233637DE".into(), &messages::AppCatalogue::new(false)),
             App::Unhostable
         );
     }

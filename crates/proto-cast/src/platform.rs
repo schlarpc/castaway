@@ -39,6 +39,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::error::CastError;
+use crate::ids::{AppId, SenderId, SessionId};
 
 /// The namespace the platform control protocol lives on. Reserved: the SDK throws
 /// `Protected namespace` if an application tries to open a bus on it.
@@ -176,14 +177,14 @@ pub struct DeviceCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppIdentity {
     /// The app id the sender launched.
-    pub application_id: String,
+    pub application_id: AppId,
     /// The registry's name for it.
     pub application_name: String,
     /// The session id `RECEIVER_STATUS` reports for the same session. The page echoes
     /// it to its own cloud services, so the two must not drift.
-    pub session_id: String,
+    pub session_id: SessionId,
     /// The sender that launched it.
-    pub launching_sender_id: String,
+    pub launching_sender_id: SenderId,
     /// What the panel is, for the page's own telemetry.
     pub icon_url: Option<String>,
 }
@@ -288,7 +289,7 @@ pub struct PlatformSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedSender {
     /// The sender's transport id.
-    pub id: String,
+    pub id: SenderId,
     /// Its user agent, if it gave one.
     pub user_agent: String,
 }
@@ -460,9 +461,9 @@ impl PlatformSession {
 
     /// A sender connected. Returns the frame telling the page, if the page is up to
     /// hear it — otherwise it is remembered and replayed on `ready`.
-    pub fn sender_connected(&mut self, id: &str, user_agent: &str) -> PlatformReaction {
+    pub fn sender_connected(&mut self, id: &SenderId, user_agent: &str) -> PlatformReaction {
         let sender = ConnectedSender {
-            id: id.to_owned(),
+            id: id.clone(),
             user_agent: user_agent.to_owned(),
         };
         if self.senders.iter().any(|s| s.id == sender.id) {
@@ -478,9 +479,13 @@ impl PlatformSession {
     }
 
     /// A sender went away.
-    pub fn sender_disconnected(&mut self, id: &str, reason: DisconnectReason) -> PlatformReaction {
+    pub fn sender_disconnected(
+        &mut self,
+        id: &SenderId,
+        reason: DisconnectReason,
+    ) -> PlatformReaction {
         let before = self.senders.len();
-        self.senders.retain(|s| s.id != id);
+        self.senders.retain(|s| s.id != *id);
         if self.senders.len() == before || !self.is_ready() {
             return PlatformReaction::default();
         }
@@ -533,11 +538,16 @@ impl PlatformSession {
     /// then is dropped by the SDK with no trace, so holding it back and saying so is the
     /// difference between a diagnosable session and a silent one.
     #[must_use]
-    pub fn relay_to_page(&self, namespace: &str, sender_id: &str, data: &str) -> Option<IpcFrame> {
+    pub fn relay_to_page(
+        &self,
+        namespace: &str,
+        sender_id: &SenderId,
+        data: &str,
+    ) -> Option<IpcFrame> {
         if !self.owns(namespace) {
             return None;
         }
-        Some(IpcFrame::app(namespace, sender_id, data))
+        Some(IpcFrame::app(namespace, sender_id.as_str(), data))
     }
 }
 
@@ -707,7 +717,7 @@ mod tests {
     #[test]
     fn a_sender_that_connected_before_the_page_loaded_is_replayed_to_it() {
         let mut session = session();
-        let early = session.sender_connected("sender-0", "Chrome/125");
+        let early = session.sender_connected(&"sender-0".into(), "Chrome/125");
         assert!(
             early.to_page.is_empty(),
             "nothing may be written to a page that has not identified itself"
@@ -727,7 +737,7 @@ mod tests {
     fn a_sender_arriving_after_the_page_is_up_is_announced_immediately() {
         let mut session = session();
         page_ready(&mut session);
-        let reaction = session.sender_connected("sender-9", "CastVideos/1.0");
+        let reaction = session.sender_connected(&"sender-9".into(), "CastVideos/1.0");
         assert_eq!(parsed(&reaction.to_page[0])["type"], "senderconnected");
         assert_eq!(parsed(&reaction.to_page[0])["userAgent"], "CastVideos/1.0");
     }
@@ -736,22 +746,25 @@ mod tests {
     fn the_same_sender_is_not_announced_twice() {
         let mut session = session();
         page_ready(&mut session);
-        assert_eq!(session.sender_connected("s", "ua").to_page.len(), 1);
-        assert!(session.sender_connected("s", "ua").to_page.is_empty());
+        assert_eq!(session.sender_connected(&"s".into(), "ua").to_page.len(), 1);
+        assert!(session
+            .sender_connected(&"s".into(), "ua")
+            .to_page
+            .is_empty());
     }
 
     #[test]
     fn a_disconnect_names_the_reason_in_the_sdks_vocabulary() {
         let mut session = session();
-        session.sender_connected("s", "ua");
+        session.sender_connected(&"s".into(), "ua");
         page_ready(&mut session);
-        let reaction = session.sender_disconnected("s", DisconnectReason::ClosedByPeer);
+        let reaction = session.sender_disconnected(&"s".into(), DisconnectReason::ClosedByPeer);
         let msg = parsed(&reaction.to_page[0]);
         assert_eq!(msg["type"], "senderdisconnected");
         assert_eq!(msg["reason"], "closed_by_peer");
         // A sender that was never there is not a disconnection.
         assert!(session
-            .sender_disconnected("ghost", DisconnectReason::Unknown)
+            .sender_disconnected(&"ghost".into(), DisconnectReason::Unknown)
             .to_page
             .is_empty());
     }
@@ -850,11 +863,15 @@ mod tests {
     fn nothing_is_relayed_to_a_page_that_has_not_come_up() {
         let mut session = session();
         assert!(session
-            .relay_to_page(crate::messages::ns::MEDIA, "s", "{}")
+            .relay_to_page(crate::messages::ns::MEDIA, &"s".into(), "{}")
             .is_none());
         page_ready(&mut session);
         let frame = session
-            .relay_to_page(crate::messages::ns::MEDIA, "s", r#"{"type":"LOAD"}"#)
+            .relay_to_page(
+                crate::messages::ns::MEDIA,
+                &"s".into(),
+                r#"{"type":"LOAD"}"#,
+            )
             .unwrap();
         assert_eq!(frame.sender_id, "s");
         assert_eq!(frame.data, r#"{"type":"LOAD"}"#);
@@ -865,7 +882,7 @@ mod tests {
         let mut session = session();
         page_ready(&mut session);
         assert!(session
-            .relay_to_page("urn:x-cast:com.example.other", "s", "{}")
+            .relay_to_page("urn:x-cast:com.example.other", &"s".into(), "{}")
             .is_none());
     }
 

@@ -17,6 +17,7 @@ pub mod auth;
 pub mod control;
 pub mod error;
 pub mod framing;
+pub mod ids;
 pub mod messages;
 pub mod mirror;
 pub mod platform;
@@ -33,6 +34,7 @@ pub use actor::{CastIdentity, CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;
 pub use control::CastRemote;
 pub use error::CastError;
+pub use ids::{AppId, SenderId, SessionId, TransportId};
 pub use messages::{ns, DEFAULT_MEDIA_RECEIVER_APP_ID};
 pub use mirror::{Codec, MediaKind, MirrorConfig, StreamConfig};
 pub use platform::{

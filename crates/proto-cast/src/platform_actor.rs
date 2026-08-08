@@ -31,6 +31,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::error::CastError;
+use crate::ids::SenderId;
 use crate::platform::{
     AppIdentity, DeviceCapabilities, DisconnectReason, IpcFrame, PageReady, PlatformEvent,
     PlatformSession, DEFAULT_PLATFORM_PORT, IPC_PATH,
@@ -55,11 +56,11 @@ enum HostCommand {
     },
     Stop,
     SenderConnected {
-        id: String,
+        id: SenderId,
         user_agent: String,
     },
     SenderDisconnected {
-        id: String,
+        id: SenderId,
         reason: DisconnectReason,
     },
     VolumeChanged {
@@ -72,7 +73,7 @@ enum HostCommand {
     /// A sender's message on an application namespace, for the page.
     ToPage {
         namespace: String,
-        sender_id: String,
+        sender_id: SenderId,
         data: String,
     },
 }
@@ -90,7 +91,7 @@ pub enum HostEvent {
         namespace: String,
         /// Which sender it is for. `*` addresses every sender on the connection, which
         /// is how a receiver broadcasts its status.
-        sender_id: String,
+        sender_id: SenderId,
         /// The payload, untouched.
         data: String,
     },
@@ -162,20 +163,20 @@ impl PlatformHost {
     }
 
     /// Tell the application a sender connected.
-    pub async fn sender_connected(&self, id: &str, user_agent: &str) {
+    pub async fn sender_connected(&self, id: &SenderId, user_agent: &str) {
         let _ = self
             .send(HostCommand::SenderConnected {
-                id: id.to_owned(),
+                id: id.clone(),
                 user_agent: user_agent.to_owned(),
             })
             .await;
     }
 
     /// Tell the application a sender went away.
-    pub async fn sender_disconnected(&self, id: &str, reason: DisconnectReason) {
+    pub async fn sender_disconnected(&self, id: &SenderId, reason: DisconnectReason) {
         let _ = self
             .send(HostCommand::SenderDisconnected {
-                id: id.to_owned(),
+                id: id.clone(),
                 reason,
             })
             .await;
@@ -192,11 +193,11 @@ impl PlatformHost {
     }
 
     /// Relay a sender's message on an application namespace to the page.
-    pub async fn to_page(&self, namespace: &str, sender_id: &str, data: &str) {
+    pub async fn to_page(&self, namespace: &str, sender_id: &SenderId, data: &str) {
         let _ = self
             .send(HostCommand::ToPage {
                 namespace: namespace.to_owned(),
-                sender_id: sender_id.to_owned(),
+                sender_id: sender_id.clone(),
                 data: data.to_owned(),
             })
             .await;
@@ -472,7 +473,7 @@ async fn handle_from_page(state: &Arc<ServerState>, text: &str) -> Result<(), Ca
             .events
             .send(HostEvent::ToSender {
                 namespace: frame.namespace,
-                sender_id: frame.sender_id,
+                sender_id: SenderId::new(frame.sender_id),
                 data: frame.data,
             })
             .await;
@@ -606,7 +607,7 @@ mod tests {
 
         host.to_page(
             crate::messages::ns::MEDIA,
-            "sender-42",
+            &"sender-42".into(),
             r#"{"type":"LOAD","media":{"contentId":"http://x/v.mp4"}}"#,
         )
         .await;
@@ -628,7 +629,7 @@ mod tests {
                 data,
             } => {
                 assert_eq!(namespace, crate::messages::ns::MEDIA);
-                assert_eq!(sender_id, "sender-42");
+                assert_eq!(sender_id.as_str(), "sender-42");
                 assert_eq!(data, r#"{"type":"MEDIA_STATUS","status":[]}"#);
             }
             other => panic!("{other:?}"),

@@ -434,7 +434,7 @@ impl CastReceiver {
             return session.page_refused(pending, crate::messages::LaunchRefusal::NotFound);
         };
 
-        let surface = match registry.resolve(&pending.app_id).await {
+        let surface = match registry.resolve(pending.app_id.as_str()).await {
             Ok(surface) => surface,
             Err(e) => {
                 warn!(app_id = %pending.app_id, error = %e, "could not resolve the launched application");
@@ -451,7 +451,10 @@ impl CastReceiver {
             );
             return session.page_refused(pending, crate::messages::LaunchRefusal::NotFound);
         };
-        let name = surface.display_name().unwrap_or(&pending.app_id).to_owned();
+        let name = surface
+            .display_name()
+            .unwrap_or(pending.app_id.as_str())
+            .to_owned();
 
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
         let identity = crate::platform::AppIdentity {
