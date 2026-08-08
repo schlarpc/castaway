@@ -1735,6 +1735,14 @@ impl BluetoothAdapter {
                         // long from now the level next moves.
                         link.volume_notify_txn = Some(msg.transaction);
                         let response = avrcp::volume_changed_response(Ctype::Interim, link.volume);
+                        // The whole #211 exchange, in one greppable line: the peer asked,
+                        // and the INTERIM below is its answer. This is what the emulator
+                        // check asserts a *real* phone stack does on connect (#225).
+                        info!(
+                            peer = %link.peer,
+                            volume = link.volume,
+                            "bluetooth: peer registered for volume changes; answering interim"
+                        );
                         out.replies.push((cid, avctp_response(&msg, &response)));
                     }
                     _ => {
