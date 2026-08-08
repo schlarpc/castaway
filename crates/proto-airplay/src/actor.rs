@@ -512,6 +512,8 @@ impl SourceAdapter for AirPlayReceiver {
             instance: svc.instance.into_string(),
             port: self.addr.port(),
             txt: svc.txt,
+            // AirPlay senders browse the bare type; sub-types are a Cast mechanism.
+            subtypes: Vec::new(),
         })
         .collect()
     }

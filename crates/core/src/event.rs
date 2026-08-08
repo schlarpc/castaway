@@ -27,6 +27,14 @@ pub enum Advertisement {
         port: u16,
         /// TXT record key/value pairs.
         txt: Vec<(String, String)>,
+        /// DNS-SD sub-types to publish the instance under, without the leading
+        /// underscore (`674A0243` → `_674A0243._sub._googlecast._tcp`).
+        ///
+        /// How a browsing sender narrows discovery to devices that run a particular
+        /// application, before it connects to anything. An adapter that can host an app
+        /// says so here; one that leaves this empty is discoverable only by senders
+        /// browsing the bare service type (#226).
+        subtypes: Vec<String>,
     },
     /// An SSDP/UPnP device advertised on 1900 with a description URL.
     SsdpDevice {

@@ -182,6 +182,9 @@ impl SourceAdapter for MatterAdapter {
             instance: service.instance.into_string(),
             port: service.port,
             txt: service.txt,
+            // Matter discovery is by its own commissioning attributes in the TXT
+            // record, not by DNS-SD sub-types.
+            subtypes: Vec::new(),
         }]
     }
 
@@ -791,6 +794,7 @@ mod tests {
             instance,
             port,
             txt,
+            ..
         } = &ads[0]
         else {
             panic!("expected an mDNS service");

@@ -58,6 +58,38 @@ const STREAMING_APP_IDS: [&str; 6] = [
     "BFD92C23", // iOS app streaming
 ];
 
+/// The application ids this receiver serves *natively*, for advertising as DNS-SD
+/// sub-types.
+///
+/// The same two constants [`App::classify`] answers `DefaultMedia` and `Streaming` from,
+/// deliberately: a sub-type is a claim that this device runs that application, and the
+/// only defensible source for that claim is the table that decides whether we actually
+/// will. Reading them from one place is what stops the advertisement and the behaviour
+/// from drifting — the same argument the Bluetooth codec table makes about advertising
+/// only what the build can decode.
+///
+/// Hosted *pages* (YouTube, Plex — [`App::Page`]) are deliberately absent. Their ids are
+/// not knowable ahead of time; the catalogue learns them one lookup at a time, and a
+/// receiver cannot advertise a sub-type for an app it has not heard of yet. Senders
+/// looking for those still find us the slower way, by connecting and asking
+/// `GET_APP_AVAILABILITY`.
+///
+/// **Order matters, for a reason that is a bug in something else.** `mdns-sd` keys its
+/// registry by fullname, which does not include the sub-type, so registering one
+/// instance under several sub-types silently keeps only the last — measured on the wire
+/// (#227). Until that is fixed, the most valuable id goes last so the one sub-type that
+/// survives is the one a phone's mirroring picker filters on.
+#[must_use]
+pub fn native_app_ids() -> Vec<&'static str> {
+    std::iter::once(DEFAULT_MEDIA_RECEIVER_APP_ID)
+        .chain(STREAMING_APP_IDS)
+        // Android mirroring, audio + video: what the system cast picker asks for on a
+        // device with a screen, and therefore the one to keep if only one survives.
+        .filter(|id| *id != "674A0243")
+        .chain(std::iter::once("674A0243"))
+        .collect()
+}
+
 /// What this receiver can do with an `appId` a sender asks about or launches.
 ///
 /// An enum rather than a boolean because the two things we support are not the same

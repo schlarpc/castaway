@@ -688,6 +688,8 @@ impl castaway_core::SourceAdapter for MiracastAdapter {
                     crate::mice::CONTAINER_ID_KEY.to_string(),
                     mice.container_id.clone(),
                 )],
+                // [MS-MICE] senders browse the bare `_display._tcp`; no sub-types.
+                subtypes: Vec::new(),
             });
         }
         out

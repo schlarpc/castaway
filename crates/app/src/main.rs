@@ -1547,11 +1547,15 @@ fn advertise_adapter(adapter: &dyn SourceAdapter, mdns: &mut MdnsResponder) {
                 instance,
                 port,
                 txt,
+                subtypes,
             } => {
                 let svc = txt.into_iter().fold(
                     MdnsService::new(ty, instance, MDNS_HOST, port),
                     |svc, (key, value)| svc.with_txt(key, value),
                 );
+                let svc = subtypes
+                    .into_iter()
+                    .fold(svc, substrate_mdns::MdnsService::with_subtype);
                 if let Err(e) = mdns.advertise(&svc) {
                     warn!(error = %e, protocol = %adapter.kind(), "failed to advertise");
                 }

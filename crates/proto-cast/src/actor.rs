@@ -964,6 +964,18 @@ impl SourceAdapter for CastReceiver {
                 // answer from one it finds empty.
                 ("rs".to_string(), String::new()),
             ],
+            // The applications this receiver runs, published as DNS-SD sub-types so a
+            // sender filtering for one finds us *while browsing* (#226). Play Services
+            // matches a discovered device to its filter criteria out of the sub-types in
+            // the mDNS answer and nothing else — a device answering only the base type
+            // is never associated with a criterion, so it never becomes a route, however
+            // correctly it answers `GET_APP_AVAILABILITY` a moment later. Real
+            // Chromecasts answer these queries; this one did not, and that is why it was
+            // missing from every picker.
+            subtypes: crate::messages::native_app_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
         }]
     }
 
@@ -1115,10 +1127,26 @@ mod tests {
                 instance,
                 port,
                 txt,
+                subtypes,
             } => {
                 assert_eq!(ty, CAST_SERVICE_TYPE);
                 assert_eq!(instance, "Lab TV");
                 assert_eq!(*port, 8009);
+                // The sub-types are what a browsing sender filters on, and a receiver
+                // that publishes none is invisible to every filtered picker however
+                // correct the rest of this record is (#226). Both mirroring ids and the
+                // default media receiver, because those are the apps we actually serve.
+                for app in ["674A0243", "8E6C866D", "CC1AD845"] {
+                    assert!(
+                        subtypes.iter().any(|s| s == app),
+                        "no sub-type for {app}: {subtypes:?}"
+                    );
+                }
+                // And nothing we cannot host — a sub-type is a claim to run the app.
+                assert!(
+                    !subtypes.iter().any(|s| s == "233637DE"),
+                    "advertising a hosted page's app id claims more than we can honour"
+                );
                 assert!(txt.contains(&("fn".to_string(), "Lab TV".to_string())));
                 assert!(txt.contains(&("id".to_string(), "0f8c2e10".to_string())));
                 // Every key openscreen's record parser treats as mandatory. Miss one

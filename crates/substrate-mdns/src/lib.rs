@@ -93,6 +93,31 @@ impl MdnsResponder {
             .map_err(|e| MdnsError::Register(e.to_string()))?;
         info!(service = %service.service_type, instance = %service.instance, "mDNS advertised");
         self.registered.push(fullname);
+
+        // Then the same instance again, once per sub-type, because `mdns-sd` carries a
+        // single `sub_domain` per `ServiceInfo`. `my_services` is keyed by *fullname*,
+        // which does not include the sub-type — so how many of these survive alongside
+        // each other is the library's business and not something to assume. Whatever it
+        // does, publishing the base type has already succeeded above, so a sub-type that
+        // does not take costs discovery-time filtering and not the device.
+        for subtype in &service.subtypes {
+            match service.to_service_info_for(Some(subtype)) {
+                Ok(info) => {
+                    if let Err(e) = self.daemon.register(info) {
+                        warn!(
+                            service = %service.service_type,
+                            %subtype,
+                            error = %e,
+                            "could not advertise a sub-type; senders filtering on it will \
+                             not see this device"
+                        );
+                    } else {
+                        debug!(service = %service.service_type, %subtype, "mDNS sub-type advertised");
+                    }
+                }
+                Err(e) => warn!(%subtype, error = %e, "malformed mDNS sub-type"),
+            }
+        }
         Ok(())
     }
 

@@ -169,6 +169,19 @@ pub struct MdnsService {
     pub host: String,
     /// TXT record key/value pairs.
     pub txt: Vec<(String, String)>,
+    /// DNS-SD *sub-types* to publish this instance under (RFC 6763 §7.1), without the
+    /// leading underscore — `674A0243` becomes
+    /// `_674A0243._sub._googlecast._tcp.local.`
+    ///
+    /// Not decoration, and not a filter *we* apply: a sub-type is how a browsing sender
+    /// narrows discovery to devices that can run a particular application, **before it
+    /// connects to anything**. Play Services does exactly this — it browses
+    /// `_<appid>._sub._googlecast._tcp` for the apps it wants and matches each answer
+    /// against its filter criteria; a device that answers only the base type is never
+    /// associated with any criterion and so never becomes a route, however correctly it
+    /// answers everything else afterwards (#226). Real Chromecasts answer these queries;
+    /// measured on the development LAN.
+    pub subtypes: Vec<String>,
 }
 
 impl MdnsService {
@@ -186,7 +199,28 @@ impl MdnsService {
             host: host.into(),
             port,
             txt: Vec::new(),
+            subtypes: Vec::new(),
         }
+    }
+
+    /// Publish this instance under a DNS-SD sub-type as well as its base type.
+    ///
+    /// Repeatable; the leading underscore is added here, so callers pass the bare label.
+    #[must_use]
+    pub fn with_subtype(mut self, subtype: impl Into<String>) -> Self {
+        self.subtypes.push(subtype.into());
+        self
+    }
+
+    /// The fully-qualified type for one sub-type registration
+    /// (`_674A0243._sub._googlecast._tcp.local.`).
+    ///
+    /// # Errors
+    /// [`MdnsError::InvalidServiceType`] if the base type is malformed.
+    pub fn qualified_subtype(&self, subtype: &str) -> Result<String, MdnsError> {
+        let base = self.qualified_type()?;
+        let label = subtype.trim_start_matches('_');
+        Ok(format!("_{label}._sub.{base}"))
     }
 
     /// Add a TXT record (builder style).
@@ -209,7 +243,22 @@ impl MdnsService {
     /// # Errors
     /// [`MdnsError`] on a bad type or if `ServiceInfo` construction fails.
     pub fn to_service_info(&self) -> Result<ServiceInfo, MdnsError> {
-        let ty_domain = self.qualified_type()?;
+        self.to_service_info_for(None)
+    }
+
+    /// The `ServiceInfo` for this instance, optionally registered under one sub-type.
+    ///
+    /// One sub-type per `ServiceInfo` because that is `mdns-sd`'s shape — its
+    /// `ServiceInfo` holds a single `sub_domain`, so publishing several means several
+    /// registrations of the same instance.
+    ///
+    /// # Errors
+    /// [`MdnsError`] on a bad type or if `ServiceInfo` construction fails.
+    pub fn to_service_info_for(&self, subtype: Option<&str>) -> Result<ServiceInfo, MdnsError> {
+        let ty_domain = match subtype {
+            Some(subtype) => self.qualified_subtype(subtype)?,
+            None => self.qualified_type()?,
+        };
         let host_name = format!("{}.local.", self.host.trim_end_matches('.'));
         // A slice, not a `HashMap`: the map's iteration order is randomised per process,
         // so the emitted TXT record came out in a different order on every run. DNS-SD
