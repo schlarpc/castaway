@@ -1474,7 +1474,10 @@ async fn spawn_cast(
         identity,
         media_ports,
     )
-    .context("building the CASTv2 receiver")?;
+    .context("building the CASTv2 receiver")?
+    // The same UUID the device id above is made from, dashes intact: `eureka_info`
+    // reports it as `ssdp_udn` (#226).
+    .with_udn(config.uuid.clone());
     // Cast is the other protocol in which the receiver is the player, so a sender's
     // scrubber can only be answered from our own clock — the same seam DLNA reads.
     let receiver = match playback {

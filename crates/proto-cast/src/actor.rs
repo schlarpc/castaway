@@ -337,6 +337,9 @@ pub struct CastReceiver {
     listen: SocketAddr,
     friendly_name: String,
     device_id: String,
+    /// The dashed UUID form of [`Self::device_id`], for `eureka_info`'s `ssdp_udn`.
+    /// Defaults to the device id when nobody supplies one — see [`Self::with_udn`].
+    udn: Option<String>,
     identity: CastIdentity,
     /// Where each session's mirroring RTP socket binds (the port an ANSWER names).
     media_ports: MediaPorts,
@@ -376,6 +379,7 @@ impl CastReceiver {
             listen,
             friendly_name: friendly_name.into(),
             device_id: device_id.into(),
+            udn: None,
             identity,
             media_ports,
             playback: None,
@@ -500,6 +504,18 @@ impl CastReceiver {
     /// scrubber can only be answered from here. Without it `currentTime` is zero for the
     /// whole item — which is what it was, knowingly, until the pipeline had a position to
     /// report at all.
+    /// The panel's UUID in dashed form, which `eureka_info` reports as `ssdp_udn`.
+    ///
+    /// Separate from the device id because the two are the same identity written two
+    /// ways: the Cast TXT record's `id` strips the dashes, this field keeps them. The
+    /// caller passes the one value both are derived from, so they cannot disagree about
+    /// which device this is — which is the property a sender's prober checks.
+    #[must_use]
+    pub fn with_udn(mut self, udn: impl Into<String>) -> Self {
+        self.udn = Some(udn.into());
+        self
+    }
+
     #[must_use]
     pub fn with_playback(mut self, report: Arc<dyn castaway_core::PlaybackReport>) -> Self {
         self.playback = Some(report);
@@ -518,6 +534,7 @@ impl CastReceiver {
             device_id: self.device_id.clone(),
             friendly_name: self.friendly_name.clone(),
             model: "castaway".to_owned(),
+            ssdp_udn: self.udn.clone().unwrap_or_else(|| self.device_id.clone()),
         }
     }
 
@@ -930,6 +947,22 @@ impl SourceAdapter for CastReceiver {
                 // which costs a sender the "someone is already casting" hint and nothing
                 // else. Flipping it live needs re-advertisement on every session change.
                 ("st".to_string(), "0".to_string()),
+                // Remote-control notifications, and it is **not** decoration: Play
+                // Services' own scanner logs `Invalid remote control notifications
+                // enabled status; 0` against a record without it, because absent parses
+                // as 0 and 0 is not a value it accepts (#226, read off the phone's log).
+                // Every real device on the test LAN sends `nf=1`.
+                //
+                // Consistent with what this receiver already tells a device prober:
+                // `GET_DEVICE_INFO` answers `controlNotifications: 1`. The two are the
+                // same claim on two surfaces, so they are written from the same fact
+                // rather than independently.
+                ("nf".to_string(), "1".to_string()),
+                // Receiver status text — empty because nothing is playing, which is
+                // exactly what an idle real device sends (`rs=`). Present rather than
+                // omitted: a key a sender looks for and does not find is a different
+                // answer from one it finds empty.
+                ("rs".to_string(), String::new()),
             ],
         }]
     }

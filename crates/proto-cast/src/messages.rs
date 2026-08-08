@@ -25,6 +25,17 @@ pub mod ns {
     /// prober connects, authenticates, asks, gets nothing, and discards the device —
     /// visibly to nobody, since from the phone it looks like the device is not there.
     pub const DISCOVERY: &str = "urn:x-cast:com.google.cast.receiver.discovery";
+
+    /// Eureka device setup/info (`eureka_info`).
+    ///
+    /// The *second* namespace whose silence is fatal, and the one Play Services uses.
+    /// Measured against a real GMS sender (#226): the phone discovers us over mDNS,
+    /// completes device auth, asks `GET_APP_AVAILABILITY` for the two Android mirroring
+    /// apps and is told yes — and then asks `eureka_info` here, gets nothing, waits
+    /// about four seconds, drops the connection and leaves the device out of the
+    /// picker. Every symptom before that point looks perfect, which is why this took a
+    /// real phone to find: openscreen's sender never asks.
+    pub const SETUP: &str = "urn:x-cast:com.google.cast.setup";
 }
 
 /// The Default Media Receiver application id — the app senders launch to LOAD media
@@ -573,6 +584,149 @@ pub fn device_info(request_id: i64, device: &DeviceInfo) -> String {
     .to_string()
 }
 
+/// One field a sender's `eureka_info` request asked for.
+///
+/// An enum rather than the raw string so the answer is exhaustive by construction: a
+/// parameter this receiver has no value for must be a *named* case that is deliberately
+/// omitted, not a string that silently falls through. The wire names are dotted paths
+/// into the response object (`device_info.ssdp_udn` is `ssdp_udn` inside `device_info`),
+/// which is why parsing and rendering are two halves of the same table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EurekaParam {
+    /// `version` — the Eureka info schema this receiver answers in.
+    Version,
+    /// `name` — the device's friendly name.
+    Name,
+    /// `multizone` — speaker-group membership.
+    Multizone,
+    /// `device_info.ssdp_udn` — the UPnP UDN, dashed UUID form.
+    SsdpUdn,
+    /// `device_info.cloud_device_id` — the device's Google-cloud registration.
+    CloudDeviceId,
+    /// Something this receiver does not model. Carried rather than dropped so the log
+    /// can name it: a future sender asking for a field we omit is the exact shape of the
+    /// bug this whole namespace was added to fix (#226).
+    Unknown(String),
+}
+
+impl EurekaParam {
+    /// Parse one wire parameter name.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "version" => Self::Version,
+            "name" => Self::Name,
+            "multizone" => Self::Multizone,
+            "device_info.ssdp_udn" => Self::SsdpUdn,
+            "device_info.cloud_device_id" => Self::CloudDeviceId,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+}
+
+/// An `eureka_info` request: which fields the sender wants.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EurekaInfoRequest {
+    /// The request id to echo.
+    pub request_id: Option<i64>,
+    /// The `data.params` list.
+    #[serde(default)]
+    pub data: EurekaInfoParams,
+}
+
+/// The `data` object of an [`EurekaInfoRequest`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EurekaInfoParams {
+    /// Dotted parameter names.
+    #[serde(default)]
+    pub params: Vec<String>,
+}
+
+impl EurekaInfoRequest {
+    /// Parse a payload, returning the typed parameters.
+    ///
+    /// # Errors
+    /// [`CastError::Json`] if the body is not an `eureka_info` request.
+    pub fn parse(payload: &str) -> Result<(Option<i64>, Vec<EurekaParam>), CastError> {
+        let req: Self =
+            serde_json::from_str(payload).map_err(|e| CastError::Json(e.to_string()))?;
+        let params = req
+            .data
+            .params
+            .iter()
+            .map(|p| EurekaParam::parse(p))
+            .collect();
+        Ok((req.request_id, params))
+    }
+}
+
+/// The Eureka info schema version this receiver answers in.
+///
+/// Not a firmware version we are pretending to run: it is which shape of `eureka_info`
+/// the reply below is written to, and it is 13 because that is what the real device this
+/// was derived from answers (`fixtures/eureka_info_response.json`). A sender reads it to
+/// decide how to parse the rest, so it has to match the shape actually emitted.
+const EUREKA_INFO_VERSION: i64 = 13;
+
+/// Answer a sender's `eureka_info` probe with exactly the fields it asked for.
+///
+/// **Only** those fields: a real device answers the request's own `params` list and
+/// nothing else, and a receiver that volunteered extra keys would be describing a device
+/// that does not exist. Fields this receiver genuinely has no value for — a cloud
+/// registration it has never had — are omitted rather than faked, which is the same
+/// answer a Chromecast that was never linked to an account gives.
+///
+/// Shape from a live capture of a real device answering this exact request; see
+/// `fixtures/eureka_info_response.json` for the recorded reply and what was redacted.
+#[must_use]
+pub fn eureka_info(request_id: i64, params: &[EurekaParam], device: &DeviceInfo) -> String {
+    let mut data = serde_json::Map::new();
+    let mut device_info = serde_json::Map::new();
+
+    for param in params {
+        match param {
+            EurekaParam::Version => {
+                data.insert("version".into(), EUREKA_INFO_VERSION.into());
+            }
+            EurekaParam::Name => {
+                data.insert("name".into(), device.friendly_name.clone().into());
+            }
+            // Truthfully empty: this panel is one device, not a speaker group, and it
+            // neither leads nor joins one. The keys are present because a sender that
+            // asked for `multizone` and got no object at all has to guess whether that
+            // means "no groups" or "did not understand"; empty lists say which.
+            EurekaParam::Multizone => {
+                data.insert(
+                    "multizone".into(),
+                    serde_json::json!({
+                        "dynamic_groups": [],
+                        "groups": [],
+                        "multichannel_status": 0,
+                    }),
+                );
+            }
+            EurekaParam::SsdpUdn => {
+                device_info.insert("ssdp_udn".into(), device.ssdp_udn.clone().into());
+            }
+            // Omitted on purpose — see the doc comment.
+            EurekaParam::CloudDeviceId | EurekaParam::Unknown(_) => {}
+        }
+    }
+    if !device_info.is_empty() {
+        data.insert("device_info".into(), device_info.into());
+    }
+
+    serde_json::json!({
+        "type": "eureka_info",
+        "request_id": request_id,
+        "response_code": 200,
+        "response_string": "OK",
+        "data": data,
+    })
+    .to_string()
+}
+
 /// Build the `INVALID_REQUEST` a receiver answers an unrecognised discovery message with.
 ///
 /// openscreen answers rather than ignores (`ApplicationAgent::HandleInvalidCommand`), and
@@ -603,6 +757,16 @@ pub struct DeviceInfo {
     pub friendly_name: String,
     /// The model; the TXT record's `md`.
     pub model: String,
+    /// The UPnP-style UDN, in dashed UUID form — what `eureka_info` calls
+    /// `device_info.ssdp_udn`.
+    ///
+    /// The same panel UUID the rest of the receiver identifies itself by, carried in the
+    /// shape this one field wants: [`Self::device_id`] is that UUID with the dashes
+    /// removed, because the Cast TXT record's `id` is written that way. Kept as its own
+    /// field rather than re-inserting dashes at the point of use, because guessing where
+    /// they go is only correct for a canonically-shaped UUID and silently wrong for
+    /// anything else an operator puts in the config.
+    pub ssdp_udn: String,
 }
 
 impl Default for DeviceInfo {
@@ -616,6 +780,7 @@ impl Default for DeviceInfo {
             device_id: String::new(),
             friendly_name: String::new(),
             model: "castaway".to_owned(),
+            ssdp_udn: String::new(),
         }
     }
 }

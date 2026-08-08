@@ -5,7 +5,7 @@
 
 use castaway_core::{ControlTxn, MediaUri, SessionEvent};
 use prost::Message as _;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::error::CastError;
 use crate::ids::{AppId, SenderId, SessionId, TransportId};
@@ -283,6 +283,18 @@ impl CastSession {
     /// # Errors
     /// [`CastError`] on undecodable payloads.
     pub fn handle(&mut self, msg: &CastMessage) -> Result<Reaction, CastError> {
+        // Every inbound message, verbatim, at trace. Two of the three bugs that made
+        // this receiver invisible to a real sender (#226 and the DISCOVERY namespace
+        // before it) were *questions nobody knew were being asked* — silence has no
+        // symptom on this protocol beyond a device quietly missing from a picker, so
+        // the only way to find them is to read what actually arrives.
+        trace!(
+            namespace = %msg.namespace,
+            source = %msg.source_id,
+            destination = %msg.destination_id,
+            payload = msg.payload_utf8.as_deref().unwrap_or("<binary>"),
+            "inbound"
+        );
         // A hosted application owns the namespaces it declared, and that includes the
         // media namespace: with YouTube up, YouTube answers `LOAD`, not us. Answering
         // alongside it would put two receivers on one session — two `MEDIA_STATUS`
@@ -310,9 +322,21 @@ impl CastSession {
             ns::RECEIVER => self.handle_receiver(msg),
             ns::MEDIA => self.handle_media(msg),
             ns::DISCOVERY => Ok(self.handle_discovery(msg)),
+            ns::SETUP => Ok(self.handle_setup(msg)),
             crate::mirror::WEBRTC_NS => self.handle_webrtc(msg),
             other => {
-                debug!(namespace = %other, "ignoring message on unknown namespace");
+                // The payload, not just the namespace. A sender that asks something we
+                // do not answer goes quiet and drops the device several seconds later,
+                // and from the room that is indistinguishable from a receiver that is
+                // switched off — the same invisibility the DISCOVERY namespace comment
+                // describes. Without the body there is nothing to implement *from*:
+                // finding `com.google.cast.setup` in a log said only that something was
+                // missed, and the next question is always "asking what?".
+                debug!(
+                    namespace = %other,
+                    payload = msg.payload_utf8.as_deref().unwrap_or("<binary>"),
+                    "ignoring message on unknown namespace"
+                );
                 Ok(Reaction::default())
             }
         }
@@ -531,6 +555,51 @@ impl CastSession {
             &msg.destination_id,
             &msg.source_id,
             ns::DISCOVERY,
+            json,
+        )])
+    }
+
+    /// Answer Play Services' `eureka_info` probe.
+    ///
+    /// The sibling of [`Self::handle_discovery`], and the one a real phone actually
+    /// sends. Both exist for the same reason: a question left unanswered here does not
+    /// produce an error anywhere a person can see, it produces a device that is missing
+    /// from the picker several seconds later (#226).
+    ///
+    /// An unparseable body is answered too, rather than ignored — same argument as
+    /// `INVALID_REQUEST` on the discovery namespace: a prober told "I did not understand
+    /// that" knows the device is alive, where one told nothing cannot distinguish us
+    /// from a device that is gone.
+    fn handle_setup(&self, msg: &CastMessage) -> Reaction {
+        let Some(payload) = msg.payload_utf8.as_deref() else {
+            return Reaction::default();
+        };
+        let json = match messages::EurekaInfoRequest::parse(payload) {
+            Ok((request_id, params)) => {
+                if let Some(unknown) = params.iter().find_map(|p| match p {
+                    messages::EurekaParam::Unknown(name) => Some(name),
+                    _ => None,
+                }) {
+                    // Named, because this is how the next missing field announces
+                    // itself: not as an error, but as a picker that is empty again.
+                    debug!(param = %unknown, "a sender asked for an eureka_info field we omit");
+                }
+                debug!(
+                    name = %self.device.friendly_name,
+                    params = params.len(),
+                    "answering a sender's eureka_info probe"
+                );
+                messages::eureka_info(request_id.unwrap_or(0), &params, &self.device)
+            }
+            Err(e) => {
+                debug!(error = %e, "an unparseable eureka_info request");
+                messages::invalid_request(None)
+            }
+        };
+        Reaction::reply(vec![CastMessage::json(
+            &msg.destination_id,
+            &msg.source_id,
+            ns::SETUP,
             json,
         )])
     }
@@ -869,6 +938,7 @@ mod tests {
             device_id: "0e8c2e10caaa4b0f8f0e1d2c3b4a5968".into(),
             friendly_name: "dma.space/screen".into(),
             model: "castaway".into(),
+            ssdp_udn: "0e8c2e10-caaa-4b0f-8f0e-1d2c3b4a5968".into(),
         });
         let probe = recv_msg(
             ns::DISCOVERY,
@@ -894,6 +964,122 @@ mod tests {
         // openscreen's own `kDefaultDeviceCapabilities`, not the mDNS `ca`.
         assert_eq!(body["deviceCapabilities"], 6149);
         assert_eq!(body["controlNotifications"], 1);
+    }
+
+    fn probed_device() -> DeviceInfo {
+        DeviceInfo {
+            device_id: "0e8c2e10caaa4b0f8f0e1d2c3b4a5968".into(),
+            friendly_name: "dma.space/screen".into(),
+            model: "castaway".into(),
+            ssdp_udn: "0e8c2e10-caaa-4b0f-8f0e-1d2c3b4a5968".into(),
+        }
+    }
+
+    /// The request Play Services actually sends, byte for byte from the bench capture,
+    /// answered in the shape a real device answers it (`tests/fixtures/eureka-info/`).
+    ///
+    /// This is the question whose silence emptied every GMS picker while device auth,
+    /// app availability and the mDNS record were all correct (#226).
+    #[test]
+    fn play_services_eureka_probe_is_answered_in_the_shape_a_real_device_uses() {
+        let mut s = session().with_device(probed_device());
+        let request = include_str!("../tests/fixtures/eureka-info/request.json");
+        let probe = recv_msg(ns::SETUP, "sender-0", "receiver-0", request.trim());
+
+        let r = s.handle(&probe).unwrap();
+        assert_eq!(r.outgoing.len(), 1, "the probe must be answered");
+        let reply = &r.outgoing[0];
+        assert_eq!(reply.namespace, ns::SETUP);
+
+        let body = payload(reply);
+        // `type` repeated rather than a `responseType`, as with GET_DEVICE_INFO: a
+        // sender matching on `responseType` would never see this reply.
+        assert_eq!(body["type"], "eureka_info");
+        assert!(body.get("responseType").is_none(), "{body}");
+        assert_eq!(body["request_id"], 3, "the request id is echoed");
+        assert_eq!(body["response_code"], 200);
+        assert_eq!(body["response_string"], "OK");
+
+        // Exactly the params asked for. `name` and `version` at the top, and the dotted
+        // `device_info.ssdp_udn` nested under its object — the shape the real device
+        // uses, not five flat keys.
+        assert_eq!(body["data"]["name"], "dma.space/screen");
+        assert_eq!(body["data"]["version"], 13);
+        assert_eq!(
+            body["data"]["device_info"]["ssdp_udn"],
+            "0e8c2e10-caaa-4b0f-8f0e-1d2c3b4a5968"
+        );
+        // No cloud registration, so the key is absent rather than invented — the same
+        // answer a Chromecast that was never linked to an account gives.
+        assert!(
+            body["data"]["device_info"].get("cloud_device_id").is_none(),
+            "{body}"
+        );
+        // Truthfully not a speaker group, said in a way that is distinguishable from
+        // "did not understand the question".
+        assert_eq!(body["data"]["multizone"]["groups"], serde_json::json!([]));
+    }
+
+    /// The reply's shape is the real device's, checked against the recorded capture
+    /// rather than against our own idea of it.
+    #[test]
+    fn the_answer_carries_the_same_keys_a_real_device_answered_with() {
+        let recorded: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/eureka-info/response.json"))
+                .unwrap();
+
+        let mut s = session().with_device(probed_device());
+        let request = include_str!("../tests/fixtures/eureka-info/request.json");
+        let r = s
+            .handle(&recv_msg(
+                ns::SETUP,
+                "sender-0",
+                "receiver-0",
+                request.trim(),
+            ))
+            .unwrap();
+        let ours = payload(&r.outgoing[0]);
+
+        for key in [
+            "type",
+            "request_id",
+            "response_code",
+            "response_string",
+            "data",
+        ] {
+            assert!(ours.get(key).is_some(), "we omit {key}: {ours}");
+            assert!(recorded.get(key).is_some(), "fixture lacks {key}");
+        }
+        // The two fields a sender correlates the discovered record against. Values
+        // differ (the fixture is redacted); the *presence and nesting* is the contract.
+        assert!(ours["data"].get("name").is_some());
+        assert!(ours["data"]["device_info"].get("ssdp_udn").is_some());
+        assert!(recorded["data"]["device_info"].get("ssdp_udn").is_some());
+    }
+
+    /// A parameter we have no value for must not silently disappear into a wildcard.
+    #[test]
+    fn an_unmodelled_parameter_is_named_rather_than_dropped() {
+        assert_eq!(
+            messages::EurekaParam::parse("device_info.mac_address"),
+            messages::EurekaParam::Unknown("device_info.mac_address".into())
+        );
+        assert_eq!(
+            messages::EurekaParam::parse("name"),
+            messages::EurekaParam::Name
+        );
+    }
+
+    /// An unparseable body is answered too — same argument as `INVALID_REQUEST` on the
+    /// discovery namespace.
+    #[test]
+    fn a_malformed_eureka_request_is_still_answered() {
+        let mut s = session().with_device(probed_device());
+        let r = s
+            .handle(&recv_msg(ns::SETUP, "sender-0", "receiver-0", "not json"))
+            .unwrap();
+        assert_eq!(r.outgoing.len(), 1, "silence would drop us from the picker");
+        assert_eq!(r.outgoing[0].namespace, ns::SETUP);
     }
 
     /// A prober that is answered "I did not understand that" knows the device is alive;
