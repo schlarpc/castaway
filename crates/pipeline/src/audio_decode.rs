@@ -1439,9 +1439,35 @@ pub(crate) mod tests {
         })
         .join()
         .unwrap();
-        std::thread::sleep(Duration::from_millis(400));
 
-        let played = speaker.played();
+        // Wait for the mix to drain, rather than guessing how long that takes. `run`
+        // returns with up to `OUTPUT_LEAD` still in the ring and a device lead behind
+        // that, and on a loaded box playing it out takes longer than any fixed sleep is
+        // willing to admit — a short read, which the assertion below would report as a
+        // session inventing a sample rate.
+        //
+        // The quiet window is a whole `OUTPUT_LEAD` because the thing being waited on and
+        // the thing that goes wrong are the same thing: a mixer that has been descheduled
+        // looks exactly like one that has finished, and a short window simply mistakes the
+        // first for the second. If nothing has reached the device in a full lead, there is
+        // nothing behind it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut settled = Duration::ZERO;
+        let mut quiet_since = std::time::Instant::now();
+        let played = loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = speaker.played();
+            if now != settled {
+                settled = now;
+                quiet_since = std::time::Instant::now();
+            } else if now > Duration::ZERO && quiet_since.elapsed() >= crate::clock::OUTPUT_LEAD {
+                break now;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mix never drained; the speaker stopped at {now:?}"
+            );
+        };
         // aptX is fixed-rate, so a second in should be about a second out.
         //
         // The window is tight on purpose, because since #111 this is also where a session

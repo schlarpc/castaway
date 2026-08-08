@@ -605,10 +605,16 @@ mod tests {
         mixer.gain().set(Volume::from_dbfs(-6.0));
         let mut a = mixer.input(crate::mixer::Backpressure::Pull);
         let mut b = mixer.input(crate::mixer::Backpressure::Pull);
-        a.write(&pcm_at(48_000, 2, 480, 0.5)).unwrap();
-        b.write(&pcm_at(48_000, 2, 480, 0.5)).unwrap();
-        settle(Duration::from_millis(10));
-        // Two sources at 0.5 sum to 1.0, attenuated once by -6 dB.
+        // A tenth of a second each, not a single quantum. Two sources only sum where
+        // both rings are non-empty in the *same* pass, so with one quantum apiece a
+        // mixer pass landing between these two writes drains `a` alone and nothing ever
+        // sums — a race no amount of settling fixes, and one a longer sleep makes more
+        // likely rather than less. Ten quanta means the pass boundary can fall anywhere.
+        a.write(&pcm_at(48_000, 2, 4800, 0.5)).unwrap();
+        b.write(&pcm_at(48_000, 2, 4800, 0.5)).unwrap();
+        settle(Duration::from_millis(100));
+        // Two sources at 0.5 sum to 1.0, attenuated once by -6 dB. A peak, so one
+        // unsummed quantum at the head cannot hide the answer.
         let peak = device.peak();
         assert!(
             (peak - 0.501_187).abs() < 1e-3,
