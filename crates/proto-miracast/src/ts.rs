@@ -699,11 +699,11 @@ fn annex_b_has_idr(data: &[u8], codec: VideoCodec) -> bool {
                 let is_idr = match codec {
                     VideoCodec::H264 => nal & 0x1F == 5,
                     VideoCodec::Hevc => matches!((nal & 0x7E) >> 1, 16..=21),
-                    // VP8 never appears in a transport stream; a WFD source cannot offer
-                    // it, and neither can any codec added to the enum later — this is a
-                    // *transport stream*, and nothing reaches here that the PMT did not
-                    // map to one of the two above.
-                    VideoCodec::Vp8 | _ => false,
+                    // VP8/VP9 never appear in a transport stream; a WFD source cannot
+                    // offer them — this is a *transport stream*, and nothing reaches
+                    // here that the PMT did not map to one of the two above. Named so a
+                    // codec added to core has to answer for itself (#213).
+                    VideoCodec::Vp8 | VideoCodec::Vp9 => false,
                 };
                 if is_idr {
                     return true;

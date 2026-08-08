@@ -121,8 +121,11 @@ fn codec_id(codec: AudioCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
         AudioCodec::Alac => Ok(ffmpeg::codec::Id::ALAC),
         AudioCodec::Opus => Ok(ffmpeg::codec::Id::OPUS),
         // LDAC never reaches here: `Backend::for_codec` routes it to its own backend
-        // before asking libav, because libav has no LDAC decoder to name.
-        other => Err(PipelineError::Decode(format!(
+        // before asking libav, because libav has no LDAC decoder to name. PCM needs no
+        // decoder at all — an adapter with samples uses `FrameSource::Pcm`, so a PCM
+        // *encoded* frame asking for a decoder is a bug upstream. Named rather than
+        // wildcarded so the next codec added to core has to answer here (#213).
+        other @ (AudioCodec::Ldac | AudioCodec::Pcm) => Err(PipelineError::Decode(format!(
             "no libav audio decoder mapped for {other:?}"
         ))),
     }

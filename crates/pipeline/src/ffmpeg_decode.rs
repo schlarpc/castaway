@@ -915,17 +915,15 @@ impl HwAttempt {
 }
 
 /// Which ffmpeg decoder a negotiated codec asks for.
-fn codec_id(codec: VideoCodec) -> Result<ffmpeg::codec::Id, PipelineError> {
+///
+/// Exhaustive on purpose: a codec added to `core` must fail to compile here rather
+/// than silently render black (#213).
+fn codec_id(codec: VideoCodec) -> ffmpeg::codec::Id {
     match codec {
-        VideoCodec::H264 => Ok(ffmpeg::codec::Id::H264),
-        VideoCodec::Hevc => Ok(ffmpeg::codec::Id::HEVC),
-        VideoCodec::Vp8 => Ok(ffmpeg::codec::Id::VP8),
-        VideoCodec::Vp9 => Ok(ffmpeg::codec::Id::VP9),
-        // `VideoCodec` is `#[non_exhaustive]`, so a codec added to `core` cannot break
-        // this build — but it must not silently render black either. Fail loudly.
-        other => Err(PipelineError::Decode(format!(
-            "no ffmpeg decoder mapped for {other:?}"
-        ))),
+        VideoCodec::H264 => ffmpeg::codec::Id::H264,
+        VideoCodec::Hevc => ffmpeg::codec::Id::HEVC,
+        VideoCodec::Vp8 => ffmpeg::codec::Id::VP8,
+        VideoCodec::Vp9 => ffmpeg::codec::Id::VP9,
     }
 }
 
@@ -959,7 +957,7 @@ where
 {
     ensure_init();
 
-    let id = codec_id(codec)?;
+    let id = codec_id(codec);
     let mut hw = HwAttempt::new(preference);
 
     // One iteration per decoder incarnation. A mid-session fallback drops out of the
@@ -1502,7 +1500,7 @@ mod tests {
             VideoCodec::Vp8,
             VideoCodec::Vp9,
         ] {
-            let id = codec_id(codec).unwrap();
+            let id = codec_id(codec);
             assert!(
                 ffmpeg::decoder::find(id).is_some(),
                 "{codec:?} is negotiable but this ffmpeg build cannot decode it",

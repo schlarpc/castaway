@@ -43,9 +43,12 @@ impl Framing {
             // Classic aptX alone has no RTP header. aptX *HD* does — the two differ
             // here despite the shared name, which is exactly how this gets got wrong.
             AudioCodec::AptX => Self::Raw,
-            // Anything else reaching an A2DP media channel is a bug upstream, but
-            // assuming RTP is the safe reading: it is what the majority use.
-            _ => Self::Rtp,
+            // None of these is an A2DP codec, so one reaching a media channel is a bug
+            // upstream; RTP is the safe reading only because it is what the majority
+            // use. Named rather than wildcarded so that adding a codec to core (LC3,
+            // say) fails to compile here instead of silently framing it as RTP and
+            // garbling the audio (#213).
+            AudioCodec::Alac | AudioCodec::Opus | AudioCodec::Pcm => Self::Rtp,
         }
     }
 }

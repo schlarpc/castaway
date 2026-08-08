@@ -181,8 +181,13 @@ impl fmt::Display for MediaUri {
 }
 
 /// Video codecs the mirroring/decode path understands.
+///
+/// Deliberately **not** `#[non_exhaustive]`, same reasoning as [`ProtocolKind`]: every
+/// consumer is a sibling crate that recompiles with core, so the attribute buys no
+/// compatibility and costs exhaustiveness — it forces the `_` arms that let a new codec
+/// slip through a framing or decode decision silently (#213). Adding a variant must
+/// fail to compile at every site that has to consider it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum VideoCodec {
     /// H.264 / AVC (AirPlay mirror, Cast, Miracast).
     H264,
@@ -197,8 +202,9 @@ pub enum VideoCodec {
 }
 
 /// Audio codecs the decode path understands.
+///
+/// Not `#[non_exhaustive]` — see [`VideoCodec`] for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum AudioCodec {
     /// Apple Lossless (AirPlay 1 RAOP).
     Alac,
