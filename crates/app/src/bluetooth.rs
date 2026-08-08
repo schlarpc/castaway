@@ -263,8 +263,27 @@ async fn open_transport(config: &Config) -> anyhow::Result<(Arc<dyn HciTransport
         }
     }
 
+    if let Some(addr) = spec.strip_prefix("tcp:") {
+        let addr = addr.trim();
+        // The address is not validated beyond "has a port": rootcanal's HCI port is
+        // wherever the harness put it, and connect() is the only authority on whether
+        // something answers there.
+        anyhow::ensure!(
+            addr.rsplit_once(':')
+                .is_some_and(|(_, port)| port.parse::<u16>().is_ok()),
+            "transport {spec:?} should look like tcp:127.0.0.1:6402"
+        );
+        let transport = hci_transport::tcp::TcpTransport::connect(addr)
+            .await
+            .with_context(|| format!("connecting to the virtual controller at {addr}"))?;
+        return Ok((Arc::new(transport), format!("tcp:{addr}")));
+    }
+
     if spec != "usb" {
-        anyhow::bail!("unknown bluetooth transport {spec:?}; expected \"usb\" or \"socket:N\"");
+        anyhow::bail!(
+            "unknown bluetooth transport {spec:?}; expected \"usb\", \"socket:N\" or \
+             \"tcp:host:port\""
+        );
     }
 
     let requested = match &config.bluetooth.controller {

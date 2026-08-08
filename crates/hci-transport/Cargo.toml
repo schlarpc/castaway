@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "HciTransport backends (USB/WinUSB, Linux HCI_CHANNEL_USER) and the ControllerInit registry that loads vendor firmware."
+description = "HciTransport backends (USB/WinUSB, Linux HCI_CHANNEL_USER, H4-over-TCP virtual controllers) and the ControllerInit registry that loads vendor firmware."
 build = "build.rs"
 
 [dependencies]
@@ -14,7 +14,9 @@ thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+# `net` unconditionally: the TCP transport (virtual controllers, #225) is portable pure
+# Rust and carries no feature gate (D55).
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net", "io-util"] }
 # Pure-Rust USB, so the transport needs no libusb and no unsafe. Same code drives a
 # dongle on Linux and a WinUSB-bound one on Windows.
 # `tokio` is not optional dressing: nusb 0.2 models its blocking syscalls as a

@@ -400,6 +400,80 @@ fn exact(buf: &[u8], len: usize, what: &'static str) -> Result<Bytes, HciError> 
     Ok(Bytes::copy_from_slice(&buf[..len]))
 }
 
+/// Reassembles HCI packets out of an H4 byte *stream*.
+///
+/// The raw-HCI socket and USB backends get one packet per read, so [`HciPacket::decode`]
+/// alone serves them. A stream transport — UART, or TCP to a rootcanal/netsim virtual
+/// controller — has no such boundary: one read may hold half a header, or three packets
+/// and the first two bytes of a fourth. This holds the tail between reads and yields
+/// packets exactly when their declared length is present.
+///
+/// Pure by design (ground rule 3): bytes in, packets out, no socket anywhere near it —
+/// which is what lets the dribble tests below run every split point of every header.
+#[derive(Debug, Default)]
+pub struct StreamDeframer {
+    buf: BytesMut,
+}
+
+impl StreamDeframer {
+    /// A deframer with nothing buffered.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed bytes exactly as they arrived from the stream.
+    pub fn extend(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Take the next complete packet, or `None` while the buffer holds only part of one.
+    ///
+    /// Call in a loop after each [`extend`](Self::extend): one read can complete several
+    /// packets.
+    ///
+    /// # Errors
+    /// [`HciError::UnknownPacketType`] if the byte where an indicator should be is not
+    /// one. On a stream there is no way to resynchronise past that — every later byte is
+    /// at an unknown offset — so the only sound response is to drop the connection.
+    pub fn next_packet(&mut self) -> Result<Option<HciPacket>, HciError> {
+        let Some(&indicator) = self.buf.first() else {
+            return Ok(None);
+        };
+        let kind = PacketType::from_indicator(indicator)?;
+        // Header size after the indicator, and where its length field lives — the one
+        // place these four shapes are written down for streaming; `decode_body` re-reads
+        // them from the complete frame below.
+        let header = match kind {
+            PacketType::Event => 2,
+            PacketType::Command | PacketType::ScoData => 3,
+            PacketType::AclData => 4,
+        };
+        let Some(head) = self.buf.get(1..1 + header) else {
+            return Ok(None);
+        };
+        let payload = match kind {
+            PacketType::Command | PacketType::ScoData => head[2] as usize,
+            PacketType::Event => head[1] as usize,
+            // The one 16-bit length: an ACL frame above 255 bytes is routine, and
+            // reading one byte of it would desynchronise the stream for good.
+            PacketType::AclData => u16::from_le_bytes([head[2], head[3]]) as usize,
+        };
+        let total = 1 + header + payload;
+        if self.buf.len() < total {
+            return Ok(None);
+        }
+        let frame = self.buf.split_to(total);
+        HciPacket::decode(&frame).map(Some)
+    }
+
+    /// Bytes held waiting for the rest of a packet.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.buf.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -495,6 +569,113 @@ mod tests {
     fn unknown_indicators_are_rejected() {
         assert!(matches!(
             HciPacket::decode(&[0x09, 0, 0]),
+            Err(HciError::UnknownPacketType(0x09))
+        ));
+    }
+
+    /// Every packet shape, delivered one byte at a time: the packet must appear on the
+    /// final byte and not one earlier. This walks every split point of every header,
+    /// which is the entire failure surface of stream framing.
+    #[test]
+    fn a_dribbled_stream_yields_each_packet_exactly_on_its_last_byte() {
+        let packets = [
+            HciPacket::Command {
+                opcode: OpCode::new(0x0C03),
+                params: Bytes::new(),
+            },
+            HciPacket::Event {
+                code: 0x0e,
+                params: Bytes::from_static(&hex!("01 03 0c 00")),
+            },
+            HciPacket::Acl(AclPacket::new(
+                ConnectionHandle::new(0x0b).unwrap(),
+                PacketBoundary::FirstFlushable,
+                Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            )),
+            HciPacket::Sco {
+                handle: ConnectionHandle::new(0x0c).unwrap(),
+                data: Bytes::from_static(&[0x55]),
+            },
+        ];
+        for pkt in packets {
+            let wire = pkt.encode().unwrap();
+            let mut deframer = StreamDeframer::new();
+            for (i, byte) in wire.iter().enumerate() {
+                deframer.extend(&[*byte]);
+                let got = deframer.next_packet().unwrap();
+                if i + 1 < wire.len() {
+                    assert!(
+                        got.is_none(),
+                        "{pkt:?} appeared {} bytes early",
+                        wire.len() - i - 1
+                    );
+                } else {
+                    assert_eq!(got, Some(pkt.clone()));
+                }
+            }
+            assert_eq!(deframer.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn one_read_holding_several_packets_yields_them_all_in_order() {
+        let a = HciPacket::Event {
+            code: 0x13,
+            params: Bytes::from_static(&hex!("01 0b 00 01 00")),
+        };
+        let b = HciPacket::Acl(AclPacket::new(
+            ConnectionHandle::new(0x0b).unwrap(),
+            PacketBoundary::Continuing,
+            Bytes::from_static(&[1, 2, 3]),
+        ));
+        let c = HciPacket::Command {
+            opcode: OpCode::new(0x0C03),
+            params: Bytes::new(),
+        };
+        let mut wire = Vec::new();
+        for pkt in [&a, &b, &c] {
+            wire.extend_from_slice(&pkt.encode().unwrap());
+        }
+        // Plus half of a fourth, which must stay pending rather than confuse anything.
+        wire.extend_from_slice(&[0x02, 0x0b]);
+
+        let mut deframer = StreamDeframer::new();
+        deframer.extend(&wire);
+        assert_eq!(deframer.next_packet().unwrap(), Some(a));
+        assert_eq!(deframer.next_packet().unwrap(), Some(b));
+        assert_eq!(deframer.next_packet().unwrap(), Some(c));
+        assert_eq!(deframer.next_packet().unwrap(), None);
+        assert_eq!(deframer.pending(), 2);
+    }
+
+    /// An ACL frame longer than 255 bytes exercises the 16-bit length field — the header
+    /// byte a one-byte read of the length would truncate, silently, on every A2DP media
+    /// packet (they are routinely ~600 bytes).
+    #[test]
+    fn an_acl_frame_larger_than_a_byte_can_describe_frames_correctly() {
+        let payload = vec![0xAB; 700];
+        let pkt = HciPacket::Acl(AclPacket::new(
+            ConnectionHandle::new(0x0b).unwrap(),
+            PacketBoundary::FirstFlushable,
+            Bytes::from(payload),
+        ));
+        let wire = pkt.encode().unwrap();
+
+        let mut deframer = StreamDeframer::new();
+        // In two arbitrary chunks, split inside the payload.
+        deframer.extend(&wire[..300]);
+        assert_eq!(deframer.next_packet().unwrap(), None);
+        deframer.extend(&wire[300..]);
+        assert_eq!(deframer.next_packet().unwrap(), Some(pkt));
+    }
+
+    #[test]
+    fn a_corrupt_indicator_is_fatal_to_the_stream() {
+        // There is no resynchronising an H4 stream: report it, so the transport closes.
+        let mut deframer = StreamDeframer::new();
+        deframer.extend(&[0x09, 0x00]);
+        assert!(matches!(
+            deframer.next_packet(),
             Err(HciError::UnknownPacketType(0x09))
         ));
     }

@@ -6,7 +6,9 @@
 //! Split from `substrate-hci` because ground rule 8 has every `substrate-*` crate at
 //! `unsafe_code = "forbid"` and the Linux raw-HCI socket needs syscalls. The USB backend
 //! needs no `unsafe` at all — `nusb` is a safe API — which also makes both firmware
-//! loaders pure safe Rust (architecture §11.2).
+//! loaders pure safe Rust (architecture §11.2). The TCP backend reaches a
+//! rootcanal/netsim *virtual* controller the same way (#225), and is pure safe portable
+//! Rust as well.
 //!
 //! Two seams, because they are two problems. Moving packets is vendor-neutral; waking a
 //! controller is not, and most modern parts ship with no usable ROM image.
@@ -19,6 +21,7 @@ pub mod init;
 
 #[cfg(all(feature = "socket", target_os = "linux"))]
 pub mod socket;
+pub mod tcp;
 #[cfg(feature = "usb")]
 pub mod usb;
 

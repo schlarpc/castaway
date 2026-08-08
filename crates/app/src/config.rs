@@ -924,6 +924,11 @@ pub struct Bluetooth {
     ///   only, and the controller must be down. This is how a *virtual* controller is
     ///   reached — `btvirt -l2` needs no firmware — which is what makes the
     ///   no-hardware integration test possible (architecture §11.7).
+    /// - `"tcp:host:port"` connects to a rootcanal/netsim HCI port, where each
+    ///   connection becomes a new virtual controller on the simulator's shared phy.
+    ///   This is how the receiver joins the Android emulator's Bluetooth world (#225):
+    ///   `tcp:127.0.0.1:6402` against a standalone rootcanal, or netsim's
+    ///   `--hci-port`.
     pub transport: String,
     /// Which USB controller to claim, as `vendor:product` the way `lsusb` prints it
     /// (`8087:0029` for an AX200). `None` takes the first Bluetooth device found.

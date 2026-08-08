@@ -37,6 +37,8 @@ pub use error::HciError;
 pub use event::{BufferSize, Event, LinkType};
 pub use flow::{AclCredits, CommandCredits};
 pub use opcode::{Ogf, OpCode};
-pub use packet::{AclPacket, Broadcast, ConnectionHandle, HciPacket, PacketBoundary, PacketType};
+pub use packet::{
+    AclPacket, Broadcast, ConnectionHandle, HciPacket, PacketBoundary, PacketType, StreamDeframer,
+};
 pub use status::Status;
 pub use transport::{HciTransport, Reassembler, ScriptedTransport};
