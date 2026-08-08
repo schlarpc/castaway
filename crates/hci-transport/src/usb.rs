@@ -23,7 +23,7 @@ use nusb::transfer::{
     Recipient, TransferError,
 };
 use nusb::{Device, DeviceInfo, Endpoint, Interface, MaybeFuture};
-use substrate_hci::{HciError, HciPacket, HciTransport, PacketType};
+use substrate_hci::{HciError, HciPacket, HciTransport, OpCode, PacketType};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -80,6 +80,29 @@ const _: () = {
 /// it. A controller that has not accepted a 3-byte command header in five seconds is not
 /// going to.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Say what a refused command transfer actually means, and which command it was.
+///
+/// Two lies to undo, and they cost a kernel diff to see through once (#229).
+///
+/// `nusb` implements a timeout by *cancelling* the transfer, so an expired
+/// [`CONTROL_TIMEOUT`] surfaces as [`TransferError::Cancelled`] — rendered "transfer was
+/// cancelled", which reads as a shutdown race. It is the opposite: nothing here cancels
+/// anything, and the transfer is abandoned precisely because the controller never took it.
+///
+/// And every command left through this one line with no name attached, so a controller
+/// that refused `Read_Version` and one that refused the forty-seventh firmware fragment
+/// produced the same sentence. Naming the opcode is most of the diagnosis: on Intel parts
+/// `FC09` in particular must go down the *bulk* endpoint while the bootloader is running,
+/// which is a different bug (#229) that this message is how you find.
+fn control_failure(opcode: OpCode, error: &TransferError) -> HciError {
+    match error {
+        TransferError::Cancelled => HciError::Transport(format!(
+            "control out: the controller did not accept {opcode} within {CONTROL_TIMEOUT:?}"
+        )),
+        other => HciError::Transport(format!("control out: {opcode}: {other}")),
+    }
+}
 
 /// Round an IN transfer length up to a whole number of packets.
 ///
@@ -397,7 +420,7 @@ impl HciTransport for UsbTransport {
                         CONTROL_TIMEOUT,
                     )
                     .await
-                    .map_err(|e| HciError::Transport(format!("control out: {e}")))?;
+                    .map_err(|e| control_failure(opcode, &e))?;
                 Ok(())
             }
             HciPacket::Acl(acl) => {
@@ -475,6 +498,39 @@ mod tests {
         } else {
             assert!(hint.contains("WinUSB"), "got: {hint}");
         }
+    }
+
+    #[test]
+    fn a_control_timeout_is_reported_as_one_and_names_the_command() {
+        // The deploy box spent a session saying "control out: transfer was cancelled",
+        // which is nusb's rendering of a *timeout* and says nothing about which command
+        // expired — the whole diagnosis of #229 was working out that it was FC09 and not
+        // FC05. Both facts have to be in the sentence.
+        let expired = control_failure(OpCode::new(0xFC09), &TransferError::Cancelled);
+        let text = expired.to_string();
+        assert!(
+            text.contains("FC09") || text.contains("fc09"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("cancelled"),
+            "a timeout must not read as a cancellation: {text}"
+        );
+        assert!(
+            text.contains('5'),
+            "should name the bound it waited: {text}"
+        );
+
+        // Anything else keeps what the transport said, still with the opcode attached.
+        let stalled = control_failure(OpCode::new(0xFC05), &TransferError::Stall).to_string();
+        assert!(
+            stalled.contains("FC05") || stalled.contains("fc05"),
+            "got: {stalled}"
+        );
+        assert!(
+            stalled.contains("stall") || stalled.contains("STALL"),
+            "got: {stalled}"
+        );
     }
 
     #[test]

@@ -170,7 +170,17 @@ impl ControllerInit for IntelInit {
                 info!("intel controller already running operational firmware");
                 return Ok(());
             }
-            RunningImage::Bootloader => {}
+            RunningImage::Bootloader => {
+                // At info, not debug, and deliberately: this happens once on a cold boot
+                // and never again, it is the branch that has never run against real
+                // hardware (#229), and without it a deploy log cannot tell a controller
+                // that refused `Read_Version` from one that refused a firmware fragment.
+                info!(
+                    image = %image_stem,
+                    version = %hex(&version),
+                    "intel controller is in the bootloader; loading firmware"
+                );
+            }
             RunningImage::Unknown => {
                 return Err(TransportError::Controller {
                     what: "intel read_version",
