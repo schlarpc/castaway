@@ -23,11 +23,16 @@
     # audit, one update story. `file+` keeps them as the raw archives: the nix/
     # derivations do the unpacking, so layout policy lives beside the build that uses it.
     #
-    # Every URL is immutable by construction. BtbN replaces the assets under its `latest`
-    # tag daily, so this pins the dated `autobuild-*` release instead; the rest are
-    # version-stamped release and CDN paths.
+    # Every URL is immutable by construction — and immutable is not durable, which the
+    # Release workflow's first cold run paid to find out. BtbN replaces the assets under
+    # its `latest` tag daily *and prunes the dated `autobuild-*` releases after a couple
+    # of weeks*, so the dated pin this used kept 404ing on any machine without the blob
+    # already in its store; a dev box's warm store masked it. The blob now lives as an
+    # asset on this repo's own `vendor` release (provenance in its notes), which only has
+    # to keep existing — the content itself is still pinned by narHash in flake.lock. The
+    # rest are version-stamped release and CDN paths whose upstreams do not prune.
     ffmpeg-windows-src = {
-      url = "file+https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-24-13-32/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip";
+      url = "file+https://github.com/schlarpc/castaway/releases/download/vendor/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip";
       flake = false;
     };
 

@@ -73,11 +73,11 @@
       "locked": {
         "narHash": "sha256-HF4vmQLCGnQAal/BBukXkV3HKTV+Y6dISFV7nI2e3Cw=",
         "type": "file",
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-24-13-32/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip"
+        "url": "https://github.com/schlarpc/castaway/releases/download/vendor/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip"
       },
       "original": {
         "type": "file",
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-24-13-32/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip"
+        "url": "https://github.com/schlarpc/castaway/releases/download/vendor/ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1.zip"
       }
     },
     "flake-parts": {
