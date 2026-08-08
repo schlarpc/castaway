@@ -71,6 +71,15 @@ tower = { version = "0.5", features = ["util"] }
 # crate is the only one that depends on both the protocol half and the decode half, which
 # is why the seam between them is tested here (#187).
 bytes.workspace = true
+# Acting as an encrypting RAOP sender in `tests/airplay_audio_decodes.rs` (#189): wrap
+# an AES key with the AirPort public half, CBC-encrypt the packets the way an iPhone
+# does, and prove the session decrypts to the same PCM as the clear run.
+crypto-raop.workspace = true
+rsa.workspace = true
+aes.workspace = true
+cbc.workspace = true
+base64.workspace = true
+sha1.workspace = true
 
 [build-dependencies]
 # Embeds assets/castaway.rc (the .exe icon) when the *target* is Windows — which is

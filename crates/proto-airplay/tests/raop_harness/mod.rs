@@ -153,6 +153,12 @@ pub fn audio_packet(sequence: u16, timestamp: u32, payload: &[u8]) -> Vec<u8> {
 ///
 /// Panics on any non-200, so a caller holds a session that is genuinely up.
 pub async fn negotiate(stream: &mut TcpStream, fmtp: &str) -> (u16, String) {
+    negotiate_with_sdp(stream, &announce_sdp(fmtp)).await
+}
+
+/// [`negotiate`], with the whole SDP supplied — for a sender that announces more than
+/// the codec line, like the `a=rsaaeskey:`/`a=aesiv:` of an encrypting one.
+pub async fn negotiate_with_sdp(stream: &mut TcpStream, sdp: &str) -> (u16, String) {
     let options = request(stream, "OPTIONS *", &[], &[], 1).await;
     assert!(options.starts_with("RTSP/1.0 200"), "{options}");
 
@@ -160,7 +166,7 @@ pub async fn negotiate(stream: &mut TcpStream, fmtp: &str) -> (u16, String) {
         stream,
         "ANNOUNCE rtsp://127.0.0.1/1",
         &[("Content-Type", "application/sdp")],
-        announce_sdp(fmtp).as_bytes(),
+        sdp.as_bytes(),
         2,
     )
     .await;

@@ -110,25 +110,39 @@ fn tone(frequency: f32, samples: usize) -> Vec<f32> {
         .collect()
 }
 
-/// What a sender streams over a negotiated RAOP session becomes the tone it encoded.
+/// Apply the RAOP audio-packet encryption rule, as a sender would: AES-128-CBC over
+/// whole blocks only, ragged tail in the clear, and a fresh cipher per packet — which
+/// *is* the per-packet IV reset the receiver's decrypt side mirrors.
+fn raop_encrypt(key: &[u8; 16], iv: &[u8; 16], payload: &[u8]) -> Vec<u8> {
+    use aes::cipher::{BlockEncryptMut as _, KeyIvInit as _};
+    let mut out = payload.to_vec();
+    let n = out.len() - (out.len() % 16);
+    if n == 0 {
+        return out;
+    }
+    let mut enc = cbc::Encryptor::<aes::Aes128>::new(key.into(), iv.into());
+    let chunks = aes::cipher::inout::InOutBuf::from(&mut out[..n])
+        .into_chunks::<aes::cipher::consts::U16>()
+        .0
+        .into_out();
+    enc.encrypt_blocks_mut(chunks);
+    out
+}
+
+/// Negotiate a session with `sdp`, stream the fixture (encrypting each packet when the
+/// SDP promised to), and return what the pipeline's decoder makes of what came out.
 ///
-/// The full path, every step the shipped code's: the RTSP negotiation builds the magic
-/// cookie from the SDP, the UDP socket the SETUP advertised receives real RTP, the
-/// session delivers `EncodedFrame`s, and libavcodec decodes them with the delivered
-/// config. The bar is 0.999 per channel because ALAC is lossless: anything short of
-/// near-unity is a framing error somewhere in the join, not a codec being a codec.
-///
-/// The two channels carry different tones, so a swap anywhere in the path scores ~0
-/// rather than passing on symmetry.
-#[tokio::test]
-async fn what_a_sender_streams_over_raop_becomes_the_tone_it_encoded() {
+/// Every step is the shipped code's: the negotiation builds the magic cookie from the
+/// SDP, the UDP socket the SETUP advertised receives real RTP, the session delivers
+/// `EncodedFrame`s, and libavcodec decodes them with the delivered config.
+async fn stream_and_decode(sdp: String, encrypt: Option<([u8; 16], [u8; 16])>) -> Vec<f32> {
     if !pipeline::audio_decode::can_decode(AudioCodec::Alac) {
         // Not a skip this build may take quietly: ALAC is what every iPhone sends first.
         panic!("this build advertises AirPlay and cannot decode ALAC");
     }
 
     let (mut stream, mut events) = raop::start(MediaPorts::Ephemeral).await;
-    let (audio_port, _record) = raop::negotiate(&mut stream, FIXTURE_FMTP).await;
+    let (audio_port, _record) = raop::negotiate_with_sdp(&mut stream, &sdp).await;
 
     // The Audio event carries the format and config the *session* derived — the exact
     // bytes the app would hand the pipeline, which is the seam under test.
@@ -164,8 +178,12 @@ async fn what_a_sender_streams_over_raop_becomes_the_tone_it_encoded() {
         .unwrap();
     let target = SocketAddr::from(([127, 0, 0, 1], audio_port));
     for (i, payload) in packets.iter().enumerate() {
+        let payload = match &encrypt {
+            Some((key, iv)) => raop_encrypt(key, iv, payload),
+            None => payload.to_vec(),
+        };
         #[allow(clippy::cast_possible_truncation)]
-        let packet = raop::audio_packet(i as u16, i as u32 * 4096, payload);
+        let packet = raop::audio_packet(i as u16, i as u32 * 4096, &payload);
         sender.send_to(&packet, target).await.unwrap();
     }
 
@@ -184,6 +202,18 @@ async fn what_a_sender_streams_over_raop_becomes_the_tone_it_encoded() {
     decoder
         .flush(|block| decoded.extend_from_slice(&block.samples))
         .unwrap();
+    decoded
+}
+
+/// What a sender streams over a negotiated RAOP session becomes the tone it encoded.
+///
+/// The bar is 0.999 per channel because ALAC is lossless: anything short of near-unity
+/// is a framing error somewhere in the join, not a codec being a codec. The two
+/// channels carry different tones, so a swap anywhere in the path scores ~0 rather
+/// than passing on symmetry.
+#[tokio::test]
+async fn what_a_sender_streams_over_raop_becomes_the_tone_it_encoded() {
+    let decoded = stream_and_decode(raop::announce_sdp(FIXTURE_FMTP), None).await;
 
     // Lossless means exact: every sample the encoder was given comes out, none invented.
     assert_eq!(
@@ -201,6 +231,58 @@ async fn what_a_sender_streams_over_raop_becomes_the_tone_it_encoded() {
             score >= 0.999,
             "the {name} channel correlates {score:.4} with its {frequency} Hz tone; ALAC \
              is lossless, so anything short of near-unity is a framing error in the join"
+        );
+    }
+}
+
+/// The same session encrypted the way an iPhone encrypts it decodes to the same PCM,
+/// bit for bit.
+///
+/// The key rides in `a=rsaaeskey:` wrapped with the AirPort public half (RSA-OAEP over
+/// SHA-1 — the real derivation, not a test double), the IV in `a=aesiv:`, and each
+/// packet is AES-CBC over whole blocks with the tail in the clear. Bit-identity with
+/// the clear run is the whole assertion: the decrypt path must be a no-op on the
+/// *audio*, and any block it misses, double-decrypts, or chains across packets decodes
+/// to different samples — loudly, because ALAC framing breaks — or to none.
+#[tokio::test]
+async fn an_encrypted_session_decodes_to_the_same_pcm_as_the_clear_one() {
+    if !crypto_raop::has_airport_key() {
+        // The AirPort key is carved at build time rather than checked in, so a build
+        // without it cannot exercise the RSA path. `nix flake check` always has it.
+        eprintln!("skipping: this build has no AirPort key");
+        return;
+    }
+    use base64::Engine as _;
+    let key = *b"0123456789abcdef";
+    let iv = *b"ABCDEFGHIJKLMNOP";
+    let wrapped = crypto_raop::airport_public_key()
+        .unwrap()
+        .encrypt(
+            &mut rsa::rand_core::OsRng,
+            rsa::Oaep::new::<sha1::Sha1>(),
+            &key,
+        )
+        .unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD_NO_PAD;
+    let sdp = format!(
+        "{}a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
+        raop::announce_sdp(FIXTURE_FMTP),
+        b64.encode(&wrapped),
+        b64.encode(iv)
+    );
+
+    let encrypted = stream_and_decode(sdp, Some((key, iv))).await;
+    let clear = stream_and_decode(raop::announce_sdp(FIXTURE_FMTP), None).await;
+
+    assert_eq!(
+        encrypted.len(),
+        clear.len(),
+        "the encrypted session decoded a different amount of audio than the clear one"
+    );
+    if let Some(at) = (0..clear.len()).find(|&i| encrypted[i].to_bits() != clear[i].to_bits()) {
+        panic!(
+            "decryption is not transparent: sample {at} is {} decrypted vs {} clear",
+            encrypted[at], clear[at]
         );
     }
 }
