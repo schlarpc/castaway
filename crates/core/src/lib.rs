@@ -14,6 +14,7 @@ pub mod display;
 pub mod error;
 pub mod event;
 pub mod lossy;
+pub mod net;
 pub mod nowplaying;
 pub mod osd;
 pub mod pipeline;

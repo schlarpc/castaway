@@ -944,21 +944,18 @@ impl SourceAdapter for CastReceiver {
             .map_err(|e| CoreError::Adapter(format!("binding CASTv2 on {}: {e}", self.listen)))?;
         info!(addr = %self.listen, "CASTv2 TLS listener ready");
 
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                // One failed accept (fd limit, RST between accept and return) shouldn't
-                // take the listener down; the next sender deserves a try.
-                Err(e) => {
-                    warn!(error = %e, "CASTv2 accept failed");
-                    continue;
-                }
-            };
-            let this = Arc::clone(&self);
-            // Tag events with the peer so two senders are distinguishable sources.
-            let conn_sink = sink.with_instance(peer.to_string());
-            tokio::spawn(async move { this.serve(stream, peer, conn_sink).await });
-        }
+        // The loop that never returns is `core`'s now (#224); matching on its
+        // `Infallible` says so without a dead `Ok(())`.
+        match castaway_core::net::accept_loop(
+            listener,
+            sink,
+            "CASTv2",
+            move |stream, peer, sink| {
+                let this = Arc::clone(&self);
+                async move { this.serve(stream, peer, sink).await }
+            },
+        )
+        .await {}
     }
 }
 

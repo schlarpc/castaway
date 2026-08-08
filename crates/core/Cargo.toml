@@ -13,10 +13,18 @@ thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 url.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+  "sync",
+  "rt",
+  "macros",
+  "time",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+] }
 
 [lints]
 workspace = true

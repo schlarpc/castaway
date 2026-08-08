@@ -193,25 +193,6 @@ impl AirPlayReceiver {
         let _ = sink.emit(SessionEvent::End).await;
         let _ = stream.shutdown().await;
     }
-
-    /// Accept connections on `listener` until it fails fatally, serving each in its own
-    /// task tagged with the peer and the channel it arrived on.
-    async fn accept_loop(self: Arc<Self>, listener: TcpListener, sink: SessionSink) {
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                // One failed accept (fd limit, RST between accept and return) shouldn't
-                // take the listener down; the next sender deserves a try.
-                Err(e) => {
-                    warn!(error = %e, "AirPlay accept failed");
-                    continue;
-                }
-            };
-            let this = Arc::clone(&self);
-            let conn_sink = sink.with_instance(peer.to_string());
-            tokio::spawn(async move { this.serve(stream, peer, conn_sink).await });
-        }
-    }
 }
 
 /// How a served connection finished, when it finished cleanly.
@@ -544,8 +525,18 @@ impl SourceAdapter for AirPlayReceiver {
             .await
             .map_err(|e| CoreError::Adapter(format!("binding AirPlay on {}: {e}", self.addr)))?;
         info!(addr = %self.addr, "AirPlay RTSP listener ready");
-        self.accept_loop(listener, sink).await;
-        Ok(())
+        // The loop that never returns is `core`'s now (#224); matching on its
+        // `Infallible` says so without a dead `Ok(())`.
+        match castaway_core::net::accept_loop(
+            listener,
+            sink,
+            "AirPlay",
+            move |stream, peer, sink| {
+                let this = Arc::clone(&self);
+                async move { this.serve(stream, peer, sink).await }
+            },
+        )
+        .await {}
     }
 }
 
