@@ -692,10 +692,12 @@ impl EurekaInfoRequest {
 /// The Eureka info schema version this receiver answers in.
 ///
 /// Not a firmware version we are pretending to run: it is which shape of `eureka_info`
-/// the reply below is written to, and it is 13 because that is what the real device this
-/// was derived from answers (`fixtures/eureka_info_response.json`). A sender reads it to
-/// decide how to parse the rest, so it has to match the shape actually emitted.
-const EUREKA_INFO_VERSION: i64 = 13;
+/// the reply is written to, and it is 13 because that is what the real device this was
+/// derived from answers (`tests/fixtures/eureka-info/response.json`). A sender reads it
+/// to decide how to parse the rest, so it has to match the shape actually emitted —
+/// which is why the number is pinned to that fixture by a test rather than trusted to
+/// this comment.
+pub const EUREKA_INFO_VERSION: i64 = 13;
 
 /// Answer a sender's `eureka_info` probe with exactly the fields it asked for.
 ///

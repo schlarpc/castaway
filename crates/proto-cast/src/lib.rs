@@ -29,6 +29,7 @@ pub mod rtcp;
 pub mod rtp;
 pub mod rtp_actor;
 pub mod session;
+pub mod txt;
 
 pub use actor::{CastIdentity, CastReceiver, TlsIdentity};
 pub use auth::CastAuthResponder;

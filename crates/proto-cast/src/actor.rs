@@ -931,10 +931,18 @@ impl SourceAdapter for CastReceiver {
                 ("id".to_string(), device.device_id.clone()),
                 ("md".to_string(), device.model.clone()),
                 ("fn".to_string(), device.friendly_name.clone()),
-                // Capability bitmask and protocol version, as senders expect them:
-                // 5 = video out + audio out, "05" = the CASTv2 generation we speak.
-                ("ca".to_string(), "5".to_string()),
-                ("ve".to_string(), "05".to_string()),
+                // What this receiver is, and which generation it speaks. Both built
+                // from named values rather than written as numbers — a capability is a
+                // claim a sender acts on before it connects, so it should have to be
+                // stated rather than mistyped (`crate::txt`).
+                (
+                    "ca".to_string(),
+                    crate::txt::DeviceCapabilities::panel().to_string(),
+                ),
+                (
+                    "ve".to_string(),
+                    crate::txt::PROTOCOL_GENERATION.to_string(),
+                ),
                 // Receiver status flag, and it is *mandatory* — openscreen's
                 // `ReceiverInfoFromDnsSdInstance` rejects the whole record with
                 // "Missing receiver status flag" when `st` is absent, so a sender that
@@ -946,7 +954,10 @@ impl SourceAdapter for CastReceiver {
                 // is built once at startup; a receiver that is playing still says idle,
                 // which costs a sender the "someone is already casting" hint and nothing
                 // else. Flipping it live needs re-advertisement on every session change.
-                ("st".to_string(), "0".to_string()),
+                (
+                    "st".to_string(),
+                    crate::txt::ReceiverState::Idle.to_string(),
+                ),
                 // Remote-control notifications, and it is **not** decoration: Play
                 // Services' own scanner logs `Invalid remote control notifications
                 // enabled status; 0` against a record without it, because absent parses
@@ -957,7 +968,10 @@ impl SourceAdapter for CastReceiver {
                 // `GET_DEVICE_INFO` answers `controlNotifications: 1`. The two are the
                 // same claim on two surfaces, so they are written from the same fact
                 // rather than independently.
-                ("nf".to_string(), "1".to_string()),
+                (
+                    "nf".to_string(),
+                    crate::txt::RemoteControlNotifications::Enabled.to_string(),
+                ),
                 // Receiver status text — empty because nothing is playing, which is
                 // exactly what an idle real device sends (`rs=`). Present rather than
                 // omitted: a key a sender looks for and does not find is a different

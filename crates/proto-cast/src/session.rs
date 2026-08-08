@@ -1057,6 +1057,22 @@ mod tests {
         assert!(recorded["data"]["device_info"].get("ssdp_udn").is_some());
     }
 
+    /// The schema version we answer in is the one the captured device answered in.
+    ///
+    /// Pinned against the fixture rather than left to a comment: a sender reads
+    /// `version` to decide how to parse the rest, so if the recorded shape ever changes
+    /// the number has to change with it, and the two must not drift quietly.
+    #[test]
+    fn the_eureka_schema_version_matches_the_device_the_shape_came_from() {
+        let recorded: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/eureka-info/response.json"))
+                .unwrap();
+        assert_eq!(
+            recorded["data"]["version"].as_i64(),
+            Some(messages::EUREKA_INFO_VERSION),
+        );
+    }
+
     /// A parameter we have no value for must not silently disappear into a wildcard.
     #[test]
     fn an_unmodelled_parameter_is_named_rather_than_dropped() {
