@@ -92,6 +92,28 @@ struct Published {
     state: Arc<LiveStream>,
     /// Never read. Held so the tap outlives the assertions; see the type's docs.
     _render: RenderLoop,
+    /// The audio half, so a failing assertion can say what the mix did rather than
+    /// leaving "peak of 0" to be re-diagnosed from scratch each time (#208).
+    audio: Arc<StreamAudio>,
+    /// Held for the same reason as the render loop — dropping it stops the mixer thread —
+    /// and read by [`Self::sound_diagnostics`].
+    mixer: pipeline::mixer::AudioMixer,
+}
+
+impl Published {
+    /// Every counter on the audio path, for a failure message. Which one is nonzero is
+    /// the diagnosis: `dropped`/`starved` say the mixer thread was not scheduled,
+    /// `clipped`/`rebase_discarded` say the timeline moved underneath the sound.
+    fn sound_diagnostics(&self) -> String {
+        let mix = self.audio.mix();
+        format!(
+            "{:?}, clipped={} rebase_discarded={} position={}",
+            self.mixer.counters(),
+            mix.clipped(),
+            mix.rebase_discarded(),
+            mix.position(),
+        )
+    }
 }
 
 impl std::ops::Deref for Published {
@@ -145,6 +167,36 @@ fn publish_with(
     // A session, opened the way one really is.
     let mut session = sound.map(|_| mixer.input(pipeline::mixer::Backpressure::Pull));
 
+    // Wait for the mixer's first pass before starting the clock. On the panel the mixer
+    // is started at boot and is warm long before a stream tap exists; this harness spawns
+    // it fresh, and under CI-shaped load its first pass can land hundreds of milliseconds
+    // out. A mix pass places sound at the instant it *runs*, so everything written before
+    // it would land that late on the timeline — past the ~250 ms of audio track two
+    // segments carry, which decodes as a peak of 0 with every loss counter rightly zero,
+    // because nothing was lost. Feeding silence until a pass has drained it is how the
+    // test waits for the premise the shipped path gets for free (#208).
+    // One block, not a loop of them: silence stacked here would sit in the ring ahead of
+    // the tone and delay its placement by exactly the depth it stacked.
+    if let Some(session) = session.as_mut() {
+        session
+            .write(&pipeline::audio_decode::PcmBlock {
+                sample_rate: RATE,
+                channels: 2,
+                samples: vec![0.0; 960],
+                pts: Duration::ZERO,
+            })
+            .expect("stereo at the mixer's own rate needs no resampler");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while mixer.counters().drained == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the mixer never ran a pass: {:?}",
+                mixer.counters()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         // The tap retires when nothing has asked for a while, and in this harness nothing
@@ -165,9 +217,13 @@ fn publish_with(
             return None;
         }
         if state.segment(segments).is_some() {
+            // The session's input is dropped here; the mixer itself rides along so the
+            // assertions can read its counters.
             return Some(Published {
                 state,
                 _render: rloop,
+                audio,
+                mixer,
             });
         }
         // Faster than the panel would present, so the cadence is what paces the stream
@@ -513,8 +569,9 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     assert_eq!(sound.channels, 2);
     assert!(
         sound.peak > 0.2,
-        "the track decoded to a peak of {}, which is silence",
-        sound.peak
+        "the track decoded to a peak of {}, which is silence; {}",
+        sound.peak,
+        state.sound_diagnostics()
     );
 }
 
