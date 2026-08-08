@@ -210,7 +210,8 @@
           #   degrades to no-DRM rather than failing if a downstream nixpkgs refuses
           #   them.
           allowUnfreePredicate = pkg:
-            builtins.elem (nixpkgs.lib.getName pkg) [
+            let name = nixpkgs.lib.getName pkg; in
+            builtins.elem name [
               "msvc-sysroot"
               "linux-firmware"
               "widevine-cdm"
@@ -219,7 +220,33 @@
               "libAirReceiver"
               "airreceiver-cast-carve"
               "airport-express-key"
+            ]
+            # The Android SDK slice `checks.android-bt` boots (#225): the emulator,
+            # platform-tools, and the google_apis system image, pinned by hash from
+            # Google's own repo XML via `androidenv`. Same precedent as the
+            # Widevine/ffmpeg blobs — proprietary, but pinned and reproducible. A
+            # prefix rather than a name list because androidenv names every component
+            # derivation separately ("android-sdk-emulator", "platform-tools",
+            # "system-image-35-google_apis-x86_64", the composed "androidsdk", …) and a
+            # list that has to grow with each SDK layout change would fail the check on
+            # every androidenv bump for no protective value — everything under these
+            # prefixes is the same licence from the same fetcher.
+            || builtins.any (p: nixpkgs.lib.hasPrefix p name) [
+              "androidsdk"
+              "android-sdk-"
+              "system-image-"
+              "emulator"
+              "platform-tools"
+              "platforms"
+              "build-tools"
+              "cmdline-tools"
+              "cmake"
+              "tools"
+              "licenses"
             ];
+          # androidenv refuses to evaluate without this; the licence text it stands for
+          # is the SDK's, and the acceptance is scoped to this flake's builds.
+          android_sdk.accept_license = true;
         };
       };
 
@@ -1007,6 +1034,46 @@
                   "$out/bin/ertm-echo"
               '';
             });
+          };
+
+          # A real phone stack as the sender (#225): the Android emulator, headless under
+          # KVM, its virtual controller on netsim/rootcanal — and castaway on the same
+          # phy over the H4-over-TCP transport. Android's Settings UI pairs with us (a
+          # consent dialog tapped by uiautomator), the phone registers for volume
+          # changes and hears its INTERIM (#211, as CI), negotiates aptX HD — the codec
+          # no BlueZ path reaches — and VLC (pinned APK, #87's sender) plays a waveform
+          # that is correlated per channel out of the mixer's recording. The netsim
+          # pcaps land in the check's output: real Android A2DP/AVRCP transcripts,
+          # regenerable on demand (rule 9). Not a nixosTest — the emulator inside a
+          # NixOS guest would be nested KVM; see the note at the top of the file.
+          android-bt = import ./nix/android-bt-test.nix {
+            inherit pkgs;
+            castaway = craneLib.buildPackage (fullArgs // {
+              inherit cargoArtifacts;
+              pname = "castaway-android-bt";
+              # `audio` alone: decoders (so the endpoint table is real — see
+              # bluetooth-vm's note) over the *null* output. Adding `audio-out` here
+              # selects cpal, whose blocking writes backpressure the decode loop into
+              # dropping media packets when the build sandbox has no sound server —
+              # measured as 960 aptX HD sync errors and a silent recording. The null
+              # sink accepts instantly and the recording taps the mix upstream of it.
+              cargoExtraArgs = "--package castaway --no-default-features --features audio";
+              doCheck = false;
+            });
+            androidComposition = pkgs.androidenv.composeAndroidPackages {
+              platformVersions = [ "35" ];
+              includeEmulator = true;
+              includeSystemImages = true;
+              systemImageTypes = [ "google_apis" ];
+              abiVersions = [ "x86_64" ];
+              includeNDK = false;
+            };
+            # The sender app, pinned the way rule 9 pins fixtures: F-Droid's own build
+            # of VLC, fetched by hash. GPL, and a test-time dependency only.
+            vlcApk = pkgs.fetchurl {
+              url = "https://f-droid.org/repo/org.videolan.vlc_13070108.apk";
+              sha256 = "06di28b5v5bpagdk05pbxyrbfij8s8pqknz9q32nqq6qvzx494aa";
+            };
           };
 
           # The mixer against a sound card whose clock is not ours (#204). See the note at
