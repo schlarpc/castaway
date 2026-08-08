@@ -1109,6 +1109,92 @@ async fn a_full_stream_reaches_the_pipeline_as_audio_frames() {
 }
 
 #[tokio::test]
+async fn a_media_channel_that_dies_without_signaling_still_ends_the_session() {
+    // The dangling state #212 found: the media L2CAP channel closes with no AVDTP Close
+    // ever arriving (a phone that crashes, a stack that skips the handshake), and the
+    // adapter used to clear the frame sender while leaving the session marked open — a
+    // session the manager held forever, for audio that could never resume.
+    let (transport, mut rx) = connected().await;
+    let (signaling, _) = open_channel(&transport, Psm::AVDTP, 0x0040).await;
+
+    let discover = avdtp(&transport, signaling, 1, Signal::Discover, &[]).await;
+    let seid = eventually("an aptX endpoint", || {
+        discover
+            .payload
+            .chunks(2)
+            .filter_map(|c| Seid::from_shifted(c[0]).ok())
+            .nth(2)
+    })
+    .await;
+    avdtp(
+        &transport,
+        signaling,
+        2,
+        Signal::GetAllCapabilities,
+        &[seid.shifted()],
+    )
+    .await;
+    let chosen = CodecCapability::AptX {
+        rates: SampleRates::HZ_48000,
+        channels: ChannelModes::JOINT_STEREO,
+    };
+    let codec = chosen.encode();
+    let mut set = vec![seid.shifted(), 0x04, 0x01, 0x00, 0x07];
+    set.push(u8::try_from(codec.len()).unwrap());
+    set.extend_from_slice(&codec);
+    avdtp(&transport, signaling, 3, Signal::SetConfiguration, &set).await;
+    avdtp(&transport, signaling, 4, Signal::Open, &[seid.shifted()]).await;
+    let (media, _) = open_channel(&transport, Psm::AVDTP, 0x0041).await;
+    avdtp(&transport, signaling, 5, Signal::Start, &[seid.shifted()]).await;
+
+    eventually("an audio session event", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::Audio { .. }))
+    })
+    .await;
+
+    // The phone tears the media channel down at the L2CAP layer and says nothing on the
+    // signaling channel.
+    push_pdu(
+        &transport,
+        &L2capPdu::new(
+            Cid::SIGNALING,
+            L2capSignal::DisconnectionRequest {
+                id: 9,
+                dest_cid: media,
+                source_cid: Cid::new(0x0041),
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+
+    // The session must end now — not whenever an AVDTP Close deigns to arrive.
+    eventually("the session end", || {
+        rx.try_recv()
+            .ok()
+            .filter(|m| matches!(m.event, SessionEvent::End))
+    })
+    .await;
+
+    // A late Close from a stack that half-finishes the handshake finds the session
+    // already ended: it is still answered, and it must not end the session twice.
+    let reply = avdtp(&transport, signaling, 6, Signal::Close, &[seid.shifted()]).await;
+    assert_eq!(
+        reply.message_type,
+        proto_bluetooth_audio::avdtp::MessageType::ResponseAccept,
+        "the late Close is still acknowledged"
+    );
+    while let Ok(msg) = rx.try_recv() {
+        assert!(
+            !matches!(msg.event, SessionEvent::End),
+            "one dead transport must not end the session twice"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_control_surface_survives_avctp_connecting_before_the_stream() {
     // Both orders happen and the sender chooses. A phone that opens AVCTP first — which
     // an iPhone does, nine seconds ahead of START in one capture — used to have its

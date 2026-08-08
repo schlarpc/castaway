@@ -216,6 +216,39 @@ struct Outbox {
     started: Option<BdAddr>,
 }
 
+/// One link's audio-session lifecycle, in one place.
+///
+/// This was four hand-synced fields — `audio_format`, `depacketizer`, `audio_tx`,
+/// `session_open` — whose invariant (open ⇔ sender present, open ⇒ format known) six
+/// sites re-established by hand, and one of them (the media `ChannelClosed` arm) got
+/// wrong: it cleared the sender and left the session "open" (#212). Now the invariant
+/// is the shape of the type, and teardown is one assignment.
+enum AudioSession {
+    /// Nothing negotiated.
+    Closed,
+    /// `SET_CONFIGURATION` has landed: the decoder's shape is known, no session
+    /// announced yet. The format is held from here until START because aptX carries no
+    /// in-band rate, so this is the decoder's only source of it (#70).
+    Configured {
+        format: AudioFormat,
+        depacketizer: Depacketizer,
+    },
+    /// `SessionEvent::Audio` has been emitted and not yet ended: frames flow into `tx`.
+    Open {
+        format: AudioFormat,
+        depacketizer: Depacketizer,
+        tx: LossySender<EncodedFrame>,
+    },
+}
+
+impl AudioSession {
+    /// Whether a `SessionEvent::Audio` has been emitted for this link and not yet
+    /// ended — the gate for every per-session emission (metadata, control, `End`).
+    const fn is_open(&self) -> bool {
+        matches!(self, AudioSession::Open { .. })
+    }
+}
+
 /// Per-ACL-link state.
 struct Link {
     peer: BdAddr,
@@ -229,13 +262,8 @@ struct Link {
     avdtp_signaling: Option<Cid>,
     avdtp_media: Option<Cid>,
     avctp: Option<Cid>,
-    depacketizer: Option<Depacketizer>,
-    /// What AVDTP negotiated, held from SET_CONFIGURATION until START. aptX carries no
-    /// in-band rate, so this is the decoder's only source of it (#70).
-    audio_format: Option<AudioFormat>,
-    audio_tx: Option<LossySender<EncodedFrame>>,
-    /// Whether a `SessionEvent::Audio` has already been emitted for this link.
-    session_open: bool,
+    /// Where this link's audio session is in its lifecycle.
+    audio: AudioSession,
     /// Last SBC bitpool we reported, so a change is logged and a steady stream is not.
     reported_bitpool: Option<u8>,
     /// Metadata accumulated for this link, re-emitted as a full snapshot on change.
@@ -451,10 +479,7 @@ impl Link {
             avdtp_signaling: None,
             avdtp_media: None,
             avctp: None,
-            depacketizer: None,
-            audio_format: None,
-            audio_tx: None,
-            session_open: false,
+            audio: AudioSession::Closed,
             reported_bitpool: None,
             now_playing: NowPlaying::default(),
             avctp_transaction: Arc::new(AtomicU8::new(0)),
@@ -754,7 +779,7 @@ impl SourceAdapter for BluetoothAdapter {
                                 if let Some(link) = links.values_mut().find(|l| l.peer == *peer) {
                                     link.description = std::mem::take(&mut link.description)
                                         .merged(SourceDescription::new().with_display_name(name));
-                                    if link.session_open {
+                                    if link.audio.is_open() {
                                         let link_sink = sink.with_instance(peer.to_string());
                                         link_sink
                                             .emit(SessionEvent::SourceInfo(
@@ -782,7 +807,7 @@ impl SourceAdapter for BluetoothAdapter {
                                     // teardown handshake, which is the ordinary case.
                                     let _ = link.sink.link_down();
                                     let _ = link.mux.link_down();
-                                    if link.session_open {
+                                    if link.audio.is_open() {
                                         let link_sink = sink.with_instance(link.peer.to_string());
                                         link_sink.emit(SessionEvent::End).await?;
                                     }
@@ -837,7 +862,7 @@ impl SourceAdapter for BluetoothAdapter {
                     // play into a decoder that has stopped listening.
                     if let Some(winner) = started {
                         for (raw, other) in links.iter_mut() {
-                            if other.peer == winner || !other.session_open {
+                            if other.peer == winner || !other.audio.is_open() {
                                 continue;
                             }
                             let Ok(other_handle) = ConnectionHandle::new(*raw) else {
@@ -932,7 +957,7 @@ impl BluetoothAdapter {
                         // the set then needs the concrete handle.
                         link.avrcp_control = Some(Arc::clone(&avrcp_control));
                         let control: Arc<dyn castaway_core::RemoteControl> = avrcp_control;
-                        if link.session_open {
+                        if link.audio.is_open() {
                             let link_sink = sink.with_instance(link.peer.to_string());
                             link_sink
                                 .emit(SessionEvent::ControlSurface(Arc::clone(&control)))
@@ -1032,7 +1057,30 @@ impl BluetoothAdapter {
                 L2capEvent::ChannelClosed { cid, psm } => {
                     if Some(cid) == link.avdtp_media {
                         link.avdtp_media = None;
-                        link.audio_tx = None;
+                        // A media transport that dies is a session that is over, whether
+                        // or not the AVDTP Close that *usually* follows ever arrives.
+                        // This arm used to clear only the sender and leave the session
+                        // marked open — reachable-in-practice only until a phone dropped
+                        // the channel without signaling, and then it dangled (#212). The
+                        // configuration survives: a well-behaved peer's Close finds
+                        // `Configured` and has nothing left to end, and a new START can
+                        // still open a fresh session on the negotiated shape.
+                        match std::mem::replace(&mut link.audio, AudioSession::Closed) {
+                            AudioSession::Open {
+                                format,
+                                depacketizer,
+                                ..
+                            } => {
+                                link.audio = AudioSession::Configured {
+                                    format,
+                                    depacketizer,
+                                };
+                                info!("bluetooth: media transport closed; ending the session");
+                                let link_sink = sink.with_instance(link.peer.to_string());
+                                link_sink.emit(SessionEvent::End).await?;
+                            }
+                            other => link.audio = other,
+                        }
                     } else if Some(cid) == link.avdtp_signaling {
                         link.avdtp_signaling = None;
                     } else if Some(cid) == link.avctp {
@@ -1274,18 +1322,36 @@ impl BluetoothAdapter {
                     // would play the new stream at the old pitch, which is #70 arriving by
                     // a second route. Dropping the channel ends that audio session; the
                     // START that follows the reconfiguration opens a fresh one with the
-                    // right shape.
-                    if link.session_open && link.audio_format != Some(format) {
-                        info!(
-                            was = ?link.audio_format,
-                            now = %format,
-                            "bluetooth: format changed; restarting the audio session"
-                        );
-                        link.audio_tx = None;
-                        link.session_open = false;
-                    }
-                    link.audio_format = Some(format);
-                    link.depacketizer = Some(Depacketizer::new(codec, format.sample_rate()));
+                    // right shape. A reconfiguration that *keeps* the format keeps the
+                    // session too — only the depacketizer is rebuilt for the new
+                    // parameters.
+                    let depacketizer = Depacketizer::new(codec, format.sample_rate());
+                    link.audio = match std::mem::replace(&mut link.audio, AudioSession::Closed) {
+                        AudioSession::Open {
+                            format: was, tx, ..
+                        } if was == format => AudioSession::Open {
+                            format,
+                            depacketizer,
+                            tx,
+                        },
+                        AudioSession::Open { format: was, .. } => {
+                            info!(
+                                %was,
+                                now = %format,
+                                "bluetooth: format changed; restarting the audio session"
+                            );
+                            AudioSession::Configured {
+                                format,
+                                depacketizer,
+                            }
+                        }
+                        AudioSession::Closed | AudioSession::Configured { .. } => {
+                            AudioSession::Configured {
+                                format,
+                                depacketizer,
+                            }
+                        }
+                    };
                     link.description = std::mem::take(&mut link.description)
                         .merged(SourceDescription::new().with_link(configuration.describe()));
                 }
@@ -1295,38 +1361,48 @@ impl BluetoothAdapter {
                     // that loses deserves to be told rather than left streaming into a
                     // decoder nobody is listening to (#68: last writer wins).
                     out.started = Some(link.peer);
-                    // START cannot precede SET_CONFIGURATION in the sink state machine,
-                    // so a missing format means a bug here rather than a sender problem —
-                    // and starting a session without one would decode at a guessed rate,
-                    // which is exactly what #70 was.
-                    let Some(format) = link.audio_format else {
-                        warn!("bluetooth: stream started with no negotiated format");
-                        continue;
-                    };
-                    if !link.session_open {
-                        let (tx, rx) = mpsc::channel(AUDIO_QUEUE_DEPTH);
-                        link.audio_tx = Some(LossySender::new(tx));
-                        link.session_open = true;
-                        let link_sink = sink.with_instance(link.peer.to_string());
-                        link_sink
-                            .emit(SessionEvent::Audio {
-                                source: FrameSource::Encoded(rx),
+                    match std::mem::replace(&mut link.audio, AudioSession::Closed) {
+                        // START cannot precede SET_CONFIGURATION in the sink state
+                        // machine, so arriving here unconfigured means a bug on our side
+                        // rather than a sender problem — and starting a session anyway
+                        // would decode at a guessed rate, which is exactly what #70 was.
+                        AudioSession::Closed => {
+                            warn!("bluetooth: stream started with no negotiated format");
+                            continue;
+                        }
+                        // Already open (a resume after SUSPEND): the session survives.
+                        open @ AudioSession::Open { .. } => link.audio = open,
+                        AudioSession::Configured {
+                            format,
+                            depacketizer,
+                        } => {
+                            let (tx, rx) = mpsc::channel(AUDIO_QUEUE_DEPTH);
+                            link.audio = AudioSession::Open {
                                 format,
-                                // Every A2DP codec describes itself in-band.
-                                config: None,
-                            })
-                            .await?;
-                        // Only now can the description be delivered: the session
-                        // manager rejects source info for a source that is not active,
-                        // and this is the moment it becomes active.
-                        link_sink
-                            .emit(SessionEvent::SourceInfo(link.description.clone()))
-                            .await?;
-                        // …and the control surface, if AVCTP got in first.
-                        if let Some(control) = &link.control {
+                                depacketizer,
+                                tx: LossySender::new(tx),
+                            };
+                            let link_sink = sink.with_instance(link.peer.to_string());
                             link_sink
-                                .emit(SessionEvent::ControlSurface(Arc::clone(control)))
+                                .emit(SessionEvent::Audio {
+                                    source: FrameSource::Encoded(rx),
+                                    format,
+                                    // Every A2DP codec describes itself in-band.
+                                    config: None,
+                                })
                                 .await?;
+                            // Only now can the description be delivered: the session
+                            // manager rejects source info for a source that is not
+                            // active, and this is the moment it becomes active.
+                            link_sink
+                                .emit(SessionEvent::SourceInfo(link.description.clone()))
+                                .await?;
+                            // …and the control surface, if AVCTP got in first.
+                            if let Some(control) = &link.control {
+                                link_sink
+                                    .emit(SessionEvent::ControlSurface(Arc::clone(control)))
+                                    .await?;
+                            }
                         }
                     }
                     // If it did not, open it ourselves. We are the AVRCP *Controller* —
@@ -1346,11 +1422,9 @@ impl BluetoothAdapter {
                     }
                 }
                 SinkEvent::Closed => {
-                    link.audio_tx = None;
-                    link.depacketizer = None;
-                    link.audio_format = None;
-                    if link.session_open {
-                        link.session_open = false;
+                    let was_open = link.audio.is_open();
+                    link.audio = AudioSession::Closed;
+                    if was_open {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink.emit(SessionEvent::End).await?;
                     }
@@ -1377,7 +1451,9 @@ impl BluetoothAdapter {
     /// session — there is nothing left to play into and the phone is still sending.
     async fn on_media(&self, link: &mut Link, payload: Bytes) -> bool {
         let mut consumer_gone = false;
-        let (Some(depacketizer), Some(tx)) = (link.depacketizer.as_mut(), link.audio_tx.as_ref())
+        let AudioSession::Open {
+            depacketizer, tx, ..
+        } = &mut link.audio
         else {
             return false;
         };
@@ -1457,19 +1533,16 @@ impl BluetoothAdapter {
                     warn!(
                         error = %e,
                         failures = link.media_failures,
-                        codec = ?link.depacketizer.as_ref().map(Depacketizer::codec),
+                        codec = ?depacketizer.codec(),
                         "bluetooth: cannot depacketize this stream; it will be silent"
                     );
                 }
             }
         }
-        // After the match, so the borrows of `depacketizer` and `audio_tx` above are
-        // finished and these fields can be cleared.
+        // After the match, so the borrow of the open session above is finished and the
+        // state can be replaced.
         if consumer_gone {
-            link.audio_tx = None;
-            link.depacketizer = None;
-            link.audio_format = None;
-            link.session_open = false;
+            link.audio = AudioSession::Closed;
         }
         consumer_gone
     }
@@ -1610,7 +1683,7 @@ impl BluetoothAdapter {
                     // most of those re-reads come back identical. Re-emitting them churns
                     // the card for no reason.
                     let unchanged = link.now_playing == previous;
-                    if link.session_open && !unchanged {
+                    if link.audio.is_open() && !unchanged {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
@@ -1682,7 +1755,7 @@ impl BluetoothAdapter {
                             if link.now_playing.state != state {
                                 link.now_playing.state = state;
                                 debug!(?state, "bluetooth: playback state");
-                                if link.session_open {
+                                if link.audio.is_open() {
                                     let link_sink = sink.with_instance(link.peer.to_string());
                                     link_sink
                                         .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
@@ -1701,7 +1774,7 @@ impl BluetoothAdapter {
                                 .then(|| std::time::Duration::from_millis(u64::from(ms)));
                             if link.now_playing.position != position {
                                 link.now_playing.position = position;
-                                if link.session_open {
+                                if link.audio.is_open() {
                                     let link_sink = sink.with_instance(link.peer.to_string());
                                     link_sink
                                         .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
@@ -1717,7 +1790,7 @@ impl BluetoothAdapter {
                         if let Ok(values) = avrcp::parse_setting_change(&vendor.parameters) {
                             debug!(?values, "bluetooth: player settings changed");
                             if avrcp::apply_settings(&mut link.now_playing, &values)
-                                && link.session_open
+                                && link.audio.is_open()
                             {
                                 let link_sink = sink.with_instance(link.peer.to_string());
                                 link_sink
@@ -1768,7 +1841,7 @@ impl BluetoothAdapter {
                     // The state byte is deliberately ignored: PLAYBACK_STATUS_CHANGED is
                     // the authority on it, and a stale GetPlayStatus answer racing a
                     // notification would flip the card back.
-                    if changed && link.session_open {
+                    if changed && link.audio.is_open() {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
@@ -1817,7 +1890,8 @@ impl BluetoothAdapter {
             {
                 if let Ok(values) = avrcp::parse_current_settings(&vendor.parameters) {
                     debug!(?values, "bluetooth: current player settings");
-                    if avrcp::apply_settings(&mut link.now_playing, &values) && link.session_open {
+                    if avrcp::apply_settings(&mut link.now_playing, &values) && link.audio.is_open()
+                    {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
@@ -1829,7 +1903,7 @@ impl BluetoothAdapter {
                 // #69: the phone is authoritative. Accept and mirror it.
                 if let Some(&raw) = vendor.parameters.first() {
                     let position = avrcp::volume_to_position(raw);
-                    if link.session_open {
+                    if link.audio.is_open() {
                         let link_sink = sink.with_instance(link.peer.to_string());
                         link_sink
                             .emit(SessionEvent::Control(castaway_core::ControlTxn::Volume(
@@ -2343,7 +2417,7 @@ impl BluetoothAdapter {
             Ok(Some(Fetched::Artwork(artwork))) => {
                 info!(bytes = artwork.len(), "bluetooth: cover art fetched");
                 link.now_playing.artwork = Some(artwork);
-                if link.session_open {
+                if link.audio.is_open() {
                     let link_sink = sink.with_instance(link.peer.to_string());
                     link_sink
                         .emit(SessionEvent::NowPlaying(link.now_playing.clone()))
