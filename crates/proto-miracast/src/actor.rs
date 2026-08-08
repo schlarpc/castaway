@@ -23,6 +23,7 @@ use castaway_core::{
     AudioFormat, DropCounter, EncodedFrame, FrameSource, LossySend, LossySender, MirrorAudio,
     SessionEvent, SessionSink, SourceDescription,
 };
+use substrate_rtsp::RtspFramer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -117,7 +118,10 @@ pub async fn run_session(
     // The mode the session negotiated, kept because a UIBC port can arrive in a later
     // M14 — after the geometry it has to map touches into is already settled.
     let mut negotiated_mode: Option<crate::video::VideoMode> = None;
-    let mut inbound = Vec::new();
+    // Identity transform: WFD's control channel is cleartext. The framer still owns
+    // the accumulation buffer, the message cap, and the drain cycle — the pump both
+    // RTSP protocols share (#220).
+    let mut framer = RtspFramer::new(MAX_RTSP_MESSAGE);
     let mut datagram = vec![0u8; DATAGRAM_BUF];
     let mut last_idr = tokio::time::Instant::now()
         .checked_sub(IDR_MIN_INTERVAL)
@@ -168,16 +172,10 @@ pub async fn run_session(
                     break;
                 }
                 last_heard = tokio::time::Instant::now();
-                inbound.extend_from_slice(&read_buf[..n]);
-                if inbound.len() > MAX_RTSP_MESSAGE {
-                    return Err(MiracastError::Connection(
-                        "control stream exceeded the message limit without framing".to_owned(),
-                    ));
-                }
+                framer.ingest(&read_buf[..n])?;
                 // A source routinely puts M4 and M5 in one segment and splits messages
                 // across segments, so this drains as many whole messages as arrived.
-                while let Some((message, consumed)) = substrate_rtsp::parse(&inbound)? {
-                    inbound.drain(..consumed);
+                while let Some(message) = framer.next_message()? {
                     let outputs = dispatch(&mut session, &message)?;
                     if apply(
                         &outputs,

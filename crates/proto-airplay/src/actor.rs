@@ -24,7 +24,7 @@ use castaway_core::{
 };
 use substrate_rtsp::rtsp_types::headers::{HeaderName, CONTENT_TYPE, CSEQ, SERVER};
 use substrate_rtsp::rtsp_types::{Message, Response, StatusCode, Version};
-use substrate_rtsp::{ByteTransform, Identity, RtspMessage};
+use substrate_rtsp::{RtspFramer, RtspMessage};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -161,14 +161,14 @@ impl AirPlayReceiver {
             Err(e) => warn!(%peer, error = %e, "could not bind the RAOP audio sockets"),
         }
         // Identity today: the encrypted control channel starts only after pair-verify,
-        // which is not implemented (#39). The seam is here so landing pairing is a swap
-        // of this transform, not a rewrite of the loop.
-        let mut transform: Box<dyn ByteTransform> = Box::new(Identity);
+        // which is not implemented (#39). The seam is here so landing pairing is a call
+        // to `set_transform`, not a rewrite of the loop.
+        let mut framer = RtspFramer::new(MAX_MESSAGE);
 
         match pump(
             &mut stream,
             &mut session,
-            &mut *transform,
+            &mut framer,
             &sink,
             peer,
             &mut audio_sockets,
@@ -231,7 +231,7 @@ enum PumpEnd {
 /// Read requests until the peer closes, folding each through the session.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one connection's whole world: the socket, the session, the byte transform, \
+    reason = "one connection's whole world: the socket, the session, the framer, \
               the event sink, and the three things a SETUP may need to answer with. \
               Bundling them into a struct would name the same fields once more and give \
               the borrow checker a harder problem, since several are `&mut` and used \
@@ -240,7 +240,7 @@ enum PumpEnd {
 async fn pump(
     stream: &mut TcpStream,
     session: &mut AirPlaySession,
-    transform: &mut dyn ByteTransform,
+    framer: &mut RtspFramer,
     sink: &SessionSink,
     peer: SocketAddr,
     audio_sockets: &mut Option<AudioSockets>,
@@ -262,7 +262,6 @@ async fn pump(
     // a task that missed one because it was busy should not then act on a stale one.
     let (flush_tx, flush_rx) = tokio::sync::watch::channel(None);
     let _reporter = ReporterGuard(reporter);
-    let mut buf = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
     loop {
         let n = stream
@@ -276,36 +275,23 @@ async fn pump(
         // sender did. `trace` because it is a per-message hexdump of a live session —
         // this is the RE capture facility (ground rule 9), not diagnostics.
         trace!(%peer, bytes = %hex(&chunk[..n]), "airplay rx");
-        // Decrypt per chunk, not per accumulated buffer: the transform is a stream
-        // cipher with position, so re-running it over bytes already decrypted would
-        // desynchronize it.
-        let mut cleartext = chunk[..n].to_vec();
-        transform
-            .decrypt_inbound(&mut cleartext)
+        // The framer decrypts, accumulates, and enforces the message cap; a cap
+        // overrun or a transform fault both end the connection here.
+        framer
+            .ingest(&chunk[..n])
             .map_err(|e| AirPlayError::Connection(e.to_string()))?;
-        buf.extend_from_slice(&cleartext);
 
-        // A message that claims more than MAX_MESSAGE is never going to arrive; drop the
-        // connection rather than buffering toward OOM.
-        if buf.len() > MAX_MESSAGE {
-            return Err(AirPlayError::Connection(format!(
-                "message exceeds {MAX_MESSAGE} bytes"
-            )));
-        }
-
-        while let Some((msg, consumed)) =
-            substrate_rtsp::parse(&buf).map_err(|e| AirPlayError::Connection(e.to_string()))?
+        while let Some(msg) = framer
+            .next_message()
+            .map_err(|e| AirPlayError::Connection(e.to_string()))?
         {
-            buf.drain(..consumed);
             let Some(reply) = dispatch(session, &msg, peer, playback)? else {
                 continue;
             };
-            let mut bytes = substrate_rtsp::write(&reply.message)
+            let bytes = framer
+                .seal(&reply.message)
                 .map_err(|e| AirPlayError::Connection(e.to_string()))?;
             trace!(%peer, bytes = %hex(&bytes), "airplay tx");
-            transform
-                .encrypt_outbound(&mut bytes)
-                .map_err(|e| AirPlayError::Connection(e.to_string()))?;
             stream
                 .write_all(&bytes)
                 .await

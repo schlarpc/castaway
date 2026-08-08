@@ -11,7 +11,14 @@
 //!   transform for Miracast, a ChaCha20 transform for AirPlay 2's encrypted control
 //!   channel after pair-verify. Each protocol's method dispatch, body parsers, and
 //!   state machine stay in its own `proto-*` crate.
+//! - [`RtspFramer`]: the sans-I/O connection pump over all of the above — the
+//!   accumulation buffer, the OOM cap, the parse-and-drain cycle, and the transform
+//!   slot, shared by both protocols' socket loops.
 #![forbid(unsafe_code)]
+
+mod framer;
+
+pub use framer::RtspFramer;
 
 use std::borrow::Cow;
 
@@ -36,6 +43,15 @@ pub enum RtspError {
     /// Serializing a message to bytes failed.
     #[error("failed to write RTSP message: {0}")]
     Write(String),
+
+    /// The buffered bytes exceed the framer's cap without completing a message. A
+    /// message that claims more than the cap is never going to arrive; drop the
+    /// connection rather than buffering toward OOM.
+    #[error("RTSP message exceeds {limit} bytes without framing")]
+    TooLarge {
+        /// The configured cap, in bytes.
+        limit: usize,
+    },
 }
 
 /// Try to parse one RTSP message from the front of `buf`.

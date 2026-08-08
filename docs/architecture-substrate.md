@@ -14,7 +14,7 @@ Both are "RTSP," but that word means two different amounts of standard.
 
 **Shared (build once):** the RTSP *message codec* — request line (`METHOD uri RTSP/1.0`), headers, `CSeq` correlation, `Content-Length` body framing, response encoding — plus a connection actor that owns the TCP socket, reads/writes messages, and matches responses to requests by CSeq.
 - Crate: **`rtsp-types`** (sdroege / GStreamer-adjacent) — pure parser/encoder for RTSP messages. This *is* your shared framing layer. Don't hand-roll it.
-- Wrap it in a `RtspConn` actor with a **pluggable transform layer** on the byte stream: identity for Miracast, **ChaCha20-Poly1305** for AirPlay 2 post-pairing (the control channel gets encrypted after pair-verify — Miracast has no such thing). That transform slot is the one crypto concession the shared layer makes.
+- Wrap it in a sans-I/O `RtspFramer` — the accumulation buffer, the OOM cap, the parse-and-drain cycle — with a **pluggable transform layer** on the byte stream: identity for Miracast, **ChaCha20-Poly1305** for AirPlay 2 post-pairing (the control channel gets encrypted after pair-verify — Miracast has no such thing). That transform slot is the one crypto concession the shared layer makes. (This was originally sketched as an `RtspConn` actor owning the socket; §3's sans-I/O rule won — each protocol keeps its own thin socket loop and feeds the shared framer. See #220 for the period when neither existed and both protocols hand-rolled the pump.)
 
 **Divergent (per-adapter, do NOT share):**
 | | Miracast (WFD) | AirPlay |
@@ -25,7 +25,7 @@ Both are "RTSP," but that word means two different amounts of standard.
 | Encryption | none | ChaCha20 envelope after pairing |
 | State machine | capability negotiation → stream | pair → fp-setup → setup → record |
 
-So: `substrate-rtsp` gives you `RtspConn` + `Message`. `proto-airplay` and `proto-miracast` each own their method dispatch, body parsers (plist / SDP / wfd-kv), and state machine. "Closer than they look" is true *at the framing/transaction layer and nowhere above it.*
+So: `substrate-rtsp` gives you `RtspFramer` + `Message`. `proto-airplay` and `proto-miracast` each own their socket loop, method dispatch, body parsers (plist / SDP / wfd-kv), and state machine. "Closer than they look" is true *at the framing/transaction layer and nowhere above it.*
 
 ### 1b. RTP/RTCP — shared parse, divergent depacketization
 
@@ -75,7 +75,7 @@ receiver/
 │  ├─ paths/                  # per-user dirs, XDG + %LOCALAPPDATA%, layout as a value (D39)
 │  ├─ substrate-mdns/         # mdns-sd wrapper: advertise N services
 │  ├─ substrate-ssdp/         # SSDP responder + UPnP description host (axum)
-│  ├─ substrate-rtsp/         # rtsp-types + RtspConn actor + transform slot
+│  ├─ substrate-rtsp/         # rtsp-types + RtspFramer pump + transform slot
 │  ├─ substrate-rtp/          # RTP/RTCP parse + jitter buffer
 │  ├─ crypto-fairplay/        # FairPlay-SAP (lift/emulate)
 │  ├─ crypto-cast-auth/       # Cast device-auth signer (one carved gen-1 cert)
