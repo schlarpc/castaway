@@ -2305,17 +2305,39 @@ because in a flake `./.` is the *git* source: while the file was untracked it wa
 at all and no filter clause could reach it. The derivation hash does not move, which reads
 exactly like a filter bug. `git add`, then look at the hash.
 
-And one test found a **real defect rather than a flaky one**, which is the return on the
+And one test found **two real defects rather than a flaky one**, which is the return on the
 whole change. `output_stream.rs` is `required-features = ["stream"]` and had therefore never
-run in CI; the first time it did,
-`sound_lands_where_on_the_timeline_it_was_played` failed. It passes on the dev box's
-hardware encoder and fails in the sandbox on libx264, by 135 ms and then 212 ms — so the
-`/stream/*` duplicate's A/V alignment depends on which encoder the box happens to have, and
-a panel that falls back to software gets audio a fifth of a second out. That is #208. Note
-the first diagnosis was wrong: exclusivity was applied on the theory that this was another
-starved measurement, and the miss got *larger*, which is what ruled it out. The test is
-`#[ignore]`d against #208 so the gate can be green — a named exception, not the silent kind,
-and exactly the debt #183 exists to keep visible.
+run in CI; the first time it did, `sound_lands_where_on_the_timeline_it_was_played` failed.
+It passed on the dev box's hardware encoder and failed in the sandbox on libx264, by 135 ms
+and then 212 ms. That is #208.
+
+**The diagnosis this entry originally carried was wrong**, and the correction is the useful
+part. It read: "the `/stream/*` duplicate's A/V alignment depends on which encoder the box
+happens to have, and a panel that falls back to software gets audio a fifth of a second
+out." No such dependence exists. What the test measured was the *harness*: its "session"
+was a closure called from inside `pump()`, so the source stopped producing whenever the
+render thread did, and under lavapipe the render thread is software rasterisation competing
+with libx264 for the same cores. Injecting the stall settled it — 100/200/300 ms of held
+render thread bought 74/109/207 ms of miss, bracketing both sandbox numbers — and it also
+explains the result that had ruled scheduling out: exclusivity gave *libx264* more cores,
+not the render thread, so the miss grew. Ground rule 4 says a source is an actor on its own
+clock; no shipped adapter is wired the way that harness was.
+
+The stream's own defect was real, separate, and not what the test caught: `AudioMix`
+addressed each block of the mixer's output by the instant its pass ran, so a burst of
+passes sharing an instant was summed on top of itself. A freshly opened sink has an empty
+device queue, which `plan` fills in back-to-back passes, so this happened at the head of
+every presentation — 60 ms of audio inside 100 µs, measured, of which 50 ms was destroyed
+with every loss counter rightly zero because nothing was dropped. The mixer is that mix's
+one writer and its passes abut, so the write is an append now and the fold cannot be
+expressed. What the clock could not say is counted instead: `AudioMix::invented` is silence
+the track needed and nobody played, which is #175's question asked where the answer exists.
+
+Both are fixed and the `#[ignore]` is gone. The stall is a scenario the file asserts on
+purpose (`a_stalled_render_thread_does_not_move_the_sound`), and the premise every audio
+assertion rests on — that the harness's own source kept the mixer fed — is checked
+separately against `starved`, so a box too loaded to measure sync says *that* instead of
+reporting a defect.
 
 Darwin cannot build the default set, so its checks pass `--no-default-features`. Darwin is
 not a deploy target; it gets a compile signal, not a coverage claim, and that is now stated

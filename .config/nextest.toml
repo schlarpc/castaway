@@ -38,12 +38,17 @@ filter = 'package(pipeline) and test(/^audio_session::tests::.*real_time/)'
 threads-required = "num-test-threads"
 
 # NOT `output_stream`, and the reason is worth recording because it looked like one of
-# these and is not. `sound_lands_where_on_the_timeline_it_was_played` also fails in the
-# sandbox while passing on the dev box, so exclusivity was the obvious guess — and it made
-# no difference at all: the miss went from 135 ms to 212 ms on the exclusive run. It is a
-# real defect that depends on which H.264 encoder opens (#208), not a starved measurement.
-# The three above were confirmed by the opposite result: they pass with the runner to
-# themselves.
+# these twice over. `sound_lands_where_on_the_timeline_it_was_played` failed in the sandbox
+# while passing on the dev box, so exclusivity was the obvious guess — and it made no
+# difference at all: the miss went from 135 ms to 212 ms on the exclusive run. That ruled
+# out contention for the *runner*, and was then read as ruling out scheduling altogether,
+# which is where the second wrong diagnosis came from: "a real defect that depends on which
+# H.264 encoder opens". It was neither. The harness drove its "session" from inside the
+# render loop, so what the test measured was that thread's worst stall, and libx264 mattered
+# only by taking the cores lavapipe was compositing on — more cores to itself on the
+# exclusive run, hence the larger miss. The source is an actor of its own now (#208), and
+# the stall it used to suffer by accident is a scenario the file asserts on purpose. The
+# three above were confirmed by the opposite result: they pass with the runner to themselves.
 
 # `stream::audio`'s pacing assertion, added after it failed once in a full-crate run and
 # passed alone — which is the file's own criterion for the distinction above, and the
