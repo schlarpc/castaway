@@ -761,7 +761,14 @@ async fn run_audio(
     let mut our_resend_seq: u16 = 0;
     // One buffer per socket: `select!` polls all three branches, so they cannot share
     // a single mutable borrow.
-    let mut audio_buf = vec![0u8; 2048];
+    //
+    // The audio buffer holds the largest UDP payload there is, not the largest packet
+    // an iPhone happens to send. `recv_from` silently truncates a datagram that does
+    // not fit, and the frame length is the *sender's* choice, declared in the SDP we
+    // accept — a 4096-sample ALAC frame is ~6.6 KB, and serving it through a 2 KB
+    // buffer produced frames that arrived, decrypted, and decoded to static with a
+    // green journal (#189, found by the decode-seam test in `crates/app`).
+    let mut audio_buf = vec![0u8; 65_536];
     let mut control_buf = vec![0u8; 2048];
     let mut timing_buf = vec![0u8; 2048];
     loop {
