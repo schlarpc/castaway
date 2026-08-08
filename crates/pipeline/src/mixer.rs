@@ -374,8 +374,28 @@ impl Gain {
 /// output stream's audio track (#101) is one; the visualiser (#15) is another. A tap is
 /// pull-free and must not block — it is called on the mixer thread, between the sum and
 /// the device write.
+///
+/// ## One stream, and `at` is not where a block belongs
+///
+/// The blocks handed to a tap are **one contiguous stream**: pass *n+1* continues exactly
+/// where pass *n* stopped, because the same samples are concatenated into the device's
+/// queue. Sessions playing at once are already summed by [`mix_pass`] before a tap sees
+/// anything, so a tap never has two writers and never has to merge.
+///
+/// `at` is when the pass *ran*, not the position the audio occupies. The two are not the
+/// same quantity and the mixer does not pace itself to make them agree: it paces to the
+/// device's queue, so its stream normally leads the wall clock by the queue's depth
+/// ([`DEVICE_LEAD`]), and a pass that finds the queue empty runs the loop again with no
+/// sleep at all. That is not an edge case — a freshly opened sink has an empty queue by
+/// definition, so **every presentation opens with a burst of passes sharing one instant**
+/// (`a_fresh_sink_hands_a_tap_a_whole_device_lead_at_once`).
+///
+/// A tap that treats `at` as an address therefore folds that burst onto itself. Use `at`
+/// to relate the stream to a wall clock; use the arriving order to lay the samples out.
+/// [`crate::stream::audio::AudioMix`] does exactly that, and did not until #208.
 pub trait MixTap: Send + Sync {
-    /// `stereo` is interleaved [`CHANNELS`]-channel audio at [`RATE`].
+    /// `stereo` is interleaved [`CHANNELS`]-channel audio at [`RATE`], continuing the
+    /// previous call's samples.
     fn mixed(&self, at: Instant, stereo: &[f32]);
 }
 
@@ -1766,6 +1786,27 @@ mod tests {
         // Even with no inputs able to speak at all: an open device is kept fed.
         assert_eq!(plan(&[Supply::Surface], 0), Pass::Backstop);
         assert_eq!(plan(&[], 0), Pass::Backstop);
+    }
+
+    #[test]
+    fn a_fresh_sink_hands_a_tap_a_whole_device_lead_at_once() {
+        // The premise [`MixTap`] warns about, in the pure form the drain policy has it:
+        // an empty device queue means `Sleep` is unreachable, so the loop runs back to
+        // back until the queue is full. Nothing in `run` sleeps in between and `now` is
+        // taken once per iteration, so a whole `DEVICE_LEAD` of audio reaches every tap
+        // inside whatever a few passes cost — measured at 60 ms inside 100 µs.
+        //
+        // A tap that addressed blocks by `at` would sum all of it onto one quantum. That
+        // is #208, and it is not a load-dependent race: it is what opening a stream does.
+        let banked = Supply::Flowing { frames: 48_000 };
+        let mut inflight = 0;
+        let mut burst = 0;
+        while let Pass::Take { frames } = plan(&[banked], inflight) {
+            burst += frames;
+            inflight += frames;
+        }
+        assert_eq!(burst, frames_in(DEVICE_LEAD));
+        assert_eq!(plan(&[banked], inflight), Pass::Sleep, "and only then");
     }
 
     #[test]
