@@ -137,7 +137,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use castaway_core::{PcmFrame as PcmBlock, Volume};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio_out::{AudioOut, AudioOutputFactory};
 use crate::error::PipelineError;
@@ -195,6 +195,36 @@ const IDLE_CLOSE: Duration = Duration::from_secs(5);
 
 /// How often the mixer retries a device it could not open, or that failed.
 const REOPEN_AFTER: Duration = Duration::from_secs(1);
+
+/// How many refusals in a row are still treated as an outage rather than as a verdict.
+///
+/// The cases worth being impatient about are transient — a panel waking from DPMS (#55), a
+/// USB DAC being replugged — and they clear in seconds. Past that the device is refusing
+/// on the merits and will refuse identically forever.
+const PATIENT_RETRIES: u32 = 3;
+
+/// The longest the mixer will wait between attempts, once it has stopped being patient.
+const REOPEN_CAP: Duration = Duration::from_secs(30);
+
+/// How long to wait before trying again, given how many times in a row the device has said
+/// no.
+///
+/// A wrong shared-mode format (#230) is not a transient: it produced a syscall, a failed
+/// `IAudioClient::Initialize` and a `warn!` every second for the life of the session, which
+/// is how a permanent condition became log spam. Doubling past [`PATIENT_RETRIES`] costs
+/// the recoverable cases nothing — they are over inside the patient window — and bounds the
+/// unrecoverable one at [`REOPEN_CAP`].
+const fn reopen_delay(consecutive: u32) -> Duration {
+    // Saturating at eight doublings: 2^8 × REOPEN_AFTER is already far past the cap, and
+    // shifting by more than the width of the type is the kind of thing that compiles.
+    let doublings = consecutive.saturating_sub(PATIENT_RETRIES);
+    let delay = REOPEN_AFTER.saturating_mul(1 << if doublings > 8 { 8 } else { doublings });
+    if delay.as_secs() > REOPEN_CAP.as_secs() {
+        REOPEN_CAP
+    } else {
+        delay
+    }
+}
 
 /// How much audio a live input may hold.
 ///
@@ -1178,6 +1208,7 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
     // When a real device may next be tried, after a failure or a refusal. A box with no
     // sound card must not spend the whole session looking for one.
     let mut retry_at: Option<Instant> = None;
+    let mut refusals = Refusals::default();
     let mut last_report = Reported {
         at: Instant::now(),
         counters: MixerCounters::default(),
@@ -1205,12 +1236,15 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
 
         if !sink.real && retry_at.is_none_or(|at| now >= at) {
             match open(device) {
-                Some(fresh) => {
+                Ok(fresh) => {
+                    if refusals.cleared() {
+                        info!("mixer: the output device took the mix after all");
+                    }
                     sink.close();
                     sink = fresh;
                     retry_at = None;
                 }
-                None => retry_at = Some(now + REOPEN_AFTER),
+                Err(e) => retry_at = Some(now + refusals.refused(&e)),
             }
         }
 
@@ -1299,26 +1333,59 @@ fn park(shared: &Arc<Shared>) {
 }
 
 /// Open a real device, or say why not.
-fn open(device: &AudioOutputFactory) -> Option<Sink> {
+///
+/// The refusal is returned rather than logged: how loudly it is worth saying depends on
+/// how many times it has already been said, and only the caller counting them knows that.
+fn open(device: &AudioOutputFactory) -> Result<Sink, PipelineError> {
     let mut out = device();
-    match out.start(RATE, CHANNELS) {
-        Ok(()) => {
-            info!(
-                rate = RATE,
-                channels = CHANNELS,
-                "mixer: output device open"
+    out.start(RATE, CHANNELS)?;
+    info!(
+        rate = RATE,
+        channels = CHANNELS,
+        "mixer: output device open"
+    );
+    Ok(Sink {
+        out,
+        real: true,
+        submitted: 0,
+        started: Instant::now(),
+    })
+}
+
+/// Consecutive refusals from the output device, and what the last one said.
+///
+/// A device that will not take the mix says the same thing every time, so the reason is
+/// logged when it is *news* and counted when it is not — the alternative was the same
+/// sentence at `warn` once a second for the life of the session (#230).
+#[derive(Default)]
+struct Refusals {
+    count: u32,
+    last: Option<String>,
+}
+
+impl Refusals {
+    /// Record a refusal, say it at the right volume, and answer when to try again.
+    fn refused(&mut self, error: &PipelineError) -> Duration {
+        self.count = self.count.saturating_add(1);
+        let reason = error.to_string();
+        if self.last.as_ref() == Some(&reason) {
+            debug!(
+                error = %reason,
+                consecutive = self.count,
+                "mixer: the output device still refuses the mix",
             );
-            Some(Sink {
-                out,
-                real: true,
-                submitted: 0,
-                started: Instant::now(),
-            })
+        } else {
+            warn!(error = %reason, "mixer: the output device refused the mix; retrying");
+            self.last = Some(reason);
         }
-        Err(e) => {
-            warn!(error = %e, "mixer: the output device refused the mix; retrying");
-            None
-        }
+        reopen_delay(self.count)
+    }
+
+    /// Note that the device came back, and say whether that is worth mentioning.
+    fn cleared(&mut self) -> bool {
+        let was_refusing = self.count > 0;
+        *self = Self::default();
+        was_refusing
     }
 }
 
@@ -2531,6 +2598,42 @@ mod tests {
             started.elapsed()
         );
         assert!(tried >= 2, "the device was never retried after it refused");
+    }
+
+    #[test]
+    fn a_device_that_keeps_refusing_is_asked_less_and_less_often() {
+        // The two cases this has to serve at once. A panel waking from DPMS (#55) is over
+        // in seconds and must not be made to wait, so the patient window retries at the
+        // flat interval...
+        for consecutive in 1..=PATIENT_RETRIES {
+            assert_eq!(
+                reopen_delay(consecutive),
+                REOPEN_AFTER,
+                "{consecutive} refusals is still an outage, not a verdict"
+            );
+        }
+
+        // ...while a shared-mode format WASAPI will never take (#230) is permanent, and
+        // asking it once a second forever is what turned one defect into a log nobody can
+        // read. It backs off, monotonically, and stops at the cap.
+        let mut previous = REOPEN_AFTER;
+        for consecutive in PATIENT_RETRIES + 1..PATIENT_RETRIES + 12 {
+            let delay = reopen_delay(consecutive);
+            assert!(
+                delay >= previous,
+                "delay went backwards at {consecutive}: {delay:?} after {previous:?}"
+            );
+            assert!(
+                delay <= REOPEN_CAP,
+                "{delay:?} exceeds the cap at {consecutive}"
+            );
+            previous = delay;
+        }
+        assert_eq!(
+            reopen_delay(u32::MAX),
+            REOPEN_CAP,
+            "an all-day refusal must land on the cap, not on an overflow"
+        );
     }
 
     #[test]

@@ -670,6 +670,37 @@ mod cpal_backend {
             .ok_or_else(|| "no default output device".to_owned())
     }
 
+    /// Say what the device wanted, not merely that it refused.
+    ///
+    /// A refusal here carries no information on its own, and on WASAPI it carries less than
+    /// it looks like it does. Shared mode has exactly one acceptable format, and cpal 0.18
+    /// will not say which: its enumeration for a render endpoint is *unprobed* — every
+    /// common rate crossed with every sample format is reported as supported, on the
+    /// grounds that `Initialize` sets `AUTOCONVERTPCM` — while the build path still
+    /// pre-checks `IsFormatSupported` and takes `S_OK` only. So [`choose_rate`] is told
+    /// yes, the build is told no, and the log said neither what was asked for nor what
+    /// would have been taken (#230).
+    ///
+    /// `default_output_config` is `GetMixFormat`: the one format that endpoint accepts by
+    /// definition. Printing it beside the request turns "not supported" into a diff, and
+    /// names the axis — rate, channels, or sample format — that has to move.
+    fn refused(device: &cpal::Device, asked: &cpal::StreamConfig, error: &cpal::Error) -> String {
+        let wanted = match device.default_output_config() {
+            Ok(mix) => format!(
+                "{} Hz, {} ch, {}",
+                mix.sample_rate(),
+                mix.channels(),
+                mix.sample_format()
+            ),
+            Err(e) => format!("<the device will not say: {e}>"),
+        };
+        format!(
+            "build output stream: {error} (asked for {} Hz, {} ch, f32; the device's own \
+             format is {wanted})",
+            asked.sample_rate, asked.channels
+        )
+    }
+
     /// The rate to open `device` at, given the source is at `wanted`.
     ///
     /// Asking for exactly what the sender sends is right on Linux and wrong on Windows,
@@ -811,7 +842,7 @@ mod cpal_backend {
                 },
                 None,
             )
-            .map_err(|e| format!("build output stream: {e}"))?;
+            .map_err(|e| refused(&device, &config, &e))?;
         stream
             .play()
             .map_err(|e| format!("start output stream: {e}"))?;
