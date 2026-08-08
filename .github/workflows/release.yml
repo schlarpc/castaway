@@ -1,0 +1,49 @@
+name: Release
+
+# Every commit on `main` becomes a release named for it, carrying the one artifact anyone
+# deploys: `castaway-windows-electron.zip` (docs/cross-build.md §4). The panel's Windows
+# box has no Nix store and no toolchain — a zip on a release page is the whole delivery
+# mechanism, and naming the release after the commit is what ties the bits on the panel
+# back to the tree they came from.
+#
+# Deliberately not gated on the Test workflow: the full check matrix takes upwards of two
+# hours, and the cross-build neither runs those tests nor shares their failure modes. A
+# broken commit produces a release the same as a good one — the release records what
+# `main` was, not that it was good; the Test workflow's own red X on the same commit is
+# the verdict, one click away.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      # The one departure from the Test workflow's read-only stance: creating the release
+      # and uploading the zip is a write to this repo's contents.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/nix-runner
+      # `.archive` rather than the bare package: the package is the deploy *tree*, and
+      # the archive derivation is that tree as one reproducible zip (stable mtimes, sorted
+      # entries) — the thing a release asset should be.
+      - run: .github/scripts/nix-build.sh '.#castaway-windows-electron.archive'
+      - name: Publish the commit-named release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short=$(git rev-parse --short "$GITHUB_SHA")
+          # The sha in the asset's own filename, so a Downloads folder with three of them
+          # still says which is which.
+          cp result/castaway-windows-electron.zip "castaway-windows-electron-$short.zip"
+          # `build-<sha>` rather than the bare sha: a tag that *is* a commit id shadows
+          # the commit in every ref-vs-object ambiguity git and the API have.
+          gh release create "build-$short" \
+            --target "$GITHUB_SHA" \
+            --title "castaway $short" \
+            --notes "$(git log -1 --format='%s%n%n%H')" \
+            "castaway-windows-electron-$short.zip"
+      - uses: ./.github/actions/postmortem
+        if: failure()
