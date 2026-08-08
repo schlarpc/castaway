@@ -15,153 +15,20 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use aes::cipher::{KeyIvInit as _, StreamCipher as _};
-use castaway_core::{
-    FrameSource, MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceAdapter, SourceId,
-};
-use proto_airplay::{AirPlayIdentity, AirPlayReceiver, MirrorKeys, StreamConnectionId};
+use castaway_core::{FrameSource, MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceId};
+use proto_airplay::{MirrorKeys, StreamConnectionId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-/// The SDP an iOS sender announces unencrypted ALAC with.
-const ANNOUNCE_SDP: &str = "v=0\r\n\
-    o=iTunes 3696222840 0 IN IP4 127.0.0.1\r\n\
-    s=iTunes\r\n\
-    c=IN IP4 127.0.0.1\r\n\
-    t=0 0\r\n\
-    m=audio 0 RTP/AVP 96\r\n\
-    a=rtpmap:96 AppleLossless\r\n\
-    a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n\
-    a=min-latency:11025\r\n";
-
-fn identity() -> AirPlayIdentity {
-    AirPlayIdentity {
-        name: "Test TV".into(),
-        device_id: "AA:BB:CC:DD:EE:FF".into(),
-        host: "castaway".into(),
-        pairing_id: "de159742-c022-4514-915b-203cb99f8b71".into(),
-        offer_hevc: false,
-        mirror_height: 1080,
-    }
-}
-
-/// Send one RTSP request and read the response head.
-async fn request(
-    stream: &mut TcpStream,
-    line: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-    cseq: u32,
-) -> String {
-    let mut req = format!("{line} RTSP/1.0\r\nCSeq: {cseq}\r\n");
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    if !body.is_empty() {
-        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
-    stream.flush().await.unwrap();
-
-    let mut buf = vec![0u8; 8192];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .expect("receiver answered in time")
-        .unwrap();
-    String::from_utf8_lossy(&buf[..n]).to_string()
-}
-
-/// Pull `server_port=NNNN` out of a Transport header.
-fn server_port(response: &str) -> u16 {
-    response
-        .split("server_port=")
-        .nth(1)
-        .and_then(|rest| {
-            rest.split(|c: char| !c.is_ascii_digit())
-                .next()
-                .and_then(|d| d.parse().ok())
-        })
-        .unwrap_or_else(|| panic!("no server_port in:\n{response}"))
-}
-
-/// An RTP audio packet with an ALAC-shaped payload.
-fn audio_packet(sequence: u16, timestamp: u32, payload: &[u8]) -> Vec<u8> {
-    let mut p = vec![0x80, 0x60];
-    p.extend_from_slice(&sequence.to_be_bytes());
-    p.extend_from_slice(&timestamp.to_be_bytes());
-    p.extend_from_slice(&0u32.to_be_bytes());
-    p.extend_from_slice(payload);
-    p
-}
+#[path = "raop_harness/mod.rs"]
+mod harness;
+use harness::{audio_packet, request, IPHONE_FMTP};
 
 #[tokio::test]
 async fn a_raop_session_negotiates_and_audio_reaches_the_pipeline() {
-    let (tx, mut events) = mpsc::channel(64);
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
-
-    // Bind explicitly so the test knows the port before the adapter starts serving.
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let receiver = std::sync::Arc::new(
-        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
-    );
-
-    tokio::spawn({
-        let receiver = std::sync::Arc::clone(&receiver);
-        async move {
-            let _ = receiver.run(sink).await;
-        }
-    });
-
-    // Wait for the listener to come up.
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = stream.expect("the receiver started listening");
-
-    // OPTIONS, then the audio negotiation in order.
-    let options = request(&mut stream, "OPTIONS *", &[], &[], 1).await;
-    assert!(options.starts_with("RTSP/1.0 200"), "{options}");
-
-    let announce = request(
-        &mut stream,
-        "ANNOUNCE rtsp://127.0.0.1/1",
-        &[("Content-Type", "application/sdp")],
-        ANNOUNCE_SDP.as_bytes(),
-        2,
-    )
-    .await;
-    assert!(announce.starts_with("RTSP/1.0 200"), "{announce}");
-
-    // A sender's own control/timing ports; we do not use them here, but SETUP is
-    // refused without them, which is the point.
-    let setup = request(
-        &mut stream,
-        "SETUP rtsp://127.0.0.1/1",
-        &[(
-            "Transport",
-            "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=6001;timing_port=6002",
-        )],
-        &[],
-        3,
-    )
-    .await;
-    assert!(setup.starts_with("RTSP/1.0 200"), "{setup}");
-    let audio_port = server_port(&setup);
-    assert_ne!(audio_port, 0, "a zero server_port means no socket is bound");
-
-    let record = request(&mut stream, "RECORD rtsp://127.0.0.1/1", &[], &[], 4).await;
-    assert!(record.starts_with("RTSP/1.0 200"), "{record}");
+    let (mut stream, mut events) = harness::start(MediaPorts::Ephemeral).await;
+    let (audio_port, record) = harness::negotiate(&mut stream, IPHONE_FMTP).await;
     assert!(record.contains("Audio-Latency"), "{record}");
 
     // The description reaches the panel, naming the generation and codec — *after* the
@@ -239,29 +106,7 @@ async fn a_raop_session_negotiates_and_audio_reaches_the_pipeline() {
 
 #[tokio::test]
 async fn a_setup_before_announce_is_refused_over_a_real_socket() {
-    let (tx, _events) = mpsc::channel(64);
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let receiver = std::sync::Arc::new(
-        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
-    );
-    tokio::spawn(async move {
-        let _ = receiver.run(sink).await;
-    });
-
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = stream.expect("the receiver started listening");
+    let (mut stream, _events) = harness::start(MediaPorts::Ephemeral).await;
 
     let setup = request(
         &mut stream,
@@ -319,29 +164,7 @@ fn mirror_message(kind: u8, timestamp: u64, payload: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_mirroring_session_delivers_both_video_and_its_audio() {
-    let (tx, mut events) = mpsc::channel(64);
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let receiver = std::sync::Arc::new(
-        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
-    );
-    tokio::spawn(async move {
-        let _ = receiver.run(sink).await;
-    });
-
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = stream.expect("the receiver started listening");
+    let (mut stream, mut events) = harness::start(MediaPorts::Ephemeral).await;
 
     // `/fp-setup` SETUP2 carries the key message the derivation needs. The session keeps
     // it, exactly as it would from a real handshake.
@@ -653,58 +476,11 @@ async fn a_mirroring_session_delivers_both_video_and_its_audio() {
 /// deployment could have opened ahead of time.
 #[tokio::test]
 async fn setup_advertises_ports_from_the_declared_media_range() {
-    let (tx, _events) = mpsc::channel(64);
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
-
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
     // Eight ports: one connection takes four (mirror data TCP + audio/control/timing UDP).
     let range = MediaPorts::Range(castaway_core::PortRange::new(42510, 42517).unwrap());
-    let receiver = std::sync::Arc::new(AirPlayReceiver::new(identity(), range).with_addr(addr));
-    tokio::spawn({
-        let receiver = std::sync::Arc::clone(&receiver);
-        async move {
-            let _ = receiver.run(sink).await;
-        }
-    });
+    let (mut stream, _events) = harness::start(range).await;
 
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = stream.expect("the receiver started listening");
-
-    let announce = request(
-        &mut stream,
-        "ANNOUNCE rtsp://127.0.0.1/1",
-        &[("Content-Type", "application/sdp")],
-        ANNOUNCE_SDP.as_bytes(),
-        1,
-    )
-    .await;
-    assert!(announce.starts_with("RTSP/1.0 200"), "{announce}");
-
-    let setup = request(
-        &mut stream,
-        "SETUP rtsp://127.0.0.1/1",
-        &[(
-            "Transport",
-            "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=6001;timing_port=6002",
-        )],
-        &[],
-        2,
-    )
-    .await;
-    assert!(setup.starts_with("RTSP/1.0 200"), "{setup}");
-    let audio_port = server_port(&setup);
+    let (audio_port, _) = harness::negotiate(&mut stream, IPHONE_FMTP).await;
     assert!(
         (42510..=42517).contains(&audio_port),
         "SETUP advertised {audio_port}, outside the declared range 42510-42517"
@@ -722,29 +498,7 @@ async fn setup_advertises_ports_from_the_declared_media_range() {
 /// the floor.
 #[tokio::test]
 async fn an_audio_only_session_starts_without_a_picture_to_belong_to() {
-    let (tx, mut events) = mpsc::channel(64);
-    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let receiver = std::sync::Arc::new(
-        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
-    );
-    tokio::spawn(async move {
-        let _ = receiver.run(sink).await;
-    });
-
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = stream.expect("the receiver started listening");
+    let (mut stream, mut events) = harness::start(MediaPorts::Ephemeral).await;
 
     let fp = request(
         &mut stream,
@@ -924,27 +678,8 @@ async fn the_card_learns_who_is_casting_once_the_session_is_the_active_one() {
         .run(rx),
     );
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let receiver = std::sync::Arc::new(
-        AirPlayReceiver::new(identity(), MediaPorts::Ephemeral).with_addr(addr),
-    );
-    tokio::spawn(async move {
-        let _ = receiver.run(sink).await;
-    });
-
-    let mut stream = None;
-    for _ in 0..50 {
-        if let Ok(s) = TcpStream::connect(addr).await {
-            stream = Some(s);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let mut stream = stream.expect("the receiver started listening");
+    let addr = harness::spawn_receiver(MediaPorts::Ephemeral, sink).await;
+    let mut stream = harness::connect(addr).await;
 
     let fp = request(
         &mut stream,
