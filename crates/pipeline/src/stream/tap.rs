@@ -68,6 +68,22 @@ pub struct StreamTap {
     /// *asked for* rather than by when it came back — a readback takes a millisecond or
     /// two and the grid should not absorb that.
     asked_at: Option<Instant>,
+    /// Slots filled with a repeat of the previous picture, total for this presentation.
+    ///
+    /// [`Publish::duplicates`](super::cadence::Publish) was consumed per job and summed
+    /// nowhere, so a stream limping at 4 real fps out of 30 read identically to one
+    /// duplicating a genuinely static panel (#233). This and the two below are the
+    /// stream's `starved`/`idle` split, reported by the teardown line.
+    duplicated: u64,
+    /// Of `duplicated`, the slots owed to the *encoder*: a due slot went unfilled while
+    /// the depth check was refusing frames. The stream's `starved` — structurally zero
+    /// while the encoder keeps up, however still the panel is.
+    stalled: u64,
+    /// How many times the grid gave up on wall-clock agreement and rebased.
+    resyncs: u64,
+    /// Whether the encoder has refused a due slot since the last publish, so the
+    /// duplicates that publish carries are attributed to it rather than to the panel.
+    encoder_behind: bool,
 }
 
 impl std::fmt::Debug for StreamTap {
@@ -138,6 +154,10 @@ impl StreamTap {
             jobs: Some(jobs),
             queued,
             asked_at: None,
+            duplicated: 0,
+            stalled: 0,
+            resyncs: 0,
+            encoder_behind: false,
         }
     }
 }
@@ -146,12 +166,15 @@ impl OutputTap for StreamTap {
     fn wants_frame(&mut self, now: Instant) -> Option<FrameWant> {
         self.asked_at = None;
         self.jobs.as_ref()?;
-        // The encode thread is behind. Skipping here costs the stream a frame and the
-        // panel nothing at all, which is the right way round.
-        if self.queued.load(Ordering::Acquire) >= DEPTH {
+        if !self.cadence.due(now) {
             return None;
         }
-        if !self.cadence.due(now) {
+        // The encode thread is behind. Skipping here costs the stream a frame and the
+        // panel nothing at all, which is the right way round — but the slot that goes by
+        // becomes a duplicate, and *whose fault* that was is worth remembering: asked
+        // after `due`, so a refusal here is always a due slot the encoder could not take.
+        if self.queued.load(Ordering::Acquire) >= DEPTH {
+            self.encoder_behind = true;
             return None;
         }
         self.asked_at = Some(now);
@@ -173,9 +196,20 @@ impl OutputTap for StreamTap {
         };
         let now = self.asked_at.take().unwrap_or_else(Instant::now);
         let publish = self.cadence.take(now);
+        // Attribute this publish's duplicates before totalling them: the flag's window is
+        // "since the last publish", so it resets here whether or not it was read.
+        let behind = std::mem::take(&mut self.encoder_behind);
+        if publish.duplicates > 0 {
+            self.duplicated += u64::from(publish.duplicates);
+            if behind {
+                self.stalled += u64::from(publish.duplicates);
+            }
+        }
         if publish.resynced {
+            self.resyncs += 1;
             tracing::warn!(
                 duplicates = publish.duplicates,
+                resyncs = self.resyncs,
                 "the panel stopped presenting long enough that the stream rebased its clock"
             );
         }
@@ -192,7 +226,9 @@ impl OutputTap for StreamTap {
             Err(TrySendError::Full(_)) => {
                 // `wants_frame` checks the depth first, so this is a race rather than a
                 // state: the count is one frame stale. The slot is already taken, so the
-                // encoder will see it as a duplicate on the next frame through.
+                // encoder will see it as a duplicate on the next frame through — and that
+                // duplicate is the encoder's, not the panel's.
+                self.encoder_behind = true;
                 self.queued.fetch_sub(1, Ordering::AcqRel);
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -212,6 +248,18 @@ impl Drop for StreamTap {
         // Dropping the sender is the stop signal: the encode thread's `recv` fails, it
         // flushes the encoder, publishes the last partial segment and releases the claim.
         self.jobs = None;
+        // The presentation's teardown line, as [`crate::mixer::MixInput`] does it. A few
+        // duplicates are the design working; `stalled` in bulk says the box cannot encode
+        // this stream at this rate, which is worth seeing without debug logging.
+        if self.duplicated > 0 {
+            tracing::info!(
+                duplicated = self.duplicated,
+                stalled = self.stalled,
+                resyncs = self.resyncs,
+                "stream: slots filled with a repeated picture; `stalled` of them because \
+                 the encoder was behind"
+            );
+        }
     }
 }
 
@@ -486,6 +534,10 @@ mod tests {
                 jobs: Some(jobs),
                 queued: Arc::new(AtomicUsize::new(0)),
                 asked_at: None,
+                duplicated: 0,
+                stalled: 0,
+                resyncs: 0,
+                encoder_behind: false,
             },
             rx,
         )
@@ -553,6 +605,65 @@ mod tests {
         assert!(tap.wants_frame(later).is_some());
         tap.on_frame(&TappedFrame::Nv12(&frame));
         assert_eq!(rx.recv().unwrap().duplicates, 8);
+    }
+
+    #[test]
+    fn duplicates_the_encoder_caused_are_told_apart_from_a_still_panel() {
+        // #233: per-job `duplicates` summed to nowhere, so a stream limping at 4 real
+        // fps because the encoder was behind read identically to one repeating a
+        // genuinely static panel. The totals draw the mixer's `starved`/`idle` line.
+        let (mut tap, rx) = detached();
+        let t0 = Instant::now();
+        let frame = planes(64, 32);
+
+        assert!(tap.wants_frame(t0).is_some());
+        tap.on_frame(&TappedFrame::Nv12(&frame));
+        let _ = rx.try_recv();
+
+        // The encode thread is full, and a due slot is refused for it: the fault is
+        // remembered until the next publish carries the duplicates it caused.
+        tap.queued.store(DEPTH, Ordering::Release);
+        assert!(
+            tap.wants_frame(t0 + Duration::from_millis(50)).is_none(),
+            "the depth check refuses a due slot"
+        );
+        // The encoder catches up 300 ms in — slot nine — so slots one through eight come
+        // back as duplicates, every one of them the encoder's.
+        tap.queued.store(0, Ordering::Release);
+        assert!(tap.wants_frame(t0 + Duration::from_millis(300)).is_some());
+        tap.on_frame(&TappedFrame::Nv12(&frame));
+        assert_eq!(rx.try_recv().unwrap().duplicates, 8);
+        assert_eq!(tap.duplicated, 8, "the total accumulates");
+        assert_eq!(tap.stalled, 8, "and every one of them is the encoder's");
+
+        // A panel that simply presented nothing for the same stretch: the duplicates
+        // total grows, and `stalled` must not move — a still panel is not a defect.
+        tap.queued.store(0, Ordering::Release);
+        assert!(tap.wants_frame(t0 + Duration::from_millis(600)).is_some());
+        tap.on_frame(&TappedFrame::Nv12(&frame));
+        assert_eq!(rx.try_recv().unwrap().duplicates, 8);
+        assert_eq!(tap.duplicated, 16);
+        assert_eq!(
+            tap.stalled, 8,
+            "a quiet panel's repeats are not the encoder's"
+        );
+    }
+
+    #[test]
+    fn a_stream_kept_on_schedule_counts_nothing() {
+        // The other direction: every slot filled on time leaves every total at zero, or
+        // the teardown line stops meaning anything.
+        let (mut tap, rx) = detached();
+        let t0 = Instant::now();
+        let frame = planes(64, 32);
+        for i in 0..30u64 {
+            let now = t0 + Duration::from_nanos(i * 1_000_000_000 / 30);
+            assert!(tap.wants_frame(now).is_some());
+            tap.on_frame(&TappedFrame::Nv12(&frame));
+            let _ = rx.try_recv();
+            tap.queued.store(0, Ordering::Release);
+        }
+        assert_eq!((tap.duplicated, tap.stalled, tap.resyncs), (0, 0, 0));
     }
 
     #[test]
