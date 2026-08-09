@@ -31,6 +31,22 @@ pub trait HciTransport: Send + Sync {
     /// [`HciError::Transport`] if the device is gone, or a decode error if the
     /// controller emitted something malformed.
     async fn recv(&self) -> Result<HciPacket, HciError>;
+
+    /// Tell the transport that the controller is running its bootloader, or has left it.
+    ///
+    /// This exists for one quirk, and it is a *framing* quirk rather than a protocol one,
+    /// which is why it lives here and not in the loader. While an Intel controller runs
+    /// its bootloader, HCI does not stay on the pipes the USB transport spec assigns it:
+    /// `Secure_Send` goes out on **bulk OUT**, and events come back on **bulk IN** as well
+    /// as on the interrupt endpoint — with no packet-type byte in either direction, since
+    /// the endpoint already says what the packet is. A transport that keeps reading bulk
+    /// IN as ACL decodes every firmware acknowledgement as a malformed L2CAP fragment and
+    /// drops it, and the upload times out on its first fragment having in fact succeeded
+    /// (#229, confirmed against an AX210 on 2026-08-08).
+    ///
+    /// Default is a no-op: only the USB transport has pipes to choose between, and a
+    /// controller reached over a socket or TCP has already had this done for it.
+    fn set_bootloader_framing(&self, _on: bool) {}
 }
 
 /// A transport that answers from a script instead of a radio.

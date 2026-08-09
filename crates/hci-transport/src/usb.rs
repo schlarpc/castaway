@@ -131,8 +131,20 @@ pub struct UsbTransport {
     /// Serialises ACL writes. Submitting a transfer needs `&mut` on the endpoint, and
     /// [`HciTransport::send`] only has `&self`.
     acl_out: Mutex<Endpoint<Bulk, Out>>,
+    /// Whether the controller is running a bootloader that puts HCI on the bulk pipes.
+    ///
+    /// See [`HciTransport::set_bootloader_framing`]. Atomic because `send`/`recv` take
+    /// `&self` and the loader flips this between them.
+    bootloader: std::sync::atomic::AtomicBool,
     _device: Device,
 }
+
+/// `Secure_Send` — the one command an Intel bootloader wants on the bulk pipe.
+///
+/// `btusb_send_frame_intel` singles this opcode out by number and so do we: everything
+/// else, `Read_Version` and `Intel_Reset` included, stays on control in both modes, which
+/// is what the capture of the kernel's own bring-up shows.
+const SECURE_SEND: OpCode = OpCode::new(0xFC09);
 
 /// Both IN endpoints, kept armed at once.
 ///
@@ -344,6 +356,7 @@ impl UsbTransport {
             id,
             reader: Mutex::new(reader),
             acl_out: Mutex::new(acl_out),
+            bootloader: std::sync::atomic::AtomicBool::new(false),
             _device: device,
         })
     }
@@ -407,6 +420,22 @@ impl HciTransport for UsbTransport {
                 body.extend_from_slice(&opcode.raw().to_le_bytes());
                 body.push(u8::try_from(params.len()).unwrap_or(u8::MAX));
                 body.extend_from_slice(&params);
+
+                // The one exception, and only while the bootloader is running: firmware
+                // fragments go out on bulk OUT, in the same unprefixed framing.
+                if opcode == SECURE_SEND
+                    && self.bootloader.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let mut endpoint = self.acl_out.lock().await;
+                    endpoint.submit(Buffer::from(body));
+                    endpoint
+                        .next_complete()
+                        .await
+                        .into_result()
+                        .map_err(|e| HciError::Transport(format!("bulk out: {opcode}: {e}")))?;
+                    return Ok(());
+                }
+
                 self.interface
                     .control_out(
                         ControlOut {
@@ -465,7 +494,15 @@ impl HciTransport for UsbTransport {
                     let read = handle_completion(
                         &mut reader.acl, completion, "bulk in",
                     ).await?;
-                    (PacketType::AclData, read)
+                    // While the bootloader runs there is no ACL — there is no link to
+                    // carry it — and this endpoint carries the acknowledgement of every
+                    // firmware fragment instead. Reading it as ACL is what made a
+                    // successful upload look like a timeout.
+                    if self.bootloader.load(std::sync::atomic::Ordering::Relaxed) {
+                        (PacketType::Event, read)
+                    } else {
+                        (PacketType::AclData, read)
+                    }
                 }
             };
 
@@ -480,6 +517,11 @@ impl HciTransport for UsbTransport {
                 Err(e) => warn!(error = %e, ?kind, "dropping a malformed USB packet"),
             }
         }
+    }
+
+    fn set_bootloader_framing(&self, on: bool) {
+        self.bootloader
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
