@@ -75,6 +75,20 @@ struct Registered {
 /// error rather than an empty result on purpose: an empty scriptlet set is indisting-
 /// uishable from a working one until someone notices ads.
 pub fn convert(modules: &[(String, String)]) -> Result<Vec<Resource>, PipelineError> {
+    convert_within(modules, EVAL_BUDGET)
+}
+
+/// [`convert`] with the evaluation budget supplied.
+///
+/// The budget is a parameter because a constant a test has to wait out is a parameter
+/// (ground rule 6): the interrupt test used to spin a QuickJS loop for the full shipped
+/// twenty seconds — the single most expensive test in the workspace, a fifth of the
+/// whole run's wall clock, burning a core the entire time — to prove a property that is
+/// exactly as true at fifty milliseconds.
+pub fn convert_within(
+    modules: &[(String, String)],
+    budget: std::time::Duration,
+) -> Result<Vec<Resource>, PipelineError> {
     let mut resolver = BuiltinResolver::default();
     let mut loader = BuiltinLoader::default();
     for (name, source) in modules {
@@ -88,7 +102,7 @@ pub fn convert(modules: &[(String, String)]) -> Result<Vec<Resource>, PipelineEr
     // Bound the run rather than trusting it to end. The handler is polled by the engine;
     // returning true unwinds whatever is executing as an exception, which the caller then
     // reports like any other conversion failure.
-    let deadline = std::time::Instant::now() + EVAL_BUDGET;
+    let deadline = std::time::Instant::now() + budget;
     runtime.set_interrupt_handler(Some(Box::new(move || std::time::Instant::now() > deadline)));
     let context = Context::full(&runtime).map_err(|e| PipelineError::Scriptlets(e.to_string()))?;
 
@@ -304,13 +318,18 @@ builtinScriptlets.push({
             "resources/scriptlets.js".into(),
             "export const builtinScriptlets = []; while (true) {}".into(),
         )];
+        // The shipped budget, shrunk: the property is that the interrupt fires and comes
+        // back as an error, which is exactly as true at fifty milliseconds as at the
+        // shipped twenty seconds — and this used to burn a core for the full twenty,
+        // 22% of the whole suite's wall clock, to say so.
+        let budget = std::time::Duration::from_millis(50);
         let started = std::time::Instant::now();
         assert!(
-            convert(&spinning).is_err(),
+            convert_within(&spinning, budget).is_err(),
             "an endless module must fail the conversion"
         );
         assert!(
-            started.elapsed() < EVAL_BUDGET + std::time::Duration::from_secs(10),
+            started.elapsed() < budget + std::time::Duration::from_secs(10),
             "it should be interrupted near the budget, not run to completion"
         );
     }

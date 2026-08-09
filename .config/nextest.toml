@@ -24,17 +24,23 @@
 filter = 'package(pipeline) and test(/^mixer::tests::/)'
 threads-required = "num-test-threads"
 
-# Same shape, one layer up: the transport clock re-anchors against `Instant::now()`, and
-# `a_new_reading_re_anchors_the_clock_and_a_repeat_does_not` is the assertion that missed
-# its 40 ms budget by 10 ms in #156 while 388 tests ran beside it on lavapipe.
-[[profile.default.overrides]]
-filter = 'package(pipeline) and binary(transport_clock)'
-threads-required = "num-test-threads"
+# `transport_clock` used to be in this list, and the removal is the point of recording it:
+# the file re-anchored against `Instant::now()` when #156 gave it a runner to itself, and
+# it has since moved wholly onto `ManualClock` — zero wall-clock reads remain, every test
+# runs in well under half a second, and serializing ten deterministic tests against the
+# whole suite was pure cost. An override earns its place by naming the wall-clock
+# assertion that needs it (#236).
 
-# The audio device drain tests in `audio_session`, for the same reason: they assert that a
-# session hands the sink samples at the rate the sink consumes them.
+# The audio device drain tests in `audio_session`: they assert that a session hands the
+# sink samples at the rate the sink consumes them.
 [[profile.default.overrides]]
 filter = 'package(pipeline) and test(/^audio_session::tests::.*real_time/)'
+threads-required = "num-test-threads"
+
+# `ldac_decode`'s session test is the same measurement — a fixture played out against the
+# wall through the real mixer — and was the one real-time drain *not* on this list (#237).
+[[profile.default.overrides]]
+filter = 'package(pipeline) and binary(ldac_decode)'
 threads-required = "num-test-threads"
 
 # NOT `output_stream`, and the reason is worth recording because it looked like one of

@@ -60,9 +60,14 @@ fn widget_visible(render: &RenderLoop) -> bool {
     shot[i] > 0xf0 && shot[i + 1] < 0x10 && shot[i + 2] > 0xf0
 }
 
-fn idle_with_widget() -> (pipeline::RenderTx, RenderLoop) {
+fn idle_with_widget() -> (
+    pipeline::RenderTx,
+    RenderLoop,
+    pipeline::render_clock::ManualClock,
+) {
     let (tx, rx) = pipeline::render_channel(8);
-    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap().with_clock(clock);
     tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     render.pump();
 
@@ -85,12 +90,12 @@ fn idle_with_widget() -> (pipeline::RenderTx, RenderLoop) {
         .unwrap();
     render.pump();
     assert!(widget_visible(&render), "the widget should start visible");
-    (tx, render)
+    (tx, render, time)
 }
 
 #[test]
 fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
-    let (tx, mut render) = idle_with_widget();
+    let (tx, mut render, time) = idle_with_widget();
 
     // An audio-only session: a card, no video. Its rect need not overlap the widget's —
     // that is the point.
@@ -107,7 +112,8 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
     // grace (see `CLEAR_GRACE`), so the card lingers briefly before yielding back.
     tx.send(RenderCommand::ClearNowPlaying);
     render.pump();
-    std::thread::sleep(std::time::Duration::from_millis(1300));
+    // The grace passes in virtual time; this used to be a real 1.3 s sleep (#236).
+    time.advance(std::time::Duration::from_millis(1300));
     settle(&mut render);
     assert!(
         widget_visible(&render),
@@ -117,7 +123,7 @@ fn a_now_playing_session_takes_the_widget_off_the_panel_and_gives_it_back() {
 
 #[test]
 fn a_pushed_shell_screen_takes_the_widget_with_it() {
-    let (_tx, mut render) = idle_with_widget();
+    let (_tx, mut render, _time) = idle_with_widget();
 
     // Navigate off Home: a service screen is the whole panel's content, and it is drawn
     // *below* the widget's layer, so paint order alone would leave the clock floating
@@ -153,7 +159,7 @@ fn the_mascot_leans_on_the_slot_and_leaves_only_for_a_full_panel_session() {
     // persists, so a session demoted into that slot is something for her arms to land on
     // rather than something that buries them. What gets her out of the way is an occupant
     // that has taken the whole panel — a matter of degree, so the change is a fade.
-    let (tx, mut render) = idle_with_widget();
+    let (tx, mut render, _time) = idle_with_widget();
     assert_eq!(
         render.mascot_opacity(),
         Some(1.0),
@@ -205,7 +211,7 @@ fn she_stays_whole_when_the_browser_is_off_being_youtube() {
     // (Surface::CastPage) there is no idle-widget *surface* — and the overlay was keyed
     // on exactly that, so coming Home showed half of dma-chan. She leans on the slot's
     // frame, and the frame is there whenever Home is.
-    let (_tx, mut render) = idle_with_widget();
+    let (_tx, mut render, _time) = idle_with_widget();
 
     // The browser leaves the clock and becomes a page; the widget surface goes away.
     render.set_surface(Surface::IdleWidget, false);
@@ -233,7 +239,7 @@ fn she_stays_whole_when_the_browser_is_off_being_youtube() {
 fn a_demoted_video_is_nowhere_near_her_and_leaves_her_alone() {
     // Video demotes to the PiP corner, not the slot. Driving her from "is a session present"
     // would have hidden her for a video in the opposite corner of the panel.
-    let (tx, mut render) = idle_with_widget();
+    let (tx, mut render, _time) = idle_with_widget();
     tx.send(RenderCommand::Video(castaway_core::DecodedFrame {
         width: W,
         height: H,

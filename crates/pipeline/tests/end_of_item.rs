@@ -39,9 +39,11 @@ fn frame() -> DecodedFrame {
 #[test]
 fn the_last_frame_of_a_finished_item_does_not_stay_on_the_panel() {
     let (tx, rx) = render_channel(8);
-    let Some(mut render) = pipeline::test_gpu::render_loop(W, H, rx) else {
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(W, H, rx) else {
         return;
     };
+    let mut render = render.with_clock(clock);
 
     // An item, playing: the layer is up.
     tx.send(RenderCommand::Video(frame()));
@@ -60,15 +62,16 @@ fn the_last_frame_of_a_finished_item_does_not_stay_on_the_panel() {
     tx.send(RenderCommand::ClearVideo);
 
     // Now run the loop the way the kiosk does, for long enough to cover the clear's grace
-    // and the layer's exit.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
+    // and the layer's exit — in virtual time, because the grace is scheduled against the
+    // injected clock and there is nothing here that needs a wall (#236). Five virtual
+    // seconds at a frame per step.
+    for _ in 0..320 {
         render.pump();
         render.tick_motion(FRAME);
         if render.layer_size(LayerId::Video).is_none() {
             return;
         }
-        std::thread::sleep(FRAME);
+        time.advance(FRAME);
     }
     panic!("the video layer outlived the item: the panel is still showing a finished cast");
 }
@@ -76,9 +79,11 @@ fn the_last_frame_of_a_finished_item_does_not_stay_on_the_panel() {
 #[test]
 fn a_frame_of_the_next_item_still_calls_off_the_clear() {
     let (tx, rx) = render_channel(8);
-    let Some(mut render) = pipeline::test_gpu::render_loop(W, H, rx) else {
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let Some(render) = pipeline::test_gpu::render_loop(W, H, rx) else {
         return;
     };
+    let mut render = render.with_clock(clock);
 
     tx.send(RenderCommand::Video(frame()));
     render.pump();
@@ -92,14 +97,14 @@ fn a_frame_of_the_next_item_still_calls_off_the_clear() {
     tx.send(RenderCommand::Video(frame()));
     render.pump();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
+    // Three virtual seconds — well past the grace a live clear would have fired at.
+    for _ in 0..190 {
         render.pump();
         render.tick_motion(FRAME);
         assert!(
             render.layer_size(LayerId::Video).is_some(),
             "the next item's frame should have called the clear off"
         );
-        std::thread::sleep(FRAME);
+        time.advance(FRAME);
     }
 }

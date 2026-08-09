@@ -112,8 +112,10 @@ fn invented_is_negligible(window: &MixerCounters) {
     assert!(
         invented < 0.01,
         "{:.1}% of what the device was given was silence the mixer invented \
-         ({} of {} frames); the source never ran out, so this is the mixer failing to \
-         take what was there rather than a gap in the audio",
+         ({} of {} frames). If the producer's own rate check above passed, the source \
+         never ran out and this is the mixer failing to take what was there; if this \
+         fires alone in a paced test, look at `starved` first — a parked producer \
+         manufactures exactly this signature (#237)",
         invented * 100.0,
         window.starved,
         window.emitted,
@@ -194,14 +196,18 @@ fn a_packet_source_on_its_own_clock_survives_a_real_device() {
             };
             let period =
                 Duration::from_nanos(1_000_000_000u64 * PACKET as u64 / u64::from(SOURCE_RATE));
-            let mut next = Instant::now();
+            let started = Instant::now();
+            let mut next = started;
+            let mut sent = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 input.write(&block).unwrap();
+                sent += 1;
                 next += period;
                 if let Some(wait) = next.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }
             }
+            (sent, started.elapsed())
         })
     };
 
@@ -214,7 +220,21 @@ fn a_packet_source_on_its_own_clock_survives_a_real_device() {
     let heard = tap.0.lock().unwrap()[from..].to_vec();
     let window = mixer.counters().since(&before);
     stop.store(true, Ordering::Relaxed);
-    producer.join().unwrap();
+    let (sent, producing) = producer.join().unwrap();
+
+    // The harness's own honesty first, as in `mixer::tests`' sibling of this test: a
+    // producer that was parked could not keep its schedule, and the mixer then padded
+    // real gaps — which every assertion below would misattribute to the device's clock,
+    // to the drain, or to #177 (#237). `nix/mixer-vm-test.nix` runs this on four
+    // dedicated cores precisely because of this hazard; the check is what says so when
+    // that stops being enough.
+    #[allow(clippy::cast_precision_loss)]
+    let offered = sent as f64 * PACKET as f64 / producing.as_secs_f64();
+    assert!(
+        offered > f64::from(SOURCE_RATE) * 0.97,
+        "the producer only kept {offered:.0} frames/s of its {SOURCE_RATE} Hz schedule; \
+         it was made to wait, so the measurements below mean nothing"
+    );
 
     let frames = heard.chunks_exact(usize::from(CHANNELS));
     let total = frames.len();

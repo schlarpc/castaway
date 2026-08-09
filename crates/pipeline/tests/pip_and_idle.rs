@@ -362,7 +362,8 @@ fn a_session_that_ends_leaves_rather_than_vanishing() {
     // frame and gone the next. Now the clear starts an exit and the layer is retired when the
     // motion has finished.
     let (tx, rx) = pipeline::render_channel(8);
-    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap().with_clock(clock);
     tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
@@ -370,8 +371,9 @@ fn a_session_that_ends_leaves_rather_than_vanishing() {
 
     tx.send(RenderCommand::ClearNowPlaying);
     render.pump();
-    // Past the grace, so the exit is allowed to begin.
-    std::thread::sleep(std::time::Duration::from_millis(1300));
+    // Past the grace, so the exit is allowed to begin. Virtual: the grace is scheduled
+    // against the injected clock, and this used to be a real 1.3 s sleep (#236).
+    time.advance(std::time::Duration::from_millis(1300));
 
     let mut opacities = Vec::new();
     frames(&mut render, |r| opacities.push(r.card_opacity()));
@@ -468,7 +470,8 @@ fn a_session_that_comes_back_mid_exit_reverses_instead_of_jumping() {
     // origin is a visible jump, and reversing for free is the whole reason each component
     // springs in real units rather than along a normalized progress.
     let (tx, rx) = pipeline::render_channel(8);
-    let mut render = RenderLoop::offscreen(W, H, rx).unwrap();
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap().with_clock(clock);
     tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
     tx.send(RenderCommand::NowPlaying(Box::default()));
     render.pump();
@@ -481,10 +484,10 @@ fn a_session_that_comes_back_mid_exit_reverses_instead_of_jumping() {
     }
     assert!((render.card_opacity() - 1.0).abs() < 0.01);
 
-    // Start leaving, and get part-way.
+    // Start leaving, and get part-way. The grace passes in virtual time (#236).
     tx.send(RenderCommand::ClearNowPlaying);
     render.pump();
-    std::thread::sleep(std::time::Duration::from_millis(1300));
+    time.advance(std::time::Duration::from_millis(1300));
     for _ in 0..3 {
         render.pump();
         render.tick_motion(std::time::Duration::from_millis(16));
