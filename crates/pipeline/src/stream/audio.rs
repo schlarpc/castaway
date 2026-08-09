@@ -573,9 +573,14 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(500));
 
+        // A whole second, not the first quantum: the two writers cannot arrange "at the
+        // same time" (the same race the volume test in `audio_session` had), so the head
+        // of the track may legitimately carry one source alone. What must hold is that
+        // the overlap exists *somewhere* — each source wrote 400 ms within milliseconds
+        // of the other — and a peak over the second finds it wherever it landed.
         let out = stream
             .mix()
-            .take(t0 + Duration::from_secs(2), 4800, SETTLE)
+            .take(t0 + Duration::from_secs(2), 48_000, SETTLE)
             .unwrap();
         let loudest = out.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
         assert!(
