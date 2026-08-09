@@ -35,6 +35,7 @@ upstream and then deleted.
 | Crate | State |
 |---|---|
 | `core` | Done. Traits (`SourceAdapter`, `Pipeline`, `DisplayControl`, `MiracastBackend`), `SessionEvent`/`FrameSource`, newtypes, last-writer-wins `SessionManager`. |
+| `test-support` | **Done.** The shared deadline poll (`eventually` and its async/chosen-deadline spellings, #236) — a dev-dependency everywhere, a runtime dependency nowhere. |
 | `paths` | **Done.** The one answer to "which directory?" on both platforms (D39). `Layout::{Xdg, LocalAppData}` is a value, not a `cfg`, so Linux CI exercises the Windows layout — absoluteness rule included. Resolution is pure (an `Environment` trait, no process env, no disk); finding nothing is reported as `Origin::Fallback` rather than guessed at. |
 | `substrate-ssdp` | Done. Pure M-SEARCH/NOTIFY layer + UDP 1900 `Responder`. |
 | `substrate-mdns` | Done. `mdns-sd` wrapper, validated `MdnsService`. |
