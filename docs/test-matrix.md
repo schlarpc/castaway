@@ -44,6 +44,7 @@ against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a
 > | the ERTM differential ran when somebody remembered — `--features bench`, `sudo`, a hand-started emulator | `checks.bluetooth-vm` runs four scenarios against BlueZ's `l2test`: the clean exchange, an I-frame dropped between the socket and the mux, a checksum that does not match, and acknowledgements that never arrive. The `bench` feature that kept ~600 lines out of every build and out of clippy is gone (D55) | #210 |
 > | every Matter cluster *handler* was unexecuted — they need a `ReadContext` or an `InvokeContext`, which means a real transaction, which means a peer | `matter-peer` is that peer: the Descriptor on three endpoints, all seven `ApplicationBasic` attributes on the *second* content app, play/pause/stop/play through the `NotActive` guard, a target list and a `NavigateTarget`, a search refused by an app that cannot search, and the ACL read that has to fail because the client holds `Operate` | #196 |
 > | AirPlay's timing exchange was dead code in the field — `timing_peer` came only from the RTSP `Transport` header, so a plist-negotiated session never probed (`clock_samples=0` on every live session), and no resend request had ever been observed leaving a socket | the plist `SETUP`'s `timingPort` and the stream entry's `controlPort` are read into `SenderPeers`; the T1 test binds the declared timing port in **both** session shapes, watches the type-82 probe arrive within 2 s of `RECORD`, serves a type-83 and asserts `clock_samples >= 1` — and a fourth test induces a sequence gap, watches the type-85 request leave the socket, and serves the retransmit back into the frame channel. The declared `latencyMin`/`latencyMax` are parsed on both paths; *consuming* the declared lead as a target buffer depth is what remains on the issue | #176 (partial) |
+> | DIAL's positive discovery path was untested at every tier — no test answered the DIAL `M-SEARCH`, and no VM ran a DIAL-enabled build | the responder's reply selection is a pure function with the two-root-device (DLNA + DIAL) tests on it, the same exchange crosses a live socket through `run_on`, and `checks.dial-vm` boots the full kiosk (Xvfb + lavapipe) and walks M-SEARCH → `LOCATION` → `Application-URL` from a second host, with the root-USN collision property asserted on the wire — see the §4.4/§4.5 addenda | #202 |
 >
 > Of the entries above, **#200 stays open**: it still wants the one LAN capture that would
 > turn a pin into a validation. **#192 and #196 stay open** for what is named in their
@@ -519,6 +520,18 @@ byebye per target within 2 s of SIGTERM; `SetVolume 25` over HTTP followed by `G
 25` and a journal `CONTROL.*Volume`; a `conformance.rs` asserting the six "do not fix" rows
 verbatim; N `GetTransportInfo` polls with no state change yield **zero** NOTIFYs.
 
+**2026-08-09, the M-SEARCH *answer* path is executed (#202).** The audit's first row covers
+the message layer; nothing had ever run `handle_datagram`'s reply selection. That selection
+is now a pure function (`Responder::search_replies`) with two-root-device tests on it —
+DLNA's MediaRenderer and DIAL's tvdevice on one responder, the shape the app actually runs
+— asserting the DIAL `ST` draws exactly DIAL's reply (ST echoed, USN composed from DIAL's
+own uuid, `LOCATION` at `/dial/dd.xml`) and that a root search draws two replies with
+distinct USNs, with one-USN-one-LOCATION asserted across `ssdp:all`. The same exchange
+crosses a live socket in
+`responder::tests::a_dial_msearch_is_answered_on_the_wire_without_colliding_with_dlna`,
+through the same `run_on` seam as the NOTIFY test. What stays with `checks.dial-vm` (§4.5)
+is the same contract from another *host*, out of the real app wiring.
+
 ### 4.5 DIAL / YouTube Lounge / SponsorBlock
 
 | Mode | Tier | Where | Gap |
@@ -544,6 +557,28 @@ than wall time did.
 [P] a check that compiles `castaway` with `electron` at all; a VM subtest doing
 `ssdp-search ssdp:all` and asserting two distinct root USNs (DLNA and DIAL); a captured
 Lounge transcript checked in and replayed at every read-chunking (#41).
+
+**2026-08-09, the first row and both [P] discovery criteria are closed by
+`checks.dial-vm` (#202).** A DIAL-enabled build is `packages.default` since D55, and the
+check boots it — the full Electron kiosk, headless under Xvfb with the same lavapipe
+triplet as `checks.test`, through the NixOS module — and walks the discovery path a real
+sender walks, from a second host on a real LAN: a targeted
+`ST: urn:dial-multiscreen-org:service:dial:1` M-SEARCH answered with the *derived* uuid
+(`device_uuid(config.uuid, "dial")`, recomputed independently in the test driver with
+Python's `uuid5`), ST echoed, `LOCATION` fetched and carrying `Application-URL` plus the
+`<UDN>` matching the USN and the `#youtube` name suffix, and `Application-URL` + `YouTube`
+answering `<state>stopped</state>`. The collision half is asserted on the same wire: both
+root USNs present and distinct under `upnp:rootdevice`, and one-USN-one-LOCATION across
+`ssdp:all`. `integration-vm`'s browser-less node keeps the complementary D27 absence
+assertions — both properties hold, on different builds, in the same CI run. The unit half
+of the same path is §4.4's 2026-08-09 addendum; the app-level wiring is pinned by
+`tests::dial_and_dlna_root_devices_share_no_usn` beside `device_uuid`'s own tests.
+
+What `dial-vm` deliberately does not prove: pixels or a page — under lavapipe the browser
+cannot produce the zero-copy GPU frames the kiosk composites (D36/#64, logged as exactly
+that), and the Lounge needs the real internet, so launch-through-playback stays with
+`nix run .#yt-selfplay`. The "real screen resolver" and SponsorBlock-actor rows above are
+also unchanged: `dial-vm` runs the code but asserts none of it.
 
 ### 4.6 Miracast / WFD
 
