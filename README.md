@@ -41,7 +41,7 @@ scrubber. The card only shows the controls that the current source supports.
 
 An embedded Chromium browser (Electron) shows the real YouTube TV app. Filter lists
 from EasyList and uBlock Origin block advertisement requests and inject scriptlets.
-The receiver downloads new lists daily and applies them when the browser starts. If
+The receiver downloads new lists daily and applies them to the running browser. If
 SponsorBlock is enabled in the configuration, the receiver skips sponsor segments
 and shows a toast with attribution.
 

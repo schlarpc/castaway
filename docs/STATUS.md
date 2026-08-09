@@ -493,7 +493,12 @@ a human perceives timing).
 > Electron (castLabs ECS) subprocess — `electron` feature, `pipeline::electron_browser` —
 > and the CEF crates, packages, and `cef` feature are gone from the tree. The section is
 > kept as the record of what was verified and how; the adblock/scriptlet/YouTube machinery
-> it describes carried over to the Electron host.
+> it describes carried over to the Electron host. One property was lost in the port and
+> restored by #239: the daily refresh reaches a *running* receiver again — under Electron
+> the browser's query path reads the shared cell at every decision, so the render-side
+> rebuild (and the cache-stamp check that triggered it) has no successor and does not need
+> one. Verified live in `browser_end_to_end.rs`: an engine installed mid-session blocks
+> the next load's requests with no respawn.
 
 The doc's "boss fight" is won — CEF builds, links, and **runs** reproducibly against nixpkgs
 `cef-binary` (flake `cefDist` + `CEF_PATH`; no download/patchelf). Proven with screenshots:
