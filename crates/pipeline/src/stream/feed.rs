@@ -328,6 +328,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_viewer_that_fell_behind_resumes_on_a_requested_keyframe() {
+        // The `Lagged` arm (#235). A subscriber resynchronised to the live edge resumes
+        // mid-GOP, and without a fresh IDR it decodes garbage — green mush on the remote
+        // surface — until the next *scheduled* keyframe, which against a
+        // keyframe-a-second stream is up to a second of it per hiccup. The arm that asks
+        // was driven by nothing.
+        let feed = Arc::new(LiveFeed::new());
+        let mut sub = feed.subscribe();
+        let _ = feed.take_keyframe_request(); // the join's own request; not under test
+        let sample = |n: u8| Sample {
+            data: avcc(&[&[0x41, n]]),
+            duration: 3000,
+            keyframe: false,
+        };
+        // Overfill the backlog while the subscriber reads nothing.
+        for n in 0..=u8::try_from(BACKLOG).unwrap() {
+            feed.publish(&sample(n), &config());
+        }
+        let frame = sub.next().await.expect("the feed is still live");
+        assert!(
+            feed.take_keyframe_request(),
+            "skipping to live must come with a keyframe request, or the viewer decodes \
+             garbage until the GOP turns over"
+        );
+        // And what it resumed on is the oldest still-buffered frame, not a stall.
+        assert!(!frame.keyframe);
+    }
+
     #[test]
     fn attaching_asks_for_a_keyframe_and_detaching_is_counted() {
         // A joining viewer cannot decode until one arrives, so it must not have to wait

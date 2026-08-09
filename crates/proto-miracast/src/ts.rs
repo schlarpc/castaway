@@ -354,6 +354,15 @@ pub struct TsDemux {
     /// decoded from here until the next IDR references data nobody has. That is what
     /// M13 exists for, and it is the trigger the sink had no way to notice (#192).
     video_gaps: u64,
+    /// Continuity-counter gaps on a stream carrying *audio*.
+    ///
+    /// The same damage on the other plane, counted separately because it is answered
+    /// differently: there is no IDR to request, the frame is simply dropped, and the
+    /// listener hears a hole. Until #233 only the video half was counted, so a link
+    /// losing an audio frame a second forever read as `video_gaps=0` and a clean
+    /// session — the sound just dropped a frame each time, with no number to say how
+    /// often.
+    audio_gaps: u64,
 }
 
 impl TsDemux {
@@ -379,6 +388,17 @@ impl TsDemux {
     #[must_use]
     pub fn video_gap_count(&self) -> u64 {
         self.video_gaps
+    }
+
+    /// How many times the coded audio has been found to be missing bytes.
+    ///
+    /// Every increase is an access unit dropped whole rather than handed to a decoder
+    /// with a hole in it — an audible gap the length of a frame. There is no repair to
+    /// trigger, so this exists to be read: it is the number that separates "the link is
+    /// eating the sound" from every other reason the audio path can go quiet (#233).
+    #[must_use]
+    pub fn audio_gap_count(&self) -> u64 {
+        self.audio_gaps
     }
 
     /// The stream types the PMT declared, for logging what a session actually negotiated.
@@ -563,13 +583,19 @@ impl TsDemux {
             expected.is_some_and(|e| e != header.continuity_counter) && !header.discontinuity
         };
         if lost {
-            let mut video = false;
+            let mut plane = None;
             if let Some(state) = self.streams.get_mut(&header.pid) {
                 state.damaged = true;
-                video = state.stream_type.video_codec().is_some();
+                plane = Some(state.stream_type);
             }
-            if video {
-                self.video_gaps = self.video_gaps.saturating_add(1);
+            match plane {
+                Some(t) if t.video_codec().is_some() => {
+                    self.video_gaps = self.video_gaps.saturating_add(1);
+                }
+                Some(t) if t.audio_codec().is_some() => {
+                    self.audio_gaps = self.audio_gaps.saturating_add(1);
+                }
+                _ => {}
             }
         }
 
@@ -956,6 +982,45 @@ pub(crate) mod tests {
         assert_eq!(frames[0].audio_codec, Some(AudioCodec::Aac));
         assert_eq!(frames[0].video_codec, None);
         assert_eq!(&frames[0].data[..], &adts[..]);
+    }
+
+    #[test]
+    fn a_gap_in_the_audio_is_counted_on_its_own_plane() {
+        // #233: the same continuity damage on the two planes was counted for one of
+        // them. A link losing an audio frame a second forever read `video_gaps=0` and
+        // looked like a clean session — the listener heard a hole per loss, and there
+        // was no number anywhere to say how often.
+        let mut demux = TsDemux::new();
+        demux.push(&ts_packet(PAT_PID, true, 0, &pat(PMT_PID)));
+        demux.push(&ts_packet(
+            PMT_PID,
+            true,
+            0,
+            &pmt(&[(VIDEO_PID, 0x1B), (AUDIO_PID, 0x0F)]),
+        ));
+        let adts = vec![0xFF, 0xF1, 0x4C, 0x80, 0x02, 0x1F, 0xFC, 0x01, 0x02, 0x03];
+        let frames = demux.push(&packetize(
+            AUDIO_PID,
+            0,
+            &pes(0xC0, Some(90_000), &adts, true),
+        ));
+        assert_eq!(frames.len(), 1);
+        // The next audio packet skips a continuity count: the air ate one.
+        let frames = demux.push(&packetize(
+            AUDIO_PID,
+            3,
+            &pes(0xC0, Some(91_024), &adts, true),
+        ));
+        assert!(
+            frames.is_empty(),
+            "a damaged access unit is dropped, not decoded with a hole"
+        );
+        assert_eq!(demux.audio_gap_count(), 1, "and the drop is on the record");
+        assert_eq!(
+            demux.video_gap_count(),
+            0,
+            "the picture lost nothing, and must not be told it did"
+        );
     }
 
     #[test]

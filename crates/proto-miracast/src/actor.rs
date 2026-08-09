@@ -259,6 +259,7 @@ fn report_media(peer: &SocketAddr, media: &MediaReceiver, idr_requests: u64, dro
         foreign = media.foreign_datagrams(),
         resyncs = media.demux().resync_count(),
         video_gaps = media.demux().video_gap_count(),
+        audio_gaps = media.demux().audio_gap_count(),
         idr_requests,
         // Frames the *pipeline* could not take, which is a different problem from the four
         // above and has a different owner: those are the radio, this is the decoder. A
