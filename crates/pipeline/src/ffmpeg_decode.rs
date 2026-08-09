@@ -365,6 +365,10 @@ where
                     layout.has_audio,
                     target,
                 );
+                // Served either way — the clock re-anchored, or the demuxer refused and
+                // playback carries on from where it was. From here the clock is the
+                // authority on position again (#232).
+                control.served();
             }
         }
 

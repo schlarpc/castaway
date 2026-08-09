@@ -478,7 +478,13 @@ impl PlaybackReport for PlaybackHandle {
         // `None` before the first frame or the first audio block, and that is the honest
         // answer: a control point asking during the fetch should be told nothing rather
         // than zero, which it would draw as "at the start" of an item that has not begun.
-        let position = session.clock.now()?;
+        //
+        // A seek being served outranks the clock (#232): between the request and
+        // `MediaClock::seek_to` on the decode thread sits a blocking demuxer move, and
+        // through all of it the clock still measures the position the seek is leaving.
+        // Reading it alone made the phone's scrubber snap back and creep until the
+        // demuxer landed.
+        let position = session.seek.destination().or_else(|| session.clock.now())?;
         let duration = session.duration.lock().ok().and_then(|d| *d);
         Some(PlaybackProgress { position, duration })
     }

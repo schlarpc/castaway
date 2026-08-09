@@ -90,14 +90,26 @@ impl State {
     /// Where the anchor says the media is at `at`, ignoring any freeze.
     fn running_at(&self, at: Instant) -> Option<Duration> {
         let anchor = self.anchor?;
-        let position = anchor.media + at.saturating_duration_since(anchor.at);
+        let elapsed = at.saturating_duration_since(anchor.at);
         Some(if anchor.buffered {
-            // What is queued minus what has not been heard yet. Saturating rather than
-            // wrapping: at the very start less than a lead's worth has been submitted, and
-            // the honest answer there is "the beginning", not a negative time.
-            position.saturating_sub(OUTPUT_LEAD)
+            // A buffered anchor names a queue position, and a queue nobody refills runs
+            // dry in exactly [`OUTPUT_LEAD`] — after which the room is hearing silence
+            // and media time stands still. So the extrapolation is bounded by the lead:
+            // in steady state the next block re-anchors long before the bound matters,
+            // and during a stall the clock stops at the last thing the room heard
+            // instead of free-running on the wall and jumping backwards when the source
+            // returns (#232). `is_hopeless` reads this same value, so the runaway also
+            // discarded every video frame arriving just after a rebuffer as seconds
+            // late.
+            //
+            // Saturating rather than wrapping: at the very start less than a lead's
+            // worth has been submitted, and the honest answer there is "the beginning",
+            // not a negative time.
+            (anchor.media + elapsed.min(OUTPUT_LEAD)).saturating_sub(OUTPUT_LEAD)
         } else {
-            position
+            // A video master has no queue and no other clock: the wall is the pace, and
+            // free-running is the design rather than a failure mode.
+            anchor.media + elapsed
         })
     }
 
@@ -288,6 +300,41 @@ mod tests {
         c.observe_audio_at(Duration::from_secs(10), at);
         // Ten seconds submitted, a quarter-second of it still in the device's buffer.
         assert_eq!(c.now_at(at).unwrap(), Duration::from_millis(9_750));
+    }
+
+    #[test]
+    fn a_stalled_audio_master_stops_the_clock_instead_of_running_ahead() {
+        // #232: during a rebuffer the PCM thread parks in `recv_timeout` and stops
+        // anchoring, and the clock used to free-run on the wall for the whole stall —
+        // then jump backwards when the source returned. `is_hopeless` reads the same
+        // value, so video arriving just after a rebuffer was discarded as seconds late.
+        //
+        // The bound is physical, not a tolerance: a queue nobody refills runs dry in
+        // exactly OUTPUT_LEAD, and from then on the room is hearing silence — media time
+        // stands still at the last thing it heard.
+        let c = MediaClock::new();
+        let t0 = Instant::now();
+        c.observe_audio_at(Duration::from_secs(10), t0);
+        // In range, the interpolation is untouched.
+        assert_eq!(
+            c.now_at(t0 + Duration::from_millis(100)).unwrap(),
+            Duration::from_millis(9_850)
+        );
+        // The queue drains dry at the lead, and the clock stops with it.
+        assert_eq!(c.now_at(t0 + OUTPUT_LEAD).unwrap(), Duration::from_secs(10));
+        assert_eq!(
+            c.now_at(t0 + Duration::from_secs(30)).unwrap(),
+            Duration::from_secs(10),
+            "half a minute of stall is still the same silence"
+        );
+        // The source comes back; the new anchor is the truth, and the step is forward.
+        let resumed = t0 + Duration::from_secs(30);
+        c.observe_audio_at(Duration::from_millis(10_500), resumed);
+        assert_eq!(
+            c.now_at(resumed).unwrap(),
+            Duration::from_millis(10_250),
+            "resumes from the new queue position, discounting the lead again"
+        );
     }
 
     #[test]

@@ -45,10 +45,30 @@ pub struct SeekControl {
     /// A single slot rather than a queue: two seeks arriving before either is served means
     /// somebody dragged a scrubber, and the second is the one they meant.
     requested: Mutex<Option<Duration>>,
+    /// Where the presentation is going, from [`Self::request`] until the decode thread
+    /// has finished serving it — the clock re-anchored, or the seek refused.
+    ///
+    /// This exists for whoever reports position (#232). The window between a `Seek`
+    /// arriving on the runtime and `MediaClock::seek_to` running on the decode thread
+    /// contains a blocking demuxer move — for an HTTP source, a range request and a
+    /// refill — and through all of it the clock free-runs from the *pre-seek* anchor. A
+    /// scrubber reading the clock alone snaps back to the old position and creeps until
+    /// the demuxer lands. The answer already exists the whole time; this keeps it
+    /// readable instead of consumed.
+    destination: Mutex<Option<Duration>>,
     /// Bumped once per seek by the decode thread, after the demuxer has moved.
     epoch: AtomicU64,
     /// Echoed back by the output thread once it has dropped everything it had queued.
     drained: AtomicU64,
+}
+
+/// Lock, recovering a poisoned mutex: a panic elsewhere is not a reason to stop
+/// answering where playback is.
+fn lock_recovering<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match lock.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl SeekControl {
@@ -60,11 +80,32 @@ impl SeekControl {
 
     /// Ask for playback to move to `target`. Called from whoever is driving.
     pub fn request(&self, target: Duration) {
-        let mut held = match self.requested.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *held = Some(target);
+        *lock_recovering(&self.requested) = Some(target);
+        *lock_recovering(&self.destination) = Some(target);
+    }
+
+    /// Where the presentation is going, while a seek is outstanding or being served.
+    ///
+    /// `None` in steady state. While this is `Some`, it — not the clock — is the honest
+    /// answer to "where is playback": the clock still measures the position the seek is
+    /// leaving.
+    #[must_use]
+    pub fn destination(&self) -> Option<Duration> {
+        *lock_recovering(&self.destination)
+    }
+
+    /// The seek has been served: the clock is re-anchored at the destination, or the
+    /// demuxer refused and playback carries on from where it was. Either way the clock is
+    /// the authority again. Called by the decode thread.
+    pub fn served(&self) {
+        // The `requested` guard is held across the clear, and `request` writes both
+        // fields in the same order: a request that lost the race to this lock re-fills
+        // the destination after it, and one that won is seen here — so a seek the decode
+        // thread has not started yet never has its destination wiped.
+        let requested = lock_recovering(&self.requested);
+        if requested.is_none() {
+            *lock_recovering(&self.destination) = None;
+        }
     }
 
     /// Whether a seek is waiting to be served.
@@ -75,20 +116,13 @@ impl SeekControl {
     /// be able to interrupt the wait, not merely be noticed after it.
     #[must_use]
     pub fn pending(&self) -> bool {
-        match self.requested.lock() {
-            Ok(g) => g.is_some(),
-            Err(poisoned) => poisoned.into_inner().is_some(),
-        }
+        lock_recovering(&self.requested).is_some()
     }
 
     /// Take the outstanding seek, if any. Called by the decode thread.
     #[must_use]
     pub fn take(&self) -> Option<Duration> {
-        let mut held = match self.requested.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        held.take()
+        lock_recovering(&self.requested).take()
     }
 
     /// Tell the output thread that everything it has queued is from before a seek, and
@@ -138,6 +172,47 @@ mod tests {
         assert_eq!(s.take(), Some(Duration::from_secs(90)));
         assert!(!s.pending());
         assert_eq!(s.take(), None);
+    }
+
+    #[test]
+    fn the_destination_outlives_the_take_until_the_seek_is_served() {
+        // #232's window, as the scrubber sees it. The decode thread takes the request and
+        // then spends however long a blocking demuxer move costs — a range request and a
+        // refill for an HTTP source — before the clock is re-anchored. `take` consuming
+        // the answer is what made the scrubber snap back to the clock's pre-seek position
+        // through that whole window.
+        let s = SeekControl::new();
+        assert_eq!(s.destination(), None, "no seek, the clock is the authority");
+        s.request(Duration::from_secs(90));
+        assert_eq!(s.destination(), Some(Duration::from_secs(90)));
+        // The decode thread picks it up; the answer must not go with it.
+        assert_eq!(s.take(), Some(Duration::from_secs(90)));
+        assert_eq!(
+            s.destination(),
+            Some(Duration::from_secs(90)),
+            "mid-service is exactly when the scrubber asks"
+        );
+        s.served();
+        assert_eq!(s.destination(), None, "the clock is the authority again");
+    }
+
+    #[test]
+    fn a_request_landing_mid_service_is_not_wiped_by_the_older_seeks_served() {
+        // A finger still dragging while the decode thread serves the previous position:
+        // the older seek's `served` must not erase where the newer one is going.
+        let s = SeekControl::new();
+        s.request(Duration::from_secs(10));
+        assert_eq!(s.take(), Some(Duration::from_secs(10)));
+        s.request(Duration::from_secs(20));
+        s.served();
+        assert_eq!(
+            s.destination(),
+            Some(Duration::from_secs(20)),
+            "the newer seek has not been started, let alone served"
+        );
+        assert_eq!(s.take(), Some(Duration::from_secs(20)));
+        s.served();
+        assert_eq!(s.destination(), None);
     }
 
     #[test]
