@@ -161,7 +161,7 @@ chacha20poly1305 = "0.10"
 ed25519-dalek = "2"
 # `getrandom`, because 3.0 moved to rand_core 0.10 and rand_core 0.10 has no `OsRng` —
 # seeding an ephemeral key from the OS is the crate's own job now, not a caller's.
-x25519-dalek = { version = "3", features = ["getrandom"] }
+x25519-dalek = { version = "3", features = ["getrandom", "static_secrets"] }
 aes = "0.8"
 ctr = "0.9"
 # AirPlay 1 audio is AES-128-CBC; Cast mirroring is CTR. Both, deliberately named.

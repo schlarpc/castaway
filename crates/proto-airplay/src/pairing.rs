@@ -44,7 +44,7 @@
 use aes::cipher::{KeyIvInit as _, StreamCipher as _};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use sha2::{Digest as _, Sha512};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public, StaticSecret};
 
 use crate::error::AirPlayError;
 
@@ -145,6 +145,26 @@ impl PairVerify {
     /// [`AirPlayError::Pairing`] if the body is not the expected 68 bytes or does not
     /// begin with the stage-1 marker.
     pub fn begin(identity: &PairingIdentity, body: &[u8]) -> Result<(Self, Vec<u8>), AirPlayError> {
+        // Ephemeral at this boundary: the secret is made here, moved in, and consumed —
+        // nothing can hold it across sessions. (`EphemeralSecret` used to enforce that
+        // by type, and drawing it *inside* the state transition is what it cost: the
+        // reply differs every run, so no captured iPhone transcript can ever be a
+        // fixture for it, and the one part of the handshake where byte order is the
+        // whole difficulty had only round-trip tests. #235; `proto-gamestream`'s
+        // `PairingSeed` is the same call.)
+        Self::begin_with(identity, body, StaticSecret::random())
+    }
+
+    /// [`Self::begin`] with the ephemeral secret supplied, so the reply is a pure
+    /// function of its inputs and a wire capture can be checked in against it.
+    ///
+    /// # Errors
+    /// As [`Self::begin`].
+    pub fn begin_with(
+        identity: &PairingIdentity,
+        body: &[u8],
+        secret: StaticSecret,
+    ) -> Result<(Self, Vec<u8>), AirPlayError> {
         if body.len() < VERIFY1_LEN || body[0] != 0x01 {
             return Err(AirPlayError::Pairing(
                 "pair-verify stage 1: expected 68 bytes beginning 01 00 00 00",
@@ -155,9 +175,6 @@ impl PairVerify {
         let mut their_identity = [0u8; KEY_LEN];
         their_identity.copy_from_slice(&body[4 + KEY_LEN..VERIFY1_LEN]);
 
-        // Ephemeral by type: `EphemeralSecret` cannot be cloned or serialized, so this
-        // key cannot outlive the exchange or be reused across sessions by accident.
-        let secret = EphemeralSecret::random();
         let our_public = X25519Public::from(&secret).to_bytes();
         let shared = secret
             .diffie_hellman(&X25519Public::from(their_public))
@@ -258,6 +275,41 @@ pub fn rekey_media(aes_key: &[u8; 16], shared: &[u8; KEY_LEN]) -> [u8; 16] {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn the_stage_one_reply_is_a_pure_function_of_its_inputs() {
+        // With the ephemeral secret supplied, the 96-byte reply is deterministic — which
+        // is what makes a captured iPhone transcript checkable in as a fixture at all
+        // (#235). Until then this pins the current bytes: the signing order and the
+        // keystream offset are exactly the regressions a round-trip test cannot see,
+        // because both sides agreeing on the wrong thing round-trips fine. A pin is not
+        // a validation (#200's distinction); replace the constant with the capture when
+        // one lands.
+        let identity = PairingIdentity::from_seed("test-receiver-uuid");
+        let sender_secret = StaticSecret::from([0x21u8; KEY_LEN]);
+        let sender_public = X25519Public::from(&sender_secret).to_bytes();
+        let sender_signing = SigningKey::from_bytes(&[7u8; KEY_LEN]);
+        let mut body = vec![0x01, 0x00, 0x00, 0x00];
+        body.extend_from_slice(&sender_public);
+        body.extend_from_slice(&sender_signing.verifying_key().to_bytes());
+
+        let (_, reply) =
+            PairVerify::begin_with(&identity, &body, StaticSecret::from([0x42u8; KEY_LEN]))
+                .unwrap();
+        let hex: String = reply.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "132c442be010fbd57e72603328aa76e71fccc1503aae219327d14d9c9993f472\
+             d706bd215c5fcc87607aa8664e0c508c3f9dab5673cdd330b509d56c0e6de8d1\
+             43894b78eb9e36e1762e5e84331be73db576cfd320482c94d1414dfa86943d0e"
+        );
+
+        // And the same inputs twice are the same bytes: nothing inside draws entropy.
+        let (_, again) =
+            PairVerify::begin_with(&identity, &body, StaticSecret::from([0x42u8; KEY_LEN]))
+                .unwrap();
+        assert_eq!(reply, again);
+    }
 
     /// The sender's half, exactly as `pyatv/protocols/airplay/srp.py` performs it.
     ///
