@@ -316,3 +316,102 @@ fn best_correlation(reference: &[f32], decoded: &[f32], max_lag: usize) -> f32 {
     }
     best
 }
+
+/// A real Android phone's LDAC, decoded through the real depacketiser.
+///
+/// The LDAC test above proves the *seam* with audio we encoded ourselves, which means it
+/// can only ever be as right as our encoder. This one is 100 packets straight off an
+/// Android phone (2026-08-08, over the AX210, `examples/phone_bench`), which is #14's
+/// point stated exactly: decode what a phone actually sends, not what a fixture does.
+///
+/// There is no reference tone to correlate against here, so the assertions are the ones a
+/// wrong decode would fail:
+///
+/// * **the sample count**, which pins the frame geometry. 382 LDAC frames across the 100
+///   packets and 97792 sample frames out is 256 samples per frame — the high-rate frame
+///   size, twice the 128 LDAC uses at 44.1/48 kHz. A decoder that took the low-rate size
+///   would return exactly half of this and still sound like something.
+/// * **that the channels differ**, because a depacketiser that lost the interleave, or a
+///   decode that duplicated one channel, produces plausible audio that is not stereo.
+/// * **no clipping and no DC**, which is what a byte-misaligned decode of a sane signal
+///   turns into.
+///
+/// Worth recording because it cost an hour of arithmetic: this phone's **RTP timestamps
+/// advance 512 per packet regardless of whether the packet carries 2 frames or 4**, so
+/// they imply half the audio that is actually there. The decoded length is the one that
+/// matches the wall clock — 4188 packets of this stream decode to 39.7s, and the phone
+/// streamed for about that long. Do not use these timestamps to derive a frame size.
+#[cfg(feature = "ldac")]
+#[test]
+fn a_real_android_phones_ldac_decodes_through_the_depacketiser() {
+    let rate = 96_000u32;
+    assert!(
+        pipeline::audio_decode::can_decode(AudioCodec::Ldac),
+        "this build advertises LDAC and cannot decode it (#14)"
+    );
+
+    let packets = records(include_bytes!(
+        "../../proto-bluetooth-audio/tests/fixtures/a2dp-ldac-96000-android.bin"
+    ));
+    assert_eq!(packets.len(), 100, "the fixture is 100 A2DP packets");
+
+    let mut depacketizer = Depacketizer::new(AudioCodec::Ldac, rate);
+    let mut decoder = AudioDecoder::new(
+        AudioCodec::Ldac,
+        AudioFormat::from_hz(rate, 2).unwrap(),
+        None,
+    )
+    .unwrap();
+    let mut decoded: Vec<f32> = Vec::new();
+
+    for (n, packet) in packets.into_iter().enumerate() {
+        let frame = depacketizer
+            .push(packet)
+            .unwrap_or_else(|e| panic!("packet {n} did not depacketise: {e}"));
+        decoder
+            .decode(&frame, |b| decoded.extend_from_slice(&b.samples))
+            .unwrap_or_else(|e| panic!("packet {n} depacketised and did not decode: {e}"));
+    }
+    decoder
+        .flush(|b| decoded.extend_from_slice(&b.samples))
+        .unwrap();
+
+    assert_eq!(
+        decoded.len() / 2,
+        382 * 256,
+        "382 LDAC frames of 256 samples each must reach the decoder"
+    );
+
+    let left: Vec<f32> = decoded.iter().step_by(2).copied().collect();
+    let right: Vec<f32> = decoded.iter().skip(1).step_by(2).copied().collect();
+
+    for (name, channel) in [("left", &left), ("right", &right)] {
+        let peak = channel.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        #[allow(clippy::cast_precision_loss)]
+        let rms = (channel.iter().map(|s| s * s).sum::<f32>() / channel.len() as f32).sqrt();
+        #[allow(clippy::cast_precision_loss)]
+        let dc = channel.iter().sum::<f32>() / channel.len() as f32;
+
+        assert!(
+            rms > 0.02,
+            "the {name} channel decoded to near-silence: {rms}"
+        );
+        assert!(peak < 1.0, "the {name} channel clipped at {peak}");
+        assert!(
+            dc.abs() < 0.01,
+            "the {name} channel has a DC offset of {dc}, which a sane decode does not"
+        );
+    }
+
+    // Real stereo. A duplicated channel is the failure this catches, and it is one that
+    // sounds entirely fine.
+    let difference = left
+        .iter()
+        .zip(&right)
+        .map(|(l, r)| (l - r).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        difference > 0.01,
+        "the channels are identical to {difference}, so the stereo image was lost"
+    );
+}
