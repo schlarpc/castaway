@@ -2751,6 +2751,68 @@ mod tests {
         );
     }
 
+    /// The flat live budget, pinned exactly, before #176's declared target lands.
+    ///
+    /// A live sender that declares nothing — Bluetooth, Cast, Miracast, a browser page —
+    /// must keep precisely this behaviour when declared targets exist: room is made at
+    /// [`LIVE_BUDGET`] and nowhere else, the oldest audio goes, the loss is booked as
+    /// `shed`, and nothing reads as starvation or a deadline drop. Stepped by hand
+    /// against a `Shared` with no thread behind it so the arithmetic is exact rather
+    /// than raced.
+    #[test]
+    fn a_live_input_without_a_declaration_keeps_the_flat_budget() {
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = MixInput {
+            backpressure: Backpressure::Live,
+            state: Arc::clone(&state),
+            shared: Arc::clone(&shared),
+            convert: None,
+            shape: None,
+            dropped: 0,
+            shed: 0,
+        };
+
+        let second = usize::try_from(frames_in(Duration::from_secs(1))).unwrap();
+        // Three seconds against a two-second budget, with nothing draining.
+        for _ in 0..3 {
+            input.write(&tone(second, 0.5)).unwrap();
+        }
+
+        assert_eq!(
+            state.queued_frames(),
+            frames_in(LIVE_BUDGET),
+            "room is made at exactly the flat budget"
+        );
+        let counters = shared.counters();
+        assert_eq!(
+            counters.shed,
+            frames_in(Duration::from_secs(1)),
+            "the overrun is booked as shed, in full"
+        );
+        assert_eq!(
+            input.shed, counters.shed,
+            "and on the teardown line's count"
+        );
+        assert_eq!(counters.starved, 0, "nothing starved");
+        assert_eq!(counters.dropped, 0, "and nothing hit the write deadline");
+        assert_eq!(
+            counters.written,
+            3 * frames_in(Duration::from_secs(1)),
+            "every block was handed in; the budget decides what stays, not what enters"
+        );
+
+        // One more block converges back to the ceiling, shedding exactly its own size:
+        // the steady state a sender that keeps running ahead sits in.
+        let block = usize::try_from(frames_in(QUANTUM)).unwrap();
+        input.write(&tone(block, 0.5)).unwrap();
+        assert_eq!(state.queued_frames(), frames_in(LIVE_BUDGET));
+        assert_eq!(
+            shared.counters().shed,
+            frames_in(Duration::from_secs(1)) + frames_in(QUANTUM)
+        );
+    }
+
     #[test]
     fn a_live_source_is_never_made_to_wait() {
         let device = Recorder::new();
