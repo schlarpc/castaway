@@ -138,6 +138,11 @@ struct Args {
     /// `PASSCODE_LIFETIME` exists for and the one the panel used to leave on the glass
     /// indefinitely (#197).
     declare_only: bool,
+    /// Send a cancel for this instance and exit: the phone whose user backed out.
+    ///
+    /// Used by the overlap scenario (#209): a phone whose pairing was refused cancels on
+    /// its way out, and the panel must not take the *other* phone's passcode down.
+    cancel_only: bool,
     /// Type a number that is not the one on the screen.
     ///
     /// The panel's PASE then fails against a verifier built from the wrong secret, which
@@ -206,7 +211,8 @@ fn usage() -> String {
     "usage: matter-peer --player <ip> --passcode-file <path> [--bind <ip>] \
      [--instance <hex16>] [--name <str>] [--url <str>] [--display-string <str>] \
      [--endpoint <n>] [--app-vendor <n>] [--app-product <n>] [--discriminator <n>] \
-     [--matter-port <n>] [--state-dir <dir>] [--declare-only] [--wrong-passcode] \
+     [--matter-port <n>] [--state-dir <dir>] [--declare-only] [--cancel-only] \
+     [--wrong-passcode] \
      [--wrong-instance] [--read-descriptor] [--app-basic] [--read-acl] \
      [--app-endpoint <n>] [--transport <verb>[,<verb>…]] [--navigate <n>] \
      [--launch-content <query>]\n\
@@ -235,6 +241,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut state_dir = None;
     let mut cast_again = false;
     let mut declare_only = false;
+    let mut cancel_only = false;
     let mut wrong_passcode = false;
     let mut wrong_instance = false;
     // `FIRST_CONTENT_APP_ENDPOINT`: the panel packs content apps densely from 6, and the
@@ -263,6 +270,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--state-dir" => state_dir = Some(PathBuf::from(value()?)),
             "--cast-again" => cast_again = true,
             "--declare-only" => declare_only = true,
+            "--cancel-only" => cancel_only = true,
             "--wrong-passcode" => wrong_passcode = true,
             "--wrong-instance" => wrong_instance = true,
             "--read-descriptor" => probes.descriptor = true,
@@ -280,9 +288,10 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         }
     }
 
-    if !cast_again && passcode_file.is_none() {
+    if !cast_again && !cancel_only && passcode_file.is_none() {
         // Commissioning is a person typing a number; the file is how the harness plays
-        // the person. Only the come-back run has no number to type.
+        // the person. The come-back run has no number to type, and the cancelling run
+        // never gets far enough to want one.
         return Err(usage().into());
     }
     if cast_again && state_dir.is_none() {
@@ -305,6 +314,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         discriminator,
         matter_port,
         declare_only,
+        cancel_only,
         wrong_passcode,
         wrong_instance,
         probes,
@@ -336,6 +346,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     let declaration = declaration(&args, &udc);
+
+    if args.cancel_only {
+        // The phone whose user backed out (#209). One cancel, one acknowledgement, and
+        // out — whether the panel takes anything off its screen for it is the panel's
+        // decision, and the VM test reads that off the panel's own journal.
+        let mut cancel = declaration;
+        cancel.cancel_passcode = true;
+        udc.send(&cancel).await?;
+        let cd = udc.reply().await?;
+        if !cd.cancel_passcode {
+            return Err(format!("the panel did not acknowledge the cancel: {cd:?}").into());
+        }
+        println!("matter-peer: cancel acknowledged");
+        return Ok(());
+    }
 
     tracing::info!(
         instance = %args.instance,

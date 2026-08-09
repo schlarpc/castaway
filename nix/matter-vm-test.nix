@@ -45,6 +45,14 @@ let
   castUrlAgain = "https://example.invalid/matter-vm-again.mp4";
   castTitleAgain = "matter-vm cast again";
 
+  # The overlap pair (#209): whichever racer wins the pairing slot casts the first URL;
+  # the refused one comes back later and casts the second. Distinct from each other and
+  # from every other cast in this file, so neither assertion can ride an earlier journal.
+  raceUrl = "https://example.invalid/matter-vm-race.mp4";
+  raceTitle = "matter-vm race winner";
+  raceRetryUrl = "https://example.invalid/matter-vm-race-retry.mp4";
+  raceRetryTitle = "matter-vm race retry";
+
   peer = pkgs.writeShellScriptBin "matter-peer-run" ''
     set -euo pipefail
     exec ${self.packages.${pkgs.stdenv.hostPlatform.system}.matter-peer}/bin/matter-peer "$@"
@@ -530,11 +538,148 @@ pkgs.testers.runNixOSTest {
         # else, so a `Clear` that never reached it leaves the passcode exactly where it
         # was — which is the failure, unchanged.
         #
-        # Read from *after* the expiry line rather than anywhere in the journal: the
-        # commissioning flow above also clears the OSD when it finishes, and an assertion
-        # that matched that one would pass with this path removed entirely.
+        # Read from *after* the expiry line rather than anywhere in the journal, so an
+        # OSD clear from any earlier flow cannot satisfy this assertion with the expiry
+        # path removed entirely. (Since #209 the expiry clear is keyed to the instance
+        # that lapsed; a finished commissioning replaces its prompt with a banner
+        # instead of clearing.)
         after_expiry = journal.split("a displayed passcode expired", 1)[1]
         assert "OSD clear" in after_expiry, after_expiry
+
+    # ---- Two phones at once (#209). --------------------------------------------------
+    #
+    # #198's failure phones each had the panel to themselves; the accident under test
+    # here is overlap. The decided policy: the pairing slot is single-occupancy, the
+    # second declaration is refused with CommissionerPasscodeDisabled — temporary
+    # unavailability, since the spec's CdError list has no "busy" code — and prompts are
+    # keyed by instance so neither phone's cancel or expiry can touch the other's number.
+
+    race_instances = {"one": "00112233445566DD", "two": "00112233445566EE"}
+    race_ports = {"one": (5543, 3843), "two": (5544, 3844)}
+
+    with subtest("two phones declare at once; one gets the glass, one a clean refusal (#209)"):
+        for racer in ("one", "two"):
+            port, disc = race_ports[racer]
+            phone.succeed(
+                f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+                f"--instance {race_instances[racer]} --name 'racer {racer}' "
+                f"--matter-port {port} --discriminator {disc} "
+                f"--passcode-file /tmp/race-{racer}.txt --url '${raceUrl}' "
+                f"--display-string '${raceTitle}' > /tmp/race-{racer}.log 2>&1 &"
+            )
+
+        # Exactly one wins the slot — the UDC socket loop is serial, so which one is a
+        # race, and the script has to be ready for either answer.
+        try:
+            phone.wait_until_succeeds(
+                "grep -q 'passcode dialog is up' /tmp/race-one.log /tmp/race-two.log",
+                timeout=60,
+            )
+            phone.wait_until_succeeds(
+                "grep -q 'the panel refused: CommissionerPasscodeDisabled' "
+                "/tmp/race-one.log /tmp/race-two.log",
+                timeout=60,
+            )
+        except Exception:
+            print(phone.succeed("cat /tmp/race-one.log || true"))
+            print(phone.succeed("cat /tmp/race-two.log || true"))
+            print(panel.succeed("journalctl -u castaway --no-pager | tail -40 || true"))
+            raise
+
+        winner = (
+            "one"
+            if "passcode dialog is up" in phone.succeed("cat /tmp/race-one.log")
+            else "two"
+        )
+        loser = "two" if winner == "one" else "one"
+        print(f"race winner: racer {winner}")
+
+        # One phone, one outcome: the winner was not also refused, and the loser never
+        # saw a dialog.
+        assert "the panel refused" not in phone.succeed(f"cat /tmp/race-{winner}.log")
+        assert "passcode dialog is up" not in phone.succeed(f"cat /tmp/race-{loser}.log")
+
+        # And the panel put up exactly one prompt — the winner's. Under the old accident
+        # both phones were issued passcodes and the second prompt overwrote the first,
+        # so whichever user looked at the screen saw at most one of the two numbers.
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert f"racer {winner} wants to cast" in journal, journal
+        assert f"racer {loser} wants to cast" not in journal, journal
+        assert re.search(
+            r"declining a UDC declaration.*CommissionerPasscodeDisabled", journal
+        ), journal
+
+    with subtest("the refused phone's cancel does not clobber the winner's prompt (#209)"):
+        # The refused user backs out on their phone, which is what a person does with a
+        # refusal. Before prompts carried instance identity, this cancel took the
+        # *winner's* passcode off the glass mid-pairing.
+        phone.succeed(
+            f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+            f"--instance {race_instances[loser]} --name 'racer {loser}' "
+            f"--cancel-only > /tmp/race-cancel.log 2>&1"
+        )
+        phone.succeed("grep -q 'matter-peer: cancel acknowledged' /tmp/race-cancel.log")
+
+        # The winner's number is still up: nothing has cleared the OSD since the
+        # winner's prompt went on it. The slice from the last prompt line is what makes
+        # this an assertion about *this* prompt rather than about the whole run.
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        since_prompt = journal.rsplit("wants to cast — enter", 1)[1]
+        assert "OSD clear" not in since_prompt, since_prompt
+
+    with subtest("the surviving phone commissions and casts through the noise (#209)"):
+        shown = panel.succeed(
+            "journalctl -u castaway --no-pager "
+            f"| grep 'racer {winner} wants to cast' "
+            "| grep -oE '[0-9]{4}-[0-9]{4}' | tail -1"
+        ).strip()
+        assert re.fullmatch(r"[0-9]{4}-[0-9]{4}", shown), f"no passcode on screen: {shown!r}"
+        phone.succeed(f"echo {shown} > /tmp/race-{winner}.txt")
+
+        try:
+            phone.wait_until_succeeds(
+                f"grep -q 'matter-peer completed' /tmp/race-{winner}.log", timeout=180
+            )
+        except Exception:
+            print(phone.succeed(f"cat /tmp/race-{winner}.log || true"))
+            print(panel.succeed("journalctl -u castaway --no-pager | tail -80 || true"))
+            raise
+
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert re.search(r"null pipeline: PLAY.*${raceUrl}", journal), journal
+
+    with subtest("the refusal is temporary: the refused phone pairs once the slot is free (#209)"):
+        port, disc = race_ports[loser]
+        phone.succeed(
+            f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+            f"--instance {race_instances[loser]} --name 'racer {loser}' "
+            f"--matter-port {port} --discriminator {disc} "
+            f"--passcode-file /tmp/race-retry.txt --url '${raceRetryUrl}' "
+            f"--display-string '${raceRetryTitle}' > /tmp/race-retry.log 2>&1 &"
+        )
+        phone.wait_until_succeeds(
+            "grep -q 'passcode dialog is up' /tmp/race-retry.log", timeout=60
+        )
+        shown = panel.succeed(
+            "journalctl -u castaway --no-pager "
+            f"| grep 'racer {loser} wants to cast' "
+            "| grep -oE '[0-9]{4}-[0-9]{4}' | tail -1"
+        ).strip()
+        assert re.fullmatch(r"[0-9]{4}-[0-9]{4}", shown), f"no passcode on screen: {shown!r}"
+        phone.succeed(f"echo {shown} > /tmp/race-retry.txt")
+
+        try:
+            phone.wait_until_succeeds(
+                "grep -q 'matter-peer completed' /tmp/race-retry.log", timeout=180
+            )
+        except Exception:
+            print(phone.succeed("cat /tmp/race-retry.log || true"))
+            print(panel.succeed("journalctl -u castaway --no-pager | tail -80 || true"))
+            raise
+
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert re.search(r"null pipeline: PLAY.*${raceRetryUrl}", journal), journal
+        assert "${raceRetryTitle}" in journal, journal
 
     with subtest("the panel restarts, and a commissioned phone casts again (#173)"):
         # Restarting the service is the bluntest of the ordinary ways every CASE session
