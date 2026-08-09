@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use castaway_core::{DecodedFrame, EncodedFrame, PixelFormat, VideoCodec};
 use ffmpeg_next as ffmpeg;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::PipelineError;
 use crate::hwaccel::{FallbackPolicy, HwPreference};
@@ -236,6 +236,10 @@ where
     ensure_init();
     let mut hw = HwAttempt::new(preference);
     let mut opened = false;
+    // Owned here rather than per incarnation, for the same reason as `opened`: a
+    // mid-session software rebuild is the same playback to the viewer, so the drop
+    // total carries across it. Logs its own teardown line when playback ends.
+    let mut drops = DropTally::default();
     loop {
         match av_session(
             uri,
@@ -244,6 +248,7 @@ where
             seek,
             audio.as_ref(),
             stop,
+            &mut drops,
             &mut |layout: &MediaLayout| {
                 // Only the first time round: a mid-session software fallback reopens the
                 // file, and telling the pipeline "here is a new item" would restart the
@@ -272,6 +277,7 @@ fn av_session<F, O>(
     seek: Option<&crate::seek::SeekControl>,
     audio_tx: Option<&std::sync::mpsc::SyncSender<castaway_core::PcmFrame>>,
     stop: &dyn Fn() -> bool,
+    drops: &mut DropTally,
     on_open: &mut O,
     on_frame: &mut F,
 ) -> Result<SessionEnd, PipelineError>
@@ -402,6 +408,7 @@ where
                     clock,
                     seek,
                     stop,
+                    drops,
                     on_frame,
                 )? {
                     Drained::Continue => {}
@@ -498,6 +505,7 @@ where
                 clock,
                 seek,
                 stop,
+                drops,
                 on_frame,
             )? {
                 Drained::Continue => {}
@@ -514,6 +522,7 @@ where
             clock,
             seek,
             stop,
+            drops,
             on_frame,
         )? {
             return Ok(SessionEnd::RebuildInSoftware);
@@ -1067,6 +1076,58 @@ where
     Ok(SessionEnd::Finished)
 }
 
+/// How often the pacing loop repeats its dropped-video warning while the drops go on.
+///
+/// One line per drop would be thirty a second exactly when the box is already behind;
+/// silence was the previous policy and is how a session with its picture frozen in
+/// bursts read identically to one with no video stream at all (#233).
+const DROP_LOG_EVERY: Duration = Duration::from_secs(5);
+
+/// What [`drain_paced`] threw away to catch up, counted where it happens.
+///
+/// The AirPlay mirror counts the same event (`SessionDiagnostics::video_drop`); URL
+/// playback dropped every hopelessly-late frame with neither counter nor log, so
+/// "dropped" and "never decoded" were indistinguishable (#233). Pure arithmetic over
+/// supplied instants, so the rate limit is assertable in virtual time; the total is
+/// logged by [`Drop::drop`], the teardown line's pattern.
+#[derive(Debug, Default)]
+struct DropTally {
+    /// Frames dropped as hopelessly late, total for this playback. Spans a mid-stream
+    /// software rebuild: the viewer's session did not restart, so its count must not.
+    total: u64,
+    /// Of `total`, the drops no log line has reported yet.
+    unreported: u64,
+    last_log: Option<std::time::Instant>,
+}
+
+impl DropTally {
+    /// Count one dropped frame. `Some(recent)` when a log line is due, carrying the
+    /// drops since the last one — at most every [`DROP_LOG_EVERY`], and always for the
+    /// first drop, because one burst is exactly when a human is looking for the cause.
+    fn note(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.total += 1;
+        self.unreported += 1;
+        let due = self
+            .last_log
+            .is_none_or(|at| now.saturating_duration_since(at) >= DROP_LOG_EVERY);
+        due.then(|| {
+            self.last_log = Some(now);
+            std::mem::take(&mut self.unreported)
+        })
+    }
+}
+
+impl Drop for DropTally {
+    fn drop(&mut self) {
+        if self.total > 0 {
+            info!(
+                frames = self.total,
+                "decode: hopelessly late video was dropped over this playback"
+            );
+        }
+    }
+}
+
 /// What a drain pass concluded.
 enum Drained {
     /// Keep feeding this decoder.
@@ -1126,6 +1187,7 @@ fn drain_paced<F>(
     clock: &crate::clock::MediaClock,
     seek: Option<&crate::seek::SeekControl>,
     stop: &dyn Fn() -> bool,
+    drops: &mut DropTally,
     on_frame: &mut F,
 ) -> Result<Drained, PipelineError>
 where
@@ -1151,6 +1213,13 @@ where
         clock.start_video_master(pts);
 
         if clock.is_hopeless(pts) {
+            if let Some(recent) = drops.note(std::time::Instant::now()) {
+                warn!(
+                    recent,
+                    total = drops.total,
+                    "decode: video is hopelessly late; dropping frames to catch up"
+                );
+            }
             continue;
         }
         // Sleep in slices so neither a preemption nor a pause is stuck behind a long
@@ -1295,6 +1364,34 @@ fn to_decoded_frame(rgba: &ffmpeg::frame::Video, pts: Duration) -> DecodedFrame 
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// The drop tally counts every drop and reports on the shipped cadence (#233).
+    ///
+    /// Virtual time: the instants are computed, not slept, so this asserts
+    /// [`DROP_LOG_EVERY`] itself rather than a number shortened for the test.
+    #[test]
+    fn late_drops_are_all_counted_and_the_log_is_paced() {
+        let t0 = std::time::Instant::now();
+        let mut drops = DropTally::default();
+
+        // The first drop reports at once: one burst is exactly when someone is looking.
+        assert_eq!(drops.note(t0), Some(1));
+        // A burst inside the window accumulates silently…
+        for i in 1..=10u64 {
+            assert_eq!(drops.note(t0 + Duration::from_millis(100 * i)), None);
+        }
+        assert_eq!(drops.total, 11, "every drop is counted, logged or not");
+        // …and the next line, due at exactly the shipped cadence, carries all of it.
+        assert_eq!(drops.note(t0 + DROP_LOG_EVERY), Some(11));
+        assert_eq!(drops.total, 12);
+        assert_eq!(drops.unreported, 0, "reported means reported");
+
+        // A playback that never drops keeps a zero total — the clean direction; the
+        // only caller of `note` is the `is_hopeless` branch, whose own two directions
+        // are pinned by `clock::tests::only_hopelessly_late_frames_are_dropped`.
+        let clean = DropTally::default();
+        assert_eq!((clean.total, clean.unreported), (0, 0));
+    }
 
     /// Assert a frame came back as system-memory RGBA of exactly the right size — the
     /// software path's contract with the compositor.
