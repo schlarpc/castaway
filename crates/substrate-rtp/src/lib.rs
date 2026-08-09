@@ -11,4 +11,4 @@ pub mod packet;
 pub mod reorder;
 
 pub use packet::{RtpError, RtpHeader, RtpPacket};
-pub use reorder::ReorderBuffer;
+pub use reorder::{Refusal, ReorderBuffer};

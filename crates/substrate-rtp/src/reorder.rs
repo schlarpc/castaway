@@ -54,9 +54,15 @@ impl ReorderBuffer {
         self.buf.is_empty()
     }
 
-    /// Insert a packet. Returns `false` if it was dropped as a duplicate or as late
-    /// (older than the next packet we expect to emit).
-    pub fn push(&mut self, packet: RtpPacket) -> bool {
+    /// Insert a packet. `Err` says why it was dropped instead of buffered.
+    ///
+    /// The two refusals used to be one `false`, and callers counting them as one number
+    /// could not tell "the depth is too small for this link" from "the sender
+    /// duplicates" (#233) — different faults with different fixes.
+    ///
+    /// # Errors
+    /// [`Refusal::Late`] or [`Refusal::Duplicate`]; see each variant for how to read it.
+    pub fn push(&mut self, packet: RtpPacket) -> Result<(), Refusal> {
         let seq = packet.header.sequence;
         match self.next {
             None => {
@@ -64,18 +70,18 @@ impl ReorderBuffer {
             }
             Some(next) if serial_lt(seq, next) => {
                 if self.started {
-                    return false; // late — we've already emitted past this point
+                    return Err(Refusal::Late); // we've already emitted past this point
                 }
                 self.next = Some(seq); // pre-emit: lower the baseline for early reorder
             }
             Some(_) => {}
         }
         if self.buf.contains_key(&seq) {
-            return false; // duplicate
+            return Err(Refusal::Duplicate);
         }
         self.buf.insert(seq, packet);
         self.enforce_depth();
-        true
+        Ok(())
     }
 
     /// Pop the next in-order packet, if it has arrived.
@@ -131,6 +137,23 @@ impl ReorderBuffer {
     }
 }
 
+/// Why [`ReorderBuffer::push`] refused a packet.
+///
+/// Not quite "late vs duplicate" on the wire — a re-sent copy of a packet that was
+/// already *emitted* is behind `next` and reads as [`Refusal::Late`], because the buffer
+/// no longer remembers what it emitted. The split that is reliable, and the one worth
+/// counting, is against [`ReorderBuffer::skipped`]: `Late` climbing alongside it means
+/// packets are arriving after the buffer gave up waiting — the depth is too small for
+/// the link's reordering — while `Duplicate` climbing with `skipped` flat is a sender
+/// (or a network) sending the same packet twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Older than the next packet due for delivery.
+    Late,
+    /// A copy of a packet still waiting in the buffer.
+    Duplicate,
+}
+
 /// RFC 1982 serial-number "less than" for 16-bit sequence numbers (handles wraparound).
 fn serial_lt(a: u16, b: u16) -> bool {
     a != b && (b.wrapping_sub(a)) < 0x8000
@@ -152,7 +175,7 @@ mod tests {
     fn in_order_passthrough() {
         let mut b = ReorderBuffer::new(8);
         for s in 10..15 {
-            b.push(pkt(s));
+            b.push(pkt(s)).unwrap();
         }
         for s in 10..15 {
             assert_eq!(b.pop().unwrap().header.sequence, s);
@@ -163,22 +186,22 @@ mod tests {
     #[test]
     fn reorders_out_of_order() {
         let mut b = ReorderBuffer::new(8);
-        b.push(pkt(2));
-        b.push(pkt(0));
-        b.push(pkt(1));
+        b.push(pkt(2)).unwrap();
+        b.push(pkt(0)).unwrap();
+        b.push(pkt(1)).unwrap();
         assert_eq!(b.pop().unwrap().header.sequence, 0);
         assert_eq!(b.pop().unwrap().header.sequence, 1);
         assert_eq!(b.pop().unwrap().header.sequence, 2);
     }
 
     #[test]
-    fn drops_late_and_duplicate() {
+    fn drops_late_and_duplicate_and_says_which_was_which() {
         let mut b = ReorderBuffer::new(8);
-        b.push(pkt(5));
+        b.push(pkt(5)).unwrap();
         assert!(b.pop().is_some()); // emits 5, next=6
-        assert!(!b.push(pkt(5))); // late
-        assert!(b.push(pkt(6)));
-        assert!(!b.push(pkt(6))); // duplicate
+        assert_eq!(b.push(pkt(5)), Err(Refusal::Late));
+        b.push(pkt(6)).unwrap();
+        assert_eq!(b.push(pkt(6)), Err(Refusal::Duplicate));
     }
 
     #[test]
@@ -189,18 +212,18 @@ mod tests {
         // this test used to do — is a stream that starts at 1 and loses nothing. It
         // passed anyway, on `first >= 1`, which is true of every packet it could have
         // returned. Nothing has ever exercised this path.
-        b.push(pkt(0));
+        b.push(pkt(0)).unwrap();
         assert_eq!(b.pop().unwrap().header.sequence, 0);
 
         // Now 1 is genuinely missing. Within the depth, it is still worth waiting for.
         for s in [2u16, 3, 4] {
-            b.push(pkt(s));
+            b.push(pkt(s)).unwrap();
         }
         assert!(b.pop().is_none(), "2 cannot be delivered before 1");
         assert_eq!(b.skipped(), 0);
 
         // Past it, it is not: latency beats freshness, so the gap is skipped.
-        b.push(pkt(5));
+        b.push(pkt(5)).unwrap();
         let mut got = Vec::new();
         while let Some(p) = b.pop() {
             got.push(p.header.sequence);
@@ -218,21 +241,21 @@ mod tests {
     fn reordering_that_resolves_itself_is_not_counted_as_loss() {
         let mut b = ReorderBuffer::new(8);
         for s in [2u16, 0, 1, 3] {
-            b.push(pkt(s));
+            b.push(pkt(s)).unwrap();
         }
         while b.pop().is_some() {}
         assert_eq!(b.skipped(), 0);
         // Nor is a duplicate, or one that turns up after its place has gone past.
-        assert!(!b.push(pkt(1)));
+        assert_eq!(b.push(pkt(1)), Err(Refusal::Late));
         assert_eq!(b.skipped(), 0);
     }
 
     #[test]
     fn handles_wraparound() {
         let mut b = ReorderBuffer::new(8);
-        b.push(pkt(0xFFFE));
-        b.push(pkt(0xFFFF));
-        b.push(pkt(0x0000));
+        b.push(pkt(0xFFFE)).unwrap();
+        b.push(pkt(0xFFFF)).unwrap();
+        b.push(pkt(0x0000)).unwrap();
         assert_eq!(b.pop().unwrap().header.sequence, 0xFFFE);
         assert_eq!(b.pop().unwrap().header.sequence, 0xFFFF);
         assert_eq!(b.pop().unwrap().header.sequence, 0x0000);

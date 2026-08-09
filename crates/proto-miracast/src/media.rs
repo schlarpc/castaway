@@ -11,7 +11,7 @@
 
 use bytes::Bytes;
 use castaway_core::EncodedFrame;
-use substrate_rtp::{ReorderBuffer, RtpPacket};
+use substrate_rtp::{Refusal, ReorderBuffer, RtpPacket};
 
 use crate::ts::TsDemux;
 
@@ -29,9 +29,16 @@ pub struct MediaReceiver {
     demux: TsDemux,
     /// Datagrams discarded for not being MP2T-in-RTP.
     foreign: u64,
-    /// Datagrams the reorder buffer refused: a duplicate, or one that turned up after its
-    /// place in the sequence had already gone past.
+    /// Datagrams that turned up after their place in the sequence had gone past.
+    ///
+    /// One number with `duplicate` until #233: collapsed, "[`REORDER_DEPTH`] is too
+    /// small for this link" read the same as "the sender duplicates", and those want
+    /// different fixes. Read against [`MediaReceiver::lost_datagrams`] — climbing
+    /// together, packets are arriving after the buffer gave up waiting on them.
     late: u64,
+    /// Datagrams that were copies of a packet still waiting in the reorder buffer:
+    /// duplication by the sender or the network, costing bandwidth and nothing else.
+    duplicate: u64,
 }
 
 impl MediaReceiver {
@@ -43,6 +50,7 @@ impl MediaReceiver {
             demux: TsDemux::new(),
             foreign: 0,
             late: 0,
+            duplicate: 0,
         }
     }
 
@@ -58,10 +66,18 @@ impl MediaReceiver {
         }
         // A duplicate or a late packet is dropped here rather than reaching the demuxer,
         // where re-feeding bytes it has already seen would break the continuity counter
-        // and cost a whole access unit.
-        if !self.reorder.push(packet) {
-            self.late = self.late.saturating_add(1);
-            return Vec::new();
+        // and cost a whole access unit. Counted apart, because they indict different
+        // things: `late` the reorder depth, `duplicate` the sender.
+        match self.reorder.push(packet) {
+            Ok(()) => {}
+            Err(Refusal::Late) => {
+                self.late = self.late.saturating_add(1);
+                return Vec::new();
+            }
+            Err(Refusal::Duplicate) => {
+                self.duplicate = self.duplicate.saturating_add(1);
+                return Vec::new();
+            }
         }
         let mut out = Vec::new();
         while let Some(packet) = self.reorder.pop() {
@@ -92,10 +108,23 @@ impl MediaReceiver {
         self.reorder.skipped()
     }
 
-    /// How many datagrams were refused as duplicates or as too late to be of use.
+    /// How many datagrams arrived after their place in the sequence had gone past.
+    ///
+    /// Read beside [`MediaReceiver::lost_datagrams`]: both climbing means the link
+    /// reorders more deeply than [`REORDER_DEPTH`] absorbs, so packets are being given
+    /// up on and then arriving anyway.
     #[must_use]
     pub const fn late_datagrams(&self) -> u64 {
         self.late
+    }
+
+    /// How many datagrams were copies of a packet already waiting in the buffer.
+    ///
+    /// Duplication by the sender or the network: harmless in itself, and a different
+    /// fault from `late` — which is why they are no longer one number (#233).
+    #[must_use]
+    pub const fn duplicate_datagrams(&self) -> u64 {
+        self.duplicate
     }
 
     /// The demuxer, for the session-level diagnostics that report what the PMT declared.
@@ -156,9 +185,19 @@ mod tests {
         // cost the access unit that was mid-assembly.
         let mut rx = MediaReceiver::new();
         rx.push_datagram(rtp(1, MP2T_PAYLOAD_TYPE, &null_ts()));
-        rx.push_datagram(rtp(1, MP2T_PAYLOAD_TYPE, &null_ts()));
+        rx.push_datagram(rtp(2, MP2T_PAYLOAD_TYPE, &null_ts()));
+        // Seq 2 was emitted, so its copy reads as late; a copy of one still *buffered*
+        // is the duplicate case proper — hold packet 4 back by leaving 3 missing.
+        rx.push_datagram(rtp(4, MP2T_PAYLOAD_TYPE, &null_ts()));
+        rx.push_datagram(rtp(4, MP2T_PAYLOAD_TYPE, &null_ts()));
         assert_eq!(rx.demux().resync_count(), 0);
         assert_eq!(rx.foreign_datagrams(), 0);
+        // …and it lands on its own counter (#233): a sender that duplicates and a
+        // reorder depth too small for the link are different faults, and reading
+        // `late` beside `lost` only works if duplicates are not folded into it.
+        assert_eq!(rx.duplicate_datagrams(), 1);
+        assert_eq!(rx.late_datagrams(), 0);
+        assert_eq!(rx.lost_datagrams(), 0);
     }
 
     #[test]
@@ -179,9 +218,12 @@ mod tests {
         rx.push_datagram(rtp(3 + depth, MP2T_PAYLOAD_TYPE, &null_ts()));
         assert_eq!(rx.lost_datagrams(), 1);
         // And one that turns up after its place has gone past is neither loss nor damage:
-        // the hole it would have filled has already been counted.
+        // the hole it would have filled has already been counted. It is `late`, not
+        // `duplicate` — beside `lost` climbing, this pair is what says the reorder depth
+        // is too small for the link (#233).
         rx.push_datagram(rtp(2, MP2T_PAYLOAD_TYPE, &null_ts()));
         assert_eq!(rx.late_datagrams(), 1);
+        assert_eq!(rx.duplicate_datagrams(), 0);
         assert_eq!(rx.lost_datagrams(), 1);
     }
 

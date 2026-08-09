@@ -249,6 +249,7 @@ fn report_media(peer: &SocketAddr, media: &MediaReceiver, idr_requests: u64, dro
         %peer,
         lost = media.lost_datagrams(),
         late = media.late_datagrams(),
+        duplicates = media.duplicate_datagrams(),
         foreign = media.foreign_datagrams(),
         resyncs = media.demux().resync_count(),
         video_gaps = media.demux().video_gap_count(),
