@@ -177,7 +177,7 @@ fn accept_within(
 
 use tracing::{debug, error, info, trace, warn};
 
-use crate::adblock_engine::AdBlocker;
+use crate::adblock_engine::SharedBlocker;
 use crate::audio_decode::PcmBlock;
 use crate::browser::{BrowserCommand, BrowserRole, BrowserView};
 use crate::browser_proto::{
@@ -404,16 +404,18 @@ impl Electron {
     /// Spawn the browser and wait for it to announce itself.
     ///
     /// `program` is the Electron binary, `app_dir` the host app directory. The adblock
-    /// engine is handed over so the reader thread can answer queries without a hop
-    /// through the main thread — blocking decisions are latency-critical and the engine
-    /// is `Send + Sync`.
+    /// cell is handed over so the reader thread can answer queries without a hop through
+    /// the main thread — blocking decisions are latency-critical and the cell is
+    /// `Send + Sync`. It is the *cell*, not an engine: every query reads the engine as
+    /// of that moment, which is what makes the daily refresh land on a running browser
+    /// instead of at the next process start (#239).
     ///
     /// # Errors
     /// [`PipelineError::GpuInit`] if the child cannot be spawned or never says `ready`.
     pub fn spawn(
         program: &std::path::Path,
         app_dir: &std::path::Path,
-        adblock: Arc<AdBlocker>,
+        adblock: SharedBlocker,
         mixer: Option<&Arc<crate::mixer::AudioMixer>>,
         user_agent: &str,
         waker: castaway_core::Waker,
@@ -660,7 +662,7 @@ struct Wiring<'a> {
     pending: &'a Arc<Mutex<PendingPaints>>,
     health: &'a Arc<Health>,
     wire: &'a Arc<Mutex<Option<WireSend>>>,
-    adblock: &'a Arc<AdBlocker>,
+    adblock: &'a SharedBlocker,
     audio: &'a Arc<Mutex<Option<BrowserAudio>>>,
     probes: &'a Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<String>>>>,
     ready_tx: &'a std::sync::mpsc::Sender<u32>,
@@ -802,8 +804,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             }
         }
         FromBrowser::ScriptletQuery { id, url } => {
-            let source = adblock.injected_script(&url).unwrap_or_default();
-            reply(wire, &ToBrowser::ScriptletSource { id, source });
+            reply(wire, &scriptlet_answer(adblock, id, &url));
         }
         FromBrowser::AdblockQuery {
             id,
@@ -811,8 +812,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             source,
             kind,
         } => {
-            let block = adblock.should_block(&url, &source, &kind);
-            reply(wire, &ToBrowser::AdblockVerdict { id, block });
+            reply(wire, &adblock_answer(adblock, id, &url, &source, &kind));
         }
         FromBrowser::LoadEnd {
             surface,
@@ -903,6 +903,32 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             _ => debug!(target: "castaway::browser", "{message}"),
         },
     }
+}
+
+/// The answer to one `adblock-query`, read through the shared cell at the moment of the
+/// query.
+///
+/// `current()` per query rather than per session is the fix for #239: an engine held
+/// across queries is a snapshot, and the daily refresh would only take effect at the next
+/// respawn. Pure — the cell in, the wire message out — so the seam the boot snapshot used
+/// to hide in is the one the tests below drive.
+fn adblock_answer(
+    adblock: &SharedBlocker,
+    id: u64,
+    url: &str,
+    source: &str,
+    kind: &str,
+) -> ToBrowser {
+    let block = adblock.current().should_block(url, source, kind);
+    ToBrowser::AdblockVerdict { id, block }
+}
+
+/// The answer to one `scriptlet-query`, read through the shared cell like
+/// [`adblock_answer`] — a refreshed list's new `##+js(...)` rules reach the very next
+/// navigation (#239).
+fn scriptlet_answer(adblock: &SharedBlocker, id: u64, url: &str) -> ToBrowser {
+    let source = adblock.current().injected_script(url).unwrap_or_default();
+    ToBrowser::ScriptletSource { id, source }
 }
 
 fn release(wire: &Arc<Mutex<Option<WireSend>>>, id: u64) {
@@ -1091,8 +1117,10 @@ pub struct RespawnSpec {
     pub program: std::path::PathBuf,
     /// The host app directory.
     pub app_dir: std::path::PathBuf,
-    /// The engine that answers blocking and scriptlet queries.
-    pub adblock: Arc<AdBlocker>,
+    /// The cell whose *current* engine answers blocking and scriptlet queries. Shared
+    /// with the daily refresh, so a respawned browser — like a running one — is always
+    /// on the newest lists (#239).
+    pub adblock: SharedBlocker,
     /// The panel's mixer, which the page's audio joins as one more source. `None` leaves
     /// the browser silent. See [`BrowserAudio`] for what a device of its own cost.
     pub mixer: Option<Arc<crate::mixer::AudioMixer>>,
@@ -1413,7 +1441,7 @@ impl ElectronHost {
             match Electron::spawn(
                 &self.respawn.program,
                 &self.respawn.app_dir,
-                Arc::clone(&self.respawn.adblock),
+                self.respawn.adblock.clone(),
                 self.respawn.mixer.as_ref(),
                 &self.respawn.user_agent,
                 self.respawn.waker.clone(),
@@ -1844,6 +1872,92 @@ impl ProcessRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adblock_engine::AdBlocker;
+
+    /// A refresh changes the verdict the *next* query gets — no respawn anywhere.
+    ///
+    /// This is #239 at the seam it regressed on: the reader thread used to hold a
+    /// boot-time `Arc<AdBlocker>`, so the daily refresh swapped an engine nothing read
+    /// and refreshed lists only took effect at process restart. `answers` here is the
+    /// reader thread's own handle, cloned at spawn the way `Electron::spawn` clones it.
+    #[test]
+    fn a_refresh_changes_the_next_adblock_verdict_without_a_respawn() {
+        let shared = SharedBlocker::new(AdBlocker::from_list_text("||before.example^\n"));
+        let answers = shared.clone(); // what the reader thread holds for the process's life
+        let page = "https://site.test/";
+
+        assert_eq!(
+            adblock_answer(&answers, 1, "https://before.example/a.js", page, "script"),
+            ToBrowser::AdblockVerdict { id: 1, block: true }
+        );
+        assert_eq!(
+            adblock_answer(&answers, 2, "https://after.example/a.js", page, "script"),
+            ToBrowser::AdblockVerdict {
+                id: 2,
+                block: false
+            }
+        );
+
+        // The daily refresh lands.
+        shared.install(AdBlocker::from_list_text("||after.example^\n"));
+
+        assert_eq!(
+            adblock_answer(&answers, 3, "https://after.example/a.js", page, "script"),
+            ToBrowser::AdblockVerdict { id: 3, block: true },
+            "the refreshed rules must answer the very next query"
+        );
+        assert_eq!(
+            adblock_answer(&answers, 4, "https://before.example/a.js", page, "script"),
+            ToBrowser::AdblockVerdict {
+                id: 4,
+                block: false
+            },
+            "and the superseded rules must be gone"
+        );
+    }
+
+    /// The scriptlet path reads the same cell: a refresh that brings a new `##+js(...)`
+    /// rule (and its body) reaches the next navigation's injection query.
+    #[test]
+    fn a_refresh_changes_the_next_scriptlet_injection_without_a_respawn() {
+        use adblock::resources::{MimeType, Resource, ResourceType};
+        use base64::Engine as _;
+
+        let shared = SharedBlocker::new(AdBlocker::with_defaults());
+        let answers = shared.clone();
+
+        let before = scriptlet_answer(&answers, 1, "https://example.com/");
+        assert_eq!(
+            before,
+            ToBrowser::ScriptletSource {
+                id: 1,
+                source: String::new()
+            },
+            "the boot lists have nothing to inject here"
+        );
+
+        // The refresh brings a rule and the body it names (`probe.js`: a `##+js(probe)`
+        // rule resolves to the resource with the `.js` extension).
+        let mut refreshed = AdBlocker::from_list_text("example.com##+js(probe, hello)\n");
+        refreshed.use_resources(vec![Resource {
+            name: "probe.js".to_string(),
+            aliases: vec![],
+            kind: ResourceType::Mime(MimeType::ApplicationJavascript),
+            content: base64::prelude::BASE64_STANDARD
+                .encode("function probe(a) { console.log('probe:' + a); }"),
+            dependencies: vec![],
+            permission: Default::default(),
+        }]);
+        shared.install(refreshed);
+
+        match scriptlet_answer(&answers, 2, "https://example.com/") {
+            ToBrowser::ScriptletSource { id: 2, source } => assert!(
+                source.contains("probe") && source.contains("hello"),
+                "the refreshed rule's scriptlet must reach the next navigation: {source}"
+            ),
+            other => panic!("wrong answer shape: {other:?}"),
+        }
+    }
 
     fn fault(surface: Option<Surface>) -> Option<Fault> {
         Some(Fault {

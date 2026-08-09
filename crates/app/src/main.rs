@@ -482,24 +482,25 @@ fn main() -> anyhow::Result<()> {
             // Whatever is already on disk, or the built-in list — instantly. Fetching on
             // the startup path used to block for up to ~110 s while `serve()` was already
             // telling senders the app was `running`; the refresh thread does it off that
-            // path and swaps the engine in behind the shared cell when it lands.
+            // path and installs the engine behind the shared cell when it lands. The
+            // browser is handed the *cell* and reads it at every query, so an install —
+            // the startup fetch and every daily one after it — is live at once rather
+            // than at the next process start (#239).
             let list_cache = pipeline::filterlists::CachePaths::default();
-            let blocker = StdArc::new(
+            let adblock = pipeline::adblock_engine::SharedBlocker::new(
                 pipeline::filterlists::load_cached_only(&list_cache)
                     .unwrap_or_else(pipeline::adblock_engine::AdBlocker::with_defaults),
             );
-            let shared: pipeline::adblock_engine::SharedBlocker =
-                StdArc::new(std::sync::RwLock::new(StdArc::clone(&blocker)));
             // Lists change on the order of days and this box stays up for weeks, so
             // re-fetch daily rather than running whatever it booted with forever.
-            pipeline::filterlists::spawn_daily_refresh(list_cache.clone(), StdArc::clone(&shared));
+            pipeline::filterlists::spawn_daily_refresh(list_cache, adblock.clone());
 
             let program = config.browser_program();
             let app_dir = config.browser_app_dir();
             let electron = pipeline::Electron::spawn(
                 &program,
                 &app_dir,
-                StdArc::clone(&blocker),
+                adblock.clone(),
                 // The browser's audio is captured out of the page and mixed here rather
                 // than played by the browser process, so it joins the mix as one more
                 // source. It used to take a device of its own, which is how page audio
@@ -515,7 +516,7 @@ fn main() -> anyhow::Result<()> {
                 pipeline::electron_browser::RespawnSpec {
                     program,
                     app_dir,
-                    adblock: blocker,
+                    adblock,
                     mixer: Some(StdArc::clone(&mixer)),
                     user_agent: pipeline::TV_USER_AGENT.to_string(),
                     waker: wake.clone(),

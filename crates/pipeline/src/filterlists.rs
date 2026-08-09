@@ -18,7 +18,7 @@
 //! keeps them a thing the operator's machine downloads rather than a thing we distribute.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use adblock::resources::Resource;
 use tracing::{info, warn};
@@ -127,42 +127,30 @@ pub fn spawn_daily_refresh(paths: CachePaths, blocker: crate::adblock_engine::Sh
         );
 }
 
-/// Fetch the lists and swap them in behind the shared cell.
+/// Fetch the lists and install the result; every decision after this answers from it.
+///
+/// Installing is enough: the browser's query path reads the cell at every decision
+/// (`electron_browser`), so there is no render-side engine to rebuild and no restart to
+/// wait for — the CEF-era cache-stamp dance this module used to describe is gone with the
+/// render processes that needed it (#239).
 fn refresh_once(paths: &CachePaths, blocker: &crate::adblock_engine::SharedBlocker) {
-    {
-        // The counters live on the blocker being replaced, so say where they got to
-        // before they go — otherwise a long-running kiosk silently resets them daily.
-        if let Ok(current) = blocker.read() {
-            info!(
-                target: "castaway::adblock",
-                seen = current.seen_count(),
-                blocked = current.blocked_count(),
-                "refreshing filter lists"
-            );
-        }
-        let refreshed = load_or_fetch_all(paths);
-        match blocker.write() {
-            Ok(mut slot) => {
-                *slot = std::sync::Arc::new(refreshed);
-                info!(target: "castaway::adblock", "filter lists refreshed");
-            }
-            Err(e) => {
-                warn!(target: "castaway::adblock", error = %e, "could not swap in refreshed lists")
-            }
-        }
-    }
+    refresh_with(blocker, || load_or_fetch_all(paths));
 }
 
-/// The newest modification time across the cached lists, or `None` if none exist.
-///
-/// How a render process notices a refresh: it holds its own engine built from these files,
-/// and comparing this against what it built from is cheaper than rebuilding to find out.
-#[must_use]
-pub fn cache_stamp(paths: &CachePaths) -> Option<SystemTime> {
-    [&paths.easylist, &paths.ubo_filters, &paths.ubo_scriptlets]
-        .into_iter()
-        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
-        .max()
+/// [`refresh_once`] with the load as a parameter, so a test can drive a whole refresh
+/// against a rewritten cache without a network.
+fn refresh_with(blocker: &crate::adblock_engine::SharedBlocker, load: impl FnOnce() -> AdBlocker) {
+    // The counters live on the blocker being replaced, so say where they got to
+    // before they go — otherwise a long-running kiosk silently resets them daily.
+    let outgoing = blocker.current();
+    info!(
+        target: "castaway::adblock",
+        seen = outgoing.seen_count(),
+        blocked = outgoing.blocked_count(),
+        "refreshing filter lists"
+    );
+    blocker.install(load());
+    info!(target: "castaway::adblock", "filter lists refreshed");
 }
 
 /// Set this to skip the startup fetch and use whatever is already cached.
@@ -221,10 +209,10 @@ pub fn load_or_fetch_all_from(
 
 /// Build a blocker from whatever is already cached, fetching nothing.
 ///
-/// For the render process: it runs per page load and must not block on the network, and
-/// the browser process has already refreshed these files this boot. `None` when there is
-/// no cached list at all, so the caller can skip injection rather than build an engine
-/// that would match nothing.
+/// For startup: the receiver boots on this instantly while the refresh thread does the
+/// first fetch off the critical path and installs the result behind the shared cell.
+/// `None` when there is no cached list at all, so the caller can fall back to the
+/// built-in list rather than build an engine that would match nothing.
 #[must_use]
 pub fn load_cached_only(paths: &CachePaths) -> Option<AdBlocker> {
     let mut combined = String::new();
@@ -548,55 +536,47 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_reaches_a_blocker_that_is_already_in_use() {
-        // The failure this guards: the live client holds its own handle, so swapping a
-        // plain `Arc` would update nothing that is actually blocking. Everything reads
-        // through the cell, so a refresh has to be visible to a holder taken beforehand.
-        let cell: crate::adblock_engine::SharedBlocker =
-            std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
-                AdBlocker::from_list_text("||before.example^\n"),
-            )));
-        let holder = std::sync::Arc::clone(&cell);
-        let page = "https://site.test/";
-        assert!(holder
-            .read()
-            .unwrap()
-            .should_block("https://before.example/a.js", page, "script"));
-
-        *cell.write().unwrap() =
-            std::sync::Arc::new(AdBlocker::from_list_text("||after.example^\n"));
-
-        let current = holder.read().unwrap();
-        assert!(
-            current.should_block("https://after.example/a.js", page, "script"),
-            "the refreshed rules must be live for a handle taken before the swap"
-        );
-        assert!(
-            !current.should_block("https://before.example/a.js", page, "script"),
-            "and the superseded ones must be gone"
-        );
-    }
-
-    #[test]
-    fn the_cache_stamp_moves_when_a_list_is_rewritten() {
-        // How a render process notices a refresh without rebuilding to find out.
-        let dir = std::env::temp_dir().join("castaway-filterlists-test-stamp");
+    fn a_refresh_from_a_rewritten_cache_changes_what_a_live_handle_answers() {
+        // The whole of #239, offline: the receiver boots on the cached lists, the cache
+        // is rewritten (a day passes, upstream changed), and a refresh through the same
+        // path the daily thread takes must change the answer a handle taken *before* the
+        // refresh gives — with no restart anywhere.
+        let dir = std::env::temp_dir().join("castaway-filterlists-test-refresh");
         std::fs::create_dir_all(&dir).unwrap();
         let paths = paths_in(&dir);
-        for p in [&paths.easylist, &paths.ubo_filters, &paths.ubo_scriptlets] {
-            let _ = std::fs::remove_file(p);
-        }
-        assert_eq!(cache_stamp(&paths), None, "no lists, no stamp");
+        std::fs::write(
+            &paths.easylist,
+            format!("||stale.example^\n{}", "!\n".repeat(600)),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&paths.ubo_filters);
+        let _ = std::fs::remove_file(&paths.ubo_scriptlets);
 
-        std::fs::write(&paths.easylist, "||a.example^\n").unwrap();
-        let first = cache_stamp(&paths).expect("a list exists now");
+        let shared = crate::adblock_engine::SharedBlocker::new(
+            load_cached_only(&paths).expect("the seeded cache builds an engine"),
+        );
+        let holder = shared.clone();
+        let page = "https://site.test/";
+        assert!(holder
+            .current()
+            .should_block("https://stale.example/a.js", page, "script"));
 
-        // Filesystem timestamps are coarse; make the rewrite unambiguously later.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        std::fs::write(&paths.easylist, "||b.example^\n").unwrap();
+        // A day passes; the lists on disk move on.
+        std::fs::write(
+            &paths.easylist,
+            format!("||fresh.example^\n{}", "!\n".repeat(600)),
+        )
+        .unwrap();
+        super::refresh_with(&shared, || with_unreachable_urls(&paths));
+
+        let current = holder.current();
         assert!(
-            cache_stamp(&paths).expect("still exists") > first,
-            "a rewritten list has to look different, or a renderer never re-reads"
+            current.should_block("https://fresh.example/a.js", page, "script"),
+            "the rewritten cache must be live for a handle taken before the refresh"
+        );
+        assert!(
+            !current.should_block("https://stale.example/a.js", page, "script"),
+            "and the superseded rules must be gone"
         );
     }
 

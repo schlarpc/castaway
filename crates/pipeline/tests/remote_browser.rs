@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use input_touch::{InputOrigin, RemoteEvent, RemoteInputQueue};
-use pipeline::adblock_engine::AdBlocker;
+use pipeline::adblock_engine::{AdBlocker, SharedBlocker};
 use pipeline::electron_browser::{Electron, ElectronHost};
 use pipeline::nv12::Nv12Planes;
 use pipeline::remote::{RemoteConfig, RemoteService};
@@ -320,11 +320,11 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
         Arc::clone(&stop),
     );
 
-    let blocker = Arc::new(AdBlocker::with_defaults());
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
     let electron = Electron::spawn(
         &electron_path(),
         &app_dir(),
-        Arc::clone(&blocker),
+        blocker.clone(),
         None,
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),

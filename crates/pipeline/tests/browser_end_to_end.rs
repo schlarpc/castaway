@@ -16,6 +16,8 @@
 //!    after the first `MAX_INFLIGHT_FRAMES`.
 //! 5. Touch reaches the page, so the CDP route is real rather than merely written.
 //! 6. The browser is gone when the host is dropped.
+//! 7. A filter-list refresh reaches the *running* browser: an engine installed
+//!    mid-session answers the next load's queries, with no respawn (#239).
 //!
 //!
 //! ## The decision, and when it gets revisited (#183)
@@ -48,7 +50,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pipeline::adblock_engine::AdBlocker;
+use pipeline::adblock_engine::{AdBlocker, SharedBlocker};
 use pipeline::browser::BrowserCommand;
 use pipeline::{Electron, ElectronHost};
 
@@ -74,7 +76,7 @@ const PAGE: &str =
      document.documentElement.style.background=c},600*(i+1)))</script></body>";
 
 fn spec(
-    adblock: Arc<AdBlocker>,
+    adblock: SharedBlocker,
     mixer: Option<Arc<pipeline::mixer::AudioMixer>>,
 ) -> pipeline::electron_browser::RespawnSpec {
     pipeline::electron_browser::RespawnSpec {
@@ -108,11 +110,11 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
         return;
     };
 
-    let blocker = Arc::new(AdBlocker::with_defaults());
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
     let electron = Electron::spawn(
         &electron_path(),
         &app_dir(),
-        Arc::clone(&blocker),
+        blocker.clone(),
         None,
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),
@@ -120,7 +122,7 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
     .expect("browser should start");
 
     let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
-    let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
+    let mut host = ElectronHost::new(electron, spec(blocker.clone(), None), rx);
     host.resize(1280, 720);
     tx.send(BrowserCommand::Navigate(PAGE.into())).unwrap();
 
@@ -193,8 +195,32 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
          painting stopped or the layer went stale (the borrow/release deadlock)"
     );
 
+    // A daily refresh must reach this *running* browser (#239). Install a fresh engine
+    // and load a page with one subresource the new rules name; the verdict for it has to
+    // come off the new engine — its counters start at zero, so any count at all is proof
+    // the reader is consulting the cell rather than a boot snapshot. `webRequest` fires
+    // before the network, so the unresolvable host costs nothing.
+    blocker.install(AdBlocker::from_list_text("||refreshed.invalid^\n"));
+    tx.send(BrowserCommand::Navigate(REFRESHED_PAGE.into()))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && blocker.current().blocked_count() == 0 {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        blocker.current().blocked_count() >= 1,
+        "the refreshed engine never blocked anything: the browser is still answering \
+         from its boot-time snapshot (#239)"
+    );
+
     host.shutdown();
 }
+
+/// One subresource for the refreshed rules to block — see the #239 leg above.
+const REFRESHED_PAGE: &str =
+    "data:text/html,<body><img src=\"http://refreshed.invalid/pixel.png\"></body>";
 
 /// Touch has to reach the *page*, not merely leave us.
 ///
@@ -209,11 +235,11 @@ fn a_touch_reaches_the_page() {
         return;
     };
 
-    let blocker = Arc::new(AdBlocker::with_defaults());
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
     let electron = Electron::spawn(
         &electron_path(),
         &app_dir(),
-        Arc::clone(&blocker),
+        blocker.clone(),
         None,
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),
@@ -290,11 +316,11 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
         })))
     };
 
-    let blocker = Arc::new(AdBlocker::with_defaults());
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
     let electron = Electron::spawn(
         &electron_path(),
         &app_dir(),
-        Arc::clone(&blocker),
+        blocker.clone(),
         Some(&mixer),
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),
@@ -418,11 +444,11 @@ fn a_cast_page_comes_and_goes_without_disturbing_the_widget() {
         return;
     };
 
-    let blocker = Arc::new(AdBlocker::with_defaults());
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
     let electron = Electron::spawn(
         &electron_path(),
         &app_dir(),
-        Arc::clone(&blocker),
+        blocker.clone(),
         None,
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),
@@ -514,11 +540,11 @@ fn minimizing_a_fullscreen_page_moves_it_into_the_widget_slot() {
         return;
     };
 
-    let blocker = Arc::new(AdBlocker::with_defaults());
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
     let electron = Electron::spawn(
         &electron_path(),
         &app_dir(),
-        Arc::clone(&blocker),
+        blocker.clone(),
         None,
         pipeline::TV_USER_AGENT,
         castaway_core::Waker::new(),

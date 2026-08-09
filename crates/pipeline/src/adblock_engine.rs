@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use adblock::request::Request;
 use adblock::resources::Resource;
@@ -21,7 +21,42 @@ const DEFAULT_RULES: &str = include_str!("adblock_default.txt");
 ///
 /// Two layers on purpose: the `RwLock` is held only long enough to clone the `Arc`, so a
 /// refresh never stalls a page load waiting for a decision to finish.
-pub type SharedBlocker = std::sync::Arc<std::sync::RwLock<std::sync::Arc<AdBlocker>>>;
+///
+/// Every *decision* goes through [`SharedBlocker::current`], taken at the moment of the
+/// decision — a held `Arc<AdBlocker>` is a snapshot no refresh can reach. That is not
+/// hypothetical: when this was a bare type alias, the browser kept its boot-time snapshot
+/// and the daily refresh swapped an engine nothing read, so refreshed lists only took
+/// effect at process restart (#239). The methods are the whole interface precisely so a
+/// caller cannot hold the inner `Arc` by accident.
+#[derive(Clone)]
+pub struct SharedBlocker {
+    cell: Arc<RwLock<Arc<AdBlocker>>>,
+}
+
+impl SharedBlocker {
+    /// Wrap the engine the receiver boots with.
+    #[must_use]
+    pub fn new(initial: AdBlocker) -> Self {
+        Self {
+            cell: Arc::new(RwLock::new(Arc::new(initial))),
+        }
+    }
+
+    /// The engine as of *now*. Take it per decision, never per session.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the guarded value is a single
+    /// pointer swapped whole, so it cannot be half-written, and a page load must not
+    /// inherit a panic from the refresh thread.
+    #[must_use]
+    pub fn current(&self) -> Arc<AdBlocker> {
+        Arc::clone(&self.cell.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Install a freshly built engine; every subsequent [`Self::current`] answers with it.
+    pub fn install(&self, next: AdBlocker) {
+        *self.cell.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(next);
+    }
+}
 
 /// Wraps an adblock [`Engine`] and counts/logs blocks.
 pub struct AdBlocker {
@@ -203,6 +238,32 @@ mod tests {
         let mut ab = AdBlocker::from_list_text("example.com##+js(not-in-our-bundle, x)\n");
         ab.use_resources(vec![scriptlet("probe.js", "function probe() {}")]);
         assert_eq!(ab.injected_script("https://example.com/"), None);
+    }
+
+    #[test]
+    fn an_install_reaches_a_handle_cloned_before_it() {
+        // The failure this guards is #239: a client that clones the *cell* stays current
+        // across a refresh, where a client that held the inner `Arc` would not — and the
+        // methods are the only interface, so holding the inner `Arc` takes deliberate
+        // effort rather than being the natural spelling.
+        let shared = SharedBlocker::new(AdBlocker::from_list_text("||before.example^\n"));
+        let holder = shared.clone();
+        let page = "https://site.test/";
+        assert!(holder
+            .current()
+            .should_block("https://before.example/a.js", page, "script"));
+
+        shared.install(AdBlocker::from_list_text("||after.example^\n"));
+
+        let current = holder.current();
+        assert!(
+            current.should_block("https://after.example/a.js", page, "script"),
+            "the refreshed rules must be live for a handle taken before the swap"
+        );
+        assert!(
+            !current.should_block("https://before.example/a.js", page, "script"),
+            "and the superseded ones must be gone"
+        );
     }
 
     #[test]
