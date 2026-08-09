@@ -76,34 +76,26 @@ impl MdnsResponder {
     /// # Errors
     /// [`MdnsError`] if the service type is malformed or registration fails.
     pub fn advertise(&mut self, service: &MdnsService) -> Result<(), MdnsError> {
-        // A rewritten instance label changes the name a picker shows, so say so once
-        // rather than letting the device quietly appear under a different name.
-        if let Some(requested) = service.instance.rewritten_from() {
-            warn!(
-                service = %service.service_type,
-                %requested,
-                advertised = %service.instance,
-                "instance name is not encodable as one DNS label; advertising a repaired name"
-            );
-        }
-        // One registration carrying every sub-type, not one registration per sub-type.
-        // The difference is not style: `mdns-sd`'s registry is keyed by a fullname that
-        // does not include the sub-type, so N registrations of one instance silently
-        // collapse to the last — which is what #227 is, and why the patched crate takes
-        // them all at once instead.
-        let info = service.to_service_info()?;
-        let fullname = info.get_fullname().to_string();
-        self.daemon
-            .register(info)
-            .map_err(|e| MdnsError::Register(e.to_string()))?;
-        info!(
-            service = %service.service_type,
-            instance = %service.instance,
-            subtypes = service.subtypes.len(),
-            "mDNS advertised"
-        );
+        let fullname = register(&self.daemon, service)?;
         self.registered.push(fullname);
         Ok(())
+    }
+
+    /// A handle for advertising records that only exist *after* startup.
+    ///
+    /// The responder itself serves the startup pass: the app collects every adapter's
+    /// advertisements and registers them before the services settle in, holding the
+    /// responder by `&mut`. A record that depends on runtime state — Matter's
+    /// operational record exists only once its fabric has a member (#173) — needs a
+    /// handle the owning adapter can keep and use later, on the *same* daemon (D26/D45:
+    /// one responder, not two racing). Registrations made through the handle are
+    /// unregistered when the handle drops.
+    #[must_use]
+    pub fn advertiser(&self) -> MdnsAdvertiser {
+        MdnsAdvertiser {
+            daemon: self.daemon.clone(),
+            registered: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     /// Browse the LAN for instances of a service type (`_nvstream._tcp`). The returned
@@ -130,4 +122,72 @@ impl Drop for MdnsResponder {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// A late-advertisement handle on the shared daemon — see [`MdnsResponder::advertiser`].
+///
+/// `advertise` takes `&self` (the registered list is behind a mutex) because the owner
+/// is typically an adapter actor that only ever holds itself by `&self`.
+pub struct MdnsAdvertiser {
+    daemon: ServiceDaemon,
+    /// Fully-qualified names registered through this handle, unregistered on drop.
+    registered: std::sync::Mutex<Vec<String>>,
+}
+
+impl MdnsAdvertiser {
+    /// Advertise a service instance, exactly as [`MdnsResponder::advertise`] would.
+    ///
+    /// # Errors
+    /// [`MdnsError`] if the service type is malformed or registration fails.
+    pub fn advertise(&self, service: &MdnsService) -> Result<(), MdnsError> {
+        let fullname = register(&self.daemon, service)?;
+        if let Ok(mut registered) = self.registered.lock() {
+            registered.push(fullname);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MdnsAdvertiser {
+    fn drop(&mut self) {
+        let Ok(mut registered) = self.registered.lock() else {
+            return;
+        };
+        for fullname in registered.drain(..) {
+            let _ = self.daemon.unregister(&fullname);
+            debug!(%fullname, "mDNS unregistered");
+        }
+    }
+}
+
+/// Register one service instance with the daemon, returning the fullname to unregister
+/// it by. The one registration path shared by the responder and its late handles.
+fn register(daemon: &ServiceDaemon, service: &MdnsService) -> Result<String, MdnsError> {
+    // A rewritten instance label changes the name a picker shows, so say so once
+    // rather than letting the device quietly appear under a different name.
+    if let Some(requested) = service.instance.rewritten_from() {
+        warn!(
+            service = %service.service_type,
+            %requested,
+            advertised = %service.instance,
+            "instance name is not encodable as one DNS label; advertising a repaired name"
+        );
+    }
+    // One registration carrying every sub-type, not one registration per sub-type.
+    // The difference is not style: `mdns-sd`'s registry is keyed by a fullname that
+    // does not include the sub-type, so N registrations of one instance silently
+    // collapse to the last — which is what #227 is, and why the patched crate takes
+    // them all at once instead.
+    let info = service.to_service_info()?;
+    let fullname = info.get_fullname().to_string();
+    daemon
+        .register(info)
+        .map_err(|e| MdnsError::Register(e.to_string()))?;
+    info!(
+        service = %service.service_type,
+        instance = %service.instance,
+        subtypes = service.subtypes.len(),
+        "mDNS advertised"
+    );
+    Ok(fullname)
 }
