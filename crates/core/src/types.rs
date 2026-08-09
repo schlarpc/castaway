@@ -283,6 +283,45 @@ impl std::fmt::Display for AudioFormat {
     }
 }
 
+/// How far behind delivery a sender intends the receiver to play — its declared
+/// playout latency, converted out of wire units at the protocol boundary.
+///
+/// AirPlay is the first source: RTSP sync packets carry the figure in sample frames at
+/// the stream's own rate (77175 frames of 44.1 kHz ALAC is 1.75 s; 7497 of AAC-ELD is
+/// 170 ms), and it arrives *after* the session's audio event, on the timing plane, so
+/// it travels as [`crate::SessionEvent::AudioLatency`] rather than as a field of the
+/// registration. A duration rather than frames because the frame count only means
+/// anything against the sender's rate, and the protocol boundary is the one place that
+/// knows it (parse, don't validate — ground rule 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeclaredLatency(std::time::Duration);
+
+impl DeclaredLatency {
+    /// From a latency counted in sample frames at `format`'s rate — the shape AirPlay
+    /// sync packets carry.
+    ///
+    /// Exact: `format`'s rate is non-zero by construction, and `u32` frames times a
+    /// nanosecond scale fits `u64` with room to spare.
+    #[must_use]
+    pub fn from_frames(frames: u32, format: AudioFormat) -> Self {
+        let nanos =
+            u64::from(frames).saturating_mul(1_000_000_000) / u64::from(format.sample_rate());
+        Self(std::time::Duration::from_nanos(nanos))
+    }
+
+    /// The declared latency as a duration.
+    #[must_use]
+    pub const fn duration(self) -> std::time::Duration {
+        self.0
+    }
+}
+
+impl std::fmt::Display for DeclaredLatency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ms", self.0.as_millis())
+    }
+}
+
 /// Decoded-frame pixel layout. `Decoded` frames carry one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

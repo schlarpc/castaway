@@ -148,6 +148,17 @@ pub enum SessionEvent {
         /// themselves in-band, which is every A2DP codec.
         config: Option<bytes::Bytes>,
     },
+    /// The active sender declared — or revised — how far behind delivery it intends the
+    /// receiver to play its audio (#176).
+    ///
+    /// Its own event rather than a field on [`SessionEvent::Audio`] or [`MirrorAudio`]
+    /// because that is the wire truth: the authoritative figure rides the protocol's
+    /// timing plane and lands *after* the session is registered, and it is per codec —
+    /// AirPlay declares 77175 frames for ALAC and 7497 for AAC-ELD, both in sync
+    /// packets the session's first events cannot have seen. The pipeline applies it to
+    /// whichever live audio session is current; a source that never declares simply
+    /// never sends this, and its input keeps the mixer's flat budget.
+    AudioLatency(crate::types::DeclaredLatency),
     /// Track metadata for the now-playing surface — a full snapshot, re-emitted whenever
     /// any part of it changes (including artwork arriving late).
     NowPlaying(NowPlaying),

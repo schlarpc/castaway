@@ -42,9 +42,9 @@ pub use session::{RemoteHandle, SessionConfig, SessionManager};
 pub use source::SourceDescription;
 pub use touch::{SurfaceTouch, TouchHandle, TouchPhase, TouchSurface};
 pub use types::{
-    AudioCodec, AudioFormat, ColorInfo, ColorRange, ColorSpace, DecodedFrame, EncodedFrame,
-    FrameImage, FrameSource, FriendlyName, GpuSurface, MediaUri, PcmFrame, PixelFormat,
-    ProtocolKind, VideoCodec, MEDIA_USER_AGENT,
+    AudioCodec, AudioFormat, ColorInfo, ColorRange, ColorSpace, DeclaredLatency, DecodedFrame,
+    EncodedFrame, FrameImage, FrameSource, FriendlyName, GpuSurface, MediaUri, PcmFrame,
+    PixelFormat, ProtocolKind, VideoCodec, MEDIA_USER_AGENT,
 };
 pub use volume::Volume;
 pub use wake::Waker;

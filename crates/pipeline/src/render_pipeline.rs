@@ -550,6 +550,13 @@ pub struct RenderPipeline {
     /// when the next source starts.
     #[cfg(feature = "audio")]
     gain: Arc<crate::audio_session::Gain>,
+    /// The live audio session's declared-latency handle, kept here because the input it
+    /// steers has moved onto its decode thread by the time the figure arrives: the
+    /// sender declares on the timing plane, mid-session, and [`Pipeline::audio_latency`]
+    /// lands it through this (#176). Replaced whenever a session's input is minted and
+    /// cleared on preempt, so a late declaration cannot retune a successor's buffer.
+    #[cfg(feature = "audio")]
+    live_latency: Mutex<Option<crate::mixer::LatencyTarget>>,
 }
 
 impl RenderPipeline {
@@ -594,6 +601,8 @@ impl RenderPipeline {
                 mixer: Mutex::new(None),
                 #[cfg(feature = "audio")]
                 gain: Arc::new(crate::audio_session::Gain::default()),
+                #[cfg(feature = "audio")]
+                live_latency: Mutex::new(None),
             },
             rx,
         )
@@ -646,6 +655,21 @@ impl RenderPipeline {
             ))
         })
         .input(backpressure)
+    }
+
+    /// A live input whose declared-latency handle is kept where
+    /// [`Pipeline::audio_latency`] can reach it.
+    ///
+    /// The input moves onto its decode thread at session start; the sender's figure
+    /// arrives later, on the timing plane. Minting the two together is what guarantees
+    /// a declaration always has the *current* session's input to land on (#176).
+    #[cfg(feature = "audio")]
+    fn live_audio_input(&self) -> crate::mixer::MixInput {
+        let input = self.audio_input(crate::mixer::Backpressure::Live);
+        if let Ok(mut slot) = self.live_latency.lock() {
+            *slot = Some(input.latency_target());
+        }
+        input
     }
     ///
     /// Cheap and clonable, and deliberately separate from the pipeline itself: by the
@@ -791,6 +815,13 @@ impl RenderPipeline {
             if let Some(flag) = guard.take() {
                 flag.store(true, Ordering::SeqCst);
             }
+        }
+        // The outgoing session's declared-latency handle goes with it: a sync packet
+        // still in flight from a preempted sender must not retune the buffer of
+        // whoever took the panel (#176).
+        #[cfg(feature = "audio")]
+        if let Ok(mut latency) = self.live_latency.lock() {
+            *latency = None;
         }
         // Let the display idle again. A session taking over re-acquires through
         // `set_active` a moment later; the gap is sub-millisecond and no idle timer has
@@ -1007,7 +1038,7 @@ impl Pipeline for RenderPipeline {
                             arx,
                             audio.format,
                             audio.config,
-                            self.audio_input(crate::mixer::Backpressure::Live),
+                            self.live_audio_input(),
                             Arc::clone(&stop),
                             // No failure report, for the same reason this path does not
                             // preempt: a mirror's audio and its picture share a stop
@@ -1072,7 +1103,7 @@ impl Pipeline for RenderPipeline {
                         rx,
                         format,
                         config,
-                        self.audio_input(crate::mixer::Backpressure::Live),
+                        self.live_audio_input(),
                         stop,
                         failed,
                     );
@@ -1083,7 +1114,7 @@ impl Pipeline for RenderPipeline {
                 FrameSource::Pcm(rx) => {
                     crate::audio_session::spawn_pcm(
                         rx,
-                        self.audio_input(crate::mixer::Backpressure::Live),
+                        self.live_audio_input(),
                         stop,
                         // Bluetooth/Spotify PCM: the sender is the clock, there is no
                         // video to synchronise, and a seek is the phone's business — so
@@ -1107,6 +1138,25 @@ impl Pipeline for RenderPipeline {
                 "this build has no audio support; rebuild with the `audio` feature".into(),
             ))
         }
+    }
+
+    async fn audio_latency(
+        &self,
+        latency: castaway_core::DeclaredLatency,
+    ) -> Result<(), CoreError> {
+        #[cfg(feature = "audio")]
+        if let Ok(slot) = self.live_latency.lock() {
+            if let Some(target) = slot.as_ref() {
+                info!(%latency, "render pipeline: sender declared its latency; adopting it as the buffer target");
+                target.set(latency.duration());
+                return Ok(());
+            }
+        }
+        // No live input to steer — the session ended, or this build has no audio. The
+        // declaration is a hint about how much to buffer, and a hint with nowhere to
+        // land is dropped honestly rather than failing the session that sent it.
+        debug!(%latency, "render pipeline: a declared latency arrived with no live audio session");
+        Ok(())
     }
 
     async fn now_playing(&self, snapshot: castaway_core::NowPlaying) -> Result<(), CoreError> {

@@ -56,6 +56,24 @@ pub trait Pipeline: Send + Sync {
         config: Option<bytes::Bytes>,
     ) -> Result<(), CoreError>;
 
+    /// The active sender declared — or revised — its intended playout latency (#176).
+    ///
+    /// Arrives after [`Pipeline::play_audio`] or [`Pipeline::mirror`], because the
+    /// figure rides the protocol's timing plane; the pipeline applies it to whichever
+    /// live audio session is current, as that session's target buffer depth.
+    ///
+    /// Defaulted to "noted and ignored" rather than left abstract, deliberately: the
+    /// declaration is a hint about *how much* to buffer, not a command to play, and a
+    /// pipeline with no mixer behind it (the null pipeline, every test double) has
+    /// nothing to apply it to and nothing to misrepresent by accepting it.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the pipeline could not take the figure.
+    async fn audio_latency(&self, latency: crate::types::DeclaredLatency) -> Result<(), CoreError> {
+        let _ = latency;
+        Ok(())
+    }
+
     /// Update the now-playing surface. Called with a full snapshot whenever any part of
     /// the metadata changes, including artwork arriving after the text.
     ///

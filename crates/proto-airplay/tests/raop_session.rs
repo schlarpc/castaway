@@ -637,7 +637,7 @@ fn answer_timing_probes(timing: UdpSocket) -> tokio::task::JoinHandle<()> {
 /// passing unit tests in `clock.rs` exercised without it ever running.
 #[tokio::test]
 async fn a_raop_session_probes_the_declared_timing_peer_and_folds_in_the_reply() {
-    let (mut stream, _events, diagnostics) = harness::start_watched(MediaPorts::Ephemeral).await;
+    let (mut stream, mut events, diagnostics) = harness::start_watched(MediaPorts::Ephemeral).await;
 
     // Bound *before* they are declared, so the receiver's first probe lands on sockets
     // the test is watching rather than ports nothing answers.
@@ -688,6 +688,23 @@ async fn a_raop_session_probes_the_declared_timing_peer_and_folds_in_the_reply()
         s.sender_latency_frames == 77_175
     })
     .await;
+
+    // …and consumed, not merely counted (#176): the same figure leaves the adapter as
+    // a session event, converted at the boundary — 77175 frames of 44.1 kHz is exactly
+    // 1.75 s — which is what the pipeline adopts as the mixer's target buffer depth.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let declared = loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .expect("waited 2 s for a SessionEvent::AudioLatency that never came");
+        let Ok(Some(msg)) = tokio::time::timeout(remaining, events.recv()).await else {
+            panic!("the event channel closed before the declared latency was emitted");
+        };
+        if let SessionEvent::AudioLatency(latency) = msg.event {
+            break latency;
+        }
+    };
+    assert_eq!(declared.duration(), Duration::from_millis(1750));
     responder.abort();
 }
 

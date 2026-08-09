@@ -19,8 +19,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use castaway_core::{
-    Advertisement, AudioFormat, CoreError, EncodedFrame, FrameSource, LossySend, LossySender,
-    MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
+    Advertisement, AudioFormat, CoreError, DeclaredLatency, EncodedFrame, FrameSource, LossySend,
+    LossySender, MediaPorts, ProtocolKind, SessionEvent, SessionSink, SourceAdapter,
 };
 use substrate_rtsp::rtsp_types::headers::{HeaderName, CONTENT_TYPE, CSEQ, SERVER};
 use substrate_rtsp::rtsp_types::{Message, Response, StatusCode, Version};
@@ -376,14 +376,27 @@ async fn pump(
                             let _ = sink
                                 .emit(SessionEvent::SourceInfo(session.sender_description()))
                                 .await;
+                            // The declared-latency figure is in frames at this plane's
+                            // own rate — 7497 of AAC-ELD, against the RAOP flow's
+                            // 77175 of ALAC — so the conversion is anchored to the
+                            // codec this SETUP negotiated. A zero rate cannot convert
+                            // and forfeits only the declaration, not the audio.
+                            let declared = AudioFormat::from_hz(
+                                params.codec.sample_rate(),
+                                u16::from(params.codec.channels()),
+                            )
+                            .map(|format| DeclaredLatencyReport::new(sink.clone(), format));
                             tokio::spawn(run_audio(
                                 sockets,
                                 stream,
                                 tx,
-                                peer.ip(),
-                                session.sender_peers(),
+                                SenderSide {
+                                    ip: peer.ip(),
+                                    peers: session.sender_peers(),
+                                },
                                 flush_rx.clone(),
                                 Arc::clone(&diagnostics),
+                                declared,
                             ));
                         }
                         None => {
@@ -770,20 +783,23 @@ async fn run_audio(
     sockets: AudioSockets,
     mut stream: AudioStream,
     frames: LossySender<EncodedFrame>,
-    peer_ip: IpAddr,
-    sender_peers: SenderPeers,
+    sender: SenderSide,
     mut flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
     diagnostics: Arc<SessionDiagnostics>,
+    mut declared: Option<DeclaredLatencyReport>,
 ) {
+    let peer_ip = sender.ip;
     let mut timing = TimingClient::new();
     let mut resends = ResendTracker::new();
     // Each peer stands on its own: a plist session may declare a timing port and no
     // control port, and requiring the pair is exactly how mirroring sessions came to
     // run with no timing peer at all (#176).
-    let timing_peer = sender_peers
+    let timing_peer = sender
+        .peers
         .timing
         .map(|p| SocketAddr::new(peer_ip, p.get()));
-    let control_peer = sender_peers
+    let control_peer = sender
+        .peers
         .control
         .map(|p| SocketAddr::new(peer_ip, p.get()));
     let mut probe =
@@ -900,6 +916,12 @@ async fn run_audio(
             Ok(AudioOutput::Sync(sync)) => {
                 diagnostics.sender_latency(sync.latency_frames());
                 debug!(latency = sync.latency_frames(), "AirPlay sync");
+                // The consumption half of #176: the figure the counters record is also
+                // the mixer's target buffer depth, so it goes to the session manager —
+                // once per value, not once per sync packet.
+                if let Some(declared) = declared.as_mut() {
+                    declared.on_sync(sync.latency_frames()).await;
+                }
             }
             Ok(AudioOutput::TimingReply(reply)) => {
                 if let Some(sample) = timing.on_reply(&reply, now_ntp()) {
@@ -933,6 +955,52 @@ enum Socket {
     Audio,
     Control,
     Timing,
+}
+
+/// The sender's half of the media plane: who it is, and which of its ports answer.
+///
+/// One argument because the two mean nothing apart — the declared ports are numbers on
+/// *that* IP, and resolving them anywhere else would aim the timing probes at nobody.
+struct SenderSide {
+    ip: IpAddr,
+    peers: SenderPeers,
+}
+
+/// How the receive loop tells the pipeline what latency the sender declared (#176).
+///
+/// The figure arrives in sync packets, in sample frames at the stream's own rate, long
+/// after the session's audio event went out — which is why it travels as its own
+/// [`SessionEvent::AudioLatency`] rather than as a field of the registration. Converted
+/// to a duration here, at the boundary that knows the rate, and emitted only when the
+/// value changes: senders repeat the same figure roughly once a second for the life of
+/// the session, and the session manager does not need to hear it again.
+struct DeclaredLatencyReport {
+    sink: SessionSink,
+    format: AudioFormat,
+    reported: Option<u32>,
+}
+
+impl DeclaredLatencyReport {
+    fn new(sink: SessionSink, format: AudioFormat) -> Self {
+        Self {
+            sink,
+            format,
+            reported: None,
+        }
+    }
+
+    /// A sync packet named `frames` of latency; pass it on if it is news.
+    async fn on_sync(&mut self, frames: u32) {
+        if self.reported == Some(frames) {
+            return;
+        }
+        self.reported = Some(frames);
+        let latency = DeclaredLatency::from_frames(frames, self.format);
+        info!(frames, %latency, "AirPlay sender declared its latency");
+        // A closed manager is the session ending; the receive loop notices through the
+        // frame channel, and this event has nothing to add to that.
+        let _ = self.sink.emit(SessionEvent::AudioLatency(latency)).await;
+    }
 }
 
 /// Who a starting stream reports to, as distinct from what it runs on.
@@ -1029,10 +1097,13 @@ async fn start_negotiated_audio(
         sockets,
         stream,
         tx,
-        peer.ip(),
-        sender_peers,
+        SenderSide {
+            ip: peer.ip(),
+            peers: sender_peers,
+        },
         flush,
         diagnostics,
+        Some(DeclaredLatencyReport::new(sink.clone(), format)),
     ));
 }
 

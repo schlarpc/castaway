@@ -281,6 +281,16 @@ impl<P: Pipeline> SessionManager<P> {
                 info!(%source, %format, "session: audio");
                 self.pipeline.play_audio(frames, format, config).await
             }
+            SessionEvent::AudioLatency(latency) => {
+                if self.active.as_ref() == Some(&source) {
+                    debug!(%source, %latency, "session: sender declared its latency");
+                    self.pipeline.audio_latency(latency).await
+                } else {
+                    // A backgrounded sender's declaration must not retune the buffer of
+                    // whoever preempted it.
+                    Err(CoreError::NoActiveSession(source.to_string()))
+                }
+            }
             SessionEvent::NowPlaying(snapshot) => {
                 if self.active.as_ref() == Some(&source) {
                     self.pipeline.now_playing(snapshot).await
