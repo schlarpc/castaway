@@ -79,7 +79,17 @@ runs:
         sudo sysctl -w vm.swappiness=60 >/dev/null
         free -h
 
+    # `extra-sandbox-paths`: `checks.android-cast` builds a TAP inside the sandbox's
+    # network namespace to put the Android emulator and the receiver on one L2 segment
+    # (#225). The unprivileged netns works out of the box; creating a tap in it does not,
+    # because the sandbox's /dev has no `net/tun` and a user namespace cannot mknod one.
+    # Bind-mounting the host's is the whole fix. Harmless for every other job — a path in
+    # the sandbox that nothing else opens — and the alternative was keeping the network
+    # leg out of `nix flake check` entirely.
     - uses: DeterminateSystems/nix-installer-action@v22
+      with:
+        extra-conf: |
+          extra-sandbox-paths = /dev/net/tun
 
     # One cache entry per group, not one per store path. magic-nix-cache stored every
     # store path as its own GitHub Actions cache entry; this repository's closure made

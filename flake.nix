@@ -807,6 +807,22 @@
           # deps the default set links.
           fullArgs = fullArgsFor system;
 
+          # The phone, pinned once for both emulator checks (#225). `android-bt` puts it
+          # on netsim's Bluetooth phy and `android-cast` on a TAP segment, but it is the
+          # same image and the same emulator, and two copies of this expression would be
+          # two things to bump and one to forget. `google_apis` rather than
+          # `google_apis_playstore`: it ships Play Services — so the Cast framework and
+          # GMS `MediaRouter` are real — while staying rootable and needing no store
+          # sign-in, and apps arrive by `adb install` of pinned APKs.
+          androidComposition = pkgs.androidenv.composeAndroidPackages {
+            platformVersions = [ "35" ];
+            includeEmulator = true;
+            includeSystemImages = true;
+            systemImageTypes = [ "google_apis" ];
+            abiVersions = [ "x86_64" ];
+            includeNDK = false;
+          };
+
           # What the `hwaccel` feature needs on top of a default build: ffmpeg's headers
           # for `ffmpeg-sys-next` (7.x, matching the crate — nixpkgs defaults to 8.x) and
           # libclang, which its bindgen dlopens. `ash` and `wgpu-hal` need nothing at build
@@ -1075,20 +1091,37 @@
               cargoExtraArgs = "--package castaway --no-default-features --features audio";
               doCheck = false;
             });
-            androidComposition = pkgs.androidenv.composeAndroidPackages {
-              platformVersions = [ "35" ];
-              includeEmulator = true;
-              includeSystemImages = true;
-              systemImageTypes = [ "google_apis" ];
-              abiVersions = [ "x86_64" ];
-              includeNDK = false;
-            };
+            inherit androidComposition;
             # The sender app, pinned the way rule 9 pins fixtures: F-Droid's own build
             # of VLC, fetched by hash. GPL, and a test-time dependency only.
             vlcApk = pkgs.fetchurl {
               url = "https://f-droid.org/repo/org.videolan.vlc_13070108.apk";
               sha256 = "06di28b5v5bpagdk05pbxyrbfij8s8pqknz9q32nqq6qvzx494aa";
             };
+          };
+
+          # The same phone, on a network instead of a radio (#225's second slice). The
+          # emulator's NIC is a TAP that castaway also binds, so mDNS and CASTv2 cross a
+          # real segment, and the sender is Android's own system Cast picker — Play
+          # Services, a different implementation from the openscreen lineage every other
+          # Cast check here uses. That difference is the whole value: it is the surface
+          # #226's three defects were invisible on, and it is what proves device auth
+          # survives a real sender (#40) and that a mirroring session actually completes.
+          # The segment capture lands in the check's output, the network leg's half of
+          # the fixture factory (rule 9). Needs `/dev/net/tun` in the sandbox; the file's
+          # header says why and the check says so itself if it is missing.
+          android-cast = import ./nix/android-cast-test.nix {
+            inherit pkgs androidComposition;
+            castaway = craneLib.buildPackage (fullArgs // {
+              inherit cargoArtifacts;
+              pname = "castaway-android-cast";
+              # Nothing but the protocol: this check terminates a mirroring session and
+              # counts what arrived, and the null pipeline receives RTP exactly as the
+              # real one does. Pulling in `render` would put wgpu and a compositor in a
+              # headless sandbox to decode frames nobody looks at.
+              cargoExtraArgs = "--package castaway --no-default-features";
+              doCheck = false;
+            });
           };
 
           # The mixer against a sound card whose clock is not ours (#204). See the note at
