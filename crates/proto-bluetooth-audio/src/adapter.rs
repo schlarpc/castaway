@@ -33,7 +33,7 @@ use crate::codec::advertised;
 use crate::control::AvrcpControl;
 use crate::host::{HostAction, HostConfig, HostController};
 use crate::media::Depacketizer;
-use crate::obex::{CoverArtSession, FetchState, Fetched};
+use crate::obex::{ChosenImage, CoverArtSession, FetchState, Fetched};
 use crate::sink::{SinkEvent, SinkSession};
 use crate::{avdtp, Message};
 
@@ -407,8 +407,11 @@ enum SettingsQuery {
 /// thumbnail's pixels and still bounded, while a peer offering 2048x2048 would spend
 /// several seconds of contended radio on decoration and risk the thing it decorates.
 ///
-/// It does not bind on any peer measured so far — iOS tops out at 280x280 from every app
-/// tried. It exists for the one that does not.
+/// iOS never reaches it — 280x280 from every app tried — but Android does: it advertises a
+/// `100*100-1280*1080` transcode range, and this is the number that comes back from it. So
+/// the bound has to *shape the request*, not veto the offer, which is what it was doing
+/// (#245): a range is clamped into by [`crate::obex::PixelSize::best_within`], and only a
+/// form whose smallest size is already over 512 is skipped.
 const MAX_COVER_ART_SIDE: u16 = 512;
 
 /// The most a *declared* cover-art size may be before the form is skipped.
@@ -2256,6 +2259,12 @@ impl BluetoothAdapter {
     /// stores nothing — it renders from `MPMediaItemArtwork` on demand — so the spec's
     /// data model does not describe what the peer is doing.
     ///
+    /// Android answers a different shape again: a fixed 200×200 native beside JPEG and PNG
+    /// *ranges* running to 1280×1080, which is an offer to transcode rather than a set of
+    /// forms held. What that costs is that the size has to be chosen here and named
+    /// concretely — see [`ChosenImage`] and #245, which is where this settled for the
+    /// phone's thumbnail for a while.
+    ///
     /// Still under the properties gate, which now needs re-weighing: it was written when
     /// this was a diagnostic and it is now a feature.
     fn upgrade_cover_art(
@@ -2276,12 +2285,13 @@ impl BluetoothAdapter {
         // The best form on offer that is worth the airtime — see [`MAX_COVER_ART_SIDE`].
         // Only one strictly larger than the linked thumbnail earns a second fetch; BIP
         // fixes that at 200×200, so anything at or below it is what we already have.
-        let Some((variant, (w, h))) =
+        let Some(chosen) =
             properties.largest_decodable_within(MAX_COVER_ART_SIDE, MAX_COVER_ART_BYTES)
         else {
             debug!("cover art: nothing on offer we can decode within the airtime budget");
             return;
         };
+        let (w, h) = chosen.size();
         if u32::from(w) * u32::from(h) <= 200 * 200 {
             debug!(
                 w,
@@ -2289,7 +2299,6 @@ impl BluetoothAdapter {
             );
             return;
         }
-        let variant = variant.clone();
         let Some((cid, art)) = &mut link.art else {
             return;
         };
@@ -2297,7 +2306,7 @@ impl BluetoothAdapter {
         let Some(session) = art.session_mut() else {
             return;
         };
-        if !session.fetch_image(handle.clone(), &variant) {
+        if !session.fetch_image(handle.clone(), chosen) {
             return;
         }
         link.art_upgraded = Some(handle.clone());
@@ -2514,7 +2523,7 @@ impl BluetoothAdapter {
                 info!(
                     handle = properties.handle.as_deref().unwrap_or("?"),
                     variants = properties.variants.len(),
-                    largest = ?properties.largest_decodable().map(|(_, size)| size),
+                    largest = ?properties.largest_decodable().map(ChosenImage::size),
                     "bluetooth: peer's image properties"
                 );
                 for variant in &properties.variants {

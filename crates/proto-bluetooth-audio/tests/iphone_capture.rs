@@ -21,7 +21,7 @@ use std::time::Duration;
 use proto_bluetooth_audio::avrcp::{
     self, RepeatSetting, SettingAttribute, SettingValue, ShuffleSetting,
 };
-use proto_bluetooth_audio::obex::{Encoding, ImageProperties, PixelSize, VariantKind};
+use proto_bluetooth_audio::obex::{ChosenImage, Encoding, ImageProperties, PixelSize, VariantKind};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
@@ -174,7 +174,7 @@ fn an_iphone_holds_its_cover_art_at_200x200() {
     // The number #75 asks for. 280×280 against the 200×200 we already fetch is not worth
     // the `GetImage` descriptor negotiation the issue's step 3 would have cost.
     assert_eq!(
-        props.largest_decodable().map(|(_, size)| size),
+        props.largest_decodable().map(ChosenImage::size),
         Some((280, 280))
     );
 }
@@ -200,18 +200,21 @@ fn the_larger_variant_can_be_asked_for_in_the_phones_own_spelling() {
     // rather than storing it, so BIP's "native means the stored form" does not bind it.
     // The only way to find out is to fetch it, which means building a descriptor.
     //
-    // The descriptor has to echo the responder's *own* encoding token and pixel spelling,
-    // because BIP compares them as strings. That is why the variant builds it rather than
-    // the caller: a form the peer never listed cannot be named.
+    // The descriptor has to echo the responder's *own* encoding token, because BIP
+    // compares those as strings. That is why the listing builds it rather than the caller:
+    // a form the peer never listed cannot be named (#245 moved the construction from the
+    // variant to the selector, so the pixel field is a size that was checked against the
+    // peer's own descriptor rather than a copy of its text).
     let props = ImageProperties::parse(&fixture("iphone-image-properties.xml")).unwrap();
-    let large = &props.variants[1];
-    let descriptor = large
-        .descriptor()
+    let large = props
+        .largest_decodable()
         .expect("a form with a size can be asked for");
+    assert_eq!(large.size(), (280, 280));
+    let descriptor = large.descriptor();
     assert!(descriptor.contains(r#"encoding="JPEG""#));
     assert!(
         descriptor.contains(r#"pixel="280*280""#),
-        "the pixel field must round-trip to the text the phone sent: {descriptor}"
+        "the pixel field must name the size the phone listed: {descriptor}"
     );
     assert!(descriptor.starts_with("<image-descriptor version=\"1.0\">"));
 

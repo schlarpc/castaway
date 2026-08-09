@@ -517,21 +517,18 @@ impl CoverArtSession {
         self.start(Fetch::Properties(handle.into()))
     }
 
-    /// Ask for one named form of an image, from a listing the peer gave us.
+    /// Ask for one form of an image, at a size the peer's own listing allows.
     ///
-    /// `variant` must have come from that peer's own [`ImageProperties`] — BIP requires
-    /// the descriptor to match a form the responder advertised, so this takes the parsed
-    /// variant rather than a width and height, and a size we invented cannot be requested.
+    /// Takes a [`ChosenImage`] rather than a width and a height because BIP requires the
+    /// descriptor to match what the responder advertised: the only way to obtain one is to
+    /// pick it out of that peer's [`ImageProperties`], so a form we invented cannot be
+    /// requested and a range cannot be asked for verbatim.
     ///
-    /// Returns `false` if the session is busy, or if the variant carries no pixel size to
-    /// name (in which case there is nothing to put in the descriptor).
-    pub fn fetch_image(&mut self, handle: impl Into<String>, variant: &ImageVariant) -> bool {
-        let Some(descriptor) = variant.descriptor() else {
-            return false;
-        };
+    /// Returns `false` if the session is busy.
+    pub fn fetch_image(&mut self, handle: impl Into<String>, image: ChosenImage<'_>) -> bool {
         self.start(Fetch::Image {
             handle: handle.into(),
-            descriptor,
+            descriptor: image.descriptor(),
         })
     }
 
@@ -849,9 +846,11 @@ impl PixelSize {
 
     /// Re-spell this size the way BIP writes it.
     ///
-    /// Needed because a `GetImage` descriptor has to name a form the responder listed,
-    /// and it compares them as strings — so the round trip through this type has to come
-    /// back to the same text the peer sent.
+    /// A parse/print round trip, used to check the grammar against real listings. **Not**
+    /// how a `GetImage` descriptor is built: it once was, on the reasoning that a
+    /// responder compares descriptors as strings and so should be handed its own text
+    /// back, but that reasoning only holds for a `Fixed` — echoing a *range* asks for a
+    /// form nobody holds (#245). [`ChosenImage::descriptor`] names one concrete size.
     #[must_use]
     pub fn as_written(self) -> String {
         match self {
@@ -870,10 +869,13 @@ impl PixelSize {
         }
     }
 
-    /// The largest size this descriptor can yield.
+    /// The ceiling this descriptor states.
     ///
-    /// The question a properties listing is read to answer: a range is worth as much as
-    /// its ceiling, because that is what a `GetImage` against it would return.
+    /// What the peer will go up to, and so the honest answer to "how big is the art on
+    /// offer" — but **not** a size to ask for. A range is an invitation to name a size
+    /// inside it, not a promise of one, and reading the ceiling as the request is what
+    /// made a bounded selector discard every ranged offer instead of clamping into it
+    /// (#245). [`Self::best_within`] is the question a fetch should ask.
     #[must_use]
     pub const fn largest(self) -> (u16, u16) {
         match self {
@@ -890,6 +892,77 @@ impl PixelSize {
             } => (max_width, max_height),
         }
     }
+
+    /// The largest size inside this descriptor with no side over `max_side`.
+    ///
+    /// The size a `GetImage` should actually name. `None` only when the *smallest* form
+    /// the descriptor offers is already over the ceiling — that is the one case where a
+    /// bound should discard an offer rather than clamp into it, because there is nothing
+    /// inside it we are allowed to ask for.
+    ///
+    /// The two range forms are clamped differently, and it matters:
+    ///
+    /// - A [`Self::Range`] is a *box*. BIP lets the client name any pair inside it, and the
+    ///   box's corner need not be the picture's shape — Android advertises a hardcoded
+    ///   `100*100-1280*1080` over artwork that is square — so each side is clamped on its
+    ///   own and the aspect ratio is left to the responder, which is the only party that
+    ///   knows it.
+    /// - A [`Self::FixedRatioRange`] is a *line*. Its whole point is that the ratio is
+    ///   pinned to the ceiling's, so it is scaled to fit; clamping its sides independently
+    ///   would name a shape the peer did not offer.
+    #[must_use]
+    pub fn best_within(self, max_side: u16) -> Option<(u16, u16)> {
+        match self {
+            // One size on offer: take it, or there is nothing here.
+            Self::Fixed { width, height } => {
+                if width <= max_side && height <= max_side {
+                    Some((width, height))
+                } else {
+                    None
+                }
+            }
+            Self::Range {
+                min_width,
+                min_height,
+                max_width,
+                max_height,
+            } => {
+                if min_width > max_side || min_height > max_side {
+                    return None;
+                }
+                Some((max_width.min(max_side), max_height.min(max_side)))
+            }
+            Self::FixedRatioRange {
+                min_width,
+                max_width,
+                max_height,
+            } => {
+                let longest = max_width.max(max_height);
+                if longest <= max_side {
+                    return Some((max_width, max_height));
+                }
+                // Both sides shrink by the same factor, floored so the longer one lands on
+                // the ceiling exactly rather than a pixel over it.
+                let width = scaled(max_width, max_side, longest);
+                let height = scaled(max_height, max_side, longest);
+                // The ratio has no lower height to check against — the grammar states one
+                // only for the width, and the height follows from it.
+                (width >= min_width).then_some((width, height))
+            }
+        }
+    }
+}
+
+/// `value * numerator / denominator`, floored.
+///
+/// `u32` for the product, because two `u16` sides multiplied leave the type the sides are
+/// measured in — 65535 × 512 is the case this exists to survive. The quotient comes back
+/// inside it: every caller passes a `value` no larger than the `denominator`.
+fn scaled(value: u16, numerator: u16, denominator: u16) -> u16 {
+    // `max(1)` on the divisor rather than a stated precondition: `0*0` is spellable in the
+    // pixel grammar, and a division that cannot panic beats one that must not (rule 7).
+    let scaled = u32::from(value) * u32::from(numerator) / u32::from(denominator.max(1));
+    u16::try_from(scaled).unwrap_or(u16::MAX)
 }
 
 /// A `w*h` pair, both parts mandatory.
@@ -946,23 +1019,62 @@ pub struct ImageVariant {
     pub size: Option<ByteSize>,
 }
 
-impl ImageVariant {
-    /// The `Img-Description` XML that asks for exactly this form.
-    ///
-    /// Built from the variant the peer itself listed rather than from a size we chose, so
-    /// a descriptor naming a form the responder never offered cannot be constructed —
-    /// which BIP requires and which is the whole reason `GetImage` is only reachable after
-    /// a properties listing has been read.
-    ///
-    /// `None` for a descriptor with no pixel size, since there would be nothing to name.
-    /// The layout is `obexd/client/bip.c`'s, newlines included.
+/// One form on offer, at the size we would ask it for.
+///
+/// The pair exists because neither half is a request on its own. A `<variant>` carrying a
+/// pixel *range* is an offer to transcode into anything inside it, so the descriptor that
+/// goes on the wire has to name one concrete size — spelling the range back verbatim asks
+/// for a form no responder holds (#245).
+///
+/// Only [`ImageProperties::largest_decodable_within`] constructs one, and only from a size
+/// it has checked against the peer's own descriptor. That is what keeps "a size the
+/// responder never offered" unrepresentable, which BIP requires and which is the whole
+/// reason `GetImage` is only reachable after a properties listing has been read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChosenImage<'a> {
+    variant: &'a ImageVariant,
+    size: (u16, u16),
+}
+
+impl<'a> ChosenImage<'a> {
+    /// The form the peer listed.
     #[must_use]
-    pub fn descriptor(&self) -> Option<String> {
-        let pixel = self.pixel?.as_written();
-        Some(format!(
-            "<image-descriptor version=\"1.0\">\n<image encoding=\"{}\" pixel=\"{pixel}\"/>\n</image-descriptor>\n",
-            self.encoding.token(),
-        ))
+    pub const fn variant(self) -> &'a ImageVariant {
+        self.variant
+    }
+
+    /// The size that will be asked for, width then height.
+    #[must_use]
+    pub const fn size(self) -> (u16, u16) {
+        self.size
+    }
+
+    /// The `Img-Description` XML that asks for exactly this form at exactly this size.
+    ///
+    /// The encoding is echoed in the responder's own spelling, because BIP compares those
+    /// as strings and a peer that wrote `jpeg` would not recognise `JPEG` back. The pixel
+    /// field is always the concrete `w*h` chosen here, never a range. The layout is
+    /// `obexd/client/bip.c`'s, newlines included.
+    #[must_use]
+    pub fn descriptor(self) -> String {
+        let (width, height) = self.size;
+        format!(
+            "<image-descriptor version=\"1.0\">\n<image encoding=\"{}\" pixel=\"{width}*{height}\"/>\n</image-descriptor>\n",
+            self.variant.encoding.token(),
+        )
+    }
+
+    /// Whether this form is the cheap one to move, at a size two forms both reach.
+    ///
+    /// Only reachable since a ranged offer stopped being discarded: Android lists a JPEG
+    /// range and a PNG range over the same picture with the same bounds, so clamped into
+    /// the airtime ceiling they come out at identical dimensions and the pixel count
+    /// cannot separate them. Their cost can — a 512×512 photograph is tens of kilobytes as
+    /// JPEG and several hundred as PNG — and this is a link already carrying the audio the
+    /// picture belongs to. JPEG alone, rather than a lossy/lossless table: it is the form
+    /// AVRCP fixes for the thumbnail, so it is the one every responder is known to produce.
+    fn cheap_for_the_radio(self) -> bool {
+        matches!(self.variant.encoding.format(), Some(ImageFormat::Jpeg))
     }
 }
 
@@ -1063,7 +1175,7 @@ impl ImageProperties {
     /// use — BIP offers that encoding and nothing in this tree reads it — and reporting it
     /// as the ceiling would answer #75's question with a number no code path could reach.
     #[must_use]
-    pub fn largest_decodable(&self) -> Option<(&ImageVariant, (u16, u16))> {
+    pub fn largest_decodable(&self) -> Option<ChosenImage<'_>> {
         self.largest_decodable_within(u16::MAX, u64::MAX)
     }
 
@@ -1079,22 +1191,40 @@ impl ImageProperties {
     /// `max_bytes` is only checked against a size the descriptor actually states, which in
     /// practice means a `<variant>`'s `maxsize`. A form that declares nothing is judged on
     /// its pixels alone, because guessing a compression ratio would refuse real images.
+    ///
+    /// `max_side` **bounds the request rather than eliminating the offer** (#245): a
+    /// ranged variant is clamped into the ceiling by [`PixelSize::best_within`], and only
+    /// a form whose smallest size is already over it is dropped. Judging a range by its
+    /// ceiling is what made an Android phone offering `100*100-1280*1080` come back as
+    /// "nothing larger than the thumbnail on offer" and land us on its 200×200 native.
     #[must_use]
     pub fn largest_decodable_within(
         &self,
         max_side: u16,
         max_bytes: u64,
-    ) -> Option<(&ImageVariant, (u16, u16))> {
+    ) -> Option<ChosenImage<'_>> {
         self.variants
             .iter()
             .filter(|v| v.encoding.format().is_some())
             .filter(|v| match v.size {
+                // A `maxsize` bounds every size inside a range, so it still holds for the
+                // smaller one we clamp to. Loose, but never wrong in the direction that
+                // spends airtime.
                 Some(ByteSize::Exact(n) | ByteSize::AtMost(n)) => n <= max_bytes,
                 None => true,
             })
-            .filter_map(|v| v.pixel.map(|p| (v, p.largest())))
-            .filter(|(_, (w, h))| *w <= max_side && *h <= max_side)
-            .max_by_key(|(_, (w, h))| u32::from(*w) * u32::from(*h))
+            .filter_map(|v| {
+                Some(ChosenImage {
+                    variant: v,
+                    size: v.pixel?.best_within(max_side)?,
+                })
+            })
+            .max_by_key(|c| {
+                (
+                    u32::from(c.size.0) * u32::from(c.size.1),
+                    c.cheap_for_the_radio(),
+                )
+            })
     }
 }
 
@@ -1699,6 +1829,122 @@ mod tests {
         assert_eq!(PixelSize::parse("+70*10"), None);
         assert_eq!(PixelSize::parse(" 200*200 "), None);
         assert_eq!(PixelSize::parse("garbage"), None);
+
+        // Each form re-spells to the text it was read from, which is what says the three
+        // grammars stayed three rather than collapsing into one on the way in.
+        for text in ["200*200", "80*60-640*480", "80**-640*480"] {
+            assert_eq!(PixelSize::parse(text).unwrap().as_written(), text);
+        }
+    }
+
+    #[test]
+    fn a_ceiling_is_something_a_range_is_clamped_into_not_dropped_for() {
+        // #245. The premise this replaces was that "a range is worth as much as its
+        // ceiling, because that is what a GetImage against it would return" — which reads
+        // an *invitation to name a size* as a promise of one, and so answers a bounded
+        // question with "nothing on offer" for every peer that transcodes.
+        let fixed = PixelSize::parse("200*200").unwrap();
+        assert_eq!(fixed.best_within(512), Some((200, 200)));
+        assert_eq!(
+            fixed.best_within(128),
+            None,
+            "a fixed form is take it or leave it"
+        );
+
+        // The Android listing from the bench: the ceiling is over ours, the floor is under
+        // it, so there is a size inside the offer to ask for.
+        let range = PixelSize::parse("100*100-1280*1080").unwrap();
+        assert_eq!(range.largest(), (1280, 1080), "still the ceiling it states");
+        assert_eq!(range.best_within(512), Some((512, 512)));
+        assert_eq!(
+            range.best_within(2000),
+            Some((1280, 1080)),
+            "a ceiling under ours is not something to clamp"
+        );
+
+        // Each side on its own, because a range is a box and BIP lets a client name any
+        // pair inside it — the corner is not the picture's shape, and Android's `1280*1080`
+        // is a constant in its properties builder rather than a measurement of the artwork.
+        assert_eq!(
+            PixelSize::parse("100*100-1280*400")
+                .unwrap()
+                .best_within(512),
+            Some((512, 400))
+        );
+
+        // The one case a bound should still refuse: the *smallest* form on offer is over
+        // it, so there is nothing inside the range we are allowed to ask for.
+        assert_eq!(
+            PixelSize::parse("600*600-1280*1080")
+                .unwrap()
+                .best_within(512),
+            None
+        );
+    }
+
+    #[test]
+    fn the_aspect_pinned_range_is_scaled_rather_than_clamped_per_side() {
+        // `80**-640*480` says the ratio is fixed, so the sizes inside it are the scalings
+        // of its ceiling and nothing else. Clamping the sides independently would name
+        // 512×480 — a 16:15 image the peer never offered.
+        let ratio = PixelSize::parse("80**-640*480").unwrap();
+        assert_eq!(ratio.best_within(512), Some((512, 384)), "4:3, preserved");
+        assert_eq!(
+            ratio.best_within(640),
+            Some((640, 480)),
+            "under the ceiling, untouched"
+        );
+
+        // The tall case: the *height* is the binding side, and the width follows it down.
+        assert_eq!(
+            PixelSize::parse("10**-480*640").unwrap().best_within(512),
+            Some((384, 512))
+        );
+
+        // And the floor still applies — a lower bound above the ceiling leaves nothing to
+        // ask for, exactly as for a plain range.
+        assert_eq!(
+            PixelSize::parse("600**-1280*1080")
+                .unwrap()
+                .best_within(512),
+            None
+        );
+    }
+
+    #[test]
+    fn a_ranged_offer_is_asked_for_at_one_concrete_size() {
+        // The coupled half of #245: a selector that picks a range is no use if the
+        // descriptor then spells the range back. `100*100-1280*1080` is a form no
+        // responder holds, and asking for it is asking to be refused.
+        //
+        // Reconstructed from the bench log of 2026-08-08 (an Android phone over LDAC),
+        // not a capture — the phone's own bytes were never saved, only the parse.
+        let doc = br#"<image-properties version="1.0" handle="7161797">
+<native encoding="JPEG" pixel="200*200" size="160000"/>
+<variant encoding="JPEG" pixel="100*100-1280*1080"/>
+<variant encoding="PNG" pixel="100*100-1280*1080"/>
+</image-properties>"#;
+        let props = ImageProperties::parse(doc).unwrap();
+
+        let chosen = props.largest_decodable_within(512, 1024 * 1024).unwrap();
+        assert_eq!(
+            chosen.size(),
+            (512, 512),
+            "512 a side, where this used to settle for the 200x200 native"
+        );
+        // JPEG over PNG at the same pixels: the ceiling is an airtime budget, and the two
+        // forms do not cost the same to move.
+        assert_eq!(
+            chosen.variant().encoding,
+            Encoding::Known(ImageFormat::Jpeg, "JPEG".to_owned())
+        );
+
+        let descriptor = chosen.descriptor();
+        assert!(
+            descriptor.contains(r#"pixel="512*512""#),
+            "one size, not a range: {descriptor}"
+        );
+        assert!(descriptor.contains(r#"encoding="JPEG""#));
     }
 
     #[test]
@@ -1713,10 +1959,10 @@ mod tests {
 <variant encoding="JPEG" pixel="200*200"/>
 </image-properties>"#;
         let props = ImageProperties::parse(doc).unwrap();
-        let (variant, size) = props.largest_decodable().unwrap();
-        assert_eq!(size, (600, 600));
+        let chosen = props.largest_decodable().unwrap();
+        assert_eq!(chosen.size(), (600, 600));
         assert_eq!(
-            variant.encoding,
+            chosen.variant().encoding,
             Encoding::Known(ImageFormat::Jpeg, "JPEG".to_owned())
         );
         // …and the one we cannot decode is still recorded, because a capture should say

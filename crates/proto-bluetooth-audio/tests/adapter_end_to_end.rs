@@ -20,7 +20,7 @@ use proto_bluetooth_audio::adapter::{BluetoothAdapter, BluetoothConfig};
 use proto_bluetooth_audio::avctp::CommandResponse;
 use proto_bluetooth_audio::avdtp::{Message, Seid, Signal};
 use proto_bluetooth_audio::codec::{ChannelModes, CodecCapability, SampleRates};
-use proto_bluetooth_audio::obex::{Header as ObexHeader, ObexPacket};
+use proto_bluetooth_audio::obex::{ChosenImage, Header as ObexHeader, ObexPacket};
 use substrate_hci::{
     event::code, AclPacket, BdAddr, ConnectionHandle, HciPacket, HciTransport, PacketBoundary,
     ScriptedTransport, Status,
@@ -1914,7 +1914,7 @@ async fn a_form_too_large_for_the_radio_is_declined_in_favour_of_the_thumbnail()
 </image-properties>"#;
     let props = ImageProperties::parse(huge).unwrap();
     assert_eq!(
-        props.largest_decodable().map(|(_, s)| s),
+        props.largest_decodable().map(ChosenImage::size),
         Some((2048, 2048)),
         "the offer itself is unbounded"
     );
@@ -1922,7 +1922,7 @@ async fn a_form_too_large_for_the_radio_is_declined_in_favour_of_the_thumbnail()
     assert_eq!(
         props
             .largest_decodable_within(512, u64::MAX)
-            .map(|(_, s)| s),
+            .map(ChosenImage::size),
         Some((200, 200)),
         "so we fall back to the native, which is the thumbnail we already fetched"
     );
@@ -1936,9 +1936,57 @@ async fn a_form_too_large_for_the_radio_is_declined_in_favour_of_the_thumbnail()
     assert_eq!(
         props
             .largest_decodable_within(512, 1024 * 1024)
-            .map(|(_, s)| s),
+            .map(ChosenImage::size),
         Some((200, 200)),
         "nine megabytes of cover art is not worth the radio"
+    );
+}
+
+#[tokio::test]
+async fn a_ranged_offer_over_the_ceiling_is_clamped_into_rather_than_declined() {
+    // The other side of the ceiling, and the bug #245 reported. A `<variant>` carrying a
+    // pixel *range* is an offer to transcode into anything inside it, so a ceiling above
+    // ours bounds the *request*; judging the offer by that ceiling threw away the only
+    // forms worth having and left the first Android phone on the bench fetching its
+    // 200×200 native — fewer pixels than an iPhone's 280.
+    //
+    // Reconstructed from the bench log of 2026-08-08, not a capture.
+    use proto_bluetooth_audio::obex::{CoverArtSession, ImageProperties};
+    let android = br#"<image-properties version="1.0" handle="7161797">
+<native encoding="JPEG" pixel="200*200" size="160000"/>
+<variant encoding="JPEG" pixel="100*100-1280*1080"/>
+<variant encoding="PNG" pixel="100*100-1280*1080"/>
+</image-properties>"#;
+    let props = ImageProperties::parse(android).unwrap();
+    // 512 is the adapter's ceiling; mirrored here because the constant is private.
+    let chosen = props
+        .largest_decodable_within(512, 1024 * 1024)
+        .expect("a range whose floor is under the ceiling has a size inside it");
+    assert_eq!(chosen.size(), (512, 512), "clamped into, not dropped for");
+
+    // …and what goes on the wire names that one size. Spelling the range back would ask
+    // for a form no responder holds.
+    let mut session = CoverArtSession::new(0x400);
+    session
+        .feed(
+            &ObexPacket {
+                code: 0xA0,
+                prefix: Bytes::from_static(&[0x10, 0x00, 0x04, 0x00]),
+                headers: vec![ObexHeader::ConnectionId(1)],
+            }
+            .encode(),
+        )
+        .unwrap();
+    assert!(session.fetch_image("7161797", chosen));
+    let get = ObexPacket::decode(&session.next_request().expect("a GET"), 0).unwrap();
+    assert!(
+        get.headers.iter().any(|h| matches!(
+            h,
+            ObexHeader::ImageDescription(d)
+                if d.contains(r#"pixel="512*512""#) && d.contains(r#"encoding="JPEG""#)
+        )),
+        "one concrete size, in the peer's own encoding token: {:?}",
+        get.headers
     );
 }
 
@@ -1954,7 +2002,7 @@ async fn a_peer_offering_nothing_bigger_than_the_thumbnail_is_not_asked_twice() 
 </image-properties>"#;
     let props = ImageProperties::parse(same).unwrap();
     assert_eq!(
-        props.largest_decodable().map(|(_, size)| size),
+        props.largest_decodable().map(ChosenImage::size),
         Some((200, 200)),
         "nothing on offer beyond what a thumbnail fetch already returns"
     );
