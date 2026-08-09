@@ -198,7 +198,16 @@ that re-declares on a timer holds a passcode on the screen forever.
 |---|---|---|
 | `_matterd._udp` | we advertise | `VP=<vid>+<pid>`, `DT=35` (Casting Video Player), `DN`, `SII`, `SAI` |
 | `_matterc._udp` | we browse | the commissionable node named in a UDC message |
-| `_matter._tcp` | **neither** | the panel's operational node lives only on a fabric it created; the phone learns that address while being commissioned |
+| `_matter._tcp` | we advertise, **once the fabric has a member** (#173) | instance `<compressed-fabric-id>-<node-id>`, uppercase hex; `SII`, `SAI`, `SAT`; the `_I<compressed-fabric-id>` sub-type |
+
+The operational record is deliberately not in the startup advertisement list: its
+instance name *is* the compressed fabric id, so it cannot be built before the fabric
+exists, and there is nobody entitled to resolve it until a phone has been commissioned.
+It goes up through the shared responder's late handle the first time the client list is
+non-empty — at boot, for a panel restarted with commissioned phones, which is exactly the
+panel a returning phone has to find. The `SII`/`SAI`/`SAT` values matter beyond
+discovery: `rs-matter` seeds a fresh CASE session's MRP parameters from the resolve TXT,
+because it does not yet exchange them in CASE Sigma1/2.
 
 `DT=35` is what makes a phone list the panel under "TVs" rather than as an unrecognised
 node. It is decimal in the TXT record and `0x0023` everywhere else.
@@ -276,18 +285,17 @@ What is still untested is a *real* phone: an implementation that has never seen 
 whose UDC retransmit timing, TXT-key expectations and instance-name casing are its own.
 `instance_matches` is case-insensitive on a guess about that, not a measurement.
 
-**The panel's operational record is not advertised, and the cast rides session reuse.**
-`advertisements()` publishes `_matterd._udp` only — the comment there says the phone
-"learns the address during commissioning rather than by browsing", and the VM test
-confirms that holds: the `LaunchURL` goes out over the CASE session `complete_via_case`
-established, on the first attempt.
-
-It stops holding when that session is gone — an idle timeout, a panel restart, a phone
-that sleeps overnight. `rs-matter`'s `Transport::initiate` reuses a live session and
-otherwise resolves `<compressed-fabric-id>-<node-id>._matter._tcp`, which this panel does
-not publish, so a returning phone has nothing to resolve. `matter-vm` casts seconds after
-commissioning and therefore takes the reuse branch every time, which is exactly why the
-harness passing does not close this. Issue **#173**.
+**The cast right after commissioning rides session reuse; the cast after a restart rides
+the operational record.** `rs-matter`'s `Transport::initiate` reuses a live CASE session
+and otherwise resolves `<compressed-fabric-id>-<node-id>._matter._tcp` — and an idle
+timeout, a panel restart or a phone asleep overnight all land on the second branch. The
+first shipped version published no such record, so a returning phone had nothing to
+resolve and could never cast again without re-commissioning; that was issue **#173**, and
+the record described in §4 closed it. `matter-vm` now proves both branches: the first
+cast seconds after `complete_via_case` (reuse, first attempt), and a second cast after
+`systemctl restart castaway.service` by a `--cast-again` peer that persisted its fabric
+(`DirKvBlobStore`) and re-established CASE off the resolve — before the fix that scenario
+failed exactly there, at the resolve.
 
 **Attestation runs the *other* way, and the first draft of this section said otherwise.**
 Worth stating precisely, because the inversion catches this too. During commissioning it

@@ -606,7 +606,7 @@ play`. STATUS.md has not caught up.
 | Passcode generation + stability | T0+T1+**T2** | `server.rs`; `udc_over_the_wire.rs::five_copies_produce_one_passcode` | found the bug that mattered — five retransmits producing five different numbers. The VM peer sends **one** declaration |
 | Commissioning window / expiry | T0 | `server.rs` (2) | **the prompt is never taken down on expiry.** `expire` runs only when the next datagram arrives; `UdcServer::run` has no timer; the OSD message is sticky. A phone that walks away leaves an 8-digit passcode on a wall panel indefinitely |
 | PASE / `AddNOC` / CASE | **T2** (ours) / **INHERITED** (core) | `matter-vm` journal asserts each stage, `node_id=4096` | `rs-matter`'s own `tests/{pase,case,...}.rs` are **not executed by anything in this repo**; and it is the same library on both sides of the VM |
-| Our CA + persistence | T0 | `fabric.rs` (5) | file round-trip only. **Nothing restarts the panel** — `install_fabric` rebuilding an identical NOC and `seed_acls` re-admitting yesterday's phones are reasoned about and proven nowhere |
+| Our CA + persistence | T0+**T2** | `fabric.rs` (5); `matter-vm`'s restart scenario (#173) | the VM now restarts the panel: `install_fabric` rebuilding an identical-to-a-client NOC and `seed_acls` re-admitting yesterday's phone are what the post-restart CASE + `LaunchURL` prove |
 | ACL privilege (`Operate`, not `Administer`) | **T2** | `matter-peer --read-acl`: reading the Access Control cluster needs Administer, and the commissioned client has to be refused | one attribute stands for the whole privilege level; nothing tries an Administer-only *invoke* |
 | Endpoint tree / Descriptor | T0+**T2** | `node.rs` (the tree and the target mapping); `matter-peer --read-descriptor` reads the root, the player and a content app back through the interaction model | the parts list is asserted exactly; the attribute and command lists are not read at all |
 | ContentLauncher `LaunchURL` | **T2 (endpoint 1)** + T0 | `matter-vm`; `player.rs` | still only the player endpoint. A *`LaunchURL`* into a content app is untested, though `LaunchContent` now reaches one |
@@ -614,7 +614,7 @@ play`. STATUS.md has not caught up.
 | Other clusters (KeypadInput, ApplicationLauncher, OnOff, …) | **NONE — not implemented** | — | a code gap before a test gap (#172) |
 | Session teardown | **NONE — no producer** | — | `CastCommand::End` is constructed nowhere; `MediaPlayback::Stop` maps to `ControlTxn::Stop`. The arm in `pump_commands` is dead code |
 | Commissioning failure paths | **NONE** | — | `commission_loop`'s error arm logs and **sends no `CommissionerDeclaration` at all**; `CdError` 1–10 have no producer. A mistyped passcode gets silence |
-| Re-cast after CASE session loss | **NONE — known broken** | — | **#173**: no `_matter._tcp` operational record, and the VM always takes rs-matter's session-reuse branch |
+| Re-cast after CASE session loss | **T2** | `matter-vm`: `systemctl restart castaway.service`, then `matter-peer --cast-again` (persisted fabric, no re-commissioning) resolves the `_matter._tcp` operational record and re-establishes CASE (#173) | the loss exercised is a panel restart; an idle-timeout or table-evicted session takes the same resolve path but is not separately staged |
 | Multi-client | **NONE** | — | `commission_loop` is serial and each attempt can block 60 s; a second phone's 180 s passcode can expire in the queue |
 
 **A connectedhomeip peer is feasible, and cheaply.** nixpkgs ships `python-matter-server`,
