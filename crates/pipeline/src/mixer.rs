@@ -817,6 +817,15 @@ pub struct MixerCounters {
     /// the device's clock misbehaving — the one way this module can be wrong that no
     /// input-side counter would show.
     pub emitted: u64,
+    /// Frames in which at least one sample hit the clamp's rail, after the gain.
+    ///
+    /// Hard clipping is the deliberate policy — two sources at once is the case this
+    /// mixer exists for, and their sum can leave the unit range — but the policy rested
+    /// on it being *rare*, and nothing measured that (#233). Outside the identity below:
+    /// a clipped frame is still an emitted frame, this says what condition it was in. A
+    /// panel squaring off into distortion for an hour was invisible to every counter,
+    /// and "turn it down" is only sayable if something counts it.
+    pub clipped: u64,
 }
 
 impl MixerCounters {
@@ -834,6 +843,7 @@ impl MixerCounters {
             shed: self.shed.saturating_sub(earlier.shed),
             dropped: self.dropped.saturating_sub(earlier.dropped),
             emitted: self.emitted.saturating_sub(earlier.emitted),
+            clipped: self.clipped.saturating_sub(earlier.clipped),
         }
     }
 
@@ -871,6 +881,7 @@ struct Shared {
     shed: AtomicU64,
     dropped: AtomicU64,
     emitted: AtomicU64,
+    clipped: AtomicU64,
     /// The loudest sample the device was given since the last report.
     ///
     /// Measured *after* [`Gain`], because the question it answers is what the speakers
@@ -902,6 +913,7 @@ impl Shared {
             shed: self.shed.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             emitted: self.emitted.load(Ordering::Relaxed),
+            clipped: self.clipped.load(Ordering::Relaxed),
         }
     }
 }
@@ -951,6 +963,7 @@ impl AudioMixer {
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
+            clipped: AtomicU64::new(0),
             peak: AtomicU32::new(0),
         });
         let thread = {
@@ -1088,6 +1101,7 @@ struct MixCounters<'a> {
     idle: &'a AtomicU64,
     drained: &'a AtomicU64,
     peak: &'a AtomicU32,
+    clipped: &'a AtomicU64,
 }
 
 /// Execute a pass: pull up to `frames` from every input, sum, and apply the panel's
@@ -1161,9 +1175,24 @@ fn mix_pass(
     gain.apply(&mut mixed);
     // Summing can leave the unit range even at unity gain — two sources at once, which is
     // the case this mixer exists to make possible. Hard-clipped rather than left to the
-    // backend, where an out-of-range `f32` is anything from a clamp to a wrap.
-    for sample in &mut mixed {
-        *sample = sample.clamp(-1.0, 1.0);
+    // backend, where an out-of-range `f32` is anything from a clamp to a wrap — and
+    // counted per frame, because the policy rests on clipping being rare and nothing
+    // used to measure whether it was (#233).
+    let mut clipped_frames = 0u64;
+    for frame in mixed.chunks_exact_mut(channels.max(1)) {
+        let mut clipped = false;
+        for sample in frame {
+            if sample.abs() > 1.0 {
+                clipped = true;
+            }
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+        clipped_frames += u64::from(clipped);
+    }
+    if clipped_frames > 0 {
+        if let Some(c) = counters {
+            c.clipped.fetch_add(clipped_frames, Ordering::Relaxed);
+        }
     }
     // Last, so what is measured is exactly the samples the device is about to be handed —
     // a peak taken before the gain would report the mix's ambition rather than its result.
@@ -1380,6 +1409,7 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
                 idle: &shared.idle,
                 drained: &shared.drained,
                 peak: &shared.peak,
+                clipped: &shared.clipped,
             }),
         );
         shared.emitted.fetch_add(frames, Ordering::Relaxed);
@@ -1529,6 +1559,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         written,
         drained,
         emitted,
+        clipped,
     } = totals.since(&last.counters);
     // Read before the early return, or a window the log skipped would fold its figures
     // into the next one and report a rate that never happened.
@@ -1569,6 +1600,8 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         drained_pct = pct(drained),
         emitted_frames = emitted,
         emitted_pct = pct(emitted),
+        clipped_frames = clipped,
+        clipped_pct = pct(clipped),
         device_dry = dry,
         inputs,
         peak_dbfs = dbfs(peak),
@@ -1706,6 +1739,7 @@ mod tests {
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
+            clipped: AtomicU64::new(0),
             peak: AtomicU32::new(0),
         })
     }
@@ -1732,11 +1766,15 @@ mod tests {
         drained: &'a AtomicU64,
         peak: &'a AtomicU32,
     ) -> MixCounters<'a> {
+        // A shared discard cell for the clip counter: the tests that care about it
+        // build their own `MixCounters` and assert on their own cell.
+        static CLIPPED_SINK: AtomicU64 = AtomicU64::new(0);
         MixCounters {
             starved,
             idle,
             drained,
             peak,
+            clipped: &CLIPPED_SINK,
         }
     }
 
@@ -1933,6 +1971,47 @@ mod tests {
         let b = filled(vec![0.8; 4]);
         let mixed = mix_pass(&[a, b], 2, Instant::now(), &Gain::default(), None);
         assert_eq!(mixed, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn clipping_is_counted_and_clean_audio_is_not() {
+        // #233: hard clipping is the deliberate policy, and the policy rests on it being
+        // rare — which nothing measured. A panel squaring off into distortion for an
+        // hour read identically to a clean one on every counter.
+        let starved = AtomicU64::new(0);
+        let idle = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        let peak = AtomicU32::new(0);
+        let clipped = AtomicU64::new(0);
+        let rig = MixCounters {
+            starved: &starved,
+            idle: &idle,
+            drained: &drained,
+            peak: &peak,
+            clipped: &clipped,
+        };
+
+        // Two sources whose sum leaves the range: every frame clips, and says so.
+        let a = filled(vec![0.8; 4]);
+        let b = filled(vec![0.8; 4]);
+        let _ = mix_pass(&[a, b], 2, Instant::now(), &Gain::default(), Some(&rig));
+        assert_eq!(
+            clipped.load(Ordering::Relaxed),
+            2,
+            "both frames hit the rail"
+        );
+
+        // The same two sources at sane levels: the counter must not move, or it stops
+        // meaning anything.
+        clipped.store(0, Ordering::Relaxed);
+        let a = filled(vec![0.4; 4]);
+        let b = filled(vec![0.4; 4]);
+        let _ = mix_pass(&[a, b], 2, Instant::now(), &Gain::default(), Some(&rig));
+        assert_eq!(
+            clipped.load(Ordering::Relaxed),
+            0,
+            "a clean sum is not a clip"
+        );
     }
 
     #[test]
