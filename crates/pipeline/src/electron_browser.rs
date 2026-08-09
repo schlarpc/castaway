@@ -951,10 +951,7 @@ pub struct ElectronHost {
     /// trip, which is why this is remembered rather than recomputed into the subprocess
     /// every frame.
     views: Views,
-    recovery_attempts: u32,
-    /// A scheduled recovery: when it is due, and which window it is for (`None` = the
-    /// whole process, so both).
-    retry: Option<Retry>,
+    ladder: RecoveryLadder,
     gave_up: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Which window holds the left button, and therefore owns the pointer even where it
     /// strays outside its viewport. `None` when the button is up.
@@ -1018,6 +1015,72 @@ struct Retry {
     surface: Option<Surface>,
 }
 
+/// The recovery ladder, as arithmetic: what one look at the fault slot should do, given
+/// only the attempt count, the pending retry and the clock.
+///
+/// Extracted from [`ElectronHost::recover`] so it can be table-tested (#235): the ladder
+/// is what stops a page that kills three renderers running from cycling through the
+/// fourth forever, and the give-up arm is what tells DIAL to stop advertising a page
+/// that is not there — and until this existed, both ran only against a real dead
+/// Electron on the deploy target. `recover` keeps everything that touches a process or
+/// the render loop; this keeps everything that decides. Same split as `mixer::plan`.
+#[derive(Debug, Default)]
+struct RecoveryLadder {
+    /// Faults taken without a healthy stretch in between. [`Self::forgive`] is what a
+    /// healthy stretch calls.
+    attempts: u32,
+    /// A recovery scheduled but not yet due.
+    retry: Option<Retry>,
+}
+
+/// What the ladder decided.
+#[derive(Debug)]
+enum Recovery {
+    /// Nothing owed: no fault, no retry due.
+    Idle,
+    /// The fault is within budget; a retry has been scheduled for later.
+    Scheduled(Fault),
+    /// The fault exhausted the budget: stop rebuilding this surface and say so.
+    GiveUp(Fault),
+    /// A scheduled retry has come due: rebuild the surface (`None` = everything).
+    Rebuild(Option<Surface>),
+}
+
+impl RecoveryLadder {
+    /// Take one step: absorb `fault` if there is one, and surface whatever has come due.
+    fn next(&mut self, fault: Option<Fault>, now: std::time::Instant) -> Recovery {
+        if let Some(fault) = fault {
+            self.attempts += 1;
+            if self.attempts > RECOVERY_ATTEMPTS {
+                // The budget is spent. The count starts over so a *different* page can
+                // still be recovered later; the caller is the one who knows whether the
+                // surface changed.
+                self.retry = None;
+                self.attempts = 0;
+                return Recovery::GiveUp(fault);
+            }
+            self.retry = Some(Retry {
+                at: now + RECOVERY_DELAY,
+                surface: fault.surface,
+            });
+            return Recovery::Scheduled(fault);
+        }
+        match self.retry {
+            Some(retry) if now >= retry.at => {
+                self.retry = None;
+                Recovery::Rebuild(retry.surface)
+            }
+            _ => Recovery::Idle,
+        }
+    }
+
+    /// A healthy stretch: past faults stop counting against the future.
+    fn forgive(&mut self) {
+        self.attempts = 0;
+        self.retry = None;
+    }
+}
+
 /// What [`ElectronHost`] needs to bring a browser back.
 ///
 /// Public because it is also what `new` takes: the same five things describe how to start
@@ -1056,8 +1119,7 @@ impl ElectronHost {
             widget_started: false,
             page_url: None,
             views: Views::default(),
-            recovery_attempts: 0,
-            retry: None,
+            ladder: RecoveryLadder::default(),
             gave_up: None,
             left_down: None,
             contacts: std::collections::HashMap::new(),
@@ -1273,18 +1335,28 @@ impl ElectronHost {
     /// what the two-window split buys.
     fn recover(&mut self, render: &mut crate::render_pipeline::RenderLoop) {
         let fault = self.electron.as_ref().and_then(|e| e.health.take_fault());
-        if let Some(fault) = fault {
-            self.recovery_attempts += 1;
-            if self.recovery_attempts > RECOVERY_ATTEMPTS {
+        let mut surface = match self.ladder.next(fault, std::time::Instant::now()) {
+            Recovery::Idle => return,
+            Recovery::Scheduled(fault) => {
+                warn!(
+                    target: "castaway::browser",
+                    fault = %fault.reason,
+                    surface = ?fault.surface,
+                    attempt = self.ladder.attempts,
+                    retry_in = ?RECOVERY_DELAY,
+                    "recovering the browser"
+                );
+                return;
+            }
+            Recovery::Rebuild(surface) => surface,
+            Recovery::GiveUp(fault) => {
                 error!(
                     target: "castaway::browser",
                     fault = %fault.reason,
                     surface = ?fault.surface,
-                    attempts = self.recovery_attempts - 1,
+                    attempts = RECOVERY_ATTEMPTS,
                     "giving up on the failing browser surface"
                 );
-                self.retry = None;
-                self.recovery_attempts = 0;
                 match fault.surface {
                     // Reloading the widget forever is wrong when the widget is what
                     // fails: the panel would cycle through the same crash for good. And
@@ -1324,26 +1396,7 @@ impl ElectronHost {
                 }
                 return;
             }
-            warn!(
-                target: "castaway::browser",
-                fault = %fault.reason,
-                surface = ?fault.surface,
-                attempt = self.recovery_attempts,
-                retry_in = ?RECOVERY_DELAY,
-                "recovering the browser"
-            );
-            self.retry = Some(Retry {
-                at: std::time::Instant::now() + RECOVERY_DELAY,
-                surface: fault.surface,
-            });
-        }
-
-        let Some(retry) = self.retry else { return };
-        if std::time::Instant::now() < retry.at {
-            return;
-        }
-        self.retry = None;
-        let mut surface = retry.surface;
+        };
 
         // A dead *process* needs respawning, not just re-navigating — the distinction the
         // embedded path never had to make, because there the process was ours.
@@ -1429,8 +1482,7 @@ impl ElectronHost {
     /// cast no longer flashes the clock through it.
     fn show_page(&mut self, render: &mut crate::render_pipeline::RenderLoop, url: &str) {
         if self.page_url.as_deref() != Some(url) {
-            self.recovery_attempts = 0;
-            self.retry = None;
+            self.ladder.forgive();
         }
         self.page_url = Some(url.to_string());
         render.set_surface(panel_surface(Surface::Page), true);
@@ -1535,7 +1587,7 @@ impl ElectronHost {
     /// or is a reaction to panel state that only moves when the loop runs anyway.
     #[must_use]
     pub fn next_due(&self) -> Option<std::time::Instant> {
-        self.retry.map(|r| r.at)
+        self.ladder.retry.map(|r| r.at)
     }
 
     /// One structured line every 5 s while the browser has audio, mirroring the mirroring
@@ -1786,5 +1838,88 @@ impl ProcessRef {
             })?;
             Ok(Self::from_child_handle(handle))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fault(surface: Option<Surface>) -> Option<Fault> {
+        Some(Fault {
+            surface,
+            reason: "a test renderer died".into(),
+        })
+    }
+
+    /// The whole ladder, in chosen instants. Until #235 every arm of this ran only
+    /// against a real dead Electron on the deploy target — the give-up arm is what stops
+    /// a page that kills three renderers running from cycling through the fourth
+    /// forever, and the `gave_up` hook downstream of it is what tells DIAL to stop
+    /// advertising a page that is not there.
+    #[test]
+    fn three_faults_are_retried_and_the_fourth_gives_up() {
+        let mut ladder = RecoveryLadder::default();
+        let t0 = std::time::Instant::now();
+
+        for attempt in 1..=RECOVERY_ATTEMPTS {
+            let step = ladder.next(fault(Some(Surface::Page)), t0);
+            assert!(
+                matches!(step, Recovery::Scheduled(_)),
+                "attempt {attempt} should schedule, got {step:?}"
+            );
+            // Not yet due: nothing happens however often the loop looks.
+            assert!(matches!(ladder.next(None, t0), Recovery::Idle));
+            // Due: the rebuild comes out, once.
+            let due = t0 + RECOVERY_DELAY;
+            assert!(matches!(
+                ladder.next(None, due),
+                Recovery::Rebuild(Some(Surface::Page))
+            ));
+            assert!(
+                matches!(ladder.next(None, due), Recovery::Idle),
+                "a served retry must not fire twice"
+            );
+        }
+
+        // The budget is spent: the next fault is a give-up, and no retry is scheduled.
+        let step = ladder.next(fault(Some(Surface::Page)), t0);
+        assert!(matches!(step, Recovery::GiveUp(_)), "got {step:?}");
+        assert!(matches!(
+            ladder.next(None, t0 + RECOVERY_DELAY * 10),
+            Recovery::Idle
+        ));
+    }
+
+    #[test]
+    fn a_healthy_stretch_forgives_the_past() {
+        // A new page navigation resets the count: three faults across three different
+        // pages are not one page failing three times.
+        let mut ladder = RecoveryLadder::default();
+        let t0 = std::time::Instant::now();
+        for _ in 0..RECOVERY_ATTEMPTS {
+            let _ = ladder.next(fault(None), t0);
+        }
+        ladder.forgive();
+        assert!(
+            matches!(ladder.next(fault(None), t0), Recovery::Scheduled(_)),
+            "after forgiveness the ladder starts over rather than giving up"
+        );
+    }
+
+    #[test]
+    fn a_process_fault_rebuilds_everything() {
+        // `None` surface is the control socket closing: both windows are gone, and the
+        // rebuild must say so rather than naming the last window that happened to fail.
+        let mut ladder = RecoveryLadder::default();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            ladder.next(fault(None), t0),
+            Recovery::Scheduled(_)
+        ));
+        assert!(matches!(
+            ladder.next(None, t0 + RECOVERY_DELAY),
+            Recovery::Rebuild(None)
+        ));
     }
 }
