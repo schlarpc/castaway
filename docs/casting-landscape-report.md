@@ -1,5 +1,3 @@
-This is a report-writing task with all source material provided inline. No tools needed — I'll synthesize the dossiers and verdicts directly.
-
 # Streaming-Receiver, Screen-Mirroring & Content-Casting Protocols: Landscape & Open-Receiver Scope
 
 *Audience: a systems engineer sizing the effort to build an open receiver. Verdicts override dossiers where they conflict.*
@@ -225,3 +223,41 @@ Real WebRTC (`getDisplayMedia` + `RTCPeerConnection`, DTLS-SRTP, ICE) is peer-to
 ---
 
 **Bottom line for scoping:** Build the **discovery + transport + decode substrate** open — that's solved and RFC-backed. Expect exactly two walls: the **auth/pairing gate** (fused keys, MFi chips, device-cert PKI) and the **link-protection/DRM gate** (HDCP, DTCP-IP, Widevine/FairPlay-Streaming). The most valuable open receivers to build today are DLNA DMR, an AirPlay audio+mirroring sink, a Miracast sink, and a Google Cast receiver scoped to the open-sender ecosystem — accepting that Chrome/Netflix/YouTube/CarPlay interop is a licensing wall, not an engineering one.
+
+---
+
+## 6. Addendum — receiver scope revisited against castaway, 2026-08-08
+
+The bottom line above is spent: everything it recommends is implemented in this tree
+(and the Cast verdict aged pessimistically — DNS-SD sub-types put castaway in a real
+Play Services picker on a borrowed identity, see the `proto-cast` row of
+`docs/STATUS.md` and #226). A second scoping pass over the remainder was made on
+2026-08-08; the work items live in the tracker, per the repo's rules — this section
+is the record of what was decided and why.
+
+**Chosen** (one issue each):
+
+- **#240 — AirPlay 2.** The largest unimplemented sender base; feasible without MFi
+  via the transient-pairing finding in §3; the modern half of a protocol
+  `proto-airplay` already speaks.
+- **#241 — FCast.** *A gap in this survey* — the dossiers missed it entirely. FUTO's
+  open casting protocol (the Grayjay cast button): `_fcast._tcp` mDNS plus
+  length-prefixed JSON over TCP, media-URL semantics in the DLNA shape, no auth, no
+  cloud. Days of work on the existing substrate, and the only candidate with an
+  openness-aligned sender community.
+- **#242 — Roku ECP.** Tier-1 in §4 and still true: public, trivial, and no open sink
+  exists anywhere. Modest payoff, near-zero cost.
+- **#243 — OpenHome renderer.** Not in the survey as a protocol because it is not
+  one — a UPnP service family over the DLNA machinery already built, whose
+  on-renderer playlist is what BubbleUPnP/Kazoo-class control points actually want.
+- **#244 — Bluetooth LE Audio / Auracast sink.** Filed to *wait on*: castaway owning
+  its own HCI stack makes it unusually placed, but ISO-capable controllers and
+  broadcasting phones are not in hand. The issue records the start conditions.
+
+**Rejected, confirming §4's verdicts:** Amazon Fling (EOL 2026-03-05), the
+Samsung/Huawei/Xiaomi proprietary layers (the Miracast+DLNA substrate underneath is
+already served), Sonos-native (SonosNet), wireless CarPlay (MFi coprocessor — and a
+wall is not a car), Open Screen Protocol (no senders to talk to). Wireless Android
+Auto is the near-miss: feasible per §3's cert analysis and the panel has the touch
+backchannel, but it stays unfiled until someone actually wants a head unit on a wall
+— an issue then, a gimmick until.
