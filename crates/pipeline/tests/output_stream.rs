@@ -321,8 +321,34 @@ fn playable(state: &LiveStream, segments: u32) -> tempfile::NamedTempFile {
 /// One decoded frame's centre pixel, in the decoder's own planar Y'CbCr.
 type Centre = (u8, u8, u8);
 
+/// The video track's timing, straight off the container.
+#[derive(Debug)]
+struct VideoTiming {
+    /// `(pts, duration)` per packet, in the track's own timescale, presentation order.
+    packets: Vec<(i64, i64)>,
+    /// Ticks per second, as the track declares it.
+    timescale: u32,
+}
+
+impl VideoTiming {
+    /// Seconds of video the `trun`s actually claim — the number
+    /// `the_audio_track_trails_the_live_edge` used to fake by assuming the frame rate.
+    fn seconds(&self) -> f64 {
+        let ticks: i64 = self.packets.iter().map(|(_, d)| d).sum();
+        ticks as f64 / f64::from(self.timescale)
+    }
+}
+
 /// Decode the file: what the track claims to be, and every frame's centre pixel.
 fn decode(path: &std::path::Path) -> ((u32, u32), Vec<Centre>) {
+    let (size, centres, _) = decode_timed(path);
+    (size, centres)
+}
+
+/// [`decode`], with the container's own timing alongside (#234): the test picture is a
+/// constant colour, so a duplicated or missing frame is invisible to the pixels — the
+/// `trun` timing is the only place cadence is checkable at all.
+fn decode_timed(path: &std::path::Path) -> ((u32, u32), Vec<Centre>, VideoTiming) {
     ffmpeg::init().unwrap();
     let mut input = ffmpeg::format::input(&path).expect("libavformat should open our segments");
     let stream = input
@@ -336,6 +362,12 @@ fn decode(path: &std::path::Path) -> ((u32, u32), Vec<Centre>) {
         .video()
         .unwrap();
 
+    let timescale = {
+        let tb = stream.time_base();
+        assert_eq!(tb.numerator(), 1, "a track timescale is 1/N");
+        u32::try_from(tb.denominator()).unwrap()
+    };
+    let mut packets = Vec::new();
     let mut centres = Vec::new();
     let take = |decoder: &mut ffmpeg::decoder::Video, centres: &mut Vec<Centre>| {
         let mut frame = ffmpeg::frame::Video::empty();
@@ -351,13 +383,21 @@ fn decode(path: &std::path::Path) -> ((u32, u32), Vec<Centre>) {
     };
     for (source, packet) in input.packets() {
         if source.index() == index {
+            packets.push((
+                packet.pts().expect("every sample carries a pts"),
+                packet.duration(),
+            ));
             decoder.send_packet(&packet).unwrap();
             take(&mut decoder, &mut centres);
         }
     }
     decoder.send_eof().unwrap();
     take(&mut decoder, &mut centres);
-    ((decoder.width(), decoder.height()), centres)
+    (
+        (decoder.width(), decoder.height()),
+        centres,
+        VideoTiming { packets, timescale },
+    )
 }
 
 /// What the audio track decoded to.
@@ -371,6 +411,12 @@ struct Sound {
     peak: f32,
     /// The frame position of the first sample that is unmistakably not silence.
     onset: Option<u64>,
+    /// Peak level of the *quietest* 20 ms window from the onset to the last loud sample.
+    ///
+    /// The hole detector (#234): `peak` is a maximum and `onset` a first crossing, so a
+    /// 40 ms hole in the middle of the tone — a lost block, a fold, an encoder gap —
+    /// changes neither. The quietest window is exactly what such a hole is.
+    quietest_window: Option<f32>,
 }
 
 /// Decode the audio track, or `None` if the file has none.
@@ -388,6 +434,8 @@ fn decode_audio(path: &std::path::Path) -> Option<Sound> {
     let mut frames = 0u64;
     let mut peak = 0f32;
     let mut onset = None;
+    // The whole first plane, kept so the windows can be cut after the onset is known.
+    let mut mono: Vec<f32> = Vec::new();
     let mut take = |decoder: &mut ffmpeg::decoder::Audio| {
         let mut frame = ffmpeg::frame::Audio::empty();
         while decoder.receive_frame(&mut frame).is_ok() {
@@ -403,6 +451,7 @@ fn decode_audio(path: &std::path::Path) -> Option<Sound> {
                     }
                 }
             }
+            mono.extend_from_slice(frame.plane::<f32>(0));
             frames += frame.samples() as u64;
         }
     };
@@ -414,12 +463,25 @@ fn decode_audio(path: &std::path::Path) -> Option<Sound> {
     }
     decoder.send_eof().unwrap();
     take(&mut decoder);
+    // The quietest 20 ms between the onset and the last loud sample. Trimmed at both
+    // ends, because the track legitimately starts and ends with silence — the hole that
+    // matters is one *inside* the sound.
+    let quietest_window = onset.and_then(|onset| {
+        let last_loud = mono.iter().rposition(|s| s.abs() > 0.1)?;
+        let span = mono.get(usize::try_from(onset).ok()?..=last_loud)?;
+        let window = decoder.rate() as usize / 50;
+        span.chunks(window)
+            .filter(|c| c.len() == window)
+            .map(|c| c.iter().fold(0.0f32, |a, s| a.max(s.abs())))
+            .min_by(f32::total_cmp)
+    });
     Some(Sound {
         sample_rate: decoder.rate(),
         channels: decoder.channels(),
         frames,
         peak,
         onset,
+        quietest_window,
     })
 }
 
@@ -541,7 +603,7 @@ fn what_the_panel_composited_comes_back_out_of_a_demuxer() {
         return;
     };
     let file = playable(&state, 2);
-    let (size, centres) = decode(file.path());
+    let (size, centres, timing) = decode_timed(file.path());
 
     assert_eq!(size, (320, 176), "the track's coded size");
     assert!(
@@ -549,6 +611,24 @@ fn what_the_panel_composited_comes_back_out_of_a_demuxer() {
         "two 200 ms segments at 30 fps should be a dozen frames, got {}",
         centres.len()
     );
+    // The cadence, off the container rather than the pixels — which cannot carry it: the
+    // picture is a constant colour, so twelve fresh frames and four fresh plus eight
+    // duplicates decode identically (#234). Every slot is exactly one frame at the
+    // stream's rate; a `trun` that wrote anything else is a stream that judders or runs
+    // at the wrong speed against its own audio, in a player, with every byte accounted
+    // for.
+    let tick = i64::from(timing.timescale / FrameRate::DEFAULT.get());
+    for window in timing.packets.windows(2) {
+        if let [(a, da), (b, _)] = window {
+            assert_eq!(
+                b - a,
+                tick,
+                "consecutive video samples must be one slot apart: {:?}",
+                timing.packets
+            );
+            assert_eq!(*da, tick, "and each must claim exactly one slot");
+        }
+    }
     for (i, (y, cb, cr)) in centres.iter().enumerate() {
         near(*y, MAGENTA_YUV.0, &format!("frame {i} luma"));
         near(*cb, MAGENTA_YUV.1, &format!("frame {i} Cb"));
@@ -704,10 +784,13 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
         return;
     };
     let file = playable(&state, segments);
-    let (_, centres) = decode(file.path());
+    let (_, _, timing) = decode_timed(file.path());
     let sound = decode_audio(file.path()).unwrap();
 
-    let video_secs = centres.len() as f64 / f64::from(FrameRate::DEFAULT.get());
+    // Off the container, not `frames / assumed_fps`: with the rate assumed, a `trun`
+    // writing wrong sample durations moved both sides of the subtraction together and
+    // the comparison could not fail (#234).
+    let video_secs = timing.seconds();
     let audio_secs = sound.frames as f64 / f64::from(RATE);
     let behind = video_secs - audio_secs;
     // The settle window, plus the segment whose audio has not been cut yet.
@@ -735,7 +818,21 @@ fn tone_onset(scenario: Scenario) -> Option<f64> {
         )
     });
     let at = onset as f64 / f64::from(RATE);
-    eprintln!("onset {at:.3}s; {}", state.sound_diagnostics());
+    eprintln!(
+        "onset {at:.3}s; quietest window {:?}; {}",
+        sound.quietest_window,
+        state.sound_diagnostics()
+    );
+    // No hole after the onset: a burst folded onto itself, a lost block, an encoder gap
+    // are all a quiet window in the middle of a tone that should never dip (#234). The
+    // placement assertion below cannot see them — `onset` is a first crossing and `peak`
+    // a maximum.
+    let quietest = sound.quietest_window.expect("the tone spans whole windows");
+    assert!(
+        quietest > 0.2,
+        "a 20 ms window inside the tone dropped to {quietest}; the sound has a hole. {}",
+        state.sound_diagnostics()
+    );
     assert!(
         (at - QUIET.as_secs_f64()).abs() < 0.06,
         "the tone starts {at:.3}s in; it was played at {:.3}s. {}",

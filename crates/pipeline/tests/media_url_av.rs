@@ -43,7 +43,11 @@ struct Run {
     /// but how far through the file the decode got is a property of the file (#170).
     last_pts: Duration,
     audio_blocks: usize,
-    audio_samples: usize,
+    /// Media time the decoded audio claims, summed per block: the property the sample
+    /// count was reaching for. `audio_samples > 40_000` passed a decode that produced a
+    /// quarter of a two-second file — half rate, a dropped channel, double speed all fit
+    /// under a 4x margin (#234).
+    audio_duration: Duration,
     elapsed: Duration,
 }
 
@@ -80,7 +84,8 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
     // `a_silent_video_is_paced_by_the_wall_clock_not_the_cpu` already pays.
     let clock_for_audio = Arc::clone(&clock);
     let collector = std::thread::spawn(move || {
-        let (mut blocks, mut samples) = (0usize, 0usize);
+        let mut blocks = 0usize;
+        let mut duration = Duration::ZERO;
         while let Ok(block) = rx.recv() {
             let through = block.pts + block.duration();
             let due = start + through.saturating_sub(pipeline::clock::OUTPUT_LEAD);
@@ -89,9 +94,9 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
             }
             clock_for_audio.observe_audio(through);
             blocks += 1;
-            samples += block.samples.len();
+            duration += block.duration();
         }
-        (blocks, samples)
+        (blocks, duration)
     });
 
     decode_av(
@@ -110,13 +115,13 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
     )
     .unwrap();
 
-    let (audio_blocks, audio_samples) = collector.join().unwrap();
+    let (audio_blocks, audio_duration) = collector.join().unwrap();
     Run {
         layout,
         frames,
         last_pts,
         audio_blocks,
-        audio_samples,
+        audio_duration,
         elapsed: start.elapsed(),
     }
 }
@@ -164,12 +169,13 @@ fn a_video_file_yields_both_pictures_and_sound() {
         r.last_pts
     );
     assert!(r.audio_blocks > 0, "no audio was decoded at all");
-    // Two seconds of 44.1/48 kHz stereo is tens of thousands of samples; anything much
-    // smaller means the stream was opened and then abandoned.
+    // The whole two seconds, within codec padding. A band, not a floor: a decode that
+    // produces half the audio at the declared rate — half rate, a dropped channel,
+    // double speed — sat comfortably above the old `> 40_000` sample count (#234).
     assert!(
-        r.audio_samples > 40_000,
-        "audio samples: {}",
-        r.audio_samples
+        (1.85..=2.2).contains(&r.audio_duration.as_secs_f64()),
+        "a two-second file decoded to {:?} of audio",
+        r.audio_duration
     );
 }
 
@@ -197,9 +203,9 @@ fn an_audio_only_url_plays_instead_of_failing() {
     assert!(r.layout.has_audio);
     assert_eq!(r.frames, 0, "and produces no video frames");
     assert!(
-        r.audio_samples > 40_000,
-        "audio samples: {}",
-        r.audio_samples
+        (1.85..=2.2).contains(&r.audio_duration.as_secs_f64()),
+        "a two-second tone decoded to {:?} of audio",
+        r.audio_duration
     );
     // A duration the card's scrubber can be drawn against.
     let d = r.layout.duration.expect("an mp3 knows how long it is");
