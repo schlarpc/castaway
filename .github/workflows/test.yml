@@ -2,7 +2,14 @@ name: Test
 
 on:
   pull_request:
+  # `main` only: work lands there directly (ground rule 10), and the one other kind of
+  # branch this repo sees is dependabot's — which already runs as a pull_request, so the
+  # unrestricted push trigger ran its whole matrix twice.
   push:
+    branches: [main]
+  # Nightly, for the checks worth having regularly but not per commit (coverage).
+  schedule:
+    - cron: "20 9 * * *"
 
 # A push that lands while the previous one is still building makes the older run
 # irrelevant, and these jobs are long enough that letting both finish wastes a lot of
@@ -42,23 +49,25 @@ jobs:
             'cs: builtins.concatStringsSep "\n" (map (c: c.drvPath) (builtins.attrValues cs))'
           echo
           checks=$(nix eval --json .#checks.x86_64-linux --apply builtins.attrNames)
+          # Coverage re-compiles the workspace instrumented and re-runs the whole suite —
+          # 70+ minutes for a number nothing gates on per commit, and its test verdict is
+          # `test`'s verdict. Nightly is enough; per-commit runs drop it (#238).
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            checks='["coverage"]'
+          else
+            checks=$(echo "$checks" | jq -c 'map(select(. != "coverage"))')
+          fi
           echo "checks=$checks" >> "$GITHUB_OUTPUT"
           echo "$checks"
 
-  # The shipped artifact, and the job that warms the cache for everything below: most of
-  # what the checks build is the same dependency tree this needs, so running it first
-  # turns the matrix from N full builds into N mostly-cached ones.
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/nix-runner
-      - run: .github/scripts/nix-build.sh
-      - uses: ./.github/actions/postmortem
-        if: failure()
+  # There is deliberately no cache-warming build job in front of the matrix any more.
+  # There was one, on the theory that it turns N full builds into N mostly-cached ones —
+  # and the measurement said otherwise: the Actions cache sits at its 10 GB eviction
+  # ceiling with ~9k entries, and `check (build)` rebuilt the *same derivation* the
+  # warming job had just built, from scratch, for 83 minutes. The premise costs 53
+  # minutes of critical path in front of every matrix and delivers nothing the per-job
+  # cache restore does not; the artifact itself is still built, as `check (build)`
+  # (#238).
 
   # One job per check, which buys two things.
   #
@@ -70,7 +79,7 @@ jobs:
   # a log that stopped mid-build; this names the check that failed, and `fail-fast: false`
   # means a red `clippy` no longer hides whether the VM tests would have passed.
   check:
-    needs: [discover, build]
+    needs: [discover]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

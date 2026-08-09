@@ -13,14 +13,19 @@
 # confirm or refute.
 set -uo pipefail
 
-# One derivation at a time, on both of the runner's cores. A private repo gets 2 vCPU and
-# 7 GB, and `max-jobs = auto` reads only the first number: several builds at once, each
-# with a peak working set, on a box that cannot hold one of the large ones comfortably.
+# One derivation at a time, on all of the runner's cores. `max-jobs = auto` would run
+# several builds at once, each with a peak working set, on a box that cannot hold two of
+# the large ones comfortably — that is the memory failure this script's sampler exists to
+# catch. But `--cores` is per-derivation parallelism *inside* the one build, and the
+# dominant phase here is a single crane derivation compiling many crates: cargo fans out
+# to whatever it is given. This was `--cores 2` from when the repo was private and the
+# runner had 2 vCPU; the repo is public now and the runner has 4, so the old number
+# idled half the machine on every compile-bound job (#238).
 #
 # On the command line rather than in nix.conf: the installer owns that file, and a setting
 # that silently did not apply is exactly how the previous attempt at this fixed nothing
 # while looking like it had.
-pacing=(--max-jobs 1 --cores 2)
+pacing=(--max-jobs 1 --cores "$(nproc)")
 
 echo "::group::Nix settings that decide the peak"
 echo "runner default:"
