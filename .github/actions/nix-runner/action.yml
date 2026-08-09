@@ -3,6 +3,25 @@ description: >
   Free enough disk for a Nix build, install Nix, and attach the build cache.
   Shared by every job in the test workflow so the disk fix cannot drift between them.
 
+inputs:
+  cache-group:
+    description: >
+      Which store snapshot this job shares. Jobs in one group restore one cache entry;
+      "main" is the Linux dependency tree, "windows" the MSVC cross tree — kept apart
+      because they are disjoint closures and together they would not fit an entry.
+    default: main
+  cache-save:
+    description: >
+      Whether this job saves the group's snapshot when it finishes. Exactly one job per
+      group saves, and only on pushes to main: every extra saver is an extra multi-GB
+      entry in a 10 GB budget, and a PR's store belongs to the PR.
+    default: "false"
+  cache-gc-size:
+    description: >
+      Prune the store to at most this size before saving, so the entry stays inside its
+      share of the repository's 10 GB cache budget. Only meaningful for the saver job.
+    default: 12G
+
 runs:
   using: composite
   steps:
@@ -61,4 +80,26 @@ runs:
         free -h
 
     - uses: DeterminateSystems/nix-installer-action@v22
-    - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+    # One cache entry per group, not one per store path. magic-nix-cache stored every
+    # store path as its own GitHub Actions cache entry; this repository's closure made
+    # that ~9,000 entries pinned at the 10 GB eviction ceiling, so the big artifacts
+    # (the crane dependency trees, the VM system closures) evicted before any job could
+    # reuse them — `check (build)` rebuilt, from scratch, the same derivation a warming
+    # job had finished minutes earlier (#238). magic-nix-cache is also EOL upstream.
+    #
+    # cache-nix-action snapshots the whole store as a single entry per key: one restore,
+    # one save, no per-path API traffic to rate-limit. The key includes both lockfiles,
+    # so a dependency bump starts a fresh entry and anything else restores the previous
+    # snapshot by prefix; `purge` deletes the superseded entries at save time, which is
+    # what keeps the two groups' entries from crowding each other out of the budget.
+    - uses: nix-community/cache-nix-action@v7
+      with:
+        primary-key: nix-${{ inputs.cache-group }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+        restore-prefixes-first-match: nix-${{ inputs.cache-group }}-
+        save: ${{ inputs.cache-save }}
+        gc-max-store-size-linux: ${{ inputs.cache-gc-size }}
+        purge: ${{ inputs.cache-save }}
+        purge-prefixes: nix-${{ inputs.cache-group }}-
+        purge-created: 0
+        purge-primary-key: never

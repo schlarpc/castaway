@@ -26,6 +26,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/nix-runner
+        with:
+          # The cross tree's snapshot; saved by the Test workflow's dll-closure check,
+          # restored here, so the two windows builds stop paying for the toolchain twice.
+          cache-group: windows
       # `.archive` rather than the bare package: the package is the deploy *tree*, and
       # the archive derivation is that tree as one reproducible zip (stable mtimes, sorted
       # entries) — the thing a release asset should be.

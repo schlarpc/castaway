@@ -92,6 +92,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/nix-runner
+        with:
+          # The windows cross tree is a disjoint closure and gets its own snapshot; the
+          # saver for each group is the job whose store contains the group's biggest
+          # rebuild cost — `test` holds the crane dependency tree everything Rust-shaped
+          # restores, the dll closure holds the MSVC/ffmpeg cross tree the Release
+          # workflow restores. Saves happen only on pushes to main: a PR's store belongs
+          # to the PR, and every extra saver is a multi-GB entry in a 10 GB budget.
+          cache-group: ${{ matrix.check == 'castaway-windows-electron-dll-closure' && 'windows' || 'main' }}
+          cache-save: ${{ (matrix.check == 'test' || matrix.check == 'castaway-windows-electron-dll-closure') && github.event_name == 'push' }}
+          cache-gc-size: ${{ matrix.check == 'castaway-windows-electron-dll-closure' && '6G' || '12G' }}
       - run: .github/scripts/nix-build.sh '.#checks.x86_64-linux.${{ matrix.check }}'
       - uses: ./.github/actions/postmortem
         if: failure()
