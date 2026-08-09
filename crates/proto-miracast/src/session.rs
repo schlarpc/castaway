@@ -33,6 +33,7 @@
 //! at a resolution nobody negotiated" is still unrepresentable.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -298,6 +299,13 @@ impl SessionState {
 }
 
 /// The sink's half of a WFD RTSP session.
+/// How often the sink may ask the source for an IDR (M13).
+///
+/// Windows honours every request, and spamming them collapses the bitrate — the
+/// source spends its budget on keyframes. One a second is already aggressive recovery
+/// against AOSP's own fifteen-second interval.
+pub(crate) const IDR_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub struct WfdSession {
     caps: SinkCapabilities,
@@ -316,6 +324,8 @@ pub struct WfdSession {
     source_server: Option<String>,
     /// The `Public:` the source advertised.
     source_methods: Option<String>,
+    /// When the last M13 went out, for the rate limit [`Self::request_idr`] enforces.
+    last_idr: Option<Instant>,
 }
 
 impl WfdSession {
@@ -331,6 +341,7 @@ impl WfdSession {
             session_timeout: None,
             source_server: None,
             source_methods: None,
+            last_idr: None,
         }
     }
 
@@ -804,17 +815,27 @@ impl WfdSession {
         ))])
     }
 
-    /// Ask the source for an IDR picture (M13).
+    /// Ask the source for an IDR picture (M13), if one is worth asking for at `now`.
     ///
     /// The sink's only recovery from a lost reference frame. Returns `None` unless media
-    /// is actually flowing, because there is nothing to recover otherwise — and it should
-    /// be rate-limited by the caller: Windows honours these, and spamming them collapses
-    /// the bitrate.
+    /// is actually flowing — there is nothing to recover otherwise — and no more than
+    /// once per [`IDR_MIN_INTERVAL`]: Windows honours every request, and spamming them
+    /// collapses the bitrate. The limit used to be a doc-comment obligation on the
+    /// caller ("it should be rate-limited") held as a loop local in the actor, which is
+    /// what made it untestable without sockets and wall time; it is the type's own now,
+    /// a property of the session like everything else here (#235).
     #[must_use]
-    pub fn request_idr(&mut self) -> Option<SinkOutput> {
+    pub fn request_idr(&mut self, now: Instant) -> Option<SinkOutput> {
         if !matches!(self.state, SessionState::Playing(_)) {
             return None;
         }
+        if self
+            .last_idr
+            .is_some_and(|at| now.saturating_duration_since(at) < IDR_MIN_INTERVAL)
+        {
+            return None;
+        }
+        self.last_idr = Some(now);
         let mut m13 = self.request("SET_PARAMETER", CONTROL_URI.to_owned(), Pending::IdrRequest);
         m13.headers
             .push(("Content-Type", "text/parameters".to_owned()));
@@ -1133,7 +1154,7 @@ mod tests {
         // `Session: 1804289383;timeout=30` echoed whole is what MiracleCast is careful
         // not to do, and some sources reject it.
         let mut s = handshake();
-        let idr = s.request_idr().expect("media is flowing");
+        let idr = s.request_idr(Instant::now()).expect("media is flowing");
         let SinkOutput::Send(req) = idr else {
             panic!("expected a request")
         };
@@ -1145,7 +1166,7 @@ mod tests {
         // AOSP substring-matches "wfd_idr_request\r\n", so a colon or a missing
         // terminator means the source never sees the request at all.
         let mut s = handshake();
-        let SinkOutput::Send(req) = s.request_idr().unwrap() else {
+        let SinkOutput::Send(req) = s.request_idr(Instant::now()).unwrap() else {
             panic!("expected a request")
         };
         assert_eq!(req.method, "SET_PARAMETER");
@@ -1156,7 +1177,25 @@ mod tests {
     #[test]
     fn an_idr_request_before_playback_is_refused() {
         let mut s = WfdSession::new(caps());
-        assert!(s.request_idr().is_none());
+        assert!(s.request_idr(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn the_idr_rate_limit_is_the_sessions_own_and_needs_no_sockets() {
+        // #235: the limit lived as a loop local in the actor, so exercising it meant
+        // real TCP, real UDP, journal-grepping and a wall-clock IDR_MIN_INTERVAL burned
+        // per branch. As session state it is three assertions and three chosen instants.
+        let mut s = handshake();
+        let t0 = Instant::now();
+        assert!(s.request_idr(t0).is_some(), "the first ask goes out");
+        assert!(
+            s.request_idr(t0 + IDR_MIN_INTERVAL / 2).is_none(),
+            "inside the interval the source is left alone, however bad the loss"
+        );
+        assert!(
+            s.request_idr(t0 + IDR_MIN_INTERVAL).is_some(),
+            "and at the interval the next ask goes out"
+        );
     }
 
     #[test]

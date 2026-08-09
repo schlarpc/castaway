@@ -54,14 +54,6 @@ const DATAGRAM_BUF: usize = 2048;
 /// blocking the socket.
 const FRAME_QUEUE: usize = 3;
 
-/// The shortest gap between two IDR requests.
-///
-/// Not politeness. AOSP's encoder default is an IDR every *fifteen seconds*, so M13 is the
-/// only thing standing between a lost reference frame and fifteen seconds of corruption —
-/// but each IDR collapses the bitrate, and a real capture shows a sink firing eight
-/// back-to-back and turning a lossy link into an unusable one.
-const IDR_MIN_INTERVAL: Duration = Duration::from_secs(1);
-
 /// The session timeout to use before the source has named one, and if it names none.
 ///
 /// RFC 2326 §12.37's default, which is also what the WFD spec and intel/wds use. AOSP
@@ -123,9 +115,6 @@ pub async fn run_session(
     // RTSP protocols share (#220).
     let mut framer = RtspFramer::new(MAX_RTSP_MESSAGE);
     let mut datagram = vec![0u8; DATAGRAM_BUF];
-    let mut last_idr = tokio::time::Instant::now()
-        .checked_sub(IDR_MIN_INTERVAL)
-        .unwrap_or_else(tokio::time::Instant::now);
     let mut idr_requests: u64 = 0;
     // Session-scoped, shared into every `Planes` rebuild: the planes are torn down and
     // remade on every pause and resume, and a total kept in them would restart
@@ -218,14 +207,18 @@ pub async fn run_session(
                     }
                     // A frame arriving with no keyframe yet means we joined mid-GOP, and
                     // AOSP's fifteen-second IDR interval makes waiting a very long stare
-                    // at a black screen.
-                    if planes.needs_keyframe && last_idr.elapsed() >= IDR_MIN_INTERVAL {
-                        // Written directly rather than through `apply`: an IDR request is
-                        // always a request, and routing it through the media-transition
-                        // handler would need the planes to be moved out from under the
-                        // loop that is using them.
-                        if let Some(SinkOutput::Send(request)) = session.request_idr() {
-                            last_idr = tokio::time::Instant::now();
+                    // at a black screen. The session owns the rate limit (#235); a
+                    // refused ask costs a comparison, so asking on every damaged
+                    // datagram is fine. `into_std` so paused tokio time still drives it.
+                    //
+                    // Written directly rather than through `apply`: an IDR request is
+                    // always a request, and routing it through the media-transition
+                    // handler would need the planes to be moved out from under the
+                    // loop that is using them.
+                    if planes.needs_keyframe {
+                        if let Some(SinkOutput::Send(request)) =
+                            session.request_idr(tokio::time::Instant::now().into_std())
+                        {
                             idr_requests = idr_requests.saturating_add(1);
                             debug!(idr_requests, "asking the source for an IDR");
                             write_request(&mut control, &request).await?;
@@ -734,6 +727,7 @@ mod tests {
     use crate::params::{
         AudioCodecs, ClientRtpPorts, ConnectorType, ContentProtection, RtpProfile,
     };
+    use crate::session::IDR_MIN_INTERVAL;
     use crate::video::VideoFormats;
     use castaway_core::{ProtocolKind, SourceId, SourceMessage};
 
