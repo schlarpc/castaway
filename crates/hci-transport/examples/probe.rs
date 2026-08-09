@@ -19,6 +19,22 @@
 //! That step is *required* to test firmware loading at all: `HCI_CHANNEL_USER` hands
 //! over a controller the kernel has already initialised, so it can never exercise the
 //! loader (architecture §11.3a).
+//!
+//! It is also not *sufficient*. Unbinding the driver does not make the controller forget
+//! its firmware, and neither does a USB port reset — the operational image survives both,
+//! and the loader takes the "already operational" branch every time. To reach the upload
+//! path the part has to be sent back to its bootloader:
+//!
+//! ```text
+//! modprobe -r btusb                                      # nothing may re-bind it
+//! cargo run -p hci-transport --example probe -- 8087:0032 --to-bootloader
+//! cargo run -p hci-transport --example probe -- 8087:0032    # now it loads firmware
+//! ```
+//!
+//! On Linux, `udev` re-loads `btusb` the moment the part re-enumerates, which reloads the
+//! firmware behind you; `echo 'install btusb /bin/true' > /run/modprobe.d/no-btusb.conf`
+//! holds it off, and deleting that file plus `modprobe btusb` gives the machine its
+//! Bluetooth back.
 
 use hci_transport::init::{self, UsbId};
 use hci_transport::{usb, FirmwareSet};
@@ -117,6 +133,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("  raw:          {params:02x?}");
         println!("\nidentify only; nothing was written");
+        return Ok(());
+    }
+
+    // Put the part *back* into the bootloader, which is the only way to exercise the
+    // loader at all. Unbinding `btusb` is not enough and neither is a USB port reset —
+    // the operational image survives both, and the kernel says "Firmware already loaded".
+    // This is `btintel_reset_to_bootloader()`: a hard reset that re-enumerates the
+    // controller. It answers nothing, because it is gone by then.
+    if std::env::args().any(|a| a == "--to-bootloader") {
+        println!("resetting into the bootloader (the device will re-enumerate)…");
+        transport
+            .send(
+                Command::Vendor {
+                    opcode: substrate_hci::OpCode::new(0xFC01),
+                    // hard reset, patch enable, ddc reload, current image, no address
+                    params: bytes::Bytes::from_static(&[0x01, 0x01, 0x01, 0x00, 0, 0, 0, 0]),
+                }
+                .encode()?,
+            )
+            .await?;
+        println!("sent; give it a second and run the probe again");
         return Ok(());
     }
 
