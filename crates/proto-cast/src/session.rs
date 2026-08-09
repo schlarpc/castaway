@@ -5,7 +5,7 @@
 
 use castaway_core::{ControlTxn, MediaUri, SessionEvent};
 use prost::Message as _;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::error::CastError;
 use crate::ids::{AppId, SenderId, SessionId, TransportId};
@@ -353,11 +353,23 @@ impl CastSession {
             return Ok(Reaction::default()); // response/error from us — ignore echoes
         };
         let reply = match self.auth.as_ref().map(|a| a.respond(&challenge)) {
-            Some(Ok(response)) => DeviceAuthMessage {
-                challenge: None,
-                response: Some(response),
-                error: None,
-            },
+            Some(Ok(response)) => {
+                // The one greppable line for "a sender challenged us and we answered".
+                // Device auth is the gate every Cast sender puts in front of everything
+                // else, and until #226 nobody could say from outside the process whether
+                // a *real* Play Services sender had got past it — which is the assertion
+                // the emulator check makes (#225).
+                info!(
+                    signature_bytes = response.signature.len(),
+                    intermediates = response.intermediate_certificate.len(),
+                    "cast: answered a sender's device-auth challenge"
+                );
+                DeviceAuthMessage {
+                    challenge: None,
+                    response: Some(response),
+                    error: None,
+                }
+            }
             Some(Err(e)) => {
                 warn!(error = %e, "device-auth signer failed");
                 auth_err()
