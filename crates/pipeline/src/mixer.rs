@@ -624,6 +624,14 @@ impl MixInput {
         if self.shape == Some((sample_rate, channels)) {
             return Ok(());
         }
+        if channels > CHANNELS {
+            // The fold's per-frame count is `folded`; this names the shape once per
+            // change, so the counter's reader knows *which* channels are being binned.
+            info!(
+                channels,
+                sample_rate, "mixer: source is wider than stereo; only the front pair is kept"
+            );
+        }
         self.convert = Some(Convert::open(sample_rate, channels)?);
         self.shape = Some((sample_rate, channels));
         Ok(())
@@ -646,6 +654,13 @@ impl MixInput {
         let stereo = convert.stereo(block)?;
         if stereo.is_empty() {
             return Ok(());
+        }
+        if convert.channels > CHANNELS {
+            // The substitution the fold makes — everything past the front pair binned —
+            // counted where it happens, whatever becomes of the block downstream (#233).
+            self.shared
+                .folded
+                .fetch_add(stereo.len() as u64 / u64::from(CHANNELS), Ordering::Relaxed);
         }
         self.enqueue(&stereo);
         Ok(())
@@ -826,6 +841,16 @@ pub struct MixerCounters {
     /// panel squaring off into distortion for an hour was invisible to every counter,
     /// and "turn it down" is only sayable if something counts it.
     pub clipped: u64,
+    /// Frames from a source wider than stereo, whose channels past the front pair were
+    /// discarded by the fold rather than downmixed.
+    ///
+    /// Keeping only front left and right is the deliberate policy — see [`to_stereo`] —
+    /// but a 5.1 film folded this way loses its centre channel, which is the dialogue,
+    /// and "I can't hear what they're saying" gets blamed on the film (#233). Counted at
+    /// conversion, alongside `written`: the fold happened whatever became of the block
+    /// downstream. Structurally zero while every source is mono or stereo, so a nonzero
+    /// reading is the one sign the substitution is in effect.
+    pub folded: u64,
 }
 
 impl MixerCounters {
@@ -844,6 +869,7 @@ impl MixerCounters {
             dropped: self.dropped.saturating_sub(earlier.dropped),
             emitted: self.emitted.saturating_sub(earlier.emitted),
             clipped: self.clipped.saturating_sub(earlier.clipped),
+            folded: self.folded.saturating_sub(earlier.folded),
         }
     }
 
@@ -882,6 +908,7 @@ struct Shared {
     dropped: AtomicU64,
     emitted: AtomicU64,
     clipped: AtomicU64,
+    folded: AtomicU64,
     /// The loudest sample the device was given since the last report.
     ///
     /// Measured *after* [`Gain`], because the question it answers is what the speakers
@@ -914,6 +941,7 @@ impl Shared {
             dropped: self.dropped.load(Ordering::Relaxed),
             emitted: self.emitted.load(Ordering::Relaxed),
             clipped: self.clipped.load(Ordering::Relaxed),
+            folded: self.folded.load(Ordering::Relaxed),
         }
     }
 }
@@ -964,6 +992,7 @@ impl AudioMixer {
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
             clipped: AtomicU64::new(0),
+            folded: AtomicU64::new(0),
             peak: AtomicU32::new(0),
         });
         let thread = {
@@ -1560,6 +1589,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         drained,
         emitted,
         clipped,
+        folded,
     } = totals.since(&last.counters);
     // Read before the early return, or a window the log skipped would fold its figures
     // into the next one and report a rate that never happened.
@@ -1602,6 +1632,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         emitted_pct = pct(emitted),
         clipped_frames = clipped,
         clipped_pct = pct(clipped),
+        folded_frames = folded,
         device_dry = dry,
         inputs,
         peak_dbfs = dbfs(peak),
@@ -1740,6 +1771,7 @@ mod tests {
             drained: AtomicU64::new(0),
             emitted: AtomicU64::new(0),
             clipped: AtomicU64::new(0),
+            folded: AtomicU64::new(0),
             peak: AtomicU32::new(0),
         })
     }
@@ -1961,6 +1993,58 @@ mod tests {
         // 5.1 in the usual order: L R C LFE Ls Rs.
         let surround = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         assert_eq!(to_stereo(&surround, 6), vec![1.0, 2.0]);
+    }
+
+    /// The fold's discard is counted, and a source that loses nothing counts nothing
+    /// (#233).
+    ///
+    /// The policy above — keep the front pair — may well be right for a panel's stereo
+    /// speakers, but a 5.1 film folded this way loses its centre channel, which is the
+    /// dialogue. Before this counter, "four channels were binned all session" and "the
+    /// source was stereo" were the same absence of evidence.
+    #[test]
+    fn the_fold_counts_the_frames_it_narrows_and_stereo_is_free() {
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = MixInput {
+            backpressure: Backpressure::Pull,
+            state: Arc::clone(&state),
+            shared: Arc::clone(&shared),
+            convert: None,
+            shape: None,
+            dropped: 0,
+            shed: 0,
+        };
+
+        // 4 frames of 5.1 at the mix rate: every frame loses four channels, and says so.
+        let surround = PcmBlock {
+            sample_rate: RATE,
+            channels: 6,
+            samples: vec![0.1; 4 * 6],
+            pts: Duration::ZERO,
+        };
+        input.write(&surround).unwrap();
+        assert_eq!(
+            shared.counters().folded,
+            4,
+            "every folded frame is counted, in frames"
+        );
+
+        // Stereo passes through and mono is duplicated: neither discards anything, and
+        // the counter must not move or it stops meaning anything.
+        input.write(&tone(4, 0.1)).unwrap();
+        let mono = PcmBlock {
+            sample_rate: RATE,
+            channels: 1,
+            samples: vec![0.1; 4],
+            pts: Duration::ZERO,
+        };
+        input.write(&mono).unwrap();
+        assert_eq!(
+            shared.counters().folded,
+            4,
+            "a fold that loses nothing is not a fold"
+        );
     }
 
     #[test]
