@@ -35,7 +35,7 @@
 //! the absence of a crash.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use proto_matter::fabric::CastingCa;
@@ -53,16 +53,17 @@ use rs_matter::dm::devices::test::TEST_DEV_ATT;
 use rs_matter::dm::endpoints::EthSysHandlerBuilder;
 use rs_matter::dm::Node;
 use rs_matter::im::{InteractionModel, InteractionModelState};
-use rs_matter::persist::DummyKvBlobStore;
+use rs_matter::persist::{DirKvBlobStore, DummyKvBlobStore, KvBlobStore};
 use rs_matter::respond::DefaultResponder;
 use rs_matter::sc::pase::{
     Spake2pVerifierPassword, Spake2pVerifierPasswordRef, MAX_COMM_WINDOW_TIMEOUT_SECS,
 };
 use rs_matter::transport::exchange::{Exchange, MatterBuffers};
+use rs_matter::transport::network::mdns::{DottedName, MdnsRemoteService};
 use rs_matter::transport::network::NoNetwork;
 use rs_matter::{root_endpoint, BasicCommData, Matter};
 
-use substrate_mdns::{MdnsResponder, MdnsService};
+use substrate_mdns::{BrowseEvent, MdnsResponder, MdnsService};
 
 use tokio::net::UdpSocket;
 
@@ -90,10 +91,31 @@ const REFUSAL_TIMEOUT: Duration = Duration::from_secs(90);
 /// log instead of papered over.
 const INVOKE_WINDOW: Duration = Duration::from_secs(30);
 
+/// How long a `--cast-again` run keeps retrying `LaunchURL`.
+///
+/// Wider than [`INVOKE_WINDOW`] because every failed attempt here already contains
+/// `rs-matter`'s own 5 s resolve timeout, and the panel this run aims at may still be
+/// bringing its sockets up after the restart that killed the CASE session.
+const CAST_AGAIN_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long one browse serves one resolve request before giving up on it.
+///
+/// Longer than the requester's own 5 s timeout on purpose: an answer that arrives just
+/// after the caller gave up still refreshes the daemon's cache for the retry.
+const RESOLVE_BROWSE_WINDOW: Duration = Duration::from_secs(10);
+
 struct Args {
     player: IpAddr,
     bind: IpAddr,
-    passcode_file: PathBuf,
+    /// Absent only in `--cast-again` mode, where no passcode exists to be typed.
+    passcode_file: Option<PathBuf>,
+    /// Where the phone's own Matter state (its fabric, above all) persists. Without it
+    /// the run is the one-shot phone the harness always had; with it, a later
+    /// `--cast-again` run can be the same phone coming back.
+    state_dir: Option<PathBuf>,
+    /// Skip commissioning entirely: load the fabric persisted by an earlier run and cast
+    /// over a CASE session established from the panel's operational record (#173).
+    cast_again: bool,
     instance: InstanceName,
     device_name: String,
     url: String,
@@ -184,9 +206,12 @@ fn usage() -> String {
     "usage: matter-peer --player <ip> --passcode-file <path> [--bind <ip>] \
      [--instance <hex16>] [--name <str>] [--url <str>] [--display-string <str>] \
      [--endpoint <n>] [--app-vendor <n>] [--app-product <n>] [--discriminator <n>] \
-     [--matter-port <n>] [--declare-only] [--wrong-passcode] [--wrong-instance] \
-     [--read-descriptor] [--app-basic] [--read-acl] [--app-endpoint <n>] \
-     [--transport <verb>[,<verb>…]] [--navigate <n>] [--launch-content <query>]"
+     [--matter-port <n>] [--state-dir <dir>] [--declare-only] [--wrong-passcode] \
+     [--wrong-instance] [--read-descriptor] [--app-basic] [--read-acl] \
+     [--app-endpoint <n>] [--transport <verb>[,<verb>…]] [--navigate <n>] \
+     [--launch-content <query>]\n\
+     or:    matter-peer --player <ip> --cast-again --state-dir <dir> [--bind <ip>] \
+     [--url <str>] [--display-string <str>] [--endpoint <n>] [--matter-port <n>]"
         .into()
 }
 
@@ -207,6 +232,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut app_product_id = 0x8001_u16;
     let mut discriminator = 3840_u16;
     let mut matter_port = MATTER_PORT;
+    let mut state_dir = None;
+    let mut cast_again = false;
     let mut declare_only = false;
     let mut wrong_passcode = false;
     let mut wrong_instance = false;
@@ -233,6 +260,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--app-product" => app_product_id = value()?.parse()?,
             "--discriminator" => discriminator = value()?.parse()?,
             "--matter-port" => matter_port = value()?.parse()?,
+            "--state-dir" => state_dir = Some(PathBuf::from(value()?)),
+            "--cast-again" => cast_again = true,
             "--declare-only" => declare_only = true,
             "--wrong-passcode" => wrong_passcode = true,
             "--wrong-instance" => wrong_instance = true,
@@ -251,10 +280,21 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         }
     }
 
+    if !cast_again && passcode_file.is_none() {
+        // Commissioning is a person typing a number; the file is how the harness plays
+        // the person. Only the come-back run has no number to type.
+        return Err(usage().into());
+    }
+    if cast_again && state_dir.is_none() {
+        return Err(format!("--cast-again needs --state-dir\n{}", usage()).into());
+    }
+
     Ok(Args {
         player: player.ok_or_else(usage)?,
         bind: bind.unwrap_or(IpAddr::from([0, 0, 0, 0])),
-        passcode_file: passcode_file.ok_or_else(usage)?,
+        passcode_file,
+        state_dir,
+        cast_again,
         instance: InstanceName::new(&instance)?,
         device_name,
         url,
@@ -281,6 +321,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = parse_args()?;
+
+    if args.cast_again {
+        // The phone that comes back. No UDC, no passcode, no commissioning — the whole
+        // point is that none of that should be needed twice.
+        return cast_again(&args).await;
+    }
 
     // ---- Phase 1: the UDC exchange, from the client's side -------------------------
 
@@ -324,7 +370,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Phase 2: play the person ---------------------------------------------------
 
-    let passcode = await_passcode(&args.passcode_file).await?;
+    let passcode_file = args
+        .passcode_file
+        .as_ref()
+        .ok_or("a commissioning run needs --passcode-file")?;
+    let passcode = await_passcode(passcode_file).await?;
     let passcode = if args.wrong_passcode {
         // One digit out, which is what a misread across a room produces. `- 1` rather
         // than `+ 1` so the result stays inside the spec's range at the top end, and
@@ -348,19 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crypto = rs_matter::crypto::default_crypto(rand_core::OsRng, dac_key.reference());
     let rand = crypto.rand()?;
 
-    let dev_det = BasicInfoConfig {
-        vid: args.app_vendor_id,
-        pid: args.app_product_id,
-        hw_ver: 1,
-        sw_ver: 1,
-        sw_ver_str: "1",
-        serial_no: "matter-peer",
-        device_name: &args.device_name,
-        vendor_name: "castaway",
-        product_name: "matter-peer",
-        hw_ver_str: "1",
-        ..Default::default()
-    };
+    let dev_det = dev_details(&args);
 
     // The passcode the panel chose, as this node's PASE secret. This is the whole point
     // of the file poll above: the number cannot be known until the panel has picked it.
@@ -380,7 +418,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let buffers = MatterBuffers::<4>::new();
     let im_state = InteractionModelState::<DummyNetworks, 3, 0>::new(DummyNetworks);
-    let kv = matter.kv(DummyKvBlobStore);
+    // With `--state-dir`, everything commissioning grants this node — its fabric, its
+    // operational certificate, its keys — survives the process, and a later
+    // `--cast-again` run is the same phone coming back rather than a stranger.
+    let kv = matter.kv(PeerStore::open(args.state_dir.as_deref())?);
     let im = InteractionModel::new(&matter, &crypto, &buffers, dm, &kv, &im_state);
     let responder = DefaultResponder::new(&im);
 
@@ -789,8 +830,9 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
 ///
 /// The direction that makes this Matter *Casting*: the panel commissioned us, and now we
 /// are the one driving it. [`Exchange::initiate`] reuses the CASE session established
-/// during `complete_via_case` — which matters, because the panel does not advertise an
-/// operational `_matter._tcp` record for us to resolve it by.
+/// during `complete_via_case` when one is live; with none — the `--cast-again` run — it
+/// resolves the panel's operational `_matter._tcp` record and establishes a fresh one
+/// (#173), which is why that run drives [`serve_resolves`] alongside this.
 async fn launch_url<C: rs_matter::crypto::Crypto>(
     matter: &Matter<'_>,
     crypto: &C,
@@ -829,6 +871,197 @@ async fn launch_url<C: rs_matter::crypto::Crypto>(
     handle.complete().await?;
 
     Ok(())
+}
+
+/// The device details both runs present. One function so the phone that comes back
+/// (#173) is byte-for-byte the device the panel commissioned.
+fn dev_details(args: &Args) -> BasicInfoConfig<'_> {
+    BasicInfoConfig {
+        vid: args.app_vendor_id,
+        pid: args.app_product_id,
+        hw_ver: 1,
+        sw_ver: 1,
+        sw_ver_str: "1",
+        serial_no: "matter-peer",
+        device_name: &args.device_name,
+        vendor_name: "castaway",
+        product_name: "matter-peer",
+        hw_ver_str: "1",
+        ..Default::default()
+    }
+}
+
+/// `--cast-again`: the phone that comes back (#173).
+///
+/// The normal run's CASE session died with the process (or, in the VM test, with the
+/// panel's restart). A real phone in that position resolves
+/// `<compressed-fabric-id>-<node-id>._matter._tcp` and establishes a fresh CASE session
+/// — `rs_matter::transport::Transport::initiate`'s second branch — which only works if
+/// the panel actually publishes that record. Before it did, this function failed at the
+/// resolve, which is the assertion the matter-vm scenario wrote first.
+async fn cast_again(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = args
+        .state_dir
+        .as_deref()
+        .ok_or("--cast-again needs --state-dir")?;
+
+    // A DAC key is only presented during commissioning, which this run never does; the
+    // crypto backend simply wants one to exist.
+    let mut dac_key = rs_matter::crypto::CanonPkcSecretKey::new();
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, dac_key.access_mut());
+    let crypto = rs_matter::crypto::default_crypto(rand_core::OsRng, dac_key.reference());
+    let rand = crypto.rand()?;
+
+    let dev_det = dev_details(args);
+
+    // No commissioning window ever opens on this run, so the PASE verifier is the empty
+    // one — the same stance the panel itself takes.
+    let dev_comm = BasicCommData {
+        password: Spake2pVerifierPassword::new(),
+        discriminator: args.discriminator,
+    };
+
+    let matter = Matter::new(&dev_det, dev_comm, &TEST_DEV_ATT, args.matter_port);
+
+    const NODE: Node<'static> = Node {
+        endpoints: &[root_endpoint!(eth)],
+    };
+    let dm = (NODE, EthSysHandlerBuilder::new().build(rand));
+
+    let buffers = MatterBuffers::<4>::new();
+    let im_state = InteractionModelState::<DummyNetworks, 3, 0>::new(DummyNetworks);
+    let kv = matter.kv(PeerStore::open(Some(state_dir))?);
+
+    // The whole point: yesterday's fabric, not a fresh one. `CommissioningComplete` on
+    // the earlier run is what persisted it.
+    matter.load_persist(&kv).await?;
+    let fab_idx = matter
+        .with_state(|state| {
+            state
+                .fabrics
+                .iter()
+                .next()
+                .map(rs_matter::fabric::Fabric::fab_idx)
+        })
+        .ok_or("no persisted fabric — run a commissioning pass with --state-dir first")?;
+    println!(
+        "matter-peer: loaded the fabric a previous run was commissioned onto, index {fab_idx}"
+    );
+
+    let im = InteractionModel::new(&matter, &crypto, &buffers, dm, &kv, &im_state);
+    let responder = DefaultResponder::new(&im);
+
+    let (send, recv) =
+        proto_matter::net::bind(SocketAddr::new(args.bind, args.matter_port)).await?;
+
+    // Browse-only this time — there is nothing to advertise, the panel is not
+    // commissioning anybody — but `rs-matter`'s resolve still needs someone to actually
+    // ask the LAN, and that someone is `serve_resolves` below.
+    let mut mdns = MdnsResponder::new()?;
+    if !args.bind.is_unspecified() {
+        mdns.restrict_to(args.bind)?;
+    }
+
+    let script = async {
+        let player_node_id = CastingCa::panel_node_id();
+        let deadline = tokio::time::Instant::now() + CAST_AGAIN_WINDOW;
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            match launch_url(&matter, &crypto, fab_idx, player_node_id, args).await {
+                Ok(()) => {
+                    println!(
+                        "matter-peer: cast again on attempt {attempt} — CASE re-established \
+                         off the operational record"
+                    );
+                    return Ok(());
+                }
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    // Each failure here is most likely the resolve timing out, which is
+                    // exactly what an unfixed panel produces — logged per attempt so the
+                    // terminal error reads as many identical failures, not one late one.
+                    tracing::info!(attempt, error = %e, "matter-peer: cast again not yet, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    return Err(format!("cast again failed after {attempt} attempts: {e}").into());
+                }
+            }
+        }
+    };
+
+    let transport = matter.run(&crypto, send, recv, NoNetwork);
+
+    let outcome = tokio::select! {
+        r = transport => r.map_err(Into::into).and(Err("the transport stopped".into())),
+        r = im.run() => r.map_err(Into::into).and(Err("the data model stopped".into())),
+        r = responder.run::<4, 4>() => {
+            r.map_err(Into::into).and(Err("the responder stopped".into()))
+        }
+        r = serve_resolves(&matter, &mdns) => r.and(Err("the resolver stopped".into())),
+        r = script => r,
+    };
+
+    let outcome: Result<(), Box<dyn std::error::Error>> = outcome;
+    outcome?;
+
+    // The same terminal sentinel as a commissioning run, so the VM test's "it finished"
+    // check is one string in both scenarios.
+    println!("matter-peer completed");
+    Ok(())
+}
+
+/// Service `rs-matter`'s mDNS resolve requests from this project's own responder.
+///
+/// `Exchange::initiate` with no live CASE session parks a resolve request on the
+/// transport and waits for "a running mDNS responder" (its words) to answer it. This
+/// binary's responder is `substrate-mdns`, so this is the bridge: take the request,
+/// browse its service type, and deposit every resolution —
+/// `try_deposit_mdns_resolve` does the instance-name matching itself, so an answer for
+/// some other node is simply ignored.
+async fn serve_resolves(
+    matter: &Matter<'_>,
+    mdns: &MdnsResponder,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let service = matter.transport().wait_mdns_resolve_request().await;
+        tracing::info!(?service, "matter-peer: resolving over mDNS");
+
+        let mut browser = mdns.browse(service.service_type())?;
+        let deadline = tokio::time::Instant::now() + RESOLVE_BROWSE_WINDOW;
+
+        // Poll with a deadline rather than blocking on the browse: the requester gives
+        // up on its own 5 s timer, and a browse that outlives its request would deposit
+        // answers into nothing.
+        while matter.transport().mdns_resolve_in_flight() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("matter-peer: nothing on the LAN answered the resolve");
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(250), browser.next()).await {
+                Ok(Some(BrowseEvent::Resolved(found))) => {
+                    tracing::info!(
+                        instance = %found.instance,
+                        port = found.port,
+                        addresses = ?found.addresses,
+                        "matter-peer: resolve candidate"
+                    );
+                    let answer = MdnsRemoteService {
+                        instance_name: DottedName(&found.fullname),
+                        port: Some(found.port),
+                        addrs: found.addresses.iter().copied(),
+                        txt: found.txt.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                        scope_id: 0,
+                    };
+                    matter.transport().try_deposit_mdns_resolve(&answer);
+                }
+                // A removal is not an answer, and an expired 250 ms tick is just the
+                // in-flight check coming round again.
+                Ok(Some(BrowseEvent::Removed { .. })) | Err(_) => {}
+                Ok(None) => return Err("the mDNS daemon shut down mid-browse".into()),
+            }
+        }
+    }
 }
 
 /// Poll until the panel has put us on its fabric.
@@ -920,6 +1153,62 @@ fn declaration(args: &Args, udc: &UdcSocket) -> IdentificationDeclaration {
         commissioner_passcode_ready: false,
         cancel_passcode: false,
         passcode_length: Some(8),
+    }
+}
+
+/// The phone's persistence: nothing for the one-shot runs the harness started with, a
+/// directory when the run is meant to be come back from (#173).
+///
+/// One enum rather than two code paths through `main`, because the type of the KV store
+/// threads through `Matter::kv` and `InteractionModel::new` — a branch there would
+/// duplicate the whole stack construction.
+enum PeerStore {
+    Ephemeral(DummyKvBlobStore),
+    Durable(DirKvBlobStore),
+}
+
+impl PeerStore {
+    fn open(dir: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        match dir {
+            None => Ok(Self::Ephemeral(DummyKvBlobStore)),
+            Some(dir) => {
+                // `DirKvBlobStore` writes `<dir>/k_<key>` and assumes the directory.
+                std::fs::create_dir_all(dir)?;
+                Ok(Self::Durable(DirKvBlobStore::new(dir.to_path_buf())))
+            }
+        }
+    }
+}
+
+impl KvBlobStore for PeerStore {
+    fn load<'a>(
+        &mut self,
+        key: u16,
+        buf: &'a mut [u8],
+    ) -> Result<Option<&'a [u8]>, rs_matter::error::Error> {
+        match self {
+            Self::Ephemeral(store) => store.load(key, buf),
+            Self::Durable(store) => KvBlobStore::load(store, key, buf),
+        }
+    }
+
+    fn store(
+        &mut self,
+        key: u16,
+        data: &[u8],
+        buf: &mut [u8],
+    ) -> Result<(), rs_matter::error::Error> {
+        match self {
+            Self::Ephemeral(store) => store.store(key, data, buf),
+            Self::Durable(store) => KvBlobStore::store(store, key, data, buf),
+        }
+    }
+
+    fn remove(&mut self, key: u16, buf: &mut [u8]) -> Result<(), rs_matter::error::Error> {
+        match self {
+            Self::Ephemeral(store) => store.remove(key, buf),
+            Self::Durable(store) => KvBlobStore::remove(store, key, buf),
+        }
     }
 }
 

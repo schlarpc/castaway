@@ -40,6 +40,11 @@ let
   castUrl = "https://example.invalid/matter-vm.mp4";
   castTitle = "matter-vm launch";
 
+  # The second cast, after the panel restarts (#173). A different URL so the assertion
+  # that it played cannot be satisfied by the first cast's journal lines.
+  castUrlAgain = "https://example.invalid/matter-vm-again.mp4";
+  castTitleAgain = "matter-vm cast again";
+
   peer = pkgs.writeShellScriptBin "matter-peer-run" ''
     set -euo pipefail
     exec ${self.packages.${pkgs.stdenv.hostPlatform.system}.matter-peer}/bin/matter-peer "$@"
@@ -173,6 +178,9 @@ pkgs.testers.runNixOSTest {
             f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
             f"--passcode-file /tmp/passcode.txt --url '${castUrl}' "
             f"--display-string '${castTitle}' "
+            # Persist the fabric this run is commissioned onto, so the cast-again
+            # scenario at the bottom can be this phone coming back (#173).
+            f"--state-dir /tmp/peer-state "
             # Everything past the LaunchURL (#196). One commissioning, then every cluster
             # handler this node serves, driven through a real interaction model by a
             # client. `--transport play,pause` in that order because the panel is playing
@@ -236,6 +244,21 @@ pkgs.testers.runNixOSTest {
         # The node id comes from our CA, not rs-matter's: 0x1000 is FIRST_CLIENT_NODE_ID.
         assert re.search(r"casting client commissioned.*node_id=4096", journal), journal
 
+        # The fabric just gained its first member, which is the moment the operational
+        # `_matter._tcp` record goes up (#173) — before that there was nobody entitled
+        # to resolve it, and without it a phone whose CASE session dies can never come
+        # back. Instance name per the spec: <compressed-fabric-id>-<node-id>, uppercase
+        # hex, the node id being the panel's own (1).
+        panel.wait_until_succeeds(
+            "journalctl -u castaway --no-pager | grep 'mDNS advertised' "
+            "| grep -q '_matter\\._tcp'",
+            timeout=30,
+        )
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert re.search(
+            r"mDNS advertised.*_matter\._tcp.*[0-9A-F]{16}-0000000000000001", journal
+        ), journal
+
     with subtest("the phone casts, and the panel plays it"):
         try:
             phone.wait_until_succeeds(
@@ -248,10 +271,10 @@ pkgs.testers.runNixOSTest {
 
         peer_log = phone.succeed("cat /tmp/peer.log")
         # The direction that makes this Matter *Casting*: the panel commissioned the
-        # phone, and the phone is now the one driving. The invoke rides the CASE session
-        # established during commissioning — the panel advertises no operational
-        # `_matter._tcp` record, so there is nothing for the client to resolve it by and
-        # session reuse is the only path this can take.
+        # phone, and the phone is now the one driving. Seconds after commissioning, the
+        # invoke rides the CASE session `complete_via_case` established — the reuse
+        # branch. The other branch, resolving the operational record when no session
+        # survives, is what the restart scenario at the bottom exercises (#173).
         assert "LauncherResponse status=Success" in peer_log, peer_log
 
         journal = panel.succeed("journalctl -u castaway --no-pager")
@@ -512,5 +535,60 @@ pkgs.testers.runNixOSTest {
         # that matched that one would pass with this path removed entirely.
         after_expiry = journal.split("a displayed passcode expired", 1)[1]
         assert "OSD clear" in after_expiry, after_expiry
+
+    with subtest("the panel restarts, and a commissioned phone casts again (#173)"):
+        # Restarting the service is the bluntest of the ordinary ways every CASE session
+        # dies at once — an idle timeout, a phone asleep overnight, and eviction from
+        # rs-matter's fixed-size session table are the same failure, slower. "Cast again
+        # tomorrow morning" is the normal use of a panel on a wall.
+        panel.succeed("systemctl restart castaway.service")
+        panel.wait_until_succeeds("ss -uln | grep -q ':5540'", timeout=90)
+
+        # Everything below asserts against this invocation of the service, not the
+        # journal the whole run has accumulated.
+        invocation = panel.succeed(
+            "systemctl show -p InvocationID --value castaway.service"
+        ).strip()
+        journal_now = f"journalctl --no-pager _SYSTEMD_INVOCATION_ID={invocation}"
+        panel.wait_until_succeeds(
+            f"{journal_now} | grep -q 'matter: casting receiver up'", timeout=90
+        )
+
+        # The phone comes back: same fabric off /tmp/peer-state, no UDC, no passcode, no
+        # commissioning. Its CASE session died with the panel, so the only way back in
+        # is resolving `<compressed-fabric-id>-<node-id>._matter._tcp` and establishing
+        # a fresh one — rs-matter's `Transport::initiate`, second branch.
+        phone.succeed(
+            f"matter-peer-run --player {panel_ip} --bind {phone_ip} "
+            f"--cast-again --state-dir /tmp/peer-state "
+            f"--url '${castUrlAgain}' --display-string '${castTitleAgain}' "
+            f"> /tmp/again.log 2>&1 &"
+        )
+        try:
+            phone.wait_until_succeeds(
+                "grep -q 'matter-peer completed' /tmp/again.log", timeout=180
+            )
+        except Exception:
+            print(phone.succeed("cat /tmp/again.log || true"))
+            print(panel.succeed(f"{journal_now} | tail -80 || true"))
+            raise
+
+        again_log = phone.succeed("cat /tmp/again.log")
+        print(again_log)
+        assert "loaded the fabric a previous run was commissioned onto" in again_log
+        assert "cast again on attempt" in again_log, again_log
+        assert "LauncherResponse status=Success" in again_log, again_log
+
+        journal = panel.succeed(journal_now)
+        # The record is up on the *new* invocation, rebuilt from persisted fabric state
+        # alone — no commissioning happened on this boot, and a panel that restarted
+        # without re-publishing it would strand every phone it ever paired.
+        assert re.search(
+            r"mDNS advertised.*_matter\._tcp.*[0-9A-F]{16}-0000000000000001", journal
+        ), journal
+        # And the second cast became a session on the restarted panel.
+        assert re.search(r"matter: launching.*app=1", journal), journal
+        assert re.search(r"null pipeline: PLAY.*${castUrlAgain}", journal), journal
+        assert "${castTitleAgain}" in journal, journal
   '';
 }
