@@ -281,7 +281,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_launch_puts_the_page_up_and_a_stop_takes_it_down() {
         let (svc, mut events) = service();
         let app = svc.router();
@@ -336,7 +336,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_relaunch_inside_the_window_leaves_the_new_screen_id_standing() {
         // G20, fixed in code and exercised by nothing until now. A screen id takes seconds
         // to resolve, so a second launch inside that window used to leave *two* resolvers
@@ -373,7 +373,8 @@ mod tests {
         })
         .await;
 
-        // Long enough that a first resolver still running would have written by now.
+        // Past the resolver's 300 ms write — virtual, so this costs nothing and cannot
+        // be outrun by a loaded box: a first resolver still running *has* written by now.
         tokio::time::sleep(Duration::from_millis(600)).await;
         let published = app_info(&app).await;
         assert!(
@@ -386,7 +387,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_second_sender_attaches_to_the_running_page_without_disturbing_it() {
         // The attach-without-launch path, which is the whole reason the screen id is
         // published at all (#96). One phone casts; a second person opens YouTube, finds
@@ -424,6 +425,7 @@ mod tests {
             shown.lock().unwrap().first().cloned()
         })
         .await;
+        // Past the resolver's 300 ms write, in virtual time.
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         // What the second sender reads.
@@ -456,7 +458,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn a_stop_calls_off_the_resolver_still_hunting_for_a_screen() {
         // The other half of the same rule. A `DELETE` clears the slot; a resolver still
         // running would refill it seconds later, and the receiver would then advertise a
@@ -477,7 +479,8 @@ mod tests {
         );
         assert_eq!(delete(&app).await, StatusCode::OK);
 
-        // Past when that resolver would have written.
+        // Past when that resolver would have written — virtual, so waiting out the whole
+        // window is free.
         tokio::time::sleep(Duration::from_millis(600)).await;
         // Asserted on the *slot*, not on the app info. A stopped app publishes no screen
         // id whatever the slot holds, so reading the XML here would pass on a receiver

@@ -66,6 +66,9 @@ rustix = { version = "1.1", features = ["fs"] }
 [dev-dependencies]
 # The shared deadline poll (#236).
 castaway-test-support.workspace = true
+# `test-util` for `start_paused`: the DIAL screen tests wait out the resolver windows in
+# virtual time rather than sleeping them (#236).
+tokio = { workspace = true, features = ["test-util"] }
 # Driving the DLNA media plane end to end, and the `/stream/*` routes without a socket:
 # a real request into the real router.
 tower = { version = "0.5", features = ["util"] }
