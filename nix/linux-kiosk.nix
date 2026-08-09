@@ -165,6 +165,15 @@ craneLib.buildPackage (commonArgs // kioskArgs // {
     EOF
   '';
 
+  # The marker the NixOS module keys its hardening on (#246): this artifact carries
+  # Chromium, whose sandbox model needs named allowances (`pkey_*`, `chroot`,
+  # user namespaces, a real /tmp for the X socket) that a browser-less package
+  # must not be granted. The module reads `passthru.castawayBrowser` rather than
+  # guessing from the package name, so a custom kiosk build gets the same treatment.
+  passthru = (commonArgs.passthru or { }) // {
+    castawayBrowser = true;
+  };
+
   meta = commonArgs.meta or { } // {
     description = "castaway: the full Linux kiosk — renderer, Electron browser, audio out, Bluetooth";
     mainProgram = "castaway";

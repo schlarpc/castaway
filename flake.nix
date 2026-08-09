@@ -1328,6 +1328,12 @@
             # wpa_supplicant castaway can command, and a DHCP server on the group
             # interface. Both are derived from the same settings the binary reads, so
             # the daemon castaway talks to and the daemon the module runs cannot drift.
+            # Whether the selected package carries the Electron browser (#246). The
+            # kiosk build declares it via `passthru.castawayBrowser`; the hardening
+            # below narrows on it, because three of its switches kill Chromium
+            # outright and a stock `enable = true` on Linux runs the kiosk.
+            browserPackage = cfg.package.passthru.castawayBrowser or false;
+
             miracastEnabled = cfg.settings.enable.miracast or false;
             miracastInterface = cfg.settings.miracast.interface or "wlan0";
             # Our side of the group subnet, in the `address/prefix` form both networkd's
@@ -1413,8 +1419,8 @@
                   The castaway package to run.
 
                   The default on Linux is the full kiosk: render pipeline, Electron browser,
-                  audio output and Bluetooth. Every optional feature is on except `ldac`,
-                  which advertises a codec the build cannot decode.
+                  audio output and Bluetooth. Every optional feature is on, `ldac`
+                  included (the codec stays opt-in at runtime — see nix/linux-kiosk.nix).
 
                   For a headless box — one proving the protocol stack, or serving DLNA
                   with no display attached — use
@@ -1422,6 +1428,13 @@
                   renderer nor a browser. It does not advertise DIAL at all: YouTube
                   casting is a web page, so a build with nowhere to put one declines to
                   offer it rather than accepting casts it can never play.
+
+                  The unit's sandbox hardening follows the package: one carrying the
+                  Electron browser (declared via `passthru.castawayBrowser`, which the
+                  kiosk build sets) gets the named allowances Chromium's own sandbox
+                  needs — user namespaces, `pkey_*`/`chroot`/`@sandbox` syscalls, a
+                  real /tmp for the X socket (#246). A browser-less package keeps the
+                  full hardening set.
                 '';
               };
 
@@ -1619,6 +1632,12 @@
                   # GameStream pairing store was hardcoded to anyway, so that credential
                   # keeps its existing path rather than moving under the deployment.
                   XDG_STATE_HOME = "%S";
+                } // lib.optionalAttrs browserPackage {
+                  # Chromium resolves its profile through HOME and a DynamicUser's
+                  # home is `/` — the same trap as the two XDG variables above, but
+                  # the browser reads HOME itself, so the XDG overrides don't reach
+                  # it. %S/castaway is the state directory the unit already owns.
+                  HOME = "%S/castaway";
                 };
 
                 serviceConfig = {
@@ -1640,17 +1659,49 @@
                   WorkingDirectory = "/var/lib/castaway";
 
                   NoNewPrivileges = true;
-                  PrivateTmp = true;
                   ProtectSystem = "strict";
                   ProtectHome = true;
                   ProtectKernelTunables = true;
                   ProtectKernelModules = true;
                   ProtectControlGroups = true;
-                  RestrictNamespaces = true;
                   RestrictRealtime = true;
                   RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ];
                   SystemCallArchitectures = "native";
-                  SystemCallFilter = [ "@system-service" ];
+
+                  # The three switches below narrow when the package carries the
+                  # browser (#246): the kiosk exists to run Chromium, and Chromium's
+                  # sandbox model is load-bearing — `--no-sandbox` was rejected
+                  # deliberately (nix/electron-linux.nix, G86/D36), so the unit has
+                  # to permit what the sandbox does. A browser-less package
+                  # (`castaway-portable`) keeps the full set.
+                  #
+                  # An X-based deploy's kiosk finds its display through
+                  # /tmp/.X11-unix; PrivateTmp shows it an empty /tmp and winit
+                  # reports a display it cannot reach. Wayland hands the socket over
+                  # XDG_RUNTIME_DIR and would tolerate PrivateTmp, but the module
+                  # cannot see which server the box runs, and a kiosk that cannot
+                  # find its display is the worse default.
+                  PrivateTmp = !browserPackage;
+                  # Chromium's namespace sandbox clones user namespaces (the setuid
+                  # helper cannot exist in the store); RestrictNamespaces makes the
+                  # zygote abort and the zygote host CHECK-crashes the whole browser
+                  # (zygote_host_impl_linux.cc:221).
+                  RestrictNamespaces = !browserPackage;
+                  # `@system-service` alone SIGSYS-kills the browser twice over: V8
+                  # allocates memory-protection keys (syscall 330, `pkey_alloc`) and
+                  # the namespace sandbox chroots its zygote into an empty directory
+                  # (syscall 161). The render sandbox then installs its own
+                  # seccomp/Landlock filters (`@sandbox`). Observed directly on the
+                  # dial-vm node and reproduced natively under `systemd-run` —
+                  # with these lines electron runs, without any one of them it dies.
+                  SystemCallFilter = [ "@system-service" ]
+                    ++ lib.optionals browserPackage [
+                    "@sandbox"
+                    "pkey_alloc"
+                    "pkey_free"
+                    "pkey_mprotect"
+                    "chroot"
+                  ];
                 };
               };
 

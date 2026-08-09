@@ -88,6 +88,11 @@ pkgs.testers.runNixOSTest {
         };
       };
 
+      # The browser-shaped hardening allowances and the profile HOME this node used
+      # to carry now live in the module itself, keyed on the package's
+      # `passthru.castawayBrowser` marker (#246) — this check booting green on a
+      # stock `services.castaway` is the regression test for that. What remains
+      # here is genuinely the VM's: a virtual display and a software GPU.
       systemd.services.castaway = {
         after = [ "xvfb.service" ];
         requires = [ "xvfb.service" ];
@@ -99,29 +104,6 @@ pkgs.testers.runNixOSTest {
           WGPU_BACKEND = "vulkan";
           VK_DRIVER_FILES =
             "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
-          # Chromium wants a writable profile; a DynamicUser's home is `/`. The state
-          # directory is the one writable place the module already owns.
-          HOME = "%S/castaway";
-        };
-        serviceConfig = {
-          # The X socket is /tmp/.X11-unix/X99; with PrivateTmp the kiosk sees an empty
-          # /tmp and winit reports a display it cannot reach.
-          PrivateTmp = lib.mkForce false;
-          # Chromium's namespace sandbox clones user namespaces (the setuid helper
-          # cannot exist in the store — see nix/electron-linux.nix, which chose the
-          # namespace sandbox over `--no-sandbox` deliberately). RestrictNamespaces
-          # would make the zygote abort and take the kiosk down with it.
-          RestrictNamespaces = lib.mkForce false;
-          # Appended, not forced — systemd unions repeated allowlist lines. The module's
-          # `@system-service` set is missing three things Chromium needs, and a filtered
-          # syscall under that set is a SIGSYS kill: V8 allocates memory-protection
-          # keys (observed on this node as electron dying on syscall 330, `pkey_alloc`),
-          # the namespace sandbox chroots its zygote into an empty directory (syscall
-          # 161, `chroot` — the zygote host CHECK-crashes the whole browser when that
-          # child dies), and the render sandbox installs its own seccomp/Landlock
-          # filters (`@sandbox`). Verified natively: electron under `systemd-run` with
-          # `@system-service` alone dies at the zygote; with these four lines it runs.
-          SystemCallFilter = [ "@sandbox" "pkey_alloc" "pkey_free" "pkey_mprotect" "chroot" ];
         };
       };
     };
