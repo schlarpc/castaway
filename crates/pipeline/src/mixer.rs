@@ -1191,7 +1191,18 @@ struct Sink {
     real: bool,
     /// Frames handed to this sink since it was opened.
     submitted: u64,
-    /// When it was opened, for a sink that cannot count.
+    /// The zero the wall-clock fallback measures from, for a sink that cannot count.
+    ///
+    /// The instant this sink was first *written to*, not the instant it was built. A
+    /// [`Sink::silent`] is constructed when the mixer thread starts and again whenever
+    /// the device is released after [`IDLE_CLOSE`], and then parked — so measuring from
+    /// construction hands it a "played" credit the size of however long the panel was
+    /// idle. `inflight` saturates to zero, [`plan`] sees a full lead of headroom every
+    /// pass and never sleeps, and the loop drains every source at memcpy speed: a media
+    /// URL races its own file in seconds while [`crate::clock::MediaClock`] is dragged
+    /// along with it. Reachable on the deploy target by three routes — a box with no
+    /// sound card, #55, and #230 — all of which are "the open failed, so keep the silent
+    /// one".
     started: Instant,
     /// The last time [`Self::played`] was seen to advance, and what it read.
     ///
@@ -1220,6 +1231,16 @@ impl Sink {
             started,
             progress: (started, 0),
         }
+    }
+
+    /// Record `frames` handed over at `now`, anchoring the wall-clock fallback the first
+    /// time. See [`Self::started`] for what anchoring it at construction cost.
+    fn submit(&mut self, frames: u64, now: Instant) {
+        if self.submitted == 0 {
+            self.started = now;
+            self.progress = (now, self.played(now));
+        }
+        self.submitted += frames;
     }
 
     /// Whether this sink has stopped consuming altogether.
@@ -1369,7 +1390,7 @@ fn run(shared: &Arc<Shared>, device: &AudioOutputFactory) {
             sink = Sink::silent();
             retry_at = Some(now + REOPEN_AFTER);
         } else {
-            sink.submitted += frames;
+            sink.submit(frames, now);
         }
         // Republished every pass, because it is half of every writer's budget: a device
         // that stops draining has to show up as a full budget, or the sources ahead of it
@@ -2620,6 +2641,53 @@ mod tests {
         assert_eq!(
             input.dropped, 0,
             "nothing should have hit the write deadline"
+        );
+    }
+
+    /// …and it must not drain them *faster* than real time either, which is the same
+    /// property and the half the test above cannot see.
+    ///
+    /// `a_box_with_no_device_still_drains_its_sources_in_real_time` bounds only the slow
+    /// side, and it passes trivially because it opens a source immediately — so the
+    /// silent sink it gets was built a millisecond earlier. On the panel the mixer thread
+    /// starts at boot and parks with no inputs, and the silent sink it built there is the
+    /// one a session an hour later ends up using when the device will not open. Measuring
+    /// its wall-clock fallback from construction made that hour a "played" credit:
+    /// `inflight` saturates to zero, `plan` finds a full lead of headroom every pass and
+    /// never sleeps, and a media URL races its own file in seconds with `MediaClock`
+    /// dragged along behind it — every frame then hopelessly late, and a black panel.
+    #[test]
+    fn a_parked_silent_sink_does_not_arrive_with_a_credit() {
+        struct Refuses;
+        impl AudioOut for Refuses {
+            fn start(&mut self, _rate: u32, _channels: u16) -> Result<(), PipelineError> {
+                Err(PipelineError::Audio("no device".into()))
+            }
+            fn write(&mut self, _block: &PcmBlock) -> Result<(), PipelineError> {
+                Err(PipelineError::Audio("no device".into()))
+            }
+            fn stop(&mut self) {}
+        }
+
+        let mixer = AudioMixer::new(Arc::new(|| Box::new(Refuses)));
+        // Park with no inputs at all, which is what a panel does between sessions.
+        std::thread::sleep(Duration::from_millis(600));
+
+        let mut input = mixer.input(Backpressure::Pull);
+        let start = Instant::now();
+        // A second of audio. Real time is real time, sound card or no sound card.
+        for _ in 0..100 {
+            input.write(&tone(480, 0.5)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(
+            input.dropped, 0,
+            "nothing should have hit the write deadline"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "a second of audio was taken in {elapsed:?}; the silent sink arrived \
+             holding a credit for the time it spent parked, so nothing paced the source"
         );
     }
 
