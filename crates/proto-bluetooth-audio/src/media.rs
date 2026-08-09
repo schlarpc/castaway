@@ -118,6 +118,23 @@ impl Depacketizer {
         }
     }
 
+    /// A fresh depacketizer for the *same live session*, keeping its damage record.
+    ///
+    /// For a RECONFIGURE that keeps the negotiated format: parsing state resets —
+    /// the source may restart its timestamps and sequence numbering, so carrying the
+    /// old baseline would count the jump as a 30-thousand-packet loss — but
+    /// `lost_packets` and `sequence_gaps` are the session's history, and
+    /// [`Depacketizer::new`] zeroing them mid-session made every loss before the
+    /// reconfiguration vanish from the close-out numbers (#233).
+    #[must_use]
+    pub fn reconfigured(&self, codec: AudioCodec, sample_rate: u32) -> Self {
+        Self {
+            lost_packets: self.lost_packets,
+            sequence_gaps: self.sequence_gaps,
+            ..Self::new(codec, sample_rate)
+        }
+    }
+
     /// Which codec this depacketizer was configured for.
     #[must_use]
     pub const fn codec(&self) -> AudioCodec {
@@ -375,6 +392,31 @@ mod tests {
         // A jump backwards is reordering or a restarted stream, not 65k losses.
         d.push(rtp_seq(20, &[0xAA; 6])).unwrap();
         assert_eq!(d.lost_packets(), 0, "a backwards jump is not a loss");
+    }
+
+    #[test]
+    fn a_same_format_reconfigure_keeps_the_sessions_loss_record() {
+        // A phone's mid-session RECONFIGURE that keeps the format keeps the audio
+        // session — and used to hand it a fresh depacketizer, zeroing `lost_packets`
+        // and making every loss before the reconfiguration vanish from the session's
+        // close-out numbers (#233).
+        let mut d = Depacketizer::new(AudioCodec::AptXHd, 44_100);
+        d.push(rtp_seq(10, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(14, &[0xAA; 6])).unwrap(); // 11..=13 lost
+        assert_eq!(d.lost_packets(), 3);
+
+        let mut d = d.reconfigured(AudioCodec::AptXHd, 44_100);
+        assert_eq!(d.lost_packets(), 3, "the damage record survives");
+        assert_eq!(d.sequence_gaps(), 1);
+        // The parsing baseline does not: the source may restart its numbering, and a
+        // carried-over baseline would book the jump as tens of thousands of losses.
+        d.push(rtp_seq(500, &[0xAA; 6])).unwrap();
+        d.push(rtp_seq(501, &[0xAA; 6])).unwrap();
+        assert_eq!(
+            d.lost_packets(),
+            3,
+            "a restarted sequence is a new baseline, not a loss"
+        );
     }
 
     #[test]

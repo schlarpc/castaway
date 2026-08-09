@@ -1338,15 +1338,18 @@ impl BluetoothAdapter {
                     // a second route. Dropping the channel ends that audio session; the
                     // START that follows the reconfiguration opens a fresh one with the
                     // right shape. A reconfiguration that *keeps* the format keeps the
-                    // session too — only the depacketizer is rebuilt for the new
-                    // parameters.
-                    let depacketizer = Depacketizer::new(codec, format.sample_rate());
+                    // session too — the depacketizer's parsing state is rebuilt for the
+                    // new parameters, and its loss record survives: a fresh one zeroed
+                    // `lost_packets` mid-session, so every loss before the RECONFIGURE
+                    // vanished from the session's numbers (#233).
                     link.audio = match std::mem::replace(&mut link.audio, AudioSession::Closed) {
                         AudioSession::Open {
-                            format: was, tx, ..
+                            format: was,
+                            tx,
+                            depacketizer: old,
                         } if was == format => AudioSession::Open {
                             format,
-                            depacketizer,
+                            depacketizer: old.reconfigured(codec, format.sample_rate()),
                             tx,
                         },
                         AudioSession::Open { format: was, .. } => {
@@ -1357,13 +1360,13 @@ impl BluetoothAdapter {
                             );
                             AudioSession::Configured {
                                 format,
-                                depacketizer,
+                                depacketizer: Depacketizer::new(codec, format.sample_rate()),
                             }
                         }
                         AudioSession::Closed | AudioSession::Configured { .. } => {
                             AudioSession::Configured {
                                 format,
-                                depacketizer,
+                                depacketizer: Depacketizer::new(codec, format.sample_rate()),
                             }
                         }
                     };
