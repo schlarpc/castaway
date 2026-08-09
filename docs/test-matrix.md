@@ -105,12 +105,22 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 
 ## 2. The harness
 
-### The 17 checks
+### The 20 checks
 
-`nix flake check` runs **all 17** checks (23 before D55 collapsed the per-feature
-ones; `moonlight-bindings` was added after, closing half of #191, and `android-bt`
-after that, opening #225's first slice), on the one system
+`nix flake check` runs **all 20** checks (23 before D55 collapsed the per-feature
+ones; `moonlight-bindings` was added after, closing half of #191, then `android-bt`
+opening #225's first slice, `dial-vm` for #202's positive discovery path, and
+`android-cast` closing #225's second slice), on the one system
 this flake now claims — see the structural note below.
+
+The count and the table below are the ones `nix eval .#checks.x86_64-linux` gives; they
+had drifted two behind it before 2026-08-09, which is a thing to check when adding a row.
+
+`android-cast` is the one check with a **host requirement beyond the `kvm` system
+feature**: it builds a TAP inside the sandbox's network namespace, and the sandbox's
+`/dev` has no `net/tun` unless nix.conf says `extra-sandbox-paths = /dev/net/tun`
+(CI sets it in the installer's extra-conf). Without it the check fails immediately and
+prints that line, rather than failing as `open: No such file or directory`.
 There is no opt-in tier inside `checks` — nothing is gated behind an env var or a separate
 invocation.
 
@@ -141,7 +151,9 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `gamestream-vm` | 2-node; peer is **real nixpkgs `sunshine`**; neither node runs castaway or the module | **T3** | 71m |
 | `bluetooth-vm` | 1 node, `hci_vhci` + btvirt; peer is **real BlueZ**; receiver launched ad-hoc, **not** via the module | T2 | 75m |
 | `mixer-vm` | 1 node, `snd-dummy` + PipeWire; runs `mixer_real_device.rs` `--include-ignored` against a device clock that is the kernel's, not ours (#204) | T2 | 28s + build |
+| `dial-vm` | 2 nodes; the **whole kiosk** (Electron, wgpu, winit under Xvfb + lavapipe) answering a targeted DIAL M-SEARCH from another host, serving the description it points at, under a USN that does not collide with the DLNA renderer beside it. The counterpart to `integration-vm`, which asserts DIAL's *absence* on a browser-less build (D27) — see §4.4/§4.5 (#202) | T2 | — |
 | `android-bt` | the Android emulator headless under KVM (no nixosTest — no nested KVM), its Bluetooth on netsim/rootcanal, castaway on the same phy over H4-over-TCP; **the peer is the real Android stack**, paired through its own Settings UI, streaming aptX HD from a pinned VLC APK, correlated per channel out of the mixer's recording (#225) | **T3** | minutes + build |
+| `android-cast` | the same emulator on a **TAP segment** instead of a radio; the sender is Android's own system Cast picker, i.e. **Play Services**, not the openscreen lineage every other Cast check uses. Asserts the picker *lists* us (the #226 surface), that the CASTv2 connection arrives **from the guest's address** rather than around the tap, that device auth against real Play Services passes (#40), and that a mirroring OFFER/ANSWER completes — then counts the phone's RTP out of the segment capture, because "negotiated and silent" is a real failure mode a log line cannot rule out (#225) | **T3** | minutes + build |
 | `ldac-bindings` | regenerate `ldac-sys/src/bindings.rs` with bindgen and `diff -u` | T3 | 3m |
 | `moonlight-bindings` | the same for `moonlight-sys/src/bindings.rs` against the pinned `Limelight.h` | T3 | <1m |
 | `castaway-windows-electron-dll-closure` | cross-build + static import-table closure | T2 | 51–70m |
