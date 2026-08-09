@@ -2298,4 +2298,61 @@ mod tests {
         assert_ne!(dial, cast);
         assert_eq!(dial, device_uuid("not-a-uuid", "dial"));
     }
+
+    /// The two UPnP root devices `serve` registers, built with the same expressions it
+    /// uses — DLNA on `config.uuid`, DIAL on `device_uuid(&config.uuid, "dial")` — share
+    /// no `USN` across their whole advertised surface (#202).
+    ///
+    /// `each_protocol_gets_its_own_device_uuid_and_keeps_it` pins the derivation;
+    /// this pins the consequence at the SSDP layer, where the collision actually bit:
+    /// every `SsdpDevice` expands to a `uuid:…::upnp:rootdevice` target and a bare
+    /// `uuid:…` target, so two services wired to one UUID answer `ssdp:all` and
+    /// `upnp:rootdevice` searches with identical USNs and different LOCATIONs, and a
+    /// control point that dedupes on USN throws one description away. If someone
+    /// "simplifies" the DIAL wiring back to `config.uuid`, this is the test that says
+    /// what breaks.
+    #[test]
+    fn dial_and_dlna_root_devices_share_no_usn() {
+        let config = crate::config::Config {
+            uuid: "0f8c1e2a-1111-4000-8000-00000000abcd".to_owned(),
+            ..Default::default()
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let sink = castaway_core::SessionSink::new(
+            castaway_core::SourceId::new(castaway_core::ProtocolKind::Dlna, "http"),
+            event_tx,
+        );
+        let dlna = proto_dlna::DlnaService::new(
+            config.advertised_name(castaway_core::ProtocolKind::Dlna),
+            &config.uuid,
+            sink,
+        );
+        let (dial_tx, _dial_rx) = tokio::sync::mpsc::channel(4);
+        let dial = proto_dial::DialService::new(
+            config.advertised_name(castaway_core::ProtocolKind::YouTubeLounge),
+            config.http_base_url(),
+            device_uuid(&config.uuid, "dial"),
+            dial_tx,
+        );
+
+        let dlna_usns: std::collections::HashSet<String> = dlna
+            .ssdp_device()
+            .targets()
+            .into_iter()
+            .map(|t| t.usn)
+            .collect();
+        let dial_usns: std::collections::HashSet<String> = dial
+            .ssdp_device()
+            .targets()
+            .into_iter()
+            .map(|t| t.usn)
+            .collect();
+        let shared: Vec<&String> = dlna_usns.intersection(&dial_usns).collect();
+        assert!(
+            shared.is_empty(),
+            "DLNA and DIAL answer overlapping searches (upnp:rootdevice, ssdp:all), so \
+             a shared USN makes one of them invisible to control points that dedupe on \
+             it: {shared:?}"
+        );
+    }
 }

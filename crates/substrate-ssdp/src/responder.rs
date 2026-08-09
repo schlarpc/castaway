@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::device::SsdpDevice;
 use crate::error::SsdpError;
-use crate::message::{SsdpRequest, SsdpResponse};
+use crate::message::{SearchTarget, SsdpRequest, SsdpResponse};
 use crate::{SSDP_MULTICAST_ADDR, SSDP_PORT};
 
 /// Configuration for the responder.
@@ -162,16 +162,32 @@ impl Responder {
         let SsdpRequest::Search { st, .. } = req else {
             return; // NOTIFY from others — ignore
         };
-        for adv in &self.devices {
-            let resp = self.response_for(adv);
-            for target in adv.device.targets().iter().filter(|t| st.selects(t)) {
-                let msg = resp.search_ok(target);
-                if let Err(e) = sock.send_to(msg.as_bytes(), from).await {
-                    warn!(error = %e, %from, "SSDP unicast reply failed");
-                }
+        for msg in self.search_replies(&st) {
+            if let Err(e) = sock.send_to(msg.as_bytes(), from).await {
+                warn!(error = %e, %from, "SSDP unicast reply failed");
             }
         }
         debug!(%from, "answered M-SEARCH");
+    }
+
+    /// Every `200 OK` an `M-SEARCH` for `st` draws: one per selected target per device.
+    /// Pure — [`Self::handle_datagram`] sends each back to the searcher.
+    ///
+    /// Separated out because the selection is where two root devices on one responder
+    /// can go wrong (#202): DLNA and DIAL both advertise `upnp:rootdevice` and the bare
+    /// `uuid:` target, so if the two devices shared a UUID, a root search would draw two
+    /// replies carrying *one* USN with two LOCATIONs — and a control point that dedupes
+    /// on USN (most do) keeps an arbitrary one. Whether that happens is decided entirely
+    /// by what this function emits, so it is the thing to pin.
+    fn search_replies(&self, st: &SearchTarget) -> Vec<String> {
+        let mut msgs = Vec::new();
+        for adv in &self.devices {
+            let resp = self.response_for(adv);
+            for target in adv.device.targets().iter().filter(|t| st.selects(t)) {
+                msgs.push(resp.search_ok(target));
+            }
+        }
+        msgs
     }
 
     /// Every `ssdp:alive` NOTIFY one announcement round carries: one per target per
@@ -303,6 +319,112 @@ mod tests {
         // 2–3 is what real stacks do; 1 is the defect this replaces.
         assert!((2..=3).contains(&NOTIFY_REPEATS), "{NOTIFY_REPEATS}");
         assert!(NOTIFY_REPEAT_GAP < Duration::from_secs(1));
+    }
+
+    /// The uuids the two-root-device tests advertise. Distinctive on purpose: the wire
+    /// test below shares a real multicast group with every other test process on this
+    /// host, so its assertions filter replies down to the ones carrying these.
+    const DLNA_UUID: &str = "uuid:5d1a0000-aaaa-4bbb-8ccc-0000000d10a1";
+    const DIAL_UUID: &str = "uuid:5d1a0000-aaaa-4bbb-8ccc-0000000d1a12";
+    const DIAL_ST: &str = "urn:dial-multiscreen-org:service:dial:1";
+
+    /// The shape the app actually runs (crates/app/src/main.rs `serve`): one responder,
+    /// two root devices — the DLNA MediaRenderer and DIAL's tvdevice — each with its own
+    /// UUID and its own description document.
+    fn two_root_devices(config: ResponderConfig) -> Responder {
+        Responder::new(config)
+            .advertise(
+                SsdpDevice {
+                    uuid: DLNA_UUID.into(),
+                    device_type: "urn:schemas-upnp-org:device:MediaRenderer:1".into(),
+                    services: vec!["urn:schemas-upnp-org:service:AVTransport:1".into()],
+                },
+                "/dlna/description.xml",
+            )
+            .advertise(
+                SsdpDevice {
+                    uuid: DIAL_UUID.into(),
+                    device_type: "urn:schemas-upnp-org:device:tvdevice:1".into(),
+                    services: vec![DIAL_ST.into()],
+                },
+                "/dial/dd.xml",
+            )
+    }
+
+    /// The header value of `name` in an SSDP reply, or None.
+    fn header<'a>(reply: &'a str, name: &str) -> Option<&'a str> {
+        reply.lines().find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    /// A targeted DIAL search draws exactly DIAL's answer: ST echoed, the USN composed
+    /// from DIAL's own UUID, and the LOCATION pointing at the DIAL device description
+    /// rather than the DLNA one. This is the selection a sender's cast button performs
+    /// (#202's item 4) and nothing had ever executed it — `handle_datagram` had no test
+    /// at any tier, so a responder that answered a DIAL search with the DLNA device (or
+    /// with nothing) passed every gate in the tree.
+    #[test]
+    fn a_dial_search_draws_dials_reply_with_its_own_location_and_usn() {
+        let replies = two_root_devices(cfg()).search_replies(&SearchTarget::parse(DIAL_ST));
+        assert_eq!(
+            replies.len(),
+            1,
+            "one device advertises the DIAL service, so one reply: {replies:?}"
+        );
+        let reply = &replies[0];
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert_eq!(header(reply, "ST"), Some(DIAL_ST), "ST must be echoed");
+        assert_eq!(
+            header(reply, "USN"),
+            Some(format!("{DIAL_UUID}::{DIAL_ST}").as_str()),
+            "the USN is DIAL's uuid composed with the searched target"
+        );
+        assert_eq!(
+            header(reply, "LOCATION"),
+            Some("http://127.0.0.1:8080/dial/dd.xml"),
+            "the LOCATION must be the DIAL description — a sender fetches it for \
+             Application-URL, which the DLNA description does not carry"
+        );
+    }
+
+    /// Two root devices on one responder never share a USN — the collision `device_uuid`
+    /// in crates/app exists to prevent. Both devices answer `upnp:rootdevice` (and
+    /// `ssdp:all`); with one UUID between them those answers carry an identical
+    /// `uuid:…::upnp:rootdevice` USN and different LOCATIONs, and a control point that
+    /// dedupes on USN keeps one arbitrarily — when DLNA's won, DIAL was invisible.
+    #[test]
+    fn two_root_devices_never_answer_with_one_usn() {
+        let r = two_root_devices(cfg());
+        let roots = r.search_replies(&SearchTarget::RootDevice);
+        assert_eq!(
+            roots.len(),
+            2,
+            "both devices answer a root search: {roots:?}"
+        );
+        let usns: Vec<&str> = roots.iter().filter_map(|m| header(m, "USN")).collect();
+        assert_eq!(usns.len(), 2, "{roots:?}");
+        assert_ne!(
+            usns[0], usns[1],
+            "an identical root USN is the DIAL/DLNA collision — a control point \
+             deduping on USN would drop one device"
+        );
+
+        // The property behind it, over the whole advertised surface: one USN, one
+        // LOCATION. `ssdp:all` selects every target of every device.
+        let mut locations: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for reply in &r.search_replies(&SearchTarget::All) {
+            let usn = header(reply, "USN").unwrap();
+            let location = header(reply, "LOCATION").unwrap();
+            if let Some(previous) = locations.insert(usn, location) {
+                assert_eq!(
+                    previous, location,
+                    "USN {usn} answered with two LOCATIONs — the collision a control \
+                     point resolves by dropping one of them"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -450,6 +572,128 @@ mod tests {
             "every advertised target must be withdrawn, not just the root device"
         );
 
+        running.await.unwrap();
+    }
+
+    /// A control point's search socket: an ephemeral loopback port that sends to the
+    /// SSDP group and collects the unicast replies. Loopback is on so the responder's
+    /// group-joined socket sees our datagram at all; the replies come back unicast to
+    /// the ephemeral port, so no other test's socket can steal them.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test searcher on an ephemeral loopback port; the registry governs \
+                  the panel's binds"
+    )]
+    fn searcher_socket() -> std::io::Result<UdpSocket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.bind(&SocketAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).into())?;
+        socket.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
+        socket.set_multicast_loop_v4(true)?;
+        socket.set_nonblocking(true)?;
+        UdpSocket::from_std(socket.into())
+    }
+
+    /// Search for `st` against the live group and collect replies until `enough` of the
+    /// ones carrying our test uuids have arrived (or a deadline expires). The group is
+    /// real and shared — another test process's responder may answer too — so the filter
+    /// is what keeps this deterministic. The search is re-sent on each poll timeout
+    /// because SSDP is bare UDP: a lost datagram is a slow test, not a failed one.
+    async fn search_ours(sock: &UdpSocket, st: &str, enough: usize) -> Vec<String> {
+        let request = format!(
+            "M-SEARCH * HTTP/1.1\r\n\
+             HOST: 239.255.255.250:1900\r\n\
+             MAN: \"ssdp:discover\"\r\n\
+             MX: 1\r\n\
+             ST: {st}\r\n\
+             \r\n"
+        );
+        let group: SocketAddr = SocketAddrV4::new(SSDP_MULTICAST_ADDR, SSDP_PORT).into();
+        let mut ours = Vec::new();
+        let mut buf = vec![0u8; 2048];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline && ours.len() < enough {
+            sock.send_to(request.as_bytes(), group).await.unwrap();
+            let poll_until = tokio::time::Instant::now() + Duration::from_millis(500);
+            while tokio::time::Instant::now() < poll_until && ours.len() < enough {
+                let Ok(Ok((n, _))) =
+                    tokio::time::timeout(Duration::from_millis(200), sock.recv_from(&mut buf))
+                        .await
+                else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let usn = header(&text, "USN").unwrap_or_default();
+                if (usn.contains(DLNA_UUID) || usn.contains(DIAL_UUID))
+                    && !ours
+                        .iter()
+                        .any(|seen: &String| header(seen, "USN") == header(&text, "USN"))
+                {
+                    ours.push(text);
+                }
+            }
+        }
+        ours
+    }
+
+    /// The positive DIAL discovery path on a real wire (#202's item 4): an `M-SEARCH`
+    /// datagram for `ST: urn:dial-multiscreen-org:service:dial:1` reaches the running
+    /// responder over the multicast group, and the unicast `200 OK` that comes back
+    /// carries DIAL's own USN and LOCATION — while a root search draws two answers with
+    /// *distinct* USNs, which is the collision property `device_uuid` protects. The pure
+    /// tests above pin the same selection; this one proves the datagrams cross a socket,
+    /// through the same `run_on` seam the NOTIFY test uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dial_msearch_is_answered_on_the_wire_without_colliding_with_dlna() {
+        let Ok(responder_sock) = test_socket(false) else {
+            eprintln!("skipping: multicast unavailable here");
+            return;
+        };
+        let Ok(searcher) = searcher_socket() else {
+            eprintln!("skipping: multicast unavailable here");
+            return;
+        };
+
+        let responder = two_root_devices(cfg());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let running = tokio::spawn(async move {
+            let _ = responder
+                .run_on(responder_sock, async {
+                    let _ = stop_rx.await;
+                })
+                .await;
+        });
+
+        // The targeted search a sender's cast button performs.
+        let dial = search_ours(&searcher, DIAL_ST, 1).await;
+        assert_eq!(dial.len(), 1, "no reply to the DIAL search: {dial:?}");
+        let reply = &dial[0];
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        assert_eq!(header(reply, "ST"), Some(DIAL_ST), "{reply}");
+        assert_eq!(
+            header(reply, "USN"),
+            Some(format!("{DIAL_UUID}::{DIAL_ST}").as_str()),
+            "{reply}"
+        );
+        assert_eq!(
+            header(reply, "LOCATION"),
+            Some("http://127.0.0.1:8080/dial/dd.xml"),
+            "{reply}"
+        );
+
+        // The root search both devices answer: two replies, two USNs.
+        let roots = search_ours(&searcher, "upnp:rootdevice", 2).await;
+        assert_eq!(
+            roots.len(),
+            2,
+            "both root devices must answer a root search: {roots:?}"
+        );
+        let usns: Vec<&str> = roots.iter().filter_map(|m| header(m, "USN")).collect();
+        assert_ne!(
+            usns[0], usns[1],
+            "one USN for two devices is the DIAL/DLNA collision on a live socket"
+        );
+
+        let _ = stop_tx.send(());
         running.await.unwrap();
     }
 }
