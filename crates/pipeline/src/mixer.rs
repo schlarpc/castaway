@@ -77,9 +77,18 @@
 //! AirPlay sender measured on #175 delivered ~20–45% of real time for its first five
 //! seconds and exactly real time after, with `sender_latency_frames=77175` declaring that
 //! it intends the receiver to sit 1.75 s behind. Front padding banks precisely the deficit
-//! the ramp creates, which is the buffer the sender expected us to hold. (Reading the
-//! declared figure and reclaiming the latency deliberately is the timing-model work, not
-//! this.)
+//! the ramp creates, which is the buffer the sender expected us to hold.
+//!
+//! What the ramp banks in excess of the declaration is *reclaimed*, not kept (#176). A
+//! sender that declares its intended lead gets a [`LatencyTarget`]: once the audio in
+//! flight runs past the target (plus a jitter band, [`RECLAIM_SLACK`]), the ring is
+//! trimmed back to the target from the oldest end — audio that is already late by the
+//! sender's own declaration, dropped once, so the banked padding does not persist as
+//! steady-state latency for the life of the session. The trim is counted as
+//! [`MixerCounters::reclaimed`], apart from `shed` (a source outrunning an undeclared
+//! budget) and emphatically apart from `starved` (silence invented mid-stream): a
+//! reclamation is the design converging, and it must not read as a defect. An input with
+//! no declaration keeps the flat [`LIVE_BUDGET`] ceiling, bit for bit.
 //!
 //! ## What silence means: [`Supply`]
 //!
@@ -258,9 +267,22 @@ const fn reopen_delay(consecutive: u32) -> Duration {
 ///
 /// Two seconds, so the declared burst fits. The cost is latency *only if the sender
 /// actually runs that far ahead*, since this is a ceiling and not a target — the ring
-/// drains at real time and sits at whatever the sender banks. Reclaiming that is the
-/// timing-model work (`clock_samples=0`), not this.
+/// drains at real time and sits at whatever the sender banks. A sender that *says* how
+/// far ahead it intends to run gets held to its word instead: see [`LatencyTarget`],
+/// which is the consumption of that figure #176 was left open for.
 const LIVE_BUDGET: Duration = Duration::from_secs(2);
+
+/// The delivery-jitter band a declared target tolerates before any audio is dropped.
+///
+/// A live input with a declared target ([`LatencyTarget`]) is trimmed *to* the target
+/// but only *once it has run past* the target plus this. The gap is not slack in the
+/// promise, it is what keeps the trim a convergence rather than a crackle: a converged
+/// ring sits exactly at the target, so a trigger with no band above it would fire on
+/// every packet whose arrival beat the drain by a few frames, and each firing cuts the
+/// oldest audio — a click per lump. Sized like [`STALE_AFTER`], and for the same
+/// reason: longer than any inter-packet gap a live source produces plus the delivery
+/// jitter on top.
+const RECLAIM_SLACK: Duration = Duration::from_millis(250);
 
 /// How long an empty input is still treated as between packets.
 ///
@@ -471,6 +493,10 @@ pub struct MixInput {
     /// separately from `dropped` because they are not the same event: this one is the
     /// design working, and it is only alarming in bulk.
     shed: u64,
+    /// Frames trimmed converging this input onto its declared target
+    /// ([`LatencyTarget`]). Apart from `shed` because the reading differs: this is
+    /// banked start-up padding being returned, not a source outrunning the panel.
+    reclaimed: u64,
 }
 
 /// The shared half of an input: what the mixer pulls from.
@@ -479,6 +505,15 @@ struct InputState {
     ring: Mutex<Ring>,
     /// Signalled by the mixer after it drains, and by [`InputState::close`].
     room: Condvar,
+    /// The sender's declared latency in nanoseconds, `0` for "never declared".
+    ///
+    /// An atomic beside the ring rather than a field inside it because its writer is a
+    /// third party: the [`MixInput`] moves onto the decode thread while the figure
+    /// arrives later, on the protocol's timing plane, through a [`LatencyTarget`] the
+    /// session wiring kept (#176). Nanoseconds rather than frames so the wire unit —
+    /// frames at the *sender's* rate — is converted exactly once, at the protocol
+    /// boundary that knows the rate.
+    declared: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -540,6 +575,20 @@ impl Ring {
 }
 
 impl InputState {
+    /// The declared target depth in mix frames, or `None` while nothing has declared.
+    ///
+    /// Clamped to what the machinery can honour. Below [`DEVICE_LEAD`] the device's own
+    /// queue busts the budget by itself and every write would empty the ring; above
+    /// [`LIVE_BUDGET`] the target exceeds what a live input may hold at all, and the
+    /// module's own ceiling wins.
+    fn declared_target(&self) -> Option<u64> {
+        let nanos = self.declared.load(Ordering::Relaxed);
+        (nanos > 0).then(|| {
+            frames_in(Duration::from_nanos(nanos))
+                .clamp(frames_in(DEVICE_LEAD), frames_in(LIVE_BUDGET))
+        })
+    }
+
     fn close(&self) {
         if let Ok(mut ring) = self.ring.lock() {
             ring.closed = true;
@@ -671,10 +720,27 @@ impl MixInput {
     /// How the room is made is [`Backpressure`]'s whole subject: a pull source parks until
     /// the mixer has drained, a live one sheds its oldest audio and carries on. This is
     /// the one place the enum is read.
+    ///
+    /// A live input's budget is two numbers, not one. The *ceiling* decides when room
+    /// has to be made; the *trim* decides how much stays. They coincide at
+    /// [`LIVE_BUDGET`] for an input with no declaration — exactly the old flat budget —
+    /// and separate for a declared one ([`LatencyTarget`]): the trim converges the ring
+    /// onto the target while the [`RECLAIM_SLACK`] band above it lets ordinary delivery
+    /// jitter ride without cutting a few frames on every packet.
     fn enqueue(&mut self, stereo: &[f32]) {
-        let budget = match self.backpressure {
-            Backpressure::Pull => frames_in(LEAD),
-            Backpressure::Live => frames_in(LIVE_BUDGET),
+        let declared = match self.backpressure {
+            Backpressure::Pull => None,
+            Backpressure::Live => self.state.declared_target(),
+        };
+        let (ceiling, trim) = match (self.backpressure, declared) {
+            (Backpressure::Pull, _) => (frames_in(LEAD), frames_in(LEAD)),
+            (Backpressure::Live, None) => (frames_in(LIVE_BUDGET), frames_in(LIVE_BUDGET)),
+            (Backpressure::Live, Some(target)) => (
+                target
+                    .saturating_add(frames_in(RECLAIM_SLACK))
+                    .min(frames_in(LIVE_BUDGET)),
+                target,
+            ),
         };
         let deadline = Instant::now() + WRITE_DEADLINE;
         let Ok(mut ring) = self.state.ring.lock() else {
@@ -683,7 +749,7 @@ impl MixInput {
         loop {
             let queued = ring.samples.len() as u64 / u64::from(CHANNELS);
             let inflight = queued + self.shared.device_inflight.load(Ordering::Relaxed);
-            if inflight < budget || ring.closed {
+            if inflight < ceiling || ring.closed {
                 break;
             }
             if self.backpressure == Backpressure::Live {
@@ -693,16 +759,25 @@ impl MixInput {
                 // audio in place and the source's own queue absorbs the difference, which
                 // is exactly the failure this enum exists to prevent.
                 let incoming = stereo.len() as u64 / u64::from(CHANNELS);
-                let room =
-                    budget.saturating_sub(self.shared.device_inflight.load(Ordering::Relaxed));
+                let room = trim.saturating_sub(self.shared.device_inflight.load(Ordering::Relaxed));
                 let keep = room.saturating_sub(incoming) * u64::from(CHANNELS);
                 let keep = usize::try_from(keep).unwrap_or(usize::MAX);
                 if ring.samples.len() > keep {
-                    let shed = ring.samples.len() - keep;
-                    ring.samples.drain(..shed);
-                    let frames = shed as u64 / u64::from(CHANNELS);
-                    self.shed += frames;
-                    self.shared.shed.fetch_add(frames, Ordering::Relaxed);
+                    let cut = ring.samples.len() - keep;
+                    ring.samples.drain(..cut);
+                    let frames = cut as u64 / u64::from(CHANNELS);
+                    // Which book the cut lands in is the whole diagnosis. Against a
+                    // declared target this is banked start-up padding being returned —
+                    // audio already late by the sender's own declaration, the design
+                    // converging. Against the flat budget it is a source outrunning the
+                    // panel's clock. Neither is starvation, and neither may read as it.
+                    if declared.is_some() {
+                        self.reclaimed += frames;
+                        self.shared.reclaimed.fetch_add(frames, Ordering::Relaxed);
+                    } else {
+                        self.shed += frames;
+                        self.shared.shed.fetch_add(frames, Ordering::Relaxed);
+                    }
                 }
                 break;
             }
@@ -727,6 +802,18 @@ impl MixInput {
             .fetch_add(stereo.len() as u64 / u64::from(CHANNELS), Ordering::Relaxed);
     }
 
+    /// An updatable handle onto this input's declared target depth.
+    ///
+    /// Taken *before* the input moves onto its decode thread, because the figure it
+    /// carries arrives after: the sender declares its intended latency on the timing
+    /// plane, mid-session, and per codec. See [`LatencyTarget`].
+    #[must_use]
+    pub fn latency_target(&self) -> LatencyTarget {
+        LatencyTarget {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     /// Throw away everything queued but not yet mixed.
     ///
     /// What a seek does: the queued audio is from before it, and the device's own share of
@@ -745,6 +832,36 @@ impl MixInput {
                 }
             }
         }
+    }
+}
+
+/// An updatable handle onto one live input's declared target depth.
+///
+/// The consumption half of #176. A sender that states how far behind delivery it
+/// intends the receiver to play — AirPlay's `sender_latency_frames`, 77175 frames of
+/// ALAC or 7497 of AAC-ELD — gets held to it: once the input's audio in flight runs
+/// past the target plus [`RECLAIM_SLACK`], the oldest audio is trimmed away until the
+/// target holds, and the banked start-up padding stops being steady-state latency.
+///
+/// Separable from the [`MixInput`] on purpose: the input moves onto the decode thread
+/// at session start, while the authoritative figure arrives *later*, on the protocol's
+/// timing plane, and may be revised. Whoever wires the session keeps this handle and
+/// sets it whenever the sender speaks. An input whose handle is never set keeps the
+/// flat [`LIVE_BUDGET`] ceiling unchanged, and a [`Backpressure::Pull`] input ignores
+/// the target entirely — a paced source answers to the media clock, not to a sender.
+#[derive(Debug, Clone)]
+pub struct LatencyTarget {
+    state: Arc<InputState>,
+}
+
+impl LatencyTarget {
+    /// Declare, or revise, the sender's intended latency.
+    ///
+    /// [`Duration::ZERO`] withdraws the declaration and restores the flat budget — it
+    /// is also the safe reading of a sender that declares nothing at all.
+    pub fn set(&self, latency: Duration) {
+        let nanos = u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX);
+        self.state.declared.store(nanos, Ordering::Relaxed);
     }
 }
 
@@ -775,6 +892,15 @@ impl Drop for MixInput {
                 "mixer: a live source ran ahead of the speakers and its oldest audio was shed"
             );
         }
+        if self.reclaimed > 0 {
+            // Separately from `shed`, because the reading differs: this is the banked
+            // start-up lead being trimmed back to what the sender declared — expected
+            // once per session, and only alarming if it keeps happening.
+            info!(
+                frames = self.reclaimed,
+                "mixer: a live source's banked lead was reclaimed to its declared latency"
+            );
+        }
         self.state.close();
         self.shared.work.notify_all();
     }
@@ -796,7 +922,7 @@ impl Drop for MixInput {
 /// not exactly:
 ///
 /// ```text
-/// written  == drained + shed + (what is still in the rings)
+/// written  == drained + shed + reclaimed + (what is still in the rings)
 /// emitted  == drained + starved + idle
 /// ```
 ///
@@ -823,6 +949,17 @@ pub struct MixerCounters {
     /// Frames dropped from a [`Backpressure::Live`] input that had run ahead of its
     /// budget.
     pub shed: u64,
+    /// Frames trimmed converging a live input onto its sender's declared latency
+    /// ([`LatencyTarget`], #176).
+    ///
+    /// Apart from `shed` because the two answer different questions: `shed` says a
+    /// source is outrunning the panel's clock, this says banked start-up padding was
+    /// returned — the front-padded ramp deficit (#175) being taken back once the sender
+    /// caught up, so the sender's intent and not the ramp decides the steady-state
+    /// latency. Expected once per declared session, in one lump; structurally zero for
+    /// every sender that declares nothing. Emphatically not starvation: no silence is
+    /// invented by a reclamation, and `starved` must not move with it.
+    pub reclaimed: u64,
     /// Frames a [`Backpressure::Pull`] input abandoned at [`WRITE_DEADLINE`] because the
     /// mixer never drained. The other defect counter: like `starved`, structurally zero
     /// while the mixer is healthy — and a nonzero reading is worse, because the audio was
@@ -866,6 +1003,7 @@ impl MixerCounters {
             written: self.written.saturating_sub(earlier.written),
             drained: self.drained.saturating_sub(earlier.drained),
             shed: self.shed.saturating_sub(earlier.shed),
+            reclaimed: self.reclaimed.saturating_sub(earlier.reclaimed),
             dropped: self.dropped.saturating_sub(earlier.dropped),
             emitted: self.emitted.saturating_sub(earlier.emitted),
             clipped: self.clipped.saturating_sub(earlier.clipped),
@@ -905,6 +1043,7 @@ struct Shared {
     written: AtomicU64,
     drained: AtomicU64,
     shed: AtomicU64,
+    reclaimed: AtomicU64,
     dropped: AtomicU64,
     emitted: AtomicU64,
     clipped: AtomicU64,
@@ -938,6 +1077,7 @@ impl Shared {
             written: self.written.load(Ordering::Relaxed),
             drained: self.drained.load(Ordering::Relaxed),
             shed: self.shed.load(Ordering::Relaxed),
+            reclaimed: self.reclaimed.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             emitted: self.emitted.load(Ordering::Relaxed),
             clipped: self.clipped.load(Ordering::Relaxed),
@@ -987,6 +1127,7 @@ impl AudioMixer {
             starved: AtomicU64::new(0),
             idle: AtomicU64::new(0),
             shed: AtomicU64::new(0),
+            reclaimed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
@@ -1017,6 +1158,7 @@ impl AudioMixer {
         let state = Arc::new(InputState {
             ring: Mutex::new(Ring::default()),
             room: Condvar::new(),
+            declared: AtomicU64::new(0),
         });
         if let Ok(mut inputs) = self.shared.inputs.lock() {
             inputs.push(Arc::clone(&state));
@@ -1030,6 +1172,7 @@ impl AudioMixer {
             shape: None,
             dropped: 0,
             shed: 0,
+            reclaimed: 0,
         }
     }
 
@@ -1584,6 +1727,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         starved,
         idle,
         shed,
+        reclaimed,
         dropped,
         written,
         drained,
@@ -1606,7 +1750,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
     };
     // Idle and emitted alone do not wake the log: a panel holding a quiet page is not an
     // event. Anything a session did — or failed to get — is.
-    if starved == 0 && shed == 0 && dropped == 0 && written == 0 && drained == 0 {
+    if starved == 0 && shed == 0 && reclaimed == 0 && dropped == 0 && written == 0 && drained == 0 {
         return;
     }
     let expected = window.as_secs_f64() * f64::from(RATE);
@@ -1623,6 +1767,7 @@ fn report(shared: &Arc<Shared>, now: Instant, last: &mut Reported, inputs: usize
         starved_pct = pct(starved),
         idle_frames = idle,
         shed_frames = shed,
+        reclaimed_frames = reclaimed,
         dropped_frames = dropped,
         written_frames = written,
         written_pct = pct(written),
@@ -1766,6 +1911,7 @@ mod tests {
             starved: AtomicU64::new(0),
             idle: AtomicU64::new(0),
             shed: AtomicU64::new(0),
+            reclaimed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             written: AtomicU64::new(0),
             drained: AtomicU64::new(0),
@@ -1780,7 +1926,22 @@ mod tests {
         Arc::new(InputState {
             ring: Mutex::new(ring),
             room: Condvar::new(),
+            declared: AtomicU64::new(0),
         })
+    }
+
+    /// A live input over `state`, stepped by hand — no mixer thread behind it.
+    fn live_input(state: &Arc<InputState>, shared: &Arc<Shared>) -> MixInput {
+        MixInput {
+            backpressure: Backpressure::Live,
+            state: Arc::clone(state),
+            shared: Arc::clone(shared),
+            convert: None,
+            shape: None,
+            dropped: 0,
+            shed: 0,
+            reclaimed: 0,
+        }
     }
 
     /// An input mid-stream with audio banked, which is what every summing test means.
@@ -2014,6 +2175,7 @@ mod tests {
             shape: None,
             dropped: 0,
             shed: 0,
+            reclaimed: 0,
         };
 
         // 4 frames of 5.1 at the mix rate: every frame loses four channels, and says so.
@@ -2276,6 +2438,7 @@ mod tests {
             shape: None,
             dropped: 0,
             shed: 0,
+            reclaimed: 0,
         };
         for _ in 0..4 {
             input.write(&tone(480, 0.5)).unwrap();
@@ -2320,6 +2483,7 @@ mod tests {
             shape: None,
             dropped: 0,
             shed: 0,
+            reclaimed: 0,
         };
         input.write(&tone(480, 0.5)).unwrap();
         assert_eq!(input.dropped, 480, "the teardown line's count, in frames");
@@ -2771,6 +2935,7 @@ mod tests {
             shape: None,
             dropped: 0,
             shed: 0,
+            reclaimed: 0,
         };
 
         let second = usize::try_from(frames_in(Duration::from_secs(1))).unwrap();
@@ -2810,6 +2975,171 @@ mod tests {
         assert_eq!(
             shared.counters().shed,
             frames_in(Duration::from_secs(1)) + frames_in(QUANTUM)
+        );
+        assert_eq!(
+            shared.counters().reclaimed,
+            0,
+            "an undeclared input never books a reclamation"
+        );
+    }
+
+    /// The AirPlay shape of #176, in exact arithmetic: a sender declares the 77175-frame
+    /// lead (1.75 s at 44.1 kHz — the figure every live log showed), ramps up late, and
+    /// then banks more than it declared. The ring must converge to the declared depth,
+    /// the excess must be trimmed from the oldest end, and the trim must be booked as
+    /// `reclaimed` — not `shed`, and never `starved`.
+    #[test]
+    fn a_declared_input_converges_to_its_target_and_the_banked_lead_is_reclaimed() {
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = live_input(&state, &shared);
+        // 77175 frames of 44.1 kHz is exactly 1.75 s; the target is that duration at
+        // the mix rate.
+        let declared = Duration::from_nanos(77_175 * 1_000_000_000 / 44_100);
+        assert_eq!(
+            declared,
+            Duration::from_millis(1750),
+            "the fixture is exact"
+        );
+        input.latency_target().set(declared);
+        let target = frames_in(declared);
+
+        // The sender catches up after its ramp and runs past its own declaration —
+        // three seconds banked against a 1.75 s intent, with nothing draining.
+        let second = usize::try_from(frames_in(Duration::from_secs(1))).unwrap();
+        for _ in 0..3 {
+            input.write(&tone(second, 0.5)).unwrap();
+        }
+
+        assert_eq!(
+            state.queued_frames(),
+            target,
+            "the ring converges to the declared depth, not to the flat budget"
+        );
+        let counters = shared.counters();
+        assert_eq!(
+            counters.reclaimed,
+            3 * frames_in(Duration::from_secs(1)) - target,
+            "everything past the declaration is reclaimed, once"
+        );
+        assert_eq!(input.reclaimed, counters.reclaimed);
+        assert_eq!(
+            counters.shed, 0,
+            "a reclamation is not a source outrunning us"
+        );
+        assert_eq!(counters.starved, 0, "and it invents no silence");
+        assert_eq!(counters.dropped, 0);
+
+        // Ordinary delivery jitter rides the band above the target without triggering
+        // another trim: converged is quiet, not a click per packet.
+        let jitter = usize::try_from(frames_in(QUANTUM)).unwrap();
+        input.write(&tone(jitter, 0.5)).unwrap();
+        assert_eq!(
+            shared.counters().reclaimed,
+            counters.reclaimed,
+            "a converged input absorbs jitter inside RECLAIM_SLACK without cutting audio"
+        );
+        assert_eq!(state.queued_frames(), target + frames_in(QUANTUM));
+    }
+
+    /// The figure arrives on the timing plane *after* the session is registered and may
+    /// name a different codec's lead — the whole reason the target is an updatable
+    /// handle rather than a field on the registration (#176).
+    #[test]
+    fn a_declaration_arriving_mid_session_takes_effect_on_the_next_write() {
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = live_input(&state, &shared);
+        let handle = input.latency_target();
+
+        // Undeclared, the input banks up to the flat budget exactly as pinned above.
+        let second = usize::try_from(frames_in(Duration::from_secs(1))).unwrap();
+        for _ in 0..3 {
+            input.write(&tone(second, 0.5)).unwrap();
+        }
+        assert_eq!(state.queued_frames(), frames_in(LIVE_BUDGET));
+        let flat_shed = shared.counters().shed;
+        assert_eq!(flat_shed, frames_in(Duration::from_secs(1)));
+
+        // Then the sender speaks: 7497 frames of 44.1 kHz — AAC-ELD's declared lead,
+        // exactly 170 ms — and the next write converges the whole bank onto it.
+        let declared = Duration::from_nanos(7_497 * 1_000_000_000 / 44_100);
+        assert_eq!(declared, Duration::from_millis(170), "the fixture is exact");
+        handle.set(declared);
+        let target = frames_in(declared);
+        let block = usize::try_from(frames_in(QUANTUM)).unwrap();
+        input.write(&tone(block, 0.5)).unwrap();
+
+        assert_eq!(
+            state.queued_frames(),
+            target,
+            "a late declaration still reclaims the whole banked lead"
+        );
+        assert_eq!(
+            shared.counters().reclaimed,
+            frames_in(LIVE_BUDGET) + frames_in(QUANTUM) - target,
+            "the bank plus the incoming block, less what the target keeps"
+        );
+        assert_eq!(
+            shared.counters().shed,
+            flat_shed,
+            "the pre-declaration shed stays where it was booked"
+        );
+    }
+
+    /// The counters stay truthful through a reclamation: the write-side identity closes
+    /// with the new term, and draining the converged ring afterwards reads as ordinary
+    /// playback — no starvation, no invention (#175's accounting, #233's ledger).
+    #[test]
+    fn reclamation_keeps_the_identities_and_is_neither_starvation_nor_invention() {
+        let state = state_with(Ring::default());
+        let shared = shared_with(vec![Arc::clone(&state)]);
+        let mut input = live_input(&state, &shared);
+        input.latency_target().set(Duration::from_millis(500));
+
+        let second = usize::try_from(frames_in(Duration::from_secs(1))).unwrap();
+        for _ in 0..2 {
+            input.write(&tone(second, 0.5)).unwrap();
+        }
+
+        // written == drained + shed + reclaimed + (what is still in the ring).
+        let totals = shared.counters();
+        assert_eq!(
+            totals.written,
+            totals.drained + totals.shed + totals.reclaimed + state.queued_frames(),
+            "the identity closes with the reclaimed term: {totals:?}"
+        );
+
+        // Drain a pass off the converged ring: real audio, counted as drained, with the
+        // starved and idle books untouched by everything that came before.
+        let starved = AtomicU64::new(0);
+        let idle = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+        let peak = AtomicU32::new(0);
+        let quantum = frames_in(QUANTUM);
+        let mixed = mix_pass(
+            &[Arc::clone(&state)],
+            quantum,
+            Instant::now(),
+            &Gain::default(),
+            Some(&counters(&starved, &idle, &drained, &peak)),
+        );
+        assert_eq!(
+            mixed,
+            vec![0.5; usize::try_from(quantum).unwrap() * usize::from(CHANNELS)],
+            "what survives a reclamation is audio, not padding"
+        );
+        assert_eq!(
+            starved.load(Ordering::Relaxed),
+            0,
+            "no silence was invented"
+        );
+        assert_eq!(idle.load(Ordering::Relaxed), 0);
+        assert_eq!(drained.load(Ordering::Relaxed), quantum);
+        assert_eq!(
+            MixerCounters::default().invented(),
+            None,
+            "and the invented fraction still refuses a zero denominator"
         );
     }
 
