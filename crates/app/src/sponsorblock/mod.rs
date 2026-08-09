@@ -107,16 +107,27 @@ struct PlaybackClock {
 
 impl PlaybackClock {
     fn new(reported: Duration, playing: bool) -> Self {
+        Self::new_at(reported, playing, Instant::now())
+    }
+
+    /// [`PlaybackClock::new`] with the instant supplied, so tests anchor the reckoning at
+    /// a chosen moment and assert positions exactly (#236).
+    fn new_at(reported: Duration, playing: bool, at: Instant) -> Self {
         Self {
             reported,
-            at: Instant::now(),
+            at,
             playing,
         }
     }
 
     fn position(&self) -> Duration {
+        self.position_at(Instant::now())
+    }
+
+    /// [`PlaybackClock::position`] as of `now`.
+    fn position_at(&self, now: Instant) -> Duration {
         if self.playing {
-            self.reported + self.at.elapsed()
+            self.reported + now.saturating_duration_since(self.at)
         } else {
             self.reported
         }
@@ -124,7 +135,12 @@ impl PlaybackClock {
 
     /// Stop advancing — the content is not what is on screen right now.
     fn pause(&mut self) {
-        self.reported = self.position();
+        self.pause_at(Instant::now());
+    }
+
+    /// [`PlaybackClock::pause`] as of `now`.
+    fn pause_at(&mut self, now: Instant) {
+        self.reported = self.position_at(now);
         self.playing = false;
     }
 }
@@ -236,14 +252,16 @@ mod tests {
 
     #[test]
     fn pausing_the_clock_keeps_the_position_it_had_reached() {
-        let mut clock = PlaybackClock::new(Duration::from_secs(10), true);
-        std::thread::sleep(Duration::from_millis(30));
-        clock.pause();
-        let held = clock.position();
-        assert!(held > Duration::from_secs(10));
-        std::thread::sleep(Duration::from_millis(30));
+        // Exact, in chosen instants — this used to sleep 60 ms of wall time and assert
+        // inequalities (#236).
+        let t0 = Instant::now();
+        let mut clock = PlaybackClock::new_at(Duration::from_secs(10), true, t0);
+        // Three seconds in, an ad break pauses the reckoning at exactly thirteen.
+        clock.pause_at(t0 + Duration::from_secs(3));
+        let held = Duration::from_secs(13);
+        assert_eq!(clock.position_at(t0 + Duration::from_secs(3)), held);
         assert_eq!(
-            clock.position(),
+            clock.position_at(t0 + Duration::from_secs(120)),
             held,
             "an ad break must not advance the content"
         );
@@ -251,16 +269,22 @@ mod tests {
 
     #[test]
     fn a_paused_clock_does_not_advance() {
-        let clock = PlaybackClock::new(Duration::from_secs(10), false);
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(clock.position(), Duration::from_secs(10));
+        let t0 = Instant::now();
+        let clock = PlaybackClock::new_at(Duration::from_secs(10), false, t0);
+        assert_eq!(
+            clock.position_at(t0 + Duration::from_secs(20)),
+            Duration::from_secs(10)
+        );
     }
 
     #[test]
     fn a_playing_clock_runs_between_reports() {
         // The whole point of dead reckoning: positions arrive on change, not on a tick.
-        let clock = PlaybackClock::new(Duration::from_secs(10), true);
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(clock.position() > Duration::from_secs(10));
+        let t0 = Instant::now();
+        let clock = PlaybackClock::new_at(Duration::from_secs(10), true, t0);
+        assert_eq!(
+            clock.position_at(t0 + Duration::from_millis(1_500)),
+            Duration::from_millis(11_500)
+        );
     }
 }
