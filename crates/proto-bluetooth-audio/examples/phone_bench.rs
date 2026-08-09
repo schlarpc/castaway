@@ -248,8 +248,16 @@ async fn observe(
                         let mut count = 0u64;
                         while frames.recv().await.is_some() {
                             count += 1;
+                            // Tallied as they arrive rather than once the stream ends,
+                            // because Ctrl-C is how this bench is *documented* to finish
+                            // — the stream is still open at that point, so a count
+                            // written only on close is always zero. `report()` then read
+                            // that zero as "the session was torn down at its first
+                            // packet" and told the operator to disbelieve three lines
+                            // that were correct. A real run of LDAC at 96 kHz, 10423 ACL
+                            // packets on the wire, reported exactly that.
+                            note(&tally, |s| s.frames = count);
                         }
-                        note(&tally, |s| s.frames = count);
                         println!("● audio stream ended after {count} frames");
                     });
                 }
