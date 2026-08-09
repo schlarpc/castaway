@@ -44,7 +44,7 @@
 use aes::cipher::{KeyIvInit as _, StreamCipher as _};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use sha2::{Digest as _, Sha512};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public, StaticSecret};
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::error::AirPlayError;
 
@@ -275,6 +275,7 @@ pub fn rekey_media(aes_key: &[u8; 16], shared: &[u8; KEY_LEN]) -> [u8; 16] {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use x25519_dalek::EphemeralSecret;
 
     #[test]
     fn the_stage_one_reply_is_a_pure_function_of_its_inputs() {
