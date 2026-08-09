@@ -980,6 +980,14 @@
 
           integration-vm = import ./nix/vm-test.nix { inherit pkgs self; };
 
+          # DIAL's positive discovery path (#202): the full kiosk — the one build that
+          # advertises DIAL at all (D27/D55) — headless in a VM under Xvfb + lavapipe,
+          # answering a targeted M-SEARCH from a second host, serving Application-URL,
+          # and keeping its root USN distinct from the DLNA renderer beside it.
+          # `integration-vm` holds the complementary property: the browser-less build
+          # advertises no DIAL at all.
+          dial-vm = import ./nix/dial-vm-test.nix { inherit pkgs self; };
+
           # The Miracast radio path end to end on mac80211_hwsim: real mac80211 radios,
           # real P2P group formation and WPS, DHCP across the group, and the sink
           # dialling out over it — the whole surface #45 said only hardware could touch,
