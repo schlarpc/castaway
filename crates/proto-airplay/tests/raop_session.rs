@@ -591,6 +591,317 @@ async fn an_audio_only_session_starts_without_a_picture_to_belong_to() {
     assert_eq!(described.address.as_deref(), Some("127.0.0.1"));
 }
 
+/// Poll the session counters until `cond` holds, or fail naming what never happened.
+///
+/// A poll with a deadline rather than a sleep (ground rule 6): an expired poll reports
+/// which counter it was waiting for, where an insufficient sleep reports a wrong number
+/// and blames the code under test.
+async fn wait_for_counters(
+    diagnostics: &proto_airplay::SessionDiagnostics,
+    what: &str,
+    cond: impl Fn(&proto_airplay::Snapshot) -> bool,
+) -> proto_airplay::Snapshot {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = diagnostics.snapshot();
+        if cond(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited 2 s for {what}; counters: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Keep answering timing probes on `timing` so a reply that raced the probe cadence
+/// (superseded requests are dropped by design) cannot starve the assertion.
+fn answer_timing_probes(timing: UdpSocket) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        while let Ok((n, from)) = timing.recv_from(&mut buf).await {
+            if n == 32 {
+                let _ = timing
+                    .send_to(&harness::timing_reply(&buf[..n]), from)
+                    .await;
+            }
+        }
+    })
+}
+
+/// The T1 timing test, RAOP shape (issue #176): the synthetic sender binds a real UDP
+/// socket on the timing port its `Transport` header declares, and a type-82 request
+/// must arrive there within 2 s of `RECORD` — then a valid type-83 reply must be
+/// *folded in*, which only `clock_samples` can prove. This is the exchange the seven
+/// passing unit tests in `clock.rs` exercised without it ever running.
+#[tokio::test]
+async fn a_raop_session_probes_the_declared_timing_peer_and_folds_in_the_reply() {
+    let (mut stream, _events, diagnostics) = harness::start_watched(MediaPorts::Ephemeral).await;
+
+    // Bound *before* they are declared, so the receiver's first probe lands on sockets
+    // the test is watching rather than ports nothing answers.
+    let timing = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let control = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let timing_port = timing.local_addr().unwrap().port();
+    let control_port = control.local_addr().unwrap().port();
+
+    let ports =
+        harness::negotiate_declaring_ports(&mut stream, IPHONE_FMTP, control_port, timing_port)
+            .await;
+
+    let mut buf = [0u8; 64];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(2), timing.recv_from(&mut buf))
+        .await
+        .expect("a timing request must arrive within 2 s of RECORD")
+        .unwrap();
+    assert_eq!(n, 32, "a timing request is exactly 32 bytes");
+    assert_eq!(buf[1] & 0x7F, 82, "payload type 82");
+    // From the receiver's own timing socket, which is where the reply must go back to.
+    assert_eq!(from.port(), ports.timing);
+
+    timing
+        .send_to(&harness::timing_reply(&buf[..n]), from)
+        .await
+        .unwrap();
+    let responder = answer_timing_probes(timing);
+    let snapshot =
+        wait_for_counters(&diagnostics, "clock_samples >= 1", |s| s.clock_samples >= 1).await;
+    assert!(
+        snapshot.clock_offset_ns.is_some(),
+        "a folded-in round trip must yield an offset: {snapshot:?}"
+    );
+
+    // And the sender's declared lead is read rather than dropped on the floor: a sync
+    // packet declaring 77175 frames (1.75 s at 44.1 kHz — the value every live log
+    // showed) reaches the counters.
+    let sync = harness::sync_packet(1_000, 0x0001_0000_0000_0000, 78_175);
+    control
+        .send_to(&sync, SocketAddr::from(([127, 0, 0, 1], ports.control)))
+        .await
+        .unwrap();
+    wait_for_counters(&diagnostics, "sender_latency_frames == 77175", |s| {
+        s.sender_latency_frames == 77_175
+    })
+    .await;
+    responder.abort();
+}
+
+/// The same T1 test in the plist shape — the one that failed before #176: a session
+/// negotiated through the two-phase plist `SETUP` (here the captured `isMedia` flow)
+/// declares its timing peer in `timingPort` and its control peer in the stream entry,
+/// and got neither read, so no probe ever left and `clock_samples` stayed 0 for the
+/// life of every mirroring and media session.
+#[tokio::test]
+async fn a_plist_session_probes_the_declared_timing_peer_and_folds_in_the_reply() {
+    let (mut stream, _events, diagnostics) = harness::start_watched(MediaPorts::Ephemeral).await;
+
+    let timing = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let timing_port = timing.local_addr().unwrap().port();
+    let control = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let control_port = control.local_addr().unwrap().port();
+
+    let fp = request(
+        &mut stream,
+        "POST /fp-setup",
+        &[("Content-Type", "application/octet-stream")],
+        &unhex(FP_KEY_MESSAGE),
+        1,
+    )
+    .await;
+    assert!(fp.starts_with("RTSP/1.0 200"), "{fp}");
+
+    // First SETUP: key material, and the sender's own NTP service — the fact the
+    // Transport-header path gets from `timing_port=` and this path used to drop.
+    let mut d = plist::Dictionary::new();
+    d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+    d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+    d.insert("timingProtocol".into(), plist::Value::String("NTP".into()));
+    d.insert(
+        "timingPort".into(),
+        plist::Value::Integer(i64::from(timing_port).into()),
+    );
+    let setup1 = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        2,
+    )
+    .await;
+    assert!(setup1.starts_with("RTSP/1.0 200"), "{setup1}");
+
+    // A real phone sends RECORD here, between the two SETUPs.
+    let record = request(&mut stream, "RECORD rtsp://127.0.0.1/1", &[], &[], 3).await;
+    assert!(record.starts_with("RTSP/1.0 200"), "{record}");
+
+    // Second SETUP: the media-audio stream, verbatim from the capture — ALAC, its
+    // declared latency bounds, and the sender's control port.
+    let mut s0 = plist::Dictionary::new();
+    s0.insert("type".into(), plist::Value::Integer(96i64.into()));
+    s0.insert("ct".into(), plist::Value::Integer(2i64.into()));
+    s0.insert("spf".into(), plist::Value::Integer(352i64.into()));
+    s0.insert("sr".into(), plist::Value::Integer(44100i64.into()));
+    s0.insert("latencyMin".into(), plist::Value::Integer(11025i64.into()));
+    s0.insert("latencyMax".into(), plist::Value::Integer(88200i64.into()));
+    s0.insert(
+        "controlPort".into(),
+        plist::Value::Integer(i64::from(control_port).into()),
+    );
+    s0.insert("isMedia".into(), plist::Value::Boolean(true));
+    let mut d = plist::Dictionary::new();
+    d.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+    );
+    let setup2 = request(
+        &mut stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        4,
+    )
+    .await;
+    assert!(setup2.starts_with("RTSP/1.0 200"), "{setup2}");
+
+    // The probe that never left before #176.
+    let mut buf = [0u8; 64];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(2), timing.recv_from(&mut buf))
+        .await
+        .expect("a plist session must probe its declared timing peer within 2 s")
+        .unwrap();
+    assert_eq!(n, 32);
+    assert_eq!(buf[1] & 0x7F, 82, "payload type 82");
+
+    timing
+        .send_to(&harness::timing_reply(&buf[..n]), from)
+        .await
+        .unwrap();
+    let responder = answer_timing_probes(timing);
+    let snapshot =
+        wait_for_counters(&diagnostics, "clock_samples >= 1", |s| s.clock_samples >= 1).await;
+    assert!(
+        snapshot.clock_offset_ns.is_some(),
+        "a folded-in round trip must yield an offset: {snapshot:?}"
+    );
+    responder.abort();
+}
+
+/// The resend path at socket level (issue #176): the shape test passed for months while
+/// no resend request had ever been observed leaving a socket. Here a sequence gap must
+/// produce a type-85 datagram on the *sender's* control socket, and serving the
+/// retransmit must heal the stream — every payload reaches the pipeline exactly once.
+#[tokio::test]
+async fn a_sequence_gap_sends_a_resend_request_out_the_socket_and_the_retransmit_plays() {
+    let (mut stream, mut events, diagnostics) = harness::start_watched(MediaPorts::Ephemeral).await;
+
+    let control = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let timing = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let control_port = control.local_addr().unwrap().port();
+    let timing_port = timing.local_addr().unwrap().port();
+
+    let ports =
+        harness::negotiate_declaring_ports(&mut stream, IPHONE_FMTP, control_port, timing_port)
+            .await;
+
+    // The frame channel, so the retransmit can be seen coming out the other end.
+    let mut frames = None;
+    for _ in 0..8 {
+        let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
+            break;
+        };
+        if let SessionEvent::Audio { source, .. } = msg.event {
+            let FrameSource::Encoded(rx) = source else {
+                panic!("expected encoded frames")
+            };
+            frames = Some(rx);
+            break;
+        }
+    }
+    let mut frames = frames.expect("RECORD should have started an audio session");
+
+    // Sequence 0 arrives, then 3: packets 1 and 2 are missing.
+    let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let audio_target = SocketAddr::from(([127, 0, 0, 1], ports.audio));
+    sender
+        .send_to(&audio_packet(0, 0, b"packet-zero....."), audio_target)
+        .await
+        .unwrap();
+    sender
+        .send_to(&audio_packet(3, 3 * 352, b"packet-three...."), audio_target)
+        .await
+        .unwrap();
+
+    // The request actually leaves a socket — the datagram that had never been observed.
+    let mut buf = [0u8; 64];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(2), control.recv_from(&mut buf))
+        .await
+        .expect("a resend request must leave within 2 s of the gap")
+        .unwrap();
+    assert_eq!(n, 8, "a resend request is exactly 8 bytes");
+    assert_eq!(buf[1] & 0x7F, 85, "payload type 85");
+    assert_eq!(
+        u16::from_be_bytes([buf[4], buf[5]]),
+        1,
+        "first missing sequence"
+    );
+    assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), 2, "missing count");
+    // From the receiver's control socket, which is where the retransmit goes back to.
+    assert_eq!(from.port(), ports.control);
+
+    // Serve it, wrapped the way senders wrap a retransmit: four prefix bytes, then the
+    // complete original packet.
+    for (seq, ts, payload) in [
+        (1u16, 352u32, &b"packet-one......"[..]),
+        (2, 704, &b"packet-two......"[..]),
+    ] {
+        let mut wrapped = vec![0x80, 0x80 | 86, 0, 0];
+        wrapped.extend_from_slice(&audio_packet(seq, ts, payload));
+        control.send_to(&wrapped, from).await.unwrap();
+    }
+
+    // Every payload comes out: the two that arrived, and the two the resend recovered.
+    let mut delivered = Vec::new();
+    for _ in 0..4 {
+        let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .expect("a frame arrived")
+            .expect("the channel is open");
+        delivered.push(frame.data);
+    }
+    for payload in [
+        &b"packet-zero....."[..],
+        &b"packet-three...."[..],
+        &b"packet-one......"[..],
+        &b"packet-two......"[..],
+    ] {
+        assert!(
+            delivered.iter().any(|d| d.as_ref() == payload),
+            "{payload:?} never reached the pipeline; got {delivered:?}"
+        );
+    }
+    assert_eq!(
+        diagnostics.snapshot().resends_sent,
+        2,
+        "the counter counts packets asked for"
+    );
+}
+
 /// A pipeline that keeps the last description it was told, and nothing else.
 ///
 /// The other tests in this file read events straight off the sink, which is one seam

@@ -466,9 +466,14 @@ iPhone capture is checked in), #80 (the AirPlay video path is built), #81, #83, 
 
 **Open on measurement.** These need a session and a log line, not hardware:
 
-10. **#79 / #176** — the same defect from opposite ends: AirPlay has no timing model, the
-    sender's declared lead is unread, and the old 17-hour `av_skew_ms` was a measurement
-    never taken (#150 stopped the false report; the model is still unwritten).
+10. **#79 / #176** — the same defect from opposite ends, and #176's wire half now runs:
+    the plist `SETUP` finally yields a timing peer (it used to come only from the RTSP
+    `Transport` header), T1 watches the type-82 probe leave and the type-83 reply fold
+    into `clock_samples` in both session shapes, the resend request has been observed
+    leaving a socket, and the declared latency is parsed wherever a sender states it.
+    What remains: *consuming* that declared lead as a target buffer depth instead of
+    front-padding's accident (#176), and #79's skew bound, which still wants a
+    real-device capture (#150 stopped the false report).
 11. **#177** — browser page audio is unpaced: bursts at multiples of real time, skew in
     minutes, constant mixer shedding.
 12. **#87** — AVRCP cover art renders for some tracks and not others over Bluetooth.

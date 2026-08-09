@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use castaway_core::{MediaPorts, ProtocolKind, SessionSink, SourceAdapter as _, SourceId};
-use proto_airplay::{AirPlayIdentity, AirPlayReceiver};
+use proto_airplay::{AirPlayIdentity, AirPlayReceiver, NtpTime, SessionDiagnostics};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -62,12 +62,29 @@ pub fn identity() -> AirPlayIdentity {
 ///
 /// The bind-then-drop dance is how the test learns the port before the adapter owns it.
 pub async fn spawn_receiver(media_ports: MediaPorts, sink: SessionSink) -> SocketAddr {
+    spawn_configured_receiver(media_ports, sink, None).await
+}
+
+/// [`spawn_receiver`], optionally sharing the session counters with the test.
+///
+/// The timing exchange and the resend path are invisible from outside the process
+/// except through those counters — `clock_samples >= 1` is what proves a type-83 reply
+/// was *folded in* rather than merely delivered (#176).
+pub async fn spawn_configured_receiver(
+    media_ports: MediaPorts,
+    sink: SessionSink,
+    diagnostics: Option<Arc<SessionDiagnostics>>,
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let receiver = Arc::new(AirPlayReceiver::new(identity(), media_ports).with_addr(addr));
+    let mut receiver = AirPlayReceiver::new(identity(), media_ports).with_addr(addr);
+    if let Some(diagnostics) = diagnostics {
+        receiver = receiver.with_diagnostics(diagnostics);
+    }
+    let receiver = Arc::new(receiver);
     tokio::spawn(async move {
         let _ = receiver.run(sink).await;
     });
@@ -93,6 +110,21 @@ pub async fn start(
     let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
     let addr = spawn_receiver(media_ports, sink).await;
     (connect(addr).await, events)
+}
+
+/// [`start`], with the session counters shared so a test can assert on them.
+pub async fn start_watched(
+    media_ports: MediaPorts,
+) -> (
+    TcpStream,
+    mpsc::Receiver<castaway_core::SourceMessage>,
+    Arc<SessionDiagnostics>,
+) {
+    let (tx, events) = mpsc::channel(64);
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::AirPlay, "test"), tx);
+    let diagnostics = Arc::new(SessionDiagnostics::new());
+    let addr = spawn_configured_receiver(media_ports, sink, Some(Arc::clone(&diagnostics))).await;
+    (connect(addr).await, events, diagnostics)
 }
 
 /// Send one RTSP request and read the response head.
@@ -126,15 +158,21 @@ pub async fn request(
 /// Pull `server_port=NNNN` out of a Transport header.
 #[must_use]
 pub fn server_port(response: &str) -> u16 {
+    transport_port(response, "server_port=")
+}
+
+/// Pull any `key=NNNN` port out of a Transport header.
+#[must_use]
+pub fn transport_port(response: &str, key: &str) -> u16 {
     response
-        .split("server_port=")
+        .split(key)
         .nth(1)
         .and_then(|rest| {
             rest.split(|c: char| !c.is_ascii_digit())
                 .next()
                 .and_then(|d| d.parse().ok())
         })
-        .unwrap_or_else(|| panic!("no server_port in:\n{response}"))
+        .unwrap_or_else(|| panic!("no {key} in:\n{response}"))
 }
 
 /// An RTP audio packet around a payload.
@@ -154,6 +192,99 @@ pub fn audio_packet(sequence: u16, timestamp: u32, payload: &[u8]) -> Vec<u8> {
 /// Panics on any non-200, so a caller holds a session that is genuinely up.
 pub async fn negotiate(stream: &mut TcpStream, fmtp: &str) -> (u16, String) {
     negotiate_with_sdp(stream, &announce_sdp(fmtp)).await
+}
+
+/// The ports one negotiated session runs on: the receiver's three, as its `SETUP`
+/// reply named them.
+pub struct Negotiated {
+    /// Where the sender streams audio.
+    pub audio: u16,
+    /// Where the sender's sync packets and our resend replies go.
+    pub control: u16,
+    /// Where the sender's timing replies go.
+    pub timing: u16,
+}
+
+/// [`negotiate`], with the *sender's* control and timing ports declared for real —
+/// the ports a scripted sender has actually bound, so the receiver's timing probes
+/// and resend requests land on sockets the test is watching (#176).
+pub async fn negotiate_declaring_ports(
+    stream: &mut TcpStream,
+    fmtp: &str,
+    sender_control: u16,
+    sender_timing: u16,
+) -> Negotiated {
+    let options = request(stream, "OPTIONS *", &[], &[], 1).await;
+    assert!(options.starts_with("RTSP/1.0 200"), "{options}");
+
+    let announce = request(
+        stream,
+        "ANNOUNCE rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/sdp")],
+        announce_sdp(fmtp).as_bytes(),
+        2,
+    )
+    .await;
+    assert!(announce.starts_with("RTSP/1.0 200"), "{announce}");
+
+    let transport = format!(
+        "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;\
+         control_port={sender_control};timing_port={sender_timing}"
+    );
+    let setup = request(
+        stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Transport", &transport)],
+        &[],
+        3,
+    )
+    .await;
+    assert!(setup.starts_with("RTSP/1.0 200"), "{setup}");
+    let negotiated = Negotiated {
+        audio: transport_port(&setup, "server_port="),
+        control: transport_port(&setup, "control_port="),
+        timing: transport_port(&setup, "timing_port="),
+    };
+
+    let record = request(stream, "RECORD rtsp://127.0.0.1/1", &[], &[], 4).await;
+    assert!(record.starts_with("RTSP/1.0 200"), "{record}");
+    negotiated
+}
+
+/// A well-formed type-83 timing reply to `request`, as a sender's NTP service answers:
+/// our transmit stamp echoed at 8..16, the sender's receive and transmit times filling
+/// the rest.
+#[must_use]
+pub fn timing_reply(request: &[u8]) -> [u8; 32] {
+    assert_eq!(request.len(), 32, "a timing request is exactly 32 bytes");
+    let now = NtpTime::from_unix_nanos(
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap(),
+    );
+    let mut r = [0u8; 32];
+    r[0] = 0x80;
+    r[1] = 0x80 | 83;
+    r[2..4].copy_from_slice(&request[2..4]);
+    r[8..16].copy_from_slice(&request[24..32]); // echo the requester's transmit time
+    r[16..24].copy_from_slice(&now.raw().to_be_bytes());
+    r[24..32].copy_from_slice(&now.raw().to_be_bytes());
+    r
+}
+
+/// The 20-byte sync packet a sender emits on its control link: "RTP `anchor` is *now*,
+/// and I intend to run `anchor - rtp_now_less_latency` frames ahead of you".
+#[must_use]
+pub fn sync_packet(rtp_now_less_latency: u32, sender_ntp_raw: u64, rtp_anchor: u32) -> Vec<u8> {
+    let mut p = vec![0x90u8, 0x80 | 84, 0, 7];
+    p.extend_from_slice(&rtp_now_less_latency.to_be_bytes());
+    p.extend_from_slice(&sender_ntp_raw.to_be_bytes());
+    p.extend_from_slice(&rtp_anchor.to_be_bytes());
+    p
 }
 
 /// [`negotiate`], with the whole SDP supplied — for a sender that announces more than
