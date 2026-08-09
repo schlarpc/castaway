@@ -154,7 +154,10 @@ async fn a_passcode_round_trip() {
     assert_eq!(reply.error_code, CdError::None);
     assert_eq!(reply.passcode_length, 8);
 
-    let Some(Prompt::Passcode { device, passcode }) = h.prompts.recv().await else {
+    let Some(Prompt::Passcode {
+        device, passcode, ..
+    }) = h.prompts.recv().await
+    else {
         panic!("nothing went on the screen");
     };
     assert_eq!(device, "Chaz's phone");
@@ -213,14 +216,17 @@ async fn a_client_is_told_how_commissioning_went() {
     assert_eq!(to.port(), h.client.port());
 
     // What the worker sends when `await_commissionable` times out: the client advertised
-    // nothing we could find.
+    // nothing we could find. The report also frees the pairing slot (#209).
     h.outcomes
-        .send(proto_matter::server::Outcome {
-            to,
-            declaration: CommissionerDeclaration {
-                error_code: CdError::CommissionableDiscoveryFailed,
-                ..CommissionerDeclaration::default()
-            },
+        .send(proto_matter::server::AttemptEnd {
+            instance: request.instance,
+            outcome: Some(proto_matter::server::Outcome {
+                to,
+                declaration: CommissionerDeclaration {
+                    error_code: CdError::CommissionableDiscoveryFailed,
+                    ..CommissionerDeclaration::default()
+                },
+            }),
         })
         .unwrap();
 
@@ -348,7 +354,105 @@ async fn cancelling_from_the_phone_clears_the_screen() {
 
     let reply = h.client.reply().await;
     assert!(reply.cancel_passcode);
-    assert_eq!(h.prompts.recv().await, Some(Prompt::Clear));
+    assert_eq!(
+        h.prompts.recv().await,
+        Some(Prompt::Clear {
+            instance: h.client.instance.clone()
+        })
+    );
+}
+
+/// Two phones on the wire at once (#209): the second is refused with the one `CdError`
+/// that reads as "busy" — and its cancel on the way out does not reach the screen.
+#[tokio::test]
+async fn a_second_phone_is_refused_and_its_cancel_touches_nothing() {
+    let mut h = harness(catalogue()).await;
+
+    h.client.send(&h.client.declaration()).await;
+    assert!(h.client.reply().await.passcode_dialog_displayed);
+    assert!(matches!(
+        h.prompts.recv().await,
+        Some(Prompt::Passcode { .. })
+    ));
+
+    // The second phone: its own socket, its own instance, the same panel.
+    let mut second = Client::new(h.client.server).await;
+    second.instance = InstanceName::new("0011223344556677").unwrap();
+    second.send(&second.declaration()).await;
+
+    let refused = second.reply().await;
+    assert_eq!(refused.error_code, CdError::CommissionerPasscodeDisabled);
+    assert!(!refused.passcode_dialog_displayed);
+
+    // The refused user backs out on their phone. Acknowledged — and the first phone's
+    // prompt stays where it is.
+    let mut cancel = second.declaration();
+    cancel.cancel_passcode = true;
+    second.send(&cancel).await;
+    assert!(second.reply().await.cancel_passcode);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.prompts.recv())
+            .await
+            .is_err(),
+        "the second phone's refusal or cancel reached the screen"
+    );
+
+    // And the first phone's flow is intact: typing the passcode still commissions it.
+    let mut ready = h.client.declaration();
+    ready.commissioner_passcode_ready = true;
+    h.client.send(&ready).await;
+    let request = h.requests.recv().await.expect("a commissioning request");
+    assert_eq!(request.instance, h.client.instance);
+}
+
+/// The refusal is temporary: once the worker reports the attempt over, the next phone is
+/// served (#209).
+#[tokio::test]
+async fn the_slot_frees_when_the_worker_reports() {
+    let mut h = harness(catalogue()).await;
+
+    h.client.send(&h.client.declaration()).await;
+    let _ = h.client.reply().await;
+    let _ = h.prompts.recv().await;
+    let mut ready = h.client.declaration();
+    ready.commissioner_passcode_ready = true;
+    h.client.send(&ready).await;
+    let request = h.requests.recv().await.expect("a commissioning request");
+    assert_eq!(h.client.reply().await.error_code, CdError::None);
+
+    // Mid-attempt: a second phone is refused.
+    let mut second = Client::new(h.client.server).await;
+    second.instance = InstanceName::new("0011223344556677").unwrap();
+    second.send(&second.declaration()).await;
+    assert_eq!(
+        second.reply().await.error_code,
+        CdError::CommissionerPasscodeDisabled
+    );
+
+    // The worker reports the attempt over — a success, so nothing is sent to anyone.
+    h.outcomes
+        .send(proto_matter::server::AttemptEnd {
+            instance: request.instance,
+            outcome: None,
+        })
+        .unwrap();
+
+    // The same phone, declaring again, now gets the glass. Polled with a deadline: the
+    // report travels a channel, and the datagram can beat it into the select loop.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        second.send(&second.declaration()).await;
+        let reply = second.reply().await;
+        if reply.passcode_dialog_displayed {
+            break;
+        }
+        assert_eq!(reply.error_code, CdError::CommissionerPasscodeDisabled);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slot never came free after the worker's report"
+        );
+    }
 }
 
 /// Anything at all arrives on an unauthenticated UDP port. None of it should stop the

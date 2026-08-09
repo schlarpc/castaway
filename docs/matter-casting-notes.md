@@ -190,6 +190,20 @@ times while somebody reads it — and invalidates the one they have started typi
 window is measured from when the number first went up, not from the last copy, or a client
 that re-declares on a timer holds a passcode on the screen forever.
 
+**One pairing at a time; a second phone is refused with `CommissionerPasscodeDisabled`
+(#209).** The screen is one slot, and the spec's `CdError` list has no "busy" code —
+read as: a Casting Player is expected to run one passcode dialog at a time. A phone that
+declares while another's passcode is up, or while its owner is mid-PASE, is answered
+with error 17 — temporary unavailability, deliberately not 11
+(`CommissionerPasscodeNotSupported`, which is permanent and could push a client into the
+client-generated flow the panel also declines) and not silence. Queueing the second
+phone was considered and rejected on wire honesty: the `CommissionerDeclaration`
+vocabulary has no way to say "wait", so a queued phone either gets
+`passcodeDialogDisplayed` for a dialog its user cannot see — steering them into typing
+the first user's number — or a flag-less declaration whose handling no client defines.
+Prompts are keyed by instance name throughout, so one phone's cancel or expiry can never
+take down the number another user is reading.
+
 ---
 
 ## 4. Discovery

@@ -49,8 +49,8 @@ use crate::node::{handlers, CastingContext, NodeTree};
 use crate::player::{
     CastCommand, Catalogue, PlaybackState, PlayerSnapshot, PlayerState, Surface, Transport,
 };
-use crate::server::{CommissionRequest, Prompt, UdcServer};
-use crate::udc::{CommissionStage, CommissionerDeclaration};
+use crate::server::{AttemptEnd, CommissionRequest, Prompt, UdcServer};
+use crate::udc::{CommissionStage, CommissionerDeclaration, InstanceName};
 
 /// How long the panel waits for a phone to appear as a commissionable node after it says
 /// the passcode is typed. Generous: this is a wait on a person walking back to the sofa,
@@ -112,6 +112,12 @@ pub struct MatterAdapter {
     config: MatterConfig,
     state: Arc<PlayerState>,
     osd: Option<OsdSink>,
+    /// Whose passcode prompt is on the glass, if anyone's. The OSD is one slot, so a
+    /// [`Prompt::Clear`] may only take it down when its key matches — a clear for a
+    /// phone whose prompt is not showing must not touch another phone's number (#209).
+    /// A banner forgets the owner: it *replaced* the prompt, and a late clear for the
+    /// flow the banner reports on must not truncate it.
+    prompt_owner: std::sync::Mutex<Option<InstanceName>>,
     browser: Option<mpsc::UnboundedSender<BrowserLaunch>>,
     operational_mdns: Option<MdnsAdvertiser>,
     /// Taken by `run`; a second call finds it gone, which is what makes running twice an
@@ -127,6 +133,7 @@ impl MatterAdapter {
             config,
             state: Arc::new(PlayerState::new()),
             osd: None,
+            prompt_owner: std::sync::Mutex::new(None),
             browser: None,
             operational_mdns: None,
             once: Mutex::new(Some(())),
@@ -424,11 +431,20 @@ impl MatterAdapter {
                     // The fabric may just have gained its first member, which is the
                     // moment the operational record becomes worth publishing (#173).
                     operational.publish_once_fabric_has_members(ca.clients());
-                    self.show(OsdMessage::banner(
+                    // The banner replaces this phone's passcode prompt on the glass —
+                    // that replacement *is* the takedown, which is why there is no
+                    // unconditional OSD clear here to catch somebody else's prompt (#209).
+                    self.show_banner(OsdMessage::banner(
                         format!("{} can now cast", request.device_name),
                         Duration::from_secs(5),
                     ));
                     tracing::info!(node_id, "matter: casting client commissioned");
+
+                    // Free the pairing slot: the next phone may declare now.
+                    let _ = cx.outcomes.send(AttemptEnd {
+                        instance: request.instance.clone(),
+                        outcome: None,
+                    });
                 }
                 Err(e) => {
                     // One phone failing is not the adapter failing: the next request is
@@ -438,7 +454,7 @@ impl MatterAdapter {
                         error = %e,
                         "matter: commissioning failed"
                     );
-                    self.show(OsdMessage::banner(
+                    self.show_banner(OsdMessage::banner(
                         format!("could not pair {}", request.device_name),
                         Duration::from_secs(5),
                     ));
@@ -447,26 +463,30 @@ impl MatterAdapter {
                     // that has to guess — and what it usually guesses is a timeout. The
                     // code is derived from the typed stage rather than from the message,
                     // so a new step in the flow is a compile error rather than a
-                    // plausible wrong code (#198).
-                    if let (Some(to), Some(error_code)) =
-                        (request.reply_to, e.commissioner_declaration_error())
-                    {
-                        tracing::info!(
-                            %to, ?error_code,
-                            "matter: telling the client why commissioning stopped"
-                        );
-                        let _ = cx.outcomes.send(crate::server::Outcome {
-                            to,
-                            declaration: CommissionerDeclaration {
-                                error_code,
-                                ..CommissionerDeclaration::default()
-                            },
-                        });
-                    }
+                    // plausible wrong code (#198). The report frees the pairing slot
+                    // whether or not there is anywhere to send the declaration (#209).
+                    let outcome = match (request.reply_to, e.commissioner_declaration_error()) {
+                        (Some(to), Some(error_code)) => {
+                            tracing::info!(
+                                %to, ?error_code,
+                                "matter: telling the client why commissioning stopped"
+                            );
+                            Some(crate::server::Outcome {
+                                to,
+                                declaration: CommissionerDeclaration {
+                                    error_code,
+                                    ..CommissionerDeclaration::default()
+                                },
+                            })
+                        }
+                        _ => None,
+                    };
+                    let _ = cx.outcomes.send(AttemptEnd {
+                        instance: request.instance.clone(),
+                        outcome,
+                    });
                 }
             }
-
-            self.clear_osd();
         }
 
         Ok(())
@@ -654,22 +674,68 @@ impl MatterAdapter {
         })
     }
 
-    /// Put the passcode where a person can read it.
+    /// Put the passcode where a person can read it — and take it down only for the phone
+    /// it belongs to.
     async fn pump_prompts(&self, mut prompts: mpsc::UnboundedReceiver<Prompt>) {
         while let Some(prompt) = prompts.recv().await {
             match prompt {
-                Prompt::Passcode { device, passcode } => {
-                    tracing::info!(%device, %passcode, "matter: passcode on screen");
-                    self.show(OsdMessage::sticky(format!(
-                        "{device} wants to cast — enter {passcode}"
-                    )));
+                Prompt::Passcode {
+                    instance,
+                    device,
+                    passcode,
+                } => {
+                    tracing::info!(%instance, %device, %passcode, "matter: passcode on screen");
+                    self.show_prompt(
+                        instance,
+                        OsdMessage::sticky(format!("{device} wants to cast — enter {passcode}")),
+                    );
                 }
-                Prompt::Clear => self.clear_osd(),
+                Prompt::Clear { instance } => self.clear_prompt(&instance),
             }
         }
     }
 
-    fn show(&self, message: OsdMessage) {
+    /// Show a phone's passcode prompt and record whose it is.
+    fn show_prompt(&self, instance: InstanceName, message: OsdMessage) {
+        if let Ok(mut owner) = self.prompt_owner.lock() {
+            *owner = Some(instance);
+        }
+        self.show_osd(message);
+    }
+
+    /// Take the prompt down — but only if it is `instance`'s (#209). A clear for a phone
+    /// whose prompt is not on the glass would otherwise take down whatever *is*: the
+    /// other phone's passcode, or a banner about a different flow entirely.
+    fn clear_prompt(&self, instance: &InstanceName) {
+        let ours = self.prompt_owner.lock().is_ok_and(|mut owner| {
+            if owner.as_ref() == Some(instance) {
+                *owner = None;
+                true
+            } else {
+                false
+            }
+        });
+        if ours {
+            self.clear_osd();
+        } else {
+            tracing::debug!(
+                %instance,
+                "matter: ignoring a clear for a prompt that is not on screen"
+            );
+        }
+    }
+
+    /// Put a banner up, replacing whatever prompt is showing — which is the visual end
+    /// of the flow the banner reports on. The owner is forgotten so a later `Clear` for
+    /// that flow does not truncate the banner.
+    fn show_banner(&self, message: OsdMessage) {
+        if let Ok(mut owner) = self.prompt_owner.lock() {
+            *owner = None;
+        }
+        self.show_osd(message);
+    }
+
+    fn show_osd(&self, message: OsdMessage) {
         if let Some(osd) = &self.osd {
             osd.show(message);
         }
@@ -751,7 +817,8 @@ struct Commissioning<'a, 'm, C> {
     /// Its own browse handle: the app's shared responder is built for advertising, and
     /// this is the one place in the crate that needs to *look* for something.
     mdns: &'a MdnsResponder,
-    /// Where to say how it went, so the client is not left guessing (#198).
+    /// Where every attempt's end is reported. It frees the pairing slot (#209), and a
+    /// failure carries the declaration that stops the client guessing (#198).
     outcomes: &'a crate::server::OutcomeSender,
 }
 
@@ -990,5 +1057,77 @@ mod tests {
             adapter.transport_to_control(Transport::StartOver),
             Some(ControlTxn::Seek(Duration::ZERO))
         );
+    }
+
+    fn instance(name: &str) -> InstanceName {
+        InstanceName::new(name).unwrap()
+    }
+
+    /// The OSD is one slot, so a `Clear` may only take down the prompt it names (#209):
+    /// with phone A's passcode on the glass, phone B's clear must change nothing.
+    #[tokio::test]
+    async fn a_clear_for_another_phone_leaves_the_prompt_up() {
+        use castaway_core::OsdCommand;
+
+        let (osd, osd_rx) = castaway_core::osd_channel();
+        let adapter = adapter().with_osd(osd);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tx.send(Prompt::Passcode {
+            instance: instance("AAAAAAAAAAAAAAAA"),
+            device: "phone a".into(),
+            passcode: "1234-5678".into(),
+        })
+        .unwrap();
+        // The stranger's clear, then the owner's: only the second may reach the glass.
+        tx.send(Prompt::Clear {
+            instance: instance("BBBBBBBBBBBBBBBB"),
+        })
+        .unwrap();
+        tx.send(Prompt::Clear {
+            instance: instance("AAAAAAAAAAAAAAAA"),
+        })
+        .unwrap();
+        drop(tx);
+
+        adapter.pump_prompts(rx).await;
+
+        assert!(matches!(osd_rx.try_recv(), Some(OsdCommand::Show(_))));
+        assert_eq!(
+            osd_rx.try_recv(),
+            Some(OsdCommand::Clear),
+            "the owner's clear must still work"
+        );
+        assert_eq!(
+            osd_rx.try_recv(),
+            None,
+            "the stranger's clear reached the glass"
+        );
+    }
+
+    /// A banner replaces the prompt it reports on — that replacement is the takedown, so
+    /// a `Clear` for that flow arriving after the banner must not truncate it.
+    #[test]
+    fn a_banner_outlives_a_late_clear_for_the_flow_it_reports_on() {
+        use castaway_core::OsdCommand;
+
+        let (osd, osd_rx) = castaway_core::osd_channel();
+        let adapter = adapter().with_osd(osd);
+        let phone = instance("AAAAAAAAAAAAAAAA");
+
+        adapter.show_prompt(
+            phone.clone(),
+            OsdMessage::sticky("phone a — enter 1234-5678"),
+        );
+        adapter.show_banner(OsdMessage::banner(
+            "phone a can now cast",
+            Duration::from_secs(5),
+        ));
+        // The late clear for a flow whose prompt the banner already replaced.
+        adapter.clear_prompt(&phone);
+
+        assert!(matches!(osd_rx.try_recv(), Some(OsdCommand::Show(_))));
+        assert!(matches!(osd_rx.try_recv(), Some(OsdCommand::Show(_))));
+        assert_eq!(osd_rx.try_recv(), None, "the banner was cleared early");
     }
 }
