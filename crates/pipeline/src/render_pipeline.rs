@@ -3615,7 +3615,17 @@ impl RenderLoop {
     /// `Pipeline` trait — a DIAL launch, which comes in as a browser command — is a session
     /// starting too, and has to claim the panel the same way.
     pub fn rest_panel_if_idle(&mut self) {
-        if self.last_touch.is_some_and(|t| t.elapsed() < IDLE_GRACE) {
+        // Against the injected clock, like the eleven other reads and unlike the
+        // `t.elapsed()` this used to be — `last_touch` is *stamped* from the injected
+        // clock, so measuring it against the wall made the grace untestable in both
+        // directions: under `ManualClock` the stamp sits at-or-ahead of wall-now,
+        // `elapsed()` saturates to zero, and the expiry branch was reachable only by
+        // sleeping twenty real seconds (#156, #235).
+        let now = self.clock.now();
+        if self
+            .last_touch
+            .is_some_and(|t| now.saturating_duration_since(t) < IDLE_GRACE)
+        {
             // `info`, not `debug`: this is the whole explanation for "I cast something
             // and the panel didn't change", and the on-disk log only keeps `info` up.
             info!("shell: a session claimed the panel, but it was touched recently; staying put");

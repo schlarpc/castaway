@@ -130,6 +130,39 @@ fn but_not_out_from_under_someone_using_it() {
 }
 
 #[test]
+fn a_touch_grown_cold_no_longer_holds_the_panel_against_a_session() {
+    // The other side of the grace, and until #235 the untestable one: the check measured
+    // `last_touch` against the wall clock while the stamp came from the injected one, so
+    // the expiry branch was reachable only by sleeping twenty real seconds — and "someone
+    // touched the panel, walked away, and then a cast arrived" is the *normal* case for
+    // a session claiming the glass, not the corner.
+    let (tx, rx) = pipeline::render_channel(8);
+    let (clock, time) = pipeline::render_clock::RenderClock::manual();
+    let mut render = RenderLoop::offscreen(W, H, rx).unwrap().with_clock(clock);
+    tx.send(RenderCommand::Home(Box::new(AttractScene::demo())));
+    render.pump();
+    render.shell_push(pipeline::shell::Screen::Picker(Box::new(
+        pipeline::picker::Picker::loading("Moonlight", "…"),
+    )));
+    render.note_touch();
+
+    // Within the grace: the picker stands.
+    tx.send(RenderCommand::RestPanel);
+    render.pump();
+    assert_eq!(render.shell_depth(), 2, "a fresh touch holds the panel");
+
+    // Twenty-one virtual seconds later, the same claim takes the glass.
+    time.advance(std::time::Duration::from_secs(21));
+    tx.send(RenderCommand::RestPanel);
+    render.pump();
+    assert_eq!(
+        render.shell_depth(),
+        1,
+        "a touch grown cold is not somebody using the panel"
+    );
+}
+
+#[test]
 fn an_audio_session_minimizes_into_the_widget_slot_and_restores() {
     // The audio twin of the video PiP: a Spotify/Bluetooth session's card sits above
     // the shell, so going home used to change nothing anyone could see. Now the card
