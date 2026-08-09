@@ -214,47 +214,81 @@ impl TsHeader {
 /// consumer that saw the raw value would see time jump backwards by 26.5 hours.
 #[derive(Debug, Default)]
 pub struct PtsOrigin {
-    /// The first PTS seen, in 90 kHz ticks.
+    /// The first extended PTS seen, in 90 kHz ticks.
     first: Option<u64>,
-    /// The previous PTS, to detect the wrap.
+    /// The previous extended PTS, to detect a restart.
     previous: u64,
-    /// How many times the counter has rolled over.
-    wraps: u64,
     /// Ticks already resolved before the most recent restart, so a re-key continues the
     /// timeline instead of returning to zero.
     carried: u64,
+    /// Each elementary stream's own wrap state — see [`StreamTicks`] for why this is
+    /// per-stream where everything above it is shared.
+    ticks: HashMap<Pid, StreamTicks>,
+}
+
+/// One elementary stream's 33-bit counter, extended to a monotone 64-bit one.
+///
+/// The wrap is a property of a *single stream's* counter: audio and video each roll over
+/// at their own moment, separated by the mux offset. It used to be detected on the shared
+/// value the two planes take turns supplying, and the first rollover then read as follows
+/// (#231): video wraps and the shared counter banks 2^33; the next audio PES has not
+/// wrapped, is *greater* than the previous raw value, takes no branch, and is extended by
+/// a modulus it never rolled past — a 26.5-hour jump — after which every alternation
+/// trips the detector again and the total only climbs, on both planes, for the rest of
+/// the session. The trigger is the sender's uptime crossing a multiple of 26.5 h during a
+/// cast, which for a phone is routine.
+///
+/// Extending per stream first means the layer above never sees a wrap at all, and this
+/// type never sees the interleave: each layer sees only the phenomenon it can classify.
+#[derive(Debug, Default)]
+struct StreamTicks {
+    /// The previous raw PTS on this stream, to detect its wrap.
+    previous: u64,
+    /// How many times this stream's counter has rolled over.
+    wraps: u64,
+}
+
+impl StreamTicks {
+    /// Extend a raw 33-bit PTS past this stream's rollovers.
+    fn extend(&mut self, pts: u64) -> u64 {
+        if self.previous > pts && self.previous - pts > PTS_WRAP_THRESHOLD {
+            // A big step backwards is this stream's counter wrapping. Anything smaller
+            // is B-frame reordering, which must not move anything.
+            self.wraps = self.wraps.saturating_add(1);
+        }
+        self.previous = pts;
+        pts.saturating_add(self.wraps.saturating_mul(PTS_MODULUS))
+    }
 }
 
 impl PtsOrigin {
-    /// Convert a raw 33-bit PTS to time since the first one this origin saw.
-    pub fn resolve(&mut self, pts: u64) -> Duration {
-        let mut first = *self.first.get_or_insert(pts);
-        if self.previous > pts {
-            let back = self.previous - pts;
-            if back > PTS_WRAP_THRESHOLD {
-                // A big step backwards is the counter wrapping.
-                self.wraps = self.wraps.saturating_add(1);
-            } else if back > PTS_RESTART_THRESHOLD {
-                // A middling one is a re-key restarting the counter — the case this type
-                // exists to hide and used not to. Subtracting the *old* origin from a
-                // restarted PTS sends resolved time backwards by the whole session and
-                // then pins it at zero until the counter climbs past where it began. So
-                // bank what has elapsed and start measuring again from here.
-                let previous_extended = self
-                    .previous
-                    .saturating_add(self.wraps.saturating_mul(PTS_MODULUS));
-                self.carried = self
-                    .carried
-                    .saturating_add(previous_extended.saturating_sub(first));
-                first = pts;
-                self.first = Some(pts);
-                self.wraps = 0;
-            }
-            // Anything smaller is B-frame reordering or two streams whose PTSs simply
-            // interleave, and must not move anything.
+    /// Convert stream `pid`'s raw 33-bit PTS to time since the first one this origin saw.
+    pub fn resolve(&mut self, pid: Pid, pts: u64) -> Duration {
+        let mut extended = self.ticks.entry(pid).or_default().extend(pts);
+        let mut first = *self.first.get_or_insert(extended);
+        if self.previous > extended && self.previous - extended > PTS_RESTART_THRESHOLD {
+            // A re-key restarting the counter — the case this type exists to hide and
+            // used not to. Subtracting the *old* origin from a restarted PTS sends
+            // resolved time backwards by the whole session and then pins it at zero
+            // until the counter climbs past where it began. So bank what has elapsed and
+            // start measuring again from here.
+            //
+            // The restart is the *program's*: one encoder restarted one mux clock, so
+            // every stream's wrap state is stale together and starts over together —
+            // which is also what keeps a restart landing between the two planes' wraps
+            // from leaving them a whole modulus apart.
+            //
+            // Steps backwards smaller than the threshold are the two planes' PTSs
+            // interleaving by the mux offset, and must not move anything.
+            self.carried = self
+                .carried
+                .saturating_add(self.previous.saturating_sub(first));
+            self.ticks.clear();
+            extended = self.ticks.entry(pid).or_default().extend(pts);
+            first = extended;
+            self.first = Some(extended);
         }
-        self.previous = pts;
-        let extended = pts.saturating_add(self.wraps.saturating_mul(PTS_MODULUS));
+        self.previous = extended;
         let ticks = self.carried.saturating_add(extended.saturating_sub(first));
         Duration::from_nanos(
             ticks
@@ -599,7 +633,10 @@ impl TsDemux {
         if pes.payload.is_empty() {
             return;
         }
-        let pts = pes.pts.map(|p| self.origin.resolve(p)).unwrap_or_default();
+        let pts = pes
+            .pts
+            .map(|p| self.origin.resolve(pid, p))
+            .unwrap_or_default();
         let video_codec = stream_type.video_codec();
         let keyframe = video_codec.is_some_and(|c| annex_b_has_idr(&pes.payload, c));
         out.push(EncodedFrame {
@@ -1031,10 +1068,44 @@ pub(crate) mod tests {
     fn pts_wrap_does_not_send_time_backwards() {
         let mut origin = PtsOrigin::default();
         let near_top = PTS_MODULUS - 90_000;
-        assert_eq!(origin.resolve(near_top), Duration::ZERO);
+        assert_eq!(origin.resolve(VIDEO_PID, near_top), Duration::ZERO);
         // One second later, the counter has rolled over to 0.
-        assert_eq!(origin.resolve(0), Duration::from_secs(1));
-        assert_eq!(origin.resolve(90_000), Duration::from_secs(2));
+        assert_eq!(origin.resolve(VIDEO_PID, 0), Duration::from_secs(1));
+        assert_eq!(origin.resolve(VIDEO_PID, 90_000), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn each_plane_wraps_on_its_own_clock_not_on_the_other_ones() {
+        // #231. The two existing neighbours test the wrap on one plane and the
+        // interleave far from the wrap; this is the two composed, which is where the
+        // shared wrap counter exploded. Audio runs one second behind video and the
+        // session crosses the rollover: video wraps first, audio a second later, and
+        // both planes must come out continuous. Under the shared counter, the first
+        // audio PES after video's wrap had not wrapped, was *greater* than the previous
+        // raw value, took no branch, and was extended by a modulus it never rolled
+        // past — a 26.5-hour jump — after which every alternation climbed further, on
+        // both planes, for the rest of the session. The trigger is the phone's uptime
+        // crossing a multiple of 26.5 h mid-cast, which is routine.
+        let mut origin = PtsOrigin::default();
+        let near_top = PTS_MODULUS - PTS_HZ; // one second before rollover
+        let s = |n: u64| Duration::from_secs(n);
+
+        // Video at t, audio trailing it by one second, alternating across the wrap.
+        assert_eq!(origin.resolve(VIDEO_PID, near_top), s(0));
+        assert_eq!(origin.resolve(AUDIO_PID, near_top - PTS_HZ), s(0));
+        // Video rolls over; audio has not yet. This is the packet that used to jump.
+        assert_eq!(origin.resolve(VIDEO_PID, 0), s(1));
+        assert_eq!(
+            origin.resolve(AUDIO_PID, near_top),
+            s(0),
+            "audio trails, in range"
+        );
+        // Audio rolls over a second later, on its own clock.
+        assert_eq!(origin.resolve(VIDEO_PID, PTS_HZ), s(2));
+        assert_eq!(origin.resolve(AUDIO_PID, 0), s(1));
+        // And from here both planes are past their own wraps, still one second apart.
+        assert_eq!(origin.resolve(VIDEO_PID, 2 * PTS_HZ), s(3));
+        assert_eq!(origin.resolve(AUDIO_PID, PTS_HZ), s(2));
     }
 
     #[test]
@@ -1042,9 +1113,9 @@ pub(crate) mod tests {
         // B-frame reordering steps PTS backwards by a frame or two. Treating that as a
         // wrap would add 26.5 hours to every frame after it.
         let mut origin = PtsOrigin::default();
-        assert_eq!(origin.resolve(90_000), Duration::ZERO);
-        assert_eq!(origin.resolve(96_000), THIRTY_FPS_FRAME * 2);
-        assert_eq!(origin.resolve(93_000), THIRTY_FPS_FRAME);
+        assert_eq!(origin.resolve(VIDEO_PID, 90_000), Duration::ZERO);
+        assert_eq!(origin.resolve(VIDEO_PID, 96_000), THIRTY_FPS_FRAME * 2);
+        assert_eq!(origin.resolve(VIDEO_PID, 93_000), THIRTY_FPS_FRAME);
     }
 
     #[test]
@@ -1056,18 +1127,33 @@ pub(crate) mod tests {
         // the time handed to A/V pacing stepped back by the whole hour.
         let mut origin = PtsOrigin::default();
         let start = 90_000;
-        assert_eq!(origin.resolve(start), Duration::ZERO);
+        assert_eq!(origin.resolve(VIDEO_PID, start), Duration::ZERO);
         let an_hour_in = start + 3600 * PTS_HZ;
-        assert_eq!(origin.resolve(an_hour_in), Duration::from_secs(3600));
+        assert_eq!(
+            origin.resolve(VIDEO_PID, an_hour_in),
+            Duration::from_secs(3600)
+        );
 
         // …and the source re-keys, restarting at a fresh small value.
         assert_eq!(
-            origin.resolve(0),
+            origin.resolve(VIDEO_PID, 0),
             Duration::from_secs(3600),
             "the timeline continues from where it was"
         );
-        assert_eq!(origin.resolve(PTS_HZ), Duration::from_secs(3601));
-        assert_eq!(origin.resolve(2 * PTS_HZ), Duration::from_secs(3602));
+        assert_eq!(origin.resolve(VIDEO_PID, PTS_HZ), Duration::from_secs(3601));
+        assert_eq!(
+            origin.resolve(VIDEO_PID, 2 * PTS_HZ),
+            Duration::from_secs(3602)
+        );
+
+        // The restart is the program's, so the other plane's stale wrap state restarts
+        // with it: audio arriving after the re-key lands on the new clock, not extended
+        // by wraps it banked on the old one.
+        assert_eq!(
+            origin.resolve(AUDIO_PID, PTS_HZ),
+            Duration::from_secs(3601),
+            "the other plane joins the restarted clock where it is"
+        );
     }
 
     #[test]
@@ -1076,11 +1162,14 @@ pub(crate) mod tests {
         // and forth past each other by the mux offset. Re-basing on that would restart the
         // timeline on every other packet.
         let mut origin = PtsOrigin::default();
-        assert_eq!(origin.resolve(10 * PTS_HZ), Duration::ZERO);
+        assert_eq!(origin.resolve(VIDEO_PID, 10 * PTS_HZ), Duration::ZERO);
         // A plane a second behind the other, alternating.
-        assert_eq!(origin.resolve(9 * PTS_HZ), Duration::ZERO);
-        assert_eq!(origin.resolve(11 * PTS_HZ), Duration::from_secs(1));
-        assert_eq!(origin.resolve(10 * PTS_HZ), Duration::ZERO);
+        assert_eq!(origin.resolve(AUDIO_PID, 9 * PTS_HZ), Duration::ZERO);
+        assert_eq!(
+            origin.resolve(VIDEO_PID, 11 * PTS_HZ),
+            Duration::from_secs(1)
+        );
+        assert_eq!(origin.resolve(AUDIO_PID, 10 * PTS_HZ), Duration::ZERO);
     }
 
     #[test]
