@@ -39,6 +39,8 @@ http = "1"
 bytes.workspace = true
 
 [dev-dependencies]
+# The shared deadline poll (#236).
+castaway-test-support.workspace = true
 hex-literal.workspace = true
 # `test-util` for `start_paused`: the reconnect loop's give-up path takes 366 seconds of
 # backoff, and the test asserts against the intervals the panel ships with rather than

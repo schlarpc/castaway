@@ -2852,12 +2852,16 @@ mod tests {
         /// Wait until the runner has made `n` login attempts.
         ///
         /// Time is paused, so this advances the clock by exactly whatever the runner is
-        /// sleeping on and not one tick more.
+        /// sleeping on and not one tick more. The deadline is virtual too, and sized to
+        /// the ladder it may have to walk out: an attempt that never comes now names
+        /// itself, where the old unbounded loop spun forever.
         async fn until_attempts(&self, n: usize) {
-            while self.starter.attempts.lock().expect("test lock").len() < n {
-                tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            castaway_test_support::eventually_within(
+                &format!("login attempt {n}"),
+                RECONNECT_MAX * 8,
+                || (self.starter.attempts.lock().expect("test lock").len() >= n).then_some(()),
+            )
+            .await;
         }
 
         /// Everything the OSD was told to show.

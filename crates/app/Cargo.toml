@@ -64,6 +64,8 @@ url.workspace = true
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
+# The shared deadline poll (#236).
+castaway-test-support.workspace = true
 # Driving the DLNA media plane end to end, and the `/stream/*` routes without a socket:
 # a real request into the real router.
 tower = { version = "0.5", features = ["util"] }

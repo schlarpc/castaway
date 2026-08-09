@@ -38,6 +38,7 @@ use axum::http::{Request, StatusCode};
 use castaway_core::{
     ProtocolKind, SessionConfig, SessionManager, SessionSink, SourceId, SourceMessage,
 };
+use castaway_test_support::{eventually, eventually_async_within};
 use pipeline::RenderPipeline;
 use proto_dlna::DlnaService;
 use tokio::sync::mpsc;
@@ -260,18 +261,15 @@ async fn a_cast_from_a_control_point_decodes_and_then_reports_that_it_finished()
     // While it plays, the position a control point polls is a real one. This is the whole
     // of G69: it used to be the `NOT_IMPLEMENTED` sentinel for the life of every item, so
     // every control point drew no progress bar at all.
-    let mut moved = None;
-    for _ in 0..300 {
-        let info = body_of(post(envelope("GetPositionInfo", "")).await).await;
-        if let Some(rel) = arg_of(&info, "RelTime") {
-            if rel != "NOT_IMPLEMENTED" {
-                moved = Some(rel);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let rel = moved.expect("the control point was never told a position");
+    let rel = eventually_async_within(
+        "the control point being told a real position",
+        Duration::from_secs(15),
+        || async {
+            let info = body_of(post(envelope("GetPositionInfo", "")).await).await;
+            arg_of(&info, "RelTime").filter(|rel| rel != "NOT_IMPLEMENTED")
+        },
+    )
+    .await;
     assert!(
         rel.starts_with("0:00:"),
         "a two-second clip reported {rel}, which is not a position in it"
@@ -281,25 +279,22 @@ async fn a_cast_from_a_control_point_decodes_and_then_reports_that_it_finished()
     // when it does, the transport has to stop saying PLAYING. Before the completion
     // channel existed it never did, so a queued playlist waited for the life of the
     // process.
-    let mut stopped = false;
-    for _ in 0..400 {
-        let info = body_of(post(envelope("GetTransportInfo", "")).await).await;
-        if arg_of(&info, "CurrentTransportState").as_deref() == Some("STOPPED") {
-            // …and a clip that played through is not an error.
-            assert_eq!(
-                arg_of(&info, "CurrentTransportStatus").as_deref(),
-                Some("OK"),
-                "an item that finished normally must not read as a failure"
-            );
-            stopped = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        stopped,
-        "the item ended and the control point was never told"
-    );
+    eventually_async_within(
+        "the control point being told the item ended",
+        Duration::from_secs(20),
+        || async {
+            let info = body_of(post(envelope("GetTransportInfo", "")).await).await;
+            (arg_of(&info, "CurrentTransportState").as_deref() == Some("STOPPED")).then(|| {
+                // …and a clip that played through is not an error.
+                assert_eq!(
+                    arg_of(&info, "CurrentTransportStatus").as_deref(),
+                    Some("OK"),
+                    "an item that finished normally must not read as a failure"
+                );
+            })
+        },
+    )
+    .await;
 
     let frames_seen = video.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -314,33 +309,23 @@ async fn a_cast_from_a_control_point_decodes_and_then_reports_that_it_finished()
     // The pump races the decode, so the wait is for the readback to catch up rather than
     // for anything to start; by the time the transport says STOPPED the frames are long
     // since applied.
-    let mut colours = 0;
-    for _ in 0..100 {
-        colours = lit.load(std::sync::atomic::Ordering::Relaxed);
-        if colours >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        colours >= 4,
-        "the panel never showed the clip: the best composited frame held {colours} \
-         distinct bright colours, and a colour-bar test pattern has several",
-    );
+    eventually(
+        "the panel to hold four distinct bright colours (a colour-bar test pattern has \
+         several, a dark or single-hue panel has fewer)",
+        || (lit.load(std::sync::atomic::Ordering::Relaxed) >= 4).then_some(()),
+    )
+    .await;
     // The handback, which is a *later* event than the transport reading STOPPED: the
     // clear is deferred by a grace so a control point that stops only to re-`LOAD` (VLC
     // scrubs that way) does not flash the idle screen, and the layer is retired only when
     // its exit motion has finished. So this waits, where reading it once would be asking
     // whether the screen had gone before it had had the chance.
-    let mut handed_back = false;
-    for _ in 0..100 {
-        handed_back = cleared.load(std::sync::atomic::Ordering::Relaxed);
-        if handed_back {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(handed_back, "the screen was never handed back at the end");
+    eventually("the screen being handed back at the end", || {
+        cleared
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then_some(())
+    })
+    .await;
 }
 
 /// A URL the box cannot fetch, which is indistinguishable from a healthy cast at the phone
@@ -389,35 +374,35 @@ async fn a_cast_at_a_url_that_is_not_there_comes_back_as_an_error() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    let mut said = None;
-    for _ in 0..400 {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/dlna/control/AVTransport")
-                    .body(Body::from(envelope("GetTransportInfo", "")))
-                    .unwrap(),
+    // Without this a URL the box could not reach reads as PLAYING / OK, which is what a
+    // healthy session reads as.
+    eventually_async_within(
+        "the transport saying ERROR_OCCURRED about the unreachable URL",
+        Duration::from_secs(20),
+        || async {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/dlna/control/AVTransport")
+                        .body(Body::from(envelope("GetTransportInfo", "")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let info = body_of(resp).await;
+            (arg_of(&info, "CurrentTransportStatus").as_deref() == Some("ERROR_OCCURRED")).then(
+                || {
+                    assert_eq!(
+                        arg_of(&info, "CurrentTransportState").as_deref(),
+                        Some("STOPPED")
+                    );
+                },
             )
-            .await
-            .unwrap();
-        let info = body_of(resp).await;
-        if arg_of(&info, "CurrentTransportStatus").as_deref() == Some("ERROR_OCCURRED") {
-            assert_eq!(
-                arg_of(&info, "CurrentTransportState").as_deref(),
-                Some("STOPPED")
-            );
-            said = Some(());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        said.is_some(),
-        "a URL the box could not reach read as PLAYING / OK, which is what a healthy \
-         session reads as",
-    );
+        },
+    )
+    .await;
 }
 
 async fn body_of(resp: axum::response::Response) -> String {

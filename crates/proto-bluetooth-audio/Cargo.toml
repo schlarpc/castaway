@@ -21,6 +21,8 @@ quick-xml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The shared deadline poll (#236).
+castaway-test-support.workspace = true
 hex-literal.workspace = true
 tokio = { workspace = true, features = [
     "signal",

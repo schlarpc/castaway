@@ -449,6 +449,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use castaway_test_support::eventually;
+
     use super::*;
     use crate::event::ControlTxn;
     use crate::types::{MediaUri, ProtocolKind};
@@ -982,12 +984,23 @@ mod tests {
         // surface has demonstrably been taken up — `controls()` is what the manager calls
         // when it accepts one. In production the ordering is not in doubt: the surface is
         // published behind the `Play` and decode ends much later.
-        settle(|| counts.controls.lock().expect("poisoned").is_some()).await;
+        eventually("the control surface being taken up", || {
+            counts
+                .controls
+                .lock()
+                .expect("poisoned")
+                .is_some()
+                .then_some(())
+        })
+        .await;
 
         ends.send(PlaybackEnd::Failed("connection refused".into()))
             .await
             .unwrap();
-        settle(|| !remote.ends.lock().expect("poisoned").is_empty()).await;
+        eventually("the end reaching the control surface", || {
+            (!remote.ends.lock().expect("poisoned").is_empty()).then_some(())
+        })
+        .await;
 
         assert_eq!(
             &*remote.ends.lock().unwrap(),
@@ -995,27 +1008,14 @@ mod tests {
             "the control point has to be able to stop saying PLAYING",
         );
         // …and the session ended with it, rather than leaving a card up over nothing.
-        settle(|| counts.stop.load(Ordering::SeqCst) >= 1).await;
+        eventually("the session being stopped with it", || {
+            (counts.stop.load(Ordering::SeqCst) >= 1).then_some(())
+        })
+        .await;
 
         drop(tx);
         drop(ends);
         running.await.unwrap();
-    }
-
-    /// Wait for an actor on another task to have got somewhere, or fail the test.
-    ///
-    /// A bounded spin rather than a fixed sleep: the manager runs as its own task, so
-    /// "has it handled that yet" has no synchronous answer, and a sleep long enough to be
-    /// reliable on a loaded CI box is long enough to be a waste on every other run.
-    async fn settle(mut done: impl FnMut() -> bool) {
-        for _ in 0..1000 {
-            if done() {
-                return;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("the session manager never got there");
     }
 
     /// A decode thread noticing on its own schedule that it was torn down arrives after

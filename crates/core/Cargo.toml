@@ -16,6 +16,8 @@ url.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
 
 [dev-dependencies]
+# The shared deadline poll (#236). Not a cycle: it depends only on tokio.
+castaway-test-support.workspace = true
 tokio = { workspace = true, features = [
   "sync",
   "rt",

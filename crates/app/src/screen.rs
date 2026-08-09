@@ -156,6 +156,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use castaway_test_support::eventually;
     use proto_dial::{DialEvent, DialService};
     use tokio::sync::mpsc;
     use tower::ServiceExt as _;
@@ -260,17 +261,6 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
-    }
-
-    /// Wait for something the pump does on its own task, rather than sleeping a guess.
-    async fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-        for _ in 0..500 {
-            if let Some(v) = f() {
-                return v;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {what}");
     }
 
     /// A resolver that takes a while and then writes its own answer — the shape of the

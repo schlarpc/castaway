@@ -15,6 +15,7 @@ use castaway_core::{
     AudioCodec, FrameSource, ProtocolKind, SessionEvent, SessionSink, SourceAdapter, SourceId,
     SourceMessage,
 };
+use castaway_test_support::eventually;
 use proto_bluetooth_audio::adapter::{BluetoothAdapter, BluetoothConfig};
 use proto_bluetooth_audio::avctp::CommandResponse;
 use proto_bluetooth_audio::avdtp::{Message, Seid, Signal};
@@ -152,17 +153,6 @@ fn respond(acl_packets: u16, report_completions: bool, sent: &HciPacket) -> Vec<
         code: code::COMMAND_COMPLETE,
         params: Bytes::from(params),
     }]
-}
-
-/// Poll until `f` returns something, or fail the test.
-async fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..2000 {
-        if let Some(v) = f() {
-            return v;
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    panic!("timed out waiting for {what}");
 }
 
 /// Every complete L2CAP PDU the adapter has written, reassembled from ACL fragments.

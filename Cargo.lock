@@ -921,6 +921,7 @@ dependencies = [
  "cast-replay",
  "castaway-core",
  "castaway-paths",
+ "castaway-test-support",
  "cbc",
  "clap",
  "control-display",
@@ -967,6 +968,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "castaway-test-support",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -978,6 +980,13 @@ name = "castaway-paths"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "castaway-test-support"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -5392,6 +5401,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "castaway-core",
+ "castaway-test-support",
  "hci-transport",
  "hex-literal",
  "quick-xml 0.41.0",
@@ -5543,6 +5553,7 @@ dependencies = [
  "base64 0.23.0",
  "bytes",
  "castaway-core",
+ "castaway-test-support",
  "ctr",
  "futures",
  "hex-literal",

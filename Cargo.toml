@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/paths",
+    "crates/test-support",
     "crates/substrate-hci",
     "crates/substrate-l2cap",
     "crates/substrate-sdp",
@@ -54,6 +55,8 @@ repository = "https://github.com/schlarpc/castaway"
 # --- internal crates ---
 castaway-core = { path = "crates/core" }
 castaway-paths = { path = "crates/paths" }
+# Dev-dependency only, everywhere: the shared deadline poll (#236).
+castaway-test-support = { path = "crates/test-support" }
 substrate-mdns = { path = "crates/substrate-mdns" }
 substrate-ssdp = { path = "crates/substrate-ssdp" }
 substrate-rtsp = { path = "crates/substrate-rtsp" }
