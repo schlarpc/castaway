@@ -180,10 +180,18 @@ fn packet_due(
     time_base: ffmpeg::Rational,
     clock: &crate::clock::MediaClock,
 ) -> bool {
-    // Presentation time, not decode time. Packets are *sent* in container order either
-    // way — this only decides when — and gating on the time the picture is wanted is what
-    // keeps a reordered stream's B-frames from arriving before their turn.
-    let Some(ts) = packet.pts().or_else(|| packet.dts()) else {
+    // Decode time, not presentation time — this gates *feeding*, and dts is the order a
+    // decoder has to be fed. It used to read the pts first, on the theory that gating on
+    // the time the picture is wanted keeps B-frames from arriving before their turn; but
+    // sending is not presenting (`drain_paced` gates each decoded frame on its own pts),
+    // and a reordered stream's P-frame carries a pts a whole reorder span *ahead* of the
+    // B-frames queued behind it. Held to its own presentation instant, it starved them
+    // past theirs: the picture came out in bursts one reorder span apart, each burst's
+    // oldest frames hundreds of milliseconds late and the unluckiest dropped as
+    // hopeless — measured at 0.4 s bursts on an ordinary x264 file, which is judder on
+    // every DLNA and Cast LOAD of anything with B-frames (#234). dts is never later
+    // than pts, so this gate only ever opens earlier.
+    let Some(ts) = packet.dts().or_else(|| packet.pts()) else {
         return true;
     };
     let at = rescale_to_duration(ts, time_base);

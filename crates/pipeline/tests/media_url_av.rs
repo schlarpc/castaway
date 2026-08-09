@@ -48,6 +48,13 @@ struct Run {
     /// quarter of a two-second file — half rate, a dropped channel, double speed all fit
     /// under a 4x margin (#234).
     audio_duration: Duration,
+    /// Median of `frame.pts - clock.now()` at each presentation, in nanoseconds,
+    /// frames past the first second. Positive means the frame was handed over early.
+    ///
+    /// The A/V sync figure (#234): every structural assertion in this file is satisfied
+    /// by a session whose picture runs half a second from its sound, because nothing
+    /// compared where a frame landed against the clock the audio drives.
+    video_skew_ns: Option<i128>,
     elapsed: Duration,
 }
 
@@ -57,6 +64,7 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
     let mut layout = MediaLayout::default();
     let mut frames = 0usize;
     let mut last_pts = Duration::ZERO;
+    let mut skews: Vec<i128> = Vec::new();
     let start = Instant::now();
 
     // The audio consumer stands in for `audio_session::run_pcm`, and the thing it has to
@@ -110,18 +118,30 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
         |frame| {
             last_pts = last_pts.max(frame.pts);
             frames += 1;
+            if frame.pts >= Duration::from_secs(1) {
+                if let Some(now) = clock.now() {
+                    let (pts_ns, now_ns) = (
+                        i128::try_from(frame.pts.as_nanos()).unwrap(),
+                        i128::try_from(now.as_nanos()).unwrap(),
+                    );
+                    skews.push(pts_ns - now_ns);
+                }
+            }
             true
         },
     )
     .unwrap();
 
     let (audio_blocks, audio_duration) = collector.join().unwrap();
+    skews.sort_unstable();
+    let video_skew_ns = (!skews.is_empty()).then(|| skews[skews.len() / 2]);
     Run {
         layout,
         frames,
         last_pts,
         audio_blocks,
         audio_duration,
+        video_skew_ns,
         elapsed: start.elapsed(),
     }
 }
@@ -169,6 +189,22 @@ fn a_video_file_yields_both_pictures_and_sound() {
         r.last_pts
     );
     assert!(r.audio_blocks > 0, "no audio was decoded at all");
+    // Lip sync, at last: the median distance between a presented frame's pts and the
+    // clock the audio drives. `drain_paced` releases a frame when the clock reaches
+    // `pts - VIDEO_DECODE_LEAD` (40 ms), so the healthy reading is a small positive
+    // number; a session whose picture ran half a second from its sound — which every
+    // other assertion in this file is satisfied by — reads as exactly that distance.
+    let skew_ms = r.video_skew_ns.expect("frames past the first second") as f64 / 1e6;
+    eprintln!("video skew median: {skew_ms:.1} ms");
+    // Healthy is single digits (measured -2.3 ms); `drain_paced` may present up to
+    // `VIDEO_DECODE_LEAD` (40 ms) early. The defect this was born catching read -170 ms:
+    // the packet gate fed the decoder in presentation order, so a P-frame held to its
+    // own instant starved the B-frames behind it and the picture came out in
+    // reorder-span bursts.
+    assert!(
+        (-60.0..=60.0).contains(&skew_ms),
+        "the picture presents {skew_ms:.1} ms from the clock its audio drives"
+    );
     // The whole two seconds, within codec padding. A band, not a floor: a decode that
     // produces half the audio at the declared rate — half rate, a dropped channel,
     // double speed — sat comfortably above the old `> 40_000` sample count (#234).
