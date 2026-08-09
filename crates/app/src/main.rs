@@ -1845,7 +1845,11 @@ fn spawn_matter(
         catalogue: proto_matter::Catalogue::new(apps),
         bind: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
     })
-    .with_osd(osd);
+    .with_osd(osd)
+    // The operational `_matter._tcp` record depends on fabric state, so it cannot be in
+    // the startup advertisement list below — the adapter publishes it through this late
+    // handle on the same shared responder once the fabric has a member (#173).
+    .with_operational_mdns(mdns.advertiser());
 
     let adapter = match browser_launches {
         Some(launches) => adapter.with_browser(launches),

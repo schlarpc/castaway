@@ -24,8 +24,28 @@ pub const COMMISSIONER_SERVICE: &str = "_matterd._udp";
 /// The commissionable-node service a client advertises once it wants commissioning.
 pub const COMMISSIONABLE_SERVICE: &str = "_matterc._udp";
 
+/// The operational service a *commissioned* client resolves the panel by (#173).
+///
+/// `_tcp` in the label whatever the transport actually is — the Matter spec's own
+/// quirk, and what `rs-matter`'s resolver queries.
+pub const OPERATIONAL_SERVICE: &str = "_matter._tcp";
+
 /// The Casting Video Player device type, as the `DT` key wants it (decimal).
 const DEVICE_TYPE_CASTING_VIDEO_PLAYER: u16 = 0x0023;
+
+/// Session idle retransmission interval, milliseconds — the `SII` TXT key. Faster than
+/// the spec default because the panel is a mains-powered box on Ethernet, not a battery
+/// node; a client that has to guess assumes the slower defaults.
+const SESSION_IDLE_INTERVAL_MS: u32 = 500;
+
+/// Session active retransmission interval, milliseconds — the `SAI` TXT key.
+const SESSION_ACTIVE_INTERVAL_MS: u32 = 300;
+
+/// Session active threshold, milliseconds — the `SAT` TXT key; the spec's default,
+/// stated rather than left to be assumed because `rs-matter` seeds a fresh CASE
+/// session's MRP parameters from the resolve TXT (it does not yet exchange them in
+/// Sigma1/2).
+const SESSION_ACTIVE_THRESHOLD_MS: u16 = 4000;
 
 /// Build the `_matterd._udp` advertisement.
 ///
@@ -44,11 +64,52 @@ pub fn commissioner_service(
         .with_txt("VP", format!("{vendor_id}+{product_id}"))
         .with_txt("DT", DEVICE_TYPE_CASTING_VIDEO_PLAYER.to_string())
         .with_txt("DN", friendly_name)
-        // Session idle/active retransmission intervals, in milliseconds. Present because
-        // a client that has to guess assumes the spec's defaults, and the panel is a
-        // mains-powered box on Ethernet — it can answer faster than a battery node.
-        .with_txt("SII", "500")
-        .with_txt("SAI", "300")
+        .with_txt("SII", SESSION_IDLE_INTERVAL_MS.to_string())
+        .with_txt("SAI", SESSION_ACTIVE_INTERVAL_MS.to_string())
+}
+
+/// The instance label of the operational record: `<compressed-fabric-id>-<node-id>`,
+/// each sixteen uppercase hex digits (Core spec §4.3.1; also exactly what
+/// `rs_matter::transport::network::MatterRemoteService::instance_name` queries for).
+#[must_use]
+pub fn operational_instance(compressed_fabric_id: u64, node_id: u64) -> String {
+    format!("{compressed_fabric_id:016X}-{node_id:016X}")
+}
+
+/// Build the `_matter._tcp` operational advertisement (#173).
+///
+/// This record is how a *returning* phone finds the panel: `rs-matter`'s
+/// `Transport::initiate` reuses a live CASE session when it has one and otherwise
+/// resolves this instance name to establish a fresh one — an idle timeout, a panel
+/// restart or a phone that slept overnight all land on the second branch, and without
+/// this record that branch has nothing to resolve.
+///
+/// Not part of [`crate::adapter::MatterAdapter`]'s startup advertisement list, because
+/// it depends on fabric state: the instance name *is* the compressed fabric id, and
+/// there is nobody entitled to resolve it until the fabric has a member. The adapter
+/// publishes it through the shared responder's late handle once that is true.
+///
+/// The `SII`/`SAI`/`SAT` TXT keys seed the new CASE session's MRP parameters on the
+/// client (`rs-matter` reads them back off the resolve because it does not yet exchange
+/// them in CASE Sigma1/2). The `_I<compressed-fabric-id>` sub-type is Core spec §4.3.1's
+/// per-fabric browse narrowing, published because real controllers use it.
+#[must_use]
+pub fn operational_service(
+    compressed_fabric_id: u64,
+    node_id: u64,
+    host: &str,
+    port: u16,
+) -> MdnsService {
+    MdnsService::new(
+        OPERATIONAL_SERVICE,
+        operational_instance(compressed_fabric_id, node_id),
+        host,
+        port,
+    )
+    .with_txt("SII", SESSION_IDLE_INTERVAL_MS.to_string())
+    .with_txt("SAI", SESSION_ACTIVE_INTERVAL_MS.to_string())
+    .with_txt("SAT", SESSION_ACTIVE_THRESHOLD_MS.to_string())
+    .with_subtype(format!("I{compressed_fabric_id:016X}"))
 }
 
 /// Where a commissionable node was found.
@@ -137,6 +198,46 @@ mod tests {
         assert_eq!(txt["DT"], "35", "casting video player, in decimal");
         assert_eq!(txt["VP"], "65521+32769");
         assert_eq!(txt["DN"], "hackerspace tv");
+    }
+
+    /// The operational instance name is the resolve key `rs-matter` queries for —
+    /// `{:016X}-{:016X}` of the compressed fabric id and node id — so its shape is the
+    /// difference between a returning phone reconnecting and it being stranded (#173).
+    #[test]
+    fn the_operational_instance_name_is_the_spec_shape() {
+        // Zero-padded to sixteen digits each, uppercase, dash-joined.
+        assert_eq!(
+            operational_instance(0xBC5C_01A6_1C48_892F, 1),
+            "BC5C01A61C48892F-0000000000000001"
+        );
+        assert_eq!(
+            operational_instance(0x1, 0xFFFF_FFFF_FFFF_FFFF),
+            "0000000000000001-FFFFFFFFFFFFFFFF"
+        );
+    }
+
+    /// The operational record: `_matter._tcp`, the MRP-seeding TXT keys, and the
+    /// per-fabric sub-type — what `Transport::initiate`'s resolve branch reads.
+    #[test]
+    fn the_operational_record_carries_the_session_parameters() {
+        let service = operational_service(0xBC5C_01A6_1C48_892F, 1, "castaway", 5540);
+        assert_eq!(service.service_type, OPERATIONAL_SERVICE);
+        assert_eq!(
+            service.instance.as_str(),
+            "BC5C01A61C48892F-0000000000000001"
+        );
+        assert_eq!(service.port, 5540);
+
+        let txt: std::collections::HashMap<_, _> = service.txt.iter().cloned().collect();
+        assert_eq!(txt["SII"], "500");
+        assert_eq!(txt["SAI"], "300");
+        assert_eq!(txt["SAT"], "4000");
+
+        // Core §4.3.1's per-fabric browse narrowing, as one encodable sub-type.
+        assert_eq!(
+            service.qualified_subtype(&service.subtypes[0]).unwrap(),
+            "_IBC5C01A61C48892F._sub._matter._tcp.local."
+        );
     }
 
     /// The instance name arrives in one message and is matched against another. A phone

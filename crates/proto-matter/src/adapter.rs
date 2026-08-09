@@ -40,7 +40,7 @@ use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::transport::network::{Address, NoNetwork};
 use rs_matter::{BasicCommData, Matter, MATTER_PORT};
 
-use substrate_mdns::MdnsResponder;
+use substrate_mdns::{MdnsAdvertiser, MdnsResponder, MdnsService};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::MatterError;
@@ -113,6 +113,7 @@ pub struct MatterAdapter {
     state: Arc<PlayerState>,
     osd: Option<OsdSink>,
     browser: Option<mpsc::UnboundedSender<BrowserLaunch>>,
+    operational_mdns: Option<MdnsAdvertiser>,
     /// Taken by `run`; a second call finds it gone, which is what makes running twice an
     /// error rather than two half-initialised Matter stacks fighting over port 5540.
     once: Mutex<Option<()>>,
@@ -127,6 +128,7 @@ impl MatterAdapter {
             state: Arc::new(PlayerState::new()),
             osd: None,
             browser: None,
+            operational_mdns: None,
             once: Mutex::new(Some(())),
         }
     }
@@ -137,6 +139,20 @@ impl MatterAdapter {
     #[must_use]
     pub fn with_osd(mut self, osd: OsdSink) -> Self {
         self.osd = Some(osd);
+        self
+    }
+
+    /// Give the adapter the shared responder's late-advertisement handle, for the
+    /// records that only exist once there is fabric state to name them (#173).
+    ///
+    /// Without one the adapter still commissions and still serves the CASE session that
+    /// establishes — but a phone whose session dies (idle timeout, panel restart, table
+    /// eviction) has no operational `_matter._tcp` record to resolve and can never come
+    /// back without re-commissioning. The app always wires this; only a bare adapter in
+    /// a unit test runs without it.
+    #[must_use]
+    pub fn with_operational_mdns(mut self, advertiser: MdnsAdvertiser) -> Self {
+        self.operational_mdns = Some(advertiser);
         self
     }
 
@@ -165,10 +181,12 @@ impl SourceAdapter for MatterAdapter {
     }
 
     fn advertisements(&self) -> Vec<Advertisement> {
-        // `_matterd._udp` — the commissioner service. Not `_matter._tcp`: the panel's
-        // operational node exists only on a fabric it created, so there is nobody to
-        // advertise it to until a phone has been commissioned, and that phone learns the
-        // address during commissioning rather than by browsing.
+        // `_matterd._udp` — the commissioner service. The operational `_matter._tcp`
+        // record is *not* here, deliberately: this list is fixed at startup, and that
+        // record depends on fabric state — its instance name is the compressed fabric
+        // id, and there is nobody entitled to resolve it until the fabric has a member.
+        // It is published through the shared responder's late handle instead
+        // ([`Self::with_operational_mdns`], #173).
         let service = crate::discovery::commissioner_service(
             &self.config.friendly_name,
             &self.config.host,
@@ -275,6 +293,30 @@ impl MatterAdapter {
         let fab_idx = install_fabric(&matter, &crypto, &ca)?;
         seed_acls(&matter, fab_idx, ca.clients())?;
 
+        // The operational record a returning phone resolves the panel by (#173). Its
+        // instance name is derived from the fabric, so it can only be built here — and
+        // it goes up as soon as the fabric has a member, which on a panel restarted with
+        // commissioned phones is right now: their CASE sessions died with the old
+        // process, and this record is the only way back in.
+        let compressed_fabric_id = matter
+            .with_state(|state| {
+                state
+                    .fabrics
+                    .fabric(fab_idx)
+                    .map(rs_matter::fabric::Fabric::compressed_fabric_id)
+            })
+            .map_err(core_err)?;
+        let mut operational = OperationalRecord::new(
+            self.operational_mdns.as_ref(),
+            crate::discovery::operational_service(
+                compressed_fabric_id,
+                CastingCa::panel_node_id(),
+                &self.config.host,
+                MATTER_PORT,
+            ),
+        );
+        operational.publish_once_fabric_has_members(ca.clients());
+
         let tree = NodeTree::new(&self.config.catalogue);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
@@ -337,7 +379,7 @@ impl MatterAdapter {
             mdns: &responder_mdns,
             outcomes: &outcome_tx,
         };
-        let commissioning = self.commission_loop(&cx, &mut ca, request_rx);
+        let commissioning = self.commission_loop(&cx, &mut ca, &mut operational, request_rx);
         let commands = self.pump_commands(command_rx, &sink);
         let prompts = self.pump_prompts(prompt_rx);
 
@@ -360,6 +402,7 @@ impl MatterAdapter {
         &self,
         cx: &Commissioning<'_, '_, C>,
         ca: &mut CastingCa,
+        operational: &mut OperationalRecord<'_>,
         mut requests: mpsc::UnboundedReceiver<CommissionRequest>,
     ) -> Result<(), MatterError> {
         while let Some(request) = requests.recv().await {
@@ -378,6 +421,9 @@ impl MatterAdapter {
                         name: request.device_name.clone(),
                     })?;
                     seed_acls(cx.matter, cx.fab_idx, ca.clients())?;
+                    // The fabric may just have gained its first member, which is the
+                    // moment the operational record becomes worth publishing (#173).
+                    operational.publish_once_fabric_has_members(ca.clients());
                     self.show(OsdMessage::banner(
                         format!("{} can now cast", request.device_name),
                         Duration::from_secs(5),
@@ -636,6 +682,62 @@ impl MatterAdapter {
     }
 }
 
+/// The `_matter._tcp` operational record, and when it goes up (#173).
+///
+/// Once, the first time the fabric is seen to have a member — at boot for a panel
+/// restarted with commissioned phones, after the first successful commissioning
+/// otherwise. Never taken down while the adapter runs: clients are remembered, not
+/// forgotten, so the set of phones entitled to resolve it only grows.
+struct OperationalRecord<'a> {
+    advertiser: Option<&'a MdnsAdvertiser>,
+    service: MdnsService,
+    published: bool,
+}
+
+impl<'a> OperationalRecord<'a> {
+    fn new(advertiser: Option<&'a MdnsAdvertiser>, service: MdnsService) -> Self {
+        Self {
+            advertiser,
+            service,
+            published: false,
+        }
+    }
+
+    /// Publish the record if the fabric has a member and it is not already up.
+    ///
+    /// Failure is logged and left retriable (the next commissioning tries again) rather
+    /// than propagated: a panel that cannot advertise one record can still commission
+    /// and still serve the session that establishes.
+    fn publish_once_fabric_has_members(&mut self, clients: &[CommissionedClient]) {
+        if self.published || clients.is_empty() {
+            return;
+        }
+        let Some(advertiser) = self.advertiser else {
+            // A bare adapter with no shared responder wired: say what that costs, once,
+            // rather than presenting as a phone-side mystery a day later.
+            tracing::warn!(
+                "matter: no mDNS advertiser wired; the operational record stays \
+                 unpublished and a phone whose CASE session dies cannot re-establish it"
+            );
+            self.published = true;
+            return;
+        };
+        match advertiser.advertise(&self.service) {
+            Ok(()) => {
+                tracing::info!(
+                    instance = %self.service.instance,
+                    "matter: operational record advertised"
+                );
+                self.published = true;
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "matter: failed to advertise the operational record"
+            ),
+        }
+    }
+}
+
 /// The apparatus a commissioning attempt runs against.
 ///
 /// Grouped because all five are fixed for the adapter's whole life and travelled together
@@ -803,6 +905,47 @@ mod tests {
         assert_eq!(instance, "hackerspace tv");
         assert_eq!(*port, crate::udc::UDC_PORT);
         assert!(txt.iter().any(|(k, v)| k == "DT" && v == "35"));
+    }
+
+    fn operational_record() -> OperationalRecord<'static> {
+        OperationalRecord::new(
+            None,
+            crate::discovery::operational_service(0xBC5C_01A6_1C48_892F, 1, "castaway", 5540),
+        )
+    }
+
+    fn client() -> crate::fabric::CommissionedClient {
+        crate::fabric::CommissionedClient {
+            node_id: 0x1000,
+            instance: "BC5C01A61C48892F".into(),
+            name: "a phone".into(),
+        }
+    }
+
+    /// The operational record waits for the fabric to have a member: an empty client
+    /// list is a fresh panel, and publishing then would advertise a node nobody is
+    /// entitled to resolve (#173).
+    #[test]
+    fn the_operational_record_waits_for_a_fabric_member() {
+        let mut record = operational_record();
+        record.publish_once_fabric_has_members(&[]);
+        assert!(!record.published, "published with nobody commissioned");
+
+        record.publish_once_fabric_has_members(&[client()]);
+        assert!(record.published, "a member fabric must publish the record");
+    }
+
+    /// Publishing is once, not per commissioning: the record's name is fabric-derived
+    /// and does not change with the second phone.
+    #[test]
+    fn the_operational_record_publishes_once() {
+        let mut record = operational_record();
+        record.publish_once_fabric_has_members(&[client()]);
+        assert!(record.published);
+        // A second call must be a no-op rather than a duplicate registration; with no
+        // advertiser wired the only observable is that it does not un-publish.
+        record.publish_once_fabric_has_members(&[client()]);
+        assert!(record.published);
     }
 
     /// Skip is relative to a position only the panel knows, which is why it could not be
