@@ -283,10 +283,11 @@ mod tests {
         writer.link_down(handle).await;
         writer.link_up(handle).await;
         writer.send(handle, pdu());
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(
-            writer.outstanding().await > 0,
-            "a live link must still be able to send"
-        );
+        // "A live link must still be able to send": the claim shows up whenever the
+        // writer task gets to the queue, so poll for it rather than sleeping a guess.
+        castaway_test_support::eventually_async("a live link's pdu claiming a credit", || async {
+            (writer.outstanding().await > 0).then_some(())
+        })
+        .await;
     }
 }
