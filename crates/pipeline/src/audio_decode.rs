@@ -154,11 +154,25 @@ enum Decoder {
     Ldac(Box<crate::ldac_decode::Decoder>),
 }
 
+/// How many refusals between repeats of the warning, once the first has fired.
+///
+/// About six seconds of an A2DP stream refusing every packet. Count-based rather than
+/// time-based so the policy is deterministic and the test needs no clock.
+const REFUSED_LOG_EVERY: u64 = 250;
+
 /// An open decoder for one A2DP stream.
 pub struct AudioDecoder {
     decoder: Decoder,
     format: AudioFormat,
     codec: AudioCodec,
+    /// Packets the decoder refused and this session skipped.
+    ///
+    /// Skipping is the right policy — one corrupt packet off a radio link must not end
+    /// the session — but it used to happen at DEBUG and uncounted, so a decoder
+    /// refusing *everything* was a silent session whose only sign was the mixer's
+    /// `starved` (#233, and the failure #14 exists to prevent). Read it back with
+    /// [`AudioDecoder::refused`].
+    refused: u64,
 }
 
 impl std::fmt::Debug for AudioDecoder {
@@ -205,6 +219,7 @@ impl AudioDecoder {
                     decoder: Decoder::Ldac(Box::new(crate::ldac_decode::Decoder::new(format)?)),
                     format,
                     codec,
+                    refused: 0,
                 })
             }
         };
@@ -274,6 +289,7 @@ impl AudioDecoder {
             decoder: Decoder::Ffmpeg(decoder),
             format,
             codec,
+            refused: 0,
         })
     }
 
@@ -281,6 +297,15 @@ impl AudioDecoder {
     #[must_use]
     pub const fn format(&self) -> AudioFormat {
         self.format
+    }
+
+    /// Packets the decoder refused and [`AudioDecoder::decode`] skipped.
+    ///
+    /// Structurally zero on a healthy stream; climbing in step with the packets sent is
+    /// a session that is silence, not audio.
+    #[must_use]
+    pub const fn refused(&self) -> u64 {
+        self.refused
     }
 
     /// Decode one encoded frame, calling `on_pcm` for each block that comes out.
@@ -328,6 +353,7 @@ impl AudioDecoder {
             i64::try_from(frame.pts.as_micros()).unwrap_or(i64::MAX),
         ));
         if let Err(e) = decoder.send_packet(&packet) {
+            self.refused += 1;
             // The leading bytes identify the framing when a decoder refuses everything:
             // `fff1`/`fff9` is ADTS, `56ex` is LOAS/LATM with a sync stream, and neither
             // is raw LATM. Guessing between them is how a stream decodes to nothing.
@@ -337,13 +363,30 @@ impl AudioDecoder {
                 .take(12)
                 .map(|b| format!("{b:02x}"))
                 .collect();
-            debug!(
-                error = %e,
-                codec = ?self.codec,
-                len = frame.data.len(),
-                head = %head,
-                "audio decoder rejected a packet",
-            );
+            // The first refusal warns — one is when someone is watching the journal —
+            // and a decoder refusing everything re-warns with its total, so a silent
+            // session names itself at production log level instead of only in the
+            // mixer's `starved` (#233). The rest stay at DEBUG: mid-stream corruption
+            // off a radio link is expected in ones.
+            if self.refused == 1 || self.refused.is_multiple_of(REFUSED_LOG_EVERY) {
+                warn!(
+                    error = %e,
+                    codec = ?self.codec,
+                    refused = self.refused,
+                    len = frame.data.len(),
+                    head = %head,
+                    "audio decoder rejected a packet; a climbing total is a silent session",
+                );
+            } else {
+                debug!(
+                    error = %e,
+                    codec = ?self.codec,
+                    refused = self.refused,
+                    len = frame.data.len(),
+                    head = %head,
+                    "audio decoder rejected a packet",
+                );
+            }
             return Ok(());
         }
         Self::drain(decoder, &mut on_pcm)
@@ -451,17 +494,31 @@ pub(crate) fn pcm_from_frame(decoded: &ffmpeg::frame::Audio) -> Result<PcmBlock,
         // So planar planes are taken from `extended_data` with the length computed here.
         // `extended_data` rather than `data[]` because it is the documented accessor and
         // stays valid past eight channels, where `data[]` runs out.
+        //
+        // A frame that violates either expectation below — a null plane for a reported
+        // channel, or a packed buffer shorter than its own sample count — is an **error**,
+        // not a channel to zero-fill. These were defensive `continue`s, and what they
+        // defended was exactly the half-silence the comment above records: audible
+        // immediately, invisible to every check (#233). The conditions are structural —
+        // an ffmpeg bump changing `extended_data`/`linesize` semantics breaks every
+        // frame the same way — so the honest behaviour is to fail the session on frame
+        // one, where CI and the journal see it, rather than play one-eared audio for as
+        // long as nobody notices.
         for ch in 0..channels {
             let plane: &[u8] = if planar {
                 // SAFETY: `decoded` holds a decoder-owned frame that is alive for this
                 // borrow. For planar audio ffmpeg guarantees `extended_data[ch]` is a
                 // valid buffer for every channel it reported, each holding exactly
-                // `samples() * bytes_per_sample` bytes.
+                // `samples() * bytes_per_sample` bytes. The null check is what keeps
+                // this sound if that guarantee is ever broken.
                 unsafe {
                     let raw = decoded.as_ptr();
                     let ptr = *(*raw).extended_data.add(ch);
                     if ptr.is_null() {
-                        continue;
+                        return Err(PipelineError::Decode(format!(
+                            "decoder frame reports {channels} channels but plane {ch} \
+                             is null; zero-filling it would be audible half-silence"
+                        )));
                     }
                     std::slice::from_raw_parts(ptr, frames * width)
                 }
@@ -475,7 +532,12 @@ pub(crate) fn pcm_from_frame(decoded: &ffmpeg::frame::Audio) -> Result<PcmBlock,
                     (i * channels + ch) * width
                 };
                 let Some(chunk) = plane.get(byte..byte + width) else {
-                    continue;
+                    return Err(PipelineError::Decode(format!(
+                        "decoder frame holds {} bytes but claims {frames} frames of \
+                         {channels} channels at {width} bytes; zero-filling the shortfall \
+                         would be inaudible-to-checks silence",
+                        plane.len()
+                    )));
                 };
                 samples[i * channels + ch] = match format {
                     Sample::I16(_) => {
@@ -960,6 +1022,106 @@ pub(crate) mod tests {
                 "{codec:?}: the channels align at different lags ({lag_l} vs {lag_r})"
             );
         }
+    }
+
+    /// A refused packet is counted where a caller can read it; a clean stream counts
+    /// nothing (#233).
+    ///
+    /// Skipping a refused packet is the right policy for a radio link, but it happened
+    /// at DEBUG and uncounted, so a decoder refusing *every* packet was a silent session
+    /// whose only trace was the mixer's `starved`.
+    #[test]
+    fn a_refused_packet_is_counted_and_a_clean_stream_counts_nothing() {
+        let rate = 44_100;
+        let pcm = sine(rate, 4096);
+        let frames = encode(AudioCodec::Sbc, rate, &pcm);
+        if !crate::test_media::available("an SBC encoder", !frames.is_empty()) {
+            return;
+        }
+        let mut decoder = AudioDecoder::new(AudioCodec::Sbc, format(rate, 2), None).unwrap();
+        let mut heard = 0u32;
+        for frame in &frames {
+            decoder.decode(frame, |_| heard += 1).unwrap();
+        }
+        assert!(heard > 0, "the clean stream decoded");
+        assert_eq!(decoder.refused(), 0, "a clean stream refuses nothing");
+
+        // Bytes with no SBC syncword anywhere: the decoder must refuse, the session
+        // must survive, and the refusal must land on the counter.
+        let garbage = EncodedFrame {
+            video_codec: None,
+            audio_codec: Some(AudioCodec::Sbc),
+            pts: Duration::ZERO,
+            keyframe: true,
+            data: bytes::Bytes::from_static(&[0u8; 64]),
+        };
+        let mut from_garbage = 0u32;
+        decoder.decode(&garbage, |_| from_garbage += 1).unwrap();
+        assert_eq!(from_garbage, 0, "garbage produced no audio");
+        assert_eq!(
+            decoder.refused(),
+            1,
+            "the refusal is a number a test can read, not only a DEBUG line"
+        );
+    }
+
+    /// A frame the converter cannot read in full is an error, not zero-fill (#233).
+    ///
+    /// The module's own comment records the failure these used to reintroduce: "audio in
+    /// the left channel and digital silence in the right", audible immediately and
+    /// invisible to an RMS check. Both defensive `continue`s are now typed errors — the
+    /// conditions are structural (an ffmpeg bump changing `extended_data`/`linesize`
+    /// semantics breaks every frame the same way), so failing the first frame loudly
+    /// beats an hour of one-eared audio — and this drives both, plus the clean path.
+    #[test]
+    fn a_frame_that_cannot_be_read_whole_is_an_error_not_half_silence() {
+        ensure_init();
+        use ffmpeg::channel_layout::ChannelLayout;
+        use ffmpeg::format::sample::Type;
+        use ffmpeg::format::Sample;
+
+        // The clean direction: a well-formed planar frame converts in full, both ears.
+        let planar = Sample::I16(Type::Planar);
+        let mut frame = ffmpeg::frame::Audio::new(planar, 8, ChannelLayout::STEREO);
+        fill_frame(&mut frame, planar, 2, &sine(44_100, 8));
+        let block = pcm_from_frame(&frame).unwrap();
+        assert_eq!(block.samples.len(), 16);
+        assert!(
+            block.samples.iter().skip(2).all(|s| *s != 0.0),
+            "every sample past the sine's zero crossing landed"
+        );
+
+        // A null plane for a channel the frame still claims: the exact shape ffmpeg's
+        // accessors produced before the `extended_data` workaround, reintroduced by hand.
+        // SAFETY: the frame is exclusively owned and its buffers are freed through
+        // `buf`/`av_frame_unref`, not through `extended_data`, so nulling the pointer
+        // orphans nothing and the frame remains sound to drop.
+        unsafe {
+            *(*frame.as_mut_ptr()).extended_data.add(1) = std::ptr::null_mut();
+        }
+        assert!(
+            pcm_from_frame(&frame).is_err(),
+            "a reported channel with no plane must refuse, not zero-fill"
+        );
+
+        // A packed frame whose buffer is shorter than its own sample count claims.
+        let packed = Sample::I16(Type::Packed);
+        let mut frame = ffmpeg::frame::Audio::new(packed, 8, ChannelLayout::STEREO);
+        fill_frame(&mut frame, packed, 2, &sine(44_100, 8));
+        assert!(
+            pcm_from_frame(&frame).is_ok(),
+            "well-formed packed converts"
+        );
+        // SAFETY: the frame is exclusively owned; `linesize[0]` is a plain scalar that
+        // only states the buffer's usable length, and shrinking a claim never makes a
+        // read reach further than the allocation.
+        unsafe {
+            (*frame.as_mut_ptr()).linesize[0] = 8;
+        }
+        assert!(
+            pcm_from_frame(&frame).is_err(),
+            "a buffer shorter than its claim must refuse, not zero-fill the shortfall"
+        );
     }
 
     /// #14's invariant, for the codec it was most likely to be wrong about.
