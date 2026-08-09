@@ -37,7 +37,7 @@ use crate::diagnostics::SessionDiagnostics;
 use crate::error::AirPlayError;
 use crate::mirror::{MirrorKeys, MirrorOutput, MirrorStream};
 use crate::session::{AirPlayRequest, AirPlaySession};
-use crate::transport::{ReceiverPorts, SenderPorts};
+use crate::transport::{ReceiverPorts, SenderPeers};
 
 /// Cap on a single buffered RTSP message. `/fp-setup` and plist bodies are a few KiB;
 /// `Content-Length` is attacker-controlled, so it gets a bound rather than a buffer that
@@ -78,6 +78,9 @@ pub struct AirPlayReceiver {
     /// the position it last knew, which for a session that has only been told to play is
     /// zero.
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+    /// Counters shared with a harness, when one asked to watch (see
+    /// [`Self::with_diagnostics`]). `None` — production — gives each connection its own.
+    diagnostics: Option<Arc<SessionDiagnostics>>,
 }
 
 impl AirPlayReceiver {
@@ -94,7 +97,21 @@ impl AirPlayReceiver {
             addr: SocketAddr::from(([0, 0, 0, 0], AIRPLAY_PORT)),
             media_ports,
             playback: None,
+            diagnostics: None,
         }
+    }
+
+    /// Share every session's counters with the caller.
+    ///
+    /// Exists for the socket-level tests: the timing exchange and the resend path are
+    /// invisible from outside the process except through these counters, and asserting
+    /// `clock_samples >= 1` is precisely what proves a type-83 reply was folded in
+    /// rather than merely delivered (#176). Production leaves this unset and every
+    /// connection gets its own fresh set.
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: Arc<SessionDiagnostics>) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
     }
 
     /// Answer `/playback-info` and `GET /scrub` from the pipeline.
@@ -165,6 +182,13 @@ impl AirPlayReceiver {
         // to `set_transform`, not a rewrite of the loop.
         let mut framer = RtspFramer::new(MAX_MESSAGE);
 
+        // Counters every task in this session writes to, and a reporter reads. A test
+        // may have supplied a shared set (`with_diagnostics`); production connections
+        // each get their own.
+        let diagnostics = self
+            .diagnostics
+            .clone()
+            .unwrap_or_else(|| Arc::new(SessionDiagnostics::new()));
         match pump(
             &mut stream,
             &mut session,
@@ -174,6 +198,7 @@ impl AirPlayReceiver {
             &mut audio_sockets,
             &mut mirror_listener,
             self.playback.as_ref(),
+            diagnostics,
         )
         .await
         {
@@ -227,6 +252,7 @@ async fn pump(
     audio_sockets: &mut Option<AudioSockets>,
     mirror_listener: &mut Option<TcpListener>,
     playback: Option<&Arc<dyn castaway_core::PlaybackReport>>,
+    diagnostics: Arc<SessionDiagnostics>,
 ) -> Result<PumpEnd, AirPlayError> {
     // The sending half of the mirror's audio channel, created with the video and filled
     // in later: a sender negotiates mirroring audio *after* its video is already
@@ -234,9 +260,7 @@ async fn pump(
     let mut mirror_audio_tx: Option<LossySender<EncodedFrame>> = None;
     // Shared by the mirror's two planes so they present on one timeline.
     let mirror_origin = Arc::new(StreamOrigin::new());
-    // Counters every task in this session writes to, and a reporter reads. See
-    // `diagnostics` for why this exists rather than debug logging.
-    let diagnostics = Arc::new(SessionDiagnostics::new());
+    // See `diagnostics` for why the counters exist rather than debug logging.
     let reporter = tokio::spawn(report_session(Arc::clone(&diagnostics)));
     // FLUSH arrives on the RTSP connection and has to reach the audio task, which is
     // elsewhere. `watch` rather than a channel: only the newest flush point matters, and
@@ -357,7 +381,7 @@ async fn pump(
                                 stream,
                                 tx,
                                 peer.ip(),
-                                session.sender_ports(),
+                                session.sender_peers(),
                                 flush_rx.clone(),
                                 Arc::clone(&diagnostics),
                             ));
@@ -366,7 +390,7 @@ async fn pump(
                             start_negotiated_audio(
                                 &params,
                                 sockets,
-                                session.sender_ports(),
+                                session.sender_peers(),
                                 flush_rx.clone(),
                                 StreamReport {
                                     sink,
@@ -747,14 +771,21 @@ async fn run_audio(
     mut stream: AudioStream,
     frames: LossySender<EncodedFrame>,
     peer_ip: IpAddr,
-    sender_ports: Option<SenderPorts>,
+    sender_peers: SenderPeers,
     mut flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
     diagnostics: Arc<SessionDiagnostics>,
 ) {
     let mut timing = TimingClient::new();
     let mut resends = ResendTracker::new();
-    let timing_peer = sender_ports.map(|p| SocketAddr::new(peer_ip, p.timing));
-    let control_peer = sender_ports.map(|p| SocketAddr::new(peer_ip, p.control));
+    // Each peer stands on its own: a plist session may declare a timing port and no
+    // control port, and requiring the pair is exactly how mirroring sessions came to
+    // run with no timing peer at all (#176).
+    let timing_peer = sender_peers
+        .timing
+        .map(|p| SocketAddr::new(peer_ip, p.get()));
+    let control_peer = sender_peers
+        .control
+        .map(|p| SocketAddr::new(peer_ip, p.get()));
     let mut probe =
         tokio::time::interval(std::time::Duration::from_millis(timing.next_interval_ms()));
     // The first tick is immediate, which is what we want: nothing converts to local time
@@ -928,8 +959,8 @@ async fn start_audio(
         warn!(peer = %report.peer, "RECORD with nothing announced; not starting audio");
         return;
     };
-    let ports = session.sender_ports();
-    start_negotiated_audio(params, sockets, ports, flush, report).await;
+    let peers = session.sender_peers();
+    start_negotiated_audio(params, sockets, peers, flush, report).await;
 }
 
 /// Start an audio receive session for whatever was negotiated.
@@ -940,7 +971,7 @@ async fn start_audio(
 async fn start_negotiated_audio(
     params: &crate::sdp::AnnounceParams,
     sockets: AudioSockets,
-    sender_ports: Option<SenderPorts>,
+    sender_peers: SenderPeers,
     flush: tokio::sync::watch::Receiver<Option<crate::audio::FlushPoint>>,
     report: StreamReport<'_>,
 ) {
@@ -965,7 +996,16 @@ async fn start_negotiated_audio(
     let (tx, rx) = mpsc::channel(512);
     let tx = LossySender::new(tx);
     let stream = AudioStream::new(params);
-    info!(%peer, %link, "AirPlay audio starting");
+    // The declared latency beside the codec, so the journal shows what the sender said
+    // it intends before the sync packets refine it — the number whose consumption as a
+    // target buffer depth is the remainder of #176.
+    info!(
+        %peer,
+        %link,
+        latency_min = ?params.min_latency,
+        latency_max = ?params.max_latency,
+        "AirPlay audio starting"
+    );
     if sink
         .emit(SessionEvent::Audio {
             source: FrameSource::Encoded(rx),
@@ -990,7 +1030,7 @@ async fn start_negotiated_audio(
         stream,
         tx,
         peer.ip(),
-        sender_ports,
+        sender_peers,
         flush,
         diagnostics,
     ));

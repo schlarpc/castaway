@@ -45,7 +45,7 @@ pub use error::{AirPlayError, ControlError, MirrorError, SdpError, TransportErro
 pub use mirror::{MirrorKeys, MirrorOutput, MirrorStream, StreamConnectionId};
 pub use sdp::{AlacConfig, AnnounceParams, RaopCodec, SessionKey, StreamCrypto};
 pub use session::{AirPlayResponse, AirPlaySession};
-pub use transport::{ReceiverPorts, SenderPorts};
+pub use transport::{ReceiverPorts, SenderPeers, SenderPorts};
 pub use video::{PlaybackInfo, Rate, StartPosition, VideoCommand, VideoEndpoint};
 
 /// The protocol kind for AirPlay sources.

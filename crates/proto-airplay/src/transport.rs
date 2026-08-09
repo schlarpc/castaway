@@ -11,6 +11,8 @@
 //! completes, plays, and then drifts with no way to correct, which is worse than a
 //! refusal the sender can report.
 
+use std::num::NonZeroU16;
+
 use crate::error::TransportError;
 
 /// The ports a sender told us to talk back on.
@@ -20,6 +22,37 @@ pub struct SenderPorts {
     pub control: u16,
     /// Where we send timing requests.
     pub timing: u16,
+}
+
+/// The sender-side ports one *session* has learned, each on its own schedule.
+///
+/// [`SenderPorts`] is what one `Transport` header names, atomically — both or refusal.
+/// This is the session's accumulated knowledge, and it is two independent options
+/// because the plist path genuinely learns them at different moments: the sender's
+/// timing port arrives in the key-material `SETUP` (top-level `timingPort`) and its
+/// control port in the type-96 stream entry (`controlPort`), possibly never. Until
+/// #176 nothing read either, which is why every mirroring and `isMedia` session ran
+/// with `clock_samples=0`.
+///
+/// `NonZeroU16` because zero on the wire means "I am not running that service"
+/// (see [`parse_transport`]) — a datagram to port 0 is not a message to a sender,
+/// and this makes it unrepresentable rather than checked at the send site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SenderPeers {
+    /// Where we send resend requests, once the sender has said.
+    pub control: Option<NonZeroU16>,
+    /// Where we send timing requests, once the sender has said.
+    pub timing: Option<NonZeroU16>,
+}
+
+impl From<SenderPorts> for SenderPeers {
+    /// A `Transport` header names both at once; zero still means "no such service".
+    fn from(ports: SenderPorts) -> Self {
+        Self {
+            control: NonZeroU16::new(ports.control),
+            timing: NonZeroU16::new(ports.timing),
+        }
+    }
 }
 
 /// The ports we bound and are about to advertise.
@@ -151,6 +184,19 @@ mod tests {
         assert!(h.contains("control_port=6001"), "{h}");
         assert!(h.contains("timing_port=6002"), "{h}");
         assert!(h.contains("mode=record"), "{h}");
+    }
+
+    #[test]
+    fn a_zero_port_means_no_service_rather_than_a_peer_at_port_zero() {
+        // Senders legitimately send `timing_port=0` for "I am not running a timing
+        // service". A `SocketAddr` with port 0 is not a place to send datagrams, so the
+        // conversion to session knowledge drops it rather than every send site checking.
+        let peers = SenderPeers::from(SenderPorts {
+            control: 6001,
+            timing: 0,
+        });
+        assert_eq!(peers.control.map(NonZeroU16::get), Some(6001));
+        assert_eq!(peers.timing, None);
     }
 
     #[test]

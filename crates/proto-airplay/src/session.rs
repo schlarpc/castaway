@@ -26,7 +26,7 @@ use crate::error::AirPlayError;
 use crate::info;
 use crate::mirror::{MirrorKeys, StreamConnectionId};
 use crate::sdp::{AnnounceParams, RaopCodec, SessionKey};
-use crate::transport::{ReceiverPorts, SenderPorts};
+use crate::transport::{ReceiverPorts, SenderPeers};
 
 /// Parse an `AA:BB:CC:DD:EE:FF` device id into six bytes.
 fn parse_mac(text: &str) -> Option<[u8; 6]> {
@@ -297,7 +297,14 @@ pub struct AirPlaySession {
     /// The address the sender reached us on, for `Apple-Challenge`.
     local_addr: Option<IpAddr>,
     /// Where the sender wants us to send resend and timing requests.
-    sender_ports: Option<SenderPorts>,
+    ///
+    /// Two independently-learned ports, because the two negotiation shapes declare them
+    /// differently: an RTSP `Transport` header names both at once, while the plist path
+    /// names the timing port in the key-material `SETUP` and the control port in the
+    /// type-96 stream entry. Deriving this *only* from the `Transport` header is the
+    /// #176 defect — every mirroring and `isMedia` session had no timing peer, so the
+    /// timing client was built and never fired.
+    sender_peers: SenderPeers,
     mirror: MirrorState,
     /// The TCP port the actor bound for the mirroring data channel.
     mirror_data_port: Option<u16>,
@@ -360,7 +367,7 @@ impl AirPlaySession {
             raop: RaopState::default(),
             local_ports: None,
             local_addr: None,
-            sender_ports: None,
+            sender_peers: SenderPeers::default(),
             mirror: MirrorState::default(),
             mirror_data_port: None,
             media_key: None,
@@ -470,10 +477,10 @@ impl AirPlaySession {
         matches!(self.raop, RaopState::Recording(_))
     }
 
-    /// Where to send resend and timing requests, once a `SETUP` has said.
+    /// Where to send resend and timing requests, as far as any `SETUP` has said.
     #[must_use]
-    pub const fn sender_ports(&self) -> Option<SenderPorts> {
-        self.sender_ports
+    pub const fn sender_peers(&self) -> SenderPeers {
+        self.sender_peers
     }
 
     /// What `ANNOUNCE` negotiated, if it has happened.
@@ -679,7 +686,7 @@ impl AirPlaySession {
             return AirPlayResponse::status(451);
         };
 
-        self.sender_ports = Some(sender);
+        self.sender_peers = SenderPeers::from(sender);
         self.raop = RaopState::SetUp(params);
         log_info!(
             audio = local.audio,
@@ -957,21 +964,30 @@ impl AirPlaySession {
         self.sender.display_name = Some(name.to_string());
     }
 
-    /// Say so when a sender asks for a timing regime this receiver does not serve.
+    /// Read the timing regime a plist `SETUP` asks for, and keep the peer it names.
     ///
-    /// Neither is refused — the sender decides what it does next, and both are things
-    /// the reference receiver merely reports. They are logged because they are otherwise
-    /// invisible: a session that dies straight after this `SETUP` looks identical
-    /// whether the sender wanted PTP, wanted the AirPlay 2 remote-control protocol, or
-    /// disliked something in the answer.
-    fn note_timing_regime(&self, dict: &plist::Dictionary) {
-        match dict.get("timingProtocol").and_then(plist::Value::as_string) {
-            Some("NTP") | None => {}
-            Some(other) => warn!(
-                timing_protocol = %other,
-                "sender asked for a timing protocol this receiver does not serve (NTP only)"
-            ),
-        }
+    /// This is where a plist session's timing peer comes from: the top-level
+    /// `timingPort` is the sender's own NTP service, the exact counterpart of the
+    /// `Transport` header's `timing_port=`. It used to be logged at `debug` and dropped,
+    /// which left every mirroring and `isMedia` session with no timing peer — the
+    /// timing client was constructed and never fired, and `clock_samples=0` on every
+    /// live session (#176).
+    ///
+    /// A regime we do not serve is reported, not refused — the sender decides what it
+    /// does next, and the reference receiver merely reports both. But a PTP sender's
+    /// port is a PTP port, so it is deliberately *not* kept: NTP requests to it would be
+    /// noise aimed at a service that never answers.
+    fn note_timing_regime(&mut self, dict: &plist::Dictionary) {
+        let ntp = match dict.get("timingProtocol").and_then(plist::Value::as_string) {
+            Some("NTP") | None => true,
+            Some(other) => {
+                warn!(
+                    timing_protocol = %other,
+                    "sender asked for a timing protocol this receiver does not serve (NTP only)"
+                );
+                false
+            }
+        };
         if dict
             .get("isRemoteControlOnly")
             .and_then(plist::Value::as_boolean)
@@ -982,8 +998,13 @@ impl AirPlaySession {
         if let Some(port) = dict
             .get("timingPort")
             .and_then(plist::Value::as_unsigned_integer)
+            .and_then(|p| u16::try_from(p).ok())
         {
             debug!(sender_timing_port = port, "sender's NTP port");
+            if ntp {
+                // Zero still means "no timing service" — `NonZeroU16::new` drops it.
+                self.sender_peers.timing = std::num::NonZeroU16::new(port);
+            }
         }
     }
 
@@ -1055,6 +1076,13 @@ impl AirPlaySession {
         // sender that omits the field; the codec itself is never defaulted.
         let sample_rate = u32::try_from(number("sr").unwrap_or(44_100)).unwrap_or(44_100);
         let spf = u32::try_from(number("spf").unwrap_or(480)).unwrap_or(480);
+        // The sender's own control port, where our resend requests go — the plist twin
+        // of the `Transport` header's `control_port=`. Every capture of this stream
+        // carries it (`controlPort: 60284` in the 2026-07-31 one), and dropping it
+        // meant a plist session could never ask for a retransmit (#176).
+        if let Some(port) = number("controlPort").and_then(|p| u16::try_from(p).ok()) {
+            self.sender_peers.control = std::num::NonZeroU16::new(port);
+        }
         let Some(codec) = stream
             .get("ct")
             .and_then(plist::Value::as_signed_integer)
@@ -1064,7 +1092,13 @@ impl AirPlaySession {
             warn!(ct = ?stream.get("ct"), "audio SETUP names a codec this receiver cannot decode");
             return AirPlayResponse::status(451);
         };
-        let params = AnnounceParams::plist_stream(codec, media.key, media.iv);
+        // The declared latency bounds, read rather than dropped: the sender states how
+        // far ahead it intends to run, and a receiver that ignores it can only bank
+        // that lead by accident (#176). `77175` max at 44.1 kHz is the 1.75 s every
+        // live log showed.
+        let latency = |key: &str| number(key).and_then(|v| u32::try_from(v).ok());
+        let params = AnnounceParams::plist_stream(codec, media.key, media.iv)
+            .with_declared_latency(latency("latencyMin"), latency("latencyMax"));
         log_info!(link = %params.describe(), spf, "AirPlay audio stream negotiated");
         // Before the move: the actor takes these parameters when it starts the stream,
         // and a `SET_PARAMETER` arriving afterwards still needs the rate they carried.
@@ -1120,7 +1154,7 @@ impl AirPlaySession {
             return AirPlayResponse::ok();
         }
         self.raop = RaopState::Idle;
-        self.sender_ports = None;
+        self.sender_peers = SenderPeers::default();
         self.mirror = MirrorState::Idle;
         self.mirror_audio = None;
         // What was negotiated goes with the negotiation; who the sender is does not —
@@ -1653,7 +1687,14 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| *k == "Transport" && v.contains("server_port=6000")));
-        assert_eq!(s.sender_ports().unwrap().control, 6001);
+        assert_eq!(
+            s.sender_peers().control.map(std::num::NonZeroU16::get),
+            Some(6001)
+        );
+        assert_eq!(
+            s.sender_peers().timing.map(std::num::NonZeroU16::get),
+            Some(6002)
+        );
         let rec = s
             .handle(&AirPlayRequest::new("RECORD", "rtsp://x/s", &[]))
             .unwrap();
@@ -1675,7 +1716,11 @@ mod tests {
         assert!(s.announced().is_none());
         // And SETUP is refused again, because nothing has been announced since.
         assert_eq!(do_setup(&mut s).status, 451);
-        assert!(s.sender_ports().is_none(), "transport is forgotten too");
+        assert_eq!(
+            s.sender_peers(),
+            SenderPeers::default(),
+            "transport is forgotten too"
+        );
     }
 
     #[test]
@@ -2264,6 +2309,61 @@ mod tests {
             params.codec
         );
         assert_eq!(params.codec.sample_rate(), 44_100);
+    }
+
+    #[test]
+    fn a_plist_setup_yields_a_timing_peer_like_a_transport_header_does() {
+        // The #176 defect in one assertion: `timing_peer` was derived only from the
+        // `Transport` header, so a session negotiated through the two-phase plist SETUP
+        // had no timing peer, the timing client never fired, and `clock_samples=0` on
+        // every mirroring and `isMedia` session.
+        let mut s = mirroring_session();
+        let mut d = plist::Dictionary::new();
+        d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+        d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+        d.insert("timingProtocol".into(), plist::Value::String("NTP".into()));
+        d.insert("timingPort".into(), plist::Value::Integer(53669i64.into()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &d).unwrap();
+        assert_eq!(setup(&mut s, &body).status, 200);
+        assert_eq!(
+            s.sender_peers().timing.map(std::num::NonZeroU16::get),
+            Some(53669)
+        );
+    }
+
+    #[test]
+    fn a_ptp_senders_port_is_not_kept_as_an_ntp_peer() {
+        // A sender asking for PTP names a PTP port. NTP requests to it would be noise
+        // aimed at a service that never answers, so it is reported and not kept.
+        let mut s = mirroring_session();
+        let mut d = plist::Dictionary::new();
+        d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+        d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+        d.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
+        d.insert("timingPort".into(), plist::Value::Integer(319i64.into()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &d).unwrap();
+        assert_eq!(setup(&mut s, &body).status, 200);
+        assert_eq!(s.sender_peers().timing, None);
+    }
+
+    #[test]
+    fn a_media_audio_stream_names_the_control_peer_and_declares_its_latency() {
+        // Both facts are verbatim in the captured stream entry (`controlPort: 60284`,
+        // `latencyMin: 11025`, `latencyMax: 88200`) and both were dropped: no control
+        // peer meant no resend request could ever leave, and an unread latency is the
+        // sender's declared lead banked as accidental steady-state latency (#176).
+        let mut s = mirroring_session();
+        assert_eq!(setup(&mut s, &mirror_setup_body(true, false)).status, 200);
+        assert_eq!(setup(&mut s, &media_audio_setup_body()).status, 200);
+        assert_eq!(
+            s.sender_peers().control.map(std::num::NonZeroU16::get),
+            Some(60284)
+        );
+        let params = s.take_mirror_audio().expect("audio was negotiated");
+        assert_eq!(params.min_latency, Some(11025));
+        assert_eq!(params.max_latency, Some(88200));
     }
 
     #[test]

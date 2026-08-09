@@ -320,11 +320,24 @@ impl AnnounceParams {
             generation: Generation::Mirroring,
             codec,
             crypto: StreamCrypto::Aes { key, iv },
-            // A sender on this path declares its latency in the sync packets rather than
-            // here; observed values are around 7497 frames against ALAC's 77175.
+            // Filled in by `with_declared_latency` when the stream entry names its
+            // bounds (`latencyMin`/`latencyMax`, the SDP attributes' plist twins); the
+            // authoritative running figure still arrives in the sync packets — observed
+            // around 7497 frames for AAC-ELD against ALAC's 77175.
             min_latency: None,
             max_latency: None,
         }
+    }
+
+    /// The latency bounds the sender declared, in frames — `a=min-latency:`/
+    /// `a=max-latency:` on the SDP path, `latencyMin`/`latencyMax` in a plist stream
+    /// entry. Until #176 the plist pair was parsed by no one, which is half of how the
+    /// sender's declared lead came to be banked by accident instead of read.
+    #[must_use]
+    pub fn with_declared_latency(mut self, min: Option<u32>, max: Option<u32>) -> Self {
+        self.min_latency = min;
+        self.max_latency = max;
+        self
     }
 
     /// A human-readable summary of what was negotiated, for the on-screen device card.
