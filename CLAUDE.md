@@ -95,6 +95,26 @@ These are binding engineering constraints for this project. They override genera
    Prefer building a harness over manual verification. Hardware-only paths (Miracast Wi-Fi Direct,
    DX12/browser render, the physical panel) are the *only* things allowed to require the real box; isolate them.
 
+   **Time in tests (#208, #236).** Rule 3 applies to clocks: read the clock once at the actor
+   boundary and pass `now`/`Duration` inward — no `Clock` trait, no `Instant::now()` inside a
+   state transition. Four corollaries, each one a defect this project has already paid for:
+   - *A constant a test has to wait out is a parameter.* Assert the **shipped** constant in
+     virtual time (`start_paused`, `ManualClock`, `tick(dt)`) rather than sleeping it out or
+     shortening it for tests — `proto-spotify` asserts its whole backoff ladder this way.
+   - *A sleep standing in for a condition is a bug.* Poll the condition with a deadline: an
+     expired poll reports what it was waiting for; an insufficient sleep reports a wrong number
+     and blames the code under test.
+   - *A test asserting a real-time property must check its own premise separately* — did the
+     harness's producer keep its schedule (`starved`), did the mixer drain — so a loaded CI box
+     reports "this box cannot measure that" instead of a defect in the product. A harness
+     "session" is an actor on its own thread with its position counted in samples, never a
+     callback inside the loop under test.
+   - *A fake models the observed backend, not the trait contract.* Both device-loss fakes
+     returned `Err` from `write` as the contract says; both real backends returned `Ok` and
+     binned the audio, and the composed deadlock (#55) was invisible until a fake was written
+     to the observed behaviour. When a contract matters, keep one fake that honours it and one
+     that violates it the way the real implementation does.
+
 7. **Errors: typed in libraries, `anyhow` in the app.** Every `substrate-*`/`proto-*`/`crypto-*`/
    `core` crate exposes a `thiserror` enum whose variants enumerate its real failure modes (so
    callers can match and protocol errors are exhaustive). Only the `app` crate uses `anyhow` for
