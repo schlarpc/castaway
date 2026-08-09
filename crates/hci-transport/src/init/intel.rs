@@ -1,13 +1,17 @@
-//! Intel controllers: the AX200/AX201 secure-boot firmware flow.
+//! Intel controllers: the AX200/AX201 and AX210/AX211 secure-boot firmware flow.
 //!
 //! Reference is the kernel's `btintel.c`, which is the specification here — and also the
-//! oracle: `btmon` capturing the kernel bring-up the same radio gives a transcript this
-//! sequence can be diffed against (architecture §11.3a).
+//! oracle: a usbmon capture of the kernel bringing up the same radio gives a transcript
+//! this sequence can be diffed against (architecture §11.3a). That diff is what this file
+//! is now built from: on 2026-08-08 an AX210 was pushed back into its bootloader and the
+//! kernel's own 2877-fragment upload captured, and what follows reproduces it fragment for
+//! fragment (#229).
 //!
 //! Note the loader can only be exercised against a controller the kernel has *not*
-//! already initialised. `HCI_CHANNEL_USER` hands over a part that is already operational,
-//! so testing this means unbinding `btusb` and claiming through USB — which is what
-//! Windows does anyway.
+//! already initialised, and unbinding `btusb` is not enough to arrange that: the
+//! operational image survives both a driver unbind and a USB port reset. The part has to
+//! be sent back to the bootloader with `Intel_Reset` first — see
+//! `examples/probe --to-bootloader`.
 
 use substrate_hci::{Command, HciPacket, HciTransport, OpCode};
 use tracing::{debug, info};
@@ -79,11 +83,62 @@ mod fragment {
     pub const PUBLIC_KEY: u8 = 0x03;
 }
 
-/// Layout of the `.sfi` header, before the command/data blocks begin.
+/// The CSS header is 128 bytes in both layouts; everything else about them differs.
 const CSS_HEADER_LEN: usize = 128;
-const PUBLIC_KEY_LEN: usize = 256;
-const SIGNATURE_LEN: usize = 256;
-const SFI_HEADER_LEN: usize = CSS_HEADER_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
+
+/// Which signed-header layout a `.sfi` carries.
+///
+/// Two generations, two layouts, and the numbers are not guessable from one another —
+/// getting this wrong sends the *other* layout's bytes as the opening fragment and the
+/// controller answers `0x1F`. Confirmed on an AX210 on 2026-08-08 (#229): the same
+/// `Secure_Send`, on the same pipe, differing only in which offset the CSS header was
+/// read from, is rejected with `0x1F` at 0 and accepted with `0x00` at 644.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecureBoot {
+    /// AX200/AX201. A 128-byte CSS header, a 256-byte RSA modulus followed by a 4-byte
+    /// exponent, then a 256-byte signature — so the signature starts at 388, not 384,
+    /// and the payload at 644, not 640. Both of those fours have been wrong here.
+    Rsa,
+    /// AX210/AX211. The 644-byte RSA header above is present but unused; a 320-byte
+    /// ECDSA header follows it, with a 128-byte CSS header and a **96**-byte key and
+    /// signature. The payload starts at 964.
+    Ecdsa,
+}
+
+/// Where each block of a signed header sits, as `(offset, length)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    css: (usize, usize),
+    public_key: (usize, usize),
+    signature: (usize, usize),
+    /// First byte of the command/data payload.
+    payload: usize,
+}
+
+impl SecureBoot {
+    /// The offsets this layout puts each block at.
+    ///
+    /// These are `btintel.c`'s `RSA_HEADER_LEN`, `ECDSA_OFFSET` and `ECDSA_HEADER_LEN`
+    /// spelled out. Every one of them was checked byte-for-byte against what the kernel
+    /// uploaded to this part.
+    const fn layout(self) -> Layout {
+        match self {
+            Self::Rsa => Layout {
+                css: (0, CSS_HEADER_LEN),
+                public_key: (128, 256),
+                signature: (388, 256),
+                payload: 644,
+            },
+            Self::Ecdsa => Layout {
+                css: (644, CSS_HEADER_LEN),
+                public_key: (772, 96),
+                signature: (868, 96),
+                payload: 964,
+            },
+        }
+    }
+}
 
 /// Largest payload one `Secure_Send` carries. The opcode's parameter field is a single
 /// byte, and the fragment type consumes one of them.
@@ -106,27 +161,37 @@ impl IntelInit {
     /// *signed* image: secure boot rejects it, or worse accepts a partial upload. The
     /// right blob was already in the binary, unused, because `flake.nix` embeds it.
     ///
-    /// `btintel` derives this from the TLV version response (the CNVi/CNVR ids) rather
-    /// than from USB. Keying on the product id is a narrower rule that happens to agree
-    /// for every part we claim; if that stops being true, the answer is to read the TLV,
-    /// not to add another entry here.
-    pub const PRODUCTS: &'static [(u16, &'static str)] = &[
-        (0x0029, "intel/ibt-20-1-3"),    // AX200
-        (0x0026, "intel/ibt-20-1-3"),    // AX201
-        (0x0032, "intel/ibt-0041-0041"), // AX210
-        (0x0033, "intel/ibt-0041-0041"), // AX211
+    /// The signed-header layout travels with the stem, because it is a property of the
+    /// same generation: the AX200 pair are RSA, the AX210 pair are ECDSA, and sending one
+    /// layout's offsets to the other part gets the opening fragment refused with `0x1F`.
+    ///
+    /// `btintel` derives both from the TLV version response (the CNVi/CNVR ids, and
+    /// `sbe_type`) rather than from USB. Keying on the product id is a narrower rule that
+    /// happens to agree for every part we claim; if that stops being true, the answer is
+    /// to read the TLV, not to add another entry here.
+    pub const PRODUCTS: &'static [(u16, &'static str, SecureBoot)] = &[
+        (0x0029, "intel/ibt-20-1-3", SecureBoot::Rsa), // AX200
+        (0x0026, "intel/ibt-20-1-3", SecureBoot::Rsa), // AX201
+        (0x0032, "intel/ibt-0041-0041", SecureBoot::Ecdsa), // AX210
+        (0x0033, "intel/ibt-0041-0041", SecureBoot::Ecdsa), // AX211
     ];
 
-    /// The image stem for a product, if this loader claims it.
+    /// The image stem and header layout for a product, if this loader claims it.
     #[must_use]
-    fn image_stem(id: UsbId) -> Option<&'static str> {
+    fn product(id: UsbId) -> Option<(&'static str, SecureBoot)> {
         if id.vendor != Self::VENDOR {
             return None;
         }
         Self::PRODUCTS
             .iter()
-            .find(|(product, _)| *product == id.product)
-            .map(|(_, stem)| *stem)
+            .find(|(product, _, _)| *product == id.product)
+            .map(|(_, stem, layout)| (*stem, *layout))
+    }
+
+    /// The image stem for a product, if this loader claims it.
+    #[must_use]
+    fn image_stem(id: UsbId) -> Option<&'static str> {
+        Self::product(id).map(|(stem, _)| stem)
     }
 }
 
@@ -157,7 +222,8 @@ impl ControllerInit for IntelInit {
         hci: &dyn HciTransport,
         firmware: &FirmwareSet,
     ) -> Result<(), TransportError> {
-        let image_stem = Self::image_stem(id).ok_or(TransportError::UnsupportedController(id))?;
+        let (image_stem, secure_boot) =
+            Self::product(id).ok_or(TransportError::UnsupportedController(id))?;
         let version = read_version(hci).await?;
         debug!(tlv = ?hex(&version), "intel version response");
 
@@ -191,20 +257,28 @@ impl ControllerInit for IntelInit {
 
         let sfi_name = format!("{image_stem}.sfi");
         let sfi = firmware.get(&sfi_name).await?;
-        download_firmware(hci, &sfi, &sfi_name).await?;
+        let parts = split_sfi(&sfi, &sfi_name, secure_boot)?;
 
-        // Reset into the image just uploaded. The parameters are `btintel`'s verbatim:
-        // reset type, patch enable, ddc reload, boot option, boot address.
-        send(
-            hci,
-            Command::Vendor {
-                opcode: INTEL_RESET,
-                params: bytes::Bytes::from_static(&[
-                    0x00, 0x01, 0x00, 0x01, 0x00, 0x08, 0x04, 0x00,
-                ]),
-            },
-        )
-        .await?;
+        // The boot address is read out of the image rather than assumed. It used to be
+        // the AX200-era constant 0x00040800; this AX210's image says 0x00100800, and
+        // booting a part at the wrong address is not something it reports politely.
+        let boot_addr = boot_address(parts.blocks).ok_or_else(|| TransportError::Firmware {
+            name: sfi_name.clone(),
+            detail: "no CMD_WRITE_BOOT_PARAMS in the image, so no boot address".to_owned(),
+        })?;
+
+        // From here until the new image is running, HCI lives on the bulk pipes.
+        hci.set_bootloader_framing(true);
+        let loaded = download_firmware(hci, &parts).await;
+        let booted = match loaded {
+            Ok(()) => boot(hci, boot_addr).await,
+            Err(e) => Err(e),
+        };
+        // Whatever happened, stop reading bulk IN as events: on the way out of this
+        // function the caller either has an operational controller or an error, and in
+        // both cases ACL is what that endpoint carries next.
+        hci.set_bootloader_framing(false);
+        booted?;
 
         // DDC is the per-board tuning table. Missing it is not fatal — the radio works,
         // just not to spec for this antenna layout — so a build without the file logs
@@ -363,40 +437,65 @@ pub struct SfiParts<'a> {
     pub blocks: &'a [u8],
 }
 
-/// Split a `.sfi` into the four transfers `btintel` performs.
+/// Split a `.sfi` into the four transfers `btintel` performs, for one header layout.
 ///
 /// # Errors
-/// [`TransportError::Firmware`] if the image is shorter than its fixed header.
-pub fn split_sfi<'a>(sfi: &'a [u8], name: &str) -> Result<SfiParts<'a>, TransportError> {
-    if sfi.len() <= SFI_HEADER_LEN {
+/// [`TransportError::Firmware`] if the image is shorter than the header that layout
+/// describes, which is the shape a mismatched image arrives in.
+pub fn split_sfi<'a>(
+    sfi: &'a [u8],
+    name: &str,
+    secure_boot: SecureBoot,
+) -> Result<SfiParts<'a>, TransportError> {
+    let layout = secure_boot.layout();
+    if sfi.len() <= layout.payload {
         return Err(TransportError::Firmware {
             name: name.to_owned(),
             detail: format!(
-                "image is {} bytes; the CSS header, key and signature alone need {}",
+                "image is {} bytes; the {:?} header alone needs {}",
                 sfi.len(),
-                SFI_HEADER_LEN
+                secure_boot,
+                layout.payload
             ),
         });
     }
-    let (css, rest) = sfi.split_at(CSS_HEADER_LEN);
-    let (public_key, rest) = rest.split_at(PUBLIC_KEY_LEN);
-    let (signature, blocks) = rest.split_at(SIGNATURE_LEN);
+    let block = |(offset, len): (usize, usize)| &sfi[offset..offset + len];
     Ok(SfiParts {
-        css,
-        public_key,
-        signature,
-        blocks,
+        css: block(layout.css),
+        public_key: block(layout.public_key),
+        signature: block(layout.signature),
+        blocks: &sfi[layout.payload..],
     })
+}
+
+/// Intel's `CMD_WRITE_BOOT_PARAMS`, whose first parameter is the address to boot from.
+const WRITE_BOOT_PARAMS: u16 = 0xFC0E;
+
+/// Find the address the image wants to be booted at.
+///
+/// `btintel_firmware_version` scans the payload for this command "instead of using
+/// static value per SKU", and the SKUs disagree: the AX200 image says `0x00040800`, this
+/// AX210's says `0x00100800`.
+#[must_use]
+pub fn boot_address(payload: &[u8]) -> Option<u32> {
+    let mut rest = payload;
+    while rest.len() >= 3 {
+        let opcode = u16::from_le_bytes([rest[0], rest[1]]);
+        let plen = usize::from(rest[2]);
+        if opcode == WRITE_BOOT_PARAMS {
+            let addr = rest.get(3..7)?;
+            return Some(u32::from_le_bytes([addr[0], addr[1], addr[2], addr[3]]));
+        }
+        rest = rest.get(3 + plen..)?;
+    }
+    None
 }
 
 /// Upload a firmware image.
 async fn download_firmware(
     hci: &dyn HciTransport,
-    sfi: &[u8],
-    name: &str,
+    parts: &SfiParts<'_>,
 ) -> Result<(), TransportError> {
-    let parts = split_sfi(sfi, name)?;
-
     // Order is fixed by the secure-boot protocol: the CSS header opens the transaction,
     // then the key, then the signature, and only then the payload. The controller
     // rejects anything out of order, which is the good case — the bad case is a part
@@ -411,25 +510,87 @@ async fn download_firmware(
     Ok(())
 }
 
-/// Split the payload into HCI-command-shaped blocks.
+/// Split the payload into fragments the controller will accept.
 ///
 /// The tail of a `.sfi` is a sequence of HCI commands — 3-byte header (opcode, then a
 /// one-byte parameter length) followed by that many parameter bytes. Fragmenting on any
-/// other boundary hands the controller a half command, which it rejects.
+/// other boundary hands the controller a half command.
+///
+/// Command boundaries are necessary but **not sufficient**: a `Secure_Send` payload has
+/// to be a multiple of four bytes, so `btintel_download_firmware_payload` accumulates
+/// whole commands until the running length is 4-aligned and sends *that* as one
+/// fragment. The image contains Intel NOPs placed to make it work out. Emitting one
+/// fragment per command instead leaves 5 of the 2877 in `ibt-0041-0041.sfi` misaligned,
+/// and the controller rejects those — this rule reproduces the kernel's own 2874
+/// fragments exactly, length for length.
 #[must_use]
-pub fn split_command_blocks(mut data: &[u8]) -> Vec<&[u8]> {
+pub fn split_command_blocks(data: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
-    while data.len() >= 3 {
-        let params = usize::from(data[2]);
-        let total = 3 + params;
-        if data.len() < total {
+    let mut start = 0;
+    let mut frag = 0;
+    while start + frag + 3 <= data.len() {
+        let plen = usize::from(data[start + frag + 2]);
+        let end = frag + 3 + plen;
+        if start + end > data.len() {
             break;
         }
-        out.push(&data[..total]);
-        data = &data[total..];
+        frag = end;
+        if frag % 4 == 0 {
+            out.push(&data[start..start + frag]);
+            start += frag;
+            frag = 0;
+        }
     }
     out
 }
+
+/// Reset into the freshly uploaded image and wait for it to come up.
+///
+/// `Intel_Reset` is not an ordinary command: it "will actually not send a command
+/// complete event" (`btusb.c`), which `btusb` papers over by injecting a fake one. Waiting
+/// for a completion here simply times out. The real signal is a vendor bootup
+/// notification from the operational firmware — captured from this part as
+/// `ff 07 02 00 02 01 02 ff 01`, and the kernel allows it five seconds.
+async fn boot(hci: &dyn HciTransport, boot_addr: u32) -> Result<(), TransportError> {
+    // reset type, patch enable, ddc reload, boot option, then the boot address.
+    let mut params = vec![0x00, 0x01, 0x00, 0x01];
+    params.extend_from_slice(&boot_addr.to_le_bytes());
+    hci.send(
+        Command::Vendor {
+            opcode: INTEL_RESET,
+            params: bytes::Bytes::from(params),
+        }
+        .encode()?,
+    )
+    .await?;
+
+    let deadline = tokio::time::Instant::now() + BOOT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::Timeout("intel bootup notification"));
+        }
+        let packet = tokio::time::timeout(remaining, hci.recv())
+            .await
+            .map_err(|_| TransportError::Timeout("intel bootup notification"))??;
+        if let HciPacket::Event { code, params } = packet {
+            if code == VENDOR_EVENT && params.first() == Some(&BOOTUP_NOTIFICATION) {
+                debug!(
+                    boot_addr = format!("{boot_addr:#010x}"),
+                    "intel image booted"
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Intel's vendor event code, which carries the bootup notification among other things.
+const VENDOR_EVENT: u8 = 0xFF;
+/// First parameter byte of that event when it means "the image is running".
+const BOOTUP_NOTIFICATION: u8 = 0x02;
+/// How long the operational image gets to come up. `btintel_boot` allows the same.
+const BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Send one fragment, split to the command parameter limit.
 async fn secure_send(
@@ -482,12 +643,32 @@ mod tests {
     use super::*;
     use crate::firmware::Firmware;
 
-    /// A controller that completes every command it is sent.
+    /// A controller that completes every command it is sent — except the one that
+    /// doesn't.
+    ///
+    /// `Intel_Reset` answers with a bootup notification and no command-complete, because
+    /// that is what the real part does (`btusb` injects the fake completion that hides
+    /// this). A fake that completed it would agree with a loader that waits for the wrong
+    /// thing, which is the failure mode ground rule 6 names by hand.
     fn controller(version_tlv: Vec<u8>) -> ScriptedTransport {
         ScriptedTransport::new().with_responder(move |sent| {
             let HciPacket::Command { opcode, .. } = sent else {
                 return Vec::new();
             };
+            if *opcode == INTEL_RESET {
+                return vec![HciPacket::Event {
+                    code: VENDOR_EVENT,
+                    params: bytes::Bytes::from_static(&[
+                        BOOTUP_NOTIFICATION,
+                        0x00,
+                        0x02,
+                        0x01,
+                        0x02,
+                        0xFF,
+                        0x01,
+                    ]),
+                }];
+            }
             let mut params = vec![0x01];
             params.extend_from_slice(&opcode.raw().to_le_bytes());
             params.push(0x00); // status: success
@@ -520,13 +701,36 @@ mod tests {
         ]
     }
 
-    /// A `.sfi` with `blocks` worth of command payload after the fixed header.
-    fn sfi(blocks: &[u8]) -> Vec<u8> {
-        let mut image = vec![0xAA; CSS_HEADER_LEN];
-        image.extend(std::iter::repeat_n(0xBB, PUBLIC_KEY_LEN));
-        image.extend(std::iter::repeat_n(0xCC, SIGNATURE_LEN));
+    /// A `.sfi` in `secure_boot`'s layout, with `blocks` as the payload.
+    ///
+    /// Built from the layout table rather than from repeated constants, so a test image
+    /// cannot drift away from the offsets the loader reads.
+    fn sfi_for(secure_boot: SecureBoot, blocks: &[u8]) -> Vec<u8> {
+        let layout = secure_boot.layout();
+        let mut image = vec![0x00; layout.payload];
+        let fill = |image: &mut Vec<u8>, (offset, len): (usize, usize), byte: u8| {
+            image[offset..offset + len].fill(byte);
+        };
+        fill(&mut image, layout.css, 0xAA);
+        fill(&mut image, layout.public_key, 0xBB);
+        fill(&mut image, layout.signature, 0xCC);
+        // Every image has to name a boot address or the loader refuses it.
+        image.extend_from_slice(&write_boot_params(0x0010_0800));
         image.extend_from_slice(blocks);
         image
+    }
+
+    /// The AX200-era layout, which is what the `ibt-20-1-3` fixtures below use.
+    fn sfi(blocks: &[u8]) -> Vec<u8> {
+        sfi_for(SecureBoot::Rsa, blocks)
+    }
+
+    /// A `CMD_WRITE_BOOT_PARAMS` command carrying `addr`, padded to 4-byte alignment.
+    fn write_boot_params(addr: u32) -> Vec<u8> {
+        let mut b = vec![0x0E, 0xFC, 0x05];
+        b.extend_from_slice(&addr.to_le_bytes());
+        b.push(0x00); // one spare parameter byte, so the command is 8 bytes
+        b
     }
 
     /// One HCI-command-shaped block with `n` parameter bytes.
@@ -534,6 +738,11 @@ mod tests {
         let mut b = vec![0x09, 0xFC, n];
         b.extend(std::iter::repeat_n(0xEE, usize::from(n)));
         b
+    }
+
+    /// A block whose total length is a multiple of four, so it is a fragment on its own.
+    fn aligned_block(words: u8) -> Vec<u8> {
+        command_block(words * 4 + 1)
     }
 
     fn firmware_with(sfi_bytes: Vec<u8>) -> FirmwareSet {
@@ -613,44 +822,112 @@ mod tests {
 
     #[test]
     fn an_sfi_splits_into_header_key_signature_and_payload() {
-        let image = sfi(&command_block(4));
-        let parts = split_sfi(&image, "test").unwrap();
+        let image = sfi(&aligned_block(1));
+        let parts = split_sfi(&image, "test", SecureBoot::Rsa).unwrap();
         assert_eq!(parts.css.len(), 128);
         assert_eq!(parts.public_key.len(), 256);
         assert_eq!(parts.signature.len(), 256);
-        assert_eq!(parts.blocks.len(), 7);
         assert!(parts.css.iter().all(|b| *b == 0xAA));
         assert!(parts.public_key.iter().all(|b| *b == 0xBB));
         assert!(parts.signature.iter().all(|b| *b == 0xCC));
     }
 
     #[test]
+    fn the_rsa_signature_starts_after_the_exponent_not_after_the_modulus() {
+        // The modulus is 256 bytes and is followed by a 4-byte exponent, so the
+        // signature is at 388 and the payload at 644. Reading them at 384 and 640 —
+        // which is what this shipped for months — takes the last four bytes of the
+        // exponent as the first four of the signature, and starts the payload inside
+        // the signature.
+        let layout = SecureBoot::Rsa.layout();
+        assert_eq!(layout.signature.0, 388, "signature offset");
+        assert_eq!(layout.payload, 644, "payload offset");
+        assert_eq!(
+            layout.public_key.0 + layout.public_key.1 + 4,
+            layout.signature.0,
+            "the 4-byte exponent sits between the modulus and the signature"
+        );
+    }
+
+    #[test]
+    fn the_ax210_layout_is_ecdsa_at_the_offsets_the_part_confirmed() {
+        // Every one of these was checked against the bytes the kernel uploaded to a
+        // real AX210 on 2026-08-08 (#229). The A/B that proves it matters: the same
+        // Secure_Send with the CSS taken from 0 is answered 0x1F, and from 644 is
+        // answered 0x00.
+        let layout = SecureBoot::Ecdsa.layout();
+        assert_eq!(layout.css, (644, 128));
+        assert_eq!(layout.public_key, (772, 96));
+        assert_eq!(layout.signature, (868, 96));
+        assert_eq!(layout.payload, 964);
+        // `ibt-0041-0041.sfi` is 713448 bytes and the part was sent 712484 of them.
+        assert_eq!(713_448 - layout.payload, 712_484);
+    }
+
+    #[test]
     fn a_short_image_is_refused_with_the_size_it_needed() {
-        let err = split_sfi(&[0u8; 100], "intel/ibt-20-1-3.sfi").unwrap_err();
+        let err = split_sfi(&[0u8; 100], "intel/ibt-20-1-3.sfi", SecureBoot::Rsa).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("640"), "should name the header size: {msg}");
+        assert!(msg.contains("644"), "should name the header size: {msg}");
+        // An AX210 image is longer, and the message has to say so rather than repeating
+        // the other generation's number.
+        let err = split_sfi(&[0u8; 700], "intel/ibt-0041-0041.sfi", SecureBoot::Ecdsa).unwrap_err();
+        assert!(format!("{err}").contains("964"), "got: {err}");
     }
 
     #[test]
     fn the_payload_is_split_on_hci_command_boundaries() {
         // Fragmenting anywhere else hands the controller half a command. Chunking by a
         // fixed size would do exactly that.
-        let mut payload = command_block(4);
-        payload.extend(command_block(0));
-        payload.extend(command_block(10));
+        let mut payload = command_block(5); // 8 bytes, aligned on its own
+        payload.extend(command_block(9)); // 12 bytes, aligned on its own
         let blocks = split_command_blocks(&payload);
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].len(), 7);
-        assert_eq!(blocks[1].len(), 3);
-        assert_eq!(blocks[2].len(), 13);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].len(), 8);
+        assert_eq!(blocks[1].len(), 12);
+    }
+
+    #[test]
+    fn commands_are_accumulated_until_the_fragment_is_four_byte_aligned() {
+        // The rule that matters, and the one this did not have: a Secure_Send payload
+        // must be a multiple of four. Three 7-byte commands are individually misaligned
+        // and are rejected one at a time; run together they are 21, 14 and finally 28
+        // bytes — so the fourth is where the fragment closes.
+        let payload: Vec<u8> = std::iter::repeat_n(command_block(4), 4).flatten().collect();
+        assert_eq!(payload.len(), 28);
+        let blocks = split_command_blocks(&payload);
+        assert_eq!(blocks.len(), 1, "one fragment, not four");
+        assert_eq!(blocks[0].len(), 28);
+        assert!(
+            blocks.iter().all(|b| b.len() % 4 == 0),
+            "every fragment must be 4-byte aligned"
+        );
+    }
+
+    #[test]
+    fn a_tail_that_never_reaches_alignment_is_dropped_rather_than_sent_misaligned() {
+        // Better to send nothing than to send a fragment the controller will refuse.
+        let payload = command_block(4);
+        assert!(split_command_blocks(&payload).is_empty());
+    }
+
+    #[test]
+    fn the_boot_address_comes_out_of_the_image_and_not_out_of_a_constant() {
+        // 0x00040800 is the AX200's; this AX210's image says 0x00100800, and the two
+        // were the same hardcoded number until the part was asked.
+        let mut payload = command_block(5);
+        payload.extend(write_boot_params(0x0010_0800));
+        assert_eq!(boot_address(&payload), Some(0x0010_0800));
+        assert_eq!(boot_address(&command_block(5)), None);
     }
 
     #[test]
     fn a_trailing_partial_command_is_dropped_rather_than_sent_short() {
-        let mut payload = command_block(2);
+        let mut payload = command_block(5); // 8 bytes: a fragment closes here
         payload.extend_from_slice(&[0x09, 0xFC, 0x40, 0x00]); // claims 64 params, has 1
         let blocks = split_command_blocks(&payload);
         assert_eq!(blocks.len(), 1, "the partial command must not be sent");
+        assert_eq!(blocks[0].len(), 8);
     }
 
     #[tokio::test]
