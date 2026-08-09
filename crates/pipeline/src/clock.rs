@@ -187,19 +187,25 @@ impl MediaClock {
     /// immediately is that [`MediaClock::is_paused`] says so, because that is what holds
     /// the video thread.
     pub fn set_paused(&self, paused: bool) {
+        self.set_paused_at(paused, Instant::now());
+    }
+
+    /// [`MediaClock::set_paused`] with the instant supplied, so the freeze and the
+    /// resume re-anchor are assertable exactly rather than within a wall tolerance.
+    pub fn set_paused_at(&self, paused: bool, at: Instant) {
         let mut state = self.state();
         if state.paused == paused {
             return;
         }
         state.paused = paused;
         if paused {
-            state.frozen = state.running_at(Instant::now());
+            state.frozen = state.running_at(at);
         } else if let Some(position) = state.frozen.take() {
             // Re-anchor as a *presented* position rather than a queued one: the output's
             // buffer was drained by the pause, so there is nothing unheard left to discount.
             state.anchor = Some(Anchor {
                 media: position,
-                at: Instant::now(),
+                at,
                 buffered: false,
             });
         }
@@ -217,10 +223,15 @@ impl MediaClock {
     /// how people find a spot, and resuming has to start from the spot they found rather
     /// than the one they left.
     pub fn seek_to(&self, position: Duration) {
+        self.seek_to_at(position, Instant::now());
+    }
+
+    /// [`MediaClock::seek_to`] with the instant supplied, for exact assertions.
+    pub fn seek_to_at(&self, position: Duration, at: Instant) {
         let mut state = self.state();
         state.anchor = Some(Anchor {
             media: position,
-            at: Instant::now(),
+            at,
             buffered: false,
         });
         if state.paused {
@@ -408,35 +419,30 @@ mod tests {
     /// "missed" and the position readout would show a place the music never reached.
     #[test]
     fn pausing_freezes_the_clock_and_resuming_does_not_replay_the_gap() {
+        // Exact, in chosen instants — this used to sleep 120 ms and hold three wall
+        // tolerances spanning adjacent statements, which is the assertion shape that
+        // missed a 40 ms budget by 10 ms under `nix flake check` in #156.
         let c = MediaClock::new();
-        c.observe_audio(Duration::from_secs(10));
-        let before_pause = c.now().unwrap();
-        c.set_paused(true);
+        let t0 = Instant::now();
+        c.observe_audio_at(Duration::from_secs(10), t0);
+        // 100 ms in, the pause lands: frozen at exactly 9.85 s.
+        c.set_paused_at(true, t0 + Duration::from_millis(100));
         assert!(c.is_paused());
+        let frozen = Duration::from_millis(9_850);
+        assert_eq!(c.now_at(t0 + Duration::from_millis(100)).unwrap(), frozen);
+        // A frozen clock does not advance, however long the pause.
+        assert_eq!(c.now_at(t0 + Duration::from_secs(30)).unwrap(), frozen);
 
-        // Where it actually froze, read once. Not compared against the reading taken
-        // *before* the pause: the clock is still running between those two lines, so the
-        // difference is real elapsed time and asserting them equal would be asserting that
-        // two statements execute at the same instant.
-        let at_pause = c.now().unwrap();
-        assert!(
-            at_pause >= before_pause && at_pause - before_pause < Duration::from_millis(50),
-            "froze at {at_pause:?} from {before_pause:?}"
-        );
-
-        std::thread::sleep(Duration::from_millis(120));
-        assert_eq!(
-            c.now().unwrap(),
-            at_pause,
-            "a frozen clock must not advance"
-        );
-
-        c.set_paused(false);
+        // Resuming half a minute later re-anchors at the frozen position: the pause was
+        // not playback, and there is nothing unheard left to discount.
+        let resumed = t0 + Duration::from_secs(30);
+        c.set_paused_at(false, resumed);
         assert!(!c.is_paused());
-        let after = c.now().unwrap();
-        assert!(
-            after >= at_pause && after < at_pause + Duration::from_millis(60),
-            "resumed at {after:?} from {at_pause:?}: the pause was counted as playback"
+        assert_eq!(c.now_at(resumed).unwrap(), frozen);
+        assert_eq!(
+            c.now_at(resumed + Duration::from_secs(1)).unwrap(),
+            frozen + Duration::from_secs(1),
+            "and it runs again from there"
         );
     }
 
@@ -470,14 +476,11 @@ mod tests {
     #[test]
     fn a_seek_moves_the_clock_where_a_seed_would_not() {
         let c = MediaClock::new();
-        c.observe_audio(Duration::from_secs(10));
-        c.seek_to(Duration::from_secs(600));
-        let now = c.now().unwrap();
-        assert!(
-            now >= Duration::from_secs(600) && now < Duration::from_secs(601),
-            "landed at {now:?}"
-        );
+        let t0 = Instant::now();
+        c.observe_audio_at(Duration::from_secs(10), t0);
+        c.seek_to_at(Duration::from_secs(600), t0);
         // No output lead to discount: the seek threw away everything that was queued.
+        assert_eq!(c.now_at(t0).unwrap(), Duration::from_secs(600));
         assert!(!c.is_hopeless(Duration::from_secs(600)));
     }
 
@@ -496,17 +499,18 @@ mod tests {
         assert_eq!(c.now(), None, "and there is still nothing to report");
 
         // The first thing to arrive is where it freezes, rather than starting it running.
-        c.start_video_master(Duration::from_secs(7));
+        let t0 = Instant::now();
+        c.start_video_master_at(Duration::from_secs(7), t0);
         assert!(c.is_paused());
-        assert_eq!(c.now(), Some(Duration::from_secs(7)));
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(c.now(), Some(Duration::from_secs(7)), "it must not advance");
+        let frozen = Some(Duration::from_secs(7));
+        assert_eq!(c.now_at(t0).unwrap(), Duration::from_secs(7));
+        assert_eq!(c.now_at(t0 + Duration::from_secs(5)), frozen, "held still");
 
-        c.set_paused(false);
-        let after = c.now().unwrap();
-        assert!(
-            after >= Duration::from_secs(7) && after < Duration::from_millis(7_100),
-            "resumed at {after:?} rather than where it was held"
+        c.set_paused_at(false, t0 + Duration::from_secs(5));
+        assert_eq!(
+            c.now_at(t0 + Duration::from_secs(5)),
+            frozen,
+            "resumed where it was held, exactly"
         );
     }
 
