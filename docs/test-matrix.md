@@ -769,8 +769,8 @@ The shared destination every protocol feeds. Measured test counts: `-p pipeline`
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
 | ffmpeg software decode | T1, **skips** | `ffmpeg_decode::tests` under `audio` | silently skips for want of the ffmpeg CLI (§3.3) |
-| URL session: both streams, pacing, seek | **NEVER RUNS** | `tests/media_url_av.rs` (10) | needs `ffmpeg`+`render`; no check has both (§3.1) |
-| Late-frame dropping | T0 | `clock.rs` (2) | runs everywhere |
+| URL session: both streams, pacing, seek | T1, in `checks.test` | `tests/media_url_av.rs` (10) | ran by no check at the audit (§3.1); `ffmpeg`+`render` are default since D55, and `checks.test` puts the ffmpeg CLI on `PATH` under `CASTAWAY_REQUIRE_FFMPEG`, so a skip there is a failure |
+| Late-frame dropping | T0, inputs only | `clock.rs` (2) — `wait_for` and `is_hopeless`, the predicates the drop consults | the dropping itself is `drain_paced` (`ffmpeg_decode.rs`), which no test drives directly: its tally is pinned (`late_drops_are_all_counted_and_the_log_is_paced`) and `media_url_av.rs` asserts its *pacing* (the ±60 ms skew median, #234), but nothing feeds it a hopeless frame and asserts the drop |
 | Two-lane render channel | T0 | `tests/render_channel.rs` (3) | runs in `render-pixels` |
 | wgpu compositor pixels | T1 | `wgpu_compositor::tests` (5) — exact RGBA at sampled coords | **untripwired skip** (§3.3); only sampled coordinates, never a whole frame |
 | Corner radius, crop-vs-stretch | T1 | `wgpu_compositor::tests` (2) | same untripwired skip; one radius value |
@@ -779,7 +779,7 @@ The shared destination every protocol feeds. Measured test counts: `-p pipeline`
 | Winit kiosk window | **T0 only** | `kiosk::tests` (20) with `window: None` | **no test opens a window.** D46: the edge-drag bug "turned out never to have worked… in the one file with no test harness" |
 | Transport strip layout / hit test / capabilities / scrub | **T0, strong** | `transport::tests` (20), `projection::tests` (13) | best-covered surface in the crate; runs by default |
 | Now-playing card | T0 + weak raster | `nowplaying_card::tests` (21) | only pixel check is `assert_ne!` (§3.5) |
-| **Mixer summation & gain** | **T0 signal** | `mixer::tests` (26) — sample-exact `0.25+0.5 → 0.75`, clipping, mute, `tapped == heard` | genuinely signal-level; the strongest audio coverage in the tree |
+| **Mixer summation & gain** | **T0 sample-exact** | `mixer::tests` (26) — `0.25+0.5 → 0.75`, clipping, mute, `tapped == heard` | the arithmetic is excellent, but every fixture is a DC constant (`tone()` is `vec![value; n]`) — no waveform, frequency or correlation anywhere in the module, so by §3.6's own definition this is (b)/(c), **not (d)**, and the mixer's perceptual behaviour is not covered (#234) |
 | Mixer pacing / `OUTPUT_LEAD` | T0 wall-clock **+ T2** | `mixer::tests` (5); `mixer_real_device.rs` (2) in `checks.mixer-vm` | the in-crate five are asserted against a fake whose `frames_played` is **wall-clock derived — correct by construction**; #204's VM is what removes that term. #174/#175/#177 were all found by a human listening, and the VM asserts on the counters that name them |
 | Device-vanish retry (#55) | T0, **half** | `a_box_with_no_device_still_drains_its_sources_in_real_time` | the factory refuses *forever*; **the recovery half has no test**, and #55 asks for exactly that |
 | LDAC / aptX / SBC / ALAC decode | **T0 signal** | `ldac_decode.rs` (11), `audio_decode.rs` (10) | see §4.3 for the per-codec weaknesses |
@@ -787,15 +787,15 @@ The shared destination every protocol feeds. Measured test counts: `-p pipeline`
 | cpal / ALSA / WASAPI backend | **NONE in CI** | — | `audio-out` is **not even compiled** by `nix flake check` on Linux; only the Windows DLL-closure check touches it |
 | `/screenshot.png` | T1, content untested | `tap::tests` (4) | asserts three bytes (§3.5) |
 | fMP4/HLS boxing | **T0, runs by default** | `fmp4`(16), `hls`(8), `cadence`(7), `timeline`(5), `feed`(8) | self-consistency against the test module's own naive `find_box`. **`hls.rs` never calls `push_audio`** |
-| fMP4/HLS vs libavformat | **NEVER RUNS + skip-passes** | `tests/output_stream.rs` (9) | the only reference-parse and the only numeric A/V-sync measurement, dark on both counts |
+| fMP4/HLS vs libavformat | T1, in `checks.test` | `tests/output_stream.rs` (9) | dark on both counts at the audit (`stream`-gated, and skip-passing by design); `stream` is default since D55 and the skips now go through the #182 tripwires, so under `checks.test`'s lavapipe + `CASTAWAY_REQUIRE_GPU`/`_FFMPEG` a missing adapter or encoder fails rather than passes |
 | RGBA→NV12 GPU pass | T1 numeric | `nv12::gpu` (5), ±2/255 | untripwired skip; a pin, not a differential |
-| H.264 encoder, AAC track, stream audio window | **NEVER RUNS** | `encoder`(6), `aac`(4), `audio`(9) | all `stream`-gated; and each self-skips |
-| WebRTC `/remote/` | **NEVER RUNS** | `remote_negotiation.rs` (9) + units (8) | `remote`-gated |
+| H.264 encoder, AAC track, stream audio window | T0/T1, in `checks.test` | `encoder`(6), `aac`(4), `audio`(9) | `stream`-gated at the audit; `stream` is default since D55 so all run in `checks.test`. The `aac` skips go through the #182 ffmpeg tripwire; the `encoder` six do not — "no encoder here, skipping" is untripwired by design, so they still pass without asserting wherever no H.264 encoder opens |
+| WebRTC `/remote/` | T1, in `checks.test` | `remote_negotiation.rs` (9) + units (8) | `remote`-gated at the audit; `remote` is default since D55, and the test needs no GPU (real sockets, the offer/answer path), so it runs in `checks.test` |
 | WebRTC fan-out / touch back | T0, runs | `feed::tests` (8), `input_touch::wire` (10), `remote::tests` (11) | strong; note two `feed` tests assert only "no panic" |
 | Real browser drives `/remote/` | **T4** | `remote_browser.rs` `#[ignore]` | STATUS.md calls it "the test that matters" |
 | Electron browser host | **NEVER RUNS** | `browser_end_to_end.rs` (5) | `electron`-gated **and** `#[ignore]`d |
-| Adblock / scriptlets | **NEVER RUNS** | 14 tests | `electron`-gated |
-| Hardware decode | **NEVER RUNS** | `hwaccel_zero_copy.rs` (3) + units (19) | `hwaccel-clippy` is clippy-only, by design. D3D11VA/DX12 (943 lines) has **no tests at all** (#58, #64) |
+| Adblock / scriptlets | T0, in `checks.test` (13 of 14) | `filterlists`(6), `ubo_scriptlets`(4), `adblock_engine`(3), `filter_subscriptions.rs`(1) | `electron`-gated at the audit; `electron` is default since D55, so the 13 lib units run in `checks.test`. `filter_subscriptions.rs` stays `#[ignore]`d — it needs the network (#183) |
+| Hardware decode | T0/T1, self-skipping | `hwaccel_zero_copy.rs` (3) + units (19) | compiled and run by `checks.test` since D55 (`hwaccel` is default; the clippy-only `hwaccel-clippy` is gone), but the zero-copy tests still self-skip their substance there — the sandbox has no render node for VA-API, and that skip is deliberately untripwired. D3D11VA/DX12 (943 lines) has **no tests at all** (#58, #64) |
 | **`control-display`** | **NONE (vacuous)** | 3 tests | §3.5. Placeholder opcodes, **wrong protocol family** per #21, `serial`/`ddc` are empty feature lists, `app` builds `NullDisplay` unconditionally |
 | **`input-touch` evdev / winuser** | **NONE** | — | both are **empty feature lists with zero lines of code**; all touch arrives via winit. The C6522QT's USB-HID touch has never been met (#65) |
 | Idle-CPU / A/V-sync numbers | **T4 prose** | D49/D50/STATUS.md | "0 jiffies", "5.4% of a core", "10.000 s / 10.005 s" are one-off dev-box measurements. **No `benches/`, no criterion, no `/proc/self/stat` read anywhere** |
