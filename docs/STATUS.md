@@ -503,8 +503,12 @@ iPhone capture is checked in), #80 (the AirPlay video path is built), #81, #83, 
     What remains: *consuming* that declared lead as a target buffer depth instead of
     front-padding's accident (#176), and #79's skew bound, which still wants a
     real-device capture (#150 stopped the false report).
-11. **#177** — browser page audio is unpaced: bursts at multiples of real time, skew in
-    minutes, constant mixer shedding.
+11. **#177 / #278** — the pacing half is resolved (page audio measured at 100.0% real
+    time, `shed=0`, on the b540764 build), and the skew figure now means something: the
+    browser's two timestamps share no origin, so `av_skew_ms` is drift on the session's
+    first pairing (`pipeline::av_skew`, #278) rather than the origin difference the old
+    subtraction reported. Measured live: |skew| ≤ 100 ms held over a session
+    (`browser_end_to_end.rs::av_skew_is_drift_on_one_baseline_not_the_origin_difference`).
 12. **#87** — AVRCP cover art renders for some tracks and not others over Bluetooth.
 
 **Open on a decision.** #82 (should an AirPlay session be controllable from the panel at

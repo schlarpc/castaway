@@ -148,9 +148,13 @@ pub enum FromBrowser {
         width: u32,
         /// Coded height in pixels.
         height: u32,
-        /// Chromium's paint timestamp in seconds, on the same media clock
-        /// [`FromBrowser::Audio::media_time`] uses. `0.0` when the compositor did not
-        /// supply one, which is the case for pages with no media element.
+        /// Chromium's paint timestamp in seconds — the compositor's frame clock, on an
+        /// origin of Chromium's choosing. **Not** the media clock
+        /// [`FromBrowser::Audio::media_time`] is on: the two share a rate, not an
+        /// origin, which is why `av_skew_ms` pairs them through a gauge that removes the
+        /// origin difference rather than subtracting them (#278). `0.0` when the
+        /// compositor did not supply one, which is the case for pages with no media
+        /// element.
         #[serde(default)]
         media_time: f64,
         /// DRM format modifier as a decimal string (Linux). `u64` does not survive JSON
@@ -231,10 +235,13 @@ pub enum FromBrowser {
     },
     /// A block of the page's audio, taken before it reached any sound card.
     ///
-    /// Carries `media_time` because that is what makes A/V sync *measurable*: the frames
-    /// castaway composites carry Chromium's paint timestamp, and both come from the same
-    /// media clock. Without the pair there is a picture and a sound with no stated
-    /// relationship, which is precisely the bug nobody can diagnose from the room.
+    /// Carries `media_time` because that is what makes A/V sync *measurable*: paired
+    /// against the paint timestamps the composited frames carry, drift between the
+    /// page's sound and its pictures becomes a number. The two are **not** on one clock
+    /// — the paint side is the compositor's own origin — so the pairing subtracts the
+    /// session-start offset rather than the raw values (#278). Without the pair there is
+    /// a picture and a sound with no stated relationship, which is precisely the bug
+    /// nobody can diagnose from the room.
     Audio {
         /// The window whose page produced it. Only [`Surface::Page`] audio counts
         /// toward the lip-sync measurement — the clock has no media clock to pair with.

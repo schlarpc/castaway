@@ -20,8 +20,11 @@
 //
 // Every block carries the media element's `currentTime` at capture. That is what makes
 // A/V sync measurable: the frames castaway composites carry Chromium's own paint
-// timestamp, and the two are the same clock. Without this the browser's picture and its
-// sound are two streams with no relationship anyone can inspect.
+// timestamp, and pairing the two turns drift into a number. They are NOT one clock —
+// the paint timestamp is the compositor's, on an origin Chromium chooses — so castaway
+// measures the offset at the first pairing and subtracts it (#278). Without this the
+// browser's picture and its sound are two streams with no relationship anyone can
+// inspect.
 'use strict';
 
 (() => {

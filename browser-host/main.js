@@ -814,6 +814,9 @@ function createWindow(surface, width, height) {
       format: info.pixelFormat === 'rgba' ? 'rgba' : 'bgra',
       width: info.codedSize.width,
       height: info.codedSize.height,
+      // The compositor's frame timestamp (microseconds → seconds), on an origin of
+      // Chromium's choosing — not the media element's clock. castaway pairs it with
+      // the audio tap's `mediaTime` by subtracting the session-start offset (#278).
       mediaTime: info.timestamp ? info.timestamp / 1e6 : 0,
       // Linux: per-plane fds plus a DRM modifier. Windows: one NT handle and no
       // modifier, because the handle describes its own layout.

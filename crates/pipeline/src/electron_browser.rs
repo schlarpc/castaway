@@ -287,29 +287,33 @@ struct Health {
     software_fallback: std::sync::atomic::AtomicBool,
     /// Frames the browser dropped because we were behind.
     drops: AtomicU64,
-    /// The media clock of the most recent audio block, in milliseconds.
-    ///
-    /// Milliseconds-as-integer because it is read from the render thread while the reader
-    /// thread writes it, and an `f64` cannot be atomic. Precision beyond a millisecond is
-    /// not meaningful for lip-sync anyway — the threshold where a viewer notices is tens
-    /// of milliseconds.
-    audio_ms: std::sync::atomic::AtomicI64,
     /// How many audio blocks have been handed to the sink.
     audio_blocks: AtomicU64,
-    /// Video media time minus audio media time, in milliseconds — the lip-sync error.
+    /// The two clocks the browser session has, paired on the reader thread (#278).
     ///
-    /// Positive means the picture is ahead of the sound. Named the same as AirPlay's
-    /// `av_skew_ms` on purpose: it is the same quantity, and a panel with two protocols
-    /// reporting sync differently is a panel nobody can compare.
+    /// Behind a mutex rather than atomics because it is state with history — a baseline
+    /// and a freshness mark — and both message kinds that feed it arrive on the one
+    /// reader thread, so the lock is never contended.
+    skew: Mutex<crate::av_skew::SkewGauge>,
+    /// A/V drift in milliseconds since the session's first audio/paint pairing (#278).
+    ///
+    /// Positive means the picture's clock has gained on the sound's. Named like AirPlay's
+    /// `av_skew_ms` deliberately — but note it is *drift*, not the absolute offset: the
+    /// paint timestamp and the media element's `currentTime` share no origin, so the
+    /// session-start offset is measured and subtracted (see [`crate::av_skew`]). The old
+    /// direct subtraction reported the difference of the two origins — `17455` holding
+    /// constant for 90 s — which is a number about Chromium's clock bookkeeping, not
+    /// about sync.
     av_skew_ms: std::sync::atomic::AtomicI64,
     /// Whether [`Health::av_skew_ms`] has ever been written.
     ///
     /// The atomic defaults to 0, which is indistinguishable from a measured perfect
     /// sync — so "a skew exists" cannot be inferred from its value, and it used to be
     /// inferred from `audio_blocks` instead. That counter moves on widget audio and on
-    /// page audio alike, and a skew is only stored when a *page* paint carrying a media
-    /// time meets a nonzero audio time, so the log asserted `av_skew_ms = 0` for the
-    /// whole life of an audio-only page and for the window before the first such paint.
+    /// page audio alike, and a skew is only stored when the gauge pairs a *page* paint
+    /// carrying a media time with fresh page audio, so the log asserted `av_skew_ms = 0`
+    /// for the whole life of an audio-only page and for the window before the first such
+    /// pairing.
     av_skew_seen: std::sync::atomic::AtomicBool,
     /// Frames imported from descriptors the browser *passed* (`SCM_RIGHTS`, #271).
     scm_frames: AtomicU64,
@@ -673,7 +677,13 @@ impl Electron {
             .map_err(|_| PipelineError::GpuInit(format!("probe {id} went unanswered")))
     }
 
-    /// Lip-sync error in milliseconds: video media time minus audio media time.
+    /// A/V drift in milliseconds since the session's first audio/paint pairing (#278):
+    /// positive when the picture's clock has gained on the sound's.
+    ///
+    /// *Drift*, not the absolute lip-sync offset — the paint timestamp and the media
+    /// element's `currentTime` share no origin, so the offset at the first pairing is
+    /// measured and subtracted (see [`crate::av_skew`]). Zero at the first pairing by
+    /// construction; a session whose clocks both run at real time stays there.
     ///
     /// `None` until a page frame and a page audio block have both carried a media clock,
     /// which for a page with no media element is never — a clock page is not out of sync,
@@ -834,19 +844,20 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             fd_transport,
             planes,
         } => {
-            // The picture's place on the media clock, against which the audio block's
-            // own `media_time` is the lip-sync error. Recorded on every frame because a
-            // skew that only appears under load is the one that matters. Page frames
-            // only: the widget has no media element, and letting a clock frame's zero
-            // into the pair would read as a wild sync excursion.
+            // The paint's timestamp, paired against the page audio's media clock by the
+            // gauge (#278) — *not* subtracted from it directly: the two are on unrelated
+            // origins, and the raw difference was a constant about Chromium's clock
+            // bookkeeping, not about sync. Recorded on every frame because a skew that
+            // only appears under load is the one that matters. Page frames only: the
+            // widget has no media element, and letting a clock frame's zero into the
+            // pair would read as a wild sync excursion. The clock is read here, once, at
+            // the actor boundary; the gauge itself is pure (#208).
             if surface == Surface::Page && media_time > 0.0 {
-                let video_ms = ms(media_time);
-                let audio_ms = health.audio_ms.load(Ordering::Relaxed);
-                if audio_ms != 0 {
-                    health
-                        .av_skew_ms
-                        .store(video_ms - audio_ms, Ordering::Relaxed);
-                    health.av_skew_seen.store(true, Ordering::Relaxed);
+                if let Ok(mut gauge) = health.skew.lock() {
+                    if let Some(skew) = gauge.video(ms(media_time), std::time::Instant::now()) {
+                        health.av_skew_ms.store(skew, Ordering::Relaxed);
+                        health.av_skew_seen.store(true, Ordering::Relaxed);
+                    }
                 }
             }
             trace!(
@@ -987,6 +998,20 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             media_time,
             paused,
         } => {
+            // The lip-sync pair is page audio against page frames; a widget that
+            // somehow made a sound still gets mixed, but must not pollute the clock.
+            // A paused element's clock is not running, so its tail block un-marks the
+            // gauge rather than sitting fresh enough to pair with the paints that
+            // follow (#278).
+            if surface == Surface::Page {
+                if let Ok(mut gauge) = health.skew.lock() {
+                    if paused {
+                        gauge.pause();
+                    } else {
+                        gauge.audio(ms(media_time), std::time::Instant::now());
+                    }
+                }
+            }
             if paused {
                 return;
             }
@@ -994,11 +1019,6 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                 warn!(target: "castaway::browser", "audio block did not decode");
                 return;
             };
-            // The lip-sync pair is page audio against page frames; a widget that
-            // somehow made a sound still gets mixed, but must not pollute the clock.
-            if surface == Surface::Page {
-                health.audio_ms.store(ms(media_time), Ordering::Relaxed);
-            }
             health.audio_blocks.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut guard) = audio.lock() {
                 if let Some(sink) = guard.as_mut() {
@@ -1020,10 +1040,11 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                         samples,
                         channels,
                         sample_rate,
-                        // The page's media clock, carried straight through. This is the
-                        // same clock a paint's `media_time` is on, which is what makes
-                        // the skew in `av_skew_ms` a real measurement rather than a
-                        // comparison of two unrelated timelines.
+                        // The page's media clock, carried straight through. NOT the
+                        // clock a paint's `media_time` is on — that is the compositor's
+                        // own timestamp, on an origin of Chromium's choosing — which is
+                        // why `av_skew_ms` pairs the two through a gauge that removes
+                        // the origin difference rather than subtracting them (#278).
                         pts: std::time::Duration::from_secs_f64(media_time.max(0.0)),
                     };
                     // No gain here any more, and that is the point: the mixer applies the
@@ -1866,6 +1887,18 @@ impl ElectronHost {
         self.electron
             .as_ref()
             .map_or((0, 0), Electron::fd_transport_counts)
+    }
+
+    /// See [`Electron::av_skew_ms`] (#278). `None` with no browser.
+    #[must_use]
+    pub fn av_skew_ms(&self) -> Option<i64> {
+        self.electron.as_ref().and_then(Electron::av_skew_ms)
+    }
+
+    /// See [`Electron::audio_blocks`]. `0` with no browser.
+    #[must_use]
+    pub fn audio_blocks(&self) -> u64 {
+        self.electron.as_ref().map_or(0, Electron::audio_blocks)
     }
 
     /// Stop the browser. Call on the main thread after the kiosk event loop exits.

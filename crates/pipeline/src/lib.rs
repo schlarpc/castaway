@@ -32,6 +32,9 @@ pub mod audio_session;
 /// wherever `ffmpeg-sys-next` is linked.
 #[cfg(feature = "libav-sys")]
 pub mod av;
+/// Lip-sync drift between the browser's two clocks, which share a rate but not an origin
+/// (#278). Pure and always compiled, so its tests run in every build.
+pub mod av_skew;
 pub mod browser;
 // Sample-rate conversion, for outputs that will not take the sender's rate — which is
 // every WASAPI endpoint and no ALSA one. See the module docs for why that asymmetry hid

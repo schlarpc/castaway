@@ -473,6 +473,150 @@ fn page_audio_arrives_as_pcm_with_a_media_clock() {
     host.shutdown();
 }
 
+/// `av_skew_ms` is drift on one baseline, not the difference of two clock origins (#278).
+///
+/// The audio side of the pairing is the media element's `currentTime`; the paint side is
+/// Electron's OSR frame timestamp, on an origin Chromium chooses. The old subtraction
+/// reported the *origin difference* — `av_skew_ms=17455` holding constant for 90 s on a
+/// live session (#177) — a number about clock bookkeeping, not sync. Fixed, a healthy
+/// session must read near zero and stay there, because both clocks run at real time and
+/// the session-start offset is measured and subtracted (`pipeline::av_skew`).
+///
+/// The premises are checked separately from the claim (#236): the page's audio must be
+/// arriving (blocks counted at the mixer's device seam) and its paints must be carrying a
+/// media clock at all (the pairing must produce *a* value) before the value's magnitude
+/// means anything.
+#[test]
+#[ignore = "needs a GPU and an Electron"]
+fn av_skew_is_drift_on_one_baseline_not_the_origin_difference() {
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
+    let Some(mut render) = pipeline::test_gpu::render_loop(640, 480, cmd_rx) else {
+        return;
+    };
+
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mixer = {
+        let counter = Arc::clone(&counter);
+        Arc::new(pipeline::mixer::AudioMixer::new(Arc::new(move || {
+            Box::new(CountingOut(Arc::clone(&counter)))
+        })))
+    };
+
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
+    let electron = Electron::spawn(
+        &electron_path(),
+        &app_dir(),
+        blocker.clone(),
+        Some(&mixer),
+        pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
+    )
+    .expect("browser should start");
+
+    let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
+    let mut host = ElectronHost::new(electron, spec(blocker, Some(mixer)), rx);
+    host.resize(640, 480);
+    let page = format!("file://{}", skew_page().display());
+    tx.send(BrowserCommand::Navigate(page)).unwrap();
+
+    // Premise 1: the page's audio is flowing. Without it there is nothing to pair and
+    // `None` would be the *correct* answer, not a failure of the measurement.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && host.audio_blocks() < 20 {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        host.audio_blocks() >= 20,
+        "only {} audio blocks arrived: the tap is not capturing, so there is no pairing \
+         to measure (this is the premise, not the claim)",
+        host.audio_blocks()
+    );
+
+    // Premise 2: paints carry a media clock and the gauge pairs them. The page repaints
+    // continuously (the animation) while its audio plays, so a session that never
+    // produces a value means the paint timestamps are missing or the pairing is broken.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut skew = None;
+    while Instant::now() < deadline && skew.is_none() {
+        host.pump(&mut render);
+        render.pump();
+        skew = host.av_skew_ms();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let first = skew.expect(
+        "audio flowed but no paint ever paired with it: either Electron supplied no OSR \
+         frame timestamp for a page with a media element, or the gauge never saw the pair",
+    );
+
+    // The claim. The clocks share no origin; before #278 this value was the origin
+    // difference — tens of seconds at minimum, growing with browser uptime. Drift on one
+    // baseline reads near zero, and a quarter second of slack is two orders of magnitude
+    // away from what the defect produced.
+    assert!(
+        first.abs() <= 250,
+        "av_skew_ms={first} on a healthy session: that is an origin difference, not drift"
+    );
+
+    // …and it *stays* near zero: a wrong-origin subtraction can also read small once by
+    // luck, but cannot hold small while both clocks advance. Watch it across five more
+    // seconds of live audio, re-checking the premise that sound kept flowing.
+    let blocks_before = host.audio_blocks();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut worst: i64 = first.abs();
+    while Instant::now() < deadline {
+        host.pump(&mut render);
+        render.pump();
+        if let Some(s) = host.av_skew_ms() {
+            worst = worst.max(s.abs());
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        host.audio_blocks() > blocks_before,
+        "the audio stopped during the observation window; this box could not hold the \
+         premise, so the drift bound was not measured"
+    );
+    assert!(
+        worst <= 250,
+        "av_skew_ms reached {worst} over five seconds of a healthy session: the pairing \
+         is not holding one baseline"
+    );
+    println!(
+        "av_skew_ms: first={first}, worst |skew|={worst} over 5 s, \
+         {} audio blocks",
+        host.audio_blocks()
+    );
+
+    host.shutdown();
+}
+
+/// The skew page: a looping tone *and* a continuous repaint, so both halves of the
+/// pairing — audio blocks and stamped paints — flow for as long as the test watches.
+fn skew_page() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("castaway-av-skew-test.html");
+    std::fs::write(
+        &path,
+        r"<body><div id='spin' style='width:120px;height:120px;background:#08f'></div><script>
+const R=48000,N=R*2,b=new ArrayBuffer(44+N*2),v=new DataView(b);
+const W=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};
+W(0,'RIFF');v.setUint32(4,36+N*2,true);W(8,'WAVEfmt ');v.setUint32(16,16,true);
+v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,R,true);
+v.setUint32(28,R*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+W(36,'data');v.setUint32(40,N*2,true);
+for(let i=0;i<N;i++)v.setInt16(44+i*2,Math.sin(i*2*Math.PI*440/R)*20000,true);
+const a=document.createElement('audio');
+a.src=URL.createObjectURL(new Blob([b],{type:'audio/wav'}));
+a.loop=true;a.autoplay=true;document.body.appendChild(a);a.play();
+let h=0;setInterval(()=>{h=(h+23)%360;
+document.getElementById('spin').style.background='hsl('+h+',80%,50%)'},50);
+</script></body>",
+    )
+    .expect("write the skew test page");
+    path
+}
+
 /// An `AudioOut` that counts the blocks that carried sound. The seam a test uses to see
 /// that samples left the page and reached the panel's one device.
 #[derive(Debug)]
