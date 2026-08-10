@@ -1455,6 +1455,37 @@ pub(crate) mod tests {
         );
     }
 
+    /// The decoder for AirPlay mirroring's audio opens with the `AudioSpecificConfig`
+    /// the session hands over — `proto-airplay`'s `AAC_ELD_CONFIG`, AOT 39 (ER AAC ELD),
+    /// 44.1 kHz, stereo, 480-sample frames (#281).
+    ///
+    /// This is ALAC's decoder-open assertion for the mirror's audio plane: libavcodec
+    /// parses the config at *open* (`decode_audio_specific_config`), so an ffmpeg build
+    /// whose native AAC decoder did not understand ELD would fail here rather than
+    /// after a phone has negotiated a session. What it does not prove is a decoded
+    /// tone: this build's only AAC encoder is the LC-family native one, so a real ELD
+    /// access unit has to come from a capture (see #281's residual). The negative half
+    /// is not hypothetical either — asking that same native encoder for
+    /// `-profile:a aac_eld` produces LC frames behind an ASC whose object type has been
+    /// truncated to 7 (TwinVQ), which is exactly the kind of config this open must
+    /// refuse.
+    #[test]
+    fn aac_eld_opens_with_the_airplay_audio_specific_config() {
+        // The four bytes every mirroring sender uses, verbatim from proto-airplay.
+        let eld_config = [0xf8u8, 0xe8, 0x50, 0x00];
+        assert!(
+            AudioDecoder::new(AudioCodec::Aac, format(44_100, 2), Some(&eld_config)).is_ok(),
+            "the AAC decoder must open with AirPlay's AAC-ELD AudioSpecificConfig"
+        );
+        // AOT 7 (TwinVQ) — the object type ffmpeg's own encoder writes when asked for
+        // ELD — must be refused at open, which is what proves open parses the config.
+        let twinvq_config = [0x3au8, 0x10];
+        assert!(
+            AudioDecoder::new(AudioCodec::Aac, format(44_100, 2), Some(&twinvq_config)).is_err(),
+            "an unsupported audio object type must fail at open, not decode to silence"
+        );
+    }
+
     /// ALAC decodes to the waveform that went in, not merely opens.
     ///
     /// `alac_opens_with_its_magic_cookie_and_not_without_it` proves libavcodec *opens* a
