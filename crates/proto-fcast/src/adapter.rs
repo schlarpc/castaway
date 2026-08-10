@@ -170,6 +170,22 @@ impl FCastReceiver {
     pub fn bound_addr(&self) -> Option<SocketAddr> {
         self.bound.get().copied()
     }
+
+    /// The `fcast://r/…` connection URL to render as a QR code (#248), or `None`
+    /// when v4 is not armed (no identity, so no `fp` to pin, so the QR would be
+    /// pointless). `addresses` are the LAN IPs the panel should advertise —
+    /// loopback and the wildcard bind are the caller's to resolve.
+    #[must_use]
+    pub fn connection_url(&self, addresses: Vec<String>) -> Option<String> {
+        let v4 = self.shared.v4.as_ref()?;
+        crate::connect_url::ConnectionInfo::v4(
+            self.shared.identity.display_name.clone(),
+            addresses,
+            self.port(),
+            v4.identity.fingerprint(),
+        )
+        .to_url()
+    }
 }
 
 impl Shared {

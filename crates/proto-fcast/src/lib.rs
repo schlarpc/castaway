@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod connect_url;
 pub mod control;
 pub mod error;
 pub mod identity;

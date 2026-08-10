@@ -79,6 +79,11 @@ pub mod filterlists;
 pub mod icon;
 #[cfg(feature = "kiosk")]
 pub mod kiosk;
+/// A reusable on-glass QR display component (#248): pure matrix generation plus
+/// a crisp pixel renderer, shared by any screen that needs to put a code on the
+/// panel.
+#[cfg(feature = "render")]
+pub mod qr;
 // The remote-control transport: WebRTC out, contacts back (#18). Always compiled —
 // the player it serves is a string with no dependencies, and only the transport
 // underneath it needs the feature.
