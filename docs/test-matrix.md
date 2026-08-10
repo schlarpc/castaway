@@ -105,13 +105,13 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 
 ## 2. The harness
 
-### The 21 checks
+### The 22 checks
 
-`nix flake check` runs **all 21** checks (23 before D55 collapsed the per-feature
+`nix flake check` runs **all 22** checks (23 before D55 collapsed the per-feature
 ones; `moonlight-bindings` was added after, closing half of #191, then `android-bt`
 opening #225's first slice, `dial-vm` for #202's positive discovery path,
-`android-cast` closing #225's second slice, and `fcast-vm` with #241), on the one system
-this flake now claims — see the structural note below.
+`android-cast` closing #225's second slice, `fcast-vm` with #241, and `fcast-v4-vm`
+with #248), on the one system this flake now claims — see the structural note below.
 
 The count and the table below are the ones `nix eval .#checks.x86_64-linux` gives; they
 had drifted two behind it before 2026-08-09, which is a thing to check when adding a row.
@@ -150,6 +150,7 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `matter-vm` | 2-node; panel from **the real NixOS module**; peer is our own `matter-peer` | T2 | 74m |
 | `gamestream-vm` | 2-node; peer is **real nixpkgs `sunshine`**; neither node runs castaway or the module | **T3** | 71m |
 | `fcast-vm` | 2-node; receiver from **the real NixOS module**; peers are the **real reference terminal sender** (the `fcast-sender-sdk` stack Grayjay embeds, pinned at the fixtures' commit) and **real nixpkgs `fcast-client`** (2024, pre-SDK, implicit v1) — discovery via the SDK's own mDNS browse, then URL casts, transport verbs, playlists, the v4→v3 downgrade (#241) | **T3** | minutes + build |
+| `fcast-v4-vm` | 2-node; receiver announcing v4 from **the real NixOS module**; the **real SDK sender** pins the `fp` off mDNS and runs a genuine TLS 1.3 session, and **FUTO's own `fast` conformance driver** sweeps a 70-case green manifest (a regression in any one fails CI) (#248) | **T3** | minutes + build |
 | `bluetooth-vm` | 1 node, `hci_vhci` + btvirt; peer is **real BlueZ**; receiver launched ad-hoc, **not** via the module | T2 | 75m |
 | `mixer-vm` | 1 node, `snd-dummy` + PipeWire; runs `mixer_real_device.rs` `--include-ignored` against a device clock that is the kernel's, not ours (#204) | T2 | 28s + build |
 | `dial-vm` | 2 nodes; the **whole kiosk** (Electron, wgpu, winit under Xvfb + lavapipe) answering a targeted DIAL M-SEARCH from another host, serving the description it points at, under a USN that does not collide with the DLNA renderer beside it. The counterpart to `integration-vm`, which asserts DIAL's *absence* on a browser-less build (D27) — see §4.4/§4.5 (#202) | T2 | — |
