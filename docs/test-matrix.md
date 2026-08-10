@@ -618,7 +618,7 @@ also unchanged: `dial-vm` runs the code but asserts none of it.
 | Concurrent STA uplink + P2P GO | **NONE / T4** | — | the VM's `wlan0` is associated to nothing; hwsim imposes no interface-combination limits |
 | Driver capability check | **T4, not built** | — | needs a netlink dependency the workspace does not have (#17) |
 | 5 GHz | **T4** | — | `CONFIG_CFG80211_REG_RELAX_NO_IR` is unset on the NixOS kernel, so NO-IR 5 GHz GO is refused. The VM pins 2437 MHz |
-| Windows backend | **NONE** | — | §7.7 open; `main.rs:1623` refuses on non-Linux. The spike lives as a comment on #17 |
+| Windows backend | **N/A — there will not be one** | `proto-miracast/examples/wfd-probe.rs` | §7.7 is answered: Windows refuses to beacon the WFD OUI (`50:6f:9a`) from a third-party process, measured 2026-08-01, so `main.rs`'s refusal on non-Linux is the final behaviour rather than a stub (#17) |
 
 **What hwsim cannot catch, concretely** (this is the boundary #17 is about): no firmware and
 no PHY, so `mt7921`'s `P2P-GROUP-FORMATION-FAILURE`, `brcmfmac`'s firmware gate, and

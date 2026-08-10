@@ -2621,9 +2621,11 @@ supported)` (driver EOPNOTSUPP — try `p2p_no_group_iface=1`); `P2P: Failed to 
 
 ### 7.7 Can a third-party app be a Miracast sink on Windows?
 
-This is the load-bearing question for the deploy target, and the answer is **"not through any
-supported sink API — but probably yes by building the group ourselves."** Three candidate paths,
-in order of how much we'd own:
+This is the load-bearing question for the deploy target, and the answer — **measured on the
+AX211 deploy box on 2026-08-01, not reasoned about** — is **no, by all three paths**. Path (c)
+was the hope and it is refused by the platform; the run and its numbers are in
+`crates/proto-miracast/examples/wfd-probe.rs` and under (c) below. Three candidate paths, in
+order of how much we'd own:
 
 **(a) `WFDStartDisplaySink` — dead.** The Win32 native-WiFi function does exactly what we want:
 *"Makes the PC discoverable / Sets the P2P device info / **Sets the Miracast IEs on all Wi-Fi
@@ -2653,7 +2655,7 @@ Added in Windows 10 1903. The flow is `CreateSession(CoreApplicationView)` → `
 Taking this path also means the Windows slice is a **completely different implementation** from the
 Linux slice — Windows owns the protocol and hands us pixels. That is the opposite of ground rule 5.
 
-**(c) `Windows.Devices.WiFiDirect.WiFiDirectAdvertisement` — the promising one.** Windows 10 10240,
+**(c) `Windows.Devices.WiFiDirect.WiFiDirectAdvertisement` — was the promising one; measured dead.** Windows 10 10240,
 `UniversalApiContract` **v1.0**, far older and broader than the Miracast namespace. It exposes
 **`IsAutonomousGroupOwnerEnabled`** *and* **`InformationElements`**
 (`IVector<WiFiDirectInformationElement>`), plus `ListenStateDiscoverability` and
@@ -2661,12 +2663,42 @@ Linux slice — Windows owns the protocol and hands us pixels. That is the oppos
 inject our own WFD IE + WSC vendor extension on Windows, then run **castaway's own RTSP/RTP sink
 over it — the same architecture as the Linux path**, with no dependency on `Windows.Media.Miracast`.
 
-> **The spike to run first**, before committing to Miracast on Windows: does
-> `WiFiDirectAdvertisementPublisher` work from an **unpackaged Win32 process**, and which manifest
-> capability (`wiFiControl`? `wiFiDirectServices`?) does it require? A day or two of work that
-> determines whether path (c) is real. If it is, the `MiracastBackend` trait has two honest impls
-> and the protocol core is shared. If it isn't, Miracast is Linux-only for this project and the
-> deploy story changes.
+**What the spike found (2026-08-01, AX211 deploy box).** `crates/proto-miracast/examples/wfd-probe.rs`
+is that spike, and it feeds the publisher the bytes [`WfdInformationElement`] produces — the same
+builder `backend_linux` hands to `WFD_SUBELEM_SET` — so the result is evidence about *our* IE and
+not a hand-rolled stand-in.
+
+The half that works is everything except the one thing that matters. An **unpackaged** Win32
+process (`GetCurrentPackageFullName` → `APPMODEL_ERROR_NO_PACKAGE`), with the machine's Location
+consent set to **Deny** and no manifest capability of any kind, stands up an autonomous group
+owner and reaches `Started`. Windows runs DHCP on the group itself (the virtual adapter comes up
+`192.168.137.1/24`), and the station interface stays associated throughout — so STA + P2P GO
+concurrency is real on this radio. No capability question to answer: there was none to grant.
+
+The half that kills it is the information element. Varying one field at a time:
+
+| OUI | OUI type | `Start()` |
+|---|---|---|
+| *(no IE)* | — | `Started` |
+| `02:00:00` (locally administered) | `0x01`, `0x0a` | `Started`, read back byte-intact |
+| `50:6f:9a` (WFA) | `0x09`, `0x0a`, `0x0b` | **`Aborted`** |
+| `00:50:f2` (Microsoft/WSC) | `0x04` | **`Aborted`** |
+
+**The gate is the OUI, not the OUI type**, and the abort arrives carrying
+`WiFiDirectError::Success` — no reason given. Windows reserves the WFA and Microsoft OUIs to its
+own P2P/WPS stack. A Miracast sink is *defined* by beaconing the WFD IE under `50:6F:9A` type
+`0x0A` (§2.1), so we can build the group and we can inject information elements, but never the one
+that makes us a sink. `--no-go` aborts identically, so group ownership is not the trigger.
+
+Two things the spike did **not** establish, both moot for the WFD OUI because it is refused before
+it can be transmitted at all: whether package identity (MSIX) lifts the reservation — untested,
+and the difference between a capability check and a blanket reservation matters if anyone retries
+this; and whether an accepted IE truly reaches the air, since the alt-OUI group never showed a
+`DIRECT-` SSID when scanned from a second machine.
+
+**So Miracast is Linux-only for this project**, and the deploy story changes accordingly (#17).
+The `MiracastBackend` trait keeps its purpose — it is what stops the Linux backend leaking into
+the portable core — but Windows has no honest impl behind it to write.
 
 Note also that the WDDM custom-Miracast-stack model is deprecated and source-side only: *"Driver
 developers should no longer implement a custom Miracast stack. Microsoft might remove support for
@@ -3036,7 +3068,7 @@ Ranked:
 | RTSP/WFD sans-I/O core + parameter types + TS/RTP depacketiser, fixture-tested | **2–4 weeks** | High — bounded, and the fixtures already exist (§8.5) |
 | MS-MICE path (mDNS + 7250 actor + 6 messages + 3 TLVs) | ~1 week | High |
 | Linux Wi-Fi Direct backend (autonomous GO, WPS, DHCP, persistent groups) | **4–8 weeks** | Low — variance is almost entirely hardware |
-| Windows platform story | unknown until the §7.7 spike | Very low |
+| Windows platform story | **settled: no Windows sink.** The §7.7 spike ran 2026-08-01 and the platform refuses the WFD OUI | High — measured, not estimated |
 | Decode robustness (15 s IDR gaps, mid-stream format change, loss recovery) | 1–2 weeks | Medium |
 
 Ranked risks:
@@ -3045,9 +3077,11 @@ Ranked risks:
    driver genuinely supports P2P GO (§7.6), with our own `wpa_supplicant` because NetworkManager
    cannot do it. Add our own DHCP server (GO) — neither NM nor dhcpcd cooperates, which is why both
    MiracleCast and lazycast ship their own.
-2. **The Windows deploy target** (§7.7). Genuinely a "the answer might be no" question, unlike
-   everything else here. **Spike it first** — a day or two of work that determines whether
-   Miracast is cross-platform or Linux-only for this project.
+2. ~~**The Windows deploy target** (§7.7).~~ **Answered, and the answer was no** (2026-08-01).
+   It was the one genuine "the answer might be no" question here, the spike was run first as this
+   said it should be, and Windows refuses to beacon the WFD OUI from any third-party process.
+   Miracast is Linux-only for this project; the risk is retired and the consequence is a deploy
+   decision, not a protocol one (#17).
 3. **Interop long tail.** No conformance oracle exists; §7 is what a decade of community debugging
    produced and it will keep growing. Ground rules 1, 3 and 6 are unusually well matched to this:
    parse-don't-validate at the byte boundary, a sans-I/O core, and fixtures instead of hardware are
@@ -3058,5 +3092,5 @@ Ranked risks:
 MiracleCast's is broken and Android never had it), all `microsoft_*` extensions (answer `none`),
 `wfd2_*`/R2, and hardware cursor.
 
-**Suggested order:** §7.7 spike → sans-I/O core against fixtures → MICE → Linux P2P behind the
+**Suggested order** (the §7.7 spike is done — it came back negative): sans-I/O core against fixtures → MICE → Linux P2P behind the
 trait → integration tests in a `nixosTest` VM against a scripted sender, before any real hardware.
