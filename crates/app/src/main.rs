@@ -435,6 +435,14 @@ fn main() -> anyhow::Result<()> {
             info!("remote control is disabled by config");
             None
         };
+        // The clock, read here at the boundary; `seasonal_accent` itself is pure (#263).
+        // Resolved before `ShellChannels` is handed over, because `serve` rebuilds Home
+        // when FCast learns its pairing URL (#248), and that rebuild must not drop the
+        // season the first paint had.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let season = seasonal_accent(config.theme, now_secs, utc_offset_secs);
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
             #[cfg(feature = "stream")]
@@ -459,6 +467,7 @@ fn main() -> anyhow::Result<()> {
                 events: shell_event_rx,
                 render: render_tx.clone(),
                 settings: settings_catalog,
+                season,
             }),
         };
         runtime.spawn(async move {
@@ -594,12 +603,9 @@ fn main() -> anyhow::Result<()> {
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
-        // The clock, read here at the boundary; `seasonal_accent` itself is pure (#263).
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let season = seasonal_accent(config.theme, now_secs, utc_offset_secs);
-        let attract = build_attract(&config, season);
+        // Built before the runtime has loaded the FCast identity, so it has no QR yet;
+        // `serve` sends a fuller Home the moment it does (#248).
+        let attract = build_attract(&config, season, &HomeState::default());
         // `auto` follows the calendar, so the calendar has to be watched; a forced or
         // plain palette never changes, and gets no task to not-change it with.
         if config.theme == pipeline::theme::ThemeChoice::Auto {
@@ -851,6 +857,10 @@ struct ShellChannels {
     render: pipeline::RenderTx,
     /// What the Settings tile opens: this build's settings, ready to list and apply.
     settings: settings::Catalog,
+    /// The seasonal accent resolved on the main thread at startup (#263), carried so a
+    /// Home rebuilt here keeps the palette the first paint had rather than reverting it
+    /// to plain. The clock is read once, at that boundary; this is the answer.
+    season: Option<pipeline::theme::Season>,
 }
 
 /// The two ways something that is not a media URL gets opened, and the one place that
@@ -1179,14 +1189,20 @@ async fn serve(
             playback.clone(),
         ));
     }
+    // Only the panel reads this back, to draw the pairing QR on the FCast tile.
+    #[cfg_attr(not(feature = "render"), allow(unused_mut, unused_assignments))]
+    let mut fcast_connect_url: Option<String> = None;
     if config.enable.fcast {
-        adapter_handles.push(spawn_fcast(
+        let wiring = spawn_fcast(
             &config,
+            iface,
             &mut mdns,
             event_tx.clone(),
             shutdown.clone(),
             playback.clone(),
-        ));
+        );
+        adapter_handles.push(wiring.task);
+        fcast_connect_url = wiring.connect_url;
     }
     if config.enable.gamestream {
         // The inverted protocol (D37): nothing to advertise, because the panel is the
@@ -1264,8 +1280,25 @@ async fn serve(
         events,
         render,
         settings,
+        season,
     }) = shell
     {
+        // Home was built on the main thread before any of this existed, so anything the
+        // running receiver had to *learn* — the FCast pairing QR, whose payload pins a key
+        // loaded from disk a moment ago — is not on it yet. Rebuild and send it now.
+        //
+        // Sent rather than mutated: `RenderCommand::Home` carries the model and the render
+        // thread draws it at the true surface size (D38), and the stack's `update_home`
+        // refreshes Home without yanking anyone out of a screen they are reading.
+        if fcast_connect_url.is_some() {
+            let home = HomeState {
+                fcast_connect_url: fcast_connect_url.clone(),
+            };
+            if let Some(scene) = build_attract(&config, season, &home) {
+                info!("FCast: the pairing QR is on the service tile");
+                render.send(pipeline::RenderCommand::Home(Box::new(scene)));
+            }
+        }
         let (adapter, commands) = match &gamestream {
             Some((a, c)) => (Some(Arc::clone(a)), c.clone()),
             // A closed sender, so a press on a tile for an adapter that never started
@@ -1823,14 +1856,27 @@ fn spawn_airplay(
     })
 }
 
+/// The FCast listener, and the one fact about it the panel wants back.
+struct FCastWiring {
+    task: tokio::task::JoinHandle<()>,
+    /// The `fcast://r/…` connection URL to draw as a QR on the FCast tile, when v4 is
+    /// announced (#248). `None` otherwise, and the tile is unchanged.
+    connect_url: Option<String>,
+}
+
 /// Stand up the FCast listener and advertise `_fcast._tcp` (#241).
+///
+/// `advertised` is the address the receiver is reachable on — the same one every mDNS
+/// record names — because the QR has to point somewhere a phone can dial, and the
+/// listener itself binds the wildcard.
 fn spawn_fcast(
     config: &Config,
+    advertised: std::net::Ipv4Addr,
     mdns: &mut MdnsResponder,
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
-) -> tokio::task::JoinHandle<()> {
+) -> FCastWiring {
     let receiver = proto_fcast::FCastReceiver::new(config.advertised_name(ProtocolKind::FCast));
     // FCast's `PlaybackUpdate`s carry the position the sender draws in its scrubber,
     // read from the same handle DLNA's `GetPositionInfo` reads. A build with no media
@@ -1857,9 +1903,10 @@ fn spawn_fcast(
         "enabled: FCast (JSON session on 46899; v4 TLS behind [fcast] announce_v4)"
     );
 
+    let connect_url = receiver.connection_url(vec![advertised.to_string()]);
     let sink = SessionSink::new(SourceId::new(ProtocolKind::FCast, "listener"), event_tx);
     let adapter = Arc::new(receiver);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         tokio::select! {
             res = adapter.run(sink) => {
                 if let Err(e) = res {
@@ -1868,7 +1915,8 @@ fn spawn_fcast(
             }
             () = shutdown.notified() => info!("FCast listener stopping"),
         }
-    })
+    });
+    FCastWiring { task, connect_url }
 }
 
 /// Load or create the persisted FCast v4 TLS key (#248).
@@ -2063,6 +2111,26 @@ fn no_renderer() -> axum::response::Response {
 
 /// Build the idle/attract image from the enabled protocols. Rendered at 1920×1080 and
 /// scaled to fill the panel.
+/// What Home shows that the config alone cannot say — facts only the running receiver
+/// knows.
+///
+/// Home is a function of the config *and* of what actually came up, and the two are
+/// learned in different places: the config is read on the main thread before the kiosk
+/// opens, while the FCast v4 identity is loaded on the runtime inside [`serve`], after
+/// the window already exists. Keeping the runtime half in one small struct means Home is
+/// still one pure function of its inputs, and rebuilding it is sending the same function
+/// a fuller argument rather than reaching into a scene that has already been drawn.
+///
+/// `Default` is "nothing has come up yet", which is the honest state at first paint.
+#[cfg(feature = "render")]
+#[derive(Debug, Clone, Default)]
+struct HomeState {
+    /// The `fcast://r/…` connection URL, once FCast is up and announcing v4 (#248).
+    /// `None` keeps the FCast tile exactly as it was — the QR is an addition to the
+    /// service card, not a thing it is missing.
+    fcast_connect_url: Option<String>,
+}
+
 #[cfg(feature = "render")]
 /// The Home screen's model — what the panel shows when nothing is casting.
 ///
@@ -2071,6 +2139,7 @@ fn no_renderer() -> axum::response::Response {
 fn build_attract(
     config: &Config,
     season: Option<pipeline::theme::Season>,
+    home: &HomeState,
 ) -> Option<pipeline::attract::AttractScene> {
     use pipeline::attract::{AttractScene, ServiceDetail, Tile, TileGlyph, WidgetSlot};
 
@@ -2093,7 +2162,12 @@ fn build_attract(
                 headline: headline.to_string(),
                 steps,
                 advertised: Some(advertised(kind)),
-                qr_payload: None,
+                // Only FCast has one to scan today; the service screen draws whatever is
+                // set and leaves the card alone when it is not.
+                qr_payload: match kind {
+                    ProtocolKind::FCast => home.fcast_connect_url.clone(),
+                    _ => None,
+                },
             }),
         };
 
@@ -2188,16 +2262,24 @@ fn build_attract(
         ));
     }
     if config.enable.fcast {
+        // The one tile whose steps change with what came up. With v4 announced there is a
+        // code on the card, and scanning it is a *better* route than the picker — it pins
+        // the receiver's key, where a device found over mDNS is trusted on the network's
+        // word — so the card says so instead of leaving a QR nobody was told to use.
+        let mut steps = vec![
+            "Play something in Grayjay".to_string(),
+            "Tap cast, and pick this screen".to_string(),
+        ];
+        if home.fcast_connect_url.is_some() {
+            steps.push("Or scan the code to connect directly".into());
+        }
         tiles.push(service(
             "fcast",
             "FCast",
             TileGlyph::FCast,
             [0x26, 0xd1, 0xff, 0xff],
             "The cast button in Grayjay.",
-            vec![
-                "Play something in Grayjay".into(),
-                "Tap cast, and pick this screen".into(),
-            ],
+            steps,
             ProtocolKind::FCast,
         ));
     }
@@ -2410,6 +2492,8 @@ fn derive_mac(uuid: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::device_uuid;
+    #[cfg(feature = "render")]
+    use super::{build_attract, HomeState};
 
     /// The date-driven palette, tested at fixed instants (#263): the clock is read at
     /// the call sites, so June is provable in March and — the part the golden-scene
@@ -2658,5 +2742,56 @@ mod tests {
              a shared USN makes one of them invisible to control points that dedupe on \
              it: {shared:?}"
         );
+    }
+
+    /// Home is a function of the config *and* of what came up (#248).
+    ///
+    /// The first paint has no QR, because the FCast identity is loaded on the runtime
+    /// after the window already exists; the rebuild `serve` sends once it has one puts the
+    /// payload on the FCast tile and nowhere else. This is the assertion the "live tile"
+    /// follow-up is about — the screen has always drawn the field, and nothing set it.
+    #[cfg(feature = "render")]
+    #[test]
+    fn the_fcast_tile_takes_its_qr_from_runtime_state() {
+        let config = crate::config::Config::default();
+        let payload = "fcast://r/eyJuYW1lIjoiUGFuZWwifQ==";
+
+        let fresh = build_attract(&config, None, &HomeState::default()).expect("a Home scene");
+        let fcast = |scene: &pipeline::attract::AttractScene| {
+            scene
+                .tiles
+                .iter()
+                .find(|t| t.id == "fcast")
+                .and_then(|t| t.detail.clone())
+                .expect("an FCast service card")
+        };
+        assert_eq!(fcast(&fresh).qr_payload, None, "nothing has come up yet");
+
+        let up = build_attract(
+            &config,
+            None,
+            &HomeState {
+                fcast_connect_url: Some(payload.to_string()),
+            },
+        )
+        .expect("a Home scene");
+        assert_eq!(fcast(&up).qr_payload.as_deref(), Some(payload));
+        assert!(
+            fcast(&up).steps.iter().any(|s| s.contains("scan")),
+            "a code nobody was told to use is furniture: {:?}",
+            fcast(&up).steps
+        );
+
+        // And only that tile: every other service card is untouched by FCast's state.
+        for tile in &up.tiles {
+            if tile.id != "fcast" {
+                assert_eq!(
+                    tile.detail.as_ref().and_then(|d| d.qr_payload.clone()),
+                    None,
+                    "{} grew a QR",
+                    tile.id
+                );
+            }
+        }
     }
 }

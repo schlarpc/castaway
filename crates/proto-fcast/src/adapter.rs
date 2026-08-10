@@ -172,12 +172,19 @@ impl FCastReceiver {
     }
 
     /// The `fcast://r/…` connection URL to render as a QR code (#248), or `None`
-    /// when v4 is not armed (no identity, so no `fp` to pin, so the QR would be
-    /// pointless). `addresses` are the LAN IPs the panel should advertise —
+    /// when v4 is not armed. `addresses` are the LAN IPs the panel should advertise —
     /// loopback and the wildcard bind are the caller's to resolve.
+    ///
+    /// `None` in two cases, and the second is the interesting one. Without an identity
+    /// there is no `fp` to pin, so the QR carries nothing mDNS does not. And with
+    /// `announce = false` the identity exists but v4 never engages — while the document
+    /// says `v=4` unconditionally, which is a *promise*: a sender that reads it refuses
+    /// to fall back to plaintext, and would then meet our `Version {{3}}` hello and give
+    /// up. A QR that cannot be honoured is worse than no QR, so the announce switch
+    /// gates this too.
     #[must_use]
     pub fn connection_url(&self, addresses: Vec<String>) -> Option<String> {
-        let v4 = self.shared.v4.as_ref()?;
+        let v4 = self.shared.v4.as_ref().filter(|v4| v4.announce)?;
         crate::connect_url::ConnectionInfo::v4(
             self.shared.identity.display_name.clone(),
             addresses,
@@ -1182,5 +1189,56 @@ impl SourceAdapter for FCastReceiver {
             async move { serve(shared, stream, peer, sink).await }
         })
         .await {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::identity::V4Identity;
+
+    /// The QR is a promise, and it is only made when it can be kept.
+    ///
+    /// The connection document says `v=4` unconditionally, and a sender that reads one
+    /// refuses to fall back to plaintext. With `announce = false` the receiver still says
+    /// `Version {3}` and greets in JSON, so a QR drawn from it would send a sender into a
+    /// session it has just promised not to accept. Both halves of #248's coupled switch
+    /// are therefore one switch here as well.
+    #[test]
+    fn the_connection_url_follows_the_announce_switch() {
+        let addresses = vec!["10.0.0.5".to_string()];
+
+        // No identity at all: nothing to pin, so the QR would carry nothing mDNS does not.
+        let plain = FCastReceiver::new("Panel");
+        assert_eq!(plain.connection_url(addresses.clone()), None);
+
+        let (identity, _) = V4Identity::generate().unwrap();
+        let carried = FCastReceiver::new("Panel").with_v4(identity, false);
+        assert_eq!(
+            carried.connection_url(addresses.clone()),
+            None,
+            "the identity is carried but v4 never engages"
+        );
+
+        let (identity, _) = V4Identity::generate().unwrap();
+        let fingerprint = identity.fingerprint().to_string();
+        let announced = FCastReceiver::new("Panel").with_v4(identity, true);
+        let url = announced.connection_url(addresses).expect("a QR payload");
+        assert!(url.starts_with("fcast://r/"));
+        let json = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE,
+            url.strip_prefix("fcast://r/").unwrap(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["name"], "Panel");
+        assert_eq!(value["addresses"][0], "10.0.0.5");
+        assert_eq!(value["services"][0]["port"], u64::from(FCAST_PORT));
+        assert_eq!(
+            value["txt"]["fp"], fingerprint,
+            "the QR pins the key that actually answers"
+        );
     }
 }
