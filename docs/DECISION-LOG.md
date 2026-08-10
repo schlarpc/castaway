@@ -2397,3 +2397,53 @@ would have tried a nixosTest on Darwin — and it had been inserted between the 
 `openscreen-device-auth` and the attribute that comment describes. Both moot once Darwin
 is gone; both fixed anyway, because a nixosTest belongs in the nixosTest block and a
 comment belongs above the thing it explains.
+
+### D58 — FCast v4: link the FlatBuffers, own everything else, and couple the announcement to the fingerprint
+
+**2026-08-09.** FCast v4 (#248) is a different protocol wearing v3's name: after the
+plaintext `Version` exchange the TCP connection upgrades **in place to TLS 1.3**, message
+bodies move from JSON opcodes to a FlatBuffers union, and there is a WebRTC mirroring plane
+and an FCompanion resource-transfer plane besides. Three decisions shaped how it landed.
+
+**The FlatBuffers layer is generated, not reimplemented (D30's carve-out).** Rule 9 says
+reimplement a device protocol's wire format, and v1-v3's JSON we do — one struct per
+message, tested against captured transcripts. But the v4 bodies are a FlatBuffers schema,
+and FlatBuffers is a *serialization format library* the way serde_json is: `flatc` over the
+published `.fbs` is a one-time codegen, not a maintenance treadmill, and the schema is the
+spec's own (vendored verbatim at `crates/fcast-flatbuf/schema/fcast.fbs`). So `fcast-flatbuf`
+is a bindings crate in the `ldac-sys`/`moonlight-sys` mould: it carries the generator's
+`unsafe` (buffer accessors behind the verifier) so `proto-fcast` stays `forbid(unsafe_code)`,
+and its output is checked in and drift-checked. At the pinned `flatc` 25.12.19 the output is
+byte-identical to the reference implementation's own codegen — verified once at vendoring.
+The *protocol semantics* over that layer — the session state machine, the relay rules, the
+error kinds, the queue model — are ours, tested three ways (captured transcripts through
+real TLS, in-process loopback, and FUTO's own `fast` conformance driver in a VM).
+
+**The announcement is one switch, because the sender SDK makes it one.** Advertising `v=4`,
+publishing the `fp` fingerprint TXT, and answering the hello with `Version {4}` are not
+three independent knobs: the SDK quits a connection where the fingerprint is present but the
+answer is v3 (it reads that as an insecure downgrade) *and* one where the answer is v4 but
+no fingerprint was learned (it has nothing to pin, so it never sends the ClientHello). Any
+partial combination is worse than plain v3. So `[fcast] announce_v4` flips all three at once,
+and it defaults **off**: announcing moves every SDK sender onto the v4 code paths wholesale
+(playlists become `Load(Queue)`, local files become `fcomp://`), and a v4 that is missing a
+plane regresses a cast that works today over v3. The v4 stack is always *armed* — a sender
+or the conformance driver that says v4 to an un-announced receiver still gets the full TLS
+session — so it is exercised in CI without being the thing a Grayjay user hits.
+
+**The identity persists, which the reference's does not.** The reference regenerates its TLS
+keypair every process start, so its `fp` — and any QR code printed from it — dies with the
+process. Ours writes the key to the state directory and rebuilds a deterministic identity
+from it, degrading to a fresh per-boot key only when that directory is unwritable (the
+reference's behaviour, as the floor rather than the default). A QR code on the wall keeps
+working across a restart. The QR itself is drawn by `pipeline::qr`, abstracted as a reusable
+component the moment it existed because Matter commissioning and the remote-control URL are
+the same shape — a payload a phone scans off the glass, the one channel a network attacker
+cannot tamper with.
+
+**What is deferred, and honestly declared.** WebRTC mirroring is `capabilities.mirroring:
+false` in the introduction until it is built (a real RTP/DTLS-SRTP plane, #248's next stage),
+so no sender attempts it. FCompanion resource transfer (#249) — which is also the seam for
+inline content and auth headers (#251) — is refused typed until the fetch seam lands. A
+receiver that says what it cannot do, and refuses cleanly, beats one that accepts a cast it
+will drop (D32).
