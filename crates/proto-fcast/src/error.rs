@@ -68,4 +68,15 @@ pub enum FCastError {
     /// The peer went silent past the heartbeat deadline ([`crate::session::DEAD_AFTER`]).
     #[error("no traffic for the heartbeat deadline; connection presumed dead")]
     HeartbeatTimeout,
+
+    /// TLS identity or handshake failure on the v4 path (#248).
+    #[error("v4 TLS: {0}")]
+    Tls(String),
+
+    /// A v4 `Flatbuf` body that fails the verifier, or a verified union whose
+    /// required member is absent. Session-fatal, as in the reference receiver —
+    /// unlike an unknown-but-well-formed payload type, which gets a polite
+    /// `Error{{InvalidPayloadType}}` reply.
+    #[error("malformed v4 packet: {0}")]
+    MalformedFlatbuf(String),
 }

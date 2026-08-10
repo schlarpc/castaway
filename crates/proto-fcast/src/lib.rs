@@ -21,6 +21,7 @@
 pub mod adapter;
 pub mod control;
 pub mod error;
+pub mod identity;
 pub mod messages;
 pub mod player;
 pub mod session;
