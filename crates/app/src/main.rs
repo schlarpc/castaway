@@ -83,6 +83,15 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = <Cli as clap::Parser>::parse();
+    // The machine's UTC offset, read here because this is the last moment it can be: a
+    // holiday is a local-date concept (#263) — Halloween starts when it gets dark *here*,
+    // not at an hour picked by the box's longitude — and on unix the offset can only be
+    // read soundly while the process is single-threaded, which stops being true the
+    // moment the runtime is built. A box that will not say (no tz database, exotic
+    // container) decorates on UTC dates, which is what it did before it was asked.
+    #[cfg(feature = "render")]
+    let utc_offset_secs: i32 =
+        time::UtcOffset::current_local_offset().map_or(0, time::UtcOffset::whole_seconds);
     // Resolved once, and handed to both the loader and the settings store: the file the
     // screen saves settings into is by construction the file the next boot reads.
     let location = config::ConfigLocation::from_cli(cli.config);
@@ -585,7 +594,24 @@ fn main() -> anyhow::Result<()> {
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
-        let attract = build_attract(&config);
+        // The clock, read here at the boundary; `seasonal_accent` itself is pure (#263).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let season = seasonal_accent(config.theme, now_secs, utc_offset_secs);
+        let attract = build_attract(&config, season);
+        // `auto` follows the calendar, so the calendar has to be watched; a forced or
+        // plain palette never changes, and gets no task to not-change it with.
+        if config.theme == pipeline::theme::ThemeChoice::Auto {
+            if let Some(scene) = attract.clone() {
+                runtime.spawn(seasonal_rollover(
+                    config.theme,
+                    utc_offset_secs,
+                    scene,
+                    render_tx.clone(),
+                ));
+            }
+        }
         // No size here on purpose: the controller rasterizes each banner for whatever the
         // surface measures at the time, so it follows the panel and any resize.
         let osd_controller = OsdController::new(osd_rx);
@@ -1967,7 +1993,10 @@ fn no_renderer() -> axum::response::Response {
 ///
 /// Returns the *scene*, not pixels: the render thread draws it at the true surface size,
 /// so the panel is no longer handed a 3840x2160 bitmap to stretch (D38).
-fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
+fn build_attract(
+    config: &Config,
+    season: Option<pipeline::theme::Season>,
+) -> Option<pipeline::attract::AttractScene> {
     use pipeline::attract::{AttractScene, ServiceDetail, Tile, TileGlyph, WidgetSlot};
 
     let name = &config.friendly_name;
@@ -2143,34 +2172,50 @@ fn build_attract(config: &Config) -> Option<pipeline::attract::AttractScene> {
             config.http_base_url().replace("http://", "")
         ),
         widget,
-        // What today is, asked once at build time rather than baked: the panel is up for
-        // weeks, so the screen has to be able to change season without a restart — which
-        // it does, because Home is rebuilt whenever the receiver's state changes.
-        season: seasonal_accent(config.theme),
+        // What today is, resolved by the caller at the boundary and passed in: once at
+        // startup, and again by `seasonal_rollover` at each local midnight — the panel
+        // is up for weeks, so the screen has to enter and leave June without a restart.
+        season,
         mascot: true,
     };
     Some(scene)
 }
 
-/// What season it is, from the wall clock (#24). Only where there is a screen to
-/// decorate.
+/// What season `choice` puts on the screen at `now_unix_secs`, on the machine's own
+/// calendar (#24, #263). Only where there is a screen to decorate.
 ///
-/// Wall clock rather than a config flag: nobody is going to remember to turn Pride on in
-/// June and off in July, and a decoration that needs an edit is a decoration that never
-/// appears.
+/// The calendar rather than only a config flag: nobody is going to remember to turn
+/// Pride on in June and off in July, and a decoration that needs an edit is a decoration
+/// that never appears.
+///
+/// Pure on purpose — the clock is read at the call sites (startup, and the rollover
+/// task's wake), never in here, so June is testable in March.
 #[cfg(feature = "render")]
-fn seasonal_accent(choice: pipeline::theme::ThemeChoice) -> Option<pipeline::theme::Season> {
-    use std::time::{SystemTime, UNIX_EPOCH};
+fn seasonal_accent(
+    choice: pipeline::theme::ThemeChoice,
+    now_unix_secs: u64,
+    utc_offset_secs: i32,
+) -> Option<pipeline::theme::Season> {
     // A forced choice needs no calendar, which also means a clock this box cannot read
     // does not stop someone asking for a palette outright.
     if let Some(forced) = choice.forced() {
         return Some(forced);
     }
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    // Civil date from a Unix timestamp, Howard Hinnant's algorithm. A date crate for
-    // three lines of arithmetic that never has to handle a timezone is not worth the
-    // dependency — the panel's seasons are day-grained and it is on UTC.
-    let days = i64::try_from(secs / 86_400).ok()?;
+    let (month, day) = local_civil_date(now_unix_secs, utc_offset_secs)?;
+    choice.resolve(month, day)
+}
+
+/// The local `(month, day)` of a Unix instant, given the machine's UTC offset.
+///
+/// Civil date by Howard Hinnant's algorithm. A date crate for a page of arithmetic is
+/// not worth the dependency — the panel's seasons are day-grained, and the one genuinely
+/// hard part (what the offset *is*) is read from the OS once, at the top of `main`.
+#[cfg(feature = "render")]
+fn local_civil_date(unix_secs: u64, utc_offset_secs: i32) -> Option<(u32, u32)> {
+    let local = i64::try_from(unix_secs)
+        .ok()?
+        .checked_add(i64::from(utc_offset_secs))?;
+    let days = local.div_euclid(86_400);
     let z = days + 719_468;
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -2178,7 +2223,69 @@ fn seasonal_accent(choice: pipeline::theme::ThemeChoice) -> Option<pipeline::the
     let mp = (5 * doy + 2) / 153;
     let day = u32::try_from(doy - (153 * mp + 2) / 5 + 1).ok()?;
     let month = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).ok()?;
-    choice.resolve(month, day)
+    Some((month, day))
+}
+
+/// Seconds from `now` until just past the next *local* midnight — the moment the
+/// seasonal palette can change (#263).
+///
+/// A minute past rather than on the stroke, so a clock that is seconds out does not wake
+/// the task on the wrong side of the boundary and make it sleep a whole day with
+/// yesterday's palette up.
+#[cfg(feature = "render")]
+fn secs_until_next_local_midnight(now_unix_secs: u64, utc_offset_secs: i32) -> u64 {
+    let local = i64::try_from(now_unix_secs)
+        .unwrap_or(0)
+        .saturating_add(i64::from(utc_offset_secs));
+    let into_day = local.rem_euclid(86_400);
+    // rem_euclid is in 0..86_400, so this is in 60..=86_460 and the cast cannot lose.
+    u64::try_from(86_400 - into_day + 60).unwrap_or(86_460)
+}
+
+/// Re-send the Home scene whenever the local date rolls the season over (#263).
+///
+/// The panel is up for weeks, so the screen has to enter and leave June without a
+/// restart. Sleeps to just past each local midnight and re-resolves; only a change is
+/// sent, so an ordinary Tuesday costs one comparison a day. Runs only for `auto` — a
+/// forced palette has nothing to roll over to.
+///
+/// The startup UTC offset is carried as the fallback: a DST change mid-uptime moves
+/// local midnight, and where the OS will answer a threaded process (Windows will, unix
+/// soundly refuses) the fresh offset is used; elsewhere the palette flips within an hour
+/// of the boundary instead, which for a day-grained decoration is close enough.
+#[cfg(feature = "render")]
+async fn seasonal_rollover(
+    choice: pipeline::theme::ThemeChoice,
+    startup_offset_secs: i32,
+    mut scene: pipeline::attract::AttractScene,
+    render: pipeline::RenderTx,
+) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    let offset = || {
+        time::UtcOffset::current_local_offset()
+            .map_or(startup_offset_secs, time::UtcOffset::whole_seconds)
+    };
+    let mut worn = scene.season;
+    loop {
+        let wait = secs_until_next_local_midnight(now_secs(), offset());
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        let season = seasonal_accent(choice, now_secs(), offset());
+        if season != worn {
+            info!(
+                from = worn.map_or("plain", pipeline::theme::Season::name),
+                to = season.map_or("plain", pipeline::theme::Season::name),
+                "theme: the season changed overnight"
+            );
+            worn = season;
+            scene.season = season;
+            render.send(pipeline::RenderCommand::Home(Box::new(scene.clone())));
+        }
+    }
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).
@@ -2213,6 +2320,103 @@ fn derive_mac(uuid: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::device_uuid;
+
+    /// The date-driven palette, tested at fixed instants (#263): the clock is read at
+    /// the call sites, so June is provable in March and — the part the golden-scene
+    /// suite leans on — an ordinary date is provably plain.
+    #[cfg(feature = "render")]
+    mod seasonal {
+        use super::super::{local_civil_date, seasonal_accent, secs_until_next_local_midnight};
+        use pipeline::theme::{Season, ThemeChoice};
+
+        /// 2026-08-09 12:00:00 UTC — an ordinary day in an ordinary week.
+        const ORDINARY: u64 = 1_786_276_800;
+        /// 2026-06-15 12:00:00 UTC — the middle of Pride.
+        const MID_JUNE: u64 = 1_781_524_800;
+        /// 2026-05-31 23:30:00 UTC — before June in London, inside it in Berlin.
+        const LATE_MAY_UTC: u64 = 1_780_270_200;
+        /// 2026-06-01 02:00:00 UTC — inside June in London, still May in Seattle.
+        const EARLY_JUNE_UTC: u64 = 1_780_279_200;
+        /// 2026-12-25 12:00:00 UTC — Christmas Day.
+        const CHRISTMAS: u64 = 1_798_200_000;
+
+        #[test]
+        fn an_ordinary_date_resolves_to_the_base_palette() {
+            // The contract the golden scenes rest on: `auto` on a normal day is `None`,
+            // which is the panel's own dark ramp, byte for byte. If this fails, the
+            // composited goldens are about to change without anyone choosing to.
+            assert_eq!(seasonal_accent(ThemeChoice::Auto, ORDINARY, 0), None);
+            assert_eq!(seasonal_accent(ThemeChoice::Auto, ORDINARY, -25_200), None);
+            assert_eq!(seasonal_accent(ThemeChoice::Auto, ORDINARY, 7_200), None);
+        }
+
+        #[test]
+        fn the_calendar_seasons_arrive_on_schedule() {
+            assert_eq!(
+                seasonal_accent(ThemeChoice::Auto, MID_JUNE, 0),
+                Some(Season::Pride)
+            );
+            assert_eq!(
+                seasonal_accent(ThemeChoice::Auto, CHRISTMAS, 0),
+                Some(Season::Christmas)
+            );
+        }
+
+        #[test]
+        fn a_holiday_lands_on_the_local_date_not_the_utc_one() {
+            // 23:30 UTC on 31 May: Berlin (UTC+2) is already an hour into June.
+            assert_eq!(seasonal_accent(ThemeChoice::Auto, LATE_MAY_UTC, 0), None);
+            assert_eq!(
+                seasonal_accent(ThemeChoice::Auto, LATE_MAY_UTC, 7_200),
+                Some(Season::Pride)
+            );
+            // 02:00 UTC on 1 June: Seattle (UTC-7) still has hours of May left.
+            assert_eq!(
+                seasonal_accent(ThemeChoice::Auto, EARLY_JUNE_UTC, 0),
+                Some(Season::Pride)
+            );
+            assert_eq!(
+                seasonal_accent(ThemeChoice::Auto, EARLY_JUNE_UTC, -25_200),
+                None
+            );
+        }
+
+        #[test]
+        fn a_forced_choice_needs_no_clock_and_plain_refuses_one() {
+            // Halloween in June, because the config said so...
+            assert_eq!(
+                seasonal_accent(ThemeChoice::Halloween, MID_JUNE, 0),
+                Some(Season::Halloween)
+            );
+            // ...and plain in June, for the photograph.
+            assert_eq!(seasonal_accent(ThemeChoice::Plain, MID_JUNE, 0), None);
+        }
+
+        #[test]
+        fn the_civil_date_arithmetic_agrees_with_the_calendar() {
+            assert_eq!(local_civil_date(MID_JUNE, 0), Some((6, 15)));
+            assert_eq!(local_civil_date(ORDINARY, 0), Some((8, 9)));
+            // The offset crosses a month boundary in both directions.
+            assert_eq!(local_civil_date(LATE_MAY_UTC, 7_200), Some((6, 1)));
+            assert_eq!(local_civil_date(EARLY_JUNE_UTC, -25_200), Some((5, 31)));
+        }
+
+        #[test]
+        fn the_rollover_sleeps_to_just_past_local_midnight() {
+            // 2026-08-09 23:00:00 UTC. On UTC, midnight is an hour out; the task wakes
+            // sixty seconds past it so a slightly-slow clock cannot strand it on the
+            // wrong side of the boundary for a day.
+            let eleven_pm_utc: u64 = 1_786_316_400;
+            assert_eq!(secs_until_next_local_midnight(eleven_pm_utc, 0), 3_660);
+            // In Seattle it is 16:00 — eight hours and a minute to local midnight.
+            assert_eq!(
+                secs_until_next_local_midnight(eleven_pm_utc, -25_200),
+                28_860
+            );
+            // Exactly on midnight, the whole day (plus the margin) lies ahead.
+            assert_eq!(secs_until_next_local_midnight(86_400, 0), 86_460);
+        }
+    }
 
     /// The page at `/` names the box, says what is on, and omits what is off —
     /// with the operator's name HTML-escaped on its way into markup.

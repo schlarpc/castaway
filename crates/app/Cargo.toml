@@ -55,6 +55,11 @@ toml = "0.8"
 toml_edit = "0.22"
 uuid.workspace = true
 url.workspace = true
+# `local-offset` because a holiday is a local-date concept (#263): the seasonal palette
+# turns on Halloween evening, not at whatever UTC hour the box's offset makes of it. The
+# offset is read once at the top of `main`, while the process is still single-threaded —
+# on unix the crate (soundly) refuses to read it after threads exist.
+time = { workspace = true, features = ["local-offset"] }
 
 
 # The unix half of the single-instance guard (#100). `flock` rather than a PID file so

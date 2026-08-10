@@ -950,6 +950,7 @@ dependencies = [
  "substrate-mdns",
  "substrate-ssdp",
  "thiserror 2.0.19",
+ "time",
  "tokio",
  "toml 0.8.23",
  "toml_edit 0.22.27",
