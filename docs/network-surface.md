@@ -26,7 +26,8 @@
 | 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (#45) | plaintext | enable.miracast | spec |
 | 5550 | udp | matter | User Directed Commissioning: a phone's IdentificationDeclaration, answered with a CommissionerDeclaration to the port it names | plaintext and unauthenticated by construction — UDC runs before any session exists, and what protects it is that the passcode it leads to is on the panel's own screen | enable.matter | spec |
 | 5540 | udp | matter | the Matter operational node: PASE and CASE, then the interaction model carrying ContentLauncher / MediaPlayback / ApplicationBasic | AES-CCM under a CASE session; the fabric's root of trust is a certificate authority this panel generates and keeps | enable.matter | spec |
-| 46899 | tcp | fcast | FCast v1-v3: length-prefixed JSON — play/pause/seek/volume in, playback updates out | plaintext, unauthenticated — the protocol adds TLS only in v4, which this receiver declines (#248) | enable.fcast | convention |
+| 46899 | tcp | fcast | FCast v1-v4 on one socket: length-prefixed JSON, or — when `[fcast] announce_v4` is set — a TLS 1.3 upgrade in place after the plaintext Version exchange, then FlatBuffers | plaintext and unauthenticated at v1-v3; at v4, TLS 1.3 with a self-signed certificate the sender pins by SPKI SHA-256 from the `fp` TXT record or the on-screen QR (#248) | enable.fcast | convention |
+| 41032–41063 (`[remote.ice_ports]`) | udp | fcast | WebRTC: SRTP carrying a v4 sender's screen (H.264 or VP8) and its sound (Opus) — inbound media, no track of ours goes back | DTLS-SRTP over a connection whose offer arrived on the already-authenticated v4 control session; host candidates only, so nothing off the LAN can pair | enable.fcast | ours |
 
 **Chosen by** answers "could we move this port?", in three tiers:
 
@@ -53,6 +54,7 @@ Notes, per listener that has one:
 - **5550/udp (matter)** — binds 0.0.0.0. Five identical datagrams arrive per request, 100 ms apart, because the message has no acknowledgement. The reply goes to the cdPort the client names, which is this same number by default but is the client's to choose.
 - **5540/udp (matter)** — binds 0.0.0.0. Both roles run on this one socket, which is what Matter Casting being inverted costs: the panel commissions the phone over it, and then serves the phone's cluster invokes back over it.
 - **46899/tcp (fcast)** — binds 0.0.0.0. Every published sender dials 46899 regardless of the SRV record's port, so the number is effectively fixed. 46898, the WebSocket variant some receiver builds add for browser senders, is not bound.
+- **41032–41063 (`[remote.ice_ports]`)/udp (fcast)** — binds the serving interface and loopback, one socket each per session. The same `[remote.ice_ports]` range the remote-control page's peers use, and the same *allocator*: one range with two pools would hand the same port to both and the second bind would fail when a real sender connected. One mirroring session at a time, so one port (#248).
 
 ## Multicast groups
 

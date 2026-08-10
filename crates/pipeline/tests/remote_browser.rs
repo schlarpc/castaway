@@ -340,7 +340,7 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
     let input = Arc::new(RemoteInputQueue::new(castaway_core::Waker::new()));
     let service = RemoteService::new(
         RemoteConfig {
-            ice_ports: ICE_PORTS,
+            ice_ports: Arc::new(pipeline::ice_ports::PortPool::new(ICE_PORTS.0, ICE_PORTS.1)),
             bind_ips: bind_ips(),
             accept_input: true,
         },

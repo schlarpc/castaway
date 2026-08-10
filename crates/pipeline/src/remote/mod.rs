@@ -43,11 +43,7 @@ pub mod page;
 pub use page::PLAYER;
 
 #[cfg(feature = "remote")]
-mod ports;
-#[cfg(feature = "remote")]
 mod service;
 
-#[cfg(feature = "remote")]
-pub use ports::PortPool;
 #[cfg(feature = "remote")]
 pub use service::{RemoteConfig, RemoteService};

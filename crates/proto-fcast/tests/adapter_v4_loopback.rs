@@ -24,21 +24,98 @@ use tokio::sync::mpsc;
 const DEADLINE: Duration = Duration::from_secs(5);
 
 async fn started() -> (std::net::SocketAddr, mpsc::Receiver<SourceMessage>, String) {
+    started_with(None).await
+}
+
+async fn started_with(
+    mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
+) -> (std::net::SocketAddr, mpsc::Receiver<SourceMessage>, String) {
     let (tx, rx) = mpsc::channel(32);
     let sink = SessionSink::new(SourceId::new(ProtocolKind::FCast, "test"), tx);
     let (identity, _key) = V4Identity::generate().unwrap();
     let fingerprint = identity.fingerprint().to_string();
-    let receiver = Arc::new(
-        FCastReceiver::new("Test Panel")
-            .with_listen(([127, 0, 0, 1], 0).into())
-            .with_v4(identity, true),
-    );
+    let receiver = FCastReceiver::new("Test Panel")
+        .with_listen(([127, 0, 0, 1], 0).into())
+        .with_v4(identity, true);
+    let receiver = Arc::new(match mirror {
+        Some(backend) => receiver.with_mirroring(backend),
+        None => receiver,
+    });
     let adapter = Arc::clone(&receiver);
     tokio::spawn(async move {
         let _ = adapter.run(sink).await;
     });
     let addr = eventually("the listener to bind", || receiver.bound_addr()).await;
     (addr, rx, fingerprint)
+}
+
+/// A mirroring plane that answers instantly and remembers what it was asked.
+///
+/// The real one is a DTLS handshake and an ICE gather over UDP sockets, which
+/// `pipeline`'s own tests exercise; what this file is for is the *protocol* half — that
+/// the offer reaches the backend unmangled, that the answer goes back on the same session
+/// id, and that the frames become a `Mirror` the session manager can act on.
+#[derive(Debug, Default)]
+struct FakeMirror {
+    /// Every offer this backend was handed, in order.
+    offers: std::sync::Mutex<Vec<String>>,
+    /// Kept alive so the emitted `FrameSource` is an *open* channel: a dropped sender
+    /// would close it, and "the sender hung up immediately" is a different session.
+    senders: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<castaway_core::EncodedFrame>>>,
+}
+
+const FAKE_ANSWER_SDP: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n";
+
+#[async_trait::async_trait]
+impl castaway_core::MirrorBackend for FakeMirror {
+    async fn answer(
+        &self,
+        offer_sdp: &str,
+    ) -> Result<castaway_core::MirrorAnswer, castaway_core::CoreError> {
+        self.offers.lock().unwrap().push(offer_sdp.to_owned());
+        let (video_tx, video_rx) = tokio::sync::mpsc::channel(4);
+        self.senders.lock().unwrap().push(video_tx);
+        Ok(castaway_core::MirrorAnswer {
+            sdp: FAKE_ANSWER_SDP.to_owned(),
+            video: castaway_core::FrameSource::Encoded(video_rx),
+            audio: None,
+        })
+    }
+}
+
+/// A backend that cannot answer — a box whose ICE range is exhausted, or one with no
+/// runtime to drive a peer connection.
+#[derive(Debug)]
+struct BrokenMirror;
+
+#[async_trait::async_trait]
+impl castaway_core::MirrorBackend for BrokenMirror {
+    async fn answer(
+        &self,
+        _offer_sdp: &str,
+    ) -> Result<castaway_core::MirrorAnswer, castaway_core::CoreError> {
+        Err(castaway_core::CoreError::Pipeline(
+            "every mirroring port is in use".into(),
+        ))
+    }
+}
+
+fn start_mirroring_frame(session_id: u16) -> Frame {
+    let mut b = fcast_flatbuf::FlatBufferBuilder::new();
+    let start = flat::StartMirroringSession::create(
+        &mut b,
+        &flat::StartMirroringSessionArgs { session_id },
+    )
+    .as_union_value();
+    let packet = flat::Packet::create(
+        &mut b,
+        &flat::PacketArgs {
+            payload_type: flat::Message::StartMirroringSession,
+            payload: Some(start),
+        },
+    );
+    b.finish(packet, None);
+    Frame::with_body(Opcode::Flatbuf, b.finished_data().to_vec())
 }
 
 /// A rustls verifier with the sender SDK's shape: pin the SPKI digest, verify
@@ -312,4 +389,135 @@ async fn a_v3_sender_still_runs_json_beside_v4() {
             break;
         }
     }
+}
+
+/// The mirroring round trip (#248): the sender's offer reaches the media plane, the
+/// answer comes back on the same session id, and the frames become a `Mirror`.
+///
+/// The capability is asserted first and is the load-bearing half: a receiver that says
+/// `mirroring: true` and then answers `InvalidState` is worse than one that says false,
+/// because the sender has already told somebody it is casting.
+#[tokio::test]
+async fn a_v4_sender_offers_a_mirror_and_is_answered() {
+    let backend = Arc::new(FakeMirror::default());
+    let (addr, mut rx, _fp) = started_with(Some(
+        Arc::clone(&backend) as Arc<dyn castaway_core::MirrorBackend>
+    ))
+    .await;
+
+    let mut sender = V4Sender::connect(addr).await;
+    let intro = sender
+        .expect_payload(flat::Message::ReceiverIntroduction)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&intro).unwrap();
+    assert!(
+        packet
+            .payload_as_receiver_introduction()
+            .unwrap()
+            .capabilities()
+            .unwrap()
+            .media()
+            .unwrap()
+            .mirroring(),
+        "a receiver with a media plane says so"
+    );
+
+    let offer =
+        "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\n";
+    sender.send(&start_mirroring_frame(7)).await;
+    sender.send(&v4msg::mirroring_answer_frame(7, offer)).await;
+
+    let body = sender
+        .expect_payload(flat::Message::MirroringSessionDescription)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&body).unwrap();
+    let description = packet.payload_as_mirroring_session_description().unwrap();
+    assert_eq!(
+        description.session_id(),
+        7,
+        "the answer names the session the sender opened"
+    );
+    assert_eq!(description.sdp(), FAKE_ANSWER_SDP);
+
+    // The offer reached the plane byte for byte: an SDP that lost its CRLFs or gained a
+    // trailing newline is one no peer will parse.
+    assert_eq!(
+        backend.offers.lock().unwrap().as_slice(),
+        [offer.to_owned()]
+    );
+
+    // …and the panel is taking the screen for it.
+    loop {
+        match next_event(&mut rx).await {
+            SessionEvent::Mirror { video, audio } => {
+                assert!(audio.is_none(), "this offer had no audio section");
+                assert!(matches!(video, castaway_core::FrameSource::Encoded(_)));
+                break;
+            }
+            SessionEvent::SourceInfo(_) | SessionEvent::NowPlaying(_) => {}
+            other => panic!("unexpected event before Mirror: {other:?}"),
+        }
+    }
+}
+
+/// Without a media plane the receiver says `mirroring: false` and refuses typed —
+/// the state this shipped in, and the one a headless build is still in.
+///
+/// Refused rather than ignored, and the session survives: a sender left waiting for an
+/// answer SDP that never comes has nothing to show and nothing to say.
+#[tokio::test]
+async fn mirroring_is_refused_typed_when_there_is_no_media_plane() {
+    let (addr, _rx, _fp) = started().await;
+    let mut sender = V4Sender::connect(addr).await;
+    let intro = sender
+        .expect_payload(flat::Message::ReceiverIntroduction)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&intro).unwrap();
+    assert!(!packet
+        .payload_as_receiver_introduction()
+        .unwrap()
+        .capabilities()
+        .unwrap()
+        .media()
+        .unwrap()
+        .mirroring());
+
+    sender.send(&start_mirroring_frame(3)).await;
+    let body = sender.expect_payload(flat::Message::Error).await;
+    let packet = fcast_flatbuf::root_as_packet(&body).unwrap();
+    assert_eq!(
+        packet.payload_as_error().unwrap().kind(),
+        flat::ErrorKind::InvalidState
+    );
+
+    // The session lives: an ordinary load still works afterwards.
+    sender.send(&load_single_frame("http://h/after.mp4")).await;
+    sender
+        .expect_payload(flat::Message::PlaybackStateChanged)
+        .await;
+}
+
+/// A plane that cannot answer says so, rather than dropping the offer on the floor.
+#[tokio::test]
+async fn a_backend_that_cannot_answer_is_reported_to_the_sender() {
+    let (addr, _rx, _fp) = started_with(Some(
+        Arc::new(BrokenMirror) as Arc<dyn castaway_core::MirrorBackend>
+    ))
+    .await;
+    let mut sender = V4Sender::connect(addr).await;
+    sender
+        .expect_payload(flat::Message::ReceiverIntroduction)
+        .await;
+
+    sender.send(&start_mirroring_frame(1)).await;
+    sender
+        .send(&v4msg::mirroring_answer_frame(1, "v=0\r\n"))
+        .await;
+    let body = sender.expect_payload(flat::Message::Error).await;
+    let packet = fcast_flatbuf::root_as_packet(&body).unwrap();
+    assert_eq!(
+        packet.payload_as_error().unwrap().kind(),
+        flat::ErrorKind::Internal,
+        "the sender is told the receiver failed, not that it was asked wrongly"
+    );
 }

@@ -482,22 +482,46 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                         and then serves the phone's cluster invokes back over it.",
             },
         ],
-        ProtocolKind::FCast => vec![Listener {
-            owner: Owner::Protocol(kind),
-            transport: Transport::Tcp,
-            port: PortSpec::Fixed(proto_fcast::FCAST_PORT),
-            bind: "0.0.0.0",
-            wire: "FCast v1-v3: length-prefixed JSON — play/pause/seek/volume in, \
-                   playback updates out",
-            security: "plaintext, unauthenticated — the protocol adds TLS only in v4, \
-                       which this receiver declines (#248)",
-            gate: Gate::AnyOf(&[ProtocolKind::FCast]),
-            provider: Provider::Process,
-            chosen_by: Provenance::Convention,
-            notes: "Every published sender dials 46899 regardless of the SRV record's \
-                    port, so the number is effectively fixed. 46898, the WebSocket \
-                    variant some receiver builds add for browser senders, is not bound.",
-        }],
+        ProtocolKind::FCast => vec![
+            Listener {
+                owner: Owner::Protocol(kind),
+                transport: Transport::Tcp,
+                port: PortSpec::Fixed(proto_fcast::FCAST_PORT),
+                bind: "0.0.0.0",
+                wire: "FCast v1-v4 on one socket: length-prefixed JSON, or — when \
+                       `[fcast] announce_v4` is set — a TLS 1.3 upgrade in place after \
+                       the plaintext Version exchange, then FlatBuffers",
+                security: "plaintext and unauthenticated at v1-v3; at v4, TLS 1.3 with \
+                           a self-signed certificate the sender pins by SPKI SHA-256 \
+                           from the `fp` TXT record or the on-screen QR (#248)",
+                gate: Gate::AnyOf(&[ProtocolKind::FCast]),
+                provider: Provider::Process,
+                chosen_by: Provenance::Convention,
+                notes: "Every published sender dials 46899 regardless of the SRV \
+                        record's port, so the number is effectively fixed. 46898, the \
+                        WebSocket variant some receiver builds add for browser senders, \
+                        is not bound.",
+            },
+            Listener {
+                owner: Owner::Protocol(kind),
+                transport: Transport::Udp,
+                port: PortSpec::IceRange,
+                bind: "the serving interface and loopback, one socket each per session",
+                wire: "WebRTC: SRTP carrying a v4 sender's screen (H.264 or VP8) and \
+                       its sound (Opus) — inbound media, no track of ours goes back",
+                security: "DTLS-SRTP over a connection whose offer arrived on the \
+                           already-authenticated v4 control session; host candidates \
+                           only, so nothing off the LAN can pair",
+                gate: Gate::AnyOf(&[ProtocolKind::FCast]),
+                provider: Provider::Process,
+                chosen_by: Provenance::Ours,
+                notes: "The same `[remote.ice_ports]` range the remote-control page's \
+                        peers use, and the same *allocator*: one range with two pools \
+                        would hand the same port to both and the second bind would fail \
+                        when a real sender connected. One mirroring session at a time, \
+                        so one port (#248).",
+            },
+        ],
     }
 }
 
@@ -1111,18 +1135,23 @@ mod tests {
     /// that something does.
     #[test]
     fn the_remote_gate_is_a_real_config_key() {
-        let off: Config = toml::from_str("[remote]\nenable = false\n").unwrap();
+        // *Both* users of the range are turned off, which is the honest statement of what
+        // closes it now: FCast's mirroring receiver draws from the same range (#248), so
+        // `remote.enable = false` alone leaves it legitimately open and asserting
+        // otherwise would be asserting a firewall rule that must not exist.
+        let off: Config =
+            toml::from_str("[remote]\nenable = false\n[enable]\nfcast = false\n").unwrap();
         assert!(!off.remote.enable);
         assert!(
             resolve(&off)
                 .iter()
                 .filter(|r| r.owner == "remote")
                 .all(|r| !r.enabled),
-            "remote.enable = false must close the ICE range"
+            "remote.enable = false must close the remote page's ICE sockets"
         );
         assert!(
             !render_netsh(&off).contains("41032-41063"),
-            "and the firewall must not open it"
+            "and with nothing else using the range, the firewall must not open it"
         );
         let on = Config::default();
         assert!(on.remote.enable, "the panel is drivable out of the box");
@@ -1131,6 +1160,14 @@ mod tests {
                 .iter()
                 .any(|r| r.owner == "remote" && r.enabled),
             "and enabled it must open one"
+        );
+
+        // The other half of the same fact: the range is open for FCast alone.
+        let mirroring_only: Config = toml::from_str("[remote]\nenable = false\n").unwrap();
+        assert!(
+            render_netsh(&mirroring_only).contains("41032-41063"),
+            "a v4 sender's screen arrives on this range whether or not the remote page \
+             is served, and a firewall that closed it would negotiate and carry nothing"
         );
     }
 

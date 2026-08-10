@@ -88,6 +88,13 @@ pub mod qr;
 // the player it serves is a string with no dependencies, and only the transport
 // underneath it needs the feature.
 pub mod remote;
+// The UDP range ICE binds, and who has which port. Shared by *both* WebRTC users — the
+// remote-control page's peers and FCast's mirroring receiver — because one range with two
+// allocators is two services handing out the same port (#18, #248).
+pub mod ice_ports;
+// Receiving a WebRTC mirror — the same transport pointing the other way (#248). The
+// reassembly half is pure and always compiled; see the module docs.
+pub mod mirror_in;
 // Keeping the panel lit while something is playing. Platform-specific behind one seam
 // (ground rule 5); see the module docs for why a sleeping monitor cost us the audio
 // device entirely.

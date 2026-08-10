@@ -225,7 +225,25 @@
       },
       "provider": "process",
       "transport": "tcp",
-      "wire": "FCast v1-v3: length-prefixed JSON — play/pause/seek/volume in, playback updates out"
+      "wire": "FCast v1-v4 on one socket: length-prefixed JSON, or — when `[fcast] announce_v4` is set — a TLS 1.3 upgrade in place after the plaintext Version exchange, then FlatBuffers"
+    },
+    {
+      "chosen_by": "ours",
+      "gate": [
+        "fcast"
+      ],
+      "owner": "fcast",
+      "port": {
+        "default_first": 41032,
+        "default_last": 41063,
+        "range_config": [
+          "remote",
+          "ice_ports"
+        ]
+      },
+      "provider": "process",
+      "transport": "udp",
+      "wire": "WebRTC: SRTP carrying a v4 sender's screen (H.264 or VP8) and its sound (Opus) — inbound media, no track of ours goes back"
     }
   ]
 }

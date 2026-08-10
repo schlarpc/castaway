@@ -402,27 +402,39 @@ fn main() -> anyhow::Result<()> {
         // The remote-control transport (#18). Built here because this is where all three
         // of its halves exist at once: the encoder's live fan-out, the input queue the
         // kiosk drains, and the handle that starts the tap.
+        // The UDP range ICE binds, allocated once for the whole process. Both WebRTC
+        // users draw from it — the remote-control page's peers (#18) and FCast's
+        // mirroring receiver (#248) — and they must share the *allocator*, not just the
+        // numbers: two pools over one range hand out the same port and the second bind
+        // fails at the moment a real peer connects.
+        #[cfg(feature = "remote")]
+        let ice_ports = std::sync::Arc::new(pipeline::ice_ports::PortPool::new(
+            config.remote.ice_ports.first,
+            config.remote.ice_ports.last,
+        ));
+        // The serving interface *and* loopback, for both. A peer pairs one of our
+        // candidates with one of its own, and a browser never offers a loopback
+        // candidate — it gathers its real interfaces and stops. So a browser open on the
+        // panel itself would have nothing to pair against if we offered only 127.0.0.1,
+        // and nothing to pair against if we offered only the LAN address while it sat on
+        // loopback.
+        #[cfg(feature = "remote")]
+        let ice_bind_ips = {
+            let lan = std::net::IpAddr::V4(config.resolved_interface());
+            let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            if lan == loopback {
+                vec![lan]
+            } else {
+                vec![lan, loopback]
+            }
+        };
         #[cfg(feature = "remote")]
         let remote_service = if config.remote.enable {
             let starter = stream_handle.clone();
             pipeline::remote::RemoteService::new(
                 pipeline::remote::RemoteConfig {
-                    ice_ports: (config.remote.ice_ports.first, config.remote.ice_ports.last),
-                    // The serving interface *and* loopback. A peer pairs one of our
-                    // candidates with one of its own, and a browser never offers a
-                    // loopback candidate — it gathers its real interfaces and stops. So
-                    // a browser open on the panel itself would have nothing to pair
-                    // against if we offered only 127.0.0.1, and nothing to pair against
-                    // if we offered only the LAN address while it sat on loopback.
-                    bind_ips: {
-                        let lan = std::net::IpAddr::V4(config.resolved_interface());
-                        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-                        if lan == loopback {
-                            vec![lan]
-                        } else {
-                            vec![lan, loopback]
-                        }
-                    },
+                    ice_ports: std::sync::Arc::clone(&ice_ports),
+                    bind_ips: ice_bind_ips.clone(),
                     accept_input: config.remote.input,
                 },
                 std::sync::Arc::clone(stream_handle.stream().feed()),
@@ -443,6 +455,25 @@ fn main() -> anyhow::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let season = seasonal_accent(config.theme, now_secs, utc_offset_secs);
+        // Where a v4 FCast sender's screen arrives (#248). Independent of
+        // `[remote] enable`, which governs whether the panel's own picture goes *out*:
+        // this is a casting protocol's media plane, gated by `enable.fcast` like the rest
+        // of FCast, and its absence is what makes the advertised capability honest.
+        #[cfg(feature = "remote")]
+        let mirror_backend: Option<std::sync::Arc<dyn castaway_core::MirrorBackend>> = if config
+            .enable
+            .fcast
+        {
+            pipeline::mirror_in::MirrorReceiver::new(pipeline::mirror_in::MirrorReceiverConfig {
+                ice_ports: std::sync::Arc::clone(&ice_ports),
+                bind_ips: ice_bind_ips,
+            })
+            .inspect_err(|e| warn!(error = %e, "FCast mirroring is unavailable"))
+            .ok()
+            .map(|receiver| receiver as std::sync::Arc<dyn castaway_core::MirrorBackend>)
+        } else {
+            None
+        };
         let handles = PipelineHandles {
             screenshot: Some(shot_handle),
             #[cfg(feature = "stream")]
@@ -454,6 +485,10 @@ fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "remote"))]
             remote: None,
             playback: Some(playback),
+            #[cfg(feature = "remote")]
+            mirror: mirror_backend,
+            #[cfg(not(feature = "remote"))]
+            mirror: None,
             #[cfg(feature = "electron")]
             cast_platform_shim: Some({
                 let tx = nav_tx_cast;
@@ -827,6 +862,10 @@ struct PipelineHandles {
     /// the player and has to report its own position. Absent in a build with no decoder,
     /// which then honestly answers "no such information" rather than inventing a zero.
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+    /// Where a v4 FCast sender's screen arrives (#248). `None` in a build with no media
+    /// plane, and the protocol then advertises `mirroring: false` — which is the point of
+    /// carrying it as an `Option` rather than as a config flag.
+    mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
     /// Panel presses the shell could not answer itself (D38), and the channel back to
     /// the render loop for the screens they produce.
     ///
@@ -902,6 +941,7 @@ async fn serve(
         stream,
         remote,
         playback,
+        mirror,
         #[cfg(feature = "render")]
         shell,
         #[cfg(feature = "electron")]
@@ -1200,6 +1240,7 @@ async fn serve(
             event_tx.clone(),
             shutdown.clone(),
             playback.clone(),
+            mirror.clone(),
         );
         adapter_handles.push(wiring.task);
         fcast_connect_url = wiring.connect_url;
@@ -1876,6 +1917,7 @@ fn spawn_fcast(
     event_tx: mpsc::Sender<SourceMessage>,
     shutdown: Arc<Notify>,
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+    mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
 ) -> FCastWiring {
     let receiver = proto_fcast::FCastReceiver::new(config.advertised_name(ProtocolKind::FCast));
     // FCast's `PlaybackUpdate`s carry the position the sender draws in its scrubber,
@@ -1895,6 +1937,12 @@ fn spawn_fcast(
             warn!(error = %format!("{e:#}"), "FCast v4 identity unavailable; running v1-v3 only");
             receiver
         }
+    };
+    // A v4 sender is told `mirroring: true` only when there is a plane to answer its
+    // offer on, so the capability and the code that honours it are one fact (#248).
+    let receiver = match mirror {
+        Some(backend) => receiver.with_mirroring(backend),
+        None => receiver,
     };
 
     advertise_adapter(&receiver, mdns);

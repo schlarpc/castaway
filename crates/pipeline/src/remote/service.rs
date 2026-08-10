@@ -34,7 +34,7 @@ use webrtc::runtime::{default_runtime, Runtime};
 use crate::error::PipelineError;
 use crate::stream::feed::{LiveFeed, Subscription};
 
-use super::ports::PortPool;
+use crate::ice_ports::PortPool;
 
 /// The H.264 payload type this end *registers*.
 ///
@@ -59,7 +59,11 @@ const GATHER_TIMEOUT: Duration = Duration::from_secs(3);
 /// What the remote-control service needs to exist.
 pub struct RemoteConfig {
     /// The UDP range ICE may bind, from `[remote.ice_ports]`.
-    pub ice_ports: (u16, u16),
+    ///
+    /// Shared with FCast's mirroring receiver (#248) rather than allocated per service:
+    /// one range with two allocators is two services confidently handing out the same
+    /// port, and the second bind fails at the moment a real peer connects.
+    pub ice_ports: std::sync::Arc<PortPool>,
     /// The addresses to offer candidates on, one socket each, all on the same port.
     ///
     /// Plural because a peer pairs a candidate of ours with one of its own, and a browser
@@ -86,7 +90,7 @@ pub struct RemoteService {
     /// wakes the tap, exactly as the first playlist fetch is for HLS.
     start: Arc<dyn Fn() + Send + Sync>,
     runtime: Arc<dyn Runtime>,
-    ports: PortPool,
+    ports: Arc<PortPool>,
     /// The peer counter behind [`RemoteId`]. Never reset, so a reconnecting peer is a new
     /// origin and cannot inherit the contacts its previous connection left behind.
     next_peer: AtomicU64,
@@ -148,7 +152,7 @@ impl RemoteService {
     ) -> Result<Arc<Self>, PipelineError> {
         let runtime = default_runtime()
             .ok_or_else(|| PipelineError::Remote("no async runtime for WebRTC".into()))?;
-        let ports = PortPool::new(config.ice_ports.0, config.ice_ports.1);
+        let ports = Arc::clone(&config.ice_ports);
         Ok(Arc::new(Self {
             config,
             feed,

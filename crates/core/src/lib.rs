@@ -27,7 +27,10 @@ pub mod types;
 pub mod volume;
 pub mod wake;
 
-pub use adapter::{MiracastBackend, SessionSink, SourceAdapter, SourceId, SourceMessage};
+pub use adapter::{
+    MiracastBackend, MirrorAnswer, MirrorBackend, SessionSink, SourceAdapter, SourceId,
+    SourceMessage,
+};
 pub use control::{ControlCapabilities, RemoteControl};
 pub use display::{DisplayControl, DisplayInput};
 pub use error::CoreError;

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use castaway_core::{
-    Advertisement, CoreError, PlaybackReport, ProtocolKind, SessionEvent, SessionSink,
-    SourceAdapter,
+    Advertisement, CoreError, MirrorBackend, PlaybackReport, ProtocolKind, SessionEvent,
+    SessionSink, SourceAdapter,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -68,6 +68,11 @@ pub(crate) struct Shared {
     /// Coupled deliberately — the sender SDK quits on `fp`-without-v4 (insecure
     /// downgrade) and on v4-without-`fp` (nothing to pin) — so both flip together.
     v4: Option<V4>,
+    /// The WebRTC plane a v4 sender's screen arrives on (#248), when this build has
+    /// one. Its presence *is* the advertised `mirroring` capability: a receiver that
+    /// says it mirrors and then answers `InvalidState` is worse than one that says it
+    /// does not, because the sender has already told someone it is casting.
+    mirror: Option<Arc<dyn MirrorBackend>>,
     pub(crate) inner: Mutex<Inner>,
 }
 
@@ -115,6 +120,7 @@ impl FCastReceiver {
                 },
                 playback: None,
                 v4: None,
+                mirror: None,
                 inner: Mutex::new(Inner {
                     player: Player::new(),
                     peers: HashMap::new(),
@@ -155,6 +161,20 @@ impl FCastReceiver {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("with_v4 is builder-time, before the adapter is shared");
         shared.v4 = Some(V4 { identity, announce });
+        self
+    }
+
+    /// Offer WebRTC screen mirroring to v4 senders, over `backend` (#248).
+    ///
+    /// Without one the receiver introduces itself with `mirroring: false` and refuses a
+    /// `StartMirroringSession` typed, which is what it did before this existed: a
+    /// build with no media plane (`--no-default-features`, the headless one) genuinely
+    /// cannot show a picture, and saying so is the honest answer.
+    #[must_use]
+    pub fn with_mirroring(mut self, backend: Arc<dyn MirrorBackend>) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("with_mirroring is builder-time, before the adapter is shared");
+        shared.mirror = Some(backend);
         self
     }
 
@@ -385,13 +405,28 @@ impl Shared {
                 }
                 Ok(Applied::default())
             }
-            // Mirroring is #248's next stage; the capabilities said
-            // `mirroring: false`, so a session that starts one anyway is told
-            // it cannot, rather than left waiting for an answer SDP that will
-            // never come.
-            V4Command::StartMirroring(_) | V4Command::MirroringOffer { .. } => Err(
-                Refusal::kinded("mirroring is not offered", ErrorKind::InvalidState),
-            ),
+            // A session that starts one is accepted only when there is a media
+            // plane to answer with; the introduction said which. Refusing here
+            // rather than leaving the sender waiting for an answer SDP that will
+            // never come is the whole point of the typed error.
+            V4Command::StartMirroring(_) => {
+                if self.mirror.is_some() {
+                    Ok(Applied::default())
+                } else {
+                    Err(Refusal::kinded(
+                        "mirroring is not offered by this receiver",
+                        ErrorKind::InvalidState,
+                    ))
+                }
+            }
+            // Answering an offer is a DTLS handshake and an ICE gather — I/O, and
+            // seconds of it. It cannot happen here, under the lock that every other
+            // connection's protocol work also takes (ground rule 3), so the actor
+            // peels this command off before it ever reaches `apply_v4`.
+            V4Command::MirroringOffer { .. } => Err(Refusal::kinded(
+                "a mirroring offer is answered off the lock",
+                ErrorKind::Internal,
+            )),
         };
         match outcome {
             Ok(Applied { events, updates }) => {
@@ -404,6 +439,29 @@ impl Shared {
                 }
                 Err(refusal)
             }
+        }
+    }
+
+    /// Queue one frame to a peer, if it is still connected.
+    fn send_to(&self, peer_id: u64, frame: &Frame) {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = guard.peers.get(&peer_id) {
+            send_frame(&peer.outbound, frame);
+        }
+    }
+
+    /// Tell one peer its request was refused, in its own dialect.
+    fn refuse_v4(&self, peer_id: u64, refusal: &Refusal) {
+        let wall_ms = Self::wall_ms();
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = guard.peers.get(&peer_id) {
+            send_refusal(peer, wall_ms, refusal, None);
         }
     }
 
@@ -846,7 +904,9 @@ async fn serve_v4(
                 &shared.identity.display_name,
                 &shared.identity.app_name,
                 &shared.identity.app_version,
-                &v4msg::Capabilities { mirroring: false },
+                &v4msg::Capabilities {
+                    mirroring: shared.mirror.is_some(),
+                },
             ),
         );
         #[allow(clippy::cast_possible_truncation)]
@@ -901,7 +961,7 @@ async fn serve_v4(
                         }
                     };
                     buf.drain(..raw.consumed);
-                    match handle_v4_frame(shared, peer_id, peer_addr, started.elapsed(), &raw) {
+                    match handle_v4_frame(shared, peer_id, peer_addr, started.elapsed(), &raw).await {
                         Ok(events) => emit_all(sink, shared, events).await,
                         Err(fault) => {
                             warn!(peer = %peer_addr, %fault, "fcast: v4 session fault; disconnecting");
@@ -1025,7 +1085,11 @@ fn handle_frame(
 }
 
 /// Feed one raw frame through a v4 session (#248).
-fn handle_v4_frame(
+///
+/// Async only for the mirroring offer, which is a DTLS handshake and an ICE gather and
+/// therefore cannot be answered under the lock the rest of the protocol work takes. Every
+/// other command is still the pure step it was.
+async fn handle_v4_frame(
     shared: &Arc<Shared>,
     peer_id: u64,
     peer_addr: SocketAddr,
@@ -1055,6 +1119,9 @@ fn handle_v4_frame(
         return Ok(Vec::new());
     };
     debug!(?command, "fcast: v4 sender command");
+    if let V4Command::MirroringOffer { session_id, sdp } = &command {
+        return Ok(answer_mirroring(shared, peer_id, *session_id, sdp).await);
+    }
     let was_load = matches!(command, V4Command::Load { .. });
     match shared.apply_v4(peer_id, command) {
         Ok(mut events) => {
@@ -1071,6 +1138,57 @@ fn handle_v4_frame(
         Err(refusal) => {
             info!(reason = %refusal.message, "fcast: v4 request refused");
             Ok(Vec::new())
+        }
+    }
+}
+
+/// Answer a sender's mirroring offer and take the screen (#248).
+///
+/// Off the lock, because building the peer connection is I/O: a DTLS handshake and an ICE
+/// gather, seconds of it in the bad case. Holding the player lock across that would stall
+/// every other sender's `pause`.
+///
+/// The answer goes back on the connection that asked, and the frames go to the session
+/// manager as a `Mirror` — which is what preempts whatever was playing. A backend that
+/// refuses is a typed error to the sender rather than silence: it has already told
+/// somebody it is casting, and a sender waiting for an answer SDP that never comes has
+/// nothing to show and nothing to say.
+async fn answer_mirroring(
+    shared: &Arc<Shared>,
+    peer_id: u64,
+    session_id: u16,
+    offer: &str,
+) -> Vec<SessionEvent> {
+    use fcast_flatbuf::flat::ErrorKind;
+    let Some(backend) = shared.mirror.clone() else {
+        shared.refuse_v4(
+            peer_id,
+            &Refusal::kinded(
+                "mirroring is not offered by this receiver",
+                ErrorKind::InvalidState,
+            ),
+        );
+        return Vec::new();
+    };
+    match backend.answer(offer).await {
+        Ok(answer) => {
+            info!(session_id, "fcast: mirroring session answered");
+            shared.send_to(
+                peer_id,
+                &v4msg::mirroring_answer_frame(session_id, &answer.sdp),
+            );
+            vec![SessionEvent::Mirror {
+                video: answer.video,
+                audio: answer.audio,
+            }]
+        }
+        Err(e) => {
+            warn!(session_id, error = %e, "fcast: could not answer the mirroring offer");
+            shared.refuse_v4(
+                peer_id,
+                &Refusal::kinded(format!("mirroring: {e}"), ErrorKind::Internal),
+            );
+            Vec::new()
         }
     }
 }

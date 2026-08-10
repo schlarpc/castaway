@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::error::CoreError;
 use crate::event::{Advertisement, SessionEvent};
-use crate::types::ProtocolKind;
+use crate::types::{FrameSource, ProtocolKind};
 
 /// Identifies one running source: which protocol, plus a per-protocol instance tag
 /// (a sender may connect twice; the tag disambiguates).
@@ -116,6 +116,46 @@ pub trait MiracastBackend: Send + Sync {
     /// Acquire a P2P Group-Owner interface, run the WFD/RTSP session, and emit frames
     /// through `sink` as a [`SessionEvent::Mirror`].
     async fn run(self: Arc<Self>, sink: SessionSink) -> Result<(), CoreError>;
+}
+
+/// A WebRTC media plane a protocol can borrow to *receive* pictures.
+///
+/// The inverse of everything else the WebRTC code in `pipeline` does: there the panel
+/// offers its own duplicate to a browser (#18), here a sender offers its screen and the
+/// panel answers. FCast v4 is the first protocol with one (#248) — the offer and the
+/// answer ride its own control connection, which is `proto-fcast`'s business, while the
+/// ICE/DTLS/RTP plane underneath is nobody's protocol in particular.
+///
+/// A trait rather than a direct call for the usual reason (ground rules 2 and 5): a
+/// `proto-*` crate must not depend on `pipeline`, and a build with no media plane at all
+/// simply has no backend to hand over — which is exactly what makes the protocol's
+/// advertised `mirroring` capability honest, since it is `backend.is_some()`.
+#[async_trait::async_trait]
+pub trait MirrorBackend: Send + Sync {
+    /// Answer `offer_sdp` and start receiving on the tracks it describes.
+    ///
+    /// Non-trickle: the returned SDP carries every candidate, because the protocols that
+    /// use this have one signalling message for the answer and no way to send a second.
+    ///
+    /// # Errors
+    /// [`CoreError::Pipeline`] if the offer is unusable, no port is free, or the
+    /// connection cannot be built.
+    async fn answer(&self, offer_sdp: &str) -> Result<MirrorAnswer, CoreError>;
+}
+
+/// What answering a mirroring offer produced: the SDP to send back, and the media.
+///
+/// The frames come back with the answer rather than through a callback because they are
+/// the *same event*: the caller emits [`crate::SessionEvent::Mirror`] with them, and a
+/// backend that answered but produced no source would have taken the screen for nothing.
+#[derive(Debug)]
+pub struct MirrorAnswer {
+    /// The SDP answer, candidates included.
+    pub sdp: String,
+    /// Video frames from the sender, already depacketized.
+    pub video: FrameSource,
+    /// The sender's audio, if its offer had any.
+    pub audio: Option<crate::event::MirrorAudio>,
 }
 
 #[cfg(test)]

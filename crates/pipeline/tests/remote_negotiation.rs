@@ -156,7 +156,7 @@ fn service(ports: (u16, u16), accept_input: bool) -> (Arc<RemoteService>, Arc<Re
     let flag = Arc::clone(&started);
     let service = RemoteService::new(
         RemoteConfig {
-            ice_ports: ports,
+            ice_ports: Arc::new(pipeline::ice_ports::PortPool::new(ports.0, ports.1)),
             bind_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
             accept_input,
         },
@@ -409,7 +409,7 @@ fn service_reusing(
 ) -> (Arc<RemoteService>, Arc<RemoteInputQueue>) {
     let service = RemoteService::new(
         RemoteConfig {
-            ice_ports: ports,
+            ice_ports: Arc::new(pipeline::ice_ports::PortPool::new(ports.0, ports.1)),
             bind_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
             accept_input: true,
         },
@@ -430,7 +430,7 @@ async fn connecting_starts_the_encoder() {
     let flag = Arc::clone(&started);
     let service = RemoteService::new(
         RemoteConfig {
-            ice_ports: (45500, 45501),
+            ice_ports: Arc::new(pipeline::ice_ports::PortPool::new(45500, 45501)),
             bind_ips: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
             accept_input: true,
         },
