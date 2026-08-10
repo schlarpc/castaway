@@ -448,13 +448,30 @@ fn main() -> anyhow::Result<()> {
             None
         };
         // The clock, read here at the boundary; `seasonal_accent` itself is pure (#263).
-        // Resolved before `ShellChannels` is handed over, because `serve` rebuilds Home
-        // when FCast learns its pairing URL (#248), and that rebuild must not drop the
-        // season the first paint had.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let season = seasonal_accent(config.theme, now_secs, utc_offset_secs);
+        // Home, and the one place that says what it currently is.
+        //
+        // Two things rewrite it while the panel is up — `serve` when FCast learns its
+        // pairing URL (#248), `seasonal_rollover` at each local midnight (#263) — and
+        // each used to hold its own copy of the scene, so whichever wrote second erased
+        // the other's change (#319). Both now read and write this cell, so a rebuild
+        // keeps the season and a recolour keeps the QR. Built here rather than beside the
+        // kiosk below because `ShellChannels` is handed to the runtime a few lines down
+        // and carries it.
+        //
+        // A `watch::Sender` rather than a mutex: it is the shared-latest-value type, its
+        // read and write need no `unwrap` for a poisoned lock, and having no receivers is
+        // a legal state for it — nothing subscribes, the panel is told by `RenderTx`.
+        let home_cell = std::sync::Arc::new(tokio::sync::watch::Sender::new(build_attract(
+            &config,
+            season,
+            // Nothing has come up yet: the FCast identity is loaded on the runtime, a
+            // moment after this.
+            &HomeState::default(),
+        )));
         // Where a v4 FCast sender's screen arrives (#248). Independent of
         // `[remote] enable`, which governs whether the panel's own picture goes *out*:
         // this is a casting protocol's media plane, gated by `enable.fcast` like the rest
@@ -502,7 +519,7 @@ fn main() -> anyhow::Result<()> {
                 events: shell_event_rx,
                 render: render_tx.clone(),
                 settings: settings_catalog,
-                season,
+                home: std::sync::Arc::clone(&home_cell),
             }),
         };
         runtime.spawn(async move {
@@ -638,20 +655,18 @@ fn main() -> anyhow::Result<()> {
         spawn_ctrl_c(&runtime, &shutdown, &kiosk_exit, wake.clone(), remote);
 
         info!("kiosk: opening fullscreen output (close the window or ctrl-c to stop)");
-        // Built before the runtime has loaded the FCast identity, so it has no QR yet;
-        // `serve` sends a fuller Home the moment it does (#248).
-        let attract = build_attract(&config, season, &HomeState::default());
+        // What the panel paints first. It has no FCast QR yet — the identity is loaded on
+        // the runtime — and `serve` sends a fuller Home the moment it has one (#248).
+        let attract = home_cell.borrow().clone();
         // `auto` follows the calendar, so the calendar has to be watched; a forced or
         // plain palette never changes, and gets no task to not-change it with.
         if config.theme == pipeline::theme::ThemeChoice::Auto {
-            if let Some(scene) = attract.clone() {
-                runtime.spawn(seasonal_rollover(
-                    config.theme,
-                    utc_offset_secs,
-                    scene,
-                    render_tx.clone(),
-                ));
-            }
+            runtime.spawn(seasonal_rollover(
+                config.theme,
+                utc_offset_secs,
+                std::sync::Arc::clone(&home_cell),
+                render_tx.clone(),
+            ));
         }
         // No size here on purpose: the controller rasterizes each banner for whatever the
         // surface measures at the time, so it follows the panel and any resize.
@@ -896,11 +911,18 @@ struct ShellChannels {
     render: pipeline::RenderTx,
     /// What the Settings tile opens: this build's settings, ready to list and apply.
     settings: settings::Catalog,
-    /// The seasonal accent resolved on the main thread at startup (#263), carried so a
-    /// Home rebuilt here keeps the palette the first paint had rather than reverting it
-    /// to plain. The clock is read once, at that boundary; this is the answer.
-    season: Option<pipeline::theme::Season>,
+    /// Home as it currently stands, shared with `seasonal_rollover` (#319). Read for the
+    /// season a rebuild has to preserve, and written with the rebuilt scene so the
+    /// rollover recolours *that* rather than the one the panel first painted.
+    home: HomeCell,
 }
+
+/// The current Home scene, shared by everything that rewrites it (#319).
+///
+/// `None` inside means this build has no Home to rewrite — `build_attract` answers for
+/// that, and both writers take it as "nothing to do" rather than inventing a scene.
+#[cfg(feature = "render")]
+type HomeCell = std::sync::Arc<tokio::sync::watch::Sender<Option<pipeline::attract::AttractScene>>>;
 
 /// The two ways something that is not a media URL gets opened, and the one place that
 /// knows whether either exists.
@@ -1324,7 +1346,7 @@ async fn serve(
         events,
         render,
         settings,
-        season,
+        home: home_cell,
     }) = shell
     {
         // Home was built on the main thread before any of this existed, so anything the
@@ -1338,8 +1360,13 @@ async fn serve(
             let home = HomeState {
                 fcast_connect_url: fcast_connect_url.clone(),
             };
+            // The season comes off the cell rather than being recomputed: whatever the
+            // panel is wearing right now is what this rebuild has to keep, and by now
+            // that may be the rollover's answer rather than startup's (#319).
+            let season = home_cell.borrow().as_ref().and_then(|scene| scene.season);
             if let Some(scene) = build_attract(&config, season, &home) {
                 info!("FCast: the pairing QR is on the service tile");
+                home_cell.send_replace(Some(scene.clone()));
                 render.send(pipeline::RenderCommand::Home(Box::new(scene)));
             }
         }
@@ -2490,7 +2517,7 @@ fn secs_until_next_local_midnight(now_unix_secs: u64, utc_offset_secs: i32) -> u
 async fn seasonal_rollover(
     choice: pipeline::theme::ThemeChoice,
     startup_offset_secs: i32,
-    mut scene: pipeline::attract::AttractScene,
+    home: HomeCell,
     render: pipeline::RenderTx,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2503,7 +2530,7 @@ async fn seasonal_rollover(
         time::UtcOffset::current_local_offset()
             .map_or(startup_offset_secs, time::UtcOffset::whole_seconds)
     };
-    let mut worn = scene.season;
+    let mut worn = home.borrow().as_ref().and_then(|scene| scene.season);
     loop {
         let wait = secs_until_next_local_midnight(now_secs(), offset());
         tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -2515,10 +2542,34 @@ async fn seasonal_rollover(
                 "theme: the season changed overnight"
             );
             worn = season;
-            scene.season = season;
-            render.send(pipeline::RenderCommand::Home(Box::new(scene.clone())));
+            // Recoloured in place, so everything Home has *learned* since the panel
+            // started — the FCast pairing QR is the first of those (#248) — survives the
+            // night that changes the palette (#319).
+            if let Some(scene) = recolour(&home, season) {
+                render.send(pipeline::RenderCommand::Home(Box::new(scene)));
+            }
         }
     }
+}
+
+/// Put `season` on the current Home scene and hand back what the panel should now show.
+///
+/// The rollover's one mutation, split out because it is where the two writers meet: the
+/// scene it recolours has to be the one `serve` last rebuilt, not the one the process
+/// started with (#319). `None` means there is no Home in this build to recolour.
+#[cfg(feature = "render")]
+fn recolour(
+    home: &tokio::sync::watch::Sender<Option<pipeline::attract::AttractScene>>,
+    season: Option<pipeline::theme::Season>,
+) -> Option<pipeline::attract::AttractScene> {
+    home.send_if_modified(|home| match home {
+        Some(scene) => {
+            scene.season = season;
+            true
+        }
+        None => false,
+    });
+    home.borrow().clone()
 }
 
 /// Derive a stable MAC-style id from the UUID (AirPlay wants a `AA:BB:..` device id).
@@ -2554,7 +2605,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::device_uuid;
     #[cfg(feature = "render")]
-    use super::{build_attract, HomeState};
+    use super::{build_attract, recolour, HomeState};
 
     /// The date-driven palette, tested at fixed instants (#263): the clock is read at
     /// the call sites, so June is provable in March and — the part the golden-scene
@@ -2854,5 +2905,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The two things that rewrite Home while the panel is up must not erase each other
+    /// (#319).
+    ///
+    /// `serve` rebuilds the scene when FCast learns its pairing URL; `seasonal_rollover`
+    /// recolours it at local midnight. They ran in that order here, which is the order a
+    /// panel that is up for weeks sees, and each held its own copy of the scene before
+    /// this — so the midnight recolour re-sent a Home built before the QR existed, and
+    /// the code went off the tile until somebody restarted the process.
+    #[cfg(feature = "render")]
+    #[test]
+    fn a_midnight_recolour_keeps_what_home_has_learned_since_startup() {
+        use pipeline::theme::Season;
+
+        let config = crate::config::Config::default();
+        let payload = "fcast://r/eyJuYW1lIjoiUGFuZWwifQ==";
+        let qr = |scene: &pipeline::attract::AttractScene| {
+            scene
+                .tiles
+                .iter()
+                .find(|t| t.id == "fcast")
+                .and_then(|t| t.detail.as_ref())
+                .and_then(|d| d.qr_payload.clone())
+        };
+
+        // Startup: no QR, and whatever season the calendar said at the time.
+        let home = std::sync::Arc::new(tokio::sync::watch::Sender::new(build_attract(
+            &config,
+            Some(Season::Pride),
+            &HomeState::default(),
+        )));
+        assert_eq!(qr(home.borrow().as_ref().expect("a Home scene")), None);
+
+        // What `serve` does when FCast comes up: rebuild with the season the cell is
+        // already wearing, and put the result back.
+        let season = home.borrow().as_ref().and_then(|scene| scene.season);
+        assert_eq!(season, Some(Season::Pride), "the rebuild reads the palette");
+        let rebuilt = build_attract(
+            &config,
+            season,
+            &HomeState {
+                fcast_connect_url: Some(payload.to_string()),
+            },
+        )
+        .expect("a Home scene");
+        home.send_replace(Some(rebuilt));
+
+        // And what the rollover does at the next local midnight.
+        let tonight = recolour(&home, Some(Season::Halloween)).expect("a Home scene");
+        assert_eq!(tonight.season, Some(Season::Halloween), "the night changed");
+        assert_eq!(
+            qr(&tonight).as_deref(),
+            Some(payload),
+            "the recolour re-sent a Home from before FCast came up"
+        );
+        // And the cell agrees with what was sent, so the *next* rebuild starts from it.
+        assert_eq!(
+            home.borrow().as_ref().and_then(|scene| scene.season),
+            Some(Season::Halloween)
+        );
+    }
+
+    /// A build with no Home to recolour is not one the rollover invents a scene for.
+    #[cfg(feature = "render")]
+    #[test]
+    fn a_recolour_with_no_home_has_nothing_to_send() {
+        let home = std::sync::Arc::new(tokio::sync::watch::Sender::new(None));
+        assert!(recolour(&home, Some(pipeline::theme::Season::Halloween)).is_none());
     }
 }
