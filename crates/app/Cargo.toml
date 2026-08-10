@@ -90,6 +90,10 @@ aes.workspace = true
 cbc.workspace = true
 base64.workspace = true
 sha1.workspace = true
+# Acting as a mirroring sender in `tests/airplay_mirror_decodes.rs` (#281): the SETUP
+# plists, and the continuous AES-CTR keystream over the data channel.
+plist.workspace = true
+ctr.workspace = true
 
 [build-dependencies]
 # Embeds assets/castaway.rc (the .exe icon) when the *target* is Windows — which is

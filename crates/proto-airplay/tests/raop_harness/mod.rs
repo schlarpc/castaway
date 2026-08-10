@@ -127,14 +127,17 @@ pub async fn start_watched(
     (connect(addr).await, events, diagnostics)
 }
 
-/// Send one RTSP request and read the response head.
-pub async fn request(
+/// Send one RTSP request and read the raw response — head and body, as bytes.
+///
+/// For the replies that carry a binary plist body, which `request`'s lossy string
+/// conversion would mangle.
+pub async fn request_bytes(
     stream: &mut TcpStream,
     line: &str,
     headers: &[(&str, &str)],
     body: &[u8],
     cseq: u32,
-) -> String {
+) -> Vec<u8> {
     let mut req = format!("{line} RTSP/1.0\r\nCSeq: {cseq}\r\n");
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
@@ -152,7 +155,19 @@ pub async fn request(
         .await
         .expect("receiver answered in time")
         .unwrap();
-    String::from_utf8_lossy(&buf[..n]).to_string()
+    buf.truncate(n);
+    buf
+}
+
+/// Send one RTSP request and read the response head.
+pub async fn request(
+    stream: &mut TcpStream,
+    line: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    cseq: u32,
+) -> String {
+    String::from_utf8_lossy(&request_bytes(stream, line, headers, body, cseq).await).to_string()
 }
 
 /// Pull `server_port=NNNN` out of a Transport header.
@@ -285,6 +300,136 @@ pub fn sync_packet(rtp_now_less_latency: u32, sender_ntp_raw: u64, rtp_anchor: u
     p.extend_from_slice(&sender_ntp_raw.to_be_bytes());
     p.extend_from_slice(&rtp_anchor.to_be_bytes());
     p
+}
+
+// --- The mirroring half of the harness ---
+
+/// A real FairPlay v3 vector: the 164-byte `/fp-setup` SETUP2 body, the 72-byte `ekey`
+/// a `SETUP` would carry, and the AES key they derive to.
+///
+/// Using a genuine one rather than a synthetic pair is what makes tests built on this a
+/// test of the whole chain: the session runs the real derivation, and the test can
+/// encrypt frames with the key it *knows* must come out. A wrong derivation fails as
+/// garbage rather than as a mismatch nobody notices.
+pub const FP_KEY_MESSAGE: &str = "46504c590301030000000098008f1a9ca548fdd57560a52926ff399f2eb154d0a7a0fffc997f58e27e00499eb9f310110d019e550e328047aea54308ab71b647041406878af96e06cf74127ae35941dceb58931b5543b39903f9f76a376248ee52e3656b561e1c1a0106ec6608df0ab4f2df528e65db6d622d3892d5b49c6c025606a574f19ebea7d93500bdd69db23333f22edcb3ccf7a6acde7389f2facabfa61b0b50";
+
+/// The `ekey` matching [`FP_KEY_MESSAGE`].
+pub const FP_EKEY: &str = "46504c59010201000000003c000000006d44ba12b91f48e061eb230fc53abfa2000000108a1060465d51b808df112d08b604501f9e3ea29ce0902f3c43b81d5319d0575f78517e01";
+
+/// The AES key the two must derive to.
+pub const FP_EXPECTED_AES_KEY: &str = "0496a612172f41e0fd71912acc33fc54";
+
+/// The `streamConnectionID` [`negotiate_mirror`] names, as a plist's signed integer.
+pub const MIRROR_STREAM_ID: i64 = 4_964_383_553_955_644_435;
+
+/// Decode a hex string.
+#[must_use]
+pub fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// A binary plist body from a dictionary.
+#[must_use]
+pub fn plist_body(dict: plist::Dictionary) -> Vec<u8> {
+    let mut buf = Vec::new();
+    plist::to_writer_binary(&mut buf, &plist::Value::Dictionary(dict)).unwrap();
+    buf
+}
+
+/// One framed mirroring message, with its encoded-geometry fields naming `encoded`.
+#[must_use]
+pub fn mirror_message(kind: u8, timestamp: u64, payload: &[u8], encoded: (f32, f32)) -> Vec<u8> {
+    let mut m = vec![0u8; 128];
+    m[0..4].copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    m[4] = kind;
+    m[8..16].copy_from_slice(&timestamp.to_le_bytes());
+    m[56..60].copy_from_slice(&encoded.0.to_le_bytes());
+    m[60..64].copy_from_slice(&encoded.1.to_le_bytes());
+    m.extend_from_slice(payload);
+    m
+}
+
+/// Pull a named port out of the first stream entry of a plist `SETUP` reply.
+#[must_use]
+pub fn stream_port(reply: &plist::Value, key: &str) -> u16 {
+    let port = reply
+        .as_dictionary()
+        .and_then(|d| d.get("streams"))
+        .and_then(plist::Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|d| d.get(key))
+        .and_then(plist::Value::as_unsigned_integer)
+        .unwrap_or_else(|| panic!("no {key} in the stream reply"));
+    assert_ne!(port, 0, "a zero {key} means nothing is listening");
+    u16::try_from(port).unwrap()
+}
+
+/// The plist body of a response, parsed.
+#[must_use]
+pub fn response_plist(raw: &[u8]) -> plist::Value {
+    let head = String::from_utf8_lossy(raw);
+    assert!(head.starts_with("RTSP/1.0 200"), "{head}");
+    let body_at = head.find("\r\n\r\n").expect("a header/body split") + 4;
+    plist::from_bytes(&raw[body_at..]).expect("a plist reply")
+}
+
+/// Drive the whole mirroring negotiation — `/fp-setup` with the captured key message,
+/// the key-material `SETUP`, and the type-110 stream `SETUP` naming
+/// [`MIRROR_STREAM_ID`] — and return the advertised data port. Uses CSeq 1–3.
+///
+/// The stream keys are `MirrorKeys::derive` over [`FP_EXPECTED_AES_KEY`] and
+/// [`MIRROR_STREAM_ID`], which is what lets a test encrypt like the sender.
+pub async fn negotiate_mirror(stream: &mut TcpStream) -> u16 {
+    let fp = request(
+        stream,
+        "POST /fp-setup",
+        &[("Content-Type", "application/octet-stream")],
+        &unhex(FP_KEY_MESSAGE),
+        1,
+    )
+    .await;
+    assert!(fp.starts_with("RTSP/1.0 200"), "{fp}");
+
+    // First mirroring SETUP: the wrapped key.
+    let mut d = plist::Dictionary::new();
+    d.insert("ekey".into(), plist::Value::Data(unhex(FP_EKEY)));
+    d.insert("eiv".into(), plist::Value::Data(vec![0u8; 16]));
+    d.insert("timingProtocol".into(), plist::Value::String("NTP".into()));
+    let setup1 = request(
+        stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        2,
+    )
+    .await;
+    assert!(setup1.starts_with("RTSP/1.0 200"), "{setup1}");
+
+    // Second: name the stream. The reply has to carry a data port that is listening.
+    let mut s0 = plist::Dictionary::new();
+    s0.insert("type".into(), plist::Value::Integer(110i64.into()));
+    s0.insert(
+        "streamConnectionID".into(),
+        plist::Value::Integer(MIRROR_STREAM_ID.into()),
+    );
+    let mut d = plist::Dictionary::new();
+    d.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(s0)]),
+    );
+    let reply = request_bytes(
+        stream,
+        "SETUP rtsp://127.0.0.1/1",
+        &[("Content-Type", "application/x-apple-binary-plist")],
+        &plist_body(d),
+        3,
+    )
+    .await;
+    stream_port(&response_plist(&reply), "dataPort")
 }
 
 /// [`negotiate`], with the whole SDP supplied — for a sender that announces more than
