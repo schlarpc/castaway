@@ -177,11 +177,31 @@ fn accept_within(
 
 use tracing::{debug, error, info, trace, warn};
 
+/// Where the fd addon (`castaway-browser-fd`'s cdylib, #271) is, if anywhere.
+///
+/// The env override first — the Nix wrapper and the tests both know exactly where they
+/// put it — then beside the binary and up to two directories above it, which covers the
+/// production layout (the addon installed next to `castaway`) and a cargo build
+/// (`target/debug/deps/<test>` with the cdylib at `target/debug/`). `None` is not an
+/// error: the spawner logs it and the reach-in path carries the session.
+#[cfg(unix)]
+fn locate_fd_addon() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("CASTAWAY_BROWSER_FD_ADDON") {
+        return Some(path.into());
+    }
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .skip(1)
+        .take(3)
+        .map(|dir| dir.join(castaway_browser_fd::ADDON_SONAME))
+        .find(|path| path.exists())
+}
+
 use crate::adblock_engine::SharedBlocker;
 use crate::audio_decode::PcmBlock;
 use crate::browser::{BrowserCommand, BrowserRole, BrowserView};
 use crate::browser_proto::{
-    encode, FromBrowser, LineFramer, PixelOrder, PlaneInfo, Surface, ToBrowser,
+    encode, FdTransport, FromBrowser, LineFramer, PixelOrder, PlaneInfo, Surface, ToBrowser,
 };
 use crate::error::PipelineError;
 use crate::hwaccel::remote_handle::{ProcessRef, RemoteHandle};
@@ -291,6 +311,14 @@ struct Health {
     /// time meets a nonzero audio time, so the log asserted `av_skew_ms = 0` for the
     /// whole life of an audio-only page and for the window before the first such paint.
     av_skew_seen: std::sync::atomic::AtomicBool,
+    /// Frames imported from descriptors the browser *passed* (`SCM_RIGHTS`, #271).
+    scm_frames: AtomicU64,
+    /// Frames imported by *reaching in* (`pidfd_getfd`/`DuplicateHandle`).
+    ///
+    /// The pair is what makes the transport observable from a test: "it painted" says
+    /// nothing about how the descriptors travelled, and the whole point of #271 is that
+    /// the reach-in path is a policy dependency the shipped arrangement must not have.
+    pulled_frames: AtomicU64,
 }
 
 impl Health {
@@ -365,6 +393,11 @@ struct PendingPaint {
     height: u32,
     modifier: u64,
     plane: PlaneInfo,
+    /// The plane's descriptor, already ours, when the browser passed it with
+    /// `SCM_RIGHTS` (#271). `None` means reach in with [`ProcessRef::pull`]. Owned
+    /// here so a paint that is superseded or dropped closes it on the way out.
+    #[cfg(unix)]
+    scm_fd: Option<std::os::fd::OwnedFd>,
 }
 
 /// One pending slot per window. Each is deliberately a single slot: an older frame
@@ -422,7 +455,8 @@ impl Electron {
     ) -> Result<Self, PipelineError> {
         // Listen *before* spawning, so the child cannot lose a race to connect.
         let (address, listener) = bind_control_socket()?;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .arg(app_dir)
             .env("CASTAWAY_USER_AGENT", user_agent)
             .env("CASTAWAY_BROWSER_SOCKET", &address)
@@ -431,11 +465,55 @@ impl Electron {
             // stray line could desynchronize framing; now both are just diagnostics.
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                PipelineError::GpuInit(format!("spawning browser {}: {e}", program.display()))
-            })?;
+            .stderr(Stdio::inherit());
+
+        // The fd plane (#271): the production frame-descriptor transport, SCM_RIGHTS on
+        // a socket beside the control one. Bound before the spawn for the same reason
+        // the control listener is, and best-effort at every step — a bind failure, a
+        // missing addon or a host app that never connects all degrade to the
+        // `pidfd_getfd` reach-in path, logged, not to a browser that cannot start.
+        #[cfg(unix)]
+        let fd_table = Arc::new(crate::electron_fd_plane::FdTable::default());
+        #[cfg(unix)]
+        let fd_listener = match crate::electron_fd_plane::bind(&address) {
+            Ok((path, fd_listener)) => {
+                command.env("CASTAWAY_BROWSER_FD_SOCKET", &path);
+                match locate_fd_addon() {
+                    Some(addon) => {
+                        command.env("CASTAWAY_BROWSER_FD_ADDON", &addon);
+                        debug!(target: "castaway::browser", addon = %addon.display(), "fd plane: addon staged");
+                    }
+                    None => info!(
+                        target: "castaway::browser",
+                        "fd plane: no {} beside the binary; frames will use pidfd_getfd (#271)",
+                        castaway_browser_fd::ADDON_SONAME
+                    ),
+                }
+                Some((path, fd_listener))
+            }
+            Err(e) => {
+                warn!(target: "castaway::browser", error = %e, "fd plane: bind failed; using pidfd_getfd");
+                None
+            }
+        };
+
+        let mut child = command.spawn().map_err(|e| {
+            PipelineError::GpuInit(format!("spawning browser {}: {e}", program.display()))
+        })?;
+
+        #[cfg(unix)]
+        if let Some((path, fd_listener)) = fd_listener {
+            // Detached on purpose: it parks in accept for at most CONNECT_TIMEOUT and
+            // then either follows the connection to its EOF (the child's exit) or ends.
+            if let Err(e) = crate::electron_fd_plane::serve(
+                fd_listener,
+                path,
+                Arc::clone(&fd_table),
+                CONNECT_TIMEOUT,
+            ) {
+                warn!(target: "castaway::browser", error = %e, "fd plane: thread failed; using pidfd_getfd");
+            }
+        }
 
         let stream = match accept_within(&listener, CONNECT_TIMEOUT, &mut child) {
             Ok(s) => s,
@@ -469,6 +547,8 @@ impl Electron {
                 let wire = Arc::clone(&wire);
                 let audio = Arc::clone(&audio);
                 let probes = Arc::clone(&probes);
+                #[cfg(unix)]
+                let fd_table = Arc::clone(&fd_table);
                 move || {
                     reader_loop(
                         rx,
@@ -481,6 +561,8 @@ impl Electron {
                             probes: &probes,
                             ready_tx: &ready_tx,
                             waker: &waker,
+                            #[cfg(unix)]
+                            fd_table: &fd_table,
                         },
                     );
                 }
@@ -546,6 +628,21 @@ impl Electron {
     #[must_use]
     pub fn drops(&self) -> u64 {
         self.health.drops.load(Ordering::Relaxed)
+    }
+
+    /// How imported frames got their descriptors: `(passed, pulled)` — passed with the
+    /// paint over `SCM_RIGHTS` (#271) versus reached in for with
+    /// `pidfd_getfd`/`DuplicateHandle`.
+    ///
+    /// What the browser tests assert on: with the addon staged, a painting session must
+    /// show `passed > 0, pulled == 0`, which is the claim "the import no longer depends
+    /// on ptrace policy or the direct-child arrangement" made observable.
+    #[must_use]
+    pub fn fd_transport_counts(&self) -> (u64, u64) {
+        (
+            self.health.scm_frames.load(Ordering::Relaxed),
+            self.health.pulled_frames.load(Ordering::Relaxed),
+        )
     }
 
     /// Evaluate an expression in the page and wait for its value.
@@ -669,6 +766,9 @@ struct Wiring<'a> {
     /// Wakes the kiosk loop (#59): a stored paint and a posted fault are both consumed
     /// by the main-thread pump, which no longer runs unless something asks it to.
     waker: &'a castaway_core::Waker,
+    /// Where SCM_RIGHTS deliveries land (#271), for a paint marked `scm` to claim.
+    #[cfg(unix)]
+    fd_table: &'a Arc<crate::electron_fd_plane::FdTable>,
 }
 
 /// Read the browser's half of the control socket until it closes, dispatching each message.
@@ -716,6 +816,8 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
         probes,
         ready_tx,
         waker,
+        #[cfg(unix)]
+        fd_table,
     } = *w;
     match msg {
         FromBrowser::Ready { pid } => {
@@ -729,6 +831,7 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
             height,
             media_time,
             modifier,
+            fd_transport,
             planes,
         } => {
             // The picture's place on the media clock, against which the audio block's
@@ -753,8 +856,45 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                 width,
                 height,
                 planes = planes.len(),
+                ?fd_transport,
                 "paint received"
             );
+            // Claim the passed descriptors *first*, whatever else is wrong with the
+            // paint: they are ours the moment they were sent, and every early return
+            // below must close them (dropping the Vec does) rather than leave them
+            // parked in the table until eviction (#271).
+            //
+            // The wait is for a thread-schedule, not a network: main.js sends the
+            // descriptors before it writes the paint line, so they are already in the
+            // kernel by the time this reader decodes it. A miss after half a second
+            // means the fd-plane connection died; the frame is released un-imported and
+            // the browser paints on.
+            #[cfg(unix)]
+            let scm_fds: Option<Vec<std::os::fd::OwnedFd>> = match fd_transport {
+                FdTransport::Process => None,
+                FdTransport::Scm => {
+                    match fd_table.take(id, std::time::Duration::from_millis(500)) {
+                        Some(fds) if !fds.is_empty() => Some(fds),
+                        _ => {
+                            warn!(
+                                target: "castaway::browser",
+                                id,
+                                "paint says scm but its descriptors never arrived; dropping the frame"
+                            );
+                            release(wire, id);
+                            return;
+                        }
+                    }
+                }
+            };
+            #[cfg(not(unix))]
+            if fd_transport == FdTransport::Scm {
+                // The host app only opens the fd plane on Linux, so this is a peer this
+                // build does not understand. The handle number is unusable either way.
+                warn!(target: "castaway::browser", id, "scm paint on a platform with no fd plane");
+                release(wire, id);
+                return;
+            }
             let Some(&plane) = planes.first() else {
                 warn!(target: "castaway::browser", id, "paint with no planes");
                 return;
@@ -781,6 +921,10 @@ fn handle(msg: FromBrowser, w: &Wiring<'_>) {
                     height,
                     modifier,
                     plane,
+                    // One plane (checked above), so the first descriptor is the frame.
+                    #[cfg(unix)]
+                    scm_fd: scm_fds
+                        .and_then(|mut fds| (!fds.is_empty()).then(|| fds.swap_remove(0))),
                 })
             });
             // The frame we just displaced was never drawn; return its buffer at once
@@ -1277,7 +1421,8 @@ impl ElectronHost {
         let Some(electron) = &self.electron else {
             return;
         };
-        let Some(paint) = electron.take_paint(surface) else {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let Some(mut paint) = electron.take_paint(surface) else {
             return;
         };
 
@@ -1310,8 +1455,39 @@ impl ElectronHost {
             );
             return; // `borrow` drops here, releasing the frame.
         }
+        // The frame's buffer, as a descriptor of ours. Passed with the paint where the
+        // fd plane is up (#271); reached in for with `pidfd_getfd`/`DuplicateHandle`
+        // otherwise. The counters are what let a test assert *which* — "it painted"
+        // says nothing about how the descriptors travelled.
+        #[cfg(unix)]
+        let local = match paint.scm_fd.take() {
+            Some(fd) => {
+                electron.health.scm_frames.fetch_add(1, Ordering::Relaxed);
+                fd
+            }
+            None => match electron.process.pull(RemoteHandle(paint.plane.fd)) {
+                Ok(handle) => {
+                    electron
+                        .health
+                        .pulled_frames
+                        .fetch_add(1, Ordering::Relaxed);
+                    handle
+                }
+                Err(e) => {
+                    warn!(target: "castaway::browser", error = %e, "could not fetch the frame's buffer");
+                    return; // `borrow` drops here, releasing the frame.
+                }
+            },
+        };
+        #[cfg(not(unix))]
         let local = match electron.process.pull(RemoteHandle(paint.plane.fd)) {
-            Ok(handle) => handle,
+            Ok(handle) => {
+                electron
+                    .health
+                    .pulled_frames
+                    .fetch_add(1, Ordering::Relaxed);
+                handle
+            }
             Err(e) => {
                 warn!(target: "castaway::browser", error = %e, "could not fetch the frame's buffer");
                 return; // `borrow` drops here, releasing the frame.
@@ -1682,6 +1858,14 @@ impl ElectronHost {
         self.electron
             .as_ref()
             .is_some_and(Electron::is_software_fallback)
+    }
+
+    /// See [`Electron::fd_transport_counts`]. `(0, 0)` with no browser.
+    #[must_use]
+    pub fn fd_transport_counts(&self) -> (u64, u64) {
+        self.electron
+            .as_ref()
+            .map_or((0, 0), Electron::fd_transport_counts)
     }
 
     /// Stop the browser. Call on the main thread after the kiosk event loop exits.

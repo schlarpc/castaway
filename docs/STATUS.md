@@ -449,8 +449,13 @@ iPhone capture is checked in), #80 (the AirPlay video path is built), #81, #83, 
    2026-07-31** and found three real bugs, all fixed. What remains is consumer→producer
    sync and 10-bit.
 2. **#64** — the same shape one layer up: Electron's shared-texture OSR now runs and
-   paints on Windows too, but the keyed-mutex/fence half is unproven and production fd
-   transport is still the spike's `pidfd_getfd` shortcut rather than `SCM_RIGHTS`.
+   paints on Windows too, but the keyed-mutex/fence half is unproven. The fd transport
+   is no longer part of this: production is `SCM_RIGHTS` over a socket beside the
+   control one (#271) — sent by the one native piece in the host app
+   (`castaway-browser-fd`, a hand-rolled N-API cdylib, because Node cannot say
+   `sendmsg(2)`), received by `electron_fd_plane`, asserted zero-`pidfd_getfd` in
+   `browser_end_to_end` — with the pidfd reach-in kept as the logged fallback for a
+   host app without the addon.
 3. **#190** — the GameStream media plane has never run against a host with a real
    encoder; everything up to `/launch` is proven against real Sunshine. And **#167** —
    a streamed session cannot be *touched*: `moonlight-sys` binds every `LiSend*` entry

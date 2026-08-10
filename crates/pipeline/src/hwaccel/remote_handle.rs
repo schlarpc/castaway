@@ -9,12 +9,15 @@
 //!
 //! - **Linux**: `pidfd_open(2)` + `pidfd_getfd(2)`. Requires `PTRACE_MODE_ATTACH`, so
 //!   under the usual `kernel.yama.ptrace_scope = 1` it works for a direct child and
-//!   fails for anything re-parented. That dependency is accepted deliberately: the
-//!   alternative, `SCM_RIGHTS`, cannot be driven from JavaScript and would mean shipping
-//!   a compiled node addon on Linux to solve a problem Windows does not have.
+//!   fails for anything re-parented — and under scope 2 or 3 it fails outright. Since
+//!   #271 this is the **fallback**, not the arrangement: production passes the
+//!   descriptors themselves with `SCM_RIGHTS` (`crate::electron_fd_plane`, sent by the
+//!   `castaway-browser-fd` addon — the "cannot be driven from JavaScript" objection is
+//!   answered by that one small native piece), and this path carries the session only
+//!   when the addon is absent.
 //! - **Windows**: `DuplicateHandle`, with the child's process handle as the source. The
 //!   handle `CreateProcess` returned already carries `PROCESS_DUP_HANDLE`, so there is
-//!   no ptrace-equivalent policy to depend on.
+//!   no ptrace-equivalent policy to depend on — which is why Windows has no fd plane.
 //!
 //! The asymmetry that remains is ownership: an fd and an NT handle are both "close this
 //! when done", but through different calls, so [`LocalHandle`] is a `cfg` pair rather

@@ -33,6 +33,7 @@ members = [
     "crates/ldac-sys",
     "crates/proto-gamestream",
     "crates/sponsorblock",
+    "crates/browser-fd",
     "crates/pipeline",
     "crates/control-display",
     "crates/input-touch",
@@ -85,6 +86,7 @@ ldac-sys = { path = "crates/ldac-sys" }
 proto-gamestream = { path = "crates/proto-gamestream", default-features = false }
 proto-spotify = { path = "crates/proto-spotify" }
 sponsorblock = { path = "crates/sponsorblock" }
+castaway-browser-fd = { path = "crates/browser-fd" }
 # `default-features = false` matters now that the default set is everything (D55): a
 # dependent that wants a lean build — `castaway-portable`, the VM fixture — passes
 # `--no-default-features` for *itself*, which does nothing about its dependencies' own

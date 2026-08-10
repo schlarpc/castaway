@@ -126,6 +126,11 @@ pipewire = { version = "0.8", optional = true }
 # drift from the wgpu we link.
 [target.'cfg(unix)'.dependencies]
 ash = { version = "0.38", optional = true }
+# The browser host's SCM_RIGHTS sender (#271). The rlib half is depended on for one
+# constant — the cdylib's file name, so the spawner and the artifact cannot drift — and
+# depending on it is also what makes `cargo build`/`cargo test` produce the cdylib the
+# host app dlopens.
+castaway-browser-fd = { workspace = true, optional = true }
 # `pidfd_open`/`pidfd_getfd` for pulling browser frame descriptors (hwaccel::remote_handle).
 # Declared through libc rather than an `extern "C"` block because the syscall numbers are
 # per-architecture and getting one wrong is a silent call to something else entirely.
@@ -276,7 +281,16 @@ hwaccel = [
 # `audio` is not optional here: the browser's audio is captured out of the page and mixed
 # by us (D36), so a browser build without the audio path would be a YouTube that plays
 # silently — which is exactly the class of failure G61 was.
-electron = ["render", "hwaccel", "audio", "dep:adblock", "dep:ureq", "dep:base64", "dep:rquickjs"]
+electron = [
+    "render",
+    "hwaccel",
+    "audio",
+    "dep:adblock",
+    "dep:ureq",
+    "dep:base64",
+    "dep:rquickjs",
+    "dep:castaway-browser-fd",
+]
 
 [lints]
 workspace = true

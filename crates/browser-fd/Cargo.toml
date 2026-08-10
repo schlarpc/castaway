@@ -1,0 +1,22 @@
+[package]
+name = "castaway-browser-fd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The one small native piece in the browser host (#271): a hand-rolled N-API module that sends dmabuf fds to castaway with SCM_RIGHTS, because Node cannot say sendmsg(2). Built as a cdylib the host app dlopens; the rlib half only names the artifact for the spawner."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The N-API surface is declared by hand (five externs) rather than through the napi
+# crates: the whole module is two functions, and the napi-rs tree is a large dependency
+# whose main deliverable — ergonomic marshalling for rich types — marshals two integers
+# and an array here. The symbols resolve from the Electron binary at load time, which is
+# the N-API contract (ABI-stable, importer-provided).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

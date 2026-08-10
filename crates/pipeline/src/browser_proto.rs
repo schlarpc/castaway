@@ -82,6 +82,27 @@ pub struct PlaneInfo {
     pub offset: u64,
 }
 
+/// How a paint's plane buffers travel from the browser to us (#271).
+///
+/// On the wire so the consumer never has to guess: the two mechanisms fail differently
+/// (a pidfd pull that races the browser's death versus a delivery that never arrives),
+/// and inferring the transport from what happens to be in the fd table would make the
+/// choice a race instead of a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FdTransport {
+    /// `planes[].fd` numbers descriptors **in the browser's own process**; the consumer
+    /// reaches in (`pidfd_getfd` on Linux, `DuplicateHandle` on Windows). The default,
+    /// and what an older host app that says nothing means.
+    #[default]
+    Process,
+    /// The descriptors were passed with `SCM_RIGHTS` on the fd-plane socket, keyed by
+    /// this paint's `id`; `planes[].fd` is correlation only. Linux-only — Windows'
+    /// `DuplicateHandle` route has no policy that can withdraw it, so it never needs
+    /// this.
+    Scm,
+}
+
 /// Pixel channel order, as the browser reported it.
 ///
 /// An enum rather than a string because getting this wrong is survivable-looking: the
@@ -136,6 +157,10 @@ pub enum FromBrowser {
         /// numbers, and `0` is linear. Absent on Windows, where the handle carries it.
         #[serde(default)]
         modifier: Option<String>,
+        /// How the plane buffers travel (#271). Defaulted, so a host app predating the
+        /// fd plane decodes as [`FdTransport::Process`] — the reach-in path.
+        #[serde(default)]
+        fd_transport: FdTransport,
         /// One entry for BGRA. More than one means a layout this build does not handle.
         planes: Vec<PlaneInfo>,
     },
@@ -673,6 +698,31 @@ mod tests {
         );
         assert_eq!(planes[0].fd, 108);
         assert_eq!(planes[0].stride, 15360);
+    }
+
+    #[test]
+    fn the_fd_transport_defaults_to_reach_in_and_decodes_the_scm_marker() {
+        // A host app predating the fd plane (#271) says nothing and must mean the
+        // pidfd/DuplicateHandle path; one that passed descriptors says so explicitly,
+        // in the spelling main.js writes.
+        let mut framer = LineFramer::default();
+        let lines: &[&[u8]] = &[
+            br#"{"type":"paint","surface":"page","id":1,"format":"bgra","width":8,"height":4,"modifier":"0","planes":[{"fd":9,"stride":32,"offset":0}]}"#,
+            br#"{"type":"paint","surface":"page","id":2,"format":"bgra","width":8,"height":4,"modifier":"0","fdTransport":"scm","planes":[{"fd":9,"stride":32,"offset":0}]}"#,
+        ];
+        let mut got = Vec::new();
+        for line in lines {
+            got.extend(framer.push(line));
+            got.extend(framer.push(b"\n"));
+        }
+        let transports: Vec<FdTransport> = got
+            .into_iter()
+            .map(|r| match r.unwrap() {
+                FromBrowser::Paint { fd_transport, .. } => fd_transport,
+                other => panic!("expected a paint, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(transports, vec![FdTransport::Process, FdTransport::Scm]);
     }
 
     #[test]

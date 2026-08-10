@@ -129,6 +129,43 @@ function log(level, message) {
   send({ type: 'log', level, message });
 }
 
+// ---------------------------------------------------------------------------
+// The fd plane (#271): frame descriptors to castaway by SCM_RIGHTS, not pidfd.
+//
+// Node cannot say sendmsg(2) — no API attaches ancillary data to a socket write — so
+// the one native piece in this app is a hand-rolled N-API module (castaway-browser-fd)
+// whose whole surface is connect(path) and sendFds(sock, id, fds). It writes to a
+// *separate* socket castaway binds beside the control one, because this process writes
+// the control socket through Node's buffered stream and a native write on the same fd
+// could land ancillary bytes inside a half-flushed line.
+//
+// Descriptors are sent BEFORE the paint message that names them: sendmsg on a Unix
+// socket is synchronous into the receiver's buffer, so by the time castaway reads the
+// paint line the fds are already on its side of the kernel.
+//
+// Every failure here is a fallback, not a fault: without the addon (or on Windows,
+// which duplicates handles and needs none of this) castaway reaches in with
+// pidfd_getfd exactly as before, and says so in its log.
+// ---------------------------------------------------------------------------
+let fdPlane = null;
+(function initFdPlane() {
+  const addonPath = process.env.CASTAWAY_BROWSER_FD_ADDON;
+  const socketPath = process.env.CASTAWAY_BROWSER_FD_SOCKET;
+  if (!addonPath || !socketPath || process.platform === 'win32') return;
+  try {
+    // process.dlopen, not require: the artifact is a plain cdylib (.so), and require()
+    // insists on a .node extension while dlopen takes the path as given.
+    const mod = { exports: {} };
+    process.dlopen(mod, addonPath);
+    const sock = mod.exports.connect(socketPath);
+    fdPlane = (id, fds) => mod.exports.sendFds(sock, id, fds);
+    log('info', `fd plane up over ${socketPath}`);
+  } catch (e) {
+    fdPlane = null;
+    log('warn', `fd plane unavailable (${e}); castaway will fall back to pidfd_getfd`);
+  }
+})();
+
 /** Frames lent to castaway, id → { texture, win }. Ids are unique across windows, so a
  * release does not need to say which window it returns to — but the entry remembers,
  * because the per-window lent count has to come back down on the right window. */
@@ -755,6 +792,21 @@ function createWindow(surface, width, height) {
     const id = ++paintSeq;
     w.__lent += 1;
     inflight.set(id, { texture: event.texture, win: w });
+    // Pass the descriptors themselves where the fd plane is up (#271); the paint
+    // message then marks itself `scm` so castaway claims them instead of reaching in.
+    // Sent before the paint line — see the fd-plane comment for why that ordering is
+    // what makes the pairing race-free.
+    let fdTransport;
+    if (pixmap && fdPlane) {
+      try {
+        fdPlane(id, pixmap.planes.map((p) => p.fd));
+        fdTransport = 'scm';
+      } catch (e) {
+        // One failure is a dead fd socket; every later send would fail the same way.
+        fdPlane = null;
+        log('warn', `fd plane send failed (${e}); falling back to pidfd_getfd`);
+      }
+    }
     send({
       type: 'paint',
       surface: w.__surface,
@@ -766,6 +818,7 @@ function createWindow(surface, width, height) {
       // Linux: per-plane fds plus a DRM modifier. Windows: one NT handle and no
       // modifier, because the handle describes its own layout.
       modifier: pixmap ? String(pixmap.modifier) : null,
+      fdTransport,
       planes: pixmap
         ? pixmap.planes.map((p) => ({ fd: p.fd, stride: p.stride, offset: p.offset }))
         : [{ fd: Number(shared), stride: 0, offset: 0 }],

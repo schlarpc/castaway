@@ -63,6 +63,11 @@ pub mod clock;
 pub mod cursor;
 #[cfg(feature = "electron")]
 pub mod electron_browser;
+/// The `SCM_RIGHTS` receive side of the browser's frame-descriptor transport (#271).
+/// Unix-only by nature: Windows pulls handles with `DuplicateHandle`, which no policy
+/// can withdraw, so it has no fd plane to receive.
+#[cfg(all(unix, feature = "electron"))]
+pub(crate) mod electron_fd_plane;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg_decode;
 #[cfg(feature = "electron")]

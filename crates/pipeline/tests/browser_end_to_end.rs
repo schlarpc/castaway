@@ -195,6 +195,39 @@ fn a_page_becomes_a_compositor_layer_and_keeps_painting() {
          painting stopped or the layer went stale (the borrow/release deadlock)"
     );
 
+    // Every one of those frames must have arrived by SCM_RIGHTS, not by reaching into
+    // the child with pidfd_getfd (#271). Zero pulls is the production claim itself: the
+    // import just proven above did not depend on ptrace policy or on the browser being
+    // our direct child. Skipped only where the addon genuinely is not on disk — a build
+    // that never produced it — because then the fallback carrying the session is the
+    // designed behaviour, not a regression.
+    #[cfg(unix)]
+    {
+        let addon_present = std::env::var_os("CASTAWAY_BROWSER_FD_ADDON").is_some()
+            || std::env::current_exe().is_ok_and(|exe| {
+                exe.ancestors()
+                    .skip(1)
+                    .take(3)
+                    .any(|dir| dir.join("libcastaway_browser_fd.so").exists())
+            });
+        let (passed, pulled) = host.fd_transport_counts();
+        if addon_present {
+            assert!(
+                passed > 0,
+                "the addon is on disk but no frame travelled by SCM_RIGHTS (#271)"
+            );
+            assert_eq!(
+                pulled, 0,
+                "{pulled} frames still reached in with pidfd_getfd despite the fd plane (#271)"
+            );
+        } else {
+            eprintln!(
+                "note: libcastaway_browser_fd.so not found (cargo build -p castaway-browser-fd); \
+                 frames used the pidfd fallback (passed={passed}, pulled={pulled})"
+            );
+        }
+    }
+
     // A daily refresh must reach this *running* browser (#239). Install a fresh engine
     // and load a page with one subresource the new rules name; the verdict for it has to
     // come off the new engine — its counters start at zero, so any count at all is proof
