@@ -180,6 +180,7 @@ fn enable_flag(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Bluetooth => "bluetooth",
         ProtocolKind::GameStream => "gamestream",
         ProtocolKind::MatterCast => "matter",
+        ProtocolKind::FCast => "fcast",
     }
 }
 
@@ -195,6 +196,7 @@ fn flag_value(kind: ProtocolKind, enable: &Enable) -> bool {
         ProtocolKind::Bluetooth => enable.bluetooth,
         ProtocolKind::GameStream => enable.gamestream,
         ProtocolKind::MatterCast => enable.matter,
+        ProtocolKind::FCast => enable.fcast,
     }
 }
 
@@ -480,6 +482,22 @@ fn protocol_listeners(kind: ProtocolKind) -> Vec<Listener> {
                         and then serves the phone's cluster invokes back over it.",
             },
         ],
+        ProtocolKind::FCast => vec![Listener {
+            owner: Owner::Protocol(kind),
+            transport: Transport::Tcp,
+            port: PortSpec::Fixed(proto_fcast::FCAST_PORT),
+            bind: "0.0.0.0",
+            wire: "FCast v1-v3: length-prefixed JSON — play/pause/seek/volume in, \
+                   playback updates out",
+            security: "plaintext, unauthenticated — the protocol adds TLS only in v4, \
+                       which this receiver declines (#248)",
+            gate: Gate::AnyOf(&[ProtocolKind::FCast]),
+            provider: Provider::Process,
+            chosen_by: Provenance::Convention,
+            notes: "Every published sender dials 46899 regardless of the SRV record's \
+                    port, so the number is effectively fixed. 46898, the WebSocket \
+                    variant some receiver builds add for browser senders, is not bound.",
+        }],
     }
 }
 
@@ -548,6 +566,14 @@ fn adverts() -> Vec<Advert> {
             points_at: "never advertised — the panel browses for the phone it was asked \
                         to commission",
             gate: ProtocolKind::MatterCast,
+        },
+        Advert {
+            medium: "mDNS",
+            record: proto_fcast::FCAST_SERVICE_TYPE,
+            points_at: "TCP 46899; TXT v=3 states the protocol version, which is what \
+                        tells a v4-capable sender to run the JSON session rather than \
+                        expect a TLS upgrade",
+            gate: ProtocolKind::FCast,
         },
         Advert {
             medium: "SSDP",

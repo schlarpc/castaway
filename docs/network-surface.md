@@ -26,6 +26,7 @@
 | 67 | udp | miracast *(deployment: systemd-networkd, via the NixOS module)* | DHCP server for the freshly-associated peer (#45) | plaintext | enable.miracast | spec |
 | 5550 | udp | matter | User Directed Commissioning: a phone's IdentificationDeclaration, answered with a CommissionerDeclaration to the port it names | plaintext and unauthenticated by construction — UDC runs before any session exists, and what protects it is that the passcode it leads to is on the panel's own screen | enable.matter | spec |
 | 5540 | udp | matter | the Matter operational node: PASE and CASE, then the interaction model carrying ContentLauncher / MediaPlayback / ApplicationBasic | AES-CCM under a CASE session; the fabric's root of trust is a certificate authority this panel generates and keeps | enable.matter | spec |
+| 46899 | tcp | fcast | FCast v1-v3: length-prefixed JSON — play/pause/seek/volume in, playback updates out | plaintext, unauthenticated — the protocol adds TLS only in v4, which this receiver declines (#248) | enable.fcast | convention |
 
 **Chosen by** answers "could we move this port?", in three tiers:
 
@@ -51,6 +52,7 @@ Notes, per listener that has one:
 - **67/udp (miracast)** — binds the P2P group interface. As group owner we must address the peer. The rule is not interface-scoped because the group interface (p2p-*-N) does not exist until the group forms.
 - **5550/udp (matter)** — binds 0.0.0.0. Five identical datagrams arrive per request, 100 ms apart, because the message has no acknowledgement. The reply goes to the cdPort the client names, which is this same number by default but is the client's to choose.
 - **5540/udp (matter)** — binds 0.0.0.0. Both roles run on this one socket, which is what Matter Casting being inverted costs: the panel commissions the phone over it, and then serves the phone's cluster invokes back over it.
+- **46899/tcp (fcast)** — binds 0.0.0.0. Every published sender dials 46899 regardless of the SRV record's port, so the number is effectively fixed. 46898, the WebSocket variant some receiver builds add for browser senders, is not bound.
 
 ## Multicast groups
 
@@ -68,6 +70,7 @@ Notes, per listener that has one:
 | mDNS (browse only) | `_nvstream._tcp` | never advertised — the receiver browses for hosts | enable.gamestream |
 | mDNS | `_matterd._udp` | UDP 5550 — the commissioner, not the node: the panel's operational identity exists only on a fabric it created, and the phone learns that address while being commissioned | enable.matter |
 | mDNS (browse only) | `_matterc._udp` | never advertised — the panel browses for the phone it was asked to commission | enable.matter |
+| mDNS | `_fcast._tcp` | TCP 46899; TXT v=3 states the protocol version, which is what tells a v4-capable sender to run the JSON session rather than expect a TLS upgrade | enable.fcast |
 | SSDP | `urn:schemas-upnp-org:device:MediaRenderer:1` | LOCATION → the shared HTTP port | enable.dlna |
 | SSDP | `urn:dial-multiscreen-org:service:dial:1` | LOCATION → the shared HTTP port | enable.dial |
 | 802.11 beacon | `WFD information element` | carried by wpa_supplicant; the source then listens on 7236 and the sink dials it | enable.miracast |

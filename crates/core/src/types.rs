@@ -38,6 +38,10 @@ pub enum ProtocolKind {
     /// Matter Casting — the Casting Video Player role. The one protocol where the panel
     /// is the *commissioner*: a phone joins a fabric we administer before it can speak.
     MatterCast,
+    /// FCast — FUTO's open casting protocol (the cast button in Grayjay). A
+    /// media-URL protocol in the DLNA shape: length-prefixed JSON over one TCP
+    /// session, and the receiver fetches the media itself.
+    FCast,
 }
 
 impl ProtocolKind {
@@ -46,7 +50,7 @@ impl ProtocolKind {
     /// Adding a variant fails the exhaustive matches over this enum first (the
     /// registry's among them, `crates/app/src/surface.rs`); update this list in the
     /// same change — `all_lists_every_variant` below holds you to the count.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::AirPlay,
         Self::Cast,
         Self::Miracast,
@@ -56,6 +60,7 @@ impl ProtocolKind {
         Self::Bluetooth,
         Self::GameStream,
         Self::MatterCast,
+        Self::FCast,
     ];
 
     /// A short, stable, lowercase identifier used in logs and source ids.
@@ -75,6 +80,7 @@ impl ProtocolKind {
             // "matter", not "matter-cast": the panel speaks one Matter role and the
             // shorter word is what a person reads in a picker.
             ProtocolKind::MatterCast => "matter",
+            ProtocolKind::FCast => "fcast",
         }
     }
 }
@@ -657,12 +663,13 @@ mod tests {
             | ProtocolKind::Spotify
             | ProtocolKind::Bluetooth
             | ProtocolKind::GameStream
-            | ProtocolKind::MatterCast => (),
+            | ProtocolKind::MatterCast
+            | ProtocolKind::FCast => (),
         };
         for kind in ProtocolKind::ALL {
             noted(kind);
         }
-        assert_eq!(ProtocolKind::ALL.len(), 9);
+        assert_eq!(ProtocolKind::ALL.len(), 10);
         // No duplicates: every slug appears once.
         let mut slugs: Vec<_> = ProtocolKind::ALL.iter().map(|k| k.slug()).collect();
         slugs.sort_unstable();

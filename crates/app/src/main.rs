@@ -1179,6 +1179,15 @@ async fn serve(
             playback.clone(),
         ));
     }
+    if config.enable.fcast {
+        adapter_handles.push(spawn_fcast(
+            &config,
+            &mut mdns,
+            event_tx.clone(),
+            shutdown.clone(),
+            playback.clone(),
+        ));
+    }
     if config.enable.gamestream {
         // The inverted protocol (D37): nothing to advertise, because the panel is the
         // client. Logged and skipped rather than fatal for the same reason as Miracast
@@ -1383,6 +1392,7 @@ fn landing_page(config: &Config) -> String {
         (config.enable.miracast, "Miracast"),
         (config.enable.gamestream, "GameStream (Moonlight client)"),
         (config.enable.matter, "Matter Casting"),
+        (config.enable.fcast, "FCast"),
     ] {
         if on {
             services.push_str(&format!("<li>{label}</li>\n"));
@@ -1813,6 +1823,40 @@ fn spawn_airplay(
     })
 }
 
+/// Stand up the FCast listener and advertise `_fcast._tcp` (#241).
+fn spawn_fcast(
+    config: &Config,
+    mdns: &mut MdnsResponder,
+    event_tx: mpsc::Sender<SourceMessage>,
+    shutdown: Arc<Notify>,
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
+) -> tokio::task::JoinHandle<()> {
+    let receiver = proto_fcast::FCastReceiver::new(config.advertised_name(ProtocolKind::FCast));
+    // FCast's `PlaybackUpdate`s carry the position the sender draws in its scrubber,
+    // read from the same handle DLNA's `GetPositionInfo` reads. A build with no media
+    // pipeline has nothing to report and says so by not offering one.
+    let receiver = match playback {
+        Some(report) => receiver.with_playback(report),
+        None => receiver,
+    };
+
+    advertise_adapter(&receiver, mdns);
+    info!("enabled: FCast (protocol v3, JSON session on 46899)");
+
+    let sink = SessionSink::new(SourceId::new(ProtocolKind::FCast, "listener"), event_tx);
+    let adapter = Arc::new(receiver);
+    tokio::spawn(async move {
+        tokio::select! {
+            res = adapter.run(sink) => {
+                if let Err(e) = res {
+                    warn!(error = %e, "FCast adapter exited");
+                }
+            }
+            () = shutdown.notified() => info!("FCast listener stopping"),
+        }
+    })
+}
+
 /// Build the Matter Casting receiver and hand it its mDNS record.
 fn spawn_matter(
     config: &Config,
@@ -2109,6 +2153,20 @@ fn build_attract(
             "Project a Windows desktop with no cable.",
             vec!["Press Win+K".into(), "Pick this screen".into()],
             ProtocolKind::Miracast,
+        ));
+    }
+    if config.enable.fcast {
+        tiles.push(service(
+            "fcast",
+            "FCast",
+            TileGlyph::FCast,
+            [0x26, 0xd1, 0xff, 0xff],
+            "The cast button in Grayjay.",
+            vec![
+                "Play something in Grayjay".into(),
+                "Tap cast, and pick this screen".into(),
+            ],
+            ProtocolKind::FCast,
         ));
     }
     if config.enable.matter {

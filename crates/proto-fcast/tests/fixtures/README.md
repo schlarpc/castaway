@@ -1,0 +1,32 @@
+# FCast wire fixtures
+
+Byte transcripts of the **reference FCast sender** (the terminal sender from
+`gitlab.futo.org/videostreaming/fcast`, built at the repository state of 2026-08-03,
+linking `fcast-sender-sdk` 0.3.0 — the same SDK Grayjay embeds) driven against a
+scripted receiver that answers exactly one thing: `Version {3}` on connect, plus
+`Pong` for `Ping`. Captured 2026-08-09 per ground rule 9: the reference
+implementation is the wire-behavior spec, and these are its recorded answers.
+
+One JSONL file per sender invocation; rows are
+`{"dir": "in"|"out", "t_ms": <ms since accept>, "hex": <whole frame>}` where `in` is
+sender→receiver and `hex` includes the 4-byte little-endian size prefix.
+
+Every transcript shows the SDK's connection preamble, none of which is optional and
+only some of which the v3 spec mentions:
+
+1. sends `Version {"version":4}` immediately (before reading ours),
+2. reads our `Version {3}` and downgrades the session to v3,
+3. sends `Initial {"appName":"FCast Sender SDK v0.3.0","appVersion":"0.3.0"}`
+   (no `displayName`),
+4. **auto-subscribes to `MediaItemEnd`** (`SubscribeEvent {"event":{"type":1}}`),
+5. waits ~2 s (its "connected event deadline") before the actual command.
+
+The `listen-events` transcript also records the scripted receiver's
+`PlaybackUpdate`/`VolumeUpdate`/`PlaybackError` pushes (`out` rows) that the sender
+accepted without complaint, and shows the sender sending **no** `Ping` of its own
+over a 9 s idle window — the heartbeat is receiver-initiated in practice.
+
+`tests/real_sender_transcripts.rs` replays every `in` frame through the pure
+session + player and asserts what the session must have concluded. Recapture with a
+newer sender by re-running the harness in the #241 work notes and adding files under
+a new `sdk-<version>-` prefix — do not overwrite these.

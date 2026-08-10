@@ -1071,6 +1071,9 @@ pub struct Enable {
     /// be commissioned, so it stays on — but note that a phone commissioned here joins a
     /// fabric this panel administers, and stays on it across restarts.
     pub matter: bool,
+    /// FCast (Grayjay's cast button): mDNS advertisement and a JSON session on 46899.
+    /// Costs one idle TCP socket and an mDNS record.
+    pub fcast: bool,
 }
 
 impl Default for Enable {
@@ -1085,6 +1088,7 @@ impl Default for Enable {
             gamestream: true,
             miracast: true,
             matter: true,
+            fcast: true,
         }
     }
 }

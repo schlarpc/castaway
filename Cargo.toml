@@ -29,6 +29,7 @@ members = [
     "crates/proto-dial",
     "crates/proto-miracast",
     "crates/proto-matter",
+    "crates/proto-fcast",
     "crates/moonlight-sys",
     "crates/ldac-sys",
     "crates/proto-gamestream",
@@ -79,6 +80,7 @@ proto-airplay = { path = "crates/proto-airplay" }
 proto-dial = { path = "crates/proto-dial" }
 proto-miracast = { path = "crates/proto-miracast" }
 proto-matter = { path = "crates/proto-matter" }
+proto-fcast = { path = "crates/proto-fcast" }
 moonlight-sys = { path = "crates/moonlight-sys" }
 ldac-sys = { path = "crates/ldac-sys" }
 # Same, for the same reason: its default is `stream`, which links moonlight-common-c.

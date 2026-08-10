@@ -25,12 +25,13 @@ them.
 | `airplay.svg` | Simple Icons, `airplayvideo` | CC0-1.0 |
 | `moonlight.svg` | moonlight-stream/moonlight-qt, `app/res/moonlight.svg` | GPL-3.0 (the project's) |
 | `matter.svg` | Wikimedia Commons, *Logo of Matter connectivity standard* | trademark, see below |
+| `fcast.svg` | FUTO's FCast repository, `website/dist/images/logo.svg` | MIT (the repo's), trademark, see below |
 
 Material Design Icons is <https://github.com/Templarian/MaterialDesign-SVG>; Simple Icons
 is <https://github.com/simple-icons/simple-icons>. AirPlay comes from the second one only
 because MDI has no AirPlay mark.
 
-**Two are edited**, because neither was usable as a stencil as shipped:
+**Three are edited**, because none was usable as a stencil as shipped:
 
 - `moonlight.svg` is drawn as three stacked layers — a grey disc, a white disc on top of
   it, and the burst over that. Flattened to one colour it is a solid circle. Here the
@@ -41,10 +42,21 @@ because MDI has no AirPlay mark.
   profiling the rasterised ink puts the gap between them at x=74.51, so the viewBox is
   cropped there. The wordmark is still in the path data and simply falls outside the
   viewport — it cannot be deleted without splitting a path that was authored as one.
+- `fcast.svg` is FUTO's icon rebuilt as a static stencil: the original draws its ten
+  rounded squares as `foreignObject` backdrop-blur layers over a gradient tile, none of
+  which resvg renders. Here they are ten plain `<rect>`s at the original geometry with
+  the original per-square `fill-opacity` (0.6–0.9 — the alpha survives into the mask, so
+  the shimmer the mark actually has is kept); the tile background and filters are
+  dropped, and the viewBox is cropped to the squares.
 
 The **licences above cover the files**, not the marks. Cast, AirPlay, DLNA, Spotify,
-YouTube, Bluetooth, Moonlight and Matter are trademarks of their owners and are used here
-to name the protocol each tile speaks, which is what they are for. Matter's is a CSA
+YouTube, Bluetooth, Moonlight, Matter and FCast are trademarks of their owners and are
+used here to name the protocol each tile speaks, which is what they are for. FCast's
+trademark policy (`TRADEMARK.md` in FUTO's repository) says this in as many words: the
+logo may be displayed "within your application's UI where it serves to communicate
+protocol compatibility to the user (e.g. ... a protocol selection menu)" — which is what
+this tile row is — and may not be the application's own icon, which it is not
+(`../brand/castaway-icon.svg` is). Matter's is a CSA
 certification mark with its own usage rules: this is nominative use on a tile labelled
 "Matter Cast", not a claim of certification, and if the panel is ever certified that is a
 question for the CSA rather than for this file.

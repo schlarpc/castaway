@@ -1,0 +1,24 @@
+[package]
+name = "proto-fcast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "FCast receiver: mDNS _fcast._tcp advertisement and a length-prefixed JSON session over TCP (protocol v1-v3)."
+
+[dependencies]
+castaway-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util"] }
+
+[dev-dependencies]
+castaway-test-support.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

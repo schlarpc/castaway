@@ -190,6 +190,8 @@ pub enum TileGlyph {
     Miracast,
     /// A cog — settings.
     Gear,
+    /// FCast.
+    FCast,
 }
 
 impl TileGlyph {
@@ -210,6 +212,7 @@ impl TileGlyph {
             Self::Folder => include_str!("../assets/glyphs/folder.svg"),
             Self::Miracast => include_str!("../assets/glyphs/miracast.svg"),
             Self::Gear => include_str!("../assets/glyphs/gear.svg"),
+            Self::FCast => include_str!("../assets/glyphs/fcast.svg"),
         }
     }
 }
@@ -985,6 +988,49 @@ mod tests {
     fn scales_to_4k_without_panicking() {
         let img = render(&AttractScene::demo(), 3840, 2160).unwrap();
         assert_eq!(img.len(), 3840 * 2160 * 4);
+    }
+
+    /// Every variant's vendored SVG parses and rasterises to actual ink. The compile
+    /// check on `TileGlyph::svg` only proves a file exists — a mark drawn with SVG
+    /// features `resvg` doesn't render (the FCast original's `foreignObject` layers,
+    /// say) would pass it and draw an empty tile.
+    #[test]
+    fn every_glyph_rasterises_to_ink() {
+        let all = [
+            TileGlyph::Cast,
+            TileGlyph::AirPlay,
+            TileGlyph::Dlna,
+            TileGlyph::Spotify,
+            TileGlyph::YouTube,
+            TileGlyph::Bluetooth,
+            TileGlyph::Moonlight,
+            TileGlyph::MatterCast,
+            TileGlyph::Folder,
+            TileGlyph::Miracast,
+            TileGlyph::Gear,
+            TileGlyph::FCast,
+        ];
+        // The match makes forgetting a new variant here a compile error.
+        let noted = |g: TileGlyph| match g {
+            TileGlyph::Cast
+            | TileGlyph::AirPlay
+            | TileGlyph::Dlna
+            | TileGlyph::Spotify
+            | TileGlyph::YouTube
+            | TileGlyph::Bluetooth
+            | TileGlyph::Moonlight
+            | TileGlyph::MatterCast
+            | TileGlyph::Folder
+            | TileGlyph::Miracast
+            | TileGlyph::Gear
+            | TileGlyph::FCast => (),
+        };
+        for glyph in all {
+            noted(glyph);
+            let mask = glyph_mask(glyph, 64).unwrap();
+            let ink = mask.iter().filter(|&&a| a > 0).count();
+            assert!(ink > 64, "{glyph:?} rasterised to (almost) nothing");
+        }
     }
 
     /// A scene with `n` tiles, for the layout tests.

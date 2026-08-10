@@ -1410,6 +1410,7 @@
               bluetooth = cfg.settings.enable.bluetooth or true;
               gamestream = cfg.settings.enable.gamestream or true;
               matter = cfg.settings.enable.matter or true;
+              fcast = cfg.settings.enable.fcast or true;
               miracast = miracastEnabled;
               # Not under `[enable]`: the remote-control UI is the panel's own surface
               # served back out rather than a protocol anything casts to, so its switch

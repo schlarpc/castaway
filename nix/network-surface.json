@@ -213,6 +213,19 @@
       "provider": "process",
       "transport": "udp",
       "wire": "the Matter operational node: PASE and CASE, then the interaction model carrying ContentLauncher / MediaPlayback / ApplicationBasic"
+    },
+    {
+      "chosen_by": "convention",
+      "gate": [
+        "fcast"
+      ],
+      "owner": "fcast",
+      "port": {
+        "fixed": 46899
+      },
+      "provider": "process",
+      "transport": "tcp",
+      "wire": "FCast v1-v3: length-prefixed JSON — play/pause/seek/volume in, playback updates out"
     }
   ]
 }

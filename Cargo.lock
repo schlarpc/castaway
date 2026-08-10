@@ -938,6 +938,7 @@ dependencies = [
  "proto-cast",
  "proto-dial",
  "proto-dlna",
+ "proto-fcast",
  "proto-gamestream",
  "proto-matter",
  "proto-miracast",
@@ -5488,6 +5489,20 @@ dependencies = [
  "tracing",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "proto-fcast"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "castaway-core",
+ "castaway-test-support",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
