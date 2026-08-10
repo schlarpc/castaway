@@ -40,6 +40,15 @@ map every number to its outcome are issues **#104** (`GAPS.md`, the 2026-07-26 a
 **#105** (`OPEN-QUESTIONS.md`); full text is at `git show 3fc6b57:docs/GAPS.md` and
 `git show 3fc6b57:docs/OPEN-QUESTIONS.md`. Do not add new `G##`/`Q##` anchors — cite the issue.
 
+**Docs do not carry counts the build already owns.** No test totals, no check totals, no
+crate counts — "2663 tests", "22 checks", "32 crates". A number like that is stale the
+next commit, and keeping it fresh is work that buys nothing: `cargo nextest list`,
+`nix eval .#checks.x86_64-linux --apply builtins.attrNames` and `ls crates/` answer them
+exactly, at the moment of asking. Name the command instead, or say "every check". The one
+admissible count is a **measurement pinned to a revision** — the test-matrix audit's
+"1784 → 2243 at `37db8a7`", D49's "5.4% of a core" — which is a record of what was
+observed and does not rot, because it never claimed to be about today.
+
 **One issue = one deliverable; residuals get their own issues.** An issue is done when its
 headline claim is true — close it then, and file each remaining piece of work discovered
 along the way as its **own** issue ("implement X", "test Y on an Android phone", "measure Z
@@ -219,10 +228,10 @@ This is a Rust project using Nix flakes with a pinned toolchain. First load the 
 ## Architecture
 
 Built from the [rust-flake](https://github.com/schlarpc/rust-flake) template. The repo **is**
-the Cargo workspace from architecture-substrate.md §2 (see ground rule 2): 32 crates under
-`crates/`, listed explicitly in the root manifest because crane's dependency-only build does
-not expand globs — a new crate goes into that `members` list by hand. `docs/STATUS.md` is the
-current per-crate record of what is real and what is not.
+the Cargo workspace from architecture-substrate.md §2 (see ground rule 2): one crate per
+concern under `crates/`, listed explicitly in the root manifest because crane's
+dependency-only build does not expand globs — a new crate goes into that `members` list by
+hand. `docs/STATUS.md` is the current per-crate record of what is real and what is not.
 
 - **crates/app/** — application entry point and wiring; the one `anyhow` crate
 - **Cargo.toml** — virtual workspace manifest; shared lints under `[workspace.lints.rust]`

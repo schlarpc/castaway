@@ -2,10 +2,10 @@
 
 Snapshot for our next sync. Companion to DECISION-LOG.md (why) and the issue tracker
 (what needs you; `docs/OPEN-QUESTIONS.md` was migrated there and deleted — see #105).
-Everything below builds with `cargo build`, passes `cargo nextest run` (**2663 tests** as of
-2026-08-10 — every feature is on by default since D55), passes `cargo clippy --all-targets -- -D warnings`,
-`nix build` produces a running binary, and `nix flake check` passes — 22 checks, which
-include the VM tests (integration, dial, miracast, bluetooth, gamestream, matter, mixer,
+Everything below builds with `cargo build`, passes `cargo nextest run` (every feature is on
+by default since D55, so that is the whole suite), passes `cargo clippy --all-targets -- -D warnings`,
+`nix build` produces a running binary, and `nix flake check` passes — every check, which
+includes the VM tests (integration, dial, miracast, bluetooth, gamestream, matter, mixer,
 fcast, fcast-v4), the two Android-emulator checks (`android-bt`, #225 — a real phone stack
 pairs, registers volume, streams aptX HD, and the waveform is correlated per channel; and
 `android-cast`, #225 — the same phone on a TAP segment, where **Play Services' own Cast
@@ -28,7 +28,7 @@ out of the segment capture rather than trusting the journal that a mirror was ne
 
 ## What exists (workspace per architecture-substrate.md §2)
 
-The table below describes 24 crates; the workspace now has 32. The Bluetooth stack
+The table below predates part of the workspace. The Bluetooth stack
 (`proto-bluetooth-audio`, `substrate-hci`, `substrate-l2cap`, `substrate-sdp`,
 `hci-transport`, `ldac-sys`), `crypto-playfair`, `cast-replay`, `cast-registry`, `paths`
 and `sponsorblock` arrived after it was written and are covered in the sections further

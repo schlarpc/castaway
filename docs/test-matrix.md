@@ -4,10 +4,11 @@ A point-in-time audit of what the automated tests actually prove, per protocol a
 against what "this mode works" would have to mean. Audited 2026-08-05 at `37db8a7`.
 
 > **Acted on, same day, and then acted on further.** The audit's own top findings are fixed,
-> so the numbers below have moved. **§3.1 (140 tests compiled by no check) and §3.2 (a broken
+> so §4's picture has moved. **§3.1 (140 tests compiled by no check) and §3.2 (a broken
 > build configuration) are closed by D55**: every feature is on by default now,
-> `castaway-portable` is a test fixture rather than a product, 23 checks became 15, and
-> `cargo nextest run` went from 1784 tests to 2243. §3.3's silent skips are all four closed.
+> `castaway-portable` is a test fixture rather than a product, the per-feature checks
+> collapsed into one set, and everything that had been compiled by nothing began to run.
+> §3.3's silent skips are all four closed.
 >
 > Sections are marked **[CLOSED]** where that applies. The rest is the standing record.
 >
@@ -105,16 +106,13 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 
 ## 2. The harness
 
-### The 22 checks
+### The checks
 
-`nix flake check` runs **all 22** checks (23 before D55 collapsed the per-feature
-ones; `moonlight-bindings` was added after, closing half of #191, then `android-bt`
-opening #225's first slice, `dial-vm` for #202's positive discovery path,
-`android-cast` closing #225's second slice, `fcast-vm` with #241, and `fcast-v4-vm`
-with #248), on the one system this flake now claims — see the structural note below.
-
-The count and the table below are the ones `nix eval .#checks.x86_64-linux` gives; they
-had drifted two behind it before 2026-08-09, which is a thing to check when adding a row.
+`nix flake check` runs every check in the flake, on the one system it now claims — see the
+structural note below. What that set *is* on any given day is
+`nix eval .#checks.x86_64-linux --apply builtins.attrNames`, which is the authority; the
+table below names them and says what each one is worth, which is the part a command cannot
+answer.
 
 `android-cast` is the one check with a **host requirement beyond the `kvm` system
 feature**: it builds a TAP inside the sandbox's network namespace, and the sandbox's
@@ -191,7 +189,8 @@ that throws on force fails a named job rather than nothing at all.
 
 ### Test count
 
-`docs/STATUS.md` claims 1404 tests. Measured at `37db8a7`:
+The audit's own measurement, at `37db8a7`, and the one place in this file a count belongs:
+it is evidence for §3.1, pinned to a revision, not a claim about today's tree.
 
 | Configuration | Before D55 | After D55 |
 |---|---|---|
@@ -389,15 +388,15 @@ Exit criteria are marked **[A]** asserted today or **[P]** proposed.
 | TLS on 8009, 4-day cert window | T0+T2 | `actor.rs::tls_certificate_expires_inside_the_senders_four_day_limit`; VM handshake | no concurrent-connection or mid-session rotation test |
 | Device auth CHALLENGE/RESPONSE | T0→**T3** | 12 vectors judged by openscreen's real `cast_auth_util.cc` (`openscreen-device-auth`) | **never happened over a socket**; the oracle rebuilds the envelope itself (`oracle.cc:62-68`); the VM sender has no `deviceauth` namespace |
 | Both borrowed identities (CKS, AirServer) | **T3** | `cks-chain-google-roots` / `airserver-chain-google-roots` → `ok` vs shipped roots; live endpoints exercised weekly by `live-endpoints.yml`; table expiry trips `expiry_canary.rs` at 90 days (#294) | live endpoints still off the code-change gate by design; the durable fix is a credential of our own (#40) |
-| CRL / revocation | T0 | `cast-replay/src/crl.rs` (8) | openscreen's `cast_crl.cc` **is compiled into the oracle** and never runs — no vector carries a `crl` field |
-| proto2 envelope | T0 | `proto2_required.rs` (4), hand-decoded | validated against Chromium 148 **by hand**; not automated |
-| Receiver ns, availability, declining launches | T0+T2 | `session.rs` (~10); VM asserts sender view **and** journal | best-covered mode in the subsystem |
+| CRL / revocation | T0 | `cast-replay/src/crl.rs` | openscreen's `cast_crl.cc` **is compiled into the oracle** and never runs — no vector carries a `crl` field |
+| proto2 envelope | T0 | `proto2_required.rs`, hand-decoded | validated against Chromium 148 **by hand**; not automated |
+| Receiver ns, availability, declining launches | T0+T2 | `session.rs`; VM asserts sender view **and** journal | best-covered mode in the subsystem |
 | Device prober (`GET_DEVICE_INFO`) | T0 | `session.rs::a_device_prober_is_told_what_this_receiver_is` | derived from a **manual iPhone capture**; bytes not checked in; no automated prober |
-| Media ns LOAD/PLAY/PAUSE/SEEK | T0+T2 | `session.rs` (~18); VM | **VM runs the null pipeline**; `SEEK` never over a socket; no Cast LOAD→pixel test |
+| Media ns LOAD/PLAY/PAUSE/SEEK | T0+T2 | `session.rs`; VM | **VM runs the null pipeline**; `SEEK` never over a socket; no Cast LOAD→pixel test |
 | Hosted app + real media | **T3 at T1** | `receiver_sdk.rs`, `hosted_app_media.rs` (`cast-app-hosting`) vs Google's pinned SDK | CAF v3 return path not asserted; **`video.muted = true`**, so no audio sample is verified |
 | Mirroring RTP + AES-CTR | **T3** | `openscreen_stream.rs` vs openscreen's own packetizer/`FrameCrypto` | strongest evidence in the subsystem; 6 frames, one codec, no loss burst |
 | Mirroring OFFER/ANSWER | T0 | `mirror.rs` negotiation tests | **every OFFER is hand-written by us**; no captured Chrome offer; ANSWER never parsed by openscreen's `Answer` parser |
-| Mirroring RTCP | T0+T1 | `rtcp.rs` (13); `mirror_udp.rs` | differential in **one direction only**; nothing openscreen wrote parses what we emit |
+| Mirroring RTCP | T0+T1 | `rtcp.rs`; `mirror_udp.rs` | differential in **one direction only**; nothing openscreen wrote parses what we emit |
 | Mirroring audio (Opus/AAC) | T0 | codec-name parsing only | **fixture is VP8 video only** (`audio: None`); nothing decodes a mirrored Opus frame |
 | Mirroring → pixels | NONE in CI | `render_pipeline.rs::encoded_mirror_decodes_and_composites_pixels` exists | needs `render`+`ffmpeg`; no check enables both |
 | Cast Connect / queue | NONE | — | not implemented and **not declared** as a non-goal; no test pins what `QUEUE_LOAD` returns |
@@ -419,22 +418,22 @@ as operator knowledge — `grep` finds no `cast_repro.py`, no puppeteer, no chro
 
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
-| Discovery `_airplay`/`_raop` | T0+**T2** | `advert.rs` (17); `vm-test.nix:677-714` | best-covered AirPlay mode — asserts `et=0,1` present, `et=0,3,5` absent, `pk` identical across both records and `/pair-setup` |
-| `/info` plist | T0+T2 | `info.rs` (12); VM | the `{qualifier:["txtAirPlay"]}` request — an iOS sender's *first* — is T0 only |
-| Pipelined / bare-path RTSP | T0+**T2** | `substrate-rtsp` (8); VM sends two requests in one `sendall` | — |
-| Apple-Challenge auth | **T0 only** | `crypto-raop` (4); `session.rs` | **nothing verifies the signature against a real verifier**; a wrong padding scheme passes every test and fails iTunes |
-| `/pair-verify` | T0 | `pairing.rs` (6) | **self-play only** — our client half against our server half |
+| Discovery `_airplay`/`_raop` | T0+**T2** | `advert.rs`; `vm-test.nix:677-714` | best-covered AirPlay mode — asserts `et=0,1` present, `et=0,3,5` absent, `pk` identical across both records and `/pair-setup` |
+| `/info` plist | T0+T2 | `info.rs`; VM | the `{qualifier:["txtAirPlay"]}` request — an iOS sender's *first* — is T0 only |
+| Pipelined / bare-path RTSP | T0+**T2** | `substrate-rtsp`; VM sends two requests in one `sendall` | — |
+| Apple-Challenge auth | **T0 only** | `crypto-raop`; `session.rs` | **nothing verifies the signature against a real verifier**; a wrong padding scheme passes every test and fails iTunes |
+| `/pair-verify` | T0 | `pairing.rs` | **self-play only** — our client half against our server half |
 | RAOP audio `et=0` | T0+**T1** | `tests/raop_session.rs` over real sockets | **the payload is the ASCII string `an ALAC frame..`**; nothing decodes it |
 | RAOP `et=1` (RSA session key) | **T0 only** | `sdp.rs`, `audio.rs` | **advertised to the LAN and never driven over a socket**; the T1 session uses unencrypted SDP |
-| FairPlay handshake | T0+T1 | `crypto-fairplay` (14) | four canned 142-byte replies are transcribed constants with **no upstream drift check**; `airplay-research.md` §6.2 specifies the check and it does not exist |
+| FairPlay handshake | T0+T1 | `crypto-fairplay` | four canned 142-byte replies are transcribed constants with **no upstream drift check**; `airplay-research.md` §6.2 specifies the check and it does not exist |
 | FairPlay `ekey` unwrap | **T0 vectors**+T1 | `crypto-playfair/tests/vectors.rs` — 20 published triples, all four modes | never validated against an `ekey` a real iPhone produced |
 | Mirroring H.264 | T0+**T1** | `raop_session.rs::a_mirroring_session_delivers_both_video_and_its_audio` | strongest test in the subsystem — real FairPlay vector, SHA-512 stream keys, keystream continuity across frames. **No decode**; payload is `an-access-unit-payload` |
 | Mirror audio (AAC-ELD) | T0+**T1** | same test + `audio.rs` | no decode; no decoder-open assertion |
 | AirPlay media session (`isMedia`) | T0+**T1** | `raop_session.rs::an_audio_only_session_starts_without_a_picture_to_belong_to` | captured from a real iPhone 2026-07-31; payload still never decoded |
-| Pushed-URL video (`POST /play`) | **T0 only** | `video.rs` (13) | **~1000 lines with zero socket-level coverage**; #80 closed without an integration test |
+| Pushed-URL video (`POST /play`) | **T0 only** | `video.rs` | **~1000 lines with zero socket-level coverage**; #80 closed without an integration test |
 | Volume / DMAP metadata / artwork / progress | **T0 only** | `control.rs`, `session.rs` | Cast's VM greps the journal for its volume change; AirPlay has no equivalent |
 | FLUSH / seek | **T0 only** | `audio.rs`, `clock.rs`, `session.rs` | never over a socket |
-| Timing / clock sync | **T0 only, and dead in the field** | `clock.rs` (7) | `session.rs:682` populates `sender_ports` **only from an RTSP `Transport` header**, so a plist-negotiated (mirroring) session never probes. **#176**: `clock_samples=0` on every live session |
+| Timing / clock sync | **T0 only, and dead in the field** | `clock.rs` | `session.rs:682` populates `sender_ports` **only from an RTSP `Transport` header**, so a plist-negotiated (mirroring) session never probes. **#176**: `clock_samples=0` on every live session |
 | Resends | **T0 only** | `clock.rs`, `audio.rs` | the T1 test sends 4 in-order packets; no resend has ever left a socket |
 | HEVC | **T0 only** | `advert.rs`, `mirror.rs` | `offer_hevc` is a config flag away from an untested wire format |
 | `av_skew_ms` | **NONE** | `diagnostics.rs` asserts only sign and unset-ness | **no bound asserted at any tier**. **#79**: reads ~17 hours, advancing at 3.3× wall rate |
@@ -458,25 +457,25 @@ media plane has never crossed a real LAN in CI.
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
 | HCI socket transport | **T2** | `bluetooth-vm` journal greps | two log lines only |
-| HCI USB / nusb | **T0** | `usb.rs` (6) | **no automated test ever opens a real dongle**; the stall-recovery panic fixed in `c77c87b` was invisible to CI by construction |
-| Controller init (Intel, Realtek) | **T0** | `init/intel.rs` (16), `init/realtek.rs` (18) — the real UB500 firmware parses | never downloaded to a real chip. The socket transport **structurally cannot** exercise it (the kernel already initialised the part) |
+| HCI USB / nusb | **T0** | `usb.rs` | **no automated test ever opens a real dongle**; the stall-recovery panic fixed in `c77c87b` was invisible to CI by construction |
+| Controller init (Intel, Realtek) | **T0** | `init/intel.rs`, `init/realtek.rs` — the real UB500 firmware parses | never downloaded to a real chip. The socket transport **structurally cannot** exercise it (the kernel already initialised the part) |
 | Bring-up → discoverable | T0+T1\*+**T2** | `host.rs`; `adapter_end_to_end.rs:441`; VM BlueZ inquiry | class-of-device not asserted (btvirt reports `0x000000`); EIR name never read back off the air |
 | Pairing / bonding (Just Works) | T0+T1\*+**T2** | `host.rs`, `adapter_end_to_end.rs:519`; `bluetooth-vm` pairs twice | SSP only — the legacy-PIN refusal is asserted nowhere but the emulator's default, which we turn off |
-| Link key persistence | T0 | `app/src/bluetooth.rs` (3) | nothing tests a fresh process reading the key file |
-| SDP advertisement | T0+T1\*+**T2** | `substrate-sdp/src/record.rs` (9); `sdptool browse` in `bluetooth-vm`, over a 192-byte MTU so every response fragments | `server.rs` still has *zero* inline tests; the continuation path is covered only by that one browse |
-| L2CAP basic + ERTM | T1 (in-memory) | `substrate-l2cap/tests/handshake.rs` (~30), `ertm.rs` (18) | peer is our own mux |
+| Link key persistence | T0 | `app/src/bluetooth.rs` | nothing tests a fresh process reading the key file |
+| SDP advertisement | T0+T1\*+**T2** | `substrate-sdp/src/record.rs`; `sdptool browse` in `bluetooth-vm`, over a 192-byte MTU so every response fragments | `server.rs` still has *zero* inline tests; the continuation path is covered only by that one browse |
+| L2CAP basic + ERTM | T1 (in-memory) | `substrate-l2cap/tests/handshake.rs`, `ertm.rs` | peer is our own mux |
 | ERTM vs the kernel | **T2** | `bluetooth-vm`, four scenarios: the clean exchange, a dropped I-frame, a bad checksum, starved acknowledgements. `examples/ertm_echo.rs` injects each; BlueZ's `l2test` is the peer | the geometry is btvirt's 192:1, which is the interesting one. Streaming mode and the extended-window option are still untouched, and no *real* controller has carried an ERTM frame |
-| AVDTP full session | T0+T1\*+**T2** | `sink_flow.rs` (~25); `avinfo` and `avtest` in `bluetooth-vm`, then bluetoothd/PipeWire for a real stream | the roomier controller the audio subtest needs is not the one the rest of the file uses (btvirt is ~1/5 real time either way) |
-| Codec negotiation / fallback | T0 | `codec.rs` (13) | the three tests binding the table to what the build can decode are **`#[cfg(feature = "audio")]` in `crates/app` and run in no check** (§3.1) |
+| AVDTP full session | T0+T1\*+**T2** | `sink_flow.rs`; `avinfo` and `avtest` in `bluetooth-vm`, then bluetoothd/PipeWire for a real stream | the roomier controller the audio subtest needs is not the one the rest of the file uses (btvirt is ~1/5 real time either way) |
+| Codec negotiation / fallback | T0 | `codec.rs` | the three tests binding the table to what the build can decode are **`#[cfg(feature = "audio")]` in `crates/app` and run in no check** (§3.1) |
 | **SBC decode** | T0, feature-gated + **T2 signal** | `audio_decode.rs::sbc_round_trips_…`; `bluetooth-vm`'s chirp correlation | the cargo test still **asserts only `rms > 0.05`**. The VM one is the real assertion and its input is PipeWire's SBC, not our encoder's — but it covers SBC alone |
-| **AAC (LATM) decode** | **NONE** | `latm.rs` (4) covers framing against a real iPhone capture | **no decode test at all.** `the_codecs_we_advertise_are_the_codecs_we_can_decode` iterates `[Sbc, AptX, AptXHd]` — AAC is absent. This is the codec every iPhone picks |
+| **AAC (LATM) decode** | **NONE** | `latm.rs` covers framing against a real iPhone capture | **no decode test at all.** `the_codecs_we_advertise_are_the_codecs_we_can_decode` iterates `[Sbc, AptX, AptXHd]` — AAC is absent. This is the codec every iPhone picks |
 | aptX decode | T0 | `audio_decode.rs::aptx_decodes_to_audio_that_sounds_like_what_went_in` | best signal assertion here — RMS window **plus** an L/R balance check. Still a self-encode→self-decode round trip |
 | aptX HD decode | **T3 signal** (was T0 claim only) | `checks.android-bt`: the real Android stack negotiates aptX HD — its own preference, pinned — and the reference waveform correlates ≥0.9 per channel out of the mixer's recording | the encoder is the emulator image's, one image, one version; and the codec pin means a preference change in a future image is a red check to read |
 | LDAC decode | T0 | `ldac_decode.rs` (7–11) — exact frame counts, RMS range, mono labelling | fixtures **generated by our own encoder**; LDAC stays opt-in for exactly this reason (#14) |
-| AVRCP metadata / settings | T0+T1\*+real capture | `avrcp.rs` (29); `iphone_capture.rs` vs real iPhone bytes | one phone, one app, one moment |
+| AVRCP metadata / settings | T0+T1\*+real capture | `avrcp.rs`; `iphone_capture.rs` vs real iPhone bytes | one phone, one app, one moment |
 | AVRCP transport / absolute volume | T0+T1\* | `avrcp.rs`, `adapter_end_to_end.rs:2695` | no independent controller ever receives one |
-| Cover art (BIP/OBEX over ERTM) | T0+T1\* | `obex.rs` (23) | **never fetched from a real image server**; **#87** is a live field bug (art renders for some VLC-Android tracks, not others) with no reproducing test |
-| Output to a real sound card | T0+**T2** | `mixer_real_device.rs` (2), in `checks.mixer-vm` | runs on `snd-dummy`, so the device clock is the kernel's rather than ours (#204). Not a real card: no analogue output, and no hardware misbehaviour — **#55** (panel sleep removes the HDMI sink) still has no test |
+| Cover art (BIP/OBEX over ERTM) | T0+T1\* | `obex.rs` | **never fetched from a real image server**; **#87** is a live field bug (art renders for some VLC-Android tracks, not others) with no reproducing test |
+| Output to a real sound card | T0+**T2** | `mixer_real_device.rs`, in `checks.mixer-vm` | runs on `snd-dummy`, so the device clock is the kernel's rather than ours (#204). Not a real card: no analogue output, and no hardware misbehaviour — **#55** (panel sleep removes the HDMI sink) still has no test |
 
 \* **T1\*** = the whole async adapter driven end to end in one process against
 `ScriptedTransport` — real state machines, real wire bytes, no socket and no independent
@@ -513,16 +512,16 @@ the emulator makes the per-format matrix automatable; that is the named next sli
 
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
-| SSDP M-SEARCH | T0+**T2** | `message.rs` (5); VM fetches every `LOCATION` from the other host | **the body is fetched and never parsed** — `descriptions.rs:88` records that a `Bar & Grill` friendly name produced non-well-formed XML this exact assertion could not catch |
-| SSDP alive/byebye | **T0 only** | `responder.rs` (1) | **never observed on a wire.** The VM never joins the multicast group and `notify_interval` is 900 s — a responder that sent nothing would pass |
+| SSDP M-SEARCH | T0+**T2** | `message.rs`; VM fetches every `LOCATION` from the other host | **the body is fetched and never parsed** — `descriptions.rs:88` records that a `Bar & Grill` friendly name produced non-well-formed XML this exact assertion could not catch |
+| SSDP alive/byebye | **T0 only** | `responder.rs` | **never observed on a wire.** The VM never joins the multicast group and `notify_interval` is 900 s — a responder that sent nothing would pass |
 | `MX` response delay | **NONE** | parsed and discarded | UDA 1.0 §1.2.3 asks for a randomised 0–`MX` delay. An unrecorded, untested divergence |
 | Device description / SCPD | T0 (weak) | `descriptions.rs`; `state.rs::every_advertised_action_is_answered_and_every_answered_action_is_advertised` | the SCPD sweep is strong; but no well-formedness check, no hostile-name test, and nothing fetches an SCPD over HTTP |
-| Transport walk + DIDL metadata | T0+**T2** | `state.rs`; `didl.rs` (10); VM journal-greps `NOW PLAYING.*Windowlicker` | every DIDL fixture is hand-written; `dlna-conformance.md` says captured blobs "do not exist yet" |
-| Seek | **T0 only** | `state.rs` (2) | **never over HTTP, never against a real demuxer.** `dlna-ctl` has no `seek` command |
+| Transport walk + DIDL metadata | T0+**T2** | `state.rs`; `didl.rs`; VM journal-greps `NOW PLAYING.*Windowlicker` | every DIDL fixture is hand-written; `dlna-conformance.md` says captured blobs "do not exist yet" |
+| Seek | **T0 only** | `state.rs` | **never over HTTP, never against a real demuxer.** `dlna-ctl` has no `seek` command |
 | RenderingControl volume/mute | **T0 only** | `state.rs`, `control.rs` | **no RCS action is ever sent over HTTP anywhere** |
 | ConnectionManager default connection | **NONE** | reached by the SCPD sweep, which never inspects out-args | row 1 of the conformance doc's "do not fix" table. A refactor to `PeerConnectionID=0` breaks no test |
 | `DMR-1.50`, no `M-DMR`, no `iconList`, namespace | **NONE** | — | four more "do not fix" rows with zero tests |
-| Content-type / `protocolInfo` HEAD probe (#99) | T0+**T1** | `probe.rs` (7) incl. real-socket cases; `lib.rs` (3) | strong |
+| Content-type / `protocolInfo` HEAD probe (#99) | T0+**T1** | `probe.rs` incl. real-socket cases; `lib.rs` | strong |
 | GENA subscribe/renew/NOTIFY/`SEQ` | T0+**T1** | `gena.rs` (7+); `lib.rs` real callback listener | **publish-on-a-diff is not tested** — the doc names it explicitly; **position/duration excluded from `LastChange`** is asserted nowhere |
 | Media plane → pixels | **T1** | `dlna_media_plane.rs` under `media-plane`, lavapipe | **video only** — the clip has an AAC track and nothing asserts a decoded sample |
 | Real control point | **T4 / NONE** | — | no T3 anywhere. Bluetooth has BlueZ, GameStream has Sunshine, Cast has openscreen — DLNA, the protocol with the most conformance surface, has none |
@@ -556,13 +555,13 @@ is the same contract from another *host*, out of the real app wiring.
 |---|---|---|---|
 | DIAL SSDP discovery (positive) | **NONE** | `dial.rs` struct-level test only | **untested at every tier.** No VM runs a DIAL-enabled build; `yt-selfplay` takes a base URL and does no SSDP |
 | Browser-less honesty (D27) | **T2** | VM asserts absence, 404s, and the log line | — |
-| `dd.xml`, app state, launch, DELETE, CORS | **T1** | `dial.rs` (~8); `app/src/screen.rs` | DIAL **does** test XML escaping (`Test & Screen`) where DLNA does not |
-| `<screenId>` attach-to-running-app | **T1** | `screen.rs`, `dial.rs` (3) | the real attach exists only in `yt-selfplay --reconnect` |
+| `dd.xml`, app state, launch, DELETE, CORS | **T1** | `dial.rs`; `app/src/screen.rs` | DIAL **does** test XML escaping (`Test & Screen`) where DLNA does not |
+| `<screenId>` attach-to-running-app | **T1** | `screen.rs`, `dial.rs` | the real attach exists only in `yt-selfplay --reconnect` |
 | Real screen resolver (`screen.rs::fetch`) | **NONE in CI** | `#[cfg(feature = "electron")]` | no check compiles it (§3.1) |
-| Lounge bind-channel framing | T0 | `lounge/mod.rs` (3), `sender.rs` (4) | **#41: no golden transcript.** Every fixture is one we invented |
-| `lounge::to_event` | T0 | (3) | **tested and unreachable** — no runtime caller. Inflates apparent DIAL coverage |
-| SponsorBlock lookup / filter / plan | T0 | `sponsorblock` (~16), incl. a 9-test `Decision` machine | fixtures are ours, not captured API responses |
-| SponsorBlock Lounge payload + clock | T0 | `app/src/sponsorblock/mod.rs` (8), against real captured payloads | these **do** run |
+| Lounge bind-channel framing | T0 | `lounge/mod.rs`, `sender.rs` | **#41: no golden transcript.** Every fixture is one we invented |
+| `lounge::to_event` | T0 | `lounge::mod` units | **tested and unreachable** — no runtime caller. Inflates apparent DIAL coverage |
+| SponsorBlock lookup / filter / plan | T0 | `sponsorblock`, incl. the `Decision` machine | fixtures are ours, not captured API responses |
+| SponsorBlock Lounge payload + clock | T0 | `app/src/sponsorblock/mod.rs`, against real captured payloads | these **do** run |
 | SponsorBlock actor (long poll, UTF-8 boundaries, lookup HTTP) | **NONE in CI** | `actor.rs` `#[cfg(feature = "electron")]` | the three `decodable_prefix` tests exist because a desync is *permanent and silent*, and they have never executed |
 | Real YouTube playback | **T4 opt-in** | `nix run .#yt-selfplay` | not a check; needs real internet. Last recorded run **2026-07-26 against the pre-D36 CEF build that no longer exists**. Oracle is the page's own `currentTime`, not pixels |
 | `skip_ads` live press | **T4, never observed** | unit-tested against a captured ad payload | YouTube served an unskippable pre-roll during capture |
@@ -602,25 +601,25 @@ also unchanged: `dial-vm` runs the code but asserts none of it.
 
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
-| WFD IE encode/decode | **T0** | `ie.rs` (17) — MiracleCast/lazycast/sigma-dut blobs round-trip | fixtures are transcribed hex, not captured. **No `.pcap` exists anywhere in the tree** |
+| WFD IE encode/decode | **T0** | `ie.rs` — MiracleCast/lazycast/sigma-dut blobs round-trip | fixtures are transcribed hex, not captured. **No `.pcap` exists anywhere in the tree** |
 | WFD IE on the air | **T2** | `miracast-vm`: `wpa_cli p2p_peer` shows the name and `1c44` (=7236) | only Device Information is checked on-air; the UIBC/Extended Capability bit is not |
 | MICE WSC vendor extension (`0x1049`) | **T0 encode, NOT WIRED** | `mice.rs` reproduces the spec hexdump | **`vendor_extension()` has no non-test caller.** Per [MS-MICE] §3.1.3 Windows "MUST fall back to standard Miracast" without it. **#166 is closed with an empty body** |
-| P2P group formation, WPS PBC | T0+**T2** | `p2p.rs` (13); VM subtests 1–3 | GO **negotiation** is deliberately absent (D35), so a source that insists on negotiating — Windows, intent 14 — is untested. The VM sender is wpa_supplicant talking to wpa_supplicant |
+| P2P group formation, WPS PBC | T0+**T2** | `p2p.rs`; VM subtests 1–3 | GO **negotiation** is deliberately absent (D35), so a source that insists on negotiating — Windows, intent 14 — is untested. The VM sender is wpa_supplicant talking to wpa_supplicant |
 | DHCP lease | **T2** | real `udhcpc` takes a lease | **`EmitRouter=false`/`EmitDNS=false` never asserted** — "the phone loses its internet during the cast" would pass |
-| Peer resolution by neighbour sweep | T0+**T2** | `backend_linux.rs` (6); VM deliberately never pings from the sender | sweep datagrams themselves never asserted |
-| M1–M7 exchange | T0+T1+**T2** | `session.rs`, `params.rs` (19), `actor.rs`; VM uses the real Windows `Server:` header and coalesces M4+M5 in one segment | `microsoft_*` → `none` asserted for 2 of the 11 names §7.2 lists |
-| M9 PAUSE / resume | **T0 only** | `session.rs` (1) | **resume is untested at every tier** |
-| M13 IDR request | T0+T1+**T2** | `session.rs` (2); `actor.rs` — joining mid-GOP, and a gap in a running stream; `miracast-vm` opens mid-GOP and drops two datagrams on a schedule | the limiter is asserted from the *source's* arrival times, which is where it matters. A source that ignores an M13 is still untested: ours always answers |
-| M16 keep-alive | **T0 only** | `session.rs` (2) | **no idle-session watchdog** — `;timeout=30` is parsed and discarded; a source that dies without FIN holds the session forever |
+| Peer resolution by neighbour sweep | T0+**T2** | `backend_linux.rs`; VM deliberately never pings from the sender | sweep datagrams themselves never asserted |
+| M1–M7 exchange | T0+T1+**T2** | `session.rs`, `params.rs`, `actor.rs`; VM uses the real Windows `Server:` header and coalesces M4+M5 in one segment | `microsoft_*` → `none` asserted for 2 of the 11 names §7.2 lists |
+| M9 PAUSE / resume | **T0 only** | `session.rs` | **resume is untested at every tier** |
+| M13 IDR request | T0+T1+**T2** | `session.rs`; `actor.rs` — joining mid-GOP, and a gap in a running stream; `miracast-vm` opens mid-GOP and drops two datagrams on a schedule | the limiter is asserted from the *source's* arrival times, which is where it matters. A source that ignores an M13 is still untested: ours always answers |
+| M16 keep-alive | **T0 only** | `session.rs` | **no idle-session watchdog** — `;timeout=30` is parsed and discarded; a source that dies without FIN holds the session forever |
 | MPEG2-TS demux | T0+**T2** | `ts.rs` (15+2); VM's Python source hand-rolls PAT/PMT/PES | fixtures synthetic; **no PCR is ever read** (#127's second half); the VM asserts counts and the continuity gaps, but **not the keyframe flag** |
-| RTP reorder / loss / depth overflow | T0+**T2** | `media.rs` (6) — two withheld datagrams become two skips and two video gaps and nothing else; `miracast-vm` withholds two over the radio and the sink's teardown line has to agree | still no *jitter* and no reordering on the wire: the hwsim medium delivers in order, so only the loss half of the buffer is exercised end to end |
+| RTP reorder / loss / depth overflow | T0+**T2** | `media.rs` — two withheld datagrams become two skips and two video gaps and nothing else; `miracast-vm` withholds two over the radio and the sink's teardown line has to agree | still no *jitter* and no reordering on the wire: the hwsim medium delivers in order, so only the loss half of the buffer is exercised end to end |
 | Drop-late-frames (a pipeline that is behind) | T0+**T2** | `actor.rs` — the queue is filled and every further frame costs itself rather than the socket; a keyframe lost that way still clears `needs_keyframe`. `miracast-vm` reports it at teardown and bounds the share | the T2 number is *incidental*: the null pipeline falls behind only because its drain is a task that has to be scheduled (8 of 128 measured), so the depth at which it starts shedding is the host's, not a decoder's. A real decoder under real load is still untested |
-| UIBC encode + coordinate mapping | **T0** | `uibc.rs` (22) — spec and lazycast golden bytes | excellent |
+| UIBC encode + coordinate mapping | **T0** | `uibc.rs` — spec and lazycast golden bytes | excellent |
 | UIBC back-channel (the socket half) | **NONE** | — | `actor.rs::open_uibc` — dial, timeout, writer task — has **no test at any tier**. Exactly the surface **#125** was filed about; the fix shipped with no regression test |
 | HDCP | T0 advertise / NONE | `params.rs` | a source sending `HDCP2.1 port=N` in M4 is **ignored entirely** — we would proceed and decode ciphertext |
 | Session availability withdrawal | **T0 encode, NOT WIRED** | `ie.rs::a_busy_sink_withdraws_itself_from_every_picker` | **`busy()` has no non-test caller.** A second source sees an available sink and joins a busy one |
 | MICE mDNS `_display._tcp` | **NONE** | declared in `advertisements()` | no test constructs `with_mice()`; `miracast-vm` has zero MICE assertions **even though `infrastructure` defaults to `true` and the listener is running there** |
-| MICE codec + PIN hash + DTLS refusal | **T0**+T1 | `mice.rs` (19) vs the spec's own hexdumps; `tests/mice_control.rs` (4) over real sockets | `mice_actor::{bind,serve,serve_one}` is **never invoked by any test** — the T1 test reimplements the handoff in miniature and says so |
+| MICE codec + PIN hash + DTLS refusal | **T0**+T1 | `mice.rs` vs the spec's own hexdumps; `tests/mice_control.rs` over real sockets | `mice_actor::{bind,serve,serve_one}` is **never invoked by any test** — the T1 test reimplements the handoff in miniature and says so |
 | Concurrent STA uplink + P2P GO | **NONE / T4** | — | the VM's `wlan0` is associated to nothing; hwsim imposes no interface-combination limits |
 | Driver capability check | **T4, not built** | — | needs a netlink dependency the workspace does not have (#17) |
 | 5 GHz | **T4** | — | `CONFIG_CFG80211_REG_RELAX_NO_IR` is unset on the NixOS kernel, so NO-IR 5 GHz GO is refused. The VM pins 2437 MHz |
@@ -657,9 +656,9 @@ play`. STATUS.md has not caught up.
 | UDC decode / encode | **T0** | `udc.rs` (6+) | `CHIP_IDENTIFICATION` is **hand-transcribed from reading connectedhomeip's C++**, not captured. No reference decoder has ever read our bytes |
 | UDC framing rejection | T0+**T1** | `udc.rs`; `tests/udc_over_the_wire.rs` | survives six shapes of garbage and still answers the next real message |
 | Passcode generation + stability | T0+T1+**T2** | `server.rs`; `udc_over_the_wire.rs::five_copies_produce_one_passcode` | found the bug that mattered — five retransmits producing five different numbers. The VM peer sends **one** declaration |
-| Commissioning window / expiry | T0 | `server.rs` (2) | **the prompt is never taken down on expiry.** `expire` runs only when the next datagram arrives; `UdcServer::run` has no timer; the OSD message is sticky. A phone that walks away leaves an 8-digit passcode on a wall panel indefinitely |
+| Commissioning window / expiry | T0 | `server.rs` | **the prompt is never taken down on expiry.** `expire` runs only when the next datagram arrives; `UdcServer::run` has no timer; the OSD message is sticky. A phone that walks away leaves an 8-digit passcode on a wall panel indefinitely |
 | PASE / `AddNOC` / CASE | **T2** (ours) / **INHERITED** (core) | `matter-vm` journal asserts each stage, `node_id=4096` | `rs-matter`'s own `tests/{pase,case,...}.rs` are **not executed by anything in this repo**; and it is the same library on both sides of the VM |
-| Our CA + persistence | T0+**T2** | `fabric.rs` (5); `matter-vm`'s restart scenario (#173) | the VM now restarts the panel: `install_fabric` rebuilding an identical-to-a-client NOC and `seed_acls` re-admitting yesterday's phone are what the post-restart CASE + `LaunchURL` prove |
+| Our CA + persistence | T0+**T2** | `fabric.rs`; `matter-vm`'s restart scenario (#173) | the VM now restarts the panel: `install_fabric` rebuilding an identical-to-a-client NOC and `seed_acls` re-admitting yesterday's phone are what the post-restart CASE + `LaunchURL` prove |
 | ACL privilege (`Operate`, not `Administer`) | **T2** | `matter-peer --read-acl`: reading the Access Control cluster needs Administer, and the commissioned client has to be refused | one attribute stands for the whole privilege level; nothing tries an Administer-only *invoke* |
 | Endpoint tree / Descriptor | T0+**T2** | `node.rs` (the tree and the target mapping); `matter-peer --read-descriptor` reads the root, the player and a content app back through the interaction model | the parts list is asserted exactly; the attribute and command lists are not read at all |
 | ContentLauncher `LaunchURL` | **T2 (endpoint 1)** + T0 | `matter-vm`; `player.rs` | still only the player endpoint. A *`LaunchURL`* into a content app is untested, though `LaunchContent` now reaches one |
@@ -691,18 +690,18 @@ a non-conformant endpoint, and a real phone's UDC retransmit timing and instance
 
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
-| mDNS host discovery | **T0 only** | `discovery.rs` (3) — pure mapping | **no test browses `_nvstream._tcp`.** `gs-probe` takes an address on argv; the VM's two-node topology proves routing, not discovery. The adapter's whole browse loop is unexecuted |
+| mDNS host discovery | **T0 only** | `discovery.rs` — pure mapping | **no test browses `_nvstream._tcp`.** `gs-probe` takes an address on argv; the VM's two-node topology proves routing, not discovery. The adapter's whole browse loop is unexecuted |
 | `/serverinfo` unpaired | T0+T1+**T3** | `nvhttp.rs`; `pairing_over_http.rs`; `gamestream-vm` | — |
 | `/serverinfo` paired over TLS | **T3** | `gamestream-vm` | the 401-fallback path (host forgot our cert) is **untested at every tier** |
 | Gen-7 pairing, phases 1–4 | **T0 golden**+T1+**T3** | `pairing.rs` vs **Sunshine's own vectors**; `gamestream-vm` pairs with the real binary | strongest-covered mode in the subsystem |
 | Phase 5, wrong PIN, forged signature, 200-with-refusal | T0+T1(+T3) | `pairing.rs`, `pairing_over_http.rs` | wrong PIN never tried against real Sunshine |
-| Certificate persistence | T0+**T3** | `adapter.rs` (3); VM re-runs with the same `--state-dir` | genuinely well covered |
+| Certificate persistence | T0+**T3** | `adapter.rs`; VM re-runs with the same `--state-dir` | genuinely well covered |
 | Mutual-TLS pinning | **T3 positive only** | implicit in the VM | **`http.rs` has zero unit tests.** No test presents a *different* certificate and asserts rejection — the negative branch of the only security boundary protecting a paired session |
-| `/applist` | T0+**T3** | `nvhttp.rs` (5); VM regex | the request builder has no unit test |
-| `/launch` | T0+**T3 partial** | `nvhttp.rs` (3); VM subtest 3 | **the VM has never seen a successful `/launch`.** The assertion is `("sessionUrl0=" in log) or ("launch refused" in log)` plus no `(400)` — a 503 passes, and headless it is always the 503 branch |
-| `/resume` | **T0 only** | `nvhttp.rs` (1) | the VM host is always idle |
+| `/applist` | T0+**T3** | `nvhttp.rs`; VM regex | the request builder has no unit test |
+| `/launch` | T0+**T3 partial** | `nvhttp.rs`; VM subtest 3 | **the VM has never seen a successful `/launch`.** The assertion is `("sessionUrl0=" in log) or ("launch refused" in log)` plus no `(400)` — a 503 passes, and headless it is always the 503 branch |
+| `/resume` | **T0 only** | `nvhttp.rs` | the VM host is always idle |
 | `/cancel` | **NONE** | — | no unit test, no socket test, unreachable in the VM (only called after a successful launch) |
-| App chooser (D38) | T0 screens only | `shell_nav.rs` (5) | navigation never talks to any host; and these are `render`-gated (§3.1) |
+| App chooser (D38) | T0 screens only | `shell_nav.rs` | navigation never talks to any host; and these are `render`-gated (§3.1) |
 | GFE fork | T0+T3 (Sunshine side) | `nvhttp.rs`; VM `sunshine=true` | **T4/NONE for GFE, permanently** — discontinued NVIDIA software needing a Windows host. Worth recording in notes §6 as a permanent T4, not a backlog item |
 | moonlight-sys link / ABI | **NONE in CI** | `links_moonlight.rs` is `#![cfg(feature = "stream")]` | never compiled (§3.1). The bindgen size/offset asserts are **self-referential** — bindgen generated both struct and assertion from the same header, so they catch a hand-edit, never upstream drift. And `lib.rs:10`/`bindings.rs:5` both reference a **`moonlight-bindings` flake check that does not exist** |
 | RTSP, ENet, video+FEC, Opus audio, A/V pacing, input, teardown | **NONE** | — | linked C, never executed. **FEC recovery under loss and A/V pacing under jitter are the two properties D37 names as the reason for linking**, and nothing induces loss anywhere in this tree. Input is not implemented at all (**#167**) |
@@ -739,21 +738,21 @@ is librespot's, and its peer is Spotify's cloud.
 |---|---|---|---|
 | mDNS advertisement | T0+T2 | `lib.rs`; VM `avahi-browse` | neither asserts `VERSION`/`Stack`, the **port**, or the `#spotify` suffix — Cast and AirPlay get port assertions in the same script |
 | `getInfo` | T0+T1+T2 | `discovery.rs`, `lib.rs`, `tests/pairing.rs`, VM | **the field set has never been checked against a real client**; `status:101`, `deviceID`, `version`, `tokenType` are emitted and asserted by nothing. Same failure shape as #48 and **nobody has filed it** |
-| `addUser` DH | T0 | `crypto.rs` (2), `discovery.rs`, `pairing.rs` | no real-client `clientKey` seen; left-padding of a short key (the classic interop bug) exercised only by generated keys |
-| Blob outer decrypt | T0 | `crypto.rs` (3), `pairing.rs` (2) | **the core of #48.** Every positive assertion is our encoder against our decoder — if the real framing were `iv‖hmac‖ct` these all still pass |
+| `addUser` DH | T0 | `crypto.rs`, `discovery.rs`, `pairing.rs` | no real-client `clientKey` seen; left-padding of a short key (the classic interop bug) exercised only by generated keys |
+| Blob outer decrypt | T0 | `crypto.rs`, `pairing.rs` | **the core of #48.** Every positive assertion is our encoder against our decoder — if the real framing were `iv‖hmac‖ct` these all still pass |
 | Inner blob → librespot `Credentials` | **T3** | `crypto.rs::our_inner_blob_is_one_librespot_can_read` | strongest evidence in the crate: librespot's own decoder reads our bytes. Still no captured `addUser` |
-| Hostile blob | T0 | `session.rs` (3) | the one part of #48 genuinely closed |
-| `activeUser` / device claim / steal | T1+T0 | `pairing.rs` (3), `session.rs` | that a *failed login* clears `activeUser` is asserted nowhere |
+| Hostile blob | T0 | `session.rs` | the one part of #48 genuinely closed |
+| `activeUser` / device claim / steal | T1+T0 | `pairing.rs`, `session.rs` | that a *failed login* clears `activeUser` is asserted nowhere |
 | No account on disk | **NONE** | — | a headline property resting on one `None` argument. Trivially closable in the VM |
 | AP login, dealer, connect-state, CDN audio | **STRUCTURAL / T4** | `examples/selfplay.rs` — **never run end to end** | needs one browser OAuth visit (Spotify has no device-code flow; automating it hits reCAPTCHA Enterprise) |
-| PCM sink | T0 | `sink.rs` (4) | well tested, incl. the std-vs-tokio-channel bug that killed the first real session |
-| Preemption / reattach | T0 | `sink.rs` (3) | the runner side (`serve_reattach`) and its coalescing loop are untested |
-| Session reopen republishes | T0 | `session.rs` (3) | uses a `StubRemote` with `ControlCapabilities::NONE`, so Spotify's real capability set is never proven to reach the panel |
+| PCM sink | T0 | `sink.rs` | well tested, incl. the std-vs-tokio-channel bug that killed the first real session |
+| Preemption / reattach | T0 | `sink.rs` | the runner side (`serve_reattach`) and its coalescing loop are untested |
+| Session reopen republishes | T0 | `session.rs` | uses a `StubRemote` with `ControlCapabilities::NONE`, so Spotify's real capability set is never proven to reach the panel |
 | **`pump_events` (phone → panel)** | **NONE** | — | **~175 lines with no test at all**, carrying ≥4 documented past regressions (position ticks blanking the card; `SessionDisconnected` falling into the wildcard; artwork pasted onto a successor track). Every phone-side transport action lands here. **Not a cloud gap** — `PlayerEvent` is plainly constructible |
 | **`run()` reconnect policy** | **NONE** | — | **~200 lines with zero tests**, and it exists precisely because librespot 0.8 does *not* reconnect — the one thing D30 says delegation cannot cover. Backoff, `HEALTHY_SESSION` reset, give-up-and-clear-`activeUser`, deliberate-vs-dropped, pairing-interrupts-backoff: all unasserted |
-| Panel → `Spirc` dispatch | T0 caps only | `control.rs` (3) | the dispatch `match` is untested — nothing asserts `Stop → disconnect(true)` rather than `pause()` |
-| Repeat / shuffle / volume | T0 outbound | `control.rs` (3) | repeat is the best-tested control path (all 3×3 transitions, never both flags set). **Inbound volume is not handled at all** — no `PlayerEvent` arm, so the phone's volume never reaches the panel |
-| Queue (`UpNext`) | T0 | `session.rs` (11) + `core` (2) | **#49: the metadata key names are guesses** and every test feeds keys we chose |
+| Panel → `Spirc` dispatch | T0 caps only | `control.rs` | the dispatch `match` is untested — nothing asserts `Stop → disconnect(true)` rather than `pause()` |
+| Repeat / shuffle / volume | T0 outbound | `control.rs` | repeat is the best-tested control path (all 3×3 transitions, never both flags set). **Inbound volume is not handled at all** — no `PlayerEvent` arm, so the phone's volume never reaches the panel |
+| Queue (`UpNext`) | T0 | `session.rs` + `core` | **#49: the metadata key names are guesses** and every test feeds keys we chose |
 | Cover art, `apply_track` | **NONE** | — | `best_cover` and the three `UniqueFields` arms are pure, trivial, and untested |
 | Capabilities → transport strip | **NONE (composition)** | both halves asserted separately | nothing feeds `SpotifyRemote::capabilities()` into `TransportModel::from_now_playing`. DLNA's equivalent join *is* asserted in the VM |
 
@@ -769,43 +768,44 @@ which are local and closable today.
 
 ### 4.10 Media pipeline and presentation
 
-The shared destination every protocol feeds. Measured test counts: `-p pipeline` default
-**181**, `+audio,ldac` **259**, `+kiosk` **429**, union of all CI **507**, compilable **622**.
+The shared destination every protocol feeds. Measured at the audit, at `37db8a7`:
+`-p pipeline` default **181**, `+audio,ldac` **259**, `+kiosk` **429**, union of all CI
+**507**, compilable **622**.
 
 | Mode | Tier | Where | Gap |
 |---|---|---|---|
 | ffmpeg software decode | T1, **skips** | `ffmpeg_decode::tests` under `audio` | silently skips for want of the ffmpeg CLI (§3.3) |
-| URL session: both streams, pacing, seek | T1, in `checks.test` | `tests/media_url_av.rs` (10) | ran by no check at the audit (§3.1); `ffmpeg`+`render` are default since D55, and `checks.test` puts the ffmpeg CLI on `PATH` under `CASTAWAY_REQUIRE_FFMPEG`, so a skip there is a failure |
-| Late-frame dropping | T0, inputs only | `clock.rs` (2) — `wait_for` and `is_hopeless`, the predicates the drop consults | the dropping itself is `drain_paced` (`ffmpeg_decode.rs`), which no test drives directly: its tally is pinned (`late_drops_are_all_counted_and_the_log_is_paced`) and `media_url_av.rs` asserts its *pacing* (the ±60 ms skew median, #234), but nothing feeds it a hopeless frame and asserts the drop |
-| Two-lane render channel | T0 | `tests/render_channel.rs` (3) | runs in `render-pixels` |
-| wgpu compositor pixels | T1 | `wgpu_compositor::tests` (5) — exact RGBA at sampled coords | **untripwired skip** (§3.3); only sampled coordinates, never a whole frame |
-| Corner radius, crop-vs-stretch | T1 | `wgpu_compositor::tests` (2) | same untripwired skip; one radius value |
-| Panel model / focus / motion | **T0, strong** | `panel::tests` (17), `motion::tests` (13), + 4 integration files | all 4×4×2 motion steps settle <1 s and land exactly on `CORNER`; back always terminates |
-| Shell navigation, transitions, gestures | T1 | 4 files (~27) | runs in `render-pixels`; closes D38's "cancel plumbing has never been sent" |
-| Winit kiosk window | **T0 only** | `kiosk::tests` (20) with `window: None` | **no test opens a window.** D46: the edge-drag bug "turned out never to have worked… in the one file with no test harness" |
-| Transport strip layout / hit test / capabilities / scrub | **T0, strong** | `transport::tests` (20), `projection::tests` (13) | best-covered surface in the crate; runs by default |
-| Now-playing card | T0 + weak raster | `nowplaying_card::tests` (21) | only pixel check is `assert_ne!` (§3.5) |
-| **Mixer summation & gain** | **T0 sample-exact** | `mixer::tests` (26) — `0.25+0.5 → 0.75`, clipping, mute, `tapped == heard` | the arithmetic is excellent, but every fixture is a DC constant (`tone()` is `vec![value; n]`) — no waveform, frequency or correlation anywhere in the module, so by §3.6's own definition this is (b)/(c), **not (d)**, and the mixer's perceptual behaviour is not covered (#234) |
-| Mixer pacing / `OUTPUT_LEAD` | T0 wall-clock **+ T2** | `mixer::tests` (5); `mixer_real_device.rs` (2) in `checks.mixer-vm` | the in-crate five are asserted against a fake whose `frames_played` is **wall-clock derived — correct by construction**; #204's VM is what removes that term. #174/#175/#177 were all found by a human listening, and the VM asserts on the counters that name them |
+| URL session: both streams, pacing, seek | T1, in `checks.test` | `tests/media_url_av.rs` | ran by no check at the audit (§3.1); `ffmpeg`+`render` are default since D55, and `checks.test` puts the ffmpeg CLI on `PATH` under `CASTAWAY_REQUIRE_FFMPEG`, so a skip there is a failure |
+| Late-frame dropping | T0, inputs only | `clock.rs` — `wait_for` and `is_hopeless`, the predicates the drop consults | the dropping itself is `drain_paced` (`ffmpeg_decode.rs`), which no test drives directly: its tally is pinned (`late_drops_are_all_counted_and_the_log_is_paced`) and `media_url_av.rs` asserts its *pacing* (the ±60 ms skew median, #234), but nothing feeds it a hopeless frame and asserts the drop |
+| Two-lane render channel | T0 | `tests/render_channel.rs` | runs in `render-pixels` |
+| wgpu compositor pixels | T1 | `wgpu_compositor::tests` — exact RGBA at sampled coords | **untripwired skip** (§3.3); only sampled coordinates, never a whole frame |
+| Corner radius, crop-vs-stretch | T1 | `wgpu_compositor::tests` | same untripwired skip; one radius value |
+| Panel model / focus / motion | **T0, strong** | `panel::tests`, `motion::tests`, + 4 integration files | all 4×4×2 motion steps settle <1 s and land exactly on `CORNER`; back always terminates |
+| Shell navigation, transitions, gestures | T1 | `shell_navigation.rs`, `shell_screen.rs`, `transitions.rs`, `home_gesture.rs` | runs in `render-pixels`; closes D38's "cancel plumbing has never been sent" |
+| Winit kiosk window | **T0 only** | `kiosk::tests` with `window: None` | **no test opens a window.** D46: the edge-drag bug "turned out never to have worked… in the one file with no test harness" |
+| Transport strip layout / hit test / capabilities / scrub | **T0, strong** | `transport::tests`, `projection::tests` | best-covered surface in the crate; runs by default |
+| Now-playing card | T0 + weak raster | `nowplaying_card::tests` | only pixel check is `assert_ne!` (§3.5) |
+| **Mixer summation & gain** | **T0 sample-exact** | `mixer::tests` — `0.25+0.5 → 0.75`, clipping, mute, `tapped == heard` | the arithmetic is excellent, but every fixture is a DC constant (`tone()` is `vec![value; n]`) — no waveform, frequency or correlation anywhere in the module, so by §3.6's own definition this is (b)/(c), **not (d)**, and the mixer's perceptual behaviour is not covered (#234) |
+| Mixer pacing / `OUTPUT_LEAD` | T0 wall-clock **+ T2** | `mixer::tests`; `mixer_real_device.rs` in `checks.mixer-vm` | the in-crate ones are asserted against a fake whose `frames_played` is **wall-clock derived — correct by construction**; #204's VM is what removes that term. #174/#175/#177 were all found by a human listening, and the VM asserts on the counters that name them |
 | Device-vanish retry (#55) | T0, **half** | `a_box_with_no_device_still_drains_its_sources_in_real_time` | the factory refuses *forever*; **the recovery half has no test**, and #55 asks for exactly that |
-| LDAC / aptX / SBC / ALAC decode | **T0 signal** | `ldac_decode.rs` (11), `audio_decode.rs` (10) | see §4.3 for the per-codec weaknesses |
-| Real audio device | **T2** | `mixer_real_device.rs` (2), `checks.mixer-vm` | `snd-dummy` in a VM: an independent clock, no analogue output. `starved`, `shed` and emission rate are all asserted (#204) |
+| LDAC / aptX / SBC / ALAC decode | **T0 signal** | `ldac_decode.rs`, `audio_decode.rs` | see §4.3 for the per-codec weaknesses |
+| Real audio device | **T2** | `mixer_real_device.rs`, `checks.mixer-vm` | `snd-dummy` in a VM: an independent clock, no analogue output. `starved`, `shed` and emission rate are all asserted (#204) |
 | cpal / ALSA / WASAPI backend | **NONE in CI** | — | `audio-out` is **not even compiled** by `nix flake check` on Linux; only the Windows DLL-closure check touches it |
-| `/screenshot.png` | T1, content untested | `tap::tests` (4) | asserts three bytes (§3.5) |
-| fMP4/HLS boxing | **T0, runs by default** | `fmp4`(16), `hls`(8), `cadence`(7), `timeline`(5), `feed`(8) | self-consistency against the test module's own naive `find_box`. **`hls.rs` never calls `push_audio`** |
-| fMP4/HLS vs libavformat | T1, in `checks.test` | `tests/output_stream.rs` (9) | dark on both counts at the audit (`stream`-gated, and skip-passing by design); `stream` is default since D55 and the skips now go through the #182 tripwires, so under `checks.test`'s lavapipe + `CASTAWAY_REQUIRE_GPU`/`_FFMPEG` a missing adapter or encoder fails rather than passes |
-| RGBA→NV12 GPU pass | T1 numeric | `nv12::gpu` (5), ±2/255 | untripwired skip; a pin, not a differential |
-| H.264 encoder, AAC track, stream audio window | T0/T1, in `checks.test` | `encoder`(6), `aac`(4), `audio`(9) | `stream`-gated at the audit; `stream` is default since D55 so all run in `checks.test`. The `aac` skips go through the #182 ffmpeg tripwire; the `encoder` six do not — "no encoder here, skipping" is untripwired by design, so they still pass without asserting wherever no H.264 encoder opens |
-| WebRTC `/remote/` | T1, in `checks.test` | `remote_negotiation.rs` (9) + units (8) | `remote`-gated at the audit; `remote` is default since D55, and the test needs no GPU (real sockets, the offer/answer path), so it runs in `checks.test` |
-| WebRTC mirroring **in** (#248) | T1, in `checks.test` | `mirror_negotiation.rs` (5) | `remote`-gated, and `remote` is default since D55, so — like the row above, and for the same reason: real sockets, no GPU — it runs in `checks.test`. The strongest of the five is the one that matters: a second real peer offers a track, DTLS completes, and H.264 comes out as `EncodedFrame`s |
-| WebRTC mirror reassembly | T0, runs | `mirror_in::assemble` (7) | pure and always compiled: FU-A reassembly, the marker/timestamp boundary rules, keyframe flags, and the 13-hour RTP clock wrap. Nothing here proves a *picture* — see the row above |
-| FCompanion resource plane (#249) | T0, runs | `companion` units (7), `adapter_v4_loopback` (2), `pushed_content.rs` (4) | the wire format is the spec's own, and the loopback case drives the whole round trip: a v4 sender claims a provider id, plays an `fcomp://` URL, and answers the reads an HTTP GET provokes. **No published sender has exercised it** — `checks.fcast-v4-vm` does not push local media, so the reference sender's own `fcomp` path is untested against ours |
-| WebRTC fan-out / touch back | T0, runs | `feed::tests` (8), `input_touch::wire` (10), `remote::tests` (11) | strong; note two `feed` tests assert only "no panic" |
+| `/screenshot.png` | T1, content untested | `tap::tests` | asserts three bytes (§3.5) |
+| fMP4/HLS boxing | **T0, runs by default** | `fmp4`, `hls`, `cadence`, `timeline`, `feed` | self-consistency against the test module's own naive `find_box`. **`hls.rs` never calls `push_audio`** |
+| fMP4/HLS vs libavformat | T1, in `checks.test` | `tests/output_stream.rs` | dark on both counts at the audit (`stream`-gated, and skip-passing by design); `stream` is default since D55 and the skips now go through the #182 tripwires, so under `checks.test`'s lavapipe + `CASTAWAY_REQUIRE_GPU`/`_FFMPEG` a missing adapter or encoder fails rather than passes |
+| RGBA→NV12 GPU pass | T1 numeric | `nv12::gpu`, ±2/255 | untripwired skip; a pin, not a differential |
+| H.264 encoder, AAC track, stream audio window | T0/T1, in `checks.test` | `encoder`, `aac`, `audio` | `stream`-gated at the audit; `stream` is default since D55 so all run in `checks.test`. The `aac` skips go through the #182 ffmpeg tripwire; the `encoder` six do not — "no encoder here, skipping" is untripwired by design, so they still pass without asserting wherever no H.264 encoder opens |
+| WebRTC `/remote/` | T1, in `checks.test` | `remote_negotiation.rs` + units | `remote`-gated at the audit; `remote` is default since D55, and the test needs no GPU (real sockets, the offer/answer path), so it runs in `checks.test` |
+| WebRTC mirroring **in** (#248) | T1, in `checks.test` | `mirror_negotiation.rs` | `remote`-gated, and `remote` is default since D55, so — like the row above, and for the same reason: real sockets, no GPU — it runs in `checks.test`. The strongest of them is the one that matters: a second real peer offers a track, DTLS completes, and H.264 comes out as `EncodedFrame`s |
+| WebRTC mirror reassembly | T0, runs | `mirror_in::assemble` | pure and always compiled: FU-A reassembly, the marker/timestamp boundary rules, keyframe flags, and the 13-hour RTP clock wrap. Nothing here proves a *picture* — see the row above |
+| FCompanion resource plane (#249) | T0, runs | `companion` units, `adapter_v4_loopback`, `pushed_content.rs` | the wire format is the spec's own, and the loopback case drives the whole round trip: a v4 sender claims a provider id, plays an `fcomp://` URL, and answers the reads an HTTP GET provokes. **No published sender has exercised it** — `checks.fcast-v4-vm` does not push local media, so the reference sender's own `fcomp` path is untested against ours |
+| WebRTC fan-out / touch back | T0, runs | `feed::tests`, `input_touch::wire`, `remote::tests` | strong; note a couple of `feed` tests assert only "no panic" |
 | Real browser drives `/remote/` | **T4** | `remote_browser.rs` `#[ignore]` | STATUS.md calls it "the test that matters" |
-| Electron browser host | **NEVER RUNS** | `browser_end_to_end.rs` (5) | `electron`-gated **and** `#[ignore]`d |
-| Adblock / scriptlets | T0, in `checks.test` (13 of 14) | `filterlists`(6), `ubo_scriptlets`(4), `adblock_engine`(3), `filter_subscriptions.rs`(1) | `electron`-gated at the audit; `electron` is default since D55, so the 13 lib units run in `checks.test`. `filter_subscriptions.rs` stays `#[ignore]`d — it needs the network (#183) |
-| Hardware decode | T0/T1, self-skipping | `hwaccel_zero_copy.rs` (3) + units (19) | compiled and run by `checks.test` since D55 (`hwaccel` is default; the clippy-only `hwaccel-clippy` is gone), but the zero-copy tests still self-skip their substance there — the sandbox has no render node for VA-API, and that skip is deliberately untripwired. D3D11VA/DX12 (943 lines) has **no tests at all** (#58, #64) |
-| **`control-display`** | **NONE (vacuous)** | 3 tests | §3.5. Placeholder opcodes, **wrong protocol family** per #21, `serial`/`ddc` are empty feature lists, `app` builds `NullDisplay` unconditionally |
+| Electron browser host | **NEVER RUNS** | `browser_end_to_end.rs` | `electron`-gated **and** `#[ignore]`d |
+| Adblock / scriptlets | T0, in `checks.test` (all but one) | `filterlists`, `ubo_scriptlets`, `adblock_engine`, `filter_subscriptions.rs` | `electron`-gated at the audit; `electron` is default since D55, so the 13 lib units run in `checks.test`. `filter_subscriptions.rs` stays `#[ignore]`d — it needs the network (#183) |
+| Hardware decode | T0/T1, self-skipping | `hwaccel_zero_copy.rs` + units | compiled and run by `checks.test` since D55 (`hwaccel` is default; the clippy-only `hwaccel-clippy` is gone), but the zero-copy tests still self-skip their substance there — the sandbox has no render node for VA-API, and that skip is deliberately untripwired. D3D11VA/DX12 (943 lines) has **no tests at all** (#58, #64) |
+| **`control-display`** | **NONE (vacuous)** | `lib.rs` and `dell.rs` units | §3.5. Placeholder opcodes, **wrong protocol family** per #21, `serial`/`ddc` are empty feature lists, `app` builds `NullDisplay` unconditionally |
 | **`input-touch` evdev / winuser** | **NONE** | — | both are **empty feature lists with zero lines of code**; all touch arrives via winit. The C6522QT's USB-HID touch has never been met (#65) |
 | Idle-CPU / A/V-sync numbers | **T4 prose** | D49/D50/STATUS.md | "0 jiffies", "5.4% of a core", "10.000 s / 10.005 s" are one-off dev-box measurements. **No `benches/`, no criterion, no `/proc/self/stat` read anywhere** |
 | Full-feature Linux artifact | **NONE** | `nix/linux-kiosk.nix:119` sets `doCheck = false` | it is a *package*, not a check — the full feature union is never test-run |
