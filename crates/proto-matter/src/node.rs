@@ -5,8 +5,10 @@
 //! - **0** — the root node. `rs-matter`'s own system clusters: Basic Information,
 //!   Operational Credentials, Access Control, General Commissioning. Untouched by us.
 //! - **1** — the Casting Video Player. `ContentLauncher` (a URL the panel plays itself),
-//!   `MediaPlayback` (the transport), and `TargetNavigator` (the list of content apps,
-//!   which is how a client that has not read the descriptor finds them).
+//!   `MediaPlayback` (the transport), `TargetNavigator` (the list of content apps,
+//!   which is how a client that has not read the descriptor finds them), `KeypadInput`
+//!   (a remote's transport keys), and `ApplicationLauncher` (the same apps addressed by
+//!   catalog entry, #274).
 //! - **6…** — one Content App per thing the panel can open. `ApplicationBasic` is what a
 //!   client matches its own app against, so those fields are the endpoint's address, not
 //!   decoration.
@@ -27,7 +29,8 @@ use std::sync::Arc;
 
 use rs_matter::devices;
 use rs_matter::dm::clusters::decl::{
-    application_basic, content_launcher, media_playback, target_navigator,
+    application_basic, application_launcher, content_launcher, keypad_input, media_playback,
+    target_navigator,
 };
 use rs_matter::dm::clusters::desc::{self, DescHandler};
 use rs_matter::dm::devices::DEV_TYPE_CASTING_VIDEO_PLAYER;
@@ -63,6 +66,12 @@ const CONTENT_LAUNCHER_FEATURES: u32 = 0b11;
 /// do not all have a rate control, and advertising one that silently does nothing is
 /// worse than not having it.
 const MEDIA_PLAYBACK_FEATURES: u32 = 0b1;
+
+/// `ApplicationLauncher` feature bits: ApplicationPlatform (#274). The panel *is* the
+/// platform — it hosts a catalogue of content apps on endpoints of its own — which is
+/// the shape where this cluster sits on the video player endpoint and `CatalogList`
+/// names the catalogs those apps come from.
+const APPLICATION_LAUNCHER_FEATURES: u32 = 0b1;
 
 /// Matches a cluster on any endpoint *except* the root.
 ///
@@ -809,6 +818,296 @@ impl target_navigator::ClusterHandler for TargetNavigatorHandler {
     }
 }
 
+/// The `KeypadInput` server: a remote control's buttons, on the player endpoint (#274).
+///
+/// The feature map is empty on purpose: the navigation, location and number key features
+/// are for devices with an on-screen menu to move a cursor around, and the panel has
+/// none. What a casting remote's keys can honestly do here is drive the transport, so the
+/// transport keys are the supported set and everything else answers `UnsupportedKey` —
+/// the status that tells a sender to hide or disable the button, rather than a `Success`
+/// for a key that did nothing.
+#[derive(Debug)]
+pub struct KeypadInputHandler {
+    ctx: Arc<CastingContext>,
+    dataver: Dataver,
+}
+
+impl KeypadInputHandler {
+    /// Build the handler.
+    pub fn new(ctx: Arc<CastingContext>, dataver: Dataver) -> Self {
+        Self { ctx, dataver }
+    }
+
+    /// The CEC keys the panel can honour, mapped onto the transport verbs it already has.
+    ///
+    /// [`None`] is "not a key this panel has", answered `UnsupportedKey`. The play/pause
+    /// *functions* (96/97) are the deterministic Feature-C variants of the plain keys and
+    /// map the same way; `PausePlayFunction` is the toggle every one-button remote sends,
+    /// resolved against the projection because a toggle is meaningless without knowing
+    /// which way it toggles.
+    fn key_to_transport(
+        key: keypad_input::CECKeyCodeEnum,
+        state: PlaybackState,
+    ) -> Option<Transport> {
+        use keypad_input::CECKeyCodeEnum as Key;
+        match key {
+            Key::Play | Key::PlayFunction => Some(Transport::Play),
+            Key::Pause => Some(Transport::Pause),
+            Key::PausePlayFunction => Some(match state {
+                PlaybackState::Playing | PlaybackState::Buffering => Transport::Pause,
+                PlaybackState::Paused | PlaybackState::NotPlaying => Transport::Play,
+            }),
+            Key::Stop | Key::StopFunction => Some(Transport::Stop),
+            // CEC's names for the track keys: 75/76 are the |<< / >>| pair, not seeks.
+            Key::Forward => Some(Transport::Next),
+            Key::Backward => Some(Transport::Previous),
+            // Rewind and FastForward deliberately not mapped: the panel refuses the same
+            // verbs on MediaPlayback with SpeedOutOfRange, and a key that pretended by
+            // seeking would make the keypad disagree with the transport cluster.
+            _ => None,
+        }
+    }
+}
+
+impl keypad_input::ClusterHandler for KeypadInputHandler {
+    const CLUSTER: Cluster<'static> = keypad_input::FULL_CLUSTER;
+
+    fn dataver(&self) -> u32 {
+        self.dataver.get()
+    }
+
+    fn dataver_changed(&self) {
+        self.dataver.changed();
+    }
+
+    fn handle_send_key<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        request: keypad_input::SendKeyRequest<'_>,
+        response: keypad_input::SendKeyResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        let key = request.key_code()?;
+        let snapshot = self.ctx.state.get();
+
+        let status = match Self::key_to_transport(key, snapshot.state) {
+            Some(transport) => match self.ctx.drive_transport(transport)? {
+                TransportOutcome::Driven => keypad_input::StatusEnum::Success,
+                // The key exists here; there is just nothing loaded for it to act on.
+                // `InvalidKeyInCurrentState`, not `UnsupportedKey`: the latter would tell
+                // the sender to remove the button for good.
+                TransportOutcome::NothingPlaying => {
+                    keypad_input::StatusEnum::InvalidKeyInCurrentState
+                }
+            },
+            None => {
+                tracing::info!(?key, "matter: declining a key the panel does not have");
+                keypad_input::StatusEnum::UnsupportedKey
+            }
+        };
+        response.status(status)?.end()
+    }
+}
+
+/// The `ApplicationLauncher` server: the content-app catalogue as a launchable platform
+/// (#274), on the player endpoint with the ApplicationPlatform feature.
+///
+/// The same apps `TargetNavigator` indexes, addressed the third way a client can aim: by
+/// catalog entry rather than by list position or by vendor/product. Launching an app on
+/// this panel *selects* it — Matter carries no media, the panel's apps have no home
+/// screen to open, and what a launch really establishes is which app a subsequent
+/// `LaunchURL`/`LaunchContent` belongs to, exactly as `NavigateTarget` does.
+#[derive(Debug)]
+pub struct ApplicationLauncherHandler {
+    ctx: Arc<CastingContext>,
+    dataver: Dataver,
+}
+
+impl ApplicationLauncherHandler {
+    /// Build the handler.
+    pub fn new(ctx: Arc<CastingContext>, dataver: Dataver) -> Self {
+        Self { ctx, dataver }
+    }
+
+    /// Resolve a request's application struct against the catalogue.
+    ///
+    /// # Errors
+    /// `ConstraintError` when the field is absent: with the ApplicationPlatform feature
+    /// the spec makes it mandatory, and there is no "current app" fallback to guess at.
+    fn requested_app(
+        &self,
+        application: Option<application_launcher::ApplicationStruct<'_>>,
+    ) -> Result<Option<&crate::player::ContentApp>, Error> {
+        let application = application.ok_or(ErrorCode::ConstraintError)?;
+        let catalog = application.catalog_vendor_id()?;
+        let id = application.application_id()?;
+        Ok(self.ctx.catalogue.by_application(catalog, id))
+    }
+
+    /// Take an app off the glass: end whatever it had playing and clear the current-app
+    /// projection, synchronously with the invoke for the usual read-back reason (#196).
+    fn retire(&self, endpoint: EndpointId) -> Result<(), Error> {
+        let snapshot = self.ctx.state.get();
+        if snapshot.app != Some(endpoint) {
+            // Not the app on the glass. On this panel an app that is not on screen is
+            // not running (`ApplicationBasic` says the same), so there is nothing to do
+            // and Success is the honest answer — stopping a stopped app is idempotent.
+            return Ok(());
+        }
+        if !matches!(snapshot.state, PlaybackState::NotPlaying) {
+            // Its media is the session; ending the session is what stopping the app means.
+            self.ctx.send(CastCommand::End)?;
+        }
+        self.ctx.state.set(crate::player::PlayerSnapshot::default());
+        Ok(())
+    }
+}
+
+impl application_launcher::ClusterHandler for ApplicationLauncherHandler {
+    const CLUSTER: Cluster<'static> =
+        application_launcher::FULL_CLUSTER.with_features(APPLICATION_LAUNCHER_FEATURES);
+
+    fn dataver(&self) -> u32 {
+        self.dataver.get()
+    }
+
+    fn dataver_changed(&self) {
+        self.dataver.changed();
+    }
+
+    fn catalog_list<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: ArrayAttributeRead<
+            rs_matter::tlv::ToTLVArrayBuilder<P, u16>,
+            rs_matter::tlv::ToTLVBuilder<P, u16>,
+        >,
+    ) -> Result<P, Error> {
+        let catalogs = self.ctx.catalogue.catalog_vendor_ids();
+        match builder {
+            ArrayAttributeRead::ReadAll(mut builder) => {
+                for id in &catalogs {
+                    builder = builder.push(id)?;
+                }
+                builder.end()
+            }
+            ArrayAttributeRead::ReadOne(index, builder) => {
+                let Some(id) = catalogs.get(index as usize) else {
+                    return Err(ErrorCode::ConstraintError.into());
+                };
+                builder.set(id)
+            }
+            ArrayAttributeRead::ReadNone(builder) => builder.end(),
+        }
+    }
+
+    fn current_app<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl ReadContext,
+        builder: rs_matter::tlv::NullableBuilder<
+            P,
+            application_launcher::ApplicationEPStructBuilder<P>,
+        >,
+    ) -> Result<P, Error> {
+        // Null unless a *content app* is current: a launch on the bare player endpoint
+        // belongs to no app, and the reserved answer is the honest one — the same shape
+        // as `TargetNavigator`'s CurrentTarget of 0.
+        let current = self
+            .ctx
+            .state
+            .get()
+            .app
+            .and_then(|endpoint| self.ctx.catalogue.at(endpoint));
+        match current {
+            Some(app) => builder
+                .non_null()?
+                .application()?
+                .catalog_vendor_id(app.catalog_vendor_id)?
+                .application_id(&app.application_id)?
+                .end()?
+                .endpoint(Some(app.endpoint))?
+                .end(),
+            None => builder.null(),
+        }
+    }
+
+    fn handle_launch_app<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        request: application_launcher::LaunchAppRequest<'_>,
+        response: application_launcher::LauncherResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        match self.requested_app(request.application()?)? {
+            Some(app) => {
+                let endpoint = app.endpoint;
+                // The selection, exactly as `NavigateTarget` makes it: the command to the
+                // adapter, and the projection moved synchronously with the invoke the
+                // client is waiting on (#196). The request's opaque `data` is a message
+                // for the app itself, and this panel's apps have nobody to hand it to.
+                self.ctx.send(CastCommand::SelectTarget(endpoint))?;
+                self.ctx.state.update(|s| s.app = Some(endpoint));
+                response
+                    .status(application_launcher::StatusEnum::Success)?
+                    .data(None)?
+                    .end()
+            }
+            None => {
+                tracing::info!("matter: declining a LaunchApp for an app the panel does not host");
+                response
+                    .status(application_launcher::StatusEnum::AppNotAvailable)?
+                    .data(None)?
+                    .end()
+            }
+        }
+    }
+
+    fn handle_stop_app<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        request: application_launcher::StopAppRequest<'_>,
+        response: application_launcher::LauncherResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        match self.requested_app(request.application()?)? {
+            Some(app) => {
+                self.retire(app.endpoint)?;
+                response
+                    .status(application_launcher::StatusEnum::Success)?
+                    .data(None)?
+                    .end()
+            }
+            None => response
+                .status(application_launcher::StatusEnum::AppNotAvailable)?
+                .data(None)?
+                .end(),
+        }
+    }
+
+    fn handle_hide_app<P: TLVBuilderParent>(
+        &self,
+        _ctx: impl InvokeContext,
+        request: application_launcher::HideAppRequest<'_>,
+        response: application_launcher::LauncherResponseBuilder<P>,
+    ) -> Result<P, Error> {
+        // The spec's HideApp leaves the app running in the background. This panel has no
+        // background — it shows one thing at a time, and an app that is not on the glass
+        // is not running (`ApplicationBasic::status` says the same) — so hiding the
+        // current app and stopping it are the same act here, and answering `Success`
+        // while secretly keeping it "running" would be a state the panel cannot honour.
+        match self.requested_app(request.application()?)? {
+            Some(app) => {
+                self.retire(app.endpoint)?;
+                response
+                    .status(application_launcher::StatusEnum::Success)?
+                    .data(None)?
+                    .end()
+            }
+            None => response
+                .status(application_launcher::StatusEnum::AppNotAvailable)?
+                .data(None)?
+                .end(),
+        }
+    }
+}
+
 /// Milliseconds, saturating. The cluster's unit; a duration past `u64::MAX` ms is not a
 /// number any media has.
 fn millis(d: std::time::Duration) -> u64 {
@@ -845,6 +1144,8 @@ impl NodeTree {
                 <ContentLauncherHandler as content_launcher::ClusterHandler>::CLUSTER,
                 <MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER,
                 <TargetNavigatorHandler as target_navigator::ClusterHandler>::CLUSTER,
+                <KeypadInputHandler as keypad_input::ClusterHandler>::CLUSTER,
+                <ApplicationLauncherHandler as application_launcher::ClusterHandler>::CLUSTER,
             ])),
             client_clusters: &[],
         });
@@ -896,6 +1197,13 @@ pub fn handlers<'a>(
     let target_navigator = Async(target_navigator::HandlerAdaptor(
         TargetNavigatorHandler::new(Arc::clone(ctx), Dataver::new_rand(&mut rand)),
     ));
+    let keypad_input = Async(keypad_input::HandlerAdaptor(KeypadInputHandler::new(
+        Arc::clone(ctx),
+        Dataver::new_rand(&mut rand),
+    )));
+    let application_launcher = Async(application_launcher::HandlerAdaptor(
+        ApplicationLauncherHandler::new(Arc::clone(ctx), Dataver::new_rand(&mut rand)),
+    ));
 
     EthSysHandlerBuilder::new()
         .build(rand)
@@ -918,6 +1226,16 @@ pub fn handlers<'a>(
         .chain(
             AppCluster(<TargetNavigatorHandler as target_navigator::ClusterHandler>::CLUSTER.id),
             target_navigator,
+        )
+        .chain(
+            AppCluster(<KeypadInputHandler as keypad_input::ClusterHandler>::CLUSTER.id),
+            keypad_input,
+        )
+        .chain(
+            AppCluster(
+                <ApplicationLauncherHandler as application_launcher::ClusterHandler>::CLUSTER.id,
+            ),
+            application_launcher,
         )
 }
 
@@ -971,6 +1289,8 @@ mod tests {
             <MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER.id,
             <TargetNavigatorHandler as target_navigator::ClusterHandler>::CLUSTER.id,
             <ApplicationBasicHandler as application_basic::ClusterHandler>::CLUSTER.id,
+            <KeypadInputHandler as keypad_input::ClusterHandler>::CLUSTER.id,
+            <ApplicationLauncherHandler as application_launcher::ClusterHandler>::CLUSTER.id,
         ] {
             assert!(
                 !root_clusters.contains(&ours),
@@ -978,10 +1298,12 @@ mod tests {
             );
         }
 
-        // The player: the endpoint a client casts to when it has no app in mind. All
-        // three of its clusters are load-bearing — no ContentLauncher and there is
+        // The player: the endpoint a client casts to when it has no app in mind. Every
+        // one of its clusters is load-bearing — no ContentLauncher and there is
         // nothing to launch with, no MediaPlayback and the transport buttons do nothing,
-        // no TargetNavigator and the content apps are invisible.
+        // no TargetNavigator and the content apps are invisible, no KeypadInput and a
+        // remote's buttons land nowhere, no ApplicationLauncher and the catalogue cannot
+        // be addressed by catalog entry (#274).
         assert_eq!(endpoints[1].id, PLAYER_ENDPOINT);
         let player = cluster_ids(endpoints[1]);
         for required in [
@@ -989,6 +1311,8 @@ mod tests {
             <ContentLauncherHandler as content_launcher::ClusterHandler>::CLUSTER.id,
             <MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER.id,
             <TargetNavigatorHandler as target_navigator::ClusterHandler>::CLUSTER.id,
+            <KeypadInputHandler as keypad_input::ClusterHandler>::CLUSTER.id,
+            <ApplicationLauncherHandler as application_launcher::ClusterHandler>::CLUSTER.id,
         ] {
             assert!(
                 player.contains(&required),
@@ -1035,6 +1359,20 @@ mod tests {
                     &<MediaPlaybackHandler as media_playback::ClusterHandler>::CLUSTER.id
                 ),
                 "the transport belongs to the player endpoint, not to each app"
+            );
+            // The platform clusters stay on the platform, for the same reason: one place
+            // to press a key, one place to launch an app (#274).
+            assert!(
+                !clusters
+                    .contains(&<KeypadInputHandler as keypad_input::ClusterHandler>::CLUSTER.id),
+                "the keypad belongs to the player endpoint, not to each app"
+            );
+            assert!(
+                !clusters.contains(
+                    &<ApplicationLauncherHandler as application_launcher::ClusterHandler>::CLUSTER
+                        .id
+                ),
+                "the launcher belongs to the player endpoint, not to each app"
             );
         }
     }
@@ -1180,5 +1518,118 @@ mod tests {
             TransportOutcome::NothingPlaying
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The CEC keys the panel honours map onto the transport it already has, and the
+    /// rest map onto nothing — which the handler answers `UnsupportedKey` (#274).
+    #[test]
+    fn transport_keys_map_and_the_rest_are_unsupported() {
+        use keypad_input::CECKeyCodeEnum as Key;
+
+        let map = |key| KeypadInputHandler::key_to_transport(key, PlaybackState::Playing);
+        assert_eq!(map(Key::Play), Some(Transport::Play));
+        assert_eq!(map(Key::PlayFunction), Some(Transport::Play));
+        assert_eq!(map(Key::Pause), Some(Transport::Pause));
+        assert_eq!(map(Key::Stop), Some(Transport::Stop));
+        assert_eq!(map(Key::StopFunction), Some(Transport::Stop));
+        assert_eq!(map(Key::Forward), Some(Transport::Next));
+        assert_eq!(map(Key::Backward), Some(Transport::Previous));
+
+        // The variable-speed keys are refused for the same reason MediaPlayback refuses
+        // the verbs: pretending with a seek would make the two clusters disagree.
+        for unmapped in [
+            Key::Rewind,
+            Key::FastForward,
+            Key::Select,
+            Key::Up,
+            Key::RootMenu,
+            Key::Numbers5,
+            Key::Power,
+        ] {
+            assert_eq!(map(unmapped), None, "{unmapped:?} must be unsupported");
+        }
+    }
+
+    /// The one-button remote's toggle resolves against the projection: pause when moving,
+    /// play otherwise. A toggle without state would send the key's name, not its meaning.
+    #[test]
+    fn pause_play_toggles_by_state() {
+        use keypad_input::CECKeyCodeEnum as Key;
+
+        let map = KeypadInputHandler::key_to_transport;
+        assert_eq!(
+            map(Key::PausePlayFunction, PlaybackState::Playing),
+            Some(Transport::Pause)
+        );
+        assert_eq!(
+            map(Key::PausePlayFunction, PlaybackState::Buffering),
+            Some(Transport::Pause)
+        );
+        assert_eq!(
+            map(Key::PausePlayFunction, PlaybackState::Paused),
+            Some(Transport::Play)
+        );
+        assert_eq!(
+            map(Key::PausePlayFunction, PlaybackState::NotPlaying),
+            Some(Transport::Play)
+        );
+    }
+
+    fn launcher_context() -> (
+        Arc<CastingContext>,
+        mpsc::UnboundedReceiver<CastCommand>,
+        ApplicationLauncherHandler,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(CastingContext {
+            catalogue: Catalogue::new([app("alpha"), app("beta")]),
+            state: Arc::new(PlayerState::new()),
+            commands: tx,
+            playback: None,
+        });
+        let handler = ApplicationLauncherHandler::new(Arc::clone(&ctx), Dataver::new(1));
+        (ctx, rx, handler)
+    }
+
+    /// Stopping the app on the glass ends its session and clears the projection — and
+    /// stopping any other hosted app is an idempotent no-op, not an error (#274).
+    #[test]
+    fn retiring_an_app_ends_its_session_and_a_stopped_app_is_a_no_op() {
+        let (ctx, mut rx, handler) = launcher_context();
+        ctx.state.set(PlayerSnapshot {
+            state: PlaybackState::Playing,
+            app: Some(FIRST_CONTENT_APP_ENDPOINT),
+            ..PlayerSnapshot::default()
+        });
+
+        // Not the current app: nothing happens, nothing is sent.
+        handler.retire(FIRST_CONTENT_APP_ENDPOINT + 1).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert_eq!(ctx.state.get().app, Some(FIRST_CONTENT_APP_ENDPOINT));
+
+        // The current app: the session ends and the projection clears, synchronously.
+        handler.retire(FIRST_CONTENT_APP_ENDPOINT).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), CastCommand::End);
+        assert_eq!(ctx.state.get(), PlayerSnapshot::default());
+
+        // Stopping it again: already stopped, still Success-shaped — no command, no change.
+        handler.retire(FIRST_CONTENT_APP_ENDPOINT).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Retiring a current app that has nothing playing clears the selection without
+    /// inventing a `SessionEvent::End` for a session that does not exist.
+    #[test]
+    fn retiring_an_idle_current_app_clears_the_selection_silently() {
+        let (ctx, mut rx, handler) = launcher_context();
+        ctx.state.set(PlayerSnapshot {
+            state: PlaybackState::NotPlaying,
+            app: Some(FIRST_CONTENT_APP_ENDPOINT),
+            ..PlayerSnapshot::default()
+        });
+
+        handler.retire(FIRST_CONTENT_APP_ENDPOINT).unwrap();
+        assert!(rx.try_recv().is_err(), "no session existed to end");
+        assert_eq!(ctx.state.get().app, None);
     }
 }

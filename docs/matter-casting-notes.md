@@ -240,7 +240,7 @@ The browse runs on its own `mdns-sd` daemon, like GameStream's — a third socke
 | Endpoint | Device type | Clusters |
 |---|---|---|
 | 0 | Root Node | `rs-matter`'s system clusters, untouched |
-| 1 | Casting Video Player `0x0023` | Descriptor, ContentLauncher, MediaPlayback, TargetNavigator |
+| 1 | Casting Video Player `0x0023` | Descriptor, ContentLauncher, MediaPlayback, TargetNavigator, KeypadInput, ApplicationLauncher |
 | 6… | Content App `0x0024` | Descriptor, ApplicationBasic, ContentLauncher |
 
 Content apps start at endpoint 6 because the reference `tv-app` does and clients have been
@@ -275,12 +275,34 @@ zero. The attribute and command lists are trimmed to what is actually served:
 list is a promise a client plans reads against), and the track commands are off the
 accepted-command list so the interaction model itself refuses them.
 
+`KeypadInput` (#274) carries no key-code features: the navigation, location and number
+keys are for devices with an on-screen menu, and the panel has none. The transport keys
+(Play/Pause/Stop, the play/pause *functions*, the one-button `PausePlayFunction` toggle,
+and CEC's `Forward`/`Backward` track pair) map onto the same transport verbs
+`MediaPlayback` drives, through the same guard — a key with nothing loaded answers
+`InvalidKeyInCurrentState`, a key the panel does not have answers `UnsupportedKey`
+(which tells a sender to drop the button), and `Rewind`/`FastForward` are deliberately
+in the second set so the keypad cannot disagree with the transport cluster's
+`SpeedOutOfRange`.
+
+`ApplicationLauncher` (#274) sits on the player endpoint with the ApplicationPlatform
+feature — the panel *is* the platform; its content apps are the catalogue — and is the
+third address a client can aim by: catalog entry, alongside `TargetNavigator`'s list
+position and `ApplicationBasic`'s vendor/product. On this panel a `LaunchApp` *selects*:
+Matter carries no media and the apps have no home screen, so what a launch establishes
+is which app a later `LaunchURL`/`LaunchContent` belongs to, exactly as `NavigateTarget`
+does. `StopApp` on the current app ends its session and clears the selection;
+`HideApp` is the same act, because the panel has no background — an app off the glass is
+not running, which is also what `ApplicationBasic`'s status says. An app the catalogue
+does not hold answers `AppNotAvailable`.
+
 ### 5.1 Conformance gaps
 
-The Casting Video Player device type's full cluster conformance includes OnOff, WakeOnLan,
-KeypadInput, ApplicationLauncher, AudioOutput and MediaInput. None is implemented. A
-strict client may refuse an endpoint that does not present them; the reference casting
-client does not. Tracked, not papered over.
+The Casting Video Player device type's full cluster conformance also includes OnOff,
+WakeOnLan, AudioOutput and MediaInput; none is implemented. (KeypadInput and
+ApplicationLauncher were in this list until #274 — #172's triage picked them as the two
+real clients actually use.) A strict client may refuse an endpoint that does not present
+the rest; the reference casting client does not. Tracked, not papered over.
 
 ---
 

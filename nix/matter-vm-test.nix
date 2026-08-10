@@ -199,8 +199,15 @@ pkgs.testers.runNixOSTest {
             # null pipeline, the two skips resolve into absolute seeks the journal shows,
             # and Seek/Rewind/FastForward produce both refusal statuses.
             f"--playback-probes "
+            # KeypadInput (#274): the transport keys while playing (pause, then the
+            # one-button toggle back to play), a key the panel does not have, and — after
+            # the transport sequence's stop — a key with nothing to act on.
+            f"--send-key pause,pause-play,select --send-key-idle play "
             f"--transport play,pause,stop,play --navigate 2 "
             f"--launch-content 'a search nobody can serve' --read-acl "
+            # ApplicationLauncher (#274): CatalogList, LaunchApp by catalog entry,
+            # CurrentApp read back, a refusal, StopApp, and the cleared selection.
+            f"--app-launcher "
             f"> /tmp/peer.log 2>&1 &"
         )
         phone.wait_until_succeeds(
@@ -437,6 +444,73 @@ pkgs.testers.runNixOSTest {
         # panel accepted and then denied having accepted is what a paused phone showing
         # "playing" looks like.
         assert states == ["Playing", "Paused", "NotPlaying", "NotPlaying"], states
+
+    with subtest("a remote's keys drive the transport, and the rest are refused (#274)"):
+        # Both new clusters are in the descriptor a client walks — on the player, and
+        # deliberately not on the content apps: one place to press a key, one place to
+        # launch an app.
+        assert "0x0509" in descriptors["1"], descriptors["1"]
+        assert "0x050c" in descriptors["1"], descriptors["1"]
+        assert "0x0509" not in descriptors["7"], descriptors["7"]
+        assert "0x050c" not in descriptors["7"], descriptors["7"]
+
+        keys = re.findall(r"keypad_input key=(\S+) status=(\w+)", peer_log)
+        print(keys)
+        assert keys == [
+            # While playing: pause works, and the one-button toggle resolves against the
+            # projection — the panel is paused by then, so the toggle plays.
+            ("pause", "Success"),
+            ("pause-play", "Success"),
+            # A menu key on a panel with no menus: UnsupportedKey, which tells the sender
+            # to drop the button — not a Success for a key that did nothing.
+            ("select", "UnsupportedKey"),
+            # After the transport sequence's stop: the button exists, the moment is
+            # wrong. InvalidKeyInCurrentState, not UnsupportedKey.
+            ("play", "InvalidKeyInCurrentState"),
+        ], keys
+
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        # The keys reached the pipeline as transport, not just as statuses: exactly two
+        # Pause controls exist at this point — the keypad's and the transport probe's —
+        # and the keypad's toggle is the second Play beside the probe's.
+        assert len(re.findall(r"null pipeline: CONTROL txn=Pause", journal)) == 2, journal
+        assert len(re.findall(r"null pipeline: CONTROL txn=Play", journal)) == 2, journal
+        assert "declining a key the panel does not have" in journal, journal
+
+    with subtest("a client launches and stops an app by its catalog entry (#274)"):
+        # CatalogList: the panel's two test apps share the CSA "vendor's own catalog", 0.
+        assert 'application_launcher catalogs=["0"]' in peer_log, peer_log
+
+        # LaunchApp lands on the same endpoint every other address resolves to — the
+        # second app is endpoint 7, and answering with the first would be a client
+        # casting into the wrong app with no way to tell.
+        assert (
+            "application_launcher launch-app(castaway.two) status=Success" in peer_log
+        ), peer_log
+        assert (
+            "application_launcher current_app=(catalog=0 app_id=castaway.two endpoint=7)"
+            in peer_log
+        ), peer_log
+
+        # An app the panel does not host is refused in the cluster's own words.
+        assert (
+            "application_launcher launch-app(com.example.absent) status=AppNotAvailable"
+            in peer_log
+        ), peer_log
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert "declining a LaunchApp" in journal, journal
+
+        # StopApp clears the selection, and CurrentApp answers with the launcher's
+        # reserved null — the same shape as TargetNavigator's CurrentTarget 0.
+        assert (
+            "application_launcher stop-app(castaway.two) status=Success" in peer_log
+        ), peer_log
+        assert "application_launcher current_app=null" in peer_log, peer_log
+
+        # Two selections total reached the adapter: NavigateTarget's and LaunchApp's.
+        assert (
+            len(re.findall(r"a client selected a content app", journal)) == 2
+        ), journal
 
     with subtest("a client can list the panel's apps and select one"):
         nav = one(r"target_navigator targets=(.*) current=(\d+)", peer_log)

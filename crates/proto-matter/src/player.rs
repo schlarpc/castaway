@@ -397,6 +397,36 @@ impl Catalogue {
         self.apps.iter().find(|a| a.endpoint == endpoint)
     }
 
+    /// The app an `ApplicationLauncher` request names: a catalog and an id within it.
+    ///
+    /// This is the *other* address a client can aim by (#274) — `ApplicationBasic` is
+    /// matched by vendor and product, this by catalog entry — and both must land on the
+    /// same endpoint. The id is compared exactly: catalog ids are assigned names, not
+    /// user input, and a case-folding match would make two apps out of one.
+    #[must_use]
+    pub fn by_application(
+        &self,
+        catalog_vendor_id: u16,
+        application_id: &str,
+    ) -> Option<&ContentApp> {
+        self.apps.iter().find(|a| {
+            a.catalog_vendor_id == catalog_vendor_id && a.application_id == application_id
+        })
+    }
+
+    /// The catalogs the hosted apps come from, deduplicated in first-appearance order —
+    /// `ApplicationLauncher`'s `CatalogList` (#274).
+    #[must_use]
+    pub fn catalog_vendor_ids(&self) -> Vec<u16> {
+        let mut ids: Vec<u16> = Vec::new();
+        for app in &self.apps {
+            if !ids.contains(&app.catalog_vendor_id) {
+                ids.push(app.catalog_vendor_id);
+            }
+        }
+        ids
+    }
+
     /// Whether any hosted app is named in a client's `targetAppList`.
     ///
     /// An empty list means "anything you have", which is true whenever we have anything —
@@ -656,6 +686,35 @@ mod tests {
             cat.launch_search(FIRST_CONTENT_APP_ENDPOINT, "   ", true),
             Err(LaunchRefusal::NotAllowed)
         );
+    }
+
+    /// The catalog address (`ApplicationLauncher`) and the vendor address
+    /// (`ApplicationBasic`) must land on the same endpoint (#274).
+    #[test]
+    fn an_application_is_found_by_its_catalog_entry_exactly() {
+        let cat = catalogue();
+        let found = cat.by_application(0, "com.example.app").unwrap();
+        assert_eq!(found.endpoint, FIRST_CONTENT_APP_ENDPOINT);
+
+        // The id is exact: a case-folded or prefixed id is a different app.
+        assert!(cat.by_application(0, "COM.EXAMPLE.APP").is_none());
+        assert!(cat.by_application(0, "com.example").is_none());
+        // …and the catalog is part of the address, not a hint.
+        assert!(cat.by_application(1, "com.example.app").is_none());
+    }
+
+    /// `CatalogList` is the catalogs, not the apps: two apps from one catalog are one
+    /// entry, in first-appearance order (#274).
+    #[test]
+    fn catalog_ids_deduplicate_in_first_appearance_order() {
+        let mut a = browser_app(1, 1, None);
+        a.catalog_vendor_id = 7;
+        let mut b = browser_app(2, 2, None);
+        b.catalog_vendor_id = 0;
+        let mut c = browser_app(3, 3, None);
+        c.catalog_vendor_id = 7;
+        assert_eq!(Catalogue::new([a, b, c]).catalog_vendor_ids(), vec![7, 0]);
+        assert!(Catalogue::default().catalog_vendor_ids().is_empty());
     }
 
     /// The pipeline's progress lands in the projection — including a duration, which

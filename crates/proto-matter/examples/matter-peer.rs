@@ -181,6 +181,17 @@ struct Probes {
     app_basic: bool,
     /// Invoke these `MediaPlayback` commands, in order, on the player endpoint.
     transport: Vec<String>,
+    /// Send these CEC keys through `KeypadInput`, in order, *before* the transport
+    /// sequence — while the launch above still has the panel playing (#274).
+    keys: Vec<String>,
+    /// Send these CEC keys *after* the transport sequence — the `stop` in it is what
+    /// makes `InvalidKeyInCurrentState` reachable (#274).
+    keys_idle: Vec<String>,
+    /// Drive `ApplicationLauncher` (#274): read `CatalogList`, launch the second app by
+    /// its catalog entry, read `CurrentApp` back, aim at an app the panel does not host,
+    /// then stop the app and read `CurrentApp` again. Fixed operands, like the playback
+    /// battery, so the VM asserts exact answers.
+    app_launcher: bool,
     /// Read `TargetList` and `CurrentTarget`, then `NavigateTarget` to this identifier.
     navigate: Option<u8>,
     /// `LaunchContent` this query at the app endpoint.
@@ -220,8 +231,9 @@ fn usage() -> String {
      [--matter-port <n>] [--state-dir <dir>] [--declare-only] [--cancel-only] \
      [--wrong-passcode] \
      [--wrong-instance] [--read-descriptor] [--playback-probes] [--app-basic] \
-     [--read-acl] [--app-endpoint <n>] [--transport <verb>[,<verb>…]] [--navigate <n>] \
-     [--launch-content <query>]\n\
+     [--read-acl] [--app-endpoint <n>] [--transport <verb>[,<verb>…]] \
+     [--send-key <key>[,<key>…]] [--send-key-idle <key>[,<key>…]] [--app-launcher] \
+     [--navigate <n>] [--launch-content <query>]\n\
      or:    matter-peer --player <ip> --cast-again --state-dir <dir> [--bind <ip>] \
      [--url <str>] [--display-string <str>] [--endpoint <n>] [--matter-port <n>]"
         .into()
@@ -289,6 +301,11 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--transport" => probes
                 .transport
                 .extend(value()?.split(',').map(str::to_owned)),
+            "--send-key" => probes.keys.extend(value()?.split(',').map(str::to_owned)),
+            "--send-key-idle" => probes
+                .keys_idle
+                .extend(value()?.split(',').map(str::to_owned)),
+            "--app-launcher" => probes.app_launcher = true,
             "--navigate" => probes.navigate = Some(value()?.parse()?),
             "--launch-content" => probes.launch_content = Some(value()?),
             other => return Err(format!("unknown argument {other:?}\n{}", usage()).into()),
@@ -581,6 +598,7 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rs_matter::dm::clusters::decl::access_control::AccessControlClient as _;
     use rs_matter::dm::clusters::decl::application_basic::ApplicationBasicClient as _;
+    use rs_matter::dm::clusters::decl::application_launcher::ApplicationLauncherClient as _;
     use rs_matter::dm::clusters::decl::content_launcher::{self, ContentLauncherClient as _};
     use rs_matter::dm::clusters::decl::descriptor::DescriptorClient as _;
     use rs_matter::dm::clusters::decl::media_playback::MediaPlaybackClient as _;
@@ -870,6 +888,10 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
         handle.complete().await?;
     }
 
+    // Keys while the panel is playing: the transport keys work, and a key the panel does
+    // not have is refused with `UnsupportedKey` (#274).
+    send_keys(matter, crypto, fab_idx, player, &probes.keys).await?;
+
     for verb in &probes.transport {
         // One exchange per verb, and the *response status* is the whole point: `NotActive`
         // when nothing is loaded and `Success` when something is, which is the guard
@@ -902,6 +924,11 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
             .await?;
         println!("matter-peer: media_playback current_state={state:?}");
     }
+
+    // Keys after the transport sequence — its `stop` is what makes a transport key with
+    // nothing to act on reachable, and the answer has to be `InvalidKeyInCurrentState`,
+    // not `UnsupportedKey`: the button exists, the moment is wrong (#274).
+    send_keys(matter, crypto, fab_idx, player, &probes.keys_idle).await?;
 
     if let Some(target) = probes.navigate {
         let targets = Exchange::initiate(matter, crypto, fab_idx, player)
@@ -995,6 +1022,59 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
         handle.complete().await?;
     }
 
+    if probes.app_launcher {
+        // The catalogue as a launchable platform (#274). CatalogList first: the catalogs
+        // the panel's apps come from, which for the VM's two test apps is the one
+        // CSA-reserved "vendor's own catalog", 0.
+        let catalogs = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_launcher()
+            .catalog_list_read_with(PLAYER_ENDPOINT, |v| {
+                v.map(|list| {
+                    list.iter()
+                        .filter_map(Result::ok)
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await??;
+        println!("matter-peer: application_launcher catalogs={catalogs:?}");
+
+        // Launch the *second* app by its catalog entry — the same off-by-one honesty the
+        // TargetNavigator probe buys: with one app every wrong lookup still lands right.
+        launch_app(matter, crypto, fab_idx, player, "castaway.two").await?;
+        read_current_app(matter, crypto, fab_idx, player).await?;
+
+        // An app the panel does not host: refused in the cluster's own words, and the
+        // selection above must survive the refusal.
+        launch_app(matter, crypto, fab_idx, player, "com.example.absent").await?;
+
+        // Stop it, and read the selection back — Null, the launcher's reserved "no app",
+        // the same shape as TargetNavigator's CurrentTarget 0.
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .application_launcher()
+            .stop_app(PLAYER_ENDPOINT, |builder| {
+                builder
+                    .application()?
+                    .some()?
+                    .catalog_vendor_id(0)?
+                    .application_id("castaway.two")?
+                    .end()?
+                    .end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: application_launcher stop-app(castaway.two) status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+        read_current_app(matter, crypto, fab_idx, player).await?;
+    }
+
     if probes.read_acl {
         // The one probe whose *failure* is the pass. Reading the Access Control cluster's
         // ACL needs Administer, and the panel seeded this client with Operate — so a
@@ -1014,6 +1094,128 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
         }
     }
 
+    Ok(())
+}
+
+/// A CEC key by the name the command line spells it. Only what the probes send.
+fn key_code(
+    name: &str,
+) -> Result<rs_matter::dm::clusters::decl::keypad_input::CECKeyCodeEnum, Box<dyn std::error::Error>>
+{
+    use rs_matter::dm::clusters::decl::keypad_input::CECKeyCodeEnum as Key;
+    Ok(match name {
+        "play" => Key::Play,
+        "pause" => Key::Pause,
+        "pause-play" => Key::PausePlayFunction,
+        "stop" => Key::Stop,
+        "forward" => Key::Forward,
+        "backward" => Key::Backward,
+        // Two keys the panel deliberately does not have: a menu key and a number key,
+        // sent to prove the `UnsupportedKey` answer.
+        "select" => Key::Select,
+        "numbers5" => Key::Numbers5,
+        other => return Err(format!("unknown key {other:?}").into()),
+    })
+}
+
+/// Send a list of CEC keys through `KeypadInput`, one exchange each, printing the status
+/// the panel answered (#274).
+async fn send_keys<C: rs_matter::crypto::Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    fab_idx: core::num::NonZeroU8,
+    player: u64,
+    keys: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rs_matter::dm::clusters::decl::keypad_input::KeypadInputClient as _;
+
+    for name in keys {
+        let key = key_code(name)?;
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .keypad_input()
+            .send_key(PLAYER_ENDPOINT, |builder| builder.key_code(key)?.end())
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: keypad_input key={name} status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+    }
+    Ok(())
+}
+
+/// Invoke `ApplicationLauncher::LaunchApp` for an app in catalog 0 and print the status.
+async fn launch_app<C: rs_matter::crypto::Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    fab_idx: core::num::NonZeroU8,
+    player: u64,
+    application_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rs_matter::dm::clusters::decl::application_launcher::ApplicationLauncherClient as _;
+
+    let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+        .await?
+        .application_launcher()
+        .launch_app(PLAYER_ENDPOINT, |builder| {
+            builder
+                .application()?
+                .some()?
+                .catalog_vendor_id(0)?
+                .application_id(application_id)?
+                .end()?
+                .data(None)?
+                .end()
+        })
+        .await?;
+    {
+        let response = handle.response()?;
+        println!(
+            "matter-peer: application_launcher launch-app({application_id}) status={:?}",
+            response.status()?
+        );
+    }
+    handle.complete().await?;
+    Ok(())
+}
+
+/// Read `ApplicationLauncher::CurrentApp` and print it — the catalog entry and the
+/// endpoint when an app is current, `null` when none is.
+async fn read_current_app<C: rs_matter::crypto::Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    fab_idx: core::num::NonZeroU8,
+    player: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rs_matter::dm::clusters::decl::application_launcher::ApplicationLauncherClient as _;
+
+    let current = Exchange::initiate(matter, crypto, fab_idx, player)
+        .await?
+        .application_launcher()
+        .current_app_read_with(PLAYER_ENDPOINT, |v| match v {
+            Ok(nullable) => match nullable.into_option() {
+                Some(app) => {
+                    let catalog = app
+                        .application()
+                        .and_then(|a| a.catalog_vendor_id())
+                        .unwrap_or_default();
+                    let id = app
+                        .application()
+                        .and_then(|a| a.application_id().map(ToString::to_string))
+                        .unwrap_or_default();
+                    let endpoint = app.endpoint().ok().flatten().unwrap_or_default();
+                    format!("(catalog={catalog} app_id={id} endpoint={endpoint})")
+                }
+                None => "null".to_string(),
+            },
+            Err(e) => format!("error: {e}"),
+        })
+        .await?;
+    println!("matter-peer: application_launcher current_app={current}");
     Ok(())
 }
 
