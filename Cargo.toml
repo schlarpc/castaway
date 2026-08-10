@@ -267,7 +267,23 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-panic = "abort"
+# No `panic = "abort"` here, deliberately, and it is not an omission — it was set by the
+# template (d5eb43c) and removed on purpose (#335).
+#
+# Two reasons, and the build one is the urgent one. A `cdylib` takes its panic strategy
+# from the profile and cargo cannot rebuild it with `unwind` for a test target, so
+# `abort` made every test target that transitively links `crates/browser-fd` — the N-API
+# addon, reached through `pipeline`'s default-on `electron` feature — refuse to link:
+# "the crate `castaway_browser_fd` requires panic strategy `abort` which is incompatible
+# with this crate's strategy of `unwind`". `checks.test` and `checks.coverage` build with
+# `--profile release`, so both were unbuildable.
+#
+# The second reason is why this is the right way round rather than a workaround: this
+# binary is a wall panel that is supposed to stay up. Unwinding is what lets one protocol
+# actor's panic end that actor instead of the whole receiver — the sessions are actors on
+# their own tasks and threads precisely so a failure is local. `abort` converts every
+# reachable panic into "the display went black", which is the opposite of what rule 7's
+# no-panic discipline is protecting.
 
 [profile.test]
 opt-level = 0
