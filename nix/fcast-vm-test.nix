@@ -162,8 +162,10 @@ pkgs.testers.runNixOSTest {
         # ticker as "Playback state changed" / "Time changed". The sender exits on
         # the timeout signal, so the exit code is the timeout's — the transcript is
         # the assertion, and it proves the *real SDK* accepted our bytes.
+        # `|| true`, not `; true`: the driver's shell runs `set -e`, which aborts the
+        # list at timeout's SIGTERM exit before a `;`-joined true can run.
         out = sender.succeed(
-            f"timeout --preserve-status 8 fcast -H {kiosk} listen; true"
+            f"timeout 8 fcast -H {kiosk} listen 2>&1 || true"
         )
         assert "Source changed" in out, out
         assert "Playback state changed" in out, out
