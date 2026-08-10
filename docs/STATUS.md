@@ -211,14 +211,15 @@ the resulting refresh token into `.env.local` itself rather than asking for a pa
   with `CASTAWAY_ELECTRON`/`CASTAWAY_BROWSER_APP`/`LD_LIBRARY_PATH` so it runs outside the
   devShell. **This is the one to deploy on Linux** (`services.castaway.package`). Every
   optional feature is on, `ldac` included as of 2026-07-29 — it links Sony's own
-  `libldacBT` for the one A2DP codec ffmpeg cannot decode (#14, D47). Note that having the
-  decoder compiled in is not the same as offering it: LDAC stays out of the advertised
-  codec table until the config asks for it, because it sorts *first* and switching it on
-  would change what every capable phone negotiates rather than adding an option. To try it:
+  `libldacBT` for the one A2DP codec ffmpeg cannot decode (#14, D47). LDAC is advertised
+  by default as of 2026-08-09 (#253): it sorts *first*, so it is what every capable phone
+  negotiates, which waited until a real Android phone had streamed to it (2026-08-08
+  bench session; the capture is checked in and decodes under a cross-correlation pin).
+  The runtime off-switch is the config's codec list:
 
   ```toml
   [bluetooth]
-  codecs = ["ldac", "sbc"]
+  codecs = ["sbc", "aac", "aptx", "aptx-hd"]
   ```
 
   Verified 2026-07-26 in its pre-D36 `--features cef` form: built from the flake, run

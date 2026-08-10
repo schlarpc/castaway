@@ -281,7 +281,7 @@ fn ldac_survives_the_trip_through_the_depacketiser() {
     let right: Vec<f32> = decoded.iter().skip(1).step_by(2).copied().collect();
 
     for (name, channel) in [("left", &left), ("right", &right)] {
-        let score = best_correlation(&reference, channel, rate as usize / 50);
+        let (score, _) = best_correlation(&reference, channel, rate as usize / 50);
         assert!(
             score >= 0.98,
             "the {name} channel correlates {score:.4} with the tone that was encoded"
@@ -289,13 +289,14 @@ fn ldac_survives_the_trip_through_the_depacketiser() {
     }
 }
 
-/// The best normalised cross-correlation over lags in `0..=max_lag`.
+/// The best normalised cross-correlation over lags in `0..=max_lag`, and the lag that
+/// achieved it.
 ///
 /// A lag search because the codec has latency of its own and that is not what is under
 /// test; that a single alignment explains the whole signal is.
 #[cfg(feature = "ldac")]
-fn best_correlation(reference: &[f32], decoded: &[f32], max_lag: usize) -> f32 {
-    let mut best = 0.0f32;
+fn best_correlation(reference: &[f32], decoded: &[f32], max_lag: usize) -> (f32, usize) {
+    let mut best = (0.0f32, 0usize);
     for lag in 0..=max_lag {
         if lag >= decoded.len() {
             break;
@@ -311,7 +312,9 @@ fn best_correlation(reference: &[f32], decoded: &[f32], max_lag: usize) -> f32 {
         if na > 0.0 && nb > 0.0 {
             #[allow(clippy::cast_possible_truncation)]
             let score = (dot / (na.sqrt() * nb.sqrt())) as f32;
-            best = best.max(score);
+            if score > best.0 {
+                best = (score, lag);
+            }
         }
     }
     best
@@ -324,8 +327,9 @@ fn best_correlation(reference: &[f32], decoded: &[f32], max_lag: usize) -> f32 {
 /// Android phone (2026-08-08, over the AX210, `examples/phone_bench`), which is #14's
 /// point stated exactly: decode what a phone actually sends, not what a fixture does.
 ///
-/// There is no reference tone to correlate against here, so the assertions are the ones a
-/// wrong decode would fail:
+/// There is no reference tone to correlate against here — the phone was playing music —
+/// so the assertions come in two kinds. First, the shape checks a wrong decode would
+/// fail:
 ///
 /// * **the sample count**, which pins the frame geometry. 382 LDAC frames across the 100
 ///   packets and 97792 sample frames out is 256 samples per frame — the high-rate frame
@@ -335,6 +339,11 @@ fn best_correlation(reference: &[f32], decoded: &[f32], max_lag: usize) -> f32 {
 ///   decode that duplicated one channel, produces plausible audio that is not stereo.
 /// * **no clipping and no DC**, which is what a byte-misaligned decode of a sane signal
 ///   turns into.
+///
+/// Second, the waveform itself: a checked-in golden of this capture's decode — the one a
+/// human verified as the track — under per-channel cross-correlation at the best lag
+/// (#253). The shape checks catch a decode that is wrong; the golden catches one that is
+/// merely different.
 ///
 /// Worth recording because it cost an hour of arithmetic: this phone's **RTP timestamps
 /// advance 512 per packet regardless of whether the packet carries 2 frames or 4**, so
@@ -413,5 +422,50 @@ fn a_real_android_phones_ldac_decodes_through_the_depacketiser() {
     assert!(
         difference > 0.01,
         "the channels are identical to {difference}, so the stereo image was lost"
+    );
+
+    // The listening test, held as an assertion (#253). The phone stream has no reference
+    // tone, so what the shape checks above cannot say is "it is still the music" — that
+    // was established once by a human on 2026-08-08 ("recognisably the track", #14), and
+    // the decode that human heard is checked in as 16-bit PCM. Every future decode is
+    // held to it #187-style: normalised cross-correlation at the best lag, per channel
+    // independently, both channels at the same alignment. A depacketiser off-by-one, a
+    // frame-geometry regression, a channel swap or a mono collapse all land far below
+    // the floor; the 16-bit quantisation of the golden itself costs ~1e-7 of it. This is
+    // the assertion the default-table flip rides on instead of a repeat listening test.
+    let golden = include_bytes!("fixtures/a2dp-ldac-96000-android-decoded.s16le");
+    let golden: Vec<f32> = golden
+        .chunks_exact(2)
+        .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0)
+        .collect();
+    assert_eq!(
+        golden.len(),
+        decoded.len(),
+        "the golden decode covers the same span as the capture"
+    );
+    let golden_left: Vec<f32> = golden.iter().step_by(2).copied().collect();
+    let golden_right: Vec<f32> = golden.iter().skip(1).step_by(2).copied().collect();
+    let mut lags = [0usize; 2];
+    for (slot, (name, reference, channel)) in [
+        ("left", &golden_left, &left),
+        ("right", &golden_right, &right),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (score, lag) = best_correlation(reference, channel, rate as usize / 50);
+        assert!(
+            score >= 0.99,
+            "the {name} channel correlates {score:.4} at lag {lag} with the decode a \
+             human verified as the track; this is no longer that decode"
+        );
+        lags[slot] = lag;
+    }
+    assert!(
+        lags[0].abs_diff(lags[1]) <= rate as usize / 1000,
+        "the channels align at different lags ({} vs {}), so the decoder desynchronised \
+         them",
+        lags[0],
+        lags[1]
     );
 }
