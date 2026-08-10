@@ -271,6 +271,11 @@ mod visualizer {
     use std::sync::Arc;
 
     /// `frames` of a 1 kHz tone as interleaved stereo at the mix rate.
+    ///
+    /// A sine on purpose, not `output_stream.rs`'s per-block constant marker (#290): the
+    /// analyzer is spectral, so what these tests need is in-band energy the bars can rise
+    /// to — a DC marker has none — and nothing here asserts continuity, which is all the
+    /// marker is for.
     fn tone(frames: usize) -> Vec<f32> {
         let rate = pipeline::mixer::RATE as f32;
         (0..frames)

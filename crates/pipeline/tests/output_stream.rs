@@ -417,6 +417,9 @@ struct Sound {
     /// 40 ms hole in the middle of the tone — a lost block, a fold, an encoder gap —
     /// changes neither. The quietest window is exactly what such a hole is.
     quietest_window: Option<f32>,
+    /// The decoded first channel, whole, so the marker blocks can be read back sample by
+    /// sample (#290).
+    mono: Vec<f32>,
 }
 
 /// Decode the audio track, or `None` if the file has none.
@@ -482,17 +485,69 @@ fn decode_audio(path: &std::path::Path) -> Option<Sound> {
         peak,
         onset,
         quietest_window,
+        mono,
     })
 }
 
 /// A session that writes real time's worth of audio whenever it is poked: silence until
-/// `quiet_for` has passed, a 440 Hz tone after it.
+/// `quiet_for` has passed, the marker tone after it.
 ///
 /// Paced against the wall clock rather than per call, because the mix places a block where
 /// the clock says it belongs — so a source that produced faster than real time would stack
 /// its blocks on the same positions and simply get louder.
 /// How often the source wakes. A decoder hands over about a packet's worth at a time.
 const SOURCE_TICK: Duration = Duration::from_millis(10);
+
+/// How far ahead of real time the source keeps its input's ring topped up.
+///
+/// A shipped session runs ahead too — a decoder is paced by the ring's backpressure, not
+/// by the clock — and the banked audio costs nothing: the mixer drains the ring in real
+/// time, so sample `n` still plays at `n / RATE` however early it was written. What it
+/// buys is the backstop race: a source that owns exactly the current block loses a coin
+/// toss every time the device queue decays to its floor while the next tick is still
+/// pending, and the mixer invents a quantum of silence mid-tone (`starved`, ~half of all
+/// runs before this). With the ring holding this much, starvation means the source thread
+/// was descheduled for longer than the whole cushion — which is a box that genuinely
+/// cannot run the harness, not a scheduling coin toss.
+const SOURCE_HEAD_START: Duration = Duration::from_millis(50);
+
+/// One marker block of the tone: 10 ms of one constant sample value.
+const MARKER_FRAMES: u64 = RATE as u64 / 100;
+
+/// The values a marker block may carry. All well above the 0.1 onset threshold — so a
+/// block of silence standing where a marker belongs can never read as "quiet but present"
+/// — and spaced far enough apart that AAC at the stream's own 128 kbit/s cannot smear one
+/// level into its neighbour.
+const MARKER_LEVELS: [f32; 4] = [0.30, 0.45, 0.60, 0.75];
+
+/// How far inside a decoded marker block the codec's own step response has died away.
+///
+/// The block boundaries are hard steps, and AAC reconstructs a step as a short ramp with
+/// ringing either side; the interior of a 10 ms plateau comes back flat. Measured, not
+/// guessed: see the deviation line `assert_the_marker_blocks_line_up` prints.
+const MARKER_MARGIN: usize = 120;
+
+/// How far a decoded block's interior mean may sit from its marker before it is a defect.
+/// Less than half the level spacing, so a wrong *level* can never pass, and well below the
+/// smallest level, so silence cannot either.
+const MARKER_TOLERANCE: f32 = 0.07;
+
+/// The marker block `k` of the tone carries — the trick `stream/audio.rs` uses for its
+/// sample-exact assertions, applied to the whole decoded path (#290). A sine is almost
+/// blind to continuity: drop, repeat or reorder one 10 ms block and its RMS, peak and
+/// onset barely move. A per-block constant marker turns every such defect into a wrong
+/// value at a known block index.
+///
+/// The level is drawn by hash (splitmix64) rather than cycled, so the sequence has no
+/// period: a hole or shift of *any* whole number of blocks disagrees with the expected
+/// sequence from that block on, rather than aliasing back into agreement.
+fn marker(block: u64) -> f32 {
+    let mut x = block.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    MARKER_LEVELS[usize::try_from(x % MARKER_LEVELS.len() as u64).unwrap()]
+}
 
 /// How many frames of [`RATE`] audio fit in `elapsed`.
 fn frames_at(elapsed: Duration) -> u64 {
@@ -520,7 +575,7 @@ struct Source {
 }
 
 impl Source {
-    /// Play `quiet_for` of silence, then a 440 Hz tone, until dropped.
+    /// Play `quiet_for` of silence, then the [`marker`] tone, until dropped.
     fn tone(mut input: pipeline::mixer::MixInput, quiet_for: Duration) -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread = std::thread::Builder::new()
@@ -537,8 +592,12 @@ impl Source {
                         // delivers the audio it missed instead of shortening it, and the
                         // boundary between silence and tone stays at sample `quiet`
                         // however the scheduler behaved — a wall-clock `loud` flag moved
-                        // it, which is half of why the old source was fragile.
-                        let owed = frames_at(began.elapsed()).saturating_sub(written);
+                        // it, which is half of why the old source was fragile. The
+                        // schedule runs [`SOURCE_HEAD_START`] ahead so the ring is never
+                        // empty when a pass looks; the mixer's real-time drain is what
+                        // paces playback, not the write.
+                        let owed =
+                            frames_at(began.elapsed() + SOURCE_HEAD_START).saturating_sub(written);
                         if owed == 0 {
                             std::thread::sleep(SOURCE_TICK);
                             continue;
@@ -549,8 +608,7 @@ impl Source {
                                 if n < quiet {
                                     return [0.0, 0.0];
                                 }
-                                let t = (n - quiet) as f32 / RATE as f32;
-                                let s = (t * 440.0 * std::f32::consts::TAU).sin() * 0.5;
+                                let s = marker((n - quiet) / MARKER_FRAMES);
                                 [s, s]
                             })
                             .collect();
@@ -734,12 +792,18 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
     // Through the shipped path: a session takes an output from the tee'd factory and
     // writes to it exactly as a cast does. If the tee, the resampler, the mix, the AAC
     // encoder, the `esds` or the second `traf` is wrong, this is silence.
+    //
+    // A tenth of a second of silence first, not zero: the head of the track decodes
+    // through the codec's start-up ramp (see `assert_the_marker_blocks_line_up`), and a
+    // tone starting inside it hands the marker grid a smeared onset to anchor on. The
+    // lead puts the ramp on silence — where the shipped track always has it — and costs
+    // the assertions nothing.
     let Some(state) = publish_with(
         320,
         176,
         2,
         Scenario {
-            sound: Some(Duration::ZERO),
+            sound: Some(Duration::from_millis(100)),
             ..Scenario::default()
         },
     ) else {
@@ -755,6 +819,20 @@ fn sound_played_on_the_panel_comes_back_in_the_stream() {
         sound.peak,
         state.sound_diagnostics()
     );
+    // Bounded above too, which the sine could not offer (#290): nothing in the tone is
+    // louder than the loudest marker, so a peak past it — beyond the codec's own step
+    // overshoot — is sound summed onto sound, the #208 stacking defect, even when every
+    // block is present. The ceiling is the top level plus the step overshoot AAC actually
+    // produces (see the deviation line the marker check prints).
+    assert!(
+        sound.peak <= 0.9,
+        "the track peaks at {}, louder than anything the session played; {}",
+        sound.peak,
+        state.sound_diagnostics()
+    );
+    // And the tone that is there is exact, not just loud (#290). Two segments minus the
+    // settle, the uncut tail and the tenth-of-a-second lead leave at least 80 ms of it.
+    assert_the_marker_blocks_line_up(&state, &sound, 8);
 }
 
 #[test]
@@ -801,6 +879,86 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
     );
 }
 
+/// Read the tone back block by block and hold every one to its own marker (#290).
+///
+/// This is what upgrades #234's hole detection from "the quietest 20 ms window stays above
+/// 0.2" to exact: a missing, repeated or reordered 10 ms block is a wrong value at a known
+/// block index, and the failure says which. The grid is anchored at the onset — the tone's
+/// block zero *is* its first loud sample — and each block is judged by the mean of its
+/// interior, clear of the codec's own step response at the boundaries ([`MARKER_MARGIN`]).
+/// Only whole blocks are held to a level: the track is cut mid-block at the live edge, and
+/// a partial block is the cut, not a defect.
+fn assert_the_marker_blocks_line_up(state: &Published, sound: &Sound, at_least: usize) {
+    let onset = usize::try_from(sound.onset.expect("a tone to line up")).unwrap();
+    let last_loud = sound
+        .mono
+        .iter()
+        .rposition(|s| s.abs() > 0.1)
+        .expect("the onset crossed 0.1, so some sample is loud");
+    let block_len = usize::try_from(MARKER_FRAMES).unwrap();
+    let blocks = (last_loud + 1 - onset) / block_len;
+    // `at_least` is what the scenario says the tone must span: a handful of blocks lining
+    // up perfectly would still mean the decode lost the bulk of the tone.
+    assert!(
+        blocks >= at_least,
+        "only {blocks} whole marker blocks decoded where at least {at_least} were played. {}",
+        state.sound_diagnostics()
+    );
+    // The first two AAC frames of the *track* decode attenuated: the overlap-add window
+    // has no predecessor at the start of a stream, so the head of the very first coded
+    // frame comes back faded in. The shipped track never shows it — a stream's head is
+    // silence until something plays — but the `quiet_for: ZERO` scenario puts the tone
+    // right there, so blocks inside the ramp are the codec's start-up, not a defect.
+    let codec_ramp = 2 * 1024;
+    let mut ramped = 0usize;
+    let mut worst = (0.0f32, 0usize);
+    for k in 0..blocks {
+        let start = onset + k * block_len;
+        if start < codec_ramp {
+            ramped += 1;
+            continue;
+        }
+        let interior = &sound.mono[start + MARKER_MARGIN..start + block_len - MARKER_MARGIN];
+        let mean = interior.iter().sum::<f32>() / interior.len() as f32;
+        let want = marker(k as u64);
+        let deviation = (mean - want).abs();
+        if deviation > worst.0 {
+            worst = (deviation, k);
+        }
+        if deviation > MARKER_TOLERANCE {
+            // The premise first (#208, #236): a wrong block with silence already invented
+            // into the track is a box that could not schedule the harness, not a stream
+            // that mislaid sound — and the two must not share a failure message. `starved`
+            // is the harness's own source missing a mixer pass; `invented` is the mixer
+            // thread itself descheduled long enough for the encoder's fill to outrun it.
+            // Either one both holes and shifts the tone.
+            let starved = state.mixer.counters().starved;
+            let invented = state.audio.mix().invented();
+            assert!(
+                starved == 0 && invented == 0,
+                "marker block {k} decoded to {mean:.3} where {want:.2} belongs, but \
+                 starved={starved} invented={invented} frames of silence went into the \
+                 tone's place, so this box cannot measure continuity — not a defect in \
+                 the stream. {}",
+                state.sound_diagnostics()
+            );
+            panic!(
+                "marker block {k} decoded to a mean of {mean:.3} where {want:.2} belongs — \
+                 a hole, repeat or reorder {} ms after the onset. {}",
+                k * 10,
+                state.sound_diagnostics()
+            );
+        }
+    }
+    eprintln!(
+        "markers: {} blocks line up ({ramped} inside the codec's start-up ramp); the worst \
+         sits {:.3} from its level, at block {}",
+        blocks - ramped,
+        worst.0,
+        worst.1
+    );
+}
+
 /// How long the panel is quiet before the tone, in the two placement tests.
 const QUIET: Duration = Duration::from_millis(250);
 
@@ -833,6 +991,11 @@ fn tone_onset(scenario: Scenario) -> Option<f64> {
         "a 20 ms window inside the tone dropped to {quietest}; the sound has a hole. {}",
         state.sound_diagnostics()
     );
+    // And exactly, block by block (#290): the threshold above says the tone never went
+    // quiet; this says every 10 ms of it is the 10 ms that was played, in order, once.
+    // Four 200 ms segments minus the settle and the uncut tail leave the tone at least
+    // 200 ms of track after its quarter second of silence.
+    assert_the_marker_blocks_line_up(&state, &sound, 20);
     assert!(
         (at - QUIET.as_secs_f64()).abs() < 0.06,
         "the tone starts {at:.3}s in; it was played at {:.3}s. {}",
