@@ -13,7 +13,15 @@
 
 use serde::Deserialize;
 
-use crate::{ContactId, Input, PointerEvent, RemoteId, TouchEvent, TouchPhase};
+use crate::{ContactId, Input, Key, PointerEvent, RemoteId, TouchEvent, TouchPhase};
+
+/// The most text one message may carry, in bytes.
+///
+/// A bound on memory, not on typing: the client sends diffs of a phone-sized field, so a
+/// real message is tens of bytes, and 4 KiB is a generous paste. Without a cap, a
+/// hostile peer's data-channel messages (up to the channel's own limit, typically
+/// 256 KiB) multiplied by the input queue's depth would be real memory.
+pub const MAX_TEXT_BYTES: usize = 4096;
 
 /// Why a message was rejected.
 #[derive(Debug, thiserror::Error)]
@@ -28,13 +36,30 @@ pub enum WireError {
     /// the router as a position no comparison is true about.
     #[error("remote input coordinate is not finite")]
     NotFinite,
+    /// More text than one message is allowed to carry ([`MAX_TEXT_BYTES`]).
+    ///
+    /// Refused rather than truncated: cutting a UTF-8 string at a byte budget mid-glyph
+    /// and inserting the front half is worse than inserting nothing, and no client this
+    /// repo ships produces such a message.
+    #[error("remote text message of {bytes} bytes exceeds {MAX_TEXT_BYTES}")]
+    TextTooLong {
+        /// How much the peer sent.
+        bytes: usize,
+    },
 }
 
 /// What a peer asked for.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RemoteCommand {
     /// Route this, exactly as if it had come off the glass.
     Input(Input),
+    /// A special key, tapped (#260). See [`crate::Key`] for why keys and text are
+    /// different messages.
+    Key(Key),
+    /// Composed text to insert at the panel's focus (#260). Never empty — an empty
+    /// insertion means nothing, so it parses as [`Self::Unknown`] rather than queueing
+    /// a no-op.
+    Text(String),
     /// Go back to the home screen.
     ///
     /// An explicit affordance rather than a gesture because the panel's way home is a
@@ -87,10 +112,53 @@ enum Message {
         dx: f32,
         dy: f32,
     },
+    Key {
+        key: KeyName,
+    },
+    Text {
+        text: String,
+    },
     Home,
     Ping,
     #[serde(other)]
     Unknown,
+}
+
+/// A key, as a peer spells it.
+///
+/// A separate enum from [`crate::Key`] so the wire can degrade: a newer page naming a
+/// key this build has never heard of parses as [`KeyName::Unknown`] and becomes
+/// [`RemoteCommand::Unknown`] — "that button does nothing" — instead of an error a
+/// stricter deserializer would make of it.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum KeyName {
+    Enter,
+    Backspace,
+    Delete,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    #[serde(other)]
+    Unknown,
+}
+
+impl KeyName {
+    const fn into_key(self) -> Option<Key> {
+        match self {
+            Self::Enter => Some(Key::Enter),
+            Self::Backspace => Some(Key::Backspace),
+            Self::Delete => Some(Key::Delete),
+            Self::Tab => Some(Key::Tab),
+            Self::Up => Some(Key::ArrowUp),
+            Self::Down => Some(Key::ArrowDown),
+            Self::Left => Some(Key::ArrowLeft),
+            Self::Right => Some(Key::ArrowRight),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// A contact phase, as a peer spells it.
@@ -154,6 +222,19 @@ pub fn parse(peer: RemoteId, text: &str) -> Result<RemoteCommand, WireError> {
                 dx,
                 dy,
             })))
+        }
+        Message::Key { key } => Ok(key
+            .into_key()
+            .map_or(RemoteCommand::Unknown, RemoteCommand::Key)),
+        Message::Text { text } => {
+            if text.len() > MAX_TEXT_BYTES {
+                return Err(WireError::TextTooLong { bytes: text.len() });
+            }
+            if text.is_empty() {
+                // Inserting nothing means nothing; degrading beats queueing a no-op.
+                return Ok(RemoteCommand::Unknown);
+            }
+            Ok(RemoteCommand::Text(text))
         }
         Message::Home => Ok(RemoteCommand::Home),
         Message::Ping => Ok(RemoteCommand::Ping),
@@ -294,6 +375,75 @@ mod tests {
             parse(PEER, r#"{"type":"ping"}"#).unwrap(),
             RemoteCommand::Ping
         );
+    }
+
+    #[test]
+    fn every_key_parses_to_the_key_it_names() {
+        // The spellings are the wire contract with the remote page's tray buttons and
+        // its keydown handler — see `remote/page.rs`.
+        for (spelling, expected) in [
+            ("enter", Key::Enter),
+            ("backspace", Key::Backspace),
+            ("delete", Key::Delete),
+            ("tab", Key::Tab),
+            ("up", Key::ArrowUp),
+            ("down", Key::ArrowDown),
+            ("left", Key::ArrowLeft),
+            ("right", Key::ArrowRight),
+        ] {
+            let body = format!(r#"{{"type":"key","key":"{spelling}"}}"#);
+            assert_eq!(
+                parse(PEER, &body).unwrap(),
+                RemoteCommand::Key(expected),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_this_build_does_not_know_degrades_rather_than_erroring() {
+        // Same contract as an unknown message type: a newer page's new button must cost
+        // that button, not the connection.
+        assert_eq!(
+            parse(PEER, r#"{"type":"key","key":"power"}"#).unwrap(),
+            RemoteCommand::Unknown
+        );
+    }
+
+    #[test]
+    fn text_arrives_as_the_string_that_was_typed() {
+        assert_eq!(
+            parse(PEER, r#"{"type":"text","text":"héllo ✓"}"#).unwrap(),
+            RemoteCommand::Text("héllo ✓".into())
+        );
+    }
+
+    #[test]
+    fn empty_text_is_a_no_op_not_a_queued_event() {
+        assert_eq!(
+            parse(PEER, r#"{"type":"text","text":""}"#).unwrap(),
+            RemoteCommand::Unknown
+        );
+    }
+
+    #[test]
+    fn oversized_text_is_refused_whole() {
+        // Truncating UTF-8 at a byte budget can split a glyph; refusal is the honest
+        // failure, and no client this repo ships can produce the message.
+        let body = format!(
+            r#"{{"type":"text","text":"{}"}}"#,
+            "x".repeat(MAX_TEXT_BYTES + 1)
+        );
+        assert!(matches!(
+            parse(PEER, &body),
+            Err(WireError::TextTooLong { bytes }) if bytes == MAX_TEXT_BYTES + 1
+        ));
+        // At the limit exactly, it goes through.
+        let body = format!(
+            r#"{{"type":"text","text":"{}"}}"#,
+            "x".repeat(MAX_TEXT_BYTES)
+        );
+        assert!(matches!(parse(PEER, &body), Ok(RemoteCommand::Text(_))));
     }
 
     #[test]

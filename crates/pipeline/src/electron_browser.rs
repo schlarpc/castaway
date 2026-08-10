@@ -1772,6 +1772,29 @@ impl input_touch::InputSink for ElectronHost {
         self.cancel_tracked(tracked);
     }
 
+    fn key(&mut self, key: input_touch::Key) {
+        // Keys have no position, so they go to the window that owns input — the page
+        // while it is on the glass, the widget otherwise — which is also where anything
+        // focusable lives. No window on the glass means nothing to type at (#260).
+        let Some((surface, _)) = self.input_target() else {
+            return;
+        };
+        self.send(&ToBrowser::Key {
+            surface,
+            key: key.into(),
+        });
+    }
+
+    fn text(&mut self, text: &str) {
+        let Some((surface, _)) = self.input_target() else {
+            return;
+        };
+        self.send(&ToBrowser::InsertText {
+            surface,
+            text: text.to_owned(),
+        });
+    }
+
     fn pointer(&mut self, event: input_touch::PointerEvent) {
         use crate::browser_proto::PointerKind;
         use input_touch::PointerEvent;

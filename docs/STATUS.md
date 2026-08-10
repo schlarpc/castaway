@@ -421,9 +421,20 @@ browser and comes back out of the panel's input queue as a contact belonging to 
 This is the test that matters, and writing it found three bugs the fixture-based one
 structurally could not — a fixture agrees with whatever you send it.
 
-**Not done:** no audio on the remote track (Opus vs the stream's AAC); no keyboard, which
-is arguably the killer feature and is scoped separately; and no *phone* has driven a real
-panel, though a real browser now has.
+**The keyboard (#260)** rides the same queue. The design constraint is the phone's IME:
+autocorrect, swipe typing and CJK *compose*, so the page forwards no key stream — the
+tray's field travels as its value's diff (`text` messages, `Input.insertText` on the far
+side), and only the strokes text cannot say — Enter, arrows, backspace on an empty field
+— travel as `key` messages (`Input.dispatchKeyEvent`). Both keep their place in the queue
+against the contacts around them, for the same reason Home does: Enter after the tap that
+focused a field must land after that tap. `remote.input = false` drops these at the same
+boundary as everything else. Tested at both halves with a real browser: typing in the
+real tray comes back out of the panel's queue as text-then-Enter (`remote_browser.rs`),
+and `InputSink::text`/`key` land in a real page's field through CDP
+(`browser_end_to_end.rs::typing_reaches_the_page`).
+
+**Not done:** no audio on the remote track (Opus vs the stream's AAC); and no *phone* has
+driven a real panel, though a real browser now has.
 
 ## Biggest open items (see the issue tracker)
 

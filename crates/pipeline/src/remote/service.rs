@@ -445,6 +445,18 @@ impl RemoteService {
                     self.input.push_home();
                 }
             }
+            // Same gate as every other input: `remote.input = false` keeps the viewing
+            // half and drops the driving half at this boundary (#260).
+            Ok(input_touch::RemoteCommand::Key(key)) => {
+                if self.config.accept_input {
+                    self.input.push_key(key);
+                }
+            }
+            Ok(input_touch::RemoteCommand::Text(text)) => {
+                if self.config.accept_input {
+                    self.input.push_text(text);
+                }
+            }
             // A keepalive says the peer is alive, which the connection already says. It
             // exists so a client behind something that reaps idle flows has a reason to
             // send anything at all.

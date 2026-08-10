@@ -456,6 +456,50 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
         (contacts[0].x, contacts[0].y)
     );
 
+    // 5. Keyboard (#260). Drive the page's own tray the way a phone's IME does — set the
+    //    field's value and let the `input` listener diff it — then press Enter through
+    //    the keydown path. Both must come back out of the panel's queue, in order:
+    //    the text first, then the key that submits it.
+    let _ = drained(&input);
+    let _ = host.probe(
+        "(document.getElementById('keys').click(), 'toggled')",
+        Duration::from_secs(5),
+    );
+    let typed = host.probe(
+        "(function(){var f=document.getElementById('typein');f.value='hi';\
+         f.dispatchEvent(new InputEvent('input',{bubbles:true}));return 'typed'})()",
+        Duration::from_secs(5),
+    );
+    assert!(typed.is_ok(), "could not type into the tray: {typed:?}");
+    let entered = host.probe(
+        "(function(){var f=document.getElementById('typein');\
+         f.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));\
+         return 'entered'})()",
+        Duration::from_secs(5),
+    );
+    assert!(entered.is_ok(), "could not press Enter: {entered:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut typed_events = Vec::new();
+    while Instant::now() < deadline && typed_events.len() < 2 {
+        host.pump(&mut render);
+        render.pump();
+        typed_events.extend(
+            drained(&input)
+                .into_iter()
+                .filter(|event| matches!(event, RemoteEvent::Text(_) | RemoteEvent::Key(_))),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        typed_events,
+        vec![
+            RemoteEvent::Text("hi".into()),
+            RemoteEvent::Key(input_touch::Key::Enter)
+        ],
+        "typing must arrive as composed text, then the Enter that submits it"
+    );
+
     stop.store(true, Ordering::Release);
     let _ = encoder.join();
     host.shutdown();

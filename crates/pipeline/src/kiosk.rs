@@ -560,6 +560,25 @@ impl KioskApp {
                 // The same road the pill and the edge swipe take, so a remote's way home
                 // and the panel's are one behaviour rather than two that drift.
                 input_touch::RemoteEvent::Home => self.go_home(),
+                // Typing is somebody using the panel, so it dates the idle return the
+                // way a touch does (#23) — and then goes straight to the focused sink:
+                // the panel's own layers have nothing to do with a keystroke (#260).
+                input_touch::RemoteEvent::Key(key) => {
+                    if let Some(render) = self.render.as_mut() {
+                        render.note_touch();
+                    }
+                    if let Some(sink) = self.input_sink() {
+                        sink.key(key);
+                    }
+                }
+                input_touch::RemoteEvent::Text(text) => {
+                    if let Some(render) = self.render.as_mut() {
+                        render.note_touch();
+                    }
+                    if let Some(sink) = self.input_sink() {
+                        sink.text(&text);
+                    }
+                }
             }
         }
     }

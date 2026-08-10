@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use castaway_core::Waker;
 use tracing::warn;
 
-use crate::{ContactId, Input, InputOrigin, TouchPhase};
+use crate::{ContactId, Input, InputOrigin, Key, TouchPhase};
 
 /// How many events may be waiting before the queue starts refusing the droppable ones.
 ///
@@ -40,7 +40,7 @@ const MAX_PENDING: usize = 4096;
 /// Disconnection is *in* the queue rather than beside it because the ordering matters: a
 /// peer that presses and then drops must have the press applied and then cancelled, and
 /// two separate lists could not say which came first.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RemoteEvent {
     /// Something to route, exactly as if it had come off the glass.
     Input(Input),
@@ -55,6 +55,13 @@ pub enum RemoteEvent {
     /// applied *after* it would be stranded — and a callback racing the drain could
     /// deliver them either way round.
     Home,
+    /// A special key, tapped (#260). In the queue for the ordering, like [`Self::Home`]:
+    /// Enter after a tap that focused a field must land after that tap.
+    Key(Key),
+    /// Composed text for the panel's focus (#260). Never coalesced — every character is
+    /// meaning, unlike a stale move — and ordered against the contacts around it for the
+    /// same reason keys are.
+    Text(String),
 }
 
 /// The queue itself. Cloneable by `Arc`; every producer and the loop share one.
@@ -115,6 +122,16 @@ impl RemoteInputQueue {
         self.push(RemoteEvent::Home);
     }
 
+    /// Queue one key tap (#260).
+    pub fn push_key(&self, key: Key) {
+        self.push(RemoteEvent::Key(key));
+    }
+
+    /// Queue composed text (#260).
+    pub fn push_text(&self, text: String) {
+        self.push(RemoteEvent::Text(text));
+    }
+
     /// Take everything waiting, with stale moves already removed.
     ///
     /// Returns them in arrival order. Empty is the overwhelmingly common case — the loop
@@ -146,13 +163,16 @@ impl RemoteInputQueue {
 
 /// Whether an event may be discarded when the queue is full.
 ///
-/// Only a move. Everything else either ends a contact or announces that a peer has, and
-/// dropping one of those is what strands a finger.
+/// A move, a key or text. What must never be dropped is anything that ends a contact or
+/// announces that a peer has — losing one of those strands a finger for the session.
+/// A move is stale by definition; a keystroke into a queue 4096 deep is typing at a
+/// panel that is wedged, and holding it (a `String`, not a `Copy` event) would let a
+/// flood of text grow real memory the bound exists to cap.
 fn is_droppable(event: &RemoteEvent) -> bool {
     matches!(
         event,
         RemoteEvent::Input(Input::Touch(t)) if t.phase == TouchPhase::Move
-    )
+    ) || matches!(event, RemoteEvent::Key(_) | RemoteEvent::Text(_))
 }
 
 /// Drop every move a later move in the same batch supersedes.
@@ -321,6 +341,57 @@ mod tests {
         let drained = q.drain();
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[1], RemoteEvent::Home);
+    }
+
+    #[test]
+    fn keys_and_text_keep_their_place_against_the_contacts_around_them() {
+        // The reason they ride this queue at all (#260): a tap that focuses a field and
+        // the Enter that submits it must arrive in the order they happened, and a
+        // callback beside the queue could deliver them either way round.
+        let q = queue();
+        let id = ContactId::remote(RemoteId::new(1), 0);
+        q.push(touch(id, TouchPhase::Down, 0.5));
+        q.push(touch(id, TouchPhase::Up, 0.5));
+        q.push_text("hi".into());
+        q.push_key(Key::Enter);
+        q.push(touch(id, TouchPhase::Down, 0.6));
+        let drained = q.drain();
+        assert_eq!(drained.len(), 5);
+        assert_eq!(drained[2], RemoteEvent::Text("hi".into()));
+        assert_eq!(drained[3], RemoteEvent::Key(Key::Enter));
+    }
+
+    #[test]
+    fn text_is_never_coalesced() {
+        // Every character is meaning; only positions supersede. Two identical strings
+        // are two insertions — "aa" typed as "a", "a".
+        let q = queue();
+        q.push_text("a".into());
+        q.push_text("a".into());
+        q.push_key(Key::Backspace);
+        q.push_key(Key::Backspace);
+        assert_eq!(q.drain().len(), 4);
+    }
+
+    #[test]
+    fn a_text_flood_cannot_grow_the_queue_and_a_release_still_lands() {
+        // Text is a `String`, so unlike a move flood the memory here is real. The bound
+        // drops keys and text once full — a keystroke into a queue this deep is typing
+        // at a wedged panel — but an end must still land, or a finger is stranded.
+        let q = queue();
+        let id = ContactId::remote(RemoteId::new(1), 0);
+        q.push(touch(id, TouchPhase::Down, 0.5));
+        for _ in 0..(MAX_PENDING * 2) {
+            q.push_text("spam".into());
+        }
+        q.push(touch(id, TouchPhase::Up, 0.5));
+        let drained = q.drain();
+        assert!(drained.len() <= MAX_PENDING + 1, "the bound held");
+        assert_eq!(
+            drained[drained.len() - 1],
+            touch(id, TouchPhase::Up, 0.5),
+            "the release must land whatever the flood was"
+        );
     }
 
     #[test]

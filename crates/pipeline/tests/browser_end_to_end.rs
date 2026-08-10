@@ -289,6 +289,98 @@ fn a_touch_reaches_the_page() {
     host.shutdown();
 }
 
+/// Typing reaches the page: composed text lands in a focused field, and the keys text
+/// cannot say (Enter, Backspace) fire as real key events (#260).
+///
+/// The other half of `remote_browser.rs`'s keyboard section, and the half a fixture
+/// cannot check: that section proves a phone's typing comes out of the panel's queue,
+/// and this proves what the queue's consumer then does — `InputSink::key`/`text` through
+/// `Input.insertText` / `Input.dispatchKeyEvent` — arrives in a page as typing a page
+/// can see. "Text was dispatched" and "the field contains it" are different claims.
+#[test]
+#[ignore = "needs a GPU and an Electron"]
+fn typing_reaches_the_page() {
+    let (_cmd_tx, cmd_rx) = pipeline::render_channel(8);
+    let Some(mut render) = pipeline::test_gpu::render_loop(640, 480, cmd_rx) else {
+        return;
+    };
+
+    let blocker = SharedBlocker::new(AdBlocker::with_defaults());
+    let electron = Electron::spawn(
+        &electron_path(),
+        &app_dir(),
+        blocker.clone(),
+        None,
+        pipeline::TV_USER_AGENT,
+        castaway_core::Waker::new(),
+    )
+    .expect("browser should start");
+
+    let (tx, rx) = std::sync::mpsc::channel::<BrowserCommand>();
+    let mut host = ElectronHost::new(electron, spec(blocker, None), rx);
+    host.resize(640, 480);
+    tx.send(BrowserCommand::Navigate(TYPING_PAGE.into()))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !browser_layer_present(&render) {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(browser_layer_present(&render), "page never painted");
+    // The page autofocuses its field; insertText goes wherever focus is, so make sure
+    // it has landed before typing at it.
+    let focused = |host: &ElectronHost| {
+        host.probe("document.activeElement.id", Duration::from_secs(5))
+            .is_ok_and(|v| v.contains("field"))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !focused(&host) {
+        host.pump(&mut render);
+        render.pump();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(focused(&host), "the field never took focus");
+
+    use input_touch::InputSink as _;
+    host.text("héllo");
+    host.key(input_touch::Key::Backspace);
+    host.text("!");
+    host.key(input_touch::Key::Enter);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut submitted = String::new();
+    while Instant::now() < deadline {
+        host.pump(&mut render);
+        render.pump();
+        if let Ok(v) = host.probe("window.__submitted", Duration::from_secs(2)) {
+            if v.contains("héll") {
+                submitted = v;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // One string asserts all three mechanisms: insertText put the text in, Backspace
+    // edited it as a key event, and Enter fired the keydown the page submits on.
+    assert!(
+        submitted.contains("héll!"),
+        "the page submitted {submitted:?}: typing did not survive the CDP trip"
+    );
+
+    host.shutdown();
+}
+
+/// A field that submits on Enter, recording what was in it. `autofocus` because the
+/// typing path inserts at the page's focus — placing focus by touch is the touch test's
+/// business, not this one's.
+const TYPING_PAGE: &str =
+    "data:text/html,<style>html,body{margin:0;height:100%;background:rgb(0,128,255)}</style>\
+     <body><input id=\"field\" autofocus>\
+     <script>window.__submitted='';const f=document.getElementById('field');\
+     f.addEventListener('keydown',(e)=>{if(e.key==='Enter'){window.__submitted=f.value}});\
+     f.focus();</script></body>";
+
 /// The page's audio has to reach *our* mixer, not the sound card.
 ///
 /// The claim being tested is specific: `MediaElementAudioSourceNode` removes an element

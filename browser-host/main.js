@@ -583,6 +583,74 @@ async function dispatchTouch(msg) {
   }
 }
 
+// Special keys, in the spelling `crates/pipeline/src/browser_proto.rs` (`Key`) encodes.
+// Composed text never comes through here — it is `Input.insertText` — so this table is
+// only the editing and navigation strokes a text insertion cannot express (#260).
+//
+// `text` on Enter is load-bearing: a keyDown without text is a rawKeyDown as far as
+// Chromium's input pipeline cares, and pages that submit on keypress/beforeinput (most
+// search boxes) never see the stroke. '\r' is what Chromium's own key mapping produces
+// for the Enter key.
+const KEYS = {
+  enter: { key: 'Enter', code: 'Enter', keyCode: 13, text: '\r' },
+  backspace: { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+  delete: { key: 'Delete', code: 'Delete', keyCode: 46 },
+  tab: { key: 'Tab', code: 'Tab', keyCode: 9 },
+  up: { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 },
+  down: { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+  left: { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+  right: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+};
+
+// One message is one tap: castaway's `InputSink::key` has tap semantics (nothing that
+// produces these can hold a key down in a way the page could see), so the down/up pair
+// is synthesized here.
+async function dispatchKey(msg) {
+  const win = getWindow(msg.surface);
+  if (!win) return;
+  const contents = win.webContents;
+  if (!contents.debugger.isAttached()) return;
+  const k = KEYS[msg.key];
+  if (!k) {
+    log('warn', `unknown key ${msg.key}`);
+    return;
+  }
+  const base = {
+    key: k.key,
+    code: k.code,
+    windowsVirtualKeyCode: k.keyCode,
+    nativeVirtualKeyCode: k.keyCode,
+  };
+  try {
+    await contents.debugger.sendCommand(
+      'Input.dispatchKeyEvent',
+      Object.assign(
+        { type: k.text ? 'keyDown' : 'rawKeyDown' },
+        base,
+        k.text ? { text: k.text, unmodifiedText: k.text } : {}
+      )
+    );
+    await contents.debugger.sendCommand('Input.dispatchKeyEvent', Object.assign({ type: 'keyUp' }, base));
+  } catch (e) {
+    log('warn', `key dispatch failed: ${e}`);
+  }
+}
+
+// Composed text into the page's focus. CDP's `Input.insertText` is the IME commit path,
+// which is exactly what the far end is: by the time a phone has composed — autocorrect,
+// swipe, CJK, paste — there is no key sequence left to replay (#260).
+async function insertText(msg) {
+  const win = getWindow(msg.surface);
+  if (!win) return;
+  const contents = win.webContents;
+  if (!contents.debugger.isAttached()) return;
+  try {
+    await contents.debugger.sendCommand('Input.insertText', { text: msg.text });
+  } catch (e) {
+    log('warn', `text insert failed: ${e}`);
+  }
+}
+
 function dispatchPointer(msg) {
   const win = getWindow(msg.surface);
   if (!win) return;
@@ -776,6 +844,12 @@ function handle(msg) {
       return;
     case 'pointer':
       dispatchPointer(msg);
+      return;
+    case 'key':
+      dispatchKey(msg);
+      return;
+    case 'insert-text':
+      insertText(msg);
       return;
     case 'wheel': {
       const win = getWindow(msg.surface);

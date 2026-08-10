@@ -230,6 +230,34 @@ pub enum PointerEvent {
     },
 }
 
+/// A special key a remote can press — the ones composed text cannot say (#260).
+///
+/// Deliberately *not* a keycode: a phone's IME composes text, so almost everything a
+/// person types arrives as [`InputSink::text`], and the only keys that need to exist as
+/// keys are the editing and navigation ones a text insertion cannot express. An enum
+/// rather than a string so an unknown key is refused at the wire boundary
+/// ([`wire::parse`]) instead of travelling to a browser that silently drops it — and so
+/// adding one forces every consumer's `match` to say what it does with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Key {
+    /// Submit / activate. The one key every text field needs.
+    Enter,
+    /// Delete backwards. Needed as a key because an empty field has no text to diff.
+    Backspace,
+    /// Delete forwards.
+    Delete,
+    /// Move focus.
+    Tab,
+    /// Navigate up — a TV page is a grid, and arrows are how grids are driven.
+    ArrowUp,
+    /// Navigate down.
+    ArrowDown,
+    /// Navigate left.
+    ArrowLeft,
+    /// Navigate right.
+    ArrowRight,
+}
+
 /// One routed input event, in the router's own vocabulary.
 ///
 /// The seam between decoding and routing. Everything upstream — winit window events, an
@@ -276,6 +304,28 @@ pub trait InputSink {
     /// The default is a no-op, for sinks that keep no contact state.
     fn cancel_origin(&mut self, origin: InputOrigin) {
         let _ = origin;
+    }
+    /// A special key, tapped (#260).
+    ///
+    /// Tap semantics — one call is one press-and-release — because the producers are a
+    /// remote page's buttons and an IME's editing keys, neither of which holds a key
+    /// down in any way the far side could see. A sink that dispatches real key events
+    /// (the browser, over CDP) synthesizes the down/up pair itself.
+    ///
+    /// The default is a no-op, for sinks with nothing to type into.
+    fn key(&mut self, key: Key) {
+        let _ = key;
+    }
+    /// Composed text, to be inserted where the sink's focus is (#260).
+    ///
+    /// Text and not keycodes, deliberately: a phone's IME composes — autocorrect,
+    /// swipe typing, CJK input, paste — and by the time the page sees anything there
+    /// is no key sequence to replay, only the string. Special keys go through
+    /// [`Self::key`] instead.
+    ///
+    /// The default is a no-op, for sinks with nothing to type into.
+    fn text(&mut self, text: &str) {
+        let _ = text;
     }
 }
 

@@ -328,6 +328,30 @@ pub enum ToBrowser {
         /// Vertical delta in pixels.
         dy: f32,
     },
+    /// A special key, tapped, into a window's page (#260).
+    ///
+    /// The host app synthesizes the CDP down/up pair (`Input.dispatchKeyEvent`); one
+    /// message is one press-and-release, matching [`input_touch::InputSink::key`]'s tap
+    /// semantics. Keys are the editing and navigation strokes composed text cannot say —
+    /// everything typeable travels as [`ToBrowser::InsertText`] instead.
+    Key {
+        /// The window whose page is typed at.
+        surface: Surface,
+        /// Which key.
+        key: Key,
+    },
+    /// Composed text, inserted at a window's page focus (#260).
+    ///
+    /// `Input.insertText` on the far side: by the time a phone's IME has composed —
+    /// autocorrect, swipe, CJK, paste — there is no key sequence left to replay, only
+    /// the string, and synthesizing per-character key events would fabricate keycodes
+    /// the composition never had.
+    InsertText {
+        /// The window whose page is typed at.
+        surface: Surface,
+        /// What to insert.
+        text: String,
+    },
     /// The answer to an [`FromBrowser::AdblockQuery`].
     AdblockVerdict {
         /// The query being answered.
@@ -388,6 +412,47 @@ pub enum TouchPhase {
     End,
     /// Contact cancelled by the system.
     Cancel,
+}
+
+/// A special key, in the spelling the host app's key table reads (#260).
+///
+/// Mapped from [`input_touch::Key`] like [`TouchPhase`] is from its phase — the wire
+/// spelling is this crate's contract with `browser-host/main.js`, and the router's
+/// vocabulary must not leak into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Key {
+    /// Submit / activate.
+    Enter,
+    /// Delete backwards.
+    Backspace,
+    /// Delete forwards.
+    Delete,
+    /// Move focus.
+    Tab,
+    /// Navigate up.
+    Up,
+    /// Navigate down.
+    Down,
+    /// Navigate left.
+    Left,
+    /// Navigate right.
+    Right,
+}
+
+impl From<input_touch::Key> for Key {
+    fn from(key: input_touch::Key) -> Self {
+        match key {
+            input_touch::Key::Enter => Self::Enter,
+            input_touch::Key::Backspace => Self::Backspace,
+            input_touch::Key::Delete => Self::Delete,
+            input_touch::Key::Tab => Self::Tab,
+            input_touch::Key::ArrowUp => Self::Up,
+            input_touch::Key::ArrowDown => Self::Down,
+            input_touch::Key::ArrowLeft => Self::Left,
+            input_touch::Key::ArrowRight => Self::Right,
+        }
+    }
 }
 
 /// The mouse-shaped events the panel can produce.
@@ -752,6 +817,75 @@ mod tests {
                 want,
                 "encoding drifted from what browser-host/main.js reads"
             );
+        }
+    }
+
+    #[test]
+    fn key_and_text_encode_in_the_words_the_host_apps_key_table_reads() {
+        // Byte-level for the same reason the surface test above is: main.js switches on
+        // `msg.type` and indexes KEYS on `msg.key`, and a spelling that drifted would
+        // route to the unknown-command log line — silently, from the panel's side (#260).
+        let cases: [(ToBrowser, &str); 3] = [
+            (
+                ToBrowser::Key {
+                    surface: Surface::Page,
+                    key: Key::Enter,
+                },
+                r#"{"type":"key","surface":"page","key":"enter"}"#,
+            ),
+            (
+                ToBrowser::Key {
+                    surface: Surface::Page,
+                    key: Key::Left,
+                },
+                r#"{"type":"key","surface":"page","key":"left"}"#,
+            ),
+            (
+                ToBrowser::InsertText {
+                    surface: Surface::Page,
+                    text: "héllo ✓".into(),
+                },
+                r#"{"type":"insert-text","surface":"page","text":"héllo ✓"}"#,
+            ),
+        ];
+        for (msg, want) in cases {
+            let bytes = encode(&msg).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&bytes[..bytes.len() - 1]).unwrap(),
+                want,
+                "encoding drifted from what browser-host/main.js reads"
+            );
+        }
+        // Every key has a row in main.js's KEYS table; the spellings are the contract.
+        for (key, want) in [
+            (Key::Enter, "enter"),
+            (Key::Backspace, "backspace"),
+            (Key::Delete, "delete"),
+            (Key::Tab, "tab"),
+            (Key::Up, "up"),
+            (Key::Down, "down"),
+            (Key::Left, "left"),
+            (Key::Right, "right"),
+        ] {
+            assert_eq!(serde_json::to_value(key).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn keys_map_from_the_input_crate() {
+        // The router's arrows are `ArrowUp`-style; the wire's are bare directions. The
+        // pairing is what this pins.
+        for (from, to) in [
+            (input_touch::Key::Enter, Key::Enter),
+            (input_touch::Key::Backspace, Key::Backspace),
+            (input_touch::Key::Delete, Key::Delete),
+            (input_touch::Key::Tab, Key::Tab),
+            (input_touch::Key::ArrowUp, Key::Up),
+            (input_touch::Key::ArrowDown, Key::Down),
+            (input_touch::Key::ArrowLeft, Key::Left),
+            (input_touch::Key::ArrowRight, Key::Right),
+        ] {
+            assert_eq!(Key::from(from), to);
         }
     }
 

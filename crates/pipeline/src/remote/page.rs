@@ -48,6 +48,12 @@
 ///   Android is the system back gesture and in iOS Safari is swipe-to-go-back — the
 ///   browser eats it before the page sees it. A remote that could only pass gestures
 ///   through would have no way home, so this one does not try.
+/// - **The keyboard is a field, not a key relay (#260).** A phone's IME composes —
+///   autocorrect, swipe typing, CJK — so by the time script sees anything there is no
+///   key stream, only the field's value. What travels is the value's *diff*: insertions
+///   as `text` messages, deletions as `backspace` keys, and nothing at all while
+///   `isComposing`. Only the strokes text cannot say — Enter, arrows, backspace on an
+///   empty field — travel as `key` messages.
 pub const PLAYER: &str = r##"
 <section id="remote">
   <h2>The panel</h2>
@@ -60,8 +66,19 @@ pub const PLAYER: &str = r##"
     <p id="note"></p>
     <div id="bar">
       <button id="home" type="button">Home</button>
+      <button id="keys" type="button">Keyboard</button>
       <button id="full" type="button">Fullscreen</button>
       <button id="stop" type="button">Stop</button>
+    </div>
+    <div id="kbd">
+      <input id="typein" type="text" autocomplete="off" autocapitalize="off"
+             autocorrect="off" spellcheck="false" placeholder="Type on the panel">
+      <button data-key="backspace" type="button" aria-label="Backspace">&#9003;</button>
+      <button data-key="enter" type="button" aria-label="Enter">&#9166;</button>
+      <button data-key="up" type="button" aria-label="Up">&#8593;</button>
+      <button data-key="down" type="button" aria-label="Down">&#8595;</button>
+      <button data-key="left" type="button" aria-label="Left">&#8592;</button>
+      <button data-key="right" type="button" aria-label="Right">&#8594;</button>
     </div>
   </div>
   <p id="hint">Live, with your touches going through. Nothing is encoded until you press
@@ -94,6 +111,17 @@ pub const PLAYER: &str = r##"
                 border-radius:.4rem; padding:.4rem .8rem; touch-action:manipulation;
                 pointer-events:auto; cursor:pointer; }
   #bar button:active { background:#333c; }
+  /* The keyboard tray: only reachable while live and toggled, so it can never shadow
+     the play button, and closing it gives the picture back its bottom band. */
+  #kbd   { position:absolute; left:0; right:0; bottom:2.9rem; display:none; gap:.4rem;
+           padding:.4rem .5rem; background:#000b; align-items:center; }
+  #stage[data-state="live"][data-kbd="on"] #kbd { display:flex; }
+  #kbd input { flex:1; min-width:6rem; font:inherit; color:#eee; background:#111;
+               border:1px solid #444; border-radius:.3rem; padding:.35rem .5rem; }
+  #kbd button { font:inherit; color:#eee; background:#222c; border:1px solid #444;
+                border-radius:.3rem; padding:.35rem .6rem; touch-action:manipulation;
+                cursor:pointer; }
+  #kbd button:active { background:#333c; }
   #note  { position:absolute; top:.5rem; left:.5rem; right:.5rem; margin:0; color:#bbb;
            font-size:.85rem; text-shadow:0 1px 2px #000; pointer-events:none; }
   #hint  { color:#999; font-size:.85rem; }
@@ -200,6 +228,74 @@ pub const PLAYER: &str = r##"
     send({ type: 'home' });
   });
 
+  // ---- Keyboard (#260) -----------------------------------------------------------
+  // The design constraint is the phone's IME: autocorrect, swipe typing and CJK input
+  // compose, so there is no key stream to forward — only the field's value. So the tray
+  // holds a real text field, and what travels is the *diff* of its value: typed text as
+  // a `text` message, deletions as `backspace` keys. The keys that cannot be said as
+  // text — Enter, arrows, backspace on an empty field — are explicit buttons and an
+  // explicit keydown path.
+  var field = document.getElementById('typein');
+  var lastValue = '';
+
+  // Send what changed since the last look. Deletions are counted in code points, not
+  // UTF-16 units, because the panel's Backspace deletes characters — two backspaces for
+  // one deleted emoji would eat a neighbour.
+  function syncField() {
+    var v = field.value;
+    var common = 0;
+    while (common < lastValue.length && common < v.length &&
+           lastValue.charCodeAt(common) === v.charCodeAt(common)) { common += 1; }
+    // Never split a surrogate pair at the diff boundary.
+    if (common > 0 &&
+        lastValue.charCodeAt(common - 1) >= 0xD800 &&
+        lastValue.charCodeAt(common - 1) <= 0xDBFF) { common -= 1; }
+    var removed = Array.from(lastValue.slice(common)).length;
+    for (var i = 0; i < removed; i++) { send({ type: 'key', key: 'backspace' }); }
+    if (v.length > common) { send({ type: 'text', text: v.slice(common) }); }
+    lastValue = v;
+  }
+
+  field.addEventListener('input', function (e) {
+    // Mid-composition values are provisional — the IME may replace them wholesale on
+    // commit. Sending them would type the candidates as well as the choice.
+    if (e.isComposing) { return; }
+    syncField();
+  });
+  field.addEventListener('compositionend', syncField);
+
+  field.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      syncField();   // anything the IME committed but input has not delivered yet
+      send({ type: 'key', key: 'enter' });
+      field.value = ''; lastValue = '';
+      e.preventDefault();
+    } else if (e.key === 'Backspace' && field.value.length === 0) {
+      // An empty field has no text to diff, but the panel's field may not be empty.
+      send({ type: 'key', key: 'backspace' });
+      e.preventDefault();
+    }
+  });
+
+  var kbd = document.getElementById('kbd');
+  Array.prototype.forEach.call(kbd.querySelectorAll('button[data-key]'), function (b) {
+    // Keep focus in the field, or every arrow press would drop the phone's keyboard.
+    b.addEventListener('pointerdown', function (e) { e.preventDefault(); });
+    b.addEventListener('click', function () { send({ type: 'key', key: b.dataset.key }); });
+  });
+
+  function resetKeyboard() {
+    stage.dataset.kbd = 'off';
+    field.value = '';
+    lastValue = '';
+  }
+
+  document.getElementById('keys').addEventListener('click', function () {
+    var on = stage.dataset.kbd === 'on';
+    stage.dataset.kbd = on ? 'off' : 'on';
+    if (!on) { field.focus(); }
+  });
+
   // The container, never the video. A native fullscreen video hands control to the
   // browser's own player UI, which cannot be overlaid and delivers no pointer events —
   // so the capture layer would simply stop existing.
@@ -225,6 +321,7 @@ pub const PLAYER: &str = r##"
   // left open on the landing page costs the panel nothing again.
   function stop() {
     releaseAll();
+    resetKeyboard();
     if (ping) { clearInterval(ping); ping = null; }
     if (pc) { try { pc.close(); } catch (e) {} pc = null; }
     channel = null;
@@ -408,6 +505,74 @@ mod tests {
             .expect("a #bar rule");
         assert!(bar.contains("pointer-events:none"), "{bar}");
         assert!(PLAYER.contains("pointer-events:auto"));
+    }
+
+    #[test]
+    fn typing_travels_as_text_and_never_while_composing() {
+        // The IME constraint (#260): composed input has no key stream to forward, so
+        // insertions are `text` messages, and a mid-composition value is provisional —
+        // forwarding it would type the candidates as well as the choice.
+        assert!(PLAYER.contains("type: 'text'"));
+        assert!(PLAYER.contains("if (e.isComposing) { return; }"));
+        assert!(PLAYER.contains("compositionend"));
+    }
+
+    #[test]
+    fn the_strokes_text_cannot_say_are_keys() {
+        // Enter, arrows and an empty-field backspace have no diff to travel as. The
+        // spellings here are the wire contract `input_touch::wire` parses.
+        assert!(PLAYER.contains("type: 'key'"));
+        for key in ["backspace", "enter", "up", "down", "left", "right"] {
+            assert!(
+                PLAYER.contains(&format!("data-key=\"{key}\"")),
+                "{key} has no button"
+            );
+        }
+        // Backspace when the field is empty still has to reach the panel.
+        assert!(PLAYER.contains("e.key === 'Backspace' && field.value.length === 0"));
+    }
+
+    #[test]
+    fn deletions_are_counted_in_code_points() {
+        // The panel's Backspace deletes characters; UTF-16 units would send two
+        // backspaces for one deleted emoji and eat its neighbour.
+        assert!(PLAYER.contains("Array.from(lastValue.slice(common)).length"));
+    }
+
+    #[test]
+    fn the_keyboard_tray_only_exists_live_and_asked_for() {
+        // Exclusive by construction like the capture layer: a hidden tray over the idle
+        // stage would shadow the play button.
+        assert!(
+            PLAYER.contains(r##"#stage[data-state="live"][data-kbd="on"] #kbd { display:flex; }"##)
+        );
+        let kbd_rule = PLAYER
+            .split("#kbd   {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .expect("a #kbd rule");
+        assert!(kbd_rule.contains("display:none"), "{kbd_rule}");
+    }
+
+    #[test]
+    fn the_field_does_not_fight_the_phones_ime() {
+        // Autocapitalize/autocorrect on a URL bar or a search box types things nobody
+        // typed; the field is a conduit, so the phone's own mangling is turned off.
+        assert!(PLAYER.contains(r#"autocapitalize="off""#));
+        assert!(PLAYER.contains(r#"autocomplete="off""#));
+    }
+
+    #[test]
+    fn enter_flushes_composition_before_it_submits() {
+        // An Enter racing ahead of the text it submits would submit the previous value.
+        let keydown = PLAYER
+            .split("e.key === 'Enter'")
+            .nth(1)
+            .and_then(|r| r.split("preventDefault").next())
+            .expect("an Enter branch");
+        let sync = keydown.find("syncField()").expect("a flush");
+        let sent = keydown.find("key: 'enter'").expect("a send");
+        assert!(sync < sent, "the flush must come before the key");
     }
 
     #[test]
