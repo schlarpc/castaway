@@ -52,7 +52,7 @@ toml = "0.8"
 # `Config` structs, because an operator's file is full of comments and hand-formatting
 # that a round-trip through serde would flatten; this edits one key and leaves the rest
 # byte-for-byte alone. (Same tree `toml` itself parses with, so no new lock entry.)
-toml_edit = "0.22"
+toml_edit = "0.25"
 uuid.workspace = true
 url.workspace = true
 # `local-offset` because a holiday is a local-date concept (#263): the seasonal palette
