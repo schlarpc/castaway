@@ -9,6 +9,8 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use castaway_core::PlaybackProgress;
+
 /// Matter endpoint ids are `u16`. Aliased so signatures say which `u16` they mean.
 pub type EndpointId = u16;
 
@@ -130,6 +132,80 @@ pub struct PlayerSnapshot {
     pub app: Option<EndpointId>,
 }
 
+impl PlayerSnapshot {
+    /// Fold a pipeline progress report into the projection (#283).
+    ///
+    /// The pipeline is the authority on where playback has reached and how long the item
+    /// is; this projection only remembers what it was last told. Three cases, each with a
+    /// reason:
+    ///
+    /// - Nothing loaded here → the report is not about our session (some other protocol
+    ///   may be pacing the pipeline), so it is ignored rather than adopted.
+    /// - No report → the pipeline has nothing to say yet (fetching, between items), so the
+    ///   last projection stands rather than snapping back to zero.
+    /// - A report → both fields are taken as given, including a `duration` of [`None`]:
+    ///   a live stream genuinely has no end, and that is a statement, not a gap.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Option<PlaybackProgress>) -> Self {
+        if matches!(self.state, PlaybackState::NotPlaying) {
+            return self;
+        }
+        let Some(progress) = progress else {
+            return self;
+        };
+        self.position = progress.position;
+        self.duration = progress.duration;
+        self
+    }
+
+    /// Validate an absolute seek against what is known about the media's end.
+    ///
+    /// # Errors
+    /// [`SeekRefusal`] when the target is past the known end — or when there is no known
+    /// end to be inside of, which is a live stream or a container that has not reported
+    /// yet. Both land on the cluster's `SeekOutOfRange`; the distinction is for the log.
+    pub fn seek_target(&self, to: Duration) -> Result<Duration, SeekRefusal> {
+        match self.duration {
+            None => Err(SeekRefusal::NoKnownEnd),
+            Some(duration) if to > duration => Err(SeekRefusal::PastEnd { duration }),
+            Some(_) => Ok(to),
+        }
+    }
+
+    /// Where a `SkipForward` lands: clamped to the end when the end is known, because the
+    /// spec says a skip past the end is a seek *to* the end, not a refusal.
+    #[must_use]
+    pub fn skip_forward_target(&self, by: Duration) -> Duration {
+        let target = self.position.saturating_add(by);
+        match self.duration {
+            Some(duration) => target.min(duration),
+            None => target,
+        }
+    }
+
+    /// Where a `SkipBackward` lands: the start is the floor, not an underflow.
+    #[must_use]
+    pub fn skip_backward_target(&self, by: Duration) -> Duration {
+        self.position.saturating_sub(by)
+    }
+}
+
+/// Why an absolute seek cannot be honoured.
+///
+/// Both variants answer the sender with `SeekOutOfRange` — the cluster's vocabulary has
+/// nothing finer — but the panel's own log wants to say which one happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekRefusal {
+    /// The media has no known end: a live stream, or a container that has not reported a
+    /// duration yet. With no end there is no range for any target to be inside.
+    NoKnownEnd,
+    /// The target is past the end of a media whose length is known.
+    PastEnd {
+        /// The known end the target overshot.
+        duration: Duration,
+    },
+}
+
 /// Shared, interior-mutable [`PlayerSnapshot`].
 ///
 /// A `std::sync::Mutex` and not a `tokio` one on purpose: the cluster handlers are
@@ -176,13 +252,32 @@ impl PlayerState {
             Err(poisoned) => f(&mut poisoned.into_inner()),
         }
     }
+
+    /// Fold a pipeline progress report in ([`PlayerSnapshot::with_progress`]) and return
+    /// what the projection now says (#283).
+    ///
+    /// Fold-and-read in one lock rather than a read, a fold and a write-back, so two
+    /// concurrent refreshes cannot interleave into a projection neither of them computed.
+    pub fn refresh(&self, progress: Option<PlaybackProgress>) -> PlayerSnapshot {
+        let fold = |snapshot: &mut PlayerSnapshot| {
+            *snapshot = snapshot.clone().with_progress(progress);
+            snapshot.clone()
+        };
+        match self.snapshot.lock() {
+            Ok(mut guard) => fold(&mut guard),
+            Err(poisoned) => fold(&mut poisoned.into_inner()),
+        }
+    }
 }
 
-/// Transport verbs `MediaPlayback` can ask for.
+/// Transport verbs the panel's clusters can ask for.
 ///
-/// Its own enum rather than [`castaway_core::ControlTxn`] because two of them —
-/// the skips — are relative to a position only the panel knows, so they cannot be
-/// translated until the moment they are applied.
+/// Its own enum rather than [`castaway_core::ControlTxn`] because it is this protocol's
+/// vocabulary, not the pipeline's: `StartOver` is a verb here and a `Seek(0)` there, and
+/// the relative skips arrive as deltas the cluster handler resolves against the
+/// projection *before* one of these is emitted — which is why there is no skip variant.
+/// (There used to be; resolving at two different times against a moving position was two
+/// answers to one question, #283.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Transport {
@@ -198,12 +293,8 @@ pub enum Transport {
     Previous,
     /// Next item in the queue.
     Next,
-    /// Seek to an absolute position.
+    /// Seek to an absolute position. Skips arrive here too, already resolved.
     Seek(Duration),
-    /// Jump forward from wherever we are.
-    SkipForward(Duration),
-    /// Jump backward from wherever we are.
-    SkipBackward(Duration),
 }
 
 /// What a Casting Client's invoke asks the panel to do.
@@ -565,6 +656,137 @@ mod tests {
             cat.launch_search(FIRST_CONTENT_APP_ENDPOINT, "   ", true),
             Err(LaunchRefusal::NotAllowed)
         );
+    }
+
+    /// The pipeline's progress lands in the projection — including a duration, which
+    /// nothing set before (#283) and which `Seek`'s bound check reads.
+    #[test]
+    fn progress_folds_position_and_duration_into_the_projection() {
+        let playing = PlayerSnapshot {
+            state: PlaybackState::Playing,
+            ..PlayerSnapshot::default()
+        };
+        let folded = playing.clone().with_progress(Some(
+            castaway_core::PlaybackProgress::at(Duration::from_secs(30))
+                .of(Duration::from_secs(300)),
+        ));
+        assert_eq!(folded.position, Duration::from_secs(30));
+        assert_eq!(folded.duration, Some(Duration::from_secs(300)));
+
+        // A live report *overwrites* a stale duration: no end is a statement, not a gap.
+        let live = folded.with_progress(Some(castaway_core::PlaybackProgress::at(
+            Duration::from_secs(31),
+        )));
+        assert_eq!(live.duration, None);
+
+        // No report keeps the last projection rather than snapping back to zero.
+        let held = live.clone().with_progress(None);
+        assert_eq!(held, live);
+    }
+
+    /// A report while nothing is loaded is someone else's session and must not be adopted.
+    #[test]
+    fn progress_is_ignored_when_nothing_is_loaded() {
+        let idle = PlayerSnapshot::default();
+        let folded = idle.clone().with_progress(Some(
+            castaway_core::PlaybackProgress::at(Duration::from_secs(30))
+                .of(Duration::from_secs(300)),
+        ));
+        assert_eq!(folded, idle);
+    }
+
+    /// The three answers a `Seek` can get, in the projection's own terms (#283): in range,
+    /// past a known end, and against media with no known end — which is a live stream, and
+    /// the honest refusal rather than a seek the pipeline cannot bound.
+    #[test]
+    fn a_seek_is_bounded_by_the_known_duration_and_refused_without_one() {
+        let vod = PlayerSnapshot {
+            state: PlaybackState::Playing,
+            duration: Some(Duration::from_secs(300)),
+            ..PlayerSnapshot::default()
+        };
+        assert_eq!(
+            vod.seek_target(Duration::from_secs(60)),
+            Ok(Duration::from_secs(60))
+        );
+        // The end itself is in range; one past it is not.
+        assert_eq!(
+            vod.seek_target(Duration::from_secs(300)),
+            Ok(Duration::from_secs(300))
+        );
+        assert_eq!(
+            vod.seek_target(Duration::from_secs(301)),
+            Err(SeekRefusal::PastEnd {
+                duration: Duration::from_secs(300)
+            })
+        );
+
+        let live = PlayerSnapshot {
+            state: PlaybackState::Playing,
+            duration: None,
+            ..PlayerSnapshot::default()
+        };
+        assert_eq!(
+            live.seek_target(Duration::ZERO),
+            Err(SeekRefusal::NoKnownEnd)
+        );
+    }
+
+    /// Skips resolve against the projection: forward clamps to a known end (the spec says
+    /// past-the-end is a seek *to* the end), backward floors at the start.
+    #[test]
+    fn skips_resolve_against_the_position_and_clamp_at_both_ends() {
+        let snapshot = PlayerSnapshot {
+            state: PlaybackState::Playing,
+            position: Duration::from_secs(30),
+            duration: Some(Duration::from_secs(40)),
+            ..PlayerSnapshot::default()
+        };
+        assert_eq!(
+            snapshot.skip_forward_target(Duration::from_secs(5)),
+            Duration::from_secs(35)
+        );
+        assert_eq!(
+            snapshot.skip_forward_target(Duration::from_secs(500)),
+            Duration::from_secs(40),
+            "past the known end lands at the end"
+        );
+        assert_eq!(
+            snapshot.skip_backward_target(Duration::from_secs(5)),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            snapshot.skip_backward_target(Duration::from_secs(500)),
+            Duration::ZERO,
+            "past the start lands at the start"
+        );
+
+        // With no known end, forward is unclamped — the pipeline is the one that knows.
+        let live = PlayerSnapshot {
+            duration: None,
+            ..snapshot
+        };
+        assert_eq!(
+            live.skip_forward_target(Duration::from_secs(500)),
+            Duration::from_secs(530)
+        );
+    }
+
+    /// `refresh` is the fold and the read in one lock, and it persists what it folded.
+    #[test]
+    fn refresh_persists_the_folded_projection() {
+        let state = PlayerState::new();
+        state.set(PlayerSnapshot {
+            state: PlaybackState::Playing,
+            ..PlayerSnapshot::default()
+        });
+        let refreshed = state.refresh(Some(
+            castaway_core::PlaybackProgress::at(Duration::from_secs(12))
+                .of(Duration::from_secs(120)),
+        ));
+        assert_eq!(refreshed.duration, Some(Duration::from_secs(120)));
+        // …and a later plain read sees the same projection.
+        assert_eq!(state.get(), refreshed);
     }
 
     #[test]

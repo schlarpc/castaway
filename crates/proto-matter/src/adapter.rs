@@ -111,6 +111,9 @@ impl Default for MatterConfig {
 pub struct MatterAdapter {
     config: MatterConfig,
     state: Arc<PlayerState>,
+    /// Where the pipeline's position and duration come from (#283); [`None`] on builds
+    /// with nothing that reports one.
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
     osd: Option<OsdSink>,
     /// Whose passcode prompt is on the glass, if anyone's. The OSD is one slot, so a
     /// [`Prompt::Clear`] may only take it down when its key matches — a clear for a
@@ -132,12 +135,25 @@ impl MatterAdapter {
         Self {
             config,
             state: Arc::new(PlayerState::new()),
+            playback: None,
             osd: None,
             prompt_owner: std::sync::Mutex::new(None),
             browser: None,
             operational_mdns: None,
             once: Mutex::new(Some(())),
         }
+    }
+
+    /// Give the adapter the pipeline's playback report (#283).
+    ///
+    /// This is where `MediaPlayback`'s `Duration` and the bound on `Seek` come from.
+    /// Without one — the null-pipeline build — the projection keeps whatever it was last
+    /// told: no duration, which a client reads as a stream with no known end, and every
+    /// absolute seek refused as `SeekOutOfRange`.
+    #[must_use]
+    pub fn with_playback(mut self, report: Arc<dyn castaway_core::PlaybackReport>) -> Self {
+        self.playback = Some(report);
+        self
     }
 
     /// Give the adapter an overlay to put the passcode on. Without one it still
@@ -334,6 +350,7 @@ impl MatterAdapter {
             catalogue: self.config.catalogue.clone(),
             state: Arc::clone(&self.state),
             commands: command_tx,
+            playback: self.playback.clone(),
         });
 
         // Four buffers: the responder is run with four concurrent exchanges below, and a
@@ -631,9 +648,8 @@ impl MatterAdapter {
                 }
 
                 CastCommand::Transport(transport) => {
-                    if let Some(txn) = self.transport_to_control(transport) {
-                        sink.emit(SessionEvent::Control(txn)).await?;
-                    }
+                    sink.emit(SessionEvent::Control(transport_to_control(transport)))
+                        .await?;
                 }
 
                 CastCommand::SelectTarget(endpoint) => {
@@ -654,24 +670,6 @@ impl MatterAdapter {
         }
 
         Ok(())
-    }
-
-    /// The two relative verbs resolve against the position only the panel knows, which is
-    /// why they could not be translated when they were parsed.
-    fn transport_to_control(&self, transport: Transport) -> Option<ControlTxn> {
-        let position = self.state.get().position;
-
-        Some(match transport {
-            Transport::Play => ControlTxn::Play,
-            Transport::Pause => ControlTxn::Pause,
-            Transport::Stop => ControlTxn::Stop,
-            Transport::StartOver => ControlTxn::Seek(Duration::ZERO),
-            Transport::Previous => ControlTxn::Previous,
-            Transport::Next => ControlTxn::Next,
-            Transport::Seek(to) => ControlTxn::Seek(to),
-            Transport::SkipForward(by) => ControlTxn::Seek(position.saturating_add(by)),
-            Transport::SkipBackward(by) => ControlTxn::Seek(position.saturating_sub(by)),
-        })
     }
 
     /// Put the passcode where a person can read it — and take it down only for the phone
@@ -745,6 +743,24 @@ impl MatterAdapter {
         if let Some(osd) = &self.osd {
             osd.clear();
         }
+    }
+}
+
+/// [`Transport`] → [`ControlTxn`]: the cluster's vocabulary into the pipeline's.
+///
+/// Total and stateless. It used to resolve the relative skips against the projection
+/// here, at drain time — a second reading of a position the cluster handler had already
+/// read once, and the two could disagree. Since #283 the handler resolves skips where the
+/// projection lives, and what arrives here is always absolute.
+fn transport_to_control(transport: Transport) -> ControlTxn {
+    match transport {
+        Transport::Play => ControlTxn::Play,
+        Transport::Pause => ControlTxn::Pause,
+        Transport::Stop => ControlTxn::Stop,
+        Transport::StartOver => ControlTxn::Seek(Duration::ZERO),
+        Transport::Previous => ControlTxn::Previous,
+        Transport::Next => ControlTxn::Next,
+        Transport::Seek(to) => ControlTxn::Seek(to),
     }
 }
 
@@ -1015,47 +1031,17 @@ mod tests {
         assert!(record.published);
     }
 
-    /// Skip is relative to a position only the panel knows, which is why it could not be
-    /// resolved at parse time.
+    /// The cluster's vocabulary maps onto the pipeline's, absolutely — skips were
+    /// resolved by the handler before any of these were emitted (#283).
     #[test]
-    fn skips_resolve_against_the_current_position() {
-        let adapter = adapter();
-        adapter
-            .state
-            .update(|s| s.position = Duration::from_secs(30));
-
+    fn start_over_is_a_seek_to_zero_and_a_seek_carries_its_target() {
         assert_eq!(
-            adapter.transport_to_control(Transport::SkipForward(Duration::from_secs(15))),
-            Some(ControlTxn::Seek(Duration::from_secs(45)))
+            transport_to_control(Transport::StartOver),
+            ControlTxn::Seek(Duration::ZERO)
         );
         assert_eq!(
-            adapter.transport_to_control(Transport::SkipBackward(Duration::from_secs(15))),
-            Some(ControlTxn::Seek(Duration::from_secs(15)))
-        );
-    }
-
-    /// A skip past the start is a seek to the start, not an underflow.
-    #[test]
-    fn a_skip_backward_past_the_start_lands_at_zero() {
-        let adapter = adapter();
-        adapter
-            .state
-            .update(|s| s.position = Duration::from_secs(5));
-        assert_eq!(
-            adapter.transport_to_control(Transport::SkipBackward(Duration::from_secs(30))),
-            Some(ControlTxn::Seek(Duration::ZERO))
-        );
-    }
-
-    #[test]
-    fn start_over_is_a_seek_to_zero() {
-        let adapter = adapter();
-        adapter
-            .state
-            .update(|s| s.position = Duration::from_secs(90));
-        assert_eq!(
-            adapter.transport_to_control(Transport::StartOver),
-            Some(ControlTxn::Seek(Duration::ZERO))
+            transport_to_control(Transport::Seek(Duration::from_secs(45))),
+            ControlTxn::Seek(Duration::from_secs(45))
         );
     }
 

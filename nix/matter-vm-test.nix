@@ -195,6 +195,10 @@ pkgs.testers.runNixOSTest {
             # by then — the LaunchURL above is what put it there — so `drive`'s
             # `NotActive` guard and its success path are both on the same run.
             f"--read-descriptor --app-basic --app-endpoint 7 "
+            # The seek surface (#283): Duration and the seek range read back Null on the
+            # null pipeline, the two skips resolve into absolute seeks the journal shows,
+            # and Seek/Rewind/FastForward produce both refusal statuses.
+            f"--playback-probes "
             f"--transport play,pause,stop,play --navigate 2 "
             f"--launch-content 'a search nobody can serve' --read-acl "
             f"> /tmp/peer.log 2>&1 &"
@@ -356,6 +360,64 @@ pkgs.testers.runNixOSTest {
         # when it *is* reached, and says why: a non-empty one is an access-control claim
         # backed by attestation this panel does not verify.)
         assert "allowed_vendors=refused" in app, app
+
+    with subtest("the Descriptor's own attribute and command lists are read (#283)"):
+        # The global list attributes come out of the cluster metadata, served by
+        # rs-matter's data model — what they claim is what a strict client walks before
+        # touching anything else, and nothing had ever read them. The Descriptor's
+        # required attributes and no commands, exactly.
+        lists = one(
+            r"descriptor lists endpoint=1 attributes=\[(.*?)\] "
+            r"accepted=\[(.*?)\] generated=\[(.*?)\]",
+            peer_log,
+        )
+        attributes = sorted(a.strip('"') for a in lists.group(1).split(", "))
+        print(attributes)
+        assert attributes == [
+            "0x0000",  # DeviceTypeList
+            "0x0001",  # ServerList
+            "0x0002",  # ClientList
+            "0x0003",  # PartsList
+            "0xfff8",  # GeneratedCommandList
+            "0xfff9",  # AcceptedCommandList
+            "0xfffb",  # AttributeList
+            "0xfffc",  # FeatureMap
+            "0xfffd",  # ClusterRevision
+        ], attributes
+        # The Descriptor has no commands, and the lists must say so rather than error.
+        assert lists.group(2) == "", lists.group(2)
+        assert lists.group(3) == "", lists.group(3)
+
+    with subtest("seek and skip against a stream with no known end (#283)"):
+        # The null pipeline reports no progress, so the projection honestly has no
+        # duration: `Duration` and both ends of the seek range read back Null — a live
+        # stream's shape, not zero.
+        assert (
+            "playback duration=None seek_range_start=None seek_range_end=None"
+            in peer_log
+        ), peer_log
+
+        # The two skips are the relative verbs #283 made real: each resolves against the
+        # projection into an absolute seek, and the two compose — 15 s forward then 5 s
+        # back lands at 10 s. The resolved targets are read out of the *panel's* journal,
+        # where the pipeline was told to go.
+        assert "playback skip-forward(15000) status=Success" in peer_log, peer_log
+        assert "playback skip-backward(5000) status=Success" in peer_log, peer_log
+        journal = panel.succeed("journalctl -u castaway --no-pager")
+        assert re.search(r"null pipeline: CONTROL.*Seek\(15s\)", journal), journal
+        assert re.search(r"null pipeline: CONTROL.*Seek\(10s\)", journal), journal
+
+        # An absolute seek into media with no known end is refused with the cluster's own
+        # status — there is no range for any target to be inside — and the panel logs the
+        # reason the wire cannot carry.
+        assert "playback seek(60000) status=SeekOutOfRange" in peer_log, peer_log
+        assert re.search(r"declining a Seek.*NoKnownEnd", journal), journal
+
+        # And the two variable-speed verbs: the panel does not advertise variable speed,
+        # so Rewind and FastForward answer SpeedOutOfRange rather than seeking and
+        # calling it rewind.
+        assert "playback rewind status=SpeedOutOfRange" in peer_log, peer_log
+        assert "playback fast-forward status=SpeedOutOfRange" in peer_log, peer_log
 
     with subtest("the transport works, and stops working when there is nothing to drive"):
         # `MediaPlaybackHandler::drive` and its `NotActive` guard: no Play, Pause or Stop

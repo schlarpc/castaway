@@ -169,8 +169,14 @@ struct Args {
 /// what those assert, and a probe that failed would fail them for an unrelated reason.
 #[derive(Debug, Default)]
 struct Probes {
-    /// Read the Descriptor on the root, the player and the app endpoint.
+    /// Read the Descriptor on the root, the player and the app endpoint — including the
+    /// Descriptor cluster's own attribute and command lists, which no client had ever
+    /// read (#283).
     descriptor: bool,
+    /// Drive the seek surface on the player endpoint (#283): read `Duration` and the
+    /// seek range, then `SkipForward`, `SkipBackward`, a `Seek`, and the two variable-
+    /// speed verbs the panel refuses. Fixed operands, so the VM asserts exact numbers.
+    playback: bool,
     /// Read all seven `ApplicationBasic` attributes on the app endpoint.
     app_basic: bool,
     /// Invoke these `MediaPlayback` commands, in order, on the player endpoint.
@@ -213,8 +219,8 @@ fn usage() -> String {
      [--endpoint <n>] [--app-vendor <n>] [--app-product <n>] [--discriminator <n>] \
      [--matter-port <n>] [--state-dir <dir>] [--declare-only] [--cancel-only] \
      [--wrong-passcode] \
-     [--wrong-instance] [--read-descriptor] [--app-basic] [--read-acl] \
-     [--app-endpoint <n>] [--transport <verb>[,<verb>…]] [--navigate <n>] \
+     [--wrong-instance] [--read-descriptor] [--playback-probes] [--app-basic] \
+     [--read-acl] [--app-endpoint <n>] [--transport <verb>[,<verb>…]] [--navigate <n>] \
      [--launch-content <query>]\n\
      or:    matter-peer --player <ip> --cast-again --state-dir <dir> [--bind <ip>] \
      [--url <str>] [--display-string <str>] [--endpoint <n>] [--matter-port <n>]"
@@ -274,6 +280,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--wrong-passcode" => wrong_passcode = true,
             "--wrong-instance" => wrong_instance = true,
             "--read-descriptor" => probes.descriptor = true,
+            "--playback-probes" => probes.playback = true,
             "--app-basic" => probes.app_basic = true,
             "--read-acl" => probes.read_acl = true,
             "--app-endpoint" => probes.app_endpoint = value()?.parse()?,
@@ -630,6 +637,51 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
                  device_types={types:?} servers={servers:?} parts={parts:?}"
             );
         }
+
+        // The Descriptor cluster's *own* attribute and command lists, still unread after
+        // everything above (#283): the global list attributes are served by `rs-matter`
+        // from the cluster metadata, and what the metadata claims is exactly what a
+        // strict client walks before touching anything else.
+        let attributes = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .descriptor()
+            .attribute_list_read_with(PLAYER_ENDPOINT, |v| {
+                v.map(|list| {
+                    list.iter()
+                        .filter_map(Result::ok)
+                        .map(|a| format!("{a:#06x}"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await??;
+        let accepted = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .descriptor()
+            .accepted_command_list_read_with(PLAYER_ENDPOINT, |v| {
+                v.map(|list| {
+                    list.iter()
+                        .filter_map(Result::ok)
+                        .map(|c| format!("{c:#06x}"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await??;
+        let generated = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .descriptor()
+            .generated_command_list_read_with(PLAYER_ENDPOINT, |v| {
+                v.map(|list| {
+                    list.iter()
+                        .filter_map(Result::ok)
+                        .map(|c| format!("{c:#06x}"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .await??;
+        println!(
+            "matter-peer: descriptor lists endpoint={PLAYER_ENDPOINT} \
+             attributes={attributes:?} accepted={accepted:?} generated={generated:?}"
+        );
     }
 
     if probes.app_basic {
@@ -702,6 +754,120 @@ async fn run_probes<C: rs_matter::crypto::Crypto>(
              version={version:?} application=({application}) status={status:?} \
              allowed_vendors={allowed}"
         );
+    }
+
+    if probes.playback {
+        // The seek surface (#283), while the LaunchURL above is still the item in
+        // flight. Distinct line shapes from the `--transport` probes on purpose: the VM
+        // matches `media_playback <verb> status=` for those, and these must not satisfy
+        // or pollute that pattern.
+        let duration = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .duration_read(PLAYER_ENDPOINT)
+            .await?;
+        let range_start = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .seek_range_start_read(PLAYER_ENDPOINT)
+            .await?;
+        let range_end = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .seek_range_end_read(PLAYER_ENDPOINT)
+            .await?;
+        println!(
+            "matter-peer: playback duration={:?} seek_range_start={:?} seek_range_end={:?}",
+            duration.into_option(),
+            range_start.into_option(),
+            range_end.into_option(),
+        );
+
+        // Two skips whose targets compose (15 s forward, then 5 s back → 10 s): what the
+        // panel forwards to its pipeline is the resolved absolute seek, and the VM reads
+        // both numbers out of the panel's own journal.
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .skip_forward(PLAYER_ENDPOINT, |builder| {
+                builder.delta_position_milliseconds(15_000)?.end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: playback skip-forward(15000) status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .skip_backward(PLAYER_ENDPOINT, |builder| {
+                builder.delta_position_milliseconds(5_000)?.end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: playback skip-backward(5000) status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+
+        // An absolute seek. Against the null pipeline no duration is ever known, so the
+        // honest answer is `SeekOutOfRange` — the refusal this probe exists to reach.
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .seek(PLAYER_ENDPOINT, |builder| builder.position(60_000)?.end())
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: playback seek(60000) status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+
+        // The two variable-speed verbs, refused with `SpeedOutOfRange`: the panel does
+        // not advertise variable speed and says so rather than seeking and calling it
+        // rewind.
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .rewind(PLAYER_ENDPOINT, |builder| {
+                builder.audio_advance_unmuted(None)?.end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: playback rewind status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
+
+        let handle = Exchange::initiate(matter, crypto, fab_idx, player)
+            .await?
+            .media_playback()
+            .fast_forward(PLAYER_ENDPOINT, |builder| {
+                builder.audio_advance_unmuted(None)?.end()
+            })
+            .await?;
+        {
+            let response = handle.response()?;
+            println!(
+                "matter-peer: playback fast-forward status={:?}",
+                response.status()?
+            );
+        }
+        handle.complete().await?;
     }
 
     for verb in &probes.transport {

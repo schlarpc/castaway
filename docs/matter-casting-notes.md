@@ -261,6 +261,20 @@ not honoured by opening a home page and calling that a result.
 not all have a rate control, and `Rewind`/`FastForward` therefore answer
 `SpeedOutOfRange` rather than seeking and calling it rewind.
 
+The seek surface reads the **pipeline**, not a copy (#283): `Duration` and the seek
+range are refreshed from the media pipeline's playback report at every read and invoke,
+and are `Null` when no duration is known — a live stream, or a container not yet open —
+which is a statement, not a gap. An absolute `Seek` into media with no known end is
+refused with `SeekOutOfRange` for *every* target (there is no range to be inside; the
+distinction between "live" and "past the end" survives only in the panel's log, because
+the cluster's vocabulary has the one status). The relative skips are resolved against
+that same projection *in the handler*, into the absolute seek the pipeline is handed —
+`SkipForward` past a known end lands at the end per the spec, `SkipBackward` floors at
+zero. The attribute and command lists are trimmed to what is actually served:
+`SampledPosition` and `PlaybackSpeed` are not advertised (nothing implements them — a
+list is a promise a client plans reads against), and the track commands are off the
+accepted-command list so the interaction model itself refuses them.
+
 ### 5.1 Conformance gaps
 
 The Casting Video Player device type's full cluster conformance includes OnOff, WakeOnLan,

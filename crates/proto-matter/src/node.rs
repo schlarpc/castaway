@@ -42,9 +42,11 @@ use rs_matter::tlv::{TLVBuilderParent, Utf8StrBuilder};
 use rand_core::RngCore;
 use tokio::sync::mpsc;
 
+use castaway_core::PlaybackReport;
+
 use crate::player::{
-    CastCommand, Catalogue, EndpointId, LaunchRefusal, PlaybackState, PlayerState, Transport,
-    PLAYER_ENDPOINT,
+    CastCommand, Catalogue, EndpointId, LaunchRefusal, PlaybackState, PlayerSnapshot, PlayerState,
+    Transport, PLAYER_ENDPOINT,
 };
 
 /// The Content App device type (0x0024). Not among `rs-matter`'s constants, because
@@ -78,7 +80,6 @@ impl Matcher for AppCluster {
 
 /// Everything the cluster handlers share: what the panel can open, what it is doing, and
 /// where to send what a client asks for.
-#[derive(Debug)]
 pub struct CastingContext {
     /// The apps this panel hosts.
     pub catalogue: Catalogue,
@@ -86,9 +87,82 @@ pub struct CastingContext {
     pub state: Arc<PlayerState>,
     /// Where a decoded invoke goes.
     pub commands: mpsc::UnboundedSender<CastCommand>,
+    /// Where the pipeline's position and duration come from (#283). [`None`] on a build
+    /// with nothing that reports — the null pipeline — where the projection then keeps
+    /// whatever it was last told: position frozen where the last accepted seek put it,
+    /// and no duration, which reads to a client as a stream with no known end.
+    pub playback: Option<Arc<dyn PlaybackReport>>,
+}
+
+impl std::fmt::Debug for CastingContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CastingContext")
+            .field("catalogue", &self.catalogue)
+            .field("state", &self.state)
+            .field("playback", &self.playback.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CastingContext {
+    /// The projection, refreshed from the pipeline (#283).
+    ///
+    /// Sampled here — at the handler boundary, once per read or invoke — and folded into
+    /// the shared projection, so everything downstream of the transaction the client is
+    /// waiting on (the bound check on a `Seek`, the resolution of a skip, the next
+    /// attribute read) agrees on one position and one duration.
+    fn refreshed(&self) -> PlayerSnapshot {
+        let progress = self.playback.as_ref().and_then(|report| report.progress());
+        self.state.refresh(progress)
+    }
+
+    /// Send a transport verb at the adapter — or report that there is nothing to drive.
+    ///
+    /// Shared by every cluster that can move the transport (`MediaPlayback`'s verbs and
+    /// `KeypadInput`'s transport keys), so the guard and the projection move are decided
+    /// once; each caller maps the outcome onto its own cluster's status vocabulary.
+    fn drive_transport(&self, transport: Transport) -> Result<TransportOutcome, Error> {
+        if matches!(self.state.get().state, PlaybackState::NotPlaying) {
+            return Ok(TransportOutcome::NothingPlaying);
+        }
+
+        self.send(CastCommand::Transport(transport))?;
+        // And move the projection this cluster reads *here*, in the transaction the client
+        // is waiting on, rather than where the command is eventually consumed. Two reasons,
+        // and the second is the one that made this a defect rather than a race:
+        //
+        // - `CastCommand` goes out on a channel the adapter drains on another task, so a
+        //   phone that presses pause and reads `CurrentState` back can otherwise see the
+        //   two out of order.
+        // - Nothing moved this projection at all except a launch and the end of a session.
+        //   So a paused phone was told it was still playing, and `NotActive` was
+        //   unreachable for the whole life of a session: nothing could put the state back
+        //   to `NotPlaying` (#196).
+        //
+        // The pipeline is the real authority; a command the panel has just accepted is the
+        // best evidence this projection has. The position moves on the absolute verbs for
+        // the same read-back reason (#283) — but the *state* deliberately stays: seeking
+        // while paused does not start playback.
+        match transport {
+            Transport::Play => self.state.update(|s| s.state = PlaybackState::Playing),
+            Transport::Pause => self.state.update(|s| s.state = PlaybackState::Paused),
+            Transport::Stop => self.state.update(|s| {
+                // Not a whole `PlayerSnapshot::default()`: stopping releases the media and
+                // not the client's idea of which app it was in, and a `CurrentTarget` that
+                // reset itself on stop reads to a phone as the app having closed.
+                s.state = PlaybackState::NotPlaying;
+                s.position = std::time::Duration::ZERO;
+                s.duration = None;
+            }),
+            Transport::StartOver => self
+                .state
+                .update(|s| s.position = std::time::Duration::ZERO),
+            Transport::Seek(to) => self.state.update(|s| s.position = to),
+            Transport::Previous | Transport::Next => {}
+        }
+        Ok(TransportOutcome::Driven)
+    }
+
     /// Push a command at the adapter.
     ///
     /// A closed channel means the adapter is gone, which for a cluster invoke is a
@@ -105,6 +179,18 @@ impl CastingContext {
         ctx.endpt()
             .ok_or_else(|| ErrorCode::EndpointNotFound.into())
     }
+}
+
+/// What became of a transport verb, in terms the clusters translate into their own words.
+///
+/// `MediaPlayback` renders [`Self::NothingPlaying`] as `NotActive`; `KeypadInput` renders
+/// it as `InvalidKeyInCurrentState`. Same fact, two vocabularies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportOutcome {
+    /// The command went to the adapter and the projection moved with it.
+    Driven,
+    /// Nothing is loaded, so there was nothing to drive.
+    NothingPlaying,
 }
 
 /// The `ContentLauncher` server: "open this", in the two forms the cluster has.
@@ -238,58 +324,44 @@ impl MediaPlaybackHandler {
         transport: Transport,
         response: media_playback::PlaybackResponseBuilder<P>,
     ) -> Result<P, Error> {
-        if matches!(self.ctx.state.get().state, PlaybackState::NotPlaying) {
-            return response
-                .status(media_playback::StatusEnum::NotActive)?
-                .data(None)?
-                .end();
-        }
-
-        self.ctx.send(CastCommand::Transport(transport))?;
-        // And move the projection this cluster reads *here*, in the transaction the client
-        // is waiting on, rather than where the command is eventually consumed. Two reasons,
-        // and the second is the one that made this a defect rather than a race:
-        //
-        // - `CastCommand` goes out on a channel the adapter drains on another task, so a
-        //   phone that presses pause and reads `CurrentState` back can otherwise see the
-        //   two out of order.
-        // - Nothing moved this projection at all except a launch and the end of a session.
-        //   So a paused phone was told it was still playing, and `NotActive` above was
-        //   unreachable for the whole life of a session: nothing could put the state back
-        //   to `NotPlaying` (#196).
-        //
-        // The pipeline is the real authority and nothing feeds its state back here yet; a
-        // command the panel has just accepted is the best evidence this projection has.
-        // The position-changing verbs deliberately leave the state alone — seeking while
-        // paused does not start playback.
-        match transport {
-            Transport::Play => self.ctx.state.update(|s| s.state = PlaybackState::Playing),
-            Transport::Pause => self.ctx.state.update(|s| s.state = PlaybackState::Paused),
-            Transport::Stop => self.ctx.state.update(|s| {
-                // Not a whole `PlayerSnapshot::default()`: stopping releases the media and
-                // not the client's idea of which app it was in, and a `CurrentTarget` that
-                // reset itself on stop reads to a phone as the app having closed.
-                s.state = PlaybackState::NotPlaying;
-                s.position = std::time::Duration::ZERO;
-                s.duration = None;
-            }),
-            Transport::StartOver
-            | Transport::Previous
-            | Transport::Next
-            | Transport::Seek(_)
-            | Transport::SkipForward(_)
-            | Transport::SkipBackward(_) => {}
-        }
-        response
-            .status(media_playback::StatusEnum::Success)?
-            .data(None)?
-            .end()
+        let status = match self.ctx.drive_transport(transport)? {
+            TransportOutcome::Driven => media_playback::StatusEnum::Success,
+            TransportOutcome::NothingPlaying => media_playback::StatusEnum::NotActive,
+        };
+        response.status(status)?.data(None)?.end()
     }
 }
 
 impl media_playback::ClusterHandler for MediaPlaybackHandler {
-    const CLUSTER: Cluster<'static> =
-        media_playback::FULL_CLUSTER.with_features(MEDIA_PLAYBACK_FEATURES);
+    // Beyond the feature map, the attribute and command lists are trimmed to what the
+    // panel actually serves: the mandatory `CurrentState`, plus `Duration` and the seek
+    // range — the shape of the media's end, which is what #283 put in the projection.
+    // `SampledPosition` and `PlaybackSpeed` are *not* advertised: nothing here implements
+    // them yet, and a list is a promise a client plans reads against. Likewise the track
+    // commands stay off the accepted-command list — the track features are not advertised
+    // and a command the metadata does not carry is refused by the interaction model
+    // itself, which is a truer answer than a handler's `CommandNotFound`.
+    const CLUSTER: Cluster<'static> = media_playback::FULL_CLUSTER
+        .with_features(MEDIA_PLAYBACK_FEATURES)
+        .with_attrs(rs_matter::with!(
+            required;
+            media_playback::AttributeId::Duration
+                | media_playback::AttributeId::SeekRangeStart
+                | media_playback::AttributeId::SeekRangeEnd
+        ))
+        .with_cmds(rs_matter::with!(
+            media_playback::CommandId::Play
+                | media_playback::CommandId::Pause
+                | media_playback::CommandId::Stop
+                | media_playback::CommandId::StartOver
+                | media_playback::CommandId::Previous
+                | media_playback::CommandId::Next
+                | media_playback::CommandId::Rewind
+                | media_playback::CommandId::FastForward
+                | media_playback::CommandId::SkipForward
+                | media_playback::CommandId::SkipBackward
+                | media_playback::CommandId::Seek
+        ));
 
     fn dataver(&self) -> u32 {
         self.dataver.get()
@@ -313,11 +385,39 @@ impl media_playback::ClusterHandler for MediaPlaybackHandler {
 
     fn duration(&self, _ctx: impl ReadContext) -> Result<rs_matter::tlv::Nullable<u64>, Error> {
         // Milliseconds on this cluster; `Null` for a live stream, which is a different
-        // statement from a duration of zero.
+        // statement from a duration of zero. Refreshed from the pipeline, which is the
+        // only party that has read the container (#283).
         Ok(self
             .ctx
-            .state
-            .get()
+            .refreshed()
+            .duration
+            .map_or_else(rs_matter::tlv::Nullable::none, |d| {
+                rs_matter::tlv::Nullable::some(millis(d))
+            }))
+    }
+
+    fn seek_range_start(
+        &self,
+        _ctx: impl ReadContext,
+    ) -> Result<rs_matter::tlv::Nullable<u64>, Error> {
+        // The panel plays plain items, not shifting live windows: seekable media is
+        // seekable from the top, and unseekable media has no range at all — `Null` on
+        // both ends, matching the `SeekOutOfRange` every seek into it gets.
+        Ok(match self.ctx.refreshed().duration {
+            Some(_) => rs_matter::tlv::Nullable::some(0),
+            None => rs_matter::tlv::Nullable::none(),
+        })
+    }
+
+    fn seek_range_end(
+        &self,
+        _ctx: impl ReadContext,
+    ) -> Result<rs_matter::tlv::Nullable<u64>, Error> {
+        // For a plain item the furthest seekable point is the end, so this is `Duration`
+        // again — stated separately because the cluster asks separately.
+        Ok(self
+            .ctx
+            .refreshed()
             .duration
             .map_or_else(rs_matter::tlv::Nullable::none, |d| {
                 rs_matter::tlv::Nullable::some(millis(d))
@@ -405,7 +505,12 @@ impl media_playback::ClusterHandler for MediaPlaybackHandler {
         response: media_playback::PlaybackResponseBuilder<P>,
     ) -> Result<P, Error> {
         let by = std::time::Duration::from_millis(request.delta_position_milliseconds()?);
-        self.drive(Transport::SkipForward(by), response)
+        // Resolved here, against the projection just refreshed from the pipeline, so the
+        // seek the adapter forwards and the position a read-back reports are the same
+        // number (#283). A skip past a known end is a seek *to* the end, per the spec —
+        // the one relative verb with no out-of-range refusal.
+        let target = self.ctx.refreshed().skip_forward_target(by);
+        self.drive(Transport::Seek(target), response)
     }
 
     fn handle_skip_backward<P: TLVBuilderParent>(
@@ -415,7 +520,8 @@ impl media_playback::ClusterHandler for MediaPlaybackHandler {
         response: media_playback::PlaybackResponseBuilder<P>,
     ) -> Result<P, Error> {
         let by = std::time::Duration::from_millis(request.delta_position_milliseconds()?);
-        self.drive(Transport::SkipBackward(by), response)
+        let target = self.ctx.refreshed().skip_backward_target(by);
+        self.drive(Transport::Seek(target), response)
     }
 
     fn handle_activate_audio_track(
@@ -448,19 +554,30 @@ impl media_playback::ClusterHandler for MediaPlaybackHandler {
         response: media_playback::PlaybackResponseBuilder<P>,
     ) -> Result<P, Error> {
         let to = std::time::Duration::from_millis(request.position()?);
+        let snapshot = self.ctx.refreshed();
 
-        // A seek past the end is the one transport command with a wrong answer rather than
-        // a refused one, and the cluster has a status for it.
-        if let Some(duration) = self.ctx.state.get().duration {
-            if to > duration {
-                return response
-                    .status(media_playback::StatusEnum::SeekOutOfRange)?
-                    .data(None)?
-                    .end();
-            }
+        // Nothing loaded outranks out-of-range: with no media there is no range to be
+        // outside of, and `NotActive` is the status that says so.
+        if matches!(snapshot.state, PlaybackState::NotPlaying) {
+            return self.drive(Transport::Seek(to), response);
         }
 
-        self.drive(Transport::Seek(to), response)
+        // A seek past the end is the one transport command with a wrong answer rather
+        // than a refused one, and the cluster has a status for it. Media with no known
+        // end gets the same status for *every* target (#283): a live stream has no range
+        // to be inside, and honouring the seek instead would hand the pipeline a target
+        // it cannot bound. The refusal is lossy on the wire — `SeekOutOfRange` covers
+        // both — so the reason goes to the panel's own log.
+        match snapshot.seek_target(to) {
+            Ok(target) => self.drive(Transport::Seek(target), response),
+            Err(refusal) => {
+                tracing::info!(to_ms = millis(to), ?refusal, "matter: declining a Seek");
+                response
+                    .status(media_playback::StatusEnum::SeekOutOfRange)?
+                    .data(None)?
+                    .end()
+            }
+        }
     }
 }
 
@@ -951,6 +1068,7 @@ mod tests {
             catalogue: catalogue.clone(),
             state: Arc::new(PlayerState::new()),
             commands: tx,
+            playback: None,
         });
         let nav = TargetNavigatorHandler::new(Arc::clone(&ctx), Dataver::new(1));
 
@@ -983,5 +1101,84 @@ mod tests {
     fn a_duration_longer_than_any_media_saturates_rather_than_wrapping() {
         assert_eq!(millis(std::time::Duration::from_millis(1500)), 1500);
         assert_eq!(millis(std::time::Duration::MAX), u64::MAX);
+    }
+
+    /// A playback report modelling the render backend: `Some` with a position and
+    /// (for a VOD item) a duration once the container is open, `None` before the first
+    /// frame — which is the observed behaviour, not the trait's letter (ground rule 6).
+    struct FakeReport(std::sync::Mutex<Option<castaway_core::PlaybackProgress>>);
+
+    impl castaway_core::PlaybackReport for FakeReport {
+        fn progress(&self) -> Option<castaway_core::PlaybackProgress> {
+            self.0.lock().ok().and_then(|p| *p)
+        }
+    }
+
+    fn context_with_report(
+        progress: Option<castaway_core::PlaybackProgress>,
+    ) -> (Arc<CastingContext>, mpsc::UnboundedReceiver<CastCommand>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(CastingContext {
+            catalogue: Catalogue::new([]),
+            state: Arc::new(PlayerState::new()),
+            commands: tx,
+            playback: Some(Arc::new(FakeReport(std::sync::Mutex::new(progress)))),
+        });
+        (ctx, rx)
+    }
+
+    /// The pipeline's duration reaches the projection through `refreshed` (#283) —
+    /// the join `handle_seek`'s bound check and the `Duration` attribute both read.
+    #[test]
+    fn refreshed_folds_the_pipeline_report_into_the_projection() {
+        use std::time::Duration;
+
+        let (ctx, _rx) = context_with_report(Some(
+            castaway_core::PlaybackProgress::at(Duration::from_secs(30))
+                .of(Duration::from_secs(300)),
+        ));
+        // A launch put the projection in flight; nothing has set a duration.
+        ctx.state.update(|s| s.state = PlaybackState::Playing);
+
+        let snapshot = ctx.refreshed();
+        assert_eq!(snapshot.position, Duration::from_secs(30));
+        assert_eq!(snapshot.duration, Some(Duration::from_secs(300)));
+        // And the fold persisted, so the adapter and later reads agree.
+        assert_eq!(ctx.state.get().duration, Some(Duration::from_secs(300)));
+    }
+
+    /// An accepted seek moves the projection in the same transaction (#283): the phone
+    /// that seeks and reads back must not see the position it just left.
+    #[test]
+    fn an_accepted_seek_moves_the_projection_synchronously() {
+        use std::time::Duration;
+
+        let (ctx, mut rx) = context_with_report(None);
+        ctx.state.update(|s| {
+            s.state = PlaybackState::Playing;
+            s.duration = Some(Duration::from_secs(300));
+        });
+
+        assert_eq!(
+            ctx.drive_transport(Transport::Seek(Duration::from_secs(60)))
+                .unwrap(),
+            TransportOutcome::Driven
+        );
+        assert_eq!(ctx.state.get().position, Duration::from_secs(60));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            CastCommand::Transport(Transport::Seek(Duration::from_secs(60)))
+        );
+    }
+
+    /// With nothing loaded there is nothing to drive, and no command may leak out.
+    #[test]
+    fn transport_against_nothing_is_refused_and_sends_nothing() {
+        let (ctx, mut rx) = context_with_report(None);
+        assert_eq!(
+            ctx.drive_transport(Transport::Play).unwrap(),
+            TransportOutcome::NothingPlaying
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -1186,6 +1186,7 @@ async fn serve(
             shutdown.clone(),
             osd.clone(),
             browser_launches,
+            playback.clone(),
         ) {
             Ok(handle) => adapter_handles.push(handle),
             Err(e) => {
@@ -1794,6 +1795,7 @@ fn spawn_matter(
     shutdown: Arc<Notify>,
     osd: castaway_core::OsdSink,
     browser_launches: Option<mpsc::UnboundedSender<proto_matter::BrowserLaunch>>,
+    playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     use proto_matter::{ContentApp, LaunchTarget, MatterAdapter, MatterConfig};
 
@@ -1853,6 +1855,14 @@ fn spawn_matter(
 
     let adapter = match browser_launches {
         Some(launches) => adapter.with_browser(launches),
+        None => adapter,
+    };
+
+    // MediaPlayback's Duration, and the bound on Seek, come from the pipeline (#283). The
+    // headless build has nothing that reports one, and the adapter then answers Null and
+    // refuses absolute seeks — which is the truth there, not a shortcut.
+    let adapter = match playback {
+        Some(report) => adapter.with_playback(report),
         None => adapter,
     };
 
