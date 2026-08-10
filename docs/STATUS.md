@@ -1,8 +1,8 @@
-# Build Status — begun 2026-07-23, brought current 2026-08-09
+# Build Status — begun 2026-07-23, brought current 2026-08-10
 
 Snapshot for our next sync. Companion to DECISION-LOG.md (why) and the issue tracker
 (what needs you; `docs/OPEN-QUESTIONS.md` was migrated there and deleted — see #105).
-Everything below builds with `cargo build`, passes `cargo nextest run` (**2612 tests** as of
+Everything below builds with `cargo build`, passes `cargo nextest run` (**2661 tests** as of
 2026-08-10 — every feature is on by default since D55), passes `cargo clippy --all-targets -- -D warnings`,
 `nix build` produces a running binary, and `nix flake check` passes — 22 checks, which
 include the VM tests (integration, dial, miracast, bluetooth, gamestream, matter, mixer,
