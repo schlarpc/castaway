@@ -348,10 +348,16 @@ the lossless command lane because a dropped transition desynchronises the panel 
 own state machine), a picker longer than the panel scrolls (`picker.scroll`, fractional so
 a drag moves smoothly), and #24's theming is under way rather than unstarted —
 `pipeline::theme` is one palette for every surface, taken from dma.space's own CSS with
-provenance in `assets/brand/README.md`, and the mark and mascot are drawn. **Still not
-done** on the theming side: DejaVu is still the primary face — though `Fonts` is now a
-fallback chain with a bundled CJK subset, so a Japanese track title renders instead of
-tofu (#88) — and the easter-egg palettes, scrolling long titles and blurred pillarbox
+provenance in `assets/brand/README.md`, and the mark and mascot are drawn. The
+easter-egg palettes are in (#263): `pipeline::theme::season` maps the local date to a
+seasonal background — Pride month, the awareness days and weeks, the twelve days of
+Christmas, Halloween — mixed into the panel's own dark ramp at 22% so the room changes
+and the text stays readable; `theme = "auto" | "plain" | <season>` in castaway.toml
+follows, silences or forces it, and a midnight task rolls the Home screen over without a
+restart. `attract_preview`/`shell_preview` take a palette name to render any of them to
+PNG. **Still not done** on the theming side: DejaVu is still the primary face — though
+`Fonts` is now a fallback chain with a bundled CJK subset, so a Japanese track title
+renders instead of tofu (#88) — and the scrolling long titles and blurred pillarbox
 borders #24 asks for are unwritten.
 
 ## Driving the panel from a phone (`/remote/`, #18)
