@@ -567,15 +567,18 @@ impl Session {
             }
 
             // Legal opcodes used outside their version: a v1 sender has no
-            // `SetSpeed`, a v2 sender no `SetPlaylistItem`. Accepting them would run
-            // a protocol the sender never agreed to.
+            // `SetSpeed`, a v2 sender no `SetPlaylistItem`, and no JSON session has
+            // v4's `Flatbuf`/`Resource`. Accepting them would run a protocol the
+            // sender never agreed to.
             Opcode::Ping
             | Opcode::Pong
             | Opcode::SetSpeed
             | Opcode::Initial
             | Opcode::SetPlaylistItem
             | Opcode::SubscribeEvent
-            | Opcode::UnsubscribeEvent => illegal(),
+            | Opcode::UnsubscribeEvent
+            | Opcode::Flatbuf
+            | Opcode::Resource => illegal(),
         }
     }
 }

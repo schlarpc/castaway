@@ -299,3 +299,104 @@ fn listen_events_pushes_match_the_shipped_translation() {
         assert_eq!(sent, ours, "opcode {:?}", expected.opcode);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Protocol v4 transcripts (#248): the same sender through TLS, decrypted by the
+// capture harness. Replayed at the message layer — the session/TLS plumbing has
+// its own tests — so what is pinned here is that the real SDK's FlatBuffers
+// parse into exactly the commands they should.
+// ---------------------------------------------------------------------------
+
+use proto_fcast::v4msg::{self, LoadSource, Parsed, V4Inbound};
+
+/// The TLS-phase inbound frames of a v4 fixture, in order.
+fn v4_frames(jsonl: &str) -> Vec<Row> {
+    parse_fixture(jsonl)
+        .into_iter()
+        .filter(|r| r.inbound)
+        .collect()
+}
+
+fn parse_v4(frame: &Frame) -> V4Inbound {
+    match v4msg::parse_flatbuf(&frame.body).unwrap() {
+        Parsed::Message(msg) => msg,
+        Parsed::Reply(kind) => panic!("sender frame judged an error: {kind:?}"),
+    }
+}
+
+/// Every v4 transcript opens with the SDK preamble the docs never mention:
+/// `SenderIntroduction` naming the SDK, then an automatic `CompanionHelloRequest`.
+#[test]
+fn the_v4_preamble_parses() {
+    let rows = v4_frames(include_str!("fixtures/sdk-0.3.0-v4-play-url.jsonl"));
+    // rows[0] is the plaintext Version; TLS frames follow.
+    let tls: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.frame.opcode == Opcode::Flatbuf)
+        .collect();
+    let V4Inbound::SenderIntroduction(info) = parse_v4(&tls[0].frame) else {
+        panic!("expected SenderIntroduction first");
+    };
+    assert_eq!(info.app_name.as_deref(), Some("FCast Sender SDK v0.3.0"));
+    assert!(matches!(
+        parse_v4(&tls[1].frame),
+        V4Inbound::CompanionHelloRequest
+    ));
+}
+
+#[test]
+fn v4_verbs_parse_to_their_commands() {
+    let load = v4_frames(include_str!("fixtures/sdk-0.3.0-v4-play-url.jsonl"));
+    let V4Inbound::Load { source, .. } = parse_v4(&load.last().unwrap().frame) else {
+        panic!("expected Load last");
+    };
+    let LoadSource::Single(item) = source else {
+        panic!("expected Single");
+    };
+    assert_eq!(item.source_url, "http://example.invalid/v4.mp4");
+    assert_eq!(item.container, "video/mp4");
+    assert_eq!(item.start_time, Some(Duration::from_secs(5)));
+    assert!(
+        item.headers.is_empty(),
+        "the SDK drops headers on v4 Single"
+    );
+
+    for (fixture, want) in [
+        (
+            include_str!("fixtures/sdk-0.3.0-v4-pause.jsonl"),
+            V4Inbound::PlaybackStateChanged(fcast_flatbuf::flat::PlaybackState::Paused),
+        ),
+        (
+            include_str!("fixtures/sdk-0.3.0-v4-set-volume.jsonl"),
+            V4Inbound::VolumeChanged(0.5),
+        ),
+        (
+            include_str!("fixtures/sdk-0.3.0-v4-set-speed.jsonl"),
+            V4Inbound::SpeedChanged(1.5),
+        ),
+        (
+            include_str!("fixtures/sdk-0.3.0-v4-stop.jsonl"),
+            V4Inbound::StopPlayback,
+        ),
+    ] {
+        let rows = v4_frames(fixture);
+        assert_eq!(parse_v4(&rows.last().unwrap().frame), want);
+    }
+
+    let seek = v4_frames(include_str!("fixtures/sdk-0.3.0-v4-seek.jsonl"));
+    let V4Inbound::ProgressChanged { position } = parse_v4(&seek.last().unwrap().frame) else {
+        panic!("expected ProgressChanged");
+    };
+    assert_eq!(position, Duration::from_secs_f64(42.5));
+}
+
+/// The SDK's `set-playlist-item` at v4 sends the raw **v3 JSON opcode** inside
+/// the TLS session — captured, not hypothesized. A v4 session answers
+/// `Error{InvalidOpcode}`; this pins that the frame really arrives as opcode 16.
+#[test]
+fn the_sdk_leaks_a_v3_opcode_into_v4() {
+    let rows = v4_frames(include_str!(
+        "fixtures/sdk-0.3.0-v4-set-playlist-item.jsonl"
+    ));
+    assert_eq!(rows.last().unwrap().frame.opcode, Opcode::SetPlaylistItem);
+}

@@ -61,6 +61,11 @@ pub enum Opcode {
     UnsubscribeEvent,
     /// Receiver (v3): a subscribed event occurred. Body is `EventMessage`.
     Event,
+    /// Both (v4): a FlatBuffers `Packet` (#248). Illegal before a v4 session —
+    /// the session layer declines it, framing just names it.
+    Flatbuf,
+    /// Sender (v4): FCompanion resource bytes, custom binary body.
+    Resource,
 }
 
 impl Opcode {
@@ -91,6 +96,8 @@ impl Opcode {
             17 => Self::SubscribeEvent,
             18 => Self::UnsubscribeEvent,
             19 => Self::Event,
+            20 => Self::Flatbuf,
+            21 => Self::Resource,
             other => return Err(FCastError::UnknownOpcode(other)),
         })
     }
@@ -119,6 +126,8 @@ impl Opcode {
             Self::SubscribeEvent => 17,
             Self::UnsubscribeEvent => 18,
             Self::Event => 19,
+            Self::Flatbuf => 20,
+            Self::Resource => 21,
         }
     }
 }
@@ -169,7 +178,7 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FCastError> {
     Ok(out)
 }
 
-/// Try to decode one frame from the front of `buf`.
+/// Try to decode one frame from the front of `buf`, at the v1-v3 ceiling.
 ///
 /// Returns `Ok(None)` if `buf` doesn't yet hold a complete frame (caller reads more).
 /// On success returns the frame and the number of bytes consumed, so the caller can
@@ -180,6 +189,18 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, FCastError> {
 /// [`FCastError::UnknownOpcode`] — all of which mean "disconnect", per the spec's own
 /// instruction for malformed headers.
 pub fn try_decode(buf: &[u8]) -> Result<Option<(Frame, usize)>, FCastError> {
+    try_decode_with_max(buf, MAX_PACKET)
+}
+
+/// [`try_decode`] with the ceiling supplied — a v4 session raises it to
+/// [`crate::v4msg::MAX_PACKET_V4`] (512 KiB) once negotiated.
+///
+/// # Errors
+/// As [`try_decode`].
+pub fn try_decode_with_max(
+    buf: &[u8],
+    max_packet: usize,
+) -> Result<Option<(Frame, usize)>, FCastError> {
     let Some(header) = buf.first_chunk::<4>() else {
         return Ok(None);
     };
@@ -187,7 +208,7 @@ pub fn try_decode(buf: &[u8]) -> Result<Option<(Frame, usize)>, FCastError> {
     if size == 0 {
         return Err(FCastError::ZeroSizeFrame);
     }
-    if size > MAX_PACKET {
+    if size > max_packet {
         return Err(FCastError::FrameTooLarge(size));
     }
     let total = 4 + size;
@@ -275,23 +296,41 @@ mod tests {
         ));
     }
 
-    /// Opcode 20 is protocol v4's `Flatbuf`. The scope note on #241: decline messages
-    /// from newer versions rather than guessing.
+    /// Opcode 22 is beyond every published version. Decline rather than guess
+    /// (#241's scope note); 20/21 are v4's and are the *session's* to gate.
     #[test]
-    fn a_v4_opcode_is_declined_not_skipped() {
-        let bytes = [0x01, 0x00, 0x00, 0x00, 20];
+    fn an_unknown_opcode_is_declined_not_skipped() {
+        let bytes = [0x01, 0x00, 0x00, 0x00, 22];
         assert!(matches!(
             try_decode(&bytes),
-            Err(FCastError::UnknownOpcode(20))
+            Err(FCastError::UnknownOpcode(22))
         ));
     }
 
     #[test]
     fn every_opcode_survives_the_wire_roundtrip() {
-        for byte in 0..=19u8 {
+        for byte in 0..=21u8 {
             let opcode = Opcode::from_wire(byte).unwrap();
             assert_eq!(opcode.to_wire(), byte);
         }
+    }
+
+    /// A v4 session lifts the packet ceiling to 512 KiB; the same declaration is
+    /// still refused at the JSON sessions' 32 000-byte one.
+    #[test]
+    fn the_ceiling_is_the_sessions_to_raise() {
+        let mut bytes = 40_000u32.to_le_bytes().to_vec();
+        bytes.push(Opcode::Flatbuf.to_wire());
+        assert!(matches!(
+            try_decode(&bytes),
+            Err(FCastError::FrameTooLarge(40_000))
+        ));
+        assert!(
+            try_decode_with_max(&bytes, crate::v4msg::MAX_PACKET_V4)
+                .unwrap()
+                .is_none(),
+            "under the v4 ceiling this is just an incomplete frame"
+        );
     }
 
     /// A frame we would refuse to read, we also refuse to write.

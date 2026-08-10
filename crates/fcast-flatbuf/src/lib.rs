@@ -47,6 +47,7 @@ pub fn root_as_packet(body: &[u8]) -> Result<flat::Packet<'_>, flatbuffers::Inva
     flat::root_as_packet(body)
 }
 
-/// Re-export for builder use in `proto-fcast` (constructing outbound messages is
-/// entirely safe API).
+/// Re-exports for builder use in `proto-fcast` (constructing outbound messages
+/// is entirely safe API).
+pub use flatbuffers;
 pub use flatbuffers::{FlatBufferBuilder, WIPOffset};

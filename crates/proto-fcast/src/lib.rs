@@ -25,6 +25,7 @@ pub mod identity;
 pub mod messages;
 pub mod player;
 pub mod session;
+pub mod v4msg;
 pub mod wire;
 
 pub use adapter::{FCastReceiver, FCAST_PORT, FCAST_SERVICE_TYPE};
