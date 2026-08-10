@@ -114,7 +114,15 @@ webrtc = { workspace = true, optional = true }
 # The sans-I/O core `webrtc` is a thin async layer over. A direct dependency because the
 # types the API takes — media engine, codec parameters, SDP, samples — live here and are
 # not re-exported; version-locked to `webrtc` for the same reason `ash` is to `wgpu-hal`.
-rtc = { version = "0.20", optional = true }
+#
+# **Not optional, unlike `webrtc` above.** `mirror_in::assemble` is compiled in every build
+# on purpose — it is the pure reassembly half, and its fixtures should run everywhere — and
+# it depacketises with `rtc::rtp`. Gating this crate behind `remote` made that module
+# unbuildable in exactly the headless feature sets CI runs most (`--features audio` and
+# friends), which is D55's failure mode verbatim: a feature that is off is code nothing
+# compiles. `rtc` is pure Rust with no native deps, so carrying it unconditionally costs a
+# compile and nothing else. The heavy async tree stays behind `remote`.
+rtc = "0.20"
 
 # The native PipeWire output backend (`audio-pipewire`): real sink names for the
 # settings screen and per-stream routing via `target.object`, neither of which the ALSA
@@ -248,7 +256,7 @@ libav-sys = ["dep:ffmpeg-sys-next"]
 stream = ["render", "ffmpeg", "audio", "libav-sys"]
 # WebRTC: the low-latency duplicate and the input channel behind it (#18).
 # Needs `stream`, which is where the encoder it feeds from lives.
-remote = ["stream", "dep:webrtc", "dep:rtc"]
+remote = ["stream", "dep:webrtc"]
 # `audio` = A2DP/audio decode (libav) plus a PCM output device (cpal). Separate from
 # `ffmpeg` because the decoders are useful in tests without pulling in an audio device,
 # and a headless CI box has no sound card.
