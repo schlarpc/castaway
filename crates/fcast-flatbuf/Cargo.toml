@@ -1,0 +1,14 @@
+[package]
+name = "fcast-flatbuf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Generated FlatBuffers types for FCast protocol v4 — flatc output over the vendored published schema, quarantined here so proto-fcast stays forbid(unsafe_code)."
+
+[dependencies]
+flatbuffers.workspace = true
+
+[lints]
+workspace = true

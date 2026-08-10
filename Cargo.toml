@@ -30,6 +30,7 @@ members = [
     "crates/proto-miracast",
     "crates/proto-matter",
     "crates/proto-fcast",
+    "crates/fcast-flatbuf",
     "crates/moonlight-sys",
     "crates/ldac-sys",
     "crates/proto-gamestream",
@@ -81,6 +82,7 @@ proto-dial = { path = "crates/proto-dial" }
 proto-miracast = { path = "crates/proto-miracast" }
 proto-matter = { path = "crates/proto-matter" }
 proto-fcast = { path = "crates/proto-fcast" }
+fcast-flatbuf = { path = "crates/fcast-flatbuf" }
 moonlight-sys = { path = "crates/moonlight-sys" }
 ldac-sys = { path = "crates/ldac-sys" }
 # Same, for the same reason: its default is `stream`, which links moonlight-common-c.
@@ -127,6 +129,11 @@ bytes = "1"
 quick-xml = { version = "0.41", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# FCast protocol v4 message bodies (#248). A serialization format library like
+# serde_json, not a reference implementation; the schema is the published spec's,
+# vendored at crates/proto-fcast/schema/fcast.fbs. The version tracks the flatc that
+# generates v4_generated.rs (nixpkgs flatbuffers 25.12.19).
+flatbuffers = "25.12.19"
 prost = "0.13"
 prost-build = "0.13"
 
