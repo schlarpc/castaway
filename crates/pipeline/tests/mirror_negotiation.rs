@@ -222,7 +222,11 @@ async fn a_real_peers_pictures_arrive_as_frames() {
     impl PeerConnectionEventHandler for Gathered {
         async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
             if state == RTCIceGatheringState::Complete {
-                self.0.notify_waiters();
+                // `notify_one`, not `notify_waiters`: host candidates are gathered before
+                // the code below gets as far as waiting, and `notify_waiters` wakes only
+                // whoever is already enrolled — so this test would sit out its own
+                // three-second timeout on every run.
+                self.0.notify_one();
             }
         }
     }
@@ -347,4 +351,31 @@ async fn a_real_peers_pictures_arrive_as_frames() {
 
     receiver.shutdown().await;
     let _ = offerer.close().await;
+}
+
+/// Sessions replace each other, and the port each one held comes back — *after* its socket
+/// is shut, not before.
+///
+/// The regression this pins: the pool used to be handed the port back first and the
+/// connection closed asynchronously afterwards, so a later session bound a port whose UDP
+/// socket the previous connection still held. It surfaced as "the offer was not
+/// answerable" with nothing to say why, and only when the box was loaded enough for the
+/// two to race — which is how it was found, in a full suite run rather than here.
+///
+/// Six replacements over an eight-port pool: with lowest-free-first allocation the third
+/// round reaches back for the first round's port, which is exactly where the old ordering
+/// broke.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_session_gives_its_port_back_before_the_next_needs_it() {
+    const PORTS: (u16, u16) = (BASE + 50, BASE + 57);
+    let receiver = receiver(PORTS);
+    for round in 0..6 {
+        let answer = receiver
+            .answer(&sender_offer(None))
+            .await
+            .unwrap_or_else(|e| panic!("offer {round} was refused: {e}"));
+        assert!(answer.sdp.contains("a=candidate:"), "round {round}");
+        assert!(receiver.is_active(), "round {round}");
+    }
+    receiver.shutdown().await;
 }

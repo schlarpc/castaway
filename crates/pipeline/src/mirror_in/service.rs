@@ -225,8 +225,13 @@ impl MirrorReceiver {
             .await
             .ok_or_else(|| PipelineError::Remote("no local description after gathering".into()))?;
 
-        // Only now is the session worth keeping. Replacing an earlier one closes it: a
-        // mirror fills the panel, and two would fight over it.
+        // Only now is the session worth keeping: everything above could have failed, and
+        // a half-built connection in the slot is one `forget` would have to reason about.
+        //
+        // The previous session is replaced and *then* closed, rather than closed first, so
+        // the new one never binds the port the old one is still holding. That costs a
+        // second port for as long as a teardown takes, which the 32-port default range has
+        // and to spare.
         let previous = self.shared.active.lock().ok().and_then(|mut held| {
             held.replace(Session {
                 connection: Arc::clone(&connection),
@@ -280,12 +285,24 @@ impl MirrorReceiver {
 }
 
 impl Shared {
-    /// Tear a session down, returning its port to the pool.
+    /// Take the live session out of the slot, if there is one.
+    fn take_active(&self) -> Option<Session> {
+        self.active.lock().ok().and_then(|mut held| held.take())
+    }
+
+    /// Tear a session down, returning its port to the pool **once the socket is shut**.
+    ///
+    /// The ordering is the whole content. Returning the port first and closing after is
+    /// what the obvious code does, and it hands the next session a port whose UDP socket
+    /// the previous connection has not released yet: the bind fails, and the failure looks
+    /// like "the offer was not answerable" with nothing to say why. Three offers over a
+    /// four-port pool is enough to hit it on a loaded box, which is how it was found.
     fn close(&self, session: Session) {
-        self.ports.give_back(session.port);
-        let connection = session.connection;
+        let Session { connection, port } = session;
+        let ports = Arc::clone(&self.ports);
         self.runtime.spawn(Box::pin(async move {
             let _ = connection.close().await;
+            ports.give_back(port);
         }));
     }
 
@@ -294,7 +311,7 @@ impl Shared {
     /// Idempotent, because it is reached from two directions — the connection state
     /// machine and a track ending — and which arrives first is not ours to decide.
     fn forget(&self) {
-        let session = self.active.lock().ok().and_then(|mut held| held.take());
+        let session = self.take_active();
         if let Some(session) = session {
             info!(port = session.port, "mirror: sender gone");
             self.close(session);

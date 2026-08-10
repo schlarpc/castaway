@@ -2441,9 +2441,21 @@ component the moment it existed because Matter commissioning and the remote-cont
 the same shape — a payload a phone scans off the glass, the one channel a network attacker
 cannot tamper with.
 
-**What is deferred, and honestly declared.** WebRTC mirroring is `capabilities.mirroring:
-false` in the introduction until it is built (a real RTP/DTLS-SRTP plane, #248's next stage),
-so no sender attempts it. FCompanion resource transfer (#249) — which is also the seam for
-inline content and auth headers (#251) — is refused typed until the fetch seam lands. A
-receiver that says what it cannot do, and refuses cleanly, beats one that accepts a cast it
-will drop (D32).
+**What was deferred, and how it landed.** The introduction said `capabilities.mirroring:
+false` and the resource plane refused typed, on D32's rule that a receiver which says what
+it cannot do beats one that accepts a cast it will drop. Both are built now, and the honest
+declaration survived the build in a better form: `mirroring` is `backend.is_some()`, so a
+build with no media plane still says false and still refuses cleanly, and every FCompanion
+and inline-content path is inert until an HTTP host is mounted, leaving exactly the old
+refusals in place. The capability and the code that honours it are one fact rather than two
+that can drift.
+
+The shapes those planes take were both decided against the obvious alternative. Mirroring
+receives on the same webrtc-rs stack the remote-control page already sends over (#18) —
+opposite direction, no local track, host candidates only — rather than a second transport,
+and the two share one ICE port *allocator* because one range with two pools hands the same
+port to both. FCompanion resolves to `http://` on our own shared host rather than teaching
+libavformat an `fcomp` protocol: an AVIO callback is `unsafe` FFI on the decode thread for a
+transfer a loopback socket already does, and serving inline content the same way is what
+gives a pushed DASH manifest a real base URL for its relative segment references — the one
+thing a `data:` URI cannot provide.

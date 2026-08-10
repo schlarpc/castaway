@@ -22,6 +22,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::companion::{CompanionUrl, ReadProgress, ResourceRead};
+use crate::content::{ContentStore, LocalHost};
 use crate::control::FCastRemote;
 use crate::error::FCastError;
 use crate::identity::V4Identity;
@@ -44,6 +46,21 @@ pub const FCAST_SERVICE_TYPE: &str = "_fcast._tcp";
 /// How often the broadcast ticker reports playback progress while something plays.
 /// The reference receiver's JSON-session cadence.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How much of an `fcomp://` resource one `CompanionResourceRequest` asks for (#249).
+///
+/// Bounded by the *answer*, not by the request: the sender splits its reply into parts and
+/// the part counter is a `U8`, so the spec makes keeping a range small enough to arrive in
+/// at most 255 parts the requester's job. One v4 packet holds just under 512 KiB, so this
+/// window cannot exceed 255 parts unless a sender chooses parts under 1 KiB.
+const READ_WINDOW: u64 = 256 * 1024;
+
+/// How long a companion read may wait for the sender that owns the resource.
+///
+/// The peer is a phone on the same Wi-Fi answering out of its own storage, so this is
+/// generous. It exists because the alternative is an HTTP request from our own decoder
+/// that never completes, holding a decode thread until the process ends.
+const COMPANION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Outbound frames queued per connection before we start dropping *updates*. A
 /// sender 64 control frames behind is not reading its socket; the heartbeat will
@@ -73,6 +90,16 @@ pub(crate) struct Shared {
     /// says it mirrors and then answers `InvalidState` is worse than one that says it
     /// does not, because the sender has already told someone it is casting.
     mirror: Option<Arc<dyn MirrorBackend>>,
+    /// Where this receiver serves what it was handed rather than pointed at (#249):
+    /// inline content, and `fcomp://` resources proxied back off the control
+    /// connection. `None` when nothing mounted [`FCastReceiver::router`], and the
+    /// player's typed refusals then stand exactly as they did.
+    local_host: Option<LocalHost>,
+    /// Bytes senders pushed inline, held for our own decoder to fetch back.
+    content: ContentStore,
+    /// The next companion read's id. Never reused within a run, so a late part from an
+    /// abandoned read cannot be spliced into a live one.
+    next_request: std::sync::atomic::AtomicU32,
     pub(crate) inner: Mutex<Inner>,
 }
 
@@ -90,6 +117,37 @@ pub(crate) struct Inner {
     /// Active FCompanion provider ids; the lowest free id is reused, like the
     /// reference.
     providers: std::collections::BTreeSet<u16>,
+    /// Companion reads in flight, keyed by request id (#249).
+    reads: HashMap<u32, PendingRead>,
+}
+
+/// A companion read waiting on the sender that owns the resource.
+struct PendingRead {
+    /// Which provider is answering, so a disconnect can abandon exactly its reads and
+    /// leave another sender's alone.
+    provider: u16,
+    kind: PendingKind,
+}
+
+enum PendingKind {
+    /// `CompanionResourceInfoRequest` — waiting for the type and size.
+    Info(tokio::sync::oneshot::Sender<CompanionInfo>),
+    /// `CompanionResourceRequest` — accumulating `Resource` parts.
+    Data {
+        read: ResourceRead,
+        answer: tokio::sync::oneshot::Sender<Result<Vec<u8>, FCastError>>,
+    },
+}
+
+/// What a sender says one of its resources is.
+#[derive(Debug, Clone)]
+pub struct CompanionInfo {
+    /// The MIME type it declared.
+    pub content_type: String,
+    /// Its total size, when the sender knows it. `None` is a stream of unknown length —
+    /// the sender's own `UnknownResourceSize`, which we serve without a `Content-Length`
+    /// rather than guessing one.
+    pub size: Option<u64>,
 }
 
 /// One connection's protocol state: which dialect it negotiated, and its pipe.
@@ -121,11 +179,15 @@ impl FCastReceiver {
                 playback: None,
                 v4: None,
                 mirror: None,
+                local_host: None,
+                content: ContentStore::new(),
+                next_request: std::sync::atomic::AtomicU32::new(1),
                 inner: Mutex::new(Inner {
                     player: Player::new(),
                     peers: HashMap::new(),
                     next_peer: 0,
                     providers: std::collections::BTreeSet::new(),
+                    reads: HashMap::new(),
                 }),
             }),
         }
@@ -176,6 +238,28 @@ impl FCastReceiver {
             .expect("with_mirroring is builder-time, before the adapter is shared");
         shared.mirror = Some(backend);
         self
+    }
+
+    /// Serve pushed content and `fcomp://` resources on the shared HTTP host (#249).
+    ///
+    /// `base` is where that host answers from a *sender's* point of view — the advertised
+    /// address, not loopback — because the URL this hands the decoder is an ordinary one
+    /// and nothing about it should assume the fetcher is in this process. Mount
+    /// [`FCastReceiver::router`] on the same host, or the URLs point at a 404.
+    ///
+    /// Without this, inline content, playlists-by-URL and `fcomp://` are all refused with
+    /// the typed errors they were refused with before (#249's "honest unsupported").
+    #[must_use]
+    pub fn with_local_host(mut self, base: impl Into<String>) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("with_local_host is builder-time, before the adapter is shared");
+        shared.local_host = Some(LocalHost::new(base));
+        self
+    }
+
+    /// The routes [`FCastReceiver::with_local_host`] promised, for the shared HTTP host.
+    pub fn router(&self) -> axum::Router {
+        routes(Arc::clone(&self.shared))
     }
 
     /// The port senders are told about.
@@ -427,6 +511,12 @@ impl Shared {
                 "a mirroring offer is answered off the lock",
                 ErrorKind::Internal,
             )),
+            // Companion answers are not player commands at all: they belong to whichever
+            // HTTP request is mid-read, and the actor routes them by request id.
+            V4Command::CompanionInfo { .. } | V4Command::CompanionData(_) => Err(Refusal::kinded(
+                "a companion answer is routed, not applied",
+                ErrorKind::Internal,
+            )),
         };
         match outcome {
             Ok(Applied { events, updates }) => {
@@ -465,6 +555,207 @@ impl Shared {
         }
     }
 
+    // -- FCompanion reads (#249) --------------------------------------------------
+
+    /// Which connection owns `provider`, if one still does.
+    ///
+    /// A lookup rather than a field on the asking session because the spec requires it:
+    /// a sender may play a companion URL another connection issued, so the read is routed
+    /// by provider id and not by who asked for the media.
+    fn provider_peer(inner: &Inner, provider: u16) -> Option<u64> {
+        inner
+            .peers
+            .iter()
+            .find_map(|(id, peer)| match &peer.session {
+                PeerSession::V4(session) if session.companion_provider() == Some(provider) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+    }
+
+    /// Issue one companion request and wait for its answer.
+    ///
+    /// The lock is taken to register the waiter and queue the frame, and dropped before
+    /// the await — the answer arrives on the connection actor, which takes the same lock.
+    async fn companion_ask<T>(
+        &self,
+        provider: u16,
+        make_pending: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> PendingKind,
+        make_frame: impl FnOnce(u32) -> Frame,
+    ) -> Result<T, FCastError> {
+        let request_id = self
+            .next_request
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = &mut *guard;
+            let Some(peer_id) = Self::provider_peer(inner, provider) else {
+                return Err(FCastError::CompanionUnavailable(format!(
+                    "no connected sender owns provider {provider}"
+                )));
+            };
+            inner.reads.insert(
+                request_id,
+                PendingRead {
+                    provider,
+                    kind: make_pending(tx),
+                },
+            );
+            if let Some(peer) = inner.peers.get(&peer_id) {
+                send_frame(&peer.outbound, &make_frame(request_id));
+            }
+        }
+        let answer = tokio::time::timeout(COMPANION_TIMEOUT, rx).await;
+        // However it ended, the waiter must go: a read left registered is a request id
+        // whose late answer would be delivered into a channel nobody holds.
+        if answer.is_err() {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reads
+                .remove(&request_id);
+        }
+        match answer {
+            Ok(Ok(value)) => Ok(value),
+            // The sender disconnected mid-read, which drops the waiter with it.
+            Ok(Err(_)) => Err(FCastError::CompanionUnavailable(
+                "the providing sender went away mid-read".into(),
+            )),
+            Err(_) => Err(FCastError::CompanionUnavailable(format!(
+                "provider {provider} did not answer within {COMPANION_TIMEOUT:?}"
+            ))),
+        }
+    }
+
+    /// Ask what an `fcomp://` resource is and how big it is.
+    ///
+    /// # Errors
+    /// [`FCastError::CompanionUnavailable`] when no connection owns the provider, or the
+    /// one that does does not answer.
+    pub(crate) async fn companion_info(
+        &self,
+        url: CompanionUrl,
+    ) -> Result<CompanionInfo, FCastError> {
+        self.companion_ask(url.provider, PendingKind::Info, |request_id| {
+            v4msg::companion_resource_info_request_frame(request_id, url.resource)
+        })
+        .await
+    }
+
+    /// Read one byte range of an `fcomp://` resource. `stop_inclusive` is inclusive.
+    ///
+    /// # Errors
+    /// [`FCastError::CompanionUnavailable`] as above, or
+    /// [`FCastError::MalformedResource`] if the parts do not reassemble.
+    pub(crate) async fn companion_read(
+        &self,
+        url: CompanionUrl,
+        start: u64,
+        stop_inclusive: u64,
+    ) -> Result<Vec<u8>, FCastError> {
+        self.companion_ask(
+            url.provider,
+            |answer| PendingKind::Data {
+                read: ResourceRead::new(),
+                answer,
+            },
+            |request_id| {
+                v4msg::companion_resource_request_frame(
+                    request_id,
+                    url.resource,
+                    start,
+                    stop_inclusive,
+                )
+            },
+        )
+        .await?
+    }
+
+    /// Deliver an answer to whoever issued the read. Unsolicited answers are dropped,
+    /// which is what the reference does with them.
+    fn deliver_companion(&self, command: V4Command) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match command {
+            V4Command::CompanionInfo {
+                request_id,
+                content_type,
+                size,
+            } => match guard.reads.remove(&request_id) {
+                Some(PendingRead {
+                    kind: PendingKind::Info(tx),
+                    ..
+                }) => {
+                    let _ = tx.send(CompanionInfo { content_type, size });
+                }
+                // Put back what we took: an info answer stamped with a *data* read's id is
+                // the sender confusing itself, and dropping the read over it would fail a
+                // transfer that is still arriving.
+                Some(other) => {
+                    guard.reads.insert(request_id, other);
+                    debug!(request_id, "fcast: resource info for a byte read");
+                }
+                None => debug!(request_id, "fcast: resource info for a read nobody issued"),
+            },
+            V4Command::CompanionData(part) => {
+                let request_id = part.request_id;
+                // Taken out of the map for the push and put back if more is coming: the
+                // answer is a one-shot, so an entry that completes must not be left behind
+                // for a later part to try to answer twice.
+                let Some(pending) = guard.reads.remove(&request_id) else {
+                    debug!(request_id, "fcast: resource bytes for a read nobody issued");
+                    return;
+                };
+                let PendingKind::Data { read, answer } = pending.kind else {
+                    guard.reads.insert(request_id, pending);
+                    debug!(request_id, "fcast: resource bytes for an info request");
+                    return;
+                };
+                let mut read = read;
+                let outcome = match read.push(part) {
+                    Ok(ReadProgress::More) => {
+                        guard.reads.insert(
+                            request_id,
+                            PendingRead {
+                                provider: pending.provider,
+                                kind: PendingKind::Data { read, answer },
+                            },
+                        );
+                        return;
+                    }
+                    Ok(ReadProgress::Complete(data)) => Ok(data),
+                    Ok(ReadProgress::NotFound) => Err(FCastError::CompanionUnavailable(
+                        "the providing sender has no such resource".into(),
+                    )),
+                    Err(e) => Err(e),
+                };
+                let _ = answer.send(outcome);
+            }
+            _ => {}
+        }
+    }
+
+    /// Abandon the reads a disconnecting provider was answering.
+    ///
+    /// Without this every in-flight read waits out [`COMPANION_TIMEOUT`] for a sender that
+    /// has already gone — fifteen seconds of a decode thread parked on an HTTP request
+    /// that cannot be answered. Scoped to the provider, so another sender's transfer is
+    /// untouched.
+    fn abandon_reads(&self, provider: u16) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads
+            .retain(|_, pending| pending.provider != provider);
+    }
+
     /// Release a disconnecting peer's companion provider id.
     fn release_provider(&self, provider: Option<u16>) {
         if let Some(id) = provider {
@@ -475,6 +766,349 @@ impl Shared {
                 .remove(&id);
         }
     }
+}
+
+/// How long a playlist fetch may take, and how much of one we will read.
+///
+/// A playlist is a few kilobytes of JSON. The cap is not tuning: without it, a `play`
+/// pointing at a live stream would have us reading it into memory for ever, and the sender
+/// is waiting for an answer the whole time.
+const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(10);
+const PLAYLIST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Turn what a sender *described* into something the decoder can open (#249).
+///
+/// Three shapes reach this, and only the first is already a URL:
+///
+/// - `url` — untouched, which is the Grayjay path and the overwhelming majority;
+/// - inline `content` — published on our own host, so a pushed DASH manifest has a real
+///   base URL for its relative segment references;
+/// - a playlist *by URL* — fetched here, because the items are not known until it is,
+///   and the player cannot do I/O (ground rule 3).
+///
+/// At the boundary rather than in the player for exactly that reason. A refusal here is
+/// the sender's answer, and with no host configured this does nothing at all — the
+/// player's own typed refusals then stand.
+async fn resolve_sources(shared: &Arc<Shared>, command: SenderCommand) -> SenderCommand {
+    let SenderCommand::Load(play) = command else {
+        return command;
+    };
+    let mut play = *play;
+    let Some(host) = shared.local_host.clone() else {
+        return SenderCommand::Load(Box::new(play));
+    };
+
+    // A playlist the sender pointed at rather than pushed. Fetched first, so the items
+    // below are resolved whichever way the playlist arrived.
+    if play.container == "application/json" && play.content.is_none() {
+        if let Some(url) = play.url.clone() {
+            match fetch_playlist(&url).await {
+                Ok(body) => {
+                    play.content = Some(body);
+                    play.url = None;
+                }
+                // Left alone: the player refuses "playlist by URL" typed, and that is a
+                // better answer than a load that half-happened.
+                Err(e) => {
+                    warn!(url, error = %e, "fcast: could not fetch the playlist");
+                    return SenderCommand::Load(Box::new(play));
+                }
+            }
+        }
+    }
+
+    if play.container == "application/json" {
+        if let Some(content) = play.content.take() {
+            play.content = Some(publish_playlist_items(shared, &host, content));
+        }
+        return SenderCommand::Load(Box::new(play));
+    }
+
+    // A single item pushed inline: the terminal sender's `cat dash.mpd | fcast play`.
+    if play.url.is_none() {
+        if let Some(content) = play.content.clone() {
+            let id = shared
+                .content
+                .publish(&play.container, bytes::Bytes::from(content));
+            play.url = Some(host.content_url(id));
+            debug!(container = %play.container, "fcast: serving pushed content back to the decoder");
+        }
+    }
+    SenderCommand::Load(Box::new(play))
+}
+
+/// Publish the inline content of every playlist item, rewriting each to its URL.
+///
+/// Walks the JSON rather than the parsed [`crate::messages::PlaylistContent`] on purpose:
+/// the document is the sender's, it round-trips untouched apart from the fields this
+/// rewrites, and an item shape we do not model is carried through rather than dropped.
+/// A document that will not parse is returned unchanged, so the player refuses it with
+/// the message it would have anyway.
+fn publish_playlist_items(shared: &Arc<Shared>, host: &LocalHost, content: String) -> String {
+    let Ok(mut document) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return content;
+    };
+    let Some(items) = document.get_mut("items").and_then(|i| i.as_array_mut()) else {
+        return content;
+    };
+    for item in items {
+        let (Some(inline), None) = (
+            item.get("content")
+                .and_then(|c| c.as_str())
+                .map(str::to_owned),
+            item.get("url").and_then(|u| u.as_str()),
+        ) else {
+            continue;
+        };
+        let container = item
+            .get("container")
+            .and_then(|c| c.as_str())
+            .unwrap_or("application/octet-stream");
+        let id = shared
+            .content
+            .publish(container, bytes::Bytes::from(inline));
+        if let Some(object) = item.as_object_mut() {
+            object.insert("url".into(), host.content_url(id).into());
+            object.remove("content");
+        }
+    }
+    serde_json::to_string(&document).unwrap_or(content)
+}
+
+/// Fetch a playlist a sender pointed at. Blocking, on a `spawn_blocking` thread — the same
+/// shape (and the same reasoning) as `proto-dlna`'s HEAD probe.
+async fn fetch_playlist(url: &str) -> Result<String, String> {
+    let url = url.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(PLAYLIST_TIMEOUT)
+            // Both, for the reason `proto-dlna` documents: `timeout_connect` wins over
+            // `timeout` for the connect phase and defaults to thirty seconds, so a URL
+            // pointing at a black hole would stall the sender's `play` for half a minute.
+            .timeout_connect(PLAYLIST_TIMEOUT)
+            .redirects(4)
+            .user_agent(castaway_core::MEDIA_USER_AGENT)
+            .build();
+        let response = agent.get(&url).call().map_err(|e| e.to_string())?;
+        let mut body = String::new();
+        let mut reader = std::io::Read::take(response.into_reader(), PLAYLIST_MAX_BYTES);
+        std::io::Read::read_to_string(&mut reader, &mut body).map_err(|e| e.to_string())?;
+        Ok(body)
+    })
+    .await
+    .map_err(|_| "the playlist fetch panicked".to_owned())?
+}
+
+/// Point a v4 item at the local proxy when its source is an `fcomp://` URL (#249).
+///
+/// Only the *fetch* URL changes: the raw packet relayed to other senders is untouched, and
+/// so is the `PlayMessage` echo v1-v3 peers see, because `fcomp://3.fcast/7` is what the
+/// sender said and what another sender would have to resolve for itself.
+fn resolve_v4_sources(shared: &Arc<Shared>, source: &mut v4msg::LoadSource) {
+    let Some(host) = shared.local_host.as_ref() else {
+        return;
+    };
+    let rewrite = |item: &mut v4msg::V4MediaItem| {
+        if let Ok(url) = CompanionUrl::parse(&item.source_url) {
+            item.source_url = host.companion_url(url);
+            debug!(
+                provider = url.provider,
+                resource = url.resource,
+                "fcast: proxying an fcomp resource"
+            );
+        }
+    };
+    match source {
+        v4msg::LoadSource::Single(item) => rewrite(item),
+        v4msg::LoadSource::Queue { items, .. } => {
+            for (item, _) in items {
+                rewrite(item);
+            }
+        }
+    }
+}
+
+/// The receiver's own HTTP surface (#249): pushed content, and `fcomp://` proxied.
+///
+/// Two routes and no more. They exist because libavformat opens URLs, and the two media
+/// shapes FCast has that are *not* URLs both become one here.
+fn routes(shared: Arc<Shared>) -> axum::Router {
+    use axum::routing::get;
+    axum::Router::new()
+        .route(
+            &format!("{}/{{id}}", crate::content::CONTENT_PATH),
+            get(content_route),
+        )
+        .route(
+            &format!(
+                "{}/{{provider}}/{{resource}}",
+                crate::content::COMPANION_PATH
+            ),
+            get(companion_route),
+        )
+        .with_state(shared)
+}
+
+/// Serve back bytes a sender pushed inline.
+async fn content_route(
+    axum::extract::State(shared): axum::extract::State<Arc<Shared>>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let Some(content) = shared.content.get(id) else {
+        // Evicted, or never published. A 404 is the honest answer and the decoder reports
+        // it as a failed fetch, which is what it is.
+        return (axum::http::StatusCode::NOT_FOUND, "no such content\n").into_response();
+    };
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, content.mime)],
+        content.bytes,
+    )
+        .into_response()
+}
+
+/// Proxy one `fcomp://` resource: HTTP in, `CompanionResourceRequest` out.
+///
+/// Streamed rather than buffered, because "the file is on my phone" is a whole film as
+/// often as it is a manifest, and the point of the range machinery is that neither end
+/// has to hold it.
+async fn companion_route(
+    axum::extract::State(shared): axum::extract::State<Arc<Shared>>,
+    axum::extract::Path((provider, resource)): axum::extract::Path<(u16, u32)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let url = CompanionUrl { provider, resource };
+    let info = match shared.companion_info(url).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(url = %url.to_url(), error = %e, "fcast: companion resource unavailable");
+            return (axum::http::StatusCode::NOT_FOUND, format!("{e}\n")).into_response();
+        }
+    };
+
+    let requested = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_byte_range);
+    // A range past the end is not a range: answering 206 for it would have the decoder
+    // reading bytes that are not there.
+    if let (Some((start, _)), Some(size)) = (requested, info.size) {
+        if start >= size {
+            return (
+                axum::http::StatusCode::RANGE_NOT_SATISFIABLE,
+                [(axum::http::header::CONTENT_RANGE, format!("bytes */{size}"))],
+            )
+                .into_response();
+        }
+    }
+    let start = requested.map_or(0, |(start, _)| start);
+    // The last byte we will serve, when anybody knows: the request's end, else the
+    // resource's, else nothing and we read until the sender runs out.
+    let end = match (requested.and_then(|(_, end)| end), info.size) {
+        (Some(end), Some(size)) => Some(end.min(size - 1)),
+        (Some(end), None) => Some(end),
+        (None, Some(size)) => Some(size - 1),
+        (None, None) => None,
+    };
+
+    let status = if requested.is_some() {
+        axum::http::StatusCode::PARTIAL_CONTENT
+    } else {
+        axum::http::StatusCode::OK
+    };
+    let mut response_headers = axum::http::HeaderMap::new();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&info.content_type) {
+        response_headers.insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    // Ranges are what a seek is made of, and a decoder that is not told they are available
+    // demuxes the whole file forward to reach the position it was asked for.
+    response_headers.insert(
+        axum::http::header::ACCEPT_RANGES,
+        axum::http::HeaderValue::from_static("bytes"),
+    );
+    if let Some(end) = end {
+        let length = end.saturating_sub(start) + 1;
+        if let Ok(value) = axum::http::HeaderValue::from_str(&length.to_string()) {
+            response_headers.insert(axum::http::header::CONTENT_LENGTH, value);
+        }
+        if requested.is_some() {
+            let total = info
+                .size
+                .map_or_else(|| "*".to_owned(), |size| size.to_string());
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+            {
+                response_headers.insert(axum::http::header::CONTENT_RANGE, value);
+            }
+        }
+    }
+
+    let body = axum::body::Body::from_stream(resource_stream(shared, url, start, end));
+    (status, response_headers, body).into_response()
+}
+
+/// A stream of windows over one companion resource.
+///
+/// [`READ_WINDOW`] at a time, because a `CompanionResourceRequest`'s answer is split into
+/// at most 255 parts and keeping inside that is the requester's job. A short window ends
+/// the stream: the sender has told us where the resource stops, which is the only way to
+/// learn it when the size was `Unknown`.
+fn resource_stream(
+    shared: Arc<Shared>,
+    url: CompanionUrl,
+    start: u64,
+    end: Option<u64>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    futures::stream::unfold(Some(start), move |state| {
+        let shared = Arc::clone(&shared);
+        async move {
+            let at = state?;
+            if end.is_some_and(|end| at > end) {
+                return None;
+            }
+            let last = end.map_or(at + READ_WINDOW - 1, |end| end.min(at + READ_WINDOW - 1));
+            let want = last - at + 1;
+            match shared.companion_read(url, at, last).await {
+                Ok(data) if data.is_empty() => None,
+                Ok(data) => {
+                    let read = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                    // A window the sender answered short is the end of the resource. That
+                    // is the *only* way to learn where it stops when the size came back
+                    // `Unknown`, so it is the condition rather than a special case.
+                    let next = (read >= want).then_some(at + read);
+                    Some((Ok(bytes::Bytes::from(data)), next))
+                }
+                // One failed window ends the body. Carrying on would serve the next
+                // window's bytes at this offset, which decodes as corruption rather than
+                // as the truncation it is.
+                Err(e) => Some((Err(std::io::Error::other(e.to_string())), None)),
+            }
+        }
+    })
+}
+
+/// The first byte range of an HTTP `Range` header, as `(start, end_inclusive)`.
+///
+/// Only `bytes=` and only the first range: libavformat asks for one open-ended range per
+/// seek and nothing else, and a multi-range answer would need a multipart body for a case
+/// no client here produces. A suffix range (`bytes=-500`) is declined rather than guessed
+/// at, because answering it wrongly reads the wrong end of the file.
+fn parse_byte_range(header: &str) -> Option<(u64, Option<u64>)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    let first = spec.split(',').next()?.trim();
+    let (start, end) = first.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end = match end.trim() {
+        "" => None,
+        end => Some(end.parse::<u64>().ok()?),
+    };
+    // An inverted range is not a range.
+    if end.is_some_and(|end| end < start) {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// A refusal, spoken in the asking session's dialect: `PlaybackError` text for
@@ -807,7 +1441,7 @@ async fn serve_json(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // The frame the plaintext phase already read.
-    match handle_frame(shared, peer_id, peer_addr, started.elapsed(), &first_frame) {
+    match handle_frame(shared, peer_id, peer_addr, started.elapsed(), &first_frame).await {
         Ok(events) => emit_all(sink, shared, events).await,
         Err(fault) => {
             warn!(peer = %peer_addr, %fault, "fcast: session fault; disconnecting");
@@ -840,7 +1474,7 @@ async fn serve_json(
                     };
                     let (frame, consumed) = decoded;
                     buf.drain(..consumed);
-                    match handle_frame(shared, peer_id, peer_addr, started.elapsed(), &frame) {
+                    match handle_frame(shared, peer_id, peer_addr, started.elapsed(), &frame).await {
                         Ok(events) => emit_all(sink, shared, events).await,
                         Err(fault) => {
                             warn!(peer = %peer_addr, %fault, "fcast: session fault; disconnecting");
@@ -1017,12 +1651,20 @@ fn finish_peer(shared: &Arc<Shared>, peer_id: u64) {
             }
         })
     };
+    if let Some(provider) = provider {
+        // Before the id is released, so a read cannot be handed to a new connection that
+        // happens to be assigned the same number.
+        shared.abandon_reads(provider);
+    }
     shared.release_provider(provider);
 }
 
 /// Feed one frame through the JSON session and the player. Pure work under the
 /// lock; the returned events are emitted by the caller afterwards.
-fn handle_frame(
+///
+/// Async only for the one step that cannot be pure: a `play` whose media the sender
+/// *pushed* or *pointed at* has to be turned into a URL first ([`resolve_sources`], #249).
+async fn handle_frame(
     shared: &Arc<Shared>,
     peer_id: u64,
     peer_addr: SocketAddr,
@@ -1063,6 +1705,7 @@ fn handle_frame(
     };
     debug!(?command, "fcast: sender command");
     let was_load = matches!(command, SenderCommand::Load(_));
+    let command = resolve_sources(shared, command).await;
     match shared.apply(Some(peer_id), command) {
         Ok(mut events) => {
             if was_load {
@@ -1122,7 +1765,28 @@ async fn handle_v4_frame(
     if let V4Command::MirroringOffer { session_id, sdp } = &command {
         return Ok(answer_mirroring(shared, peer_id, *session_id, sdp).await);
     }
+    if matches!(
+        command,
+        V4Command::CompanionInfo { .. } | V4Command::CompanionData(_)
+    ) {
+        shared.deliver_companion(command);
+        return Ok(Vec::new());
+    }
     let was_load = matches!(command, V4Command::Load { .. });
+    // `fcomp://` is not a URL any decoder can open; the local proxy is (#249). Only the
+    // fetch changes — the raw relay other senders receive is untouched.
+    let mut command = command;
+    match &mut command {
+        V4Command::Load { source, .. } => resolve_v4_sources(shared, source),
+        V4Command::QueueInsert { item, .. } => {
+            let mut single = v4msg::LoadSource::Single(item.clone());
+            resolve_v4_sources(shared, &mut single);
+            if let v4msg::LoadSource::Single(resolved) = single {
+                *item = resolved;
+            }
+        }
+        _ => {}
+    }
     match shared.apply_v4(peer_id, command) {
         Ok(mut events) => {
             if was_load {

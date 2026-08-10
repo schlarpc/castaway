@@ -21,10 +21,20 @@ rcgen.workspace = true
 sha2.workspace = true
 base64.workspace = true
 castaway-paths.workspace = true
+# The receiver's own HTTP surface on the shared host (D7): the inline content a sender
+# pushed, and the `fcomp://` resources it serves over the control connection (#249). Both
+# exist so the decoder can open an ordinary URL — libavformat has never heard of `fcomp`.
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+# Fetching a playlist a sender pointed at rather than pushed (#249). Blocking, driven from
+# `spawn_blocking`, exactly as `proto-dlna`'s HEAD probe is and for the same reasons.
+ureq.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util"] }
 
 [dev-dependencies]
 castaway-test-support.workspace = true
+hyper.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "rt", "macros", "time", "io-util", "rt-multi-thread", "test-util"] }
 
 [lints]

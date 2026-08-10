@@ -73,6 +73,21 @@ pub enum FCastError {
     #[error("v4 TLS: {0}")]
     Tls(String),
 
+    /// An `fcomp://` URL that is not the shape the v4 spec's FCompanion section fixes
+    /// (#249). Misparsing one routes a resource read to the wrong sender.
+    #[error("malformed fcomp URL: {0}")]
+    MalformedCompanionUrl(String),
+
+    /// A `Resource` (opcode 21) body that cannot be read as one: too short for its
+    /// header, an undefined `GetResourceResult` variant, or parts out of sequence.
+    #[error("malformed Resource packet: {0}")]
+    MalformedResource(String),
+
+    /// An `fcomp://` resource could not be read: no connected sender owns the provider,
+    /// the one that does went away mid-read, or it never answered (#249).
+    #[error("fcomp resource unavailable: {0}")]
+    CompanionUnavailable(String),
+
     /// A v4 `Flatbuf` body that fails the verifier, or a verified union whose
     /// required member is absent. Session-fatal, as in the reference receiver —
     /// unlike an unknown-but-well-formed payload type, which gets a polite

@@ -13,7 +13,7 @@
       },
       "provider": "process",
       "transport": "tcp",
-      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS), /remote/* (the remote-control page and its WHEP signalling)"
+      "wire": "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS), /remote/* (the remote-control page and its WHEP signalling), /fcast/* (media an FCast sender pushed or serves itself)"
     },
     {
       "chosen_by": "spec",

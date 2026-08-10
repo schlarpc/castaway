@@ -66,6 +66,17 @@ pub enum V4Command {
     QueueSelect(QueuePosition),
     /// The sender wants to serve `fcomp://` resources.
     CompanionHello,
+    /// A sender answered "what is this resource" for a read we issued (#249).
+    CompanionInfo {
+        /// The read this answers.
+        request_id: u32,
+        /// The MIME type the sender declared.
+        content_type: String,
+        /// Its size, when the sender knows it.
+        size: Option<u64>,
+    },
+    /// One `Resource` packet: part of a range we asked for (#249).
+    CompanionData(crate::companion::ResourcePart),
     /// Begin a mirroring session.
     StartMirroring(u16),
     /// The sender's SDP offer for the active mirroring session.
@@ -176,10 +187,12 @@ impl SessionV4 {
                 }
                 self.on_flatbuf(packet_num, &raw.body)
             }
-            // FCompanion resource bytes answer requests we have not issued yet
-            // (#249's seam). Parse for shape, drop for now: an unsolicited
-            // response is logged-and-dropped in the reference too.
-            Opcode::Resource => Ok(V4Reaction::default()),
+            // FCompanion resource bytes (#249). Parsed here and routed by request
+            // id at the actor; a part for a read nobody is waiting on is dropped
+            // there, as the reference drops an unsolicited response.
+            Opcode::Resource => Ok(command(V4Command::CompanionData(
+                crate::companion::parse_resource(&raw.body)?,
+            ))),
             // The whole JSON opcode table, at v4, is a polite typed refusal —
             // including the `SetPlaylistItem` the real SDK verifiably leaks
             // (fixtures, `v4-set-playlist-item`).
@@ -293,8 +306,15 @@ impl SessionV4 {
                 flat::ErrorKind::InvalidState,
                 Some(packet_num),
             )),
-            // An info answer for a request we never issued (#249's seam).
-            V4Inbound::CompanionResourceInfoResponse { .. } => V4Reaction::default(),
+            V4Inbound::CompanionResourceInfoResponse {
+                request_id,
+                content_type,
+                size,
+            } => command(V4Command::CompanionInfo {
+                request_id,
+                content_type,
+                size,
+            }),
         })
     }
 

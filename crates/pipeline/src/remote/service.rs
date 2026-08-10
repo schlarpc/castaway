@@ -590,15 +590,21 @@ impl RemoteService {
         let Some(peer) = removed else {
             return;
         };
-        self.ports.give_back(peer.port);
         // Cancelled, not released. A dropped connection did not *finish* a gesture, and
         // synthesising the release would commit whatever it was over — on the transport
         // strip, that means seeking to wherever the finger was when Wi-Fi died.
         self.input.push_gone(InputOrigin::Remote(id));
         info!(peer = id.get(), port = peer.port, "remote: peer gone");
+        // The port goes back **after** the socket is shut, not before. Released first, it
+        // is handed to the next peer while this connection still holds the UDP socket, and
+        // the bind fails at the moment somebody connects (found in the mirroring
+        // receiver, which shares this pool and this ordering).
         let connection = peer.connection;
+        let ports = Arc::clone(&self.ports);
+        let port = peer.port;
         self.runtime.spawn(Box::pin(async move {
             let _ = connection.close().await;
+            ports.give_back(port);
         }));
     }
 
@@ -648,8 +654,8 @@ impl RemoteService {
             Err(_) => Vec::new(),
         };
         for peer in peers {
-            self.ports.give_back(peer.port);
             let _ = peer.connection.close().await;
+            self.ports.give_back(peer.port);
         }
     }
 }

@@ -471,6 +471,48 @@ pub fn companion_hello_response_frame(provider_id: u16) -> Frame {
     finish(b, flat::Message::CompanionHelloResponse, payload)
 }
 
+/// `CompanionResourceInfoRequest { request_id, resource_id }` — "what is this, and how
+/// big is it?", asked of the sender that owns the provider id (#249).
+#[must_use]
+pub fn companion_resource_info_request_frame(request_id: u32, resource_id: u32) -> Frame {
+    let mut b = FlatBufferBuilder::new();
+    let payload = flat::CompanionResourceInfoRequest::create(
+        &mut b,
+        &flat::CompanionResourceInfoRequestArgs {
+            request_id,
+            resource_id,
+        },
+    )
+    .as_union_value();
+    finish(b, flat::Message::CompanionResourceInfoRequest, payload)
+}
+
+/// `CompanionResourceRequest { request_id, resource_id, read_head }` — a byte range,
+/// answered with one or more `Resource` packets (#249).
+///
+/// `stop_inclusive` is inclusive, as the field name says and as HTTP's own `Range` is;
+/// getting that off by one reads a byte short of every window.
+#[must_use]
+pub fn companion_resource_request_frame(
+    request_id: u32,
+    resource_id: u32,
+    start: u64,
+    stop_inclusive: u64,
+) -> Frame {
+    let mut b = FlatBufferBuilder::new();
+    let read_head = flat::ResourceReadHead::new(start, stop_inclusive);
+    let payload = flat::CompanionResourceRequest::create(
+        &mut b,
+        &flat::CompanionResourceRequestArgs {
+            request_id,
+            resource_id,
+            read_head: Some(&read_head),
+        },
+    )
+    .as_union_value();
+    finish(b, flat::Message::CompanionResourceRequest, payload)
+}
+
 /// `MirroringSessionDescription` — the answer SDP.
 #[must_use]
 pub fn mirroring_answer_frame(session_id: u16, sdp: &str) -> Frame {

@@ -1244,6 +1244,9 @@ async fn serve(
         );
         adapter_handles.push(wiring.task);
         fcast_connect_url = wiring.connect_url;
+        // The two media shapes FCast has that are not URLs — content a sender pushed, and
+        // `fcomp://` it serves itself — become ordinary URLs on the shared host (#249).
+        http = http.merge(wiring.router);
     }
     if config.enable.gamestream {
         // The inverted protocol (D37): nothing to advertise, because the panel is the
@@ -1897,12 +1900,14 @@ fn spawn_airplay(
     })
 }
 
-/// The FCast listener, and the one fact about it the panel wants back.
+/// The FCast listener, and the two things about it the rest of the process needs back.
 struct FCastWiring {
     task: tokio::task::JoinHandle<()>,
     /// The `fcast://r/…` connection URL to draw as a QR on the FCast tile, when v4 is
     /// announced (#248). `None` otherwise, and the tile is unchanged.
     connect_url: Option<String>,
+    /// Pushed content and the `fcomp://` proxy, for the shared HTTP host (#249).
+    router: Router,
 }
 
 /// Stand up the FCast listener and advertise `_fcast._tcp` (#241).
@@ -1919,7 +1924,10 @@ fn spawn_fcast(
     playback: Option<Arc<dyn castaway_core::PlaybackReport>>,
     mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
 ) -> FCastWiring {
-    let receiver = proto_fcast::FCastReceiver::new(config.advertised_name(ProtocolKind::FCast));
+    // The base a *sender* would use, not loopback: what this hands the decoder is an
+    // ordinary URL, and nothing about it should assume the fetcher is in this process.
+    let receiver = proto_fcast::FCastReceiver::new(config.advertised_name(ProtocolKind::FCast))
+        .with_local_host(config.http_base_url());
     // FCast's `PlaybackUpdate`s carry the position the sender draws in its scrubber,
     // read from the same handle DLNA's `GetPositionInfo` reads. A build with no media
     // pipeline has nothing to report and says so by not offering one.
@@ -1952,6 +1960,7 @@ fn spawn_fcast(
     );
 
     let connect_url = receiver.connection_url(vec![advertised.to_string()]);
+    let router = receiver.router();
     let sink = SessionSink::new(SourceId::new(ProtocolKind::FCast, "listener"), event_tx);
     let adapter = Arc::new(receiver);
     let task = tokio::spawn(async move {
@@ -1964,7 +1973,11 @@ fn spawn_fcast(
             () = shutdown.notified() => info!("FCast listener stopping"),
         }
     });
-    FCastWiring { task, connect_url }
+    FCastWiring {
+        task,
+        connect_url,
+        router,
+    }
 }
 
 /// Load or create the persisted FCast v4 TLS key (#248).

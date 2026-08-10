@@ -213,7 +213,8 @@ fn shared_listeners() -> Vec<Listener> {
             bind: "0.0.0.0",
             wire: "HTTP/1.1 — UPnP descriptions, DLNA SOAP + GENA, DIAL REST, \
                    Spotify zeroconf pairing, /screenshot.png, /stream/* (HLS), \
-                   /remote/* (the remote-control page and its WHEP signalling)",
+                   /remote/* (the remote-control page and its WHEP signalling), \
+                   /fcast/* (media an FCast sender pushed or serves itself)",
             security: "plaintext HTTP, unauthenticated — anyone who can reach this \
                        port can *drive* the panel, not merely watch it (#18)",
             gate: Gate::Always,
@@ -229,7 +230,10 @@ fn shared_listeners() -> Vec<Listener> {
                     WHEP offer that sets up a peer connection; the media and the input \
                     channel then ride UDP in `[remote.ice_ports]`, not this port. \
                     `remote.input = false` keeps the viewing half and drops every \
-                    input message at the boundary.",
+                    input message at the boundary. /fcast/content/* hands back bytes a \
+                    sender pushed inline and /fcast/companion/* proxies a ranged read \
+                    over that sender's own control connection (#249), both so the \
+                    decoder can open an ordinary URL.",
         },
         Listener {
             owner: Owner::Mdns,

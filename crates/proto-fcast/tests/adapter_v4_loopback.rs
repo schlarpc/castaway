@@ -4,6 +4,9 @@
 //! bench, held in-tree so CI cannot lose it.
 
 #![allow(clippy::unwrap_used)]
+// Ephemeral loopback sockets for the test's own HTTP host; the registry
+// (crates/app/src/surface.rs) governs production binds.
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +33,21 @@ async fn started() -> (std::net::SocketAddr, mpsc::Receiver<SourceMessage>, Stri
 async fn started_with(
     mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
 ) -> (std::net::SocketAddr, mpsc::Receiver<SourceMessage>, String) {
+    let (addr, rx, fingerprint, _base) = started_full(mirror, false).await;
+    (addr, rx, fingerprint)
+}
+
+/// The receiver, optionally with its HTTP surface served — which is what an `fcomp://`
+/// load resolves to and therefore half of what that test is about (#249).
+async fn started_full(
+    mirror: Option<Arc<dyn castaway_core::MirrorBackend>>,
+    serve_http: bool,
+) -> (
+    std::net::SocketAddr,
+    mpsc::Receiver<SourceMessage>,
+    String,
+    String,
+) {
     let (tx, rx) = mpsc::channel(32);
     let sink = SessionSink::new(SourceId::new(ProtocolKind::FCast, "test"), tx);
     let (identity, _key) = V4Identity::generate().unwrap();
@@ -37,16 +55,29 @@ async fn started_with(
     let receiver = FCastReceiver::new("Test Panel")
         .with_listen(([127, 0, 0, 1], 0).into())
         .with_v4(identity, true);
-    let receiver = Arc::new(match mirror {
+    let receiver = match mirror {
         Some(backend) => receiver.with_mirroring(backend),
         None => receiver,
-    });
+    };
+    let (receiver, base) = if serve_http {
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", http.local_addr().unwrap());
+        let receiver = receiver.with_local_host(&base);
+        let router = receiver.router();
+        tokio::spawn(async move {
+            let _ = axum::serve(http, router).await;
+        });
+        (receiver, base)
+    } else {
+        (receiver, String::new())
+    };
+    let receiver = Arc::new(receiver);
     let adapter = Arc::clone(&receiver);
     tokio::spawn(async move {
         let _ = adapter.run(sink).await;
     });
     let addr = eventually("the listener to bind", || receiver.bound_addr()).await;
-    (addr, rx, fingerprint)
+    (addr, rx, fingerprint, base)
 }
 
 /// A mirroring plane that answers instantly and remembers what it was asked.
@@ -520,4 +551,224 @@ async fn a_backend_that_cannot_answer_is_reported_to_the_sender() {
         flat::ErrorKind::Internal,
         "the sender is told the receiver failed, not that it was asked wrongly"
     );
+}
+
+/// A `CompanionHelloRequest` frame.
+fn companion_hello_frame() -> Frame {
+    let mut b = fcast_flatbuf::FlatBufferBuilder::new();
+    let hello = flat::CompanionHelloRequest::create(&mut b, &flat::CompanionHelloRequestArgs {})
+        .as_union_value();
+    let packet = flat::Packet::create(
+        &mut b,
+        &flat::PacketArgs {
+            payload_type: flat::Message::CompanionHelloRequest,
+            payload: Some(hello),
+        },
+    );
+    b.finish(packet, None);
+    Frame::with_body(Opcode::Flatbuf, b.finished_data().to_vec())
+}
+
+/// `CompanionResourceInfoResponse` — the sender saying what one of its resources is.
+fn resource_info_frame(request_id: u32, content_type: &str, size: Option<u64>) -> Frame {
+    let mut b = fcast_flatbuf::FlatBufferBuilder::new();
+    let content_type = b.create_string(content_type);
+    let (size_type, size_value) = match size {
+        Some(size) => {
+            let known =
+                flat::KnownResourceSize::create(&mut b, &flat::KnownResourceSizeArgs { size });
+            (
+                flat::CompanionResourceSize::Known,
+                Some(known.as_union_value()),
+            )
+        }
+        None => {
+            let unknown =
+                flat::UnknownResourceSize::create(&mut b, &flat::UnknownResourceSizeArgs {});
+            (
+                flat::CompanionResourceSize::Unknown,
+                Some(unknown.as_union_value()),
+            )
+        }
+    };
+    let response = flat::CompanionResourceInfoResponse::create(
+        &mut b,
+        &flat::CompanionResourceInfoResponseArgs {
+            request_id,
+            content_type: Some(content_type),
+            resource_size_type: size_type,
+            resource_size: size_value,
+        },
+    )
+    .as_union_value();
+    let packet = flat::Packet::create(
+        &mut b,
+        &flat::PacketArgs {
+            payload_type: flat::Message::CompanionResourceInfoResponse,
+            payload: Some(response),
+        },
+    );
+    b.finish(packet, None);
+    Frame::with_body(Opcode::Flatbuf, b.finished_data().to_vec())
+}
+
+/// A `Load` naming an `fcomp://` source.
+fn load_companion_frame(provider: u16, resource: u32) -> Frame {
+    load_single_frame(&format!("fcomp://{provider}.fcast/{resource}"))
+}
+
+/// The whole FCompanion round trip (#249): the sender offers to serve resources, plays
+/// one by `fcomp://` URL, and the bytes come back over the *control connection* while an
+/// ordinary HTTP GET — the shape libavformat makes — is what asks for them.
+///
+/// The load being pointed at our own host is only half of it. The other half is that the
+/// GET is answered from the sender's own storage, in parts, over the socket it dialled in
+/// on, which is the part that has no analogue anywhere else in this tree.
+#[tokio::test]
+async fn a_companion_resource_is_read_back_over_the_control_connection() {
+    use proto_fcast::companion::{encode_resource, ResourcePart, ResourceResult};
+
+    let (addr, mut rx, _fp, base) = started_full(None, true).await;
+    let mut sender = V4Sender::connect(addr).await;
+    sender
+        .expect_payload(flat::Message::ReceiverIntroduction)
+        .await;
+
+    // The sender offers to serve, and is told which provider id it owns.
+    sender.send(&companion_hello_frame()).await;
+    let body = sender
+        .expect_payload(flat::Message::CompanionHelloResponse)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&body).unwrap();
+    let provider = packet
+        .payload_as_companion_hello_response()
+        .unwrap()
+        .provider_id();
+
+    // …and plays a resource of its own by that id.
+    const RESOURCE: u32 = 7;
+    const BODY: &[u8] = b"the bytes that were on the phone";
+    sender.send(&load_companion_frame(provider, RESOURCE)).await;
+
+    let url = loop {
+        if let SessionEvent::Play { source, .. } = next_event(&mut rx).await {
+            break source.uri().to_string();
+        }
+    };
+    assert_eq!(
+        url,
+        format!("{base}/fcast/companion/{provider}/{RESOURCE}"),
+        "an fcomp URL must reach the decoder as one it can open"
+    );
+
+    // Now be the sender: answer the reads the HTTP request provokes. Driven from a task,
+    // because the GET below does not return until they have been answered.
+    let fetch = tokio::spawn(async move { get(&url).await });
+
+    let body_frame = sender
+        .expect_payload(flat::Message::CompanionResourceInfoRequest)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&body_frame).unwrap();
+    let info = packet.payload_as_companion_resource_info_request().unwrap();
+    assert_eq!(info.resource_id(), RESOURCE, "the read names the resource");
+    let info_request_id = info.request_id();
+    sender
+        .send(&resource_info_frame(
+            info_request_id,
+            "video/mp4",
+            Some(BODY.len() as u64),
+        ))
+        .await;
+
+    let read_frame = sender
+        .expect_payload(flat::Message::CompanionResourceRequest)
+        .await;
+    let packet = fcast_flatbuf::root_as_packet(&read_frame).unwrap();
+    let read = packet.payload_as_companion_resource_request().unwrap();
+    assert_eq!(read.resource_id(), RESOURCE);
+    let head = read.read_head().unwrap();
+    assert_eq!(head.start(), 0, "the first window starts at the beginning");
+    assert!(
+        head.stop_inclusive() >= u64::try_from(BODY.len()).unwrap() - 1,
+        "the window must cover what was asked for: {}",
+        head.stop_inclusive()
+    );
+    let read_request_id = read.request_id();
+    assert_ne!(
+        read_request_id, info_request_id,
+        "each read gets its own id, so a late part cannot be spliced into another"
+    );
+
+    // Answered in two parts, because that is the case the spec spends its words on and
+    // the one a single-part answer would never exercise.
+    let (first, second) = BODY.split_at(10);
+    for (index, chunk) in [first, second].iter().enumerate() {
+        sender
+            .send(&Frame::with_body(
+                Opcode::Resource,
+                encode_resource(&ResourcePart {
+                    request_id: read_request_id,
+                    part: u8::try_from(index).unwrap(),
+                    total: 2,
+                    result: ResourceResult::Data(chunk.to_vec()),
+                }),
+            ))
+            .await;
+    }
+
+    let (status, headers, served) = fetch.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| value.as_str()),
+        Some("video/mp4"),
+        "the sender's declared type is what the demuxer probe reads"
+    );
+    assert_eq!(
+        served, BODY,
+        "the bytes the sender served came through whole"
+    );
+}
+
+/// A `fcomp://` URL whose provider nobody owns is a 404, not a hang.
+///
+/// The failure that matters: an unanswerable read left registered would park a decode
+/// thread on an HTTP request for the whole companion timeout.
+#[tokio::test]
+async fn an_fcomp_url_with_no_provider_is_refused_promptly() {
+    let (_addr, _rx, _fp, base) = started_full(None, true).await;
+    let (status, _, _) = get(&format!("{base}/fcast/companion/9/1")).await;
+    assert_eq!(status, 404);
+}
+
+/// A one-line HTTP/1.1 GET, so the routes are driven the way libavformat drives them.
+async fn get(url: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let rest = url.strip_prefix("http://").expect("an http url");
+    let (authority, path) = rest.split_once('/').expect("a path");
+    let mut stream = TcpStream::connect(authority).await.unwrap();
+    let request = format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(DEADLINE, stream.read_to_end(&mut raw))
+        .await
+        .expect("the receiver's HTTP host did not answer")
+        .unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a complete header block");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut lines = head.lines();
+    let status: u16 = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    let headers = lines
+        .filter_map(|line| line.split_once(": "))
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
+        .collect();
+    (status, headers, raw[split + 4..].to_vec())
 }

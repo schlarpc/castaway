@@ -78,9 +78,11 @@ impl ResolvedItem {
     fn resolve(play: PlayMessage, what: &str) -> Result<Self, Refusal> {
         use fcast_flatbuf::flat::ErrorKind;
         if play.url.is_none() && play.content.is_some() {
-            // Inline content (a DASH manifest pushed as text) needs somewhere to be
-            // fetched *from* — hosting it is issue #249. Refused rather than guessed
-            // at: a sender told "unsupported" can fall back to its URL path.
+            // Inline content needs somewhere to be fetched *from*, and the adapter has
+            // already published it on the shared host when there is one
+            // (`resolve_sources`, #249). Reaching here means there is not — a build with
+            // no HTTP surface mounted — and a sender told "unsupported" can fall back to
+            // its URL path, which is better than a load that hangs.
             return Err(Refusal::kinded(
                 format!("{what}: inline content is not supported by this receiver; send a URL"),
                 ErrorKind::UnsupportedFormat,
@@ -114,8 +116,12 @@ impl ResolvedItem {
         })
     }
 
-    /// Resolve one v4 item (#248). `fcomp://` is FCompanion's scheme — #249's
-    /// seam — refused typed until it lands.
+    /// Resolve one v4 item (#248).
+    ///
+    /// `fcomp://` — FCompanion's scheme, media the *sender* serves — has already been
+    /// rewritten to the local proxy by the actor when a host is configured (#249). It
+    /// reaches here only in a build with no HTTP surface, where `ResourceNotFound` is the
+    /// truthful answer: the resource exists, and this receiver cannot get at it.
     fn resolve_v4(item: &crate::v4msg::V4MediaItem, what: &str) -> Result<Self, Refusal> {
         use fcast_flatbuf::flat::ErrorKind;
         let uri = MediaUri::parse(&item.source_url).map_err(|e| {
@@ -270,9 +276,10 @@ impl Player {
     pub fn load(&mut self, play: PlayMessage) -> Result<Applied, Refusal> {
         let (queue, index, is_playlist) = if play.container == "application/json" {
             let Some(content) = play.content.as_deref() else {
-                // A playlist *URL* would need fetching before we know its items —
-                // deliberately not guessed at (issue #249 covers hosted/fetched
-                // content in both directions).
+                // The items are not known until the playlist has been fetched, and this
+                // is a pure function. The adapter fetches it at the boundary when there is
+                // a host configured (#249); reaching here means the fetch was not possible
+                // or did not succeed, and the sender is told so rather than left waiting.
                 return Err(Refusal::kinded(
                     "playlist by URL is not supported by this receiver; send the playlist inline",
                     fcast_flatbuf::flat::ErrorKind::UnsupportedFormat,
