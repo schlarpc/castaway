@@ -32,6 +32,17 @@ over a 9 s idle window — the heartbeat is receiver-initiated in practice.
 field explicitly (`"content":null`, `"time":0.0`, `"speed":1.0`), which is exactly
 the implicit-v1 path and the null-tolerance the session claims to handle.
 
+The `sdk-0.3.0-v4-*` transcripts are the same sender run through a **protocol v4**
+session (#248): the scripted receiver advertised `v=4` and an `fp` TXT over mDNS
+(the SDK refuses v4 without a fingerprint to pin — verified: by bare IP it closes
+before the ClientHello), answered `Version {4}`, and terminated TLS 1.3 with the
+pinned self-signed cert. Rows gain a `"plaintext"` field; TLS-phase frames are
+recorded decrypted. Every one shows the v4 preamble — `SenderIntroduction` then an
+automatic `CompanionHelloRequest`, both FlatBuffers under opcode 20 — and
+`v4-set-playlist-item` catches the SDK sending the **raw v3 JSON opcode 16 inside a
+v4 session**, which a receiver must answer with `Error{InvalidOpcode}` rather than
+honour.
+
 `tests/real_sender_transcripts.rs` replays every `in` frame through the pure
 session + player and asserts what the session must have concluded. Recapture with a
 newer sender by re-running the harness in the #241 work notes and adding files under
