@@ -3456,6 +3456,184 @@ mod tests {
         assert!(tried >= 2, "the device was never retried after it refused");
     }
 
+    /// Named output devices the way the strict backends see them (#252): a registry of
+    /// nodes by name, where removing and re-adding a name yields a *different* node.
+    ///
+    /// This is the name-matching decision, stated as a fake so a test can observe it: a
+    /// device's identity is the name string the backend enumerates
+    /// (`OutputDeviceInfo::id` — a PipeWire `node.name`, a WASAPI device name), because
+    /// it is the only identity that survives the remove/re-add a DPMS cycle performs
+    /// (#55) — numeric node ids and endpoint handles do not. So "the same device came
+    /// back" *means* "a new node appeared under the remembered name", which is why each
+    /// `add` binds a fresh [`Recorder`]: audio landing on the second recorder is the
+    /// re-adoption, not a stream that somehow survived.
+    #[derive(Default)]
+    struct FakeNodes {
+        nodes: Mutex<std::collections::HashMap<String, Arc<Recorder>>>,
+    }
+
+    impl FakeNodes {
+        /// A node appears under `name` — a new one, even if the name was seen before.
+        fn add(self: &Arc<Self>, name: &str) -> Arc<Recorder> {
+            let node = Recorder::new();
+            self.nodes
+                .lock()
+                .unwrap()
+                .insert(name.to_owned(), Arc::clone(&node));
+            node
+        }
+
+        /// The node under `name` vanishes (the panel slept).
+        fn remove(self: &Arc<Self>, name: &str) {
+            self.nodes.lock().unwrap().remove(name);
+        }
+
+        /// What the app installs: a factory whose every open re-resolves the remembered
+        /// name, exactly as `output_factory` + the strict backends do.
+        fn factory(self: &Arc<Self>, remembered: &str) -> AudioOutputFactory {
+            let nodes = Arc::clone(self);
+            let name = remembered.to_owned();
+            Arc::new(move || {
+                Box::new(StrictNamed {
+                    nodes: Arc::clone(&nodes),
+                    name: name.clone(),
+                    node: None,
+                })
+            })
+        }
+    }
+
+    /// One backend instance over [`FakeNodes`], modelling the observed behaviour of the
+    /// strict backends: `start` resolves the name and *refuses* when it is absent —
+    /// never substitutes — and a write to a node that has since been removed is the
+    /// endpoint-invalidated error the real backends surface.
+    struct StrictNamed {
+        nodes: Arc<FakeNodes>,
+        name: String,
+        node: Option<Arc<Recorder>>,
+    }
+
+    impl AudioOut for StrictNamed {
+        fn start(&mut self, rate: u32, channels: u16) -> Result<(), PipelineError> {
+            let Some(node) = self.nodes.nodes.lock().unwrap().get(&self.name).cloned() else {
+                return Err(PipelineError::Audio(format!(
+                    "device {:?} is not present",
+                    self.name
+                )));
+            };
+            self.node = Some(Arc::clone(&node));
+            let mut node = node;
+            node.start(rate, channels)
+        }
+
+        fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
+            let Some(node) = self.node.as_ref() else {
+                return Err(PipelineError::Audio("never started".into()));
+            };
+            // The node this stream opened may be gone, or replaced under the same name
+            // — either way *this* stream's endpoint is invalid, and saying so is what
+            // hands recovery to the mixer.
+            let current = self.nodes.nodes.lock().unwrap().get(&self.name).cloned();
+            if !current.is_some_and(|c| Arc::ptr_eq(&c, node)) {
+                return Err(PipelineError::Audio("the endpoint has gone away".into()));
+            }
+            Arc::clone(node).write(block)
+        }
+
+        fn stop(&mut self) {}
+
+        fn frames_played(&self) -> Option<u64> {
+            self.node
+                .as_ref()
+                .and_then(|node| Arc::clone(node).frames_played())
+        }
+    }
+
+    /// #252's arrival clause: a config remembering a device that is not there yet must
+    /// neither error the session nor be "corrected" to some other device — it selects
+    /// the named device when it appears. Through the mixer this is nothing more than
+    /// the strict backends' refusal composed with the `retry_at` loop, and that
+    /// composition is what runs here.
+    #[test]
+    fn a_device_named_in_the_config_is_selected_when_it_arrives() {
+        let nodes = Arc::new(FakeNodes::default());
+        let mixer = AudioMixer::new(nodes.factory("hdmi"));
+        let mut input = mixer.input(Backpressure::Pull);
+
+        // Play into the absence for a while — long enough that the loop has refused
+        // more than once. The session must drain in real time throughout.
+        let arrives_at = Instant::now() + REOPEN_AFTER + REOPEN_AFTER / 2;
+        while Instant::now() < arrives_at {
+            input.write(&tone(240, 0.5)).unwrap();
+        }
+
+        let node = nodes.add("hdmi");
+        // Audible within one retry interval of arrival, plus the same grace the
+        // comeback test allows. Polled rather than slept: an expired deadline reports
+        // what was being waited for.
+        let deadline = Instant::now() + REOPEN_AFTER + Duration::from_millis(500);
+        while node.peak() < 0.4 && Instant::now() < deadline {
+            input.write(&tone(240, 0.5)).unwrap();
+        }
+        assert!(
+            node.peak() > 0.4,
+            "the configured device arrived and was not selected (peak {})",
+            node.peak()
+        );
+        assert_eq!(
+            input.dropped, 0,
+            "waiting for the configured device cost the source its audio"
+        );
+    }
+
+    /// #252's headline, in #55's shape: DPMS sleep removes the HDMI sink and waking
+    /// re-adds it as a *new* node under the same name. The remembered selection has to
+    /// follow the name onto the new node, with nobody touching the Settings menu.
+    #[test]
+    fn a_remembered_device_that_returns_as_a_new_node_is_readopted() {
+        let nodes = Arc::new(FakeNodes::default());
+        let first = nodes.add("hdmi");
+        let mixer = AudioMixer::new(nodes.factory("hdmi"));
+        let mut input = mixer.input(Backpressure::Pull);
+
+        // Steady state on the first node, so the outage interrupts a playing session
+        // rather than beating it to the device.
+        let settled = Instant::now() + Duration::from_secs(2);
+        while first.peak() < 0.4 && Instant::now() < settled {
+            input.write(&tone(240, 0.5)).unwrap();
+        }
+        assert!(
+            first.peak() > 0.4,
+            "the session never became audible before the outage (peak {})",
+            first.peak()
+        );
+
+        // The panel sleeps: the node is removed, and the session keeps playing into
+        // the outage...
+        nodes.remove("hdmi");
+        let outage_over = Instant::now() + REOPEN_AFTER + REOPEN_AFTER / 2;
+        while Instant::now() < outage_over {
+            input.write(&tone(240, 0.5)).unwrap();
+        }
+
+        // ...and wakes: a new node, same name.
+        let second = nodes.add("hdmi");
+        let deadline = Instant::now() + REOPEN_AFTER + Duration::from_millis(500);
+        while second.peak() < 0.4 && Instant::now() < deadline {
+            input.write(&tone(240, 0.5)).unwrap();
+        }
+        assert!(
+            second.peak() > 0.4,
+            "the remembered device returned as a new node and was not re-adopted \
+             (peak {})",
+            second.peak()
+        );
+        assert_eq!(
+            input.dropped, 0,
+            "the outage is allowed to cost the source its audibility, not its audio"
+        );
+    }
+
     #[test]
     fn a_device_that_keeps_refusing_is_asked_less_and_less_often() {
         // The two cases this has to serve at once. A panel waking from DPMS (#55) is over

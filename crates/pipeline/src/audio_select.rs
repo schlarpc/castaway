@@ -21,6 +21,16 @@ pub enum OutputSelection {
     /// A specific device, named in the active backend's own vocabulary — a PipeWire
     /// `node.name`, a WASAPI device name. Meaningless on any other machine, which is
     /// why config keys it per backend.
+    ///
+    /// The name **is** the identity (#252): backends match it by exact string equality
+    /// against what they enumerate ([`OutputDeviceInfo::id`]), because a name is the
+    /// only identity that survives the device vanishing and returning — a slept
+    /// panel's HDMI sink comes back as a *new* PipeWire node with a new numeric id
+    /// and the same `node.name` (#55), and WASAPI endpoint handles do not survive
+    /// either. Two consequences, both deliberate: a named device that is absent is a
+    /// refusal rather than a substitution (the mixer keeps retrying, so the device is
+    /// selected when it arrives and re-selected when it returns), and a device that
+    /// changes its name is a different device.
     Device(String),
 }
 

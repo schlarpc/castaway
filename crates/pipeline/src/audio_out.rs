@@ -345,25 +345,9 @@ mod cpal_backend {
         }
     }
 
-    /// How hard an open should hold to the device the session is already using.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Loyalty {
-        /// Resolve the selection from scratch. What a fresh session does.
-        AsSelected,
-        /// Reopening mid-session. Under `Device` the named endpoint is the only
-        /// acceptable answer; under `SystemDefault` the *current* default is, because
-        /// that selection means "follow the default" and following it is the point.
-        Reopening,
-    }
-
     impl CpalAudioOut {
         /// Open the device and start the stream, replacing anything already open.
-        fn open(
-            &mut self,
-            sample_rate: u32,
-            channels: u16,
-            loyalty: Loyalty,
-        ) -> Result<(), PipelineError> {
+        fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
             let (samples_tx, samples_rx) = sync_channel::<Vec<f32>>(QUEUE_BLOCKS);
             let (shutdown_tx, shutdown_rx) = sync_channel::<()>(1);
             // The thread reports whether the device opened, so this can still fail
@@ -378,7 +362,6 @@ mod cpal_backend {
             let selection = self.selection.clone();
             let lost = Arc::clone(&self.lost);
             lost.store(false, Ordering::Relaxed);
-            let strict = loyalty == Loyalty::Reopening;
 
             std::thread::spawn(move || {
                 let stream = match open_stream(
@@ -387,7 +370,6 @@ mod cpal_backend {
                     channels,
                     samples_rx,
                     super::StreamCounters { underruns, played },
-                    strict,
                     &lost,
                 ) {
                     Ok((s, opened_at, device)) => {
@@ -462,7 +444,7 @@ mod cpal_backend {
             }
             self.last_attempt = Some(now);
             self.release();
-            match self.open(rate, channels, Loyalty::Reopening) {
+            match self.open(rate, channels) {
                 Ok(()) => {
                     info!("audio output recovered");
                     self.outage_logged = false;
@@ -534,9 +516,7 @@ mod cpal_backend {
         fn start(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
             self.stop();
             self.shape = Some((sample_rate, channels));
-            // Honour the selection as written, falling back if a named device is absent:
-            // at session start there is nothing to be loyal to yet.
-            self.open(sample_rate, channels, Loyalty::AsSelected)
+            self.open(sample_rate, channels)
         }
 
         fn write(&mut self, block: &PcmBlock) -> Result<(), PipelineError> {
@@ -656,41 +636,34 @@ mod cpal_backend {
 
     /// The device `selection` names, or the default.
     ///
-    /// A named device that is not there falls back to the default *with a warning*
-    /// rather than failing the session: the case this happens in is a USB DAC that was
-    /// unplugged, and a panel that goes silent because its favourite device left is
-    /// worse than one that plays from the wrong speakers and says so.
-    fn pick_device(
-        host: &cpal::Host,
-        selection: &OutputSelection,
-        strict: bool,
-    ) -> Result<cpal::Device, String> {
-        if let OutputSelection::Device(name) = selection {
-            if strict {
-                // Reopening mid-session: the named endpoint is the only acceptable
-                // answer. Falling back here is what turns a sleeping monitor into audio
-                // played out of a disconnected analog jack — a retry that substitutes
-                // does not wait, it succeeds immediately on the wrong device, and nothing
-                // ever moves it back.
-                return host
-                    .output_devices()
-                    .map_err(|e| format!("listing output devices: {e}"))?
-                    .find(|d| device_name(d).is_some_and(|n| n == *name))
-                    .ok_or_else(|| format!("device {name:?} is not present"));
-            }
-        }
-        if let OutputSelection::Device(name) = selection {
-            let found = host
+    /// A named device that is not present is a refusal, never a substitution (#252).
+    /// This used to fall back to the default at session start, on the theory that wrong
+    /// speakers beat a panel gone silent over an unplugged DAC — but a substitution that
+    /// *succeeds* is never revisited, so the moment it mattered (the panel's endpoint
+    /// removed by DPMS sleep, #55) it turned a seconds-long outage into audio
+    /// permanently on a disconnected analog jack. And since #111 the mixer rebuilds this
+    /// backend from the factory on every reopen, so "session start" is also every
+    /// recovery — the strictness the reopen path already had was being bypassed by the
+    /// path that mattered.
+    ///
+    /// Refusing makes an absent device indistinguishable from one that will not open,
+    /// which is the point: the mixer answers both by retrying (`REOPEN_AFTER`, backed
+    /// off), so the named endpoint is adopted the moment it appears and re-adopted when
+    /// it returns — the same event, since it is matched by *name*
+    /// ([`super::OutputDeviceInfo::id`]) and names are the only identity that survives a
+    /// remove/re-add. Anyone who wants the wrong-speakers-over-silence trade states it
+    /// by selecting [`OutputSelection::SystemDefault`].
+    fn pick_device(host: &cpal::Host, selection: &OutputSelection) -> Result<cpal::Device, String> {
+        match selection {
+            OutputSelection::Device(name) => host
                 .output_devices()
                 .map_err(|e| format!("listing output devices: {e}"))?
-                .find(|d| device_name(d).is_some_and(|n| n == *name));
-            match found {
-                Some(device) => return Ok(device),
-                None => warn!(device = %name, "configured output device not found; using default"),
-            }
+                .find(|d| device_name(d).is_some_and(|n| n == *name))
+                .ok_or_else(|| format!("device {name:?} is not present")),
+            OutputSelection::SystemDefault => host
+                .default_output_device()
+                .ok_or_else(|| "no default output device".to_owned()),
         }
-        host.default_output_device()
-            .ok_or_else(|| "no default output device".to_owned())
     }
 
     /// Say what the device wanted, not merely that it refused.
@@ -796,11 +769,10 @@ mod cpal_backend {
         channels: u16,
         rx: Receiver<Vec<f32>>,
         counters: super::StreamCounters,
-        strict: bool,
         lost: &Arc<AtomicBool>,
     ) -> Result<(cpal::Stream, u32, String), String> {
         let host = cpal::default_host();
-        let device = pick_device(&host, selection, strict)?;
+        let device = pick_device(&host, selection)?;
         let name = device_name(&device).unwrap_or_else(|| "<unnamed>".to_owned());
         let opened_at = choose_rate(&device, sample_rate, channels)?;
 

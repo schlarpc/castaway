@@ -8,9 +8,12 @@
 //! owned by a thread of its own — because that shape is what keeps a dropout from
 //! being anyone else's problem.
 //!
-//! A named sink that is not there falls back to whatever the session manager links
-//! (the default), same policy as the cpal backend: wrong speakers that say so beat a
-//! panel gone silent over an unplugged DAC.
+//! A named sink that is not there is a refusal, not a substitution — same policy as
+//! the cpal backend, decided at #252: the sink is matched by `node.name`, which is the
+//! one identity that survives a DPMS cycle removing and re-adding the node (#55), and
+//! an open that refuses is what lets the mixer's retry loop adopt the sink the moment
+//! it (re)appears. Whoever prefers wrong-speakers-over-silence selects the system
+//! default, where following the session manager is the stated policy.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -208,6 +211,22 @@ impl PipeWireAudioOut {
     }
 
     fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), PipelineError> {
+        // A named sink has to be *present* before the stream is built (#252). Without
+        // this check, connecting with `target.object` naming an absent node "succeeds"
+        // and then never links: `start` reports a working output, the mixer counts a
+        // real sink, and the failure surfaces later as a stall instead of now as the
+        // refusal it is — which is what the mixer's retry loop is built to answer.
+        // Matched by `node.name` (`OutputDeviceInfo::id`), the identity that survives
+        // the node being removed and re-added (#55). The sink can still vanish between
+        // this check and the connect; `node.dont-reconnect` and the `lost` flag catch
+        // that the way they catch any mid-stream loss.
+        if let OutputSelection::Device(node) = &self.selection {
+            if !list_sinks()?.iter().any(|sink| sink.id == *node) {
+                return Err(PipelineError::Audio(format!(
+                    "sink {node:?} is not present"
+                )));
+            }
+        }
         let (samples_tx, samples_rx) = sync_channel::<Vec<f32>>(QUEUE_BLOCKS);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<()>();
         let (ready_tx, ready_rx) = sync_channel::<Result<(), String>>(1);
