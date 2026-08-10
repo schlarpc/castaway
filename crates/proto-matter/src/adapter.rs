@@ -612,7 +612,7 @@ impl MatterAdapter {
                     match surface {
                         Surface::Player => {
                             sink.emit(SessionEvent::Play {
-                                source: MediaUri::parse(&url)?,
+                                source: MediaUri::parse(&url)?.into(),
                                 start: None,
                             })
                             .await?;

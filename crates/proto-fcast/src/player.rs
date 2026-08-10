@@ -12,8 +12,8 @@
 use std::time::Duration;
 
 use castaway_core::{
-    ControlTxn, MediaUri, NowPlaying, PlaybackEnd, PlaybackProgress, QueueItem, SessionEvent,
-    Volume,
+    ControlTxn, MediaRequest, MediaUri, NowPlaying, PlaybackEnd, PlaybackProgress, QueueItem,
+    RequestHeader, SessionEvent, Volume,
 };
 
 use crate::messages::{MediaItemEventKind, PlayMessage, PlayState, PlaylistContent};
@@ -61,7 +61,11 @@ pub struct Applied {
 /// One resolved, playable entry.
 #[derive(Debug, Clone)]
 struct ResolvedItem {
-    uri: MediaUri,
+    /// The fetch, headers and all (#251). FCast is the one protocol here whose senders
+    /// say how to open the media as well as where it is — Grayjay puts an
+    /// `Authorization: Bearer …` on an auth-gated source — and before this seam existed
+    /// the URL was kept and the headers dropped.
+    request: MediaRequest,
     start: Option<Duration>,
     /// The item in `PlayMessage` shape, for media-item events and `playData` echoes.
     echo: PlayMessage,
@@ -90,13 +94,20 @@ impl ResolvedItem {
         };
         let uri = MediaUri::parse(url)
             .map_err(|e| Refusal::kinded(format!("{what}: {e}"), ErrorKind::UnsupportedFormat))?;
+        let headers = request_headers(
+            play.headers
+                .iter()
+                .flatten()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            what,
+        )?;
         let start = play
             .time
             .filter(|&t| t > 0.0)
             .and_then(|t| Duration::try_from_secs_f64(t).ok());
         let title = play.metadata.as_ref().and_then(|m| m.title.clone());
         Ok(Self {
-            uri,
+            request: MediaRequest::with_headers(uri, headers),
             start,
             title,
             echo: play,
@@ -132,13 +143,44 @@ impl ResolvedItem {
                     custom: None,
                 }),
         };
+        let headers = request_headers(
+            item.headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            what,
+        )?;
         Ok(Self {
-            uri,
+            request: MediaRequest::with_headers(uri, headers),
             start: item.start_time.filter(|d| !d.is_zero()),
             title: item.title.clone(),
             echo,
         })
     }
+}
+
+/// Turn what a sender sent into headers we will actually put on a fetch.
+///
+/// Sorted by name, which the wire is not: v1-v3 carries them in a JSON object and
+/// `serde_json` hands those back in hash order, so the *same* `play` produced a different
+/// header block on each run and no fixture could pin it. v4's vector is ordered, and
+/// sorting it too costs nothing and makes the two dialects produce one block.
+///
+/// A header we will not send is a refusal rather than a silent drop: a sender that puts
+/// `Authorization: Bearer …\r\nHost: elsewhere` on an item is either broken or hostile,
+/// and playing the media without the header it said was required would look like success.
+fn request_headers<'a>(
+    headers: impl Iterator<Item = (&'a str, &'a str)>,
+    what: &str,
+) -> Result<Vec<RequestHeader>, Refusal> {
+    use fcast_flatbuf::flat::ErrorKind;
+    let mut parsed = headers
+        .map(|(name, value)| {
+            RequestHeader::new(name, value)
+                .map_err(|e| Refusal::kinded(format!("{what}: {e}"), ErrorKind::MalformedBody))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    parsed.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(parsed)
 }
 
 #[derive(Debug)]
@@ -525,7 +567,13 @@ impl Player {
     fn up_next(loaded: &Loaded) -> Vec<QueueItem> {
         loaded.queue[loaded.index + 1..]
             .iter()
-            .map(|next| QueueItem::new(next.title.clone().unwrap_or_else(|| next.uri.to_string())))
+            .map(|next| {
+                QueueItem::new(
+                    next.title
+                        .clone()
+                        .unwrap_or_else(|| next.request.to_string()),
+                )
+            })
             .collect()
     }
 
@@ -545,12 +593,18 @@ impl Player {
         now_playing.duration = None;
         let up_next: Vec<QueueItem> = loaded.queue[loaded.index + 1..]
             .iter()
-            .map(|next| QueueItem::new(next.title.clone().unwrap_or_else(|| next.uri.to_string())))
+            .map(|next| {
+                QueueItem::new(
+                    next.title
+                        .clone()
+                        .unwrap_or_else(|| next.request.to_string()),
+                )
+            })
             .collect();
 
         let mut events = vec![
             SessionEvent::Play {
-                source: item.uri.clone(),
+                source: item.request.clone(),
                 start: item.start,
             },
             SessionEvent::NowPlaying(now_playing),
@@ -819,10 +873,77 @@ mod tests {
             .events
             .iter()
             .find_map(|e| match e {
-                SessionEvent::Play { source, .. } => Some(source.url().to_string()),
+                SessionEvent::Play { source, .. } => Some(source.uri().to_string()),
                 _ => None,
             })
             .expect("a Play event")
+    }
+
+    fn played_headers(applied: &Applied) -> Vec<(String, String)> {
+        applied
+            .events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Play { source, .. } => Some(
+                    source
+                        .headers()
+                        .iter()
+                        .map(|h| (h.name().to_owned(), h.value().to_owned()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("a Play event")
+    }
+
+    /// #251: the captured fixture has `Authorization: Bearer …` on a plain `play`, and
+    /// the sender did tell us how to fetch the media. It now rides the `Play`.
+    #[test]
+    fn a_v1_to_v3_play_carries_its_request_headers() {
+        let mut player = Player::new();
+        let play = PlayMessage {
+            headers: Some(
+                [
+                    ("Authorization".to_string(), "Bearer sekrit".to_string()),
+                    ("Referer".to_string(), "https://h/".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..play_url("http://h/v.mp4")
+        };
+        let applied = player.load(play).unwrap();
+        // Sorted, because the wire here is a JSON object and serde hands those back in
+        // hash order — the same `play` must produce the same fetch on every run.
+        assert_eq!(
+            played_headers(&applied),
+            [
+                ("Authorization".to_string(), "Bearer sekrit".to_string()),
+                ("Referer".to_string(), "https://h/".to_string()),
+            ]
+        );
+    }
+
+    /// A header we would not send is a typed refusal, not a silent drop: fetching
+    /// without the credential the sender said was required would look like success and
+    /// fail at the server.
+    #[test]
+    fn a_header_that_would_forge_a_request_is_refused() {
+        let mut player = Player::new();
+        let play = PlayMessage {
+            headers: Some(
+                [(
+                    "Authorization".to_string(),
+                    "Bearer a\r\nHost: elsewhere".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..play_url("http://h/v.mp4")
+        };
+        let refusal = player.load(play).unwrap_err();
+        assert_eq!(refusal.kind, fcast_flatbuf::flat::ErrorKind::MalformedBody);
+        assert!(player.play_data().is_none(), "a refusal changes nothing");
     }
 
     #[test]

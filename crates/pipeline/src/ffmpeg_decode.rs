@@ -221,6 +221,7 @@ fn packet_due(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_av<F, O>(
     uri: &str,
+    headers: &[castaway_core::RequestHeader],
     preference: HwPreference,
     clock: &crate::clock::MediaClock,
     seek: Option<&crate::seek::SeekControl>,
@@ -243,6 +244,7 @@ where
     loop {
         match av_session(
             uri,
+            headers,
             &mut hw,
             clock,
             seek,
@@ -272,6 +274,7 @@ where
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn av_session<F, O>(
     uri: &str,
+    headers: &[castaway_core::RequestHeader],
     hw: &mut HwAttempt,
     clock: &crate::clock::MediaClock,
     seek: Option<&crate::seek::SeekControl>,
@@ -285,7 +288,7 @@ where
     F: FnMut(DecodedFrame) -> bool,
     O: FnMut(&MediaLayout),
 {
-    let mut ictx = open_input(uri)?;
+    let mut ictx = open_input(uri, headers)?;
 
     let video = ictx
         .streams()
@@ -605,12 +608,69 @@ const RECONNECT_DELAY_MAX_S: &str = "5";
 /// be asked about the resource and then handed the resource as one client.
 use castaway_core::MEDIA_USER_AGENT as USER_AGENT;
 
-/// Open `uri` for demuxing, with the options a network fetch needs.
+/// The two headers that make this a DLNA client rather than an anonymous GET.
+///
+/// `getcontentFeatures.dlna.org` asks the server to describe what it is about to send;
+/// `transferMode.dlna.org: Streaming` is the mode for audio and video, as against
+/// `Interactive` for images and `Background` for a bulk copy. Neither is mandatory, and
+/// servers that key their behaviour off them are common enough that omitting them means
+/// being served a different thing than every other renderer on the LAN gets.
+const DLNA_HEADERS: &[(&str, &str)] = &[
+    ("getcontentFeatures.dlna.org", "1"),
+    ("transferMode.dlna.org", "Streaming"),
+];
+
+/// What libavformat's `headers` option and `user_agent` option should be set to for a
+/// fetch the sender described (#251).
+///
+/// Two options rather than one blob because libavformat's HTTP protocol sends
+/// `user_agent` as its own field: a `User-Agent` left in the blob is sent *as well*, and a
+/// server then sees the field twice. Whatever the sender said wins — it knows which client
+/// its source expects — and everything else is appended after our own defaults, so a
+/// sender that sets `transferMode.dlna.org` overrides ours by being later in the block.
+///
+/// Pure and separated from the open so the merge is testable without a socket.
+fn fetch_options(headers: &[castaway_core::RequestHeader]) -> (String, String) {
+    let mut block = String::new();
+    for (name, value) in DLNA_HEADERS {
+        // A sender that names one of our defaults replaces it rather than duplicating it.
+        if headers.iter().any(|h| h.is(name)) {
+            continue;
+        }
+        block.push_str(name);
+        block.push_str(": ");
+        block.push_str(value);
+        block.push_str("\r\n");
+    }
+    for header in headers {
+        if header.is("user-agent") {
+            continue;
+        }
+        // No escaping and none needed: `RequestHeader` refuses a value holding CR, LF or
+        // any other control byte at the protocol boundary, which is the only place the
+        // check can be complete (see `castaway_core::RequestHeader`).
+        block.push_str(header.name());
+        block.push_str(": ");
+        block.push_str(header.value());
+        block.push_str("\r\n");
+    }
+    let user_agent = headers
+        .iter()
+        .find(|h| h.is("user-agent"))
+        .map_or_else(|| USER_AGENT.to_owned(), |h| h.value().to_owned());
+    (block, user_agent)
+}
+
+/// Open `uri` for demuxing, with the options a network fetch needs and whatever request
+/// headers the sender supplied.
 ///
 /// Applied only to network URIs. A local file has no socket to time out and no headers to
 /// carry, and handing libavformat options its protocol does not recognise earns a warning
 /// per open for nothing.
-fn open_input(uri: &str) -> Result<ffmpeg::format::context::Input, PipelineError> {
+fn open_input(
+    uri: &str,
+    headers: &[castaway_core::RequestHeader],
+) -> Result<ffmpeg::format::context::Input, PipelineError> {
     if !is_network_uri(uri) {
         return ffmpeg::format::input(&uri).map_err(map_err);
     }
@@ -621,21 +681,12 @@ fn open_input(uri: &str) -> Result<ffmpeg::format::context::Input, PipelineError
     // The HTTP/TCP protocols' own name for the same idea; they read this one, not
     // `rw_timeout`, on some builds.
     options.set("timeout", NETWORK_TIMEOUT_US);
-    options.set("user_agent", USER_AGENT);
     options.set("reconnect", "1");
     options.set("reconnect_streamed", "1");
     options.set("reconnect_delay_max", RECONNECT_DELAY_MAX_S);
-    // The two headers that make this a DLNA client rather than an anonymous GET.
-    //
-    // `getcontentFeatures.dlna.org` asks the server to describe what it is about to send;
-    // `transferMode.dlna.org: Streaming` is the mode for audio and video, as against
-    // `Interactive` for images and `Background` for a bulk copy. Neither is mandatory, and
-    // servers that key their behaviour off them are common enough that omitting them means
-    // being served a different thing than every other renderer on the LAN gets.
-    options.set(
-        "headers",
-        "getcontentFeatures.dlna.org: 1\r\ntransferMode.dlna.org: Streaming\r\n",
-    );
+    let (block, user_agent) = fetch_options(headers);
+    options.set("user_agent", &user_agent);
+    options.set("headers", &block);
     ffmpeg::format::input_with_dictionary(&uri, options).map_err(map_err)
 }
 
@@ -695,7 +746,7 @@ fn url_session<F>(
 where
     F: FnMut(DecodedFrame) -> bool,
 {
-    let mut ictx = open_input(uri)?;
+    let mut ictx = open_input(uri, &[])?;
     let input = ictx
         .streams()
         .best(ffmpeg::media::Type::Video)
@@ -1364,6 +1415,84 @@ fn to_decoded_frame(rgba: &ffmpeg::frame::Video, pts: Duration) -> DecodedFrame 
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn header(name: &str, value: &str) -> castaway_core::RequestHeader {
+        castaway_core::RequestHeader::new(name, value).unwrap()
+    }
+
+    /// A fetch nobody described is exactly the fetch it was before #251: our two DLNA
+    /// hints and our own user agent.
+    #[test]
+    fn a_bare_fetch_is_unchanged() {
+        let (block, user_agent) = fetch_options(&[]);
+        assert_eq!(
+            block,
+            "getcontentFeatures.dlna.org: 1\r\ntransferMode.dlna.org: Streaming\r\n"
+        );
+        assert_eq!(user_agent, USER_AGENT);
+    }
+
+    /// The case #251 is about: Grayjay says the source is auth-gated, and the token has
+    /// to reach the server rather than being kept and dropped.
+    #[test]
+    fn a_senders_headers_ride_the_fetch() {
+        let (block, user_agent) = fetch_options(&[header("Authorization", "Bearer abc")]);
+        assert!(
+            block.ends_with("Authorization: Bearer abc\r\n"),
+            "the sender's headers land after our defaults: {block:?}"
+        );
+        assert!(block.contains("transferMode.dlna.org: Streaming\r\n"));
+        assert_eq!(user_agent, USER_AGENT);
+    }
+
+    /// `user_agent` is libavformat's own option and is sent as its own field. A build
+    /// that left the header in the blob as well sent `User-Agent` twice, so it is lifted
+    /// out — and what the sender said wins, because it knows which client its source
+    /// expects to see.
+    #[test]
+    fn a_sender_user_agent_becomes_the_option_and_leaves_the_block() {
+        let (block, user_agent) = fetch_options(&[
+            header("User-Agent", "Grayjay/1.2"),
+            header("Referer", "https://grayjay.app/"),
+        ]);
+        assert_eq!(user_agent, "Grayjay/1.2");
+        assert!(!block.to_ascii_lowercase().contains("user-agent"));
+        assert!(block.contains("Referer: https://grayjay.app/\r\n"));
+    }
+
+    /// A sender that names one of our own hints replaces it rather than being sent
+    /// alongside it — one field, one value, and the sender's wins.
+    #[test]
+    fn a_sender_can_override_our_dlna_hints() {
+        let (block, _) = fetch_options(&[header("transferMode.dlna.org", "Background")]);
+        assert!(block.contains("transferMode.dlna.org: Background\r\n"));
+        assert_eq!(
+            block.matches("transferMode.dlna.org").count(),
+            1,
+            "not sent twice: {block:?}"
+        );
+        assert!(block.contains("getcontentFeatures.dlna.org: 1\r\n"));
+    }
+
+    /// The block is CRLF-framed, so every line has to be one header. Nothing here
+    /// escapes anything — `RequestHeader` refuses a value with a control byte at the
+    /// protocol boundary — and this is the test that says so out loud.
+    #[test]
+    fn every_line_of_the_block_is_one_header() {
+        let (block, _) = fetch_options(&[
+            header("Authorization", "Bearer abc"),
+            header("X-Thing", "a b c"),
+        ]);
+        assert_eq!(
+            block.lines().count(),
+            4,
+            "two defaults and two sender headers"
+        );
+        for line in block.split_terminator("\r\n") {
+            let (name, _) = line.split_once(": ").expect("one `name: value` per line");
+            assert!(!name.is_empty() && !name.contains(' '), "{line:?}");
+        }
+    }
 
     /// The drop tally counts every drop and reports on the shipped cadence (#233).
     ///

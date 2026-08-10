@@ -6,9 +6,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use castaway_core::{
-    ControlTxn, CoreError, FrameSource, MediaUri, NowPlaying, Pipeline, SourceDescription,
-};
+use castaway_core::{ControlTxn, CoreError, FrameSource, NowPlaying, Pipeline, SourceDescription};
 use tracing::info;
 
 /// A pipeline that logs every operation and drains mirror frame sources (dropping
@@ -114,8 +112,12 @@ impl NullPipeline {
 
 #[async_trait]
 impl Pipeline for NullPipeline {
-    async fn play(&self, source: MediaUri, start: Option<Duration>) -> Result<(), CoreError> {
-        info!(%source, ?start, "null pipeline: PLAY");
+    async fn play(
+        &self,
+        source: castaway_core::MediaRequest,
+        start: Option<Duration>,
+    ) -> Result<(), CoreError> {
+        info!(%source, headers = source.headers().len(), ?start, "null pipeline: PLAY");
         Ok(())
     }
 
@@ -266,9 +268,14 @@ mod tests {
     #[tokio::test]
     async fn play_and_control_succeed() {
         let p = NullPipeline::new();
-        p.play(MediaUri::parse("https://x/v.mp4").unwrap(), None)
-            .await
-            .unwrap();
+        p.play(
+            castaway_core::MediaUri::parse("https://x/v.mp4")
+                .unwrap()
+                .into(),
+            None,
+        )
+        .await
+        .unwrap();
         p.control(ControlTxn::Pause).await.unwrap();
         p.stop().await.unwrap();
     }

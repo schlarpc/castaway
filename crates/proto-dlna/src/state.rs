@@ -367,7 +367,9 @@ impl Renderer {
         let source = MediaUri::parse(uri)
             .map_err(|_| DlnaError::InvalidArgument("CurrentURI not a valid URI"))?;
         let mut events = vec![SessionEvent::Play {
-            source,
+            // No headers: a DLNA control point points at a server on the same LAN and
+            // says nothing about how to open it (#251).
+            source: source.into(),
             start: None,
         }];
         // What the control point said this is, published right behind the play that makes

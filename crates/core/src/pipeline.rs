@@ -12,7 +12,7 @@ use crate::error::CoreError;
 use crate::event::ControlTxn;
 use crate::nowplaying::{NowPlaying, QueueItem};
 use crate::source::SourceDescription;
-use crate::types::{AudioFormat, FrameSource, MediaUri};
+use crate::types::{AudioFormat, FrameSource, MediaRequest};
 
 /// The media/render backend the session drives. One active session maps to one set of
 /// these calls. Kept minimal and codec/GPU-agnostic so the session layer stays pure.
@@ -20,9 +20,12 @@ use crate::types::{AudioFormat, FrameSource, MediaUri};
 pub trait Pipeline: Send + Sync {
     /// Fetch and play a media URI (the media-URL path).
     ///
+    /// `source` carries the request headers the sender supplied, if any: the fetch is one
+    /// the sender described, not just a URL we found (#251).
+    ///
     /// # Errors
     /// [`CoreError::Pipeline`] on decode/open failure.
-    async fn play(&self, source: MediaUri, start: Option<Duration>) -> Result<(), CoreError>;
+    async fn play(&self, source: MediaRequest, start: Option<Duration>) -> Result<(), CoreError>;
 
     /// Begin live mirroring from a frame source (the pixel path).
     ///

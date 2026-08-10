@@ -10,6 +10,10 @@ pub enum CoreError {
     #[error("invalid media uri: {0}")]
     InvalidUri(String),
 
+    /// A request header a sender sent is not one we will put on a fetch.
+    #[error("invalid request header: {0}")]
+    InvalidHeader(String),
+
     /// A friendly/display name violated its invariants (empty or too long).
     #[error("invalid friendly name: {0}")]
     InvalidName(&'static str),

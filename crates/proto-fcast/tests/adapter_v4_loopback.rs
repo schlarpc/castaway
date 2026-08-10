@@ -228,7 +228,7 @@ async fn a_v4_sender_upgrades_and_loads() {
     loop {
         match next_event(&mut rx).await {
             SessionEvent::Play { source, .. } => {
-                assert_eq!(source.url().as_str(), "http://h/v4.mp4");
+                assert_eq!(source.uri().as_str(), "http://h/v4.mp4");
                 break;
             }
             SessionEvent::ControlSurface(_) | SessionEvent::NowPlaying(_) => {}
@@ -308,7 +308,7 @@ async fn a_v3_sender_still_runs_json_beside_v4() {
     stream.write_all(&play).await.unwrap();
     loop {
         if let SessionEvent::Play { source, .. } = next_event(&mut rx).await {
-            assert_eq!(source.url().as_str(), "http://h/json.mp4");
+            assert_eq!(source.uri().as_str(), "http://h/json.mp4");
             break;
         }
     }

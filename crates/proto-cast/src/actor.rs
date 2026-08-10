@@ -1230,7 +1230,9 @@ mod tests {
 
         // A LOAD's Play is immediately followed by the surface, in that order.
         let play = SessionEvent::Play {
-            source: castaway_core::MediaUri::parse("http://10.0.0.2/film.mkv").unwrap(),
+            source: castaway_core::MediaUri::parse("http://10.0.0.2/film.mkv")
+                .unwrap()
+                .into(),
             start: None,
         };
         let out = with_control_surface(vec![play], &remote);

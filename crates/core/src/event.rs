@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::control::RemoteControl;
 use crate::nowplaying::{NowPlaying, QueueItem, RepeatMode};
 use crate::source::SourceDescription;
-use crate::types::{AudioFormat, FrameSource, MediaUri};
+use crate::types::{AudioFormat, FrameSource, MediaRequest, MediaUri};
 
 /// What an adapter needs advertised on the network to be discoverable.
 ///
@@ -104,8 +104,13 @@ pub enum SessionEvent {
     /// Media-URL casting: the receiver fetches & decodes (Cast LOAD, AirPlay video,
     /// DLNA, Lounge).
     Play {
-        /// The media to fetch and play.
-        source: MediaUri,
+        /// The media to fetch and play, and what to say while fetching it.
+        ///
+        /// A [`MediaRequest`] rather than a bare [`MediaUri`] because a sender that
+        /// points at an auth-gated source also tells us how to open it (#251), and
+        /// dropping that half made a load fail honestly for a reason we had been given.
+        /// Every protocol that carries no headers builds one from its URI.
+        source: MediaRequest,
         /// Optional start offset.
         start: Option<Duration>,
     },

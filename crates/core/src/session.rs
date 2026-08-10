@@ -262,10 +262,15 @@ impl<P: Pipeline> SessionManager<P> {
     pub async fn handle(&mut self, msg: SourceMessage) -> Result<(), CoreError> {
         let SourceMessage { source, event } = msg;
         match event {
-            SessionEvent::Play { source: uri, start } => {
+            SessionEvent::Play {
+                source: request,
+                start,
+            } => {
                 self.begin_session(&source).await?;
-                info!(%source, %uri, "session: play");
-                self.pipeline.play(uri, start).await
+                // `%request` is the URI alone — a sender's `Authorization` header must not
+                // land in a log file on an unattended panel (see `MediaRequest::fmt`).
+                info!(%source, %request, headers = request.headers().len(), "session: play");
+                self.pipeline.play(request, start).await
             }
             SessionEvent::Mirror { video, audio } => {
                 self.begin_session(&source).await?;
@@ -453,7 +458,7 @@ mod tests {
 
     use super::*;
     use crate::event::ControlTxn;
-    use crate::types::{MediaUri, ProtocolKind};
+    use crate::types::{MediaRequest, MediaUri, ProtocolKind};
     use crate::ControlCapabilities;
 
     #[derive(Default)]
@@ -474,7 +479,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Pipeline for FakePipeline {
-        async fn play(&self, _s: MediaUri, _start: Option<Duration>) -> Result<(), CoreError> {
+        async fn play(&self, _s: MediaRequest, _start: Option<Duration>) -> Result<(), CoreError> {
             self.0.play.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -563,7 +568,7 @@ mod tests {
         SourceMessage {
             source: src.clone(),
             event: SessionEvent::Play {
-                source: MediaUri::parse("https://x/y.mp4").unwrap(),
+                source: MediaUri::parse("https://x/y.mp4").unwrap().into(),
                 start: None,
             },
         }

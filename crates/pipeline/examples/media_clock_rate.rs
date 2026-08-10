@@ -86,6 +86,7 @@ fn main() {
 
     let outcome = decode_av(
         &path,
+        &[],
         HwPreference::SoftwareOnly,
         &clock,
         Some(&seek),

@@ -143,7 +143,7 @@ async fn a_v3_sender_plays_and_pauses() {
     let SessionEvent::Play { source, start } = play else {
         panic!("expected Play, got {play:?}");
     };
-    assert_eq!(source.url().as_str(), "http://h/v.mp4");
+    assert_eq!(source.uri().as_str(), "http://h/v.mp4");
     assert_eq!(start, Some(Duration::from_secs(10)));
     let surface = next_event(&mut rx).await;
     assert!(matches!(surface, SessionEvent::ControlSurface(_)));

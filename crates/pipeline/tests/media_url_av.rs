@@ -109,6 +109,7 @@ fn run(path: &std::path::Path, want_audio: bool) -> Run {
 
     decode_av(
         path.to_str().unwrap(),
+        &[],
         HwPreference::SoftwareOnly,
         &clock,
         None,
@@ -387,6 +388,7 @@ fn a_paced_audio_consumer_does_not_stall_the_demuxer_that_feeds_it() {
     let mut frames = 0usize;
     decode_av(
         path.to_str().unwrap(),
+        &[],
         HwPreference::SoftwareOnly,
         &clock,
         Some(&seek),
@@ -506,6 +508,7 @@ fn media_is_fetched_over_http_not_just_opened_from_disk() {
     let mut layout = MediaLayout::default();
     let result = decode_av(
         &url,
+        &[],
         HwPreference::SoftwareOnly,
         &clock,
         None,
@@ -525,6 +528,97 @@ fn media_is_fetched_over_http_not_just_opened_from_disk() {
     assert!(layout.has_video && layout.has_audio, "{layout:?}");
     assert!(frames > 0, "no frames came back from an HTTP source");
     assert!(samples > 0, "no audio came back from an HTTP source");
+}
+
+/// The other half of #251, end to end: a sender's request headers reach the server.
+///
+/// The server here is the one the issue describes — an auth-gated source that answers 401
+/// to an anonymous GET — so the assertion is not "the option was set" but "the media
+/// played, and it could only have played if the token was sent". Before the seam existed
+/// `proto-fcast` parsed `Play.headers`, kept it, and fetched bare.
+#[test]
+fn a_senders_authorization_header_reaches_the_server() {
+    use std::io::{Read as _, Write as _};
+
+    let path = tmp("gated.mp4");
+    if !make(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=160x120:rate=10",
+            "-c:v",
+            "libx264",
+        ],
+        &path,
+    ) {
+        eprintln!("skipping: ffmpeg unavailable");
+        return;
+    }
+    let served = std::fs::read(&path).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        // What the *last* request carried, so an unauthenticated probe followed by an
+        // authenticated fetch cannot pass this by accident: every request is judged.
+        let mut anonymous = 0usize;
+        let mut authorized = 0usize;
+        for _ in 0..2 {
+            let Ok((mut sock, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let read = sock.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            if request.contains("authorization: bearer sekrit\r\n") {
+                authorized += 1;
+                let header = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: video/mp4\r\n\r\n",
+                    served.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(&served);
+            } else {
+                anonymous += 1;
+                let _ = sock.write_all(b"HTTP/1.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+            }
+            let _ = sock.flush();
+            drop(sock);
+            if authorized > 0 {
+                break;
+            }
+        }
+        (anonymous, authorized)
+    });
+
+    let url = format!("http://127.0.0.1:{port}/gated.mp4");
+    let headers = [castaway_core::RequestHeader::new("Authorization", "Bearer sekrit").unwrap()];
+    let clock = Arc::new(MediaClock::new());
+    let mut frames = 0usize;
+    let result = decode_av(
+        &url,
+        &headers,
+        HwPreference::SoftwareOnly,
+        &clock,
+        None,
+        None,
+        &|| false,
+        |_| {},
+        |_frame| {
+            frames += 1;
+            true
+        },
+    );
+    let (anonymous, authorized) = server.join().unwrap();
+
+    result.expect("the gated media could not be fetched");
+    assert_eq!(
+        anonymous, 0,
+        "a request went out without the sender's token"
+    );
+    assert!(authorized > 0, "the server was never asked");
+    assert!(frames > 0, "no frames came back from the gated source");
 }
 
 /// A seek moves the demuxer, and the frames that come back are from where it was sent.
@@ -563,6 +657,7 @@ fn a_seek_lands_where_it_was_sent_rather_than_where_it_was() {
     let mut times: Vec<Duration> = Vec::new();
     decode_av(
         path.to_str().unwrap(),
+        &[],
         HwPreference::SoftwareOnly,
         &clock,
         Some(&seek),
@@ -635,6 +730,7 @@ fn a_paused_session_can_still_be_scrubbed() {
             let mut times: Vec<Duration> = Vec::new();
             let _ = decode_av(
                 path.to_str().unwrap(),
+                &[],
                 HwPreference::SoftwareOnly,
                 &clock,
                 Some(&seek),
@@ -715,7 +811,7 @@ async fn the_pipeline_reports_where_it_is_and_that_it_finished() {
     assert!(progress.progress().is_none());
 
     let uri = MediaUri::parse(&format!("file://{}", path.display())).unwrap();
-    pipe.play(uri, None).await.unwrap();
+    pipe.play(uri.into(), None).await.unwrap();
 
     // The clock is seeded by the first frame, so a position appears shortly after the
     // decoder opens the file — and it is a *position*, not a total.
@@ -758,7 +854,7 @@ async fn a_url_that_cannot_be_fetched_is_reported_as_a_failure() {
     drop(dead);
 
     let uri = MediaUri::parse(&format!("http://127.0.0.1:{port}/nothing.mp4")).unwrap();
-    pipe.play(uri, None).await.unwrap();
+    pipe.play(uri.into(), None).await.unwrap();
 
     let end = tokio::time::timeout(Duration::from_secs(30), ends_rx.recv())
         .await

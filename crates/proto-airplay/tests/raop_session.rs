@@ -797,7 +797,7 @@ struct CardPipeline(mpsc::UnboundedSender<castaway_core::SourceDescription>);
 impl castaway_core::Pipeline for CardPipeline {
     async fn play(
         &self,
-        _source: castaway_core::MediaUri,
+        _source: castaway_core::MediaRequest,
         _start: Option<Duration>,
     ) -> Result<(), castaway_core::CoreError> {
         Ok(())

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use castaway_core::{
-    ControlTxn, CoreError, DecodedFrame, FrameImage, FrameSource, MediaUri, Pipeline, PixelFormat,
+    ControlTxn, CoreError, DecodedFrame, FrameImage, FrameSource, Pipeline, PixelFormat,
     PlaybackEnd, PlaybackProgress, PlaybackReport,
 };
 use tracing::{debug, error, info, warn};
@@ -863,7 +863,11 @@ impl RenderPipeline {
 
 #[async_trait]
 impl Pipeline for RenderPipeline {
-    async fn play(&self, source: MediaUri, start: Option<Duration>) -> Result<(), CoreError> {
+    async fn play(
+        &self,
+        source: castaway_core::MediaRequest,
+        start: Option<Duration>,
+    ) -> Result<(), CoreError> {
         self.release_screen();
         self.claim_panel();
         self.preempt();
@@ -871,7 +875,9 @@ impl Pipeline for RenderPipeline {
         info!(%source, ?start, "render pipeline: PLAY (decode → compositor)");
 
         let tx = self.tx.clone();
-        let uri = source.to_string();
+        // The URI alone, for the log lines and the end report. `source` itself carries the
+        // sender's request headers and must not be formatted into either.
+        let uri = source.uri().to_string();
         let hw = self.hw;
 
         // The session's clock, and the audio sink that drives it. Both live here rather
@@ -933,7 +939,7 @@ impl Pipeline for RenderPipeline {
 
         // Decode is blocking + thread-affine → dedicated OS thread, never the runtime.
         std::thread::spawn(move || {
-            let result = decode_into(&uri, hw, &tx, &stop, &clock, &seek, &duration, audio_tx);
+            let result = decode_into(&source, hw, &tx, &stop, &clock, &seek, &duration, audio_tx);
 
             // Preemption is not completion. When another source has taken the screen the
             // stop flag is what ended this decode, and the layers on screen belong to
@@ -1009,7 +1015,7 @@ impl Pipeline for RenderPipeline {
             FrameSource::Pcm(_) => Err(CoreError::Pipeline(
                 "a mirror session cannot be PCM audio; use play_audio".into(),
             )),
-            FrameSource::Url(uri) => self.play(uri, None).await,
+            FrameSource::Url(uri) => self.play(uri.into(), None).await,
             FrameSource::Decoded(mut rx) => {
                 info!("render pipeline: MIRROR (decoded frames → compositor)");
                 let tx = self.tx.clone();
@@ -1334,7 +1340,7 @@ impl Pipeline for RenderPipeline {
 /// Decode `uri` into render commands until EOF or `stop` is set.
 #[allow(clippy::too_many_arguments)]
 fn decode_into(
-    uri: &str,
+    request: &castaway_core::MediaRequest,
     hw: HwPreference,
     tx: &RenderTx,
     stop: &Arc<AtomicBool>,
@@ -1346,7 +1352,8 @@ fn decode_into(
     #[cfg(feature = "ffmpeg")]
     {
         crate::ffmpeg_decode::decode_av(
-            uri,
+            request.uri().as_str(),
+            request.headers(),
             hw,
             clock,
             Some(seek),
@@ -1379,7 +1386,7 @@ fn decode_into(
     }
     #[cfg(not(feature = "ffmpeg"))]
     {
-        let _ = (uri, hw, tx, stop, clock, seek, duration, audio_tx);
+        let _ = (request, hw, tx, stop, clock, seek, duration, audio_tx);
         Err(PipelineError::Decode(
             "decode requires the `ffmpeg` feature".into(),
         ))
@@ -4224,7 +4231,7 @@ mod tests {
             .unwrap();
         let uri = format!("file://{}", path.display());
         rt.block_on(async {
-            pipe.play(MediaUri::parse(&uri).unwrap(), None)
+            pipe.play(castaway_core::MediaUri::parse(&uri).unwrap().into(), None)
                 .await
                 .unwrap();
         });
@@ -4392,7 +4399,9 @@ mod card_tests {
 
         pipeline
             .play(
-                MediaUri::parse("http://example.invalid/a.mp4").unwrap(),
+                MediaUri::parse("http://example.invalid/a.mp4")
+                    .unwrap()
+                    .into(),
                 None,
             )
             .await

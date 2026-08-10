@@ -636,7 +636,10 @@ impl CastSession {
                 self.player_state = Some(messages::PlayerState::Playing);
                 Ok(Reaction::reply_with(
                     vec![self.media_status_msg(&sender, request_id)],
-                    SessionEvent::Play { source: uri, start },
+                    SessionEvent::Play {
+                        source: uri.into(),
+                        start,
+                    },
                 ))
             }
             "PLAY" => Ok(self.media_control(

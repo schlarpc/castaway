@@ -178,11 +178,202 @@ impl MediaUri {
     pub fn scheme(&self) -> &str {
         self.0.scheme()
     }
+
+    /// The whole URI as a string slice — what a fetcher hands its library.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 impl fmt::Display for MediaUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0.as_str())
+    }
+}
+
+/// One HTTP request header a sender asked us to send when fetching its media.
+///
+/// A validated type rather than a `(String, String)` because the thing it feeds is a
+/// **CRLF-joined blob**: libavformat's `headers` option, and every other HTTP client's
+/// header block, is one string with `\r\n` between entries. A value carrying its own
+/// `\r\n` therefore injects whole headers — or a request body — into a fetch aimed at
+/// somebody else's server, and the only place that can be caught once and for all is
+/// where wire bytes become a type (ground rule 1).
+///
+/// The grammar is RFC 9110's: a name is one or more `tchar`, a value is visible ASCII
+/// plus space and horizontal tab. Nothing here canonicalises case — a server that cares
+/// gets what the sender wrote — but [`RequestHeader::is`] compares case-insensitively,
+/// which is what the field-name rules actually say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestHeader {
+    name: String,
+    value: String,
+}
+
+impl RequestHeader {
+    /// Parse one header from what a sender sent.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidHeader`] for an empty or non-token name, or a value holding a
+    /// control character — `\r` and `\n` above all.
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Result<Self, CoreError> {
+        let name = name.into();
+        let value = value.into();
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            return Err(CoreError::InvalidHeader(format!(
+                "{name:?} is not a header name"
+            )));
+        }
+        // Leading/trailing whitespace is not part of a field value (RFC 9110 §5.5), and
+        // a sender that padded one should not have that padding sent back out.
+        let value = value.trim_matches([' ', '\t']).to_owned();
+        if !value.bytes().all(is_field_vchar) {
+            return Err(CoreError::InvalidHeader(format!(
+                "the value of {name} holds a control character"
+            )));
+        }
+        Ok(Self { name, value })
+    }
+
+    /// The field name, as the sender spelled it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The field value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Whether this is the named header, compared the way field names actually compare.
+    #[must_use]
+    pub fn is(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name)
+    }
+}
+
+impl fmt::Display for RequestHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.name, self.value)
+    }
+}
+
+/// RFC 9110 `tchar`: what a field name may be built from.
+const fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// RFC 9110 field-value byte: visible ASCII, space, tab, or obs-text (0x80..=0xFF).
+const fn is_field_vchar(b: u8) -> bool {
+    matches!(b, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff)
+}
+
+/// A media fetch: what to open, and what to say while opening it.
+///
+/// The seam issue #251 asked for, and deliberately **not** FCast-shaped even though
+/// FCast is its only current customer: a sender that knows the media is behind an
+/// `Authorization` header has told us how to fetch it, and before this the pipeline went
+/// out bare and the load failed honestly but pointlessly. DLNA and Cast simply carry no
+/// headers, so they build one of these from a bare [`MediaUri`] and nothing about them
+/// changes.
+///
+/// Headers travel *with the URI* rather than as a pipeline setting because they are a
+/// property of the one fetch: a queue whose second item is on another host with another
+/// token must not inherit the first item's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRequest {
+    uri: MediaUri,
+    headers: Vec<RequestHeader>,
+}
+
+impl MediaRequest {
+    /// A bare fetch — the URI and nothing else. What every protocol that carries no
+    /// headers emits.
+    #[must_use]
+    pub const fn new(uri: MediaUri) -> Self {
+        Self {
+            uri,
+            headers: Vec::new(),
+        }
+    }
+
+    /// A fetch carrying request headers.
+    #[must_use]
+    pub const fn with_headers(uri: MediaUri, headers: Vec<RequestHeader>) -> Self {
+        Self { uri, headers }
+    }
+
+    /// What to open.
+    #[must_use]
+    pub const fn uri(&self) -> &MediaUri {
+        &self.uri
+    }
+
+    /// What to say while opening it.
+    #[must_use]
+    pub fn headers(&self) -> &[RequestHeader] {
+        &self.headers
+    }
+
+    /// The value of one header, if the sender set it.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.is(name))
+            .map(RequestHeader::value)
+    }
+
+    /// Every header *except* the named one, in order.
+    ///
+    /// For the fetcher that has to lift one out and pass it separately: libavformat wants
+    /// `User-Agent` as its own option, and a build that put it in the blob as well sent
+    /// the field twice.
+    pub fn headers_except<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a RequestHeader> + 'a {
+        self.headers.iter().filter(move |h| !h.is(name))
+    }
+
+    /// Drop the headers and keep the URI.
+    #[must_use]
+    pub fn into_uri(self) -> MediaUri {
+        self.uri
+    }
+}
+
+impl From<MediaUri> for MediaRequest {
+    fn from(uri: MediaUri) -> Self {
+        Self::new(uri)
+    }
+}
+
+impl fmt::Display for MediaRequest {
+    /// The URI alone. These strings reach logs, and a sender's `Authorization: Bearer …`
+    /// is precisely the thing that must not be written to a file on a wall panel.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.uri, f)
     }
 }
 
@@ -588,6 +779,73 @@ mod tests {
     fn media_uri_rejects_unsupported_scheme() {
         assert!(MediaUri::parse("ftp://example.com/a").is_err());
         assert!(MediaUri::parse("not a url").is_err());
+    }
+
+    /// The header a sender really sends (#251's fixture has one of these on a plain
+    /// `play`) survives the boundary intact, padding trimmed.
+    #[test]
+    fn a_bearer_token_parses_and_keeps_its_spelling() {
+        let header = RequestHeader::new("Authorization", "  Bearer abc.def  ").unwrap();
+        assert_eq!(header.name(), "Authorization");
+        assert_eq!(header.value(), "Bearer abc.def");
+        assert!(
+            header.is("authorization"),
+            "field names compare ASCII-caselessly"
+        );
+        assert!(!header.is("authorisation"));
+    }
+
+    /// The whole reason this is a type: the block it feeds is CRLF-joined, so a value
+    /// carrying its own CRLF would forge headers on a request aimed at somebody else's
+    /// server. Refused where the wire becomes a type, not deeper in.
+    #[test]
+    fn a_value_cannot_smuggle_a_second_header() {
+        assert!(matches!(
+            RequestHeader::new("X-Thing", "a\r\nAuthorization: Bearer stolen"),
+            Err(CoreError::InvalidHeader(_))
+        ));
+        assert!(RequestHeader::new("X-Thing", "a\nb").is_err());
+        assert!(RequestHeader::new("X-Thing", "a\0b").is_err());
+        // And a name has to be a token — `:` in one would split the field itself.
+        assert!(RequestHeader::new("X: Y", "z").is_err());
+        assert!(RequestHeader::new("", "z").is_err());
+    }
+
+    /// A request is a URI plus headers, and the headers belong to *that* fetch.
+    #[test]
+    fn a_request_carries_its_headers_and_hides_them_from_logs() {
+        let uri = MediaUri::parse("https://example.com/a.mp4").unwrap();
+        let request = MediaRequest::with_headers(
+            uri.clone(),
+            vec![
+                RequestHeader::new("Authorization", "Bearer secret").unwrap(),
+                RequestHeader::new("User-Agent", "Grayjay/1.0").unwrap(),
+            ],
+        );
+        assert_eq!(request.uri(), &uri);
+        assert_eq!(request.header("authorization"), Some("Bearer secret"));
+        assert_eq!(request.header("Referer"), None);
+        assert_eq!(
+            request
+                .headers_except("user-agent")
+                .map(RequestHeader::name)
+                .collect::<Vec<_>>(),
+            ["Authorization"],
+            "the fetcher lifts User-Agent out to its own option"
+        );
+        // The Display impl is what reaches the log file on an unattended panel.
+        assert_eq!(request.to_string(), "https://example.com/a.mp4");
+        assert!(!format!("{request}").contains("secret"));
+    }
+
+    /// Every protocol that carries no headers builds one of these and nothing about it
+    /// changes.
+    #[test]
+    fn a_bare_uri_is_a_request_with_no_headers() {
+        let uri = MediaUri::parse("https://example.com/a.mp4").unwrap();
+        let request: MediaRequest = uri.clone().into();
+        assert!(request.headers().is_empty());
+        assert_eq!(request.into_uri(), uri);
     }
 
     /// A stand-in for what `pipeline` really puts behind the trait (a DMA-BUF descriptor

@@ -778,7 +778,10 @@ impl AirPlaySession {
                     rate: Some(Rate::Playing),
                     ..Default::default()
                 };
-                SessionEvent::Play { source, start: at }
+                SessionEvent::Play {
+                    source: source.into(),
+                    start: at,
+                }
             }
             VideoCommand::Scrub(to) => {
                 log_info!(?to, "AirPlay video: scrub");
@@ -2537,7 +2540,7 @@ mod tests {
         assert_eq!(r.status, 200);
         match r.event {
             Some(SessionEvent::Play { source, start }) => {
-                assert_eq!(source.url().as_str(), "http://10.0.0.5/v.m3u8");
+                assert_eq!(source.uri().as_str(), "http://10.0.0.5/v.m3u8");
                 assert_eq!(start, None);
             }
             other => panic!("a /play must produce a Play event, got {other:?}"),
