@@ -213,7 +213,7 @@ impl Player {
         });
         self.state = PlayState::Playing;
 
-        let mut applied = self.start_current(MediaItemEventKind::Start);
+        let mut applied = self.start_current();
         applied
             .updates
             .insert(0, ReceiverUpdate::PlayChanged(Some(play)));
@@ -228,7 +228,12 @@ impl Player {
     }
 
     /// Events and updates for starting (or restarting) the current queue item.
-    fn start_current(&self, entering: MediaItemEventKind) -> Applied {
+    ///
+    /// The event kind follows the reference receiver's rule, which `fast`'s
+    /// `cast_simple_playlist` case pins: a *single* load fires `MediaItemStart`, a
+    /// *playlist* item fires `MediaItemChange` — on every item start, the first
+    /// included. Never both.
+    fn start_current(&self) -> Applied {
         let Some(loaded) = &self.loaded else {
             return Applied::default();
         };
@@ -251,18 +256,17 @@ impl Player {
         if !up_next.is_empty() {
             events.push(SessionEvent::UpNext(up_next));
         }
-        let mut updates = Vec::new();
-        if entering == MediaItemEventKind::Change {
-            updates.push(ReceiverUpdate::MediaItem {
-                kind: MediaItemEventKind::Change,
+        let updates = vec![
+            ReceiverUpdate::MediaItem {
+                kind: if loaded.is_playlist {
+                    MediaItemEventKind::Change
+                } else {
+                    MediaItemEventKind::Start
+                },
                 item: item.echo.clone(),
-            });
-        }
-        updates.push(ReceiverUpdate::MediaItem {
-            kind: MediaItemEventKind::Start,
-            item: item.echo.clone(),
-        });
-        updates.push(ReceiverUpdate::Playback(self.snapshot(None)));
+            },
+            ReceiverUpdate::Playback(self.snapshot(None)),
+        ];
         Applied { events, updates }
     }
 
@@ -370,7 +374,7 @@ impl Player {
         };
         loaded.index = index;
         self.state = PlayState::Playing;
-        Ok(self.start_current(MediaItemEventKind::Change))
+        Ok(self.start_current())
     }
 
     /// Step to the adjacent playlist item (the panel's next/previous buttons).
@@ -408,7 +412,7 @@ impl Player {
             PlaybackEnd::Finished if loaded.index + 1 < loaded.queue.len() => {
                 loaded.index += 1;
                 self.state = PlayState::Playing;
-                let mut applied = self.start_current(MediaItemEventKind::Change);
+                let mut applied = self.start_current();
                 updates.append(&mut applied.updates);
                 Applied {
                     events: applied.events,
@@ -539,11 +543,28 @@ mod tests {
             .unwrap();
         assert_eq!(played_uri(&applied), "http://h/a.mp4");
         assert_eq!(player.snapshot(None).item_index, Some(0));
+        // A playlist item fires `MediaItemChange` — the reference's rule, pinned by
+        // fast's cast_simple_playlist, and it fires for the FIRST item too. `Start`
+        // is the single-load event and must not fire here.
+        assert!(applied.updates.iter().any(|u| matches!(
+            u,
+            ReceiverUpdate::MediaItem {
+                kind: MediaItemEventKind::Change,
+                ..
+            }
+        )));
+        assert!(!applied.updates.iter().any(|u| matches!(
+            u,
+            ReceiverUpdate::MediaItem {
+                kind: MediaItemEventKind::Start,
+                ..
+            }
+        )));
 
         let applied = player.media_ended(&PlaybackEnd::Finished);
         assert_eq!(played_uri(&applied), "http://h/b.mp4");
         assert_eq!(player.snapshot(None).item_index, Some(1));
-        // The end of the old item and the start of the new both fire.
+        // The end of the old item and the change to the new both fire.
         assert!(applied.updates.iter().any(|u| matches!(
             u,
             ReceiverUpdate::MediaItem {
@@ -554,7 +575,7 @@ mod tests {
         assert!(applied.updates.iter().any(|u| matches!(
             u,
             ReceiverUpdate::MediaItem {
-                kind: MediaItemEventKind::Start,
+                kind: MediaItemEventKind::Change,
                 ..
             }
         )));
