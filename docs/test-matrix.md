@@ -287,10 +287,13 @@ applied everywhere, and there is no equivalent for ffmpeg.
   safe (the carve is in `commonArgs`); a developer's bare `cargo nextest run` reports green
   having compared nothing.
 
-Four `#[ignore]`d files run nowhere, ever: `browser_end_to_end.rs`, `remote_browser.rs`,
-`filter_subscriptions.rs`, `cast-replay/tests/live_backend.rs`. `mixer_real_device.rs` was
-the fifth until `checks.mixer-vm` (#204); it keeps its `#[ignore]` because `checks.test`
-has no sound card, and the VM passes `--include-ignored`.
+Three `#[ignore]`d files run nowhere, ever: `browser_end_to_end.rs`, `remote_browser.rs`,
+`filter_subscriptions.rs`. `mixer_real_device.rs` was the fourth until `checks.mixer-vm`
+(#204); it keeps its `#[ignore]` because `checks.test` has no sound card, and the VM passes
+`--include-ignored`. `cast-replay/tests/live_backend.rs` was the fifth until the scheduled
+`live-endpoints.yml` (#294): it stays out of `nix flake check` — a third party's outage must
+not red a code change — but a weekly job runs it against both live endpoints so a revocation
+or API drift surfaces there instead of silently (#40).
 
 ### 3.4 Fixes shipped with no regression test
 
@@ -382,7 +385,7 @@ Exit criteria are marked **[A]** asserted today or **[P]** proposed.
 | mDNS `_googlecast._tcp` | T0+T2 | `actor.rs` advert tests; `vm-test.nix` avahi-browse | TXT never judged by a sender's parser; `ca` bits asserted present, not correct |
 | TLS on 8009, 4-day cert window | T0+T2 | `actor.rs::tls_certificate_expires_inside_the_senders_four_day_limit`; VM handshake | no concurrent-connection or mid-session rotation test |
 | Device auth CHALLENGE/RESPONSE | T0→**T3** | 12 vectors judged by openscreen's real `cast_auth_util.cc` (`openscreen-device-auth`) | **never happened over a socket**; the oracle rebuilds the envelope itself (`oracle.cc:62-68`); the VM sender has no `deviceauth` namespace |
-| Both borrowed identities (CKS, AirServer) | **T3** | `cks-chain-google-roots` / `airserver-chain-google-roots` → `ok` vs shipped roots | live endpoints only `#[ignore]`d (`live_backend.rs`); CKS table expires 2027-12-06 with no alarm |
+| Both borrowed identities (CKS, AirServer) | **T3** | `cks-chain-google-roots` / `airserver-chain-google-roots` → `ok` vs shipped roots; live endpoints exercised weekly by `live-endpoints.yml`; table expiry trips `expiry_canary.rs` at 90 days (#294) | live endpoints still off the code-change gate by design; the durable fix is a credential of our own (#40) |
 | CRL / revocation | T0 | `cast-replay/src/crl.rs` (8) | openscreen's `cast_crl.cc` **is compiled into the oracle** and never runs — no vector carries a `crl` field |
 | proto2 envelope | T0 | `proto2_required.rs` (4), hand-decoded | validated against Chromium 148 **by hand**; not automated |
 | Receiver ns, availability, declining launches | T0+T2 | `session.rs` (~10); VM asserts sender view **and** journal | best-covered mode in the subsystem |
