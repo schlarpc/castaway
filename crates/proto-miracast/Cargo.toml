@@ -22,5 +22,17 @@ tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync"
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 
+# The `wfd-probe` example only. Windows exposes autonomous group ownership and vendor IE
+# injection through WinRT, so the spike for a Windows backend (§7.7(c) of
+# docs/miracast-protocol-notes.md) needs the projection; the crate itself does not.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61", features = [
+  "Devices_WiFiDirect",
+  "Foundation",
+  "Foundation_Collections",
+  "Security_Cryptography",
+  "Storage_Streams",
+] }
+
 [lints]
 workspace = true
