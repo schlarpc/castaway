@@ -171,10 +171,18 @@ receiver's journal, so the event is proven to cross adapter → session manager 
   never crossed a real LAN in CI — audio and mirroring are driven over real sockets, but
   only in-process (`tests/raop_harness/mod.rs`, with the decode seam in `crates/app`
   proving real ALAC on both the clear and the encrypted legs — #189).
+- **FCast** (`checks.fcast-vm`, #241): the *published* transmitters, not scripts — the
+  reference terminal sender (the `fcast-sender-sdk` stack Grayjay embeds, pinned at the
+  fixtures' commit) finds the panel through its own mDNS browse, downgrades its
+  `Version {4}` hello to our v3, casts a URL and an inline playlist, jumps the playlist
+  index, drives pause/resume/seek/volume/stop, and in listen mode prints the
+  `Source changed`/`Playback state changed` lines that prove the SDK parsed our
+  `Initial.playData` and `PlaybackUpdate`s; nixpkgs' 2024 pre-SDK `fcast-client` casts
+  over the implicit-v1 path. TXT `v=3` is asserted via avahi as the third-party view.
 - **mDNS**: `_spotify-connect._tcp`, `_googlecast._tcp`, `_airplay._tcp`, and `_raop._tcp`
   are all browsable from the sender with the ports that actually answered. The responder's
-  record set has since grown `_matterd._udp`/`_matterc._udp`, `_display._tcp` (MICE), and
-  the Cast DNS-SD sub-types (#226).
+  record set has since grown `_matterd._udp`/`_matterc._udp`, `_display._tcp` (MICE),
+  `_fcast._tcp` (#241), and the Cast DNS-SD sub-types (#226).
 
 ## A Spotify session, with no phone (`cargo run -p proto-spotify --example selfplay -- http://<receiver>:8080`)
 The Spotify sibling of `yt-selfplay`, and needed for the same reason: Spotify's cloud is a

@@ -129,8 +129,11 @@ pkgs.testers.runNixOSTest {
 
     with subtest("the advertisement is discoverable and states protocol v3"):
         # Third-party view first: avahi sees the record, its TXT v, and the port.
+        # The instance is `${advertised}`, but avahi-browse's parseable output
+        # escapes `#` as `\035` (measured on the bench), so the grep matches the
+        # unescaped prefix and the port+TXT that share the resolved line.
         sender.wait_until_succeeds(
-            "avahi-browse -rpt _fcast._tcp | grep '${advertised}' | grep ';46899;' | grep -q 'v=3'",
+            "avahi-browse -rpt _fcast._tcp | grep '${friendlyName}' | grep ';46899;' | grep -q 'v=3'",
             timeout=60,
         )
         # Then the view that matters: the sender SDK's own discovery finds us by name.
