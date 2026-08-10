@@ -40,6 +40,27 @@ map every number to its outcome are issues **#104** (`GAPS.md`, the 2026-07-26 a
 **#105** (`OPEN-QUESTIONS.md`); full text is at `git show 3fc6b57:docs/GAPS.md` and
 `git show 3fc6b57:docs/OPEN-QUESTIONS.md`. Do not add new `G##`/`Q##` anchors — cite the issue.
 
+**One issue = one deliverable; residuals get their own issues.** An issue is done when its
+headline claim is true — close it then, and file each remaining piece of work discovered
+along the way as its **own** issue ("implement X", "test Y on an Android phone", "measure Z
+on the Windows box"), cross-referenced from the closing comment. Do not append residual work
+items as comments on a mostly-done issue, and do not retitle or rescope an issue to keep it
+alive after its original question is answered: that is how the 2026-08-09 audit found 22 of
+59 open issues already resolved as written, their real remaining work buried in comment
+threads (#252–#294 are the extractions). Corollaries:
+
+- *Findings go in comments; work goes in issues.* A measurement, a correction, or a
+  post-mortem that answers the issue belongs in a comment on it. Anything that still needs
+  doing afterwards does not — it gets `gh issue create` (after the duplicate check above).
+- *"Partial, leaving open" is a yellow flag.* Landing part of an issue is fine; landing the
+  headline and leaving the issue open for its leftovers is the omnibus pattern. Split at
+  that moment, while the leftovers are still crisp.
+- *Hardware-gated work carries a `hardware needed (<type>)` label* — android phone, iphone,
+  phone (either), windows box, panel, wifi radio, le-audio controller — so a session with
+  the hardware in hand can be planned with one label query
+  (`gh issue list --label "hardware needed (android phone)"`). Create a new type-specific
+  label rather than widening an existing one.
+
 ## Ground rules
 
 These are binding engineering constraints for this project. They override general defaults.
