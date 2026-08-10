@@ -19,15 +19,31 @@ use castaway_core::{
 use crate::messages::{MediaItemEventKind, PlayMessage, PlayState, PlaylistContent};
 use crate::session::{PlaybackSnapshot, ReceiverUpdate};
 
-/// A load or control request the player refuses, with the message the asking sender
-/// is shown (as a `PlaybackError`). A refusal changes nothing: whatever was playing
-/// keeps playing.
+/// A load or control request the player refuses, with the message a v1-v3 sender
+/// is shown (as a `PlaybackError`) and the typed kind a v4 sender gets (as
+/// `Error {{ kind }}`). A refusal changes nothing: whatever was playing keeps
+/// playing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refusal(pub String);
+pub struct Refusal {
+    /// The human-readable reason (v1-v3's error surface).
+    pub message: String,
+    /// The typed kind (v4's error surface).
+    pub kind: fcast_flatbuf::flat::ErrorKind,
+}
 
 impl Refusal {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            kind: fcast_flatbuf::flat::ErrorKind::Internal,
+        }
+    }
+
+    pub(crate) fn kinded(message: impl Into<String>, kind: fcast_flatbuf::flat::ErrorKind) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
     }
 }
 
@@ -56,18 +72,24 @@ impl ResolvedItem {
     /// Resolve one play request or playlist entry. `what` names the entry in a
     /// refusal message.
     fn resolve(play: PlayMessage, what: &str) -> Result<Self, Refusal> {
+        use fcast_flatbuf::flat::ErrorKind;
         if play.url.is_none() && play.content.is_some() {
             // Inline content (a DASH manifest pushed as text) needs somewhere to be
             // fetched *from* — hosting it is issue #249. Refused rather than guessed
             // at: a sender told "unsupported" can fall back to its URL path.
-            return Err(Refusal::new(format!(
-                "{what}: inline content is not supported by this receiver; send a URL"
-            )));
+            return Err(Refusal::kinded(
+                format!("{what}: inline content is not supported by this receiver; send a URL"),
+                ErrorKind::UnsupportedFormat,
+            ));
         }
         let Some(url) = play.url.as_deref() else {
-            return Err(Refusal::new(format!("{what}: no URL to play")));
+            return Err(Refusal::kinded(
+                format!("{what}: no URL to play"),
+                ErrorKind::MalformedBody,
+            ));
         };
-        let uri = MediaUri::parse(url).map_err(|e| Refusal::new(format!("{what}: {e}")))?;
+        let uri = MediaUri::parse(url)
+            .map_err(|e| Refusal::kinded(format!("{what}: {e}"), ErrorKind::UnsupportedFormat))?;
         let start = play
             .time
             .filter(|&t| t > 0.0)
@@ -80,6 +102,43 @@ impl ResolvedItem {
             echo: play,
         })
     }
+
+    /// Resolve one v4 item (#248). `fcomp://` is FCompanion's scheme — #249's
+    /// seam — refused typed until it lands.
+    fn resolve_v4(item: &crate::v4msg::V4MediaItem, what: &str) -> Result<Self, Refusal> {
+        use fcast_flatbuf::flat::ErrorKind;
+        let uri = MediaUri::parse(&item.source_url).map_err(|e| {
+            let kind = if item.source_url.starts_with("fcomp://") {
+                ErrorKind::ResourceNotFound
+            } else {
+                ErrorKind::UnsupportedFormat
+            };
+            Refusal::kinded(format!("{what}: {e}"), kind)
+        })?;
+        let echo = PlayMessage {
+            container: item.container.clone(),
+            url: Some(item.source_url.clone()),
+            content: None,
+            time: item.start_time.map(|d| d.as_secs_f64()),
+            volume: item.volume.map(f64::from),
+            speed: item.speed.map(f64::from),
+            headers: (!item.headers.is_empty()).then(|| item.headers.iter().cloned().collect()),
+            metadata: item
+                .title
+                .clone()
+                .map(|title| crate::messages::MediaMetadata {
+                    title: Some(title),
+                    thumbnail_url: item.thumbnail_url.clone(),
+                    custom: None,
+                }),
+        };
+        Ok(Self {
+            uri,
+            start: item.start_time.filter(|d| !d.is_zero()),
+            title: item.title.clone(),
+            echo,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -90,6 +149,15 @@ struct Loaded {
     index: usize,
     /// Whether this came in as a playlist — a single URL has no `itemIndex`.
     is_playlist: bool,
+    /// Whether finishing an item plays the next. v3 playlists always advance
+    /// (their protocol has no flag); v4 queues carry it explicitly.
+    autoplay: bool,
+    /// The raw v4 `Load` when this was a v4 *single* — replayed (stripped) to a
+    /// sender that joins mid-session, exactly the slice the reference replays.
+    v4_single_raw: Option<Vec<u8>>,
+    /// Whether v4 queue mutation applies (`QueueInsert` needs a *queue*, not a
+    /// single, and not a v3 playlist whose senders couldn't see the change).
+    v4_queue: bool,
 }
 
 /// The shared player model. One per adapter, behind the actor's lock.
@@ -163,14 +231,22 @@ impl Player {
                 // A playlist *URL* would need fetching before we know its items —
                 // deliberately not guessed at (issue #249 covers hosted/fetched
                 // content in both directions).
-                return Err(Refusal::new(
+                return Err(Refusal::kinded(
                     "playlist by URL is not supported by this receiver; send the playlist inline",
+                    fcast_flatbuf::flat::ErrorKind::UnsupportedFormat,
                 ));
             };
-            let playlist = PlaylistContent::from_json(content)
-                .map_err(|e| Refusal::new(format!("playlist: {e}")))?;
+            let playlist = PlaylistContent::from_json(content).map_err(|e| {
+                Refusal::kinded(
+                    format!("playlist: {e}"),
+                    fcast_flatbuf::flat::ErrorKind::MalformedBody,
+                )
+            })?;
             if playlist.items.is_empty() {
-                return Err(Refusal::new("playlist: no items"));
+                return Err(Refusal::kinded(
+                    "playlist: no items",
+                    fcast_flatbuf::flat::ErrorKind::MalformedBody,
+                ));
             }
             let items: Vec<ResolvedItem> = playlist
                 .items
@@ -210,6 +286,11 @@ impl Player {
             queue,
             index,
             is_playlist,
+            // v3 playlists have no autoplay flag; the protocol's receivers have
+            // always advanced, and so do we.
+            autoplay: true,
+            v4_single_raw: None,
+            v4_queue: false,
         });
         self.state = PlayState::Playing;
 
@@ -225,6 +306,227 @@ impl Player {
                 Volume::from_position(self.volume as f32),
             )));
         Ok(applied)
+    }
+
+    /// Load v4 content (#248): a single item, or a queue with the reference's
+    /// exact acceptance rules (256-item cap as `MalformedBody`, a start index
+    /// past the end as `QueuePositionOutOfRange`).
+    ///
+    /// # Errors
+    /// A typed [`Refusal`]; nothing changes on refusal.
+    pub fn load_v4(
+        &mut self,
+        source: crate::v4msg::LoadSource,
+        raw: Vec<u8>,
+    ) -> Result<Applied, Refusal> {
+        use crate::v4msg::LoadSource;
+        use fcast_flatbuf::flat::ErrorKind;
+
+        let (queue, index, is_playlist, autoplay, v4_single_raw, v4_queue) = match source {
+            LoadSource::Single(item) => {
+                let resolved = ResolvedItem::resolve_v4(&item, "play request")?;
+                (vec![resolved], 0, false, true, Some(raw.clone()), false)
+            }
+            LoadSource::Queue {
+                items,
+                start_index,
+                autoplay,
+            } => {
+                if items.is_empty() {
+                    return Err(Refusal::kinded("queue: no items", ErrorKind::MalformedBody));
+                }
+                if items.len() > 256 {
+                    return Err(Refusal::kinded(
+                        format!("queue of {} items exceeds the 256-item cap", items.len()),
+                        ErrorKind::MalformedBody,
+                    ));
+                }
+                let index = usize::from(start_index.unwrap_or(0));
+                if index >= items.len() {
+                    return Err(Refusal::kinded(
+                        format!("start index {index} outside 0..{}", items.len()),
+                        ErrorKind::QueuePositionOutOfRange,
+                    ));
+                }
+                let resolved: Vec<ResolvedItem> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (item, _show))| {
+                        ResolvedItem::resolve_v4(item, &format!("queue item {i}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                (resolved, index, true, autoplay, None, true)
+            }
+        };
+
+        if let Some(volume) = queue[index].echo.volume.filter(|v| (0.0..=1.0).contains(v)) {
+            self.volume = volume;
+        }
+        let play_echo = queue[index].echo.clone();
+        self.loaded = Some(Loaded {
+            play: play_echo.clone(),
+            queue,
+            index,
+            is_playlist,
+            autoplay,
+            v4_single_raw,
+            v4_queue,
+        });
+        self.state = PlayState::Playing;
+
+        let mut applied = self.start_current();
+        // v4 peers get the stripped raw relay; v1-v3 peers the PlayMessage echo.
+        applied
+            .updates
+            .insert(0, ReceiverUpdate::PlayChanged(Some(play_echo)));
+        applied.updates.insert(1, ReceiverUpdate::V4Load { raw });
+        applied.updates.push(ReceiverUpdate::Volume(self.volume));
+        applied
+            .events
+            .push(SessionEvent::Control(ControlTxn::Volume(
+                #[allow(clippy::cast_possible_truncation)]
+                Volume::from_position(self.volume as f32),
+            )));
+        Ok(applied)
+    }
+
+    /// The raw v4 `Load` currently playing, when it was a v4 single — replayed
+    /// (stripped) to late-joining v4 senders, the slice the reference replays.
+    #[must_use]
+    pub fn v4_single_raw(&self) -> Option<&[u8]> {
+        self.loaded
+            .as_ref()
+            .and_then(|l| l.v4_single_raw.as_deref())
+    }
+
+    /// Resolve a v4 queue position against the current queue length.
+    fn position_index(
+        loaded: &Loaded,
+        position: crate::v4msg::QueuePosition,
+        insert: bool,
+    ) -> Result<usize, Refusal> {
+        use crate::v4msg::QueuePosition;
+        use fcast_flatbuf::flat::ErrorKind;
+        let len = loaded.queue.len();
+        let index = match position {
+            QueuePosition::Index(i) => usize::from(i),
+            QueuePosition::Front => 0,
+            // For an insert, `Back` means append; for select/remove, the last item.
+            QueuePosition::Back => {
+                if insert {
+                    len
+                } else {
+                    len.saturating_sub(1)
+                }
+            }
+        };
+        let limit = if insert { len } else { len.saturating_sub(1) };
+        if index > limit {
+            return Err(Refusal::kinded(
+                format!("position {index} outside the queue of {len}"),
+                ErrorKind::QueuePositionOutOfRange,
+            ));
+        }
+        Ok(index)
+    }
+
+    fn v4_queue_mut(&mut self) -> Result<&mut Loaded, Refusal> {
+        use fcast_flatbuf::flat::ErrorKind;
+        self.loaded
+            .as_mut()
+            .filter(|l| l.v4_queue)
+            .ok_or_else(|| Refusal::kinded("no queue is loaded", ErrorKind::InvalidState))
+    }
+
+    /// Insert a v4 queue item (#248).
+    ///
+    /// # Errors
+    /// `InvalidState` without a queue, `QueueFull` at the 256 cap,
+    /// `QueuePositionOutOfRange` past the end.
+    pub fn queue_insert_v4(
+        &mut self,
+        item: &crate::v4msg::V4MediaItem,
+        position: crate::v4msg::QueuePosition,
+        raw: Vec<u8>,
+    ) -> Result<Applied, Refusal> {
+        use fcast_flatbuf::flat::ErrorKind;
+        let resolved = ResolvedItem::resolve_v4(item, "inserted item")?;
+        let loaded = self.v4_queue_mut()?;
+        if loaded.queue.len() >= 256 {
+            return Err(Refusal::kinded(
+                "the queue already holds 256 items",
+                ErrorKind::QueueFull,
+            ));
+        }
+        let index = Self::position_index(loaded, position, true)?;
+        if index <= loaded.index {
+            loaded.index += 1;
+        }
+        loaded.queue.insert(index, resolved);
+        Ok(Applied {
+            events: vec![SessionEvent::UpNext(Self::up_next(loaded))],
+            updates: vec![
+                ReceiverUpdate::QueueInsertRelay { raw },
+                ReceiverUpdate::Playback(self.snapshot(None)),
+            ],
+        })
+    }
+
+    /// Remove a v4 queue item (#248). The playing item cannot be removed.
+    ///
+    /// # Errors
+    /// `InvalidState`, `QueuePositionOutOfRange`, or `QueueRemovePlayingItem`.
+    pub fn queue_remove_v4(
+        &mut self,
+        position: crate::v4msg::QueuePosition,
+    ) -> Result<Applied, Refusal> {
+        use fcast_flatbuf::flat::ErrorKind;
+        let loaded = self.v4_queue_mut()?;
+        let index = Self::position_index(loaded, position, false)?;
+        if index == loaded.index {
+            return Err(Refusal::kinded(
+                "cannot remove the playing item",
+                ErrorKind::QueueRemovePlayingItem,
+            ));
+        }
+        if index < loaded.index {
+            loaded.index -= 1;
+        }
+        loaded.queue.remove(index);
+        Ok(Applied {
+            events: vec![SessionEvent::UpNext(Self::up_next(loaded))],
+            updates: vec![
+                ReceiverUpdate::QueueRemoveRelay(position),
+                ReceiverUpdate::Playback(self.snapshot(None)),
+            ],
+        })
+    }
+
+    /// Jump to a v4 queue item (#248).
+    ///
+    /// # Errors
+    /// `InvalidState` or `QueuePositionOutOfRange`.
+    pub fn queue_select_v4(
+        &mut self,
+        position: crate::v4msg::QueuePosition,
+    ) -> Result<Applied, Refusal> {
+        let loaded = self.v4_queue_mut()?;
+        let index = Self::position_index(loaded, position, false)?;
+        loaded.index = index;
+        self.state = PlayState::Playing;
+        let mut applied = self.start_current();
+        applied.updates.push(ReceiverUpdate::QueueSelectRelay {
+            position,
+            initiated_by_receiver: false,
+        });
+        Ok(applied)
+    }
+
+    fn up_next(loaded: &Loaded) -> Vec<QueueItem> {
+        loaded.queue[loaded.index + 1..]
+            .iter()
+            .map(|next| QueueItem::new(next.title.clone().unwrap_or_else(|| next.uri.to_string())))
+            .collect()
     }
 
     /// Events and updates for starting (or restarting) the current queue item.
@@ -318,9 +620,13 @@ impl Player {
         }
         Applied {
             events: vec![SessionEvent::Control(ControlTxn::Seek(target))],
-            updates: vec![ReceiverUpdate::Playback(
-                self.snapshot(Some(PlaybackProgress::at(target))),
-            )],
+            updates: vec![
+                ReceiverUpdate::Playback(self.snapshot(Some(PlaybackProgress::at(target)))),
+                ReceiverUpdate::Progress {
+                    position: target,
+                    duration: None,
+                },
+            ],
         }
     }
 
@@ -346,9 +652,10 @@ impl Player {
             // Asking for 1.0 is asking for what is already true.
             return Ok(Applied::default());
         }
-        Err(Refusal::new(format!(
-            "playback speed {speed} is not supported by this receiver (plays at 1.0)"
-        )))
+        Err(Refusal::kinded(
+            format!("playback speed {speed} is not supported by this receiver (plays at 1.0)"),
+            fcast_flatbuf::flat::ErrorKind::RateOutOfRange,
+        ))
     }
 
     /// Jump to a playlist index.
@@ -358,19 +665,28 @@ impl Player {
     /// index is out of range.
     pub fn set_playlist_item(&mut self, index: u64) -> Result<Applied, Refusal> {
         let Some(loaded) = &mut self.loaded else {
-            return Err(Refusal::new("no playlist is loaded"));
+            return Err(Refusal::kinded(
+                "no playlist is loaded",
+                fcast_flatbuf::flat::ErrorKind::InvalidState,
+            ));
         };
         if !loaded.is_playlist {
-            return Err(Refusal::new("the loaded content is not a playlist"));
+            return Err(Refusal::kinded(
+                "the loaded content is not a playlist",
+                fcast_flatbuf::flat::ErrorKind::InvalidState,
+            ));
         }
         let Some(index) = usize::try_from(index)
             .ok()
             .filter(|&i| i < loaded.queue.len())
         else {
-            return Err(Refusal::new(format!(
-                "playlist item {index} is out of range (0..{})",
-                loaded.queue.len()
-            )));
+            return Err(Refusal::kinded(
+                format!(
+                    "playlist item {index} is out of range (0..{})",
+                    loaded.queue.len()
+                ),
+                fcast_flatbuf::flat::ErrorKind::QueuePositionOutOfRange,
+            ));
         };
         loaded.index = index;
         self.state = PlayState::Playing;
@@ -383,7 +699,10 @@ impl Player {
     /// A [`Refusal`] at either end of the playlist, or when there is none.
     pub fn step(&mut self, forward: bool) -> Result<Applied, Refusal> {
         let Some(loaded) = &self.loaded else {
-            return Err(Refusal::new("no playlist is loaded"));
+            return Err(Refusal::kinded(
+                "no playlist is loaded",
+                fcast_flatbuf::flat::ErrorKind::InvalidState,
+            ));
         };
         let index = if forward {
             loaded.index as u64 + 1
@@ -409,11 +728,23 @@ impl Player {
         }];
 
         match end {
-            PlaybackEnd::Finished if loaded.index + 1 < loaded.queue.len() => {
+            PlaybackEnd::Finished if loaded.autoplay && loaded.index + 1 < loaded.queue.len() => {
                 loaded.index += 1;
+                let next = loaded.index;
+                let announce_v4 = loaded.v4_queue;
                 self.state = PlayState::Playing;
                 let mut applied = self.start_current();
                 updates.append(&mut applied.updates);
+                if announce_v4 {
+                    // The receiver moved the pointer, so *every* sender hears
+                    // it — the originator distinction only exists for
+                    // sender-driven selections.
+                    #[allow(clippy::cast_possible_truncation)]
+                    updates.push(ReceiverUpdate::QueueSelectRelay {
+                        position: crate::v4msg::QueuePosition::Index(next as u8),
+                        initiated_by_receiver: true,
+                    });
+                }
                 Applied {
                     events: applied.events,
                     updates,
@@ -429,7 +760,10 @@ impl Player {
             }
             PlaybackEnd::Failed(message) => {
                 self.state = PlayState::Idle;
-                updates.push(ReceiverUpdate::Error(format!("playback failed: {message}")));
+                updates.push(ReceiverUpdate::Error {
+                    message: format!("playback failed: {message}"),
+                    kind: fcast_flatbuf::flat::ErrorKind::Internal,
+                });
                 updates.push(ReceiverUpdate::Playback(self.snapshot(None)));
                 Applied {
                     events: Vec::new(),
@@ -523,14 +857,22 @@ mod tests {
                 ..PlayMessage::default()
             })
             .unwrap_err();
-        assert!(refusal.0.contains("inline content"), "{}", refusal.0);
+        assert!(
+            refusal.message.contains("inline content"),
+            "{}",
+            refusal.message
+        );
         assert_eq!(
             player.play_data().unwrap().url.as_deref(),
             Some("http://h/ok.mp4")
         );
 
         let refusal = player.load(play_url("ftp://h/no.mp4")).unwrap_err();
-        assert!(refusal.0.contains("unsupported scheme"), "{}", refusal.0);
+        assert!(
+            refusal.message.contains("unsupported scheme"),
+            "{}",
+            refusal.message
+        );
     }
 
     /// The playlist is owned here: finishing an item plays the next one and the
@@ -677,10 +1019,9 @@ mod tests {
         let mut player = Player::new();
         player.load(play_url("http://h/gone.mp4")).unwrap();
         let applied = player.media_ended(&PlaybackEnd::Failed("404".into()));
-        assert!(applied
-            .updates
-            .iter()
-            .any(|u| matches!(u, ReceiverUpdate::Error(e) if e.contains("404"))));
+        assert!(applied.updates.iter().any(
+            |u| matches!(u, ReceiverUpdate::Error { message, .. } if message.contains("404"))
+        ));
         assert_eq!(player.snapshot(None).state, PlayState::Idle);
     }
 

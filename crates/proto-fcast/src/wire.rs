@@ -201,6 +201,36 @@ pub fn try_decode_with_max(
     buf: &[u8],
     max_packet: usize,
 ) -> Result<Option<(Frame, usize)>, FCastError> {
+    match try_decode_raw(buf, max_packet)? {
+        None => Ok(None),
+        Some(raw) => {
+            let opcode = Opcode::from_wire(raw.opcode)?;
+            Ok(Some((Frame::with_body(opcode, raw.body), raw.consumed)))
+        }
+    }
+}
+
+/// A frame whose opcode byte has not been judged yet.
+///
+/// v4 sessions need this split: an unknown opcode byte there is *answered* with
+/// `Error {{ InvalidOpcode }}` and skipped — the reference's conformance driver
+/// holds receivers to that — where the JSON sessions treat it as a framing fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawFrame {
+    /// The opcode byte, possibly outside every published table.
+    pub opcode: u8,
+    /// The body bytes.
+    pub body: Vec<u8>,
+    /// Bytes to drain from the read buffer.
+    pub consumed: usize,
+}
+
+/// Decode one frame's size and bytes without judging the opcode.
+///
+/// # Errors
+/// [`FCastError::ZeroSizeFrame`] and [`FCastError::FrameTooLarge`] — the two
+/// header faults the spec says must disconnect in every version.
+pub fn try_decode_raw(buf: &[u8], max_packet: usize) -> Result<Option<RawFrame>, FCastError> {
     let Some(header) = buf.first_chunk::<4>() else {
         return Ok(None);
     };
@@ -215,11 +245,11 @@ pub fn try_decode_with_max(
     if buf.len() < total {
         return Ok(None);
     }
-    let opcode = Opcode::from_wire(buf[4])?;
-    Ok(Some((
-        Frame::with_body(opcode, buf[5..total].to_vec()),
-        total,
-    )))
+    Ok(Some(RawFrame {
+        opcode: buf[4],
+        body: buf[5..total].to_vec(),
+        consumed: total,
+    }))
 }
 
 #[cfg(test)]

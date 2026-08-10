@@ -25,6 +25,7 @@ pub mod identity;
 pub mod messages;
 pub mod player;
 pub mod session;
+pub mod session_v4;
 pub mod v4msg;
 pub mod wire;
 

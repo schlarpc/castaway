@@ -61,6 +61,9 @@ pub struct Config {
     /// Matter Casting settings.
     #[serde(default)]
     pub matter: Matter,
+    /// FCast settings.
+    #[serde(default)]
+    pub fcast: FCast,
     /// Where the panel's output volume starts, as a slider position in `0.0..=1.0`.
     ///
     /// The panel has one pair of speakers and one volume ([`pipeline::audio_session::Gain`]),
@@ -478,6 +481,25 @@ impl Default for Miracast {
             infrastructure: true,
         }
     }
+}
+
+/// FCast settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct FCast {
+    /// Announce protocol v4 (#248): the hello answers `Version {4}` and the mDNS
+    /// TXT carries `v=4` plus the TLS fingerprint. One switch for all three on
+    /// purpose — the sender SDK quits on any partial combination (a fingerprint
+    /// beside a v3 answer reads as an insecure downgrade; a v4 answer with no
+    /// fingerprint gives it nothing to pin).
+    ///
+    /// Off until the v4 session passes the real-transmitter VM check end to end
+    /// (#248's staging): announcing early would flip every SDK sender onto the
+    /// v4 code paths wholesale, and a partial v4 regresses casts that work today
+    /// over v3. The v4 stack itself is always built and armed — a sender or
+    /// conformance driver pointed at a receiver with this on gets the full TLS
+    /// session.
+    pub announce_v4: bool,
 }
 
 /// AirPlay settings.
@@ -1130,6 +1152,7 @@ impl Default for Config {
             log: Log::default(),
             attract_widget_url: Some("https://wiki.dma.space/".to_string()),
             bluetooth: Bluetooth::default(),
+            fcast: FCast::default(),
             airplay: AirPlay::default(),
             spotify: Spotify::default(),
             sponsorblock: SponsorBlock::default(),

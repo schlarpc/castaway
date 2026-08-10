@@ -287,7 +287,10 @@ fn listen_events_pushes_match_the_shipped_translation() {
         fresh.frame_update(1_754_700_000_500, &ReceiverUpdate::Volume(0.75)),
         fresh.frame_update(
             0,
-            &ReceiverUpdate::Error("synthetic error for capture".into()),
+            &ReceiverUpdate::Error {
+                message: "synthetic error for capture".into(),
+                kind: fcast_flatbuf::flat::ErrorKind::Internal,
+            },
         ),
     ];
     for (row, expected) in pushed.iter().zip(expected) {

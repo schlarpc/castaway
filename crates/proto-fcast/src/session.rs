@@ -154,7 +154,12 @@ pub enum ReceiverUpdate {
     /// The volume changed.
     Volume(f64),
     /// Playback failed on our side.
-    Error(String),
+    Error {
+        /// The human-readable reason (v1-v3's `PlaybackError`).
+        message: String,
+        /// The typed kind (v4's `Error` broadcast).
+        kind: fcast_flatbuf::flat::ErrorKind,
+    },
     /// What is loaded changed (v3 broadcasts this as `PlayUpdate`).
     PlayChanged(Option<PlayMessage>),
     /// A media item event fired (v3, subscribed sessions only).
@@ -163,6 +168,39 @@ pub enum ReceiverUpdate {
         kind: MediaItemEventKind,
         /// The item it is about.
         item: PlayMessage,
+    },
+    /// A v4 `Load` to relay to *other* v4 senders, stripped (#248). v1-v3
+    /// sessions hear the same load through [`ReceiverUpdate::PlayChanged`].
+    V4Load {
+        /// The raw inbound packet body.
+        raw: Vec<u8>,
+    },
+    /// A v4 `QueueInsert` relay (stripped), other senders only.
+    QueueInsertRelay {
+        /// The raw inbound packet body.
+        raw: Vec<u8>,
+    },
+    /// A v4 `QueueRemove` relay, other senders only.
+    QueueRemoveRelay(crate::v4msg::QueuePosition),
+    /// A v4 `QueueItemSelected`: relayed to other senders when a sender chose,
+    /// broadcast to everyone when the receiver advanced (autoplay/end-of-item).
+    QueueSelectRelay {
+        /// The selected position.
+        position: crate::v4msg::QueuePosition,
+        /// Receiver-initiated selections go to every sender, the originator too.
+        initiated_by_receiver: bool,
+    },
+    /// The speed actually in force (v4 `SpeedChanged` broadcast; v1-v3 senders
+    /// read speed out of their `PlaybackUpdate`s instead).
+    SpeedActual(f64),
+    /// A position discontinuity — a seek landed. v4 senders hear it as an
+    /// immediate `ProgressChanged`; v1-v3 senders already got the position in the
+    /// `Playback` update that rides beside this.
+    Progress {
+        /// The new position.
+        position: std::time::Duration,
+        /// The duration, when the pipeline knows it.
+        duration: Option<std::time::Duration>,
     },
 }
 
@@ -415,7 +453,7 @@ impl Session {
                 ),
             }),
             // v1 has no error opcode; a v1 sender simply sees the state go idle.
-            ReceiverUpdate::Error(message) => match version {
+            ReceiverUpdate::Error { message, .. } => match version {
                 SessionVersion::V1 => None,
                 SessionVersion::V2 | SessionVersion::V3 => Some(json_frame(
                     Opcode::PlaybackError,
@@ -441,6 +479,15 @@ impl Session {
                     None
                 }
             }
+            // v4-only surfaces; the JSON dialects have no message for them.
+            // (Queue movement still reaches v3 senders as `itemIndex` in their
+            // `PlaybackUpdate`s, and the load itself as `PlayChanged`.)
+            ReceiverUpdate::V4Load { .. }
+            | ReceiverUpdate::QueueInsertRelay { .. }
+            | ReceiverUpdate::QueueRemoveRelay(_)
+            | ReceiverUpdate::QueueSelectRelay { .. }
+            | ReceiverUpdate::SpeedActual(_)
+            | ReceiverUpdate::Progress { .. } => None,
         }
     }
 
@@ -901,7 +948,13 @@ mod tests {
         v1.on_frame(Duration::ZERO, &ctx(&receiver, None), &version_frame(1))
             .unwrap();
         assert_eq!(
-            v1.frame_update(1, &ReceiverUpdate::Error("boom".into())),
+            v1.frame_update(
+                1,
+                &ReceiverUpdate::Error {
+                    message: "boom".into(),
+                    kind: fcast_flatbuf::flat::ErrorKind::Internal
+                }
+            ),
             None
         );
         assert_eq!(

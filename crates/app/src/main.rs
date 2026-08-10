@@ -1839,9 +1839,23 @@ fn spawn_fcast(
         Some(report) => receiver.with_playback(report),
         None => receiver,
     };
+    // The v4 TLS identity (#248): the key persists so the fingerprint — the trust
+    // anchor senders pin, and what a printed QR encodes — survives restarts. An
+    // unwritable state directory degrades to a fresh per-boot key (the reference
+    // receiver's behaviour every boot) rather than losing the protocol.
+    let receiver = match fcast_v4_identity() {
+        Ok(identity) => receiver.with_v4(identity, config.fcast.announce_v4),
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "FCast v4 identity unavailable; running v1-v3 only");
+            receiver
+        }
+    };
 
     advertise_adapter(&receiver, mdns);
-    info!("enabled: FCast (protocol v3, JSON session on 46899)");
+    info!(
+        announce_v4 = config.fcast.announce_v4,
+        "enabled: FCast (JSON session on 46899; v4 TLS behind [fcast] announce_v4)"
+    );
 
     let sink = SessionSink::new(SourceId::new(ProtocolKind::FCast, "listener"), event_tx);
     let adapter = Arc::new(receiver);
@@ -1855,6 +1869,23 @@ fn spawn_fcast(
             () = shutdown.notified() => info!("FCast listener stopping"),
         }
     })
+}
+
+/// Load or create the persisted FCast v4 TLS key (#248).
+fn fcast_v4_identity() -> anyhow::Result<proto_fcast::identity::V4Identity> {
+    use anyhow::Context as _;
+    let dir = castaway_paths::host().state().join("fcast");
+    let key_path = dir.join("v4-key.der");
+    if let Ok(key) = std::fs::read(&key_path) {
+        return proto_fcast::identity::V4Identity::from_key(&key)
+            .with_context(|| format!("rebuilding the v4 identity from {}", key_path.display()));
+    }
+    let (identity, key) =
+        proto_fcast::identity::V4Identity::generate().context("generating a v4 identity")?;
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&key_path, &key))
+        .with_context(|| format!("persisting the v4 key to {}", key_path.display()))?;
+    Ok(identity)
 }
 
 /// Build the Matter Casting receiver and hand it its mDNS record.

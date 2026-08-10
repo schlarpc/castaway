@@ -95,7 +95,7 @@ impl RemoteControl for FCastRemote {
                 return Err(CoreError::UnsupportedControl(format!("{other:?}")));
             }
         };
-        let events = events.map_err(|refusal| CoreError::UnsupportedControl(refusal.0))?;
+        let events = events.map_err(|refusal| CoreError::UnsupportedControl(refusal.message))?;
         for event in events {
             self.sink
                 .emit(event)
