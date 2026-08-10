@@ -147,11 +147,12 @@ async fn a_v3_sender_plays_and_pauses() {
     assert_eq!(start, Some(Duration::from_secs(10)));
     let surface = next_event(&mut rx).await;
     assert!(matches!(surface, SessionEvent::ControlSurface(_)));
-    // NowPlaying and the volume-apply follow; drain up to the Control(Volume).
+    // NowPlaying, the volume-apply, and finally the sender's identity: drain to
+    // the SourceInfo that closes a load's event train.
     loop {
         match next_event(&mut rx).await {
-            SessionEvent::Control(ControlTxn::Volume(_)) => break,
-            SessionEvent::NowPlaying(_) => {}
+            SessionEvent::SourceInfo(_) => break,
+            SessionEvent::Control(ControlTxn::Volume(_)) | SessionEvent::NowPlaying(_) => {}
             other => panic!("unexpected event {other:?}"),
         }
     }

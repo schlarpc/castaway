@@ -1010,6 +1010,14 @@
           # minus the driver's own quirks (§7.6), which remain the hardware's to prove.
           miracast-vm = import ./nix/miracast-vm-test.nix { inherit pkgs self; };
 
+          # FCast end to end between two hosts (#241), driven by the *real*
+          # transmitters: the reference terminal sender (the fcast-sender-sdk stack
+          # Grayjay embeds, Nix-pinned at the commit the wire fixtures were captured
+          # from) and nixpkgs' 2024 pre-SDK client for the implicit-v1 path. Discovery
+          # through the SDK's own mDNS browse, then URL casts, transport verbs,
+          # playlists, and the version downgrade — none of it scripted by us.
+          fcast-vm = import ./nix/fcast-vm-test.nix { inherit pkgs self; };
+
           # Matter commissioning end to end between two hosts (#171). The half of
           # `proto-matter` a socket test cannot reach: the `_matterc._udp` browse, PASE,
           # AddNOC, CASE, and the client invoking `LaunchURL` back over the session

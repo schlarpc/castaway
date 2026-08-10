@@ -26,6 +26,12 @@ The `listen-events` transcript also records the scripted receiver's
 accepted without complaint, and shows the sender sending **no** `Ping` of its own
 over a 9 s idle window — the heartbeat is receiver-initiated in practice.
 
+`client-2024-play.jsonl` is a different implementation entirely: nixpkgs'
+`fcast-client` (0.1.0-unstable-2024-05-23, the pre-SDK terminal client). It sends
+**no `Version` at all** — its first frame is the `Play` — and writes every optional
+field explicitly (`"content":null`, `"time":0.0`, `"speed":1.0`), which is exactly
+the implicit-v1 path and the null-tolerance the session claims to handle.
+
 `tests/real_sender_transcripts.rs` replays every `in` frame through the pure
 session + player and asserts what the session must have concluded. Recapture with a
 newer sender by re-running the harness in the #241 work notes and adding files under

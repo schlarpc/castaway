@@ -105,12 +105,12 @@ Only (d) distinguishes "the session negotiated and the panel is black" from "it 
 
 ## 2. The harness
 
-### The 20 checks
+### The 21 checks
 
-`nix flake check` runs **all 20** checks (23 before D55 collapsed the per-feature
+`nix flake check` runs **all 21** checks (23 before D55 collapsed the per-feature
 ones; `moonlight-bindings` was added after, closing half of #191, then `android-bt`
-opening #225's first slice, `dial-vm` for #202's positive discovery path, and
-`android-cast` closing #225's second slice), on the one system
+opening #225's first slice, `dial-vm` for #202's positive discovery path,
+`android-cast` closing #225's second slice, and `fcast-vm` with #241), on the one system
 this flake now claims — see the structural note below.
 
 The count and the table below are the ones `nix eval .#checks.x86_64-linux` gives; they
@@ -149,6 +149,7 @@ So the question is never "did CI run it". It is **"is there a check for it"**.
 | `miracast-vm` | 1 node, 2 `mac80211_hwsim` radios + netns; **real NixOS module** | T2 | 57m |
 | `matter-vm` | 2-node; panel from **the real NixOS module**; peer is our own `matter-peer` | T2 | 74m |
 | `gamestream-vm` | 2-node; peer is **real nixpkgs `sunshine`**; neither node runs castaway or the module | **T3** | 71m |
+| `fcast-vm` | 2-node; receiver from **the real NixOS module**; peers are the **real reference terminal sender** (the `fcast-sender-sdk` stack Grayjay embeds, pinned at the fixtures' commit) and **real nixpkgs `fcast-client`** (2024, pre-SDK, implicit v1) — discovery via the SDK's own mDNS browse, then URL casts, transport verbs, playlists, the v4→v3 downgrade (#241) | **T3** | minutes + build |
 | `bluetooth-vm` | 1 node, `hci_vhci` + btvirt; peer is **real BlueZ**; receiver launched ad-hoc, **not** via the module | T2 | 75m |
 | `mixer-vm` | 1 node, `snd-dummy` + PipeWire; runs `mixer_real_device.rs` `--include-ignored` against a device clock that is the kernel's, not ours (#204) | T2 | 28s + build |
 | `dial-vm` | 2 nodes; the **whole kiosk** (Electron, wgpu, winit under Xvfb + lavapipe) answering a targeted DIAL M-SEARCH from another host, serving the description it points at, under a USN that does not collide with the DLNA renderer beside it. The counterpart to `integration-vm`, which asserts DIAL's *absence* on a browser-less build (D27) — see §4.4/§4.5 (#202) | T2 | — |

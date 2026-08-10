@@ -266,6 +266,14 @@ async fn emit_all(sink: &SessionSink, shared: &Arc<Shared>, events: Vec<SessionE
 /// One connection's actor: read frames, feed the session, apply commands, write
 /// whatever the session and the broadcasts queue up.
 async fn serve(shared: Arc<Shared>, stream: TcpStream, peer_addr: SocketAddr, sink: SessionSink) {
+    // Every connection speaks as ONE logical source. FCast senders share the
+    // receiver's single session by design — the terminal sender opens a fresh TCP
+    // connection per verb, and a phone may pause what another phone played — so a
+    // per-connection source tag would make the session manager refuse the pause as
+    // coming from a source that never played (found on the bench, not in review:
+    // play landed and every later verb was silently dropped). Who a session is
+    // *for* still reaches the screen, via `SourceInfo` below.
+    let sink = sink.with_instance("player");
     let started = tokio::time::Instant::now();
     let (mut reader, mut writer) = stream.into_split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
@@ -329,7 +337,7 @@ async fn serve(shared: Arc<Shared>, stream: TcpStream, peer_addr: SocketAddr, si
                     };
                     let (frame, consumed) = decoded;
                     buf.drain(..consumed);
-                    match handle_frame(&shared, peer_id, started.elapsed(), &frame) {
+                    match handle_frame(&shared, peer_id, peer_addr, started.elapsed(), &frame) {
                         Ok(events) => emit_all(&sink, &shared, events).await,
                         Err(fault) => {
                             warn!(peer = %peer_addr, %fault, "fcast: session fault; disconnecting");
@@ -378,11 +386,12 @@ async fn serve(shared: Arc<Shared>, stream: TcpStream, peer_addr: SocketAddr, si
 fn handle_frame(
     shared: &Arc<Shared>,
     peer_id: u64,
+    peer_addr: SocketAddr,
     now: Duration,
     frame: &Frame,
 ) -> Result<Vec<SessionEvent>, FCastError> {
     let wall_ms = Shared::wall_ms();
-    let reaction = {
+    let (reaction, sender_identity) = {
         let mut guard = shared
             .inner
             .lock()
@@ -403,15 +412,33 @@ fn handle_frame(
         for reply in &reaction.replies {
             send_frame(&peer.outbound, reply);
         }
-        reaction
+        let identity = peer.session.peer().cloned();
+        (reaction, identity)
     };
 
     let Some(command) = reaction.command else {
         return Ok(Vec::new());
     };
     debug!(?command, "fcast: sender command");
+    let was_load = matches!(command, SenderCommand::Load(_));
     match shared.apply(Some(peer_id), command) {
-        Ok(events) => Ok(events),
+        Ok(mut events) => {
+            if was_load {
+                // All connections share one source tag (see `serve`), so *who*
+                // loaded this is said here instead: the `Initial` identity when the
+                // sender gave one, and its address either way.
+                let mut description =
+                    castaway_core::SourceDescription::new().with_address(peer_addr.to_string());
+                if let Some(name) = sender_identity
+                    .as_ref()
+                    .and_then(|i| i.display_name.clone().or_else(|| i.app_name.clone()))
+                {
+                    description = description.with_display_name(name);
+                }
+                events.push(SessionEvent::SourceInfo(description));
+            }
+            Ok(events)
+        }
         Err(refusal) => {
             // The refusal already went back to the asking sender as a
             // `PlaybackError`; the connection stays up and whatever was playing

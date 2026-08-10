@@ -178,6 +178,23 @@ fn play_playlist() {
     assert_eq!(snapshot.item_index, Some(0));
 }
 
+/// A different real implementation: nixpkgs' 2024 pre-SDK terminal client. No
+/// `Version` frame at all — the `Play` verb *is* the hello — and every optional
+/// field written as an explicit `null`. The session must conclude v1 and load
+/// anyway.
+#[test]
+fn the_2024_client_speaks_implicit_v1() {
+    let (session, player, commands) = replay(include_str!("fixtures/client-2024-play.jsonl"));
+    assert_eq!(session.version(), Some(SessionVersion::V1));
+    assert!(session.peer().is_none(), "v1 has no Initial to identify by");
+    let Some(SenderCommand::Load(play)) = commands.last() else {
+        panic!("expected a Load, got {commands:?}");
+    };
+    assert_eq!(play.url.as_deref(), Some("http://example.com/v.mp4"));
+    assert_eq!(play.content, None, "explicit null parses as absent");
+    assert!(player.play_data().is_some());
+}
+
 #[test]
 fn transport_verbs() {
     for (fixture, expected) in [
