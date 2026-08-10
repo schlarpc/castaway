@@ -223,6 +223,7 @@ Test files that **no check compiles**:
 |---|---|---|
 | `crates/pipeline/tests/media_url_av.rs` | `ffmpeg` + `render` | 10 |
 | `crates/pipeline/tests/remote_negotiation.rs` | `remote` | 9 |
+| `crates/pipeline/tests/mirror_negotiation.rs` | `remote` | 5 |
 | `crates/pipeline/tests/output_stream.rs` | `stream` | 9 |
 | `crates/pipeline/tests/browser_end_to_end.rs` | `electron` (+`#[ignore]`) | 5 |
 | `crates/proto-gamestream/tests/links_moonlight.rs` | `stream` | 4 |
@@ -796,6 +797,9 @@ The shared destination every protocol feeds. Measured test counts: `-p pipeline`
 | RGBA→NV12 GPU pass | T1 numeric | `nv12::gpu` (5), ±2/255 | untripwired skip; a pin, not a differential |
 | H.264 encoder, AAC track, stream audio window | T0/T1, in `checks.test` | `encoder`(6), `aac`(4), `audio`(9) | `stream`-gated at the audit; `stream` is default since D55 so all run in `checks.test`. The `aac` skips go through the #182 ffmpeg tripwire; the `encoder` six do not — "no encoder here, skipping" is untripwired by design, so they still pass without asserting wherever no H.264 encoder opens |
 | WebRTC `/remote/` | T1, in `checks.test` | `remote_negotiation.rs` (9) + units (8) | `remote`-gated at the audit; `remote` is default since D55, and the test needs no GPU (real sockets, the offer/answer path), so it runs in `checks.test` |
+| WebRTC mirroring **in** (#248) | T1, in `checks.test` | `mirror_negotiation.rs` (5) | `remote`-gated, and `remote` is default since D55, so — like the row above, and for the same reason: real sockets, no GPU — it runs in `checks.test`. The strongest of the five is the one that matters: a second real peer offers a track, DTLS completes, and H.264 comes out as `EncodedFrame`s |
+| WebRTC mirror reassembly | T0, runs | `mirror_in::assemble` (7) | pure and always compiled: FU-A reassembly, the marker/timestamp boundary rules, keyframe flags, and the 13-hour RTP clock wrap. Nothing here proves a *picture* — see the row above |
+| FCompanion resource plane (#249) | T0, runs | `companion` units (7), `adapter_v4_loopback` (2), `pushed_content.rs` (4) | the wire format is the spec's own, and the loopback case drives the whole round trip: a v4 sender claims a provider id, plays an `fcomp://` URL, and answers the reads an HTTP GET provokes. **No published sender has exercised it** — `checks.fcast-v4-vm` does not push local media, so the reference sender's own `fcomp` path is untested against ours |
 | WebRTC fan-out / touch back | T0, runs | `feed::tests` (8), `input_touch::wire` (10), `remote::tests` (11) | strong; note two `feed` tests assert only "no panic" |
 | Real browser drives `/remote/` | **T4** | `remote_browser.rs` `#[ignore]` | STATUS.md calls it "the test that matters" |
 | Electron browser host | **NEVER RUNS** | `browser_end_to_end.rs` (5) | `electron`-gated **and** `#[ignore]`d |
