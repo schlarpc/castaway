@@ -40,6 +40,10 @@ pub mod timeline;
 pub mod aac;
 #[cfg(feature = "stream")]
 pub mod audio;
+/// The same mix again as Opus, for the remote's WebRTC track (#259) — browsers do not
+/// take AAC over RTP. Needs the same libav the AAC encoder does.
+#[cfg(feature = "stream")]
+pub mod opus;
 
 #[cfg(feature = "stream")]
 mod encoder;
@@ -52,6 +56,8 @@ pub use aac::AacEncoder;
 pub use audio::{AudioMix, StreamAudio};
 #[cfg(feature = "stream")]
 pub use encoder::{EncoderChoice, H264Encoder};
+#[cfg(feature = "stream")]
+pub use opus::OpusEncoder;
 #[cfg(feature = "stream")]
 pub use tap::StreamTap;
 

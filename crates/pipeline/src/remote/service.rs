@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_H264};
+use rtc::peer_connection::configuration::media_engine::{
+    MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS,
+};
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -41,6 +43,10 @@ use super::ports::PortPool;
 /// 102 with `packetization-mode=1` and the constrained-baseline profile is what every
 /// browser accepts and what our encoders emit.
 const H264_PAYLOAD_TYPE: PayloadType = 102;
+
+/// The Opus payload type this end registers (#259). Same caveat as
+/// [`H264_PAYLOAD_TYPE`]: what goes on the wire is the offerer's number.
+const OPUS_PAYLOAD_TYPE: PayloadType = 111;
 
 /// How long to wait for ICE gathering before answering anyway.
 ///
@@ -102,6 +108,16 @@ struct Peer {
     /// The sender `add_track` returned, kept for one reason: it is the only thing that
     /// knows the payload type this peer actually negotiated. See [`RemoteService::spawn_pump`].
     sender: Arc<dyn RtpSender>,
+    /// The track its sound goes out on (#259), with its own SSRC and sender — same
+    /// reasons as the video triple, one media kind over.
+    audio_track: Arc<TrackLocalStaticSample>,
+    audio_ssrc: u32,
+    audio_sender: Arc<dyn RtpSender>,
+    /// Whether the peer's offer carried an audio m-line at all (#259). Read from the
+    /// *offer*, not from the sender's parameters: an unmatched sender still reports the
+    /// codec it was registered with, so its parameters cannot distinguish "negotiated
+    /// Opus" from "was never asked".
+    wants_audio: bool,
     /// Whether the pump has been started. `Connected` can be reported more than once —
     /// an ICE restart passes back through it — and two pumps on one track would
     /// interleave two copies of every frame into one sequence number space.
@@ -173,6 +189,32 @@ impl RemoteService {
         out
     }
 
+    /// The same diagnostic for the audio track (#259). `None` for a peer whose offer
+    /// carried no audio m-line — its pictures still flow; only the sound is absent.
+    ///
+    /// Gated on [`Peer::wants_audio`] before the sender is asked, because an unmatched
+    /// sender answers with the codec it was *registered* with — the same trap the video
+    /// diagnostic exists to catch, one step earlier.
+    pub async fn peer_audio_payload_types(&self) -> Vec<(RemoteId, Option<PayloadType>)> {
+        let senders: Vec<(RemoteId, bool, Arc<dyn RtpSender>)> = match self.peers.lock() {
+            Ok(peers) => peers
+                .iter()
+                .map(|p| (p.id, p.wants_audio, Arc::clone(&p.audio_sender)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut out = Vec::with_capacity(senders.len());
+        for (id, wants_audio, sender) in senders {
+            let payload_type = if wants_audio {
+                negotiated_payload_type(&sender).await
+            } else {
+                None
+            };
+            out.push((id, payload_type));
+        }
+        out
+    }
+
     /// Answer a peer's offer, standing up its connection.
     ///
     /// # Errors
@@ -209,12 +251,27 @@ impl RemoteService {
     ) -> Result<String, PipelineError> {
         let offer = RTCSessionDescription::offer(offer_sdp.to_owned())
             .map_err(|e| PipelineError::Remote(format!("offer: {e}")))?;
+        // Decided from the offer because nothing downstream can say it: see
+        // [`Peer::wants_audio`].
+        let wants_audio = offer
+            .unmarshal()
+            .map(|parsed| {
+                parsed
+                    .media_descriptions
+                    .iter()
+                    .any(|media| media.media_name.media == "audio")
+            })
+            .unwrap_or(false);
 
         let mut media_engine = MediaEngine::default();
         let codec = video_codec();
         media_engine
             .register_codec(codec.clone(), RtpCodecKind::Video)
             .map_err(|e| PipelineError::Remote(format!("codec: {e}")))?;
+        let opus = audio_codec();
+        media_engine
+            .register_codec(opus.clone(), RtpCodecKind::Audio)
+            .map_err(|e| PipelineError::Remote(format!("audio codec: {e}")))?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)
             .map_err(|e| PipelineError::Remote(format!("interceptors: {e}")))?;
 
@@ -270,6 +327,32 @@ impl RemoteService {
             .await
             .map_err(|e| PipelineError::Remote(format!("add_track: {e}")))?;
 
+        // The sound beside the pictures (#259): its own track, SSRC and sender, in the
+        // same stream (`"castaway"`) so a browser's `ontrack` hands both to one
+        // `MediaStream` and the `<video>` element carries them together.
+        let audio_ssrc = audio_ssrc_for(id);
+        let audio_track = Arc::new(
+            TrackLocalStaticSample::new(MediaStreamTrack::new(
+                "castaway".to_owned(),
+                "panel-audio".to_owned(),
+                "panel-audio".to_owned(),
+                RtpCodecKind::Audio,
+                vec![RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters {
+                        ssrc: Some(audio_ssrc),
+                        ..Default::default()
+                    },
+                    codec: opus.rtp_codec.clone(),
+                    ..Default::default()
+                }],
+            ))
+            .map_err(|e| PipelineError::Remote(format!("audio track: {e}")))?,
+        );
+        let audio_sender = connection
+            .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
+            .await
+            .map_err(|e| PipelineError::Remote(format!("add_track (audio): {e}")))?;
+
         connection
             .set_remote_description(offer)
             .await
@@ -299,6 +382,10 @@ impl RemoteService {
                 track,
                 ssrc,
                 sender,
+                audio_track,
+                audio_ssrc,
+                audio_sender,
+                wants_audio,
                 pumping: false,
             });
         }
@@ -339,11 +426,22 @@ impl RemoteService {
                 .filter(|p| !p.pumping)
                 .map(|p| {
                     p.pumping = true;
-                    (Arc::clone(&p.track), p.ssrc, Arc::clone(&p.sender))
+                    (
+                        Arc::clone(&p.track),
+                        p.ssrc,
+                        Arc::clone(&p.sender),
+                        p.wants_audio.then(|| {
+                            (
+                                Arc::clone(&p.audio_track),
+                                p.audio_ssrc,
+                                Arc::clone(&p.audio_sender),
+                            )
+                        }),
+                    )
                 }),
             Err(_) => None,
         };
-        let Some((track, ssrc, sender)) = started else {
+        let Some((track, ssrc, sender, audio)) = started else {
             return;
         };
         info!(peer = id.get(), "remote: streaming to peer");
@@ -353,6 +451,9 @@ impl RemoteService {
         // is a compare-exchange — so this costs nothing in the normal case.
         (self.start)();
         self.spawn_pump(id, track, ssrc, sender);
+        if let Some((audio_track, audio_ssrc, audio_sender)) = audio {
+            self.spawn_audio_pump(id, audio_track, audio_ssrc, audio_sender);
+        }
     }
 
     /// Feed one peer's track from the live encoder output until either goes away.
@@ -400,6 +501,74 @@ impl RemoteService {
             drop(subscription);
             service.forget(id);
         }));
+    }
+
+    /// Feed one peer's audio track from the Opus fan-out until either goes away (#259).
+    ///
+    /// The sound's lifecycle rides the video's: this pump ending does *not* forget the
+    /// peer — a remote with pictures and no sound is degraded, not gone — and the peer
+    /// going away errors the write here, which is what ends the task. A peer whose offer
+    /// carried no audio m-line negotiates no codec and simply never gets a pump.
+    fn spawn_audio_pump(
+        self: &Arc<Self>,
+        id: RemoteId,
+        track: Arc<TrackLocalStaticSample>,
+        ssrc: u32,
+        sender: Arc<dyn RtpSender>,
+    ) {
+        let mut subscription = self.feed.subscribe_audio();
+        let service = Arc::clone(self);
+        self.runtime.spawn(Box::pin(async move {
+            // The offerer's number, exactly as the video pump asks — see `spawn_pump`
+            // for what stamping our own registered 111 would produce.
+            let payload_type = match negotiated_payload_type(&sender).await {
+                Some(payload_type) => payload_type,
+                None => {
+                    debug!(
+                        peer = id.get(),
+                        "remote: peer negotiated no audio codec; the track stays silent"
+                    );
+                    return;
+                }
+            };
+            debug!(peer = id.get(), payload_type, "remote: sending audio");
+            loop {
+                // The video pump learns of a dead peer from its writes, because frames
+                // always flow while a peer is up. Sound does not have that property — a
+                // build with no audio path publishes nothing, ever — so a pump parked on
+                // an empty feed re-checks that its peer still exists rather than
+                // outliving it by the life of the process.
+                let frame =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), subscription.next())
+                        .await;
+                let frame = match frame {
+                    Err(_) => {
+                        if service.knows(id) {
+                            continue;
+                        }
+                        break;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(frame)) => frame,
+                };
+                let sample = rtc::media::Sample {
+                    data: bytes::Bytes::copy_from_slice(&frame.data),
+                    duration: frame.duration,
+                    ..Default::default()
+                };
+                if let Err(e) = track.write_sample(ssrc, payload_type, &sample, &[]).await {
+                    debug!(peer = id.get(), error = %e, "remote: audio track closed");
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Whether a peer is still in the list — the audio pump's liveness re-check.
+    fn knows(&self, id: RemoteId) -> bool {
+        self.peers
+            .lock()
+            .is_ok_and(|peers| peers.iter().any(|p| p.id == id))
     }
 
     /// A peer is over: cancel whatever it was holding and let its port go.
@@ -509,6 +678,25 @@ fn video_codec() -> RTCRtpCodecParameters {
     }
 }
 
+/// The codec the answer offers for sound: Opus, stereo, at WebRTC's one true rate
+/// (#259).
+///
+/// The fmtp line matches what every browser offers — 20 ms minimum ptime, in-band FEC
+/// tolerated — so the codec matcher's strict (mime + fmtp) pass succeeds against a
+/// Chromium offer instead of falling through to the mime-only pass.
+fn audio_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: OPUS_PAYLOAD_TYPE,
+    }
+}
+
 /// A stable, distinct SSRC per peer.
 ///
 /// Derived from the peer counter rather than random so a capture is readable and two
@@ -516,6 +704,13 @@ fn video_codec() -> RTCRtpCodecParameters {
 fn ssrc_for(id: RemoteId) -> u32 {
     let n = u32::try_from(id.get() & u64::from(u32::MAX)).unwrap_or(1);
     n.max(1)
+}
+
+/// The audio track's SSRC for the same peer: the video SSRC with the top bit set, so
+/// the two streams of one connection cannot collide with each other *or* with any other
+/// peer's, and a capture still reads as "peer n" at a glance (#259).
+fn audio_ssrc_for(id: RemoteId) -> u32 {
+    ssrc_for(id) | 0x8000_0000
 }
 
 /// One peer's events.
@@ -600,6 +795,23 @@ mod tests {
     }
 
     #[test]
+    fn a_peers_audio_ssrc_collides_with_nobody() {
+        // Not its own video stream, and not any neighbour's either stream (#259).
+        let ssrcs = [
+            ssrc_for(RemoteId::new(1)),
+            audio_ssrc_for(RemoteId::new(1)),
+            ssrc_for(RemoteId::new(2)),
+            audio_ssrc_for(RemoteId::new(2)),
+        ];
+        for (i, a) in ssrcs.iter().enumerate() {
+            assert_ne!(*a, 0, "zero reads as unset");
+            for b in &ssrcs[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
     fn the_codec_is_the_one_every_browser_accepts() {
         let codec = video_codec();
         assert_eq!(codec.payload_type, H264_PAYLOAD_TYPE);
@@ -608,5 +820,17 @@ mod tests {
             .sdp_fmtp_line
             .contains("packetization-mode=1"));
         assert_eq!(codec.rtp_codec.clock_rate, 90_000);
+    }
+
+    #[test]
+    fn the_audio_codec_is_opus_at_the_rate_webrtc_requires() {
+        // 48 kHz stereo is the only Opus a browser will negotiate for a music-capable
+        // track, and it is also the mixer's native rate — no resample on this path.
+        let codec = audio_codec();
+        assert_eq!(codec.payload_type, OPUS_PAYLOAD_TYPE);
+        assert_eq!(codec.rtp_codec.mime_type, MIME_TYPE_OPUS);
+        assert_eq!(codec.rtp_codec.clock_rate, 48_000);
+        assert_eq!(codec.rtp_codec.channels, 2);
+        assert!(codec.rtp_codec.sdp_fmtp_line.contains("minptime=10"));
     }
 }

@@ -48,6 +48,11 @@
 ///   Android is the system back gesture and in iOS Safari is swipe-to-go-back — the
 ///   browser eats it before the page sees it. A remote that could only pass gestures
 ///   through would have no way home, so this one does not try.
+/// - **The sound rides the same connection, and the unmute waits for the track (#259).**
+///   The `<video>` is marked `muted` so its idle autoplay needs no gesture; pressing
+///   *Take control* is the gesture, and `ontrack` unmutes under its sticky activation.
+///   An audio transceiver is offered alongside the video one — without it the panel has
+///   no m-line to answer and the track cannot exist.
 /// - **The keyboard is a field, not a key relay (#260).** A phone's IME composes —
 ///   autocorrect, swipe typing, CJK — so by the time script sees anything there is no
 ///   key stream, only the field's value. What travels is the value's *diff*: insertions
@@ -342,8 +347,14 @@ pub const PLAYER: &str = r##"
     channel.onopen = function () { say(''); };
 
     self.addTransceiver('video', { direction: 'recvonly' });
+    self.addTransceiver('audio', { direction: 'recvonly' });
     self.ontrack = function (e) {
       video.srcObject = e.streams[0] || new MediaStream([e.track]);
+      // The element is muted in the markup so its idle autoplay never needs a
+      // gesture; the press that started this negotiation *was* one, and sticky user
+      // activation is what lets the unmute stand. Unmuted here rather than at start,
+      // so a failed negotiation never leaves an unmuted element behind (#259).
+      video.muted = false;
       // The moment it stops being a video and starts being the panel.
       state('live');
       say('');
@@ -444,6 +455,24 @@ mod tests {
             .and_then(|r| r.split("};").next())
             .expect("an ontrack handler");
         assert!(ontrack.contains("state('live')"), "{ontrack}");
+    }
+
+    #[test]
+    fn the_panels_sound_is_asked_for_and_the_unmute_waits_for_the_track() {
+        // Without the audio transceiver the offer has no audio m-line, the panel has
+        // nothing to answer, and the track cannot exist (#259). And the unmute must live
+        // in `ontrack`, not at start: unmuting before the negotiation succeeds would
+        // leave a failed attempt with an unmuted element, and unmuting never would leave
+        // the whole feature silently working except for the sound.
+        assert!(PLAYER.contains("addTransceiver('audio', { direction: 'recvonly' })"));
+        let ontrack = PLAYER
+            .split("self.ontrack")
+            .nth(1)
+            .and_then(|r| r.split("};").next())
+            .expect("an ontrack handler");
+        assert!(ontrack.contains("video.muted = false"), "{ontrack}");
+        // The markup keeps `muted` for the idle autoplay; only the live track lifts it.
+        assert!(PLAYER.contains("autoplay muted playsinline"));
     }
 
     #[test]

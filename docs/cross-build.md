@@ -188,6 +188,13 @@ splat behaviour can break the hash even though `crtVersion`/`sdkVersion` haven't
   dependency with no mingw platform support. MSVC import libraries are ABI-neutral across a DLL
   boundary (plain C ABI), which is why gcc-built ffmpeg DLLs link fine under `lld-link`.
 
+  The pin **carries libopus** — checked for #259 by inspection, not a rebuild: the configuration
+  string embedded in the archive's `avcodec-61.dll`
+  (`ffmpeg-n7.1.5-10-g2aefd64d48-win64-lgpl-shared-7.1`) includes `--enable-libopus`, so the
+  remote's Opus audio track (`stream::opus`) opens on the Windows artifact exactly as on Linux.
+  A future pin bump should keep that flag; `stream::opus` failing to open degrades the remote to
+  pictures-only and logs "the remote track will be silent".
+
 - **Electron** — castLabs "Electron for Content Security" (ECS), the browser runtime (D36).
   Two inputs, `electron-windows-src` for the deploy artifact and `electron-linux-src` for
   dev/CI, and they must be **bumped together**: one Chromium major everywhere is the point,

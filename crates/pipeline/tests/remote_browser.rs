@@ -245,6 +245,46 @@ fn encode_into(feed: Arc<LiveFeed>, stop: Arc<AtomicBool>) -> Option<std::thread
     }))
 }
 
+/// Encode a tone into the audio fan-out until told to stop (#259).
+///
+/// Real Opus from the real encoder, paced at frame rate, because the point is that a
+/// browser *decodes* it — the negotiation tests already prove the SDP shape.
+fn sound_into(feed: Arc<LiveFeed>, stop: Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
+    use pipeline::stream::feed::EncodedAudio;
+    let mut encoder = match pipeline::stream::OpusEncoder::open(48_000, 96_000) {
+        Ok(encoder) => encoder,
+        Err(e) => {
+            eprintln!("skipping the audio half: no Opus encoder ({e})");
+            return None;
+        }
+    };
+    Some(std::thread::spawn(move || {
+        let size = encoder.frame_size();
+        let mut phase = 0usize;
+        while !stop.load(Ordering::Acquire) {
+            let frame: Vec<f32> = (0..size)
+                .flat_map(|i| {
+                    let t = (phase + i) as f32 / 48_000.0;
+                    let s = (t * 440.0 * std::f32::consts::TAU).sin() * 0.4;
+                    [s, s]
+                })
+                .collect();
+            phase += size;
+            if let Ok(packets) = encoder.encode(&frame) {
+                for packet in packets {
+                    feed.publish_audio(EncodedAudio {
+                        data: packet.data.into(),
+                        duration: Duration::from_nanos(
+                            u64::from(packet.samples) * 1_000_000_000 / 48_000,
+                        ),
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }))
+}
+
 /// Pump the browser the way the kiosk does, polling `expression` until `ready` accepts it.
 fn until(
     host: &mut ElectronHost,
@@ -314,6 +354,7 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
     let Some(encoder) = encode_into(Arc::clone(&feed), Arc::clone(&stop)) else {
         return;
     };
+    let sound = sound_into(Arc::clone(&feed), Arc::clone(&stop));
     let port = serve(
         Arc::clone(&service),
         runtime.handle().clone(),
@@ -404,6 +445,46 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
         feed.watched(),
         "a connected peer should be holding the encoder alive"
     );
+
+    // 3b. …and the browser decoded the *sound* (#259). The probe hangs an analyser off
+    //     the received `MediaStream` and reads the peak of the decoded waveform — the
+    //     audio twin of the video-frames check: a track that arrived but carried
+    //     undecodable packets, or the wrong payload type, reads as silence, and the
+    //     tone we encode reads as a peak near 0.4. Tapping the stream rather than the
+    //     element keeps the measurement independent of the element's mute state and of
+    //     the audio tap the browser host injects into every page. Only asserted where
+    //     the audio half is actually running, which is this box's Opus encoder's call.
+    if sound.is_some() {
+        let stamped = runtime.block_on(service.peer_audio_payload_types());
+        assert_eq!(stamped.len(), 1);
+        assert!(
+            stamped[0].1.is_some(),
+            "a real browser's offer must negotiate the Opus we register"
+        );
+        let peak = until(
+            &mut host,
+            &mut render,
+            "(function(){var v=document.getElementById('panel');\
+             if(!v.srcObject||v.srcObject.getAudioTracks().length===0)return 'no-track';\
+             if(!window.__meter){var c=new AudioContext();\
+             var s=c.createMediaStreamSource(v.srcObject);var a=c.createAnalyser();\
+             a.fftSize=2048;s.connect(a);\
+             window.__meter={c:c,a:a,buf:new Float32Array(2048)};}\
+             var m=window.__meter;m.c.resume();m.a.getFloatTimeDomainData(m.buf);\
+             var p=0;for(var i=0;i<m.buf.length;i++){var x=Math.abs(m.buf[i]);if(x>p)p=x;}\
+             return String(p)})()",
+            |v| {
+                v.trim()
+                    .trim_matches('"')
+                    .parse::<f64>()
+                    .is_ok_and(|p| p > 0.05)
+            },
+            Duration::from_secs(30),
+        );
+        let peak = peak
+            .unwrap_or_else(|| panic!("the browser decoded no audio: the remote track is silent"));
+        println!("browser decoded audio, waveform peak {}", peak.trim());
+    }
 
     // 4. …and now the other direction. A real pointer on the picture, routed through the
     //    browser exactly as the panel's own glass routes one, and it has to come back out
@@ -502,5 +583,8 @@ fn a_real_browser_plays_the_panel_and_its_touches_come_back() {
 
     stop.store(true, Ordering::Release);
     let _ = encoder.join();
+    if let Some(sound) = sound {
+        let _ = sound.join();
+    }
     host.shutdown();
 }

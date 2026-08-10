@@ -34,6 +34,12 @@ use super::fmp4::{AvcConfig, Sample, TIMESCALE};
 /// stalled task cannot hold a second of pictures alive per peer.
 const BACKLOG: usize = 64;
 
+/// The audio fan-out's backlog, in coded Opus frames (#259).
+///
+/// 20 ms each, so 128 is ~2.5 s — the same order as the video backlog, chosen the same
+/// way: a scheduling hiccup survives, a stalled peer does not accumulate the session.
+const AUDIO_BACKLOG: usize = 128;
+
 /// The Annex-B start code, which is the whole of the AVCC→Annex-B difference.
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -48,10 +54,27 @@ pub struct EncodedFrame {
     pub keyframe: bool,
 }
 
+/// One coded Opus frame of the panel's sound, for a peer's audio track (#259).
+///
+/// The same mix the HLS duplicate's AAC track carries — tapped at the mixer, so it is
+/// the samples the speakers were given — encoded a second time because WebRTC wants
+/// Opus. No keyframe flag: every Opus frame is independently decodable.
+#[derive(Debug, Clone)]
+pub struct EncodedAudio {
+    /// The Opus packet, as RFC 7587 puts it on the wire.
+    pub data: std::sync::Arc<[u8]>,
+    /// How much sound it carries.
+    pub duration: Duration,
+}
+
 /// The live fan-out: encoded pictures out, keyframe requests back.
 #[derive(Debug)]
 pub struct LiveFeed {
     frames: broadcast::Sender<EncodedFrame>,
+    /// The panel's sound beside the pictures (#259). A separate channel because the two
+    /// tracks pace independently — a peer's video task must not have to filter audio
+    /// out of its stream, nor hold audio frames alive while it waits for a keyframe.
+    audio: broadcast::Sender<EncodedAudio>,
     /// Set by a subscriber that needs a decodable starting point — a peer that just
     /// joined, or one whose decoder lost sync. Cleared by the encode loop when it acts on
     /// it, so a burst of requests during one GOP costs one keyframe rather than several.
@@ -74,8 +97,10 @@ impl LiveFeed {
     #[must_use]
     pub fn new() -> Self {
         let (frames, _) = broadcast::channel(BACKLOG);
+        let (audio, _) = broadcast::channel(AUDIO_BACKLOG);
         Self {
             frames,
+            audio,
             keyframe_wanted: AtomicBool::new(false),
             subscribers: AtomicUsize::new(0),
         }
@@ -130,6 +155,60 @@ impl LiveFeed {
             duration: Duration::from_secs_f64(f64::from(sample.duration) / f64::from(TIMESCALE)),
             keyframe: sample.keyframe,
         });
+    }
+
+    /// Whether any peer is listening for sound (#259).
+    ///
+    /// The gate the encode loop reads *before* the Opus encode, so a session with HLS
+    /// viewers and no WebRTC peers does not pay for a second audio codec nobody hears.
+    /// Distinct from [`Self::watched`], which is video-subscriber liveness and what
+    /// keeps the whole tap alive.
+    #[must_use]
+    pub fn audio_watched(&self) -> bool {
+        self.audio.receiver_count() > 0
+    }
+
+    /// Publish one coded Opus frame to whoever is listening.
+    pub fn publish_audio(&self, frame: EncodedAudio) {
+        // The only error is "nobody is listening", which `audio_watched` already gates
+        // upstream of the encode and which is not a problem in any case.
+        let _ = self.audio.send(frame);
+    }
+
+    /// Attach to the sound (#259). No guard and no keyframe request: audio subscribers
+    /// do not keep the tap alive — the same peer always holds a video [`Subscription`],
+    /// which does — and every Opus frame is a valid starting point.
+    #[must_use]
+    pub fn subscribe_audio(&self) -> AudioSubscription {
+        AudioSubscription {
+            frames: self.audio.subscribe(),
+        }
+    }
+}
+
+/// An attached audio listener. Dropping it detaches.
+#[derive(Debug)]
+pub struct AudioSubscription {
+    frames: broadcast::Receiver<EncodedAudio>,
+}
+
+impl AudioSubscription {
+    /// The next coded frame, or `None` once the feed is gone.
+    ///
+    /// A listener that fell behind resumes at the newest frame — the same loss the video
+    /// side takes and for the same reason, except that audio needs no keyframe to
+    /// recover on: the next Opus frame decodes on its own, and the receiver's jitter
+    /// buffer reads the gap as loss it already knows how to conceal.
+    pub async fn next(&mut self) -> Option<EncodedAudio> {
+        loop {
+            match self.frames.recv().await {
+                Ok(frame) => return Some(frame),
+                Err(broadcast::error::RecvError::Closed) => return None,
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::debug!(missed, "remote listener fell behind; skipping to live");
+                }
+            }
+        }
     }
 }
 
@@ -369,6 +448,56 @@ mod tests {
         assert!(!feed.take_keyframe_request(), "the request is one-shot");
         drop(sub);
         assert!(!feed.watched(), "the guard decremented on drop");
+    }
+
+    #[tokio::test]
+    async fn audio_frames_reach_a_listener_with_their_duration() {
+        let feed = Arc::new(LiveFeed::new());
+        assert!(!feed.audio_watched(), "nobody is listening yet");
+        let mut listener = feed.subscribe_audio();
+        assert!(feed.audio_watched());
+        feed.publish_audio(EncodedAudio {
+            data: vec![0xFC, 0xFF, 0xFE].into(),
+            duration: Duration::from_millis(20),
+        });
+        let frame = listener.next().await.expect("the feed is live");
+        assert_eq!(frame.data.as_ref(), &[0xFC, 0xFF, 0xFE]);
+        assert_eq!(frame.duration, Duration::from_millis(20));
+    }
+
+    #[test]
+    fn an_audio_listener_does_not_keep_the_tap_alive_or_cost_a_keyframe() {
+        // Liveness is the video subscription's job — every peer holds one — and a spare
+        // audio listener that pinned the tap would keep the encoder running for a track
+        // that cannot exist without the video one. Nor does audio need an IDR: every
+        // Opus frame decodes on its own.
+        let feed = Arc::new(LiveFeed::new());
+        let listener = feed.subscribe_audio();
+        assert!(!feed.watched(), "audio alone must not read as a viewer");
+        assert!(!feed.take_keyframe_request(), "audio needs no keyframe");
+        drop(listener);
+        assert!(!feed.audio_watched());
+    }
+
+    #[tokio::test]
+    async fn a_lagged_audio_listener_resumes_at_live_without_a_keyframe_request() {
+        let feed = Arc::new(LiveFeed::new());
+        let mut listener = feed.subscribe_audio();
+        for n in 0..=u8::try_from(AUDIO_BACKLOG).unwrap() {
+            feed.publish_audio(EncodedAudio {
+                data: vec![n].into(),
+                duration: Duration::from_millis(20),
+            });
+        }
+        let frame = listener.next().await.expect("still live");
+        assert!(
+            !frame.data.is_empty(),
+            "resumed on a frame rather than an error"
+        );
+        assert!(
+            !feed.take_keyframe_request(),
+            "audio loss must not cost the video track an IDR"
+        );
     }
 
     #[test]

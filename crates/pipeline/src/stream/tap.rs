@@ -31,8 +31,10 @@ use super::aac::AacEncoder;
 use super::audio::{StreamAudio, CHANNELS, RATE};
 use super::cadence::Cadence;
 use super::encoder::H264Encoder;
+use super::feed::EncodedAudio;
 use super::fmp4::{AacConfig, Media, Track, AUDIO_TRACK, TIMESCALE, VIDEO_TRACK};
 use super::hls::Segmenter;
+use super::opus::{Chunker, OpusEncoder};
 use super::timeline::Timeline;
 use super::{fmp4, LiveStream, StreamConfig, StreamStatus};
 use crate::nv12::Nv12Planes;
@@ -298,7 +300,19 @@ fn encode_loop(
     // may have no AAC encoder. Either way the video track still goes out — a stream with
     // no sound beats no stream.
     let mut sound = audio.and_then(|audio| match AacEncoder::open(RATE, config.audio_bitrate) {
-        Ok(encoder) => Some(Sound::new(encoder, audio)),
+        Ok(encoder) => {
+            // The remote's Opus beside the HLS track's AAC (#259): same mix, same
+            // draw, second codec, because WebRTC does not take AAC. Its absence
+            // costs only the remote's sound, so it degrades separately.
+            let opus = match OpusEncoder::open(RATE, config.audio_bitrate) {
+                Ok(opus) => Some(opus),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the remote track will be silent");
+                    None
+                }
+            };
+            Some(Sound::new(encoder, audio, opus))
+        }
         Err(e) => {
             tracing::warn!(error = %e, "the output stream will be silent");
             None
@@ -452,16 +466,30 @@ struct Sound {
     /// The alternative is an `elst` edit list, which is more boxes and which several
     /// players ignore.
     prime: usize,
+    /// The remote's Opus, fed the same draws (#259). `None` when no encoder opened —
+    /// the HLS track is unaffected either way.
+    opus: Option<RemoteAudio>,
+}
+
+/// The Opus re-encode of the mix, for WebRTC peers (#259).
+struct RemoteAudio {
+    encoder: OpusEncoder,
+    /// Regroups the AAC-sized draws (1024 samples) into Opus's 20 ms frames (960).
+    pending: Chunker,
 }
 
 impl Sound {
-    fn new(encoder: AacEncoder, audio: &StreamAudio) -> Self {
+    fn new(encoder: AacEncoder, audio: &StreamAudio, opus: Option<OpusEncoder>) -> Self {
         Self {
             mix: audio.mix(),
             config: encoder.config().clone(),
             name: encoder.name().to_string(),
             prime: encoder.initial_padding(),
             encoder,
+            opus: opus.map(|encoder| RemoteAudio {
+                pending: Chunker::new(encoder.frame_size()),
+                encoder,
+            }),
         }
     }
 
@@ -480,6 +508,42 @@ impl Sound {
             let Some(frames) = self.mix.take(now, frame_size, settle) else {
                 return;
             };
+            // The remote's copy first, so an AAC error cannot silence the peers along
+            // with the playlist. Gated on a listener existing — the check is the cheap
+            // half, the encode the expensive one — and the chunker is emptied when
+            // nobody is left, so the held remainder cannot front-run the next
+            // listener's sound (#259).
+            let mut opus_stopped = false;
+            if let Some(opus) = self.opus.as_mut() {
+                if state.feed().audio_watched() {
+                    opus.pending.push(&frames);
+                    while let Some(frame) = opus.pending.take() {
+                        match opus.encoder.encode(&frame) {
+                            Ok(coded) => {
+                                for packet in coded {
+                                    state.feed().publish_audio(EncodedAudio {
+                                        data: packet.data.into(),
+                                        duration: Duration::from_nanos(
+                                            u64::from(packet.samples) * 1_000_000_000
+                                                / u64::from(RATE),
+                                        ),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "the remote track's audio stopped");
+                                opus_stopped = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    opus.pending.clear();
+                }
+            }
+            if opus_stopped {
+                self.opus = None;
+            }
             match self.encoder.encode(&frames) {
                 Ok(samples) => {
                     for sample in samples {
@@ -491,7 +555,6 @@ impl Sound {
                     // leaves a track that ends where it stopped, which players handle;
                     // taking the whole stream down for it would not be a trade worth making.
                     tracing::warn!(error = %e, "the output stream's audio stopped");
-                    let _ = state;
                     return;
                 }
             }

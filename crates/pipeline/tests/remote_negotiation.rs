@@ -88,6 +88,67 @@ fn browser_offer() -> String {
         + "\r\n"
 }
 
+/// The payload type the offer numbers Opus with — again deliberately not the 111 this
+/// end registers, for the same reason as [`OFFERED_PAYLOAD_TYPE`] (#259).
+const OFFERED_AUDIO_PAYLOAD_TYPE: u8 = 100;
+
+/// The same offer with an audio m-line, which is what the shipped player now sends: its
+/// `addTransceiver('audio')` is what gives the panel an m-line to answer with sound.
+fn browser_offer_with_audio() -> String {
+    [
+        "v=0",
+        "o=- 4611731400430051336 2 IN IP4 127.0.0.1",
+        "s=-",
+        "t=0 0",
+        "a=group:BUNDLE 0 1 2",
+        "a=msid-semantic: WMS",
+        &format!("m=video 9 UDP/TLS/RTP/SAVPF {OFFERED_PAYLOAD_TYPE}"),
+        "c=IN IP4 0.0.0.0",
+        "a=rtcp:9 IN IP4 0.0.0.0",
+        "a=ice-ufrag:sTuV",
+        "a=ice-pwd:0123456789abcdef0123456789",
+        "a=ice-options:trickle",
+        "a=fingerprint:sha-256 \
+         11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:\
+11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00",
+        "a=setup:actpass",
+        "a=mid:0",
+        "a=recvonly",
+        "a=rtcp-mux",
+        &format!("a=rtpmap:{OFFERED_PAYLOAD_TYPE} H264/90000"),
+        &format!(
+            "a=fmtp:{OFFERED_PAYLOAD_TYPE} \
+             level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+        ),
+        &format!("m=audio 9 UDP/TLS/RTP/SAVPF {OFFERED_AUDIO_PAYLOAD_TYPE}"),
+        "c=IN IP4 0.0.0.0",
+        "a=rtcp:9 IN IP4 0.0.0.0",
+        "a=ice-ufrag:sTuV",
+        "a=ice-pwd:0123456789abcdef0123456789",
+        "a=fingerprint:sha-256 \
+         11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:\
+11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00",
+        "a=setup:actpass",
+        "a=mid:1",
+        "a=recvonly",
+        "a=rtcp-mux",
+        &format!("a=rtpmap:{OFFERED_AUDIO_PAYLOAD_TYPE} opus/48000/2"),
+        &format!("a=fmtp:{OFFERED_AUDIO_PAYLOAD_TYPE} minptime=10;useinbandfec=1"),
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+        "c=IN IP4 0.0.0.0",
+        "a=ice-ufrag:sTuV",
+        "a=ice-pwd:0123456789abcdef0123456789",
+        "a=fingerprint:sha-256 \
+         11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:\
+11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00",
+        "a=setup:actpass",
+        "a=mid:2",
+        "a=sctp-port:5000",
+    ]
+    .join("\r\n")
+        + "\r\n"
+}
+
 fn service(ports: (u16, u16), accept_input: bool) -> (Arc<RemoteService>, Arc<RemoteInputQueue>) {
     let feed = Arc::new(LiveFeed::new());
     let input = Arc::new(RemoteInputQueue::new(castaway_core::Waker::new()));
@@ -171,6 +232,53 @@ async fn the_answer_speaks_the_offerers_payload_type_not_ours() {
         stamped[0].1,
         Some(OFFERED_PAYLOAD_TYPE),
         "packets would go out under our number instead of the negotiated one"
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_with_audio_is_answered_with_opus_under_the_offerers_number() {
+    // The remote's sound (#259): an offer shaped like the shipped player's — video,
+    // audio, data channel — must come back with an Opus m-line, numbered the way the
+    // *offerer* numbered it, and the audio sender must know that number, because it is
+    // what the audio pump stamps on every packet.
+    let (service, _input) = service((BASE + 40, BASE + 43), true);
+    let answer = service.answer(&browser_offer_with_audio()).await.unwrap();
+
+    assert!(answer.contains("m=audio"), "no audio m-line: {answer}");
+    assert!(
+        answer.contains(&format!(
+            "a=rtpmap:{OFFERED_AUDIO_PAYLOAD_TYPE} opus/48000/2"
+        )),
+        "the answer should carry Opus under the offer's payload type: {answer}"
+    );
+    // And the video half is undisturbed by the second m-line.
+    assert!(answer.contains("H264/90000"), "{answer}");
+
+    let stamped = service.peer_audio_payload_types().await;
+    assert_eq!(stamped.len(), 1);
+    assert_eq!(
+        stamped[0].1,
+        Some(OFFERED_AUDIO_PAYLOAD_TYPE),
+        "audio packets would go out under our number instead of the negotiated one"
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_video_only_offer_still_connects_and_simply_has_no_sound() {
+    // Degradation, not refusal (#259): an older client — or anything that never asked
+    // for audio — negotiates exactly what it offered. The audio sender then knows no
+    // codec, which is what keeps the audio pump from stamping anything.
+    let (service, _input) = service((BASE + 50, BASE + 53), true);
+    let answer = service.answer(&browser_offer()).await.unwrap();
+    assert!(answer.contains("m=video"), "{answer}");
+
+    let stamped = service.peer_audio_payload_types().await;
+    assert_eq!(stamped.len(), 1);
+    assert_eq!(
+        stamped[0].1, None,
+        "an unoffered track must not claim a negotiated codec"
     );
     service.shutdown().await;
 }
