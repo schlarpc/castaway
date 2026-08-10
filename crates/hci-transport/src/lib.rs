@@ -32,7 +32,7 @@ mod embedded {
 
 pub use error::TransportError;
 pub use firmware::{Firmware, FirmwareSet};
-pub use init::{ControllerInit, IntelInit, NoInit, RealtekInit, UsbId};
+pub use init::{ControllerInit, IntelInit, NoInit, RealtekInit, UnknownControllerPolicy, UsbId};
 
 /// Every firmware image compiled into this build.
 #[must_use]

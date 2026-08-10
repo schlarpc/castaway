@@ -160,6 +160,45 @@ pub fn registry_strict() -> Vec<Box<dyn ControllerInit>> {
     vec![Box::new(IntelInit), Box::new(RealtekInit)]
 }
 
+/// What to do with a controller no firmware loader claims (#91).
+///
+/// This is the [`registry`]/[`registry_strict`] choice as a value, so the app config can
+/// carry it to [`registry_for`] without knowing which loaders exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownControllerPolicy {
+    /// Assume it runs from ROM: [`NoInit`] takes it, silently for the parts on its
+    /// allow-list and loudly for everything else. Right for a box that must come up
+    /// with whatever dongle it finds.
+    #[default]
+    AssumeRom,
+    /// Refuse it at startup with [`TransportError::UnsupportedController`]. Right for a
+    /// box known to have supported hardware, where "the radio came up inert" should be
+    /// impossible rather than a warning in a log nobody reads. Note this refuses
+    /// ROM-based parts (the CSR8510) too: strict means *a loader claims it*, and no
+    /// loader claims a part that needs nothing.
+    Refuse,
+}
+
+/// The initialisers the policy asks for.
+#[must_use]
+pub fn registry_for(policy: UnknownControllerPolicy) -> Vec<Box<dyn ControllerInit>> {
+    match policy {
+        UnknownControllerPolicy::AssumeRom => registry(),
+        UnknownControllerPolicy::Refuse => registry_strict(),
+    }
+}
+
+/// Whether a non-catch-all loader claims this id — that is, whether we can actually
+/// *drive* the part rather than merely hope it runs from ROM.
+///
+/// This is what `open_first` prefers when enumeration order is the only other input
+/// (#91): on a bench with an AX200 and an unknown dongle, the AX200 should win no matter
+/// which the bus lists first.
+#[must_use]
+pub fn has_dedicated_loader(id: UsbId) -> bool {
+    registry_strict().iter().any(|init| init.matches(id))
+}
+
 /// Pick the initialiser for a controller.
 ///
 /// # Errors
@@ -217,6 +256,39 @@ mod tests {
             panic!("strict mode must refuse an unknown controller");
         };
         assert!(format!("{err}").contains("0a12:0001"), "got: {err}");
+    }
+
+    #[test]
+    fn the_policy_selects_the_registry_it_names() {
+        // AssumeRom is today's behaviour: everything initialises, NoInit last.
+        let lenient: Vec<&str> = registry_for(UnknownControllerPolicy::AssumeRom)
+            .iter()
+            .map(|i| i.name())
+            .collect();
+        assert_eq!(lenient.last(), Some(&"rom"));
+
+        // Refuse is registry_strict: an unknown part is a startup error naming the id,
+        // not a radio that enumerates and then does nothing.
+        let Err(err) = select(registry_for(UnknownControllerPolicy::Refuse), CSR8510) else {
+            panic!("refuse policy must refuse a part no loader claims");
+        };
+        assert!(
+            matches!(err, TransportError::UnsupportedController(id) if id == CSR8510),
+            "got: {err}"
+        );
+        // And it must still accept the hardware the loaders exist for.
+        assert!(select(registry_for(UnknownControllerPolicy::Refuse), AX200).is_ok());
+    }
+
+    #[test]
+    fn a_dedicated_loader_is_one_that_is_not_the_catch_all() {
+        assert!(has_dedicated_loader(AX200));
+        assert!(has_dedicated_loader(RTL8761BU));
+        // The CSR8510 works, but from ROM: nothing *drives* it, so it earns no
+        // preference over enumeration order.
+        assert!(!has_dedicated_loader(CSR8510));
+        // An arbitrary unknown dongle.
+        assert!(!has_dedicated_loader(UsbId::new(0x0e8d, 0x0616)));
     }
 
     #[test]

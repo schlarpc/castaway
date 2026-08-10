@@ -947,6 +947,31 @@ pub struct Bluetooth {
     /// Where link keys and other persistent state live. `None` uses the platform's state
     /// directory: `$XDG_STATE_HOME/castaway`, or `%LOCALAPPDATA%\castaway\state`.
     pub state_dir: Option<String>,
+    /// What to do with a USB controller no firmware loader claims (#91).
+    ///
+    /// - `"assume-rom"` (default): initialise it anyway, on the guess that it runs from
+    ///   ROM — right for a CSR8510, a warning in the log and an inert radio for a
+    ///   Broadcom/MediaTek/Qualcomm part that needed firmware nothing here can load.
+    /// - `"refuse"`: fail Bluetooth startup naming the id. For a box known to have
+    ///   supported hardware (Intel AX2xx, Realtek RTL8761B/BU), where the wrong dongle
+    ///   should be an error at the console rather than a receiver that looks up and
+    ///   never pairs. Note `"refuse"` also refuses ROM-based parts like the CSR8510 —
+    ///   strict means *a loader claims it*.
+    ///
+    /// Only meaningful for `transport = "usb"`: a socket or TCP controller was brought
+    /// up by whoever owns it, and no loader runs.
+    pub unknown_controller: UnknownController,
+}
+
+/// The `[bluetooth] unknown_controller` policy: what an unclaimed USB controller is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnknownController {
+    /// Initialise it as if it runs from ROM (today's behaviour, with a loud warning).
+    #[default]
+    AssumeRom,
+    /// Refuse it at startup with an error naming the USB id.
+    Refuse,
 }
 
 /// Spotify Connect settings.
@@ -1123,6 +1148,7 @@ impl Default for Bluetooth {
             firmware_dir: None,
             codecs: None,
             state_dir: None,
+            unknown_controller: UnknownController::default(),
         }
     }
 }
@@ -1376,6 +1402,48 @@ mod tests {
         assert!(c.enable.cast);
         // Unspecified flags fall back to their defaults.
         assert!(c.enable.dlna);
+    }
+
+    #[test]
+    fn the_unknown_controller_policy_parses_and_defaults_lenient() {
+        // The default must stay assume-rom: "all on degrades to all this box can do"
+        // is the config's contract, and refusing dongles by default would break it.
+        assert_eq!(
+            Config::default().bluetooth.unknown_controller,
+            UnknownController::AssumeRom
+        );
+
+        let c: Config = toml::from_str(
+            r#"
+            [bluetooth]
+            unknown_controller = "refuse"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.bluetooth.unknown_controller, UnknownController::Refuse);
+
+        let c: Config = toml::from_str(
+            r#"
+            [bluetooth]
+            unknown_controller = "assume-rom"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.bluetooth.unknown_controller, UnknownController::AssumeRom);
+
+        // A typo is a parse error naming the field, not a silent fallback to lenient —
+        // an operator who wrote the key meant to gate startup on it.
+        let err = toml::from_str::<Config>(
+            r#"
+            [bluetooth]
+            unknown_controller = "strict"
+        "#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("unknown_controller"),
+            "got: {err}"
+        );
     }
 
     /// On by default: without a CKS credential, device auth fails against every

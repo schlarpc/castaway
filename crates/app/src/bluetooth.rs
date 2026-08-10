@@ -304,7 +304,8 @@ async fn open_transport(config: &Config) -> anyhow::Result<(Arc<dyn HciTransport
              initialise (see architecture §11.3b)"
         );
     }
-    let transport = UsbTransport::open_and_init(requested, &firmware)
+    let policy = unknown_controller_policy(config.bluetooth.unknown_controller);
+    let transport = UsbTransport::open_and_init(requested, &firmware, policy)
         .await
         .context("opening the bluetooth controller")?;
     let id = transport.id().to_string();
@@ -331,6 +332,23 @@ fn decodable() -> Vec<castaway_core::AudioCodec> {
         // Without the audio feature nothing decodes, but the stack is still worth
         // running against the null pipeline to prove discovery and pairing.
         Vec::new()
+    }
+}
+
+/// The library's policy for the config's words (#91).
+///
+/// The boundary conversion: the config enum is serde's, the transport enum is the
+/// library's, and matching here is what keeps `hci-transport` serde-free.
+fn unknown_controller_policy(
+    choice: crate::config::UnknownController,
+) -> hci_transport::init::UnknownControllerPolicy {
+    match choice {
+        crate::config::UnknownController::AssumeRom => {
+            hci_transport::init::UnknownControllerPolicy::AssumeRom
+        }
+        crate::config::UnknownController::Refuse => {
+            hci_transport::init::UnknownControllerPolicy::Refuse
+        }
     }
 }
 
@@ -555,6 +573,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("castaway-bt-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_config_policy_reaches_the_registry_it_names() {
+        // The whole point of `unknown_controller = "refuse"` (#91): the strict registry
+        // must actually be the one selected from, so an unclaimed part is a startup
+        // error naming its id rather than a warning and an inert radio.
+        use hci_transport::init::{registry_for, select, UnknownControllerPolicy};
+        let csr8510 = UsbId::new(0x0a12, 0x0001);
+
+        let policy = unknown_controller_policy(crate::config::UnknownController::Refuse);
+        assert_eq!(policy, UnknownControllerPolicy::Refuse);
+        assert!(select(registry_for(policy), csr8510).is_err());
+
+        let policy = unknown_controller_policy(crate::config::UnknownController::AssumeRom);
+        assert_eq!(policy, UnknownControllerPolicy::AssumeRom);
+        assert!(select(registry_for(policy), csr8510).is_ok());
     }
 
     #[test]
