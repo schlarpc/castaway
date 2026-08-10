@@ -566,8 +566,31 @@ fn a_whole_session_turns_ldac_frames_into_played_audio() {
     let played = speaker.played();
     let want = Duration::from_nanos(84 * 128 * 1_000_000_000 / 44_100);
     assert!(
-        played.abs_diff(want) < Duration::from_millis(15),
+        played + Duration::from_millis(15) > want,
         "played {played:?} of the fixture's {want:?}; the whole of it must reach the output"
+    );
+    // The other direction is bounded by the mixer's own accounting rather than by a fixed
+    // window (#276): `played()` spans first-to-last audible sample, so the span can only
+    // exceed the fixture by silence inserted *mid-stream* — and the mixer invents silence
+    // in exactly one counted place, its backstop (`MixerCounters::starved`). An ordinary
+    // scheduling slip that drains the live input punches a counted hole and passes here
+    // as a reading; silence that stretched the stream *without* moving the counter is the
+    // defect this assertion exists to catch.
+    let counters = mixer.counters();
+    let invented = Duration::from_nanos(
+        counters
+            .starved
+            .saturating_mul(1_000_000_000)
+            .div_euclid(u64::from(pipeline::mixer::RATE)),
+    );
+    let overshoot = played.saturating_sub(want);
+    assert!(
+        overshoot <= invented + Duration::from_millis(15),
+        "played {played:?} of the fixture's {want:?}: the {overshoot:?} overshoot exceeds \
+         the {invented:?} of invented silence the mixer counted (starved = {} frames, \
+         invented = {:?} of emitted) — silence entered the stream uncounted",
+        counters.starved,
+        counters.invented(),
     );
     assert!(
         *speaker.peak.lock().expect("poisoned") > 0.05,
