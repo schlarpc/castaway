@@ -98,7 +98,21 @@ struct Published {
     /// Held for the same reason as the render loop — dropping it stops the mixer thread —
     /// and read by [`Self::sound_diagnostics`].
     mixer: pipeline::mixer::AudioMixer,
+    /// The longest the encode thread went without draining the mix, as the harness loop
+    /// observed it (#247). The premise the live-edge bound rests on — see
+    /// [`Self::assert_the_mix_was_drained_on_schedule`].
+    longest_drain_gap: Duration,
 }
+
+/// The longest the mix may go undrained before the live-edge bound is unmeasurable.
+///
+/// The audio behind a segment's cut is whatever the encode thread drained *before* the
+/// cut, so `the_audio_track_trails_the_live_edge`'s upper bound — the settle plus one
+/// segment — is really a bound on the gap between the final cut and the drain before it:
+/// healthy jobs drain every frame slot (~33 ms), and a gap approaching the 200 ms segment
+/// is exactly what leaves a cut short of its audio. Three quarters of one is already the
+/// box failing to schedule the encode thread, not the stream mislaying sound.
+const DRAIN_GAP_LIMIT: Duration = Duration::from_millis(150);
 
 impl Published {
     /// Every counter on the audio path, for a failure message. Which one is nonzero is
@@ -131,6 +145,24 @@ impl Published {
             starved < 0.05,
             "the harness source was descheduled for {starved:.3}s, so this box cannot \
              measure sync — not a defect in the stream. {}",
+            self.sound_diagnostics()
+        );
+    }
+
+    /// Fail unless the encode thread kept draining the mix on its schedule.
+    ///
+    /// The premise of the live-edge bound, checked separately so a loaded box reports
+    /// *that* rather than a stream defect (#247, the missing half of #208's rework). This
+    /// is the `starved` pattern for the other thread the measurement depends on: the
+    /// harness drives the render loop itself, but the drain runs on `castaway-stream`,
+    /// and nothing the product counts can say whether that thread held its cadence or
+    /// lost the box for a quarter of a second.
+    fn assert_the_mix_was_drained_on_schedule(&self) {
+        assert!(
+            self.longest_drain_gap < DRAIN_GAP_LIMIT,
+            "the mix went undrained for {:?} — most of a segment — so this box cannot \
+             measure the live edge; not a defect in the stream. {}",
+            self.longest_drain_gap,
             self.sound_diagnostics()
         );
     }
@@ -248,6 +280,15 @@ fn publish_with(width: u32, height: u32, segments: u32, scenario: Scenario) -> O
     let loop_began = Instant::now();
     let mut stalled = false;
 
+    // The drain watch (#247): sample how far the encode thread has drained the mix, and
+    // remember the longest stretch it made no progress. Sampled from this loop — a couple
+    // of atomic-ish reads every few milliseconds — because the gap is a property of the
+    // `castaway-stream` thread's schedule, which nothing else observes in real time.
+    let mix = audio.mix();
+    let mut drained_to = mix.position();
+    let mut drained_at: Option<Instant> = None;
+    let mut longest_drain_gap = Duration::ZERO;
+
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         // The tap retires when nothing has asked for a while, and in this harness nothing
@@ -272,7 +313,21 @@ fn publish_with(width: u32, height: u32, segments: u32, scenario: Scenario) -> O
             );
             return None;
         }
+        let position = mix.position();
+        if position != drained_to {
+            let now = Instant::now();
+            if let Some(last) = drained_at {
+                longest_drain_gap = longest_drain_gap.max(now - last);
+            }
+            drained_to = position;
+            drained_at = Some(now);
+        }
         if state.segment(segments).is_some() {
+            // Close the watch's last interval: a stall the final cut waited out is
+            // exactly the gap the live-edge premise exists to catch.
+            if let Some(last) = drained_at {
+                longest_drain_gap = longest_drain_gap.max(last.elapsed());
+            }
             // The source is dropped here, which stops and joins its thread; the mixer
             // rides along so the assertions can read its counters.
             drop(source);
@@ -281,6 +336,7 @@ fn publish_with(width: u32, height: u32, segments: u32, scenario: Scenario) -> O
                 _render: rloop,
                 audio,
                 mixer,
+                longest_drain_gap,
             });
         }
         // Faster than the panel would present, so the cadence is what paces the stream
@@ -873,10 +929,45 @@ fn the_audio_track_trails_the_live_edge_and_never_leads_it() {
     let behind = video_secs - audio_secs;
     // The settle window, plus the segment whose audio has not been cut yet.
     let allowed = StreamConfig::default().audio_settle.as_secs_f64() + 0.2;
-    assert!(
-        (0.0..=allowed).contains(&behind),
-        "audio is {behind:.3}s behind the video (video {video_secs:.3}s, audio {audio_secs:.3}s)"
+    // On the record whichever way it goes: the one flake this has shown (#247) was
+    // tailed for its summary line, and the numbers that would have diagnosed it were
+    // never captured.
+    eprintln!(
+        "live edge: video {video_secs:.3}s, audio {audio_secs:.3}s, behind {behind:.3}s; \
+         longest drain gap {:?}; {}",
+        state.longest_drain_gap,
+        state.sound_diagnostics()
     );
+    // Both directions are real-time properties, so both rest on the same premise: the
+    // encode thread holding its cadence (#247). Trailing too far is a final cut whose
+    // audio was drained too long before it. Leading is subtler — it is *not* proof of
+    // placement by arrival on its own, which is what this file used to assume: reproduced
+    // under three concurrent suites, an encode thread that loses the box for a second
+    // leaves the video track seconds behind the wall clock while the audio track keeps
+    // real-time pace, and the first N segments then carry more audio than video with
+    // every sample still at its right position (measured: behind -2.741 s with a 899 ms
+    // drain gap and invented=12992). So a breach either way checks the premise first,
+    // and a loaded box says "cannot measure" instead of reporting a stream defect.
+    if !(0.0..=allowed).contains(&behind) {
+        state.assert_the_mix_was_drained_on_schedule();
+        if behind < 0.0 {
+            panic!(
+                "the audio track LEADS the video by {:.3}s (video {video_secs:.3}s, audio \
+                 {audio_secs:.3}s) with the mix drained on schedule (longest gap {:?}) — \
+                 sound is being placed by arrival rather than by the clock. {}",
+                -behind,
+                state.longest_drain_gap,
+                state.sound_diagnostics()
+            );
+        }
+        panic!(
+            "audio is {behind:.3}s behind the video (video {video_secs:.3}s, audio \
+             {audio_secs:.3}s), past the settle plus one uncut segment ({allowed:.3}s), \
+             with the mix drained on schedule (longest gap {:?}). {}",
+            state.longest_drain_gap,
+            state.sound_diagnostics()
+        );
+    }
 }
 
 /// Read the tone back block by block and hold every one to its own marker (#290).
