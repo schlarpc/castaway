@@ -1,0 +1,68 @@
+name: Live endpoints
+
+# The two borrowed Cast identities (`crates/cast-replay`) authenticate with signatures
+# from someone else's live service: AirReceiver's CKS backend and AirServer's credential
+# database endpoint. Both are third parties who can change or revoke unilaterally, and
+# #40 names that as the failure this project cannot detect in advance — a revocation or an
+# API change lands as a silent fallback to the checked-in table, not as an error.
+#
+# So this job exercises both endpoints on a schedule and lets the run go red when one
+# stops behaving. It runs the `#[ignore]`d live tests in
+# `crates/cast-replay/tests/live_backend.rs` (#294).
+#
+# Deliberately NOT part of `nix flake check` / the Test workflow. Those gate code changes,
+# and a third party's outage must never red a commit that did nothing wrong — the whole
+# reason the tests carry `#[ignore]`. Here the endpoint *is* the thing under test, so its
+# outage failing the run is the signal, not noise. There is nothing to assert beyond
+# "the run is green": a red run is the alert.
+on:
+  schedule:
+    # Weekly, Monday 08:00 UTC. Often enough to catch a revocation or API drift within a
+    # week; not so often that an unattended job hammers someone else's endpoint (D43/D44
+    # warn against running the refresh in a loop).
+    - cron: "0 8 * * 1"
+  # And on demand, so a suspected revocation can be checked without waiting for Monday.
+  workflow_dispatch:
+
+# One run at a time; a manual dispatch while the weekly run is in flight supersedes it.
+concurrency:
+  group: live-endpoints
+  cancel-in-progress: false
+
+jobs:
+  live-endpoints:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/nix-runner
+        # Restores the shared Linux store snapshot; never saves — a live-endpoint probe
+        # is not a source of build artifacts worth persisting, and only one saver per
+        # group belongs in the 10 GB budget (the Test workflow's `test` check).
+        with:
+          cache-group: main
+          cache-save: "false"
+      - name: Exercise both identities' live endpoints
+        run: |
+          set -euo pipefail
+          # The carved vendor credentials the live paths need, on the same terms
+          # `castCarveEnvFor` supplies them to every other build: CKS's request/response
+          # credentials come from the AirReceiver carve, AirServer's database KEK from the
+          # AirServer carve. Built here and pointed at by env so the devshell — which does
+          # not export these — still gets them.
+          CASTAWAY_AIRRECEIVER_CARVE="$(nix build --no-link --print-out-paths .#airreceiver-carve)"
+          CASTAWAY_AIRSERVER_CARVE="$(nix build --no-link --print-out-paths .#airserver-carve)"
+          export CASTAWAY_AIRRECEIVER_CARVE CASTAWAY_AIRSERVER_CARVE
+          export CASTAWAY_AIRSERVER_KEK_PERSON_FILE="$CASTAWAY_AIRSERVER_CARVE/kek_person.bin"
+          export CASTAWAY_AIRSERVER_KEK_PASS_FILE="$CASTAWAY_AIRSERVER_CARVE/kek_pass.bin"
+          # `binary(live_backend)`, not a bare `live_backend` positional: nextest matches a
+          # positional substring against the test *name*, which does not contain
+          # `live_backend`, so the positional form selects zero tests silently — a probe
+          # that never runs is worse than no probe. The filterset selects exactly the two
+          # live tests, one per identity.
+          nix develop --command \
+            cargo nextest run -p cast-replay --run-ignored all -E 'binary(live_backend)'
+      - uses: ./.github/actions/postmortem
+        if: failure()
