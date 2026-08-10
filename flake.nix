@@ -1018,6 +1018,12 @@
           # playlists, and the version downgrade — none of it scripted by us.
           fcast-vm = import ./nix/fcast-vm-test.nix { inherit pkgs self; };
 
+          # FCast protocol v4 (#248): the same real transmitters against a
+          # receiver announcing v4 — the SDK pins the fp from mDNS and runs a
+          # genuine TLS 1.3 session — then FUTO's own conformance driver sweeps
+          # the 70-case green manifest, so a regression in any one case fails CI.
+          fcast-v4-vm = import ./nix/fcast-v4-vm-test.nix { inherit pkgs self; };
+
           # Matter commissioning end to end between two hosts (#171). The half of
           # `proto-matter` a socket test cannot reach: the `_matterc._udp` browse, PASE,
           # AddNOC, CASE, and the client invoking `LaunchURL` back over the session
