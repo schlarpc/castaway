@@ -116,6 +116,7 @@ pub mod airserver_api;
 pub mod airserver_db;
 pub mod api;
 pub mod cache;
+pub mod canary;
 pub mod cks;
 pub mod crl;
 mod pem;
@@ -125,6 +126,7 @@ pub mod template;
 pub mod window;
 
 pub use airserver::{has_bundled_identity, AirServerTable};
+pub use canary::{days_until, MIN_REMAINING_DAYS};
 pub use cks::has_bundled_identity as has_bundled_cks;
 pub use cks::CksTable;
 pub use crl::{CastCrl, ServableCrl, ServeRefusal};

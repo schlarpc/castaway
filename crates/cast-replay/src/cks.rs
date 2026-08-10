@@ -134,10 +134,19 @@ impl CksTable {
         (index < WINDOW_COUNT).then_some(index)
     }
 
+    /// The first instant the shipped table does **not** cover — its horizon,
+    /// exclusive: 2027-12-06T00:00:00Z.
+    ///
+    /// A compile-time constant, derived from the same layout that produces every
+    /// window, so it is readable without a carved identity. The expiry canary
+    /// (`tests/expiry_canary.rs`) reads it that way, so the "table is running out"
+    /// check fires on any build rather than only where the fixtures are present.
+    pub const HORIZON_UNIX: i64 = EPOCH_UNIX + WINDOW_COUNT as i64 * WINDOW_SECS;
+
     /// The last instant the table covers, exclusive.
     #[must_use]
     pub const fn covers_until(&self) -> i64 {
-        EPOCH_UNIX + WINDOW_COUNT as i64 * WINDOW_SECS
+        Self::HORIZON_UNIX
     }
 
     /// Build the credential for the window covering `unix`.

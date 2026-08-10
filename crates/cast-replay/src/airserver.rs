@@ -206,10 +206,20 @@ impl AirServerTable {
             .map(|_| index)
     }
 
+    /// The first instant this table does **not** cover — its horizon, exclusive:
+    /// 2027-03-21T00:00:00Z.
+    ///
+    /// A compile-time constant, on the same terms and for the same reason as
+    /// [`crate::cks::CksTable::HORIZON_UNIX`]: the expiry canary
+    /// (`tests/expiry_canary.rs`) reads it without a carved identity. This table
+    /// stops eight months before CKS's, so it is the one the canary trips on first.
+    pub const HORIZON_UNIX: i64 =
+        EPOCH_UNIX + (WINDOW_COUNT as i64 - 1) * STEP_SECS + VALIDITY_SECS;
+
     /// The last instant this table covers, exclusive.
     #[must_use]
     pub const fn covers_until(&self) -> i64 {
-        EPOCH_UNIX + (WINDOW_COUNT as i64 - 1) * STEP_SECS + VALIDITY_SECS
+        Self::HORIZON_UNIX
     }
 
     /// The first instant this table covers.
