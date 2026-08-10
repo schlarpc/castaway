@@ -100,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         headline: String::new(),
         steps: vec![],
         advertised: None,
+        qr_payload: None,
     };
     Ok(())
 }

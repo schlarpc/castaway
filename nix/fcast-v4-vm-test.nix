@@ -147,30 +147,30 @@ pkgs.testers.runNixOSTest {
         scan = sender.succeed("fcast scan --timeout 10")
         assert "${advertised}" in scan, scan
         sender.succeed(
-            f'fcast -n "${advertised}" play --mime-type video/mp4 --url http://example.invalid/v4.mp4 -t 5'
+            'fcast -n "${advertised}" play --mime-type video/mp4 --url http://example.invalid/v4.mp4 -t 5'
         )
         journal("fcast: v4 TLS up")
         journal("session: play")
         journal("http://example.invalid/v4.mp4")
 
     with subtest("v4 transport verbs reach the pipeline"):
-        sender.succeed(f'fcast -n "${advertised}" pause')
+        sender.succeed('fcast -n "${advertised}" pause')
         journal("null pipeline: CONTROL txn=Pause")
-        sender.succeed(f'fcast -n "${advertised}" resume')
+        sender.succeed('fcast -n "${advertised}" resume')
         journal("null pipeline: CONTROL txn=Play")
-        sender.succeed(f'fcast -n "${advertised}" seek -t 42')
+        sender.succeed('fcast -n "${advertised}" seek -t 42')
         journal("null pipeline: CONTROL txn=Seek(42s)")
-        sender.succeed(f'fcast -n "${advertised}" set-volume -v 0.5')
+        sender.succeed('fcast -n "${advertised}" set-volume -v 0.5')
         journal("null pipeline: CONTROL txn=Volume")
-        sender.succeed(f'fcast -n "${advertised}" stop')
+        sender.succeed('fcast -n "${advertised}" stop')
         journal("null pipeline: CONTROL txn=Stop")
 
     with subtest("a listening v4 sender is told what is playing"):
         sender.succeed(
-            f'fcast -n "${advertised}" play --mime-type video/mp4 --url http://example.invalid/listen.mp4'
+            'fcast -n "${advertised}" play --mime-type video/mp4 --url http://example.invalid/listen.mp4'
         )
         out = sender.succeed(
-            f'timeout 8 fcast -n "${advertised}" listen 2>&1 || true'
+            'timeout 8 fcast -n "${advertised}" listen 2>&1 || true'
         )
         assert "Source changed" in out, out
         assert "Playback state changed" in out, out

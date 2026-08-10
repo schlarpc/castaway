@@ -161,6 +161,11 @@ pub struct ServiceDetail {
     /// The exact name to look for in a picker, shown prominently — it is the one string
     /// that has to be got right, and the one nobody can guess.
     pub advertised: Option<String>,
+    /// A payload to render as a QR code beside the instructions, when the
+    /// protocol has one a phone scans instead of typing — FCast's `fcast://r/…`
+    /// connection URL, and (the reuse this was factored for) a Matter `MT:…`
+    /// commissioning code. `None` leaves the screen text-only.
+    pub qr_payload: Option<String>,
 }
 
 /// The glyph a tile draws. Distance fields rather than an icon font, for the same reason
@@ -250,6 +255,7 @@ impl AttractScene {
                             "Menu → Cast, or the cast button in a video".into(),
                         ],
                         advertised: Some(advertised(ProtocolKind::Cast)),
+                        qr_payload: None,
                     }),
                 },
                 Tile {
@@ -264,6 +270,7 @@ impl AttractScene {
                             "Or the AirPlay button in a video or track".into(),
                         ],
                         advertised: Some(advertised(ProtocolKind::AirPlay)),
+                        qr_payload: None,
                     }),
                 },
                 Tile {
@@ -278,6 +285,7 @@ impl AttractScene {
                             "Or any app with \"Play on\" / \"Cast to device\"".into(),
                         ],
                         advertised: Some(advertised(ProtocolKind::Dlna)),
+                        qr_payload: None,
                     }),
                 },
                 Tile {
@@ -289,6 +297,7 @@ impl AttractScene {
                         headline: "Play to the room, and keep the phone as the remote.".into(),
                         steps: vec!["Play something".into(), "Tap Devices, bottom-left".into()],
                         advertised: Some(advertised(ProtocolKind::Spotify)),
+                        qr_payload: None,
                     }),
                 },
                 Tile {
@@ -300,6 +309,7 @@ impl AttractScene {
                         headline: "The cast button in the YouTube app.".into(),
                         steps: vec!["Tap it, and pick this screen".into()],
                         advertised: Some(advertised(ProtocolKind::YouTubeLounge)),
+                        qr_payload: None,
                     }),
                 },
                 Tile {

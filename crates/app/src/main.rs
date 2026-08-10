@@ -2093,6 +2093,7 @@ fn build_attract(
                 headline: headline.to_string(),
                 steps,
                 advertised: Some(advertised(kind)),
+                qr_payload: None,
             }),
         };
 

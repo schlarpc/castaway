@@ -175,6 +175,49 @@ pub fn render(screen: &ServiceScreen, width: u32, height: u32) -> Result<Vec<u8>
         &f.regular,
     );
 
+    // A QR pairing code on the right, when the protocol has one to scan (FCast's
+    // connection URL). It carries the fingerprint a phone must pin, off a channel
+    // — the glass — a network attacker cannot tamper with, so it earns the space.
+    // The instructions keep the left column; the code sits in the right third.
+    if let Some(payload) = &screen.detail.qr_payload {
+        if let Ok(matrix) = crate::qr::QrMatrix::encode(payload) {
+            let side = 300.0 * s;
+            let card = Rect {
+                x: width as f32 - side - margin - 24.0 * s,
+                y: plate.y,
+                w: side + 24.0 * s,
+                h: side + 24.0 * s,
+            };
+            shape::rounded_rect(&mut buf, width, height, card, 16.0 * s, pal.plate);
+            // White quiet zone and modules: a QR needs light margins to scan, and
+            // the accent-tinted plate behind it is only the frame.
+            let _ = crate::qr::draw(
+                &mut buf,
+                width,
+                height,
+                &matrix,
+                crate::qr::QrStyle {
+                    x: card.x + 12.0 * s,
+                    y: card.y + 12.0 * s,
+                    side,
+                    dark: theme::WELL,
+                    light: [0xff, 0xff, 0xff, 0xff],
+                },
+            );
+            text::draw_text(
+                &mut buf,
+                width,
+                height,
+                card.x + 12.0 * s,
+                card.y + card.h + 30.0 * s,
+                "Scan to connect",
+                24.0 * s,
+                pal.step,
+                &f.regular,
+            );
+        }
+    }
+
     // Steps, numbered. Numbers rather than bullets because these are in order — "open
     // the app" before "pick the screen" — and a bullet list says they are not.
     let mut y = plate.y + plate.h + 76.0 * s;
@@ -272,6 +315,7 @@ mod tests {
                 headline: "Cast a tab, or your whole screen.".into(),
                 steps: vec!["Open Chrome or Edge".into(), "Menu, then Cast".into()],
                 advertised: Some("dma.space/screen#cast".into()),
+                qr_payload: None,
             },
         }
     }
